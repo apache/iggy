@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::binary_impls::send_raw_messages;
 use crate::{
     ClientState, Credentials, DiagnosticEvent, Identifier, IggyError, NonZeroIggyDuration,
     PartitionContext,
@@ -25,16 +24,85 @@ use bytes::Bytes;
 use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::WireEncode;
 use iggy_binary_protocol::codes::{
-    DELETE_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE, SEND_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE,
+    DELETE_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
-use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::messages::{PollMessagesRequest, WaitForMessagesRequest};
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::Instant;
+
+/// Default budget shared by a binary call's lookups, admission and retries.
+#[doc(hidden)]
+pub const BINARY_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+tokio::task_local! {
+    static OPERATION_DEADLINE: Instant;
+    static OPERATION_LINEAGE: Option<BinaryOperationLineage>;
+}
+
+/// The caller sign-in shared by every request of one public operation.
+/// The owner is stable across session recovery and distinguishes nested clients.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BinaryOperationLineage {
+    owner: u128,
+    lineage: u64,
+}
+
+impl BinaryOperationLineage {
+    pub fn new(owner: u128, lineage: u64) -> Self {
+        Self { owner, lineage }
+    }
+
+    pub fn capture(owner: u128, lineage: u64) -> Self {
+        binary_operation_lineage()
+            .filter(|current| current.owner == owner)
+            .unwrap_or(Self { owner, lineage })
+    }
+
+    pub fn lineage(self) -> u64 {
+        self.lineage
+    }
+}
+
+#[doc(hidden)]
+pub fn binary_operation_lineage() -> Option<BinaryOperationLineage> {
+    OPERATION_LINEAGE.try_get().ok().flatten()
+}
+
+#[doc(hidden)]
+pub async fn with_binary_lineage<F: Future>(
+    lineage: Option<BinaryOperationLineage>,
+    future: F,
+) -> F::Output {
+    OPERATION_LINEAGE.scope(lineage, future).await
+}
+
+#[doc(hidden)]
+pub async fn with_binary_deadline<F: Future>(deadline: Instant, future: F) -> F::Output {
+    let deadline = OPERATION_DEADLINE
+        .try_with(|current| deadline.min(*current))
+        .unwrap_or(deadline);
+    OPERATION_DEADLINE.scope(deadline, future).await
+}
+
+#[doc(hidden)]
+pub fn binary_operation_deadline() -> Instant {
+    OPERATION_DEADLINE
+        .try_with(|deadline| *deadline)
+        .unwrap_or_else(|_| Instant::now() + BINARY_OPERATION_TIMEOUT)
+}
 
 #[async_trait]
 pub trait BinaryTransport {
+    #[doc(hidden)]
+    fn operation_lineage(&self) -> Option<BinaryOperationLineage> {
+        None
+    }
+
     /// Gets the state of the client.
     async fn get_state(&self) -> ClientState;
     /// Sets the state of the client.
@@ -43,31 +111,20 @@ pub trait BinaryTransport {
     /// Low-level raw API: send `code` with an encoded `payload` and return the
     /// raw reply body.
     ///
-    /// Partition commands carry the partition context the typed API would send:
-    /// - `SendMessages` with an explicit partition id uses the cached send
-    ///   context, or captures one from `GetPartitionRoute`. After a
-    ///   `HistoryUnavailable` refusal the topic's cached contexts are dropped and
-    ///   one fresh capture is tried. `Balanced` and `MessagesKey` partitioning
-    ///   fail with [`IggyError::FeatureUnavailable`] before anything is sent:
-    ///   use [`MessageClient::send_messages`](crate::MessageClient::send_messages)
-    ///   or an explicit partition id.
-    /// - `PollMessages` takes the routed path of a typed poll (`GetPollRouting`),
-    ///   and `StoreConsumerOffset` and `DeleteConsumerOffset` that of a typed
-    ///   offset write (`GetConsumerOffsetRouting`). Each takes the context its
-    ///   route reports, so after another client deleted and recreated the
-    ///   partition, one call can fail with `HistoryUnavailable`
-    ///   (`ConsumerGroupPartitionNotOwned` for a consumer group). The failed
-    ///   route is dropped and the next call routes again.
+    /// The transport routes partition commands to their primary and captures
+    /// context when the caller supplies none. Raw `SendMessages` requires an
+    /// explicit partition id; raw `Balanced` and `MessagesKey` sends return
+    /// [`IggyError::FeatureUnavailable`]. Use [`MessageClient::send_messages`](crate::MessageClient::send_messages)
+    /// for balanced or keyed selection.
     ///
-    /// A partition command payload that does not decode fails with
-    /// [`IggyError::InvalidCommand`] before anything is sent. Every other code
-    /// is sent unchanged, without a partition context.
+    /// Retries keep their request identity and first context. A definitive
+    /// history refusal lets a send capture once again; an uncertain operation
+    /// stays retained under its original context for explicit recovery.
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError>
     where
         Self: Sync,
     {
         match code {
-            SEND_MESSAGES_CODE => send_raw_messages(self, payload).await,
             POLL_MESSAGES_CODE => {
                 let request = PollMessagesRequest::decode_from(&payload)
                     .map_err(|_| IggyError::InvalidCommand)?;
@@ -84,14 +141,36 @@ pub trait BinaryTransport {
         }
     }
     /// Send with a captured partition incarnation and owner. Every retry must retain it.
-    /// A history refusal after an uncertain attempt must return
-    /// `TransientNotCommitted`, so callers cannot refresh and repeat that write.
+    /// A history refusal after an uncertain attempt returns `OperationUncertain`,
+    /// so callers cannot refresh and repeat that write under a new identity.
     async fn send_raw_with_context(
         &self,
         code: u32,
         payload: Bytes,
         context: PartitionContext,
     ) -> Result<Bytes, IggyError>;
+    /// Send a non-replicated command `code` with an encoded `payload` to the
+    /// replica `replica_id` and return its raw reply body.
+    ///
+    /// The request carries the session's metadata watermark, so the replica
+    /// answers once it applied the metadata the session saw. The reply is the
+    /// chosen replica's own: a refusal such as [`IggyError::NotPrimary`] is
+    /// returned, never retried on another replica. A replicated command, a poll
+    /// or a consumer-offset read returns [`IggyError::InvalidCommand`] before
+    /// anything is sent. A replica the roster does not name, or names without
+    /// an endpoint for this transport, returns [`IggyError::InvalidIdentifier`].
+    /// A link lost after the request was written makes the outcome unknown, so
+    /// a call that no later attempt answers returns
+    /// [`IggyError::TransientNotCommitted`]. Transports without replica links
+    /// return [`IggyError::FeatureUnavailable`].
+    async fn send_raw_to_replica(
+        &self,
+        _code: u32,
+        _payload: Bytes,
+        _replica_id: u8,
+    ) -> Result<Bytes, IggyError> {
+        Err(IggyError::FeatureUnavailable)
+    }
     /// Route a store or delete offset request while retaining the membership connection.
     /// Every retry keeps a captured `context`. Without one, the request takes the context
     /// its route reports.
@@ -113,6 +192,41 @@ pub trait BinaryTransport {
     ) -> Result<Bytes, IggyError>
     where
         Self: Sync;
+    /// The partition count from the newest usable route for this topic.
+    #[doc(hidden)]
+    fn routed_partition_count(
+        &self,
+        _stream_id: &Identifier,
+        _topic_id: &Identifier,
+    ) -> Option<u32> {
+        None
+    }
+    /// Route a poll with bounded server wait and response size.
+    async fn send_poll_with_response_and_options(
+        &self,
+        request: &PollMessagesRequest,
+        context: Option<PartitionContext>,
+        options: Option<crate::DeferredPollOptions>,
+    ) -> Result<Bytes, IggyError>
+    where
+        Self: Sync,
+    {
+        if options.is_none() {
+            self.send_poll_with_response(request, context).await
+        } else {
+            Err(IggyError::FeatureUnavailable)
+        }
+    }
+
+    /// A readiness wait shares a multiplexed connection, like a positive poll wait.
+    /// A client runs at most `MAX_DEFERRED_REQUESTS` deferred requests at once.
+    async fn send_wait_with_response(
+        &self,
+        _request: &WaitForMessagesRequest,
+    ) -> Result<Bytes, IggyError> {
+        Err(IggyError::FeatureUnavailable)
+    }
+
     fn get_heartbeat_interval(&self) -> NonZeroIggyDuration;
 
     /// Per-transport consumer-group + partitioning cache used to resolve
@@ -132,6 +246,57 @@ mod vsr_session_sealed {
 /// mutation corrupts the dedup counter or silently breaks at-most-once.
 #[async_trait]
 pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
+    /// Runs one explicit attempt, including cleanup if the caller cancels it.
+    #[doc(hidden)]
+    async fn sign_in_with_credentials(
+        &self,
+        credentials: Credentials,
+    ) -> Result<crate::IdentityInfo, IggyError>
+    where
+        Self: crate::BinaryClient + Sized,
+    {
+        crate::binary_sign_in(self, credentials).await
+    }
+
+    #[doc(hidden)]
+    async fn finish_sign_in(
+        &self,
+        credentials: Credentials,
+        user_id: u32,
+    ) -> Result<(), IggyError> {
+        self.set_state(ClientState::Authenticated).await;
+        self.remember_session_credentials(credentials, user_id)
+            .await;
+        self.publish_event(DiagnosticEvent::SignedIn).await;
+        Ok(())
+    }
+
+    /// Completes only the captured caller's Logout. Preparatory Logout keeps its lineage.
+    #[doc(hidden)]
+    async fn finish_sign_out(&self, _signing_in: bool) -> Result<(), IggyError> {
+        self.forget_session_credentials().await;
+        self.reset_vsr_session().await?;
+        self.set_state(ClientState::Connected).await;
+        self.publish_event(DiagnosticEvent::SignedOut).await;
+        Ok(())
+    }
+
+    /// Establish a connection for explicit credentials before capturing the
+    /// sign-in fence. Binary SDK transports suppress automatic sign-in here.
+    #[doc(hidden)]
+    async fn prepare_sign_in(&self) -> Result<(), IggyError>
+    where
+        Self: crate::Client,
+    {
+        if matches!(
+            self.get_state().await,
+            ClientState::Disconnected | ClientState::Connecting
+        ) {
+            self.connect().await?;
+        }
+        Ok(())
+    }
+
     /// Internal bearer proof. Never log or expose this value to application users.
     #[doc(hidden)]
     async fn session_bind_secret(&self) -> Result<BindSecret, IggyError>;
@@ -193,18 +358,6 @@ pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
     /// Drop them: after an explicit logout there is no session to restore,
     /// and a reconnect must not resurrect one.
     async fn forget_session_credentials(&self) {}
-    /// A committed password change for `user`: when it is the signed-in user,
-    /// the credentials the next reconnect signs in with switch to the new
-    /// password, or that reconnect would replay the old one and fail an
-    /// unrelated request with `InvalidCredentials`. Other users' changes are
-    /// ignored.
-    ///
-    /// This covers a configured `AutoLogin` as well as a sign-in the caller
-    /// ran: the configured credentials still decide *who* the client signs in
-    /// as, and a committed change decides what that user's password is.
-    async fn refresh_session_password(&self, _user: &Identifier, _new_password: &str) {}
-    /// Keep auxiliary logins and reconnects working after the session user is renamed.
-    async fn refresh_session_username(&self, _user: &Identifier, _new_username: &str) {}
     /// SDK crate version sent in the login-register version prefix.
     /// Implemented by the transports so the value is the SDK crate's own
     /// `CARGO_PKG_VERSION` (`iggy` for Rust), not `iggy_common`'s.
@@ -234,19 +387,16 @@ pub fn decode_session_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ConsumerGroupClientState;
+    use crate::{Client, Consumer, ConsumerGroupClientState, MessageClient, PollingStrategy};
     use bytes::BytesMut;
-    use iggy_binary_protocol::codes::{
-        GET_CONSUMER_OFFSET_ROUTING_CODE, GET_PARTITION_ROUTE_CODE, GET_POLL_ROUTING_CODE,
-        PING_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
-    };
+    use iggy_binary_protocol::codes::SYNC_CONSUMER_GROUP_CODE;
+    use iggy_binary_protocol::codes::{GET_PARTITION_ROUTE_CODE, PING_CODE, SEND_MESSAGES_CODE};
     use iggy_binary_protocol::requests::consumer_offsets::{
         DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
     };
-    use iggy_binary_protocol::requests::messages::{
-        GetPartitionRouteRequest, RawMessage, SendMessagesEncoder,
-    };
-    use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
+    use iggy_binary_protocol::requests::messages::{RawMessage, SendMessagesEncoder};
+    use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
+    use iggy_binary_protocol::responses::messages::PollMessagesResponseHeader;
     use iggy_binary_protocol::{
         AckLevel, WireConsumer, WireIdentifier, WirePartitioning, WirePollingStrategy,
     };
@@ -256,12 +406,6 @@ mod tests {
     const TOPIC: &str = "orders";
     const PARTITION: u32 = 3;
     const RECEIPT: &[u8] = b"receipt";
-    const CAPTURED: PartitionContext = PartitionContext {
-        incarnation: 7,
-        owner_generation: 0,
-        metadata_op: 9,
-    };
-
     #[derive(Debug, PartialEq)]
     enum Call {
         Raw(u32, Bytes, PartitionContext),
@@ -270,10 +414,18 @@ mod tests {
     }
 
     /// Keeps the provided `send_raw_with_response`, the behavior under test.
-    #[derive(Default)]
+    #[derive(Debug, Default)]
     struct Recorder {
         calls: Mutex<Vec<Call>>,
         state: Arc<ConsumerGroupClientState>,
+        sync: Mutex<Option<SyncPublication>>,
+    }
+
+    #[derive(Debug)]
+    struct SyncPublication {
+        caller_changed: bool,
+        empty: bool,
+        replaced: bool,
     }
 
     impl Recorder {
@@ -303,13 +455,40 @@ mod tests {
             context: PartitionContext,
         ) -> Result<Bytes, IggyError> {
             self.record(Call::Raw(code, payload, context));
-            if code == GET_PARTITION_ROUTE_CODE {
-                return Ok(PartitionRouteResponse {
-                    incarnation: CAPTURED.incarnation,
-                    metadata_op: CAPTURED.metadata_op,
-                    view: 0,
-                    partitions_count: PARTITION + 1,
-                    primary_replica: 0,
+            if code == SYNC_CONSUMER_GROUP_CODE {
+                let mut scenario = self.sync.lock().unwrap();
+                let scenario = scenario.as_mut().unwrap();
+                if scenario.replaced {
+                    assert!(self.state.is_registered("1|orders|3"));
+                    assert_eq!(self.state.next_group_partition("1|orders|3"), Some(7));
+                    if scenario.caller_changed {
+                        return Err(IggyError::Unauthenticated);
+                    }
+                } else {
+                    // The transport has accepted the reply; replacement wins before common cache publication.
+                    scenario.replaced = true;
+                    self.state.clear_session_scoped();
+                    self.state.register_group(
+                        "1|orders|3".to_owned(),
+                        Identifier::numeric(STREAM).unwrap(),
+                        Identifier::named(TOPIC).unwrap(),
+                        Identifier::numeric(3).unwrap(),
+                    );
+                    self.state
+                        .set_assignment("1|orders|3".to_owned(), 9, vec![7]);
+                    return Ok(if scenario.empty {
+                        Bytes::new()
+                    } else {
+                        SyncConsumerGroupResponse {
+                            generation: 1,
+                            partitions: vec![2],
+                        }
+                        .to_bytes()
+                    });
+                }
+                return Ok(SyncConsumerGroupResponse {
+                    generation: 9,
+                    partitions: vec![7],
                 }
                 .to_bytes());
             }
@@ -332,6 +511,15 @@ mod tests {
             context: Option<PartitionContext>,
         ) -> Result<Bytes, IggyError> {
             self.record(Call::Poll(request.clone(), context));
+            if self.sync.lock().unwrap().is_some() {
+                return Ok(PollMessagesResponseHeader {
+                    partition_id: request.partition_id.unwrap(),
+                    current_offset: 0,
+                    messages_count: 0,
+                    context: Default::default(),
+                }
+                .to_bytes());
+            }
             Ok(Bytes::from_static(RECEIPT))
         }
 
@@ -342,6 +530,130 @@ mod tests {
         fn consumer_group_state(&self) -> Arc<ConsumerGroupClientState> {
             Arc::clone(&self.state)
         }
+    }
+
+    impl VsrSessionSealed for Recorder {}
+    impl crate::BinaryClient for Recorder {}
+
+    #[async_trait]
+    impl VsrSessionControl for Recorder {
+        async fn session_bind_secret(&self) -> Result<BindSecret, IggyError> {
+            Err(IggyError::FeatureUnavailable)
+        }
+        async fn session_identity(&self) -> Result<SessionIdentity, IggyError> {
+            Err(IggyError::FeatureUnavailable)
+        }
+        async fn bind_vsr_session(&self, _session: u64) -> Result<(), IggyError> {
+            Err(IggyError::FeatureUnavailable)
+        }
+        async fn reset_vsr_session(&self) -> Result<(), IggyError> {
+            Err(IggyError::FeatureUnavailable)
+        }
+        fn sdk_version(&self) -> &'static str {
+            "0.0.0"
+        }
+    }
+
+    #[async_trait]
+    impl Client for Recorder {
+        async fn connect(&self) -> Result<(), IggyError> {
+            Ok(())
+        }
+        async fn disconnect(&self) -> Result<(), IggyError> {
+            Ok(())
+        }
+        async fn shutdown(&self) -> Result<(), IggyError> {
+            Ok(())
+        }
+        async fn subscribe_events(&self) -> async_broadcast::Receiver<DiagnosticEvent> {
+            async_broadcast::broadcast(1).1
+        }
+    }
+
+    async fn given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership(
+        caller_changed: bool,
+        empty: bool,
+    ) {
+        let transport = Recorder {
+            sync: Mutex::new(Some(SyncPublication {
+                caller_changed,
+                empty,
+                replaced: false,
+            })),
+            ..Default::default()
+        };
+        let result = transport
+            .poll_messages(
+                &Identifier::numeric(STREAM).unwrap(),
+                &Identifier::named(TOPIC).unwrap(),
+                None,
+                &Consumer::group(Identifier::numeric(3).unwrap()),
+                &PollingStrategy::offset(0),
+                1,
+                false,
+            )
+            .await;
+        if caller_changed {
+            assert_eq!(result.unwrap_err(), IggyError::Unauthenticated);
+        } else {
+            assert!(
+                result.is_ok(),
+                "automatic recovery must re-sync: {result:?}"
+            );
+        }
+        assert!(transport.state.is_registered("1|orders|3"));
+        assert_eq!(transport.state.next_group_partition("1|orders|3"), Some(7));
+        let calls = transport.take_calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, Call::Raw(SYNC_CONSUMER_GROUP_CODE, ..)))
+                .count(),
+            2
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, Call::Poll(..)))
+                .count(),
+            usize::from(!caller_changed)
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership_recovery_assignment()
+     {
+        given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership(
+            false, false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership_recovery_empty()
+     {
+        given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership(
+            false, true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership_caller_assignment()
+     {
+        given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership(
+            true, false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership_caller_empty()
+     {
+        given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership(
+            true, true,
+        )
+        .await;
     }
 
     fn wire_topic() -> WireIdentifier {
@@ -372,61 +684,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_raw_send_to_partition_id_when_repeated_should_capture_context_once() {
+    async fn given_raw_send_to_partition_id_when_sent_should_leave_routing_to_transport() {
         let transport = Recorder::default();
         let payload = send_payload(&WirePartitioning::PartitionId(PARTITION));
-        for _ in 0..2 {
-            let response = transport
-                .send_raw_with_response(SEND_MESSAGES_CODE, payload.clone())
-                .await
-                .unwrap();
-            assert_eq!(response, Bytes::from_static(RECEIPT));
-        }
-        let capture = GetPartitionRouteRequest {
-            stream_id: WireIdentifier::numeric(STREAM),
-            topic_id: wire_topic(),
-            partition_id: PARTITION,
-        };
+        let response = transport
+            .send_raw_with_response(SEND_MESSAGES_CODE, payload.clone())
+            .await
+            .unwrap();
+        assert_eq!(response, Bytes::from_static(RECEIPT));
         assert_eq!(
             transport.take_calls(),
-            vec![
-                Call::Raw(
-                    GET_PARTITION_ROUTE_CODE,
-                    capture.to_bytes(),
-                    PartitionContext::default()
-                ),
-                Call::Raw(SEND_MESSAGES_CODE, payload.clone(), CAPTURED),
-                Call::Raw(SEND_MESSAGES_CODE, payload, CAPTURED),
-            ]
+            vec![Call::Raw(
+                SEND_MESSAGES_CODE,
+                payload,
+                PartitionContext::default()
+            )]
         );
-        // Typed sends key the same cache by domain identifiers.
-        assert_eq!(
-            transport.state.partition_context(
-                &Identifier::numeric(STREAM).unwrap(),
-                &Identifier::named(TOPIC).unwrap(),
-                PARTITION
-            ),
-            Some(CAPTURED)
-        );
-    }
-
-    #[tokio::test]
-    async fn given_raw_send_without_partition_id_when_sent_should_fail_before_sending() {
-        let transport = Recorder::default();
-        for partitioning in [
-            WirePartitioning::Balanced,
-            WirePartitioning::MessagesKey(b"key".to_vec()),
-        ] {
-            let result = transport
-                .send_raw_with_response(SEND_MESSAGES_CODE, send_payload(&partitioning))
-                .await;
-            assert_eq!(
-                result,
-                Err(IggyError::FeatureUnavailable),
-                "{partitioning:?}"
-            );
-        }
-        assert!(transport.take_calls().is_empty());
     }
 
     #[tokio::test]
@@ -485,13 +758,7 @@ mod tests {
     async fn given_non_partition_code_when_sent_should_pass_through_with_default_context() {
         let transport = Recorder::default();
         let payload = Bytes::from_static(b"opaque");
-        for code in [
-            PING_CODE,
-            GET_PARTITION_ROUTE_CODE,
-            GET_POLL_ROUTING_CODE,
-            POLL_MESSAGES_ON_PRIMARY_CODE,
-            GET_CONSUMER_OFFSET_ROUTING_CODE,
-        ] {
+        for code in [PING_CODE, GET_PARTITION_ROUTE_CODE] {
             transport
                 .send_raw_with_response(code, payload.clone())
                 .await
@@ -510,17 +777,29 @@ mod tests {
     #[tokio::test]
     async fn given_undecodable_partition_payload_when_sent_should_fail_before_sending() {
         let transport = Recorder::default();
-        let mut metadata_past_end =
-            send_payload(&WirePartitioning::PartitionId(PARTITION)).to_vec();
-        metadata_past_end[..4].copy_from_slice(&u32::MAX.to_le_bytes());
-        for (code, payload) in [
-            (SEND_MESSAGES_CODE, Bytes::new()),
-            (SEND_MESSAGES_CODE, Bytes::from(metadata_past_end)),
-            (POLL_MESSAGES_CODE, Bytes::from_static(b"lost-poll")),
-        ] {
-            let result = transport.send_raw_with_response(code, payload).await;
-            assert_eq!(result, Err(IggyError::InvalidCommand), "code {code}");
-        }
+
+        let result = transport
+            .send_raw_with_response(POLL_MESSAGES_CODE, Bytes::from_static(b"lost-poll"))
+            .await;
+
+        assert_eq!(result, Err(IggyError::InvalidCommand));
         assert!(transport.take_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_nested_clients_when_capturing_lineage_should_preserve_each_owner() {
+        let outer = BinaryOperationLineage::capture(1, 10);
+        with_binary_lineage(Some(outer), async {
+            assert_eq!(BinaryOperationLineage::capture(1, 11), outer);
+            let inner = BinaryOperationLineage::capture(2, 20);
+            assert_ne!(inner, outer);
+            with_binary_lineage(Some(inner), async {
+                assert_eq!(BinaryOperationLineage::capture(2, 21), inner);
+            })
+            .await;
+            assert_eq!(BinaryOperationLineage::capture(1, 12), outer);
+        })
+        .await;
+        assert!(binary_operation_lineage().is_none());
     }
 }

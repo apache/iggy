@@ -27,13 +27,17 @@ namespace Apache.Iggy.Configuration;
 /// </summary>
 public sealed class IggyClientConfigurator
 {
+    internal const int DEFAULT_MAX_PENDING_OPERATIONS = 256;
+    internal const long DEFAULT_MAX_PENDING_OPERATION_BYTES = 64L * 1024 * 1024;
     // The bounds Task.Delay and PeriodicTimer accept, which the reconnect loop and heartbeat run on. Below the
     // minimum the delay truncates to zero and redials in a hot loop.
     internal static readonly TimeSpan MinInterval = TimeSpan.FromMilliseconds(1);
     internal static readonly TimeSpan MaxInterval = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
 
     /// <summary>
-    ///     The base address of the Iggy server.
+    ///     The base address of the Iggy server. When the cluster has one node, the <see cref="Enums.Protocol.Tcp" />
+    ///     client uses this address instead of the address that the node advertises, so a port mapping or a
+    ///     port-forward works.
     /// </summary>
     public required string BaseAddress { get; set; }
 
@@ -47,6 +51,18 @@ public sealed class IggyClientConfigurator
     ///     Default is 64 MiB, minimum is the 256-byte header.
     /// </summary>
     public int MaxResponseFrameSize { get; set; } = 64 * 1024 * 1024;
+
+    /// <summary>
+    ///     Maximum active and retained mutations across all partitions and metadata. Default is 256. The client also
+    ///     keeps the proved outcomes of this many replays for <see cref="IggyClient.IIggyClient.ResolveOperationAsync" />.
+    /// </summary>
+    public int MaxPendingOperations { get; init; } = DEFAULT_MAX_PENDING_OPERATIONS;
+
+    /// <summary>
+    ///     Maximum bytes of frozen mutation headers and bodies across active and retained operations.
+    ///     A replay shares its original reservation. Default is 64 MiB; minimum is one 256-byte header.
+    /// </summary>
+    public long MaxPendingOperationBytes { get; init; } = DEFAULT_MAX_PENDING_OPERATION_BYTES;
 
     /// <summary>
     ///     The size of the receive buffer in bytes. When null, the size is not set on the socket, so the
@@ -65,9 +81,11 @@ public sealed class IggyClientConfigurator
     /// <summary>
     ///     Interval between the pings the <see cref="Enums.Protocol.Tcp" /> client sends on its own while
     ///     connected, so an idle session survives the server's heartbeat verification and consumer-group
-    ///     assignments stay fresh. Default is 5 seconds; must be between 1 millisecond and about 49 days.
-    ///     Init-only: the client validates the interval once and hands it to a timer that would fault on an
-    ///     out-of-range value.
+    ///     assignments stay fresh. Each heartbeat also restarts the replica links that used up their
+    ///     <see cref="ReconnectionSettings.MaxRetries" />, with a fresh budget, so a signed-in client recovers
+    ///     from an outage longer than one reconnect burst. Default is 5 seconds; must be between 1 millisecond
+    ///     and about 49 days. Init-only: the client validates the interval once and hands it to a timer that
+    ///     would fault on an out-of-range value.
     /// </summary>
     public TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(5);
 
@@ -110,15 +128,15 @@ public sealed class IggyClientConfigurator
     ///     Creates a TCP configuration from a connection string in the format shared by every Iggy SDK:
     ///     <c>iggy://username:password@host:port?options</c>, or <c>iggy://token@host:port</c> to sign in with a
     ///     personal access token. The <c>iggy+tcp://</c> scheme is accepted as well. The credentials become the
-    ///     <see cref="AutoLoginSettings" />; the remaining settings can still be changed on the returned instance, except
-    ///     <see cref="HeartbeatInterval" />, which is init-only: <c>heartbeat_interval</c> in the string is the only
-    ///     way to set it.
+    ///     <see cref="AutoLoginSettings" />. Heartbeat and pending-operation limits are init-only;
+    ///     their connection-string options set them during construction.
     /// </summary>
     /// <remarks>
     ///     Credentials are taken literally: they are not percent-decoded and must not contain <c>@</c> or <c>:</c>.
     ///     Supported options: <c>tls</c>, <c>tls_domain</c>, <c>tls_ca_file</c>, <c>reconnection_retries</c>
     ///     (a count or <c>unlimited</c>), <c>reconnection_interval</c>, <c>heartbeat_interval</c>,
-    ///     <c>reestablish_after</c> and <c>nodelay</c>. Durations look like <c>500ms</c>, <c>5s</c> or <c>1m30s</c>.
+    ///     <c>reestablish_after</c>, <c>nodelay</c>, <c>max_pending_operations</c> (positive integer),
+    ///     and <c>max_pending_operation_bytes</c> (positive). Durations look like <c>500ms</c>, <c>5s</c> or <c>1m30s</c>.
     ///     Reconnection defaults to unlimited retries every second, and after each reconnect the client still waits
     ///     <see cref="ReconnectionSettings.WaitAfterReconnect" /> (1 second by default). <c>reestablish_after</c> is
     ///     validated but ignored, since <c>reconnection_interval</c> paces every redial. <c>nodelay</c> is validated

@@ -80,6 +80,18 @@ func TestEncodeRequest_EncodesALogoutFrame(t *testing.T) {
 	assert.Equal(t, uint64(2), session.CurrentRequestID())
 }
 
+func TestEncodeRequest_StampsRandomIdentifierForDeleteSegments(t *testing.T) {
+	payload := []byte{1, 2, 3}
+	session := boundSession(t)
+	frame, err := EncodeRequest(session, uint32(command.DeleteSegmentsCode), payload)
+	require.NoError(t, err)
+	another, err := EncodeRequest(session, uint32(command.DeleteSegmentsCode), payload)
+	require.NoError(t, err)
+	require.NotEqual(t, [16]byte{}, [16]byte(frame[requestOffsetChecksum:requestOffsetChecksum+16]))
+	require.NotEqual(t, frame[requestOffsetChecksum:requestOffsetChecksum+16],
+		another[requestOffsetChecksum:requestOffsetChecksum+16])
+}
+
 func TestEncodeRequest_CarriesTheCodeOfANonReplicatedCommand(t *testing.T) {
 	session := boundSession(t)
 

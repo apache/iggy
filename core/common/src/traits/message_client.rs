@@ -120,6 +120,95 @@ pub trait MessageClient {
         .await
     }
 
+    /// Wait for the readiness minimum and return up to `count` messages.
+    /// Expiry returns an available partial; response bytes are independently bounded.
+    /// A lost response can follow progress admission; see `poll_messages`.
+    ///
+    /// A consumer group poll without a partition waits on one assigned partition, chosen
+    /// round-robin, so messages on the other partitions wait up to `max_wait`. To wait on the
+    /// whole assignment, call `wait_for_messages` first and poll a partition that it lists.
+    #[allow(clippy::too_many_arguments)]
+    async fn poll_messages_deferred(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy: &PollingStrategy,
+        count: u32,
+        auto_commit: bool,
+        options: crate::DeferredPollOptions,
+    ) -> Result<PolledMessages, IggyError> {
+        self.poll_messages_with_strategy_for_and_options(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            &|_| *strategy,
+            count,
+            auto_commit,
+            Some(options),
+        )
+        .await
+    }
+
+    /// Deferred polling with the strategy resolved after choosing a partition.
+    /// Custom transports must opt in; positive waits never silently downgrade.
+    #[allow(clippy::too_many_arguments)]
+    async fn poll_messages_with_strategy_for_and_options(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
+        count: u32,
+        auto_commit: bool,
+        options: Option<crate::DeferredPollOptions>,
+    ) -> Result<PolledMessages, IggyError> {
+        if options.is_some() {
+            return Err(IggyError::FeatureUnavailable);
+        }
+        self.poll_messages_with_strategy_for(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            strategy_for,
+            count,
+            auto_commit,
+        )
+        .await
+    }
+
+    /// Wait until at least one of `partitions` holds a message at its start point, and return
+    /// the ids of the partitions that do. An empty list means that `options.max_wait` expired.
+    /// The wait reads and commits no message. Only `max_wait` and `request_timeout` apply.
+    ///
+    /// Each start point is [`PollingStrategy::offset`] or [`PollingStrategy::next`] of
+    /// `consumer`, and each partition appears once. A reported partition returns at least one
+    /// message to a poll with the same consumer and strategy, unless a purge or retention
+    /// removed the messages, or another commit moved `next` past them, in the meantime. A
+    /// reply can leave out a `next` partition whose stored offset moved back during the wait.
+    ///
+    /// The wait runs on the primary of each partition. If the partitions have more than one
+    /// primary, the call waits on each of them and returns the first reply that lists a
+    /// partition. It then cancels the other waits on their shared connections.
+    ///
+    /// A consumer group member that does not own one of the partitions gets
+    /// `ConsumerGroupPartitionNotOwned`. The default implementation is for transports without
+    /// the command, such as HTTP: it fails with `FeatureUnavailable`.
+    async fn wait_for_messages(
+        &self,
+        _stream_id: &Identifier,
+        _topic_id: &Identifier,
+        _partitions: &[(u32, PollingStrategy)],
+        _consumer: &Consumer,
+        _options: crate::DeferredPollOptions,
+    ) -> Result<Vec<u32>, IggyError> {
+        Err(IggyError::FeatureUnavailable)
+    }
+
     /// Send messages using specified partitioning strategy to the given stream and topic by unique IDs or names.
     ///
     /// Authentication is required, and the permission to send the messages.
@@ -138,7 +227,9 @@ pub trait MessageClient {
     ///
     /// Binary clients refresh the partition context once after a definitive
     /// `HistoryUnavailable` (87) refusal. A refusal after an uncertain send
-    /// keeps its original context and returns `TransientNotCommitted` (57).
+    /// keeps its original context and returns `OperationUncertain(op)`.
+    /// `Balanced` and `MessagesKey` sends select a new partition once after a
+    /// definitive `PartitionNotFound` refusal.
     async fn send_messages(
         &self,
         stream_id: &Identifier,

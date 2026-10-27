@@ -36,25 +36,23 @@ Official Rust client SDK for [Apache Iggy](https://iggy.apache.org), the persist
 - **Consumer**: standalone or consumer-group over binary transports; HTTP supports standalone consumers only. Consumed as an async `Stream`. Polling strategies: `next`, `offset`, `timestamp`, `first`, `last`.
 - **Auto-commit** offset policies: `Interval`, `When`, `After`, `IntervalOrWhen`, `IntervalOrAfter`, or disabled.
 - **Stream builder** (`IggyStream`, `IggyStreamProducer`, `IggyStreamConsumer`) for declarative producer + consumer setup on shared or separate stream/topic.
-- **Reliability**: automatic reconnection with retries, heartbeat, send retries, and offset auto-commit handled by the high-level API.
+- **Reliability**: managed replica connections, heartbeat, ordered mutation lanes, explicit recovery of uncertain mutations, and offset auto-commit.
 - **Message features**: optional headers (`HeaderKey` / `HeaderValue`), client-side AES-256-GCM encryption (via `Aes256GcmEncryptor`), topic compression metadata (`None` and `Gzip`; no runtime compression yet), server-honored message expiry, and server-side deduplication.
 - **Admin**: stream/topic/partition CRUD, consumer-group management, server-side consumer offsets, system stats.
+- **Resource options**: typed create and update options for streams, topics and users (`StreamCreateOptions`, `TopicUpdateOptions`, `UserUpdateOptions` and friends). An update sends only the settings it names and resets others by key. A stream can carry its own at-rest key (`StreamCreateOptions::encryption_key`), reads report only its source and fingerprints.
 
 ## Installation
 
 Run from your application crate. Use a release compatible with your server; for
 unreleased changes, build the SDK and server from the same source checkout.
 
-Cluster auto-commit polling requires servers that support consumer session
-attachment and primary poll routing (binary commands 15, 103 and 104).
-Rust manual and interval offset writes also require command 123. It discovers
-the primary while allowing final commits for partitions awaiting handoff;
-stores and deletes retain their existing wire formats and deduplication keys. Pause
-binary auto-commit consumers during this upgrade, upgrade every server first,
-then upgrade the SDKs and restart the consumers so they join their groups again.
-Older SDKs can lose group membership when a backup refuses an offset commit;
-the new SDK does not fall back to that path on an older server.
-HTTP clients use server-side forwarding and need no new routing commands.
+This checkout requires matching servers and SDKs with fresh storage. Older data
+directories are refused without modification; `--fresh` deletes existing data
+in the configured directory. See the [server recovery guide](../server/README.md#upgrade-recovery).
+Mixed versions and rolling upgrades are unsupported. Binary clients share one
+logical session across replica links using BindSession (15) and discover
+partition primaries with GetPartitionRoute (105). Commands 14, 103, 104, 123 and 124
+are retired. HTTP clients use server-side forwarding.
 
 ```bash
 cargo add iggy
@@ -68,10 +66,104 @@ them, retain their logical identity and bind proof across transport reconnects,
 and clear them on explicit logout. `VsrSessionSealed` is an implementation marker,
 not a restriction on external implementations. The bind proof is a bearer
 credential for internal session control and must never be logged or exposed.
+`refresh_session_password` and `refresh_session_username` are removed. A
+transport that signs in again applies a committed credential change where its
+calls complete.
+
+`IggyError::ProducerSendFailed` changes its public `stream_name` and `topic_name`
+fields from `String` to `Box<str>`. Existing constructors must convert their names
+with `.into()`; the callback's `ErrorCtx` fields remain `String`. It also adds a
+public `uncertain: usize` field, so struct literals and exhaustive patterns must
+name it. `ConsumerGroupClientState` no longer has its public `partition_count` and
+`set_partition_context` methods.
 
 An established session has its own lifetime. Password or PAT changes and PAT
 expiry do not end it. Logout, session lease expiry, or user deactivation end the
 session and prevent its bind proof from restoring it.
+
+## Mutation recovery
+
+TCP, QUIC and WebSocket serialize mutations within each partition history and
+within the metadata lane. Different lanes can progress concurrently. An
+`IggyError::OperationUncertain(operation_id)` retains the exact request for
+recovery. A later mutation on the same lane returns
+`IggyError::LaneBlocked(operation_id)` until that operation is resolved or abandoned.
+
+Call `client.resolve_operation(operation_id, deadline).await`, where `deadline`
+is a `std::time::Instant`. A proved success returns `Ok(())`; a proved committed
+business rejection returns its original error. Both release the lane. Another
+`OperationUncertain` keeps the request available for a later recovery attempt.
+The client keeps the proved outcomes of its last `max_pending_operations`
+replays, also across a session reset. So a later resolve returns the same
+outcome without a request, also after a producer or a consumer of the client
+resolved the operation first.
+`client.abandon_operation(operation_id).await` releases the lane while leaving
+the outcome unknown. A session reset drops retained requests. An
+`OperationNotRetained` error does not establish the outcome. A reset or an
+abandon came before a proved outcome, or the proved outcome aged out.
+Recovery is unavailable over HTTP.
+
+Receipt access follows the server's [session and revocation policy](../server/README.md#sessions-and-retry-receipts).
+An unresolved operation cannot recover its receipt after its original session
+ends, even after a new login or account reactivation. With a live session,
+partition permission revocation prevents resolution with 41 until a re-grant;
+metadata can replay the user's own committed cached result without a new
+permission check. A fresh application send can duplicate an uncertain operation.
+
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../server/README.md#metadata-freshness-and-counters).
+
+An explicit sign-in or logout ends earlier calls: unsent calls fail with 40,
+and possibly applied mutations remain uncertain. SDK-managed recovery can keep
+an unsent call waiting for a session or a primary within its original deadline.
+Expiry returns 58. A refused automatic sign-in ends each unsent call that waits
+for it with 40. Until the caller signs in, later calls also fail with 40.
+`IggyError` carries no cause, so the client logs the refusal as a warning. If
+the sign-in of a `connect()` call is refused, that call returns the refusal.
+Recovery uses the caller's last explicit sign-in, or configured automatic
+credentials only if the caller never signed in. Logout disables automatic sign-in.
+
+HTTP 503 `relay_refused` uses the configured HTTP retry policy, regardless of
+its body code. Rust's HTTP retry schedule does not use the server's `Retry-After`
+header. This retry support does not provide retained-operation recovery.
+If the last 503 body carries code 58, the call returns `TransientNotAccepted`.
+A write that possibly committed, for example after a 504 or a lost reply, is
+not sent again and returns `TransientNotCommitted`.
+
+On a multi-node cluster, an HTTP call often reaches a node that is not the
+partition primary. For message sends, polls and consumer offset calls, that
+node relays the call to the primary. The relay needs identical `http.jwt`
+secrets or `cluster.auth` on every node. Without that key material, these calls
+answer 503 with code 58. See
+[HTTP routing and backpressure](../server/README.md#http-routing-and-backpressure).
+
+A committed password change or rename of the signed-in user updates the
+credentials that the client signs in with again. This holds for a typed call, a
+raw request and a change that `resolve_operation` proves. A committed rejection,
+such as a wrong current password, leaves them unchanged.
+
+The client defaults to 256 active or retained mutations and 64 MiB of frozen
+request frames. Configure positive limits through `PendingOperationsConfig`
+on the binary transport builder, or through connection-string options:
+
+```text
+iggy://iggy:iggy@localhost:8090?max_pending_operations=256&max_pending_operation_bytes=67108864
+```
+
+Admission waits within the call deadline before allocating a request ID or
+sending. A frame larger than the byte limit fails locally. Completion,
+abandonment and session reset release operation capacity; bytes remain charged
+while a writer still holds the frame. Replaying a retained request reuses its
+reservation.
+
+Auto-commit and `Next` polls share their partition's mutation barrier while the
+call is active. They retain their weak acknowledgement: cancellation or failover
+can leave progress unknown. Error 57 or a lost reply after send ends the call
+immediately without replay; errors 58/89 still retry known non-admission.
+These polls are not retained for recovery.
 
 ## Quick start
 
@@ -119,14 +211,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut consumer = client
         .consumer_group(CONSUMER_GROUP, STREAM, TOPIC)?
-        .auto_commit(AutoCommit::IntervalOrWhen(
-            NonZeroIggyDuration::from_str("1s")?,
-            AutoCommitWhen::ConsumingAllMessages,
-        ))
         .create_consumer_group_if_not_exists()
         .auto_join_consumer_group()
         .polling_strategy(PollingStrategy::next())
-        .poll_interval(IggyDuration::from_str("1ms")?)
         .batch_length(1000)
         .build();
     consumer.init().await?;
@@ -147,6 +234,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         println!("  header {key} = {value:?}");
                     }
                 }
+                consumer
+                    .store_offset(message.message.header.offset, Some(message.partition_id))
+                    .await?;
             }
             Err(error) => eprintln!("poll error: {error}"),
         }
@@ -157,7 +247,219 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 For lower-level control over individual commands (login, stream/topic management, raw send, polling by offset or timestamp), use the transport-specific clients directly. See the [examples](https://github.com/apache/iggy/tree/master/examples/rust) and the [Rust SDK docs](https://iggy.apache.org/docs/sdk/rust/intro/).
 
+`IggyClient::send_binary_request_to_replica(code, payload, replica_id)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
+
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. The request carries the session's metadata watermark. Replicated commands, polls, readiness waits, deferred-request cancels, consumer-offset reads and session-control codes fail with `InvalidCommand` before anything is sent.
+
+An id that cluster metadata does not name fails with `InvalidIdentifier`. An unreachable node is retried until the request deadline, and a `NotPrimary` reply is returned rather than sent to another node.
+
+HTTP clients return `FeatureUnavailable` for this call, as for `send_binary_request`.
+
 For `IggyConsumerConfig`, `partitions_count` controls topic creation only. An ordinary consumer uses partition `0` unless the builder's `partition_id` or the config's `with_partition_id` selects another partition. Code that previously used `partitions_count` to select an existing partition must set `partition_id` explicitly. Consumer-group assignment ignores `partition_id`.
+
+## Deferred polling
+
+High-level consumers use long polling by default. `DeferredPollOptions` separates
+readiness from batch limits: `min_count = 1`, `max_wait = 1s`, `max_bytes = 1 MiB`
+and `request_timeout = 11s`. `batch_length` remains the maximum message count.
+Use `.poll_options(options)` on either consumer builder, or pass options to the
+low-level `poll_messages_deferred` method. A zero `max_wait` skips readiness
+waiting while preserving the same byte limits and request budget.
+
+The server responds when the minimum is readable, the byte cap is reached, or the
+readiness wait expires. Expiry allows a final bounded read; the separate request
+timeout bounds routing, waiting, I/O and response handling. It returns partial or
+empty data when appropriate. Read failures and exhausted request budgets return
+errors. `max_bytes` covers the binary body, including response metadata and batch
+framing; HTTP applies the same selection limit before JSON encoding. The server
+also stops a reply at `sharding.deferred_poll_max_read_bytes`, unless its first
+record alone is wider. A first record that cannot fit returns `InvalidSizeBytes`,
+without advancing its offset.
+The high-level consumer then fetches that record alone, without the byte limit.
+
+Both builders default to `Next` and manual commits. Process messages in partition order,
+then call `store_offset(offset, Some(partition_id))`. Fetch positions advance
+independently of stored offsets. An initial `Next` is resolved once per partition.
+A partition that a rebalance leaves with its group member continues after the last
+message that the application took. The member resolves `Next` again for a partition
+that it gets back from another member. After the client starts a new session, the
+member resolves `Next` again for every partition. Restarting before a commit can replay work.
+Explicit auto-commit policies remain available and can commit messages before processing.
+
+This default is incompatible with earlier releases. The builder used to commit
+with `AutoCommit::IntervalOrWhen(1s, PollingMessages)`, and `IggyConsumerConfig`
+used `AutoCommit::When(PollingMessages)` with `Last`. Code that relied on those
+defaults must set `auto_commit` explicitly, or each restart reads the same
+messages again. `IggyConsumerConfig::with_auto_commit` sets it on a `default` or
+`from_stream_topic` config. A consumer that delivered messages but stored no
+offset logs a warning at shutdown. With `AutoCommit::Disabled` and `Next`,
+`consume_messages` also warns at its start, because its message consumer cannot
+store offsets.
+
+Under `PollingMessages` the server commits every batch that it reads, so the
+consumer does not prefetch. It fetches one batch when the application asks for a
+message and its buffer is empty. A group member first waits until one of its
+partitions holds a message. It sends one readiness wait (binary command 107) per
+partition primary, which watches every assigned partition, and then fetches from
+a ready partition.
+
+Prefetch reserves both byte and message capacity before each request and holds
+it through queued and partially consumed batches. Defaults are 16 MiB of encoded
+response bytes and 16,000 messages, or `batch_length` messages when that is
+larger; use `.prefetch_bytes(...)` and
+`.prefetch_messages(...)` to change them. Each must fit at least one maximum
+response. Decoded message metadata and bounded HTTP JSON overhead are additional;
+these limits are not process RSS limits. Memory handed to application code is
+outside the consumer budget. Assignment refresh, reconnection and cancellation
+continue while the application stalls. Revoked generations are discarded before
+delivery. The normal `poll_interval` setting has been removed; error backoff is
+still configurable.
+
+Binary data requests share multiplexed connections with control traffic.
+A client admits at most 64 deferred requests, and each high-level consumer admits
+at most 16 across fetches and readiness waits, including waits split across replicas.
+Requests waiting for admission spend their original request budget. A group member with more
+partitions than prefetch slots fetches only the partitions that hold a message,
+and one readiness wait per partition primary watches the others. Cancellation
+sends command 108 for the original request on the
+same authenticated connection. QUIC stream cancellation is translated into that
+command by the server transport. It stops a poll still waiting for readiness.
+The binary transport retries a poll that does not commit and does not use
+`next` with the same request identity, reducing its wait and timeout before each attempt.
+A poll that can move an offset is not resent after a lost reply: it fails with
+`TransientNotCommitted`, and the high-level worker retries its explicit
+position. With opt-in server auto-commit, a lost reply, timeout or cancellation
+may race an accepted offset update. `TransientNotCommitted` means the offset may
+already have advanced; it does not prove that the server rejected the poll.
+Timing margins cannot remove this uncertainty. Use manual commits after processing
+when a lost response must not skip messages.
+
+Progress polls (`Next` or auto-commit), offset reads, stores and deletes share a
+progress lane per partition. Sends use the separate mutation lane, so a parked
+poll does not delay a producer sharing the client. Offset stores and deletes
+hold both lanes; an unresolved store or delete blocks later progress until it is
+resolved or abandoned. Different consumers on one partition still share the
+progress lane.
+
+A parked progress poll holds the progress lane of its partition for up to
+`max_wait`. Offset reads, stores and deletes of the same client on that
+partition wait for it. Each of these calls waits for at most the 30-second
+operation timeout. If the poll holds the lane longer, the call fails with
+`TransientNotAccepted`. The client did not send the call, so it is safe to
+retry.
+
+HTTP uses `GET /streams/{stream}/topics/{topic}/messages/deferred` with the ordinary
+poll fields plus `wait_us`, `min_count`, `max_bytes` and `request_timeout_us`.
+Omitted options use the SDK defaults. Binary command 106 carries the same
+contract. `wait_for_messages` (binary command 107) waits until any of several
+partitions holds a message and reads nothing. It has no HTTP route. Upgrade
+servers before SDKs; unsupported servers reject these requests.
+SDK retries, server forwarding and the high-level worker deduct the elapsed
+time from the original budgets. Routing and admission waits also spend that
+budget, and the caller keeps its original request timeout. Proxy timeouts
+should exceed the configured request timeout. The low-level immediate poll API retains
+its existing command and route.
+
+The server defaults to a 30-second maximum readiness wait, 1024 pending polls per
+shard, 64 per logical session (or HTTP user), 16 MiB per read reservation and
+64 MiB of in-flight read reservations. A longer requested wait is shortened to
+the server maximum. A disk read stops after the messages that fill `max_bytes`,
+capped at the read reservation. If its buffers fill their share of that
+reservation first, it stops there. It returns what it read, even below
+`min_count`. Configure
+`sharding.deferred_poll_*` accordingly. The response cap is applied to the selected
+result; it does not cap all storage work. Capacity refusal returns
+`DeferredPollCapacityExceeded` (90); clients back off on the same route. Over
+HTTP, a partition primary with no free relay slot refuses a relayed deferred poll
+with the same code. If the caller's credential holds its whole share of slots,
+the status is 429. In all other cases, it is 503. A
+high-level consumer whose poll is still refused when its request timeout ends
+returns the error to the application and polls that partition again after
+`polling_retry_interval`. A replica
+that cannot serve a partition still returns `TransientNotAccepted` (58) or
+`NotPrimary` (89), prompting route refresh. Upgrade clients with code 90 support
+before enabling deferred polling against this server. Metrics expose pending polls, read reservations and
+completion outcomes.
+
+Bench exposes `--max-wait`, `--min-count`, `--max-bytes` and `--request-timeout`
+for both consumer APIs and records them in report names. Intentional batching
+waits contribute to measured latency.
+
+## Metadata changes
+
+`get_metadata_changes` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manage_servers` permission.
+
+```rust
+use iggy::prelude::*;
+use std::time::Duration;
+
+async fn follow(client: &IggyClient, groups: Vec<MetadataChangeGroup>) -> Result<(), IggyError> {
+    let mut query = MetadataChangesQuery {
+        groups,
+        ..MetadataChangesQuery::default()
+    };
+    loop {
+        let page = client.get_metadata_changes(&query).await?;
+        match page.status {
+            MetadataChangeStatus::Ok => {
+                for record in &page.records {
+                    println!("op {} by {:?}: {:?}", record.op, record.actor_user_id, record.change);
+                }
+                if let Some(next) = page.next {
+                    query.start = MetadataChangeStart::After(next);
+                }
+                if !page.has_more {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+            MetadataChangeStatus::Behind => tokio::time::sleep(Duration::from_millis(100)).await,
+            MetadataChangeStatus::Expired | MetadataChangeStatus::Reset => {
+                query.start = rebuild(client, &query.groups).await?;
+            }
+        }
+    }
+}
+
+/// Pages the current state, then returns the position to follow from.
+async fn rebuild(
+    client: &IggyClient,
+    groups: &[MetadataChangeGroup],
+) -> Result<MetadataChangeStart, IggyError> {
+    let mut scan_groups = groups.to_vec();
+    scan_groups.extend(groups.iter().flat_map(|group| group.parents()));
+    let mut query = MetadataChangesQuery {
+        start: MetadataChangeStart::Current(None),
+        groups: scan_groups,
+        ..MetadataChangesQuery::default()
+    };
+    loop {
+        let page = client.get_metadata_changes(&query).await?;
+        match page.status {
+            MetadataChangeStatus::Ok => {}
+            MetadataChangeStatus::Behind => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            MetadataChangeStatus::Expired | MetadataChangeStatus::Reset => {
+                query.start = MetadataChangeStart::Current(None);
+                continue;
+            }
+        }
+        for item in &page.items {
+            println!("{item:?}");
+        }
+        match (page.current_page_token, page.next) {
+            (Some(token), _) => query.start = MetadataChangeStart::Current(Some(token)),
+            (None, Some(anchor)) => return Ok(MetadataChangeStart::After(anchor)),
+            (None, None) => query.start = MetadataChangeStart::Current(None),
+        }
+    }
+}
+```
+
+`Expired` means the log no longer holds the history after the cursor, and `Reset` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return.
+
+Current pages need the parent groups of every selected group, for example `topics` with `streams`, so `rebuild` adds them through `MetadataChangeGroup::parents()`. Keep a rebuilt state private until a change page answers `Ok` with `has_more == false` and a `head_op` at or above the last current page's.
 
 ## Versioning
 

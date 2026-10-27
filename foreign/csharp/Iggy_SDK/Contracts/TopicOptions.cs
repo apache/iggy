@@ -15,32 +15,41 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Headers;
+using System.Text.Json.Serialization;
 using Apache.Iggy.Enums;
+using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
+using Apache.Iggy.JsonConverters;
+using Apache.Iggy.Utils;
 
 namespace Apache.Iggy.Contracts;
 
 /// <summary>
-///     Topic options that have no named parameter of their own, typed instead of keyed by hand.
+///     Options a topic takes at creation, passed to <see cref="IIggyTopic.CreateTopicAsync" />.
 /// </summary>
 /// <remarks>
-///     Hand the result of <see cref="ToDictionary" /> to the <c>options</c> parameter of
-///     <see cref="IIggyTopic.CreateTopicAsync" />. Every key here is settable at creation only: an
-///     update takes just the options that have a parameter of their own and refuses the rest by
-///     name, the same way it refuses a key outside the server's catalog, so a mistyped key fails
-///     the call rather than being ignored. <see cref="IIggySystem.DescribeOptionsAsync" />
-///     enumerates the keys a given server accepts, with the kind and default of each.
-///     A property left null emits no key, which leaves the server default in place.
+///     <see cref="MessageExpiry" /> and <see cref="MaxTopicSize" /> can change later through a
+///     <see cref="TopicUpdate" />, every other setting is fixed at creation. A property left null emits no key,
+///     which leaves the server default in place. <see cref="IIggySystem.DescribeOptionsAsync" /> enumerates the
+///     keys a given server accepts, with the kind, default and mutability of each.
 /// </remarks>
 public sealed class TopicOptions
 {
-    private const string SegmentSizeKey = "segment_size";
-    private const string DurabilityKey = "durability";
-    private const string ConsumerOffsetDurabilityKey = "consumer_offset_durability";
-    private const string MessagesRequiredToSaveKey = "messages_required_to_save";
-    private const string SizeOfMessagesRequiredToSaveKey = "size_of_messages_required_to_save";
-    private const string PreallocateSegmentsKey = "preallocate_segments";
+    /// <summary>
+    ///     Compression algorithm label stored with the topic. Fixed at creation.
+    /// </summary>
+    public CompressionAlgorithm? CompressionAlgorithm { get; init; }
+
+    /// <summary>
+    ///     How long a message is kept. <see cref="TimeSpan.MaxValue" /> never expires, zero keeps the server default.
+    /// </summary>
+    public TimeSpan? MessageExpiry { get; init; }
+
+    /// <summary>
+    ///     Topic-wide retained size cap in bytes, divided among partitions and at least the segment size.
+    ///     <see cref="ulong.MaxValue" /> is unlimited, zero keeps the server default.
+    /// </summary>
+    public ulong? MaxTopicSize { get; init; }
 
     /// <summary>
     ///     Size of a single segment in bytes. The server checks it against its own bounds, a
@@ -55,6 +64,11 @@ public sealed class TopicOptions
 
     /// <summary>Explicit offset completion policy. Defaults to replicated independently of message durability.</summary>
     public Durability ConsumerOffsetDurability { get; init; } = Durability.Replicated;
+
+    /// <summary>
+    ///     Whether partitions can be added or deleted after creation. The server default is mutable.
+    /// </summary>
+    public PartitionResizePolicy? PartitionResizePolicy { get; init; }
 
     /// <summary>
     ///     Attempt a flush after this many messages accumulate in a partition buffer. Must be non-zero.
@@ -74,59 +88,108 @@ public sealed class TopicOptions
     public bool? PreallocateSegments { get; init; }
 
     /// <summary>
+    ///     Option keys with no property of their own, keyed by option name, for keys newer than this build. A
+    ///     property above wins on collision, and the server refuses a key outside its catalog by name. A raw
+    ///     durability is kept unless the matching property asks for persisted durability.
+    /// </summary>
+    [JsonConverter(typeof(RedactedOptionsConverter))]
+    public IReadOnlyDictionary<string, HeaderValue>? Options { get; init; }
+
+    /// <summary>
     ///     Renders the options that were set, each under the kind the server's catalog gives its key.
     /// </summary>
-    /// <returns>Option values keyed by option name, including both durability defaults.</returns>
+    /// <returns>Option values keyed by option name, including both durability policies.</returns>
+    /// <exception cref="ArgumentException">A raw durability is invalid or contradicts a persisted property.</exception>
     public Dictionary<string, HeaderValue> ToDictionary()
     {
-        var options = new Dictionary<string, HeaderValue>();
+        var options = OptionKeys.Raw(Options);
+
+        if (CompressionAlgorithm is { } compressionAlgorithm)
+        {
+            options[Name(TopicOptionKey.CompressionAlgorithm)] = HeaderValue.FromString(compressionAlgorithm switch
+            {
+                Enums.CompressionAlgorithm.None => "none",
+                Enums.CompressionAlgorithm.Gzip => "gzip",
+                _ => throw new ArgumentOutOfRangeException(nameof(CompressionAlgorithm), compressionAlgorithm,
+                    "Unknown compression algorithm")
+            });
+        }
+
+        if (MessageExpiry is { } messageExpiry && DurationHelpers.ToDuration(messageExpiry) is not 0 and var micros)
+        {
+            options[Name(TopicOptionKey.MessageExpiry)] = HeaderValue.FromUInt64(micros);
+        }
+
+        if (MaxTopicSize is { } maxTopicSize and not 0)
+        {
+            options[Name(TopicOptionKey.MaxTopicSize)] = HeaderValue.FromUInt64(maxTopicSize);
+        }
 
         if (SegmentSize is { } segmentSize)
         {
-            options[SegmentSizeKey] = HeaderValue.FromUInt64(segmentSize);
+            options[Name(TopicOptionKey.SegmentSize)] = HeaderValue.FromUInt64(segmentSize);
         }
 
-        options[DurabilityKey] = HeaderValue.FromString(EncodeDurability(Durability));
-        options[ConsumerOffsetDurabilityKey] = HeaderValue.FromString(EncodeDurability(ConsumerOffsetDurability));
+        options[Name(TopicOptionKey.Durability)] = DurabilityValue(TopicOptionKey.Durability, Durability);
+        options[Name(TopicOptionKey.ConsumerOffsetDurability)] =
+            DurabilityValue(TopicOptionKey.ConsumerOffsetDurability, ConsumerOffsetDurability);
+
+        if (PartitionResizePolicy is { } partitionResizePolicy)
+        {
+            options[Name(TopicOptionKey.PartitionResizePolicy)] = HeaderValue.FromString(partitionResizePolicy switch
+            {
+                Enums.PartitionResizePolicy.Mutable => "mutable",
+                Enums.PartitionResizePolicy.Fixed => "fixed",
+                _ => throw new ArgumentOutOfRangeException(nameof(PartitionResizePolicy), partitionResizePolicy,
+                    "Unknown partition resize policy")
+            });
+        }
 
         if (MessagesRequiredToSave is { } messagesRequiredToSave)
         {
-            options[MessagesRequiredToSaveKey] = HeaderValue.FromUInt32(messagesRequiredToSave);
+            options[Name(TopicOptionKey.MessagesRequiredToSave)] = HeaderValue.FromUInt32(messagesRequiredToSave);
         }
 
         if (SizeOfMessagesRequiredToSave is { } sizeOfMessagesRequiredToSave)
         {
-            options[SizeOfMessagesRequiredToSaveKey] = HeaderValue.FromUInt64(sizeOfMessagesRequiredToSave);
+            options[Name(TopicOptionKey.SizeOfMessagesRequiredToSave)] =
+                HeaderValue.FromUInt64(sizeOfMessagesRequiredToSave);
         }
 
         if (PreallocateSegments is { } preallocateSegments)
         {
-            options[PreallocateSegmentsKey] = HeaderValue.FromBool(preallocateSegments);
+            options[Name(TopicOptionKey.PreallocateSegments)] = HeaderValue.FromBool(preallocateSegments);
         }
 
         return options;
     }
-    internal static Dictionary<string, HeaderValue> WithDurabilityDefaults(IReadOnlyDictionary<string, HeaderValue>? source)
+
+    private HeaderValue DurabilityValue(TopicOptionKey key, Durability policy)
     {
-        var options = source is null ? new Dictionary<string, HeaderValue>() : new Dictionary<string, HeaderValue>(source);
-        foreach (var key in new[] { DurabilityKey, ConsumerOffsetDurabilityKey })
+        var name = Name(key);
+        if (Options is not null && Options.TryGetValue(name, out var raw))
         {
-            if (!options.TryGetValue(key, out var value))
+            var rawPolicy = raw.Kind == HeaderKind.String
+                ? raw.ToString() switch
+                {
+                    "replicated" => Durability.Replicated,
+                    "persisted" => Durability.Persisted,
+                    _ => (Durability?)null
+                }
+                : null;
+            if (rawPolicy is null || (policy == Durability.Persisted && rawPolicy != policy))
             {
-                options[key] = HeaderValue.FromString("replicated");
+                throw new ArgumentException($"Invalid {name}", nameof(Options));
             }
-            else if (value.Kind != HeaderKind.String || value.ToString() is not ("replicated" or "persisted"))
-            {
-                throw new ArgumentException($"Invalid {key}", nameof(source));
-            }
+
+            policy = rawPolicy.Value;
         }
-        return options;
+
+        return HeaderValue.FromString(policy == Durability.Persisted ? "persisted" : "replicated");
     }
 
-    private static string EncodeDurability(Durability value) => value switch
+    private static string Name(TopicOptionKey key)
     {
-        Durability.Replicated => "replicated",
-        Durability.Persisted => "persisted",
-        _ => throw new ArgumentOutOfRangeException(nameof(value), value, "Unknown durability")
-    };
+        return OptionKeys.Describe(key).Name;
+    }
 }

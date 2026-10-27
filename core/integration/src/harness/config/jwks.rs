@@ -17,6 +17,10 @@
 
 use bon::Builder;
 
+/// The iggy user every token from the mock issuer acts as. A test that starts
+/// the JWKS server seeds a user with this name.
+pub const JWKS_ISSUER_USERNAME: &str = "a2a-test-user";
+
 #[derive(Debug, Clone, Builder, Default)]
 pub struct JwksConfig {
     pub enabled: bool,

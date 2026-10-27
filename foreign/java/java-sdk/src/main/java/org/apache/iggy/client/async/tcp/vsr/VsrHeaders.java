@@ -41,6 +41,7 @@ public final class VsrHeaders {
     // so every field past the operation sits eight bytes earlier than it did
     // while the header still carried one.
     static final int REQUEST_CLIENT_OFFSET = 128;
+    static final int REQUEST_CHECKSUM_OFFSET = 144;
     static final int REQUEST_ID_OFFSET = 168;
     static final int REQUEST_OPERATION_OFFSET = 176;
     static final int REQUEST_SESSION_OFFSET = 184;
@@ -50,10 +51,16 @@ public final class VsrHeaders {
     static final int REQUEST_METADATA_OP_OFFSET = 216;
 
     // ReplyHeader
+    static final int REPLY_CHECKSUM_OFFSET = 128;
+    static final int REPLY_CLIENT_OFFSET = 160;
+    static final int REPLY_OP_OFFSET = 176;
     static final int REPLY_COMMIT_OFFSET = 184;
     static final int REPLY_REQUEST_OFFSET = 200;
     static final int REPLY_OPERATION_OFFSET = 208;
     static final int REPLY_STATUS_OFFSET = 216;
+    static final int REPLY_COMMITTED_RESULT_OFFSET = 220;
+    static final int REPLY_INCARNATION_OFFSET = 224;
+    static final int COMMITTED_RESULT = 1;
 
     // EvictionHeader
     static final int EVICTION_PROTOCOL_VERSION_OFFSET = 144;

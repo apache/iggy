@@ -36,8 +36,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Pins a 60s server heartbeat because harness clients never ping on their own:
 // the SDK pinger is spawned by `IggyClient::connect`, which the harness builder
-// does not call. At the shipped 30s interval an idle group member is reaped by
-// the server's verifier, and the failure surfaces as a short member count
+// does not call. With heartbeat checks on, the server logs out a group member
+// that stays silent too long, and the failure surfaces as a short member count
 // instead of anything about the scenario under test.
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
@@ -60,7 +60,10 @@ async fn consumer_group_retries_rejoin_after_failure(harness: &TestHarness) {
         streams: None,
     };
 
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &stream_id,
@@ -83,6 +86,7 @@ async fn consumer_group_retries_rejoin_after_failure(harness: &TestHarness) {
             CONSUMER_PASSWORD,
             UserStatus::Active,
             Some(consumer_permissions.clone()),
+            &UserCreateOptions::default(),
         )
         .await
         .unwrap();
@@ -191,7 +195,10 @@ async fn given_offset_strategy_when_member_polls_two_partitions_should_read_each
     let stream_id = Identifier::named(STREAM_NAME).unwrap();
     let topic_id = Identifier::named(TOPIC_NAME).unwrap();
 
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &stream_id,

@@ -39,6 +39,7 @@ export const REQUEST_OFFSET = {
   size: 48,
   command: 60,
   client: 128,
+  requestChecksum: 144,
   timestamp: 160,
   request: 168,
   operation: 176,
@@ -53,10 +54,21 @@ export const REQUEST_OFFSET = {
 export const REPLY_OFFSET = {
   size: 48,
   command: 60,
+  requestChecksum: 128,
+  client: 160,
+  op: 176,
   commit: 184,
+  request: 200,
   operation: 208,
-  status: 216
+  status: 216,
+  reserved: 220,
+  partitionIncarnation: 224
 } as const;
+
+export const COMMITTED_RESULT_MARKER = 1;
+export const hasCommittedResult = (header: Buffer): boolean =>
+  peekCommand(header) === Command.Reply && readStatus(header) === 0 &&
+  header[REPLY_OFFSET.reserved] === COMMITTED_RESULT_MARKER;
 
 /** `EvictionHeader` field offsets the client reads. */
 export const EVICTION_OFFSET = {
@@ -167,7 +179,7 @@ export const peekCommand = (header: Buffer): number =>
 export const readSize = (header: Buffer): number =>
   header.readUInt32LE(REPLY_OFFSET.size);
 
-/** Reads the pre-commit denial status; 0 means the reply committed. */
+/** Reads the pre-commit denial status; zero alone does not prove commit. */
 export const readStatus = (header: Buffer): number =>
   header.readUInt32LE(REPLY_OFFSET.status);
 

@@ -17,7 +17,8 @@
  */
 
 use crate::prelude::{
-    Identifier, IggyClient, IggyError, StreamClient, TopicClient, TopicCreateOptions,
+    Identifier, IggyClient, IggyError, StreamClient, StreamCreateOptions, TopicClient,
+    TopicCreateOptions,
 };
 
 use crate::stream_builder::IggyConsumerConfig;
@@ -61,7 +62,9 @@ pub(crate) async fn build_iggy_stream_topic_if_not_exists(
         }
 
         trace!("Creating stream: {stream_name}");
-        client.create_stream(stream_name).await?;
+        client
+            .create_stream(stream_name, &StreamCreateOptions::default())
+            .await?;
     }
 
     trace!("Check if topic exists.");

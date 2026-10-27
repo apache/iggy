@@ -82,7 +82,7 @@ impl Segment {
         match expiry {
             IggyExpiry::NeverExpire | IggyExpiry::ServerDefault => false,
             IggyExpiry::ExpireDuration(duration) => {
-                self.max_timestamp + duration.as_micros() <= now.as_micros()
+                self.max_timestamp.saturating_add(duration.as_micros()) <= now.as_micros()
             }
         }
     }
@@ -128,6 +128,14 @@ mod tests {
         let now = IggyTimestamp::now();
         let segment = sealed_segment(now.as_micros());
         let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_hours(1)));
+        assert!(!segment.is_expired(now, expiry));
+    }
+
+    #[test]
+    fn expiry_past_the_end_of_the_clock_is_never_reached() {
+        let now = IggyTimestamp::now();
+        let segment = sealed_segment(now.as_micros());
+        let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(u64::MAX - 1));
         assert!(!segment.is_expired(now, expiry));
     }
 

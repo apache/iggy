@@ -22,10 +22,14 @@ package org.apache.iggy.client.async.tcp;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.SystemClient;
 import org.apache.iggy.cluster.ClusterMetadata;
+import org.apache.iggy.exception.IggyValidationException;
 import org.apache.iggy.serde.BytesDeserializer;
+import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
+import org.apache.iggy.system.MetadataChanges;
+import org.apache.iggy.system.MetadataChangesQuery;
 import org.apache.iggy.system.OptionSpec;
 import org.apache.iggy.system.OptionsScope;
 import org.apache.iggy.system.Stats;
@@ -59,9 +63,8 @@ public class SystemTcpClient implements SystemClient {
 
         log.debug("Getting server statistics");
 
-        return connection()
-                .send(CommandCode.System.GET_STATS.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.System.GET_STATS.getValue(), payload), response -> {
                     try {
                         return BytesDeserializer.readStats(response);
                     } finally {
@@ -76,11 +79,31 @@ public class SystemTcpClient implements SystemClient {
 
         log.debug("Describing {} options", scope);
 
-        return connection()
-                .send(CommandCode.System.DESCRIBE_OPTIONS.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.System.DESCRIBE_OPTIONS.getValue(), payload), response -> {
                     try {
                         return BytesDeserializer.readOptionSpecs(response);
+                    } finally {
+                        response.release();
+                    }
+                });
+    }
+
+    @Override
+    public CompletableFuture<MetadataChanges> getMetadataChanges(MetadataChangesQuery query) {
+        try {
+            query.validate();
+        } catch (IggyValidationException refused) {
+            return CompletableFuture.failedFuture(refused);
+        }
+        var payload = BytesSerializer.toGetMetadataChanges(query);
+
+        log.debug("Reading metadata changes");
+
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.System.GET_METADATA_CHANGES.getValue(), payload), response -> {
+                    try {
+                        return BytesDeserializer.readMetadataChanges(response);
                     } finally {
                         response.release();
                     }
@@ -93,9 +116,8 @@ public class SystemTcpClient implements SystemClient {
 
         log.debug("Getting cluster metadata");
 
-        return connection()
-                .send(CommandCode.System.GET_CLUSTER_METADATA.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.System.GET_CLUSTER_METADATA.getValue(), payload), response -> {
                     try {
                         return BytesDeserializer.readClusterMetadata(response);
                     } finally {
@@ -110,13 +132,14 @@ public class SystemTcpClient implements SystemClient {
 
         log.debug("Getting current client info");
 
-        return connection().send(CommandCode.System.GET_ME.getValue(), payload).thenApply(response -> {
-            try {
-                return BytesDeserializer.readClientInfoDetails(response);
-            } finally {
-                response.release();
-            }
-        });
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.System.GET_ME.getValue(), payload), response -> {
+                    try {
+                        return BytesDeserializer.readClientInfoDetails(response);
+                    } finally {
+                        response.release();
+                    }
+                });
     }
 
     @Override
@@ -126,9 +149,8 @@ public class SystemTcpClient implements SystemClient {
 
         log.debug("Getting client info for client ID: {}", clientId);
 
-        return connection()
-                .send(CommandCode.System.GET_CLIENT.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.System.GET_CLIENT.getValue(), payload), response -> {
                     try {
                         return BytesDeserializer.readClientInfoDetails(response);
                     } finally {
@@ -143,9 +165,8 @@ public class SystemTcpClient implements SystemClient {
 
         log.debug("Getting all clients");
 
-        return connection()
-                .send(CommandCode.System.GET_ALL_CLIENTS.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.System.GET_ALL_CLIENTS.getValue(), payload), response -> {
                     try {
                         List<ClientInfo> clients = new ArrayList<>();
                         while (response.isReadable()) {
@@ -164,9 +185,10 @@ public class SystemTcpClient implements SystemClient {
 
         log.debug("Pinging server");
 
-        return connection().send(CommandCode.System.PING.getValue(), payload).thenApply(response -> {
-            response.release();
-            return "pong";
-        });
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.System.PING.getValue(), payload), response -> {
+                    response.release();
+                    return "pong";
+                });
     }
 }

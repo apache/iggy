@@ -32,7 +32,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout, timeout_at};
 
 use super::fetch::LazyClient;
-use super::{IggyBridge, SLOT_LIMIT, TopicTarget, in_slot, permit_by};
+use super::{IggyBridge, SLOT_LIMIT, TopicTarget, in_slot, permit_by, resolve_blocker};
 use crate::bridge::config::{IggyBridgeConfig, ProduceSessionLimits};
 use crate::bridge::error::BridgeError;
 
@@ -408,15 +408,24 @@ impl IggyBridge {
             return (Err(BridgeError::Timeout), Some((turn, kept)));
         }
         let (stream_id, topic_id) = (target.stream_id.clone(), target.topic_id.clone());
+        let recovery_deadline = (Instant::now() + SLOT_LIMIT).into_std();
         let send = async move {
             // Owns the messages, so a send cut off at the limit drops them.
             let send = {
                 let client = Arc::clone(&client);
                 async move {
                     let partitioning = Partitioning::partition_id(partition);
-                    client
-                        .send_messages(&stream_id, &topic_id, &partitioning, &mut messages)
-                        .await
+                    loop {
+                        match client
+                            .send_messages(&stream_id, &topic_id, &partitioning, &mut messages)
+                            .await
+                        {
+                            Err(IggyError::LaneBlocked(operation)) => {
+                                resolve_blocker(&client, operation, recovery_deadline).await?;
+                            }
+                            result => return result,
+                        }
+                    }
                 }
             };
             within_slot_limit(&session, &client, kept, send).await
@@ -460,13 +469,13 @@ async fn within_slot_limit<T, K>(
     }
 }
 
-/// The SDK does not replay a send after these, so it may have landed.
+/// The SDK does not replay a send after these, so it may have landed. `StaleClient` is not one:
+/// the SDK returns it only for a send that Iggy rejected, so it answers 6.
 const fn send_error(error: IggyError) -> BridgeError {
     match error {
-        IggyError::Disconnected
-        | IggyError::EmptyResponse
-        | IggyError::TcpError
-        | IggyError::StaleClient => BridgeError::SendLost(error),
+        IggyError::Disconnected | IggyError::EmptyResponse | IggyError::TcpError => {
+            BridgeError::SendLost(error)
+        }
         error => BridgeError::Iggy(error),
     }
 }
@@ -478,6 +487,7 @@ mod tests {
     use iggy::prelude::{IggyClientBuilder, SystemClient};
 
     use super::*;
+    use crate::protocol::api::ERROR_NOT_LEADER_OR_FOLLOWER;
 
     const WAIT: Duration = Duration::from_millis(20);
     const IDLE: Duration = Duration::from_secs(60);
@@ -592,6 +602,14 @@ mod tests {
             within_slot_limit(&session, &unconnected(), 7, lost).await,
             (Err(BridgeError::SendLost(IggyError::Disconnected)), Some(7))
         ));
+    }
+
+    #[test]
+    fn given_a_stale_client_rejection_when_sending_should_answer_not_leader_or_follower() {
+        assert_eq!(
+            send_error(IggyError::StaleClient).to_kafka_error_code(),
+            ERROR_NOT_LEADER_OR_FOLLOWER
+        );
     }
 
     #[tokio::test(start_paused = true)]

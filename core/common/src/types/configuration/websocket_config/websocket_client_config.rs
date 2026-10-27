@@ -17,7 +17,9 @@
 
 use crate::types::configuration::auth_config::connection_string::ConnectionString;
 use crate::types::configuration::websocket_config::websocket_connection_string_options::WebSocketConnectionStringOptions;
-use crate::{AutoLogin, NonZeroIggyDuration, WebSocketClientReconnectionConfig};
+use crate::{
+    AutoLogin, NonZeroIggyDuration, PendingOperationsConfig, WebSocketClientReconnectionConfig,
+};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use tungstenite::protocol::WebSocketConfig as TungsteniteConfig;
@@ -29,6 +31,8 @@ pub struct WebSocketClientConfig {
     pub server_address: String,
     /// Whether to automatically login user after establishing connection.
     pub auto_login: AutoLogin,
+    /// Shared limits across this client's mutation lanes.
+    pub pending_operations: PendingOperationsConfig,
     /// Whether to automatically reconnect when disconnected.
     pub reconnection: WebSocketClientReconnectionConfig,
     /// Interval of heartbeats sent by the client
@@ -72,6 +76,7 @@ impl Default for WebSocketClientConfig {
         WebSocketClientConfig {
             server_address: "127.0.0.1:8092".to_string(),
             auto_login: AutoLogin::Disabled,
+            pending_operations: PendingOperationsConfig::default(),
             reconnection: WebSocketClientReconnectionConfig::default(),
             heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
             ws_config: WebSocketConfig::default(),
@@ -158,6 +163,7 @@ impl From<ConnectionString<WebSocketConnectionStringOptions>> for WebSocketClien
         WebSocketClientConfig {
             server_address: connection_string.server_address().into(),
             auto_login: connection_string.auto_login().to_owned(),
+            pending_operations: connection_string.options().pending_operations(),
             reconnection: connection_string.options().reconnection().to_owned(),
             heartbeat_interval: connection_string.options().heartbeat_interval(),
             ws_config,

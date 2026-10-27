@@ -324,6 +324,7 @@ where
         SB: 'static,
     {
         let _completion_pump = self.poll_completions.pump_guard();
+        let _deferred_pump = self.deferred_polls.pump_guard();
         self.plane.partitions().set_io_notifier(
             self.partition_io.notifier(),
             self.partition_io.limits.bytes_max(),
@@ -367,7 +368,29 @@ where
         // backoff on every pump turn while the shutdown channel is empty.
         let mut stop_signal = std::pin::pin!(stop.recv().fuse());
         let mut fatal: Option<FatalCommit> = None;
+        let deadline_timer = |deadline: Option<u64>| {
+            async move {
+                if let Some(deadline) = deadline {
+                    self.bus
+                        .sleep(std::time::Duration::from_micros(
+                            deadline.saturating_sub(self.bus.monotonic_micros()),
+                        ))
+                        .await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }
+            .fuse()
+        };
+        let mut armed_deadline = None;
+        let mut deferred_deadline = std::pin::pin!(deadline_timer(None));
         loop {
+            self.service_deferred_polls().await;
+            let next_deadline = self.deferred_polls.earliest_deadline();
+            if next_deadline != armed_deadline {
+                armed_deadline = next_deadline;
+                deferred_deadline.set(deadline_timer(next_deadline));
+            }
             // `select_biased!`, not `select!`: the unbiased macro draws its
             // arm order from a process-random thread-local PRNG, which the
             // deterministic simulator cannot seed. The listed order is the
@@ -408,8 +431,13 @@ where
                     // a quiet shard until the next inbound frame's tail
                     // drain; parked partition frames then never re-dispatch.
                     self.apply_reconcile_ops();
+                    self.deferred_polls.maintenance();
                     consensus_tick.set(rearm_tick());
                     self.process_loopback(&mut loopback_buf).await;
+                }
+                () = deferred_deadline.as_mut() => {
+                    armed_deadline = None;
+                    deferred_deadline.set(deadline_timer(None));
                 }
                 frame = poll_fn(|_| {
                     self.pop_redispatched_frame().map_or(Poll::Pending, Poll::Ready)
@@ -492,6 +520,7 @@ where
                         Err(_) => break,
                     }
                 }
+                () = poll_fn(|context| self.deferred_polls.poll_ready(context)).fuse() => {}
                 () = poll_fn(|context| {
                     self.plane.partitions().register_loopback_waker(context.waker());
                     self.partition_io.register_waker(context.waker());
@@ -509,6 +538,7 @@ where
         }
 
         self.poll_completions.close();
+        self.deferred_polls.close();
 
         // A stop can win the select immediately after a frame fenced a
         // partition, before the next tick observes it. Preserve that fault so
@@ -943,20 +973,17 @@ where
             }
             LifecycleFrame::ForwardClientSend { client_id, msg } => {
                 if let Err(e) = self.bus.send_to_client(client_id, msg).await {
-                    // Terminal per `SendError` docs: the client never
-                    // receives the reply and request / response semantics
-                    // break above the bus. Bump the receiver-side counter
-                    // (sender side already bumps in `builder.rs`) and raise
-                    // to `warn!` so it surfaces in default operator logs.
+                    // The production bus refuses every frame sent by id, so
+                    // this is the expected outcome there, not a fault.
                     self.metrics.record_frame_drop(
                         frame_drop_variant::FORWARD_CLIENT_SEND,
                         frame_drop_reason::DELIVERY_FAILED,
                     );
-                    tracing::warn!(
+                    tracing::debug!(
                         shard = self.id,
                         client_id,
                         error = ?e,
-                        "forward-client-send delivery failed"
+                        "staged client deny has no route by client id"
                     );
                 }
             }
@@ -985,6 +1012,12 @@ where
                 reply,
             } => {
                 self.on_partition_read(namespace, read, reply).await;
+            }
+            LifecycleFrame::ReadinessWait { wait, reply } => {
+                self.admit_readiness_wait(wait, &reply);
+            }
+            LifecycleFrame::ReadinessCancel { waiter } => {
+                self.cancel_readiness_wait(waiter);
             }
             LifecycleFrame::PartitionSubmit {
                 request,
@@ -1015,6 +1048,19 @@ where
                         "metadata commit tick received before reconciler handler installed; dropping"
                     );
                 }
+            }
+            LifecycleFrame::PartitionPlacementViews(reports) => {
+                if self.id == 0 {
+                    self.plane.metadata().observe_partition_views(&reports);
+                } else {
+                    self.metrics.record_frame_drop(
+                        frame_drop_variant::PARTITION_PLACEMENT_VIEWS,
+                        frame_drop_reason::MISROUTED,
+                    );
+                }
+            }
+            LifecycleFrame::PrimaryRebalance(frame) => {
+                self.on_local_rebalance(*frame).await;
             }
             LifecycleFrame::PartitionPersistenceCompleted(completion) => {
                 let namespace = IggyNamespace::from_raw(completion.group);
@@ -1163,10 +1209,15 @@ enum ReplicaHandshakeOutcome {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::partition_placement_tests::owner;
+    use crate::{build_deny_reply_from_request_header, shard_channel};
+    use iggy_binary_protocol::RoutedRequestHeader;
     use iggy_binary_protocol::{
         Command, ConsensusError, GenericHeader, HEADER_SIZE, PrepareHeader,
         prepare_identity_checksum_bytes,
     };
+    use iggy_common::IggyError;
     use server_common::iobuf::Owned;
     use server_common::{MESSAGE_ALIGN, Message, MessageBag};
     use std::mem::offset_of;
@@ -1233,6 +1284,180 @@ mod tests {
              InvalidBitPattern as corruption, and dispatch drops both with only a warn log, \
              no operator signal and no upgrade fence, so an old node in a mixed cluster \
              gap-stops its consensus group while quorum hides it; got {error:?}"
+        );
+    }
+    #[compio::test]
+    async fn given_no_reply_owner_when_forwarded_client_send_arrives_should_not_fire_http_slot() {
+        const CLIENT: u128 = 41;
+        const REQUEST: u64 = 7;
+        let (shard, _) = owner(0);
+        shard.bus.clients().insert_in_process(CLIENT).unwrap();
+        let (_slot, mut reply) = shard
+            .bus
+            .clients()
+            .install_reply_slot(CLIENT, REQUEST)
+            .unwrap();
+        let header = RoutedRequestHeader {
+            client: CLIENT,
+            request: REQUEST,
+            ..Default::default()
+        };
+        let message = build_deny_reply_from_request_header(
+            &header,
+            IggyError::TransientNotAccepted.as_code(),
+        );
+        shard
+            .process_frame(ShardFrame::lifecycle(LifecycleFrame::ForwardClientSend {
+                client_id: CLIENT,
+                msg: message.into_generic().into_frozen().into(),
+            }))
+            .await;
+        assert!(
+            matches!(reply.try_recv(), Ok(None)),
+            "an originless forwarded reply must not fill an HTTP slot"
+        );
+    }
+
+    #[compio::test]
+    async fn given_no_reply_owner_when_shard_denies_tombstoned_partition_should_not_fire_http_slot()
+    {
+        const CLIENT: u128 = 42;
+        const REQUEST: u64 = 8;
+        let (shard, _) = owner(0);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        shard.plane.partitions().tombstone(namespace);
+        shard.bus.clients().insert_in_process(CLIENT).unwrap();
+        let (_slot, mut reply) = shard
+            .bus
+            .clients()
+            .install_reply_slot(CLIENT, REQUEST)
+            .unwrap();
+        let request = Message::<RoutedRequestHeader>::new(size_of::<RoutedRequestHeader>())
+            .transmute_header(|_, header: &mut RoutedRequestHeader| {
+                header.command = Command::Request;
+                header.operation = Operation::SendMessages;
+                header.client = CLIENT;
+                header.session = 1;
+                header.request = REQUEST;
+                header.group = namespace.inner();
+                header.size = u32::try_from(size_of::<RoutedRequestHeader>()).unwrap();
+            });
+        shard.on_message(MessageBag::Request(request)).await;
+        assert!(
+            matches!(reply.try_recv(), Ok(None)),
+            "a tombstone denial without its owner must not fill an HTTP slot"
+        );
+    }
+
+    #[compio::test]
+    async fn given_no_reply_owner_when_shard_denies_unroutable_request_should_not_fire_http_slot() {
+        const CLIENT: u128 = 43;
+        const REQUEST: u64 = 9;
+        let (shard, _) = owner(0);
+        shard.bus.clients().insert_in_process(CLIENT).unwrap();
+        let (_slot, mut reply) = shard
+            .bus
+            .clients()
+            .install_reply_slot(CLIENT, REQUEST)
+            .unwrap();
+        let request = Message::<RoutedRequestHeader>::new(size_of::<RoutedRequestHeader>())
+            .transmute_header(|_, header: &mut RoutedRequestHeader| {
+                header.command = Command::Request;
+                header.operation = Operation::NonReplicated;
+                header.client = CLIENT;
+                header.request = REQUEST;
+                header.size = u32::try_from(size_of::<RoutedRequestHeader>()).unwrap();
+            });
+        shard.on_message(MessageBag::Request(request)).await;
+        assert!(
+            matches!(reply.try_recv(), Ok(None)),
+            "an unroutable denial without its owner must not fill an HTTP slot"
+        );
+    }
+
+    #[compio::test]
+    async fn given_carried_reply_when_partition_is_tombstoned_or_park_buffer_full_should_answer_owner()
+     {
+        const CLIENT: u128 = 45;
+        const REQUEST: u64 = 11;
+        for tombstoned in [false, true] {
+            let (shard, _) = owner(0);
+            let namespace = IggyNamespace::new(0, 0, 0);
+            shard.bus.clients().insert_in_process(CLIENT).unwrap();
+            let (_slot, mut unrelated) = shard
+                .bus
+                .clients()
+                .install_reply_slot(CLIENT, REQUEST)
+                .unwrap();
+            let request = Message::<RoutedRequestHeader>::new(size_of::<RoutedRequestHeader>())
+                .transmute_header(|_, header: &mut RoutedRequestHeader| {
+                    header.command = Command::Request;
+                    header.operation = Operation::SendMessages;
+                    header.client = CLIENT;
+                    header.session = 1;
+                    header.request = REQUEST;
+                    header.group = namespace.inner();
+                    header.size = u32::try_from(size_of::<RoutedRequestHeader>()).unwrap();
+                });
+            if tombstoned {
+                shard.plane.partitions().tombstone(namespace);
+            } else {
+                for _ in 0..crate::MAX_PARKED_PER_NAMESPACE {
+                    shard.on_message(MessageBag::Request(request.clone())).await;
+                }
+                assert_eq!(
+                    shard.parked_frame_count(namespace),
+                    crate::MAX_PARKED_PER_NAMESPACE
+                );
+            }
+            let (reply, receiver) = crate::channel(1);
+            shard
+                .process_frame(ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
+                    request,
+                    reply,
+                    attachment: None,
+                }))
+                .await;
+            let response = receiver
+                .try_recv()
+                .expect("the carried receiver is answered immediately")
+                .expect("a concrete denial")
+                .try_into_typed::<iggy_binary_protocol::ReplyHeader>()
+                .unwrap();
+            assert_eq!(
+                response.header().status,
+                IggyError::TransientNotAccepted.as_code()
+            );
+            assert!(
+                matches!(unrelated.try_recv(), Ok(None)),
+                "the same client/request pair does not confer slot ownership"
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn given_no_reply_owner_when_shard_stages_deny_should_not_fire_http_slot() {
+        const CLIENT: u128 = 44;
+        const REQUEST: u64 = 10;
+        let (mut shard, _) = owner(0);
+        let (sender, _inbox, replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        shard.bus.clients().insert_in_process(CLIENT).unwrap();
+        let (_slot, mut reply) = shard
+            .bus
+            .clients()
+            .install_reply_slot(CLIENT, REQUEST)
+            .unwrap();
+        let header = RoutedRequestHeader {
+            client: CLIENT,
+            request: REQUEST,
+            ..Default::default()
+        };
+        assert!(shard.stage_transient_deny(&header));
+        shard.process_frame(replies.recv().await.unwrap()).await;
+        assert!(
+            matches!(reply.try_recv(), Ok(None)),
+            "a staged denial without its owner must not fill an HTTP slot"
         );
     }
 }

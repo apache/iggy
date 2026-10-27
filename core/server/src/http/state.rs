@@ -21,19 +21,25 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::future::{Future, poll_fn};
 use std::net::IpAddr;
+use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::{Poll, Waker};
 
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::Response;
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
+use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
+use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{ClusterMetadata, IggyError, IggyTimestamp, UserStatus};
 use message_bus::InstanceToken;
 use metadata::MetadataSubmitError;
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::user::User;
 use send_wrapper::SendWrapper;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -41,9 +47,11 @@ use tracing::warn;
 use crate::cluster_meta::ClusterRoster;
 use crate::consumer_group::lease::{ConsumerGroupLiveness, SessionActivity};
 use crate::dispatch::session_ops::{submit_logout_on_owner, submit_register_on_owner};
+use crate::http::admission::RelayTargets;
 use crate::http::error::{AuthError, ReadError, primary_redirect_location};
+use crate::http::relay_proof::RelayKey;
 
-use crate::http::jwt::JwtManager;
+use crate::http::jwt::{JwtManager, TrustedIssuer};
 use crate::http::metrics::HttpMetrics;
 use crate::http::session::{
     BarrierEntry, FIRST_REQUEST_ID, FRESH_ENTRY_WATERMARK, HttpSession, RegistrationBarrier,
@@ -173,21 +181,113 @@ pub(in crate::http) type HttpState = SendWrapper<Rc<HttpInner>>;
 
 /// Per-node forwarding context hung off `HttpInner`: the outbound client
 /// (pinned-cert TLS when the listener serves HTTPS), the scheme it dials, the
-/// request-body buffer bound, and the in-flight budget. Built by
-/// `http::forward::build_forward_state`; lives here so the state hub never
-/// imports the forwarding middleware.
+/// request-body buffer bound, the key that proves a relay comes from a node,
+/// the budget of the relays this node sends, and the separate budget of the
+/// relays it serves as their hop target. A relayed deferred poll holds its
+/// slots for its whole wait, so it takes them from a second pair of budgets.
+/// Built by `http::forward::build_forward_state`; lives here so the state hub
+/// never imports the forwarding middleware.
 pub(in crate::http) struct ForwardState {
-    /// False when no cluster-wide bearer key material exists (no configured
-    /// JWT secret, no cluster PSK): a forwarded bearer would 401 on the
-    /// primary, so the middleware passes through and followers answer with
-    /// the transient 503 instead.
-    pub(in crate::http) active: bool,
+    /// Derived from the cluster-wide bearer key material, so `None` when none
+    /// exists (no configured JWT secret, no cluster PSK). Then forwarding is
+    /// off and every relay field is refused.
+    pub(in crate::http) relay_key: Option<RelayKey>,
     pub(in crate::http) client: cyper::Client,
     /// Also read by the 307 redirect builder: the primary is assumed to serve
     /// the same scheme as this node (uniform cluster HTTP config).
     pub(in crate::http) scheme: &'static str,
     pub(in crate::http) body_limit: usize,
     pub(in crate::http) in_flight: Rc<Cell<u32>>,
+    pub(in crate::http) deferred_in_flight: Rc<Cell<u32>>,
+    pub(in crate::http) relay_targets: RelayTargets,
+    pub(in crate::http) deferred_relay_targets: RelayTargets,
+    pub(in crate::http) floor_reads: FloorReads,
+}
+
+/// This node's metadata floor reads, single flight. A read already sent can
+/// miss an op acknowledged after it left, so it serves only the waiters that
+/// came before it was sent. The waiters that come while it is in flight share
+/// the next read, which the first of them sends once it ends.
+#[derive(Default)]
+pub(in crate::http) struct FloorReads {
+    /// Reads sent so far, which also numbers each read.
+    sent: Cell<u64>,
+    in_flight: Cell<bool>,
+    /// The number and outcome of the newest read that ended.
+    ended: Cell<Option<(u64, ControlFlow<Option<u64>>)>>,
+    /// Waiters parked until the read in flight ends.
+    parked: RefCell<Vec<Waker>>,
+}
+
+impl FloorReads {
+    /// The outcome of a read sent after this call. A waiter shares the read in
+    /// flight only when it was sent after the waiter came, and otherwise sends
+    /// the next one with `read` unless another waiter sent it first.
+    pub(in crate::http) async fn read<F>(
+        &self,
+        read: impl FnOnce() -> F,
+    ) -> ControlFlow<Option<u64>>
+    where
+        F: Future<Output = ControlFlow<Option<u64>>>,
+    {
+        let sent_before = self.sent.get();
+        loop {
+            if let Some((number, outcome)) = self.ended.get()
+                && number > sent_before
+            {
+                return outcome;
+            }
+            if !self.in_flight.get() {
+                break;
+            }
+            self.park().await;
+        }
+        let number = self.sent.get() + 1;
+        self.sent.set(number);
+        self.in_flight.set(true);
+        let sending = SentFloorRead { reads: self };
+        let outcome = read().await;
+        self.ended.set(Some((number, outcome)));
+        drop(sending);
+        outcome
+    }
+
+    async fn park(&self) {
+        let mut parked = false;
+        poll_fn(|context| {
+            if parked {
+                return Poll::Ready(());
+            }
+            parked = true;
+            self.parked.borrow_mut().push(context.waker().clone());
+            Poll::Pending
+        })
+        .await;
+    }
+}
+
+/// The read in flight. Its drop ends it, also when its waiter is dropped
+/// mid-read, and wakes the parked waiters so one of them sends the next read.
+struct SentFloorRead<'a> {
+    reads: &'a FloorReads,
+}
+
+impl Drop for SentFloorRead<'_> {
+    fn drop(&mut self) {
+        self.reads.in_flight.set(false);
+        for waker in self.reads.parked.take() {
+            waker.wake();
+        }
+    }
+}
+
+impl ForwardState {
+    /// Without cluster-wide bearer key material a forwarded bearer would 401
+    /// on the primary, so the middleware passes through and followers answer
+    /// with the transient 503 instead.
+    pub(in crate::http) const fn active(&self) -> bool {
+        self.relay_key.is_some()
+    }
 }
 
 /// Shared shard-0 HTTP state.
@@ -217,10 +317,6 @@ pub(in crate::http) struct HttpInner {
     /// clients out of the shared VSR client table. Read by `resolve_session`
     /// when admitting a fresh session.
     pub(in crate::http) max_http_sessions: usize,
-    /// Configured `[personal_access_token] max_tokens_per_user`, enforced
-    /// pre-consensus by the PAT rewrite inside the write submit (the cap is
-    /// config-derived, so it must never branch inside the replicated apply).
-    pub(in crate::http) max_tokens_per_user: u32,
     /// Awaited partition writes currently in flight across all sessions, gated
     /// by [`MAX_IN_FLIGHT_WRITES_GLOBAL`]. Only [`InFlightWriteGuard`] touches
     /// it, so every admission is paired with exactly one release.
@@ -294,14 +390,15 @@ impl HttpInner {
     /// this one is parked (single-threaded `RefCell` + cooperative scheduling).
     pub(in crate::http) async fn resolve_session(
         &self,
-        key: String,
+        key: &str,
         user_id: u32,
+        user_created_at: IggyTimestamp,
         expiry: u64,
     ) -> Result<Rc<HttpSession>, AuthError> {
         loop {
-            self.ensure_active_user(user_id)?;
+            self.ensure_active_user(user_id, Some(user_created_at))?;
             let now = IggyTimestamp::now().to_secs();
-            if let Some(session) = self.live_session(&key, now) {
+            if let Some(session) = self.live_session(key, now) {
                 return Ok(session);
             }
             {
@@ -316,7 +413,7 @@ impl HttpInner {
                     session.reattach(&mut registry);
                 }
             }
-            if let Some(session) = self.live_session(&key, now) {
+            if let Some(session) = self.live_session(key, now) {
                 return Ok(session);
             }
 
@@ -328,7 +425,7 @@ impl HttpInner {
                 (self.max_http_sessions.saturating_sub(table.len()), torn)
             };
             self.teardown_reply_targets(torn);
-            match self.registrations.enter(&key, available_slots) {
+            match self.registrations.enter(key, available_slots) {
                 BarrierEntry::Full => return Err(AuthError::SessionUnavailable),
                 BarrierEntry::Wait(waiter) => {
                     // Another first-request is registering this credential.
@@ -339,27 +436,63 @@ impl HttpInner {
                 BarrierEntry::Lead(_guard) => {
                     // The guard reserves local capacity across Register and
                     // releases it on failure or cancellation, waking waiters.
-                    let fresh = self.register_session(key.clone(), user_id, expiry).await?;
+                    let fresh = self
+                        .register_session(key.to_owned(), user_id, user_created_at, expiry)
+                        .await?;
                     self.sessions
                         .borrow_mut()
-                        .insert(key.clone(), Rc::clone(&fresh));
+                        .insert(key.to_owned(), Rc::clone(&fresh));
                     return Ok(fresh);
                 }
             }
         }
     }
 
-    pub(in crate::http) fn ensure_active_user(&self, user_id: u32) -> Result<(), AuthError> {
-        let active = self.shard.plane.metadata().mux_stm.users().read(|users| {
-            users
-                .items
-                .get(user_id as usize)
-                .is_some_and(|user| user.status == UserStatus::Active)
-        });
-        if !active {
-            return Err(IggyError::Unauthenticated.into());
-        }
-        Ok(())
+    /// `created_at` of the active user at `user_id`. Refused when the id is
+    /// free, the user is not active, or `expected` is another account's stamp:
+    /// a delete frees the id for the next create, so a credential pins the
+    /// account it was issued to and every later check compares the stamp.
+    pub(in crate::http) fn ensure_active_user(
+        &self,
+        user_id: u32,
+        expected: Option<IggyTimestamp>,
+    ) -> Result<IggyTimestamp, IggyError> {
+        self.shard
+            .plane
+            .metadata()
+            .mux_stm
+            .users()
+            .read(|users| {
+                users
+                    .items
+                    .get(user_id as usize)
+                    .filter(|user| user.status == UserStatus::Active)
+                    .map(|user| user.created_at)
+            })
+            // A token carries micros, so compare at that precision.
+            .filter(|created_at| {
+                expected.is_none_or(|expected| expected.as_micros() == created_at.as_micros())
+            })
+            .ok_or(IggyError::Unauthenticated)
+    }
+
+    /// `(id, created_at)` of the account a trusted issuer's tokens act as: the
+    /// user named by the issuer, looked up per request. See
+    /// [`trusted_issuer_account`].
+    pub(in crate::http) fn trusted_issuer_user(
+        &self,
+        issuer: &TrustedIssuer,
+    ) -> Result<(u32, IggyTimestamp), IggyError> {
+        self.shard
+            .plane
+            .metadata()
+            .mux_stm
+            .users()
+            .read(|users| trusted_issuer_account(users.user_by_name(&issuer.config.username)))
+            .ok_or_else(|| {
+                issuer.warn_invalid_account();
+                IggyError::Unauthenticated
+            })
     }
 
     /// Highest metadata op `user_id` was told committed here; see
@@ -367,6 +500,13 @@ impl HttpInner {
     /// the session table.
     pub(in crate::http) fn metadata_watermark(&self, user_id: u32) -> u64 {
         self.metadata_watermarks.get(user_id)
+    }
+
+    /// Whether this node holds a live session for `key`, which
+    /// [`Self::resolve_session`] returns without a `Register`.
+    pub(in crate::http) fn has_live_session(&self, key: &str) -> bool {
+        self.live_session(key, IggyTimestamp::now().to_secs())
+            .is_some()
     }
 
     /// Clone the live (non-expired) entry for `key`, if present. Confines the
@@ -402,6 +542,7 @@ impl HttpInner {
         &self,
         key: String,
         user_id: u32,
+        user_created_at: IggyTimestamp,
         expiry: u64,
     ) -> Result<Rc<HttpSession>, AuthError> {
         /// A collision is rare enough that this many in a row means the minter
@@ -410,7 +551,7 @@ impl HttpInner {
 
         for attempt in 1..=MINT_ATTEMPTS {
             match self
-                .register_session_once(key.clone(), user_id, expiry)
+                .register_session_once(key.clone(), user_id, user_created_at, expiry)
                 .await
             {
                 Ok(session) => return Ok(session),
@@ -434,6 +575,7 @@ impl HttpInner {
         &self,
         key: String,
         user_id: u32,
+        user_created_at: IggyTimestamp,
         expiry: u64,
     ) -> Result<Rc<HttpSession>, AuthError> {
         let coordinator = self
@@ -444,6 +586,7 @@ impl HttpInner {
         // `client_seq`, so an HTTP session id can never collide with a TCP
         // virtual client's and the shard-0 tag (top 16 bits == 0) is preserved.
         let client_id = coordinator.mint_shard_zero_client_id();
+        self.metrics.session_registers.inc();
         // Shared Register entry point; on shard 0 (always, for HTTP) it runs
         // `submit_register_in_process` directly on the metadata owner.
         //
@@ -457,9 +600,15 @@ impl HttpInner {
         let (result_slot, committed) = oneshot::channel();
         let shard = Rc::clone(&self.shard);
         compio::runtime::spawn(async move {
-            let verifier =
-                consensus::client_table::bind_verifier(client_id, user_id, &rand::random());
-            let result = submit_register_on_owner(&shard, client_id, user_id, verifier).await;
+            let registration = RegisterRequest {
+                user_created_at: user_created_at.as_micros(),
+                bind_verifier: consensus::client_table::bind_verifier(
+                    client_id,
+                    user_id,
+                    &rand::random(),
+                ),
+            };
+            let result = submit_register_on_owner(&shard, client_id, user_id, registration).await;
             if let Err(Ok(bound)) = result_slot.send(result)
                 && bound.watermark == FRESH_ENTRY_WATERMARK
             {
@@ -508,7 +657,7 @@ impl HttpInner {
         .await
         .ok_or(AuthError::SessionUnavailable)?;
         // Register and catch-up may yield to a user revocation.
-        self.ensure_active_user(user_id)?;
+        self.ensure_active_user(user_id, Some(user_created_at))?;
         let attachment = metadata
             .client_table
             .borrow_mut()
@@ -594,6 +743,9 @@ const fn register_submit_auth_error(error: &MetadataSubmitError) -> AuthError {
         | MetadataSubmitError::PipelineFull
         | MetadataSubmitError::PrimaryUnreachable => AuthError::SessionNotAccepted,
         MetadataSubmitError::ClientIdOwnedByAnotherUser => AuthError::SessionIdOwnedByAnotherUser,
+        MetadataSubmitError::Unauthenticated => {
+            AuthError::Unauthenticated(IggyError::Unauthenticated)
+        }
         // The proposal may still commit. Unknown future outcomes fail closed
         // into the same client-only retry class.
         MetadataSubmitError::InProgress
@@ -633,11 +785,25 @@ pub(in crate::http) fn insert_view_header(state: &HttpInner, mut response: Respo
     response
 }
 
+/// `(id, created_at)` of `user` when a trusted issuer may act as it: active and
+/// not root. A deleted user's id goes to the next user created, so the issuer
+/// is matched by username, and an external issuer never holds root.
+fn trusted_issuer_account(user: Option<&User>) -> Option<(u32, IggyTimestamp)> {
+    let user = user?;
+    if user.id == DEFAULT_ROOT_USER_ID {
+        return None;
+    }
+    (user.status == UserStatus::Active).then_some((user.id, user.created_at))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MetadataWatermarks, register_submit_auth_error};
+    use super::{MetadataWatermarks, register_submit_auth_error, trusted_issuer_account};
     use crate::http::error::AuthError;
+    use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+    use iggy_common::{IggyTimestamp, UserStatus};
     use metadata::MetadataSubmitError;
+    use metadata::stm::user::User;
 
     /// The floor is what the read gate waits for, so nothing may lower it: two
     /// concurrent requests by one user can have their committed replies land
@@ -698,6 +864,37 @@ mod tests {
                 register_submit_auth_error(&error),
                 AuthError::SessionUnavailable
             ));
+        }
+    }
+
+    #[test]
+    fn given_root_inactive_or_unknown_user_when_trusted_issuer_maps_onto_it_should_refuse() {
+        let root = user(DEFAULT_ROOT_USER_ID, UserStatus::Active);
+        let inactive = user(1, UserStatus::Inactive);
+        assert_eq!(
+            trusted_issuer_account(Some(&root)),
+            None,
+            "an external issuer must never act as root"
+        );
+        assert_eq!(trusted_issuer_account(Some(&inactive)), None);
+        assert_eq!(trusted_issuer_account(None), None);
+    }
+
+    #[test]
+    fn given_active_user_when_trusted_issuer_maps_onto_it_should_resolve_its_account() {
+        let active = user(1, UserStatus::Active);
+        assert_eq!(
+            trusted_issuer_account(Some(&active)),
+            Some((1, active.created_at))
+        );
+    }
+
+    fn user(id: u32, status: UserStatus) -> User {
+        User {
+            id,
+            status,
+            created_at: IggyTimestamp::from(1_700_000_000_000_000),
+            ..User::default()
         }
     }
 }

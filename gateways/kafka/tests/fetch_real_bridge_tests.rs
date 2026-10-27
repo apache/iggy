@@ -47,8 +47,8 @@ use tokio_util::sync::CancellationToken;
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_FETCH, API_KEY_PRODUCE, BrokerAdvertise, ConnectionState, GatewayState,
-    handle_connection_request, handle_request_bounded,
+    API_KEY_FETCH, API_KEY_PRODUCE, ConnectionState, GatewayState, handle_connection_request,
+    handle_request_bounded,
 };
 use iggy_gateway_kafka::records::{MAPPING_VERSION, TimestampWindow, VERSION_HEADER, to_iggy};
 
@@ -89,10 +89,8 @@ async fn gateway_with_topic(server: &TestServer, partitions: u32) -> GatewayStat
         .await
         .expect("the topic must exist before fetching from it");
     GatewayState::new(
-        BrokerAdvertise::default(),
         Some(Arc::new(bridge)),
         MAX_FRAME_SIZE,
-        false,
         0,
         GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     )

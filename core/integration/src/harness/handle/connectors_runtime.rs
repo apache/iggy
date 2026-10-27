@@ -209,7 +209,7 @@ impl TestBinary for ConnectorsRuntimeHandle {
 
     fn stop(&mut self) -> Result<(), TestBinaryError> {
         if let Some(child) = self.child_handle.take() {
-            let child = common::graceful_kill(child);
+            let child = common::graceful_kill(child).child;
 
             if let Ok(output) = child.wait_with_output() {
                 let stderr = String::from_utf8_lossy(&output.stderr);

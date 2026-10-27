@@ -43,8 +43,9 @@ pub struct TrustedIssuerConfig {
     pub issuer: String,
     pub audience: String,
     pub jwks_url: String,
+    /// The iggy user every token from this issuer acts as.
     #[serde(default)]
-    pub user_id: u32,
+    pub username: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]

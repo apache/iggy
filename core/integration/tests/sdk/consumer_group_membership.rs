@@ -48,10 +48,9 @@ const CONSUMER_GROUP_MEMBER_NOT_FOUND: u32 = 5006;
 
 // Every spec here pins a 60s server heartbeat because harness clients never
 // ping on their own: the SDK pinger is spawned by `IggyClient::connect`, which
-// the harness builder does not call. At the shipped 30s interval a group member
-// that idles through another client's setup is reaped by the server's verifier,
-// and the failure surfaces as a short member count instead of anything about
-// the scenario under test.
+// the harness builder does not call. With heartbeat checks on, the server logs
+// out a group member that stays silent too long, and the failure surfaces as a
+// short member count instead of anything about the scenario under test.
 
 // A consumer-group member holding zero partitions has the same empty client-side
 // assignment as a non-member; only membership tells them apart. When the group
@@ -78,7 +77,10 @@ async fn given_group_member_holds_no_partitions_when_group_deleted_should_surfac
     let admin = clients.remove(0);
     let consumer_client = clients.remove(0);
 
-    admin.create_stream(STREAM_NAME).await.unwrap();
+    admin
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     admin
         .create_topic(
             &stream_id,
@@ -107,7 +109,6 @@ async fn given_group_member_holds_no_partitions_when_group_deleted_should_surfac
         .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
         .batch_length(1)
-        .poll_interval(IggyDuration::new(Duration::from_millis(100)))
         .auto_join_consumer_group()
         .do_not_create_consumer_group_if_not_exists()
         .build();
@@ -184,7 +185,10 @@ async fn given_member_holds_no_partitions_when_polled_should_report_no_assigned_
     let first_member = clients.remove(0);
     let second_member = clients.remove(0);
 
-    first_member.create_stream(STREAM_NAME).await.unwrap();
+    first_member
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     first_member
         .create_topic(
             &stream_id,
@@ -269,7 +273,10 @@ async fn given_member_that_does_not_auto_join_when_joined_by_the_caller_should_r
         .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
         .await
         .unwrap();
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &stream_id,
@@ -352,7 +359,10 @@ async fn given_join_and_leave_failures_when_sent_over_the_wire_should_return_leg
         "join with a missing stream",
     );
 
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     assert_rejected(
         root_client
             .join_consumer_group(&stream_id, &missing, &group_id)
@@ -435,7 +445,10 @@ async fn given_group_member_when_session_reset_should_forget_membership(harness:
         .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
         .await
         .unwrap();
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &stream_id,
@@ -534,7 +547,10 @@ async fn given_weak_offset_durability_when_owner_changes_should_preserve_progres
     let topic_id = Identifier::named(TOPIC_NAME).unwrap();
     let group_id = Identifier::named(CONSUMER_GROUP_NAME).unwrap();
     let consumer = Consumer::group(group_id.clone());
-    predecessor.create_stream(STREAM_NAME).await.unwrap();
+    predecessor
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     predecessor
         .create_topic(
             &stream_id,

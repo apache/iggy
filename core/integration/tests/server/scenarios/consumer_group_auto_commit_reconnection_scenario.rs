@@ -37,7 +37,10 @@ pub async fn run(harness: &TestHarness) {
 
 async fn init_system(client: &IggyClient) {
     // 1. Create the stream
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     // 2. Create the topic
     client
@@ -137,7 +140,6 @@ async fn create_auto_commit_consumer(client: &IggyClient) -> IggyConsumer {
         .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
         .batch_length(10)
-        .poll_interval(IggyDuration::from_str("100ms").expect("Invalid duration"))
         .polling_strategy(PollingStrategy::next())
         .auto_join_consumer_group()
         .auto_commit(AutoCommit::IntervalOrAfter(

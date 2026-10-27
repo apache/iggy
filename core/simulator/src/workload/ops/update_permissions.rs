@@ -47,8 +47,9 @@ pub fn sample(
         Outcome::UserNotFound => Some(Input {
             user: shadow.fabricate_absent_name("user"),
         }),
-        // Not a targeted outcome (absent from `OUTCOMES`); never sampled.
-        Outcome::CannotChangePermissions => None,
+        // Not targeted outcomes (absent from `OUTCOMES`); never sampled. The
+        // sim client sends no permissions payload, so no grant names a target.
+        Outcome::CannotChangePermissions | Outcome::StreamNotFound | Outcome::TopicNotFound => None,
     }
 }
 

@@ -24,7 +24,9 @@ import org.apache.iggy.user.IdentityInfo;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserInfo;
 import org.apache.iggy.user.UserInfoDetails;
+import org.apache.iggy.user.UserOptions;
 import org.apache.iggy.user.UserStatus;
+import org.apache.iggy.user.UserUpdate;
 
 import java.util.List;
 import java.util.Optional;
@@ -85,16 +87,31 @@ public interface UsersClient {
     CompletableFuture<List<UserInfo>> getUsers();
 
     /**
+     * Create a user with the details provided and no options.
+     *
+     * @see #createUser(String, String, UserStatus, Optional, UserOptions)
+     */
+    default CompletableFuture<UserInfoDetails> createUser(
+            String username, String password, UserStatus status, Optional<Permissions> permissions) {
+        return createUser(username, password, status, permissions, UserOptions.empty());
+    }
+
+    /**
      * Create a user with the details provided.
      *
      * @param username The username of the new user.
      * @param password The password of the new user.
      * @param status The status of the new user.
      * @param permissions An optional set of permissions for the new user.
+     * @param options The user's options. No user key exists yet, so these carry only raw entries.
      * @return A {@link CompletableFuture} that completes with a {@link UserInfoDetails} that gives information about the newly created user.
      */
     CompletableFuture<UserInfoDetails> createUser(
-            String username, String password, UserStatus status, Optional<Permissions> permissions);
+            String username,
+            String password,
+            UserStatus status,
+            Optional<Permissions> permissions,
+            UserOptions options);
 
     /**
      * Delete the user with the given ID.
@@ -114,22 +131,24 @@ public interface UsersClient {
     CompletableFuture<Void> deleteUser(UserId userId);
 
     /**
-     * Update the user identified by the given userId, setting (if provided) their username and or status.
+     * Update the user identified by the given userId.
      *
-     * @see #updateUser(UserId, Optional, Optional)
+     * @see #updateUser(UserId, UserUpdate)
      */
-    default CompletableFuture<Void> updateUser(Long userId, Optional<String> username, Optional<UserStatus> status) {
-        return updateUser(UserId.of(userId), username, status);
+    default CompletableFuture<Void> updateUser(Long userId, UserUpdate update) {
+        return updateUser(UserId.of(userId), update);
     }
 
     /**
-     * Update the user identified by the given userId, setting (if provided) their username and or status.
+     * Update the user identified by the given userId: its username, its status, or both. Every key left
+     * out keeps its value. Renaming the signed-in user also moves the credentials this client signs back
+     * in with after a reconnect.
+     *
      * @param userId The ID of the user to update.
-     * @param username The new username of the user, or an empty optional if no update is required.
-     * @param status The new status of the user, or an empty optional if no update is required.
+     * @param update What to change.
      * @return A {@link CompletableFuture} that completes but yields no value.
      */
-    CompletableFuture<Void> updateUser(UserId userId, Optional<String> username, Optional<UserStatus> status);
+    CompletableFuture<Void> updateUser(UserId userId, UserUpdate update);
 
     /**
      * Update the permissions of the user identified by the provided userId.

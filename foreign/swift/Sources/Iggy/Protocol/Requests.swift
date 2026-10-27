@@ -34,14 +34,6 @@ enum Requests {
         return writer.bytes
     }
 
-    static func updateStream(streamID: Identifier, name: String, options: [UInt8]) throws -> [UInt8] {
-        var writer = ByteWriter()
-        try streamID.encode(into: &writer)
-        try writer.writeName(validatedWireName(name))
-        writer.write(options)
-        return writer.bytes
-    }
-
     // MARK: Topics
 
     static func streamAndTopic(_ streamID: Identifier, _ topicID: Identifier) throws -> [UInt8] {
@@ -60,12 +52,36 @@ enum Requests {
         return writer.bytes
     }
 
-    static func updateTopic(streamID: Identifier, topicID: Identifier, name: String, options: [UInt8]) throws -> [UInt8] {
+    // MARK: Resource updates
+
+    /// What an `UpdateResource` patches, tagged on the wire with its options
+    /// scope.
+    enum ResourceTarget {
+        case topic(stream: Identifier, topic: Identifier)
+        case stream(Identifier)
+        case user(Identifier)
+    }
+
+    /// `[scope:u8][target ids][reset_count:u8][reset_key:name]*[options block]`
+    static func updateResource(_ target: ResourceTarget, _ patch: OptionsPatch) throws -> [UInt8] {
         var writer = ByteWriter()
-        try streamID.encode(into: &writer)
-        try topicID.encode(into: &writer)
-        try writer.writeName(validatedWireName(name))
-        writer.write(options)
+        switch target {
+        case .topic(let stream, let topic):
+            writer.write(OptionsScope.topic.rawValue)
+            try stream.encode(into: &writer)
+            try topic.encode(into: &writer)
+        case .stream(let stream):
+            writer.write(OptionsScope.stream.rawValue)
+            try stream.encode(into: &writer)
+        case .user(let user):
+            writer.write(OptionsScope.user.rawValue)
+            try user.encode(into: &writer)
+        }
+        writer.write(UInt8(patch.reset.count))
+        for key in patch.reset {
+            try writer.writeName(key)
+        }
+        writer.write(try OptionsBlock.encode(patch.set))
         return writer.bytes
     }
 
@@ -159,6 +175,14 @@ enum Requests {
         return writer.bytes
     }
 
+    static func partitionRoute(streamID: Identifier, topicID: Identifier, partitionID: UInt32) throws -> [UInt8] {
+        var writer = ByteWriter()
+        try streamID.encode(into: &writer)
+        try topicID.encode(into: &writer)
+        writer.write(partitionID)
+        return writer.bytes
+    }
+
     // MARK: Users
 
     /// Byte length of a bind secret carried by login and bind-session requests.
@@ -208,24 +232,20 @@ enum Requests {
         }
     }
 
-    static func updateUser(userID: Identifier, username: String?, status: UserStatus?, options: [UInt8]) throws -> [UInt8] {
-        var writer = ByteWriter()
-        try userID.encode(into: &writer)
-        if let username {
-            try validateUsername(username)
-            writer.write(UInt8(1))
-            try writer.writeName(username)
-        } else {
-            writer.write(UInt8(0))
+    /// The user a user-scope ``updateResource(_:_:)`` payload names and the
+    /// name it sets, nil when it patches another scope or keeps the name.
+    static func renamedUser(_ payload: [UInt8]) throws -> (userID: Identifier, username: String)? {
+        guard payload.first == OptionsScope.user.rawValue else {
+            return nil
         }
-        if let status {
-            writer.write(UInt8(1))
-            writer.write(status.rawValue)
-        } else {
-            writer.write(UInt8(0))
+        return try Responses.decode(payload.dropFirst()) { reader in
+            let userID = try Identifier.decode(from: &reader)
+            for _ in 0..<(try reader.readUInt8()) {
+                _ = try reader.readName()
+            }
+            let options = try OptionsBlock.decode(try reader.readBytes(reader.remaining), explicit: true)
+            return options[UserOptionKey.username.rawValue]?.value.stringValue.map { (userID, $0) }
         }
-        writer.write(options)
-        return writer.bytes
     }
 
     static func updatePermissions(userID: Identifier, permissions: Permissions?) throws -> [UInt8] {
@@ -243,6 +263,16 @@ enum Requests {
         try writer.writeName(currentPassword)
         try writer.writeName(newPassword)
         return writer.bytes
+    }
+
+    /// The user a ``changePassword(userID:currentPassword:newPassword:)``
+    /// payload names and its new password.
+    static func changedPassword(_ payload: [UInt8]) throws -> (userID: Identifier, newPassword: String) {
+        try Responses.decode(payload[...]) { reader in
+            let userID = try Identifier.decode(from: &reader)
+            _ = try reader.readName()
+            return (userID, try reader.readName())
+        }
     }
 
     /// `[protocol_version:u32][sdk_name][sdk_version]`, the prefix of both
@@ -338,6 +368,42 @@ enum Requests {
 
     static func describeOptions(scope: OptionsScope) -> [UInt8] {
         [scope.rawValue]
+    }
+
+    /// `[start:u8][cursor:44][has_since:u8][since:u64][has_until:u8][until:u64][limit:u32][groups_count:u8][group:u8]*[token_len:u16][token]`.
+    /// The cursor is all zero unless the read starts after it, and groups
+    /// travel in the caller's order, at most 255 of them as in the Rust encoder.
+    static func getMetadataChanges(_ query: MetadataChangesQuery) -> [UInt8] {
+        var groups = query.groups
+        if groups.count > Int(UInt8.max) {
+            var seen = Set<MetadataChangeGroup>()
+            groups = groups.filter { seen.insert($0).inserted }
+        }
+        var token: [UInt8] = []
+        if case .current(let pageToken?) = query.start {
+            token = pageToken.encoded()
+        }
+        var writer = ByteWriter(capacity: 1 + MetadataChangeCursor.encodedSize + 9 + 9 + 4 + 1 + groups.count + 2 + token.count)
+        writer.write(query.start.code)
+        if case .after(let cursor) = query.start {
+            cursor.encode(into: &writer)
+        } else {
+            writer.writeZeros(MetadataChangeCursor.encodedSize)
+        }
+        for bound in [query.since, query.until] {
+            writer.write(bound != nil)
+            if let bound {
+                writer.write(bound.microseconds)
+            }
+        }
+        writer.write(query.limit)
+        writer.write(UInt8(groups.count))
+        for group in groups {
+            writer.write(group.rawValue)
+        }
+        writer.write(UInt16(token.count))
+        writer.write(token)
+        return writer.bytes
     }
 }
 

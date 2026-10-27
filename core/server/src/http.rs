@@ -31,6 +31,7 @@ mod jwks;
 mod jwt;
 mod metrics;
 mod reads;
+mod relay_proof;
 mod reply;
 mod session;
 mod state;
@@ -71,11 +72,11 @@ use crate::http::handlers::{
     change_password, create_cg, create_partitions, create_pat, create_stream, create_topic,
     create_user, delete_cg, delete_consumer_offset, delete_partitions, delete_pat, delete_segments,
     delete_stream, delete_topic, delete_user, describe_options, get_cg, get_cgs, get_client,
-    get_clients, get_cluster_metadata, get_consumer_offset, get_pats, get_snapshot, get_stats,
-    get_stream, get_streams, get_topic, get_topics, get_user, get_users, login_user,
-    login_with_personal_access_token, logout_user, ping, poll_messages, refresh_token,
-    send_messages, store_consumer_offset, update_permissions, update_stream, update_topic,
-    update_user,
+    get_clients, get_cluster_metadata, get_consumer_offset, get_metadata_changes, get_pats,
+    get_snapshot, get_stats, get_stream, get_streams, get_topic, get_topics, get_user, get_users,
+    login_user, login_with_personal_access_token, logout_user, ping, poll_messages,
+    poll_messages_deferred, refresh_token, send_messages, store_consumer_offset,
+    update_permissions, update_stream, update_topic, update_user,
 };
 use crate::http::jwt::JwtManager;
 use crate::http::session::RegistrationBarrier;
@@ -128,20 +129,20 @@ pub fn prepare(
             .then_some(cluster.auth.shared_secret.as_str());
     let jwt = JwtManager::build(&http_config.jwt, cluster_psk)?;
     // Forwarding needs a bearer every node can verify; without key material it
-    // degrades to off (followers answer the transient 503) instead of failing
-    // the boot, so keyless clusters still serve HTTP node-locally.
-    let forwarding_active = http_forwarding_key_material(&http_config.jwt, cluster);
-    if cluster.enabled && !forwarding_active {
+    // degrades to off (metadata followers and partition backups answer the
+    // transient 503) instead of failing the boot, so keyless clusters still
+    // serve HTTP node-locally.
+    let key_material = http_forwarding_key_material(&http_config.jwt, cluster);
+    if cluster.enabled && key_material.is_none() {
         warn!(
-            "cluster mode with http enabled but no http.jwt secrets and no cluster.auth: bearers are node-local and follower-to-primary forwarding is disabled - control-plane writes on followers answer a transient 503; configure http.jwt encoding/decoding secrets or enable cluster.auth (identical on every node) to activate forwarding"
+            "cluster mode with http enabled but no http.jwt secrets and no cluster.auth: bearers are node-local and forwarding is disabled - control-plane writes on followers, and message sends, polls and consumer offset calls on a node that is not the partition primary, answer a transient 503 (code 58); partition primaries are spread over the nodes, which makes that the common case; configure http.jwt encoding/decoding secrets or enable cluster.auth (identical on every node) to activate forwarding"
         );
     }
     // Saturating: a configured limit past the pointer width (32-bit target,
     // >4 GiB value) clamps to the largest enforceable cap instead of wrapping.
     let max_request_size =
         usize::try_from(http_config.max_request_size.as_bytes_u64()).unwrap_or(usize::MAX);
-    let forward =
-        forward::build_forward_state(&http_config.tls, max_request_size, forwarding_active)?;
+    let forward = forward::build_forward_state(&http_config.tls, max_request_size, key_material)?;
     // Validated here, before the socket opens, so a bad [http.cors] fails boot
     // before the "started" log prints.
     let cors = http_config
@@ -207,7 +208,6 @@ pub fn start(
     session_liveness: Rc<RefCell<crate::consumer_group::lease::ConsumerGroupLiveness>>,
     http_config: &HttpConfig,
     clients_table_max: usize,
-    max_tokens_per_user: u32,
     server_config: Arc<ServerConfig>,
     roster: Rc<ClusterRoster>,
     connections: &Rc<ConnectionCap>,
@@ -235,7 +235,6 @@ pub fn start(
         registrations: RegistrationBarrier::default(),
         roster,
         max_http_sessions: crate::http::session::max_http_sessions(clients_table_max),
-        max_tokens_per_user,
         in_flight_writes: Cell::new(0),
         forward,
         metrics: metrics::HttpMetrics::init(shard_metrics_all),
@@ -364,7 +363,8 @@ const PING_PATH: &str = "/ping";
 /// still serve locally unless `?consistency=linearizable`). The partition
 /// routes go to the primary of their partition instead. The local routes
 /// never need a primary: health, the login/refresh flows (STM read + JWT
-/// mint) and node-local reads.
+/// mint), node-local reads, and the metadata floor another node reads here,
+/// whose caller proves itself with a relay proof instead of a bearer.
 ///
 /// `max_request_size` becomes the router-wide `DefaultBodyLimit` (413 past
 /// it), exactly like the legacy server: it bounds the per-request term of the
@@ -412,7 +412,12 @@ fn router(
         .route("/stats", get(get_stats))
         .route("/options/{scope}", get(describe_options))
         .route("/snapshot", post(get_snapshot))
+        .route("/metadata/changes", get(get_metadata_changes))
         .route("/cluster/metadata", get(get_cluster_metadata))
+        .route(
+            forward::METADATA_FLOOR_PATH,
+            get(forward::answer_metadata_floor),
+        )
         .route("/clients", get(get_clients))
         .route("/clients/{client_id}", get(get_client));
     let local = match metrics_endpoint {
@@ -468,13 +473,17 @@ fn router(
 
 /// Every request of a partition runs on the primary of its partition group,
 /// reads included, as on the binary transports: the node that receives one
-/// chooses the partition and relays the request once when another replica is
-/// the primary ([`forward::route_partition`]).
+/// chooses the partition, serves it, and relays the request once when its
+/// owner refuses as a backup ([`forward::serve_partition`]).
 fn partition_routes(state: HttpState) -> Router<HttpState> {
     Router::new()
         .route(
             "/streams/{stream_id}/topics/{topic_id}/messages",
             post(send_messages).get(poll_messages),
+        )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/messages/deferred",
+            get(poll_messages_deferred),
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/consumer-offsets",
@@ -539,7 +548,17 @@ fn forwardable_routes(state: HttpState) -> Router<HttpState> {
         .route_layer(from_fn_with_state(state, forward::forward_to_primary))
 }
 
-/// Stamp `Connection: close` on a 413, which rejects its request body unread.
+/// Close the connection after a 413, which rejects its request body unread.
+async fn close_on_payload_too_large(request: Request, next: Next) -> Response {
+    let version = request.version();
+    let response = next.run(request).await;
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return close_connection(version, response);
+    }
+    response
+}
+
+/// Stamp `Connection: close` on a response that leaves its request body unread.
 ///
 /// hyper decides to close only once it notices the dropped body, and that is
 /// after the response head is already encoded: the reply advertises keep-alive,
@@ -549,10 +568,8 @@ fn forwardable_routes(state: HttpState) -> Router<HttpState> {
 ///
 /// HTTP/2 carries no connection-level headers, so h2 replies are left alone
 /// rather than handed a header hyper would strip and warn about.
-async fn close_on_payload_too_large(request: Request, next: Next) -> Response {
-    let http2 = request.version() == Version::HTTP_2;
-    let mut response = next.run(request).await;
-    if !http2 && response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+fn close_connection(version: Version, mut response: Response) -> Response {
+    if version != Version::HTTP_2 {
         response
             .headers_mut()
             .insert(CONNECTION, HeaderValue::from_static("close"));

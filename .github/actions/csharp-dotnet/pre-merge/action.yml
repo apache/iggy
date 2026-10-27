@@ -33,9 +33,11 @@ runs:
           8.0.x
           10.0.x
 
-    - name: Setup Rust
+    - name: Download runtime binaries
       if: startsWith(inputs.task, 'e2e')
-      uses: ./.github/actions/utils/setup-rust
+      uses: ./.github/actions/utils/download-runtime
+      with:
+        install-system-dependencies: "false"
 
     - name: Restore dependencies
       run: |
@@ -81,7 +83,6 @@ runs:
       if: startsWith(inputs.task, 'e2e')
       shell: bash
       run: |
-        cargo build --locked --bin iggy-server --bin iggy
         docker build \
           -f core/server/Dockerfile \
           --target runtime-prebuilt \

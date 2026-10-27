@@ -44,7 +44,6 @@ stream = "demo_stream"
 topics = ["demo_topic"]
 schema = "json"
 batch_length = 100
-poll_interval = "100ms"
 consumer_group = "test_cg"
 [plugin_config]
 connection_uri = "mongodb://localhost:27017"
@@ -81,7 +80,6 @@ stream = "demo_stream"
 topics = ["demo_topic"]
 schema = "json"
 batch_length = 100
-poll_interval = "100ms"
 consumer_group = "mongodb_cg"
 
 [plugin_config]

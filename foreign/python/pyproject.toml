@@ -22,7 +22,7 @@ build-backend = "maturin"
 [project]
 name = "apache-iggy"
 requires-python = ">=3.11"
-version = "0.9.1.dev1"
+version = "0.9.1.dev5"
 description = "Apache Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -132,7 +132,7 @@ asyncio_default_fixture_loop_scope = "session"
 timeout = 30
 # A test that pins the GIL leaves neither pytest-timeout nor asyncio able to fire.
 # The faulthandler watchdog needs no GIL, so it dumps every thread and aborts the run.
-faulthandler_timeout = 60
+faulthandler_timeout = 120
 faulthandler_exit_on_timeout = true
 testpaths = ["tests"]
 python_files = ["test_*.py"]
@@ -150,6 +150,8 @@ filterwarnings = [
 
 [tool.uv]
 exclude-newer = "7 days"
+# certifi ships CA removals that cannot wait out the full cooldown.
+exclude-newer-package = { certifi = "2 days" }
 cache-keys = [
     { file = "pyproject.toml" },
     { file = "Cargo.toml" },

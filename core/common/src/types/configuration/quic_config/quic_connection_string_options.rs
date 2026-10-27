@@ -16,13 +16,14 @@
 // under the License.
 
 use crate::{
-    ConnectionStringOptions, IggyDuration, IggyError, NonZeroIggyDuration,
+    ConnectionStringOptions, IggyDuration, IggyError, NonZeroIggyDuration, PendingOperationsConfig,
     QuicClientReconnectionConfig,
 };
 use std::str::FromStr;
 
 #[derive(Debug)]
 pub struct QuicConnectionStringOptions {
+    pending_operations: PendingOperationsConfig,
     reconnection: QuicClientReconnectionConfig,
     response_buffer_size: u64,
     max_concurrent_bidi_streams: u64,
@@ -37,6 +38,10 @@ pub struct QuicConnectionStringOptions {
 }
 
 impl QuicConnectionStringOptions {
+    pub fn pending_operations(&self) -> PendingOperationsConfig {
+        self.pending_operations
+    }
+
     pub fn reconnection(&self) -> &QuicClientReconnectionConfig {
         &self.reconnection
     }
@@ -89,6 +94,7 @@ impl ConnectionStringOptions for QuicConnectionStringOptions {
 
     fn parse_options(options: &str) -> Result<QuicConnectionStringOptions, IggyError> {
         let options = options.split('&').collect::<Vec<&str>>();
+        let mut pending_operations = PendingOperationsConfig::default();
         let mut response_buffer_size = 1000 * 1000 * 10;
         let mut max_concurrent_bidi_streams = 10000;
         let mut datagram_send_buffer_size = 100_000;
@@ -111,6 +117,16 @@ impl ConnectionStringOptions for QuicConnectionStringOptions {
                 return Err(IggyError::InvalidConnectionString);
             }
             match option_parts[0] {
+                "max_pending_operations" => {
+                    pending_operations.max_operations = option_parts[1]
+                        .parse()
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
+                }
+                "max_pending_operation_bytes" => {
+                    pending_operations.max_bytes = option_parts[1]
+                        .parse()
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
+                }
                 "response_buffer_size" => match option_parts[1].parse::<u64>() {
                     Ok(value) => {
                         response_buffer_size = value;
@@ -215,7 +231,7 @@ impl ConnectionStringOptions for QuicConnectionStringOptions {
         let heartbeat_interval = NonZeroIggyDuration::from_str(heartbeat_interval.as_str())
             .map_err(|_| IggyError::InvalidConnectionString)?;
 
-        let connection_string_options = QuicConnectionStringOptions::new(
+        let mut connection_string_options = QuicConnectionStringOptions::new(
             reconnection,
             response_buffer_size,
             max_concurrent_bidi_streams,
@@ -229,6 +245,7 @@ impl ConnectionStringOptions for QuicConnectionStringOptions {
             heartbeat_interval,
         );
 
+        connection_string_options.pending_operations = pending_operations;
         Ok(connection_string_options)
     }
 }
@@ -249,6 +266,7 @@ impl QuicConnectionStringOptions {
         heartbeat_interval: NonZeroIggyDuration,
     ) -> Self {
         Self {
+            pending_operations: PendingOperationsConfig::default(),
             reconnection,
             response_buffer_size,
             max_concurrent_bidi_streams,
@@ -267,6 +285,7 @@ impl QuicConnectionStringOptions {
 impl Default for QuicConnectionStringOptions {
     fn default() -> Self {
         QuicConnectionStringOptions {
+            pending_operations: PendingOperationsConfig::default(),
             reconnection: Default::default(),
             response_buffer_size: 1000 * 1000 * 10,
             max_concurrent_bidi_streams: 10000,

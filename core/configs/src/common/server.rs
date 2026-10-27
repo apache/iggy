@@ -22,6 +22,7 @@ use serde_with::DisplayFromStr;
 use serde_with::serde_as;
 use server_common::MemoryPoolSettings;
 use server_common::log::{TelemetryEndpointSettings, TelemetrySettings};
+use std::time::Duration;
 
 pub use server_common::log::TelemetryTransport;
 
@@ -83,6 +84,24 @@ pub struct HeartbeatConfig {
     pub interval: IggyDuration,
 }
 
+impl HeartbeatConfig {
+    // Integer 6/5 rather than `mul_f64`, which panics on an absurd interval.
+    const SESSION_TIMEOUT_NUMERATOR: u32 = 6;
+    const SESSION_TIMEOUT_DENOMINATOR: u32 = 5;
+
+    /// The session timeout, 1.2 x `interval`. With heartbeat checks on, a
+    /// connection silent this long stops renewing its session. With or without
+    /// checks, the metadata primary ends a session that no server renewed for
+    /// this long.
+    #[must_use]
+    pub fn session_timeout(&self) -> Duration {
+        self.interval
+            .get_duration()
+            .saturating_mul(Self::SESSION_TIMEOUT_NUMERATOR)
+            / Self::SESSION_TIMEOUT_DENOMINATOR
+    }
+}
+
 #[serde_as]
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 #[serde(default)]
@@ -90,9 +109,6 @@ pub struct ConsumerGroupConfig {
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub rebalancing_timeout: IggyDuration,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub session_timeout: IggyDuration,
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub heartbeat_interval: IggyDuration,

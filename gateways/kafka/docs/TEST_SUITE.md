@@ -36,10 +36,10 @@ in the same target directory; neither harness invokes `cargo build` itself). Ski
 fails with a clear "binary not found" message naming the build command to run, not a hang or a
 silent skip.
 
-### `iggy-gateway-kafka` binary (required for `phase1_e2e_tests`)
+### `iggy-gateway-kafka` binary (required for `phase1_e2e_tests` and `cluster_id_real_bridge_tests`)
 
-`phase1_e2e_tests` spawns the compiled gateway itself, bridged to a spawned `iggy-server`, so
-`iggy-server` still needs the manual build step above. `iggy-gateway-kafka` does not: it is this
+`phase1_e2e_tests` and `cluster_id_real_bridge_tests` spawn the compiled gateway itself, bridged
+to a spawned `iggy-server`, so `iggy-server` still needs the manual build step above. `iggy-gateway-kafka` does not: it is this
 package's own `[[bin]]`, so `CARGO_BIN_EXE_iggy-gateway-kafka` resolves at compile time and Cargo
 builds it automatically as part of `cargo test -p iggy-gateway-kafka`.
 
@@ -72,22 +72,27 @@ file under `tests/` anymore.
 | [`fixtures_canary_tests.rs`](../tests/fixtures_canary_tests.rs) | Fails loudly if `KAFKA_FIXTURES_REQUIRED=1` and no `.bin` fixtures exist, so a broken generation step can't leave the fixture-backed suites green-but-empty | Canary only |
 | [`version_firewall_tests.rs`](../tests/version_firewall_tests.rs) | Version boundary matrix, unsupported keys, corrupt bodies | Partial |
 | [`idempotence_tests.rs`](../tests/idempotence_tests.rs) | `InitProducerId` allocation across every supported version, and the transactional refusals on `InitProducerId`/Produce | No |
-| [`broker_advertise_tests.rs`](../tests/broker_advertise_tests.rs) | `BrokerAdvertise::from_server_config` parsing | No |
+| [`broker_advertise_tests.rs`](../tests/broker_advertise_tests.rs) | `BrokerAdvertise::for_listener` parsing and Metadata reflection | No |
 | [`server_integration_tests.rs`](../tests/server_integration_tests.rs) | `read_frame` unit-level I/O | No |
 | [`consumer_group_tests.rs`](../tests/consumer_group_tests.rs) | `FindCoordinator`/`JoinGroup`/`Heartbeat`/`LeaveGroup`/`SyncGroup`/`DescribeGroups`/`ListGroups` against one shared `GatewayState` with paused time, plus two-socket TCP rebalance and leave scenarios | No |
 | [`server_e2e_tests.rs`](../tests/server_e2e_tests.rs) | Full `KafkaGateway` TCP round-trips | Partial |
 | [`listener_robustness_tests.rs`](../tests/listener_robustness_tests.rs) | TCP listener robustness — framing, pipelining, concurrency, connection limits | No |
 | [`sasl_tests.rs`](../tests/sasl_tests.rs) | SASL/PLAIN over a socket — full handshake, every refusal path, and the disabled default. Drives a stub verifier implementing `SaslAuthenticator`, so no Iggy server is needed | No |
-| [`kafka_client_e2e_tests.rs`](../tests/kafka_client_e2e_tests.rs) | **Real Kafka clients** against the whole stack: a spawned `iggy-server`, the gateway in-process with a real authenticator, and kcat / the Java tools from containers. With a bridge, kcat writes records, and kcat and the Java consumer read them back through Fetch. Java consumers in one group resume from their commits, across a gateway restart and a member leaving. The only suite that can catch a client-compatibility bug, since every other one hand-builds frames | No, but needs Docker and a built `iggy-server` |
-| [`bridge_iggy_integration_tests.rs`](../tests/bridge_iggy_integration_tests.rs) | `IggyBridge` against a real, spawned `iggy-server` — provisioning idempotency, high watermark, credential/connection edge cases | No (needs the `iggy-server` binary - see Prerequisites) |
-| [`list_offsets_real_bridge_tests.rs`](../tests/list_offsets_real_bridge_tests.rs) | ListOffsets (key 2) through the whole handler against a real, spawned `iggy-server`: LATEST, EARLIEST, codes 3 and 43 | No (needs the `iggy-server` binary - see Prerequisites) |
+| [`tls_listener_tests.rs`](../tests/tls_listener_tests.rs) | The `SSL` and `SASL_SSL` listeners over a real socket with certificates minted per test: each listener advertising its own port, a plaintext client refused on the TLS port, SASL inside TLS, client certificates mapped to users through a stub `PrincipalResolver` (`required`, `requested`, unknown user, a subject no rule maps, a failing or hung lookup, `SASL_SSL` asking for no certificate), a multi-MiB response to a slow reader, the handshake budget, certificate reload without a restart, and the startup refusals | No |
+| [`kafka_client_e2e_tests.rs`](../tests/kafka_client_e2e_tests.rs) | **Real Kafka clients** against the whole stack: a spawned `iggy-server`, the gateway in-process with a real authenticator, and kcat / the Java tools from containers. With a bridge, kcat writes records, and kcat and the Java consumer read them back through Fetch. Java consumers in one group resume from their commits, across a gateway restart and a member leaving. `kafka-cluster cluster-id` prints the same id across a gateway restart. Lookups by time resolve through `kafka-get-offsets` (a time, 0, `-3` and a future time), `kafka-consumer-groups --reset-offsets --to-datetime`, and the consumer's `offsetsForTimes` in a probe compiled with the host `javac`. librdkafka and the Java client connect with `security.protocol=SSL` and `SASL_SSL`, and a client certificate admits each as the Iggy user it names. With auto topic creation on, the Java producer sends to a topic nobody created. The only suite that can catch a client-compatibility bug, since every other one hand-builds frames | No, but needs Docker, a built `iggy-server` and a host JDK (`javac`) |
+| [`bridge_iggy_integration_tests.rs`](../tests/bridge_iggy_integration_tests.rs) | `IggyBridge` against a real, spawned `iggy-server` — provisioning idempotency, high watermark, credential/connection edge cases, and the bridge dialing a TLS-only server over TLS | No (needs the `iggy-server` binary - see Prerequisites) |
+| [`list_offsets_real_bridge_tests.rs`](../tests/list_offsets_real_bridge_tests.rs) | ListOffsets (key 2) through the whole handler against a real, spawned `iggy-server`: LATEST, EARLIEST, lookups by time and `MAX_TIMESTAMP`, the `-1` answers, code 3, several partitions looked up by time in one request, and a stalled lookup leaving the later partitions their answers | No (needs the `iggy-server` binary - see Prerequisites) |
 | [`fetch_real_bridge_tests.rs`](../tests/fetch_real_bridge_tests.rs) | Fetch (key 1) through the whole handler against a real, spawned `iggy-server` — records go in through the Iggy SDK or the Produce handler and come back through `kafka_protocol`'s client decoder, at every version, with codes 0, 1, 3, 6, -1 and 70, paged polls, and the wait | No (needs the `iggy-server` binary - see Prerequisites) |
 | [`produce_real_bridge_tests.rs`](../tests/produce_real_bridge_tests.rs) | Produce (key 0) through the whole handler against a real, spawned `iggy-server` — records go in as Kafka wire bytes and come back through the Iggy SDK, plus one error code per partition | No (needs the `iggy-server` binary - see Prerequisites) |
+| [`create_partitions_real_bridge_tests.rs`](../tests/create_partitions_real_bridge_tests.rs) | CreatePartitions (key 37) through the whole handler against a real, spawned `iggy-server`: a grow appends indices and shows in Metadata's listing, the grow-only rule (37), a missing topic (3), `validate_only`, duplicate names (42), the manual assignment checks (39), the per-request and topic caps, the `manage_topics` gate (29), a duplicate answered before authorization (42, then 29 for the rest), two overlapping grows to one count (one 0, one 37), a fixed partition topic (44, `validate_only` too), and v0/v1 requests | No (needs the `iggy-server` binary - see Prerequisites) |
 | [`offsets_real_bridge_tests.rs`](../tests/offsets_real_bridge_tests.rs) | OffsetCommit (key 8) and OffsetFetch (key 9) through the whole handler against a real, spawned `iggy-server`: offsets stored as sent, the Iggy external group key, a negative commit as a delete, -1 for nothing committed, a null topic list, and a gateway restart ([#3542](https://github.com/apache/iggy/issues/3542) acceptance) | No (needs the `iggy-server` binary - see Prerequisites) |
-| [`phase1_e2e_tests.rs`](../tests/phase1_e2e_tests.rs) | [#3539](https://github.com/apache/iggy/issues/3539) acceptance: CreateTopics → Metadata → Produce → ListOffsets over real TCP against the real compiled `iggy-gateway-kafka` binary bridged to a real spawned `iggy-server` - the only suite that spawns the gateway as a process rather than calling `KafkaGateway::run` in-process | No (needs both binaries - see Prerequisites) |
+| [`offset_groups_real_bridge_tests.rs`](../tests/offset_groups_real_bridge_tests.rs) | ListGroups (key 16), DescribeGroups (key 15), DeleteGroups (key 42) and OffsetDelete (key 47) through the whole handler against a real, spawned `iggy-server`. A group with offsets and no members is `Empty`, and a live group is listed once. Also the filters, a commit after the last scan, a new gateway, a native Iggy group, and only the live groups once a scan failed with Iggy down. DeleteGroups refuses a group with members, and after they leave deletes it on every topic. Through a relay that holds an Iggy call past its deadline, a commit and a group deletion each keep the other out until the call ends, and past the SDK's 30 s deadline until a replay proves what the call did. A delete that an earlier delete in doubt kept from Iggy lets go of its group. A deletion that ends after its request answered 14 answers 0 to the retry. OffsetDelete keeps the offsets of a topic that a member subscribes to, deletes the others, and finds a group that another gateway committed for since the last scan | No (needs the `iggy-server` binary - see Prerequisites) |
+| [`cluster_id_real_bridge_tests.rs`](../tests/cluster_id_real_bridge_tests.rs) | The cluster id stored in a real, spawned `iggy-server`: one id for every bridge, the first write winning when several start at once, a persisted topic with no expiry or size cap, the id surviving an `iggy-server` SIGKILL, a stored value that is not an id refused, one id per default stream, and the compiled gateway binary reporting the same id in Metadata and DescribeCluster across a restart ([#4519](https://github.com/apache/iggy/issues/4519)) | No (needs both binaries - see Prerequisites) |
+| [`phase1_e2e_tests.rs`](../tests/phase1_e2e_tests.rs) | [#3539](https://github.com/apache/iggy/issues/3539) acceptance: CreateTopics → Metadata → Produce → ListOffsets over real TCP against the real compiled `iggy-gateway-kafka` binary bridged to a real spawned `iggy-server` - with `cluster_id_real_bridge_tests.rs`, one of the two suites that spawn the gateway as a process rather than calling `KafkaGateway::run` in-process | No (needs both binaries - see Prerequisites) |
 
-`tests/common/` holds shared helpers (`codec.rs`, `fixtures.rs`, `gateway_process.rs`, `scope.rs`,
-`server.rs`, `iggy_server.rs`, `tcp.rs`, `wire.rs`), compiled per test binary via `#[path]`, not a test binary itself. `codec.rs`
+`tests/common/` holds shared helpers (`certs.rs`, `codec.rs`, `fixtures.rs`, `gateway_process.rs`,
+`scope.rs`, `server.rs`, `iggy_server.rs`, `tcp.rs`, `wire.rs`), compiled per test binary via `#[path]`, not a test binary itself. `certs.rs`
+mints a CA, server and client certificates with `rcgen` per test, so nothing in the tree can expire. `codec.rs`
 is test-only primitive encode/decode scaffolding for hand-building legacy/adversarial wire shapes
 `kafka_protocol`'s spec-correct encoder cannot produce - it is not the gateway's production codec.
 
@@ -95,10 +100,10 @@ is test-only primitive encode/decode scaffolding for hand-building legacy/advers
 
 ## Real-client end-to-end suite
 
-`kafka_client_e2e_tests.rs` needs two things the rest of the suite does not: Docker, and an
-already-built `iggy-server` in the same target directory. Missing either makes it skip with a
-printed reason rather than fail, which is what lets `cargo test -p iggy-gateway-kafka` stay usable
-without either.
+`kafka_client_e2e_tests.rs` needs three things the rest of the suite does not: Docker, an
+already-built `iggy-server` in the same target directory, and a host JDK 17+ (`javac`) for the
+consumer `offsetsForTimes` probe. Missing any of them makes it skip with a printed reason rather
+than fail, which is what lets `cargo test -p iggy-gateway-kafka` stay usable without them.
 
 Client containers run with `--pull never`, so pull the two images first. Without them the suite
 skips and names the missing one.

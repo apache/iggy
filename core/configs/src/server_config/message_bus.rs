@@ -120,6 +120,19 @@ pub struct MessageBusConfig {
     #[serde(default = "default_client_queue_capacity")]
     pub client_queue_capacity: usize,
 
+    /// How long a reply waits for room in a full client queue before the
+    /// connection is closed.
+    #[serde(default = "default_client_write_stall_timeout")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub client_write_stall_timeout: IggyDuration,
+
+    /// Bytes of requests one SDK connection may have queued behind the
+    /// requests the server runs for it. An empty queue takes any frame.
+    #[serde(default = "default_client_request_queue_bytes_max")]
+    #[config_env(leaf)]
+    pub client_request_queue_bytes_max: IggyByteSize,
+
     /// Interval between outbound reconnect attempts to peers with
     /// `peer_id > self_id`. Also bounds each dial, so a peer that drops
     /// SYNs cannot stall the sweep.
@@ -201,6 +214,14 @@ impl Validatable<ConfigurationError> for MessageBusConfig {
             eprintln!("{COMPONENT} message_bus.client_queue_capacity must be > 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
+        if self.client_write_stall_timeout.as_micros() == 0 {
+            eprintln!("{COMPONENT} message_bus.client_write_stall_timeout must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.client_request_queue_bytes_max.as_bytes_u64() == 0 {
+            eprintln!("{COMPONENT} message_bus.client_request_queue_bytes_max must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         if self.max_message_size.as_bytes_u64() == 0 {
             eprintln!("{COMPONENT} message_bus.max_message_size must be > 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -238,6 +259,22 @@ impl Validatable<ConfigurationError> for MessageBusConfig {
 /// Zero fails validation, so the value comes from the embedded `config.toml`.
 fn default_client_queue_capacity() -> usize {
     SERVER_CONFIG.message_bus.client_queue_capacity as usize
+}
+
+fn default_client_write_stall_timeout() -> IggyDuration {
+    SERVER_CONFIG
+        .message_bus
+        .client_write_stall_timeout
+        .parse()
+        .expect("message_bus.client_write_stall_timeout is a duration")
+}
+
+fn default_client_request_queue_bytes_max() -> IggyByteSize {
+    SERVER_CONFIG
+        .message_bus
+        .client_request_queue_bytes_max
+        .parse()
+        .expect("message_bus.client_request_queue_bytes_max is a byte size")
 }
 
 /// [`IggyByteSize`]'s own `Default` is 0 bytes, which turns the read-ahead
@@ -313,6 +350,38 @@ mod tests {
         let mut config = baseline();
         config.client_queue_capacity = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_client_write_stall_timeout() {
+        let mut config = baseline();
+        config.client_write_stall_timeout = IggyDuration::from(std::time::Duration::ZERO);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_client_request_queue_bytes_max() {
+        let mut config = baseline();
+        config.client_request_queue_bytes_max = IggyByteSize::from(0_u64);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn missing_client_stall_and_queue_bytes_keep_config_defaults() {
+        let mut config = serde_json::to_value(baseline()).unwrap();
+        let fields = config.as_object_mut().unwrap();
+        fields.remove("client_write_stall_timeout");
+        fields.remove("client_request_queue_bytes_max");
+        let decoded: MessageBusConfig = serde_json::from_value(config).unwrap();
+        assert_eq!(
+            decoded.client_write_stall_timeout,
+            baseline().client_write_stall_timeout
+        );
+        assert_eq!(
+            decoded.client_request_queue_bytes_max,
+            baseline().client_request_queue_bytes_max
+        );
+        decoded.validate().unwrap();
     }
 
     #[test]

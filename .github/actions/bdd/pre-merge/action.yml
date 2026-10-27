@@ -1,0 +1,108 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: bdd-pre-merge
+description: Run a BDD suite with the shared covered runtime
+inputs:
+  component:
+    required: true
+    description: BDD component
+  task:
+    required: true
+    description: BDD SDK task
+  codecov-token:
+    required: false
+    description: Codecov upload token
+runs:
+  using: composite
+  steps:
+    - name: Setup Rust for BDD
+      if: inputs.task == 'bdd-rust'
+      uses: ./.github/actions/utils/setup-rust
+      with:
+        coverage: "true"
+        # The suite compiles in Docker. The host only runs the coverage report.
+        free-disk-space: "false"
+        read-cache: "false"
+
+    - name: Download runtime binaries
+      uses: ./.github/actions/utils/download-runtime
+      with:
+        install-system-dependencies: "false"
+
+    - name: Run BDD tests
+      shell: bash
+      run: |
+        # Extract SDK name from task (format: bdd-<sdk>).
+        SDK_NAME=$(echo "${{ inputs.task }}" | sed 's/^bdd-//')
+        export IGGY_SERVER_PATH="target/debug/iggy-server"
+        echo "Server binary location: $(ls -lh target/debug/iggy-server)"
+
+        echo "Running BDD tests for SDK: $SDK_NAME"
+        echo "Current directory: $(pwd)"
+        echo "CLI binary location: $(ls -lh target/debug/iggy)"
+
+        # Export path to the pre-built cli binary (relative to repo root)
+        export IGGY_CLI_PATH="target/debug/iggy"
+        export IGGY_ROOT_USERNAME="iggy"
+        export IGGY_ROOT_PASSWORD="iggy"
+        COVERAGE_ARGS=()
+        if [[ "$SDK_NAME" == rust ]]; then
+          COVERAGE_ARGS=(--coverage)
+        fi
+        ./scripts/run-bdd-tests.sh "${COVERAGE_ARGS[@]}" "$SDK_NAME"
+
+    - name: Clean up Docker resources (BDD)
+      if: always()
+      shell: bash
+      run: |
+        ./scripts/run-bdd-tests.sh clean || true
+        docker system prune -f || true
+
+    - name: Generate Rust coverage report
+      if: always() && !cancelled() && inputs.task == 'bdd-rust'
+      shell: bash
+      run: |
+        if compgen -G 'target/*.profraw' > /dev/null; then
+          cargo llvm-cov report --codecov --output-path codecov.json
+        else
+          echo "::notice::No coverage profiles found; skipping report"
+        fi
+
+    - name: Upload Rust coverage to Codecov
+      if: always() && !cancelled() && inputs.task == 'bdd-rust' && hashFiles('codecov.json', 'reports/rust-bdd-coverage.lcov') != ''
+      uses: codecov/codecov-action@v7.1.1
+      with:
+        token: ${{ inputs.codecov-token }}
+        files: codecov.json,reports/rust-bdd-coverage.lcov
+        disable_search: true
+        flags: rust-bdd
+        fail_ci_if_error: false
+        override_pr: ${{ github.event.pull_request.number }}
+
+    - name: Upload reports
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.component }}-${{ inputs.task }}-reports-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          reports/**
+          target/llvm-cov/**
+          coverage.lcov
+          codecov.json
+        if-no-files-found: ignore
+        retention-days: 7

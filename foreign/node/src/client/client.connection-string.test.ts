@@ -18,12 +18,15 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { MAX_U32 } from '../constant.js';
+import { HEADER_SIZE } from '../wire/vsr/header.js';
 import {
   parseConnectionString,
   parseDuration
 } from './client.connection-string.js';
 import {
   DEFAULT_HEARTBEAT_INTERVAL,
+  DEFAULT_MAX_PENDING_OPERATIONS,
+  DEFAULT_MAX_PENDING_OPERATION_BYTES,
   normalizeClientConfig
 } from './client.config.js';
 
@@ -89,6 +92,40 @@ describe('parseConnectionString', () => {
       }
     );
   });
+
+  for (const scheme of ['iggy', 'iggy+tcp']) {
+    it(`maps mutation limits to client options for ${scheme}`, () => {
+      const config = parseConnectionString(`${scheme}://iggy:secret@localhost:8090` +
+        '?max_pending_operations=7&max_pending_operation_bytes=1024&nodelay=true');
+      assert.equal(config.maxPendingOperations, 7);
+      assert.equal(config.maxPendingOperationBytes, 1024);
+      assert.deepEqual(config.options, { host: 'localhost', port: 8090, noDelay: true });
+      const normalized = normalizeClientConfig(config);
+      assert.equal(normalized.maxPendingOperations, config.maxPendingOperations);
+      assert.equal(normalized.maxPendingOperationBytes, config.maxPendingOperationBytes);
+    });
+  }
+
+  for (const [option, field, minimum] of [
+    ['max_pending_operations', 'maxPendingOperations', 1],
+    ['max_pending_operation_bytes', 'maxPendingOperationBytes', 1]
+  ] as const) {
+    it(`accepts the minimum and safe-integer maximum for ${option}`, () => {
+      for (const value of [minimum, Number.MAX_SAFE_INTEGER]) {
+        const config = parseConnectionString(`iggy://iggy:secret@localhost:8090?${option}=${value}`);
+        assert.equal(config[field], value);
+        assert.equal(normalizeClientConfig(config)[field], value);
+      }
+    });
+
+    it(`rejects invalid and overflowing ${option}`, () => {
+      for (const value of ['', '0', '-1', '1.5', 'NaN', 'Infinity', '1e3',
+        String(minimum - 1), String(Number.MAX_SAFE_INTEGER + 1), '999999999999999999999']) {
+        assert.throws(() => parseConnectionString(`iggy://iggy:secret@localhost:8090?${option}=${value}`),
+          TypeError, `accepted ${option}=${value}`);
+      }
+    });
+  }
 
   it('applies unlimited/1s reconnection defaults to partial options', () => {
     // retries alone keep the 1s interval; interval alone keeps unlimited.
@@ -216,6 +253,7 @@ describe('parseConnectionString', () => {
       'iggy://iggy:hunter2@localhost:8090?unknown=value',
       'iggy://iggy:hunter2@localhost:8090?tls=maybe',
       'iggy://iggy:hunter2@localhost:8090?reconnection_retries=three',
+      'iggy://iggy:hunter2@localhost:8090?max_pending_operations=0',
       'iggy://iggy:hunter2@localhost:70000'
     ]) {
       try {
@@ -294,7 +332,18 @@ describe('normalizeClientConfig with connection strings', () => {
       password: 'secret'
     });
     assert.equal(normalized.heartbeatInterval, DEFAULT_HEARTBEAT_INTERVAL);
+    assert.equal(normalized.maxPendingOperations, DEFAULT_MAX_PENDING_OPERATIONS);
+    assert.equal(normalized.maxPendingOperationBytes, DEFAULT_MAX_PENDING_OPERATION_BYTES);
     assert.deepEqual(normalized.poolSize, { min: 1, max: 1 });
+  });
+
+  it('preserves the unspecified mutation limit when only one is configured', () => {
+    const count = normalizeClientConfig('iggy://iggy:secret@localhost:8090?max_pending_operations=7');
+    assert.equal(count.maxPendingOperations, 7);
+    assert.equal(count.maxPendingOperationBytes, DEFAULT_MAX_PENDING_OPERATION_BYTES);
+    const bytes = normalizeClientConfig(`iggy://iggy:secret@localhost:8090?max_pending_operation_bytes=${HEADER_SIZE}`);
+    assert.equal(bytes.maxPendingOperations, DEFAULT_MAX_PENDING_OPERATIONS);
+    assert.equal(bytes.maxPendingOperationBytes, HEADER_SIZE);
   });
 
   it('rejects reconnect intervals beyond the node timer ceiling', () => {

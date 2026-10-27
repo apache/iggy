@@ -98,6 +98,8 @@ public enum MaxTopicSize: Sendable, Hashable {
 
 /// A stream as listed. Named `StreamInfo` so that a file importing
 /// Foundation, which has its own `Stream`, never sees an ambiguous type.
+/// ``options`` holds the keys the client set and the projections the server
+/// computes, such as ``encryptionKeySource``.
 public struct StreamInfo: Sendable, Hashable {
     public var id: UInt32
     public var createdAt: IggyTimestamp
@@ -146,30 +148,26 @@ public struct StreamDetails: Sendable, Hashable {
     }
 }
 
-/// A topic as listed.
+/// A topic as listed. Message expiry, compression and the size cap live in
+/// ``options``, read typed through ``messageExpiry``,
+/// ``compressionAlgorithm`` and ``maxTopicSize``.
 public struct Topic: Sendable, Hashable {
     public var id: UInt32
     public var createdAt: IggyTimestamp
     public var name: String
     public var sizeBytes: UInt64
-    public var messageExpiry: IggyExpiry
-    public var compressionAlgorithm: CompressionAlgorithm
-    public var maxTopicSize: MaxTopicSize
     public var messagesCount: UInt64
     public var partitionsCount: UInt32
     public var options: ResourceOptions
 
     public init(
-        id: UInt32, createdAt: IggyTimestamp, name: String, sizeBytes: UInt64, messageExpiry: IggyExpiry, compressionAlgorithm: CompressionAlgorithm,
-        maxTopicSize: MaxTopicSize, messagesCount: UInt64, partitionsCount: UInt32, options: ResourceOptions = [:]
+        id: UInt32, createdAt: IggyTimestamp, name: String, sizeBytes: UInt64, messagesCount: UInt64, partitionsCount: UInt32,
+        options: ResourceOptions = [:]
     ) {
         self.id = id
         self.createdAt = createdAt
         self.name = name
         self.sizeBytes = sizeBytes
-        self.messageExpiry = messageExpiry
-        self.compressionAlgorithm = compressionAlgorithm
-        self.maxTopicSize = maxTopicSize
         self.messagesCount = messagesCount
         self.partitionsCount = partitionsCount
         self.options = options
@@ -182,9 +180,6 @@ public struct TopicDetails: Sendable, Hashable {
     public var createdAt: IggyTimestamp
     public var name: String
     public var sizeBytes: UInt64
-    public var messageExpiry: IggyExpiry
-    public var compressionAlgorithm: CompressionAlgorithm
-    public var maxTopicSize: MaxTopicSize
     public var messagesCount: UInt64
     public var partitionsCount: UInt32
     public var partitions: [Partition]
@@ -195,9 +190,6 @@ public struct TopicDetails: Sendable, Hashable {
         createdAt = topic.createdAt
         name = topic.name
         sizeBytes = topic.sizeBytes
-        messageExpiry = topic.messageExpiry
-        compressionAlgorithm = topic.compressionAlgorithm
-        maxTopicSize = topic.maxTopicSize
         messagesCount = topic.messagesCount
         partitionsCount = topic.partitionsCount
         self.partitions = partitions

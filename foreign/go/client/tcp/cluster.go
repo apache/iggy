@@ -19,10 +19,6 @@ package tcp
 
 import (
 	"context"
-	"fmt"
-	"net"
-	"strconv"
-	"strings"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
@@ -30,38 +26,67 @@ import (
 )
 
 func (c *IggyTcpClient) GetClusterMetadata(ctx context.Context) (*iggcon.ClusterMetadata, error) {
-	response, err := c.do(ctx, &command.GetClusterMetadata{})
-	if err != nil {
-		return nil, err
+	if ctx == nil {
+		return nil, ierror.ErrNilContext
 	}
-	var metadata iggcon.ClusterMetadata
-	err = metadata.UnmarshalBinary(response)
-	if err != nil {
-		return nil, err
-	}
-	if len(metadata.Nodes) == 0 {
-		return nil, fmt.Errorf("%w: empty cluster roster", ierror.ErrTransientNotAccepted)
-	}
-	endpoints := make(map[uint8]string, len(metadata.Nodes))
-	for _, node := range metadata.Nodes {
-		if node.Endpoints.Tcp != 0 {
-			endpoints[node.ReplicaID] = net.JoinHostPort(strings.Trim(node.IP, "[]"), strconv.Itoa(int(node.Endpoints.Tcp)))
+	ctx, cancel := c.operationContext(ctx)
+	defer cancel()
+	for {
+		// The fence refuses a roster that a session change overtook, so it is
+		// taken only after a running recovery, and a recovery that overtakes
+		// the read starts it again under the new session.
+		if err := c.waitForRecovery(ctx); err != nil {
+			return nil, err
+		}
+		c.mtx.Lock()
+		fence := c.sessionFence
+		c.mtx.Unlock()
+		body, err := c.do(ctx, &command.GetClusterMetadata{})
+		if err != nil {
+			return nil, err
+		}
+		var metadata iggcon.ClusterMetadata
+		if err = metadata.UnmarshalBinary(body); err != nil {
+			return nil, err
+		}
+		err = c.installRoster(fence, &metadata)
+		if err == nil {
+			return &metadata, nil
+		}
+		if !c.sessionRecovers(ctx, err) {
+			return nil, err
 		}
 	}
-	c.polls.mu.Lock()
-	c.polls.endpoints = endpoints
-	c.polls.mu.Unlock()
-	c.clustered.Store(len(metadata.Nodes) > 1)
-	c.topologyKnown.Store(true)
-	return &metadata, nil
 }
 
-// ensureTopology reads the roster once, so a partition request knows whether
-// it must go to the partition primary.
-func (c *IggyTcpClient) ensureTopology(ctx context.Context) error {
-	if c.topologyKnown.Load() {
-		return nil
+func (c *IggyTcpClient) refreshRoster(ctx context.Context, link *tcpLink) error {
+	if link == nil {
+		link = c.links.any()
 	}
-	_, err := c.GetClusterMetadata(ctx)
-	return err
+	if link == nil {
+		return ierror.ErrTransientNotAccepted
+	}
+	c.mtx.Lock()
+	fence := c.sessionFence
+	c.mtx.Unlock()
+	body, err := c.readOnLink(ctx, link, command.GetClusterMetadataCode, nil, nil)
+	if err != nil {
+		return err
+	}
+	var metadata iggcon.ClusterMetadata
+	if err = metadata.UnmarshalBinary(body); err != nil {
+		return err
+	}
+	return c.installRoster(fence, &metadata)
+}
+
+// installRoster installs metadata read under the session of fence, unless a
+// session change overtook that read.
+func (c *IggyTcpClient) installRoster(fence uint64, metadata *iggcon.ClusterMetadata) error {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if c.sessionFence != fence {
+		return ierror.ErrUnauthenticated
+	}
+	return c.links.install(metadata)
 }

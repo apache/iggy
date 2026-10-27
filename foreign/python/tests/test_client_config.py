@@ -38,8 +38,12 @@ from apache_iggy import (
     AutoLogin,
     IggyClient,
     IggyExpiry,
+    PendingOperationsConfig,
+    QuicConfig,
     TcpConfig,
     TcpReconnectionConfig,
+    TopicOptions,
+    WebSocketConfig,
 )
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
@@ -308,8 +312,9 @@ class TestClientConstruction:
             client.create_topic(
                 stream="stream",
                 name="topic",
-                partitions_count=1,
-                message_expiry=IggyExpiry.ExpireDuration(timedelta(seconds=-1)),
+                options=TopicOptions(
+                    message_expiry=IggyExpiry.ExpireDuration(timedelta(seconds=-1))
+                ),
             )
 
     @pytest.mark.parametrize(
@@ -366,22 +371,27 @@ class TestClientConstruction:
                 auto_commit=auto_commit,
             )
 
-    def test_zero_poll_interval_is_allowed(self):
-        """Test that a zero poll interval passes validation.
+    def test_arguments_after_auto_join_are_keyword_only(self):
+        """Test that a positional argument after auto_join_consumer_group fails.
 
-        Zero there means "do not wait before polling" and is short-circuited
-        before the sleep, unlike the retry intervals. Reaching the awaitable is
-        what proves it: building one without a running loop is the next failure,
-        and a rejected value would have raised ValueError first.
+        The removed poll_interval was the tenth argument. A positional call
+        written for it would otherwise set polling_retry_interval.
         """
         client = IggyClient()
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(TypeError, match="positional arguments"):
             client.consumer_group(
-                name="group",
-                stream="stream",
-                topic="topic",
-                poll_interval=timedelta(0),
+                "group",
+                "stream",
+                "topic",
+                None,
+                None,
+                None,
+                None,
+                True,
+                True,
+                # pyrefly: ignore  # bad-argument-count
+                timedelta(seconds=1),
             )
 
 
@@ -470,3 +480,29 @@ class TestAutoLoginAgainstServer:
 
         with pytest.raises(RuntimeError):
             await client.connect()
+
+
+@pytest.mark.unit
+class TestPendingOperationsConfig:
+    @pytest.mark.parametrize("config_type", [TcpConfig, QuicConfig, WebSocketConfig])
+    def test_shared_limits_round_trip(self, config_type):
+        defaults = config_type().pending_operations
+        assert defaults.max_operations == 256
+        assert defaults.max_bytes == 64 * 1024 * 1024
+        limits = PendingOperationsConfig(max_operations=3, max_bytes=4096)
+        config = config_type(pending_operations=limits)
+        assert config.pending_operations.max_operations == 3
+        assert config.pending_operations.max_bytes == 4096
+        assert repr(limits) in repr(config)
+        with pytest.raises(AttributeError):
+            # pyrefly: ignore  # read-only
+            limits.max_operations = 4
+
+    @pytest.mark.parametrize("field", ["max_operations", "max_bytes"])
+    @pytest.mark.parametrize(
+        "value,exception",
+        [(0, ValueError), (-1, OverflowError), (2**128, OverflowError)],
+    )
+    def test_invalid_limits_are_rejected(self, field, value, exception):
+        with pytest.raises(exception):
+            PendingOperationsConfig(**{field: value})

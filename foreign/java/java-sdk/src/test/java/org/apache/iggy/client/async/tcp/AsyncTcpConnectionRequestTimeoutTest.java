@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -38,6 +39,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class AsyncTcpConnectionRequestTimeoutTest {
     private static final int TEST_TIMEOUT_SECONDS = 5;
     private static final Duration REQUEST_TIMEOUT = Duration.ofMillis(100);
+    // Long enough for a sign-in on a fresh channel of a loaded runner.
+    private static final Duration REGISTER_TIMEOUT = Duration.ofSeconds(1);
+    private static final String USERNAME = "iggy";
+    private static final String PASSWORD = "iggy";
 
     private AsyncIggyTcpClient client;
 
@@ -49,68 +54,114 @@ class AsyncTcpConnectionRequestTimeoutTest {
     }
 
     @Test
-    void shouldReplaceChannelAfterResponseTimeout() throws Exception {
-        try (ServerSocket server = new ServerSocket(0, 2, InetAddress.getLoopbackAddress())) {
-            client = AsyncIggyTcpClient.builder()
-                    .host(server.getInetAddress().getHostAddress())
-                    .port(server.getLocalPort())
-                    .requestTimeout(REQUEST_TIMEOUT)
-                    .build();
-
-            CompletableFuture<Socket> firstAccepted = accept(server);
-            client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            try (Socket firstSocket = firstAccepted.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                verifyRequestTimesOutAndClosesSocket(client.system().ping(), firstSocket);
-            }
-
-            CompletableFuture<Socket> secondAccepted = accept(server);
-            CompletableFuture<String> secondResponse = client.system().ping();
-            try (Socket secondSocket = secondAccepted.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                verifyRequestTimesOutAndClosesSocket(secondResponse, secondSocket);
-            }
-        }
+    void shouldIgnoreLateReplyAfterTimeoutAndReuseTheSameChannel() throws Exception {
+        verifyIsolatedCompletion(false);
     }
 
     @Test
-    void shouldFailMultiplexedRequestsAndUseReplacementChannelAfterTimeout() throws Exception {
-        try (ServerSocket server = new ServerSocket(0, 2, InetAddress.getLoopbackAddress())) {
+    void shouldCancelOnlyTheRequestedCallAndKeepItsConcurrentPeer() throws Exception {
+        verifyIsolatedCompletion(true);
+    }
+
+    private void verifyIsolatedCompletion(boolean cancel) throws Exception {
+        try (ServerSocket server = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
             client = AsyncIggyTcpClient.builder()
                     .host(server.getInetAddress().getHostAddress())
                     .port(server.getLocalPort())
                     .requestTimeout(REQUEST_TIMEOUT)
+                    .heartbeatInterval(Duration.ofHours(1))
                     .build();
-
-            CompletableFuture<Socket> firstAccepted = accept(server);
+            CompletableFuture<Socket> accepted = accept(server);
             client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            try (Socket firstSocket = firstAccepted.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                CompletableFuture<String> first = client.system().ping();
-                CompletableFuture<String> second = client.system().ping();
-
-                assertThat(verifyRequestTimesOutAndClosesSocket(first, firstSocket))
-                        .hasSize(2 * 256);
-                assertThatThrownBy(() -> second.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
-                        .isInstanceOf(ExecutionException.class)
-                        .hasCauseInstanceOf(IggyTimeoutException.class);
-            }
-
-            CompletableFuture<Socket> secondAccepted = accept(server);
-            CompletableFuture<String> third = client.system().ping();
-            try (Socket secondSocket = secondAccepted.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                assertThat(verifyRequestTimesOutAndClosesSocket(third, secondSocket))
-                        .hasSize(256);
+            try (Socket socket = accepted.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                socket.setSoTimeout((int) TimeUnit.SECONDS.toMillis(TEST_TIMEOUT_SECONDS));
+                var first = client.system().ping();
+                var firstRequest = AsyncIggyTcpClientTransientFailoverTest.readRequest(socket.getInputStream(), 0);
+                CompletableFuture<String> second;
+                if (cancel) {
+                    second = client.system().ping();
+                    assertThat(first.cancel(false)).isTrue();
+                } else {
+                    assertThatThrownBy(() -> first.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                            .isInstanceOf(ExecutionException.class)
+                            .hasCauseInstanceOf(IggyTimeoutException.class);
+                    second = client.system().ping();
+                }
+                var secondRequest = AsyncIggyTcpClientTransientFailoverTest.readRequest(socket.getInputStream(), 0);
+                assertThat(secondRequest)
+                        .as("an explicit request timeout or cancellation keeps the shared channel open")
+                        .isNotNull();
+                assertThat(secondRequest.requestId()).isNotEqualTo(firstRequest.requestId());
+                AsyncIggyTcpClientTransientFailoverTest.writeResponse(
+                        socket.getOutputStream(),
+                        firstRequest,
+                        AsyncIggyTcpClientTransientFailoverTest.Response.success(
+                                firstRequest.operation(), io.netty.buffer.Unpooled.EMPTY_BUFFER));
+                AsyncIggyTcpClientTransientFailoverTest.writeResponse(
+                        socket.getOutputStream(),
+                        secondRequest,
+                        AsyncIggyTcpClientTransientFailoverTest.Response.success(
+                                secondRequest.operation(), io.netty.buffer.Unpooled.EMPTY_BUFFER));
+                assertThat(second.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo("pong");
+                assertThat(first.isCompletedExceptionally()).isTrue();
             }
         }
     }
 
-    private static byte[] verifyRequestTimesOutAndClosesSocket(CompletableFuture<?> response, Socket socket)
-            throws Exception {
-        assertThatThrownBy(() -> response.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
-                .isInstanceOf(ExecutionException.class)
-                .hasCauseInstanceOf(IggyTimeoutException.class);
-        socket.setSoTimeout((int) TimeUnit.SECONDS.toMillis(TEST_TIMEOUT_SECONDS));
-        byte[] request = socket.getInputStream().readAllBytes();
-        assertThat(request).isNotEmpty();
-        return request;
+    /**
+     * Every Register has the same request id. A Register that timed out closes its channel, so its late reply cannot
+     * answer the next Register and fail the proof check of that one.
+     */
+    @Test
+    void shouldSignInOnAFreshChannelAfterARegisterTimedOut() throws Exception {
+        try (ServerSocket server = new ServerSocket(0, 2, InetAddress.getLoopbackAddress())) {
+            client = AsyncIggyTcpClient.builder()
+                    .host(server.getInetAddress().getHostAddress())
+                    .port(server.getLocalPort())
+                    .requestTimeout(REGISTER_TIMEOUT)
+                    .heartbeatInterval(Duration.ofHours(1))
+                    .build();
+            CompletableFuture<Socket> accepted = accept(server);
+            client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            try (Socket first = accepted.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                first.setSoTimeout((int) TimeUnit.SECONDS.toMillis(TEST_TIMEOUT_SECONDS));
+                var timedOut = client.users().login(USERNAME, PASSWORD);
+                var lateRegister = AsyncIggyTcpClientTransientFailoverTest.readRequest(first.getInputStream(), 0);
+                AsyncIggyTcpClientTransientFailoverTest.assertServerError(
+                        timedOut, IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode());
+                AsyncIggyTcpClientTransientFailoverTest.serve(server, request -> {
+                    if (request.operation() == AsyncIggyTcpClientTransientFailoverTest.OPERATION_REGISTER) {
+                        return AsyncIggyTcpClientTransientFailoverTest.Response.success(
+                                request.operation(), AsyncIggyTcpClientTransientFailoverTest.registerBody(1));
+                    }
+                    if (request.is(
+                            AsyncIggyTcpClientTransientFailoverTest.GET_CLUSTER_METADATA_CODE,
+                            AsyncIggyTcpClientTransientFailoverTest.OPERATION_NON_REPLICATED)) {
+                        return AsyncIggyTcpClientTransientFailoverTest.Response.success(
+                                request.operation(),
+                                AsyncIggyTcpClientTransientFailoverTest.singleNodeMetadata(server.getLocalPort()));
+                    }
+                    throw new IllegalStateException("Unexpected request: " + request);
+                });
+
+                var signIn = client.users().login(USERNAME, PASSWORD);
+                var reusedChannel = AsyncIggyTcpClientTransientFailoverTest.readRequest(first.getInputStream(), 0);
+                try {
+                    AsyncIggyTcpClientTransientFailoverTest.writeResponse(
+                            first.getOutputStream(),
+                            lateRegister,
+                            AsyncIggyTcpClientTransientFailoverTest.Response.success(
+                                    lateRegister.operation(), AsyncIggyTcpClientTransientFailoverTest.registerBody(1)));
+                } catch (IOException closedByClient) {
+                    // The client closed the channel of the timed-out Register, so the late reply has nowhere to go.
+                }
+
+                assertThat(signIn.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)).isNotNull();
+                assertThat(reusedChannel)
+                        .as("a Register on the channel of the timed-out one")
+                        .isNull();
+            }
+        }
     }
 
     private static CompletableFuture<Socket> accept(ServerSocket server) {

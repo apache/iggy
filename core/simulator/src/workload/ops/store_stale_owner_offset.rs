@@ -29,6 +29,7 @@ use server_common::Message;
 #[derive(Debug, Clone)]
 pub struct Input {
     pub captured: CapturedOwner,
+    pub group_id: u32,
     pub offset: u64,
 }
 
@@ -49,6 +50,7 @@ pub fn sample(
     let high = shadow.sends_committed(captured.namespace);
     (high > 0).then(|| Input {
         captured,
+        group_id: FIXTURE_GROUP_ID,
         offset: prng.random_range(0..high),
     })
 }
@@ -60,7 +62,7 @@ pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequest
         .store_consumer_offset(
             captured.namespace,
             KIND_CONSUMER_GROUP,
-            FIXTURE_GROUP_ID,
+            input.group_id,
             input.offset,
             AckLevel::Quorum,
         )

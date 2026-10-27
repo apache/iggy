@@ -17,6 +17,7 @@
 
 using System.Net;
 using System.Text;
+using System.Text.Json;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Headers;
@@ -34,15 +35,12 @@ public sealed class HttpTopicOptionsTests
                                                "created_at": 1750000000000000,
                                                "name": "topic",
                                                "size": "0 B",
-                                               "message_expiry": 0,
-                                               "compression_algorithm": "none",
-                                               "max_topic_size": 0,
                                                "messages_count": 0,
                                                "partitions_count": 1,
                                                "partitions": [],
                                                "options": {
-                                                 "preallocate_segments": { "value": "true", "explicit": true },
-                                                 "segment_size": { "value": "134217728", "explicit": false }
+                                                 "preallocate_segments": { "value": "true", "kind": "bool", "explicit": true },
+                                                 "segment_size": { "value": "134217728", "kind": "uint64", "explicit": false }
                                                }
                                              }
                                              """;
@@ -88,11 +86,13 @@ public sealed class HttpTopicOptionsTests
         Assert.NotNull(topic);
         var explicitOption = Assert.Single(topic.Options!);
         Assert.Equal("preallocate_segments", explicitOption.Key.AsString());
-        Assert.Equal("true", explicitOption.Value.ToString());
+        Assert.Equal(HeaderKind.Bool, explicitOption.Value.Kind);
+        Assert.True(explicitOption.Value.ToBool());
 
         var derivedOption = Assert.Single(topic.DerivedOptions!);
         Assert.Equal("segment_size", derivedOption.Key.AsString());
-        Assert.Equal("134217728", derivedOption.Value.ToString());
+        Assert.Equal(HeaderKind.Uint64, derivedOption.Value.Kind);
+        Assert.Equal(134217728UL, derivedOption.Value.ToUInt64());
     }
 
     [Fact]
@@ -102,12 +102,14 @@ public sealed class HttpTopicOptionsTests
         var client = new HttpMessageStream(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
 
         await client.CreateTopicAsync(StreamId, "topic", 1,
-            options: new TopicOptions { Durability = Apache.Iggy.Enums.Durability.Persisted, SegmentSize = 134217728 }.ToDictionary(),
+            options: new TopicOptions { Durability = Apache.Iggy.Enums.Durability.Persisted, SegmentSize = 134217728 },
             token: TestContext.Current.CancellationToken);
 
-        Assert.Contains("\"durability\":\"persisted\"", handler.RequestBody);
-        Assert.Contains("\"consumer_offset_durability\":\"replicated\"", handler.RequestBody);
-        Assert.Contains("\"segment_size\":\"134217728\"", handler.RequestBody);
+        using var body = JsonDocument.Parse(handler.RequestBody);
+        var options = body.RootElement.GetProperty("options");
+        Assert.Equal("persisted", options.GetProperty("durability").GetString());
+        Assert.Equal("replicated", options.GetProperty("consumer_offset_durability").GetString());
+        Assert.Equal(134217728UL, options.GetProperty("segment_size").GetUInt64());
     }
 
     [Fact]
@@ -119,8 +121,8 @@ public sealed class HttpTopicOptionsTests
         var topic = await client.GetTopicByIdAsync(StreamId, Identifier.Numeric(1),
             TestContext.Current.CancellationToken);
 
-        Assert.Equal(HeaderKind.String, Assert.Single(topic!.Options!).Value.Kind);
-        Assert.Equal(HeaderKind.String, Assert.Single(topic.DerivedOptions!).Value.Kind);
+        Assert.Equal(HeaderKind.Bool, Assert.Single(topic!.Options!).Value.Kind);
+        Assert.Equal(HeaderKind.Uint64, Assert.Single(topic.DerivedOptions!).Value.Kind);
     }
 
     [Fact]

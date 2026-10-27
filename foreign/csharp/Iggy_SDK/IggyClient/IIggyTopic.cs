@@ -16,8 +16,6 @@
 // under the License.
 
 using Apache.Iggy.Contracts;
-using Apache.Iggy.Enums;
-using Apache.Iggy.Headers;
 
 namespace Apache.Iggy.IggyClient;
 
@@ -52,53 +50,36 @@ public interface IIggyTopic
     /// </summary>
     /// <remarks>
     ///     The topic name must be unique within the stream. Topics contain one or more partitions for distributing messages.
-    ///     Additional parameters control message expiry, compression, replication, and maximum size.
+    ///     <paramref name="options" /> controls compression, message expiry, maximum size, durability and the other
+    ///     settings of the server's catalog. Call <see cref="IIggySystem.DescribeOptionsAsync" /> to see which keys a
+    ///     server accepts.
     /// </remarks>
     /// <param name="streamId">The identifier of the stream where the topic will be created (numeric ID or name).</param>
     /// <param name="name">The unique name of the topic (max 255 UTF-8 bytes).</param>
     /// <param name="partitionsCount">The number of partitions for the topic (max 1000).</param>
-    /// <param name="compressionAlgorithm">The compression algorithm to use for messages (default: None).</param>
-    /// <param name="messageExpiry">The message expiry period (0 for server default, MaxValue for never expire).</param>
-    /// <param name="maxTopicSize">The topic-wide retained size limit in bytes, divided among partitions. Zero uses the server default at creation.</param>
-    /// <param name="options">
-    ///     Option keys with no parameter of their own, keyed by option name. Reaches a key the server
-    ///     catalog gained after this build shipped; a named parameter above wins on collision, and a key
-    ///     outside the catalog is refused by name. <see cref="TopicOptions" /> builds this map for the
-    ///     keys the catalog ships with. Call
-    ///     <see cref="IIggySystem.DescribeOptionsAsync" /> to see which keys a server accepts.
-    /// </param>
+    /// <param name="options">The topic's settings. Null sends both durability policies as replicated and leaves the rest to the server defaults.</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>
     ///     A task that represents the asynchronous operation and returns the created topic information, or null if
     ///     creation failed.
     /// </returns>
     Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount,
-        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
-        TimeSpan? messageExpiry = null, ulong maxTopicSize = 0,
-        IReadOnlyDictionary<string, HeaderValue>? options = null, CancellationToken token = default);
+        TopicOptions? options = null, CancellationToken token = default);
 
     /// <summary>
-    ///     Updates the configuration of an existing topic.
+    ///     Applies the changes in <paramref name="update" /> to an existing topic, leaving every other setting as is.
     /// </summary>
     /// <remarks>
-    ///     This method allows updating topic properties such as name, compression algorithm, size limits and message
-    ///     expiry.
+    ///     An update renames the topic, sets its message expiry and size cap, and resets those two to the server
+    ///     defaults. Settings fixed at creation have no property on <see cref="TopicUpdate" />, and a reset of one
+    ///     is refused before anything is sent.
     /// </remarks>
     /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
     /// <param name="topicId">The identifier of the topic to update (numeric ID or name).</param>
-    /// <param name="name">The new name for the topic (max 255 UTF-8 bytes).</param>
-    /// <param name="compressionAlgorithm">The new compression algorithm to use (default: None).</param>
-    /// <param name="maxTopicSize">The retention size update in bytes. TCP omits zero; HTTP sends the default sentinel.</param>
-    /// <param name="messageExpiry">The new message expiry period (0 for server default, MaxValue for never expire).</param>
-    /// <param name="options">
-    ///     Option keys with no parameter of their own. The server refuses any key an update may not
-    ///     change, by name; a key left out keeps its current value.
-    /// </param>
+    /// <param name="update">The keys to set and reset. At least one is required.</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task that represents the asynchronous operation.</returns>
-    Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name,
-        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, ulong maxTopicSize = 0,
-        TimeSpan? messageExpiry = null, IReadOnlyDictionary<string, HeaderValue>? options = null,
+    Task UpdateTopicAsync(Identifier streamId, Identifier topicId, TopicUpdate update,
         CancellationToken token = default);
 
     /// <summary>

@@ -145,6 +145,9 @@ build_rust_target_manifest() {
   fi
 
   SYNTH_DIR="$(mktemp -d -t iggy-license-root-XXXXXX)"
+  # Reuse the repo lock. A fresh resolve drifts from what the binaries
+  # link and fails once every matching version of a dep is yanked.
+  cp "$REPO_ROOT/Cargo.lock" "$SYNTH_DIR/Cargo.lock"
 
   {
     printf '[workspace]\n\n'

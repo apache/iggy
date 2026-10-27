@@ -89,6 +89,7 @@ impl ClientProviderConfig {
         match config.transport {
             TransportProtocol::Quic => {
                 config.quic = Some(Arc::new(QuicClientConfig {
+                    pending_operations: Default::default(),
                     client_address: args.quic_client_address,
                     server_address: args.quic_server_address,
                     server_name: args.quic_server_name,
@@ -134,6 +135,7 @@ impl ClientProviderConfig {
             }
             TransportProtocol::Tcp => {
                 config.tcp = Some(Arc::new(TcpClientConfig {
+                    pending_operations: Default::default(),
                     server_address: args.tcp_server_address,
                     tls_enabled: args.tcp_tls_enabled,
                     tls_domain: args.tcp_tls_domain,
@@ -164,6 +166,7 @@ impl ClientProviderConfig {
             }
             TransportProtocol::WebSocket => {
                 config.websocket = Some(Arc::new(WebSocketClientConfig {
+                    pending_operations: Default::default(),
                     server_address: args.websocket_server_address,
                     heartbeat_interval: NonZeroIggyDuration::from_str(
                         &args.websocket_heartbeat_interval,

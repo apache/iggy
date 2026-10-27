@@ -22,7 +22,7 @@ Basic messaging BDD test implementation for Python SDK
 import asyncio
 import socket
 
-from apache_iggy import Consumer, IggyClient, PollingStrategy, SendMessage
+from apache_iggy import Consumer, IggyClient, PollingStrategy, SendMessage, TopicOptions
 from pytest_bdd import given, parsers, scenarios, then, when
 
 # Load scenarios from the shared feature file
@@ -119,7 +119,9 @@ def create_topic(context, topic_name, stream_id, partitions):
 
     async def _create():
         await context.client.create_topic(
-            stream=stream_id, name=topic_name, partitions_count=partitions
+            stream=stream_id,
+            name=topic_name,
+            options=TopicOptions(partitions_count=partitions),
         )
 
         topic = await context.client.get_topic(stream_id, topic_name)

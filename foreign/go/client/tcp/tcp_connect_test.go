@@ -26,17 +26,19 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
@@ -78,6 +80,91 @@ func selfSignedCert(t *testing.T) (tls.Certificate, string) {
 	return certificate, caPath
 }
 
+func TestConnectBoundsSilentSignInWithoutCallerDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		serverConnection, connection := net.Pipe()
+		defer func() { _ = serverConnection.Close() }()
+		client := newTestClient(t, connection)
+		client.rememberedLogin = NewAutoLogin(NewUsernamePasswordCredentials("iggy", "secret"))
+		server := serve(serverConnection, func(_ int, read request) []byte { return nil })
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- client.Connect(ctx) }()
+		time.Sleep(responseReadTimeout)
+		synctest.Wait()
+		select {
+		case err := <-done:
+			require.Error(t, err)
+		default:
+			t.Fatal("Connect exceeded its sign-in budget without a caller deadline")
+		}
+		require.Len(t, server.recorded(), 1)
+	})
+}
+
+func TestExplicitSilentSignInFailsAsNotAcceptedAtItsDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		serverConnection, connection := net.Pipe()
+		defer func() { _ = serverConnection.Close() }()
+		client := newTestClient(t, connection)
+		server := serve(serverConnection, func(_ int, read request) []byte { return nil })
+		done := make(chan error, 1)
+		go func() {
+			_, err := client.LoginUser(context.Background(), "iggy", "secret")
+			done <- err
+		}()
+		time.Sleep(responseReadTimeout)
+		synctest.Wait()
+		select {
+		case err := <-done:
+			require.ErrorIs(t, err, ierror.ErrTransientNotAccepted)
+		default:
+			t.Fatal("LoginUser outlived its sign-in deadline")
+		}
+		require.Len(t, server.recorded(), 1)
+	})
+}
+
+func TestConnectDoesNotSpendSignInBudgetWaitingForDial(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client := newDialingClient(t, "127.0.0.1:1")
+		for range cap(client.links.permits) {
+			client.links.permits <- struct{}{}
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- client.Connect(ctx) }()
+		time.Sleep(responseReadTimeout + time.Second)
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("Connect consumed the sign-in budget before dialing: %v", err)
+		default:
+		}
+		cancel()
+		require.ErrorIs(t, <-done, context.Canceled)
+	})
+}
+
+func TestExplicitSignInCannotReplaceEpochAfterCloseStarts(t *testing.T) {
+	serverConnection, connection := net.Pipe()
+	defer func() { _ = serverConnection.Close() }()
+	client := newTestClient(t, connection)
+	server := serve(serverConnection, func(_ int, read request) []byte {
+		return registerReplyFrame(signedInUserID, managedLinkSession)
+	})
+	epoch := client.epoch.Load()
+	client.closeOnce.Do(func() { close(client.closed) })
+	_, err := client.LoginUser(context.Background(), "user", "password")
+	require.ErrorIs(t, err, ierror.ErrClientShutdown)
+	require.Same(t, epoch, client.epoch.Load(), "a new epoch would cancel Close's pending detach")
+	require.Empty(t, server.recorded())
+	require.NoError(t, client.Close())
+	require.False(t, linkReady(client.links.bootstrap))
+}
+
 // testListener is a VSR server on a loopback port. The handler is called with
 // the zero-based index of the accepted connection and of the frame within it.
 type testListener struct {
@@ -91,8 +178,17 @@ func listenVSR(t *testing.T, wrap func(net.Conn) net.Conn,
 	handler func(connection, index int, read request) []byte,
 ) *testListener {
 	t.Helper()
+	return listenVSRAt(t, "127.0.0.1:0", wrap, handler)
+}
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+// listenVSRAt is listenVSR on a given address, so that a test can bring a
+// closed server back where the client dials.
+func listenVSRAt(t *testing.T, address string, wrap func(net.Conn) net.Conn,
+	handler func(connection, index int, read request) []byte,
+) *testListener {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", address)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = listener.Close() })
 
@@ -156,7 +252,7 @@ func (s *testListener) connections() int {
 func newDialingClient(t *testing.T, address string, options ...Option) *IggyTcpClient {
 	t.Helper()
 
-	all := append([]Option{WithServerAddress(address)}, options...)
+	all := append([]Option{WithServerAddress(address), WithHeartbeatInterval(0)}, options...)
 	client := NewIggyTcpClient(slog.New(slog.DiscardHandler), all...)
 	client.config.reconnection.maxRetries = 1
 	client.config.reconnection.interval = 10 * time.Millisecond
@@ -177,7 +273,7 @@ func singleNodeHandler(t *testing.T, address func() string) func(int, int, reque
 		case read.operation() == vsr.OperationRegister:
 			return registerReplyFrame(7, 128)
 		default:
-			return replyFrame(vsr.OperationNonReplicated, nil)
+			return replyFrame(read.operation(), nil)
 		}
 	}
 }
@@ -204,7 +300,7 @@ func TestConnect_SignsInAndThenSettlesLeadership(t *testing.T) {
 
 	assert.True(t, client.session.Bound())
 	assert.Equal(t, uint64(128), client.session.SessionID())
-	assert.Equal(t, iggcon.SessionStateAuthenticated, client.sessionState)
+	assert.True(t, client.session.Bound())
 }
 
 func TestConnect_SignsInWithAPersonalAccessToken(t *testing.T) {
@@ -262,58 +358,15 @@ func TestConnect_RedirectsToTheLeaderAfterSigningIn(t *testing.T) {
 	require.Len(t, onFollower, 2, "the follower answered the sign-in and the roster")
 	assert.Equal(t, vsr.OperationRegister, onFollower[0].operation())
 	assert.Equal(t, uint32(command.GetClusterMetadataCode), onFollower[1].code())
-	assert.Equal(t, leader.address(), client.currentServerAddress)
+	assert.Equal(t, leader.address(), client.GetConnectionInfo().ServerAddress)
 
+	require.Eventually(t, func() bool { return client.links.replica(1) != nil }, time.Second, time.Millisecond)
 	onLeader := leader.recorded()
-	require.Len(t, onLeader, 2, "the sign-in replay is followed by a leader re-check")
+	require.Len(t, onLeader, 1, "the advertised replica proactively binds the existing session")
 	assert.Equal(t, uint32(command.BindSessionCode), onLeader[0].code())
-	assert.Equal(t, uint32(command.GetClusterMetadataCode), onLeader[1].code())
 	assert.True(t, client.session.Bound())
 	assert.Equal(t, uint64(512), client.session.SessionID(),
 		"the leader resumes the original session")
-}
-
-func TestConnect_RechecksLeadershipAfterTheRedirectedSignIn(t *testing.T) {
-	var leader *testListener
-	leader = listenVSR(t, nil, singleNodeHandler(t, func() string { return leader.address() }))
-
-	var intermediate *testListener
-	intermediate = listenVSR(t, nil, func(_, _ int, read request) []byte {
-		switch {
-		case read.code() == uint32(command.BindSessionCode):
-			return bindReplyFrame(7, read.sessionID())
-		case read.code() == uint32(command.GetClusterMetadataCode):
-			return clusterMetadataFrame(t, 1, intermediate.address(), leader.address())
-		case read.operation() == vsr.OperationRegister:
-			return registerReplyFrame(7, 256)
-		default:
-			return replyFrame(vsr.OperationNonReplicated, nil)
-		}
-	})
-
-	var follower *testListener
-	follower = listenVSR(t, nil, func(_, _ int, read request) []byte {
-		switch {
-		case read.code() == uint32(command.BindSessionCode):
-			return bindReplyFrame(7, read.sessionID())
-		case read.code() == uint32(command.GetClusterMetadataCode):
-			return clusterMetadataFrame(t, 1, follower.address(), intermediate.address())
-		case read.operation() == vsr.OperationRegister:
-			return registerReplyFrame(7, 512)
-		default:
-			return replyFrame(vsr.OperationNonReplicated, nil)
-		}
-	})
-
-	client := newDialingClient(t, follower.address(),
-		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
-	require.NoError(t, client.Connect(context.Background()))
-
-	assert.Equal(t, leader.address(), client.currentServerAddress)
-	assert.Equal(t, 1, follower.connections())
-	assert.Equal(t, 1, intermediate.connections())
-	assert.Equal(t, 1, leader.connections())
-	assert.True(t, client.session.Bound())
 }
 
 func TestConnect_KeepsTheConnectionWhenTheRosterHasOneNode(t *testing.T) {
@@ -353,20 +406,20 @@ func TestExchange_ResumesBeforeReplayingANonReplicatedRequest(t *testing.T) {
 
 	assert.Equal(t, 2, server.connections())
 	recorded := server.recorded()
-	require.Len(t, recorded, 6)
+	require.Len(t, recorded, 5)
 
 	assert.Equal(t, uint32(command.PingCode), recorded[2].code(), "the dropped attempt")
 	assert.Equal(t, uint32(command.BindSessionCode), recorded[3].code(),
 		"the replay resumes before it repeats the request")
-	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[4].code())
-	assert.Equal(t, uint32(command.PingCode), recorded[5].code())
+	assert.Equal(t, uint32(command.PingCode), recorded[4].code())
 
-	assert.Equal(t, recorded[2].clientID(), recorded[5].clientID(),
+	assert.Equal(t, recorded[2].header, recorded[4].header)
+	assert.Equal(t, recorded[2].clientID(), recorded[4].clientID(),
 		"a replacement connection preserves the client identity")
 	assert.Equal(t, uint64(128), client.session.SessionID())
 }
 
-func TestExchange_RefusesToReplayAReplicatedRequestWithAnUnknownOutcome(t *testing.T) {
+func TestExchange_ReplaysAReplicatedRequestWithTheExactIdentity(t *testing.T) {
 	var server *testListener
 	server = listenVSR(t, nil, func(connection, index int, read request) []byte {
 		switch {
@@ -389,14 +442,17 @@ func TestExchange_RefusesToReplayAReplicatedRequestWithAnUnknownOutcome(t *testi
 	require.NoError(t, client.Connect(context.Background()))
 
 	_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
-	assert.ErrorIs(t, err, ierror.ErrDisconnected,
-		"a replay would carry a fresh client identity the server cannot deduplicate")
-
-	assert.Equal(t, 1, server.connections(), "no reconnect was attempted")
-	recorded := server.recorded()
-	require.Len(t, recorded, 3)
-	assert.Equal(t, vsr.OperationCreateStream, recorded[2].operation(),
-		"the request reached the wire exactly once")
+	require.NoError(t, err)
+	require.Equal(t, 2, server.connections())
+	var mutations []request
+	for _, read := range server.recorded() {
+		if read.operation() == vsr.OperationCreateStream {
+			mutations = append(mutations, read)
+		}
+	}
+	require.Len(t, mutations, 2)
+	require.Equal(t, mutations[0].header, mutations[1].header)
+	require.Equal(t, mutations[0].payload, mutations[1].payload)
 }
 
 func TestExchange_ReconnectsThroughAKnownFollowerAfterTheLeaderDies(t *testing.T) {
@@ -440,17 +496,13 @@ func TestExchange_ReconnectsThroughAKnownFollowerAfterTheLeaderDies(t *testing.T
 
 	require.NoError(t, client.Ping(context.Background()))
 
-	assert.Equal(t, follower.address(), client.currentServerAddress)
+	assert.Equal(t, follower.address(), client.GetConnectionInfo().ServerAddress)
 	assert.True(t, client.session.Bound())
 	recorded := follower.recorded()
-	require.Len(t, recorded, 5)
-	assert.Equal(t, vsr.OperationRegister, recorded[0].operation(),
-		"the dialed follower completed the initial sign-in")
-	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[1].code())
-	assert.Equal(t, uint32(command.BindSessionCode), recorded[2].code(),
-		"the reconnect resumed the retained session on the surviving node")
-	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[3].code())
-	assert.Equal(t, uint32(command.PingCode), recorded[4].code())
+	require.Equal(t, vsr.OperationRegister, recorded[0].operation())
+	require.GreaterOrEqual(t, requestCount(recorded, command.GetClusterMetadataCode), 2)
+	require.Equal(t, 1, requestCount(recorded, command.PingCode))
+	require.Equal(t, 1, follower.connections(), "the already managed follower remains available")
 }
 
 func TestConnect_DropsTheConnectionWhenAutomaticSignInFails(t *testing.T) {
@@ -467,65 +519,11 @@ func TestConnect_DropsTheConnectionWhenAutomaticSignInFails(t *testing.T) {
 	err := client.Connect(context.Background())
 
 	assert.ErrorIs(t, err, ierror.ErrInvalidCredentials)
-	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
-	assert.Nil(t, client.conn)
-}
-
-func TestExchange_DoesNotPreemptAReplayedSignIn(t *testing.T) {
-	var server *testListener
-	registers := 0
-	var mtx sync.Mutex
-	server = listenVSR(t, nil, func(connection, index int, read request) []byte {
-		switch {
-		case read.code() == uint32(command.BindSessionCode):
-			return bindReplyFrame(7, read.sessionID())
-		case read.code() == uint32(command.GetClusterMetadataCode):
-			return clusterMetadataFrame(t, 0, server.address())
-		case read.operation() == vsr.OperationRegister:
-			mtx.Lock()
-			registers++
-			count := registers
-			mtx.Unlock()
-			// Drop the second register so the explicit sign-in reconnects.
-			if connection == 0 && count == 2 {
-				return nil
-			}
-			return registerReplyFrame(7, uint64(128+connection))
-		default:
-			return replyFrame(vsr.OperationNonReplicated, nil)
-		}
-	})
-
-	client := newDialingClient(t, server.address(),
-		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
-	require.NoError(t, client.Connect(context.Background()))
-
-	identity, err := client.LoginUser(context.Background(), "other", "secret")
-	require.NoError(t, err)
-	assert.Equal(t, uint32(7), identity.UserId)
-
-	var signIns int
-	for _, recorded := range server.recorded() {
-		if recorded.operation() == vsr.OperationRegister {
-			signIns++
-		}
-	}
-	// The connect sign-in, the dropped explicit one, and its replay. An
-	// automatic sign-in on the new connection would make a fourth.
-	assert.Equal(t, 3, signIns)
-
-	// The suppression rides the replay's own context, so nothing about it
-	// outlives that call: the next Connect resumes the bound session.
-	require.NoError(t, client.disconnect())
-	require.NoError(t, client.Connect(context.Background()))
-	signIns = 0
-	for _, recorded := range server.recorded() {
-		if recorded.operation() == vsr.OperationRegister {
-			signIns++
-		}
-	}
-	assert.Equal(t, 3, signIns, "resume must not register another session")
-	assert.Equal(t, 1, requestCount(server.recorded(), command.BindSessionCode))
+	var refusal ierror.IggyError
+	require.ErrorAs(t, err, &refusal)
+	assert.Equal(t, ierror.InvalidCredentialsCode, refusal.Code(), "Connect returns the refusal, not the 40 of the epoch it ended")
+	assert.False(t, linkReady(client.links.any()))
+	assert.Nil(t, client.links.any())
 }
 
 func TestExchange_FailsFastWhenAutoLoginIsOff(t *testing.T) {
@@ -542,8 +540,8 @@ func TestExchange_FailsFastWhenAutoLoginIsOff(t *testing.T) {
 	require.NoError(t, client.session.Bind(9))
 
 	_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
-	assert.ErrorIs(t, err, ierror.ErrDisconnected)
-	assert.Equal(t, 1, server.connections(), "no reconnect was attempted")
+	assert.ErrorIs(t, err, ierror.ErrNotConnected)
+	assert.Equal(t, 1, server.connections(), "ordinary requests do not bootstrap a connection")
 }
 
 func TestLogoutUser_ResetsTheSessionSoTheNextSignInIsANewIdentity(t *testing.T) {
@@ -581,22 +579,6 @@ func TestLogoutUser_ResetsTheSessionSoTheNextSignInIsANewIdentity(t *testing.T) 
 	assert.True(t, client.session.Bound())
 }
 
-func TestHandleLeaderRedirection_StopsAtTheRedirectBudget(t *testing.T) {
-	client, serverConn := newPipeClient(t)
-	serve(serverConn, func(_ int, _ request) []byte {
-		return clusterMetadataFrame(t, 0, "10.0.0.1:8090", "10.0.0.2:8090")
-	})
-	for range iggcon.MaxLeaderRedirects {
-		client.leaderRedirectionState.IncrementRedirect("10.0.0.1:8090")
-	}
-
-	redirect, err := client.HandleLeaderRedirection(context.Background())
-	require.NoError(t, err)
-	assert.False(t, redirect, "the budget stops a redirect storm")
-	assert.Equal(t, []string{"10.0.0.1:8090", "10.0.0.2:8090"}, client.knownServerAddresses,
-		"the roster still feeds the reconnect candidates")
-}
-
 func TestConnect_UnwindsWhenEveryReadFailsInsideTheConnectFlow(t *testing.T) {
 	// An accept-then-close listener makes every dial succeed and every first
 	// read fail, the shape that previously recursed Connect through the
@@ -624,7 +606,7 @@ func TestConnect_UnwindsWhenEveryReadFailsInsideTheConnectFlow(t *testing.T) {
 	require.Error(t, err, "the failure unwinds instead of recursing")
 	assert.NotErrorIs(t, err, context.DeadlineExceeded,
 		"Connect gave up on its own, not through the safety-net timeout")
-	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
+	assert.False(t, linkReady(client.links.any()))
 }
 
 func TestConnect_ExchangesOverTLS(t *testing.T) {
@@ -661,4 +643,545 @@ func TestCreateTLSConfig_ExtractsAnIPv6ServerName(t *testing.T) {
 	config, err := client.createTLSConfig("[::1]:8090")
 	require.NoError(t, err)
 	assert.Equal(t, "::1", config.ServerName)
+}
+
+func TestLoginUserCanRetryRejectedCredentialsOnTheSameClient(t *testing.T) {
+	var registers atomic.Uint32
+	var server *testListener
+	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		if read.operation() == vsr.OperationRegister && registers.Add(1) == 1 {
+			return evictionFrame(vsr.EvictionInvalidCredentials, 0, 0)
+		}
+		return singleNodeHandler(t, func() string { return server.address() })(0, 0, read)
+	})
+	client := newDialingClient(t, server.address())
+	require.NoError(t, client.Connect(context.Background()))
+	_, err := client.LoginUser(context.Background(), "iggy", "wrong")
+	require.ErrorIs(t, err, ierror.ErrInvalidCredentials)
+	require.Empty(t, client.operations.retained)
+	require.Empty(t, client.operations.lanes)
+	_, err = client.LoginUser(context.Background(), "iggy", "correct")
+	require.NoError(t, err)
+	require.True(t, client.session.Bound())
+	require.Equal(t, uint32(2), registers.Load())
+	require.NoError(t, client.Ping(context.Background()))
+}
+
+// Disconnect forgets the sign-in of the caller, as the Rust SDK does. The next
+// connect signs in as the configured user, or not at all without one, and the
+// client keeps its metadata floor.
+func TestConnectAfterDisconnectForgetsTheCallerSignInAndKeepsTheMetadataFloor(t *testing.T) {
+	for _, configured := range []bool{false, true} {
+		name := "without_auto_login"
+		if configured {
+			name = "with_auto_login"
+		}
+		t.Run(name, func(t *testing.T) {
+			var registers atomic.Uint64
+			var server *testListener
+			server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+				if read.operation() == vsr.OperationRegister {
+					return registerReplyFrame(7, 100+registers.Add(1))
+				}
+				return singleNodeHandler(t, func() string { return server.address() })(0, 0, read)
+			})
+			var options []Option
+			if configured {
+				options = append(options, WithAutoLogin(NewUsernamePasswordCredentials("iggy", "secret")))
+			}
+			client := newDialingClient(t, server.address(), options...)
+			require.NoError(t, client.Connect(context.Background()))
+			_, err := client.LoginUser(context.Background(), "other", "password")
+			require.NoError(t, err)
+			client.metadataWatermark.Store(42)
+			identity := client.session.ClientID()
+			requestID := client.session.CurrentRequestID()
+			require.NoError(t, client.Disconnect())
+			require.False(t, sessionBound(client))
+
+			require.NoError(t, client.Connect(context.Background()))
+
+			require.NotEqual(t, identity, client.session.ClientID())
+			require.Equal(t, uint64(42), client.metadataWatermark.Load())
+			var signIns []string
+			for _, read := range registerRequests(server) {
+				signIns = append(signIns, registerUsername(read.payload))
+			}
+			if !configured {
+				require.False(t, sessionBound(client), "the connect has no user to sign in as")
+				require.Equal(t, []string{"other"}, signIns)
+				return
+			}
+			require.True(t, sessionBound(client))
+			require.Equal(t, []string{"iggy", "other", "iggy"}, signIns)
+			require.Greater(t, client.session.CurrentRequestID(), requestID)
+			require.NoError(t, client.Ping(context.Background()))
+		})
+	}
+}
+
+// Disconnect also ends a LogoutUser, as in the Rust SDK, so the next connect
+// signs in as the configured user.
+func TestConnectAfterLogoutAndDisconnectSignsInAsTheConfiguredUser(t *testing.T) {
+	var registers atomic.Uint64
+	var server *testListener
+	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		if read.operation() == vsr.OperationRegister {
+			return registerReplyFrame(7, 100+registers.Add(1))
+		}
+		return singleNodeHandler(t, func() string { return server.address() })(0, 0, read)
+	})
+	client := newDialingClient(t, server.address(), WithAutoLogin(NewUsernamePasswordCredentials("iggy", "secret")))
+	require.NoError(t, client.Connect(context.Background()))
+	require.NoError(t, client.LogoutUser(context.Background()))
+	require.NoError(t, client.Disconnect())
+
+	require.NoError(t, client.Connect(context.Background()))
+
+	require.True(t, sessionBound(client), "the connect signed in as the configured user")
+	require.Equal(t, uint64(2), registers.Load())
+	require.NoError(t, client.Ping(context.Background()))
+}
+
+func TestConcurrentConnectWaiterCannotRestartOrCancelSharedRegistration(t *testing.T) {
+	registered, release := make(chan struct{}), make(chan struct{})
+	var server *testListener
+	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		if read.operation() == vsr.OperationRegister {
+			close(registered)
+			<-release
+		}
+		return singleNodeHandler(t, func() string { return server.address() })(0, 0, read)
+	})
+	client := newDialingClient(t, server.address(), WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+	first := make(chan error, 1)
+	go func() { first <- client.Connect(context.Background()) }()
+	<-registered
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, client.Connect(ctx), context.DeadlineExceeded)
+	close(release)
+	require.NoError(t, <-first)
+	require.Equal(t, 1, server.connections())
+	var registrations int
+	for _, read := range server.recorded() {
+		if read.operation() == vsr.OperationRegister {
+			registrations++
+		}
+	}
+	require.Equal(t, 1, registrations)
+	require.Equal(t, 1, requestCount(server.recorded(), command.GetClusterMetadataCode))
+	require.True(t, client.session.Bound())
+}
+
+// A call that starts while Connect signs in waits for that session, as it
+// waits for a recovery, and then goes out under it.
+func TestCallsThatStartDuringConnectWaitForItsSession(t *testing.T) {
+	registered, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
+	var server *testListener
+	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		switch read.operation() {
+		case vsr.OperationRegister:
+			close(registered)
+			<-release
+		case vsr.OperationCreateStream:
+			return replyFrame(vsr.OperationCreateStream, resultSection())
+		}
+		return singleNodeHandler(t, func() string { return server.address() })(0, 0, read)
+	})
+	client := newDialingClient(t, server.address(), WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+	connected := make(chan error, 1)
+	go func() { connected <- client.Connect(context.Background()) }()
+	<-registered
+	ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+	defer cancel()
+	created, pinged := make(chan error, 1), make(chan error, 1)
+	go func() {
+		_, err := client.do(ctx, &command.CreateStream{Name: "waiting"})
+		created <- err
+	}()
+	go func() { pinged <- client.Ping(ctx) }()
+	require.Never(t, func() bool { return len(created) != 0 || len(pinged) != 0 }, recoveryWaitDeadline, managedLinkPoll,
+		"the calls wait for the session of the Connect")
+
+	unblock()
+	require.NoError(t, <-connected)
+	require.NoError(t, <-created)
+	require.NoError(t, <-pinged)
+	calls := createStreams(server.recorded())
+	for _, read := range server.recorded() {
+		if read.code() == uint32(command.PingCode) {
+			calls = append(calls, read)
+		}
+	}
+	require.Len(t, calls, 2)
+	for _, call := range calls {
+		require.Equal(t, managedLinkSession, call.sessionID(), "the call goes out under the new session")
+	}
+}
+
+// The server refuses the sign-in of Connect for a reason other than its
+// credentials. Connect returns the refusal, and the calls that wait for it end
+// with 58 and the refusal as their cause. The client keeps its sign-in.
+func TestCallsThatWaitForAConnectRefusedForAnotherReasonEndWith58(t *testing.T) {
+	registered, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
+	newerProtocol := vsr.ProtocolVersion + 1
+	var refused atomic.Bool
+	var server *testListener
+	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		if read.operation() == vsr.OperationRegister && refused.CompareAndSwap(false, true) {
+			close(registered)
+			<-release
+			return evictionFrame(vsr.EvictionIncompatibleProtocol, newerProtocol, newerProtocol)
+		}
+		return singleNodeHandler(t, func() string { return server.address() })(0, 0, read)
+	})
+	client := newDialingClient(t, server.address(), WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+	epoch := client.epoch.Load()
+	connected := make(chan error, 1)
+	go func() { connected <- client.Connect(context.Background()) }()
+	<-registered
+	ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+	defer cancel()
+	created, pinged := make(chan error, 1), make(chan error, 1)
+	go func() {
+		_, err := client.do(ctx, &command.CreateStream{Name: "waiting"})
+		created <- err
+	}()
+	go func() { pinged <- client.Ping(ctx) }()
+	require.Never(t, func() bool { return len(created) != 0 || len(pinged) != 0 }, recoveryWaitDeadline, managedLinkPoll,
+		"the calls wait for the session of the Connect")
+
+	unblock()
+	err := <-connected
+	var refusal ierror.IggyError
+	require.ErrorAs(t, err, &refusal)
+	require.Equal(t, ierror.IncompatibleProtocolVersionCode, refusal.Code(), "Connect returns its own refusal")
+	for _, call := range []chan error{created, pinged} {
+		err := <-call
+		require.ErrorIs(t, err, ierror.ErrTransientNotAccepted)
+		require.ErrorIs(t, err, ierror.ErrIncompatibleProtocolVersion, "the call keeps the refusal as its cause")
+	}
+	require.Same(t, epoch, client.epoch.Load(), "the refusal keeps the epoch")
+	require.Empty(t, createStreams(server.recorded()), "the create never went out")
+	require.NoError(t, client.Connect(ctx), "the client keeps its sign-in")
+	require.True(t, sessionBound(client))
+}
+
+func TestLoginUserRacingDisconnectCannotRememberItsCredentials(t *testing.T) {
+	serverConnection, connection := net.Pipe()
+	defer func() { _ = serverConnection.Close() }()
+	client := newTestClient(t, connection)
+	var server *testListener
+	server = listenVSR(t, nil, singleNodeHandler(t, func() string { return server.address() }))
+	client.config.serverAddress = server.address()
+	link := client.links.bootstrap
+	received, release := make(chan struct{}), make(chan struct{})
+	answer := sync.OnceFunc(func() { close(release) })
+	defer answer()
+	serve(serverConnection, func(_ int, read request) []byte {
+		close(received)
+		<-release
+		return registerReplyFrame(signedInUserID, managedLinkSession)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+	defer cancel()
+	signedIn := make(chan error, 1)
+	go func() { _, err := client.LoginUser(ctx, "other", "password"); signedIn <- err }()
+	select {
+	case <-received:
+	case <-ctx.Done():
+		t.Fatal("the sign-in did not send its registration")
+	}
+
+	// Hold the accepted reply before Bind, then stop the link. Holding its
+	// mutex pauses signIn at markBound after Bind, the former gap before
+	// register remembered the credentials. Disconnect can finish because
+	// the link is already closed.
+	client.mtx.Lock()
+	unlockSession := sync.OnceFunc(client.mtx.Unlock)
+	defer unlockSession()
+	answer()
+	require.Eventually(t, func() bool { return len(link.capacity) == 0 }, managedLinkTestBudget, managedLinkPoll,
+		"the registration exchange did not finish")
+	link.close(ierror.ErrDisconnected)
+	link.done.Wait()
+	link.mu.Lock()
+	unlockLink := sync.OnceFunc(link.mu.Unlock)
+	defer unlockLink()
+	unlockSession()
+	require.Eventually(t, func() bool { return sessionBound(client) }, managedLinkTestBudget, managedLinkPoll,
+		"the registration reply did not bind")
+
+	require.NoError(t, client.Disconnect())
+	unlockLink()
+	select {
+	case err := <-signedIn:
+		require.Error(t, err)
+	case <-ctx.Done():
+		t.Fatal("the interrupted sign-in did not end")
+	}
+	_, remembered := client.signInCredentials()
+	require.False(t, remembered, "the sign-in restored credentials after Disconnect")
+	require.NoError(t, client.Connect(ctx))
+	require.Empty(t, registerRequests(server), "Connect must not reuse the interrupted sign-in")
+}
+
+func TestExplicitSignInFailureRequiresAnotherExplicitSignIn(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		login    func(context.Context, *IggyTcpClient) error
+		phase    command.Code
+		cancel   bool
+		deadline bool
+	}{
+		{name: "invalid_username", login: func(ctx context.Context, client *IggyTcpClient) error {
+			_, err := client.LoginUser(ctx, "", signInPassword)
+			return err
+		}},
+		{name: "invalid_token", login: func(ctx context.Context, client *IggyTcpClient) error {
+			_, err := client.LoginWithPersonalAccessToken(ctx, strings.Repeat("x", 256))
+			return err
+		}},
+		{name: "nil_context", login: func(_ context.Context, client *IggyTcpClient) error {
+			//nolint:staticcheck // A nil caller context is part of the failed-attempt policy.
+			_, err := client.LoginUser(nil, "other", signInPassword)
+			return err
+		}},
+		{name: "cancelled_context", login: func(ctx context.Context, client *IggyTcpClient) error {
+			ctx, cancel := context.WithCancel(ctx)
+			cancel()
+			_, err := client.LoginUser(ctx, "other", signInPassword)
+			return err
+		}},
+		{name: "register_refused", phase: command.LoginRegisterCode},
+		{name: "register_cancelled", phase: command.LoginRegisterCode, cancel: true},
+		{name: "register_deadline", phase: command.LoginRegisterCode, deadline: true},
+		{name: "roster_refused", phase: command.GetClusterMetadataCode},
+		{name: "roster_cancelled", phase: command.GetClusterMetadataCode, cancel: true},
+		{name: "roster_deadline", phase: command.GetClusterMetadataCode, deadline: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var fail atomic.Bool
+			reached, release := make(chan struct{}), make(chan struct{})
+			unblock := sync.OnceFunc(func() { close(release) })
+			defer unblock()
+			var server *testListener
+			server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+				phase := read.code() == uint32(test.phase)
+				if test.phase == command.LoginRegisterCode {
+					phase = read.operation() == vsr.OperationRegister
+				}
+				if fail.Load() && test.phase != 0 && phase {
+					if test.cancel || test.deadline {
+						close(reached)
+						<-release
+					}
+					return statusReplyFrame(read.operation(), uint32(ierror.InvalidCredentialsCode), nil)
+				}
+				return singleNodeHandler(t, func() string { return server.address() })(0, 0, read)
+			})
+			client := newDialingClient(t, server.address(), WithAutoLogin(NewUsernamePasswordCredentials(signInUsername, signInPassword)))
+			require.NoError(t, client.Connect(context.Background()))
+			fail.Store(true)
+			ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+			defer cancel()
+			loginCtx := ctx
+			if test.deadline {
+				var endDeadline context.CancelFunc
+				loginCtx, endDeadline = context.WithTimeout(ctx, time.Second)
+				defer endDeadline()
+			}
+			done := make(chan error, 1)
+			go func() {
+				if test.login != nil {
+					done <- test.login(loginCtx, client)
+					return
+				}
+				_, err := client.LoginUser(loginCtx, "other", signInPassword)
+				done <- err
+			}()
+			if test.cancel || test.deadline {
+				select {
+				case <-reached:
+				case <-ctx.Done():
+					t.Fatal("the explicit sign-in did not reach its held reply")
+				}
+				if test.cancel {
+					cancel()
+				}
+			}
+			require.Error(t, <-done)
+			unblock()
+			fail.Store(false)
+			assert.False(t, sessionBound(client), "a failed public sign-in must discard its tentative session")
+			before := len(registerRequests(server))
+			binds := requestCount(server.recorded(), command.BindSessionCode)
+			require.NoError(t, client.Connect(context.Background()))
+			require.NoError(t, client.Disconnect())
+			require.NoError(t, client.Connect(context.Background()))
+			assert.Len(t, registerRequests(server), before, "Connect must not unblock automatic fallback")
+			assert.Equal(t, binds, requestCount(server.recorded(), command.BindSessionCode), "the failed attempt must not resume with BindSession")
+			_, err := client.do(context.Background(), &command.CreateStream{Name: "requires-sign-in"})
+			assert.ErrorIs(t, err, ierror.ErrUnauthenticated)
+			_, err = client.LoginUser(context.Background(), "retry", signInPassword)
+			require.NoError(t, err)
+			require.NoError(t, client.Ping(context.Background()))
+			require.Equal(t, "retry", registerUsername(registerRequests(server)[len(registerRequests(server))-1].payload))
+		})
+	}
+}
+
+func TestExplicitSignInSupersedesInitialAutomaticConnect(t *testing.T) {
+	for _, token := range []bool{false, true} {
+		t.Run(fmt.Sprintf("token_%t", token), func(t *testing.T) {
+			reached, release := make(chan struct{}), make(chan struct{})
+			unblock := sync.OnceFunc(func() { close(release) })
+			defer unblock()
+			var server *testListener
+			server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+				if read.operation() == vsr.OperationRegister && registerUsername(read.payload) == signInUsername {
+					close(reached)
+					<-release
+				}
+				return singleNodeHandler(t, func() string { return server.address() })(0, 0, read)
+			})
+			client := newDialingClient(t, server.address(), WithAutoLogin(NewUsernamePasswordCredentials(signInUsername, signInPassword)))
+			automatic := make(chan error, 1)
+			go func() { automatic <- client.Connect(context.Background()) }()
+			<-reached
+			ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+			defer cancel()
+			var err error
+			if token {
+				_, err = client.LoginWithPersonalAccessToken(ctx, "caller-token")
+			} else {
+				_, err = client.LoginUser(ctx, "caller", signInPassword)
+			}
+			require.NoError(t, err, "explicit credentials must not wait behind the held automatic Register")
+			require.Error(t, <-automatic)
+			unblock()
+			require.NoError(t, client.Ping(ctx))
+			credentials, enabled := client.signInCredentials()
+			require.True(t, enabled)
+			if token {
+				require.Equal(t, "caller-token", credentials.personalAccessToken)
+			} else {
+				require.Equal(t, "caller", credentials.username)
+			}
+		})
+	}
+}
+
+func TestInvalidExplicitSignInSupersedesAnOlderAttemptBeforeItsGate(t *testing.T) {
+	for _, invalid := range []bool{false, true} {
+		t.Run(fmt.Sprintf("invalid_%t", invalid), func(t *testing.T) {
+			reached, release := make(chan struct{}), make(chan struct{})
+			unblock := sync.OnceFunc(func() { close(release) })
+			defer unblock()
+			var server *testListener
+			server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+				if read.operation() == vsr.OperationRegister {
+					close(reached)
+					<-release
+				}
+				return singleNodeHandler(t, func() string { return server.address() })(0, 0, read)
+			})
+			client := newDialingClient(t, server.address())
+			require.NoError(t, client.Connect(context.Background()))
+			ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+			defer cancel()
+			first := make(chan error, 1)
+			go func() { _, err := client.LoginUser(ctx, "first", signInPassword); first <- err }()
+			<-reached
+			username := "second"
+			secondCtx := ctx
+			if invalid {
+				username = ""
+			} else {
+				var end context.CancelFunc
+				secondCtx, end = context.WithCancel(ctx)
+				end()
+			}
+			_, err := client.LoginUser(secondCtx, username, signInPassword)
+			require.Error(t, err)
+			unblock()
+			require.Error(t, <-first, "the superseded attempt must not bind after the newer attempt failed")
+			require.False(t, sessionBound(client))
+			require.NoError(t, client.Connect(ctx))
+			require.Len(t, registerRequests(server), 1)
+		})
+	}
+}
+
+func TestNewExplicitSignInSupersedesHeldRosterCompletion(t *testing.T) {
+	reached, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
+	var registrations atomic.Uint32
+	var server *testListener
+	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		if read.operation() == vsr.OperationRegister {
+			return registerReplyFrame(signedInUserID, managedLinkSession+uint64(registrations.Add(1)))
+		}
+		if read.code() == uint32(command.GetClusterMetadataCode) && registrations.Load() == 1 {
+			close(reached)
+			<-release
+			return statusReplyFrame(read.operation(), uint32(ierror.InvalidCredentialsCode), nil)
+		}
+		return singleNodeHandler(t, func() string { return server.address() })(0, 0, read)
+	})
+	client := newDialingClient(t, server.address())
+	require.NoError(t, client.Connect(context.Background()))
+	ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+	defer cancel()
+	first := make(chan error, 1)
+	go func() { _, err := client.LoginUser(ctx, "first", signInPassword); first <- err }()
+	<-reached
+	_, err := client.LoginUser(ctx, "second", signInPassword)
+	require.NoError(t, err, "the newer caller must end the tentative older session")
+	unblock()
+	require.Error(t, <-first)
+	credentials, enabled := client.signInCredentials()
+	require.True(t, enabled)
+	require.Equal(t, "second", credentials.username)
+	require.NoError(t, client.Ping(ctx))
+}
+
+func TestDisconnectCompletionCannotForgetANewerExplicitSignIn(t *testing.T) {
+	server, evict := credentialServer(t, func(_ int, read request) []byte { return committedReply(read, 0) })
+	peer, connection := net.Pipe()
+	defer func() { _ = peer.Close() }()
+	readStopped, resumeRead := make(chan struct{}), make(chan struct{})
+	resume := sync.OnceFunc(func() { close(resumeRead) })
+	defer resume()
+	client := newTestClient(t, &managedLinkTestConnection{Conn: connection, readStopped: readStopped, resumeRead: resumeRead})
+	client.config.serverAddress = server.address()
+	client.config.autoLogin = NewAutoLogin(NewUsernamePasswordCredentials(signInUsername, signInPassword))
+	client.links.bootstrap.endpoint = server.address()
+	serve(peer, func(index int, read request) []byte {
+		return singleNodeHandler(t, func() string { return server.address() })(0, index, read)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+	defer cancel()
+	require.NoError(t, client.Connect(ctx))
+	disconnected := make(chan error, 1)
+	go func() { disconnected <- client.Disconnect() }()
+	select {
+	case <-readStopped:
+	case <-ctx.Done():
+		t.Fatal("Disconnect did not stop the old reader")
+	}
+	_, err := client.LoginUser(ctx, "newer", signInPassword)
+	require.NoError(t, err)
+	resume()
+	require.NoError(t, <-disconnected)
+	credentials, enabled := client.signInCredentials()
+	require.True(t, enabled)
+	assert.Equal(t, "newer", credentials.username, "old Disconnect cleanup must not forget the later sign-in")
+	requireSignInAgain(t, client, server, evict, "newer", signInPassword)
 }

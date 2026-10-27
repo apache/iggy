@@ -34,7 +34,7 @@
 //!
 //!     // Client is already logged in as root
 //!     let client = harness.client();
-//!     // client.create_stream(...).await.unwrap();
+//!     // client.create_stream(..., &StreamCreateOptions::default()).await.unwrap();
 //!
 //!     harness.stop().await.unwrap();
 //! }
@@ -48,6 +48,7 @@ mod fixture;
 pub mod handle;
 mod helpers;
 mod orchestrator;
+mod peer_relay;
 mod port_reserver;
 pub mod seeds;
 mod traits;
@@ -61,13 +62,14 @@ pub use context::{TestContext, get_test_directory};
 pub use error::TestBinaryError;
 pub use handle::{
     ClientBuilder, ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle,
+    StopOutcome,
 };
 pub use orchestrator::{TestHarness, TestHarnessBuilder, TestLogs};
 pub use traits::{IggyServerDependent, Restartable, TestBinary};
 
 pub use helpers::{
-    USER_PASSWORD, assert_clean_system, create_user, delete_user, login_root, login_user,
-    wait_for_consumer_group_assignment,
+    USER_PASSWORD, assert_clean_system, backup_commit_budget, create_user, delete_user, login_root,
+    login_user, wait_for_consumer_group_assignment, wait_for_topic, wait_for_topic_messages_count,
 };
 
 pub use fixture::TestFixture;

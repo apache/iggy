@@ -15,8 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
-use iggy_common::{BinaryTransport, ClientState};
+macro_rules! with_client {
+    ($self:expr, $client:ident => $body:expr) => {{
+        let deadline = iggy_common::binary_operation_deadline();
+        iggy_common::with_binary_deadline(deadline, async {
+            let $client = tokio::time::timeout_at(deadline, $self.client.read())
+                .await
+                .map_err(|_| iggy_common::IggyError::TransientNotAccepted)?;
+            $body
+        })
+        .await
+    }};
+}
+
+pub(crate) use with_client;
 
 mod binary_cluster;
 mod binary_consumer_group;
@@ -42,34 +54,6 @@ pub mod producer_sharding;
 
 const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
 
-/// Whether the reconnect that followed a leader redirect already left this
-/// client signed in as the user the redirected sign-in was for.
-///
-/// The connect flow signs in with the credentials that sign-in just
-/// remembered, so on a client without a configured `AutoLogin` the session on
-/// the leader is already the right one: signing in again would run a logout
-/// plus a second login, an argon2 each on the server, to arrive where the
-/// client already is. With `AutoLogin::Enabled(a)` the reconnect signed in the
-/// configured user instead, who need not be the one signing in here, so the
-/// sign-in still has to run.
-pub(crate) async fn redirect_login_settled(client: &ClientWrapper) -> bool {
-    let (state, auto_login_configured) = match client {
-        ClientWrapper::Tcp(tcp_client) => (
-            tcp_client.get_state().await,
-            tcp_client.auto_login_configured(),
-        ),
-        ClientWrapper::Quic(quic_client) => (
-            quic_client.get_state().await,
-            quic_client.auto_login_configured(),
-        ),
-        ClientWrapper::WebSocket(ws_client) => (
-            ws_client.get_state().await,
-            ws_client.auto_login_configured(),
-        ),
-        _ => return false,
-    };
-
-    state == ClientState::Authenticated && !auto_login_configured
-}
-const MAX_BATCH_LENGTH: usize = 1000000;
+/// The messages per request of a direct producer whose `batch_length` is 0.
+pub const MAX_BATCH_LENGTH: std::num::NonZeroU32 = std::num::NonZeroU32::new(1_000_000).unwrap();
 const MIB: usize = 1_048_576;

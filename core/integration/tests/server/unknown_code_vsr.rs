@@ -56,6 +56,7 @@ use crate::server::raw_tcp::{
 
 /// A code no `COMMAND_TABLE` entry claims.
 const UNKNOWN_CODE: u32 = 9999;
+const RETIRED_ROUTING_CODES: [u32; 3] = [103, 104, 123];
 
 /// An operation byte `Operation` does not declare.
 /// `reserved_codes_remain_unknown` pins 131 as never reused, so a new
@@ -78,14 +79,16 @@ const NEXT_REQUEST: u64 = 2;
 const CLIENT_ID: u128 = 0xBAD_C0DE;
 
 #[iggy_harness]
-async fn given_bound_session_when_unknown_non_replicated_code_sent_should_deny_invalid_command(
+async fn given_bound_session_when_unknown_or_retired_code_sent_should_deny_invalid_command(
     harness: &TestHarness,
 ) {
-    assert!(
-        lookup_command(UNKNOWN_CODE).is_none(),
-        "test needs a code absent from COMMAND_TABLE"
-    );
-    assert_non_replicated_code_denied_invalid_command(harness, UNKNOWN_CODE).await;
+    for code in [UNKNOWN_CODE].into_iter().chain(RETIRED_ROUTING_CODES) {
+        assert!(
+            lookup_command(code).is_none(),
+            "code {code} must stay retired"
+        );
+        assert_non_replicated_code_denied_invalid_command(harness, code).await;
+    }
 }
 
 #[iggy_harness]
@@ -190,5 +193,12 @@ async fn assert_non_replicated_code_denied_invalid_command(harness: &TestHarness
         reply_body.is_empty(),
         "a deny Reply carries an empty body, got {} bytes",
         reply_body.len()
+    );
+    let next = non_replicated_header(CLIENT_ID, session, NEXT_REQUEST, GET_ME_CODE);
+    let (next_reply, _) = exchange(&mut stream, &next, &[]).await;
+    assert_eq!(
+        reply_status(&next_reply),
+        0,
+        "code {code} must not close the session"
     );
 }

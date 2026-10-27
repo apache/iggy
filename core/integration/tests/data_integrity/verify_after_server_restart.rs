@@ -91,6 +91,9 @@ async fn should_fill_data_and_verify_after_restart() {
     let expected_clients_count = stats.clients_count;
     let expected_consumer_groups_count = stats.consumer_groups_count;
 
+    // Keep this handle from reconnecting alongside the replacement after restart.
+    client.disconnect().await.unwrap();
+
     // Restart server
     harness.restart_server().await.unwrap();
     let server_addr = harness.server().raw_tcp_addr().unwrap();
@@ -170,10 +173,7 @@ async fn should_fill_data_and_verify_after_restart() {
         "pinned-consumer",
         IggyByteSize::from(amount_of_data_to_process.as_bytes_u64() * 2),
     );
-    drop(client_after_restart);
-
-    // Connect and login to server
-    let client = harness.tcp_root_client().await.unwrap();
+    let client = client_after_restart;
 
     // Save stats from the second server (should have double the data)
     let stats = client.get_stats().await.unwrap();
@@ -277,9 +277,18 @@ async fn should_handle_resource_deletion_and_restart() {
     let client = harness.tcp_root_client().await.unwrap();
 
     // Create 3 streams
-    let stream_0 = client.create_stream("stream-0").await.unwrap();
-    let stream_1 = client.create_stream("stream-1").await.unwrap();
-    let stream_2 = client.create_stream("stream-2").await.unwrap();
+    let stream_0 = client
+        .create_stream("stream-0", &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream_1 = client
+        .create_stream("stream-1", &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream_2 = client
+        .create_stream("stream-2", &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     assert_eq!(stream_0.id, 0);
     assert_eq!(stream_1.id, 1);
@@ -372,7 +381,10 @@ async fn should_handle_resource_deletion_and_restart() {
     // was used instead of vacant_key() to predict the assigned ID.
     // After deletion: streams are [0, 2], len=2, but vacant_key=1
     // Bug: code used len (2) to create directory, but metadata assigned ID 1
-    let stream_reused = client.create_stream("stream-reused").await.unwrap();
+    let stream_reused = client
+        .create_stream("stream-reused", &StreamCreateOptions::default())
+        .await
+        .unwrap();
     assert_eq!(
         stream_reused.id, 1,
         "New stream should reuse deleted ID 1, got {}",

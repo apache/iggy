@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use ext_php_rs::{php_class, php_impl};
+use ext_php_rs::{boxed::ZBox, exception::PhpResult, php_class, php_impl, types::ZendHashTable};
 use iggy::prelude::TopicDetails as RustTopicDetails;
+
+use crate::options::options_array;
 
 #[php_class]
 #[php(name = "Iggy\\TopicDetails")]
@@ -42,13 +44,27 @@ impl TopicDetails {
         self.inner.name.to_string()
     }
 
-    #[php(getter)]
+    #[php(getter, change_case = "snake_case")]
     pub fn messages_count(&self) -> u64 {
         self.inner.messages_count
     }
 
-    #[php(getter)]
+    #[php(getter, change_case = "snake_case")]
     pub fn partitions_count(&self) -> u32 {
         self.inner.partitions_count
+    }
+
+    /// Options the creating or updating client set, as option name to scalar value.
+    /// Integers above `PHP_INT_MAX`, such as never-expire and unlimited
+    /// (18446744073709551615), are decimal strings.
+    #[php(getter)]
+    pub fn options(&self) -> PhpResult<ZBox<ZendHashTable>> {
+        options_array(&self.inner.options, true)
+    }
+
+    /// Options the server filled in from its catalog defaults.
+    #[php(getter, change_case = "snake_case")]
+    pub fn derived_options(&self) -> PhpResult<ZBox<ZendHashTable>> {
+        options_array(&self.inner.options, false)
     }
 }

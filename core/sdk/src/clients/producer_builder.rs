@@ -20,8 +20,7 @@ use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
 use crate::prelude::IggyProducer;
 use iggy_common::locking::IggyRwLock;
 use iggy_common::{
-    Durability, EncryptorKind, Identifier, IggyExpiry, MaxTopicSize, NonZeroIggyDuration,
-    Partitioner, Partitioning,
+    Durability, EncryptorKind, Identifier, IggyExpiry, MaxTopicSize, Partitioner, Partitioning,
 };
 use std::sync::Arc;
 
@@ -47,8 +46,6 @@ pub struct IggyProducerBuilder {
     create_stream_if_not_exists: bool,
     create_topic_if_not_exists: bool,
     topic_partitions_count: u32,
-    send_retries_count: Option<u32>,
-    send_retries_interval: Option<NonZeroIggyDuration>,
     topic_message_expiry: IggyExpiry,
     topic_max_size: MaxTopicSize,
     topic_durability: Durability,
@@ -82,8 +79,6 @@ impl IggyProducerBuilder {
             topic_message_expiry: IggyExpiry::ServerDefault,
             topic_max_size: MaxTopicSize::ServerDefault,
             topic_durability: Durability::default(),
-            send_retries_count: Some(3),
-            send_retries_interval: Some(NonZeroIggyDuration::ONE_SECOND),
             mode: SendMode::default(),
         }
     }
@@ -196,19 +191,6 @@ impl IggyProducerBuilder {
         }
     }
 
-    /// Starts a new attempt only after `IggyError::TransientNotAccepted`.
-    /// An ambiguous outcome or terminal refusal stops producer retries. The
-    /// transport may replay the exact request within its original session.
-    /// Defaults to 3 retries with a one-second interval. See the
-    /// [retry contract](super::producer::IggyProducer#retrying-and-what-a-failure-means).
-    pub fn send_retries(self, retries: Option<u32>, interval: Option<NonZeroIggyDuration>) -> Self {
-        Self {
-            send_retries_count: retries,
-            send_retries_interval: interval,
-            ..self
-        }
-    }
-
     /// Sets the producer to use direct message sending.
     /// This mode sends from the calling task without buffering between calls.
     /// `DirectConfig::linger_time` can delay a call before its requests are sent.
@@ -240,8 +222,6 @@ impl IggyProducerBuilder {
             self.topic_message_expiry,
             self.topic_max_size,
             self.topic_durability,
-            self.send_retries_count,
-            self.send_retries_interval,
             self.mode,
         )
     }

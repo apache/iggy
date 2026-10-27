@@ -32,7 +32,7 @@ use crate::iggy_partition::{InstalledConsumerGroupOwner, InstalledPartitionHisto
 use crate::offset_storage::{discard_offset_replacement, stage_offset_replacement};
 use crate::partition_storage::{read_revision_record, write_revision_record};
 use crate::segment_anchor::ANCHOR_SUFFIX;
-use crate::types::PartitionsConfig;
+use crate::types::{OFFSETS_DIR, PartitionsConfig};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use consensus::client_table::{CLIENTS_TABLE_SLOT_MAX, ClientTable, ClientTableMode};
 use consensus::le_cursor::{LeCursor, Truncated, split_verified_trailer};
@@ -2316,8 +2316,8 @@ pub(crate) async fn clear_materialization_missing(directory: &str) -> std::io::R
 /// Move every segment file in `partition_dir` aside into `<dir>.fenced.<n>/`,
 /// returning the directory used.
 ///
-/// Boot recovery also supplies `wal_revision` to
-/// move the refused prepare WAL. Live callers leave it unset to retain open writers.
+/// Callers supply `wal_revision` to move the refused prepare WAL, once its
+/// writers are closed (boot recovery, or a live quarantine after its drain).
 ///
 /// The partition directory itself STAYS, and so do its two superblock slots:
 /// they hold the group's only durable `(view, log_view)`, and moving them would
@@ -2404,6 +2404,28 @@ pub async fn quarantine_partition_files(
         fsync_dir(parent).await?;
     }
     Ok(target)
+}
+
+/// Move the consumer offset files of `partition_dir` into the `fenced` copy
+/// [`quarantine_partition_files`] created, so a rebuild starts without the
+/// offsets the diverged history produced.
+///
+/// # Errors
+/// The underlying `std::io::Error`, with the same operator-facing semantics as
+/// [`quarantine_partition_files`].
+pub async fn quarantine_offsets(partition_dir: &str, fenced: &str) -> std::io::Result<()> {
+    match compio::fs::rename(
+        &Path::new(partition_dir).join(OFFSETS_DIR),
+        &Path::new(fenced).join(OFFSETS_DIR),
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    fsync_dir(fenced).await?;
+    fsync_dir(partition_dir).await
 }
 
 /// Unlink every staging file in `partition_dir` except `keep`.
@@ -2694,6 +2716,10 @@ where
         if self.partition_dir.is_none() {
             // Also defuses the in-memory trap where `segment.size` grows with
             // no bytes on disk ("simulated in-memory batch persistence").
+            // TODO: simulator cluster partitions have no directory, so the
+            // simulator never serves or installs a partition state transfer.
+            // A simulated replica that needs one stays behind until the
+            // simulator models partition state transfer.
             return Err(PartitionTransferUnavailable::NoPartitionDir);
         }
         if self.repair.is_some() {
@@ -3346,6 +3372,7 @@ where
         }
         let pending =
             self.prepare_state_transfer_install(commit_op, staged, offsets_bytes, peer)?;
+        self.cancel_primary_transfer();
         self.transition = Some(crate::iggy_partition::PendingPartitionTransition::Install(
             Box::new(pending),
         ));
@@ -4235,6 +4262,7 @@ where
         self.owner_install_barrier = 0;
         self.observed_view = self.consensus().view();
         self.repair = None;
+        self.forget_recovered_commit();
         self.transfer_offer_cache.borrow_mut().take();
     }
 
@@ -4468,6 +4496,7 @@ where
         let peer = self.consensus().primary_index(self.consensus().view());
         let pending =
             self.prepare_state_transfer_install(commit_op, staged, offsets_bytes, peer)?;
+        self.cancel_primary_transfer();
         self.transition = Some(crate::iggy_partition::PendingPartitionTransition::Install(
             Box::new(pending),
         ));
@@ -4480,7 +4509,11 @@ where
                 },
                 crate::PartitionIoStep::Pending => {
                     if let Some(persistence) = &self.persistence {
-                        if let Err(source) = persistence.drain_with_timeout().await
+                        if let Err(source) = persistence
+                            .drain_with_timeout(|timeout| {
+                                self.consensus().message_bus().sleep(timeout)
+                            })
+                            .await
                             && let Some(crate::iggy_partition::PendingPartitionTransition::Install(
                                 mut install,
                             )) = self.transition.take()

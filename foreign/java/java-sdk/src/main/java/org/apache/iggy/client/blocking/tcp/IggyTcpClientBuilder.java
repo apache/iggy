@@ -23,6 +23,7 @@ import io.netty.channel.IoEventLoopGroup;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientBuilder;
 import org.apache.iggy.config.RetryPolicy;
+import org.apache.iggy.config.TcpConnectionString;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 
 import java.io.File;
@@ -127,7 +128,8 @@ public final class IggyTcpClientBuilder {
     }
 
     /**
-     * Sets the retry policy.
+     * Sets the retry policy for the redials after a connection loss, see
+     * {@link AsyncIggyTcpClientBuilder#retryPolicy(RetryPolicy)}.
      *
      * @param retryPolicy the retry policy to use
      * @return this builder
@@ -207,6 +209,36 @@ public final class IggyTcpClientBuilder {
      */
     public IggyTcpClientBuilder tlsCertificate(String tlsCertificatePath) {
         asyncBuilder.tlsCertificate(tlsCertificatePath);
+        return this;
+    }
+
+    /**
+     * Bounds active and retained mutations; admission waits within each call's deadline. The count also bounds
+     * the proved replay outcomes that the client keeps for later resolves.
+     */
+    public IggyTcpClientBuilder pendingOperations(int count, long bytes) {
+        asyncBuilder.pendingOperations(count, bytes);
+        return this;
+    }
+
+    /**
+     * Sets the host, port, credentials and TLS options from a connection string.
+     *
+     * <p>The format is {@code iggy://<username>:<password>@<host>:<port>?<options>}, with
+     * {@code tls=true|false} and {@code tls_ca_file=<path>} as the supported options.
+     * Settings that are not in the connection string keep their current values, so a string
+     * without {@code tls} leaves an earlier {@link #enableTls()} in place.
+     *
+     * @param connectionString the connection string, for example {@code iggy://iggy:iggy@localhost:8090?tls=true}
+     * @return this builder
+     * @throws org.apache.iggy.exception.IggyInvalidArgumentException if the connection string is invalid
+     * @see TcpConnectionString
+     */
+    public IggyTcpClientBuilder fromConnectionString(String connectionString) {
+        TcpConnectionString parsed = TcpConnectionString.parse(connectionString);
+        asyncBuilder.fromConnectionString(connectionString);
+        this.username = parsed.username();
+        this.password = parsed.password();
         return this;
     }
 

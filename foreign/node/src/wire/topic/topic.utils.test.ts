@@ -22,18 +22,15 @@ import { serializeOptions } from '../options.utils.js';
 import { HeaderValue } from '../message/header.utils.js';
 
 describe('deserializeBaseTopic', () => {
-  it('uses the 50-byte fixed layout with two options blocks', () => {
-    const fixed = Buffer.alloc(51);
+  it('uses the 33-byte fixed layout with settings in two options blocks', () => {
+    const fixed = Buffer.alloc(34);
     fixed.writeUInt32LE(7, 0);
     fixed.writeBigUInt64LE(1_710_000_000_000n, 4);
     fixed.writeUInt32LE(3, 12);
-    fixed.writeBigUInt64LE(86_400_000_000n, 16);
-    fixed.writeUInt8(2, 24);
-    fixed.writeBigUInt64LE(1_000_000n, 25);
-    fixed.writeBigUInt64LE(4096n, 33);
-    fixed.writeBigUInt64LE(12n, 41);
-    fixed.writeUInt8(1, 49);
-    fixed.write('t', 50);
+    fixed.writeBigUInt64LE(4096n, 16);
+    fixed.writeBigUInt64LE(12n, 24);
+    fixed.writeUInt8(1, 32);
+    fixed.write('t', 33);
 
     const explicit = serializeOptions([
       { key: 'message_expiry', value: HeaderValue.Uint64(86_400_000_000n) }
@@ -67,12 +64,12 @@ describe('deserializeBaseTopic', () => {
     });
   });
 
-  it('skips empty options blocks', () => {
-    const fixed = Buffer.alloc(51);
+  it('skips empty options blocks and falls back to the catalog defaults', () => {
+    const fixed = Buffer.alloc(34);
     fixed.writeUInt32LE(1, 0);
     fixed.writeUInt32LE(2, 12);
-    fixed.writeUInt8(1, 49);
-    fixed.write('t', 50);
+    fixed.writeUInt8(1, 32);
+    fixed.write('t', 33);
     const data = Buffer.concat([fixed, Buffer.alloc(8)]);
 
     const { bytesRead, data: topic } = deserializeBaseTopic(data);
@@ -81,5 +78,8 @@ describe('deserializeBaseTopic', () => {
     assert.equal(topic.partitionsCount, 2);
     assert.deepEqual(topic.options, {});
     assert.deepEqual(topic.derivedOptions, {});
+    assert.equal(topic.compressionAlgorithm, 1);
+    assert.equal(topic.messageExpiry, 0xffff_ffff_ffff_ffffn);
+    assert.equal(topic.maxTopicSize, 0xffff_ffff_ffff_ffffn);
   });
 });

@@ -23,7 +23,6 @@ components:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".cargo/**"
-      - ".config/**" # nextest + cargo-rail config gate every Rust test job
 
   # crates.io publish chain verification. Runs scripts/verify-crates-publish.sh,
   # which spins up cargo-http-registry as a local alt-registry and chain-publishes
@@ -65,6 +64,7 @@ components:
   ci-infrastructure:
     paths:
       - ".github/**"
+      - "scripts/ci/restore-runtime.sh"
 
   # Core library components that others depend on
   rust-sdk:
@@ -110,6 +110,7 @@ components:
     paths:
       - "core/binary_protocol/**"
       - "core/consensus/**"
+      - ".config/nextest.toml"
     tasks:
       - "miri"
 
@@ -161,6 +162,7 @@ components:
       - "core/partitions/**"
       - "core/shard/**" # drives the shutdown flush and boot-time partition recovery
       - "scripts/ci/storage-compat.sh"
+      - ".config/nextest.toml" # storage-compat.sh drives its own nextest run
       # The check itself, so weakening it re-runs it. Scoped to the test, the
       # module wiring that keeps it compiled in, the crate manifest and the
       # harness it drives rather than `core/integration/**`, which would fire
@@ -203,6 +205,7 @@ components:
       - "ci-infrastructure"
     paths:
       - "Dockerfile*"
+      - ".config/**" # nextest and cargo-rail configuration
       - "!foreign/**" # Exclude foreign SDKs
       - "!web/**" # Exclude web UI
     tasks:
@@ -343,7 +346,7 @@ components:
       - "foreign/swift/**"
       - "bdd/swift/**"
       - "examples/swift/**"
-    tasks: ["lint", "test", "build", "build-macos", "golden"]
+    tasks: ["lint", "test", "build", "build-macos", "golden", "e2e"]
 
   # Shared BDD infrastructure that affects all BDD tests
   bdd-infrastructure:
@@ -352,6 +355,7 @@ components:
       - "bdd/docker-compose.yml"
       - "bdd/docker-compose.server.yml"
       - "bdd/docker-compose.cluster.yml"
+      - "bdd/docker-compose.no-quorum.yml"
       - "bdd/docker-compose.coverage.yml"
 
   # Individual BDD tests per SDK - only run when specific SDK changes
@@ -564,6 +568,9 @@ components:
   # CI/CD workflow monitoring (informational, no tasks)
   ci-workflows:
     paths:
+      - ".github/config/components.yml"
+      - "scripts/ci/restore-runtime.sh"
+      - "scripts/ci/test-runtime-artifacts.py"
       - ".github/workflows/**/*.yml"
       - ".github/actions/**/*.yml"
       - ".github/ci/**/*.yml"

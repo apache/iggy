@@ -21,6 +21,8 @@ import { translateErrorCode } from './error.code.js';
 export class ResponseError extends Error {
   readonly commandCode: number;
   readonly errorCode: number;
+  fromServer = false;
+  committed = false;
 
   constructor(commandCode: number, errorCode: number, detail?: string) {
     super(

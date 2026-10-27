@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::change_log::{AppliedChange, change_actor, stream_body, topic_body};
 use crate::stm::consumer_group::{
     CompleteConsumerGroupRevocationRequest, ConsumerGroup, ConsumerGroupOwnershipTransition,
     ConsumerGroupSnapshot, JoinConsumerGroupRequest, LeaveConsumerGroupRequest,
     RefreshConsumerGroupSessionRequest, RemoveConsumerGroupMemberRequest,
+    RemoveConsumerGroupMembersRequest,
 };
 use crate::stm::id_slab::IdSlab;
 use crate::stm::lifecycle::{
@@ -26,8 +28,8 @@ use crate::stm::lifecycle::{
 };
 use crate::stm::result::{
     ApplyReply, CreatePartitionsResult, CreateStreamResult, CreateTopicResult,
-    DeletePartitionsResult, DeleteStreamResult, DeleteTopicResult, TruncatePartitionResult,
-    UpdateStreamResult, UpdateTopicResult,
+    DeletePartitionsResult, DeleteStreamResult, DeleteTopicResult, DeletedResource,
+    TruncatePartitionResult, UpdateStreamResult, UpdateTopicResult,
 };
 use crate::stm::snapshot::Snapshotable;
 use crate::stm::{ApplyContext, StateHandler};
@@ -35,11 +37,9 @@ use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::{AHashMap, AHashSet};
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
-use std::collections::{BTreeMap, BTreeSet};
-// Only `seed_namespace` (sim/test-gated) uses this at module scope, so keep the
-// import under the same gate. The test module re-imports it independently.
-#[cfg(any(test, feature = "simulator"))]
-use iggy_binary_protocol::primitives::options::WireOptions;
+use iggy_binary_protocol::primitives::metadata_changes::{
+    WireMetadataChange, WireStreamBody, WireStreamDeletedBody, WireStreamKey, WireTopicDeletedBody,
+};
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
@@ -50,8 +50,9 @@ use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsWithAssignmentsRequest, DeletePartitionsRequest,
 };
 use iggy_binary_protocol::requests::streams::{
-    CreateStreamRequest, DeleteStreamRequest, UpdateStreamRequest,
+    CreateStreamRequest, DeleteStreamRequest, RewrapStreamKeysRequest, UpdateStreamResolvedRequest,
 };
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 // Only the slab-seeding helpers build a bare `CreateTopicRequest`; without
 // their cfg the import is dead and `-p <crate>` clippy (which skips the
 // simulator feature) rejects it.
@@ -59,7 +60,7 @@ use iggy_binary_protocol::primitives::partition_history::{ConsumerGroupOwner, Pa
 #[cfg(any(test, feature = "simulator"))]
 use iggy_binary_protocol::requests::topics::CreateTopicRequest;
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicWithAssignmentsRequest, DeleteTopicRequest, UpdateTopicRequest,
+    CreateTopicWithAssignmentsRequest, DeleteTopicRequest, UpdateTopicResolvedRequest,
 };
 use iggy_binary_protocol::responses::consumer_groups::consumer_group_response::ConsumerGroupResponse;
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::{
@@ -68,17 +69,24 @@ use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::{
 use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_binary_protocol::responses::streams::get_stream::{GetStreamResponse, TopicHeader};
 use iggy_binary_protocol::responses::topics::get_topic::PartitionResponse;
-use iggy_binary_protocol::{WireIdentifier, WireName};
-use iggy_common::wire_conversions::{resource_options_from_wire, resource_options_to_wire_split};
+use iggy_binary_protocol::{WireIdentifier, WireName, WireOptions};
+use iggy_common::wire_conversions::{
+    resource_options_from_wire, resource_options_to_wire, resource_options_to_wire_split,
+};
 use iggy_common::{
-    CompressionAlgorithm, IggyByteSize, IggyExpiry, IggyTimestamp, MaxTopicSize,
-    PartitionResizePolicy, PartitionStats, ResourceOptions, StreamStats, TopicCreateOptions,
-    TopicRuntimeOptions, TopicStats, topic_option_keys,
+    HeaderKey, HeaderValue, IggyByteSize, IggyExpiry, IggyTimestamp, MaxTopicSize, OptionKey,
+    OptionValue, OptionsProvenance, OptionsScope, PartitionResizePolicy, PartitionStats,
+    ResourceOptions, StreamStats, TopicCreateOptions, TopicResolvedOptions, TopicStats, WrapSet,
+    public_options, stream_wrap_set,
 };
 use serde::{Deserialize, Serialize};
 use server_common::sharding::{IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Removals [`RemovedPartitions`] keeps. A reader that falls further behind
+/// rebuilds from the tree, which a delete of this many partitions costs anyway.
+pub(crate) const REMOVED_PARTITIONS_RETAINED: usize = 4096;
 
 /// Partition snapshot representation for serialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,14 +117,10 @@ pub struct Partition {
     /// reused the slab key, so the local partition is stale and must be torn
     /// down before rebuild.
     pub created_revision: u64,
-    /// View the admitting primary minted the create in, read off the request
-    /// body (never the prepare header, whose `view` a post-view-change
-    /// retransmit restamps per delivery). Every replica seeds the partition's
-    /// consensus group from it, so they all name the same primary: the metadata
-    /// primary at creation, which is what the roster advertises. Never above
-    /// the group's current view, since the group starts here and views only
-    /// climb, so a replica materialising late joins at or below its peers, the
-    /// floor a view-0 start used to be.
+    /// Committed initial view selected for this partition. Every replica uses
+    /// this body-carried value to seed the same primary, including late
+    /// materialisation and replay after a metadata view change. Partition
+    /// elections may advance beyond this floor without changing the assignment.
     pub created_view: u32,
     /// Replicated delete watermark: the reconciler on every replica removes
     /// sealed segments with `end_offset` below this. Advanced monotonically by
@@ -164,9 +168,6 @@ pub struct TopicSnapshot {
     pub id: usize,
     pub name: String,
     pub created_at: IggyTimestamp,
-    pub message_expiry: IggyExpiry,
-    pub compression_algorithm: CompressionAlgorithm,
-    pub max_topic_size: MaxTopicSize,
     pub stats: StatsSnapshot,
     pub partitions: Vec<PartitionSnapshot>,
     // `round_robin_counter` is intentionally NOT snapshotted. It is a local
@@ -181,6 +182,9 @@ pub struct TopicSnapshot {
     pub options: ResourceOptions,
     #[serde(default)]
     pub consumer_group_catalog_op: u64,
+    /// Metadata op that created this topic incarnation. A reused topic id
+    /// gets a new value.
+    pub created_op: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -188,13 +192,13 @@ pub struct Topic {
     pub id: usize,
     pub name: Arc<str>,
     pub created_at: IggyTimestamp,
-    pub message_expiry: IggyExpiry,
-    pub compression_algorithm: CompressionAlgorithm,
-    pub max_topic_size: MaxTopicSize,
-    /// Resolved creation options: the client's explicit keys plus the
-    /// defaults derived at admission. `partitions_count` is never stored
-    /// here; the partitions vec is the authority.
+    /// The client's explicit keys plus the defaults derived at admission, the
+    /// single source of truth for the topic's settings. `partitions_count` is
+    /// never stored here, the partitions vec is the authority. Replace it
+    /// through [`Topic::set_options`] so `resolved` follows.
     pub options: ResourceOptions,
+    /// Typed view of `options`, rebuilt whenever they change. Not persisted.
+    pub resolved: TopicResolvedOptions,
 
     pub stats: Arc<TopicStats>,
     pub partitions: Vec<Partition>,
@@ -219,6 +223,8 @@ pub struct Topic {
     /// set. A partition expects one allocation boundary per op, so a reader
     /// takes the catalog and this op from the same published state.
     pub consumer_group_catalog_op: u64,
+    /// Metadata op that created this topic incarnation.
+    pub created_op: u64,
 }
 
 impl Default for Topic {
@@ -227,10 +233,8 @@ impl Default for Topic {
             id: 0,
             name: Arc::from(""),
             created_at: IggyTimestamp::default(),
-            message_expiry: IggyExpiry::default(),
-            compression_algorithm: CompressionAlgorithm::default(),
-            max_topic_size: MaxTopicSize::default(),
             options: ResourceOptions::new(),
+            resolved: TopicResolvedOptions::from(&ResourceOptions::new()),
             stats: Arc::new(TopicStats::default()),
             partitions: Vec::new(),
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
@@ -238,27 +242,19 @@ impl Default for Topic {
             consumer_group_index: AHashMap::default(),
             next_consumer_group_id: 0,
             consumer_group_catalog_op: 0,
+            created_op: 0,
         }
     }
 }
 
 impl Topic {
-    pub fn new(
-        name: Arc<str>,
-        created_at: IggyTimestamp,
-        message_expiry: IggyExpiry,
-        compression_algorithm: CompressionAlgorithm,
-        max_topic_size: MaxTopicSize,
-        stream_stats: Arc<StreamStats>,
-    ) -> Self {
+    pub fn new(name: Arc<str>, created_at: IggyTimestamp, stream_stats: Arc<StreamStats>) -> Self {
         Self {
             id: 0,
             name,
             created_at,
-            message_expiry,
-            compression_algorithm,
-            max_topic_size,
             options: ResourceOptions::new(),
+            resolved: TopicResolvedOptions::from(&ResourceOptions::new()),
             stats: Arc::new(TopicStats::new(stream_stats)),
             partitions: Vec::new(),
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
@@ -266,7 +262,14 @@ impl Topic {
             consumer_group_index: AHashMap::default(),
             next_consumer_group_id: 0,
             consumer_group_catalog_op: 0,
+            created_op: 0,
         }
+    }
+
+    /// Replace the stored options and rebuild the typed view from them.
+    pub fn set_options(&mut self, options: ResourceOptions) {
+        self.resolved = TopicResolvedOptions::from(&options);
+        self.options = options;
     }
 
     pub fn rebalance_consumer_groups(&mut self, metadata_op: u64, timestamp: IggyTimestamp) {
@@ -299,6 +302,9 @@ pub struct StreamSnapshot {
     pub topics: Vec<(usize, TopicSnapshot)>,
     #[serde(default)]
     pub options: ResourceOptions,
+    /// Metadata op that created this stream incarnation. A reused stream id
+    /// gets a new value, so per-stream key material never carries over.
+    pub created_op: u64,
 }
 
 #[derive(Debug)]
@@ -307,6 +313,8 @@ pub struct Stream {
     pub name: Arc<str>,
     pub created_at: IggyTimestamp,
     pub options: ResourceOptions,
+    /// Metadata op that created this stream incarnation.
+    pub created_op: u64,
 
     pub stats: Arc<StreamStats>,
     pub topics: IdSlab<Topic>,
@@ -320,6 +328,7 @@ impl Default for Stream {
             name: Arc::from(""),
             created_at: IggyTimestamp::default(),
             options: ResourceOptions::default(),
+            created_op: 0,
             stats: Arc::new(StreamStats::default()),
             topics: IdSlab::new(),
             topic_index: AHashMap::default(),
@@ -334,6 +343,7 @@ impl Clone for Stream {
             name: self.name.clone(),
             created_at: self.created_at,
             options: self.options.clone(),
+            created_op: self.created_op,
             stats: self.stats.clone(),
             topics: self.topics.clone(),
             topic_index: self.topic_index.clone(),
@@ -349,6 +359,7 @@ impl Stream {
             name,
             created_at,
             options: ResourceOptions::new(),
+            created_op: 0,
             stats: Arc::new(StreamStats::default()),
             topics: IdSlab::new(),
             topic_index: AHashMap::default(),
@@ -362,6 +373,7 @@ impl Stream {
             name,
             created_at,
             options: ResourceOptions::new(),
+            created_op: 0,
             stats,
             topics: IdSlab::new(),
             topic_index: AHashMap::default(),
@@ -783,15 +795,65 @@ define_state! {
         // The keys of `lifecycle_intents` ordered by stream and topic, so a
         // blocker query visits only its own scope. Rebuilt on restore.
         pub(crate) lifecycle_scopes: BTreeSet<LifecycleScope>,
-        pub(crate) finalizing_lifecycle: bool,
+        // The context of the intent a `CompleteLifecycle` is finishing, so its
+        // delete records name the request and the requester.
+        pub(crate) finalizing_lifecycle: Option<ApplyContext>,
         // Rebuilt after membership changes and restore; ticks visit only open transitions.
         pub(crate) pending_revocations: BTreeMap<(usize, usize, u64, usize), ConsumerGroupOwnershipTransition>,
         // Locations are (stream, topic, group, member); never persisted.
         pub(crate) consumer_group_members: AHashMap<u128, Vec<(usize, usize, u64, usize)>>,
+        // Committed partitions per created view, so placement counts them
+        // without a walk. Rebuilt on restore.
+        pub(crate) created_views: BTreeMap<u32, u64>,
+        // Partitions the newest commits removed, so placement retires what it
+        // observed of them without a walk. A restore starts it empty.
+        pub(crate) removed_partitions: RemovedPartitions,
         // Shared aggregate stats, one `Arc` per stream/topic across both
         // left-right buffers (see `StatsRegistry`). Not snapshotted -- rebuilt
         // as streams/topics restore.
         pub stats_registry: Arc<StatsRegistry>,
+    }
+}
+
+/// Partitions that recent commits removed, oldest first, each stamped with
+/// the `namespace_revision` its commit set. Only the newest entries stay, so a
+/// reader that last looked before [`Self::since`] can answer must start over.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RemovedPartitions {
+    entries: VecDeque<RemovedPartition>,
+    /// Newest stamp whose entries are gone, evicted or never recorded.
+    forgotten_through: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RemovedPartition {
+    pub namespace_revision: u64,
+    pub namespace: IggyNamespace,
+    pub created_revision: u64,
+}
+
+impl RemovedPartitions {
+    /// Every partition removed after `namespace_revision`, or `None` when some
+    /// of those removals are no longer recorded.
+    pub(crate) fn since(
+        &self,
+        namespace_revision: u64,
+    ) -> Option<impl Iterator<Item = &RemovedPartition>> {
+        (self.forgotten_through <= namespace_revision).then(|| {
+            let first = self
+                .entries
+                .partition_point(|removed| removed.namespace_revision <= namespace_revision);
+            self.entries.range(first..)
+        })
+    }
+
+    fn push(&mut self, removed: RemovedPartition) {
+        if self.entries.len() == REMOVED_PARTITIONS_RETAINED
+            && let Some(evicted) = self.entries.pop_front()
+        {
+            self.forgotten_through = evicted.namespace_revision;
+        }
+        self.entries.push_back(removed);
     }
 }
 
@@ -938,10 +1000,10 @@ impl StateHandler for TruncatePartitionRequest {
 collect_handlers! {
     Streams {
         CreateStream,
-        UpdateStream,
+        UpdateStreamResolved,
         DeleteStream,
         CreateTopicWithAssignments,
-        UpdateTopic,
+        UpdateTopicResolved,
         DeleteTopic,
         CreatePartitionsWithAssignments,
         DeletePartitions,
@@ -957,8 +1019,9 @@ collect_handlers! {
         CompleteConsumerGroupRevocation,
         TruncatePartition,
         CompleteLifecycle,
+        RewrapStreamKeys,
     }
-    internal { RefreshConsumerGroupSession }
+    internal { RefreshConsumerGroupSession, RemoveConsumerGroupMembers }
 }
 
 impl StreamsInner {
@@ -989,6 +1052,24 @@ impl StreamsInner {
         }
         self.consumer_group_members
             .retain(|_, memberships| !memberships.is_empty());
+    }
+
+    /// Takes partitions a commit removed out of the placement indexes, after
+    /// that commit set `namespace_revision`.
+    fn retire_partitions(&mut self, stream_id: usize, topic_id: usize, partitions: &[Partition]) {
+        for partition in partitions {
+            if let Some(count) = self.created_views.get_mut(&partition.created_view) {
+                *count -= 1;
+                if *count == 0 {
+                    self.created_views.remove(&partition.created_view);
+                }
+            }
+            self.removed_partitions.push(RemovedPartition {
+                namespace_revision: self.namespace_revision,
+                namespace: IggyNamespace::new(stream_id, topic_id, partition.id),
+                created_revision: partition.created_revision,
+            });
+        }
     }
 
     /// Resolve a wire stream identifier to its committed slab id, `None` when
@@ -1227,10 +1308,10 @@ impl Streams {
         self.inner.read(|inner| {
             let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
             Some((
-                topic.message_expiry,
-                topic.max_topic_size,
+                topic.resolved.message_expiry,
+                topic.resolved.max_topic_size,
                 topic.partitions.len(),
-                TopicRuntimeOptions::from_resource_options(&topic.options).segment_size,
+                topic.resolved.runtime.segment_size,
             ))
         })
     }
@@ -1297,7 +1378,7 @@ impl Streams {
             let stream_slab = inner.resolve_stream_id(stream_id)?;
             let topic_slab = inner.resolve_topic_id(stream_slab, topic_id)?;
             let topic = inner.items.get(stream_slab)?.topics.get(topic_slab)?;
-            TopicRuntimeOptions::from_resource_options(&topic.options).segment_size
+            topic.resolved.runtime.segment_size
         })
     }
 
@@ -1592,16 +1673,21 @@ impl Streams {
         session: u64,
         metadata_op: u64,
         timestamp: IggyTimestamp,
-    ) {
+        actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange> {
         if session == 0
             || !self
                 .inner
                 .read(|inner| inner.consumer_group_members.contains_key(&client_id))
         {
-            return;
+            return Vec::new();
         }
         let cmd = StreamsCommand::RefreshConsumerGroupSession(
-            RefreshConsumerGroupSessionRequest { client_id, session },
+            RefreshConsumerGroupSessionRequest {
+                client_id,
+                session,
+                actor_user_id,
+            },
             timestamp,
             ApplyContext {
                 metadata_op,
@@ -1610,53 +1696,61 @@ impl Streams {
         );
         if let Err(error) = self.inner.try_apply(cmd) {
             tracing::error!(client_id, %error, "consumer session refresh dispatched to reader-only Streams STM");
+            return Vec::new();
         }
+        self.last_changes()
     }
 
     /// Drop a disconnected client from every consumer group it joined and
     /// rebalance. Applied through the left-right writer as a deterministic
     /// side-effect of the `Logout` commit on each replica (not a separate
     /// replicated op). A no-op on the reader-mode peers, where commits aren't
-    /// applied.
+    /// applied. Returns the removals' change records.
     pub fn remove_consumer_group_member(
         &self,
         client_id: u128,
         timestamp: IggyTimestamp,
         metadata_op: u64,
-    ) {
-        self.remove_consumer_group_members(&[client_id], timestamp, metadata_op);
+        actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange> {
+        self.remove_consumer_group_members(&[client_id], timestamp, metadata_op, actor_user_id)
     }
 
     /// Remove `client_ids` in order, as [`Self::remove_consumer_group_member`]
     /// would, with one publish. The removals of one op decide owners at the
     /// same generation, so a reader that installed an owner between two of
-    /// them could never install the final one.
+    /// them could never install the final one. The records come back in
+    /// canonical order, whatever the order of `client_ids`.
     pub fn remove_consumer_group_members(
         &self,
         client_ids: &[u128],
         timestamp: IggyTimestamp,
         metadata_op: u64,
-    ) {
+        actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange> {
         if client_ids.is_empty() {
-            return;
+            return Vec::new();
         }
-        let cmds = client_ids.iter().map(|&client_id| {
-            StreamsCommand::RemoveConsumerGroupMember(
-                RemoveConsumerGroupMemberRequest { client_id },
-                timestamp,
-                ApplyContext {
-                    metadata_op,
-                    ..ApplyContext::default()
-                },
-            )
-        });
-        if let Err(error) = self.inner.try_apply_all(cmds) {
+        let command = StreamsCommand::RemoveConsumerGroupMembers(
+            RemoveConsumerGroupMembersRequest {
+                client_ids: client_ids.to_vec(),
+                actor_user_id,
+            },
+            timestamp,
+            ApplyContext {
+                metadata_op,
+                ..ApplyContext::default()
+            },
+        );
+        if let Err(error) = self.inner.try_apply(command) {
             tracing::error!(
                 ?client_ids,
                 %error,
                 "remove_consumer_group_members dispatched to reader-only Streams STM"
             );
+            return Vec::new();
         }
+        self.last_changes()
     }
 
     /// Total consumer-group count across all topics (for stats).
@@ -1873,7 +1967,7 @@ impl Streams {
         stream_slab: usize,
         topic_slab: usize,
         target_partitions: &[CreatedPartitionAssignment],
-        created_view: u32,
+        durability: iggy_common::Durability,
     ) {
         let stream_wire =
             WireIdentifier::numeric(u32::try_from(stream_slab).expect("sim stream slab fits u32"));
@@ -1902,8 +1996,8 @@ impl Streams {
                             name: WireName::new(Self::seeded_topic_name(stream_slab, slab))
                                 .expect("sim topic name is valid"),
                             options: iggy_common::TopicCreateOptions {
-                                durability: iggy_common::Durability::Persisted,
-                                consumer_offset_durability: iggy_common::Durability::Persisted,
+                                durability,
+                                consumer_offset_durability: durability,
                                 ..Default::default()
                             }
                             .to_wire()
@@ -1911,7 +2005,6 @@ impl Streams {
                         },
                         derived_options: WireOptions::empty(),
                         partitions,
-                        created_view,
                     },
                     IggyTimestamp::from(1),
                     ApplyContext::default(),
@@ -1932,8 +2025,8 @@ impl Streams {
     /// the missing partition. Mirrors [`Users::ensure_root_user`](crate::stm::user::Users::ensure_root_user): a seed
     /// helper that bypasses consensus, never a production runtime path.
     ///
-    /// `created_view` stands in for the view a real create's admitting primary
-    /// mints into the request body; see [`Partition::created_view`].
+    /// `created_view` supplies each seeded assignment's initial view;
+    /// see [`Partition::created_view`].
     ///
     /// # Panics
     /// Panics if the apply is attempted on a reader handle rather than the
@@ -1945,6 +2038,27 @@ impl Streams {
         namespace: IggyNamespace,
         consensus_group_id: u64,
         created_view: u32,
+    ) {
+        self.seed_namespace_with_durability(
+            namespace,
+            consensus_group_id,
+            created_view,
+            iggy_common::Durability::Persisted,
+        );
+    }
+
+    /// [`Self::seed_namespace`] with the topic's message and consumer-offset
+    /// durability set to `durability`. Only a topic the call creates takes it.
+    ///
+    /// # Panics
+    /// As [`Self::seed_namespace`].
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn seed_namespace_with_durability(
+        &self,
+        namespace: IggyNamespace,
+        consensus_group_id: u64,
+        created_view: u32,
+        durability: iggy_common::Durability,
     ) {
         let stream_slab = namespace.stream_id();
         let topic_slab = namespace.topic_id();
@@ -1973,12 +2087,13 @@ impl Streams {
         // leave no gap for a later sibling to fall into.
         let target_partitions: Vec<_> = (0..=partition_id)
             .map(|id| CreatedPartitionAssignment {
+                initial_view: created_view,
                 partition_id: id,
                 consensus_group_id: sibling_group_id(id),
             })
             .collect();
         self.seed_stream_slabs(stream_slab);
-        self.seed_topic_slabs(stream_slab, topic_slab, &target_partitions, created_view);
+        self.seed_topic_slabs(stream_slab, topic_slab, &target_partitions, durability);
 
         if self.created_revision_for_namespace(namespace).is_some() {
             return;
@@ -1997,6 +2112,7 @@ impl Streams {
         let base = u32::try_from(base).expect("sim partition base fits u32");
         let partitions = (base..=partition_id)
             .map(|id| CreatedPartitionAssignment {
+                initial_view: created_view,
                 partition_id: id - base,
                 consensus_group_id: sibling_group_id(id),
             })
@@ -2011,7 +2127,6 @@ impl Streams {
                             .expect("sim partition count fits u32"),
                     },
                     partitions,
-                    created_view,
                 },
                 IggyTimestamp::from(1),
                 ApplyContext::default(),
@@ -2034,6 +2149,18 @@ impl Streams {
     }
 }
 
+fn count_created_views(items: &IdSlab<Stream>) -> BTreeMap<u32, u64> {
+    let mut created_views = BTreeMap::new();
+    for partition in items
+        .iter()
+        .flat_map(|(_, stream)| stream.topics.iter())
+        .flat_map(|(_, topic)| topic.partitions.iter())
+    {
+        *created_views.entry(partition.created_view).or_default() += 1;
+    }
+    created_views
+}
+
 /// Whether the next insert's slab key still fits the packed namespace layout.
 ///
 /// Takes `vacant_key()` rather than `len()` because the KEY is what gets packed
@@ -2052,7 +2179,7 @@ const fn admits_slab_key(vacant_key: usize, ceiling: usize) -> bool {
 /// A primary mints dense 0-based ids, so the vector index IS the id and the
 /// direct hit answers every ordinary topic. The scan exists only for a vector
 /// left sparse by a partition delete, where an index no longer names its id.
-fn find_partition(partitions: &[Partition], partition_id: usize) -> Option<&Partition> {
+pub(crate) fn find_partition(partitions: &[Partition], partition_id: usize) -> Option<&Partition> {
     if let Some(partition) = partitions.get(partition_id)
         && partition.id == partition_id
     {
@@ -2100,6 +2227,11 @@ impl StateHandler for CreateStreamRequest {
         let Ok(options) = resource_options_from_wire(&self.options, true) else {
             return ApplyReply::err(CreateStreamResult::InvalidOptionValue);
         };
+        // The edge replaces a client key with its wrapped form. A plaintext key
+        // reaching apply means that step was skipped, and it is never stored.
+        if options.contains_key(&HeaderKey::from(OptionKey::EncryptionKey)) {
+            return ApplyReply::err(CreateStreamResult::InvalidOptionValue);
+        }
 
         // Share one `Arc<StreamStats>` across both left-right buffers via the
         // registry (see `StatsRegistry`). The id the next insert will use is
@@ -2108,12 +2240,19 @@ impl StateHandler for CreateStreamRequest {
         if !admits_slab_key(id, MAX_STREAMS) {
             return ApplyReply::err(CreateStreamResult::TooManyStreams);
         }
+        // The reply is cached for retries and folded into snapshots, so it is
+        // projected here, before caching: internal keys such as the wrapped
+        // stream key never leave the state machine. The projections come from
+        // committed state alone, so every node caches the same reply. A replay
+        // keeps the create-time KEK fingerprints, which a later rewrap outdates.
+        let reply_options = public_reply_options(OptionsScope::Stream, &options);
         let stream_stats = state.stats_registry.stream(id);
         let stream = Stream {
             id,
             name: name_arc.clone(),
             created_at: timestamp,
             options,
+            created_op: state.apply_context.metadata_op,
             stats: stream_stats,
             topics: IdSlab::new(),
             topic_index: AHashMap::default(),
@@ -2121,11 +2260,23 @@ impl StateHandler for CreateStreamRequest {
         let inserted = state.items.insert(stream);
         debug_assert_eq!(inserted, id, "vacant_key must match the insert slot");
         state.index.insert(name_arc, id);
+        let changes = state
+            .items
+            .get(id)
+            .and_then(stream_body)
+            .map(|body| {
+                AppliedChange::new(
+                    &WireMetadataChange::StreamCreated(body),
+                    change_actor(&state.apply_context),
+                )
+            })
+            .into_iter()
+            .collect();
 
         // Reply body: a freshly created stream has no topics. The SDK
         // `create_stream` decodes a `GetStreamResponse`. Serialization is
         // local to this state machine (it owns the committed shape).
-        ApplyReply::ok(
+        let reply = ApplyReply::ok(
             GetStreamResponse {
                 stream: StreamResponse {
                     id: id as u32,
@@ -2134,49 +2285,78 @@ impl StateHandler for CreateStreamRequest {
                     size_bytes: 0,
                     messages_count: 0,
                     name: self.name.clone(),
-                    options: self.options.clone(),
+                    options: reply_options.0,
+                    derived_options: reply_options.1,
                 },
                 topics: Vec::new(),
             }
             .to_bytes(),
-        )
+        );
+        ApplyReply { changes, ..reply }
     }
 }
 
-impl StateHandler for UpdateStreamRequest {
+impl StateHandler for UpdateStreamResolvedRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
             return ApplyReply::err(UpdateStreamResult::StreamNotFound);
         };
-
         if state.lifecycle_blocks(stream_id, None) {
             return ApplyReply::err(iggy_common::IggyError::LifecycleBusy.as_code());
         }
-        let Some(stream) = state.items.get_mut(stream_id) else {
+        let Some(stream) = state.items.get(stream_id) else {
             return ApplyReply::err(UpdateStreamResult::StreamNotFound);
         };
-
-        let new_name_arc: Arc<str> = Arc::from(self.name.as_str());
-        if let Some(&existing_id) = state.index.get(&new_name_arc)
+        // Every check runs before any mutation, so a refused patch leaves the
+        // stream exactly as it was: no half-applied rename or option change.
+        let new_name: Option<Arc<str>> = self.name.as_ref().map(|name| Arc::from(name.as_str()));
+        if let Some(name) = &new_name
+            && let Some(&existing_id) = state.index.get(name)
             && existing_id != stream_id
         {
             return ApplyReply::err(UpdateStreamResult::NameAlreadyExists);
         }
-
-        // Decoded before any mutation: a malformed block must leave the stream
-        // untouched rather than half-renamed.
-        let Ok(updated_options) = resource_options_from_wire(&self.options, true) else {
-            return ApplyReply::err(UpdateStreamResult::InvalidOptionValue);
+        let options = match patched_options(
+            &stream.options,
+            &self.explicit_options,
+            &self.derived_options,
+        ) {
+            Ok(options) => options,
+            Err(PatchError::InvalidValue) => {
+                return ApplyReply::err(UpdateStreamResult::InvalidOptionValue);
+            }
+            Err(PatchError::TooLarge) => {
+                return ApplyReply::err(UpdateStreamResult::OptionsBlockTooLarge);
+            }
         };
+        let before = stream_body(stream);
 
-        state.index.remove(&stream.name);
-        stream.name = new_name_arc.clone();
-        // Patch, never replace: keys the client did not send keep their
-        // current value, so a client that predates a key cannot erase it.
-        stream.options.extend(updated_options);
-        state.index.insert(new_name_arc, stream_id);
-        ApplyReply::ok(Bytes::new())
+        let Some(stream) = state.items.get_mut(stream_id) else {
+            return ApplyReply::err(UpdateStreamResult::StreamNotFound);
+        };
+        if let Some(name) = new_name {
+            state.index.remove(&stream.name);
+            stream.name = name.clone();
+            state.index.insert(name, stream_id);
+        }
+        stream.options = options;
+        // An equal patch commits as ok but changes nothing public.
+        let after = stream_body(stream);
+        let changes = after
+            .filter(|after| before.as_ref() != Some(after))
+            .map(|body| {
+                AppliedChange::new(
+                    &WireMetadataChange::StreamUpdated(body),
+                    change_actor(&state.apply_context),
+                )
+            })
+            .into_iter()
+            .collect();
+        ApplyReply {
+            changes,
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -2194,16 +2374,35 @@ impl StateHandler for DeleteStreamRequest {
             return ApplyReply::err(DeleteStreamResult::StreamNotFound);
         };
         let name = stream.name.clone();
+        let (requested_op, actor) = state.deletion_origin();
+        let deleted = WireName::new(name.as_ref())
+            .ok()
+            .map(|wire_name| WireStreamDeletedBody {
+                key: WireStreamKey::from(stream),
+                created_at: stream.created_at.as_micros(),
+                name: wire_name,
+                requested_op,
+            });
         // Evict registry entries so a reused slab id starts with fresh stats.
         // Before the removal: the committed tree is what names the entries.
         state.stats_registry.remove_stream(stream_id, stream);
-        state.items.remove(stream_id);
+        let removed = state.items.remove(stream_id);
         state.index.remove(&name);
         state.revision = state.revision.wrapping_add(1);
         state.namespace_revision = state.revision;
+        for (topic_id, topic) in &removed.topics {
+            state.retire_partitions(stream_id, topic_id, &topic.partitions);
+        }
         // The dropped stream may have held groups with pending revocations.
         state.recompute_consumer_group_metadata();
-        ApplyReply::ok(Bytes::new())
+        ApplyReply {
+            deleted_resource: Some(DeletedResource::Stream(stream_id)),
+            changes: deleted
+                .map(|body| AppliedChange::new(&WireMetadataChange::StreamDeleted(body), actor))
+                .into_iter()
+                .collect(),
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -2304,11 +2503,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             id: topic_id,
             name: name_arc.clone(),
             created_at: timestamp,
-            message_expiry: resolved.message_expiry.unwrap_or(IggyExpiry::ServerDefault),
-            compression_algorithm: resolved.compression_algorithm.unwrap_or_default(),
-            max_topic_size: resolved
-                .max_topic_size
-                .unwrap_or(MaxTopicSize::ServerDefault),
+            resolved: TopicResolvedOptions::from(&options),
             options,
             stats: topic_stats,
             partitions: Vec::new(),
@@ -2317,6 +2512,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             consumer_group_index: AHashMap::default(),
             next_consumer_group_id: 0,
             consumer_group_catalog_op: 0,
+            created_op: state.apply_context.metadata_op,
         };
 
         let inserted = stream.topics.insert(topic);
@@ -2328,9 +2524,13 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
                     consensus_group_id: partition.consensus_group_id,
                     created_at: timestamp,
                     created_revision: new_revision,
-                    created_view: self.created_view,
+                    created_view: partition.initial_view,
                     deleted_up_to_offset: 0,
                 };
+                *state
+                    .created_views
+                    .entry(partition.created_view)
+                    .or_default() += 1;
                 topic.partitions.push(partition);
             }
         }
@@ -2340,13 +2540,37 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         let Some(topic) = stream.topics.get(topic_id) else {
             return ApplyReply::err(CreateTopicResult::StreamNotFound);
         };
-        ApplyReply::ok(encode_create_topic_reply(
-            &self.request.name,
-            topic_id,
-            topic,
-            state.apply_context.metadata_op,
-        ))
+        let changes = topic_body(stream, topic)
+            .map(|body| {
+                AppliedChange::new(
+                    &WireMetadataChange::TopicCreated(body),
+                    change_actor(&state.apply_context),
+                )
+            })
+            .into_iter()
+            .collect();
+        ApplyReply {
+            changes,
+            ..ApplyReply::ok(encode_create_topic_reply(
+                &self.request.name,
+                topic_id,
+                topic,
+                state.apply_context.metadata_op,
+            ))
+        }
     }
+}
+
+/// A create reply's option blocks: the public projection, or none for a
+/// resource this build cannot serve. The resource is stored either way, so the
+/// committed verdict never depends on the local catalog.
+pub(crate) fn public_reply_options(
+    scope: OptionsScope,
+    stored: &ResourceOptions,
+) -> (WireOptions, WireOptions) {
+    public_options(scope, stored)
+        .and_then(|public| resource_options_to_wire_split(&public))
+        .unwrap_or_else(|_| (WireOptions::empty(), WireOptions::empty()))
 }
 
 /// Encode the `CreateTopic` reply as `[TopicHeader][PartitionResponse]*`,
@@ -2366,16 +2590,11 @@ fn encode_create_topic_reply(
     let Ok(partitions_count_u32) = u32::try_from(topic.partitions.len()) else {
         return Bytes::new();
     };
-    let Ok((options, derived_options)) = resource_options_to_wire_split(&topic.options) else {
-        return Bytes::new();
-    };
+    let (options, derived_options) = public_reply_options(OptionsScope::Topic, &topic.options);
     let header = TopicHeader {
         id: topic_id_u32,
         created_at: topic.created_at.into(),
         partitions_count: partitions_count_u32,
-        message_expiry: u64::from(topic.message_expiry),
-        compression_algorithm: topic.compression_algorithm.as_code(),
-        max_topic_size: u64::from(topic.max_topic_size),
         size_bytes: 0,
         messages_count: 0,
         name: name.clone(),
@@ -2419,7 +2638,7 @@ fn encode_create_topic_reply(
     buf.freeze()
 }
 
-impl StateHandler for UpdateTopicRequest {
+impl StateHandler for UpdateTopicResolvedRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
@@ -2431,61 +2650,190 @@ impl StateHandler for UpdateTopicRequest {
         if state.lifecycle_blocks(stream_id, Some(topic_id)) {
             return ApplyReply::err(iggy_common::IggyError::LifecycleBusy.as_code());
         }
-
         let Some(stream) = state.items.get_mut(stream_id) else {
             return ApplyReply::err(UpdateTopicResult::StreamNotFound);
         };
-        let Some(topic) = stream.topics.get_mut(topic_id) else {
+        let Some(topic) = stream.topics.get(topic_id) else {
             return ApplyReply::err(UpdateTopicResult::TopicNotFound);
         };
-
-        let new_name_arc: Arc<str> = Arc::from(self.name.as_str());
-        if let Some(&existing_id) = stream.topic_index.get(&new_name_arc)
+        // Every check runs before any mutation, so a refused patch leaves the
+        // topic exactly as it was: no half-applied rename or option change.
+        // The blocks are read leniently, a key this build does not know is
+        // stored rather than refused, so the verdict never depends on the
+        // build applying it.
+        let new_name: Option<Arc<str>> = self.name.as_ref().map(|name| Arc::from(name.as_str()));
+        if let Some(name) = &new_name
+            && let Some(&existing_id) = stream.topic_index.get(name)
             && existing_id != topic_id
         {
             return ApplyReply::err(UpdateTopicResult::NameAlreadyExists);
         }
-
-        // Decoded before any mutation: a malformed block must leave the topic
-        // untouched rather than half-renamed.
-        let Ok(mut updated_options) = resource_options_from_wire(&self.options, true) else {
-            return ApplyReply::err(UpdateTopicResult::InvalidOptionValue);
+        let options = match patched_options(
+            &topic.options,
+            &self.explicit_options,
+            &self.derived_options,
+        ) {
+            Ok(options) => options,
+            Err(PatchError::InvalidValue) => {
+                return ApplyReply::err(UpdateTopicResult::InvalidOptionValue);
+            }
+            Err(PatchError::TooLarge) => {
+                return ApplyReply::err(UpdateTopicResult::OptionsBlockTooLarge);
+            }
         };
-        if self
-            .options
-            .into_iter()
-            .any(|entry| entry.key == topic_option_keys::PARTITION_RESIZE_POLICY.as_bytes())
+        // The edge floor ran on a view a delete and recreate can outrun, and
+        // `segment_size` is create-only, so the committed topic's value decides.
+        let segment_size = topic.resolved.runtime.effective_segment_size();
+        if let Some(max_topic_size) =
+            TopicCreateOptions::parse_committed(&self.explicit_options).max_topic_size
+            && !matches!(max_topic_size, MaxTopicSize::ServerDefault)
+            && max_topic_size.as_bytes_u64() < segment_size.as_bytes_u64()
         {
-            return ApplyReply::err(UpdateTopicResult::UnsupportedOptionKey);
+            return ApplyReply::err(UpdateTopicResult::InvalidTopicSize);
         }
-        // Read leniently, like every other committed op: a key this build does
-        // not know is skipped rather than failing an operation its peers
-        // accepted.
-        let updated = TopicCreateOptions::parse_committed(&self.options);
-        // Default sentinels leave both the effective value and its provenance
-        // unchanged, just as an omitted key does.
-        updated_options.retain(|key, _| match key.as_str() {
-            Ok(topic_option_keys::MESSAGE_EXPIRY) => updated.message_expiry.is_some(),
-            Ok(topic_option_keys::MAX_TOPIC_SIZE) => updated.max_topic_size.is_some(),
-            _ => true,
-        });
+        let before = topic_body(stream, topic);
 
-        stream.topic_index.remove(&topic.name);
-        topic.name = new_name_arc.clone();
-        if let Some(compression_algorithm) = updated.compression_algorithm {
-            topic.compression_algorithm = compression_algorithm;
+        let Some(topic) = stream.topics.get_mut(topic_id) else {
+            return ApplyReply::err(UpdateTopicResult::TopicNotFound);
+        };
+        if let Some(name) = new_name {
+            stream.topic_index.remove(&topic.name);
+            topic.name = name.clone();
+            stream.topic_index.insert(name, topic_id);
         }
-        if let Some(message_expiry) = updated.message_expiry {
-            topic.message_expiry = message_expiry;
+        topic.set_options(options);
+        // An equal patch commits as ok but changes nothing public.
+        let after = stream
+            .topics
+            .get(topic_id)
+            .and_then(|topic| topic_body(stream, topic));
+        let changes = after
+            .filter(|after| before.as_ref() != Some(after))
+            .map(|body| {
+                AppliedChange::new(
+                    &WireMetadataChange::TopicUpdated(body),
+                    change_actor(&state.apply_context),
+                )
+            })
+            .into_iter()
+            .collect();
+        ApplyReply {
+            changes,
+            ..ApplyReply::ok(Bytes::new())
         }
-        if let Some(max_topic_size) = updated.max_topic_size {
-            topic.max_topic_size = max_topic_size;
-        }
-        // Patch, never replace, for the stored map too.
-        topic.options.extend(updated_options);
-        stream.topic_index.insert(new_name_arc, topic_id);
-        ApplyReply::ok(Bytes::new())
     }
+}
+
+impl StateHandler for RewrapStreamKeysRequest {
+    type State = StreamsInner;
+    /// Replace the wrap set of every stream incarnation an entry still names.
+    /// An entry for a recreated stream, another key or a malformed set is
+    /// skipped, so a late or repeated rewrap never touches the wrong stream.
+    /// Reply body: the number of sets replaced, `u32` LE.
+    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
+        let mut replaced = 0u32;
+        // The record of each rewrapped stream compares its first and last
+        // state in this op, ascending by stream id.
+        let mut before: BTreeMap<usize, Option<WireStreamBody>> = BTreeMap::new();
+        for entry in &self.entries {
+            let Some(stream) = state.items.get_mut(entry.stream_id as usize) else {
+                continue;
+            };
+            if stream.created_op != entry.created_op {
+                continue;
+            }
+            let Ok(Some(stored)) = stream_wrap_set(&stream.options) else {
+                continue;
+            };
+            let Ok(set) = WrapSet::try_from(entry.wrap_set.as_ref()) else {
+                continue;
+            };
+            if stored.key_fingerprint_bytes() != entry.key_fingerprint
+                || set.key_fingerprint_bytes() != entry.key_fingerprint
+                || set.origin() != stored.origin()
+            {
+                continue;
+            }
+            let Ok(value) = HeaderValue::try_from(set.as_ref()) else {
+                continue;
+            };
+            before
+                .entry(entry.stream_id as usize)
+                .or_insert_with(|| stream_body(stream));
+            stream.options.insert(
+                HeaderKey::from(OptionKey::EncryptionKeyWrapped),
+                OptionValue::explicit(value),
+            );
+            replaced += 1;
+        }
+        let actor = change_actor(&state.apply_context);
+        let changes = before
+            .into_iter()
+            .filter_map(|(stream_id, before)| {
+                let after = state.items.get(stream_id).and_then(stream_body)?;
+                (before.as_ref() != Some(&after))
+                    .then(|| AppliedChange::new(&WireMetadataChange::StreamUpdated(after), actor))
+            })
+            .collect();
+        ApplyReply {
+            changes,
+            ..ApplyReply::ok(Bytes::copy_from_slice(&replaced.to_le_bytes()))
+        }
+    }
+}
+
+/// Why a committed patch could not be applied.
+pub(crate) enum PatchError {
+    /// A block held an entry of a known kind with the wrong payload.
+    InvalidValue,
+    /// The patched map would exceed the options block limits.
+    TooLarge,
+}
+
+/// `current` with the patch applied: derived resets first, then the explicit
+/// set entries, each replacing the stored entry of the same key. The patch's
+/// `critical_keys` names are added to the stored marker instead.
+///
+/// The size check runs on the result, against the same caps a response
+/// encoder enforces, so a stored map can always be read back. It depends only
+/// on the committed blocks and state, so every replica reaches the same
+/// verdict.
+pub(crate) fn patched_options(
+    current: &ResourceOptions,
+    explicit: &WireOptions,
+    derived: &WireOptions,
+) -> Result<ResourceOptions, PatchError> {
+    let mut explicit =
+        resource_options_from_wire(explicit, true).map_err(|_| PatchError::InvalidValue)?;
+    let derived =
+        resource_options_from_wire(derived, false).map_err(|_| PatchError::InvalidValue)?;
+    let marker_key = HeaderKey::from(OptionKey::CriticalKeys);
+    let mut options = current.clone();
+    options.extend(derived);
+    if let Some(added) = explicit.remove(&marker_key) {
+        let merged = merged_critical_marker(current.get(&marker_key), &added)?;
+        options.insert(marker_key, OptionValue::explicit(merged));
+    }
+    options.extend(explicit);
+    resource_options_to_wire(&options, OptionsProvenance::All).map_err(|_| PatchError::TooLarge)?;
+    Ok(options)
+}
+
+/// The stored marker's names joined with the patch's, sorted and unique.
+///
+/// Plain text work, never a catalog lookup, so a name this build does not know
+/// survives and every replica stores the same marker.
+fn merged_critical_marker(
+    stored: Option<&OptionValue>,
+    added: &OptionValue,
+) -> Result<HeaderValue, PatchError> {
+    let mut names = BTreeSet::new();
+    for marker in stored.into_iter().chain([added]) {
+        let text = str::from_utf8(marker.value.as_bytes()).map_err(|_| PatchError::InvalidValue)?;
+        names.extend(text.split(','));
+    }
+    let merged = names.into_iter().collect::<Vec<_>>().join(",");
+    HeaderValue::try_from(merged.as_str()).map_err(|_| PatchError::TooLarge)
 }
 
 impl StateHandler for DeleteTopicRequest {
@@ -2502,6 +2850,7 @@ impl StateHandler for DeleteTopicRequest {
         {
             return reply;
         }
+        let (requested_op, actor) = state.deletion_origin();
         let Some(stream) = state.items.get_mut(stream_id) else {
             return ApplyReply::err(DeleteTopicResult::StreamNotFound);
         };
@@ -2510,6 +2859,14 @@ impl StateHandler for DeleteTopicRequest {
             return ApplyReply::err(DeleteTopicResult::TopicNotFound);
         };
         let name = topic.name.clone();
+        let deleted = WireName::new(name.as_ref())
+            .ok()
+            .map(|wire_name| WireTopicDeletedBody {
+                key: stream.topic_key(topic),
+                created_at: topic.created_at.as_micros(),
+                name: wire_name,
+                requested_op,
+            });
         // Read the ids off the committed topic before it goes: they are what
         // names its registry entries.
         let partition_ids: Vec<usize> = topic
@@ -2517,7 +2874,7 @@ impl StateHandler for DeleteTopicRequest {
             .iter()
             .map(|partition| partition.id)
             .collect();
-        stream.topics.remove(topic_id);
+        let removed = stream.topics.remove(topic_id);
         stream.topic_index.remove(&name);
         // Roll the topic and its partitions out of the stream total and evict
         // their entries, so a reused slab id starts from zero.
@@ -2526,9 +2883,20 @@ impl StateHandler for DeleteTopicRequest {
             .remove_topic(stream_id, topic_id, &partition_ids);
         state.revision = state.revision.wrapping_add(1);
         state.namespace_revision = state.revision;
+        state.retire_partitions(stream_id, topic_id, &removed.partitions);
         // The dropped topic may have held groups with pending revocations.
         state.recompute_consumer_group_metadata();
-        ApplyReply::ok(Bytes::new())
+        ApplyReply {
+            deleted_resource: Some(DeletedResource::Topic {
+                stream_id,
+                topic_id,
+            }),
+            changes: deleted
+                .map(|body| AppliedChange::new(&WireMetadataChange::TopicDeleted(body), actor))
+                .into_iter()
+                .collect(),
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -2556,9 +2924,7 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
             let Some(topic) = stream.topics.get_mut(topic_id) else {
                 return ApplyReply::err(CreatePartitionsResult::TopicNotFound);
             };
-            if TopicCreateOptions::from_resource_options(&topic.options).partition_resize_policy
-                == Some(PartitionResizePolicy::Fixed)
-            {
+            if topic.resolved.partition_resize_policy == PartitionResizePolicy::Fixed {
                 return ApplyReply::err(CreatePartitionsResult::PartitionResizeDisabled);
             }
 
@@ -2612,23 +2978,44 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
             return ApplyReply::err(CreatePartitionsResult::TopicNotFound);
         };
         for (resolved_id_usize, partition) in resolved.into_iter().zip(self.partitions.iter()) {
+            *state
+                .created_views
+                .entry(partition.initial_view)
+                .or_default() += 1;
             topic.partitions.push(Partition {
                 id: resolved_id_usize,
                 consensus_group_id: partition.consensus_group_id,
                 created_at: timestamp,
                 created_revision: new_revision,
-                created_view: self.created_view,
+                created_view: partition.initial_view,
                 deleted_up_to_offset: 0,
             });
         }
         // Added partitions are unassigned until the groups rebalance.
         topic.rebalance_consumer_groups(state.apply_context.metadata_op, timestamp);
         state.recompute_consumer_group_metadata();
+        let changes = if self.partitions.is_empty() {
+            Vec::new()
+        } else {
+            state
+                .partitions_changed(stream_id, topic_id, Vec::new(), None)
+                .map(|body| {
+                    AppliedChange::new(
+                        &WireMetadataChange::PartitionsChanged(body),
+                        change_actor(&state.apply_context),
+                    )
+                })
+                .into_iter()
+                .collect()
+        };
 
         // Matches legacy CreatePartitions wire contract: empty-ok body on
         // success. SDK discards the reply payload (resolved ids are derivable
         // from the request's base + count).
-        ApplyReply::ok(Bytes::new())
+        ApplyReply {
+            changes,
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -2650,9 +3037,7 @@ impl StateHandler for DeletePartitionsRequest {
         };
 
         let count_to_delete = self.partitions_count as usize;
-        if TopicCreateOptions::from_resource_options(&topic.options).partition_resize_policy
-            == Some(PartitionResizePolicy::Fixed)
-        {
+        if topic.resolved.partition_resize_policy == PartitionResizePolicy::Fixed {
             return ApplyReply::err(DeletePartitionsResult::PartitionResizeDisabled);
         }
         if count_to_delete > topic.partitions.len() {
@@ -2676,16 +3061,14 @@ impl StateHandler for DeletePartitionsRequest {
         };
         // Zero count is rejected pre-consensus; a replayed legacy entry still
         // applies as the historical ok no-op.
+        let mut changes = Vec::new();
         if count_to_delete > 0 {
             let retained = topic.partitions.len() - count_to_delete;
-            // Read the ids off the tail before it goes: `retained` is a count,
-            // and only a primary that minted dense ids makes it double as an id
+            // Read the ids off the removed tail: `retained` is a count, and
+            // only a primary that minted dense ids makes it double as an id
             // threshold.
-            let removed_ids: Vec<usize> = topic.partitions[retained..]
-                .iter()
-                .map(|partition| partition.id)
-                .collect();
-            topic.partitions.truncate(retained);
+            let removed = topic.partitions.split_off(retained);
+            let removed_ids: Vec<usize> = removed.iter().map(|partition| partition.id).collect();
             // Members assigned the removed partitions must give them up.
             topic.rebalance_consumer_groups(state.apply_context.metadata_op, timestamp);
             state.recompute_consumer_group_metadata();
@@ -2696,8 +3079,25 @@ impl StateHandler for DeletePartitionsRequest {
                 .remove_partitions(stream_id, topic_id, &removed_ids);
             state.revision = state.revision.wrapping_add(1);
             state.namespace_revision = state.revision;
+            state.retire_partitions(stream_id, topic_id, &removed);
+            let (requested_op, actor) = state.deletion_origin();
+            let mut removed_ids: Vec<u32> = removed_ids
+                .iter()
+                .filter_map(|&id| u32::try_from(id).ok())
+                .collect();
+            removed_ids.sort_unstable();
+            changes.extend(
+                state
+                    .partitions_changed(stream_id, topic_id, removed_ids, requested_op)
+                    .map(|body| {
+                        AppliedChange::new(&WireMetadataChange::PartitionsChanged(body), actor)
+                    }),
+            );
         }
-        ApplyReply::ok(Bytes::new())
+        ApplyReply {
+            changes,
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -2740,9 +3140,6 @@ impl Snapshotable for Streams {
                                     id: topic.id,
                                     name: topic.name.to_string(),
                                     created_at: topic.created_at,
-                                    message_expiry: topic.message_expiry,
-                                    compression_algorithm: topic.compression_algorithm,
-                                    max_topic_size: topic.max_topic_size,
                                     options: topic.options.clone(),
                                     stats: StatsSnapshot {
                                         size_bytes: t_size,
@@ -2770,6 +3167,7 @@ impl Snapshotable for Streams {
                                         .collect(),
                                     next_consumer_group_id: topic.next_consumer_group_id,
                                     consumer_group_catalog_op: topic.consumer_group_catalog_op,
+                                    created_op: topic.created_op,
                                 },
                             )
                         })
@@ -2787,6 +3185,7 @@ impl Snapshotable for Streams {
                             },
                             topics,
                             options: stream.options.clone(),
+                            created_op: stream.created_op,
                         },
                     )
                 })
@@ -2876,9 +3275,7 @@ impl StreamsInner {
                     id: topic_snap.id,
                     name: topic_name.clone(),
                     created_at: topic_snap.created_at,
-                    message_expiry: topic_snap.message_expiry,
-                    compression_algorithm: topic_snap.compression_algorithm,
-                    max_topic_size: topic_snap.max_topic_size,
+                    resolved: TopicResolvedOptions::from(&topic_snap.options),
                     options: topic_snap.options,
                     stats: topic_stats,
                     partitions: topic_snap
@@ -2909,6 +3306,7 @@ impl StreamsInner {
                             .unwrap_or(0),
                     ),
                     consumer_group_catalog_op: topic_snap.consumer_group_catalog_op,
+                    created_op: topic_snap.created_op,
                     consumer_groups: topic_snap
                         .consumer_groups
                         .into_iter()
@@ -2927,6 +3325,7 @@ impl StreamsInner {
                 name: stream_name.clone(),
                 created_at: stream_snap.created_at,
                 options: stream_snap.options,
+                created_op: stream_snap.created_op,
                 stats: stream_stats,
                 topics,
                 topic_index,
@@ -2945,6 +3344,7 @@ impl StreamsInner {
             .values()
             .map(LifecycleIntent::scope)
             .collect();
+        let created_views = count_created_views(&items);
         let mut inner = Self {
             index,
             items,
@@ -2952,10 +3352,15 @@ impl StreamsInner {
             namespace_revision: snapshot.namespace_revision,
             lifecycle_intents,
             lifecycle_scopes,
-            finalizing_lifecycle: false,
+            finalizing_lifecycle: None,
             // Recomputed from the restored groups just below.
             pending_revocations: BTreeMap::new(),
             consumer_group_members: AHashMap::new(),
+            created_views,
+            removed_partitions: RemovedPartitions {
+                entries: VecDeque::new(),
+                forgotten_through: snapshot.namespace_revision,
+            },
             last_result: None,
             apply_context: ApplyContext::default(),
             stats_registry,
@@ -2978,11 +3383,16 @@ mod tests {
         CreatePartitionsRequest as WireCreatePartitionsRequest,
         CreatePartitionsWithAssignmentsRequest,
     };
+    use iggy_binary_protocol::requests::streams::RewrapStreamKeyEntry;
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest as WireCreateTopicRequest, CreateTopicWithAssignmentsRequest,
     };
     use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
-    use iggy_common::{HeaderKey, HeaderKind, TopicUpdateOptions, topic_option_keys};
+    use iggy_common::{
+        CompressionAlgorithm, DEFAULT_SEGMENT_SIZE, HeaderKey, HeaderKind, OptionKey, OptionValue,
+        OptionValueCodec, ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, WrappedStreamKey,
+        topic_option_keys,
+    };
     use std::str::FromStr;
 
     #[test]
@@ -3042,7 +3452,6 @@ mod tests {
             ..TopicCreateOptions::default()
         };
         let request = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: WireCreateTopicRequest {
                 stream_id: WireIdentifier::numeric(0),
                 partitions_count: 1,
@@ -3053,6 +3462,7 @@ mod tests {
             },
             derived_options: derived.to_wire().unwrap(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
             }],
@@ -3062,9 +3472,18 @@ mod tests {
 
         let stream = inner.items.get(0).unwrap();
         let (_, topic) = stream.topics.iter().next().unwrap();
-        assert_eq!(topic.message_expiry, IggyExpiry::from(5_000_000u64));
-        assert_eq!(topic.max_topic_size, MaxTopicSize::from(10_000_000_000u64));
-        assert_eq!(topic.compression_algorithm, CompressionAlgorithm::None);
+        assert_eq!(
+            topic.resolved.message_expiry,
+            IggyExpiry::from(5_000_000u64)
+        );
+        assert_eq!(
+            topic.resolved.max_topic_size,
+            MaxTopicSize::from(10_000_000_000u64)
+        );
+        assert_eq!(
+            topic.resolved.compression_algorithm,
+            CompressionAlgorithm::None
+        );
 
         // partitions_count is create-consumed, never persisted.
         assert_eq!(topic.options.len(), 5);
@@ -3092,49 +3511,86 @@ mod tests {
         );
     }
 
-    /// The seed every replica materialises a group from is the body-carried
-    /// `created_view`, minted once by the admitting primary. A header-derived
-    /// view would differ per replica after a post-view-change retransmit.
     #[test]
-    fn create_ops_record_the_body_carried_view_on_the_partition() {
+    fn given_committed_assignments_when_replaying_should_preserve_each_initial_view() {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "s");
 
         let create_topic = CreateTopicWithAssignmentsRequest {
-            created_view: 7,
             request: WireCreateTopicRequest {
                 stream_id: WireIdentifier::numeric(0),
-                partitions_count: 1,
+                partitions_count: 2,
                 name: WireName::new("t").unwrap(),
                 options: WireOptions::empty(),
             },
             derived_options: WireOptions::empty(),
-            partitions: vec![CreatedPartitionAssignment {
-                partition_id: 0,
-                consensus_group_id: 1,
-            }],
+            partitions: vec![
+                CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 1,
+                    initial_view: 7,
+                },
+                CreatedPartitionAssignment {
+                    partition_id: 1,
+                    consensus_group_id: 2,
+                    initial_view: 8,
+                },
+            ],
         };
+        let create_topic =
+            CreateTopicWithAssignmentsRequest::decode_from(&create_topic.to_bytes()).unwrap();
         let reply = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::from(1));
         assert_eq!(reply.code, 0, "create topic must succeed");
 
         let create_partitions = CreatePartitionsWithAssignmentsRequest {
-            created_view: 9,
             request: CreatePartitionsRequest {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(0),
-                partitions_count: 1,
+                partitions_count: 2,
             },
-            partitions: vec![CreatedPartitionAssignment {
-                partition_id: 0,
-                consensus_group_id: 2,
-            }],
+            partitions: vec![
+                CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 3,
+                    initial_view: 9,
+                },
+                CreatedPartitionAssignment {
+                    partition_id: 1,
+                    consensus_group_id: 4,
+                    initial_view: 10,
+                },
+            ],
         };
-        let reply = StateHandler::apply(&create_partitions, &mut inner, IggyTimestamp::from(2));
+        let committed_body = create_partitions.to_bytes();
+        let streams: Streams = inner.into();
+        let mut snapshot = MetadataSnapshot::new(1);
+        snapshot.streams = Some(streams.to_snapshot());
+        let decoded = MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
+        let mut restored =
+            StreamsInner::inner_from_snapshot(decoded.streams.unwrap(), Arc::default());
+
+        let replayed =
+            CreatePartitionsWithAssignmentsRequest::decode_from(&committed_body).unwrap();
+        let reply = StateHandler::apply(&replayed, &mut restored, IggyTimestamp::from(2));
         assert_eq!(reply.code, 0, "create partitions must succeed");
 
-        let topic = inner.items.get(0).unwrap().topics.get(0).unwrap();
-        assert_eq!(topic.partitions[0].created_view, 7);
-        assert_eq!(topic.partitions[1].created_view, 9);
+        let restored: Streams = restored.into();
+        let restored = Streams::from_snapshot(restored.to_snapshot()).unwrap();
+        let assignments = restored.read(|inner| {
+            let topic = inner.items.get(0).unwrap().topics.get(0).unwrap();
+            topic
+                .partitions
+                .iter()
+                .map(|partition| {
+                    (
+                        partition.id,
+                        partition.consensus_group_id,
+                        partition.created_view,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(assignments, [(0, 1, 7), (1, 2, 8), (2, 3, 9), (3, 4, 10)]);
     }
 
     /// A client may send the literal 0 that means "resolve the default". The
@@ -3172,7 +3628,6 @@ mod tests {
             &mut sentinel,
         );
         let request = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: WireCreateTopicRequest {
                 stream_id: WireIdentifier::numeric(0),
                 partitions_count: 1,
@@ -3181,6 +3636,7 @@ mod tests {
             },
             derived_options: derived.to_wire().unwrap(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
             }],
@@ -3192,7 +3648,10 @@ mod tests {
 
         let stream = inner.items.get(0).unwrap();
         let (_, topic) = stream.topics.iter().next().unwrap();
-        assert_eq!(topic.max_topic_size, MaxTopicSize::from(10_000_000_000u64));
+        assert_eq!(
+            topic.resolved.max_topic_size,
+            MaxTopicSize::from(10_000_000_000u64)
+        );
         let size_key = HeaderKey::from_str(topic_option_keys::MAX_TOPIC_SIZE).unwrap();
         let stored = topic.options.get(&size_key).unwrap();
         assert_eq!(
@@ -3202,14 +3661,503 @@ mod tests {
         );
     }
 
+    const OLD_CONFIG_KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
+    const NEW_CONFIG_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+    const THIRD_CONFIG_KEY: &str = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
+
+    fn key_context(key: &str, previous: &[&str]) -> ServerKeyContext {
+        let previous: Vec<String> = previous.iter().map(|key| (*key).to_owned()).collect();
+        ServerKeyContext::from_config(key, &previous, true).unwrap()
+    }
+
+    fn envelope(context: &ServerKeyContext, seed: u8, origin: StreamKeyOrigin) -> WrappedStreamKey {
+        context
+            .wrap(
+                &StreamEncryptionKey::try_from([seed; 32].as_slice()).unwrap(),
+                origin,
+            )
+            .unwrap()
+    }
+
+    fn create_encrypted_stream(inner: &mut StreamsInner, name: &str, set: &WrapSet, op: u64) {
+        let mut options = ResourceOptions::new();
+        options.insert(
+            HeaderKey::from(OptionKey::EncryptionKeyWrapped),
+            OptionValue::explicit(HeaderValue::try_from(set.as_ref()).unwrap()),
+        );
+        inner.apply_context.metadata_op = op;
+        let request = CreateStreamRequest {
+            name: WireName::new(name).unwrap(),
+            options: resource_options_to_wire(&options, OptionsProvenance::All).unwrap(),
+        };
+        assert_eq!(
+            StateHandler::apply(&request, inner, IggyTimestamp::now()).code,
+            0
+        );
+    }
+
+    fn rewrap_entry(
+        stream_id: u32,
+        created_op: u64,
+        stored: &WrapSet,
+        set: &[u8],
+    ) -> RewrapStreamKeyEntry {
+        RewrapStreamKeyEntry {
+            stream_id,
+            created_op,
+            key_fingerprint: stored.key_fingerprint_bytes().try_into().unwrap(),
+            wrap_set: Bytes::copy_from_slice(set),
+        }
+    }
+
+    fn replaced_count(reply: &ApplyReply) -> u32 {
+        u32::from_le_bytes(reply.body.as_ref().try_into().unwrap())
+    }
+
     #[test]
-    fn update_topic_sentinels_preserve_effective_options_and_provenance() {
+    fn given_stale_rewrap_entry_for_recreated_stream_when_applying_should_skip_it() {
+        let old = key_context(OLD_CONFIG_KEY, &[]);
+        let rotated = key_context(NEW_CONFIG_KEY, &[OLD_CONFIG_KEY]);
+        let mut inner = StreamsInner::new();
+        let first = WrapSet::from(envelope(&old, 1, StreamKeyOrigin::Server));
+        create_encrypted_stream(&mut inner, "orders", &first, 5);
+        let delete = DeleteStreamRequest {
+            stream_id: WireIdentifier::numeric(0),
+        };
+        assert_eq!(
+            crate::stm::lifecycle::apply_with_lifecycle_completion(
+                &delete,
+                &mut inner,
+                IggyTimestamp::now()
+            )
+            .code,
+            0
+        );
+        let second = WrapSet::from(envelope(&old, 2, StreamKeyOrigin::Server));
+        create_encrypted_stream(&mut inner, "orders", &second, 9);
+        let stale = rotated.target_set(&first).unwrap().unwrap();
+        let fresh = rotated.target_set(&second).unwrap().unwrap();
+
+        for skipped in [
+            rewrap_entry(0, 5, &first, stale.as_ref()),
+            rewrap_entry(0, 9, &first, fresh.as_ref()),
+            rewrap_entry(7, 9, &second, fresh.as_ref()),
+        ] {
+            let reply = StateHandler::apply(
+                &RewrapStreamKeysRequest {
+                    entries: vec![skipped],
+                },
+                &mut inner,
+                IggyTimestamp::now(),
+            );
+            assert_eq!(replaced_count(&reply), 0);
+            assert_eq!(
+                stream_wrap_set(&inner.items[0].options).unwrap(),
+                Some(second.clone())
+            );
+        }
+
+        let reply = StateHandler::apply(
+            &RewrapStreamKeysRequest {
+                entries: vec![rewrap_entry(0, 9, &second, fresh.as_ref())],
+            },
+            &mut inner,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(replaced_count(&reply), 1);
+        assert_eq!(
+            stream_wrap_set(&inner.items[0].options).unwrap(),
+            Some(fresh)
+        );
+    }
+
+    #[test]
+    fn given_rewrap_entry_of_earlier_incarnation_with_same_key_when_applying_should_skip_it() {
+        let old = key_context(OLD_CONFIG_KEY, &[]);
+        let rotated = key_context(NEW_CONFIG_KEY, &[OLD_CONFIG_KEY]);
+        let mut inner = StreamsInner::new();
+        let first = WrapSet::from(envelope(&old, 1, StreamKeyOrigin::Client));
+        create_encrypted_stream(&mut inner, "orders", &first, 5);
+        let delete = DeleteStreamRequest {
+            stream_id: WireIdentifier::numeric(0),
+        };
+        assert_eq!(
+            crate::stm::lifecycle::apply_with_lifecycle_completion(
+                &delete,
+                &mut inner,
+                IggyTimestamp::now()
+            )
+            .code,
+            0
+        );
+        let second = WrapSet::from(envelope(&old, 1, StreamKeyOrigin::Client));
+        create_encrypted_stream(&mut inner, "orders", &second, 9);
+        let stale = rotated
+            .target_set(&first)
+            .expect("rewrap target builds")
+            .expect("first set lacks the new KEK");
+
+        let reply = StateHandler::apply(
+            &RewrapStreamKeysRequest {
+                entries: vec![rewrap_entry(0, 5, &first, stale.as_ref())],
+            },
+            &mut inner,
+            IggyTimestamp::now(),
+        );
+
+        assert_eq!(replaced_count(&reply), 0);
+        assert_eq!(
+            stream_wrap_set(&inner.items[0].options).expect("stored set decodes"),
+            Some(second)
+        );
+    }
+
+    #[test]
+    fn given_rewrap_entry_of_another_key_when_applying_should_skip_it() {
+        let old = key_context(OLD_CONFIG_KEY, &[]);
+        let rotated = key_context(NEW_CONFIG_KEY, &[OLD_CONFIG_KEY]);
+        let mut inner = StreamsInner::new();
+        let stored = WrapSet::from(envelope(&old, 3, StreamKeyOrigin::Server));
+        create_encrypted_stream(&mut inner, "payments", &stored, 4);
+        let before = inner.items[0].options.clone();
+        let other = WrapSet::from(envelope(&old, 9, StreamKeyOrigin::Server));
+        let other_rewrapped = rotated
+            .target_set(&other)
+            .expect("rewrap target builds")
+            .expect("other set lacks the new KEK");
+
+        let reply = StateHandler::apply(
+            &RewrapStreamKeysRequest {
+                entries: vec![rewrap_entry(0, 4, &other, other_rewrapped.as_ref())],
+            },
+            &mut inner,
+            IggyTimestamp::now(),
+        );
+
+        assert_eq!(replaced_count(&reply), 0);
+        assert_eq!(inner.items[0].options, before);
+    }
+
+    #[test]
+    fn given_malformed_rewrap_set_when_applying_should_skip_without_mutation() {
+        let old = key_context(OLD_CONFIG_KEY, &[]);
+        let new = key_context(NEW_CONFIG_KEY, &[]);
+        let third = key_context(THIRD_CONFIG_KEY, &[]);
+        let mut inner = StreamsInner::new();
+        let stored = WrapSet::from(envelope(&old, 3, StreamKeyOrigin::Client));
+        create_encrypted_stream(&mut inner, "payments", &stored, 4);
+        let before = inner.items[0].options.clone();
+        let same_key = |context: &ServerKeyContext| envelope(context, 3, StreamKeyOrigin::Client);
+        let mut sorted = vec![same_key(&old), same_key(&new), same_key(&third)];
+        sorted.sort_by_key(WrappedStreamKey::kek_fingerprint);
+        let concat = |envelopes: &[WrappedStreamKey]| -> Vec<u8> {
+            envelopes
+                .iter()
+                .flat_map(|envelope| envelope.as_ref().to_vec())
+                .collect()
+        };
+        let mut reversed = sorted[..2].to_vec();
+        reversed.reverse();
+        let malformed = [
+            Vec::new(),
+            concat(&reversed),
+            concat(&[same_key(&old), same_key(&old)]),
+            concat(&[same_key(&old), envelope(&new, 9, StreamKeyOrigin::Client)]),
+            concat(&[same_key(&old), envelope(&new, 3, StreamKeyOrigin::Server)]),
+            concat(
+                &[
+                    sorted.clone(),
+                    vec![envelope(&new, 3, StreamKeyOrigin::Client)],
+                ]
+                .concat(),
+            ),
+        ];
+        for set in malformed {
+            let reply = StateHandler::apply(
+                &RewrapStreamKeysRequest {
+                    entries: vec![rewrap_entry(0, 4, &stored, &set)],
+                },
+                &mut inner,
+                IggyTimestamp::now(),
+            );
+            assert_eq!(replaced_count(&reply), 0, "{} bytes", set.len());
+            assert_eq!(inner.items[0].options, before);
+        }
+    }
+
+    #[test]
+    fn given_well_formed_set_of_other_key_or_origin_when_rewrapping_should_skip_it() {
+        let old = key_context(OLD_CONFIG_KEY, &[]);
+        let new = key_context(NEW_CONFIG_KEY, &[]);
+        let mut inner = StreamsInner::new();
+        let stored = WrapSet::from(envelope(&old, 3, StreamKeyOrigin::Client));
+        create_encrypted_stream(&mut inner, "payments", &stored, 4);
+        let before = inner.items[0].options.clone();
+        let other_key = WrapSet::from(envelope(&new, 9, StreamKeyOrigin::Client));
+        let relabeled = WrapSet::from(envelope(&new, 3, StreamKeyOrigin::Server));
+        let rewrapped = WrapSet::from(envelope(&new, 3, StreamKeyOrigin::Client));
+
+        let mut replaced = Vec::new();
+        for set in [&other_key, &relabeled] {
+            let reply = StateHandler::apply(
+                &RewrapStreamKeysRequest {
+                    entries: vec![rewrap_entry(0, 4, &stored, set.as_ref())],
+                },
+                &mut inner,
+                IggyTimestamp::now(),
+            );
+            replaced.push(replaced_count(&reply));
+            assert_eq!(inner.items[0].options, before);
+        }
+        let reply = StateHandler::apply(
+            &RewrapStreamKeysRequest {
+                entries: vec![rewrap_entry(0, 4, &stored, rewrapped.as_ref())],
+            },
+            &mut inner,
+            IggyTimestamp::now(),
+        );
+        replaced.push(replaced_count(&reply));
+        assert_eq!(replaced, [0, 0, 1]);
+        assert_eq!(
+            stream_wrap_set(&inner.items[0].options).unwrap(),
+            Some(rewrapped)
+        );
+    }
+
+    #[test]
+    fn given_plaintext_stream_key_when_applying_create_should_refuse_without_storing() {
+        let mut options = ResourceOptions::new();
+        options.insert(
+            HeaderKey::from(OptionKey::EncryptionKey),
+            OptionValue::explicit(HeaderValue::try_from([7u8; 32].as_slice()).unwrap()),
+        );
+        let request = CreateStreamRequest {
+            name: WireName::new("secrets").unwrap(),
+            options: resource_options_to_wire(&options, OptionsProvenance::All).unwrap(),
+        };
+        let mut inner = StreamsInner::new();
+
+        let reply = StateHandler::apply(&request, &mut inner, IggyTimestamp::now());
+
+        assert_eq!(
+            reply.code,
+            u32::from(CreateStreamResult::InvalidOptionValue)
+        );
+        assert!(inner.items.is_empty());
+        assert!(inner.index.is_empty());
+    }
+
+    #[test]
+    fn given_topic_with_retention_when_restoring_snapshot_should_rebuild_resolved_view() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let message_expiry = IggyExpiry::from(5_000_000u64);
+        let max_topic_size = MaxTopicSize::from(10_000_000_000u64);
+        let segment_size = IggyByteSize::from(64 * 1024 * 1024);
+        let create = CreateTopicWithAssignmentsRequest {
+            request: WireCreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                name: WireName::new("topic").unwrap(),
+                options: TopicCreateOptions {
+                    message_expiry: Some(message_expiry),
+                    ..TopicCreateOptions::default()
+                }
+                .to_explicit_wire(|key| key == topic_option_keys::MESSAGE_EXPIRY)
+                .unwrap(),
+            },
+            derived_options: TopicCreateOptions {
+                max_topic_size: Some(max_topic_size),
+                segment_size: Some(segment_size),
+                ..TopicCreateOptions::default()
+            }
+            .to_wire()
+            .unwrap(),
+            partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+        };
+        assert_eq!(
+            StateHandler::apply(&create, &mut inner, IggyTimestamp::from(1)).code,
+            0
+        );
+        let streams: Streams = inner.into();
+        let mut snapshot = MetadataSnapshot::new(1);
+        snapshot.streams = Some(streams.to_snapshot());
+        let decoded = MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
+
+        let restored = Streams::from_snapshot(decoded.streams.unwrap()).unwrap();
+
+        assert_eq!(
+            restored.topic_retention_config(0, 0).unwrap(),
+            (message_expiry, max_topic_size, 1, Some(segment_size))
+        );
+        assert_eq!(
+            restored.topic_segment_size(&WireIdentifier::numeric(0), &WireIdentifier::numeric(0)),
+            Some(segment_size)
+        );
+    }
+
+    #[test]
+    fn given_stored_critical_marker_when_patch_declares_more_keys_should_store_the_bounded_union() {
+        let marker_key = HeaderKey::from(OptionKey::CriticalKeys);
+        let marker = |text: &str| OptionValue::explicit(HeaderValue::try_from(text).unwrap());
+        let update = |names: &str| {
+            let mut explicit = ResourceOptions::new();
+            explicit.insert(marker_key.clone(), marker(names));
+            UpdateStreamResolvedRequest {
+                stream_id: WireIdentifier::numeric(0),
+                name: None,
+                explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All)
+                    .unwrap(),
+                derived_options: WireOptions::empty(),
+            }
+        };
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        inner.items[0]
+            .options
+            .insert(marker_key.clone(), marker("encryption_key_wrapped"));
+
+        let reply = StateHandler::apply(&update("a_future_key"), &mut inner, IggyTimestamp::now());
+        assert_eq!(reply.code, 0);
+        let merged = marker("a_future_key,encryption_key_wrapped");
+        assert_eq!(inner.items[0].options.get(&marker_key), Some(&merged));
+
+        let reply =
+            StateHandler::apply(&update(&"z".repeat(230)), &mut inner, IggyTimestamp::now());
+        assert_eq!(
+            reply.code,
+            u32::from(UpdateStreamResult::OptionsBlockTooLarge)
+        );
+        assert_eq!(inner.items[0].options.get(&marker_key), Some(&merged));
+    }
+
+    #[test]
+    fn given_internal_or_unservable_topic_options_when_creating_should_not_echo_them() {
+        let marker_key = HeaderKey::from(OptionKey::CriticalKeys);
+        let wrapped_key = HeaderKey::from(OptionKey::EncryptionKeyWrapped);
+        let future_key = HeaderKey::try_from("a_future_key").unwrap();
+        let marker = |text: &str| OptionValue::explicit(HeaderValue::try_from(text).unwrap());
+        let set = WrapSet::from(envelope(
+            &key_context(OLD_CONFIG_KEY, &[]),
+            1,
+            StreamKeyOrigin::Server,
+        ));
+        let mut servable = ResourceOptions::new();
+        servable.insert(marker_key.clone(), marker("encryption_key_wrapped"));
+        servable.insert(
+            wrapped_key.clone(),
+            OptionValue::explicit(HeaderValue::try_from(set.as_ref()).unwrap()),
+        );
+        let mut unservable = ResourceOptions::new();
+        unservable.insert(marker_key.clone(), marker("a_future_key"));
+        unservable.insert(
+            future_key.clone(),
+            OptionValue::explicit(HeaderValue::from(7u64)),
+        );
+
+        for stored in [servable, unservable] {
+            let mut inner = StreamsInner::new();
+            create_stream(&mut inner, "stream");
+            let create = CreateTopicWithAssignmentsRequest {
+                request: make_topic_request(0, 1, "topic"),
+                derived_options: resource_options_to_wire(&stored, OptionsProvenance::All).unwrap(),
+                partitions: vec![CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 1,
+                    initial_view: 0,
+                }],
+            };
+
+            let apply = StateHandler::apply(&create, &mut inner, IggyTimestamp::now());
+
+            assert_eq!(apply.code, 0);
+            assert!(inner.items[0].topics[0].options.contains_key(&marker_key));
+            let (reply, _) = GetTopicResponse::decode(&apply.body).unwrap();
+            let echoed: Vec<HeaderKey> = resource_options_from_wire(&reply.topic.options, true)
+                .unwrap()
+                .into_keys()
+                .chain(
+                    resource_options_from_wire(&reply.topic.derived_options, false)
+                        .unwrap()
+                        .into_keys(),
+                )
+                .collect();
+            for hidden in [&marker_key, &wrapped_key, &future_key] {
+                assert!(!echoed.contains(hidden), "{echoed:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn given_unknown_critical_key_when_applying_create_stream_should_store_it_without_echoing_options()
+     {
+        let mut options = ResourceOptions::new();
+        options.insert(
+            HeaderKey::from(OptionKey::CriticalKeys),
+            OptionValue::explicit(HeaderValue::try_from("a_future_key").unwrap()),
+        );
+        options.insert(
+            HeaderKey::try_from("a_future_key").unwrap(),
+            OptionValue::explicit(HeaderValue::from(7u64)),
+        );
+        let request = CreateStreamRequest {
+            name: WireName::new("future").unwrap(),
+            options: resource_options_to_wire(&options, OptionsProvenance::All).unwrap(),
+        };
+        let mut inner = StreamsInner::new();
+
+        let reply = StateHandler::apply(&request, &mut inner, IggyTimestamp::now());
+
+        assert_eq!(reply.code, 0);
+        assert_eq!(inner.items[0].options, options);
+        let (response, _) = GetStreamResponse::decode(&reply.body).unwrap();
+        assert_eq!(
+            (response.stream.options, response.stream.derived_options),
+            (WireOptions::empty(), WireOptions::empty())
+        );
+    }
+
+    #[test]
+    fn given_reused_stream_id_when_creating_should_have_distinct_created_op() {
+        let mut inner = StreamsInner::new();
+        let timestamp = IggyTimestamp::from(1);
+        let create = CreateStreamRequest {
+            name: WireName::new("orders").unwrap(),
+            options: WireOptions::empty(),
+        };
+        inner.apply_context.metadata_op = 5;
+        assert_eq!(StateHandler::apply(&create, &mut inner, timestamp).code, 0);
+        let first = inner.items[0].created_op;
+
+        inner.apply_context.metadata_op = 6;
+        let delete = DeleteStreamRequest {
+            stream_id: WireIdentifier::numeric(0),
+        };
+        assert_eq!(
+            crate::stm::lifecycle::apply_with_lifecycle_completion(&delete, &mut inner, timestamp)
+                .code,
+            0
+        );
+        assert!(inner.items.get(0).is_none());
+
+        inner.apply_context.metadata_op = 7;
+        assert_eq!(StateHandler::apply(&create, &mut inner, timestamp).code, 0);
+        let recreated = &inner.items[0];
+        assert_eq!(recreated.created_at, timestamp);
+        assert_eq!((first, recreated.created_op), (5, 7));
+    }
+
+    #[test]
+    fn given_rename_only_patch_when_applying_should_preserve_options_and_provenance() {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         let message_expiry = IggyExpiry::from(5_000_000u64);
         let max_topic_size = MaxTopicSize::from(10_000_000_000u64);
         let create = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: WireCreateTopicRequest {
                 stream_id: WireIdentifier::numeric(0),
                 partitions_count: 1,
@@ -3230,59 +4178,241 @@ mod tests {
             partitions: vec![CreatedPartitionAssignment {
                 partition_id: 0,
                 consensus_group_id: 1,
+                initial_view: 0,
             }],
         };
         assert_eq!(
             StateHandler::apply(&create, &mut inner, IggyTimestamp::from(1)).code,
             0
         );
-        let original_options = inner
-            .items
-            .get(0)
-            .unwrap()
-            .topics
-            .get(0)
-            .unwrap()
-            .options
-            .clone();
+        let original_options = inner.items[0].topics[0].options.clone();
 
-        for options in [
-            TopicUpdateOptions::default(),
-            TopicUpdateOptions {
-                message_expiry: Some(IggyExpiry::ServerDefault),
-                max_topic_size: Some(MaxTopicSize::ServerDefault),
-                ..TopicUpdateOptions::default()
-            },
-            TopicUpdateOptions {
-                raw: [
-                    topic_option_keys::MESSAGE_EXPIRY,
-                    topic_option_keys::MAX_TOPIC_SIZE,
-                ]
-                .into_iter()
-                .map(|key| (key.to_owned(), "server_default".to_owned()))
-                .collect(),
-                ..TopicUpdateOptions::default()
-            },
-        ] {
-            let update = UpdateTopicRequest {
+        let update = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: Some(WireName::new("renamed").unwrap()),
+            explicit_options: WireOptions::empty(),
+            derived_options: WireOptions::empty(),
+        };
+        assert_eq!(
+            StateHandler::apply(&update, &mut inner, IggyTimestamp::from(2)).code,
+            0
+        );
+        let topic = &inner.items[0].topics[0];
+        assert_eq!(topic.name.as_ref(), "renamed");
+        assert_eq!(topic.resolved.message_expiry, message_expiry);
+        assert_eq!(topic.resolved.max_topic_size, max_topic_size);
+        assert_eq!(topic.options, original_options);
+    }
+
+    #[test]
+    fn given_topic_patch_without_name_when_applying_should_preserve_name_and_other_keys() {
+        let mut inner = streams_with_resize_policy(Some(PartitionResizePolicy::Mutable));
+        let before = inner.items[0].topics[0].options.clone();
+        let expiry = IggyExpiry::from(9_000_000u64);
+        let mut explicit = ResourceOptions::new();
+        explicit.insert(
+            HeaderKey::from(OptionKey::MessageExpiry),
+            OptionValue::explicit(expiry.encode().unwrap()),
+        );
+        let update = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All).unwrap(),
+            derived_options: WireOptions::empty(),
+        };
+        assert_eq!(
+            StateHandler::apply(&update, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+        let topic = &inner.items[0].topics[0];
+        assert_eq!(topic.name.as_ref(), "topic");
+        assert_eq!(topic.resolved.message_expiry, expiry);
+        let mut expected = before;
+        expected.extend(explicit);
+        assert_eq!(topic.options, expected);
+    }
+
+    #[test]
+    fn given_explicit_topic_key_when_resetting_should_store_primary_default_as_derived() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let create = CreateTopicWithAssignmentsRequest {
+            request: WireCreateTopicRequest {
                 stream_id: WireIdentifier::numeric(0),
-                topic_id: WireIdentifier::numeric(0),
-                name: WireName::new("renamed").unwrap(),
-                options: options.to_wire().unwrap(),
+                partitions_count: 1,
+                name: WireName::new("topic").unwrap(),
+                options: TopicCreateOptions {
+                    max_topic_size: Some(MaxTopicSize::from(10_000_000_000u64)),
+                    ..TopicCreateOptions::default()
+                }
+                .to_explicit_wire(|key| key == topic_option_keys::MAX_TOPIC_SIZE)
+                .unwrap(),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+                initial_view: 0,
+            }],
+        };
+        assert_eq!(
+            StateHandler::apply(&create, &mut inner, IggyTimestamp::from(1)).code,
+            0
+        );
+        let default = OptionKey::MaxTopicSize
+            .descriptor()
+            .default_value()
+            .unwrap()
+            .unwrap();
+        let mut derived = ResourceOptions::new();
+        derived.insert(
+            HeaderKey::from(OptionKey::MaxTopicSize),
+            OptionValue::derived(default.clone()),
+        );
+        let update = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: WireOptions::empty(),
+            derived_options: resource_options_to_wire(&derived, OptionsProvenance::All).unwrap(),
+        };
+        assert_eq!(
+            StateHandler::apply(&update, &mut inner, IggyTimestamp::from(2)).code,
+            0
+        );
+        let topic = &inner.items[0].topics[0];
+        let stored = &topic.options[&HeaderKey::from(OptionKey::MaxTopicSize)];
+        assert_eq!(stored, &OptionValue::derived(default));
+        assert_eq!(
+            topic.resolved.max_topic_size,
+            MaxTopicSize::from(iggy_common::DEFAULT_MAX_TOPIC_SIZE)
+        );
+    }
+
+    #[test]
+    fn given_conflicting_rename_with_patch_when_applying_should_leave_state_unchanged() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        for name in ["first", "second"] {
+            let create = CreateTopicWithAssignmentsRequest {
+                request: make_topic_request(0, 1, name),
+                derived_options: WireOptions::empty(),
+                partitions: vec![CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 1,
+                    initial_view: 0,
+                }],
             };
             assert_eq!(
-                StateHandler::apply(&update, &mut inner, IggyTimestamp::from(2)).code,
+                StateHandler::apply(&create, &mut inner, IggyTimestamp::now()).code,
                 0
             );
-            let topic = inner.items.get(0).unwrap().topics.get(0).unwrap();
-            assert_eq!(topic.name.as_ref(), "renamed");
-            assert_eq!(topic.message_expiry, message_expiry);
-            assert_eq!(topic.max_topic_size, max_topic_size);
-            assert_eq!(
-                topic.options, original_options,
-                "update {options:?} must preserve values and provenance"
-            );
         }
+        let before = inner.items[0].topics[0].options.clone();
+        let index_before = inner.items[0].topic_index.clone();
+        let mut explicit = ResourceOptions::new();
+        explicit.insert(
+            HeaderKey::from(OptionKey::MessageExpiry),
+            OptionValue::explicit(IggyExpiry::from(1_000_000u64).encode().unwrap()),
+        );
+        let update = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: Some(WireName::new("second").unwrap()),
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All).unwrap(),
+            derived_options: WireOptions::empty(),
+        };
+        assert_eq!(
+            StateHandler::apply(&update, &mut inner, IggyTimestamp::now()).code,
+            u32::from(UpdateTopicResult::NameAlreadyExists)
+        );
+        let topic = &inner.items[0].topics[0];
+        assert_eq!(topic.name.as_ref(), "first");
+        assert_eq!(topic.options, before);
+        assert_eq!(inner.items[0].topic_index, index_before);
+
+        let rename_stream = UpdateStreamResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            name: Some(WireName::new("renamed-stream").unwrap()),
+            explicit_options: WireOptions::empty(),
+            derived_options: WireOptions::empty(),
+        };
+        assert_eq!(
+            StateHandler::apply(&rename_stream, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+        assert_eq!(inner.items[0].name.as_ref(), "renamed-stream");
+        assert_eq!(
+            inner.resolve_stream_id(&WireIdentifier::named("renamed-stream").unwrap()),
+            Some(0)
+        );
+        assert_eq!(
+            inner.resolve_stream_id(&WireIdentifier::named("stream").unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn given_cap_below_topic_segment_size_when_applying_update_should_refuse_it_unchanged() {
+        let segment_size = 64 * 1024 * 1024;
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let mut request = make_topic_request(0, 1, "topic");
+        request.options = TopicCreateOptions {
+            segment_size: Some(IggyByteSize::from(segment_size)),
+            ..TopicCreateOptions::default()
+        }
+        .to_explicit_wire(|key| key == topic_option_keys::SEGMENT_SIZE)
+        .unwrap();
+        let create = CreateTopicWithAssignmentsRequest {
+            request,
+            derived_options: WireOptions::empty(),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+                initial_view: 0,
+            }],
+        };
+        assert_eq!(
+            StateHandler::apply(&create, &mut inner, IggyTimestamp::from(1)).code,
+            0
+        );
+        let before = inner.items[0].topics[0].options.clone();
+
+        let below = topic_cap_update(segment_size - 1, Some("renamed"));
+        assert_eq!(
+            StateHandler::apply(&below, &mut inner, IggyTimestamp::from(2)).code,
+            u32::from(UpdateTopicResult::InvalidTopicSize)
+        );
+        let topic = &inner.items[0].topics[0];
+        assert_eq!(topic.name.as_ref(), "topic");
+        assert_eq!(topic.options, before);
+
+        let at_floor = topic_cap_update(segment_size, Some("renamed"));
+        assert_eq!(
+            StateHandler::apply(&at_floor, &mut inner, IggyTimestamp::from(3)).code,
+            0
+        );
+        let topic = &inner.items[0].topics[0];
+        assert_eq!(topic.name.as_ref(), "renamed");
+        assert_eq!(
+            topic.resolved.max_topic_size,
+            MaxTopicSize::from(segment_size)
+        );
+    }
+
+    #[test]
+    fn given_topic_without_segment_size_when_applying_cap_below_default_should_refuse_it() {
+        let mut inner = streams_with_resize_policy(None);
+        let before = inner.items[0].topics[0].options.clone();
+        let update = topic_cap_update(DEFAULT_SEGMENT_SIZE - 1, None);
+        assert_eq!(
+            StateHandler::apply(&update, &mut inner, IggyTimestamp::now()).code,
+            u32::from(UpdateTopicResult::InvalidTopicSize)
+        );
+        assert_eq!(inner.items[0].topics[0].options, before);
     }
 
     #[test]
@@ -3349,15 +4479,16 @@ mod tests {
         .to_wire()
         .unwrap();
         let created = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request,
             derived_options: WireOptions::empty(),
             partitions: vec![
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 1,
                 },
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 1,
                     consensus_group_id: 2,
                 },
@@ -3368,6 +4499,21 @@ mod tests {
             0
         );
         inner
+    }
+
+    fn topic_cap_update(max_topic_size: u64, name: Option<&str>) -> UpdateTopicResolvedRequest {
+        UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: name.map(|name| WireName::new(name).unwrap()),
+            explicit_options: TopicCreateOptions {
+                max_topic_size: Some(MaxTopicSize::from(max_topic_size)),
+                ..TopicCreateOptions::default()
+            }
+            .to_explicit_wire(|key| key == topic_option_keys::MAX_TOPIC_SIZE)
+            .unwrap(),
+            derived_options: WireOptions::empty(),
+        }
     }
 
     #[test]
@@ -3386,13 +4532,13 @@ mod tests {
                 StreamsInner::inner_from_snapshot(decoded.streams.unwrap(), Arc::default());
             let revision = restored.revision;
             let create = CreatePartitionsWithAssignmentsRequest {
-                created_view: 0,
                 request: WireCreatePartitionsRequest {
                     stream_id: WireIdentifier::numeric(0),
                     topic_id: WireIdentifier::numeric(0),
                     partitions_count: 1,
                 },
                 partitions: vec![CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 3,
                 }],
@@ -3447,41 +4593,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn given_resize_policy_when_updating_in_ordered_apply_should_reject_without_renaming() {
-        for policy in [PartitionResizePolicy::Mutable, PartitionResizePolicy::Fixed] {
-            let mut inner = streams_with_resize_policy(Some(policy));
-            let replacement = if policy == PartitionResizePolicy::Fixed {
-                PartitionResizePolicy::Mutable
-            } else {
-                PartitionResizePolicy::Fixed
-            };
-            let update = UpdateTopicRequest {
-                stream_id: WireIdentifier::numeric(0),
-                topic_id: WireIdentifier::numeric(0),
-                name: WireName::new("renamed").unwrap(),
-                options: TopicCreateOptions {
-                    partition_resize_policy: Some(replacement),
-                    ..TopicCreateOptions::default()
-                }
-                .to_wire()
-                .unwrap(),
-            };
-            let revision = inner.revision;
-            assert_eq!(
-                StateHandler::apply(&update, &mut inner, IggyTimestamp::now()).code,
-                u32::from(UpdateTopicResult::UnsupportedOptionKey),
-            );
-            assert_eq!(inner.items[0].topics[0].name.as_ref(), "topic");
-            assert_eq!(
-                TopicCreateOptions::from_resource_options(&inner.items[0].topics[0].options)
-                    .partition_resize_policy,
-                Some(policy),
-            );
-            assert_eq!(inner.revision, revision);
-        }
-    }
-
     /// Regression guard for the [`StreamsSnapshot`] serialized-form invariant: a
     /// populated snapshot must re-encode byte-identically after a decode, or the
     /// checkpoint checksum cross-check (`recovery::verify_checkpoint_pairing`) would
@@ -3499,15 +4610,16 @@ mod tests {
         for stream_id in 0..2u32 {
             for topic_name in ["logs", "events"] {
                 let create_topic = CreateTopicWithAssignmentsRequest {
-                    created_view: 0,
                     request: make_topic_request(stream_id, 2, topic_name),
                     derived_options: WireOptions::empty(),
                     partitions: vec![
                         CreatedPartitionAssignment {
+                            initial_view: 0,
                             partition_id: 0,
                             consensus_group_id: 1,
                         },
                         CreatedPartitionAssignment {
+                            initial_view: 0,
                             partition_id: 1,
                             consensus_group_id: 2,
                         },
@@ -3568,15 +4680,16 @@ mod tests {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         let create_topic = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: make_topic_request(0, 2, "topic"),
             derived_options: WireOptions::empty(),
             partitions: vec![
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 1,
                 },
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 1,
                     consensus_group_id: 2,
                 },
@@ -3597,15 +4710,16 @@ mod tests {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         let create_topic = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: make_topic_request(0, 2, "topic"),
             derived_options: WireOptions::empty(),
             partitions: vec![
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 10,
                 },
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 1,
                     consensus_group_id: 11,
                 },
@@ -3614,7 +4728,6 @@ mod tests {
         let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
 
         let create_partitions = CreatePartitionsWithAssignmentsRequest {
-            created_view: 0,
             request: WireCreatePartitionsRequest {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(0),
@@ -3622,10 +4735,12 @@ mod tests {
             },
             partitions: vec![
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 12,
                 },
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 1,
                     consensus_group_id: 13,
                 },
@@ -3654,15 +4769,16 @@ mod tests {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         let create_topic = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: make_topic_request(0, 2, "topic"),
             derived_options: WireOptions::empty(),
             partitions: vec![
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 100,
                 },
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 1,
                     consensus_group_id: 101,
                 },
@@ -3689,15 +4805,16 @@ mod tests {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         let create_topic = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: make_topic_request(0, 2, "topic"),
             derived_options: WireOptions::empty(),
             partitions: vec![
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 50,
                 },
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 1,
                     consensus_group_id: 51,
                 },
@@ -3706,7 +4823,6 @@ mod tests {
         let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
 
         let create_partitions = CreatePartitionsWithAssignmentsRequest {
-            created_view: 0,
             request: WireCreatePartitionsRequest {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(0),
@@ -3716,10 +4832,12 @@ mod tests {
             // two topic-creation partitions), so resolved ids are 2 and 3.
             partitions: vec![
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 60,
                 },
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 1,
                     consensus_group_id: 61,
                 },
@@ -3744,13 +4862,13 @@ mod tests {
         create_stream(&mut inner, "stream");
         // Topic missing => validation failure path
         let create_partitions = CreatePartitionsWithAssignmentsRequest {
-            created_view: 0,
             request: WireCreatePartitionsRequest {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(99),
                 partitions_count: 1,
             },
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
             }],
@@ -3787,11 +4905,11 @@ mod tests {
             let mut inner = StreamsInner::new();
             create_stream(&mut inner, "stream");
             let create_topic = CreateTopicWithAssignmentsRequest {
-                created_view: 0,
                 request: make_topic_request(0, partitions_count, "topic"),
                 derived_options: WireOptions::empty(),
                 partitions: (0..partitions_count)
                     .map(|partition_id| CreatedPartitionAssignment {
+                        initial_view: 0,
                         partition_id,
                         consensus_group_id: 1,
                     })
@@ -3836,10 +4954,10 @@ mod tests {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         let create_topic = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: make_topic_request(0, 1, "topic"),
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
             }],
@@ -4116,15 +5234,16 @@ mod tests {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "alpha");
         let create_topic = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: make_topic_request(0, 2, "logs"),
             derived_options: WireOptions::empty(),
             partitions: vec![
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 3,
                     consensus_group_id: 1,
                 },
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 4,
                     consensus_group_id: 2,
                 },
@@ -4191,11 +5310,11 @@ mod tests {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "alpha");
         let create_topic = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: make_topic_request(0, 4, "logs"),
             derived_options: WireOptions::empty(),
             partitions: (0..4)
                 .map(|partition_id| CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id,
                     consensus_group_id: u64::from(partition_id) + 1,
                 })
@@ -4275,10 +5394,10 @@ mod tests {
         // inherit what the probe above counted.
         create_stream(&mut inner, "beta");
         let create_topic = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: make_topic_request(0, 1, "logs"),
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
             }],
@@ -4361,10 +5480,10 @@ mod tests {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "alpha");
         let create_topic = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: make_topic_request(0, 1, "logs"),
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
             }],
@@ -4586,7 +5705,6 @@ mod tests {
 
         for index in 0..MAX_TOPICS {
             let request = CreateTopicWithAssignmentsRequest {
-                created_view: 0,
                 request: make_topic_request(0, 0, &format!("t{index}")),
                 derived_options: WireOptions::empty(),
                 partitions: Vec::new(),
@@ -4596,7 +5714,6 @@ mod tests {
         }
 
         let overflow = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: make_topic_request(0, 0, "one-too-many"),
             derived_options: WireOptions::empty(),
             partitions: Vec::new(),
@@ -4626,10 +5743,10 @@ mod tests {
         create_stream(&mut inner, "s");
 
         let seed = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: make_topic_request(0, 1, "t"),
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: u32::try_from(MAX_PARTITIONS - 2).unwrap(),
                 consensus_group_id: 1,
             }],
@@ -4641,13 +5758,13 @@ mod tests {
 
         // Resolves to MAX_PARTITIONS - 1: the last legal id.
         let last = CreatePartitionsWithAssignmentsRequest {
-            created_view: 0,
             request: WireCreatePartitionsRequest {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(0),
                 partitions_count: 1,
             },
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 2,
             }],
@@ -4659,13 +5776,13 @@ mod tests {
         );
 
         let overflow = CreatePartitionsWithAssignmentsRequest {
-            created_view: 0,
             request: WireCreatePartitionsRequest {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(0),
                 partitions_count: 1,
             },
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 3,
             }],
@@ -4691,10 +5808,10 @@ mod tests {
         create_stream(&mut inner, "s");
 
         let request = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: make_topic_request(0, 1, "t"),
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: u32::try_from(MAX_PARTITIONS).unwrap(),
                 consensus_group_id: 1,
             }],
@@ -4763,7 +5880,6 @@ mod tests {
         create_stream(&mut inner, "s");
         for name in ["a", "b", "c"] {
             let request = CreateTopicWithAssignmentsRequest {
-                created_view: 0,
                 request: make_topic_request(0, 0, name),
                 derived_options: WireOptions::empty(),
                 partitions: Vec::new(),
@@ -4822,15 +5938,16 @@ mod tests {
         create_stream(&mut inner, "s");
 
         let request = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: make_topic_request(0, 2, "t"),
             derived_options: WireOptions::empty(),
             partitions: vec![
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 7,
                     consensus_group_id: 1,
                 },
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 7,
                     consensus_group_id: 2,
                 },
@@ -4857,10 +5974,10 @@ mod tests {
         create_stream(&mut inner, "s");
 
         let seed = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: make_topic_request(0, 1, "t"),
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
             }],
@@ -4871,7 +5988,6 @@ mod tests {
         );
 
         let duplicate = CreatePartitionsWithAssignmentsRequest {
-            created_view: 0,
             request: WireCreatePartitionsRequest {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(0),
@@ -4879,10 +5995,12 @@ mod tests {
             },
             partitions: vec![
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 2,
                 },
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 3,
                 },
@@ -4910,10 +6028,10 @@ mod tests {
         create_stream(&mut inner, "s");
 
         let seed = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: make_topic_request(0, 1, "t"),
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
             }],
@@ -4924,7 +6042,6 @@ mod tests {
         );
 
         let distinct = CreatePartitionsWithAssignmentsRequest {
-            created_view: 0,
             request: WireCreatePartitionsRequest {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(0),
@@ -4932,10 +6049,12 @@ mod tests {
             },
             partitions: vec![
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 2,
                 },
                 CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 1,
                     consensus_group_id: 3,
                 },

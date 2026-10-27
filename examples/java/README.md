@@ -36,7 +36,7 @@ You can also customize the server using environment variables:
 
 ```bash
 ## Example: set a custom TCP address
-IGGY_TCP_ADDRESS=127.0.0.1:8090 cargo run --bin iggy-server
+IGGY_TCP_ADDRESS=127.0.0.1:8090 cargo run --bin iggy-server -- --with-default-root-credentials
 ```
 
 ## Basic Examples
@@ -132,10 +132,10 @@ Non-blocking async consumption with advanced patterns:
 
 Shows:
 
-- Backpressure management (don't poll faster than you can process)
+- Deferred polling, so the server holds the request until messages are ready
+- An idle limit that stops the consumer after a quiet period
 - Error recovery with exponential backoff
 - Thread pool separation (Netty I/O threads vs. processing threads)
-- Offset-based polling with CompletableFuture
 
 **CRITICAL ASYNC PATTERN - Thread Pool Management:**
 

@@ -26,16 +26,22 @@
 //! the HTTP layer), never in the builder.
 
 use crate::cluster_meta::ClusterRoster;
-use crate::dispatch::authz::{authorize_default_read, authorize_partition_read, authorize_uid};
+use crate::dispatch::authz::{
+    authorize_attached, authorize_default_read, authorize_partition_read,
+    authorize_served_partition_read, authorize_uid,
+};
 use crate::dispatch::complete_session_binding;
 use crate::dispatch::failure::{
-    FrameChannel, send_host_frame, send_non_replicated_bytes, send_non_replicated_deny,
+    ClientOrigin, FrameChannel, send_host_frame, send_non_replicated_bytes,
+    send_non_replicated_deny,
 };
+use crate::dispatch::metadata_changes::metadata_changes_reply;
 use crate::dispatch::partition::{
-    handle_get_consumer_offset, handle_poll_messages, resolve_poll_request,
+    handle_get_consumer_offset, handle_poll_messages, read_deferred_poll, resolve_deferred_poll,
+    resolve_readiness_wait,
 };
-use crate::namespace::{fence_and_resolve_offset_namespace, resolve_partition_namespace};
-use crate::reply_frame::{build_empty_reply, current_metadata_commit};
+use crate::namespace::resolve_partition_namespace;
+use crate::reply_frame::{build_empty_reply, build_reply_from_bytes, current_metadata_commit};
 use crate::responses::{
     build_get_me_response, build_get_personal_access_tokens_response,
     build_non_replicated_response, connected_client_to_response,
@@ -47,42 +53,45 @@ use crate::wire::request_body;
 use bytes::Bytes;
 use configs::server::ServerConfig;
 use consensus::MetadataHandle;
-use futures::future::{Either, select};
+use consensus::client_table::SessionAttachment;
+use futures::future::{Abortable, Either, select};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
-    BIND_SESSION_CODE, DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
-    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE,
-    GET_ME_CODE, GET_PARTITION_ROUTE_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_POLL_ROUTING_CODE,
+    BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE,
+    GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE,
+    GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
     GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, PING_CODE, POLL_MESSAGES_CODE,
-    POLL_MESSAGES_ON_PRIMARY_CODE, SYNC_CONSUMER_GROUP_CODE,
+    POLL_MESSAGES_DEFERRED_CODE, SYNC_CONSUMER_GROUP_CODE, WAIT_FOR_MESSAGES_CODE,
 };
 use iggy_binary_protocol::dispatch::lookup_command;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
-use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
-use iggy_binary_protocol::requests::messages::{GetPartitionRouteRequest, PollMessagesRequest};
+use iggy_binary_protocol::requests::messages::{
+    DeferredPollMessagesRequest, GetPartitionRouteRequest, WaitForMessagesRequest,
+};
+use iggy_binary_protocol::requests::system::BindSessionRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::system::get_snapshot::GetSnapshotRequest;
-use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
-use iggy_binary_protocol::responses::messages::{PartitionRouteResponse, PollRoutingResponse};
+use iggy_binary_protocol::responses::messages::{PartitionRouteResponse, WaitForMessagesResponse};
 use iggy_binary_protocol::responses::system::get_snapshot::GetSnapshotResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{HEADER_SIZE, RoutedRequestHeader, WireDecode, WireEncode};
-use iggy_common::{ClusterNodeRole, IggyError, SnapshotCompression, SystemSnapshotType};
+use iggy_common::{IggyError, SnapshotCompression, SystemSnapshotType};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
+use message_bus::BusMessage;
 use message_bus::framing::MAX_MESSAGE_SIZE;
 use metadata::AppliedFrontier;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use server_common::Message;
 use shard::{PartitionRead, PartitionReadReply};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -96,7 +105,7 @@ use tracing::{debug, warn};
 async fn handle_get_personal_access_tokens<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request: &Message<RoutedRequestHeader>,
 ) where
     B: ShellBus,
@@ -105,11 +114,12 @@ async fn handle_get_personal_access_tokens<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     let response = build_get_personal_access_tokens_response(shard, sessions, transport_client_id);
     send_non_replicated_bytes(
         shard,
         request,
-        transport_client_id,
+        origin,
         response.to_bytes(),
         FrameChannel::Reply,
         "get_personal_access_tokens",
@@ -124,7 +134,7 @@ async fn handle_get_personal_access_tokens<B, MJ, S, SB>(
 async fn handle_get_me<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request: &Message<RoutedRequestHeader>,
 ) where
     B: ShellBus,
@@ -133,11 +143,12 @@ async fn handle_get_me<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     let response = build_get_me_response(shard, sessions, transport_client_id);
     send_non_replicated_bytes(
         shard,
         request,
-        transport_client_id,
+        origin,
         response.to_bytes(),
         FrameChannel::Reply,
         "get_me",
@@ -187,9 +198,11 @@ pub fn read_frontier_budget(config: &ServerConfig) -> Duration {
 /// - `GetClusterMetadata` answers from the configured roster plus the
 ///   consensus view, and sits on the SDK's leader-discovery path, where the
 ///   wait would be real.
-/// - `PollMessages` and `GetConsumerOffset` are partition-plane reads: their
-///   answer comes from a partition group's own log, not the metadata STM, and
-///   holding them would put metadata lag on the data path.
+/// - `PollMessages`, `PollMessagesDeferred`, `WaitForMessages` and
+///   `GetConsumerOffset` are partition-plane reads: their answer comes from a
+///   partition group's own log, not the metadata STM, and holding them would
+///   put metadata lag on the data path.
+/// - `CancelDeferredRequest` reads nothing and gets no reply.
 /// - `GetSnapshotFile` shells out to system tools off-thread; there is no
 ///   metadata answer to hold.
 /// - A code this build does not know: its only outcome is `InvalidCommand`,
@@ -205,7 +218,9 @@ pub const fn read_needs_metadata_frontier(code: u32) -> bool {
             | DESCRIBE_OPTIONS_CODE
             | GET_CLUSTER_METADATA_CODE
             | POLL_MESSAGES_CODE
-            | POLL_MESSAGES_ON_PRIMARY_CODE
+            | POLL_MESSAGES_DEFERRED_CODE
+            | WAIT_FOR_MESSAGES_CODE
+            | CANCEL_DEFERRED_REQUEST_CODE
             | GET_CONSUMER_OFFSET_CODE
             | GET_SNAPSHOT_FILE_CODE
     ) && lookup_command(code).is_some()
@@ -325,9 +340,12 @@ where
 /// whole budget before answering one buys nothing. Then again on a wait
 /// that parked -- the rule resolves its scope and the caller's grants off the
 /// state machine, and a park is exactly the case where both moved under it.
+/// The session can also end during the park, so both passes check the
+/// connection's attachment first.
 #[allow(clippy::future_not_send)]
 async fn authorize_and_hold_read<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    attachment: Option<&SessionAttachment>,
     code: u32,
     watermark: u64,
     authorize: impl Fn() -> Result<(), IggyError>,
@@ -339,12 +357,12 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    authorize()?;
+    authorize_attached(attachment, &authorize)?;
     if !read_needs_metadata_frontier(code) {
         return Ok(());
     }
     if await_metadata_read_frontier(shard, watermark).await? == FrontierWait::CaughtUp {
-        authorize()?;
+        authorize_attached(attachment, &authorize)?;
     }
     Ok(())
 }
@@ -354,16 +372,17 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     server_config: &Arc<ServerConfig>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request: Message<RoutedRequestHeader>,
-    // Acting user, peer address and read-your-writes floor for the read gates
-    // below, resolved by the funnel in the same connection lookup as the
-    // heartbeat. `user_id` is `None` only on the pre-auth path (PING), which
-    // serves ungated codes; the gated arms fail closed on it. An unknown
-    // connection arrives with a floor of `0`: it was promised nothing, so its
-    // reads wait for nothing.
+    // Session attachment, acting user, peer address and read-your-writes floor
+    // for the read gates below, resolved by the funnel in the same connection
+    // lookup as the heartbeat. `user_id` is `None` only on the pre-auth path
+    // (PING), which serves ungated codes; the gated arms fail closed on it. An
+    // unknown connection arrives with a floor of `0`: it was promised nothing,
+    // so its reads wait for nothing.
     ConnectionContext {
-        bound: _,
+        bound,
+        attachment,
         user_id,
         address: client_address,
         metadata_watermark: watermark,
@@ -376,12 +395,15 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     const CODE_RANGE: std::ops::Range<usize> = 0..4;
+    let transport_client_id = origin.id;
+    let attachment = attachment.as_ref();
     // A client that reads on a connection bound before its last write saw
     // commit carries that commit in `minimum_metadata_op`, and the connection
     // floor alone would let the read miss it.
     let watermark = watermark.max(request.header().minimum_metadata_op);
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
     match code {
+        CANCEL_DEFERRED_REQUEST_CODE => {}
         PING_CODE => {
             // No `record_heartbeat` here: the funnel records one for EVERY
             // frame before classification, so a ping is already covered.
@@ -393,8 +415,8 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 commit,
             );
             send_host_frame(
-                &shard.bus,
-                transport_client_id,
+                shard,
+                origin,
                 reply.into_generic().into_frozen(),
                 FrameChannel::Reply,
                 "ping_reply",
@@ -405,34 +427,38 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             // Self-scoped, so no permissioner rule -- but the consumer-group
             // list it carries is read off the streams STM, so it is gated like
             // any other metadata read.
-            if let Err(error) = authorize_and_hold_read(shard, code, watermark, || Ok(())).await {
-                send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
-                    .await;
+            if let Err(error) =
+                authorize_and_hold_read(shard, attachment, code, watermark, || Ok(())).await
+            {
+                send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 return;
             }
-            handle_get_me(shard, sessions, transport_client_id, &request).await;
+            handle_get_me(shard, sessions, origin, &request).await;
         }
         GET_PERSONAL_ACCESS_TOKENS_CODE => {
-            if let Err(error) = authorize_and_hold_read(shard, code, watermark, || Ok(())).await {
-                send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
-                    .await;
+            if let Err(error) =
+                authorize_and_hold_read(shard, attachment, code, watermark, || Ok(())).await
+            {
+                send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 return;
             }
-            handle_get_personal_access_tokens(shard, sessions, transport_client_id, &request).await;
+            handle_get_personal_access_tokens(shard, sessions, origin, &request).await;
         }
         GET_CLIENTS_CODE => {
-            if let Err(error) = authorize_and_hold_read(shard, code, watermark, || {
-                authorize_uid(shard, user_id, Permissioner::get_clients)
-            })
-            .await
+            let authorize = || authorize_uid(shard, user_id, Permissioner::get_clients);
+            if let Err(error) =
+                authorize_and_hold_read(shard, attachment, code, watermark, &authorize).await
             {
-                send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
-                    .await;
+                send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 return;
             }
             // Shared-nothing: each shard knows only its own connections, so
             // gather across all shards (scatter-gather over the mesh).
             let infos = shard.list_all_clients().await;
+            if let Err(error) = authorize_attached(attachment, authorize) {
+                send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
+                return;
+            }
             let response = GetClientsResponse {
                 clients: infos
                     .iter()
@@ -442,7 +468,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             send_non_replicated_bytes(
                 shard,
                 &request,
-                transport_client_id,
+                origin,
                 response.to_bytes(),
                 FrameChannel::Reply,
                 "get_clients",
@@ -450,13 +476,11 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             .await;
         }
         GET_CLIENT_CODE => {
-            if let Err(error) = authorize_and_hold_read(shard, code, watermark, || {
-                authorize_uid(shard, user_id, Permissioner::get_client)
-            })
-            .await
+            let authorize = || authorize_uid(shard, user_id, Permissioner::get_client);
+            if let Err(error) =
+                authorize_and_hold_read(shard, attachment, code, watermark, &authorize).await
             {
-                send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
-                    .await;
+                send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 return;
             }
             // No reverse map from the wire u32 id to a u128 transport id /
@@ -466,6 +490,10 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 .ok()
                 .map(|req| req.client_id);
             let infos = shard.list_all_clients().await;
+            if let Err(error) = authorize_attached(attachment, authorize) {
+                send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
+                return;
+            }
             #[allow(clippy::cast_possible_truncation)]
             let found = target.and_then(|id| infos.iter().find(|info| info.client_id as u32 == id));
             // The SDK decodes an empty body as `None` (client not found).
@@ -496,7 +524,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             send_non_replicated_bytes(
                 shard,
                 &request,
-                transport_client_id,
+                origin,
                 bytes,
                 FrameChannel::Reply,
                 "get_client",
@@ -504,34 +532,50 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             .await;
         }
         GET_SNAPSHOT_FILE_CODE => {
-            handle_get_snapshot(shard, server_config, transport_client_id, &request, user_id).await;
+            handle_get_snapshot(shard, server_config, origin, &request, user_id, attachment).await;
         }
-        GET_POLL_ROUTING_CODE
-        | GET_CONSUMER_OFFSET_ROUTING_CODE
-        | BIND_SESSION_CODE
-        | GET_PARTITION_ROUTE_CODE => {
-            let result = if code == BIND_SESSION_CODE {
-                bind_session(shard, sessions, transport_client_id, &request).await
-            } else if code == GET_PARTITION_ROUTE_CODE {
-                partition_route(shard, &request, user_id, watermark).await
-            } else {
-                consumer_routing(
-                    shard,
-                    sessions,
-                    transport_client_id,
-                    &request,
-                    user_id,
-                    client_address,
-                    code,
-                )
+        GET_METADATA_CHANGES_CODE => {
+            let authorize = || authorize_uid(shard, user_id, Permissioner::get_metadata_changes);
+            if let Err(error) =
+                authorize_and_hold_read(shard, attachment, code, watermark, &authorize).await
+            {
+                send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
+                return;
+            }
+            // A current state page hops to shard 0, and the session can end
+            // during the hop.
+            let reply = metadata_changes_reply(shard, request_body(&request), user_id)
                 .await
+                .and_then(|bytes| authorize_attached(attachment, authorize).map(|()| bytes));
+            match reply {
+                Ok(bytes) => {
+                    send_non_replicated_bytes(
+                        shard,
+                        &request,
+                        origin,
+                        bytes,
+                        FrameChannel::Reply,
+                        "metadata_changes",
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
+                }
+            }
+        }
+        BIND_SESSION_CODE | GET_PARTITION_ROUTE_CODE => {
+            let result = if code == BIND_SESSION_CODE {
+                bind_session(shard, sessions, origin, &request).await
+            } else {
+                partition_route(shard, &request, user_id, attachment, watermark).await
             };
             match result {
                 Ok(bytes) => {
                     send_non_replicated_bytes(
                         shard,
                         &request,
-                        transport_client_id,
+                        origin,
                         bytes,
                         FrameChannel::Reply,
                         "partition_context",
@@ -539,18 +583,34 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                     .await;
                 }
                 Err(error) => {
-                    send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
-                        .await;
+                    send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 }
             }
         }
-        POLL_MESSAGES_CODE | POLL_MESSAGES_ON_PRIMARY_CODE => {
-            let consumer_client = sessions.borrow().consumer_session(transport_client_id);
+        POLL_MESSAGES_CODE | POLL_MESSAGES_DEFERRED_CODE | WAIT_FOR_MESSAGES_CODE => {
+            let consumer_client = bound
+                .zip(attachment)
+                .map(|((client_id, _), attachment)| (client_id, attachment))
+                .ok_or(IggyError::Unauthenticated);
             match consumer_client {
                 Ok((consumer_client_id, attachment)) => {
+                    if code != POLL_MESSAGES_CODE {
+                        handle_deferred_request(
+                            shard,
+                            sessions,
+                            origin,
+                            &request,
+                            code,
+                            user_id,
+                            consumer_client_id,
+                            attachment,
+                        )
+                        .await;
+                        return;
+                    }
                     handle_poll_messages(
                         shard,
-                        transport_client_id,
+                        origin,
                         &request,
                         user_id,
                         consumer_client_id,
@@ -559,24 +619,24 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                     .await;
                 }
                 Err(error) => {
-                    send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
-                        .await;
+                    send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 }
             }
         }
         GET_CONSUMER_OFFSET_CODE => {
-            handle_get_consumer_offset(shard, transport_client_id, &request, user_id).await;
+            handle_get_consumer_offset(shard, origin, &request, user_id, attachment).await;
         }
         SYNC_CONSUMER_GROUP_CODE => {
             // Self-scoped: serves the caller's own assignment keyed by the
             // header client id, so it carries no permissioner rule. The
             // assignment itself is metadata-STM state, hence the gate.
-            if let Err(error) = authorize_and_hold_read(shard, code, watermark, || Ok(())).await {
-                send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
-                    .await;
+            if let Err(error) =
+                authorize_and_hold_read(shard, attachment, code, watermark, || Ok(())).await
+            {
+                send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 return;
             }
-            handle_sync_consumer_group(shard, transport_client_id, &request).await;
+            handle_sync_consumer_group(shard, origin, &request).await;
         }
         _ => {
             let roster = sessions.borrow().cluster_roster();
@@ -589,17 +649,176 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 );
             }
             handle_default_non_replicated(
-                shard,
-                transport_client_id,
-                code,
-                &request,
-                user_id,
-                watermark,
-                &roster,
-                client_ip,
+                shard, origin, code, &request, user_id, attachment, watermark, &roster, client_ip,
             )
             .await;
         }
+    }
+}
+
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
+async fn handle_deferred_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    origin: ClientOrigin,
+    request: &Message<RoutedRequestHeader>,
+    code: u32,
+    user_id: Option<u32>,
+    consumer_client_id: u128,
+    attachment: &SessionAttachment,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let decoded = if code == POLL_MESSAGES_DEFERRED_CODE {
+        DeferredPollMessagesRequest::decode_from(request_body(request)).map(Either::Left)
+    } else {
+        WaitForMessagesRequest::decode_from(request_body(request)).map(Either::Right)
+    };
+    let Ok(wire) = decoded else {
+        send_non_replicated_deny(shard, request, origin, IggyError::InvalidCommand.as_code()).await;
+        return;
+    };
+    let timeout_us = match &wire {
+        Either::Left(poll) => poll.request_timeout_us,
+        Either::Right(wait) => wait.request_timeout_us,
+    };
+    serve_deferred_request(
+        shard,
+        sessions,
+        (origin, request),
+        Duration::from_micros(timeout_us),
+        async {
+            let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
+            if !attachment.is_valid() {
+                return Err(IggyError::StaleClient);
+            }
+            if !shard
+                .plane
+                .metadata()
+                .applied_frontier()
+                .partition_requests_allowed(shard.bus.monotonic_now())
+                || request.header().minimum_metadata_op > current_metadata_commit(shard)
+            {
+                return Err(IggyError::TransientNotAccepted);
+            }
+            match wire {
+                Either::Left(poll) => {
+                    let resolved = resolve_deferred_poll(
+                        shard,
+                        &poll,
+                        request.header(),
+                        (consumer_client_id, attachment.clone(), user_id),
+                    )?;
+                    read_deferred_poll(shard, request, resolved, attachment).await
+                }
+                Either::Right(wait) => {
+                    let duration = Duration::from_micros(shard.deferred_wait_us(wait.wait_us));
+                    let (caller, targets) = resolve_readiness_wait(
+                        shard,
+                        wait,
+                        (consumer_client_id, attachment.clone(), user_id),
+                    )?;
+                    let contexts: Vec<_> = targets
+                        .iter()
+                        .map(|target| {
+                            (
+                                target.namespace,
+                                target.metadata.context(current_metadata_commit(shard)),
+                            )
+                        })
+                        .collect();
+                    let partitions = shard.wait_for_messages(caller, targets, duration).await?;
+                    for (namespace, context) in contexts {
+                        authorize_served_partition_read(
+                            shard,
+                            Some(attachment),
+                            namespace,
+                            context.incarnation,
+                            Permissioner::poll_messages,
+                        )?;
+                    }
+                    let header = request.header();
+                    Ok(build_reply_from_bytes(
+                        header,
+                        header.client,
+                        header.session,
+                        current_metadata_commit(shard),
+                        &WaitForMessagesResponse { partitions }.to_bytes(),
+                    )
+                    .into_generic()
+                    .into_frozen()
+                    .into())
+                }
+            }
+        },
+    )
+    .await;
+}
+
+#[allow(clippy::future_not_send)]
+async fn serve_deferred_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    (origin, request): (ClientOrigin, &Message<RoutedRequestHeader>),
+    watchdog: Duration,
+    reply: impl Future<Output = Result<BusMessage, IggyError>>,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let (guard, cancellation) = match SessionManager::begin_deferred_request(
+        sessions,
+        origin.id,
+        request.header().request,
+        watchdog,
+        shard.bus.monotonic_now(),
+    ) {
+        Ok(active) => active,
+        Err(error) => {
+            send_non_replicated_deny(shard, request, origin, error.as_code()).await;
+            return;
+        }
+    };
+    let response_queued = Cell::new(false);
+    let outcome = {
+        let operation = Abortable::new(
+            async {
+                let mut reply = reply.await?;
+                let written = reply.track_write();
+                // A watchdog expiry while the send waits for room drops the reply
+                // unsent, so only a returned send counts as queued.
+                send_host_frame(shard, origin, reply, FrameChannel::Reply, "deferred_reply").await;
+                response_queued.set(true);
+                written
+                    .await
+                    .map_err(|_| IggyError::ShardCommunicationError)
+            },
+            cancellation,
+        );
+        let operation = pin!(operation);
+        let timeout = pin!(shard.bus.sleep(watchdog));
+        match select(operation, timeout).await {
+            Either::Left((Ok(result), _)) => Some(result),
+            Either::Left((Err(_), _)) => None,
+            Either::Right(_) => Some(Err(IggyError::ShardCommunicationError)),
+        }
+    };
+    if matches!(outcome, Some(Ok(()))) {
+        guard.written(shard.bus.monotonic_now());
+    }
+    drop(guard);
+    // A queued reply can still reach the peer after the write watchdog expires.
+    if let Some(Err(error)) = outcome
+        && !response_queued.get()
+    {
+        send_non_replicated_deny(shard, request, origin, error.as_code()).await;
     }
 }
 
@@ -607,7 +826,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
 async fn bind_session<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request: &Message<RoutedRequestHeader>,
 ) -> Result<Bytes, IggyError>
 where
@@ -617,6 +836,7 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     let (version_info, _) = iggy_binary_protocol::ClientVersionInfo::decode(request_body(request))
         .map_err(|_| IggyError::InvalidCommand)?;
     if !iggy_binary_protocol::is_protocol_compatible(version_info.protocol_version) {
@@ -660,6 +880,7 @@ async fn partition_route<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
+    attachment: Option<&SessionAttachment>,
     watermark: u64,
 ) -> Result<Bytes, IggyError>
 where
@@ -671,7 +892,7 @@ where
 {
     let wire = GetPartitionRouteRequest::decode_from(request_body(request))
         .map_err(|_| IggyError::InvalidCommand)?;
-    authorize_and_hold_read(shard, GET_PARTITION_ROUTE_CODE, watermark, || {
+    let authorize = || {
         authorize_partition_read(
             shard,
             &wire.stream_id,
@@ -684,7 +905,14 @@ where
             },
         )
         .map_or(Ok(()), |code| Err(IggyError::from_code(code)))
-    })
+    };
+    authorize_and_hold_read(
+        shard,
+        attachment,
+        GET_PARTITION_ROUTE_CODE,
+        watermark,
+        &authorize,
+    )
     .await?;
     let metadata_op = shard.plane.metadata().applied_frontier().get();
     let namespace = resolve_partition_namespace(
@@ -708,6 +936,27 @@ where
     else {
         return Err(IggyError::TransientNotAccepted);
     };
+    authorize_served_partition_read(
+        shard,
+        attachment,
+        namespace,
+        incarnation,
+        |permissioner, user_id, stream_id, topic_id| {
+            permissioner
+                .append_messages(user_id, stream_id, topic_id)
+                .or_else(|_| permissioner.poll_messages(user_id, stream_id, topic_id))
+        },
+    )?;
+    if shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .partition_route(namespace)
+        .is_none_or(|(current, _)| current != incarnation)
+    {
+        return Err(IggyError::TransientNotAccepted);
+    }
     Ok(PartitionRouteResponse {
         incarnation,
         metadata_op,
@@ -719,113 +968,13 @@ where
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_arguments)]
-async fn consumer_routing<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
-    request: &Message<RoutedRequestHeader>,
-    user_id: Option<u32>,
-    client_address: Option<SocketAddr>,
-    code: u32,
-) -> Result<Bytes, IggyError>
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let poll = if code == GET_POLL_ROUTING_CODE {
-        let poll = PollMessagesRequest::decode_from(request_body(request))
-            .map_err(|_| IggyError::InvalidCommand)?;
-        Some(poll)
-    } else {
-        None
-    };
-    let (wire, _) = GetConsumerOffsetRequest::decode(request_body(request))
-        .map_err(|_| IggyError::InvalidCommand)?;
-    let (client_id, session) = sessions
-        .borrow()
-        .get_session(transport_client_id)
-        .ok_or(IggyError::Unauthenticated)?;
-    let watermark = sessions.borrow().metadata_watermark(transport_client_id);
-    authorize_and_hold_read(shard, code, watermark, || {
-        authorize_partition_read(
-            shard,
-            &wire.stream_id,
-            &wire.topic_id,
-            user_id,
-            |permissioner, user_id, stream_id, topic_id| {
-                permissioner.poll_messages(user_id, stream_id, topic_id)
-            },
-        )
-        .map_or(Ok(()), |code| Err(IggyError::from_code(code)))
-    })
-    .await?;
-    let namespace = if let Some(poll) = poll {
-        resolve_poll_request(shard, &poll, client_id)?.0
-    } else {
-        fence_and_resolve_offset_namespace(
-            shard,
-            &wire.consumer,
-            &wire.stream_id,
-            &wire.topic_id,
-            wire.partition_id,
-            client_id,
-        )?
-    };
-    let group_id = if wire.consumer.kind == iggy_binary_protocol::KIND_CONSUMER_GROUP {
-        Some(crate::namespace::resolve_offset_group_id(
-            shard.plane.metadata().mux_stm.streams(),
-            &wire.stream_id,
-            &wire.topic_id,
-            &wire.consumer.id,
-        )?)
-    } else {
-        None
-    };
-    let streams = shard.plane.metadata().mux_stm.streams();
-    let metadata = if code == GET_POLL_ROUTING_CODE {
-        streams.poll_metadata(namespace, group_id, client_id)
-    } else {
-        streams.consumer_offset_metadata(namespace, group_id, client_id)
-    }
-    .ok_or(IggyError::TransientNotAccepted)?;
-    let context = metadata.context(shard.plane.metadata().applied_frontier().get());
-    let primary = match shard
-        .partition_read(namespace, PartitionRead::Primary)
-        .await
-    {
-        Some(PartitionReadReply::Primary { primary, .. }) => primary,
-        Some(PartitionReadReply::Rejected(error)) => return Err(error),
-        _ => return Err(IggyError::TransientNotAccepted),
-    };
-    let roster = sessions.borrow().cluster_roster();
-    let primary = roster
-        .cluster_metadata(Some(primary), client_address.map(|address| address.ip()))
-        .nodes
-        .into_iter()
-        .find(|node| node.role == ClusterNodeRole::Leader)
-        .ok_or(IggyError::TransientNotAccepted)?;
-    Ok(PollRoutingResponse {
-        context,
-        consumer_session: SessionIdentity {
-            client_id,
-            session,
-            metadata_watermark: watermark.max(shard.plane.metadata().applied_frontier().get()),
-        },
-        primary: primary.into(),
-    }
-    .to_bytes())
-}
-
-#[allow(clippy::future_not_send, clippy::too_many_arguments)]
 async fn handle_default_non_replicated<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     code: u32,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
+    attachment: Option<&SessionAttachment>,
     watermark: u64,
     roster: &ClusterRoster,
     client_ip: Option<IpAddr>,
@@ -836,15 +985,15 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     // Gate by command code before the shared builder runs. The builder stays
     // authz-free (it is byte-shared with the HTTP read path, which gates
     // separately); a denial replies status!=0 with an empty body. The
     // read-your-writes hold sits INSIDE the same call, behind that denial: an
     // unauthorized read must fail now, not after the whole poll budget.
-    if let Err(error) = authorize_and_hold_read(shard, code, watermark, || {
-        authorize_default_read(shard, code, request_body(request), user_id)
-    })
-    .await
+    let authorize = || authorize_default_read(shard, code, request_body(request), user_id);
+    if let Err(error) =
+        authorize_and_hold_read(shard, attachment, code, watermark, &authorize).await
     {
         // Same line as the builder-`Err` branch below: `send_non_replicated_deny`
         // logs only on send FAILURE, so a refusal that reaches the client would
@@ -867,25 +1016,32 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
                 "denying non-replicated VSR request"
             );
         }
-        send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
+        send_non_replicated_deny(shard, request, origin, error.as_code()).await;
         return;
     }
     // Stats is the one default read with an async input: the cross-shard
-    // connected-client gather. Run it here so the shared builder stays sync.
-    let clients_count = if code == GET_STATS_CODE {
-        u32::try_from(shard.count_all_clients().await).unwrap_or(u32::MAX)
+    // connected-client gather. Run it here so the shared builder stays sync,
+    // and gate again after it, because the session can end during the gather.
+    let (clients_count, gate) = if code == GET_STATS_CODE {
+        let clients_count = shard.count_all_clients().await;
+        (
+            u32::try_from(clients_count).unwrap_or(u32::MAX),
+            authorize_attached(attachment, authorize),
+        )
     } else {
-        0
+        (0, Ok(()))
     };
-    match build_non_replicated_response(
-        shard,
-        code,
-        request_body(request),
-        user_id,
-        roster,
-        client_ip,
-        clients_count,
-    ) {
+    match gate.and_then(|()| {
+        build_non_replicated_response(
+            shard,
+            code,
+            request_body(request),
+            user_id,
+            roster,
+            client_ip,
+            clients_count,
+        )
+    }) {
         Ok(response) => {
             let commit = current_metadata_commit(shard);
             let reply = response.into_reply(
@@ -895,8 +1051,8 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
                 commit,
             );
             send_host_frame(
-                &shard.bus,
-                transport_client_id,
+                shard,
+                origin,
                 reply.into_generic().into_frozen(),
                 FrameChannel::Reply,
                 "non_replicated_reply",
@@ -905,31 +1061,32 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
         }
         Err(error) => {
             // Surface the builder's typed error (unsupported op, undecodable
-            // body, or a not-found parity read) on the same deny channel the
-            // authz gate uses; a silent drop would wedge the client until its
-            // read timeout.
+            // body, or a not-found parity read), or the gate's refusal after
+            // the stats gather, on the same deny channel the authz gate uses;
+            // a silent drop would wedge the client until its read timeout.
             warn!(
                 transport_client_id,
                 code,
                 error = %error,
                 "denying non-replicated VSR request"
             );
-            send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
+            send_non_replicated_deny(shard, request, origin, error.as_code()).await;
         }
     }
 }
 
-/// Serve `GET_SNAPSHOT_FILE`: gate on the snapshot rule (`read_servers ||
-/// manage_servers`, the legacy gate - the archive dumps host diagnostics, so
-/// plain authentication must not suffice), then await the off-thread
-/// collection (see `snapshot::collect`) and reply with the raw ZIP bytes.
+/// Serve `GET_SNAPSHOT_FILE`: gate on the snapshot rule (`manage_servers`,
+/// since the archive dumps server logs and host diagnostics), then await the
+/// off-thread collection (see `snapshot::collect`), gate again, and reply
+/// with the raw ZIP bytes.
 #[allow(clippy::future_not_send)]
 async fn handle_get_snapshot<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     server_config: &Arc<ServerConfig>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
+    attachment: Option<&SessionAttachment>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -937,13 +1094,21 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    if let Err(error) = authorize_uid(shard, user_id, Permissioner::get_snapshot) {
-        send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
+    let transport_client_id = origin.id;
+    let authorize = || {
+        authorize_attached(attachment, || {
+            authorize_uid(shard, user_id, Permissioner::get_snapshot)
+        })
+    };
+    if let Err(error) = authorize() {
+        send_non_replicated_deny(shard, request, origin, error.as_code()).await;
         return;
     }
     let result = match decode_get_snapshot(request_body(request)) {
         Ok((compression, snapshot_types)) => {
-            snapshot::collect(Arc::clone(server_config), compression, snapshot_types).await
+            snapshot::collect(Arc::clone(server_config), compression, snapshot_types)
+                .await
+                .and_then(|archive| authorize().map(|()| archive))
         }
         Err(error) => Err(error),
     };
@@ -967,7 +1132,7 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
                 send_non_replicated_deny(
                     shard,
                     request,
-                    transport_client_id,
+                    origin,
                     IggyError::SnapshotFileCompletionFailed.as_code(),
                 )
                 .await;
@@ -976,7 +1141,7 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
             send_non_replicated_bytes(
                 shard,
                 request,
-                transport_client_id,
+                origin,
                 GetSnapshotResponse { data: archive }.to_bytes(),
                 FrameChannel::Reply,
                 "get_snapshot",
@@ -985,7 +1150,7 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
         }
         Err(error) => {
             warn!(transport_client_id, error = %error, "denying snapshot request");
-            send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
+            send_non_replicated_deny(shard, request, origin, error.as_code()).await;
         }
     }
 }
@@ -1010,7 +1175,7 @@ fn decode_get_snapshot(
 #[allow(clippy::future_not_send)]
 async fn handle_sync_consumer_group<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request: &Message<RoutedRequestHeader>,
 ) where
     B: ShellBus,
@@ -1019,6 +1184,7 @@ async fn handle_sync_consumer_group<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     let body = match SyncConsumerGroupRequest::decode_from(request_body(request)) {
         Ok(wire) => shard
             .plane
@@ -1050,7 +1216,7 @@ async fn handle_sync_consumer_group<B, MJ, S, SB>(
     send_non_replicated_bytes(
         shard,
         request,
-        transport_client_id,
+        origin,
         body,
         FrameChannel::Reply,
         "sync_consumer_group",
@@ -1066,9 +1232,10 @@ mod tests {
     };
     use configs::server::ServerConfig;
     use iggy_binary_protocol::codes::{
-        DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE,
-        GET_SNAPSHOT_FILE_CODE, GET_STREAM_CODE, PING_CODE, POLL_MESSAGES_CODE,
-        SYNC_CONSUMER_GROUP_CODE,
+        CANCEL_DEFERRED_REQUEST_CODE, DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE,
+        GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_SNAPSHOT_FILE_CODE, GET_STREAM_CODE, PING_CODE,
+        POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE, SYNC_CONSUMER_GROUP_CODE,
+        WAIT_FOR_MESSAGES_CODE,
     };
     use iggy_common::IggyDuration;
     use metadata::AppliedFrontier;
@@ -1188,6 +1355,9 @@ mod tests {
             DESCRIBE_OPTIONS_CODE,
             GET_CLUSTER_METADATA_CODE,
             POLL_MESSAGES_CODE,
+            POLL_MESSAGES_DEFERRED_CODE,
+            WAIT_FOR_MESSAGES_CODE,
+            CANCEL_DEFERRED_REQUEST_CODE,
             GET_CONSUMER_OFFSET_CODE,
             GET_SNAPSHOT_FILE_CODE,
         ] {

@@ -35,6 +35,7 @@ final class FakeVSRServer: @unchecked Sendable {
         let session: UInt64
         let clientID: UInt128Value
         let checksum: UInt64
+        let context: PartitionContext
         let payload: [UInt8]
     }
 
@@ -43,15 +44,25 @@ final class FakeVSRServer: @unchecked Sendable {
         /// Status zero with this body; result-framed operations get the
         /// empty result section prepended.
         case ok([UInt8])
+        case uncommitted([UInt8])
+        /// `ok` from a metadata operation that committed at `commit`.
+        case committed([UInt8], commit: UInt64)
         /// A pre-commit denial: the status in the header, no body.
         case status(UInt32)
+        /// `status`, then the connection closes.
+        case statusThenClose(UInt32)
         /// A committed rejection carried in the result section.
         case committedRejection(UInt32)
         case eviction(VSRFrame.EvictionReason)
         /// A reply that answers some other request id.
         case wrongRequestID(UInt64)
+        /// A committed success under the operation the primary rewrote the
+        /// request into, answering `requestID` or else the request's own id.
+        case resolved(ConsensusOperation, requestID: UInt64? = nil)
         /// Closes the connection instead of answering.
         case close
+        /// Answers with status zero and this body, then closes the connection.
+        case okThenClose([UInt8])
         /// Never answers.
         case stall
         /// A status-zero reply written in two TCP chunks with a pause between.
@@ -59,6 +70,10 @@ final class FakeVSRServer: @unchecked Sendable {
     }
 
     typealias Responder = @Sendable (Request) async -> Reply
+
+    /// How long ``stop()`` waits for a client to close its end of a
+    /// connection before the server closes the connection anyway.
+    private static let clientCloseTimeLimit: TimeAmount = .seconds(2)
 
     let state = FakeServerState()
     private let group = MultiThreadedEventLoopGroup.singleton
@@ -72,12 +87,12 @@ final class FakeVSRServer: @unchecked Sendable {
     }
 
     var connectionCount: Int {
-        get async { await state.opened }
+        get async { state.opened }
     }
 
     /// Connections that are still open.
     var openConnectionCount: Int {
-        get async { await state.openCount }
+        get async { state.openCount }
     }
 
     /// Replaces the script; the default answers everything successfully.
@@ -97,7 +112,7 @@ final class FakeVSRServer: @unchecked Sendable {
             .childChannelInitializer { channel in
                 channel.eventLoop.makeCompletedFuture {
                     try channel.pipeline.syncOperations.addHandler(ByteToMessageHandler(FrameDecoder()))
-                    try channel.pipeline.syncOperations.addHandler(FakeServerHandler(state: state))
+                    try channel.pipeline.syncOperations.addHandler(FakeServerHandler(state: state, channel: channel))
                 }
             }
         let channel = try await bootstrap.bind(host: "127.0.0.1", port: port).get()
@@ -106,17 +121,25 @@ final class FakeVSRServer: @unchecked Sendable {
         await state.setAddress(address)
     }
 
+    /// Stops listening first, so no client connects again while the open
+    /// connections close. A client closes its end only after it has read the
+    /// server's end, so once this returns every client knows its connection
+    /// is gone and fails its next request before writing it.
     func stop() async {
-        await state.closeAll()
         try? await channel?.close().get()
         channel = nil
+        await state.closeAllAndAwaitClients(within: Self.clientCloseTimeLimit)
     }
 
     func closeAllConnections() async {
-        await state.closeAll()
+        state.closeAll()
     }
 
     // MARK: Reply helpers
+
+    /// The eviction reasons that end a session, which the client reads as
+    /// unauthenticated.
+    static let sessionEndingEvictions: [VSRFrame.EvictionReason] = [.noSession, .sessionTooLow, .sessionReleaseMismatch, .userInactive, .sessionError]
 
     /// The body of a successful register reply.
     static func registerBody(userID: UInt32 = 0, session: UInt64 = 1, serverVersion: String = "fake") -> [UInt8] {
@@ -128,33 +151,138 @@ final class FakeVSRServer: @unchecked Sendable {
         return writer.bytes
     }
 
-    /// A roster with one node per address; the first is the leader.
-    static func rosterBody(_ addresses: [String], leaderIndex: Int = 0) -> [UInt8] {
+    /// A roster with one node per address; the first is the leader unless
+    /// `leaderIndex` names another, or none when it is nil. The leader
+    /// reports `leaderStatus`, every other node is healthy.
+    static func rosterBody(_ addresses: [String], leaderIndex: Int? = 0, leaderStatus: ClusterNodeStatus = .healthy) -> [UInt8] {
         var writer = ByteWriter()
         try! writer.writeLongString("fake-cluster")
         writer.write(UInt32(addresses.count))
         for (index, address) in addresses.enumerated() {
-            let endpoint = try! Endpoint(parsing: address)
-            writer.write(UInt8(index))
-            try! writer.writeLongString("node-\(index)")
-            try! writer.writeLongString(endpoint.host)
-            writer.write(UInt16(endpoint.port))
-            writer.write(UInt16(0))
-            writer.write(UInt16(0))
-            writer.write(UInt16(0))
-            writer.write(index == leaderIndex ? ClusterNodeRole.leader.rawValue : ClusterNodeRole.follower.rawValue)
-            writer.write(ClusterNodeStatus.healthy.rawValue)
+            let leader = index == leaderIndex
+            writeNode(address, replicaID: UInt8(index), leader: leader, status: leader ? leaderStatus : .healthy, into: &writer)
         }
         return writer.bytes
     }
 
-    static func encodeReply(request: Request, operation: ConsensusOperation, status: UInt32, body: [UInt8]) -> [UInt8] {
+    static func writeNode(_ address: String, replicaID: UInt8, leader: Bool, status: ClusterNodeStatus, into writer: inout ByteWriter) {
+        let endpoint = try! Endpoint(parsing: address)
+        writer.write(replicaID)
+        try! writer.writeLongString("node-\(replicaID)")
+        try! writer.writeLongString(endpoint.host)
+        writer.write(UInt16(endpoint.port))
+        writer.write(UInt16(0))
+        writer.write(UInt16(0))
+        writer.write(UInt16(0))
+        writer.write(leader ? ClusterNodeRole.leader.rawValue : ClusterNodeRole.follower.rawValue)
+        writer.write(status.rawValue)
+    }
+
+    /// The reply to `GetPartitionRoute`.
+    static func partitionRouteBody(_ context: PartitionContext, partitionsCount: UInt32 = 3, primaryReplica: UInt8 = 0, view: UInt32 = 1) -> [UInt8] {
+        var writer = ByteWriter()
+        writer.write(context.incarnation)
+        writer.write(context.metadataOp)
+        writer.write(view)
+        writer.write(partitionsCount)
+        writer.write(primaryReplica)
+        return writer.bytes
+    }
+
+    /// A poll reply without messages.
+    static func polledBody(partitionID: UInt32, context: PartitionContext = .empty) -> [UInt8] {
+        var writer = ByteWriter()
+        writer.write(partitionID)
+        writer.write(UInt64(0))
+        writer.write(UInt32(0))
+        context.encode(into: &writer)
+        return writer.bytes
+    }
+
+    /// A poll reply carrying one batch with a message at each of `offsets`,
+    /// whose payload is `message <offset>`. Checksums are left zero, which a
+    /// reply decoded without verification accepts.
+    static func polledBody(partitionID: UInt32, offsets: [UInt64], currentOffset: UInt64? = nil, context: PartitionContext = routeContext) -> [UInt8] {
+        var writer = ByteWriter()
+        writer.write(partitionID)
+        writer.write(currentOffset ?? offsets.max() ?? 0)
+        writer.write(UInt32(offsets.count))
+        context.encode(into: &writer)
+        guard let base = offsets.first else {
+            return writer.bytes
+        }
+        var frames = ByteWriter()
+        for offset in offsets {
+            let payload = Array("message \(offset)".utf8)
+            frames.write(UInt64(0))
+            frames.write(MessageID(0))
+            frames.write(UInt32(offset - base))
+            frames.write(UInt32(0))
+            frames.write(UInt32(0))
+            frames.write(UInt32(payload.count))
+            frames.write(UInt64(0))
+            frames.write(payload)
+        }
+        let header = Batch.Header(
+            partitionID: UInt64(partitionID), baseOffset: base, baseTimestamp: 0, originTimestamp: 0,
+            batchLength: UInt64(Batch.headerSize + frames.count), batchChecksum: 0, messageCount: UInt32(offsets.count))
+        writer.write(header.encode())
+        writer.write(frames.bytes)
+        return writer.bytes
+    }
+
+    /// The reply to `SyncConsumerGroup` for a member.
+    static func assignmentBody(generation: UInt64, partitions: [UInt32]) -> [UInt8] {
+        var writer = ByteWriter()
+        writer.write(generation)
+        writer.write(UInt32(partitions.count))
+        for partition in partitions {
+            writer.write(partition)
+        }
+        return writer.bytes
+    }
+
+    /// A send reply confirming one request at `baseOffset`.
+    static func confirmationBody(partitionID: UInt32, baseOffset: UInt64) -> [UInt8] {
+        var writer = ByteWriter()
+        writer.write(UInt32(1))
+        writer.write(UInt32(1))
+        writer.write(UInt32(2))
+        writer.write(partitionID)
+        writer.write(baseOffset)
+        return writer.bytes
+    }
+
+    /// A topic with three partitions, 0 to 2, under `contexts`.
+    static func topicBody(contexts: [PartitionContext]) -> [UInt8] {
+        precondition(contexts.count == 3, "the golden topic header names three partitions")
+        var writer = ByteWriter()
+        writer.write(GoldenFixture.shared.bytes("response.topic_header"))
+        for (id, context) in contexts.enumerated() {
+            writer.write(UInt32(id))
+            writer.write(UInt64(0))
+            writer.write(UInt32(1))
+            writer.write(UInt64(0))
+            writer.write(UInt64(0))
+            writer.write(UInt64(0))
+            context.encode(into: &writer)
+        }
+        return writer.bytes
+    }
+
+    static func encodeReply(
+        request: Request, operation: ConsensusOperation, status: UInt32, body: [UInt8], commit: UInt64 = 0, committed: Bool = true
+    ) -> [UInt8] {
         var frame = [UInt8](repeating: 0, count: VSRFrame.headerSize)
         frame.withUnsafeMutableBytes { buffer in
             buffer.storeBytes(of: UInt32(VSRFrame.headerSize + body.count).littleEndian, toByteOffset: VSRFrame.ReplyOffset.size, as: UInt32.self)
             buffer[VSRFrame.ReplyOffset.command] = VSRFrame.Command.reply.rawValue
+            buffer.storeBytes(of: commit.littleEndian, toByteOffset: VSRFrame.ReplyOffset.commit, as: UInt64.self)
             buffer.storeBytes(of: request.requestID.littleEndian, toByteOffset: VSRFrame.ReplyOffset.request, as: UInt64.self)
             buffer[VSRFrame.ReplyOffset.operation] = operation.rawValue
+            if committed && status == 0 && (operation.isMetadata || operation.isPartition) {
+                buffer[VSRFrame.ReplyOffset.committedResult] = VSRFrame.committedResultMarker
+            }
             buffer.storeBytes(of: status.littleEndian, toByteOffset: VSRFrame.ReplyOffset.status, as: UInt32.self)
         }
         return frame + body
@@ -190,17 +318,45 @@ final class FakeVSRServer: @unchecked Sendable {
             connection: connection, operation: operation, code: code, requestID: u64(VSRFrame.RequestOffset.request),
             session: u64(VSRFrame.RequestOffset.session),
             clientID: UInt128Value(low: u64(VSRFrame.RequestOffset.client), high: u64(VSRFrame.RequestOffset.client + 8)),
-            checksum: u64(VSRFrame.RequestOffset.requestChecksum), payload: frame.body)
+            checksum: u64(VSRFrame.RequestOffset.requestChecksum),
+            context: PartitionContext(
+                incarnation: u64(VSRFrame.RequestOffset.partitionIncarnation), ownerGeneration: u64(VSRFrame.RequestOffset.ownerGeneration),
+                metadataOp: u64(VSRFrame.RequestOffset.minimumMetadataOp)),
+            payload: frame.body)
+    }
+
+    /// The partition context the default script routes every partition to.
+    static let routeContext = PartitionContext(incarnation: 7, ownerGeneration: 0, metadataOp: 10)
+
+    /// The answer to a register and to a resume: the session is bound, as on
+    /// a node that holds it. Nil for any other request.
+    static func sessionReply(_ request: Request) -> Reply? {
+        if request.operation == .register {
+            return .ok(registerBody())
+        }
+        if request.code == CommandCode.bindSession.rawValue {
+            return .ok(registerBody(session: request.session))
+        }
+        return nil
     }
 
     /// Answers every request successfully with an empty body, a bound
-    /// session for a register, and a single-node roster for the metadata read.
+    /// session for a register and a bind, a single-node roster for the
+    /// metadata read, routes to this server under ``routeContext``, and an
+    /// empty poll.
     static func defaultReply(_ request: Request, address: String) -> Reply {
-        switch request.operation {
-        case .register:
+        if request.operation == .register {
             return .ok(registerBody())
-        case .nonReplicated where request.code == CommandCode.getClusterMetadata.rawValue:
+        }
+        switch request.code.flatMap(CommandCode.init(rawValue:)) {
+        case .getClusterMetadata:
             return .ok(rosterBody([address]))
+        case .bindSession:
+            return .ok(registerBody(session: request.session))
+        case .getPartitionRoute:
+            return .ok(partitionRouteBody(routeContext))
+        case .pollMessages:
+            return .ok(polledBody(partitionID: 0, context: routeContext))
         default:
             return .ok([])
         }
@@ -209,10 +365,18 @@ final class FakeVSRServer: @unchecked Sendable {
 
 actor FakeServerState {
     private(set) var requests: [FakeVSRServer.Request] = []
-    private(set) var opened = 0
-    private var channels: [ObjectIdentifier: Channel] = [:]
     private var responder: FakeVSRServer.Responder?
     var address = ""
+    /// Written on the event loop as a connection comes up and goes down, not
+    /// from a task. The listener runs a connection's initializer before it
+    /// keeps the connection, so once the listener has closed, every
+    /// connection it kept is here for a stop to close.
+    private nonisolated let connections = Locked(Connections())
+
+    private struct Connections {
+        var opened = 0
+        var open: [ObjectIdentifier: Channel] = [:]
+    }
 
     func setResponder(_ responder: @escaping FakeVSRServer.Responder) {
         self.responder = responder
@@ -222,23 +386,48 @@ actor FakeServerState {
         self.address = address
     }
 
-    func connectionOpened(_ channel: Channel) -> Int {
-        opened += 1
-        channels[ObjectIdentifier(channel)] = channel
-        return opened
+    nonisolated var opened: Int { connections.withLock { $0.opened } }
+
+    nonisolated var openCount: Int { connections.withLock { $0.open.count } }
+
+    /// Records a connection that came up and returns its number.
+    nonisolated func connectionOpened(_ channel: Channel) -> Int {
+        connections.withLock { connections in
+            connections.opened += 1
+            connections.open[ObjectIdentifier(channel)] = channel
+            return connections.opened
+        }
     }
 
-    func connectionClosed(_ channel: Channel) {
-        channels[ObjectIdentifier(channel)] = nil
+    nonisolated func connectionClosed(_ channel: Channel) {
+        _ = connections.withLock { $0.open.removeValue(forKey: ObjectIdentifier(channel)) }
     }
 
-    var openCount: Int { channels.count }
-
-    func closeAll() {
-        for channel in channels.values {
+    nonisolated func closeAll() {
+        for channel in takeOpen() {
             channel.close(promise: nil)
         }
-        channels.removeAll()
+    }
+
+    /// Half-closes every connection and waits until each client closes its
+    /// end too. A client that keeps its end open past `limit` is cut off.
+    nonisolated func closeAllAndAwaitClients(within limit: TimeAmount) async {
+        let open = takeOpen()
+        let cutoffs = open.map { channel in
+            channel.close(mode: .output, promise: nil)
+            return channel.eventLoop.scheduleTask(in: limit) { channel.close(promise: nil) }
+        }
+        for (channel, cutoff) in zip(open, cutoffs) {
+            try? await channel.closeFuture.get()
+            cutoff.cancel()
+        }
+    }
+
+    private nonisolated func takeOpen() -> [Channel] {
+        connections.withLock { connections in
+            defer { connections.open.removeAll() }
+            return Array(connections.open.values)
+        }
     }
 
     func handle(_ request: FakeVSRServer.Request) async -> FakeVSRServer.Reply {
@@ -250,32 +439,27 @@ actor FakeServerState {
     }
 }
 
-final class FakeServerHandler: ChannelInboundHandler, @unchecked Sendable {
+final class FakeServerHandler: ChannelInboundHandler {
     typealias InboundIn = RawFrame
 
     private let state: FakeServerState
-    private var connection = 0
+    /// The number the server gives this connection, recorded as the
+    /// connection comes up, before any of its frames or its close.
+    private let connection: Int
 
-    init(state: FakeServerState) {
+    init(state: FakeServerState, channel: Channel) {
         self.state = state
-    }
-
-    func channelActive(context: ChannelHandlerContext) {
-        let channel = context.channel
-        Task { [self] in
-            connection = await state.connectionOpened(channel)
-        }
+        connection = state.connectionOpened(channel)
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        let channel = context.channel
-        Task { await state.connectionClosed(channel) }
+        state.connectionClosed(context.channel)
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let frame = unwrapInboundIn(data)
         let channel = context.channel
-        Task { [self] in
+        Task { [state, connection] in
             let request = FakeVSRServer.decodeRequest(connection: connection, frame: frame)
             let reply = await state.handle(request)
             let operation = request.operation
@@ -290,8 +474,15 @@ final class FakeServerHandler: ChannelInboundHandler, @unchecked Sendable {
             switch reply {
             case .ok(let body):
                 write(FakeVSRServer.encodeReply(request: request, operation: operation, status: 0, body: framedBody(body)))
+            case .uncommitted(let body):
+                write(FakeVSRServer.encodeReply(request: request, operation: operation, status: 0, body: framedBody(body), committed: false))
+            case .committed(let body, let commit):
+                write(FakeVSRServer.encodeReply(request: request, operation: operation, status: 0, body: framedBody(body), commit: commit))
             case .status(let status):
                 write(FakeVSRServer.encodeReply(request: request, operation: operation, status: status, body: []))
+            case .statusThenClose(let status):
+                write(FakeVSRServer.encodeReply(request: request, operation: operation, status: status, body: []))
+                channel.close(promise: nil)
             case .committedRejection(let code):
                 var writer = ByteWriter()
                 writer.write(UInt32(1))
@@ -303,9 +494,17 @@ final class FakeServerHandler: ChannelInboundHandler, @unchecked Sendable {
             case .wrongRequestID(let requestID):
                 let wrong = FakeVSRServer.Request(
                     connection: request.connection, operation: operation, code: request.code, requestID: requestID, session: request.session,
-                    clientID: request.clientID, checksum: request.checksum, payload: request.payload)
+                    clientID: request.clientID, checksum: request.checksum, context: request.context, payload: request.payload)
                 write(FakeVSRServer.encodeReply(request: wrong, operation: operation, status: 0, body: framedBody([])))
+            case .resolved(let resolved, let requestID):
+                let answered = FakeVSRServer.Request(
+                    connection: request.connection, operation: resolved, code: request.code, requestID: requestID ?? request.requestID,
+                    session: request.session, clientID: request.clientID, checksum: request.checksum, context: request.context, payload: request.payload)
+                write(FakeVSRServer.encodeReply(request: answered, operation: resolved, status: 0, body: [0, 0, 0, 0]))
             case .close:
+                channel.close(promise: nil)
+            case .okThenClose(let body):
+                write(FakeVSRServer.encodeReply(request: request, operation: operation, status: 0, body: framedBody(body)))
                 channel.close(promise: nil)
             case .stall:
                 break

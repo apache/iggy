@@ -74,6 +74,8 @@ class IggyTest {
         assertThat(builder.port(8090)).isSameAs(builder);
         assertThat(builder.enableTls()).isSameAs(builder);
         assertThat(builder.tls(false)).isSameAs(builder);
+        assertThat(builder.fromConnectionString("iggy://iggy:iggy@localhost:8090"))
+                .isSameAs(builder);
     }
 
     @Test
@@ -85,6 +87,8 @@ class IggyTest {
         assertThat(builder.port(8090)).isSameAs(builder);
         assertThat(builder.enableTls()).isSameAs(builder);
         assertThat(builder.tls(false)).isSameAs(builder);
+        assertThat(builder.fromConnectionString("iggy://iggy:iggy@localhost:8090"))
+                .isSameAs(builder);
     }
 
     @Test

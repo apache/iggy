@@ -23,6 +23,7 @@ use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
 use iggy::prelude::IggyExpiry;
+use iggy::prelude::StreamCreateOptions;
 use iggy::prelude::TopicCreateOptions;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
@@ -84,7 +85,7 @@ impl IggyCmdTestCase for TestConsumerGroupListCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         // Create stream and capture its actual ID
         let stream = client
-            .create_stream(&self.stream_name)
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
             .await
             .expect("Failed to create stream");
         self.actual_stream_id = Some(stream.id);

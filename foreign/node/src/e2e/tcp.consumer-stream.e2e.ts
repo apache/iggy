@@ -104,6 +104,10 @@ describe('e2e -> consumer-stream', async () => {
     });
 
     after(async () => {
+      // The member that did not get the last batch can still be polling,
+      // and a poll that fails after the delete has no error listener.
+      s.destroy();
+      s2.destroy();
       assert.ok(await c.stream.delete({ streamId: streamName }));
       assert.ok(await c.session.logout());
       await c.destroy();

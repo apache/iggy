@@ -299,7 +299,6 @@ pub mod consumer_ext;
 mod diagnostic_events;
 mod driver;
 pub mod http;
-mod leader_aware;
 mod links;
 pub mod prelude;
 pub mod quic;

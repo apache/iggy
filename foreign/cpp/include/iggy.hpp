@@ -29,10 +29,13 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -75,6 +78,12 @@ class ConsumerGroupDetails;
 class ConsumerGroupMember;
 class IggyMessagePolled;
 class IggyMessageToSend;
+class MetadataChangeCursor;
+class MetadataChangeRecord;
+class MetadataChanges;
+class MetadataChangesQuery;
+class MetadataCurrentItem;
+class MetadataCurrentPageToken;
 
 namespace detail {
 /** @brief Internal base for string-backed option types. */
@@ -94,16 +103,74 @@ class StringTag {
     std::string value_;
 };
 
+/** @brief Runs a bridge call and rethrows its failure as IggyException with the call's ErrorInfo. */
+template <typename Operation>
+decltype(auto) RethrowAsIggyException(Operation &&operation);
+
 }  // namespace detail
 
 /**
  * @brief Exception thrown when an Iggy client operation fails.
+ *
+ * Code() and Kind() are available only when a call forwards a typed Rust SDK
+ * error. IggyBlockingClient documents the covered methods. Other calls and
+ * C++ or bridge-local argument errors leave Code() empty and Kind() empty,
+ * except the metadata change calls, which report invalid input with the kind
+ * each one documents.
+ * OperationId() is present only for operation_uncertain, lane_blocked, and
+ * operation_not_retained errors and preserves the full unsigned 64-bit ID.
  */
 class IggyException : public std::runtime_error {
   public:
     explicit IggyException(const char *message) : std::runtime_error(message) {}
     explicit IggyException(const std::string &message) : std::runtime_error(message) {}
+
+    [[nodiscard]] std::optional<std::uint32_t> Code() const noexcept { return code_; }
+    [[nodiscard]] const std::string &Kind() const noexcept {
+        static const std::string kNoKind;
+        return kind_ ? *kind_ : kNoKind;
+    }
+    [[nodiscard]] std::optional<std::uint64_t> OperationId() const noexcept { return operation_id_; }
+
+  private:
+    IggyException(const std::string &message, const ffi::ErrorInfo &error) : std::runtime_error(message) {
+        if (!error.kind.empty()) {
+            kind_ = std::make_shared<const std::string>(error.kind);
+            code_ = error.code;
+        }
+        if (error.has_operation_id) {
+            operation_id_ = error.operation_id;
+        }
+    }
+
+    template <typename Operation>
+    friend decltype(auto) detail::RethrowAsIggyException(Operation &&operation);
+
+    std::optional<std::uint32_t> code_;
+    // Shared, so that copying the exception cannot throw.
+    std::shared_ptr<const std::string> kind_;
+    std::optional<std::uint64_t> operation_id_;
 };
+
+namespace detail {
+
+template <typename Operation>
+decltype(auto) RethrowAsIggyException(Operation &&operation) {
+    ffi::ErrorInfo error_info{};
+    try {
+        if constexpr (std::is_invocable_v<Operation, ffi::ErrorInfo &>) {
+            return std::forward<Operation>(operation)(error_info);
+        } else {
+            return std::forward<Operation>(operation)();
+        }
+    } catch (const IggyException &) {
+        throw;
+    } catch (const std::exception &error) {
+        throw IggyException(error.what(), error_info);
+    }
+}
+
+}  // namespace detail
 
 /**
  * @brief Details returned after a successful login.
@@ -692,6 +759,8 @@ class Permissions final {
 
     friend class IggyBlockingClient;
     friend class UserInfoDetails;
+    friend class MetadataUserChange;
+    friend class MetadataUserPermissionsUpdated;
 
     GlobalPermissions global_;
     std::map<std::uint32_t, StreamPermissions> streams_;
@@ -1071,15 +1140,16 @@ class IggyMessagePolled final {
 };
 
 /**
- * @brief Options recorded for a stream or topic.
+ * @brief Options recorded for a stream, topic, or user.
  *
- * Explicit() contains values supplied when the resource was created. Derived()
- * contains values resolved from the server configuration at that time. Derived
- * values describe the resource's creation settings and can differ when the
- * resource is recreated with a different server configuration.
+ * Explicit() contains values a client supplied at creation or in a later
+ * update. Derived() contains values the server filled in: defaults resolved
+ * at admission, values restored by a reset, and the read-only stream
+ * encryption projections. Key material is never returned.
  *
- * This is a response-only model returned by Options(). Use TopicCreateOptions
- * to configure a new topic. Stream creation currently accepts only a name.
+ * This is a response-only model returned by Options(). Use
+ * TopicCreateOptions, StreamCreateOptions, or UserCreateOptions to configure a
+ * new resource.
  */
 class ResourceOptions final {
   public:
@@ -1090,10 +1160,8 @@ class ResourceOptions final {
     [[nodiscard]] const std::map<std::string, HeaderField> &Explicit() const noexcept { return explicit_; }
 
     /**
-     * @brief Returns entries derived from configured defaults at admission.
+     * @brief Returns entries the server filled in.
      * @return Derived entries as map from option name to typed value.
-     * @note Stream responses currently expose explicit entries only, so this
-     *       collection is empty for Stream and StreamDetails.
      */
     [[nodiscard]] const std::map<std::string, HeaderField> &Derived() const noexcept { return derived_; }
 
@@ -1112,6 +1180,10 @@ class ResourceOptions final {
     friend class StreamDetails;
     friend class UserInfo;
     friend class UserInfoDetails;
+    friend class MetadataStreamChange;
+    friend class MetadataTopicChange;
+    friend class MetadataTopicItem;
+    friend class MetadataUserChange;
 
     std::map<std::string, HeaderField> explicit_;
     std::map<std::string, HeaderField> derived_;
@@ -1152,7 +1224,7 @@ class UserInfo final {
     [[nodiscard]] const std::string &Username() const noexcept { return username_; }
 
     /**
-     * @brief Returns explicit user creation options.
+     * @brief Returns user options and their provenance.
      * @return Options owned by this value.
      */
     [[nodiscard]] const ResourceOptions &Options() const noexcept { return options_; }
@@ -1221,7 +1293,7 @@ class UserInfoDetails final {
     [[nodiscard]] const std::optional<::iggy::Permissions> &Permissions() const noexcept { return permissions_; }
 
     /**
-     * @brief Returns explicit user creation options.
+     * @brief Returns user options and their provenance.
      * @return Options owned by this value.
      */
     [[nodiscard]] const ResourceOptions &Options() const noexcept { return options_; }
@@ -1295,19 +1367,21 @@ class Topic final {
     [[nodiscard]] std::uint64_t SizeBytes() const noexcept { return size_bytes_; }
 
     /**
-     * @brief Returns the server-encoded message retention value.
+     * @brief Returns the message retention resolved from the topic options.
      * @return Retention value in microseconds or a protocol sentinel.
      */
     [[nodiscard]] std::uint64_t MessageExpiry() const noexcept { return message_expiry_; }
 
     /**
-     * @brief Returns the server-selected storage compression algorithm.
+     * @brief Returns the storage compression algorithm resolved from the topic
+     *        options.
      * @return Algorithm name owned by this value.
      */
     [[nodiscard]] const std::string &CompressionAlgorithm() const noexcept { return compression_algorithm_; }
 
     /**
-     * @brief Returns the configured maximum retained topic size.
+     * @brief Returns the maximum retained topic size resolved from the topic
+     *        options.
      * @return Maximum size in bytes.
      */
     [[nodiscard]] std::uint64_t MaxTopicSize() const noexcept { return max_topic_size_; }
@@ -1545,19 +1619,20 @@ class TopicDetails final {
     [[nodiscard]] std::uint64_t SizeBytes() const noexcept { return size_bytes_; }
 
     /**
-     * @brief Returns the server-encoded message retention value.
+     * @brief Returns the message retention resolved from the topic options.
      * @return Retention value in microseconds or a protocol sentinel.
      */
     [[nodiscard]] std::uint64_t MessageExpiry() const noexcept { return message_expiry_; }
 
     /**
-     * @brief Returns the storage compression algorithm selected for this topic.
+     * @brief Returns the storage compression algorithm resolved from the topic
+     *        options.
      * @return Algorithm name owned by this value.
      */
     [[nodiscard]] const std::string &CompressionAlgorithm() const noexcept { return compression_algorithm_; }
 
     /**
-     * @brief Returns the maximum retained size configured for this topic.
+     * @brief Returns the maximum retained size resolved from the topic options.
      * @return Maximum size in bytes.
      */
     [[nodiscard]] std::uint64_t MaxTopicSize() const noexcept { return max_topic_size_; }
@@ -1631,6 +1706,30 @@ class TopicDetails final {
 };
 
 /**
+ * @brief Who chose a stream's at-rest data key.
+ *
+ * Reads report the source and fingerprints of a stream's key, never the key
+ * itself.
+ */
+enum class StreamEncryptionSource : std::uint8_t {
+    None   = 0,  ///< The stream is stored as plaintext for life.
+    Stream = 1,  ///< The client supplied the key at creation.
+    Server = 2,  ///< The server generated the key at creation.
+};
+
+constexpr std::string_view to_string(const StreamEncryptionSource source) {
+    switch (source) {
+        case StreamEncryptionSource::None:
+            return "none";
+        case StreamEncryptionSource::Stream:
+            return "stream";
+        case StreamEncryptionSource::Server:
+            return "server";
+    }
+    throw std::invalid_argument("Unknown stream encryption source");
+}
+
+/**
  * @brief Snapshot of one stream's metadata and aggregate statistics.
  *
  * CreateStream() and GetStream() return this value.
@@ -1699,11 +1798,45 @@ class StreamDetails final {
     [[nodiscard]] const std::vector<Topic> &Topics() const noexcept { return topics_; }
 
     /**
-     * @brief Returns explicit stream creation options.
+     * @brief Returns stream options and their provenance.
+     *
+     * Derived() carries the read-only encryption projections. Key material is
+     * never returned.
      * @return Options owned by this value.
-     * @note The current bridge does not return derived stream options.
      */
     [[nodiscard]] const ResourceOptions &Options() const noexcept { return options_; }
+
+    /**
+     * @brief Returns who chose the stream's at-rest key.
+     * @return Key source. A plaintext stream reports
+     *         StreamEncryptionSource::None. `std::nullopt` means the read
+     *         carried no source entry or one this SDK build does not know.
+     */
+    [[nodiscard]] std::optional<StreamEncryptionSource> EncryptionKeySource() const noexcept {
+        return encryption_key_source_;
+    }
+
+    /**
+     * @brief Returns the fingerprint of the stream's key.
+     *
+     * The value is 16 lowercase hex characters. Compare it with
+     * EncryptionKeyFingerprint() of a key you hold to check which key the
+     * stream uses.
+     * @return Fingerprint, or `std::nullopt` for a plaintext stream.
+     */
+    [[nodiscard]] const std::optional<std::string> &EncryptionKeyFingerprint() const noexcept {
+        return encryption_key_fingerprint_;
+    }
+
+    /**
+     * @brief Returns the fingerprints of the server keys that wrap the
+     *        stream's key.
+     * @return One fingerprint outside a server key rotation, empty for a
+     *         plaintext stream.
+     */
+    [[nodiscard]] const std::vector<std::string> &EncryptionKekFingerprints() const noexcept {
+        return encryption_kek_fingerprints_;
+    }
 
   private:
     StreamDetails(std::uint32_t id,
@@ -1713,7 +1846,10 @@ class StreamDetails final {
                   std::uint64_t messages_count,
                   std::uint32_t topics_count,
                   std::vector<Topic> topics,
-                  ResourceOptions options)
+                  ResourceOptions options,
+                  std::optional<StreamEncryptionSource> encryption_key_source,
+                  std::optional<std::string> encryption_key_fingerprint,
+                  std::vector<std::string> encryption_kek_fingerprints)
         : id_(id),
           created_at_(created_at),
           name_(std::move(name)),
@@ -1721,7 +1857,10 @@ class StreamDetails final {
           messages_count_(messages_count),
           topics_count_(topics_count),
           topics_(std::move(topics)),
-          options_(std::move(options)) {}
+          options_(std::move(options)),
+          encryption_key_source_(encryption_key_source),
+          encryption_key_fingerprint_(std::move(encryption_key_fingerprint)),
+          encryption_kek_fingerprints_(std::move(encryption_kek_fingerprints)) {}
 
     static StreamDetails FromFfi(ffi::StreamDetails stream);
 
@@ -1735,6 +1874,9 @@ class StreamDetails final {
     std::uint32_t topics_count_;
     std::vector<Topic> topics_;
     ResourceOptions options_;
+    std::optional<StreamEncryptionSource> encryption_key_source_;
+    std::optional<std::string> encryption_key_fingerprint_;
+    std::vector<std::string> encryption_kek_fingerprints_;
 };
 
 /**
@@ -1788,11 +1930,45 @@ class Stream final {
     [[nodiscard]] std::uint32_t TopicsCount() const noexcept { return topics_count_; }
 
     /**
-     * @brief Returns explicit stream creation options.
+     * @brief Returns stream options and their provenance.
+     *
+     * Derived() carries the read-only encryption projections. Key material is
+     * never returned.
      * @return Options owned by this value.
-     * @note The current bridge does not return derived stream options.
      */
     [[nodiscard]] const ResourceOptions &Options() const noexcept { return options_; }
+
+    /**
+     * @brief Returns who chose the stream's at-rest key.
+     * @return Key source. A plaintext stream reports
+     *         StreamEncryptionSource::None. `std::nullopt` means the read
+     *         carried no source entry or one this SDK build does not know.
+     */
+    [[nodiscard]] std::optional<StreamEncryptionSource> EncryptionKeySource() const noexcept {
+        return encryption_key_source_;
+    }
+
+    /**
+     * @brief Returns the fingerprint of the stream's key.
+     *
+     * The value is 16 lowercase hex characters. Compare it with
+     * EncryptionKeyFingerprint() of a key you hold to check which key the
+     * stream uses.
+     * @return Fingerprint, or `std::nullopt` for a plaintext stream.
+     */
+    [[nodiscard]] const std::optional<std::string> &EncryptionKeyFingerprint() const noexcept {
+        return encryption_key_fingerprint_;
+    }
+
+    /**
+     * @brief Returns the fingerprints of the server keys that wrap the
+     *        stream's key.
+     * @return One fingerprint outside a server key rotation, empty for a
+     *         plaintext stream.
+     */
+    [[nodiscard]] const std::vector<std::string> &EncryptionKekFingerprints() const noexcept {
+        return encryption_kek_fingerprints_;
+    }
 
   private:
     Stream(std::uint32_t id,
@@ -1801,14 +1977,20 @@ class Stream final {
            std::uint64_t size_bytes,
            std::uint64_t messages_count,
            std::uint32_t topics_count,
-           ResourceOptions options)
+           ResourceOptions options,
+           std::optional<StreamEncryptionSource> encryption_key_source,
+           std::optional<std::string> encryption_key_fingerprint,
+           std::vector<std::string> encryption_kek_fingerprints)
         : id_(id),
           created_at_(created_at),
           name_(std::move(name)),
           size_bytes_(size_bytes),
           messages_count_(messages_count),
           topics_count_(topics_count),
-          options_(std::move(options)) {}
+          options_(std::move(options)),
+          encryption_key_source_(encryption_key_source),
+          encryption_key_fingerprint_(std::move(encryption_key_fingerprint)),
+          encryption_kek_fingerprints_(std::move(encryption_kek_fingerprints)) {}
 
     static Stream FromFfi(ffi::Stream stream);
 
@@ -1821,6 +2003,9 @@ class Stream final {
     std::uint64_t messages_count_;
     std::uint32_t topics_count_;
     ResourceOptions options_;
+    std::optional<StreamEncryptionSource> encryption_key_source_;
+    std::optional<std::string> encryption_key_fingerprint_;
+    std::vector<std::string> encryption_kek_fingerprints_;
 };
 
 /**
@@ -2735,15 +2920,128 @@ constexpr std::string_view to_string(const Durability durability) {
 }
 
 /**
+ * @brief Whether a topic's partition set may change after creation.
+ */
+enum class PartitionResizePolicy : std::uint8_t {
+    Mutable,  ///< Partitions may be created and deleted later.
+    Fixed,    ///< The partition set is fixed at topic creation.
+};
+
+constexpr std::string_view to_string(const PartitionResizePolicy policy) {
+    switch (policy) {
+        case PartitionResizePolicy::Mutable:
+            return "mutable";
+        case PartitionResizePolicy::Fixed:
+            return "fixed";
+    }
+    throw std::invalid_argument("Unknown partition resize policy");
+}
+
+/**
+ * @brief Option keys of the stream scope, in catalog order.
+ *
+ * Name is updatable. EncryptionKey is a create-only secret. The fingerprint
+ * and source keys are read-only projections. No stream key is resettable.
+ */
+enum class StreamOptionKey : std::uint8_t {
+    Name,
+    EncryptionKey,
+    EncryptionKeySource,
+    EncryptionKeyFingerprint,
+    EncryptionKekFingerprint,
+};
+
+constexpr std::string_view to_string(const StreamOptionKey key) {
+    switch (key) {
+        case StreamOptionKey::Name:
+            return "name";
+        case StreamOptionKey::EncryptionKey:
+            return "encryption_key";
+        case StreamOptionKey::EncryptionKeySource:
+            return "encryption_key_source";
+        case StreamOptionKey::EncryptionKeyFingerprint:
+            return "encryption_key_fingerprint";
+        case StreamOptionKey::EncryptionKekFingerprint:
+            return "encryption_kek_fingerprint";
+    }
+    throw std::invalid_argument("Unknown stream option key");
+}
+
+/**
+ * @brief Option keys of the topic scope, in catalog order.
+ *
+ * Name, MessageExpiry, and MaxTopicSize are updatable, and MessageExpiry and
+ * MaxTopicSize are also resettable. Every other key is create-only.
+ */
+enum class TopicOptionKey : std::uint8_t {
+    Name,
+    CompressionAlgorithm,
+    MessageExpiry,
+    MaxTopicSize,
+    SegmentSize,
+    Durability,
+    ConsumerOffsetDurability,
+    PartitionResizePolicy,
+    MessagesRequiredToSave,
+    SizeOfMessagesRequiredToSave,
+    PreallocateSegments,
+};
+
+constexpr std::string_view to_string(const TopicOptionKey key) {
+    switch (key) {
+        case TopicOptionKey::Name:
+            return "name";
+        case TopicOptionKey::CompressionAlgorithm:
+            return "compression_algorithm";
+        case TopicOptionKey::MessageExpiry:
+            return "message_expiry";
+        case TopicOptionKey::MaxTopicSize:
+            return "max_topic_size";
+        case TopicOptionKey::SegmentSize:
+            return "segment_size";
+        case TopicOptionKey::Durability:
+            return "durability";
+        case TopicOptionKey::ConsumerOffsetDurability:
+            return "consumer_offset_durability";
+        case TopicOptionKey::PartitionResizePolicy:
+            return "partition_resize_policy";
+        case TopicOptionKey::MessagesRequiredToSave:
+            return "messages_required_to_save";
+        case TopicOptionKey::SizeOfMessagesRequiredToSave:
+            return "size_of_messages_required_to_save";
+        case TopicOptionKey::PreallocateSegments:
+            return "preallocate_segments";
+    }
+    throw std::invalid_argument("Unknown topic option key");
+}
+
+/**
+ * @brief Option keys of the user scope, in catalog order.
+ *
+ * Both keys are updatable. Neither is resettable.
+ */
+enum class UserOptionKey : std::uint8_t {
+    Username,
+    Status,
+};
+
+constexpr std::string_view to_string(const UserOptionKey key) {
+    switch (key) {
+        case UserOptionKey::Username:
+            return "username";
+        case UserOptionKey::Status:
+            return "status";
+    }
+    throw std::invalid_argument("Unknown user option key");
+}
+
+/**
  * @brief Options for creating a topic.
  *
  * Use the typed setters to configure supported topic settings. Leave a setting
  * unset to use the server default. Use SetRawEntries() for supported options
  * that do not yet have a typed setter. When both specify the same option, the
  * typed setting takes precedence.
- *
- * For example, the entry `partition_resize_policy` set to `fixed` makes the
- * server reject later partition creation and deletion on this topic.
  */
 class TopicCreateOptions final {
   public:
@@ -2886,6 +3184,26 @@ class TopicCreateOptions final {
     }
 
     /**
+     * @brief Returns whether the topic's partition set may change later.
+     * @return Configured policy, or `std::nullopt` to use the server default
+     *         (`mutable`).
+     */
+    [[nodiscard]] std::optional<::iggy::PartitionResizePolicy> PartitionResizePolicy() const noexcept {
+        return partition_resize_policy_;
+    }
+
+    /**
+     * @brief Sets whether the topic's partition set may change later.
+     * @param policy PartitionResizePolicy::Fixed makes the server reject later
+     *        partition creation and deletion on this topic.
+     * @return Reference to this options object.
+     */
+    TopicCreateOptions &SetPartitionResizePolicy(::iggy::PartitionResizePolicy policy) noexcept {
+        partition_resize_policy_ = policy;
+        return *this;
+    }
+
+    /**
      * @brief Returns the message-count threshold for flushing the journal.
      * @return Configured threshold, or `std::nullopt` to use the server default.
      */
@@ -2995,6 +3313,7 @@ class TopicCreateOptions final {
     std::optional<std::uint64_t> segment_size_;
     std::optional<::iggy::Durability> durability_;
     std::optional<::iggy::Durability> consumer_offset_durability_;
+    std::optional<::iggy::PartitionResizePolicy> partition_resize_policy_;
     std::optional<std::uint32_t> messages_required_to_save_;
     std::optional<std::uint64_t> size_of_messages_required_to_save_;
     std::optional<bool> preallocate_segments_;
@@ -3007,33 +3326,33 @@ class TopicCreateOptions final {
  * @brief Options for updating a topic.
  *
  * Use this class to change a topic's mutable settings. Leave a setting unset
- * to retain its current value. Topic creation settings, such as the partition
- * count and segment size, cannot be changed after the topic is created.
+ * to retain its current value, or name it in Reset() to return it to the
+ * server default. Topic creation settings, such as the compression
+ * algorithm, partition count, and segment size, cannot be changed after the
+ * topic is created.
  *
  * Use the typed setters for supported settings. SetRawEntries() can configure
  * other supported mutable settings. When both configure the same setting, the
- * typed setting takes precedence.
+ * typed setting takes precedence. An update must change at least one setting,
+ * and must not both set and reset the same one.
  */
 class TopicUpdateOptions final {
   public:
     TopicUpdateOptions() = default;
 
     /**
-     * @brief Returns the requested storage compression update.
-     * @return Compression algorithm to apply, or `std::nullopt` when this
-     *         update leaves compression unchanged.
+     * @brief Returns the requested topic name.
+     * @return New name, or `std::nullopt` when this update keeps the name.
      */
-    [[nodiscard]] const std::optional<::iggy::CompressionAlgorithm> &CompressionAlgorithm() const noexcept {
-        return compression_algorithm_;
-    }
+    [[nodiscard]] const std::optional<std::string> &Name() const noexcept { return name_; }
 
     /**
-     * @brief Sets the storage compression algorithm.
-     * @param compression_algorithm Compression algorithm to apply.
+     * @brief Renames the topic.
+     * @param name New topic name, unique within its stream.
      * @return Reference to this options object.
      */
-    TopicUpdateOptions &SetCompressionAlgorithm(::iggy::CompressionAlgorithm compression_algorithm) {
-        compression_algorithm_ = std::move(compression_algorithm);
+    TopicUpdateOptions &SetName(std::string name) {
+        name_ = std::move(name);
         return *this;
     }
 
@@ -3047,7 +3366,8 @@ class TopicUpdateOptions final {
     /**
      * @brief Sets the message retention policy.
      * @param message_expiry Expiry policy to apply. Expiry::ServerDefault()
-     *        leaves the current policy unchanged.
+     *        leaves the current policy unchanged. Use
+     *        Reset(TopicOptionKey::MessageExpiry) to return to the default.
      * @return Reference to this options object.
      */
     TopicUpdateOptions &SetMessageExpiry(::iggy::Expiry message_expiry) {
@@ -3069,7 +3389,8 @@ class TopicUpdateOptions final {
     /**
      * @brief Sets the maximum retained topic size.
      * @param max_topic_size Maximum size to retain. MaxTopicSize::ServerDefault()
-     *        leaves the current limit unchanged.
+     *        leaves the current limit unchanged. Use
+     *        Reset(TopicOptionKey::MaxTopicSize) to return to the default.
      * @return Reference to this options object.
      */
     TopicUpdateOptions &SetMaxTopicSize(::iggy::MaxTopicSize max_topic_size) {
@@ -3119,10 +3440,146 @@ class TopicUpdateOptions final {
         return *this;
     }
 
+    /**
+     * @brief Returns the settings this update resets to their defaults.
+     * @return Keys to reset, ordered by catalog position.
+     */
+    [[nodiscard]] const std::set<TopicOptionKey> &ResetKeys() const noexcept { return reset_; }
+
+    /**
+     * @brief Resets a setting to its server default.
+     * @param key Setting to reset. Only MessageExpiry and MaxTopicSize are
+     *        resettable. UpdateTopic() refuses any other key before sending
+     *        with the error the server would return.
+     * @return Reference to this options object.
+     */
+    TopicUpdateOptions &Reset(TopicOptionKey key) {
+        reset_.insert(key);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the settings this update resets by name.
+     * @return Names to reset, for keys newer than this SDK build.
+     */
+    [[nodiscard]] const std::set<std::string> &RawResetKeys() const noexcept { return raw_reset_; }
+
+    /**
+     * @brief Resets a setting by name to its server default.
+     *
+     * Use this for keys newer than this SDK build. The server decides whether
+     * the key exists and may be reset.
+     * @param key Setting name to reset.
+     * @return Reference to this options object.
+     */
+    TopicUpdateOptions &RawReset(std::string key) {
+        raw_reset_.insert(std::move(key));
+        return *this;
+    }
+
   private:
-    std::optional<::iggy::CompressionAlgorithm> compression_algorithm_;
+    std::optional<std::string> name_;
     std::optional<::iggy::Expiry> message_expiry_;
     std::optional<::iggy::MaxTopicSize> max_topic_size_;
+    std::map<std::string, std::string> raw_;
+    std::set<TopicOptionKey> reset_;
+    std::set<std::string> raw_reset_;
+
+    friend class IggyBlockingClient;
+};
+
+/**
+ * @brief Options for creating a stream.
+ *
+ * A stream may carry its own 32-byte data encryption key. The key must be 32
+ * random bytes, never derived from a password, because reads expose its
+ * fingerprint. It travels inside the create request over whatever transport
+ * the client uses, so protecting it in transit with TLS is the caller's
+ * responsibility. The server stores the key wrapped and never returns it:
+ * reads report only its source and fingerprints. Without a key, a server with
+ * encryption enabled generates one for the stream.
+ *
+ * An invalid key is refused by CreateStream() before anything is sent. This
+ * type never prints or logs the key.
+ */
+class StreamCreateOptions final {
+  public:
+    StreamCreateOptions() = default;
+
+    /**
+     * @brief Returns whether this create carries an encryption key.
+     * @return `true` after SetEncryptionKey() or SetEncryptionKeyBase64().
+     */
+    [[nodiscard]] bool HasEncryptionKey() const noexcept {
+        return encryption_key_.has_value() || encryption_key_base64_.has_value();
+    }
+
+    /**
+     * @brief Sets the stream's data encryption key from raw bytes.
+     * @param key Exactly 32 random bytes. CreateStream() refuses any other
+     *        length with invalid_encryption_key.
+     * @return Reference to this options object.
+     */
+    StreamCreateOptions &SetEncryptionKey(const std::vector<std::uint8_t> &key) {
+        encryption_key_ = key;
+        encryption_key_base64_.reset();
+        return *this;
+    }
+
+    /**
+     * @brief Sets the stream's data encryption key from its base64 text.
+     * @param key Canonical standard padded base64 of exactly 32 bytes.
+     *        CreateStream() refuses whitespace, the URL-safe alphabet, missing
+     *        padding, and noncanonical trailing bits with
+     *        invalid_encryption_key.
+     * @return Reference to this options object.
+     */
+    StreamCreateOptions &SetEncryptionKeyBase64(std::string key) {
+        encryption_key_base64_ = std::move(key);
+        encryption_key_.reset();
+        return *this;
+    }
+
+    /**
+     * @brief Returns additional stream settings as key-value pairs.
+     * @return Ordered map of setting names and values.
+     * @note A dedicated setter takes precedence when it configures the same
+     *       setting.
+     */
+    [[nodiscard]] const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
+
+    /**
+     * @brief Adds or replaces additional stream settings.
+     *
+     * Use this for keys newer than this SDK build. Unsupported names and
+     * invalid values are rejected when the stream is created.
+     * @param entries Setting names and values to add.
+     * @return Reference to this options object.
+     */
+    StreamCreateOptions &SetRawEntries(const std::map<std::string, std::string> &entries) {
+        for (const auto &entry : entries) {
+            raw_.insert_or_assign(entry.first, entry.second);
+        }
+        return *this;
+    }
+    /**
+     * @brief Adds or replaces additional stream settings.
+     * @param entries Setting names and values to move into this options object.
+     * @return Reference to this options object.
+     * @see SetRawEntries(const std::map<std::string, std::string>&)
+     */
+    StreamCreateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
+        while (!entries.empty()) {
+            auto node = entries.extract(entries.begin());
+            raw_.erase(node.key());
+            raw_.insert(std::move(node));
+        }
+        return *this;
+    }
+
+  private:
+    std::optional<std::vector<std::uint8_t>> encryption_key_;
+    std::optional<std::string> encryption_key_base64_;
     std::map<std::string, std::string> raw_;
 
     friend class IggyBlockingClient;
@@ -3131,27 +3588,45 @@ class TopicUpdateOptions final {
 /**
  * @brief Options for updating a stream.
  *
- * Use this class to supply stream settings to UpdateStream(). Currently, Iggy
- * does not support updating stream settings, so the server rejects every
- * supplied setting. The raw entries are retained for compatibility with future
- * server versions that add mutable stream settings.
+ * Leave a setting unset to retain its current value. The name is the only
+ * updatable stream setting, and no stream setting is resettable, so Reset()
+ * exists to refuse a reset before anything is sent, with the error the server
+ * would return. RawReset() names keys newer than this SDK build and leaves the
+ * decision to the server. An update must change at least one setting.
  */
 class StreamUpdateOptions final {
   public:
     StreamUpdateOptions() = default;
 
     /**
+     * @brief Returns the requested stream name.
+     * @return New name, or `std::nullopt` when this update keeps the name.
+     */
+    [[nodiscard]] const std::optional<std::string> &Name() const noexcept { return name_; }
+
+    /**
+     * @brief Renames the stream.
+     * @param name New unique stream name.
+     * @return Reference to this options object.
+     */
+    StreamUpdateOptions &SetName(std::string name) {
+        name_ = std::move(name);
+        return *this;
+    }
+
+    /**
      * @brief Returns the requested stream settings as key-value pairs.
      * @return Ordered map of setting names and values.
-     * @note The server currently rejects all stream settings.
      */
     [[nodiscard]] const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
 
     /**
      * @brief Adds or replaces requested stream settings.
+     *
+     * Use this for updatable keys newer than this SDK build. Unsupported or
+     * immutable settings are rejected when the stream is updated.
      * @param entries Setting names and values to add.
      * @return Reference to this options object.
-     * @note The server currently rejects all stream settings.
      */
     StreamUpdateOptions &SetRawEntries(const std::map<std::string, std::string> &entries) {
         for (const auto &entry : entries) {
@@ -3164,9 +3639,98 @@ class StreamUpdateOptions final {
      * @param entries Setting names and values to move into this options object.
      * @return Reference to this options object.
      * @see SetRawEntries(const std::map<std::string, std::string>&)
-     * @note The server currently rejects all stream settings.
      */
     StreamUpdateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
+        while (!entries.empty()) {
+            auto node = entries.extract(entries.begin());
+            raw_.erase(node.key());
+            raw_.insert(std::move(node));
+        }
+        return *this;
+    }
+
+    /**
+     * @brief Returns the settings this update resets to their defaults.
+     * @return Keys to reset, ordered by catalog position.
+     */
+    [[nodiscard]] const std::set<StreamOptionKey> &ResetKeys() const noexcept { return reset_; }
+
+    /**
+     * @brief Requests a reset of a stream setting.
+     * @param key Setting to reset. No stream key is resettable in this
+     *        release, so UpdateStream() refuses every reset before sending.
+     * @return Reference to this options object.
+     */
+    StreamUpdateOptions &Reset(StreamOptionKey key) {
+        reset_.insert(key);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the settings this update resets by name.
+     * @return Names to reset, for keys newer than this SDK build.
+     */
+    [[nodiscard]] const std::set<std::string> &RawResetKeys() const noexcept { return raw_reset_; }
+
+    /**
+     * @brief Resets a setting by name to its server default.
+     *
+     * Use this for keys newer than this SDK build. The server decides whether
+     * the key exists and may be reset.
+     * @param key Setting name to reset.
+     * @return Reference to this options object.
+     */
+    StreamUpdateOptions &RawReset(std::string key) {
+        raw_reset_.insert(std::move(key));
+        return *this;
+    }
+
+  private:
+    std::optional<std::string> name_;
+    std::map<std::string, std::string> raw_;
+    std::set<StreamOptionKey> reset_;
+    std::set<std::string> raw_reset_;
+
+    friend class IggyBlockingClient;
+};
+
+/**
+ * @brief Options for creating a user.
+ *
+ * No typed user setting exists yet. The type exists so a future setting is
+ * a new setter rather than a signature change.
+ */
+class UserCreateOptions final {
+  public:
+    UserCreateOptions() = default;
+
+    /**
+     * @brief Returns additional user settings as key-value pairs.
+     * @return Ordered map of setting names and values.
+     */
+    [[nodiscard]] const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
+
+    /**
+     * @brief Adds or replaces additional user settings.
+     *
+     * Use this for keys newer than this SDK build. Unsupported names and
+     * invalid values are rejected when the user is created.
+     * @param entries Setting names and values to add.
+     * @return Reference to this options object.
+     */
+    UserCreateOptions &SetRawEntries(const std::map<std::string, std::string> &entries) {
+        for (const auto &entry : entries) {
+            raw_.insert_or_assign(entry.first, entry.second);
+        }
+        return *this;
+    }
+    /**
+     * @brief Adds or replaces additional user settings.
+     * @param entries Setting names and values to move into this options object.
+     * @return Reference to this options object.
+     * @see SetRawEntries(const std::map<std::string, std::string>&)
+     */
+    UserCreateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
         while (!entries.empty()) {
             auto node = entries.extract(entries.begin());
             raw_.erase(node.key());
@@ -3184,11 +3748,11 @@ class StreamUpdateOptions final {
 /**
  * @brief Options for updating a user.
  *
- * Use this class to supply user settings to UpdateUser(). Updating a user
- * patches only the supplied settings; omitted settings remain unchanged.
- * Currently, Iggy does not support updating user settings, so the server
- * rejects every supplied setting. The raw entries are retained for
- * compatibility with future server versions that add mutable user settings.
+ * Updating a user patches only the supplied settings. Omitted settings remain
+ * unchanged. No user setting is resettable, so Reset() exists to refuse a
+ * reset before anything is sent, with the error the server would return.
+ * RawReset() names keys newer than this SDK build and leaves the decision to
+ * the server. An update must change at least one setting.
  */
 class UserUpdateOptions final {
   public:
@@ -3196,17 +3760,53 @@ class UserUpdateOptions final {
     UserUpdateOptions() = default;
 
     /**
+     * @brief Returns the requested user name.
+     * @return New name, or `std::nullopt` when this update keeps the name.
+     */
+    [[nodiscard]] const std::optional<std::string> &Username() const noexcept { return username_; }
+
+    /**
+     * @brief Renames the user.
+     *
+     * Renaming the authenticated user also updates the credentials the client
+     * uses when it reconnects.
+     * @param username New unique user name, 3 to 50 bytes.
+     * @return Reference to this options object.
+     */
+    UserUpdateOptions &SetUsername(std::string username) {
+        username_ = std::move(username);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested authentication status.
+     * @return New status, or `std::nullopt` when this update keeps the status.
+     */
+    [[nodiscard]] std::optional<UserStatus> Status() const noexcept { return status_; }
+
+    /**
+     * @brief Sets the user's authentication status.
+     * @param status New status. Deactivating a user ends its sessions.
+     * @return Reference to this options object.
+     */
+    UserUpdateOptions &SetStatus(UserStatus status) noexcept {
+        status_ = status;
+        return *this;
+    }
+
+    /**
      * @brief Returns the requested user settings as key-value pairs.
      * @return Ordered map of setting names and values.
-     * @note The server currently rejects all user settings.
      */
     [[nodiscard]] const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
 
     /**
      * @brief Adds or replaces requested user settings.
+     *
+     * Use this for updatable keys newer than this SDK build. Unsupported or
+     * immutable settings are rejected when the user is updated.
      * @param entries Setting names and values to add.
      * @return Reference to this options object.
-     * @note The server currently rejects all user settings.
      */
     UserUpdateOptions &SetRawEntries(const std::map<std::string, std::string> &entries) {
         for (const auto &entry : entries) {
@@ -3219,7 +3819,6 @@ class UserUpdateOptions final {
      * @param entries Setting names and values to move into this options object.
      * @return Reference to this options object.
      * @see SetRawEntries(const std::map<std::string, std::string>&)
-     * @note The server currently rejects all user settings.
      */
     UserUpdateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
         while (!entries.empty()) {
@@ -3230,10 +3829,1796 @@ class UserUpdateOptions final {
         return *this;
     }
 
+    /**
+     * @brief Returns the settings this update resets to their defaults.
+     * @return Keys to reset, ordered by catalog position.
+     */
+    [[nodiscard]] const std::set<UserOptionKey> &ResetKeys() const noexcept { return reset_; }
+
+    /**
+     * @brief Requests a reset of a user setting.
+     * @param key Setting to reset. No user key is resettable in this release,
+     *        so UpdateUser() refuses every reset before sending.
+     * @return Reference to this options object.
+     */
+    UserUpdateOptions &Reset(UserOptionKey key) {
+        reset_.insert(key);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the settings this update resets by name.
+     * @return Names to reset, for keys newer than this SDK build.
+     */
+    [[nodiscard]] const std::set<std::string> &RawResetKeys() const noexcept { return raw_reset_; }
+
+    /**
+     * @brief Resets a setting by name to its server default.
+     *
+     * Use this for keys newer than this SDK build. The server decides whether
+     * the key exists and may be reset.
+     * @param key Setting name to reset.
+     * @return Reference to this options object.
+     */
+    UserUpdateOptions &RawReset(std::string key) {
+        raw_reset_.insert(std::move(key));
+        return *this;
+    }
+
   private:
+    std::optional<std::string> username_;
+    std::optional<UserStatus> status_;
     std::map<std::string, std::string> raw_;
+    std::set<UserOptionKey> reset_;
+    std::set<std::string> raw_reset_;
 
     friend class IggyBlockingClient;
+};
+
+/**
+ * @brief Resource kind whose option catalog DescribeOptions() serves.
+ */
+enum class OptionsScope : std::uint8_t {
+    Topic  = 1,
+    Stream = 2,
+    User   = 3,
+};
+
+constexpr std::string_view to_string(const OptionsScope scope) {
+    switch (scope) {
+        case OptionsScope::Topic:
+            return "topic";
+        case OptionsScope::Stream:
+            return "stream";
+        case OptionsScope::User:
+            return "user";
+    }
+    throw std::invalid_argument("Unknown options scope");
+}
+
+/**
+ * @brief One key of a resource's option catalog.
+ *
+ * DescribeOptions() returns these values. The flags say what a create or an
+ * update accepts for the key: binary transports report a refused key by error
+ * code only, so this is the discovery surface for valid keys.
+ */
+class OptionSpec final {
+  public:
+    /**
+     * @brief Returns the option key.
+     * @return Key name owned by this value.
+     */
+    [[nodiscard]] const std::string &Key() const noexcept { return key_; }
+
+    /**
+     * @brief Returns the kind the value is encoded under.
+     * @return Header kind of the value and of DefaultValue().
+     */
+    [[nodiscard]] HeaderKind Kind() const noexcept { return kind_; }
+
+    /**
+     * @brief Returns the key's default in Kind()'s encoding.
+     * @return Encoded default, empty when the key has no default.
+     */
+    [[nodiscard]] const std::vector<std::uint8_t> &DefaultValue() const noexcept { return default_value_; }
+
+    /**
+     * @brief Returns the human-readable description.
+     * @return Description owned by this value.
+     */
+    [[nodiscard]] const std::string &Description() const noexcept { return description_; }
+
+    /** @brief Returns whether an update may set the key. */
+    [[nodiscard]] bool Updatable() const noexcept { return updatable_; }
+
+    /** @brief Returns whether an update may reset the key to its default. */
+    [[nodiscard]] bool Resettable() const noexcept { return resettable_; }
+
+    /** @brief Returns whether the key is write-only and never returned. */
+    [[nodiscard]] bool Secret() const noexcept { return secret_; }
+
+    /** @brief Returns whether the server computes the key on reads only. */
+    [[nodiscard]] bool ReadOnly() const noexcept { return read_only_; }
+
+    /** @brief Returns whether a node that does not understand the key refuses to serve the resource. */
+    [[nodiscard]] bool Critical() const noexcept { return critical_; }
+
+  private:
+    OptionSpec(std::string key,
+               HeaderKind kind,
+               std::vector<std::uint8_t> default_value,
+               std::string description,
+               bool updatable,
+               bool resettable,
+               bool secret,
+               bool read_only,
+               bool critical)
+        : key_(std::move(key)),
+          kind_(kind),
+          default_value_(std::move(default_value)),
+          description_(std::move(description)),
+          updatable_(updatable),
+          resettable_(resettable),
+          secret_(secret),
+          read_only_(read_only),
+          critical_(critical) {}
+
+    static OptionSpec FromFfi(ffi::OptionSpec spec);
+
+    friend class IggyBlockingClient;
+
+    std::string key_;
+    HeaderKind kind_;
+    std::vector<std::uint8_t> default_value_;
+    std::string description_;
+    bool updatable_;
+    bool resettable_;
+    bool secret_;
+    bool read_only_;
+    bool critical_;
+};
+
+/**
+ * @brief Computes the fingerprint of a stream encryption key.
+ *
+ * The fingerprint is 16 lowercase hex characters, the same value reads
+ * report through StreamDetails::EncryptionKeyFingerprint(). It is computed
+ * locally and identifies a key without revealing it.
+ *
+ * @param key Exactly 32 raw key bytes.
+ * @return Key fingerprint.
+ * @throws IggyException with Kind() invalid_encryption_key when @p key is not
+ *         32 bytes long. The message never contains key material.
+ */
+std::string EncryptionKeyFingerprint(const std::vector<std::uint8_t> &key);
+
+/**
+ * @brief Computes the fingerprint of a stream encryption key given as base64.
+ *
+ * Takes the same form as StreamCreateOptions::SetEncryptionKeyBase64().
+ *
+ * @param key_base64 Canonical standard padded base64 of exactly 32 bytes.
+ * @return Key fingerprint.
+ * @throws IggyException with Kind() invalid_encryption_key when @p key_base64
+ *         is not canonical or does not decode to 32 bytes. The message never
+ *         contains key material.
+ */
+std::string EncryptionKeyFingerprint(const std::string &key_base64);
+
+/**
+ * @brief Family of metadata change records and the unit of filtering.
+ *
+ * The values are the wire codes. A query without groups selects every group.
+ */
+enum class MetadataChangeGroup : std::uint8_t {
+    Streams              = 1,
+    Topics               = 2,
+    Partitions           = 3,
+    ConsumerGroups       = 4,
+    ConsumerGroupMembers = 5,
+    Users                = 6,
+    PersonalAccessTokens = 7,
+    Sessions             = 8,
+};
+
+constexpr std::string_view to_string(const MetadataChangeGroup group) {
+    switch (group) {
+        case MetadataChangeGroup::Streams:
+            return "streams";
+        case MetadataChangeGroup::Topics:
+            return "topics";
+        case MetadataChangeGroup::Partitions:
+            return "partitions";
+        case MetadataChangeGroup::ConsumerGroups:
+            return "consumer_groups";
+        case MetadataChangeGroup::ConsumerGroupMembers:
+            return "consumer_group_members";
+        case MetadataChangeGroup::Users:
+            return "users";
+        case MetadataChangeGroup::PersonalAccessTokens:
+            return "personal_access_tokens";
+        case MetadataChangeGroup::Sessions:
+            return "sessions";
+    }
+    throw std::invalid_argument("Unknown metadata change group");
+}
+
+/**
+ * @brief Kind of a metadata change record. The values are the wire codes.
+ */
+enum class MetadataChangeKind : std::uint8_t {
+    StreamCreated                    = 1,
+    StreamUpdated                    = 2,
+    StreamDeleted                    = 3,
+    TopicCreated                     = 10,
+    TopicUpdated                     = 11,
+    TopicDeleted                     = 12,
+    PartitionsChanged                = 20,
+    ConsumerGroupCreated             = 30,
+    ConsumerGroupDeleted             = 31,
+    ConsumerGroupMemberJoined        = 40,
+    ConsumerGroupMemberLeft          = 41,
+    ConsumerGroupPartitionHandedOver = 42,
+    UserCreated                      = 50,
+    UserUpdated                      = 51,
+    UserDeleted                      = 52,
+    UserPasswordChanged              = 53,
+    UserPermissionsUpdated           = 54,
+    PersonalAccessTokenCreated       = 60,
+    PersonalAccessTokenDeleted       = 61,
+    SessionRegistered                = 70,
+    SessionClosed                    = 71,
+};
+
+constexpr std::string_view to_string(const MetadataChangeKind kind) {
+    switch (kind) {
+        case MetadataChangeKind::StreamCreated:
+            return "stream_created";
+        case MetadataChangeKind::StreamUpdated:
+            return "stream_updated";
+        case MetadataChangeKind::StreamDeleted:
+            return "stream_deleted";
+        case MetadataChangeKind::TopicCreated:
+            return "topic_created";
+        case MetadataChangeKind::TopicUpdated:
+            return "topic_updated";
+        case MetadataChangeKind::TopicDeleted:
+            return "topic_deleted";
+        case MetadataChangeKind::PartitionsChanged:
+            return "partitions_changed";
+        case MetadataChangeKind::ConsumerGroupCreated:
+            return "consumer_group_created";
+        case MetadataChangeKind::ConsumerGroupDeleted:
+            return "consumer_group_deleted";
+        case MetadataChangeKind::ConsumerGroupMemberJoined:
+            return "consumer_group_member_joined";
+        case MetadataChangeKind::ConsumerGroupMemberLeft:
+            return "consumer_group_member_left";
+        case MetadataChangeKind::ConsumerGroupPartitionHandedOver:
+            return "consumer_group_partition_handed_over";
+        case MetadataChangeKind::UserCreated:
+            return "user_created";
+        case MetadataChangeKind::UserUpdated:
+            return "user_updated";
+        case MetadataChangeKind::UserDeleted:
+            return "user_deleted";
+        case MetadataChangeKind::UserPasswordChanged:
+            return "user_password_changed";
+        case MetadataChangeKind::UserPermissionsUpdated:
+            return "user_permissions_updated";
+        case MetadataChangeKind::PersonalAccessTokenCreated:
+            return "personal_access_token_created";
+        case MetadataChangeKind::PersonalAccessTokenDeleted:
+            return "personal_access_token_deleted";
+        case MetadataChangeKind::SessionRegistered:
+            return "session_registered";
+        case MetadataChangeKind::SessionClosed:
+            return "session_closed";
+    }
+    throw std::invalid_argument("Unknown metadata change kind");
+}
+
+/**
+ * @brief Outcome of a metadata change query.
+ */
+enum class MetadataChangeStatus : std::uint8_t {
+    Ok      = 0,  ///< Records or items after the requested position.
+    Behind  = 1,  ///< The answering node has not applied the requested position yet. Retry later.
+    Expired = 2,  ///< The node no longer holds every record after the position. Rebuild from current state.
+    Reset   = 3,  ///< The position belongs to another history. Rebuild from current state.
+};
+
+constexpr std::string_view to_string(const MetadataChangeStatus status) {
+    switch (status) {
+        case MetadataChangeStatus::Ok:
+            return "ok";
+        case MetadataChangeStatus::Behind:
+            return "behind";
+        case MetadataChangeStatus::Expired:
+            return "expired";
+        case MetadataChangeStatus::Reset:
+            return "reset";
+    }
+    throw std::invalid_argument("Unknown metadata change status");
+}
+
+/**
+ * @brief Whether an answer pages change records or current state items.
+ */
+enum class MetadataChangePhase : std::uint8_t {
+    Changes = 0,
+    Current = 1,
+};
+
+constexpr std::string_view to_string(const MetadataChangePhase phase) {
+    switch (phase) {
+        case MetadataChangePhase::Changes:
+            return "changes";
+        case MetadataChangePhase::Current:
+            return "current";
+    }
+    throw std::invalid_argument("Unknown metadata change phase");
+}
+
+/** @brief Why a consumer group member was removed. */
+enum class MetadataMemberLeftReason : std::uint8_t {
+    Left         = 0,
+    SessionEnded = 1,
+};
+
+constexpr std::string_view to_string(const MetadataMemberLeftReason reason) {
+    switch (reason) {
+        case MetadataMemberLeftReason::Left:
+            return "left";
+        case MetadataMemberLeftReason::SessionEnded:
+            return "session_ended";
+    }
+    throw std::invalid_argument("Unknown member left reason");
+}
+
+/** @brief Why a personal access token was removed. */
+enum class MetadataTokenDeletedReason : std::uint8_t {
+    Deleted = 0,
+    Expired = 1,
+};
+
+constexpr std::string_view to_string(const MetadataTokenDeletedReason reason) {
+    switch (reason) {
+        case MetadataTokenDeletedReason::Deleted:
+            return "deleted";
+        case MetadataTokenDeletedReason::Expired:
+            return "expired";
+    }
+    throw std::invalid_argument("Unknown token deleted reason");
+}
+
+/** @brief Why a session was closed. */
+enum class MetadataSessionClosedReason : std::uint8_t {
+    Logout  = 0,
+    Expired = 1,
+    Revoked = 2,  ///< The user was deactivated or deleted.
+};
+
+constexpr std::string_view to_string(const MetadataSessionClosedReason reason) {
+    switch (reason) {
+        case MetadataSessionClosedReason::Logout:
+            return "logout";
+        case MetadataSessionClosedReason::Expired:
+            return "expired";
+        case MetadataSessionClosedReason::Revoked:
+            return "revoked";
+    }
+    throw std::invalid_argument("Unknown session closed reason");
+}
+
+/** @brief Why a user's public permission set changed. */
+enum class MetadataPermissionsUpdatedReason : std::uint8_t {
+    Updated         = 0,  ///< UpdatePermissions() replaced the set.
+    ResourceDeleted = 1,  ///< A stream or topic delete pruned the user's grants on it.
+};
+
+constexpr std::string_view to_string(const MetadataPermissionsUpdatedReason reason) {
+    switch (reason) {
+        case MetadataPermissionsUpdatedReason::Updated:
+            return "updated";
+        case MetadataPermissionsUpdatedReason::ResourceDeleted:
+            return "resource_deleted";
+    }
+    throw std::invalid_argument("Unknown permissions updated reason");
+}
+
+/**
+ * @brief Position of the last metadata change record a caller consumed.
+ *
+ * Persist ToString() and pass the cursor back through
+ * MetadataChangesQuery::After() to read the records after it. Op() zero names
+ * the beginning of the history LogId() identifies.
+ */
+class MetadataChangeCursor final {
+  public:
+    /**
+     * @brief Parses the `mc1_` text form ToString() returns.
+     * @param text Cursor text.
+     * @return Parsed cursor.
+     * @throws IggyException with Kind() invalid_command when @p text is not a
+     *         canonical cursor. The message never contains the text.
+     */
+    static MetadataChangeCursor Parse(const std::string &text);
+
+    /** @brief Returns the prepare checksum of op 1 of this history. */
+    [[nodiscard]] absl::uint128 LogId() const noexcept { return log_id_; }
+
+    /** @brief Returns the metadata operation of the consumed record. */
+    [[nodiscard]] std::uint64_t Op() const noexcept { return op_; }
+
+    /** @brief Returns the prepare checksum of Op(). */
+    [[nodiscard]] absl::uint128 Checksum() const noexcept { return checksum_; }
+
+    /** @brief Returns the position of the consumed record within Op(). */
+    [[nodiscard]] std::uint32_t Ordinal() const noexcept { return ordinal_; }
+
+    /** @brief Returns whether the cursor names the beginning of its history. */
+    [[nodiscard]] bool IsZero() const noexcept { return op_ == 0; }
+
+    /** @brief Returns the `mc1_` text form, `mc1_` and 59 characters of unpadded base64url. */
+    [[nodiscard]] const std::string &ToString() const noexcept { return text_; }
+
+    friend bool operator==(const MetadataChangeCursor &left, const MetadataChangeCursor &right) noexcept {
+        return left.text_ == right.text_;
+    }
+
+    friend bool operator!=(const MetadataChangeCursor &left, const MetadataChangeCursor &right) noexcept {
+        return !(left == right);
+    }
+
+  private:
+    MetadataChangeCursor() = default;
+
+    static MetadataChangeCursor FromFfi(ffi::MetadataChangeCursor cursor);
+
+    friend class MetadataChanges;
+    friend class MetadataCurrentPageToken;
+
+    absl::uint128 log_id_{};
+    std::uint64_t op_{};
+    absl::uint128 checksum_{};
+    std::uint32_t ordinal_{};
+    std::string text_;
+};
+
+/**
+ * @brief Continuation of a current state scan.
+ *
+ * Pass it back unchanged through MetadataChangesQuery::Current() with the
+ * same groups to read the next page.
+ */
+class MetadataCurrentPageToken final {
+  public:
+    /**
+     * @brief Parses the `cs1_` text form ToString() returns.
+     * @param text Page token text.
+     * @return Parsed page token.
+     * @throws IggyException with Kind() invalid_command when @p text is not a
+     *         canonical page token. The message never contains the text.
+     */
+    static MetadataCurrentPageToken Parse(const std::string &text);
+
+    /** @brief Returns the `cs1_` text form. */
+    [[nodiscard]] const std::string &ToString() const noexcept { return text_; }
+
+    /** @brief Returns the position captured before the scan's first page. */
+    [[nodiscard]] const MetadataChangeCursor &Anchor() const noexcept { return anchor_; }
+
+    /** @brief Returns the highest head any page of the scan reported so far. */
+    [[nodiscard]] std::uint64_t RequiredHead() const noexcept { return required_head_; }
+
+    /** @brief Returns the groups the scan was started with, in code order. */
+    [[nodiscard]] std::vector<MetadataChangeGroup> Groups() const {
+        std::vector<MetadataChangeGroup> groups;
+        for (std::uint8_t code = 1; code <= 8; ++code) {
+            if ((groups_mask_ & (1U << (code - 1))) != 0) {
+                groups.push_back(static_cast<MetadataChangeGroup>(code));
+            }
+        }
+        return groups;
+    }
+
+    /** @brief Returns the group of the last item returned. */
+    [[nodiscard]] MetadataChangeGroup LastGroup() const noexcept { return last_group_; }
+
+    /** @brief Returns the key of the last item returned, in the page token key layout. */
+    [[nodiscard]] const std::vector<std::uint8_t> &LastKey() const noexcept { return last_key_; }
+
+  private:
+    MetadataCurrentPageToken() = default;
+
+    static MetadataCurrentPageToken FromFfi(ffi::MetadataCurrentPageToken token);
+
+    friend class MetadataChanges;
+
+    std::string text_;
+    MetadataChangeCursor anchor_;
+    std::uint64_t required_head_{};
+    std::uint8_t groups_mask_{};
+    MetadataChangeGroup last_group_{MetadataChangeGroup::Streams};
+    std::vector<std::uint8_t> last_key_;
+};
+
+/**
+ * @brief One read of the metadata change log or of the current state.
+ *
+ * Start with Earliest(), Latest(), After(), or Current(), then narrow the
+ * read with the setters. IggyBlockingClient::GetMetadataChanges() refuses an
+ * invalid query with Kind() invalid_command before anything is sent.
+ */
+class MetadataChangesQuery final {
+  public:
+    /** @brief Where the read starts. The values are the wire codes. */
+    enum class Start : std::uint8_t {
+        Earliest = 0,  ///< The oldest operation the requested groups still hold completely.
+        Latest   = 1,  ///< No records, only a cursor at the newest retained record.
+        After    = 2,  ///< The records after Cursor().
+        Current  = 3,  ///< Current state pages, continuing after PageToken() when set.
+    };
+
+    static constexpr std::uint32_t kDefaultLimit = 100;
+    static constexpr std::uint32_t kMaxLimit     = 1000;
+
+    /** @brief Reads from the oldest operation the requested groups still hold completely. */
+    static MetadataChangesQuery Earliest() { return MetadataChangesQuery(Start::Earliest); }
+
+    /** @brief Reads no records and returns a cursor at the newest retained record to follow from. */
+    static MetadataChangesQuery Latest() { return MetadataChangesQuery(Start::Latest); }
+
+    /** @brief Reads the records after @p cursor. */
+    static MetadataChangesQuery After(MetadataChangeCursor cursor) {
+        MetadataChangesQuery query(Start::After);
+        query.cursor_ = std::move(cursor);
+        return query;
+    }
+
+    /** @brief Reads the first page of a current state scan. */
+    static MetadataChangesQuery Current() { return MetadataChangesQuery(Start::Current); }
+
+    /** @brief Reads the page of a current state scan after @p token. Keep the scan's groups. */
+    static MetadataChangesQuery Current(MetadataCurrentPageToken token) {
+        MetadataChangesQuery query(Start::Current);
+        query.page_token_ = std::move(token);
+        return query;
+    }
+
+    /** @brief Returns where the read starts. */
+    [[nodiscard]] Start StartMode() const noexcept { return start_; }
+
+    /** @brief Returns the cursor of an After() read. */
+    [[nodiscard]] const std::optional<MetadataChangeCursor> &Cursor() const noexcept { return cursor_; }
+
+    /** @brief Returns the page token of a continued Current() read. */
+    [[nodiscard]] const std::optional<MetadataCurrentPageToken> &PageToken() const noexcept { return page_token_; }
+
+    /** @brief Returns the requested groups. Empty means every group. */
+    [[nodiscard]] const std::vector<MetadataChangeGroup> &Groups() const noexcept { return groups_; }
+
+    /** @brief Returns the inclusive lower bound on record timestamps, in microseconds. */
+    [[nodiscard]] std::optional<std::uint64_t> Since() const noexcept { return since_; }
+
+    /** @brief Returns the inclusive upper bound on record timestamps, in microseconds. */
+    [[nodiscard]] std::optional<std::uint64_t> Until() const noexcept { return until_; }
+
+    /** @brief Returns the most records or items one page returns. */
+    [[nodiscard]] std::uint32_t Limit() const noexcept { return limit_; }
+
+    /**
+     * @brief Selects the groups to read.
+     *
+     * A current state scan must include each selected group's parents, so a
+     * mirror can apply the cascades of their deletes.
+     * @param groups Requested groups. Empty selects every group.
+     * @return Reference to this query.
+     */
+    MetadataChangesQuery &SetGroups(std::vector<MetadataChangeGroup> groups) {
+        groups_ = std::move(groups);
+        return *this;
+    }
+
+    /**
+     * @brief Keeps records with a timestamp at or after @p micros.
+     *
+     * Time bounds apply to Earliest() and After() reads only.
+     * @param micros Microseconds since the Unix epoch.
+     * @return Reference to this query.
+     */
+    MetadataChangesQuery &SetSince(std::uint64_t micros) {
+        since_ = micros;
+        return *this;
+    }
+
+    /**
+     * @brief Keeps records with a timestamp at or before @p micros.
+     *
+     * Time bounds apply to Earliest() and After() reads only.
+     * @param micros Microseconds since the Unix epoch.
+     * @return Reference to this query.
+     */
+    MetadataChangesQuery &SetUntil(std::uint64_t micros) {
+        until_ = micros;
+        return *this;
+    }
+
+    /**
+     * @brief Sets the most records or items one page returns.
+     * @param limit From 1 to kMaxLimit. The default is kDefaultLimit.
+     * @return Reference to this query.
+     */
+    MetadataChangesQuery &SetLimit(std::uint32_t limit) {
+        limit_ = limit;
+        return *this;
+    }
+
+    /**
+     * @brief Applies the checks GetMetadataChanges() runs before sending.
+     * @throws IggyException with Kind() invalid_command when the limit is
+     *         outside 1 to kMaxLimit, Since() is above Until(), a time bound
+     *         accompanies Latest() or Current() or lies past what the
+     *         platform clock holds, a current state scan misses a parent
+     *         group, or the page token was issued for other groups.
+     */
+    void Validate() const;
+
+    /**
+     * @brief Encodes the query as the binary transports send it, without
+     *        validating it.
+     * @return Request payload without framing.
+     * @throws IggyException with Kind() invalid_command for a group this build
+     *         does not know or a time bound past what the platform clock holds.
+     */
+    [[nodiscard]] std::vector<std::uint8_t> ToBytes() const;
+
+  private:
+    explicit MetadataChangesQuery(Start start) : start_(start) {}
+
+    [[nodiscard]] ffi::MetadataChangesQuery ToFfi() const;
+
+    friend class IggyBlockingClient;
+
+    Start start_;
+    std::optional<MetadataChangeCursor> cursor_;
+    std::optional<MetadataCurrentPageToken> page_token_;
+    std::vector<MetadataChangeGroup> groups_;
+    std::optional<std::uint64_t> since_;
+    std::optional<std::uint64_t> until_;
+    std::uint32_t limit_{kDefaultLimit};
+};
+
+/**
+ * @brief A stream after a create or update, and a current state streams item.
+ */
+class MetadataStreamChange final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. A recreated stream with a reused ID has another. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
+
+    /** @brief Returns the stream name after the change. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /**
+     * @brief Returns the public options after the change, as the read routes return them.
+     * @return `std::nullopt` when the server holds option state this build
+     *         cannot read. Keep the previous values then.
+     */
+    [[nodiscard]] const std::optional<ResourceOptions> &Options() const noexcept { return options_; }
+
+  private:
+    MetadataStreamChange() = default;
+
+    static MetadataStreamChange FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+    friend class MetadataCurrentItem;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint64_t created_at_{};
+    std::string name_;
+    std::optional<ResourceOptions> options_;
+};
+
+/**
+ * @brief A removed stream.
+ */
+class MetadataStreamDeleted final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
+
+    /** @brief Returns the stream name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the op of a deferred delete's request, absent for an immediate delete. */
+    [[nodiscard]] std::optional<std::uint64_t> RequestedOp() const noexcept { return requested_op_; }
+
+  private:
+    MetadataStreamDeleted() = default;
+
+    static MetadataStreamDeleted FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint64_t created_at_{};
+    std::string name_;
+    std::optional<std::uint64_t> requested_op_;
+};
+
+/**
+ * @brief A topic after a create or update.
+ */
+class MetadataTopicChange final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
+
+    /** @brief Returns the topic name after the change. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the partition count after the change. */
+    [[nodiscard]] std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
+
+    /** @brief Returns the public options, `std::nullopt` when this build cannot read them. */
+    [[nodiscard]] const std::optional<ResourceOptions> &Options() const noexcept { return options_; }
+
+  private:
+    MetadataTopicChange() = default;
+
+    static MetadataTopicChange FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint64_t created_at_{};
+    std::string name_;
+    std::uint32_t partitions_count_{};
+    std::optional<ResourceOptions> options_;
+};
+
+/**
+ * @brief A current state topics item. Partition counts travel as partitions items.
+ */
+class MetadataTopicItem final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
+
+    /** @brief Returns the topic name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the public options, `std::nullopt` when this build cannot read them. */
+    [[nodiscard]] const std::optional<ResourceOptions> &Options() const noexcept { return options_; }
+
+  private:
+    MetadataTopicItem() = default;
+
+    static MetadataTopicItem FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataCurrentItem;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint64_t created_at_{};
+    std::string name_;
+    std::optional<ResourceOptions> options_;
+};
+
+/**
+ * @brief A removed topic.
+ */
+class MetadataTopicDeleted final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
+
+    /** @brief Returns the topic name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the op of a deferred delete's request, absent for an immediate delete. */
+    [[nodiscard]] std::optional<std::uint64_t> RequestedOp() const noexcept { return requested_op_; }
+
+  private:
+    MetadataTopicDeleted() = default;
+
+    static MetadataTopicDeleted FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint64_t created_at_{};
+    std::string name_;
+    std::optional<std::uint64_t> requested_op_;
+};
+
+/**
+ * @brief A partition count change.
+ */
+class MetadataPartitionsChanged final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the partition count after the change. */
+    [[nodiscard]] std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
+
+    /** @brief Returns the deleted partition IDs in ascending order, empty on create. */
+    [[nodiscard]] const std::vector<std::uint32_t> &RemovedPartitionIds() const noexcept {
+        return removed_partition_ids_;
+    }
+
+    /** @brief Returns the op of a deferred delete's request, absent for an immediate change. */
+    [[nodiscard]] std::optional<std::uint64_t> RequestedOp() const noexcept { return requested_op_; }
+
+  private:
+    MetadataPartitionsChanged() = default;
+
+    static MetadataPartitionsChanged FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t partitions_count_{};
+    std::vector<std::uint32_t> removed_partition_ids_;
+    std::optional<std::uint64_t> requested_op_;
+};
+
+/**
+ * @brief A current state partitions item.
+ */
+class MetadataPartitionsItem final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the partition count. */
+    [[nodiscard]] std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
+
+  private:
+    MetadataPartitionsItem() = default;
+
+    static MetadataPartitionsItem FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataCurrentItem;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t partitions_count_{};
+};
+
+/**
+ * @brief A created consumer group with the topic's resulting group count.
+ */
+class MetadataConsumerGroupCreated final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the consumer group name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the topic's consumer group count after the change. */
+    [[nodiscard]] std::uint32_t ConsumerGroupsCount() const noexcept { return consumer_groups_count_; }
+
+  private:
+    MetadataConsumerGroupCreated() = default;
+
+    static MetadataConsumerGroupCreated FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::string name_;
+    std::uint32_t consumer_groups_count_{};
+};
+
+/**
+ * @brief A removed consumer group with the topic's resulting group count.
+ */
+class MetadataConsumerGroupDeleted final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the consumer group name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the topic's consumer group count after the change. */
+    [[nodiscard]] std::uint32_t ConsumerGroupsCount() const noexcept { return consumer_groups_count_; }
+
+    /** @brief Returns the op of a deferred delete's request, absent for an immediate delete. */
+    [[nodiscard]] std::optional<std::uint64_t> RequestedOp() const noexcept { return requested_op_; }
+
+  private:
+    MetadataConsumerGroupDeleted() = default;
+
+    static MetadataConsumerGroupDeleted FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::string name_;
+    std::uint32_t consumer_groups_count_{};
+    std::optional<std::uint64_t> requested_op_;
+};
+
+/**
+ * @brief A current state consumer groups item.
+ */
+class MetadataConsumerGroupItem final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the consumer group name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+  private:
+    MetadataConsumerGroupItem() = default;
+
+    static MetadataConsumerGroupItem FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataCurrentItem;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::string name_;
+};
+
+/**
+ * @brief A member that joined a consumer group.
+ */
+class MetadataMemberJoined final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the member ID within the group. */
+    [[nodiscard]] std::uint32_t MemberId() const noexcept { return member_id_; }
+
+    /** @brief Returns the session's client ID. */
+    [[nodiscard]] absl::uint128 ClientId() const noexcept { return client_id_; }
+
+    /** @brief Returns the group's member count after the change. */
+    [[nodiscard]] std::uint32_t MembersCount() const noexcept { return members_count_; }
+
+    /** @brief Returns the installed partition IDs, normally empty because a handover installs them. */
+    [[nodiscard]] const std::vector<std::uint32_t> &PartitionIds() const noexcept { return partition_ids_; }
+
+  private:
+    MetadataMemberJoined() = default;
+
+    static MetadataMemberJoined FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::uint32_t member_id_{};
+    absl::uint128 client_id_{};
+    std::uint32_t members_count_{};
+    std::vector<std::uint32_t> partition_ids_;
+};
+
+/**
+ * @brief A member that left a consumer group.
+ */
+class MetadataMemberLeft final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the member ID within the group. */
+    [[nodiscard]] std::uint32_t MemberId() const noexcept { return member_id_; }
+
+    /** @brief Returns the session's client ID. */
+    [[nodiscard]] absl::uint128 ClientId() const noexcept { return client_id_; }
+
+    /** @brief Returns the group's member count after the change. */
+    [[nodiscard]] std::uint32_t MembersCount() const noexcept { return members_count_; }
+
+    /** @brief Returns why the member was removed. */
+    [[nodiscard]] MetadataMemberLeftReason Reason() const noexcept { return reason_; }
+
+  private:
+    MetadataMemberLeft() = default;
+
+    static MetadataMemberLeft FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::uint32_t member_id_{};
+    absl::uint128 client_id_{};
+    std::uint32_t members_count_{};
+    MetadataMemberLeftReason reason_{MetadataMemberLeftReason::Left};
+};
+
+/**
+ * @brief A completed partition handover within a consumer group.
+ */
+class MetadataPartitionHandedOver final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the partition that changed owner. */
+    [[nodiscard]] std::uint32_t PartitionId() const noexcept { return partition_id_; }
+
+    /** @brief Returns the new owner, absent when the last member left. */
+    [[nodiscard]] std::optional<std::uint32_t> MemberId() const noexcept { return member_id_; }
+
+  private:
+    MetadataPartitionHandedOver() = default;
+
+    static MetadataPartitionHandedOver FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::uint32_t partition_id_{};
+    std::optional<std::uint32_t> member_id_;
+};
+
+/**
+ * @brief A current state consumer group members item.
+ */
+class MetadataMemberItem final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the member ID within the group. */
+    [[nodiscard]] std::uint32_t MemberId() const noexcept { return member_id_; }
+
+    /** @brief Returns the session's client ID. */
+    [[nodiscard]] absl::uint128 ClientId() const noexcept { return client_id_; }
+
+    /** @brief Returns the installed partition IDs in ascending order. */
+    [[nodiscard]] const std::vector<std::uint32_t> &PartitionIds() const noexcept { return partition_ids_; }
+
+  private:
+    MetadataMemberItem() = default;
+
+    static MetadataMemberItem FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataCurrentItem;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::uint32_t member_id_{};
+    absl::uint128 client_id_{};
+    std::vector<std::uint32_t> partition_ids_;
+};
+
+/**
+ * @brief A user after a create or update, and a current state users item.
+ */
+class MetadataUserChange final {
+  public:
+    /** @brief Returns the numeric user ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the creation timestamp in microseconds. A recreated user with a reused ID has another. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the username after the change. */
+    [[nodiscard]] const std::string &Username() const noexcept { return username_; }
+
+    /** @brief Returns the user status after the change. */
+    [[nodiscard]] UserStatus Status() const noexcept { return status_; }
+
+    /** @brief Returns the complete public permission set, empty when the user has none. */
+    [[nodiscard]] const std::optional<::iggy::Permissions> &Permissions() const noexcept { return permissions_; }
+
+    /** @brief Returns the public options, `std::nullopt` when this build cannot read them. */
+    [[nodiscard]] const std::optional<ResourceOptions> &Options() const noexcept { return options_; }
+
+  private:
+    MetadataUserChange() = default;
+
+    static MetadataUserChange FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+    friend class MetadataCurrentItem;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    std::string username_;
+    UserStatus status_{UserStatus::Active};
+    std::optional<::iggy::Permissions> permissions_;
+    std::optional<ResourceOptions> options_;
+};
+
+/**
+ * @brief A deleted user, or one whose password changed.
+ */
+class MetadataUserIdentity final {
+  public:
+    /** @brief Returns the numeric user ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the username. */
+    [[nodiscard]] const std::string &Username() const noexcept { return username_; }
+
+  private:
+    MetadataUserIdentity() = default;
+
+    static MetadataUserIdentity FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    std::string username_;
+};
+
+/**
+ * @brief A user's public permission set after a change.
+ */
+class MetadataUserPermissionsUpdated final {
+  public:
+    /** @brief Returns the numeric user ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the username. */
+    [[nodiscard]] const std::string &Username() const noexcept { return username_; }
+
+    /** @brief Returns the complete permission set after the change, empty when the user has none. */
+    [[nodiscard]] const std::optional<::iggy::Permissions> &Permissions() const noexcept { return permissions_; }
+
+    /** @brief Returns why the set changed. */
+    [[nodiscard]] MetadataPermissionsUpdatedReason Reason() const noexcept { return reason_; }
+
+  private:
+    MetadataUserPermissionsUpdated() = default;
+
+    static MetadataUserPermissionsUpdated FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    std::string username_;
+    std::optional<::iggy::Permissions> permissions_;
+    MetadataPermissionsUpdatedReason reason_{MetadataPermissionsUpdatedReason::Updated};
+};
+
+/**
+ * @brief A created personal access token, and a current state personal access tokens item.
+ */
+class MetadataTokenChange final {
+  public:
+    /** @brief Returns the owner's numeric user ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the owner's creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the token name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the expiry in microseconds, absent for a token that never expires. */
+    [[nodiscard]] std::optional<std::uint64_t> Expiry() const noexcept { return expiry_; }
+
+  private:
+    MetadataTokenChange() = default;
+
+    static MetadataTokenChange FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+    friend class MetadataCurrentItem;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    std::string name_;
+    std::optional<std::uint64_t> expiry_;
+};
+
+/**
+ * @brief A removed personal access token.
+ */
+class MetadataTokenDeleted final {
+  public:
+    /** @brief Returns the owner's numeric user ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the owner's creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the token name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns why the token was removed. */
+    [[nodiscard]] MetadataTokenDeletedReason Reason() const noexcept { return reason_; }
+
+  private:
+    MetadataTokenDeleted() = default;
+
+    static MetadataTokenDeleted FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    std::string name_;
+    MetadataTokenDeletedReason reason_{MetadataTokenDeletedReason::Deleted};
+};
+
+/**
+ * @brief A registered session, and a current state sessions item.
+ */
+class MetadataSession final {
+  public:
+    /** @brief Returns the session user's numeric ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the session user's creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the session's client ID. */
+    [[nodiscard]] absl::uint128 ClientId() const noexcept { return client_id_; }
+
+    /** @brief Returns the session epoch. */
+    [[nodiscard]] std::uint64_t Session() const noexcept { return session_; }
+
+  private:
+    MetadataSession() = default;
+
+    static MetadataSession FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+    friend class MetadataCurrentItem;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    absl::uint128 client_id_{};
+    std::uint64_t session_{};
+};
+
+/**
+ * @brief A closed session.
+ */
+class MetadataSessionClosed final {
+  public:
+    /** @brief Returns the session user's numeric ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the session user's creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the session's client ID. */
+    [[nodiscard]] absl::uint128 ClientId() const noexcept { return client_id_; }
+
+    /** @brief Returns the session epoch. */
+    [[nodiscard]] std::uint64_t Session() const noexcept { return session_; }
+
+    /** @brief Returns why the session was closed. */
+    [[nodiscard]] MetadataSessionClosedReason Reason() const noexcept { return reason_; }
+
+  private:
+    MetadataSessionClosed() = default;
+
+    static MetadataSessionClosed FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    absl::uint128 client_id_{};
+    std::uint64_t session_{};
+    MetadataSessionClosedReason reason_{MetadataSessionClosedReason::Logout};
+};
+
+/**
+ * @brief A binary record of a group or kind this build does not know, kept
+ *        with its codes and raw body.
+ */
+class MetadataUnknownChange final {
+  public:
+    /** @brief Returns the group's wire code. */
+    [[nodiscard]] std::uint8_t GroupCode() const noexcept { return group_code_; }
+
+    /** @brief Returns the kind's wire code. */
+    [[nodiscard]] std::uint8_t KindCode() const noexcept { return kind_code_; }
+
+    /** @brief Returns the raw record body. */
+    [[nodiscard]] const std::vector<std::uint8_t> &Body() const noexcept { return body_; }
+
+  private:
+    MetadataUnknownChange() = default;
+
+    friend class MetadataChangeRecord;
+
+    std::uint8_t group_code_{};
+    std::uint8_t kind_code_{};
+    std::vector<std::uint8_t> body_;
+};
+
+/**
+ * @brief A JSON record of a group or kind this build does not know, kept whole.
+ */
+class MetadataUnknownJsonChange final {
+  public:
+    /** @brief Returns the group name the server sent. */
+    [[nodiscard]] const std::string &Group() const noexcept { return group_; }
+
+    /** @brief Returns the kind name the server sent. */
+    [[nodiscard]] const std::string &Kind() const noexcept { return kind_; }
+
+    /** @brief Returns the whole record object as JSON text. */
+    [[nodiscard]] const std::string &Json() const noexcept { return json_; }
+
+  private:
+    MetadataUnknownJsonChange() = default;
+
+    friend class MetadataChangeRecord;
+
+    std::string group_;
+    std::string kind_;
+    std::string json_;
+};
+
+/**
+ * @brief A binary current state item of a group this build does not know.
+ */
+class MetadataUnknownItem final {
+  public:
+    /** @brief Returns the group's wire code. */
+    [[nodiscard]] std::uint8_t GroupCode() const noexcept { return group_code_; }
+
+    /** @brief Returns the raw item body. */
+    [[nodiscard]] const std::vector<std::uint8_t> &Body() const noexcept { return body_; }
+
+  private:
+    MetadataUnknownItem() = default;
+
+    friend class MetadataCurrentItem;
+
+    std::uint8_t group_code_{};
+    std::vector<std::uint8_t> body_;
+};
+
+/**
+ * @brief A JSON current state item of a group this build does not know, kept whole.
+ */
+class MetadataUnknownJsonItem final {
+  public:
+    /** @brief Returns the group name the server sent. */
+    [[nodiscard]] const std::string &Group() const noexcept { return group_; }
+
+    /** @brief Returns the whole item object as JSON text. */
+    [[nodiscard]] const std::string &Json() const noexcept { return json_; }
+
+  private:
+    MetadataUnknownJsonItem() = default;
+
+    friend class MetadataCurrentItem;
+
+    std::string group_;
+    std::string json_;
+};
+
+/**
+ * @brief One metadata change record: the committed operation that produced
+ *        it, its position within that operation, and what is true after it.
+ *
+ * Change() holds the typed body. Kind() tells apart kinds that share a body
+ * type, such as stream_created and stream_updated.
+ */
+class MetadataChangeRecord final {
+  public:
+    /** @brief The typed body of a record. */
+    using Body = std::variant<MetadataStreamChange,
+                              MetadataStreamDeleted,
+                              MetadataTopicChange,
+                              MetadataTopicDeleted,
+                              MetadataPartitionsChanged,
+                              MetadataConsumerGroupCreated,
+                              MetadataConsumerGroupDeleted,
+                              MetadataMemberJoined,
+                              MetadataMemberLeft,
+                              MetadataPartitionHandedOver,
+                              MetadataUserChange,
+                              MetadataUserIdentity,
+                              MetadataUserPermissionsUpdated,
+                              MetadataTokenChange,
+                              MetadataTokenDeleted,
+                              MetadataSession,
+                              MetadataSessionClosed,
+                              MetadataUnknownChange,
+                              MetadataUnknownJsonChange>;
+
+    /**
+     * @brief Decodes one record envelope as a binary response carries it.
+     * @param bytes Record envelope and body.
+     * @return Decoded record. A group or kind this build does not know is
+     *         kept as MetadataUnknownChange.
+     * @throws IggyException with Kind() invalid_format when @p bytes are malformed.
+     */
+    static MetadataChangeRecord FromBytes(const std::vector<std::uint8_t> &bytes);
+
+    /** @brief Returns the metadata operation that produced the record. */
+    [[nodiscard]] std::uint64_t Op() const noexcept { return op_; }
+
+    /** @brief Returns the record's position within Op(). */
+    [[nodiscard]] std::uint32_t Ordinal() const noexcept { return ordinal_; }
+
+    /** @brief Returns the prepare checksum of Op(). */
+    [[nodiscard]] absl::uint128 Checksum() const noexcept { return checksum_; }
+
+    /** @brief Returns the prepare timestamp of Op() in microseconds. */
+    [[nodiscard]] std::uint64_t Timestamp() const noexcept { return timestamp_; }
+
+    /** @brief Returns the acting user, absent for server actions. */
+    [[nodiscard]] std::optional<std::uint32_t> ActorUserId() const noexcept { return actor_user_id_; }
+
+    /** @brief Returns the kind, absent for a record this build does not know. */
+    [[nodiscard]] std::optional<MetadataChangeKind> Kind() const noexcept { return kind_; }
+
+    /** @brief Returns the group, absent for a record this build does not know. */
+    [[nodiscard]] std::optional<MetadataChangeGroup> Group() const noexcept { return group_; }
+
+    /** @brief Returns the typed body. */
+    [[nodiscard]] const Body &Change() const noexcept { return change_; }
+
+  private:
+    MetadataChangeRecord(std::uint64_t op,
+                         std::uint32_t ordinal,
+                         absl::uint128 checksum,
+                         std::uint64_t timestamp,
+                         std::optional<std::uint32_t> actor_user_id,
+                         std::optional<MetadataChangeKind> kind,
+                         std::optional<MetadataChangeGroup> group,
+                         Body change)
+        : op_(op),
+          ordinal_(ordinal),
+          checksum_(checksum),
+          timestamp_(timestamp),
+          actor_user_id_(actor_user_id),
+          kind_(kind),
+          group_(group),
+          change_(std::move(change)) {}
+
+    static MetadataChangeRecord FromFfi(ffi::MetadataChangeRecord record);
+    static Body BodyFromFfi(MetadataChangeKind kind, ffi::MetadataChangeBody &body);
+
+    friend class MetadataChanges;
+
+    std::uint64_t op_;
+    std::uint32_t ordinal_;
+    absl::uint128 checksum_;
+    std::uint64_t timestamp_;
+    std::optional<std::uint32_t> actor_user_id_;
+    std::optional<MetadataChangeKind> kind_;
+    std::optional<MetadataChangeGroup> group_;
+    Body change_;
+};
+
+/**
+ * @brief One current state item: a resource or session as it is now.
+ */
+class MetadataCurrentItem final {
+  public:
+    /** @brief The typed body of an item. Each group has its own type. */
+    using Body = std::variant<MetadataStreamChange,
+                              MetadataTopicItem,
+                              MetadataPartitionsItem,
+                              MetadataConsumerGroupItem,
+                              MetadataMemberItem,
+                              MetadataUserChange,
+                              MetadataTokenChange,
+                              MetadataSession,
+                              MetadataUnknownItem,
+                              MetadataUnknownJsonItem>;
+
+    /**
+     * @brief Decodes one item as a binary response carries it.
+     * @param bytes Item envelope and body.
+     * @return Decoded item. A group this build does not know is kept as
+     *         MetadataUnknownItem.
+     * @throws IggyException with Kind() invalid_format when @p bytes are malformed.
+     */
+    static MetadataCurrentItem FromBytes(const std::vector<std::uint8_t> &bytes);
+
+    /** @brief Returns the group, absent for an item this build does not know. */
+    [[nodiscard]] std::optional<MetadataChangeGroup> Group() const noexcept { return group_; }
+
+    /** @brief Returns the typed body. */
+    [[nodiscard]] const Body &Value() const noexcept { return value_; }
+
+  private:
+    MetadataCurrentItem(std::optional<MetadataChangeGroup> group, Body value)
+        : group_(group), value_(std::move(value)) {}
+
+    static MetadataCurrentItem FromFfi(ffi::MetadataCurrentItem item);
+    static Body BodyFromFfi(MetadataChangeGroup group, ffi::MetadataChangeBody &body);
+
+    friend class MetadataChanges;
+
+    std::optional<MetadataChangeGroup> group_;
+    Body value_;
+};
+
+/**
+ * @brief One page of the metadata change log, or of the current state.
+ *
+ * IggyBlockingClient::GetMetadataChanges() returns this value. On
+ * MetadataChangeStatus::Ok keep Next() and pass it to the following read. On
+ * Behind retry later, on Expired or Reset rebuild from the current state.
+ */
+class MetadataChanges final {
+  public:
+    /**
+     * @brief Decodes a response payload as the binary transports carry it.
+     * @param payload Response payload without framing.
+     * @return Decoded page.
+     * @throws IggyException with Kind() invalid_format when @p payload is malformed.
+     */
+    static MetadataChanges FromBytes(const std::vector<std::uint8_t> &payload);
+
+    /** @brief Returns the outcome of the query. */
+    [[nodiscard]] MetadataChangeStatus Status() const noexcept { return status_; }
+
+    /** @brief Returns whether the page carries records or current state items. */
+    [[nodiscard]] MetadataChangePhase Phase() const noexcept { return phase_; }
+
+    /** @brief Returns the node's log ID, absent before it applied op 1. */
+    [[nodiscard]] std::optional<absl::uint128> LogId() const noexcept { return log_id_; }
+
+    /** @brief Returns the lowest whole operation from which the requested groups are complete. */
+    [[nodiscard]] std::uint64_t OldestOp() const noexcept { return oldest_op_; }
+
+    /**
+     * @brief Returns the timestamp above which the requested groups are complete.
+     * @return Microseconds, zero when nothing was evicted.
+     */
+    [[nodiscard]] std::uint64_t RetainedSince() const noexcept { return retained_since_; }
+
+    /** @brief Returns the highest metadata operation the node applied. */
+    [[nodiscard]] std::uint64_t HeadOp() const noexcept { return head_op_; }
+
+    /**
+     * @brief Returns the cursor to send back.
+     * @return Present on MetadataChangeStatus::Ok, echoed on Behind, absent on
+     *         Expired and Reset. The last current state page carries the
+     *         anchor to follow the change log from.
+     */
+    [[nodiscard]] const std::optional<MetadataChangeCursor> &Next() const noexcept { return next_; }
+
+    /** @brief Returns whether more records remain after Next(), or another state page exists. */
+    [[nodiscard]] bool HasMore() const noexcept { return has_more_; }
+
+    /** @brief Returns the change records of a changes page. */
+    [[nodiscard]] const std::vector<MetadataChangeRecord> &Records() const noexcept { return records_; }
+
+    /** @brief Returns the items of a current state page. */
+    [[nodiscard]] const std::vector<MetadataCurrentItem> &Items() const noexcept { return items_; }
+
+    /** @brief Returns the continuation of a current state scan, absent once it is complete. */
+    [[nodiscard]] const std::optional<MetadataCurrentPageToken> &CurrentPageToken() const noexcept {
+        return current_page_token_;
+    }
+
+  private:
+    MetadataChanges() = default;
+
+    static MetadataChanges FromFfi(ffi::MetadataChanges changes);
+
+    friend class IggyBlockingClient;
+
+    MetadataChangeStatus status_{MetadataChangeStatus::Ok};
+    MetadataChangePhase phase_{MetadataChangePhase::Changes};
+    std::optional<absl::uint128> log_id_;
+    std::uint64_t oldest_op_{};
+    std::uint64_t retained_since_{};
+    std::uint64_t head_op_{};
+    std::optional<MetadataChangeCursor> next_;
+    bool has_more_{};
+    std::vector<MetadataChangeRecord> records_;
+    std::vector<MetadataCurrentItem> items_;
+    std::optional<MetadataCurrentPageToken> current_page_token_;
 };
 
 /**
@@ -3300,6 +5685,29 @@ class PollingStrategy final {
  * Builder initializes a TCP client. To use QUIC, HTTP, or WebSocket, create the
  * client with FromConnectionString().
  *
+ * Concurrent calls on the same client are safe. The object must remain alive
+ * and must not be moved while any call is in progress. Moving, assigning, or
+ * destroying a client concurrently with a call on it is undefined behavior.
+ *
+ * Rust SDK errors populate IggyException::Code() and IggyException::Kind() for:
+ *
+ * - Login(), Logout(), ResolveOperation(), and AbandonOperation().
+ * - CreateUser(), UpdateUser(), and DeleteUser().
+ * - EncryptionKeyFingerprint() and invalid keys passed to CreateStream().
+ * - CreateStream(), UpdateStream(), and DeleteStream().
+ * - CreateTopic(), UpdateTopic(), and DeleteTopic().
+ * - CreatePartitions(), DeletePartitions(), and DeleteSegments().
+ * - CreateConsumerGroup(), DeleteConsumerGroup(), JoinConsumerGroup(), and
+ *   LeaveConsumerGroup().
+ * - StoreConsumerOffset(), StoreConsumerPosition(), and DeleteConsumerOffset().
+ * - GetMetadataChanges().
+ *
+ * Other methods report errors through the exception message only. C++ and
+ * bridge-local argument validation failures also have no structured error
+ * details, even for the methods listed above. GetMetadataChanges() is the
+ * exception: it reports every invalid query as invalid_command, including one
+ * the bridge refuses.
+ *
  * @code{.cpp}
  * auto client{iggy::IggyBlockingClient::Builder()
  *                 .WithServerAddress("127.0.0.1:8090")
@@ -3312,6 +5720,7 @@ class PollingStrategy final {
 class IggyBlockingClient final {
   public:
     class Builder;
+    static constexpr std::chrono::seconds kDefaultResolutionTimeout{30};
 
     /** @brief IggyBlockingClient is move-only. */
     IggyBlockingClient(const IggyBlockingClient &)            = delete;
@@ -3378,6 +5787,8 @@ class IggyBlockingClient final {
      * - `reestablish_after=<duration>`
      * - `heartbeat_interval=<duration>`
      * - `nodelay=<bool>`
+     * - `max_pending_operations=<positive integer>`
+     * - `max_pending_operation_bytes=<positive integer>`
      *
      * QUIC accepts these query parameters:
      *
@@ -3394,6 +5805,8 @@ class IggyBlockingClient final {
      * - `reconnection_max_retries=<uint32|unlimited>`
      * - `reconnection_interval=<duration>`
      * - `reconnection_reestablish_after=<duration>`
+     * - `max_pending_operations=<positive integer>`
+     * - `max_pending_operation_bytes=<positive integer>`
      *
      * HTTP accepts these query parameters:
      *
@@ -3416,6 +5829,8 @@ class IggyBlockingClient final {
      * - `tls_domain=<string>`
      * - `tls_ca_file=<path>`
      * - `tls_validate_certificate=<bool>`
+     * - `max_pending_operations=<positive integer>`
+     * - `max_pending_operation_bytes=<positive integer>`
      *
      * Durations use Iggy duration syntax, such as `500ms`, `5s`, or `1min`.
      * Boolean values are `true` or `false`.
@@ -3457,6 +5872,8 @@ class IggyBlockingClient final {
      * changes the client state to disconnected, but keeps the client reusable.
      * Call Connect() to establish a new connection. Configured automatic login
      * is applied when reconnecting.
+     * For binary transports, disconnect also drops all retained operations
+     * without settling their outcomes. They cannot be resolved after reconnecting.
      *
      * @note The disconnect holds until the next Connect(): requests fail and
      *       nothing reconnects the client in the background, even with
@@ -3559,16 +5976,18 @@ class IggyBlockingClient final {
      * @param password Initial user password.
      * @param status Initial authentication status.
      * @param permissions Optional permission assignment.
+     * @param options User creation options.
      * @return Details of the newly created user.
-     * @throws IggyException if the client is unavailable or unauthenticated;
-     *         the name, password, status, or permissions are invalid; the name
-     *         is already in use; the caller lacks manage-users permission; or
-     *         the request fails.
+     * @throws IggyException if the client is unavailable or unauthenticated,
+     *         the name, password, status, permissions, or an option are
+     *         invalid, the name is already in use, the caller lacks
+     *         manage-users permission, or the request fails.
      */
     UserInfoDetails CreateUser(std::string username,
                                std::string password,
                                UserStatus status,
-                               const std::optional<Permissions> &permissions = std::nullopt);
+                               const std::optional<Permissions> &permissions = std::nullopt,
+                               const UserCreateOptions &options              = {});
 
     /**
      * @brief Deletes a user account.
@@ -3589,33 +6008,26 @@ class IggyBlockingClient final {
     /**
      * @brief Changes a user's name, status, and mutable settings.
      *
-     * A supplied name must contain between 3 and 50 bytes and remain unique.
-     * Setting the status to inactive prevents subsequent authentication.
-     * Passing `std::nullopt` for the name or status leaves that field
-     * unchanged. The supplied UserUpdateOptions changes only the settings it
-     * contains; settings left unset retain their current values. User settings
-     * are currently not mutable, so the options object must be empty. Passing
-     * `std::nullopt` for both fields and an empty options object is accepted as
-     * a no-op.
+     * The supplied UserUpdateOptions changes only the settings it contains.
+     * Settings left unset retain their current values. A supplied name must
+     * contain between 3 and 50 bytes and remain unique. Setting the status to
+     * inactive prevents subsequent authentication. An update that changes
+     * nothing, sets and resets the same setting, or resets a typed user
+     * setting is refused before anything is sent. Renaming the authenticated user also
+     * updates the credentials the client uses when it reconnects.
      *
      * A failed or unknown transport outcome can leave the update committed.
      * Retrieve the user before retrying with different values.
      *
      * @param user User to update, addressed by numeric ID or name.
-     * @param username New unique name, or `std::nullopt` to retain the name.
-     * @param status New authentication status, or `std::nullopt` to retain the
-     *        status.
-     * @param options User update options.
-     * @throws IggyException if the client is unavailable or unauthenticated;
-     *         an identifier, name, status, or option is invalid; an option is
-     *         unsupported; the user does not exist; the name is already in
-     *         use; the caller lacks manage-users permission; or the request
-     *         fails.
+     * @param options Settings to change.
+     * @throws IggyException if the client is unavailable or unauthenticated,
+     *         an identifier, name, status, or option is invalid, an option is
+     *         unsupported or not resettable, the user does not exist, the name
+     *         is already in use, the caller lacks manage-users permission, or
+     *         the request fails.
      */
-    void UpdateUser(const Identifier &user,
-                    std::optional<std::string> username,
-                    std::optional<UserStatus> status,
-                    const UserUpdateOptions &options = {});
+    void UpdateUser(const Identifier &user, const UserUpdateOptions &options);
 
     /**
      * @brief Creates a top-level stream in the cluster metadata.
@@ -3624,29 +6036,41 @@ class IggyBlockingClient final {
      * partitions, or messages. Its name must be unique, non-empty, and no more
      * than 255 UTF-8 bytes.
      *
+     * StreamCreateOptions may carry the stream's own encryption key. The key
+     * travels in the request, the server stores it wrapped and never returns
+     * it, and the result reports only its source and fingerprints. Without a
+     * key, a server with encryption enabled generates one for the stream. An
+     * invalid key is refused before anything is sent.
+     *
      * A transport failure after submission can leave the stream created. Look
      * it up by name before retrying or choosing another name.
      *
      * @param name Unique stream name.
+     * @param options Stream creation options.
      * @return Details of the newly created, topic-less stream.
-     * @throws IggyException if the client is unavailable or unauthenticated;
-     *         the name is invalid or already in use; the caller lacks
-     *         stream-management permission; or the request fails.
+     * @throws IggyException if the client is unavailable or unauthenticated,
+     *         the name, the key, or an option is invalid, the name is already
+     *         in use, the caller lacks stream-management permission, or the
+     *         request fails.
      */
-    StreamDetails CreateStream(std::string name);
+    StreamDetails CreateStream(std::string name, const StreamCreateOptions &options = {});
 
     /**
-     * @brief Renames a stream.
+     * @brief Renames a stream or changes its mutable settings.
      *
-     * @param stream Stream to rename, addressed by numeric ID or name.
-     * @param name New unique stream name.
-     * @param options Stream update options (currently no updatable keys; `raw`
-     *        carries forward-compatible keys, each rejected until catalogued).
+     * The supplied StreamUpdateOptions changes only the settings it contains.
+     * Renaming keeps the stream's ID, encryption key, and data. An update that
+     * changes nothing or resets any stream setting is refused before anything
+     * is sent.
+     *
+     * @param stream Stream to update, addressed by numeric ID or name.
+     * @param options Settings to change.
      * @throws IggyException if the client is unavailable, the caller lacks
-     *         stream-management permission, either value is invalid, the stream
-     *         does not exist, the name is already taken, or the request fails.
+     *         stream-management permission, a value is invalid, a setting is
+     *         not updatable or resettable, the stream does not exist, the name
+     *         is already taken, or the request fails.
      */
-    void UpdateStream(const Identifier &stream, std::string name, const StreamUpdateOptions &options = {});
+    void UpdateStream(const Identifier &stream, const StreamUpdateOptions &options);
 
     /**
      * @brief Lists stream summaries visible to the authenticated user.
@@ -3707,27 +6131,27 @@ class IggyBlockingClient final {
     TopicDetails CreateTopic(const Identifier &stream, std::string name, const TopicCreateOptions &options = {});
 
     /**
-     * @brief Renames a topic and updates its mutable configuration.
+     * @brief Renames a topic, changes its mutable settings, or resets them.
      *
      * The supplied TopicUpdateOptions changes only the settings it contains;
-     * settings left unset retain their current values. Topic creation settings,
-     * such as the partition count and segment size, cannot be changed after the
-     * topic is created. Use SetRawEntries() for supported mutable settings
-     * without a dedicated setter.
+     * settings left unset retain their current values and their provenance.
+     * Topic creation settings, such as the compression algorithm, partition
+     * count, and segment size, cannot be changed after the topic is created.
+     * Use SetRawEntries() for supported mutable settings without a dedicated
+     * setter. An update that changes nothing, sets and resets the same
+     * setting, or resets a setting that has no default is refused before
+     * anything is sent.
      *
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Topic to update, addressed by numeric ID or name.
-     * @param name New unique topic name within @p stream.
-     * @param options Topic update options.
-     * @throws IggyException if the client is unavailable or unauthenticated;
-     *         an identifier, name, setting, or option is invalid; the stream or
-     *         topic does not exist; the caller lacks permission; or the server
-     *         rejects or cannot commit the write.
+     * @param options Settings to change or reset.
+     * @throws IggyException if the client is unavailable or unauthenticated,
+     *         an identifier, name, setting, or option is invalid, a setting is
+     *         not updatable or resettable, the stream or topic does not exist,
+     *         the caller lacks permission, or the server rejects or cannot
+     *         commit the write.
      */
-    void UpdateTopic(const Identifier &stream,
-                     const Identifier &topic,
-                     std::string name,
-                     const TopicUpdateOptions &options = {});
+    void UpdateTopic(const Identifier &stream, const Identifier &topic, const TopicUpdateOptions &options);
 
     /**
      * @brief Lists topic summaries in a stream.
@@ -3965,12 +6389,13 @@ class IggyBlockingClient final {
      * @param consumer Consumer identity that owns the offset.
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Parent topic, addressed by numeric ID or name.
-     * @param partition_id Partition whose offset is stored, or `std::nullopt`
-     *        to omit the partition from the request. The maximum
-     *        `std::uint32_t` value is rejected because it is reserved by the
-     *        FFI representation.
+     * @param partition_id Partition whose offset is stored. TCP, QUIC, and
+     *        WebSocket require a value. Only HTTP permits `std::nullopt` to
+     *        omit the partition. The maximum `std::uint32_t` value is rejected
+     *        because it is reserved by the FFI representation.
      * @param offset Message offset to store.
      * @throws IggyException if an identifier, partition, or offset is invalid;
+     *         the partition is absent on a binary transport (invalid_identifier);
      *         the resource does not exist; the client is unauthenticated; the
      *         caller lacks permission; or the request fails.
      */
@@ -4056,11 +6481,13 @@ class IggyBlockingClient final {
      * @param consumer Consumer identity that owns the offset.
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Parent topic, addressed by numeric ID or name.
-     * @param partition_id Partition whose offset is deleted, or `std::nullopt`
-     *        to omit the partition from the request. The maximum
+     * @param partition_id Partition whose offset is deleted. TCP, QUIC, and
+     *        WebSocket require a value. The `std::nullopt` default is for HTTP
+     *        only and omits the partition from its request. The maximum
      *        `std::uint32_t` value is rejected because it is reserved by the
      *        FFI representation.
      * @throws IggyException if an identifier or partition is invalid; the
+     *         partition is absent on a binary transport (invalid_identifier); the
      *         resource or stored offset does not exist; the client is
      *         unauthenticated; the caller lacks permission; or the request
      *         fails.
@@ -4114,6 +6541,39 @@ class IggyBlockingClient final {
     std::vector<ClientInfo> GetClients();
 
     /**
+     * @brief Returns the option catalog of one resource scope.
+     *
+     * Each entry names a key with its kind, default, description, and whether
+     * an update may set or reset it, whether it is secret, read-only, or
+     * critical. Internal keys are not listed.
+     *
+     * @param scope Resource scope to describe.
+     * @return Catalog entries in catalog order.
+     * @throws IggyException if the client is unavailable or unauthenticated,
+     *         or the request fails.
+     */
+    std::vector<OptionSpec> DescribeOptions(OptionsScope scope);
+
+    /**
+     * @brief Reads one page of the metadata change log or of the current state.
+     *
+     * The node records one change per public result of a committed metadata
+     * operation, such as a stream created, a topic renamed, a user's
+     * permissions changed, or a session closed. A mirror keeps a cursor, reads
+     * the records after it, and stores the returned MetadataChanges::Next().
+     * Records carry option values as the read routes return them and never
+     * key material.
+     *
+     * @param query Start position, groups, time bounds, and page size.
+     * @return One page of records or current state items.
+     * @throws IggyException with Kind() invalid_command when @p query is
+     *         invalid, before anything is sent; with Kind() unauthorized when
+     *         the caller is neither root nor holds the global manage_servers
+     *         permission; or when the request fails.
+     */
+    MetadataChanges GetMetadataChanges(const MetadataChangesQuery &query);
+
+    /**
      * @brief Retrieves server process, storage, and resource statistics.
      *
      * The returned fields are an observed snapshot and can change immediately.
@@ -4127,17 +6587,44 @@ class IggyBlockingClient final {
      */
     Stats GetStats();
 
+    /**
+     * @brief Replays a retained operation with its original identity and bytes.
+     *
+     * Success proves a successful commit without returning the original response
+     * payload. A proved committed business rejection throws its original error.
+     * Both outcomes release the retained operation and its lane.
+     * An operation_uncertain result keeps the original frame and lane for a later
+     * resolve. operation_not_retained does not prove that the original command
+     * failed or make resending it safe. Disconnect() and session reset drop
+     * retained operations without settling them or allowing later recovery.
+     * The client keeps the proved outcomes of its last max_operations replays,
+     * also across a session reset. A later resolve of a proved operation returns
+     * the same outcome without a request.
+     * TCP, QUIC, and WebSocket support recovery; HTTP reports feature_unavailable.
+     *
+     * @param operation_id ID carried by operation_uncertain or lane_blocked.
+     * @param timeout Positive retry budget; defaults to kDefaultResolutionTimeout.
+     * @throws IggyException if @p timeout is not positive or cannot form a deadline;
+     *         the result is a committed rejection or remains uncertain; the
+     *         operation is not retained; recovery is unsupported; or resolution
+     *         otherwise fails.
+     */
+    void ResolveOperation(std::uint64_t operation_id, std::chrono::microseconds timeout = kDefaultResolutionTimeout);
+
+    /**
+     * @brief Releases a retained operation and its local lane.
+     *
+     * Abandonment does not undo or determine the server result. HTTP reports
+     * feature_unavailable because it does not retain operations.
+     *
+     * @param operation_id ID carried by operation_uncertain or lane_blocked.
+     * @throws IggyException if the operation is not retained, recovery is
+     *         unsupported, or the client handle is unavailable.
+     */
+    void AbandonOperation(std::uint64_t operation_id);
+
   private:
     explicit IggyBlockingClient(ffi::Client *client);
-
-    template <typename Operation>
-    static decltype(auto) RethrowAsIggyException(Operation &&operation) {
-        try {
-            return std::forward<Operation>(operation)();
-        } catch (const std::exception &error) {
-            throw IggyException(error.what());
-        }
-    }
 
     [[nodiscard]] ffi::Client *Handle() const;
     void Reset() noexcept;
@@ -4315,6 +6802,21 @@ class IggyBlockingClient::Builder final {
     Builder &WithNoDelay();
 
     /**
+     * @brief Bounds active and retained mutations across this client session.
+     *
+     * Defaults are 256 operations and 64 MiB. Frozen headers and bodies count
+     * toward the byte limit while an outstanding writer still holds them, even
+     * after completion or abandonment. Build() validates that both limits fit
+     * the platform's size type.
+     *
+     * @param max_operations Positive maximum number of active or retained mutations.
+     * @param max_bytes Positive maximum number of frozen request bytes.
+     * @return Reference to this builder.
+     * @throws IggyException immediately if either limit is zero.
+     */
+    Builder &WithPendingOperations(std::uint64_t max_operations, std::uint64_t max_bytes);
+
+    /**
      * @brief Builds an owning Iggy blocking client.
      *
      * Build() validates the TCP configuration and creates an independent
@@ -4341,6 +6843,9 @@ class IggyBlockingClient::Builder final {
     std::string tls_ca_file_;
     std::optional<bool> tls_validate_certificate_;
     bool no_delay_{};
+    bool has_pending_operations_{};
+    std::uint64_t pending_max_operations_{};
+    std::uint64_t pending_max_bytes_{};
 };
 
 }  // namespace iggy

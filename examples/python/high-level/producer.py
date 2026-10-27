@@ -20,7 +20,13 @@ import asyncio
 from datetime import timedelta
 from typing import NamedTuple
 
-from apache_iggy import DirectProducerConfig, IggyClient, Partitioning, SendMessage
+from apache_iggy import (
+    DirectProducerConfig,
+    IggyClient,
+    Partitioning,
+    SendMessage,
+    TopicOptions,
+)
 from loguru import logger
 
 STREAM_NAME = "high-level-stream"
@@ -54,7 +60,7 @@ async def ensure_send_to_destination(client: IggyClient) -> None:
         await client.create_topic(
             stream=SEND_TO_STREAM_NAME,
             name=SEND_TO_TOPIC_NAME,
-            partitions_count=2,
+            options=TopicOptions(partitions_count=2),
         )
 
 
@@ -79,8 +85,6 @@ async def main() -> None:
         topic_partitions_count=3,
         topic_message_expiry=None,
         topic_max_size=None,
-        send_retries=3,
-        send_retry_interval=timedelta(seconds=1),
     )
 
     async with producer:

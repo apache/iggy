@@ -18,86 +18,32 @@
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_broadcast::Receiver;
 use async_trait::async_trait;
-use iggy_common::Client;
-use iggy_common::{DiagnosticEvent, IggyError};
+use iggy_common::{Client, DiagnosticEvent, IggyError};
 use std::time::Instant;
 
 #[async_trait]
 impl Client for ClientWrapper {
     async fn connect(&self) -> Result<(), IggyError> {
-        match self {
-            // The trait `connect` is the caller's: it clears a held disconnect,
-            // where each transport's own `connect` keeps it.
-            ClientWrapper::Iggy(client) => Client::connect(client).await,
-            ClientWrapper::Http(client) => Client::connect(client).await,
-            ClientWrapper::Tcp(client) => Client::connect(client).await,
-            ClientWrapper::Quic(client) => Client::connect(client).await,
-            ClientWrapper::WebSocket(client) => Client::connect(client).await,
-        }
+        super::dispatch_client!(self, Client::connect()).await
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.disconnect().await,
-            ClientWrapper::Http(client) => client.disconnect().await,
-            ClientWrapper::Tcp(client) => client.disconnect().await,
-            ClientWrapper::Quic(client) => client.disconnect().await,
-            ClientWrapper::WebSocket(client) => client.disconnect().await,
-        }
+        super::dispatch_client!(self, Client::disconnect()).await
     }
 
     async fn shutdown(&self) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.shutdown().await,
-            ClientWrapper::Http(client) => client.shutdown().await,
-            ClientWrapper::Tcp(client) => client.shutdown().await,
-            ClientWrapper::Quic(client) => client.shutdown().await,
-            ClientWrapper::WebSocket(client) => client.shutdown().await,
-        }
+        super::dispatch_client!(self, Client::shutdown()).await
     }
 
     async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
-        match self {
-            ClientWrapper::Iggy(client) => client.subscribe_events().await,
-            ClientWrapper::Http(client) => client.subscribe_events().await,
-            ClientWrapper::Tcp(client) => client.subscribe_events().await,
-            ClientWrapper::Quic(client) => client.subscribe_events().await,
-            ClientWrapper::WebSocket(client) => client.subscribe_events().await,
-        }
+        super::dispatch_client!(self, Client::subscribe_events()).await
     }
 
     async fn resolve_operation(&self, op: u64, deadline: Instant) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.resolve_operation(op, deadline).await,
-            ClientWrapper::Http(client) => client.resolve_operation(op, deadline).await,
-            ClientWrapper::Tcp(client) => client.resolve_operation(op, deadline).await,
-            ClientWrapper::Quic(client) => client.resolve_operation(op, deadline).await,
-            ClientWrapper::WebSocket(client) => client.resolve_operation(op, deadline).await,
-        }
+        super::dispatch_client!(self, Client::resolve_operation(op, deadline)).await
     }
 
     async fn abandon_operation(&self, op: u64) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.abandon_operation(op).await,
-            ClientWrapper::Http(client) => client.abandon_operation(op).await,
-            ClientWrapper::Tcp(client) => client.abandon_operation(op).await,
-            ClientWrapper::Quic(client) => client.abandon_operation(op).await,
-            ClientWrapper::WebSocket(client) => client.abandon_operation(op).await,
-        }
-    }
-}
-
-impl ClientWrapper {
-    /// Connects again through the transport's own `connect`, which leaves a
-    /// caller's `disconnect()` in force: a reconnect the client starts on its
-    /// own, such as after a leader redirect, is refused while it holds.
-    pub(crate) async fn reconnect_keeping_intent(&self) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Tcp(client) => client.connect().await,
-            ClientWrapper::Quic(client) => client.connect().await,
-            ClientWrapper::WebSocket(client) => client.connect().await,
-            ClientWrapper::Iggy(client) => Client::connect(client).await,
-            ClientWrapper::Http(client) => Client::connect(client).await,
-        }
+        super::dispatch_client!(self, Client::abandon_operation(op)).await
     }
 }

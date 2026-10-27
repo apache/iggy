@@ -17,7 +17,7 @@
 
 use crate::{
     AutoLogin, ConnectionString, ConnectionStringOptions, NonZeroIggyDuration,
-    QuicClientReconnectionConfig, QuicConnectionStringOptions,
+    PendingOperationsConfig, QuicClientReconnectionConfig, QuicConnectionStringOptions,
 };
 use std::str::FromStr;
 
@@ -32,6 +32,8 @@ pub struct QuicClientConfig {
     pub server_name: String,
     /// Whether to automatically login user after establishing connection.
     pub auto_login: AutoLogin,
+    /// Shared limits across this client's mutation lanes.
+    pub pending_operations: PendingOperationsConfig,
     // Whether to automatically reconnect when disconnected.
     pub reconnection: QuicClientReconnectionConfig,
     /// The size of the response buffer.
@@ -63,6 +65,7 @@ impl Default for QuicClientConfig {
             server_address: "127.0.0.1:8080".to_string(),
             server_name: "localhost".to_string(),
             auto_login: AutoLogin::Disabled,
+            pending_operations: PendingOperationsConfig::default(),
             heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
             reconnection: QuicClientReconnectionConfig::default(),
             response_buffer_size: 1000 * 1000 * 10,
@@ -85,6 +88,7 @@ impl From<ConnectionString<QuicConnectionStringOptions>> for QuicClientConfig {
             server_address: connection_string.server_address().into(),
             server_name: "localhost".to_string(),
             auto_login: connection_string.auto_login().to_owned(),
+            pending_operations: connection_string.options().pending_operations(),
             reconnection: connection_string.options().reconnection().to_owned(),
             response_buffer_size: connection_string.options().response_buffer_size(),
             max_concurrent_bidi_streams: connection_string.options().max_concurrent_bidi_streams(),

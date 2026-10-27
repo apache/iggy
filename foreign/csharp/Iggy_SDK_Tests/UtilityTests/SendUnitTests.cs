@@ -23,6 +23,7 @@ using Apache.Iggy.Extensions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Publishers;
+using Apache.Iggy.Vsr;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
@@ -256,6 +257,180 @@ public class SendUnitTests
 
         client.Verify(c => c.SendMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
             It.IsAny<Partitioning>(), It.IsAny<IList<Message>>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    public enum ResolutionOutcome
+    {
+        Committed,
+        NotRetained,
+        Rejected
+    }
+
+    [Theory]
+    [InlineData(false, ResolutionOutcome.Committed)]
+    [InlineData(true, ResolutionOutcome.Committed)]
+    [InlineData(true, ResolutionOutcome.NotRetained)]
+    [InlineData(true, ResolutionOutcome.Rejected)]
+    public async Task Processor_ResolvesOwnRetainedSend_BeforeRetryingOnlyTheNewBatch(
+        bool retry, ResolutionOutcome outcome)
+    {
+        const ulong operationId = 42;
+        var unknown = new VsrRequestOutcomeUnknownException(new IOException("Reply lost."), operationId);
+        var calls = new List<string>();
+        var failures = new List<MessageBatchFailedEventArgs>();
+        var resolved = false;
+        var sendToken = CancellationToken.None;
+        var client = new Mock<IIggyClient>();
+        client.Setup(value => value.SendMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
+                It.IsAny<Partitioning>(), It.IsAny<IList<Message>>(), It.IsAny<CancellationToken>()))
+            .Returns((Identifier _, Identifier _, Partitioning _, IList<Message> messages, CancellationToken token) =>
+            {
+                var payload = messages[0].Payload.Span[0];
+                calls.Add($"send {payload}");
+                if (payload == 1)
+                {
+                    return Task.FromException<SendMessagesResponse>(unknown);
+                }
+                if (!resolved)
+                {
+                    sendToken = token;
+                    return Task.FromException<SendMessagesResponse>(new VsrLaneBlockedException(operationId));
+                }
+                Assert.Equal(sendToken, token);
+                return Task.FromResult(new SendMessagesResponse { Confirmations = [] });
+            });
+        client.Setup(value => value.ResolveOperationAsync(operationId, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns((ulong _, TimeSpan timeout, CancellationToken token) =>
+            {
+                calls.Add("resolve");
+                Assert.Equal(sendToken, token);
+                Assert.InRange(timeout, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(30));
+                resolved = true;
+                return outcome switch
+                {
+                    ResolutionOutcome.NotRetained => Task.FromException(new VsrOperationNotRetainedException(operationId)),
+                    ResolutionOutcome.Rejected => Task.FromException(new IggyInvalidStatusCodeException(
+                        VsrError.TOPIC_ID_NOT_FOUND, "The earlier send was rejected.", fromServer: true)
+                    { Committed = true }),
+                    _ => Task.CompletedTask
+                };
+            });
+        var config = BackgroundConfig(1);
+        config.EnableRetry = retry;
+        config.InitialRetryDelay = TimeSpan.FromMilliseconds(1);
+        await using var processor = new BackgroundMessageProcessor(client.Object, config, NullLoggerFactory.Instance);
+        processor.SubscribeOnMessageBatchFailed(failure =>
+        {
+            failures.Add(failure);
+            return Task.CompletedTask;
+        });
+        await processor.EnqueueAsync(new ReadyUnit([new Message(Guid.NewGuid(), new byte[] { 1 })], null),
+            TestContext.Current.CancellationToken);
+        await processor.EnqueueAsync(new ReadyUnit([new Message(Guid.NewGuid(), new byte[] { 2 })], null),
+            TestContext.Current.CancellationToken);
+        processor.Start();
+        await processor.WaitForDrainAsync(TestContext.Current.CancellationToken).WaitAsync(TimeSpan.FromSeconds(5),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(["send 1", "send 2", "resolve", "send 2"], calls);
+        var failed = Assert.Single(failures);
+        Assert.Same(unknown, failed.Exception);
+        Assert.Equal(new byte[] { 1 }, Assert.Single(failed.FailedMessages).Payload.ToArray());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Processor_WhenResolutionRemainsUnknown_ShouldReportTheNewBatchAsBlocked(bool retry)
+    {
+        const ulong operationId = 42;
+        var unknown = new VsrRequestOutcomeUnknownException(new IOException("Reply lost."), operationId);
+        var blocked = new VsrLaneBlockedException(operationId);
+        var sent = new List<byte>();
+        var failures = new List<MessageBatchFailedEventArgs>();
+        var client = new Mock<IIggyClient>();
+        client.Setup(value => value.SendMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
+                It.IsAny<Partitioning>(), It.IsAny<IList<Message>>(), It.IsAny<CancellationToken>()))
+            .Returns((Identifier _, Identifier _, Partitioning _, IList<Message> messages, CancellationToken _) =>
+            {
+                var payload = messages[0].Payload.Span[0];
+                sent.Add(payload);
+                return Task.FromException<SendMessagesResponse>(payload == 1 ? unknown : blocked);
+            });
+        client.Setup(value => value.ResolveOperationAsync(operationId, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(unknown);
+        var config = BackgroundConfig(1);
+        config.EnableRetry = retry;
+        config.InitialRetryDelay = TimeSpan.FromMilliseconds(1);
+        await using var processor = new BackgroundMessageProcessor(client.Object, config, NullLoggerFactory.Instance);
+        processor.SubscribeOnMessageBatchFailed(failure =>
+        {
+            failures.Add(failure);
+            return Task.CompletedTask;
+        });
+        await processor.EnqueueAsync(new ReadyUnit([new Message(Guid.NewGuid(), new byte[] { 1 })], null),
+            TestContext.Current.CancellationToken);
+        await processor.EnqueueAsync(new ReadyUnit([new Message(Guid.NewGuid(), new byte[] { 2 })], null),
+            TestContext.Current.CancellationToken);
+        await processor.EnqueueAsync(new ReadyUnit([new Message(Guid.NewGuid(), new byte[] { 3 })], null),
+            TestContext.Current.CancellationToken);
+        processor.Start();
+        await processor.WaitForDrainAsync(TestContext.Current.CancellationToken).WaitAsync(TimeSpan.FromSeconds(5),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(new byte[] { 1, 2, 3 }, sent);
+        Assert.Equal(3, failures.Count);
+        Assert.Same(unknown, failures[0].Exception);
+        Assert.Same(blocked, failures[1].Exception);
+        Assert.Same(blocked, failures[2].Exception);
+        Assert.Equal(new byte[] { 2 }, Assert.Single(failures[1].FailedMessages).Payload.ToArray());
+        client.Verify(value => value.ResolveOperationAsync(operationId, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()),
+            Times.Exactly(2));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Processor_WhenAnotherProducerOwnsTheBlocker_ShouldNotResolveOrRetry(bool retry)
+    {
+        const ulong ownOperation = 42;
+        const ulong foreignOperation = 84;
+        var sent = new List<byte>();
+        var failures = new List<MessageBatchFailedEventArgs>();
+        var blocked = new VsrLaneBlockedException(foreignOperation);
+        var client = new Mock<IIggyClient>();
+        client.Setup(value => value.SendMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
+                It.IsAny<Partitioning>(), It.IsAny<IList<Message>>(), It.IsAny<CancellationToken>()))
+            .Returns((Identifier _, Identifier _, Partitioning _, IList<Message> messages, CancellationToken _) =>
+            {
+                var payload = messages[0].Payload.Span[0];
+                sent.Add(payload);
+                return Task.FromException<SendMessagesResponse>(payload == 1
+                    ? new VsrRequestOutcomeUnknownException(new IOException("Reply lost."), ownOperation)
+                    : blocked);
+            });
+        var config = BackgroundConfig(1);
+        config.EnableRetry = retry;
+        config.InitialRetryDelay = TimeSpan.FromMilliseconds(1);
+        await using var processor = new BackgroundMessageProcessor(client.Object, config, NullLoggerFactory.Instance);
+        processor.SubscribeOnMessageBatchFailed(failure =>
+        {
+            failures.Add(failure);
+            return Task.CompletedTask;
+        });
+        await processor.EnqueueAsync(new ReadyUnit([new Message(Guid.NewGuid(), new byte[] { 1 })], null),
+            TestContext.Current.CancellationToken);
+        await processor.EnqueueAsync(new ReadyUnit([new Message(Guid.NewGuid(), new byte[] { 2 })], null),
+            TestContext.Current.CancellationToken);
+        processor.Start();
+        await processor.WaitForDrainAsync(TestContext.Current.CancellationToken).WaitAsync(TimeSpan.FromSeconds(5),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(new byte[] { 1, 2 }, sent);
+        Assert.Equal(2, failures.Count);
+        Assert.Same(blocked, failures[1].Exception);
+        client.Verify(value => value.ResolveOperationAsync(It.IsAny<ulong>(), It.IsAny<TimeSpan>(),
+            It.IsAny<CancellationToken>()), Times.Never);
     }
 
     private static Mock<IIggyClient> MockClient(List<int> sentCounts)

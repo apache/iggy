@@ -50,8 +50,8 @@ under the License.
     {
       label: 'Edit',
       icon: 'editPen',
-      action: () => {
-        openModal('EditUserModal');
+      action: (user: User) => {
+        openModal('EditUserModal', { user });
       }
     },
     {
@@ -68,7 +68,7 @@ under the License.
         openModal('DeleteUserModal');
       }
     }
-  ] satisfies { label: string; icon: iconType; action: VoidFunction }[];
+  ] satisfies { label: string; icon: iconType; action: (_user: User) => void }[];
 
   const toggleAllChecked = (e: Event) => {
     const { checked } = e.target as HTMLInputElement;
@@ -179,7 +179,7 @@ under the License.
                 {#each userActions as { action, icon, label } (label)}
                   <button
                     onclick={() => {
-                      action();
+                      action(row);
                       close();
                     }}
                     class={twMerge(

@@ -29,11 +29,7 @@ impl PartitionClient for IggyClient {
         topic_id: &Identifier,
         partitions_count: u32,
     ) -> Result<(), IggyError> {
-        self.client
-            .read()
-            .await
-            .create_partitions(stream_id, topic_id, partitions_count)
-            .await
+        super::with_client!(self, client => client.create_partitions(stream_id, topic_id, partitions_count).await)
     }
 
     async fn delete_partitions(
@@ -42,10 +38,6 @@ impl PartitionClient for IggyClient {
         topic_id: &Identifier,
         partitions_count: u32,
     ) -> Result<(), IggyError> {
-        self.client
-            .read()
-            .await
-            .delete_partitions(stream_id, topic_id, partitions_count)
-            .await
+        super::with_client!(self, client => client.delete_partitions(stream_id, topic_id, partitions_count).await)
     }
 }

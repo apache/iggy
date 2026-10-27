@@ -43,6 +43,8 @@ func encodedStream(streamId iggcon.Identifier) string {
 }
 
 // topicCache holds partition counts and the producer round-robin cursors.
+const maxCachedTopics = 4096
+
 type topicCache struct {
 	mtx              sync.Mutex
 	partitionsCounts map[topicKey]uint32
@@ -61,6 +63,12 @@ func (c *topicCache) setPartitionsCount(key topicKey, count uint32) {
 	defer c.mtx.Unlock()
 	if c.partitionsCounts == nil {
 		c.partitionsCounts = make(map[topicKey]uint32)
+	}
+	if _, found := c.partitionsCounts[key]; !found && len(c.partitionsCounts) >= maxCachedTopics {
+		for old := range c.partitionsCounts {
+			delete(c.partitionsCounts, old)
+			break
+		}
 	}
 	c.partitionsCounts[key] = count
 }
@@ -114,6 +122,12 @@ func (c *topicCache) nextBalanced(key topicKey, partitionsCount uint32) uint32 {
 	defer c.mtx.Unlock()
 	if c.balancedCursors == nil {
 		c.balancedCursors = make(map[topicKey]uint32)
+	}
+	if _, found := c.balancedCursors[key]; !found && len(c.balancedCursors) >= maxCachedTopics {
+		for old := range c.balancedCursors {
+			delete(c.balancedCursors, old)
+			break
+		}
 	}
 	partition := c.balancedCursors[key] % partitionsCount
 	c.balancedCursors[key]++

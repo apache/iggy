@@ -75,7 +75,7 @@ describe('VSR reply decoding', () => {
   });
 
   it('rejects an undeclared reply operation discriminant', () => {
-    for (const operation of [69, 150, 163, 255])
+    for (const operation of [69, 129, 133, 142, 163, 255])
       assert.throws(
         () => decodeResponse(reply(operation)),
         (error: unknown) =>
@@ -118,6 +118,20 @@ describe('VSR reply decoding', () => {
       decodeResponse(reply(Operation.CreateStream, body)),
       Buffer.from('stream')
     );
+  });
+
+  it('strips the result section of every resolved update reply', () => {
+    for (const operation of [Operation.UpdateStreamResolved, Operation.UpdateTopicResolved,
+      Operation.UpdateUserResolved]) {
+      assert.deepEqual(decodeResponse(reply(operation, Buffer.alloc(4))), Buffer.alloc(0));
+      const refused = Buffer.alloc(12);
+      refused.writeUInt32LE(1, 0);
+      refused.writeUInt32LE(4103, 8);
+      assert.throws(
+        () => decodeResponse(reply(operation, refused), COMMAND_CODE.UpdateResource),
+        (error: unknown) => error instanceof ResponseError && error.errorCode === 4103
+      );
+    }
   });
 
   it('strips a non-empty successful result section', () => {

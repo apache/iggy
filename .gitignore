@@ -48,6 +48,8 @@ foreign/node/.npm
 *.a
 *.lib
 *.out
+*.pid
+__pycache__/
 go.work
 core/bench/dashboard/frontend/dist
 core/integration/tests/connectors/postgres/cdc_restart_connectors/*

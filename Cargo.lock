@@ -250,6 +250,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aead-stream"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a901e5bcd15b4a9555a8f17a608d28ef92cf77bc4aa3b4a0c1a3fce1a9cc0bac"
+dependencies = [
+ "aead 0.6.1",
+]
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -269,6 +278,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpubits",
  "cpufeatures 0.3.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -297,6 +307,22 @@ dependencies = [
  "ctr 0.10.1",
  "ctutils",
  "ghash 0.6.0",
+ "zeroize",
+]
+
+[[package]]
+name = "aes-gcm-siv"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c32325128cb24de2a2d14d92da7569dae7073f9e47334521d494747fa94d902"
+dependencies = [
+ "aead 0.6.1",
+ "aes 0.9.3",
+ "cipher 0.5.2",
+ "ctr 0.10.1",
+ "ctutils",
+ "polyval 0.7.3",
+ "zeroize",
 ]
 
 [[package]]
@@ -1431,6 +1457,10 @@ dependencies = [
  "futures-util",
  "log",
  "pin-project-lite",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
  "tungstenite 0.29.0",
 ]
 
@@ -5282,6 +5312,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
+name = "fixedbitset"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
+
+[[package]]
 name = "flagset"
 version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5742,6 +5778,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2eecf2d5dc9b66b732b97707a0210906b1d30523eb773193ab777c0c84b3e8d5"
 dependencies = [
  "polyval 0.7.3",
+ "zeroize",
 ]
 
 [[package]]
@@ -7052,7 +7089,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.11.1-edge.1"
+version = "0.11.1-edge.5"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -7075,6 +7112,7 @@ dependencies = [
  "reqwest-middleware",
  "reqwest-retry",
  "reqwest-tracing",
+ "ring",
  "rustls",
  "secrecy",
  "serde",
@@ -7089,7 +7127,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench"
-version = "0.6.1-edge.1"
+version = "0.6.1-edge.4"
 dependencies = [
  "async-trait",
  "bench-report",
@@ -7105,6 +7143,7 @@ dependencies = [
  "hostname",
  "human-repr",
  "iggy",
+ "iggy_binary_protocol",
  "nonzero_lit",
  "rand 0.10.3",
  "rayon",
@@ -7147,7 +7186,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-cli"
-version = "0.14.1-edge.1"
+version = "0.14.1-edge.4"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -7181,7 +7220,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.5.1-edge.1"
+version = "0.5.1-edge.4"
 dependencies = [
  "apache-avro 0.22.0",
  "async-trait",
@@ -7241,10 +7280,12 @@ dependencies = [
 
 [[package]]
 name = "iggy-gateway-kafka"
-version = "0.1.0"
+version = "0.1.0-edge.1"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
+ "base64 0.23.1",
  "bytes",
  "crc32c",
  "flate2",
@@ -7253,6 +7294,10 @@ dependencies = [
  "kafka-protocol",
  "libc",
  "lz4",
+ "rcgen",
+ "regex",
+ "regex-syntax",
+ "rustls",
  "secrecy",
  "serde",
  "serde_json",
@@ -7262,18 +7307,20 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "x509-parser",
  "zstd 0.14.2",
 ]
 
 [[package]]
 name = "iggy-mcp"
-version = "0.5.1-edge.1"
+version = "0.5.1-edge.4"
 dependencies = [
  "axum",
  "axum-server",
@@ -7308,12 +7355,13 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.11.1-edge.1"
+version = "0.11.1-edge.4"
 dependencies = [
  "aligned-vec",
  "bytemuck",
  "bytes",
  "enumset",
+ "ring",
  "secrecy",
  "serde",
  "thiserror 2.0.21",
@@ -7322,9 +7370,10 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.11.1-edge.1"
+version = "0.11.1-edge.5"
 dependencies = [
  "aes-gcm 0.11.1",
+ "aes-gcm-siv",
  "async-broadcast",
  "async-trait",
  "base64 0.23.1",
@@ -7336,6 +7385,7 @@ dependencies = [
  "clap",
  "comfy-table",
  "derive_more",
+ "hex",
  "humantime",
  "iggy_binary_protocol",
  "papaya",
@@ -7353,6 +7403,7 @@ dependencies = [
  "ulid",
  "url",
  "uuid",
+ "xaes-256-gcm",
 ]
 
 [[package]]
@@ -7629,6 +7680,28 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "iggy_connector_mqtt_source"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "dashmap",
+ "humantime",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "rumqttc-v4-next",
+ "rumqttc-v5-next",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -8034,6 +8107,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "base64 0.23.1",
+ "blake3",
  "bon",
  "bytemuck",
  "bytes",
@@ -8073,6 +8147,8 @@ dependencies = [
  "reqwest-retry",
  "ring",
  "rmcp",
+ "rumqttc-v4-next",
+ "rumqttc-v5-next",
  "rust-s3",
  "secrecy",
  "serde",
@@ -9359,6 +9435,16 @@ checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
 dependencies = [
  "num-traits",
  "pxfm",
+]
+
+[[package]]
+name = "mqttbytes-core-next"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "366b6ba2b4209ca4bc5ac731ccddf570d09831981eed07e5fbd63564cf0cf1aa"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -10824,6 +10910,7 @@ dependencies = [
  "cpubits",
  "cpufeatures 0.3.1",
  "universal-hash 0.6.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -12090,6 +12177,71 @@ dependencies = [
 ]
 
 [[package]]
+name = "rumqttc-core-next"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "249896ab27ed630590971738264baa8f722f18965d2e387c706c40a3c2a572cc"
+dependencies = [
+ "async-tungstenite",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
+name = "rumqttc-v4-next"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3767dde22a804ea806107d0f4331e33cb794d1b8468b11c86fb0c1366f07054"
+dependencies = [
+ "async-tungstenite",
+ "bytes",
+ "fixedbitset",
+ "flume",
+ "futures-util",
+ "log",
+ "mqttbytes-core-next",
+ "percent-encoding",
+ "rumqttc-core-next",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
+name = "rumqttc-v5-next"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3dfa6ddcc7a7dd5688f9bf78d8f81cb94f367bce56c055d8d94cf81ecb0518bf"
+dependencies = [
+ "async-tungstenite",
+ "bytes",
+ "fixedbitset",
+ "flume",
+ "futures-util",
+ "log",
+ "mqttbytes-core-next",
+ "percent-encoding",
+ "rumqttc-core-next",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
 name = "rust-embed"
 version = "8.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12831,7 +12983,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.9.1-edge.1"
+version = "0.9.1-edge.4"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -12863,10 +13015,12 @@ dependencies = [
  "fs2",
  "futures",
  "hash32 1.0.0",
+ "hex",
  "human-repr",
  "hwlocality",
  "hyper",
  "hyper-util",
+ "iggy",
  "iggy_binary_protocol",
  "iggy_common",
  "journal",
@@ -12888,6 +13042,7 @@ dependencies = [
  "prometheus-client",
  "quote",
  "rand 0.10.3",
+ "ring",
  "ringbuffer",
  "rmp-serde",
  "rolling-file",
@@ -16117,6 +16272,19 @@ dependencies = [
  "rusticata-macros",
  "thiserror 2.0.21",
  "time",
+]
+
+[[package]]
+name = "xaes-256-gcm"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc0e35bc669c7ce781caf52f51a1e672237825014c7a8cbb1292e194800d97fe"
+dependencies = [
+ "aead 0.6.1",
+ "aead-stream",
+ "aes 0.9.3",
+ "aes-gcm 0.11.1",
+ "cipher 0.5.2",
 ]
 
 [[package]]

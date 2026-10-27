@@ -29,7 +29,6 @@ stream = "events"
 topics = ["influx_events"]
 schema = "json"
 batch_length = 100
-poll_interval = "5ms"
 consumer_group = "influxdb_sink"
 
 [plugin_config]

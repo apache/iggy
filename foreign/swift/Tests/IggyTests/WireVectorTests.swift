@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import Foundation
 import Testing
 
 @testable import Iggy
@@ -61,7 +62,12 @@ struct RequestVectorTests {
         #expect(try encode(5) == golden.bytes("request.delete_stream"))
         #expect(try encode("my-stream") == golden.bytes("request.get_stream"))
         #expect(golden.bytes("request.get_streams").isEmpty)
-        #expect(try Requests.updateStream(streamID: "old-name", name: "new-name", options: []) == golden.bytes("request.update_stream"))
+        let key = Data((0..<UInt8(EncryptionKey.length)).map { $0 })
+        #expect(
+            try Requests.createStream(name: "test-stream", options: StreamCreateOptions(encryptionKey: key).encode())
+                == golden.bytes("request.create_stream.key"))
+        #expect(
+            try Requests.updateResource(.stream("old-name"), StreamUpdateOptions(name: "new-name").toPatch()) == golden.bytes("request.update_resource.stream"))
     }
 
     @Test func topics() throws {
@@ -71,8 +77,13 @@ struct RequestVectorTests {
         #expect(try Requests.streamAndTopic(1, 5) == golden.bytes("request.delete_topic"))
         #expect(try Requests.streamAndTopic("my-stream", "my-topic") == golden.bytes("request.get_topic"))
         #expect(try encode(42) == golden.bytes("request.get_topics"))
-        let options = try OptionsBlock.encode(["message_expiry": .explicit(.uint64(604_800_000_000))])
-        #expect(try Requests.updateTopic(streamID: 1, topicID: 2, name: "updated-topic", options: options) == golden.bytes("request.update_topic"))
+        let update = TopicUpdateOptions(name: "updated-topic", messageExpiry: .after(.seconds(604_800)), reset: [.maxTopicSize])
+        #expect(try Requests.updateResource(.topic(stream: 1, topic: 2), update.toPatch()) == golden.bytes("request.update_resource.topic"))
+        // Reset names travel in byte order, whatever order they were named in.
+        let resets = TopicUpdateOptions(reset: [.maxTopicSize, .messageExpiry])
+        #expect(
+            try Requests.updateResource(.topic(stream: "stream", topic: "topic"), resets.toPatch())
+                == golden.bytes("request.update_resource.topic.reset_only"))
     }
 
     @Test func partitionsAndSegments() throws {
@@ -113,6 +124,7 @@ struct RequestVectorTests {
         #expect(
             try Requests.pollMessages(consumer: .group(3), streamID: 1, topicID: 1, partitionID: nil, strategy: .first, count: 10, autoCommit: false)
                 == golden.bytes("request.poll_messages.group"))
+        #expect(try Requests.partitionRoute(streamID: 10, topicID: "orders", partitionID: 5) == golden.bytes("request.get_partition_route"))
 
         let headers: UserHeaders = ["trace-id": "abc", "attempt": .uint32(3)]
         let messages = [
@@ -134,8 +146,11 @@ struct RequestVectorTests {
         #expect(try encode("old-user") == golden.bytes("request.delete_user"))
         #expect(try encode(42) == golden.bytes("request.get_user"))
         #expect(golden.bytes("request.get_users").isEmpty)
-        #expect(try Requests.updateUser(userID: 1, username: "new-name", status: .inactive, options: []) == golden.bytes("request.update_user"))
-        #expect(try Requests.updateUser(userID: 5, username: nil, status: nil, options: []) == golden.bytes("request.update_user.none"))
+        #expect(
+            try Requests.updateResource(.user(1), UserUpdateOptions(username: "new-name", status: .inactive).toPatch())
+                == golden.bytes("request.update_resource.user"))
+        #expect(
+            try Requests.updateResource(.user("admin"), UserUpdateOptions(status: .active).toPatch()) == golden.bytes("request.update_resource.user.status"))
         #expect(try Requests.updatePermissions(userID: 1, permissions: samplePermissions) == golden.bytes("request.update_permissions"))
         #expect(try Requests.updatePermissions(userID: "admin", permissions: nil) == golden.bytes("request.update_permissions.none"))
         #expect(try Requests.changePassword(userID: 1, currentPassword: "old-pass", newPassword: "new-pass-123") == golden.bytes("request.change_password"))
@@ -167,6 +182,12 @@ struct RequestVectorTests {
         #expect(golden.bytes("request.get_cluster_metadata").isEmpty)
         #expect(try Requests.getSnapshot(compression: .deflated, types: [.filesystemOverview, .serverLogs]) == golden.bytes("request.get_snapshot"))
         #expect(Requests.describeOptions(scope: .topic) == golden.bytes("request.describe_options"))
+        let cursor = MetadataChangeCursor(
+            logID: UInt128Value(0x0d4b_8f2a_6e1c_93d7), op: 4187, checksum: UInt128Value(0xf2a4_c6e8_b0d1_f359), ordinal: 1)
+        #expect(
+            Requests.getMetadataChanges(
+                MetadataChangesQuery(start: .after(cursor), groups: [.topics, .streams], since: IggyTimestamp(microseconds: 1_760_356_800_000_000), limit: 500))
+                == golden.bytes("request.get_metadata_changes"))
         let testBindSecret = Array(repeating: UInt8(0x5a), count: Requests.bindSecretSize)
         let testClientID = UInt128Value(low: 1, high: 0)
         #expect(
@@ -177,7 +198,7 @@ struct RequestVectorTests {
     @Test func protocolVersionMatchesTheCrate() {
         #expect(ProtocolVersion.current.packed == golden.protocolVersion)
         #expect(ProtocolVersion.current.description == ProtocolVersion(packed: golden.protocolVersion).description)
-        #expect(ProtocolVersion(major: 0, minor: 11, patch: 1).description == "0.11.1")
+        #expect(ProtocolVersion(major: 0, minor: 12, patch: 0).description == "0.12.0")
     }
 }
 
@@ -187,13 +208,23 @@ struct VSRHeaderVectorTests {
     let clientID = UInt128Value(low: 0xFEDC_BA98_7654_3210, high: 0x0123_4567_89AB_CDEF)
 
     func header(_ request: VSRFrame.EncodedRequest) -> [UInt8] {
-        Array(request.bytes[..<VSRFrame.headerSize])
+        var bytes = Array(request.bytes[..<VSRFrame.headerSize])
+        bytes.replaceSubrange(
+            VSRFrame.RequestOffset.requestChecksum..<VSRFrame.RequestOffset.requestChecksum + 16,
+            with: repeatElement(0, count: 16))
+        return bytes
+    }
+
+    func requestIdentifier(_ request: VSRFrame.EncodedRequest) -> UInt128Value {
+        let range = VSRFrame.RequestOffset.requestChecksum..<VSRFrame.RequestOffset.requestChecksum + 16
+        return UInt128Value(littleEndianBytes: request.bytes[range])
     }
 
     @Test func registerHeader() throws {
         var session = ConsensusSession(clientID: clientID)
         let request = try VSRFrame.encodeRequest(session: &session, code: CommandCode.loginRegister.rawValue, payload: [1, 2, 3])
         #expect(header(request) == golden.bytes("vsr.request.register"))
+        #expect(!requestIdentifier(request).isZero)
         #expect(Array(request.bytes[VSRFrame.headerSize...]) == [1, 2, 3])
         #expect(request.requestID == 0)
         #expect(request.operation == .register)
@@ -203,30 +234,47 @@ struct VSRHeaderVectorTests {
         var session = ConsensusSession(clientID: clientID)
         let unbound = try VSRFrame.encodeRequest(session: &session, code: CommandCode.ping.rawValue, payload: [])
         #expect(header(unbound) == golden.bytes("vsr.request.ping"))
+        #expect(requestIdentifier(unbound).isZero)
         try session.bind(99)
         _ = try session.nextRequestID()
         _ = try session.nextRequestID()
         let bound = try VSRFrame.encodeRequest(session: &session, code: CommandCode.ping.rawValue, payload: [])
         #expect(header(bound) == golden.bytes("vsr.request.ping.bound"))
+        #expect(requestIdentifier(bound).isZero)
     }
 
-    @Test func metadataHeaderStampsTheChecksum() throws {
+    @Test func metadataHeaderStampsRandomIdentifier() throws {
         var session = ConsensusSession(clientID: clientID)
         try session.bind(99)
         let payload = golden.bytes("payload.create_stream")
         #expect(payload == (try Requests.createStream(name: "stream")))
         let request = try VSRFrame.encodeRequest(session: &session, code: CommandCode.createStream.rawValue, payload: payload)
         #expect(header(request) == golden.bytes("vsr.request.create_stream"))
+        #expect(!requestIdentifier(request).isZero)
         #expect(request.requestID == 1)
         #expect(UInt64(littleEndianBytes: request.bytes[VSRFrame.RequestOffset.request..<VSRFrame.RequestOffset.request + 8]) == 1)
     }
 
-    @Test func partitionHeaderLeavesTheChecksumZero() throws {
+    /// The generic update is replicated, so its header carries a random request identifier.
+    @Test func updateResourceHeaderStampsRandomIdentifier() throws {
+        var session = ConsensusSession(clientID: clientID)
+        try session.bind(99)
+        let payload = golden.bytes("payload.update_resource")
+        let update = TopicUpdateOptions(name: "updated-topic", messageExpiry: .after(.seconds(604_800)), reset: [.maxTopicSize])
+        #expect(payload == (try Requests.updateResource(.topic(stream: 1, topic: 2), update.toPatch())))
+        let request = try VSRFrame.encodeRequest(session: &session, code: CommandCode.updateResource.rawValue, payload: payload)
+        #expect(header(request) == golden.bytes("vsr.request.update_resource"))
+        #expect(!requestIdentifier(request).isZero)
+        #expect(request.operation == .updateResource)
+    }
+
+    @Test func partitionHeaderLeavesTheIdentifierZero() throws {
         var session = ConsensusSession(clientID: clientID)
         try session.bind(99)
         _ = try session.nextRequestID()
         let request = try VSRFrame.encodeRequest(session: &session, code: CommandCode.sendMessages.rawValue, payload: [9, 9, 9, 9])
         #expect(header(request) == golden.bytes("vsr.request.send_messages"))
+        #expect(requestIdentifier(request).isZero)
         #expect(request.requestID == 2)
     }
 
@@ -253,9 +301,11 @@ struct VSRHeaderVectorTests {
         }
         let logout = try VSRFrame.encodeRequest(session: &session, code: CommandCode.logoutUser.rawValue, payload: [])
         #expect(header(logout) == golden.bytes("vsr.request.logout"))
+        #expect(!requestIdentifier(logout).isZero)
         #expect(logout.operation == .logout)
         let unknown = try VSRFrame.encodeRequest(session: &session, code: 60_000, payload: [])
         #expect(header(unknown) == golden.bytes("vsr.request.unknown_code"))
+        #expect(requestIdentifier(unknown).isZero)
         #expect(unknown.operation == .nonReplicated)
     }
 
@@ -264,10 +314,14 @@ struct VSRHeaderVectorTests {
         #expect(VSRFrame.peekCommand(ok) == .reply)
         #expect(VSRFrame.readSize(ok) == UInt32(VSRFrame.headerSize + 12))
         #expect(VSRFrame.readReplyRequestID(ok) == 7)
+        #expect(VSRFrame.readReplyCommit(ok) == 12)
         #expect(VSRFrame.readReplyStatus(ok) == 0)
         #expect(VSRFrame.readReplyOperation(ok) == .createStream)
+        #expect(!VSRFrame.hasCommittedResult(ok))
+        #expect(VSRFrame.hasCommittedResult(golden.bytes("vsr.reply.committed")[...]))
 
         let denied = golden.bytes("vsr.reply.denied")[...]
+        #expect(!VSRFrame.hasCommittedResult(denied))
         #expect(throws: IggyError(.unauthorized)) {
             try VSRFrame.decodeReply(header: denied, body: [])
         }

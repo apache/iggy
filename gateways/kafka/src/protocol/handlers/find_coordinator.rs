@@ -28,9 +28,9 @@ use kafka_protocol::protocol::StrBytes;
 
 use crate::error::Result;
 use crate::protocol::api::{
-    API_KEY_FIND_COORDINATOR, ApiVersionRange, BrokerAdvertise, ERROR_INVALID_REQUEST, ERROR_NONE,
-    ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED, ERROR_UNSUPPORTED_VERSION, GatewayState,
-    HandleOutcome, is_supported_version,
+    API_KEY_FIND_COORDINATOR, ApiVersionRange, BrokerAdvertise, ConnectionState,
+    ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, is_supported_version,
 };
 use crate::protocol::bounds_guard::validate_find_coordinator_shape;
 use crate::protocol::handlers::{
@@ -57,7 +57,12 @@ const UNSUPPORTED_KEY_TYPE_MESSAGE: &str = "only group coordination is supported
     clippy::unused_async,
     reason = "the shared handler signature, kept until a handler awaits the bridge"
 )]
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     if !is_supported_version(API_KEY_FIND_COORDINATOR, api_version) {
         return unsupported_version_response(API_KEY_FIND_COORDINATOR, api_version, |version| {
             encode_error_response(version, ERROR_UNSUPPORTED_VERSION)
@@ -67,7 +72,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         validate_find_coordinator_shape(version, body, state.max_frame_size)
     }) {
         Ok(request) => respond_or_close(
-            encode_response(api_version, &request, &state.broker),
+            encode_response(api_version, &request, &connection.broker),
             "FindCoordinator",
         ),
         Err(error) => {

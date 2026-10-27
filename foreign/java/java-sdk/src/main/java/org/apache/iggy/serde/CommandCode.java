@@ -33,6 +33,8 @@ public interface CommandCode {
         GET_CLUSTER_METADATA(12),
         DESCRIBE_OPTIONS(13),
         BIND_SESSION(15),
+        UPDATE_RESOURCE(16),
+        GET_METADATA_CHANGES(17),
         GET_ME(20),
         GET_CLIENT(21),
         GET_ALL_CLIENTS(22);
@@ -54,7 +56,7 @@ public interface CommandCode {
         GET_ALL(32),
         CREATE(33),
         DELETE(34),
-        UPDATE(35),
+        // 35 is retired and must never be reused.
         UPDATE_PERMISSIONS(36),
         CHANGE_PASSWORD(37),
         LOGIN(38),
@@ -95,9 +97,11 @@ public interface CommandCode {
     enum Messages implements CommandCode {
         POLL(100),
         SEND(101),
-        GET_POLL_ROUTING(103),
-        POLL_ON_PRIMARY(104),
-        GET_PARTITION_ROUTE(105);
+        // 103 and 104 are retired and must never be reused.
+        GET_PARTITION_ROUTE(105),
+        POLL_DEFERRED(106),
+        WAIT_FOR_MESSAGES(107),
+        CANCEL_DEFERRED_REQUEST(108);
 
         private final int value;
 
@@ -114,8 +118,8 @@ public interface CommandCode {
     enum ConsumerOffset implements CommandCode {
         GET(120),
         STORE(121),
-        DELETE(122),
-        GET_ROUTING(123);
+        DELETE(122);
+        // 123 and 124 are retired and must never be reused.
 
         private final int value;
 
@@ -133,8 +137,8 @@ public interface CommandCode {
         GET(200),
         GET_ALL(201),
         CREATE(202),
-        DELETE(203),
-        UPDATE(204);
+        DELETE(203);
+        // 204 is retired and must never be reused.
 
         private final int value;
 
@@ -152,8 +156,8 @@ public interface CommandCode {
         GET(300),
         GET_ALL(301),
         CREATE(302),
-        DELETE(303),
-        UPDATE(304);
+        DELETE(303);
+        // 304 is retired and must never be reused.
 
         private final int value;
 

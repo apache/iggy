@@ -210,9 +210,16 @@ struct ClientEntry {
 #[derive(Debug, Clone)]
 pub struct SessionAttachment {
     session: Weak<()>,
+    user_id: u32,
 }
 
 impl SessionAttachment {
+    /// Authenticated owner of this session, retained for permission rechecks.
+    #[must_use]
+    pub const fn user_id(&self) -> u32 {
+        self.user_id
+    }
+
     #[must_use]
     pub fn is_valid(&self) -> bool {
         self.session.strong_count() != 0
@@ -420,12 +427,16 @@ enum SliceRequestStatus {
 
 /// Result of retaining a committed metadata receipt.
 ///
-/// Real client operations fail closed on a non-`Cached` outcome;
+/// Real client operations fail closed on `NoEntry` and `SkippedRegression`;
 /// server-originated operations have no registered entry or receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitReply {
     /// Reply cached and the watermark advanced (or refreshed in place).
     Cached,
+    /// The op committed after its session ended at `ended_op`. Nothing is
+    /// retained, so its outcome stays uncertain and the end marker still
+    /// bounds the latest receipt.
+    SessionEnded { ended_op: u64 },
     /// No registered entry, including for server-originated operations.
     NoEntry,
     /// A replayed op is older than the restored protection frontier.
@@ -1067,7 +1078,8 @@ impl ClientTable {
 
     /// Retain a committed metadata result before advancing the applied frontier.
     /// Missing ownership or regressing protection is a commit failure.
-    /// Server-originated operations return [`CommitReply::NoEntry`].
+    /// Server-originated operations return [`CommitReply::NoEntry`]. An op
+    /// committed after its session ended returns [`CommitReply::SessionEnded`].
     /// # Panics
     /// If the client id differs from the reply or the private index is inconsistent.
     pub fn commit_reply(
@@ -1113,6 +1125,12 @@ impl ClientTable {
                 stored: entry.watermark,
                 received: new_request,
             };
+        }
+        // A request admitted before its session ended can commit after the end.
+        // Decoders refuse a receipt above the end marker, so that op stays
+        // uncertain. The op that ended the session commits at the marker.
+        if let Some(ended_op) = entry.ended_op.filter(|&ended_op| new_commit > ended_op) {
+            return CommitReply::SessionEnded { ended_op };
         }
 
         // Freeze once; later dedup-hit clones Arc-bump.
@@ -1470,6 +1488,7 @@ impl ClientTable {
         let attachment = entry.attachment.get_or_insert_with(|| Arc::new(()));
         Some(SessionAttachment {
             session: Arc::downgrade(attachment),
+            user_id,
         })
     }
 
@@ -1507,6 +1526,16 @@ impl ClientTable {
     #[must_use]
     pub fn count(&self) -> usize {
         self.index.len()
+    }
+
+    /// Sessions not yet ended, as `(client_id, user_id, epoch)` in slot order.
+    /// Never the bind verifier or a cached reply.
+    pub fn active_sessions(&self) -> impl Iterator<Item = (u128, u32, u64)> + '_ {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|entry| entry.ended_op.is_none())
+            .map(|entry| (entry.client_id, entry.user_id, entry.epoch))
     }
 }
 
@@ -1838,7 +1867,9 @@ impl ClientEntry {
                     || (ended == self.latest_commit
                         && !matches!(
                             header.operation,
-                            Operation::Logout | Operation::UpdateUser | Operation::DeleteUser
+                            Operation::Logout
+                                | Operation::UpdateUserResolved
+                                | Operation::DeleteUser
                         ))
             })
         {
@@ -1928,7 +1959,10 @@ impl ClientEntry {
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::{Command, Operation};
+    use iggy_binary_protocol::{
+        Command, Operation, PrepareHeader, REJECTION_SECTION_LEN, RoutedRequestHeader, result_code,
+        write_rejection_section,
+    };
 
     /// Arbitrary non-zero user id for register fixtures; most tests don't
     /// assert on it (see `register_stores_user_id` for the accessor check).
@@ -2007,6 +2041,22 @@ mod tests {
             ..ReplyHeader::default()
         };
         msg
+    }
+
+    #[test]
+    fn given_ended_and_live_sessions_when_listing_active_should_yield_only_live_identities() {
+        let mut table = ClientTable::new(8);
+        for (client, user, epoch) in [(1, 11, 10), (2, 22, 20), (3, 11, 30)] {
+            table
+                .commit_register(client, user, [0x5a; 32], make_register_reply(client, epoch))
+                .unwrap();
+        }
+        table.end_user_sessions(22, 40);
+
+        let mut active: Vec<_> = table.active_sessions().collect();
+        active.sort_unstable();
+
+        assert_eq!(active, [(1, 11, 10), (3, 11, 30)]);
     }
 
     #[test]
@@ -2223,7 +2273,7 @@ mod tests {
         let secret = [0x5a; BIND_SECRET_BYTES];
         for self_revocation in [
             None,
-            Some(Operation::UpdateUser),
+            Some(Operation::UpdateUserResolved),
             Some(Operation::DeleteUser),
         ] {
             let mut table = ClientTable::new(1);
@@ -2274,6 +2324,147 @@ mod tests {
         }
     }
 
+    #[test]
+    fn given_self_deactivation_through_generic_patch_when_validating_protection_should_accept_resolved_operation()
+     {
+        const CLIENT: u128 = 7;
+        const EPOCH: u64 = 10;
+        const END: u64 = 40;
+        let secret = [0x5a; BIND_SECRET_BYTES];
+        for (operation, accepted) in [
+            (Operation::UpdateUserResolved, true),
+            (Operation::UpdateStreamResolved, false),
+            (Operation::UpdateTopicResolved, false),
+        ] {
+            let mut table = ClientTable::new(1);
+            table
+                .commit_register(
+                    CLIENT,
+                    TEST_USER_ID,
+                    bind_verifier(CLIENT, TEST_USER_ID, &secret),
+                    make_register_reply(CLIENT, EPOCH),
+                )
+                .unwrap();
+            table.commit_reply(CLIENT, TEST_USER_ID, make_reply_for(CLIENT, 5, END - 1));
+            assert_eq!(table.end_user_sessions(TEST_USER_ID, END).len(), 1);
+            let receipt = make_reply_for(CLIENT, 6, END).transmute_header(|old, header| {
+                *header = old;
+                header.operation = operation;
+            });
+            table.commit_reply(CLIENT, TEST_USER_ID, receipt);
+            assert_eq!(
+                ClientTable::from_snapshot(table.to_snapshot()).is_ok(),
+                accepted,
+                "{operation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_resolved_update_receipt_when_retrying_client_operation_should_return_cached_reply() {
+        for resolved in [
+            Operation::UpdateStreamResolved,
+            Operation::UpdateTopicResolved,
+            Operation::UpdateUserResolved,
+        ] {
+            let (mut table, epoch) = table_with_client();
+            let reply = make_reply_for(1, 1, 11).transmute_header(|old, header| {
+                *header = old;
+                header.operation = resolved;
+            });
+            table.commit_reply(1, TEST_USER_ID, reply.clone());
+            for restored in [
+                ClientTable::from_snapshot(table.to_snapshot()).unwrap(),
+                ClientTable::decode(&table.encode()).unwrap(),
+            ] {
+                let RequestStatus::Duplicate(cached) =
+                    restored.check_request(1, epoch, 1, Operation::UpdateResource)
+                else {
+                    panic!("lost the receipt for {resolved:?}");
+                };
+                assert_eq!(cached.into_message().as_slice(), reply.as_slice());
+                assert!(matches!(
+                    restored.check_request(1, epoch, 1, Operation::DeleteStream),
+                    RequestStatus::OperationMismatch { .. }
+                ));
+            }
+        }
+    }
+
+    /// A request admitted before its user's revocation committed commits
+    /// right behind it. Its session already ended, so the op stays uncertain.
+    #[test]
+    fn given_revoked_user_when_a_pipelined_request_commits_should_keep_the_tombstone() {
+        const REVOKER: u128 = 7;
+        const PIPELINED: u128 = 8;
+        const REVOKER_EPOCH: u64 = 10;
+        const PIPELINED_EPOCH: u64 = 11;
+        const END: u64 = 40;
+        let secret = [0x5a; BIND_SECRET_BYTES];
+        for self_revocation in [
+            None,
+            Some(Operation::UpdateUserResolved),
+            Some(Operation::DeleteUser),
+        ] {
+            let mut table = ClientTable::new(2);
+            for (client, epoch) in [(REVOKER, REVOKER_EPOCH), (PIPELINED, PIPELINED_EPOCH)] {
+                table
+                    .commit_register(
+                        client,
+                        TEST_USER_ID,
+                        bind_verifier(client, TEST_USER_ID, &secret),
+                        make_register_reply(client, epoch),
+                    )
+                    .unwrap();
+            }
+            let ended = table.end_user_sessions(TEST_USER_ID, END);
+            if let Some(operation) = self_revocation {
+                let revocation = make_reply_for(REVOKER, 1, END).transmute_header(|old, header| {
+                    *header = old;
+                    header.operation = operation;
+                });
+                assert_eq!(
+                    table.commit_reply(REVOKER, TEST_USER_ID, revocation),
+                    CommitReply::Cached,
+                    "the revoking op commits at the end marker itself"
+                );
+            }
+            let at_end = table.encode();
+            assert_eq!(
+                table.commit_reply(
+                    PIPELINED,
+                    TEST_USER_ID,
+                    make_reply_for(PIPELINED, 1, END + 1)
+                ),
+                CommitReply::SessionEnded { ended_op: END },
+                "{self_revocation:?}"
+            );
+            let transferred = table.encode();
+            assert!(
+                transferred == at_end,
+                "{self_revocation:?}: an op after the end must leave the table unchanged"
+            );
+            let revoker_receipt = if self_revocation.is_some() {
+                END
+            } else {
+                REVOKER_EPOCH
+            };
+            for restored in [
+                ClientTable::from_snapshot(table.to_snapshot()).expect("checkpoint must restore"),
+                ClientTable::decode(&transferred).expect("state transfer must decode"),
+            ] {
+                assert_eq!(restored.ended_sessions().collect::<Vec<_>>(), ended);
+                assert_eq!(
+                    restored
+                        .get_reply(REVOKER)
+                        .map(|receipt| receipt.header().commit),
+                    Some(revoker_receipt)
+                );
+                assert_eq!(restored.get_watermark(PIPELINED), Some(REGISTER_REQUEST_ID));
+            }
+        }
+    }
+
     /// Register client 1 (register commit stamped at op 10). Returns
     /// (table, epoch=1).
     fn table_with_client() -> (ClientTable, u64) {
@@ -2283,6 +2474,57 @@ mod tests {
             .unwrap();
         let epoch = table.get_epoch(1).expect("just registered");
         (table, epoch)
+    }
+
+    #[test]
+    fn given_committed_rejection_when_receipt_is_restored_should_preserve_final_result_proof() {
+        const CLIENT: u128 = 1;
+        const REQUEST: u64 = 1;
+        const COMMIT: u64 = 11;
+        let (mut table, epoch) = table_with_client();
+        let request = RoutedRequestHeader {
+            client: CLIENT,
+            session: epoch,
+            request: REQUEST,
+            operation: Operation::CreateUser,
+            ..Default::default()
+        };
+        let code = IggyError::UserAlreadyExists.as_code();
+        let uncommitted = crate::build_result_rejection_reply(&request, COMMIT, code);
+        assert!(!uncommitted.header().has_committed_result());
+        let prepare = PrepareHeader {
+            client: CLIENT,
+            request: REQUEST,
+            op: COMMIT,
+            operation: request.operation,
+            ..Default::default()
+        };
+        let committed = crate::build_reply_message_with(&prepare, REJECTION_SECTION_LEN, |body| {
+            write_rejection_section(body, code);
+        });
+        assert_eq!(uncommitted.header().op, committed.header().op);
+        assert_eq!(uncommitted.header().commit, committed.header().commit);
+        assert_eq!(uncommitted.body(), committed.body());
+        assert!(committed.header().has_committed_result());
+        assert_eq!(
+            table.commit_reply(CLIENT, TEST_USER_ID, committed.clone()),
+            CommitReply::Cached
+        );
+
+        for restored in [
+            ClientTable::from_snapshot(table.to_snapshot()).unwrap(),
+            ClientTable::decode(&table.encode()).unwrap(),
+        ] {
+            let RequestStatus::Duplicate(reply) =
+                restored.check_request(CLIENT, epoch, REQUEST, request.operation)
+            else {
+                panic!("restored committed rejection must remain available to a retry");
+            };
+            assert_eq!(reply.as_bytes(), committed.as_slice());
+            let reply = reply.into_message();
+            assert!(reply.header().has_committed_result());
+            assert_eq!(result_code(reply.body()), Some(code));
+        }
     }
 
     // Registration tests
@@ -2582,7 +2824,7 @@ mod tests {
                 };
                 assert_eq!(cached.into_message().as_slice(), reply.as_slice());
                 assert!(matches!(
-                    restored.check_request(1, epoch, 1, Operation::UpdateStream),
+                    restored.check_request(1, epoch, 1, Operation::UpdateResource),
                     RequestStatus::OperationMismatch { .. }
                 ));
             }

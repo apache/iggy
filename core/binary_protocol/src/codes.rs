@@ -28,6 +28,8 @@ pub const GET_CLUSTER_METADATA_CODE: u32 = 12;
 pub const DESCRIBE_OPTIONS_CODE: u32 = 13;
 // Code 14 is retired.
 pub const BIND_SESSION_CODE: u32 = 15;
+pub const UPDATE_RESOURCE_CODE: u32 = 16;
+pub const GET_METADATA_CHANGES_CODE: u32 = 17;
 pub const GET_ME_CODE: u32 = 20;
 pub const GET_CLIENT_CODE: u32 = 21;
 pub const GET_CLIENTS_CODE: u32 = 22;
@@ -37,7 +39,6 @@ pub const GET_USER_CODE: u32 = 31;
 pub const GET_USERS_CODE: u32 = 32;
 pub const CREATE_USER_CODE: u32 = 33;
 pub const DELETE_USER_CODE: u32 = 34;
-pub const UPDATE_USER_CODE: u32 = 35;
 pub const UPDATE_PERMISSIONS_CODE: u32 = 36;
 pub const CHANGE_PASSWORD_CODE: u32 = 37;
 pub const LOGIN_USER_CODE: u32 = 38;
@@ -55,26 +56,32 @@ pub const LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE: u32 = 44;
 pub const POLL_MESSAGES_CODE: u32 = 100;
 pub const SEND_MESSAGES_CODE: u32 = 101;
 // 102 was FLUSH_UNSAVED_BUFFER. Never reuse it: older clients still send it.
-pub const GET_POLL_ROUTING_CODE: u32 = 103;
-pub const POLL_MESSAGES_ON_PRIMARY_CODE: u32 = 104;
+// 103 was GET_POLL_ROUTING. Never reuse it: released clients still send it.
+// 104 was POLL_MESSAGES_ON_PRIMARY. Never reuse it: released clients still send it.
 /// The route of one partition: its incarnation, the group view and the primary
 /// of that view. Sends, polls and consumer offsets all route with it.
 pub const GET_PARTITION_ROUTE_CODE: u32 = 105;
+pub const POLL_MESSAGES_DEFERRED_CODE: u32 = 106;
+pub const WAIT_FOR_MESSAGES_CODE: u32 = 107;
+/// Cancels a deferred request on the same authenticated connection.
+///
+/// The body is empty, `request` identifies the original request, and no reply
+/// is sent. A connection that is not authenticated gets an `Unauthenticated`
+/// deny instead.
+pub const CANCEL_DEFERRED_REQUEST_CODE: u32 = 108;
 
 // -- Consumer Offsets --
 pub const GET_CONSUMER_OFFSET_CODE: u32 = 120;
 pub const STORE_CONSUMER_OFFSET_CODE: u32 = 121;
 pub const DELETE_CONSUMER_OFFSET_CODE: u32 = 122;
-/// Primary and parent session for offset writes; uses `GetConsumerOffsetRequest`
-/// and `PollRoutingResponse`, with the offset ownership fence (revocations may drain).
-pub const GET_CONSUMER_OFFSET_ROUTING_CODE: u32 = 123;
+// 123 was GET_CONSUMER_OFFSET_ROUTING. Never reuse it: released clients still send it.
+// 124 was DELETE_CONSUMER_OFFSET_2. Never reuse it.
 
 // -- Streams --
 pub const GET_STREAM_CODE: u32 = 200;
 pub const GET_STREAMS_CODE: u32 = 201;
 pub const CREATE_STREAM_CODE: u32 = 202;
 pub const DELETE_STREAM_CODE: u32 = 203;
-pub const UPDATE_STREAM_CODE: u32 = 204;
 // 205 was PURGE_STREAM. Never reuse it.
 
 // -- Topics --
@@ -82,7 +89,6 @@ pub const GET_TOPIC_CODE: u32 = 300;
 pub const GET_TOPICS_CODE: u32 = 301;
 pub const CREATE_TOPIC_CODE: u32 = 302;
 pub const DELETE_TOPIC_CODE: u32 = 303;
-pub const UPDATE_TOPIC_CODE: u32 = 304;
 // 305 was PURGE_TOPIC. Never reuse it.
 
 // -- Partitions --
@@ -116,7 +122,7 @@ pub const fn command_name(code: u32) -> Result<&'static str, WireError> {
 mod tests {
     use super::*;
 
-    const RETIRED_CODES: &[u32] = &[14, 102, 205, 305];
+    const RETIRED_CODES: &[u32] = &[14, 35, 102, 103, 104, 123, 124, 204, 205, 304, 305];
 
     const ALL_CODES: &[u32] = &[
         PING_CODE,
@@ -125,6 +131,8 @@ mod tests {
         GET_CLUSTER_METADATA_CODE,
         DESCRIBE_OPTIONS_CODE,
         BIND_SESSION_CODE,
+        UPDATE_RESOURCE_CODE,
+        GET_METADATA_CHANGES_CODE,
         GET_ME_CODE,
         GET_CLIENT_CODE,
         GET_CLIENTS_CODE,
@@ -132,7 +140,6 @@ mod tests {
         GET_USERS_CODE,
         CREATE_USER_CODE,
         DELETE_USER_CODE,
-        UPDATE_USER_CODE,
         UPDATE_PERMISSIONS_CODE,
         CHANGE_PASSWORD_CODE,
         LOGIN_USER_CODE,
@@ -144,24 +151,22 @@ mod tests {
         DELETE_PERSONAL_ACCESS_TOKEN_CODE,
         LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
         POLL_MESSAGES_CODE,
-        GET_POLL_ROUTING_CODE,
-        POLL_MESSAGES_ON_PRIMARY_CODE,
         GET_PARTITION_ROUTE_CODE,
+        POLL_MESSAGES_DEFERRED_CODE,
+        WAIT_FOR_MESSAGES_CODE,
+        CANCEL_DEFERRED_REQUEST_CODE,
         SEND_MESSAGES_CODE,
         GET_CONSUMER_OFFSET_CODE,
         STORE_CONSUMER_OFFSET_CODE,
         DELETE_CONSUMER_OFFSET_CODE,
-        GET_CONSUMER_OFFSET_ROUTING_CODE,
         GET_STREAM_CODE,
         GET_STREAMS_CODE,
         CREATE_STREAM_CODE,
         DELETE_STREAM_CODE,
-        UPDATE_STREAM_CODE,
         GET_TOPIC_CODE,
         GET_TOPICS_CODE,
         CREATE_TOPIC_CODE,
         DELETE_TOPIC_CODE,
-        UPDATE_TOPIC_CODE,
         CREATE_PARTITIONS_CODE,
         DELETE_PARTITIONS_CODE,
         DELETE_SEGMENTS_CODE,

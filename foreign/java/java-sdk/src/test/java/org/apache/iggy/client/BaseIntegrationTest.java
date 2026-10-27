@@ -35,7 +35,8 @@ import java.util.List;
 
 /**
  * Base for integration tests. By default the server under test is the
- * {@code apache/iggy:edge} image started via testcontainers. The tag tracks
+ * {@code apache/iggy:edge} image started via testcontainers. Set {@code IGGY_SERVER_DOCKER_IMAGE}
+ * to test a local server build. The default tag tracks
  * master, so refresh the local copy with {@code docker pull apache/iggy:edge}
  * whenever the SDK's wire protocol moves ahead of it.
  *
@@ -50,7 +51,8 @@ import java.util.List;
 public abstract class BaseIntegrationTest {
 
     protected static GenericContainer<?> iggyServer;
-    private static final DockerImageName IGGY_IMAGE = DockerImageName.parse("apache/iggy:edge");
+    private static final DockerImageName IGGY_IMAGE =
+            DockerImageName.parse(System.getenv().getOrDefault("IGGY_SERVER_DOCKER_IMAGE", "apache/iggy:edge"));
     private static final String LOCALHOST_IP = "127.0.0.1";
     private static final int HTTP_PORT = 3000;
     private static final int TCP_PORT = 8090;

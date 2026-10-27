@@ -22,12 +22,10 @@ use crate::cli::common::{
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use humantime::Duration as HumanDuration;
-use iggy::prelude::Client;
-use iggy::prelude::CompressionAlgorithm;
-use iggy::prelude::IggyByteSize;
-use iggy::prelude::IggyExpiry;
-use iggy::prelude::MaxTopicSize;
-use iggy::prelude::TopicCreateOptions;
+use iggy::prelude::{
+    Client, HeaderKey, IggyByteSize, IggyExpiry, MaxTopicSize, OptionKey, StreamCreateOptions,
+    TopicCreateOptions,
+};
 use predicates::str::diff;
 use serial_test::parallel;
 use std::str::FromStr;
@@ -38,49 +36,36 @@ struct TestTopicUpdateCmd {
     stream_name: String,
     topic_id: u32,
     topic_name: String,
-    compression_algorithm: CompressionAlgorithm,
     message_expiry: Option<Vec<String>>,
     max_topic_size: MaxTopicSize,
-    topic_new_name: String,
-    topic_new_compression_algorithm: CompressionAlgorithm,
-    topic_new_message_expiry: Option<Vec<String>>,
-    topic_new_max_size: MaxTopicSize,
+    new_name: Option<String>,
+    new_message_expiry: Option<Vec<String>>,
+    new_max_topic_size: Option<MaxTopicSize>,
+    reset: Vec<OptionKey>,
     using_stream_id: TestStreamId,
     using_topic_id: TestTopicId,
 }
 
 impl TestTopicUpdateCmd {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        stream_id: u32,
-        stream_name: String,
-        topic_id: u32,
-        topic_name: String,
-        compression_algorithm: CompressionAlgorithm,
-        message_expiry: Option<Vec<String>>,
-        max_topic_size: MaxTopicSize,
-        topic_new_name: String,
-        topic_new_compression_algorithm: CompressionAlgorithm,
-        topic_new_message_expiry: Option<Vec<String>>,
-        topic_new_max_size: MaxTopicSize,
-        using_stream_id: TestStreamId,
-        using_topic_id: TestTopicId,
-    ) -> Self {
+    fn new(stream_id: u32, stream_name: &str, topic_id: u32, topic_name: &str) -> Self {
         Self {
             stream_id,
-            stream_name,
+            stream_name: stream_name.to_owned(),
             topic_id,
-            topic_name,
-            compression_algorithm,
-            message_expiry,
-            max_topic_size,
-            topic_new_name,
-            topic_new_compression_algorithm,
-            topic_new_message_expiry,
-            topic_new_max_size,
-            using_stream_id,
-            using_topic_id,
+            topic_name: topic_name.to_owned(),
+            message_expiry: None,
+            max_topic_size: MaxTopicSize::ServerDefault,
+            new_name: None,
+            new_message_expiry: None,
+            new_max_topic_size: None,
+            reset: Vec::new(),
+            using_stream_id: TestStreamId::Named,
+            using_topic_id: TestTopicId::Named,
         }
+    }
+
+    fn final_name(&self) -> &str {
+        self.new_name.as_deref().unwrap_or(&self.topic_name)
     }
 
     fn to_args(&self) -> Vec<String> {
@@ -88,39 +73,59 @@ impl TestTopicUpdateCmd {
             TestStreamId::Numeric => vec![format!("{}", self.stream_id)],
             TestStreamId::Named => vec![self.stream_name.clone()],
         };
-
         command.push(match self.using_topic_id {
             TestTopicId::Numeric => format!("{}", self.topic_id),
             TestTopicId::Named => self.topic_name.clone(),
         });
-
-        command.push(self.topic_new_name.clone());
-        command.push(self.topic_new_compression_algorithm.to_string());
-        command.push(format!("--max-topic-size={}", self.topic_new_max_size));
-
-        if let Some(message_expiry) = &self.topic_new_message_expiry {
+        if let Some(name) = &self.new_name {
+            command.push(format!("--name={name}"));
+        }
+        if let Some(max_topic_size) = &self.new_max_topic_size {
+            command.push(format!(
+                "--max-topic-size={}",
+                max_topic_size.as_bytes_u64()
+            ));
+        }
+        if let Some(message_expiry) = &self.new_message_expiry {
+            command.push("--message-expiry".to_owned());
             command.extend(message_expiry.clone());
         }
-
+        for key in &self.reset {
+            command.push(format!("--reset={key}"));
+        }
         command
     }
+
+    fn changes(&self) -> String {
+        let mut changes = Vec::new();
+        if let Some(name) = &self.new_name {
+            changes.push(format!("name: {name}"));
+        }
+        if let Some(message_expiry) = &self.new_message_expiry {
+            changes.push(format!("message expiry: {}", expiry(message_expiry)));
+        }
+        if let Some(max_topic_size) = &self.new_max_topic_size {
+            changes.push(format!("max topic size: {max_topic_size}"));
+        }
+        for key in &self.reset {
+            changes.push(format!("reset: {key}"));
+        }
+        changes.join(", ")
+    }
+}
+
+fn expiry(parts: &[String]) -> IggyExpiry {
+    let duration: Duration = *parts.join(" ").parse::<HumanDuration>().unwrap();
+    IggyExpiry::ExpireDuration(duration.into())
 }
 
 #[async_trait]
 impl IggyCmdTestCase for TestTopicUpdateCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name).await;
+        let stream = client
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
-
-        let message_expiry = match &self.message_expiry {
-            None => IggyExpiry::ServerDefault,
-            Some(message_expiry) => {
-                let duration: Duration =
-                    *message_expiry.join(" ").parse::<HumanDuration>().unwrap();
-
-                IggyExpiry::ExpireDuration(duration.into())
-            }
-        };
 
         let topic = client
             .create_topic(
@@ -128,11 +133,7 @@ impl IggyCmdTestCase for TestTopicUpdateCmd {
                 &self.topic_name,
                 &TopicCreateOptions {
                     partitions_count: Some(1),
-                    compression_algorithm: (self.compression_algorithm
-                        != CompressionAlgorithm::default())
-                    .then_some(self.compression_algorithm),
-                    message_expiry: (message_expiry != IggyExpiry::ServerDefault)
-                        .then_some(message_expiry),
+                    message_expiry: self.message_expiry.as_deref().map(expiry),
                     max_topic_size: (self.max_topic_size != MaxTopicSize::ServerDefault)
                         .then_some(self.max_topic_size),
                     ..TopicCreateOptions::default()
@@ -155,30 +156,14 @@ impl IggyCmdTestCase for TestTopicUpdateCmd {
             TestStreamId::Numeric => format!("{}", self.stream_id),
             TestStreamId::Named => self.stream_name.clone(),
         };
-
         let topic_id = match self.using_topic_id {
             TestTopicId::Numeric => format!("{}", self.topic_id),
             TestTopicId::Named => self.topic_name.clone(),
         };
-
-        let compression_algorithm = &self.topic_new_compression_algorithm;
-
-        let message_expiry = (match &self.topic_new_message_expiry {
-            Some(value) => value.join(" "),
-            None => IggyExpiry::ServerDefault.to_string(),
-        })
-        .to_string();
-
-        let new_topic_name = &self.topic_new_name;
-        let new_max_topic_size = self.topic_new_max_size.to_string();
-
+        let changes = self.changes();
         let expected_message = format!(
-            "Executing update topic with ID: {topic_id}, name: {new_topic_name}, \
-                                message expiry: {message_expiry}, compression algorithm: {compression_algorithm}, max topic size: \
-                                {new_max_topic_size}, in stream with ID: {stream_id}\n\
-                                Topic with ID: {topic_id} updated name: {new_topic_name}, updated message expiry: {message_expiry}, \
-                                updated compression algorithm: {compression_algorithm}, \
-                                updated max topic size: {new_max_topic_size} in stream with ID: {stream_id}\n"
+            "Executing update topic with ID: {topic_id} ({changes}) in stream with ID: {stream_id}\n\
+             Topic with ID: {topic_id} updated ({changes}) in stream with ID: {stream_id}\n"
         );
 
         command_state.success().stdout(diff(expected_message));
@@ -188,32 +173,39 @@ impl IggyCmdTestCase for TestTopicUpdateCmd {
         let topic = client
             .get_topic(
                 &self.stream_name.clone().try_into().unwrap(),
-                &self.topic_new_name.clone().try_into().unwrap(),
+                &self.final_name().try_into().unwrap(),
             )
             .await;
         assert!(topic.is_ok());
         let topic_details = topic.unwrap().expect("Failed to get topic");
-        assert_eq!(topic_details.name, self.topic_new_name);
-        assert_eq!(topic_details.messages_count, 0);
+        assert_eq!(topic_details.name, self.final_name());
+        let resolved = topic_details.resolved_options();
 
-        if self.topic_new_message_expiry.is_some() {
-            let duration: Duration = *self
-                .topic_new_message_expiry
-                .clone()
-                .unwrap()
-                .join(" ")
-                .parse::<HumanDuration>()
-                .unwrap();
-            assert_eq!(
-                topic_details.message_expiry,
-                IggyExpiry::ExpireDuration(duration.into())
-            );
+        let expected_expiry = self
+            .new_message_expiry
+            .as_deref()
+            .or(self.message_expiry.as_deref())
+            .filter(|_| !self.reset.contains(&OptionKey::MessageExpiry))
+            .map_or(IggyExpiry::NeverExpire, expiry);
+        assert_eq!(resolved.message_expiry, expected_expiry);
+        let expected_max_topic_size = self
+            .new_max_topic_size
+            .or((self.max_topic_size != MaxTopicSize::ServerDefault).then_some(self.max_topic_size))
+            .filter(|_| !self.reset.contains(&OptionKey::MaxTopicSize))
+            .unwrap_or(MaxTopicSize::Unlimited);
+        assert_eq!(resolved.max_topic_size, expected_max_topic_size);
+        for key in &self.reset {
+            let option = topic_details
+                .options
+                .get(&HeaderKey::from(*key))
+                .expect("a reset key holds its default");
+            assert!(!option.explicit, "{key} must read back as derived");
         }
 
         let topic = client
             .delete_topic(
                 &self.stream_name.clone().try_into().unwrap(),
-                &self.topic_new_name.clone().try_into().unwrap(),
+                &self.final_name().try_into().unwrap(),
             )
             .await;
         assert!(topic.is_ok());
@@ -231,44 +223,36 @@ pub async fn should_be_successful() {
     let mut iggy_cmd_test = IggyCmdTest::default();
     iggy_cmd_test.setup().await;
     iggy_cmd_test
-        .execute_test(TestTopicUpdateCmd::new(
-            0,
-            String::from("main"),
-            0,
-            String::from("sync"),
-            Default::default(),
-            None,
-            MaxTopicSize::ServerDefault,
-            String::from("new_name"),
-            CompressionAlgorithm::Gzip,
-            None,
-            MaxTopicSize::Custom(IggyByteSize::from_str("2GiB").unwrap()),
-            TestStreamId::Named,
-            TestTopicId::Named,
-        ))
+        .execute_test(TestTopicUpdateCmd {
+            new_name: Some("new_name".to_owned()),
+            new_max_topic_size: Some(MaxTopicSize::Custom(
+                IggyByteSize::from_str("2GiB").unwrap(),
+            )),
+            ..TestTopicUpdateCmd::new(0, "main", 0, "sync")
+        })
         .await;
     iggy_cmd_test
-        .execute_test(TestTopicUpdateCmd::new(
-            1,
-            String::from("production"),
-            0,
-            String::from("topic"),
-            Default::default(),
-            None,
-            MaxTopicSize::ServerDefault,
-            String::from("testing"),
-            CompressionAlgorithm::Gzip,
-            None,
-            MaxTopicSize::Unlimited,
-            TestStreamId::Named,
-            TestTopicId::Named,
-        ))
+        .execute_test(TestTopicUpdateCmd {
+            new_name: Some("testing".to_owned()),
+            new_message_expiry: Some(vec!["1day".to_owned(), "1hour".to_owned()]),
+            ..TestTopicUpdateCmd::new(1, "production", 0, "topic")
+        })
         .await;
-    // There used to be 3 more test cases, but they don't fit anymore the test scenario
-    // Previously we allowed to update topic name to an already existing one, which is now forbidden.
+}
 
-    // Imagine a scenario where user tries to use any of our APIs with the `Identifier::named` variant for topic identifier
-    // How to distinguish between topics with same name.
+#[tokio::test]
+#[parallel]
+pub async fn given_topic_reset_when_using_cli_should_send_only_requested_keys() {
+    let mut iggy_cmd_test = IggyCmdTest::default();
+    iggy_cmd_test.setup().await;
+    iggy_cmd_test
+        .execute_test(TestTopicUpdateCmd {
+            message_expiry: Some(vec!["10m".to_owned()]),
+            max_topic_size: MaxTopicSize::Custom(IggyByteSize::from_str("5GiB").unwrap()),
+            reset: vec![OptionKey::MaxTopicSize],
+            ..TestTopicUpdateCmd::new(2, "reset-stream", 0, "reset-topic")
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -280,19 +264,21 @@ pub async fn should_help_match() {
         .execute_test_for_help_command(TestHelpCmd::new(
             vec!["topic", "update", "--help"],
             format!(
-                r#"Update topic name, compression algorithm and message expiry time for given topic ID in given stream ID
+                r#"Update topic name, message expiry or max topic size for given topic ID in given stream ID
 
 Stream ID can be specified as a stream name or ID
 Topic ID can be specified as a topic name or ID
+Only the settings passed change, every other setting keeps its value.
+Compression, segment size, durability and the other create-time settings cannot change.
 
 Examples
- iggy topic update 1 1 sensor3 none
- iggy topic update prod sensor3 old-sensor none
- iggy topic update test debugs ready gzip 15days
- iggy topic update 1 1 new-name gzip
- iggy topic update 1 2 new-name none 1day 1hour 1min 1sec
+ iggy topic update 1 1 --name sensor3
+ iggy topic update prod sensor3 --name old-sensor --message-expiry 15days
+ iggy topic update test debugs --max-topic-size 15GB
+ iggy topic update 1 2 --message-expiry 1day 1hour 1min 1sec
+ iggy topic update 1 2 --reset message_expiry --reset max_topic_size
 
-{USAGE_PREFIX} topic update [OPTIONS] <STREAM_ID> <TOPIC_ID> <NAME> <COMPRESSION_ALGORITHM> [MESSAGE_EXPIRY]...
+{USAGE_PREFIX} topic update [OPTIONS] <STREAM_ID> <TOPIC_ID>
 
 Arguments:
   <STREAM_ID>
@@ -305,27 +291,29 @@ Arguments:
 {CLAP_INDENT}
           Topic ID can be specified as a topic name or ID
 
-  <NAME>
+Options:
+  -n, --name <NAME>
           New name for the topic
 
-  <COMPRESSION_ALGORITHM>
-          Compression metadata (none or gzip). Payload compression is not implemented
-
-  [MESSAGE_EXPIRY]...
-          New message expiry time in human-readable format like "unlimited" or "15days 2min 2s"
-{CLAP_INDENT}
-          Skipping this parameter or using "server_default" preserves the current message expiry.
-{CLAP_INDENT}
-          [default: server_default]
-
-Options:
   -m, --max-topic-size <MAX_TOPIC_SIZE>
           New max topic size in human-readable format like "unlimited" or "15GB"
 {CLAP_INDENT}
-          Skipping this parameter or using "server_default" preserves the current max topic size.
           A finite size cannot be lower than the topic segment size.
+
+  -e, --message-expiry <MESSAGE_EXPIRY>...
+          New message expiry time in human-readable format like "unlimited" or "15days 2min 2s"
+
+      --set <KEY=VALUE>
+          Updatable topic option as key=value, repeatable
 {CLAP_INDENT}
-          [default: server_default]
+          Values are sent as strings and parsed server-side.
+          Run "iggy options topic" to list the keys and which ones can change.
+
+  -r, --reset <RESET>
+          Setting to return to its default, like message_expiry or max_topic_size
+{CLAP_INDENT}
+          Repeat the flag to reset several settings.
+          The server refuses a key that cannot be reset.
 
   -h, --help
           Print help (see a summary with '-h')
@@ -344,20 +332,21 @@ pub async fn should_short_help_match() {
         .execute_test_for_help_command(TestHelpCmd::new(
             vec!["topic", "update", "-h"],
             format!(
-                r#"Update topic name, compression algorithm and message expiry time for given topic ID in given stream ID
+                r#"Update topic name, message expiry or max topic size for given topic ID in given stream ID
 
-{USAGE_PREFIX} topic update [OPTIONS] <STREAM_ID> <TOPIC_ID> <NAME> <COMPRESSION_ALGORITHM> [MESSAGE_EXPIRY]...
+{USAGE_PREFIX} topic update [OPTIONS] <STREAM_ID> <TOPIC_ID>
 
 Arguments:
-  <STREAM_ID>              Stream ID to update topic
-  <TOPIC_ID>               Topic ID to update
-  <NAME>                   New name for the topic
-  <COMPRESSION_ALGORITHM>  Compression metadata (none or gzip). Payload compression is not implemented
-  [MESSAGE_EXPIRY]...      New message expiry time in human-readable format like "unlimited" or "15days 2min 2s" [default: server_default]
+  <STREAM_ID>  Stream ID to update topic
+  <TOPIC_ID>   Topic ID to update
 
 Options:
-  -m, --max-topic-size <MAX_TOPIC_SIZE>  New max topic size in human-readable format like "unlimited" or "15GB" [default: server_default]
-  -h, --help                             Print help (see more with '--help')
+  -n, --name <NAME>                         New name for the topic
+  -m, --max-topic-size <MAX_TOPIC_SIZE>     New max topic size in human-readable format like "unlimited" or "15GB"
+  -e, --message-expiry <MESSAGE_EXPIRY>...  New message expiry time in human-readable format like "unlimited" or "15days 2min 2s"
+      --set <KEY=VALUE>                     Updatable topic option as key=value, repeatable
+  -r, --reset <RESET>                       Setting to return to its default, like message_expiry or max_topic_size
+  -h, --help                                Print help (see more with '--help')
 "#,
             ),
         ))

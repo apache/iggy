@@ -17,7 +17,7 @@
 
 # Toolchain is pinned by rust-toolchain.toml. The base
 # image ships rustup, so the pin auto-resolves on first cargo invocation.
-ARG RUST_VERSION=1.99
+ARG RUST_VERSION=1.99.1
 FROM rust:${RUST_VERSION}-slim-trixie
 
 # Build + runtime dependencies mirror the production Dockerfile builder

@@ -16,6 +16,7 @@
 // under the License.
 
 use super::client_builder::{ClientBuilder, ServerConnection};
+use super::common::SIGTERM_TIMEOUT;
 use super::connectors_runtime::ConnectorsRuntimeHandle;
 use super::mcp::McpHandle;
 use crate::harness::config::{ConnectorsRuntimeConfig, McpConfig, TestServerConfig};
@@ -25,15 +26,16 @@ use crate::harness::port_reserver::PortReserver;
 use crate::harness::traits::{IggyServerDependent, Restartable, TestBinary};
 use assert_cmd::prelude::CommandCargoExt;
 use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
-use iggy_common::TransportProtocol;
+use iggy_common::{IggyDuration, TransportProtocol};
 use rand::RngExt as _;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle, available_parallelism, sleep};
@@ -49,6 +51,20 @@ const FAILURE_LOG_TAIL_LINES: usize = 8;
 /// between parses as valid TOML with sections or keys missing; readiness
 /// retries on this message.
 const INCOMPLETE_DUMP_MESSAGE: &str = "Failed to parse server config: the dump is incomplete";
+/// The effective config the server dumps at boot, relative to its data path.
+const CONFIG_DUMP_PATH: &str = "runtime/current_config.toml";
+
+/// How the last [`TestBinary::stop`] of a running server ended.
+#[derive(Debug, Clone, Copy)]
+pub struct StopOutcome {
+    /// `None` when the status could not be collected.
+    pub exit_status: Option<ExitStatus>,
+    /// The server did not exit within [`SIGTERM_TIMEOUT`] of SIGTERM and got
+    /// SIGKILL, so its shutdown flush may not have run.
+    pub killed_after_timeout: bool,
+    /// Waiting for the process failed, so neither field above is reliable.
+    pub wait_error: Option<io::ErrorKind>,
+}
 
 #[derive(Debug, Clone)]
 struct ServerProtocolAddr {
@@ -87,6 +103,10 @@ pub struct ServerHandle {
     mcp: Option<McpHandle>,
     connectors_runtime: Option<ConnectorsRuntimeHandle>,
     open_files_limit: Option<u64>,
+    last_stop: Option<StopOutcome>,
+    /// When [`ServerHandle::signal_stop`] sent SIGTERM; the next stop waits
+    /// out the rest of the grace from then instead of signalling again.
+    sigterm_sent_at: Option<Instant>,
 }
 
 impl std::fmt::Debug for ServerHandle {
@@ -138,6 +158,30 @@ impl ServerHandle {
             .join(format!("server_{}_local_data", self.server_id))
     }
 
+    /// The `cluster.commit_broadcast_interval` the server runs with, read from
+    /// the config it dumped at boot.
+    ///
+    /// # Errors
+    ///
+    /// [`TestBinaryError::InvalidState`] when the dump cannot be read or holds
+    /// no valid interval.
+    pub fn commit_broadcast_interval(&self) -> Result<Duration, TestBinaryError> {
+        let path = self.data_path().join(CONFIG_DUMP_PATH);
+        let invalid = |reason: String| TestBinaryError::InvalidState {
+            message: format!("{}: {reason}", path.display()),
+        };
+        let dump = fs::read_to_string(&path).map_err(|error| invalid(error.to_string()))?;
+        let config: Value = toml::from_str(&dump).map_err(|error| invalid(error.to_string()))?;
+        let interval = config
+            .get("cluster")
+            .and_then(|cluster| cluster.get("commit_broadcast_interval"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("no cluster.commit_broadcast_interval".to_string()))?;
+        IggyDuration::from_str(interval)
+            .map(|interval| interval.get_duration())
+            .map_err(|error| invalid(format!("commit_broadcast_interval {interval:?}: {error}")))
+    }
+
     fn stdout_log_path(&self) -> PathBuf {
         self.context
             .base_dir()
@@ -174,6 +218,10 @@ impl ServerHandle {
         self.config.extra_envs.insert(key.into(), value.into());
     }
 
+    pub fn remove_env(&mut self, key: impl Into<String>) {
+        self.config.removed_envs.push(key.into());
+    }
+
     pub fn collect_logs(&self) -> (String, String) {
         super::common::collect_logs(&self.stdout_path, &self.stderr_path)
     }
@@ -202,6 +250,29 @@ impl ServerHandle {
         Ok(())
     }
 
+    /// How the most recent stop of a running process ended. A stop of a
+    /// server that was not running clears it.
+    pub fn last_stop(&self) -> Option<StopOutcome> {
+        self.last_stop
+    }
+
+    /// Send SIGTERM without waiting, so a caller can signal every node before
+    /// it waits for any of them. The next [`TestBinary::stop`] waits for the
+    /// exit and records the outcome. No-op when the server is not running.
+    pub fn signal_stop(&mut self) {
+        // The watchdog panics on any exit it did not expect.
+        self.stop_watchdog();
+        if let Some(child) = self.child_handle.as_ref() {
+            // A child the watchdog already reaped may have handed its pid to
+            // another process, so a dead node gets no signal; `stop` still
+            // collects what the wait can tell about it.
+            if super::common::is_process_alive(child.id()) {
+                super::common::send_sigterm(child);
+            }
+            self.sigterm_sent_at = Some(Instant::now());
+        }
+    }
+
     /// The stderr log when it holds a panic that can leave a dead task behind.
     pub fn stderr_panic_report(&self) -> Option<String> {
         super::common::stderr_panic_report(&self.stderr_path)
@@ -215,6 +286,15 @@ impl ServerHandle {
     #[must_use]
     pub fn replica_mesh_complete(&self) -> bool {
         self.stdout_contains("replica mesh complete")
+    }
+
+    /// True once this node has logged that it admits partition requests.
+    /// A replica in a multi-node cluster refuses them as transient until it
+    /// holds fresh quorum evidence, which arrives one probe round after the
+    /// mesh forms. A single-node server never emits the marker.
+    #[must_use]
+    pub fn partition_admission_open(&self) -> bool {
+        self.stdout_contains("partition admission opened")
     }
 
     /// True once this node's stdout log contains `marker`. Spec tests use
@@ -528,7 +608,7 @@ impl ServerHandle {
 
     fn wait_for_server_ready(&mut self) -> Result<(), TestBinaryError> {
         let data_path = self.data_path();
-        let config_path = data_path.join("runtime/current_config.toml");
+        let config_path = data_path.join(CONFIG_DUMP_PATH);
 
         let max_attempts = (MAX_PORT_WAIT_DURATION_S * 1000) / SLEEP_INTERVAL_MS;
         let deadline = Instant::now() + Duration::from_secs(MAX_PORT_WAIT_DURATION_S);
@@ -743,6 +823,8 @@ impl ServerHandle {
             mcp: None,
             connectors_runtime: None,
             open_files_limit: None,
+            last_stop: None,
+            sigterm_sent_at: None,
         }
     }
 
@@ -923,6 +1005,8 @@ impl TestBinary for ServerHandle {
             mcp: None,
             connectors_runtime: None,
             open_files_limit: None,
+            last_stop: None,
+            sigterm_sent_at: None,
         }
     }
 
@@ -969,7 +1053,7 @@ impl TestBinary for ServerHandle {
         self.build_envs()?;
 
         let data_path = self.data_path();
-        let config_path = data_path.join("runtime/current_config.toml");
+        let config_path = data_path.join(CONFIG_DUMP_PATH);
         if config_path.exists() {
             let _ = fs::remove_file(&config_path);
         }
@@ -1014,6 +1098,9 @@ impl TestBinary for ServerHandle {
             command.env_remove("RUST_LOG");
         }
         command.envs(&self.envs);
+        for key in &self.config.removed_envs {
+            command.env_remove(key);
+        }
         if let Some(current_dir) = &self.config.current_dir {
             command.current_dir(current_dir);
         }
@@ -1038,8 +1125,9 @@ impl TestBinary for ServerHandle {
         }
 
         // `--replica-id` is the single identity input expected by the
-        // server when cluster mode is enabled; all other cluster config is
-        // byte-identical across nodes. Pass the harness's `server_id`
+        // server when cluster mode is enabled; every node sees the same
+        // roster, except that with peer relays each node's peers carry the
+        // relay ports that node dials. Pass the harness's `server_id`
         // unconditionally; bootstrap only validates it when
         // `cluster.enabled=true`, so single-node tests see no effect.
         command.arg("--replica-id").arg(self.server_id.to_string());
@@ -1080,6 +1168,7 @@ impl TestBinary for ServerHandle {
             source: e,
         })?;
         self.child_handle = Some(child);
+        self.sigterm_sent_at = None;
         self.watchdog_stop = Arc::new(AtomicBool::new(false));
 
         self.wait_for_server_ready()?;
@@ -1091,11 +1180,24 @@ impl TestBinary for ServerHandle {
 
     fn stop(&mut self) -> Result<(), TestBinaryError> {
         self.stop_watchdog();
+        self.last_stop = None;
+        let sigterm_sent_at = self.sigterm_sent_at.take();
 
         if let Some(child) = self.child_handle.take() {
-            let child = super::common::graceful_kill(child);
+            let stopped = match sigterm_sent_at {
+                Some(sent_at) => super::common::wait_or_kill(child, sent_at + SIGTERM_TIMEOUT),
+                None => super::common::graceful_kill(child),
+            };
+            let output = stopped.child.wait_with_output();
+            self.last_stop = Some(StopOutcome {
+                exit_status: output.as_ref().ok().map(|output| output.status),
+                killed_after_timeout: stopped.killed_after_timeout,
+                wait_error: stopped
+                    .wait_error
+                    .or_else(|| output.as_ref().err().map(io::Error::kind)),
+            });
 
-            if let Ok(output) = child.wait_with_output() {
+            if let Ok(output) = output {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -1187,6 +1289,8 @@ impl ServerHandle {
         // Watchdog must stop BEFORE the signal lands: it polls liveness every
         // 100ms and panics on unexpected process death.
         self.stop_watchdog();
+        self.last_stop = None;
+        self.sigterm_sent_at = None;
         if let Some(mut child) = self.child_handle.take() {
             // SAFETY: plain syscall. The watchdog is already joined, so its
             // unexpected-death path (a raw waitpid) can no longer reap this

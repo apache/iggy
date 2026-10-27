@@ -21,17 +21,19 @@
 //! to the issue + verify half: no revoked-token persistence. Self-issued HS256
 //! is the common path; with `[[http.jwt.trusted_issuers]]` configured, `decode`
 //! also verifies external RS256/EC tokens against the issuer's JWKS
-//! ([`super::jwks`]) and remaps their subject onto the configured iggy user.
+//! ([`super::jwks`]) and maps them onto the configured iggy username.
 //! The refresh-token route re-issues by composing `decode_for_refresh` (verify
 //! plus a refusal of trusted-issuer tokens) with `generate` at the handler;
 //! without a revocation list that refresh is stateless, so the token it was
-//! minted from stays valid until its own `exp`. The claim set
-//! (`JwtClaims`, including the `jti`) and the `IggyError -> HTTP` grading are
-//! reused verbatim so issued tokens and error bodies stay identical to the
-//! legacy server.
+//! minted from stays valid until its own `exp`. The claim set (`JwtClaims`) is
+//! the legacy one plus `user_created_at`, which names the account a
+//! self-issued token was issued to. The `IggyError -> HTTP` grading is reused
+//! verbatim so error bodies stay identical to the legacy server.
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use configs::http::{HttpJwtConfig, TrustedIssuerConfig};
 use iggy_common::{IggyDuration, IggyError, IggyExpiry, IggyTimestamp, UserId};
@@ -78,7 +80,25 @@ pub struct JwtManager {
     /// Trusted external issuers keyed by normalized issuer URL. Empty unless
     /// `[[http.jwt.trusted_issuers]]` is configured, in which case `decode`
     /// takes the JWKS verification path for tokens from these issuers.
-    trusted_issuers: HashMap<String, TrustedIssuerConfig>,
+    trusted_issuers: HashMap<String, Arc<TrustedIssuer>>,
+}
+
+#[derive(Debug)]
+pub(in crate::http) struct TrustedIssuer {
+    pub config: TrustedIssuerConfig,
+    warned_account: AtomicBool,
+}
+
+impl TrustedIssuer {
+    pub fn warn_invalid_account(&self) {
+        if !self.warned_account.swap(true, Ordering::Relaxed) {
+            warn!(
+                issuer = %self.config.issuer,
+                username = %self.config.username,
+                "refusing trusted issuer tokens: configured user is missing, inactive or root"
+            );
+        }
+    }
 }
 
 impl JwtManager {
@@ -110,14 +130,18 @@ impl JwtManager {
         // `jsonwebtoken` leaves `validate_nbf` off by default, so this is
         // explicit; the claim is always present, so it only ever tightens.
         validation.validate_nbf = true;
-        // Validate every trusted issuer at startup so a broken config fails loud
-        // instead of silently rejecting every A2A token at first use: an empty
-        // issuer or `jwks_url` can never verify, and mapping onto the root user
-        // (id 0) would resolve every external subject to root (`decode` guards
-        // the root case again at verify time as defense in depth).
+        // Reject missing fields at startup instead of failing token verification
+        // at first use. Root mappings are refused per request, by user id.
         for issuer_config in config.trusted_issuers.iter().flatten() {
             if issuer_config.issuer.is_empty() {
                 error!("trusted issuer configured with an empty issuer URL");
+                return Err(IggyError::InvalidConfiguration);
+            }
+            if issuer_config.audience.is_empty() {
+                error!(
+                    issuer = %issuer_config.issuer,
+                    "trusted issuer configured with an empty audience"
+                );
                 return Err(IggyError::InvalidConfiguration);
             }
             if issuer_config.jwks_url.is_empty() {
@@ -127,10 +151,10 @@ impl JwtManager {
                 );
                 return Err(IggyError::InvalidConfiguration);
             }
-            if issuer_config.user_id == 0 {
+            if issuer_config.username.is_empty() {
                 error!(
                     issuer = %issuer_config.issuer,
-                    "trusted issuer user_id is missing or 0 (must be a non-zero iggy user id)"
+                    "trusted issuer configured without a username, the key that replaced user_id"
                 );
                 return Err(IggyError::InvalidConfiguration);
             }
@@ -142,7 +166,10 @@ impl JwtManager {
             .map(|issuer_config| {
                 (
                     normalize_issuer_url(&issuer_config.issuer),
-                    issuer_config.clone(),
+                    Arc::new(TrustedIssuer {
+                        config: issuer_config.clone(),
+                        warned_account: AtomicBool::new(false),
+                    }),
                 )
             })
             .collect();
@@ -160,13 +187,18 @@ impl JwtManager {
         })
     }
 
-    /// Issue a signed access token for `user_id` carrying a unique `jti` plus
-    /// issued-at / not-before / expiry stamps derived from the config.
+    /// Issue a signed access token for the account `user_id` created at
+    /// `user_created_at`, carrying a unique `jti` plus issued-at / not-before /
+    /// expiry stamps derived from the config.
     ///
     /// # Errors
     ///
     /// Returns [`IggyError::CannotGenerateJwt`] if signing fails.
-    pub fn generate(&self, user_id: UserId) -> Result<GeneratedToken, IggyError> {
+    pub fn generate(
+        &self,
+        user_id: UserId,
+        user_created_at: IggyTimestamp,
+    ) -> Result<GeneratedToken, IggyError> {
         let header = Header::new(self.algorithm);
         let iat = IggyTimestamp::now().to_secs();
         let expiry_secs = match self.access_token_expiry {
@@ -184,6 +216,7 @@ impl JwtManager {
             iat,
             exp,
             nbf,
+            user_created_at: Some(user_created_at.as_micros()),
         };
         let access_token = encode::<JwtClaims>(&header, &claims, &self.encoding_key)
             .map_err(|_| IggyError::CannotGenerateJwt)?;
@@ -194,20 +227,20 @@ impl JwtManager {
         })
     }
 
-    /// Verify a token's signature and registered claims, returning its claim
-    /// set (the `jti` is what a session table keys on).
+    /// Verify a token's signature and registered claims, returning its `jti`
+    /// (what a session table keys on), its `exp` and the account it acts as.
     ///
     /// With no trusted issuers this is the self-issued HS256 verify and the
     /// returned future resolves without awaiting. When the token's issuer
     /// matches a configured trusted issuer, verification instead uses the
-    /// issuer's JWKS key (awaiting the fetch on a cache miss) and the returned
-    /// `sub` is the configured iggy user id, not the external subject.
+    /// issuer's JWKS key (awaiting the fetch on a cache miss) and the subject
+    /// is the configured iggy username, not the external subject.
     ///
     /// # Errors
     ///
     /// Returns [`IggyError::Unauthenticated`] if the token is malformed,
     /// expired, or fails issuer/audience/signature validation.
-    pub async fn decode(&self, token: &str) -> Result<JwtClaims, IggyError> {
+    pub async fn decode(&self, token: &str) -> Result<VerifiedToken, IggyError> {
         // With no trusted issuers this is the original self-issued verifier,
         // resolving without ever awaiting.
         if self.trusted_issuers.is_empty() {
@@ -222,8 +255,8 @@ impl JwtManager {
         // external token can never be accepted as self-issued; a valid
         // self-issued token returns here and the classification below only runs
         // once it has failed.
-        if let Ok(claims) = self.decode_self_issued(token) {
-            return Ok(claims);
+        if let Ok(verified) = self.decode_self_issued(token) {
+            return Ok(verified);
         }
 
         // Self-issued verify failed. Classify the token by its (untrusted) issuer
@@ -234,22 +267,14 @@ impl JwtManager {
             return Err(IggyError::Unauthenticated);
         };
         let normalized_iss = normalize_issuer_url(&insecure.claims.iss);
-        let Some(config) = self.trusted_issuers.get(&normalized_iss) else {
+        let Some(issuer) = self.trusted_issuers.get(&normalized_iss) else {
             debug!(
                 issuer = %insecure.claims.iss,
                 "token issuer matches no trusted issuer and failed self-issued verify"
             );
             return Err(IggyError::Unauthenticated);
         };
-
-        // A trusted external subject must never resolve to the root user.
-        if config.user_id == 0 {
-            error!(
-                issuer = %config.issuer,
-                "trusted-issuer token cannot map to root user (user_id = 0)"
-            );
-            return Err(IggyError::Unauthenticated);
-        }
+        let config = &issuer.config;
 
         // `insecure.header` is parsed from the same header segment `decode_header`
         // reads, so reuse it for `alg` and `kid` instead of parsing twice.
@@ -288,48 +313,66 @@ impl JwtManager {
         validation.set_audience(std::slice::from_ref(&config.audience));
         validation.validate_nbf = true;
         validation.leeway = self.validation.leeway;
-        let mut claims = decode::<JwtClaims>(token, &decoding_key, &validation)
+        let claims = decode::<JwtClaims>(token, &decoding_key, &validation)
             .map(|data| data.claims)
             .map_err(|error| {
                 error!(%error, "trusted-issuer JWT verification failed");
                 IggyError::Unauthenticated
             })?;
 
-        // Remap the external subject onto the fixed configured iggy user; the
-        // raw external `sub` is discarded (no auto-provisioning).
-        claims.sub = config.user_id.to_string();
-        Ok(claims)
+        // The raw external `sub` is discarded (no auto-provisioning): every
+        // token from this issuer acts as the configured iggy user.
+        Ok(VerifiedToken {
+            jti: claims.jti,
+            exp: claims.exp,
+            subject: TokenSubject::TrustedIssuer(Arc::clone(issuer)),
+        })
     }
 
-    /// Verify a token for the refresh route, additionally refusing any token
-    /// minted by a trusted external issuer: those carry their own lifecycle (the
-    /// issuer controls their `exp`), so exchanging one for a self-issued token
-    /// would mint a bearer that outlives the external grant. Mirrors the legacy
-    /// `JwtManager::refresh_token` reject.
+    /// Verify a token for the refresh route and return the account it names,
+    /// refusing any token minted by a trusted external issuer: those carry
+    /// their own lifecycle (the issuer controls their `exp`), so exchanging one
+    /// for a self-issued token would mint a bearer that outlives the external
+    /// grant. Mirrors the legacy `JwtManager::refresh_token` reject.
     ///
     /// # Errors
     ///
     /// Returns [`IggyError::InvalidAccessToken`] for a trusted-issuer token, or
     /// whatever [`Self::decode`] returns for an otherwise invalid one.
-    pub async fn decode_for_refresh(&self, token: &str) -> Result<JwtClaims, IggyError> {
-        let claims = self.decode(token).await?;
-        if self
-            .trusted_issuers
-            .contains_key(&normalize_issuer_url(&claims.iss))
-        {
-            error!(issuer = %claims.iss, "refusing to refresh a trusted-issuer token");
-            return Err(IggyError::InvalidAccessToken);
+    pub async fn decode_for_refresh(
+        &self,
+        token: &str,
+    ) -> Result<(UserId, IggyTimestamp), IggyError> {
+        match self.decode(token).await?.subject {
+            TokenSubject::Account {
+                user_id,
+                created_at,
+            } => Ok((user_id, created_at)),
+            TokenSubject::TrustedIssuer(issuer) => {
+                debug!(username = %issuer.config.username, "refusing to refresh a trusted-issuer token");
+                Err(IggyError::InvalidAccessToken)
+            }
         }
-        Ok(claims)
     }
 
     /// Self-issued HS256 verify against the configured secret and validation.
     /// The synchronous common path shared by the fast path and by every
     /// trusted-issuer classification miss.
-    fn decode_self_issued(&self, token: &str) -> Result<JwtClaims, IggyError> {
-        decode::<JwtClaims>(token, &self.decoding_key, &self.validation)
+    fn decode_self_issued(&self, token: &str) -> Result<VerifiedToken, IggyError> {
+        let claims = decode::<JwtClaims>(token, &self.decoding_key, &self.validation)
             .map(|data| data.claims)
-            .map_err(|_| IggyError::Unauthenticated)
+            .map_err(|_| IggyError::Unauthenticated)?;
+        let user_id = claims.sub.parse().map_err(|_| IggyError::Unauthenticated)?;
+        // Missing only on a token from a server that did not stamp it yet.
+        let created_at = claims.user_created_at.ok_or(IggyError::Unauthenticated)?;
+        Ok(VerifiedToken {
+            jti: claims.jti,
+            exp: claims.exp,
+            subject: TokenSubject::Account {
+                user_id,
+                created_at: IggyTimestamp::from(created_at),
+            },
+        })
     }
 }
 
@@ -472,7 +515,7 @@ impl<'de> Deserialize<'de> for Audience {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub(in crate::http) struct JwtClaims {
+struct JwtClaims {
     pub jti: String,
     pub iss: String,
     pub aud: Audience,
@@ -480,6 +523,35 @@ pub(in crate::http) struct JwtClaims {
     pub iat: u64,
     pub exp: u64,
     pub nbf: u64,
+    /// `created_at` (micros) of the account the token was issued to. A user
+    /// delete frees its id for the next create, so the id in `sub` alone
+    /// cannot tell that account from a newer one. Every self-issued token sets
+    /// it. Only a trusted-issuer token leaves it `None`, and `decode` maps
+    /// that token onto the configured username instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_created_at: Option<u64>,
+}
+
+/// A token that passed [`JwtManager::decode`].
+#[derive(Debug)]
+pub(in crate::http) struct VerifiedToken {
+    pub jti: String,
+    pub exp: u64,
+    pub subject: TokenSubject,
+}
+
+/// The account a verified token acts as.
+#[derive(Debug)]
+pub(in crate::http) enum TokenSubject {
+    /// A self-issued token names the account it was issued to.
+    Account {
+        user_id: UserId,
+        created_at: IggyTimestamp,
+    },
+    /// A trusted-issuer token acts as the user its issuer config names, looked
+    /// up per request, so a later account that takes a deleted user's id does
+    /// not inherit the issuer.
+    TrustedIssuer(Arc<TrustedIssuer>),
 }
 
 #[derive(Debug)]
@@ -504,6 +576,15 @@ mod tests {
         }
     }
 
+    const USER_ID: UserId = 7;
+    const USER_CREATED_AT_MICROS: u64 = 1_700_000_000_000_000;
+
+    fn issue(manager: &JwtManager) -> GeneratedToken {
+        manager
+            .generate(USER_ID, IggyTimestamp::from(USER_CREATED_AT_MICROS))
+            .expect("issues")
+    }
+
     // The default config has no trusted issuers, so `decode` takes the
     // synchronous self-issued path; any executor can drive the ready future.
     #[tokio::test]
@@ -511,7 +592,7 @@ mod tests {
         // not_before well past the leeway window, so the freshly issued token
         // is not yet valid and decode must reject it.
         let manager = JwtManager::build(&config("3600 s", "5 s"), None).expect("builds");
-        let token = manager.generate(7).expect("issues");
+        let token = issue(&manager);
         assert!(
             manager.decode(&token.access_token).await.is_err(),
             "a token presented before its nbf must be rejected"
@@ -523,29 +604,70 @@ mod tests {
         // Default not_before (0s) => nbf == iat, so the token is valid now and
         // enabling nbf validation does not reject a normally issued token.
         let manager = JwtManager::build(&config("0 s", "5 s"), None).expect("builds");
-        let token = manager.generate(7).expect("issues");
-        let claims = manager
-            .decode(&token.access_token)
+        let token = issue(&manager);
+        assert!(
+            manager.decode(&token.access_token).await.is_ok(),
+            "a token at its nbf must be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_issued_token_when_decoded_should_name_the_account_it_was_issued_to() {
+        let manager = JwtManager::build(&config("0 s", "5 s"), None).expect("builds");
+        let verified = manager
+            .decode(&issue(&manager).access_token)
             .await
             .expect("valid now");
-        assert_eq!(claims.sub, "7");
+        assert!(
+            matches!(
+                verified.subject,
+                TokenSubject::Account { user_id: USER_ID, created_at }
+                    if created_at.as_micros() == USER_CREATED_AT_MICROS
+            ),
+            "unexpected subject {:?}",
+            verified.subject
+        );
+    }
+
+    #[tokio::test]
+    async fn given_self_issued_token_without_account_stamp_when_decoded_should_reject() {
+        let manager = JwtManager::build(&config("0 s", "5 s"), None).expect("builds");
+        let mut claims = decode::<JwtClaims>(
+            &issue(&manager).access_token,
+            &manager.decoding_key,
+            &manager.validation,
+        )
+        .expect("valid now")
+        .claims;
+        // A token from before tokens named their account, signed with the live key.
+        claims.user_created_at = None;
+        let token = encode(
+            &Header::new(manager.algorithm),
+            &claims,
+            &manager.encoding_key,
+        )
+        .expect("signs");
+        assert!(
+            manager.decode(&token).await.is_err(),
+            "a validly signed token that names no account must be refused"
+        );
     }
 
     #[test]
-    fn build_rejects_trusted_issuer_mapping_to_root() {
+    fn build_rejects_trusted_issuer_with_empty_username() {
         let jwt = HttpJwtConfig {
             trusted_issuers: Some(vec![TrustedIssuerConfig {
                 issuer: "https://external.example".to_string(),
                 audience: "iggy".to_string(),
                 jwks_url: "https://external.example/.well-known/jwks.json".to_string(),
-                user_id: 0,
+                username: String::new(),
             }]),
             ..HttpJwtConfig::default()
         };
         match JwtManager::build(&jwt, None) {
             Err(IggyError::InvalidConfiguration) => {}
             Err(other) => panic!("expected InvalidConfiguration, got {other:?}"),
-            Ok(_) => panic!("build must reject a trusted issuer mapping to the root user"),
+            Ok(_) => panic!("build must reject a trusted issuer with an empty username"),
         }
     }
 
@@ -556,7 +678,7 @@ mod tests {
                 issuer: String::new(),
                 audience: "iggy".to_string(),
                 jwks_url: "https://external.example/.well-known/jwks.json".to_string(),
-                user_id: 1,
+                username: "service".to_string(),
             }]),
             ..HttpJwtConfig::default()
         };
@@ -568,13 +690,31 @@ mod tests {
     }
 
     #[test]
+    fn build_rejects_trusted_issuer_with_empty_audience() {
+        let jwt = HttpJwtConfig {
+            trusted_issuers: Some(vec![TrustedIssuerConfig {
+                issuer: "https://external.example".to_string(),
+                audience: String::new(),
+                jwks_url: "https://external.example/jwks".to_string(),
+                username: "service".to_string(),
+            }]),
+            ..HttpJwtConfig::default()
+        };
+        match JwtManager::build(&jwt, None) {
+            Err(IggyError::InvalidConfiguration) => {}
+            Err(other) => panic!("expected InvalidConfiguration, got {other:?}"),
+            Ok(_) => panic!("build must reject a trusted issuer with an empty audience"),
+        }
+    }
+
+    #[test]
     fn build_rejects_trusted_issuer_with_empty_jwks_url() {
         let jwt = HttpJwtConfig {
             trusted_issuers: Some(vec![TrustedIssuerConfig {
                 issuer: "https://external.example".to_string(),
                 audience: "iggy".to_string(),
                 jwks_url: String::new(),
-                user_id: 1,
+                username: "service".to_string(),
             }]),
             ..HttpJwtConfig::default()
         };

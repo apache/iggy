@@ -17,6 +17,7 @@
 
 pub mod acl;
 pub mod api;
+pub mod auto_topic_creation;
 pub mod bounds_guard;
 pub mod dedup;
 pub mod handlers;

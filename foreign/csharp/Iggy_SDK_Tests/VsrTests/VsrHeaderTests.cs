@@ -111,7 +111,7 @@ public sealed class VsrHeaderTests
 
         Assert.Equal((byte)VsrOperation.NonReplicated, header[VsrHeader.REQUEST_OPERATION_OFFSET]);
         Assert.Equal(1UL, ReadUInt64(header, VsrHeader.REQUEST_ID_OFFSET));
-        Assert.Equal(1UL, session.RequestCounter);
+        Assert.Equal(2UL, session.RequestCounter);
         Assert.Equal(5UL, ReadUInt64(header, VsrHeader.REQUEST_SESSION_OFFSET));
         Assert.Equal((uint)CommandCodes.PING_CODE, ReadUInt32(header, VsrHeader.REQUEST_RESERVED_OFFSET));
     }

@@ -29,36 +29,47 @@
 //! the same order on every replica, so the primary (`on_ack`), each backup
 //! (`commit_journal`), and WAL replay (`recover`) all recompute the identical
 //! decision. This is why identity must ride the header rather than being
-//! resolved from a local session table: a backup has no session for the
-//! acting client.
+//! resolved from a transport-local session table: a backup has no connection
+//! for the acting client. The commit paths also check the replicated session
+//! table through `reject_stale_session` before this permission gate.
 
 use crate::MuxStateMachine;
+use crate::change_log::{AppliedChange, change_actor};
 use crate::impls::metadata::StreamsFrontend;
 use crate::permissioner::Permissioner;
-use crate::stm::StateMachine;
 use crate::stm::consumer_group::{JoinConsumerGroupRequest, LeaveConsumerGroupRequest};
-use crate::stm::result::ApplyReply;
+use crate::stm::result::{ApplyReply, CreateUserResult, UpdatePermissionsResult};
 use crate::stm::stream::{Streams, TruncatePartitionRequest};
 use crate::stm::user::Users;
+use crate::stm::{ApplyContext, StateMachine};
+use consensus::ClientTable;
+use iggy_binary_protocol::primitives::metadata_changes::WireUserKey;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
 };
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsWithAssignmentsRequest, DeletePartitionsRequest,
 };
-use iggy_binary_protocol::requests::streams::{DeleteStreamRequest, UpdateStreamRequest};
+use iggy_binary_protocol::requests::streams::{DeleteStreamRequest, UpdateStreamResolvedRequest};
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicWithAssignmentsRequest, DeleteTopicRequest, UpdateTopicRequest,
+    CreateTopicWithAssignmentsRequest, DeleteTopicRequest, UpdateTopicResolvedRequest,
 };
-use iggy_binary_protocol::requests::users::ChangePasswordRequest;
+use iggy_binary_protocol::requests::users::{
+    ChangePasswordRequest, CreateUserRequest, UpdatePermissionsRequest,
+};
 use iggy_binary_protocol::{Operation, PrepareHeader, WireDecode, WireIdentifier, WireName};
-use iggy_common::{IggyError, variadic};
+use iggy_common::{IggyError, IggyTimestamp, variadic};
 use server_common::Message;
 
 /// Gate a committed prepare, then apply it. A denial commits as an
 /// `Unauthorized` no-op (the gate never mutates state); an allow proceeds to
 /// the normal state-machine dispatch. This is the single funnel every
 /// production apply path uses, so no committed op can bypass the RBAC check.
+///
+/// The same funnel drops the grants on a stream or topic that the op deleted.
+/// The mux hands each op to one state machine, so `Users` never sees the
+/// delete, and a grant left behind would reach the next stream or topic that
+/// reuses the id.
 ///
 /// The primary (`on_ack`) and backup (`commit_journal`) paths hold the concrete
 /// mux and call this directly; WAL replay (`recover`) is generic over the state
@@ -78,7 +89,45 @@ where
     if let Some(denied) = authorize(&prepare, mux.users(), mux.streams()) {
         return Ok(denied);
     }
-    mux.update(prepare)
+    if let Some(rejected) = reject_dangling_grant(&prepare, mux.users(), mux.streams()) {
+        return Ok(rejected);
+    }
+    let header = prepare.header();
+    let timestamp = IggyTimestamp::from(header.timestamp);
+    let context = ApplyContext::from(header);
+    let mut reply = mux.update(prepare)?;
+    if let Some(deleted) = reply.deleted_resource {
+        // Pruning is part of the delete, so its records name the delete's
+        // actor: the requester of a two-phase delete, not the completing server.
+        let actor = reply
+            .changes
+            .first()
+            .map_or_else(|| change_actor(&context), |deletion| deletion.actor_user_id);
+        // Publish the pruned grants before a later op can reuse the resource ID.
+        // Peer shards may see the deletion first, but cannot see its replacement yet.
+        let pruned = mux
+            .users()
+            .remove_grants(deleted, timestamp, context, actor);
+        reply.changes.extend(pruned);
+    }
+    Ok(reply)
+}
+
+/// An admitted request can commit after its user was deleted or disabled.
+/// Check the replicated session table before resolving the reused user ID.
+/// Partition completions use a synthetic session without a client-table entry.
+pub(crate) fn reject_stale_session(
+    header: &PrepareHeader,
+    client_table: &ClientTable,
+) -> Option<ApplyReply> {
+    if matches!(
+        header.operation,
+        Operation::CompleteConsumerGroupRevocation | Operation::CompleteLifecycle
+    ) {
+        return None;
+    }
+    (header.session != 0 && client_table.get_epoch(header.client) != Some(header.session))
+        .then(|| ApplyReply::err(IggyError::StaleClient.as_code()))
 }
 
 /// Generic entry point to `gated_apply` for the WAL-replay path.
@@ -98,9 +147,70 @@ pub trait GatedApply:
 
     /// Partition-set revision used to validate retirement coverage during WAL replay.
     fn namespace_revision(&self) -> u64;
+
+    fn is_active_account(&self, user_id: u32, created_at: u64) -> bool;
+
+    /// Rebinds the consumer group memberships of the client a replayed
+    /// Register committed to `session`, returning the handover records.
+    fn refresh_session(
+        &self,
+        header: &PrepareHeader,
+        session: u64,
+        actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange>;
+
+    /// Ends the consumer group memberships of `client_ids` as the replayed
+    /// op did, returning the records of the removals in canonical order.
+    fn end_memberships(
+        &self,
+        client_ids: &[u128],
+        header: &PrepareHeader,
+        actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange>;
+
+    /// The identity a session record gives `user_id`, `None` for no such user.
+    fn user_key(&self, user_id: u32) -> Option<WireUserKey>;
 }
 
 impl GatedApply for MuxStateMachine<variadic!(Users, Streams)> {
+    fn is_active_account(&self, user_id: u32, created_at: u64) -> bool {
+        self.users().is_active_account(user_id, created_at)
+    }
+
+    fn refresh_session(
+        &self,
+        header: &PrepareHeader,
+        session: u64,
+        actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange> {
+        self.streams().refresh_consumer_group_session(
+            header.client,
+            session,
+            header.op,
+            IggyTimestamp::from(header.timestamp),
+            actor_user_id,
+        )
+    }
+
+    fn end_memberships(
+        &self,
+        client_ids: &[u128],
+        header: &PrepareHeader,
+        actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange> {
+        self.streams().remove_consumer_group_members(
+            client_ids,
+            IggyTimestamp::from(header.timestamp),
+            header.op,
+            actor_user_id,
+        )
+    }
+
+    fn user_key(&self, user_id: u32) -> Option<WireUserKey> {
+        self.users()
+            .read(|users| users.items.get(user_id as usize).map(WireUserKey::from))
+    }
+
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError> {
         gated_apply(self, prepare)
     }
@@ -112,10 +222,8 @@ impl GatedApply for MuxStateMachine<variadic!(Users, Streams)> {
 
 /// The root user is always the first user created (slab id 0) and holds every
 /// grant. Short-circuited below rather than checked against the permissioner:
-/// server-originated ops carry `user_id` 0 with no session, and WAL replay
-/// gates committed ops before the unreplicated root bootstrap
-/// (`ensure_root_user`) has populated the permissioner, so the gate must not
-/// depend on permissioner contents.
+/// server-originated ops carry `user_id` 0 with no session. Initial root
+/// creation is one such operation and precedes permissioner population.
 const ROOT_USER_ID: u32 = 0;
 
 /// Decides whether the acting user may run this committed op.
@@ -146,8 +254,10 @@ pub(crate) fn authorize(
     match header.operation {
         // Streams. `create_stream` is unscoped; the rest resolve the stream id.
         Operation::CreateStream => check(users, |perm| perm.create_stream(user_id)),
-        Operation::UpdateStream => {
-            let Ok(request) = UpdateStreamRequest::decode_from(body) else {
+        // The generic patch reaches apply only in its resolved form, which
+        // keeps the permission of the scope it patches.
+        Operation::UpdateStreamResolved => {
+            let Ok(request) = UpdateStreamResolvedRequest::decode_from(body) else {
                 return None;
             };
             stream_scoped(users, streams, &request.stream_id, |perm, sid| {
@@ -174,8 +284,8 @@ pub(crate) fn authorize(
                 perm.create_topic(user_id, sid)
             })
         }
-        Operation::UpdateTopic => {
-            let Ok(request) = UpdateTopicRequest::decode_from(body) else {
+        Operation::UpdateTopicResolved => {
+            let Ok(request) = UpdateTopicResolvedRequest::decode_from(body) else {
                 return None;
             };
             topic_scoped(
@@ -294,7 +404,7 @@ pub(crate) fn authorize(
         // legacy execution layer exempts when the target is the acting user.
         Operation::CreateUser => check(users, |perm| perm.create_user(user_id)),
         Operation::DeleteUser => check(users, |perm| perm.delete_user(user_id)),
-        Operation::UpdateUser => check(users, |perm| perm.update_user(user_id)),
+        Operation::UpdateUserResolved => check(users, |perm| perm.update_user(user_id)),
         Operation::UpdatePermissions => check(users, |perm| perm.update_permissions(user_id)),
         Operation::ChangePassword => {
             let Ok(request) = ChangePasswordRequest::decode_from(body) else {
@@ -323,6 +433,7 @@ pub(crate) fn authorize(
         | Operation::RetireSession
         | Operation::CreateTopic
         | Operation::CreatePartitions
+        | Operation::UpdateResource
         | Operation::DeleteSegments
         | Operation::CreatePersonalAccessToken
         | Operation::DeletePersonalAccessToken
@@ -330,10 +441,65 @@ pub(crate) fn authorize(
         | Operation::StoreConsumerOffset
         | Operation::DeleteConsumerOffset
         | Operation::CompleteLifecycle
+        | Operation::RewrapStreamKeys
         | Operation::TransitionPartitionHistory
         | Operation::InstallConsumerGroupOwner
         | Operation::RetireConsumerGroupOwners => None,
     }
+}
+
+/// Refuses a `CreateUser` or `UpdatePermissions` that grants on a stream or
+/// topic that does not exist.
+///
+/// Grants name streams and topics by slab id, and a create takes a free id, so
+/// a grant on a missing id would reach whatever is created there next. The
+/// check runs here because the mux hands the op to `Users`, which cannot see
+/// the streams, and at apply time, so it sees a delete committed just before.
+/// An op that apply refuses for another reason passes through, so the client
+/// gets that code, as with `admits_partitions_create`.
+fn reject_dangling_grant(
+    prepare: &Message<PrepareHeader>,
+    users: &Users,
+    streams: &Streams,
+) -> Option<ApplyReply> {
+    let body = prepare.body();
+    let (permissions, stream_not_found, topic_not_found) = match prepare.header().operation {
+        Operation::CreateUser => {
+            let request = CreateUserRequest::decode_from(body).ok()?;
+            users
+                .read(|inner| inner.validate_create_user(&request))
+                .ok()?;
+            (
+                request.permissions?,
+                u32::from(CreateUserResult::StreamNotFound),
+                u32::from(CreateUserResult::TopicNotFound),
+            )
+        }
+        Operation::UpdatePermissions => {
+            let request = UpdatePermissionsRequest::decode_from(body).ok()?;
+            users
+                .read(|inner| inner.permissions_target(&request.user_id))
+                .ok()?;
+            (
+                request.permissions?,
+                u32::from(UpdatePermissionsResult::StreamNotFound),
+                u32::from(UpdatePermissionsResult::TopicNotFound),
+            )
+        }
+        _ => return None,
+    };
+    streams.read(|inner| {
+        permissions.streams.iter().find_map(|grant| {
+            let Some(stream) = inner.items.get(grant.stream_id as usize) else {
+                return Some(ApplyReply::err(stream_not_found));
+            };
+            grant
+                .topics
+                .iter()
+                .any(|topic| !stream.topics.contains(topic.topic_id as usize))
+                .then(|| ApplyReply::err(topic_not_found))
+        })
+    })
 }
 
 /// What a create that `[metadata] partitions_max` counts adds partitions to.
@@ -428,6 +594,36 @@ fn topic_scoped(
 /// gate. Production always uses the `variadic!(Users, Streams)` machine above.
 #[cfg(test)]
 impl GatedApply for MuxStateMachine<()> {
+    fn is_active_account(&self, _user_id: u32, _created_at: u64) -> bool {
+        true
+    }
+
+    fn refresh_session(
+        &self,
+        _header: &PrepareHeader,
+        _session: u64,
+        _actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange> {
+        Vec::new()
+    }
+
+    fn end_memberships(
+        &self,
+        _client_ids: &[u128],
+        _header: &PrepareHeader,
+        _actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange> {
+        Vec::new()
+    }
+
+    /// Every account exists here, as [`Self::is_active_account`] says.
+    fn user_key(&self, user_id: u32) -> Option<WireUserKey> {
+        Some(WireUserKey {
+            user_id,
+            user_created_at: 0,
+        })
+    }
+
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError> {
         self.update(prepare)
     }
@@ -441,16 +637,18 @@ impl GatedApply for MuxStateMachine<()> {
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
+    use crate::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::primitives::permissions::{
-        WireGlobalPermissions, WirePermissions, WireStreamPermissions,
+        WireGlobalPermissions, WirePermissions, WireStreamPermissions, WireTopicPermissions,
     };
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::CreateTopicRequest;
-    use iggy_binary_protocol::requests::users::CreateUserRequest;
+    use iggy_binary_protocol::requests::users::{CreateUserRequest, UpdateUserResolvedRequest};
     use iggy_binary_protocol::{Command, WireEncode, WireName, WireOptions};
-    use iggy_common::UserStatus;
+    use iggy_common::{StreamPermissions, UserStatus};
     use server_common::iobuf::Owned;
+    use std::collections::BTreeMap;
 
     const HEADER_SIZE: usize = size_of::<PrepareHeader>();
     /// Root is the first user, so it takes slab id 0; the first user created
@@ -527,7 +725,6 @@ mod tests {
 
     fn create_topic_body(stream_id: u32, name: &str) -> bytes::Bytes {
         CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(stream_id),
                 partitions_count: 1,
@@ -536,6 +733,7 @@ mod tests {
             },
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
             }],
@@ -563,6 +761,90 @@ mod tests {
             send_messages: false,
             topics: Vec::new(),
         }
+    }
+
+    fn stream_read(stream_id: u32) -> WireStreamPermissions {
+        WireStreamPermissions {
+            stream_id,
+            manage_stream: false,
+            read_stream: true,
+            manage_topics: false,
+            read_topics: false,
+            poll_messages: false,
+            send_messages: false,
+            topics: Vec::new(),
+        }
+    }
+
+    /// No stream-wide bit, so access to each topic comes from its entry alone.
+    fn topic_read(stream_id: u32, topic_ids: &[u32]) -> WireStreamPermissions {
+        WireStreamPermissions {
+            read_stream: false,
+            topics: topic_ids
+                .iter()
+                .map(|&topic_id| WireTopicPermissions {
+                    topic_id,
+                    manage_topic: false,
+                    read_topic: true,
+                    poll_messages: false,
+                    send_messages: false,
+                })
+                .collect(),
+            ..stream_read(stream_id)
+        }
+    }
+
+    fn update_permissions_body(target: &str, streams: Vec<WireStreamPermissions>) -> bytes::Bytes {
+        UpdatePermissionsRequest {
+            user_id: WireIdentifier::named(target).unwrap(),
+            permissions: Some(WirePermissions {
+                global: no_grants(),
+                streams,
+            }),
+        }
+        .to_bytes()
+    }
+
+    fn delete_stream_body(stream_id: u32) -> bytes::Bytes {
+        DeleteStreamRequest {
+            stream_id: WireIdentifier::numeric(stream_id),
+        }
+        .to_bytes()
+    }
+
+    fn delete_topic_body(stream_id: u32, topic_id: u32) -> bytes::Bytes {
+        DeleteTopicRequest {
+            stream_id: WireIdentifier::numeric(stream_id),
+            topic_id: WireIdentifier::numeric(topic_id),
+        }
+        .to_bytes()
+    }
+
+    fn commit_as_root(
+        mux: &MuxStateMachine<variadic!(Users, Streams)>,
+        op: u64,
+        operation: Operation,
+        body: &[u8],
+    ) {
+        let reply = mux
+            .gated_update(make_prepare(op, operation, ROOT, body))
+            .unwrap();
+        assert_eq!(reply.code, 0, "root {operation:?} must commit");
+    }
+
+    fn stream_grants_of(
+        mux: &MuxStateMachine<variadic!(Users, Streams)>,
+        user_id: u32,
+    ) -> Option<BTreeMap<usize, StreamPermissions>> {
+        mux.users().read(|users| {
+            users
+                .items
+                .get(user_id as usize)?
+                .permissions
+                .as_deref()?
+                .streams
+                .clone()
+        })
     }
 
     const UNAUTHORIZED: u32 = 41;
@@ -597,6 +879,91 @@ mod tests {
             mux.streams().read(|inner| inner.items.len()),
             0,
             "denied op must not mutate stream state"
+        );
+    }
+
+    #[test]
+    fn given_unprivileged_user_when_applying_resolved_patch_should_deny_all_scopes() {
+        let mux = mux();
+        commit_as_root(
+            &mux,
+            1,
+            Operation::CreateUser,
+            &create_user_body("alice", no_grants(), Vec::new()),
+        );
+        commit_as_root(&mux, 2, Operation::CreateStream, &create_stream_body("s0"));
+        commit_as_root(
+            &mux,
+            3,
+            Operation::CreateTopicWithAssignments,
+            &create_topic_body(0, "t0"),
+        );
+        let patches = [
+            (
+                Operation::UpdateStreamResolved,
+                UpdateStreamResolvedRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    name: Some(WireName::new("s0-renamed").unwrap()),
+                    explicit_options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
+                }
+                .to_bytes(),
+            ),
+            (
+                Operation::UpdateTopicResolved,
+                UpdateTopicResolvedRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    name: Some(WireName::new("t0-renamed").unwrap()),
+                    explicit_options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
+                }
+                .to_bytes(),
+            ),
+            (
+                Operation::UpdateUserResolved,
+                UpdateUserResolvedRequest {
+                    user_id: WireIdentifier::numeric(ALICE),
+                    username: Some(WireName::new("alice-renamed").unwrap()),
+                    status: None,
+                    explicit_options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
+                }
+                .to_bytes(),
+            ),
+        ];
+        let names = |mux: &MuxStateMachine<variadic!(Users, Streams)>| {
+            let stream_and_topic = mux.streams().read(|inner| {
+                let stream = &inner.items[0];
+                (stream.name.to_string(), stream.topics[0].name.to_string())
+            });
+            let user = mux.users().read(|inner| {
+                inner
+                    .items
+                    .get(ALICE as usize)
+                    .map(|user| user.username.to_string())
+            });
+            (stream_and_topic, user)
+        };
+        let before = names(&mux);
+
+        for (index, (operation, body)) in patches.iter().enumerate() {
+            let reply = mux
+                .gated_update(make_prepare(4 + index as u64, *operation, ALICE, body))
+                .unwrap();
+            assert_eq!(reply.code, UNAUTHORIZED, "{operation:?} must be denied");
+        }
+        assert_eq!(names(&mux), before);
+
+        for (index, (operation, body)) in patches.iter().enumerate() {
+            commit_as_root(&mux, 7 + index as u64, *operation, body);
+        }
+        assert_eq!(
+            names(&mux),
+            (
+                ("s0-renamed".to_owned(), "t0-renamed".to_owned()),
+                Some("alice-renamed".to_owned())
+            )
         );
     }
 
@@ -732,6 +1099,34 @@ mod tests {
     }
 
     #[test]
+    fn given_reserved_client_id_when_session_is_stale_should_reject_client_operations() {
+        let table = ClientTable::new(consensus::CLIENTS_TABLE_MAX);
+        for client in [
+            message_bus::server_internal_client_id(0),
+            message_bus::AUTO_COMMIT_CLIENT_ID,
+        ] {
+            for operation in [
+                Operation::CreatePersonalAccessToken,
+                Operation::TruncatePartition,
+            ] {
+                let header = PrepareHeader {
+                    client,
+                    session: 1,
+                    operation,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    reject_stale_session(&header, &table)
+                        .expect("a reserved ID must not bypass session fencing")
+                        .code,
+                    IggyError::StaleClient.as_code(),
+                    "{operation:?} must check the caller's session"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn given_non_root_user_when_create_pat_should_skip_the_gate() {
         let mux = mux();
         mux.gated_update(make_prepare(
@@ -795,5 +1190,243 @@ mod tests {
         assert_eq!(primary_codes[2], UNAUTHORIZED, "alice's create is denied");
         assert_eq!(primary.streams().read(|inner| inner.items.len()), 1);
         assert_eq!(replay.streams().read(|inner| inner.items.len()), 1);
+    }
+
+    #[test]
+    fn given_stream_grant_when_stream_deleted_should_not_grant_the_stream_that_reuses_its_id() {
+        let mux = mux();
+        commit_as_root(&mux, 1, Operation::CreateStream, &create_stream_body("old"));
+        commit_as_root(
+            &mux,
+            2,
+            Operation::CreateStream,
+            &create_stream_body("kept"),
+        );
+        commit_as_root(
+            &mux,
+            3,
+            Operation::CreateUser,
+            &create_user_body("alice", no_grants(), vec![stream_read(0), stream_read(1)]),
+        );
+        assert!(
+            mux.users()
+                .authorize(|perm| perm.get_stream(ALICE, 0))
+                .is_ok()
+        );
+
+        commit_as_root(&mux, 4, Operation::DeleteStream, &delete_stream_body(0));
+        commit_as_root(&mux, 5, Operation::CreateStream, &create_stream_body("new"));
+        assert_eq!(
+            mux.streams()
+                .resolve_stream_id(&WireIdentifier::named("new").unwrap()),
+            Some(0),
+            "the new stream must reuse the freed id"
+        );
+
+        assert!(
+            mux.users()
+                .authorize(|perm| perm.get_stream(ALICE, 0))
+                .is_err(),
+            "a grant on a deleted stream must not reach the stream that reuses its id"
+        );
+        assert!(
+            mux.users()
+                .authorize(|perm| perm.get_stream(ALICE, 1))
+                .is_ok(),
+            "the grant on the live stream stays"
+        );
+        assert_eq!(
+            stream_grants_of(&mux, ALICE).map(|streams| streams.into_keys().collect::<Vec<_>>()),
+            Some(vec![1]),
+            "the user record must drop the grant too, or a snapshot restore rebuilds it"
+        );
+    }
+
+    #[test]
+    fn given_topic_grant_when_topic_deleted_should_not_grant_the_topic_that_reuses_its_id() {
+        let mux = mux();
+        commit_as_root(&mux, 1, Operation::CreateStream, &create_stream_body("s"));
+        commit_as_root(
+            &mux,
+            2,
+            Operation::CreateTopicWithAssignments,
+            &create_topic_body(0, "old"),
+        );
+        commit_as_root(
+            &mux,
+            3,
+            Operation::CreateTopicWithAssignments,
+            &create_topic_body(0, "kept"),
+        );
+        commit_as_root(
+            &mux,
+            4,
+            Operation::CreateUser,
+            &create_user_body("alice", no_grants(), vec![topic_read(0, &[0, 1])]),
+        );
+        assert!(
+            mux.users()
+                .authorize(|perm| perm.get_topic(ALICE, 0, 0))
+                .is_ok()
+        );
+
+        commit_as_root(&mux, 5, Operation::DeleteTopic, &delete_topic_body(0, 0));
+        // A topic with partitions leaves, and frees its id, only when the
+        // lifecycle of its delete completes.
+        let completion = CompleteLifecycleRequest::new(
+            5,
+            0,
+            vec![LifecycleCompletion {
+                topic_id: 0,
+                partition_id: 0,
+                partition_op: 1,
+            }],
+        )
+        .unwrap();
+        commit_as_root(
+            &mux,
+            6,
+            Operation::CompleteLifecycle,
+            &completion.to_bytes(),
+        );
+        commit_as_root(
+            &mux,
+            7,
+            Operation::CreateTopicWithAssignments,
+            &create_topic_body(0, "new"),
+        );
+        assert_eq!(
+            mux.streams().resolve_topic_ids(
+                &WireIdentifier::numeric(0),
+                &WireIdentifier::named("new").unwrap()
+            ),
+            Some((0, 0)),
+            "the new topic must reuse the freed id"
+        );
+
+        assert!(
+            mux.users()
+                .authorize(|perm| perm.get_topic(ALICE, 0, 0))
+                .is_err(),
+            "a grant on a deleted topic must not reach the topic that reuses its id"
+        );
+        assert!(
+            mux.users()
+                .authorize(|perm| perm.get_topic(ALICE, 0, 1))
+                .is_ok(),
+            "the grant on the live topic stays"
+        );
+        let topic_ids = stream_grants_of(&mux, ALICE)
+            .and_then(|mut streams| streams.remove(&0))
+            .and_then(|stream| stream.topics)
+            .map(|topics| topics.into_keys().collect::<Vec<_>>());
+        assert_eq!(
+            topic_ids,
+            Some(vec![1]),
+            "the user record must drop the topic grant too, or a snapshot restore rebuilds it"
+        );
+    }
+
+    #[test]
+    fn given_grant_on_missing_stream_when_creating_user_should_reject_with_stream_not_found() {
+        let mux = mux();
+        let reply = mux
+            .gated_update(make_prepare(
+                1,
+                Operation::CreateUser,
+                ROOT,
+                &create_user_body("alice", no_grants(), vec![stream_read(0)]),
+            ))
+            .unwrap();
+
+        assert_eq!(reply.code, u32::from(CreateUserResult::StreamNotFound));
+        assert!(
+            mux.users()
+                .read(|users| users.user_by_name("alice").is_none()),
+            "a rejected create must not add the user"
+        );
+    }
+
+    #[test]
+    fn given_grant_on_missing_topic_when_updating_permissions_should_reject_with_topic_not_found() {
+        let mux = mux();
+        commit_as_root(&mux, 1, Operation::CreateStream, &create_stream_body("s"));
+        commit_as_root(
+            &mux,
+            2,
+            Operation::CreateUser,
+            &create_user_body("alice", no_grants(), vec![stream_read(0)]),
+        );
+
+        let reply = mux
+            .gated_update(make_prepare(
+                3,
+                Operation::UpdatePermissions,
+                ROOT,
+                &update_permissions_body("alice", vec![topic_read(0, &[0])]),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            reply.code,
+            u32::from(UpdatePermissionsResult::TopicNotFound)
+        );
+        assert_eq!(
+            stream_grants_of(&mux, ALICE).map(|streams| streams.into_keys().collect::<Vec<_>>()),
+            Some(vec![0]),
+            "a rejected update must keep the previous grants"
+        );
+        assert!(
+            mux.users()
+                .authorize(|perm| perm.get_stream(ALICE, 0))
+                .is_ok(),
+            "the previous stream grant must still apply"
+        );
+    }
+
+    #[test]
+    fn given_taken_name_and_dangling_grant_when_creating_user_should_answer_user_already_exists() {
+        let mux = mux();
+        commit_as_root(
+            &mux,
+            1,
+            Operation::CreateUser,
+            &create_user_body("alice", no_grants(), Vec::new()),
+        );
+
+        let reply = mux
+            .gated_update(make_prepare(
+                2,
+                Operation::CreateUser,
+                ROOT,
+                &create_user_body("alice", no_grants(), vec![stream_read(0)]),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            reply.code,
+            u32::from(CreateUserResult::UserAlreadyExists),
+            "the refusal of apply must win over the dangling-grant refusal"
+        );
+    }
+
+    #[test]
+    fn given_root_target_and_dangling_grant_when_updating_permissions_should_answer_cannot_change_permissions()
+     {
+        let mux = mux();
+        let reply = mux
+            .gated_update(make_prepare(
+                1,
+                Operation::UpdatePermissions,
+                ROOT,
+                &update_permissions_body("iggy", vec![stream_read(0)]),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            reply.code,
+            u32::from(UpdatePermissionsResult::CannotChangePermissions),
+            "the refusal of apply must win over the dangling-grant refusal"
+        );
     }
 }

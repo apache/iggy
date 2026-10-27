@@ -46,6 +46,10 @@ updates:
       rust:
         patterns:
           - "*"
+      rust-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -66,6 +70,10 @@ updates:
       default-days: 7
     groups:
       github-actions:
+        patterns:
+          - "*"
+      github-actions-security:
+        applies-to: security-updates
         patterns:
           - "*"
 
@@ -99,6 +107,10 @@ updates:
       python:
         patterns:
           - "*"
+      python-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: "npm"
     directories:
@@ -119,6 +131,10 @@ updates:
       default-days: 7
     groups:
       web:
+        patterns:
+          - "*"
+      web-security:
+        applies-to: security-updates
         patterns:
           - "*"
 
@@ -144,6 +160,10 @@ updates:
       node:
         patterns:
           - "*"
+      node-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: "gomod"
     directories:
@@ -166,6 +186,10 @@ updates:
       default-days: 7
     groups:
       go:
+        patterns:
+          - "*"
+      go-security:
+        applies-to: security-updates
         patterns:
           - "*"
 
@@ -193,6 +217,10 @@ updates:
       - dependency-name: "Microsoft.Extensions.Logging.Abstractions"
     groups:
       csharp:
+        patterns:
+          - "*"
+      csharp-security:
+        applies-to: security-updates
         patterns:
           - "*"
 
@@ -223,6 +251,10 @@ updates:
       - dependency-name: "org.apache.iggy:*"
     groups:
       java:
+        patterns:
+          - "*"
+      java-security:
+        applies-to: security-updates
         patterns:
           - "*"
 
@@ -279,6 +311,10 @@ updates:
       docker:
         patterns:
           - "*"
+      docker-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: "bazel"
     directories:
@@ -299,5 +335,9 @@ updates:
       default-days: 7
     groups:
       cpp:
+        patterns:
+          - "*"
+      cpp-security:
+        applies-to: security-updates
         patterns:
           - "*"

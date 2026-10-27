@@ -156,18 +156,15 @@ where
                 count: self.senders.len(),
             })?;
 
-        // Install the cross-shard forward closures. The bus' slow path
-        // (`send_to_replica` / `send_to_client`) calls these when the
-        // destination connection lives on a different shard; the closure
-        // wraps the message into a `LifecycleFrame::Forward{Replica,
-        // Client}Send` and `try_send`s it to the owning shard's inbox.
-        // The receiving shard's router unwraps the frame and re-enters
-        // the bus' fast path locally. The `senders` Vec is canonically
-        // ordered (`senders[i].shard_id() == i`).
+        // Install the cross-shard replica forward closure. The bus' slow path
+        // (`send_to_replica`) calls it when the replica connection lives on a
+        // different shard. The closure wraps the message into a
+        // `LifecycleFrame::ForwardReplicaSend` and `try_send`s it to the
+        // owning shard's inbox. The receiving shard's router unwraps the frame
+        // and re-enters the bus' fast path locally. The `senders` Vec is
+        // canonically ordered (`senders[i].shard_id() == i`).
         let senders_for_replica: Rc<Vec<TaggedSender>> = Rc::new(self.senders.clone());
-        let senders_for_client = Rc::clone(&senders_for_replica);
         let metrics_for_replica = self.metrics.clone();
-        let metrics_for_client = self.metrics.clone();
         self.bus
             .set_replica_forward_fn(Box::new(move |replica_id, owning_shard, msg| {
                 senders_for_replica.get(usize::from(owning_shard)).map_or(
@@ -183,28 +180,6 @@ where
                                 classify_try_send_err(&err),
                             );
                             SendError::ReplicaForwardFailed(replica_id)
-                        })
-                    },
-                )
-            }));
-        self.bus
-            .set_client_forward_fn(Box::new(move |client_id, owning_shard, msg| {
-                senders_for_client.get(usize::from(owning_shard)).map_or(
-                    Err(SendError::ClientForwardFailed(client_id)),
-                    |sender| {
-                        let frame = ShardFrame::lifecycle(LifecycleFrame::ForwardClientSend {
-                            client_id,
-                            msg,
-                        });
-                        // Reply lane: a forwarded client reply is terminal on
-                        // drop, so it must not compete with consensus frames
-                        // for main-lane capacity.
-                        sender.reply_sender().try_send(frame).map_err(|err| {
-                            metrics_for_client.record_frame_drop(
-                                frame_drop_variant::FORWARD_CLIENT_SEND,
-                                classify_try_send_err(&err),
-                            );
-                            SendError::ClientForwardFailed(client_id)
                         })
                     },
                 )

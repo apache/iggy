@@ -16,6 +16,7 @@
 // under the License.
 
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Text;
 using Apache.Iggy.Consumers;
 using Apache.Iggy.Contracts;
@@ -33,6 +34,88 @@ namespace Apache.Iggy.Tests.ConsumerTests;
 
 public class RentedConsumerTests
 {
+    private const ulong BlockingOperationId = 73;
+
+    [Fact]
+    public async Task given_a_rented_progress_poll_behind_a_retained_mutation_when_receiving_should_stop_without_resolving_it()
+    {
+        var client = BuildClientMock(new Queue<PolledMessagesRental>());
+        var attempts = 0;
+        client.Setup(mock => mock.PollMessagesRentedAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
+                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(),
+                It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+            .Returns(async (Identifier _, Identifier _, uint? partition, Consumer _, Func<uint, PollingStrategy> strategy,
+                uint _, bool _, CancellationToken token) =>
+            {
+                strategy(partition ?? 0);
+                if (++attempts > 1)
+                {
+                    await Task.Delay(Timeout.Infinite, token);
+                }
+
+                throw new VsrLaneBlockedException(BlockingOperationId);
+            });
+        await using var consumer = new IggyConsumer(client.Object, BuildConfig(), NullLoggerFactory.Instance);
+        await consumer.InitAsync(TestContext.Current.CancellationToken);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cancellation.CancelAfter(TimeSpan.FromSeconds(5));
+        await using var messages = consumer.ReceiveRentedAsync(cancellation.Token).GetAsyncEnumerator(cancellation.Token);
+
+        var error = await Assert.ThrowsAsync<VsrLaneBlockedException>(() => messages.MoveNextAsync().AsTask());
+
+        Assert.Equal(BlockingOperationId, error.OperationId);
+        Assert.Equal(1, attempts);
+        client.Verify(mock => mock.ResolveOperationAsync(It.IsAny<ulong>(), It.IsAny<TimeSpan>(),
+            It.IsAny<CancellationToken>()), Times.Never);
+        client.Verify(mock => mock.AbandonOperationAsync(It.IsAny<ulong>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task given_an_uncertain_rented_progress_poll_when_receiving_should_report_it_and_poll_again()
+    {
+        var owner = new TrackingMemoryOwner(16);
+        var client = BuildClientMock(new Queue<PolledMessagesRental>());
+        var attempts = 0;
+        var unknown = new VsrRequestOutcomeUnknownException(new IOException());
+        client.Setup(mock => mock.PollMessagesRentedAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
+                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(),
+                It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+            .Returns((Identifier _, Identifier _, uint? partition, Consumer _, Func<uint, PollingStrategy> strategy,
+                uint _, bool _, CancellationToken _) =>
+            {
+                strategy(partition ?? 0);
+                return ++attempts > 1
+                    ? Task.FromResult(new PolledMessagesRental(owner)
+                    {
+                        PartitionId = 1,
+                        CurrentOffset = 0,
+                        Messages = BuildMessages(owner, 1)
+                    })
+                    : Task.FromException<PolledMessagesRental>(unknown);
+            });
+        await using var consumer = new IggyConsumer(client.Object, BuildConfig(), NullLoggerFactory.Instance);
+        var errors = new ConcurrentQueue<Exception>();
+        consumer.SubscribeToErrorEvents(error =>
+        {
+            errors.Enqueue(error.Exception);
+            return Task.CompletedTask;
+        });
+        await consumer.InitAsync(TestContext.Current.CancellationToken);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cancellation.CancelAfter(TimeSpan.FromSeconds(5));
+        await using var messages = consumer.ReceiveRentedAsync(cancellation.Token).GetAsyncEnumerator(cancellation.Token);
+
+        Assert.True(await messages.MoveNextAsync());
+
+        using var received = messages.Current;
+        Assert.Equal("msg-0", Encoding.UTF8.GetString(received.Message.Payload.Span));
+        Assert.Same(unknown, Assert.Single(errors));
+        Assert.Equal(2, attempts);
+        client.Verify(mock => mock.ResolveOperationAsync(It.IsAny<ulong>(), It.IsAny<TimeSpan>(),
+            It.IsAny<CancellationToken>()), Times.Never);
+        client.Verify(mock => mock.AbandonOperationAsync(It.IsAny<ulong>()), Times.Never);
+    }
+
     [Fact]
     public async Task ReceiveRentedAsync_Should_YieldMessages_WithExpectedPayloads()
     {

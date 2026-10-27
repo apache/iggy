@@ -24,6 +24,7 @@ import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.local.LocalIoHandler;
 import io.netty.channel.nio.NioIoHandler;
 import org.apache.iggy.client.BaseIntegrationTest;
+import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyAuthenticationException;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
@@ -240,6 +241,14 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().maxVsrFrameSize((long) Integer.MAX_VALUE + 1);
 
         assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldDefaultPendingOperationLimitsToTheSessionDefaults() {
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder();
+
+        assertThat(builder.maxPendingOperations()).isEqualTo(ConsensusSession.DEFAULT_MAX_PENDING_OPERATIONS);
+        assertThat(builder.maxPendingOperationBytes()).isEqualTo(ConsensusSession.DEFAULT_MAX_PENDING_OPERATION_BYTES);
     }
 
     @Test
@@ -682,6 +691,18 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         assertThat(client.personalAccessTokens()).isNotNull();
         assertThat(client.partitions()).isNotNull();
         assertThat(client.consumerOffsets()).isNotNull();
+    }
+
+    @Test
+    void testBuildAndLoginFromConnectionString() throws Exception {
+        // buildAndLogin completes only after the login with the credentials from the connection string succeeds
+        client = AsyncIggyTcpClient.builder()
+                .fromConnectionString(
+                        "iggy://" + TEST_USERNAME + ":" + TEST_PASSWORD + "@" + serverHost() + ":" + serverTcpPort())
+                .buildAndLogin()
+                .get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+        assertThat(client.users()).isNotNull();
     }
 
     @Test

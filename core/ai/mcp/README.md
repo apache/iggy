@@ -100,6 +100,20 @@ Each tool checks these MCP permissions before forwarding the request. The broker
 
 `poll_messages` additionally requires `update` when `auto_commit = true` or `strategy = "next"`. The `next` strategy enables auto-commit even when `auto_commit` is omitted or false. For read-only polling, use `offset`, `first`, `last`, or `timestamp` with auto-commit disabled.
 
+## Recovering uncertain writes
+
+Write errors can include `data.operation_id` as a decimal string. Keep this value
+exactly as returned. `resolve_operation` retries the retained original operation
+with its original identity; success proves it committed and releases its lane.
+It does not reconstruct the original response body. If the result is still
+uncertain, the operation remains available for another resolve.
+
+`abandon_operation` explicitly releases local recovery state. It does not undo
+the write or establish whether it committed. Retrying the business action after
+abandoning it can duplicate an earlier effect. Both tools take
+`{"operation_id": "123"}` and require at least one of the `create`, `update`, or
+`delete` MCP permissions. A process restart loses this local recovery state.
+
 ## Systemd integration
 
 Build with the `systemd` feature to enable systemd readiness and watchdog notifications:

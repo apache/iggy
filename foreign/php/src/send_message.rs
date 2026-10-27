@@ -131,17 +131,17 @@ impl From<RustSendMessagesConfirmationResponse> for SendMessagesConfirmation {
 
 #[php_impl]
 impl SendMessagesConfirmation {
-    #[php(getter)]
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_id(&self) -> u32 {
         self.inner.stream_id
     }
 
-    #[php(getter)]
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_id(&self) -> u32 {
         self.inner.topic_id
     }
 
-    #[php(getter)]
+    #[php(getter, change_case = "snake_case")]
     pub fn partition_id(&self) -> u32 {
         self.inner.partition_id
     }
@@ -153,7 +153,7 @@ impl SendMessagesConfirmation {
     ///
     /// Confirmation follows VSR quorum commit. Persisted message durability also
     /// requires recoverable stable-storage copies on the quorum.
-    #[php(getter)]
+    #[php(getter, change_case = "snake_case")]
     pub fn base_offset(&self) -> u64 {
         self.inner.base_offset
     }

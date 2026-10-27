@@ -1,0 +1,59 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: download-runtime
+description: >-
+  Restore coverage-instrumented runtime binaries for this workflow revision.
+  In .github/workflows/_detect.yml, needsRuntime must select the caller's
+  task, and in .github/workflows/pre-merge.yml the caller's job must need
+  runtime.
+
+inputs:
+  restore:
+    description: Extract and verify the archive after downloading
+    default: "true"
+  install-system-dependencies:
+    description: Install libraries for running the binaries on the host
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Install runtime libraries
+      if: inputs.install-system-dependencies == 'true'
+      shell: bash
+      run: |
+        missing=()
+        for package in libhwloc-dev libudev-dev; do
+          if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null)" != 'install ok installed' ]]; then
+            missing+=("$package")
+          fi
+        done
+        if (( ${#missing[@]} )); then
+          ./scripts/ci/apt-install.sh "${missing[@]}"
+        fi
+
+    - name: Download runtime archive
+      uses: actions/download-artifact@v8
+      with:
+        name: rust-runtime-${{ github.run_id }}
+        path: ${{ runner.temp }}/rust-runtime
+
+    - name: Verify and restore runtime binaries
+      if: inputs.restore == 'true'
+      shell: bash
+      run: ./scripts/ci/restore-runtime.sh "$RUNNER_TEMP/rust-runtime"

@@ -16,6 +16,7 @@
 // under the License.
 
 use clap::ValueEnum;
+use iggy::prelude::OptionKey;
 use iggy_cli::commands::binary_client::get_clients::GetClientsOutput;
 use iggy_cli::commands::binary_cluster::get_cluster_metadata::GetClusterMetadataOutput;
 use iggy_cli::commands::binary_consumer_groups::get_consumer_groups::GetConsumerGroupsOutput;
@@ -25,6 +26,7 @@ use iggy_cli::commands::binary_streams::get_streams::GetStreamsOutput;
 use iggy_cli::commands::binary_system::stats::GetStatsOutput;
 use iggy_cli::commands::binary_topics::get_topics::GetTopicsOutput;
 use iggy_cli::commands::binary_users::get_users::GetUsersOutput;
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum ListMode {
@@ -151,4 +153,22 @@ pub(crate) fn parse_key_value(raw: &str) -> Result<(String, String), String> {
         }
     }
     Ok((key.to_string(), value.to_string()))
+}
+
+/// Split repeated `--reset` names into keys this build checks before sending
+/// and newer keys the server decides on.
+pub(crate) fn split_reset(names: &[String]) -> (BTreeSet<OptionKey>, BTreeSet<String>) {
+    let mut known = BTreeSet::new();
+    let mut newer = BTreeSet::new();
+    for name in names {
+        match name.parse::<OptionKey>() {
+            Ok(key) => {
+                known.insert(key);
+            }
+            Err(_) => {
+                newer.insert(name.clone());
+            }
+        }
+    }
+    (known, newer)
 }

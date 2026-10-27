@@ -34,7 +34,10 @@ use server_common::sharding::IggyNamespace;
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use tracing::warn;
 
-use crate::dispatch::partition::{dispatch_partition_request, resolve_delete_segments_truncate};
+use crate::dispatch::ClientOrigin;
+use crate::dispatch::partition::{
+    PartitionAdmission, dispatch_partition_request, resolve_delete_segments_truncate,
+};
 use crate::dispatch::session_ops::submit_logout_on_owner;
 use crate::dispatch::submit::{committed_reply_commit, submit_client_request_on_owner};
 use crate::http::admission::admit_partition_write;
@@ -98,12 +101,10 @@ pub(in crate::http) async fn submit_committed(
     let shard = Rc::clone(&state.shard);
     let task_session = Rc::clone(session);
     let watermarks = Rc::clone(&state.metadata_watermarks);
-    let max_tokens_per_user = state.max_tokens_per_user;
     // Detached so a client disconnect cannot abandon the gate mid-submit;
     // the write runs to completion regardless of handler liveness.
     compio::runtime::spawn(async move {
-        let result =
-            submit_gated(&shard, &task_session, operation, max_tokens_per_user, &body).await;
+        let result = submit_gated(&shard, &task_session, operation, &body).await;
         // Recorded here rather than after the await below, for the same reason
         // the submit is detached: a caller that disconnected mid-write still
         // committed the op, and its next request as this user must not be
@@ -113,7 +114,7 @@ pub(in crate::http) async fn submit_committed(
         // A follower with HTTP forwarding ON never runs this task: the
         // middleware relays the write and records the floor from the serving
         // primary's applied op instead (`http::forward::record_relayed_floor`).
-        // One gap survives that split - a relayed 503 carrying
+        // One gap survives that split - a relayed 504 carrying
         // `TransientNotCommitted` is passed through untouched rather than
         // retried, because its op may still commit, and only a 2xx records a
         // floor. A write that did commit behind that code therefore leaves
@@ -169,27 +170,28 @@ pub(in crate::http) async fn submit_committed(
 /// [`submit_committed`] then forgets the entry so the caller's retry
 /// re-registers cleanly.
 ///
-/// Both shard-0 request rewrites run here before consensus, mirroring the TCP
-/// dispatch path: the PAT rewrite enforces the per-user token cap, then mints
-/// a raw token and replicates only its hash
-/// (`CreatePersonalAccessToken`), and the user-password rewrite hashes the new
+/// The [`http_chain`] stages run here before consensus, mirroring the TCP
+/// dispatch path: the PAT rewrite mints a raw token and replicates only its hash
+/// (`CreatePersonalAccessToken`), the user-password rewrite hashes the new
 /// password and, for `ChangePassword`, strips the current one and verifies it
-/// against the stored hash (`CreateUser` / `ChangePassword`). Both are no-ops
-/// for every other operation, so plaintext secrets never enter consensus on any
-/// write. A third resolution handles `DeleteSegments`, which is not itself a
-/// consensus op: it is rewritten to the metadata `TruncatePartition` that commits
-/// the trim (see [`resolve_delete_segments_truncate`]), so the truncate rides
-/// this session's gate id. A rejection (a malformed body, a caller at the
-/// personal-access-token cap, or an unresolved delete-segments namespace) still
-/// spends the id like any other exit. A failed current-password check is not a
-/// rejection here: the op still commits with an emptied new-password sentinel
-/// that the replicated apply grades to `InvalidCredentials` (see
-/// `verify_and_rewrite_change_password`).
+/// against the stored hash (`CreateUser` / `ChangePassword`), the static bounds
+/// admit every options block through the catalog, and the secret options
+/// rewrite replaces a stream key with its wrap set (`CreateStream`). The
+/// header this gateway builds leaves `request_checksum` zero, so no digest of
+/// the original body rides the prepare either, and no plaintext secret from
+/// an HTTP write enters consensus. A further resolution handles
+/// `DeleteSegments`, which is not itself a consensus op: it is rewritten to the
+/// metadata `TruncatePartition` that commits the trim (see
+/// [`resolve_delete_segments_truncate`]), so the truncate rides
+/// this session's gate id. A rejection (a malformed body or an unresolved
+/// delete-segments namespace) still spends the id like any other exit. A failed
+/// current-password check is not a rejection here: the op still commits with an
+/// emptied new-password sentinel that the replicated apply grades to
+/// `InvalidCredentials` (see `verify_and_rewrite_change_password`).
 async fn submit_gated(
     shard: &Rc<ServerShard>,
     session: &HttpSession,
     operation: Operation,
-    max_tokens_per_user: u32,
     body: &[u8],
 ) -> Result<(RoutedRequestHeader, Message<GenericHeader>, Option<String>), WriteError> {
     let mut next_request_id = session.gate.lock().await;
@@ -208,8 +210,8 @@ async fn submit_gated(
         request_id,
         body,
     );
-    let (message, raw_token) = http_chain(shard, session.user_id, max_tokens_per_user, message)
-        .map_err(WriteError::Rejected)?;
+    let (message, raw_token) =
+        http_chain(shard, session.user_id, message).map_err(WriteError::Rejected)?;
     // `DeleteSegments` is not itself a consensus op: resolve it to the metadata
     // `TruncatePartition` that commits the trim before it reaches consensus,
     // mirroring the TCP dispatch. The truncate rides this session's burned
@@ -270,8 +272,9 @@ async fn submit_gated(
         // the same transient.
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            // Budget exhausted: surface a retryable 503 (never the catch-all
-            // 400), with the code sticky across frames. Once ANY frame was
+            // Budget exhausted: surface the transient code (never the
+            // catch-all 400), sticky across frames: a 503 when nothing was
+            // admitted, else the 504 unknown outcome. Once ANY frame was
             // `TransientNotCommitted` the op may still commit cluster-wide (a
             // view-change-canceled prepare can reach quorum and be inherited
             // by the new primary), so a later `TransientNotAccepted` frame -
@@ -358,12 +361,13 @@ pub(in crate::http) async fn logout_session(state: &HttpInner, session: &Rc<Http
     state.forget_session(session);
 }
 
-/// Choose the partition of a write once and fix its context: the given one,
-/// else the context current on this node. A relayed write reaches the primary
-/// with both, so a retry turn never places it again.
+/// Choose the partition of a write by `client_id` once and fix its context:
+/// the given one, else the context current on this node. A relayed write
+/// reaches the primary with both, so a retry turn never places it again. The
+/// node that serves the write checks it again under the caller's session.
 pub(in crate::http) fn capture_partition_write(
     state: &HttpInner,
-    session: &HttpSession,
+    client_id: u128,
     operation: Operation,
     body: &[u8],
     context: Option<PartitionContext>,
@@ -373,25 +377,20 @@ pub(in crate::http) fn capture_partition_write(
             &state.shard,
             operation,
             body,
-            session.client_id,
+            client_id,
         )
         .map_err(PartitionWriteError::Rejected)?,
     );
-    let attachment = session.attachment.borrow().clone();
-    let captured = crate::dispatch::partition::capture_offset_attachment(
+    let metadata = crate::dispatch::partition::partition_write_metadata(
         state.shard.plane.metadata().mux_stm.streams(),
         namespace,
         body,
-        session.client_id,
-        attachment,
+        client_id,
         operation,
     )
     .map_err(PartitionWriteError::Rejected)?;
-    let context = context.unwrap_or_else(|| {
-        captured
-            .metadata
-            .context(state.shard.plane.metadata().applied_frontier().get())
-    });
+    let context = context
+        .unwrap_or_else(|| metadata.context(state.shard.plane.metadata().applied_frontier().get()));
     Ok((namespace, context))
 }
 
@@ -474,19 +473,22 @@ async fn partition_write(
     let attachment = session.attachment.borrow().clone();
     let outcome =
         compio::time::timeout(deadline.saturating_duration_since(Instant::now()), async {
-            dispatch_partition_request(
+            let admission = dispatch_partition_request(
                 &state.shard,
                 message,
                 session.client_id,
                 session.session,
-                session.client_id,
+                ClientOrigin::capture(&state.shard.bus, session.client_id),
                 Some(session.user_id),
                 Some((session.client_id, attachment)),
                 Some(namespace),
                 None,
             )
             .await;
-            if let Some(dispatched) = dispatched.take() {
+            // A deny is already in the reply slot, so NoAck answers it below.
+            if admission == PartitionAdmission::Admitted
+                && let Some(dispatched) = dispatched.take()
+            {
                 let _ = dispatched.send(Ok(()));
             }
             receiver.await
@@ -502,8 +504,10 @@ async fn partition_write(
     }
 }
 
-/// Return after dispatch while a detached task holds the partition gate until
-/// the reply or deadline. A 202 still carries no commit or admission guarantee.
+/// Return once the partition plane takes the write, while a detached task holds
+/// the partition gate until the reply or deadline. A deny before the partition
+/// returns as an error. A 202 still carries no commit guarantee, and the plane
+/// can still refuse the write.
 pub(in crate::http) async fn produce_unacked(
     state: &Rc<HttpInner>,
     session: &Rc<HttpSession>,
@@ -545,9 +549,9 @@ pub(in crate::http) async fn produce_unacked(
 
 /// Install this session's in-process reply target on first data-plane use.
 ///
-/// The registry key is the session's shard-0 client id - the same id stamped
-/// into `RoutedRequestHeader.client` - so a partition reply routed through
-/// `send_to_client` lands on this entry and resolves the request-keyed slot.
+/// The registry key is the session's shard-0 client id, and a write captures
+/// this entry as its `ClientOrigin`, so its partition reply lands here and
+/// resolves the request-keyed slot.
 /// `None` from the registry means the key is already occupied; treat it as
 /// installed but leave the token unset so this session never tears down an
 /// entry it does not own.
@@ -562,5 +566,93 @@ fn ensure_in_process_reply_target(state: &HttpInner, session: &HttpSession) {
         .insert_in_process(session.client_id)
     {
         session.registry_token.set(Some(token));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::test_support::{register_reply, request_message};
+    use crate::http::reads::tests::read_state;
+    use consensus::Plane;
+    use std::mem::size_of;
+
+    #[compio::test]
+    async fn given_no_reply_owner_when_metadata_replays_should_not_fire_http_slot() {
+        const CLIENT: u128 = 41;
+        const SESSION: u64 = 1;
+        const REQUEST: u64 = 7;
+        let state = read_state();
+        let metadata = state.shard.plane.metadata();
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(CLIENT, 0, [0x5a; 32], register_reply(CLIENT, SESSION))
+            .unwrap();
+        let committed = register_reply(CLIENT, SESSION + 1).transmute_header(
+            |mut header, reply: &mut ReplyHeader| {
+                header.operation = Operation::CreateStream;
+                header.request = REQUEST;
+                header.op = SESSION + 1;
+                header.size = u32::try_from(size_of::<ReplyHeader>()).unwrap();
+                *reply = header;
+            },
+        );
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_reply(CLIENT, 0, committed);
+        state.shard.bus.clients().insert_in_process(CLIENT).unwrap();
+        let (_slot, mut unrelated) = state
+            .shard
+            .bus
+            .clients()
+            .install_reply_slot(CLIENT, REQUEST)
+            .unwrap();
+        let request = request_message(Operation::CreateStream, CLIENT, SESSION, REQUEST, &[]);
+        metadata.on_request(request.clone()).await;
+        assert!(
+            matches!(unrelated.try_recv(), Ok(None)),
+            "a replay without its request owner must not fill an HTTP slot"
+        );
+        let reply = metadata.submit_request_in_process(request).await.unwrap();
+        assert_eq!(reply.header().command, Command::Reply);
+        assert!(
+            matches!(unrelated.try_recv(), Ok(None)),
+            "the legitimate metadata RPC returns through its carried receiver"
+        );
+    }
+
+    #[compio::test]
+    async fn given_no_reply_owner_when_metadata_evicts_should_not_fire_http_slot() {
+        const CLIENT: u128 = 42;
+        let state = read_state();
+        state.shard.bus.clients().insert_in_process(CLIENT).unwrap();
+        // An eviction has no request. The old raw-header lookup reads its reserved zeroes.
+        let (_slot, mut unrelated) = state
+            .shard
+            .bus
+            .clients()
+            .install_reply_slot(CLIENT, 0)
+            .unwrap();
+        let request = request_message(Operation::CreateStream, CLIENT, 1, 1, &[]);
+        state
+            .shard
+            .plane
+            .metadata()
+            .on_request(request.clone())
+            .await;
+        assert!(
+            matches!(unrelated.try_recv(), Ok(None)),
+            "an eviction without its request owner must not fill any HTTP slot"
+        );
+        let reply = state
+            .shard
+            .plane
+            .metadata()
+            .submit_request_in_process(request)
+            .await
+            .unwrap();
+        assert_eq!(reply.header().command, Command::Eviction);
     }
 }

@@ -46,14 +46,14 @@ var (
 // It holds the ephemeral client identifier, the session fence the server
 // assigns once Register commits, and the request watermark.
 //
-// Bound snapshots share an atomic request counter across connections. Binding
-// and resetting still require the owning transport's lock.
+// Taking a request id is safe from any goroutine. Binding and resetting
+// require the owning transport's lock.
 type Session struct {
 	bindSecret       [BindSecretBytes]byte
 	client           ClientID
 	session          uint64
 	bound            bool
-	requestCounter   *atomic.Uint64
+	requestCounter   atomic.Uint64
 	registerConsumed bool
 }
 
@@ -65,15 +65,9 @@ func NewSession() *Session {
 // NewSessionWithClientID returns an unbound session with a caller-supplied
 // client identifier.
 func NewSessionWithClientID(client ClientID) *Session {
-	counter := &atomic.Uint64{}
-	counter.Store(1)
-	return &Session{client: client, requestCounter: counter}
-}
-
-// Fork keeps the bound identity and counter while isolating connection teardown.
-func (s *Session) Fork() *Session {
-	snapshot := *s
-	return &snapshot
+	session := &Session{client: client}
+	session.requestCounter.Store(1)
+	return session
 }
 
 // BindSecret returns the registered session proof.
@@ -134,6 +128,11 @@ func (s *Session) NextRequestID() (uint64, error) {
 	if !s.bound {
 		return 0, ErrNotBound
 	}
+	return s.NextReadRequestID()
+}
+
+// NextReadRequestID keeps reply correlation unique before authentication too.
+func (s *Session) NextReadRequestID() (uint64, error) {
 	for {
 		id := s.requestCounter.Load()
 		if id == math.MaxUint64 {
@@ -162,13 +161,11 @@ func (s *Session) reset() {
 	s.client = newClientID()
 	s.session = 0
 	s.bound = false
-	s.requestCounter = &atomic.Uint64{}
-	s.requestCounter.Store(1)
 	s.registerConsumed = false
 }
 
-// newClientID draws an ephemeral u128, retrying the one value the server
-// rejects during header validation. crypto/rand.Read does not report an error
+// newClientID keeps the top bit clear to avoid server-only IDs and retries zero.
+// crypto/rand.Read does not report an error
 // as of Go 1.24. It panics if the system entropy source is unavailable.
 func newClientID() ClientID {
 	var buf [16]byte
@@ -176,7 +173,7 @@ func newClientID() ClientID {
 		_, _ = rand.Read(buf[:])
 		client := ClientID{
 			Lo: binary.LittleEndian.Uint64(buf[0:8]),
-			Hi: binary.LittleEndian.Uint64(buf[8:16]),
+			Hi: binary.LittleEndian.Uint64(buf[8:16]) & math.MaxInt64,
 		}
 		if !client.IsZero() {
 			return client

@@ -59,8 +59,14 @@ ENVIRONMENT VARIABLES:
         IGGY_NODE_ADVERTISED_ADDRESS=localhost         # Address clients dial, required
                                                        # when a listener binds a wildcard
         IGGY_LOGGING_LEVEL=debug                # Log level
-        IGGY_ROOT_USERNAME=iggy                        # Root user, set with the password
-        IGGY_ROOT_PASSWORD=secret                      # Root password, set with the username
+        IGGY_ROOT_USERNAME=iggy                        # Root user, required with the password
+        IGGY_ROOT_PASSWORD=secret                      # Root password, required with the username
+
+    Initial root creation requires both variables, or
+    --with-default-root-credentials, on every replica before the first cluster
+    start so any promoted node can initialize root. Root is journaled and
+    replicated. Restarts recover it without these inputs. The server never
+    generates a root password or writes credential values to output or logs.
 
 TRANSPORT PROTOCOLS:
     - TCP (binary protocol)                            (default: 127.0.0.1:8090)
@@ -129,9 +135,9 @@ Example:
     /// already present in the environment, so the flag is equivalent to
     /// exporting both by hand and the environment always takes precedence.
     ///
-    /// These values initialize only a newly created root user. On restart,
-    /// supplied credentials are validated but do not replace the recovered
-    /// root user or its stored password.
+    /// The leader journals and replicates the initial root user. Restarts recover
+    /// that account without the flag or variables. Supplied values are validated
+    /// but never replace a stored root user or its password.
     ///
     /// Examples:
     ///   iggy-server --with-default-root-credentials     # Root logs in as iggy/iggy

@@ -64,12 +64,11 @@ public class PartitionsTcpClient implements PartitionsClient {
 
         log.debug("Creating {} partitions for stream: {}, topic: {}", partitionsCount, streamId, topicId);
 
-        return connection()
-                .send(CommandCode.Partition.CREATE.getValue(), payload)
-                .thenAccept(response -> {
-                    response.release();
-                    topologyChanged.run();
-                });
+        return AsyncTcpConnection.mapResponse(connection().send(CommandCode.Partition.CREATE, payload), response -> {
+            response.release();
+            topologyChanged.run();
+            return null;
+        });
     }
 
     @Override
@@ -80,11 +79,10 @@ public class PartitionsTcpClient implements PartitionsClient {
 
         log.debug("Deleting {} partitions for stream: {}, topic: {}", partitionsCount, streamId, topicId);
 
-        return connection()
-                .send(CommandCode.Partition.DELETE.getValue(), payload)
-                .thenAccept(response -> {
-                    response.release();
-                    topologyChanged.run();
-                });
+        return AsyncTcpConnection.mapResponse(connection().send(CommandCode.Partition.DELETE, payload), response -> {
+            response.release();
+            topologyChanged.run();
+            return null;
+        });
     }
 }

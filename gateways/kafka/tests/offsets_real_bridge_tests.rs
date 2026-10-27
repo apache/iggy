@@ -36,9 +36,7 @@ use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::bridge::{IggyBridge, OFFSET_GROUP_PREFIX};
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
-use iggy_gateway_kafka::protocol::api::{
-    BrokerAdvertise, ConnectionState, ERROR_NONE, GatewayState,
-};
+use iggy_gateway_kafka::protocol::api::{ConnectionState, ERROR_NONE, GatewayState};
 use iggy_gateway_kafka::protocol::handlers::{offset_commit, offset_fetch};
 
 use codec::Decoder;
@@ -61,10 +59,8 @@ async fn connected_state(server: &TestServer) -> GatewayState {
         .await
         .expect("bridge should connect to a ready server");
     GatewayState::new(
-        BrokerAdvertise::default(),
         Some(Arc::new(bridge)),
         TEST_MAX_FRAME_SIZE,
-        false,
         0,
         GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     )

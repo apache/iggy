@@ -192,7 +192,10 @@ final class ExchangeHandler: ChannelInboundHandler, @unchecked Sendable {
     /// Writes one request and arms the deadline of its reply.
     func send(_ frame: [UInt8], timeout: Duration, on channel: Channel, replyTo continuation: CheckedContinuation<RawFrame, Error>) {
         if closed {
-            continuation.resume(throwing: closeError ?? IggyError(.disconnected, context: "connection closed"))
+            // Nothing of this request was written, so it is safe to send
+            // again on another connection.
+            let cause = closeError.map { "\($0)" } ?? "connection closed"
+            continuation.resume(throwing: IggyError(.notConnected, context: "the connection closed before the request was written: \(cause)"))
             return
         }
         if let previous = pending {

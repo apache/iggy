@@ -141,6 +141,42 @@ function new_connection_string_client(): IggyClient
     return $client;
 }
 
+/**
+ * Logged-in client for one transport, as root unless credentials are given. QUIC, HTTP and
+ * WebSocket addresses default to the server's default ports on the TCP host.
+ */
+function new_transport_client(string $transport, ?string $username = null, ?string $password = null): IggyClient
+{
+    $username ??= env_or_default('IGGY_ROOT_USERNAME', 'iggy');
+    $password ??= env_or_default('IGGY_ROOT_PASSWORD', 'iggy');
+    if ($transport === 'tcp') {
+        $client = new IggyClient(server_address());
+        $client->connect();
+        $client->loginUser($username, $password);
+
+        return $client;
+    }
+
+    $schemes = ['quic' => 'iggy+quic', 'http' => 'iggy+http', 'websocket' => 'iggy+ws'];
+    $addresses = [
+        'quic' => env_or_default('IGGY_QUIC_ADDRESS', server_host() . ':8080'),
+        'http' => env_or_default('IGGY_HTTP_ADDRESS', server_host() . ':3000'),
+        'websocket' => env_or_default('IGGY_WEBSOCKET_ADDRESS', server_host() . ':8092'),
+    ];
+    $encodedUsername = rawurlencode($username);
+    $encodedPassword = rawurlencode($password);
+
+    $client = IggyClient::fromConnectionString(
+        "{$schemes[$transport]}://{$encodedUsername}:{$encodedPassword}@{$addresses[$transport]}",
+    );
+    $client->connect();
+    if ($transport === 'http') {
+        $client->loginUser($username, $password);
+    }
+
+    return $client;
+}
+
 function create_stream_and_topic(object $client, string $stream, string $topic, int $partitions = 1): void
 {
     $client->createStream($stream);
@@ -172,6 +208,48 @@ function cleanup_stream_with_topics(object $client, string|int $stream, array $t
     cleanup_stream($client, $stream);
 }
 
+/**
+ * The SDK has no user management, so tests create a user through the raw CreateUser command
+ * (33): active and without permissions.
+ */
+function create_user_without_permissions(IggyClient $client, string $username, string $password): void
+{
+    $client->sendBinaryRequest(
+        33,
+        chr(strlen($username)) . $username . chr(strlen($password)) . $password . chr(1) . chr(0),
+    );
+}
+
+/** Deletes a user by name through the raw DeleteUser command (34). */
+function delete_user_by_name(IggyClient $client, string $username): void
+{
+    $client->sendBinaryRequest(34, chr(2) . chr(strlen($username)) . $username);
+}
+
+/**
+ * Stream id to name, from the raw GetStreams answer (201): per stream its id, created_at,
+ * topics_count, size, messages_count, name and the two length-prefixed option blocks.
+ */
+function stream_list(IggyClient $client): array
+{
+    $payload = $client->sendBinaryRequest(201, '');
+    $streams = [];
+    $position = 0;
+    while ($position < strlen($payload)) {
+        $id = unpack('V', $payload, $position)[1];
+        $position += 4 + 8 + 4 + 8 + 8;
+        $nameLength = ord($payload[$position]);
+        $streams[$id] = substr($payload, $position + 1, $nameLength);
+        $position += 1 + $nameLength;
+        for ($block = 0; $block < 2; $block++) {
+            $position += 4 + unpack('V', $payload, $position)[1];
+        }
+    }
+    ksort($streams);
+
+    return $streams;
+}
+
 function collect_payloads(array $messages): array
 {
     return array_map(static fn (ReceiveMessage $message): string => $message->payload(), $messages);
@@ -191,4 +269,6 @@ if (!extension_loaded('iggy-php')) {
     Assert::fail('The iggy-php extension is not loaded.');
 }
 
-wait_for_server(server_host(), server_port());
+if (getenv('IGGY_SKIP_SERVER_WAIT') !== '1') {
+    wait_for_server(server_host(), server_port());
+}
