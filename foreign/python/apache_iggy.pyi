@@ -2103,6 +2103,7 @@ class IggyClient:
         init_retries: builtins.int | None = None,
         init_retry_interval: datetime.timedelta | None = None,
         allow_replay: builtins.bool = False,
+        offset_drain_timeout: datetime.timedelta | None = None,
     ) -> collections.abc.Awaitable[IggyConsumer]:
         r"""
         Creates a new consumer group consumer.
@@ -2112,6 +2113,11 @@ class IggyClient:
         `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
         `AutoCommit` interval is negative, or if any of those except `poll_interval`
         is zero.
+
+        `offset_drain_timeout=None` preserves the Rust default of five seconds for each
+        background offset task during shutdown. Zero aborts tasks that are still pending;
+        final commits and group leave still run. Negative values raise `ValueError`.
+        This timeout does not bound the entire shutdown operation.
 
         Consumer groups are not available over HTTP. With `auto_join_consumer_group`
         left on, this call fails at the join with `Feature is unavailable`.
@@ -2260,6 +2266,15 @@ class IggyConsumer:
         consumer group member. The consumer drops the failed route and the position it
         continued from, and the next iteration routes again.
         """
+    def shutdown(self) -> collections.abc.Awaitable[None]:
+        r"""
+        Drains pending offset work, performs final commits when auto-commit is enabled,
+        leaves the consumer group and stops its connection watcher. Repeated calls are safe.
+        Stop `consume_messages()` with its `asyncio.Event` and await its completion first.
+        Do not await this method from the callback or while an iterator's next call is pending:
+        consumption holds the same consumer lock. Subsequent iterator calls terminate.
+        The Rust SDK currently logs final commit and group-leave failures rather than raising them.
+        """
     def consume_messages(
         self,
         callback: collections.abc.Callable[
@@ -2270,6 +2285,7 @@ class IggyConsumer:
         r"""
         Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
         Returns an awaitable that completes when shutdown is signaled or a RuntimeError on failure.
+        After it completes, call `shutdown()` to drain offsets and release group membership.
         After another client deleted and created a partition again, one poll can fail with
         `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009) for a consumer
         group member. The error is logged, not raised: the failed route is dropped, and the

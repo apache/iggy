@@ -189,8 +189,28 @@ impl IggyConsumer {
         ReceiveMessageIterator { inner }
     }
 
+    /// Drains pending offset work, performs final commits when auto-commit is enabled,
+    /// leaves the consumer group and stops its connection watcher. Repeated calls are safe.
+    /// Stop `consume_messages()` with its `asyncio.Event` and await its completion first.
+    /// Do not await this method from the callback or while an iterator's next call is pending:
+    /// consumption holds the same consumer lock. Subsequent iterator calls terminate.
+    /// The Rust SDK currently logs final commit and group-leave failures rather than raising them.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn shutdown<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .lock()
+                .await
+                .shutdown()
+                .await
+                .map_err(to_runtime_error)
+        })
+    }
+
     /// Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
     /// Returns an awaitable that completes when shutdown is signaled or a RuntimeError on failure.
+    /// After it completes, call `shutdown()` to drain offsets and release group membership.
     /// After another client deleted and created a partition again, one poll can fail with
     /// `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009) for a consumer
     /// group member. The error is logged, not raised: the failed route is dropped, and the

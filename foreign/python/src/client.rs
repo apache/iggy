@@ -1778,6 +1778,11 @@ impl IggyClient {
     /// `AutoCommit` interval is negative, or if any of those except `poll_interval`
     /// is zero.
     ///
+    /// `offset_drain_timeout=None` preserves the Rust default of five seconds for each
+    /// background offset task during shutdown. Zero aborts tasks that are still pending;
+    /// final commits and group leave still run. Negative values raise `ValueError`.
+    /// This timeout does not bound the entire shutdown operation.
+    ///
     /// Consumer groups are not available over HTTP. With `auto_join_consumer_group`
     /// left on, this call fails at the join with `Feature is unavailable`.
     /// Turning it off is not a workaround: the join is skipped, but a group
@@ -1802,6 +1807,7 @@ impl IggyClient {
         init_retries=None,
         init_retry_interval=None,
         allow_replay=false,
+        offset_drain_timeout=None,
     ))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[IggyConsumer]", imports=("collections.abc")))]
     fn consumer_group<'a>(
@@ -1828,6 +1834,8 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         init_retry_interval: Option<Py<PyDelta>>,
         allow_replay: bool,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        offset_drain_timeout: Option<Py<PyDelta>>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let mut builder = self
             .inner
@@ -1888,6 +1896,9 @@ impl IggyClient {
         }
         if allow_replay {
             builder = builder.allow_replay()
+        }
+        if let Some(timeout) = offset_drain_timeout {
+            builder = builder.offset_drain_timeout(py_delta_to_iggy_duration(&timeout)?);
         }
         let mut consumer = builder.build();
 
