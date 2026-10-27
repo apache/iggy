@@ -108,13 +108,23 @@ if [[ ! $ISSUE =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 
-# Annotations in Actions, plain lines elsewhere.
-info() { echo "$*"; }
+# Annotations in Actions, plain lines elsewhere. Messages can carry model
+# text, so each stays on one line: a line starting with "::" would run as a
+# workflow command.
+info() {
+  local msg="$*"
+  msg=${msg//$'\r'/ }
+  echo "${msg//$'\n'/ }"
+}
 warning() {
+  local msg="$*"
   if [[ -n ${GITHUB_ACTIONS:-} ]]; then
-    echo "::warning::$*"
+    msg=${msg//%/%25}
+    msg=${msg//$'\r'/%0D}
+    echo "::warning::${msg//$'\n'/%0A}"
   else
-    echo "warning: $*"
+    msg=${msg//$'\r'/ }
+    echo "warning: ${msg//$'\n'/ }"
   fi
 }
 

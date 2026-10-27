@@ -99,7 +99,9 @@ FOUND=$(jq -r '
   | ($body | split("\n") | map(select(test("^\\s*#") | not)) | join(" ")
      | gsub("\\s+"; " ") | sub("^ "; "") | sub(" $"; "")) as $prose
   # An explicit "N/A" or "None" under the issue heading is an answer.
-  | (if ($body | test("#\\d+|github\\.com/apache/iggy/issues/\\d+") | not)
+  # "#123" must stand alone, so a colour like #007bff or an entity like &#123;
+  # is not taken for an issue link.
+  | (if ($body | test("(^|[^\\w&])#\\d+\\b|github\\.com/apache/iggy/issues/\\d+") | not)
         and ($issue | split("\n") | any(test("^\\s*(N/A|None)\\b"; "i")) | not)
      then "Link the issue this PR addresses, for example `Closes #123` or `Relates to #123`, or write N/A under \"Which issue does this PR address?\"."
      else empty end),
