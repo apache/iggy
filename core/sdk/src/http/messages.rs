@@ -30,6 +30,55 @@ use iggy_common::SendMessagesConfirmations;
 
 #[async_trait]
 impl MessageClient for HttpClient {
+    async fn poll_messages_with_strategy_for_and_options(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
+        count: u32,
+        auto_commit: bool,
+        options: Option<iggy_common::DeferredPollOptions>,
+    ) -> Result<PolledMessages, IggyError> {
+        let Some(options) = options else {
+            return self
+                .poll_messages_with_strategy_for(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    consumer,
+                    strategy_for,
+                    count,
+                    auto_commit,
+                )
+                .await;
+        };
+        if consumer.kind == ConsumerKind::ExternalGroup
+            || (consumer.kind == ConsumerKind::ConsumerGroup && partition_id.is_none())
+        {
+            return Err(IggyError::FeatureUnavailable);
+        }
+        let path = format!(
+            "{}/deferred",
+            get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str())
+        );
+        self.get_deferred_poll(
+            &path,
+            &PollMessages {
+                stream_id: stream_id.clone(),
+                topic_id: topic_id.clone(),
+                partition_id,
+                consumer: consumer.clone(),
+                strategy: strategy_for(partition_id.unwrap_or(0)),
+                count,
+                auto_commit,
+            },
+            options,
+        )
+        .await
+    }
+
     async fn poll_messages(
         &self,
         stream_id: &Identifier,
@@ -230,9 +279,10 @@ mod tests {
     use crate::http::http_client::HttpClient;
     use crate::http::scripted_server::{Recorded, Reply, ScriptedServer};
     use crate::prelude::{
-        Identifier, IggyError, IggyMessage, MessageClient, PartitionClient, PartitionContext,
-        Partitioning, SendMessagesConfirmationResponse, StreamClient, StreamCreateOptions,
-        TopicClient, TopicCreateOptions,
+        Consumer, DeferredPollOptions, Identifier, IggyError, IggyMessage, MessageClient,
+        PartitionClient, PartitionContext, Partitioning, PollingStrategy,
+        SendMessagesConfirmationResponse, StreamClient, StreamCreateOptions, TopicClient,
+        TopicCreateOptions,
     };
     use bytes::Bytes;
 
@@ -279,6 +329,29 @@ mod tests {
             .iter()
             .map(|request| request.line.as_str())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn given_an_external_group_when_polling_deferred_should_refuse_it_before_sending() {
+        let server = ScriptedServer::start(vec![]).await;
+        let client = server.client();
+        let (stream_id, topic_id) = ids();
+
+        let polled = client
+            .poll_messages_deferred(
+                &stream_id,
+                &topic_id,
+                Some(PARTITION_ID),
+                &Consumer::external_group(Identifier::numeric(1).unwrap()),
+                &PollingStrategy::next(),
+                1,
+                false,
+                DeferredPollOptions::default(),
+            )
+            .await;
+
+        assert_eq!(polled.map(|_| ()), Err(IggyError::FeatureUnavailable));
+        assert!(server.requests().is_empty());
     }
 
     #[tokio::test]

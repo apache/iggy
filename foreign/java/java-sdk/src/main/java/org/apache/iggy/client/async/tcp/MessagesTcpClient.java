@@ -29,6 +29,7 @@ import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.hash.XxHash32;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PartitioningKind;
@@ -112,7 +113,36 @@ public class MessagesTcpClient implements MessagesClient {
             PollingStrategy strategy,
             Long count,
             boolean autoCommit) {
-        long deadline = pollRouter.operationDeadline();
+        return pollMessagesImpl(streamId, topicId, partitionId, consumer, strategy, count, autoCommit, null);
+    }
+
+    @Override
+    public CompletableFuture<PolledMessages> pollMessagesDeferred(
+            StreamId streamId,
+            TopicId topicId,
+            Optional<Long> partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            Long count,
+            boolean autoCommit,
+            DeferredPollOptions options) {
+        options.validate(count);
+        return pollMessagesImpl(streamId, topicId, partitionId, consumer, strategy, count, autoCommit, options);
+    }
+
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    private CompletableFuture<PolledMessages> pollMessagesImpl(
+            StreamId streamId,
+            TopicId topicId,
+            Optional<Long> partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            Long count,
+            boolean autoCommit,
+            DeferredPollOptions options) {
+        long deadline = options == null
+                ? pollRouter.operationDeadline()
+                : System.nanoTime() + options.requestTimeout().toNanos();
         var state = pollRouter.startCall();
         if (consumer.kind() == Consumer.Kind.ConsumerGroup && partitionId.isEmpty()) {
             // The VSR broker fences group polls against unowned partitions
@@ -126,6 +156,7 @@ public class MessagesTcpClient implements MessagesClient {
                     strategy,
                     count,
                     autoCommit,
+                    options,
                     GROUP_POLL_MAX_ATTEMPTS,
                     cancellation,
                     deadline,
@@ -137,8 +168,8 @@ public class MessagesTcpClient implements MessagesClient {
             });
             return pollRouter.onClientLoop(result);
         }
-        return pollRouter.onClientLoop(
-                pollPartition(streamId, topicId, partitionId, consumer, strategy, count, autoCommit, deadline, state));
+        return pollRouter.onClientLoop(pollPartition(
+                streamId, topicId, partitionId, consumer, strategy, count, autoCommit, options, deadline, state));
     }
 
     @SuppressWarnings("checkstyle:ParameterNumber")
@@ -150,8 +181,20 @@ public class MessagesTcpClient implements MessagesClient {
             PollingStrategy strategy,
             Long count,
             boolean autoCommit,
+            DeferredPollOptions options,
             long deadline,
             AsyncTcpConnection.TransientFailoverState state) {
+        DeferredPollOptions attempt = null;
+        if (options != null) {
+            // The deadline was set when the call began, so a later attempt carries only what is left of it.
+            Optional<DeferredPollOptions> remaining =
+                    options.remaining(options.requestTimeout().minusNanos(deadline - System.nanoTime()));
+            if (remaining.isEmpty()) {
+                return CompletableFuture.failedFuture(
+                        new IggyServerException(IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode()));
+            }
+            attempt = remaining.get();
+        }
 
         var payload = Unpooled.buffer();
 
@@ -164,9 +207,17 @@ public class MessagesTcpClient implements MessagesClient {
         payload.writeIntLE(count.intValue());
 
         payload.writeByte(autoCommit ? 1 : 0);
+        if (attempt != null) {
+            payload.writeLongLE(attempt.maxWaitMicros());
+            payload.writeIntLE((int) attempt.minCount());
+            payload.writeIntLE((int) attempt.maxBytes());
+            payload.writeLongLE(attempt.requestTimeoutMicros());
+        }
 
         CompletableFuture<ByteBuf> sent = pollRouter.partitionRequest(
-                org.apache.iggy.serde.CommandCode.Messages.POLL.getValue(),
+                options == null
+                        ? org.apache.iggy.serde.CommandCode.Messages.POLL.getValue()
+                        : org.apache.iggy.serde.CommandCode.Messages.POLL_DEFERRED.getValue(),
                 payload,
                 strategy.context(),
                 deadline,
@@ -320,6 +371,7 @@ public class MessagesTcpClient implements MessagesClient {
             PollingStrategy strategy,
             Long count,
             boolean autoCommit,
+            DeferredPollOptions options,
             int attemptsLeft,
             CallCancellation cancellation,
             long deadline,
@@ -360,6 +412,7 @@ public class MessagesTcpClient implements MessagesClient {
                             strategy,
                             count,
                             autoCommit,
+                            options,
                             deadline,
                             state);
                     cancellation.track(polledPartition);
@@ -375,6 +428,7 @@ public class MessagesTcpClient implements MessagesClient {
                                             strategy,
                                             count,
                                             autoCommit,
+                                            options,
                                             attemptsLeft - 1,
                                             cancellation,
                                             deadline,

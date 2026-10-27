@@ -75,7 +75,7 @@ impl ConsumerClient for LowLevelConsumerClient {
         };
         let before_poll = Instant::now();
         let polled = client
-            .poll_messages_with_strategy_for(
+            .poll_messages_with_strategy_for_and_options(
                 &self.stream_id,
                 &self.topic_id,
                 self.partition_id,
@@ -83,6 +83,7 @@ impl ConsumerClient for LowLevelConsumerClient {
                 &strategy_for,
                 messages_to_receive,
                 self.auto_commit,
+                Some(self.config.poll_options),
             )
             .await;
 
@@ -189,8 +190,8 @@ mod tests {
     use crate::utils::client_factory::TcpClientFactory;
     use bench_report::numeric_parameter::BenchmarkNumericParameter;
     use iggy::prelude::{
-        ClientWrapper, Consumer, Identifier, IggyClient, IggyDuration, PollingStrategy, TcpClient,
-        TcpClientConfig,
+        ClientWrapper, Consumer, DeferredPollOptions, Identifier, IggyClient, IggyDuration,
+        PollingStrategy, TcpClient, TcpClientConfig,
     };
     use std::{collections::HashMap, sync::Arc};
 
@@ -213,6 +214,7 @@ mod tests {
                     messages_per_batch: BenchmarkNumericParameter::Value(1),
                     warmup_time: IggyDuration::default(),
                     polling_kind: polling_strategy.kind,
+                    poll_options: DeferredPollOptions::default(),
                     origin_timestamp_latency_calculation: false,
                     pretty: false,
                 },
