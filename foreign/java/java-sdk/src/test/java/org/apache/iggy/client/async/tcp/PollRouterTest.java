@@ -866,7 +866,7 @@ class PollRouterTest {
             ByteBuf metadata = coordinator.roster().join();
             Thread roster = start("roster-read", () -> {
                 try {
-                    router.observeTopology(BytesDeserializer.readClusterMetadata(metadata));
+                    router.observeTopology(BytesDeserializer.readClusterMetadata(metadata), coordinator);
                 } finally {
                     metadata.release();
                 }

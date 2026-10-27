@@ -348,8 +348,7 @@ class AsyncIggyTcpClientFailoverSignInTest {
 
         private WalkingClient(ServerSocket source) {
             super(
-                    source.getInetAddress().getHostAddress(),
-                    source.getLocalPort(),
+                    List.of(new ConnectionInfo(source.getInetAddress().getHostAddress(), source.getLocalPort())),
                     null,
                     null,
                     null,

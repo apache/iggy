@@ -166,7 +166,9 @@ public class AsyncIggyTcpClient {
             IggyErrorCode.INVALID_PERSONAL_ACCESS_TOKEN.getCode(),
             IggyErrorCode.PERSONAL_ACCESS_TOKEN_EXPIRED.getCode());
 
-    private final ConnectionInfo seedConnectionInfo;
+    /** The addresses the client was configured with, in order. */
+    private final List<ConnectionInfo> configuredEndpoints;
+
     private final AtomicReference<Object> reconnecting = new AtomicReference<>();
     private volatile Optional<String> username;
     private volatile Optional<String> password;
@@ -267,8 +269,7 @@ public class AsyncIggyTcpClient {
      */
     public AsyncIggyTcpClient(String host, int port) {
         this(
-                host,
-                port,
+                List.of(new ConnectionInfo(host, port)),
                 null,
                 null,
                 null,
@@ -285,8 +286,7 @@ public class AsyncIggyTcpClient {
 
     @SuppressWarnings("checkstyle:ParameterNumber")
     AsyncIggyTcpClient(
-            String host,
-            int port,
+            List<ConnectionInfo> addresses,
             String username,
             String password,
             Duration connectionTimeout,
@@ -299,8 +299,8 @@ public class AsyncIggyTcpClient {
             Optional<File> tlsCertificate,
             Optional<IoEventLoopGroup> sharedEventLoopGroup,
             int ioThreads) {
-        this.connectionInfo = new ConnectionInfo(host, port);
-        this.seedConnectionInfo = this.connectionInfo;
+        this.configuredEndpoints = List.copyOf(addresses);
+        this.connectionInfo = configuredEndpoints.get(0);
         this.username = Optional.ofNullable(username);
         this.password = Optional.ofNullable(password);
         this.connectionTimeout = Optional.ofNullable(connectionTimeout);
@@ -309,7 +309,7 @@ public class AsyncIggyTcpClient {
         this.pollRouter = new PollRouter(
                 connection::get, this::openPollConnection, this.requestTimeout.orElse(PollRouter.POLL_TIMEOUT));
         this.pollRouter.coordinatorEndpoint(() -> connectionInfo);
-        this.pollRouter.configuredEndpoint(seedConnectionInfo);
+        this.pollRouter.configuredEndpoints(configuredEndpoints);
         this.heartbeatInterval = heartbeatInterval;
         this.maxVsrFrameSize = maxVsrFrameSize;
         this.retryPolicy = Optional.ofNullable(retryPolicy);
@@ -346,20 +346,8 @@ public class AsyncIggyTcpClient {
         session.endLineage();
         session.reset();
         pollRouter.clearSession();
-        ConnectionInfo target = connectionInfo;
-        AsyncTcpConnection newConnection = openConnection(target);
-        AsyncTcpConnection previousConnection;
-        // Under the lock of replay(), so a replay records the connection that carries its Register.
-        synchronized (this) {
-            pendingReplay = null;
-            previousConnection = connection.getAndSet(newConnection);
-        }
-        if (previousConnection != null) {
-            previousConnection.close();
-        }
-        routingState.clearAssignments();
         Supplier<AsyncTcpConnection> currentConnection = connection::get;
-        return newConnection.connect().thenRun(() -> {
+        return connectFrom(connectCandidates(), 0).thenAccept(target -> {
             log.debug("Connected to {} | {}", target.serverAddress(), IggyVersion.getInstance());
             var messages = new MessagesTcpClient(currentConnection, routingState, pollRouter);
             var offsets = new ConsumerOffsetsTcpClient(currentConnection, pollRouter);
@@ -376,6 +364,39 @@ public class AsyncIggyTcpClient {
             personalAccessTokensClient = new PersonalAccessTokensTcpClient(currentConnection, loginRoutingHook);
             partitionsClient = new PartitionsTcpClient(currentConnection, pollRouter::clear);
         });
+    }
+
+    /**
+     * Dials the candidates in order from {@code index} until one answers, so a client configured with several nodes
+     * of one cluster starts while one of them is down. Resolves to the endpoint that answered.
+     */
+    private CompletableFuture<ConnectionInfo> connectFrom(List<ConnectionInfo> candidates, int index) {
+        ConnectionInfo target = candidates.get(index);
+        AsyncTcpConnection newConnection = openConnection(target);
+        AsyncTcpConnection previousConnection;
+        // Under the lock of replay(), so a replay records the connection that carries its Register.
+        synchronized (this) {
+            pendingReplay = null;
+            previousConnection = connection.getAndSet(newConnection);
+        }
+        if (previousConnection != null) {
+            previousConnection.close();
+        }
+        connectionInfo = target;
+        routingState.clearAssignments();
+        return newConnection
+                .connect()
+                .handle((connected, error) -> {
+                    if (error == null) {
+                        return CompletableFuture.completedFuture(target);
+                    }
+                    if (closed || index + 1 >= candidates.size()) {
+                        return CompletableFuture.<ConnectionInfo>failedFuture(error);
+                    }
+                    log.warn("Connecting to {} failed: {}", target.serverAddress(), error.getMessage());
+                    return connectFrom(candidates, index + 1);
+                })
+                .thenCompose(Function.identity());
     }
 
     /**
@@ -1035,7 +1056,7 @@ public class AsyncIggyTcpClient {
      * expired reply. Requests that were in flight stay failed (their outcome
      * is unknown); the redial only restores the client for subsequent calls.
      * Each rotation sweeps every endpoint the client knows -- where it was,
-     * the metadata primary, the configured seed, then the roster it learned.
+     * the metadata primary, the configured addresses, then the roster it learned.
      * Only a rotation that reaches none of them waits out the retry policy's delay. The
      * sign-in that last succeeded is replayed on whichever endpoint answers,
      * personal access tokens included.
@@ -1096,7 +1117,7 @@ public class AsyncIggyTcpClient {
         List<ConnectionInfo> candidates = redialCandidates();
         // The retry budget bounds the rotations, not the endpoints. A policy of
         // zero retries with several endpoints known still gets one rotation:
-        // those endpoints - the address the client was configured with, the
+        // those endpoints - the addresses the client was configured with, the
         // nodes the roster named - were made known in order to be tried, and
         // the other SDKs sweep them once too. With one endpoint known, zero
         // retries redials nothing, which is what it asked for.
@@ -1562,31 +1583,35 @@ public class AsyncIggyTcpClient {
                 ? remaining
                 : LeaderAwareness.LEADERLESS_POLL_INTERVAL;
         return LeaderAwareness.findLeaderElsewhere(
-                        () -> AsyncTcpConnection.mapResponse(
-                                connection
-                                        .get()
-                                        .send(
-                                                CommandCode.System.GET_CLUSTER_METADATA.getValue(),
-                                                Unpooled.EMPTY_BUFFER,
-                                                deadline),
-                                response -> {
-                                    try {
-                                        return observeTopology(BytesDeserializer.readClusterMetadata(response));
-                                    } finally {
-                                        response.release();
-                                    }
-                                }),
+                        () -> {
+                            AsyncTcpConnection carrier = connection.get();
+                            return AsyncTcpConnection.mapResponse(
+                                    carrier.send(
+                                            CommandCode.System.GET_CLUSTER_METADATA.getValue(),
+                                            Unpooled.EMPTY_BUFFER,
+                                            deadline),
+                                    response -> {
+                                        try {
+                                            return observeTopology(
+                                                    BytesDeserializer.readClusterMetadata(response), carrier);
+                                        } finally {
+                                            response.release();
+                                        }
+                                    });
+                        },
                         currentTarget,
                         remaining,
                         pause)
                 .thenApply(LeaderAwareness.LeaderLookup::redirect);
     }
 
-    private ClusterMetadata observeTopology(ClusterMetadata metadata) {
+    /** Keeps the roster that {@code carrier} read. */
+    private ClusterMetadata observeTopology(ClusterMetadata metadata, AsyncTcpConnection carrier) {
         if (!metadata.nodes().isEmpty()) {
+            ConnectionInfo configured = LeaderAwareness.configuredEndpointOf(configuredEndpoints, carrier.endpoint());
             rememberRoster(new LeaderAwareness.LeaderLookup(
-                    Optional.empty(), LeaderAwareness.nodeTargets(metadata, seedConnectionInfo)));
-            pollRouter.observeTopology(metadata);
+                    Optional.empty(), LeaderAwareness.nodeTargets(metadata, configured)));
+            pollRouter.observeTopology(metadata, carrier);
         }
         return metadata;
     }
@@ -1595,8 +1620,8 @@ public class AsyncIggyTcpClient {
      * Keeps what a leader check learned about where the cluster's nodes are.
      *
      * Replaced wholesale rather than merged: the roster is the cluster's own
-     * answer, so a node it dropped stops being dialed. The configured seed is
-     * kept separately and outlives it.
+     * answer, so a node it dropped stops being dialed. The configured
+     * addresses are kept separately and outlive it.
      *
      * An inconclusive check -- an unreadable roster, a metadata read that
      * failed -- names no endpoint, and that must leave the last roster
@@ -1614,6 +1639,11 @@ public class AsyncIggyTcpClient {
         return rosterTargets;
     }
 
+    /** The addresses this client was configured with, for tests in this package. */
+    List<ConnectionInfo> configuredEndpoints() {
+        return configuredEndpoints;
+    }
+
     /** Whether a sign-in is remembered for replay, for tests in this package. */
     boolean hasRememberedLogin() {
         return rememberedLogin != null;
@@ -1621,17 +1651,29 @@ public class AsyncIggyTcpClient {
 
     /**
      * Endpoints a redial rotates through, likeliest first: where the client
-     * currently is, the last known metadata primary, the address it was
-     * configured with, then the roster it learned while connected. Duplicates
-     * are dropped by spelling, so an
+     * currently is, the last known metadata primary, the addresses it was
+     * configured with, in order, then the roster it learned while connected.
+     * Duplicates are dropped by spelling, so an
      * endpoint the roster merely writes differently does not earn a second
      * attempt. Spelling only: this runs on the Netty event loop, where a
      * resolver lookup per candidate pair would block it.
      */
     private List<ConnectionInfo> redialCandidates() {
+        return eachSpellingOnce(Stream.of(
+                        Stream.of(connectionInfo, pollRouter.metadataPrimary()),
+                        configuredEndpoints.stream(),
+                        rosterTargets.stream())
+                .flatMap(Function.identity()));
+    }
+
+    /** Endpoints {@link #connect()} dials in order: where the client is, then the addresses it was configured with. */
+    private List<ConnectionInfo> connectCandidates() {
+        return eachSpellingOnce(Stream.concat(Stream.of(connectionInfo), configuredEndpoints.stream()));
+    }
+
+    private static List<ConnectionInfo> eachSpellingOnce(Stream<ConnectionInfo> endpoints) {
         List<ConnectionInfo> candidates = new ArrayList<>();
-        candidates.add(connectionInfo);
-        Stream.concat(Stream.of(pollRouter.metadataPrimary(), seedConnectionInfo), rosterTargets.stream())
+        endpoints
                 .filter(Objects::nonNull)
                 .filter(endpoint ->
                         candidates.stream().noneMatch(candidate -> LeaderAwareness.isSameSpelling(candidate, endpoint)))

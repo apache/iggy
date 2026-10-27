@@ -24,6 +24,7 @@ import io.netty.channel.IoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandle;
 import io.netty.util.concurrent.EventExecutor;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
 import org.apache.iggy.client.async.tcp.vsr.VsrHeaders;
@@ -34,6 +35,7 @@ import org.apache.iggy.exception.IggyMissingCredentialsException;
 
 import java.io.File;
 import java.time.Duration;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
@@ -81,6 +83,8 @@ import java.util.function.Function;
 public final class AsyncIggyTcpClientBuilder {
     private String host = "localhost";
     private Integer port = 8090;
+    // Every address of the connection string, the first of which host and port hold.
+    private List<ConnectionInfo> addresses = List.of();
     private String username;
     private String password;
     private boolean enableTls = false;
@@ -99,24 +103,26 @@ public final class AsyncIggyTcpClientBuilder {
     public AsyncIggyTcpClientBuilder() {}
 
     /**
-     * Sets the host address for the Iggy server.
+     * Sets the host address for the Iggy server, replacing a list of addresses from a connection string.
      *
      * @param host the host address
      * @return this builder
      */
     public AsyncIggyTcpClientBuilder host(String host) {
         this.host = host;
+        addresses = List.of();
         return this;
     }
 
     /**
-     * Sets the port for the Iggy server.
+     * Sets the port for the Iggy server, replacing a list of addresses from a connection string.
      *
      * @param port the port number
      * @return this builder
      */
     public AsyncIggyTcpClientBuilder port(Integer port) {
         this.port = port;
+        addresses = List.of();
         return this;
     }
 
@@ -185,6 +191,10 @@ public final class AsyncIggyTcpClientBuilder {
      * Settings that are not in the connection string keep their current values, so a string
      * without {@code tls} leaves an earlier {@link #enableTls()} in place.
      *
+     * <p>The address may list several nodes of one cluster, separated by commas, as in
+     * {@code iggy://iggy:iggy@node-1:8090,node-2:8090}. {@link AsyncIggyTcpClient#connect()} tries each
+     * in order, and a redial tries them before the nodes of the last roster.
+     *
      * @param connectionString the connection string, for example {@code iggy://iggy:iggy@localhost:8090?tls=true}
      * @return this builder
      * @throws IggyInvalidArgumentException if the connection string is invalid
@@ -194,6 +204,7 @@ public final class AsyncIggyTcpClientBuilder {
         TcpConnectionString parsed = TcpConnectionString.parse(connectionString);
         host(parsed.host());
         port(parsed.port());
+        addresses = parsed.addresses();
         credentials(parsed.username(), parsed.password());
         parsed.tls().ifPresent(this::tls);
         parsed.tlsCaFile().ifPresent(this::tlsCertificate);
@@ -352,6 +363,8 @@ public final class AsyncIggyTcpClientBuilder {
     public AsyncIggyTcpClient build() {
         validateHost();
         validatePort();
+        List<ConnectionInfo> configured = addresses.isEmpty() ? List.of(new ConnectionInfo(host, port)) : addresses;
+        validateListedPorts(configured);
         validateConnectionTimeout();
         validateAcquireTimeout();
         validateRequestTimeout();
@@ -361,8 +374,7 @@ public final class AsyncIggyTcpClientBuilder {
         validateEventLoopGroup();
 
         AsyncIggyTcpClient client = new AsyncIggyTcpClient(
-                host,
-                port,
+                configured,
                 username,
                 password,
                 connectionTimeout,
@@ -387,6 +399,13 @@ public final class AsyncIggyTcpClientBuilder {
 
     private void validatePort() {
         if (port == null || port <= 0) {
+            throw new IggyInvalidArgumentException("Port must be a positive integer");
+        }
+    }
+
+    // The connection string accepts port 0, so every listed address needs the check of validatePort().
+    private static void validateListedPorts(List<ConnectionInfo> configured) {
+        if (configured.stream().anyMatch(address -> address.port() <= 0)) {
             throw new IggyInvalidArgumentException("Port must be a positive integer");
         }
     }

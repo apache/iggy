@@ -391,6 +391,29 @@ class LeaderAwarenessTest {
             assertThat(targets).containsExactly(new ConnectionInfo("iggy-0", 8091), new ConnectionInfo("iggy-1", 8092));
         }
 
+        // A client configured with several nodes reaches a one-node cluster
+        // through one of them, and only that one is known to reach the node.
+        @Test
+        void shouldMapAOneNodeRosterToTheConfiguredEndpointThatReachedIt() {
+            var gone = new ConnectionInfo("10.0.0.1", 8090);
+            var mapped = new ConnectionInfo("127.0.0.1", 18090);
+            var metadata = cluster(node("node-0", "iggy-0", 8090, ClusterNodeRole.Leader, ClusterNodeStatus.Healthy));
+
+            var configured = LeaderAwareness.configuredEndpointOf(List.of(gone, mapped), mapped);
+
+            assertThat(LeaderAwareness.nodeTargets(metadata, configured)).containsExactly(mapped);
+        }
+
+        @Test
+        void shouldFallBackToTheFirstConfiguredEndpointForALinkDialedElsewhere() {
+            var first = new ConnectionInfo("10.0.0.1", 8090);
+            var second = new ConnectionInfo("10.0.0.2", 8090);
+
+            assertThat(LeaderAwareness.configuredEndpointOf(List.of(first, second), new ConnectionInfo("iggy-0", 8090)))
+                    .isEqualTo(first);
+            assertThat(LeaderAwareness.configuredEndpointOf(List.of(), first)).isNull();
+        }
+
         // An inconclusive check names no endpoint, which is what lets the
         // client keep the last roster it read: replacing it with an empty list
         // would erase the candidates exactly when the cluster is unreachable.

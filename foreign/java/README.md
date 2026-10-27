@@ -131,7 +131,7 @@ An id that cluster metadata does not name fails with `INVALID_IDENTIFIER`. An un
 
 ## Quick Start
 
-`Iggy.tcpClientBuilder()` handles the routing and the session for you. Over TCP and TCP/TLS, the client keeps the consumer group membership on the coordinator. It maintains one shared-session connection per advertised replica and multiplexes partition requests on those connections. With a one-node roster, the client dials the configured endpoint instead of the advertised one. This keeps a single node behind a port map or a port-forward reachable.
+`Iggy.tcpClientBuilder()` handles the routing and the session for you. Over TCP and TCP/TLS, the client keeps the consumer group membership on the coordinator. It maintains one shared-session connection per advertised replica and multiplexes partition requests on those connections. With a one-node roster, the client dials the configured address that reached the node instead of the advertised one. This keeps a single node behind a port map or a port-forward reachable.
 
 Start the server with the [example prerequisites](../../examples/java/#running-examples) and matching credentials. The following snippets show alternative clients. Close a blocking client with `close()` or an async client with `close().join()` when finished.
 
@@ -180,6 +180,9 @@ The connection string accepts `iggy://` and `iggy+tcp://` with `<username>:<pass
 `tls` and `tls_ca_file` options, each at most once. `tls_ca_file` requires `tls=true`, and a string without `tls`
 keeps the TLS setting already on the builder. Personal access tokens and other options are not supported yet
 and are rejected with an `IggyInvalidArgumentException`.
+
+The address can list several nodes of one cluster, separated by commas, as in `iggy://iggy:iggy@node-1:8090,node-2:8090`.
+`connect()` tries each in order, and a redial tries them before the nodes of the last roster.
 
 ### TCP Client (Async)
 

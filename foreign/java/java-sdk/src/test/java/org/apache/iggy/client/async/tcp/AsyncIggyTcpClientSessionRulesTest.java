@@ -1155,8 +1155,7 @@ class AsyncIggyTcpClientSessionRulesTest {
 
         private HeldSettlementClient(ServerSocket socket) {
             super(
-                    socket.getInetAddress().getHostAddress(),
-                    socket.getLocalPort(),
+                    List.of(new ConnectionInfo(socket.getInetAddress().getHostAddress(), socket.getLocalPort())),
                     null,
                     null,
                     null,

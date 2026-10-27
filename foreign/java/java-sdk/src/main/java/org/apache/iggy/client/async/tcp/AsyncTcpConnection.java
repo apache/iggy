@@ -129,6 +129,7 @@ public class AsyncTcpConnection {
     private static final Duration RETRY_BACKOFF_MAX = Duration.ofSeconds(1);
     private static final String EVENT_LOOP_THREAD_PREFIX = "iggy-tcp-io";
 
+    private final ConnectionInfo endpoint;
     private final IoEventLoopGroup eventLoopGroup;
     private final boolean ownsEventLoopGroup;
     private final EventLoop eventLoop;
@@ -193,6 +194,7 @@ public class AsyncTcpConnection {
             TransientFailoverHandler transientFailoverHandler,
             IntConsumer sessionResetListener,
             BiConsumer<AsyncTcpConnection, Throwable> connectionFailureListener) {
+        this.endpoint = new ConnectionInfo(host, port);
         this.transientFailoverHandler = transientFailoverHandler;
         this.sessionResetListener = sessionResetListener;
         this.connectionFailureListener = connectionFailureListener;
@@ -351,6 +353,11 @@ public class AsyncTcpConnection {
 
     boolean heartbeatScheduled() {
         return heartbeat.scheduled();
+    }
+
+    /** The endpoint this connection dials. */
+    ConnectionInfo endpoint() {
+        return endpoint;
     }
 
     EventLoop eventLoop() {

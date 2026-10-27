@@ -19,6 +19,7 @@
 
 package org.apache.iggy.config;
 
+import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -75,6 +76,27 @@ class TcpConnectionStringTest {
 
         assertThat(parsed.host()).isEqualTo("::1");
         assertThat(parsed.port()).isEqualTo(8090);
+    }
+
+    @Test
+    void shouldParseAListOfAddressesWithEachTrimmed() {
+        TcpConnectionString parsed =
+                TcpConnectionString.parse("iggy://iggy:iggy@10.0.0.1:8090, [2001:db8::1]:8090 ,node-3:8090?tls=true");
+
+        assertThat(parsed.addresses())
+                .containsExactly(
+                        new ConnectionInfo("10.0.0.1", 8090),
+                        new ConnectionInfo("2001:db8::1", 8090),
+                        new ConnectionInfo("node-3", 8090));
+        assertThat(parsed.host()).isEqualTo("10.0.0.1");
+        assertThat(parsed.port()).isEqualTo(8090);
+        assertThat(parsed.tls()).contains(true);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"10.0.0.1:8090,", "10.0.0.1:8090,,node-3:8090", "10.0.0.1:8090,node-3"})
+    void shouldRejectAListThatHoldsABadAddress(String addresses) {
+        assertInvalid("iggy://iggy:iggy@" + addresses, "server address must be");
     }
 
     @ParameterizedTest

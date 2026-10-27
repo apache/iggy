@@ -122,6 +122,98 @@ class AsyncIggyTcpClientEndpointFailoverTest {
     }
 
     @Test
+    void shouldConnectThroughTheNextConfiguredAddressWhenTheFirstIsDown() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        String host = loopback.getHostAddress();
+        int gonePort = refusedPort();
+        try (ServerSocket nextSocket = new ServerSocket(0, 4, loopback);
+                ServerSocket lastSocket = new ServerSocket(0, 4, loopback)) {
+            MockNode next = MockNode.serve(
+                    nextSocket, request -> Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER));
+            MockNode last = MockNode.serve(
+                    lastSocket, request -> Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER));
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .fromConnectionString("iggy://iggy:iggy@" + host + ":" + gonePort + "," + host + ":"
+                            + nextSocket.getLocalPort() + "," + host + ":" + lastSocket.getLocalPort())
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+
+                assertThat(client.getConnectionInfo()).isEqualTo(new ConnectionInfo(host, nextSocket.getLocalPort()));
+                AsyncIggyTcpClientEventLoopGroupTest.await(
+                        () -> next.dials.get() == 1, "the next address accepts the dial", RECOVERY);
+                assertThat(last.dials).hasValue(0);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+                next.close();
+                last.close();
+            }
+        }
+    }
+
+    @Test
+    void shouldFailToConnectWhenNoConfiguredAddressAnswers() throws Exception {
+        String host = InetAddress.getLoopbackAddress().getHostAddress();
+        AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                .fromConnectionString(
+                        "iggy://iggy:iggy@" + host + ":" + refusedPort() + "," + host + ":" + refusedPort())
+                .build();
+        try {
+            assertThatThrownBy(() -> client.connect().get(5, TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class);
+        } finally {
+            client.close().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * A single node advertises its own view of its address, so the client keeps
+     * the configured address that reached it. The first configured address may
+     * name a node that is gone.
+     */
+    @Test
+    void shouldRedialTheConfiguredAddressThatReachedAOneNodeCluster() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        String host = loopback.getHostAddress();
+        int gonePort = refusedPort();
+        int advertisedPort = refusedPort();
+        try (ServerSocket mappedSocket = new ServerSocket(0, 4, loopback)) {
+            ConnectionInfo mapped = new ConnectionInfo(host, mappedSocket.getLocalPort());
+            MockNode node = MockNode.serve(mappedSocket, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            AsyncIggyTcpClientTransientFailoverTest.singleNodeMetadata(advertisedPort));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+            });
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .fromConnectionString("iggy://" + USERNAME + ":" + FIRST_PASSWORD + "@" + host + ":" + gonePort
+                            + "," + host + ":" + mapped.port())
+                    .requestTimeout(Duration.ofSeconds(2))
+                    .heartbeatInterval(HEARTBEAT)
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                assertThat(client.rosterTargets()).containsExactly(mapped);
+
+                node.dropConnections();
+
+                assertThat(resumeWithin(client, RECOVERY)).isTrue();
+                assertThat(node.dials.get()).isGreaterThanOrEqualTo(2);
+                assertThat(client.getConnectionInfo()).isEqualTo(mapped);
+                assertThat(client.rosterTargets()).containsExactly(mapped);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+                node.close();
+            }
+        }
+    }
+
+    @Test
     void shouldKeepTheLatestLoginAfterReplicaPromotionAndSessionExpiration() throws Exception {
         InetAddress loopback = InetAddress.getLoopbackAddress();
         try (ServerSocket primarySocket = new ServerSocket(0, 4, loopback);
@@ -1490,6 +1582,13 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 .heartbeatInterval(HEARTBEAT)
                 .retryPolicy(ONE_RETRY)
                 .build();
+    }
+
+    /** A loopback port that nothing listens on, so a dial to it is refused. */
+    private static int refusedPort() throws IOException {
+        try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            return socket.getLocalPort();
+        }
     }
 
     /** Retries until one request completes, or the budget runs out. */

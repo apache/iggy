@@ -69,7 +69,7 @@ public final class IggyTcpClientBuilder {
     IggyTcpClientBuilder() {}
 
     /**
-     * Sets the host address for the Iggy server.
+     * Sets the host address for the Iggy server, replacing a list of addresses from a connection string.
      *
      * @param host the host address
      * @return this builder
@@ -80,7 +80,7 @@ public final class IggyTcpClientBuilder {
     }
 
     /**
-     * Sets the port for the Iggy server.
+     * Sets the port for the Iggy server, replacing a list of addresses from a connection string.
      *
      * @param port the port number
      * @return this builder
@@ -228,6 +228,10 @@ public final class IggyTcpClientBuilder {
      * {@code tls=true|false} and {@code tls_ca_file=<path>} as the supported options.
      * Settings that are not in the connection string keep their current values, so a string
      * without {@code tls} leaves an earlier {@link #enableTls()} in place.
+     *
+     * <p>The address may list several nodes of one cluster, separated by commas, as in
+     * {@code iggy://iggy:iggy@node-1:8090,node-2:8090}. {@link IggyTcpClient#connect()} tries each
+     * in order, and a redial tries them before the nodes of the last roster.
      *
      * @param connectionString the connection string, for example {@code iggy://iggy:iggy@localhost:8090?tls=true}
      * @return this builder

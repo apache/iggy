@@ -199,8 +199,7 @@ class AsyncIggyTcpClientLoginRoutingTest {
         @SuppressWarnings("unchecked")
         private TestClient(Duration timeout) throws ReflectiveOperationException {
             super(
-                    "seed",
-                    8090,
+                    List.of(new ConnectionInfo("seed", 8090)),
                     null,
                     null,
                     null,

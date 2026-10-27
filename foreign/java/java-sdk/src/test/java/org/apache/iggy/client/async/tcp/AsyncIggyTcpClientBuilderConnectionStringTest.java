@@ -19,11 +19,14 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import org.apache.iggy.client.ConnectionInfo;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.junit.jupiter.api.Test;
 
 import java.io.File;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class AsyncIggyTcpClientBuilderConnectionStringTest {
 
@@ -52,6 +55,40 @@ class AsyncIggyTcpClientBuilderConnectionStringTest {
 
         assertThat(builder.isTlsEnabled()).isTrue();
         assertThat(builder.tlsCertificateFile()).isEqualTo(new File("/certs/ca.pem"));
+    }
+
+    @Test
+    void shouldConfigureEveryAddressThatTheConnectionStringLists() {
+        AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                .fromConnectionString("iggy://iggy:iggy@10.0.0.1:8090,[::1]:8091,node-3:8092")
+                .build();
+
+        assertThat(client.configuredEndpoints())
+                .containsExactly(
+                        new ConnectionInfo("10.0.0.1", 8090),
+                        new ConnectionInfo("::1", 8091),
+                        new ConnectionInfo("node-3", 8092));
+        assertThat(client.getConnectionInfo()).isEqualTo(new ConnectionInfo("10.0.0.1", 8090));
+    }
+
+    @Test
+    void shouldReplaceTheListedAddressesWithAPortSetLater() {
+        AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                .fromConnectionString("iggy://iggy:iggy@10.0.0.1:8090,node-3:8090")
+                .port(9090)
+                .build();
+
+        assertThat(client.configuredEndpoints()).containsExactly(new ConnectionInfo("10.0.0.1", 9090));
+    }
+
+    @Test
+    void shouldRejectAListedAddressWithPortZero() {
+        AsyncIggyTcpClientBuilder builder =
+                AsyncIggyTcpClient.builder().fromConnectionString("iggy://iggy:iggy@10.0.0.1:8090,node-3:0");
+
+        assertThatThrownBy(builder::build)
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessageContaining("Port must be a positive integer");
     }
 
     @Test

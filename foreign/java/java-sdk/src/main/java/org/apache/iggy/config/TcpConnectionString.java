@@ -19,9 +19,12 @@
 
 package org.apache.iggy.config;
 
+import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 
+import java.util.Arrays;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -32,6 +35,7 @@ import java.util.regex.Pattern;
  *
  * <p>The format is {@code iggy://<username>:<password>@<host>:<port>?<options>}, where
  * {@code iggy+tcp://} is accepted as well and the host may be an IPv6 address in brackets.
+ * The address may list several nodes of one cluster, separated by commas.
  * The supported options are {@code tls=true|false} and {@code tls_ca_file=<path>}, each at most once.
  * {@code tls_ca_file} requires {@code tls=true}.
  * Error messages never include the connection string, because it contains the password.
@@ -55,17 +59,15 @@ public final class TcpConnectionString {
     // malformed scheme can contain the credentials.
     private static final Pattern TRANSPORT_NAME = Pattern.compile("^[A-Za-z]+$");
 
-    private final String host;
-    private final int port;
+    private final List<ConnectionInfo> addresses;
     private final String username;
     private final String password;
     private final Boolean tls;
     private final String tlsCaFile;
 
     private TcpConnectionString(
-            String host, int port, String username, String password, Boolean tls, String tlsCaFile) {
-        this.host = host;
-        this.port = port;
+            List<ConnectionInfo> addresses, String username, String password, Boolean tls, String tlsCaFile) {
+        this.addresses = addresses;
         this.username = username;
         this.password = password;
         this.tls = tls;
@@ -73,21 +75,30 @@ public final class TcpConnectionString {
     }
 
     /**
-     * Returns the server host.
+     * Returns the host of the first server address.
      *
      * @return the server host
      */
     public String host() {
-        return host;
+        return addresses.get(0).host();
     }
 
     /**
-     * Returns the server port.
+     * Returns the port of the first server address.
      *
      * @return the server port
      */
     public int port() {
-        return port;
+        return addresses.get(0).port();
+    }
+
+    /**
+     * Returns every server address, in order.
+     *
+     * @return the server addresses, the first of which {@link #host()} and {@link #port()} return
+     */
+    public List<ConnectionInfo> addresses() {
+        return addresses;
     }
 
     /**
@@ -154,11 +165,12 @@ public final class TcpConnectionString {
         if (addressAndOptions.length > 2) {
             throw invalid("expected at most one '?' before the options");
         }
-        Address address = parseAddress(addressAndOptions[0]);
+        List<ConnectionInfo> addresses = Arrays.stream(addressAndOptions[0].split(",", -1))
+                .map(address -> parseAddress(address.strip()))
+                .toList();
         Options options = addressAndOptions.length == 2 ? parseOptions(addressAndOptions[1]) : Options.NONE;
 
-        return new TcpConnectionString(
-                address.host(), address.port(), credentials[0], credentials[1], options.tls(), options.tlsCaFile());
+        return new TcpConnectionString(addresses, credentials[0], credentials[1], options.tls(), options.tlsCaFile());
     }
 
     private static void parseScheme(String scheme) {
@@ -190,7 +202,7 @@ public final class TcpConnectionString {
         return usernameAndPassword;
     }
 
-    private static Address parseAddress(String serverAddress) {
+    private static ConnectionInfo parseAddress(String serverAddress) {
         Matcher address = ADDRESS.matcher(serverAddress);
         if (!address.matches()) {
             throw invalid("server address must be <host>:<port> or [<ipv6>]:<port>");
@@ -200,7 +212,7 @@ public final class TcpConnectionString {
             throw invalid("port must be at most " + MAX_PORT);
         }
         String host = address.group(1) != null ? address.group(1) : address.group(2);
-        return new Address(host, port);
+        return new ConnectionInfo(host, port);
     }
 
     private static Options parseOptions(String options) {
@@ -247,15 +259,14 @@ public final class TcpConnectionString {
     /** Keeps the password out of logs. */
     @Override
     public String toString() {
-        return "TcpConnectionString[host=" + host + ", port=" + port + ", username=" + username + ", password=***, tls="
-                + tls + ", tlsCaFile=" + tlsCaFile + "]";
+        return "TcpConnectionString[addresses="
+                + addresses.stream().map(ConnectionInfo::serverAddress).toList() + ", username=" + username
+                + ", password=***, tls=" + tls + ", tlsCaFile=" + tlsCaFile + "]";
     }
 
     private static IggyInvalidArgumentException invalid(String reason) {
         return new IggyInvalidArgumentException("Invalid connection string: " + reason);
     }
-
-    private record Address(String host, int port) {}
 
     private record Options(Boolean tls, String tlsCaFile) {
         private static final Options NONE = new Options(null, null);

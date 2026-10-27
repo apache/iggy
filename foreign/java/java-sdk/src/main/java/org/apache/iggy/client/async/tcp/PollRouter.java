@@ -92,7 +92,7 @@ final class PollRouter {
     private final Duration pollTimeout;
     private final Map<TargetKey, Route> routes = new LinkedHashMap<>(16, 0.75f, true);
     private Supplier<ConnectionInfo> coordinatorEndpoint;
-    private ConnectionInfo configuredEndpoint;
+    private List<ConnectionInfo> configuredEndpoints = List.of();
     private int activeDials;
     private long topologyGeneration;
     private final Map<ConnectionInfo, Slot> connections = new HashMap<>();
@@ -121,8 +121,8 @@ final class PollRouter {
         coordinatorEndpoint = endpoint;
     }
 
-    void configuredEndpoint(ConnectionInfo endpoint) {
-        configuredEndpoint = endpoint;
+    void configuredEndpoints(List<ConnectionInfo> endpoints) {
+        configuredEndpoints = List.copyOf(endpoints);
     }
 
     synchronized boolean ownsConnection(AsyncTcpConnection connection) {
@@ -459,21 +459,23 @@ final class PollRouter {
         partitionCounts.clear();
     }
 
-    void observeTopology(ClusterMetadata metadata) {
+    /** Applies the roster that {@code carrier} read. */
+    void observeTopology(ClusterMetadata metadata, AsyncTcpConnection carrier) {
+        ConnectionInfo configured = LeaderAwareness.configuredEndpointOf(configuredEndpoints, carrier.endpoint());
         // Outside the monitor, as in clearSession: a close takes the slot monitor, which a slot holds while it opens
         // its link, and fails the waiters of the dial inline.
-        applyTopology(metadata).forEach(Slot::close);
+        applyTopology(metadata, configured).forEach(Slot::close);
     }
 
     /** Returns the slots whose endpoints left the roster. */
     @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
-    private synchronized List<Slot> applyTopology(ClusterMetadata metadata) {
+    private synchronized List<Slot> applyTopology(ClusterMetadata metadata, ConnectionInfo configured) {
         replicas.clear();
         ConnectionInfo leader = null;
         rosterSize = metadata.nodes().size();
         for (var node : metadata.nodes()) {
             if (node.endpoints().tcp() != 0) {
-                ConnectionInfo endpoint = LeaderAwareness.nodeTarget(metadata, node, configuredEndpoint);
+                ConnectionInfo endpoint = LeaderAwareness.nodeTarget(metadata, node, configured);
                 replicas.put(node.replicaId(), endpoint);
                 if (node.role() == ClusterNodeRole.Leader) {
                     leader = endpoint;
@@ -1064,7 +1066,7 @@ final class PollRouter {
                         new AsyncTcpConnection.TransientFailoverState())
                 .thenAccept(response -> {
                     try {
-                        observeTopology(BytesDeserializer.readClusterMetadata(response));
+                        observeTopology(BytesDeserializer.readClusterMetadata(response), parent);
                     } finally {
                         response.release();
                     }

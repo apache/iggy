@@ -171,14 +171,27 @@ final class LeaderAwareness {
      * The endpoint to dial for a node of this roster. A single node advertises
      * its own view of its address, such as a bind address or a container name,
      * and a port map or a port-forward can make that address unreachable. So a
-     * one-node roster maps to the configured endpoint. A larger roster keeps the
-     * advertised addresses, because partition requests go to specific
-     * primaries.
+     * one-node roster maps to the configured endpoint, see
+     * {@link #configuredEndpointOf}. A larger roster keeps the advertised
+     * addresses, because partition requests go to specific primaries.
      */
     static ConnectionInfo nodeTarget(ClusterMetadata metadata, ClusterNode node, ConnectionInfo configured) {
         return metadata.nodes().size() == 1 && configured != null
                 ? configured
                 : new ConnectionInfo(node.ip(), node.endpoints().tcp());
+    }
+
+    /**
+     * The configured endpoint that {@code dialed} spells, else the first
+     * configured one, or null when none is configured. A one-node roster maps
+     * to it: only the endpoint of the link that read the roster is known to
+     * reach that node.
+     */
+    static ConnectionInfo configuredEndpointOf(List<ConnectionInfo> configured, ConnectionInfo dialed) {
+        return configured.stream()
+                .filter(endpoint -> dialed != null && isSameSpelling(endpoint, dialed))
+                .findFirst()
+                .orElse(configured.isEmpty() ? null : configured.get(0));
     }
 
     /**
