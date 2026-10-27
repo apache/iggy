@@ -504,7 +504,7 @@ name = "iggy-cluster"
 # primary signals liveness through its commit broadcast, and the window must
 # span several broadcasts so one delayed broadcast never trips an election.
 # On Linux it is also the TCP_USER_TIMEOUT of every replica link: sent data
-# that stays unacknowledged this long closes the link.
+# or keepalive probes that stay unacknowledged this long close the link.
 heartbeat_timeout = "5s"
 
 # How often the primary broadcasts its commit point to every backup (duration).

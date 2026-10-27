@@ -42,10 +42,10 @@
 //! per-peer queue depth, close-grace, reconnect period,
 //! handshake-grace).
 //!
-//! Liveness detection is NOT done via TCP keepalive on the bus: SDK
-//! clients manage their own keepalive policy; replica<->replica
-//! liveness is observed by VSR heartbeats. No keepalive knobs live in
-//! this section.
+//! Client sockets get no TCP keepalive: SDK clients manage their own
+//! keepalive policy. Replica sockets get keepalive probes, and on Linux
+//! `cluster.heartbeat_timeout` bounds how long they may go unanswered.
+//! No keepalive knobs live in this section.
 //!
 //! Construction of the runtime type from this struct happens in the
 //! follow-up PR that wires `core/server` to call

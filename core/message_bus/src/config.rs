@@ -33,12 +33,11 @@
 //! [`From<&ServerConfig> for MessageBusConfig`](MessageBusConfig)
 //! folds that section into [`WebSocketConfig`] once at boot.
 //!
-//! Liveness detection is NOT done via TCP keepalive on the bus: SDK
-//! clients manage their own keepalive policy at the application layer,
-//! and replica<->replica liveness is observed by VSR heartbeats rather
-//! than by `SO_KEEPALIVE`. Heartbeats never close a replica socket, so
-//! [`MessageBusConfig::replica_user_timeout`] clears a dead one once a
-//! frame waits on it. An idle dead link stays until the next frame.
+//! SDK clients manage their own keepalive policy at the application
+//! layer, so client sockets get no TCP keepalive. VSR heartbeats never
+//! close a replica socket, so replica sockets get keepalive probes, and
+//! on Linux [`MessageBusConfig::replica_user_timeout`] closes a link
+//! whose peer stays silent that long, idle or not.
 //!
 //! Neither plane is authenticated at the bus layer: identity and
 //! credential checks belong to the caller (`core/server`) via
@@ -195,8 +194,8 @@ pub struct MessageBusConfig {
     pub handshake_grace: Duration,
 
     /// `TCP_USER_TIMEOUT` of every replica link, from
-    /// `cluster.heartbeat_timeout`: sent data that stays unacknowledged
-    /// this long closes the link. Linux only; see
+    /// `cluster.heartbeat_timeout`: sent data or keepalive probes that stay
+    /// unacknowledged this long close the link. Linux only; see
     /// `socket_opts::apply_replica_socket_options`.
     pub replica_user_timeout: Duration,
 

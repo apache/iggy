@@ -58,7 +58,7 @@ use tracing::{debug, info, warn};
 ///
 /// Linux does not propagate `TCP_NODELAY` from the listener to the
 /// accepted fd, so we toggle it here on every installed stream, with the
-/// user timeout that clears a dead link once a frame waits on it (see
+/// keepalive and the user timeout that clear a dead link (see
 /// [`apply_replica_socket_options`]). A miss is logged, not a failure.
 fn spawn_replica_install<Fut>(
     bus: &Rc<IggyMessageBus>,
@@ -412,8 +412,8 @@ pub fn install_replica_conn<C: TransportConn>(
     // an installed (peer, link) is refused here without ever touching the
     // local registry: no orphan post-loop and no need for
     // `RejectedRegistration`-style drain on this path. The live link stays.
-    // A half-open one goes away through its user timeout or the peer's RST
-    // once a frame waits on it. An idle one stays until the next frame.
+    // A half-open one goes away through keepalive, its user timeout or the
+    // peer's RST, which frees the slot for the next redial.
     if !bus.mark_replica_owned(link) {
         warn!(
             replica = peer_id,
