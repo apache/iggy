@@ -21,7 +21,8 @@
 //! [`PrincipalPermissions`], which `auth` fills in. That keeps the protocol layer independent of
 //! the SDK and makes the mapping unit-testable without a server.
 //!
-//! See `docs/ACL_MAPPING.md` for the decisions this implements, including what is not mapped.
+//! See `gateways/kafka/docs/ACL_MAPPING.md` for the decisions this implements, including what
+//! is not mapped.
 
 use bytes::Bytes;
 use kafka_protocol::messages::DescribeAclsResponse;
@@ -95,8 +96,9 @@ pub const ANY_HOST: &str = "*";
 pub struct PrincipalPermissions {
     /// True when the principal holds either of Iggy's server flags. `manage_servers` is not
     /// carried separately: Iggy reads it in exactly one rule, as an alias for this one, so it
-    /// gates no mutation anywhere and renders nothing of its own. `docs/ACL_MAPPING.md` has the
-    /// argument, which is the same one that keeps `manage_users` out of the table.
+    /// gates no mutation anywhere and renders nothing of its own.
+    /// `gateways/kafka/docs/ACL_MAPPING.md` has the argument, which is the same one that keeps
+    /// `manage_users` out of the table.
     pub read_servers: bool,
     pub read_topics: bool,
     pub manage_topics: bool,

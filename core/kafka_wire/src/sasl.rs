@@ -22,7 +22,7 @@
 //! this module extracts is the caller's job, which keeps the state machine unit-testable and
 //! keeps `handle_request_bounded` free of an `async` signature its ~70 call sites would inherit.
 //!
-//! See `docs/AUTHENTICATION.md` for the decisions this implements.
+//! See `gateways/kafka/docs/AUTHENTICATION.md` for the decisions this implements.
 
 use std::fmt::{Display, Formatter};
 
@@ -43,7 +43,7 @@ use crate::api::{API_KEY_API_VERSIONS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_H
 /// `PLAIN` alone, and not by preference: Iggy stores one Argon2 hash per user, while SCRAM
 /// requires the server to hold PBKDF2-derived keys and to send the salt and iteration count to
 /// the client. Neither is derivable from an Argon2 hash, so SCRAM needs credential storage that
-/// does not exist. `docs/AUTHENTICATION.md` has the full argument.
+/// does not exist. `gateways/kafka/docs/AUTHENTICATION.md` has the full argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaslMechanism {
     Plain,

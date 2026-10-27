@@ -1714,8 +1714,9 @@ pub fn validate_describe_cluster_shape(version: i16, body: &Bytes) -> Result<()>
 
 /// `SaslHandshake` carries one non-nullable string, the mechanism name.
 ///
-/// `_version` is unused: the message is never flexible, so v0 and v1 share this shape, and the
-/// state machine refuses v0 before a body is ever validated.
+/// The message is never flexible, so v0 and v1 share this shape, and both are walked: the
+/// connection loop reads the mechanism name out of every handshake body before the SASL state
+/// machine decides, and it is that decision, not this guard, that refuses v0.
 ///
 /// # Errors
 ///

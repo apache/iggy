@@ -17,8 +17,8 @@
 
 //! One Kafka record to and from one Iggy message.
 //!
-//! `docs/BRIDGE_MAPPING.md` is the specification. This module implements it and nothing else:
-//! no Iggy calls, no handler wiring.
+//! `gateways/kafka/docs/BRIDGE_MAPPING.md` is the specification. This module implements it and
+//! nothing else: no Iggy calls, no handler wiring.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;

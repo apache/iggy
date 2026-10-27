@@ -490,6 +490,13 @@ static SASL_ADVERTISED_RANGES: &[ApiVersionRange] = &[
     },
 ];
 
+/// Versions of `DescribeAcls` this gateway answers.
+///
+/// Public so the connection loop can enforce it. The key is deliberately absent from this module's
+/// `SUPPORTED_RANGES` firewall table, which is what makes this the only bound there is, and the
+/// advertised range below is derived from it so the two cannot drift apart.
+pub const SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS: std::ops::RangeInclusive<i16> = 1..=3;
+
 /// Advertised only on a listener that names a principal, and absent from [`SUPPORTED_RANGES`]
 /// for the same reason the SASL keys are: it answers about the authenticated principal, which
 /// only the connection knows. On a plaintext listener with SASL off there is none, so there is
@@ -498,8 +505,8 @@ static SASL_ADVERTISED_RANGES: &[ApiVersionRange] = &[
 /// there without the SASL keys.
 static ACL_ADVERTISED_RANGES: &[ApiVersionRange] = &[ApiVersionRange {
     api_key: API_KEY_DESCRIBE_ACLS,
-    min_version: 1,
-    max_version: 3,
+    min_version: *SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS.start(),
+    max_version: *SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS.end(),
 }];
 
 /// Sent with every `SASL_AUTHENTICATION_FAILED`, whatever the real cause.
@@ -547,12 +554,6 @@ pub fn describe_acls_outcome(
         "DescribeAcls",
     )
 }
-
-/// Versions of `DescribeAcls` this gateway answers, and the range `ApiVersions` advertises.
-///
-/// Public so the connection loop can enforce it. The key is deliberately absent from this module's
-/// `SUPPORTED_RANGES` firewall table, which is what makes this the only bound there is.
-pub const SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS: std::ops::RangeInclusive<i16> = 1..=3;
 
 /// `DescribeAcls` answer carrying only an error code.
 ///

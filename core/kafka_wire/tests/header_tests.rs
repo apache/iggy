@@ -18,8 +18,8 @@
 //! `request_header_version` / `response_header_version` are thin wrappers around
 //! `kafka_protocol::messages::ApiKey` (see `src/header.rs`); decoding/encoding the
 //! header bytes themselves is `kafka_protocol::messages::RequestHeader`/`ResponseHeader`'s own
-//! tested responsibility, not re-tested here. These tests cover the gateway-specific policy
-//! layered on top: the unknown-API-key fallback and the `ApiVersions` response-header special case.
+//! tested responsibility, not re-tested here. These tests cover the policy this crate layers
+//! on top: the unknown-API-key fallback and the `ApiVersions` response-header special case.
 
 use kafka_protocol::messages::ApiKey;
 
@@ -31,7 +31,7 @@ use iggy_kafka_wire::header::{request_header_version, response_header_version};
 
 /// Flexible-encoding threshold per API key, hand-transcribed from the Kafka protocol spec and
 /// cross-checked against the independent `kafka-protocol` crate below rather than trusted on its
-/// own. There is no table in `protocol/header.rs` to mirror - that module is two
+/// own. There is no table in `src/header.rs` to mirror - that module is two
 /// `ApiKey::try_from(...).map_or(...)` wrappers, not a lookup table (see its own module doc).
 ///
 /// Keys 4-7 (LeaderAndIsr/StopReplica/UpdateMetadata/ControlledShutdown) are inter-broker-only
