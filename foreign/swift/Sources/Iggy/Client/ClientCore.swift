@@ -117,7 +117,8 @@ actor ClientCore {
         self.configuration = configuration
         self.connector = connector
         self.logger = logger
-        currentAddress = configuration.address
+        // A malformed list stays as configured, and the first connect reports it.
+        currentAddress = (try? configuration.serverAddresses().first) ?? configuration.address
         let session = ConsensusSession()
         self.session = session
         pollRouter = PollRouter(fence: session.clientID)
@@ -866,7 +867,7 @@ actor ClientCore {
                 state = .connecting
             }
 
-            var candidates = dialCandidates()
+            var candidates = try dialCandidates()
             let pacedEndpoint = currentAddress
             if candidates.count > 1, reestablishWait() != nil {
                 // The paced endpoint goes last; the others owe no cooldown.
@@ -1095,10 +1096,11 @@ actor ClientCore {
     }
 
     /// Endpoints to dial for one connect, likeliest first: where the client
-    /// currently is, the configured address, then the roster it learned.
-    private func dialCandidates() -> [String] {
+    /// currently is, the configured addresses in order, then the roster it
+    /// learned.
+    private func dialCandidates() throws -> [String] {
         var candidates = [currentAddress]
-        for endpoint in [configuration.address] + rosterEndpoints where !candidates.contains(where: { isSameSpelling($0, endpoint) }) {
+        for endpoint in try configuration.serverAddresses() + rosterEndpoints where !candidates.contains(where: { isSameSpelling($0, endpoint) }) {
             candidates.append(endpoint)
         }
         return candidates

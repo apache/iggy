@@ -92,8 +92,13 @@ configuration.reconnection = ReconnectionOptions(maxRetries: 5, interval: .secon
 let client = IggyClient(configuration: configuration)
 ```
 
+The address can list several nodes of one cluster, separated by commas, as in
+`node-1:8090,node-2:8090`: a new client tries each in order, then the nodes of the last
+roster that it read.
+
 The server certificate is verified against the system roots, or against `caFile` when
-set, and against the host of the address unless `TLSOptions.domain` names another one.
+set, and against the host of the address it dials unless `TLSOptions.domain` names
+another one.
 
 ### Resource options
 

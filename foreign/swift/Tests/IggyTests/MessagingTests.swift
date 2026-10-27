@@ -34,23 +34,6 @@ private func connectedClient(
     return client
 }
 
-/// A dialer that records every endpoint before it dials it. The fake server
-/// counts a connection only some time after the client's connect returned,
-/// so a check for a wrong dial reads this record instead.
-private struct RecordingConnector: IggyConnector {
-    let dialed = Locked<[Endpoint]>([])
-
-    func connect(to endpoint: Endpoint, tls: TLSOptions?, timeout: Duration, noDelay: Bool) async throws -> any IggyConnection {
-        dialed.withLock { $0.append(endpoint) }
-        return try await NIOConnector().connect(to: endpoint, tls: tls, timeout: timeout, noDelay: noDelay)
-    }
-
-    func hasDialed(_ server: FakeVSRServer) throws -> Bool {
-        let endpoint = try Endpoint(parsing: server.address)
-        return dialed.withLock { $0.contains(endpoint) }
-    }
-}
-
 /// A dialer that gets no answer from `unanswering`, as from a host that
 /// drops the SYN without a reset: the dial fails once its timeout passes.
 /// Every other endpoint is dialed for real.
@@ -90,11 +73,6 @@ private struct SlowConnector: IggyConnector {
 private func requests(_ server: FakeVSRServer, _ code: CommandCode) async -> [FakeVSRServer.Request] {
     await server.requests.filter { $0.code == code.rawValue }
 }
-
-/// An address where nothing listens, so a dial is refused at once. Port 1
-/// is privileged and below the ephemeral range, so no fake server can take
-/// it, unlike the port of a stopped server, which another one can bind.
-private let unreachableAddress = "127.0.0.1:1"
 
 /// The partition a send names: `[metadata_len:4][stream:6][topic:6][kind:1][length:1][partition:4]`
 /// with numeric ids.

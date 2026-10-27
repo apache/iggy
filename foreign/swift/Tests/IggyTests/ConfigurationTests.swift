@@ -93,6 +93,19 @@ struct ClientConfigurationTests {
         #expect(TLSOptions(domain: "10.0.0.5").serverName(for: try Endpoint(parsing: "iggy.example:8090")) == nil)
     }
 
+    @Test func splitsAListOfAddressesAndTrimsEachOne() throws {
+        let listed = ClientConfiguration(address: " 10.0.0.1:8090 , [::1]:8090,node-3:8090 ")
+        #expect(try listed.serverAddresses() == ["10.0.0.1:8090", "[::1]:8090", "node-3:8090"])
+        #expect(try ClientConfiguration(address: "localhost:8090").serverAddresses() == ["localhost:8090"])
+    }
+
+    @Test(arguments: ["10.0.0.1:8090,", "10.0.0.1:8090,,node-3:8090", ",10.0.0.1:8090", "10.0.0.1:8090,node-3"])
+    func rejectsAListWithAnEmptyOrMalformedAddress(_ address: String) {
+        #expect(throws: IggyError(.invalidServerAddress)) {
+            try ClientConfiguration(address: address).serverAddresses()
+        }
+    }
+
     @Test func missingCertificateAuthorityFileIsReported() {
         let options = TLSOptions(caFile: "/nonexistent/iggy-ca.pem")
         #expect(throws: IggyError(.invalidTlsCertificatePath)) { try options.makeContext() }

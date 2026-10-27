@@ -71,7 +71,8 @@ public final class IggyClient: Sendable {
         self.init(configuration: configuration, connector: NIOConnector(), logger: logger)
     }
 
-    /// Creates a client for `address` (`host:port`).
+    /// Creates a client for `address`: `host:port`, or a comma-separated list
+    /// of the nodes of one cluster.
     public convenience init(address: String, autoLogin: Credentials? = nil, tls: TLSOptions? = nil) {
         self.init(configuration: ClientConfiguration(address: address, tls: tls, autoLogin: autoLogin))
     }

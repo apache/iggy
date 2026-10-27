@@ -48,6 +48,28 @@ final class Locked<Value>: @unchecked Sendable {
     }
 }
 
+/// An address where nothing listens, so a dial is refused at once. Port 1
+/// is privileged and below the ephemeral range, so no fake server can take
+/// it, unlike the port of a stopped server, which another one can bind.
+let unreachableAddress = "127.0.0.1:1"
+
+/// A dialer that records every endpoint before it dials it. The fake server
+/// counts a connection only some time after the client's connect returned,
+/// so a check for a wrong dial reads this record instead.
+struct RecordingConnector: IggyConnector {
+    let dialed = Locked<[Endpoint]>([])
+
+    func connect(to endpoint: Endpoint, tls: TLSOptions?, timeout: Duration, noDelay: Bool) async throws -> any IggyConnection {
+        dialed.withLock { $0.append(endpoint) }
+        return try await NIOConnector().connect(to: endpoint, tls: tls, timeout: timeout, noDelay: noDelay)
+    }
+
+    func hasDialed(_ server: FakeVSRServer) throws -> Bool {
+        let endpoint = try Endpoint(parsing: server.address)
+        return dialed.withLock { $0.contains(endpoint) }
+    }
+}
+
 /// Polls `condition` until it holds or `timeout` passes.
 func eventually(timeout: Duration = .seconds(5), _ condition: @Sendable () async -> Bool) async -> Bool {
     let deadline = ContinuousClock.now + timeout

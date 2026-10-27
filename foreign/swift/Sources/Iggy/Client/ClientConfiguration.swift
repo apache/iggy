@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import Foundation
+
 /// Credentials a client signs in with.
 public enum Credentials: Sendable, Hashable {
     case usernamePassword(username: String, password: String)
@@ -61,7 +63,10 @@ public struct ReconnectionOptions: Sendable, Hashable {
 /// configuration.tls = TLSOptions(caFile: "core/certs/iggy_ca_cert.pem", domain: "localhost")
 /// ```
 public struct ClientConfiguration: Sendable, Hashable {
-    /// `host:port` of the server, or of any node of a cluster.
+    /// `host:port` of the server, or of any node of a cluster. To reach a
+    /// cluster while one of its nodes is down, list several nodes, separated
+    /// by commas: a new client tries each in order, then the nodes of the
+    /// last roster that it read.
     public var address: String
     /// TLS settings; nil for plain TCP.
     public var tls: TLSOptions?
@@ -100,6 +105,16 @@ public struct ClientConfiguration: Sendable, Hashable {
         self.noDelay = noDelay
         self.connectTimeout = connectTimeout
         self.requestTimeout = requestTimeout
+    }
+
+    /// Each address of ``address``, in order. One empty or malformed address
+    /// fails the whole list, even when an address before it would connect.
+    func serverAddresses() throws -> [String] {
+        let addresses = address.split(separator: ",", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
+        guard addresses.allSatisfy({ (try? Endpoint(parsing: $0)) != nil }) else {
+            throw IggyError(.invalidServerAddress, context: address)
+        }
+        return addresses
     }
 }
 

@@ -32,14 +32,14 @@ private let sessionEnds = FakeVSRServer.sessionEndingEvictions.map { FakeVSRServ
 /// a metadata nor a partition operation.
 private let replicatedWrites: [CommandCode] = [.deleteStream, .sendMessages, .storeConsumerOffset, .deleteSegments]
 
-/// A client on the fake server with fast reconnection. The request timeout is
-/// generous unless the test is about running into it, so a slow machine does
-/// not cut a reconnect short.
+/// A client on the fake server with fast reconnection, at `address` when set.
+/// The request timeout is generous unless the test is about running into it,
+/// so a slow machine does not cut a reconnect short.
 private func makeClient(
-    _ server: FakeVSRServer, autoLogin: Credentials? = rootLogin, reconnection: Bool = true, maxRetries: UInt32? = nil,
+    _ server: FakeVSRServer, address: String? = nil, autoLogin: Credentials? = rootLogin, reconnection: Bool = true, maxRetries: UInt32? = nil,
     requestTimeout: Duration = .seconds(10), heartbeat: Duration = .seconds(60), connector: any IggyConnector = NIOConnector()
 ) -> IggyClient {
-    var configuration = ClientConfiguration(address: server.address, autoLogin: autoLogin)
+    var configuration = ClientConfiguration(address: address ?? server.address, autoLogin: autoLogin)
     configuration.reconnection = ReconnectionOptions(enabled: reconnection, maxRetries: maxRetries, interval: .milliseconds(20), reestablishAfter: .zero)
     configuration.requestTimeout = requestTimeout
     configuration.connectTimeout = .seconds(2)
@@ -57,6 +57,17 @@ private struct GatedConnector: IggyConnector {
             try await Task.sleep(for: .milliseconds(2))
         }
         return try await NIOConnector().connect(to: endpoint, tls: tls, timeout: timeout, noDelay: noDelay)
+    }
+}
+
+/// A dialer that refuses every dial and records the TLS server name each
+/// one would present.
+private struct RefusingConnector: IggyConnector {
+    let serverNames = Locked<[String?]>([])
+
+    func connect(to endpoint: Endpoint, tls: TLSOptions?, timeout: Duration, noDelay: Bool) async throws -> any IggyConnection {
+        serverNames.withLock { $0.append(tls?.serverName(for: endpoint)) }
+        throw IggyError(.cannotEstablishConnection, context: "\(endpoint) refused the dial")
     }
 }
 
@@ -1953,6 +1964,67 @@ struct ClientTransportTests {
         defer { Task { await revived.stop() } }
         try await client.connect()
         #expect(await client.state == .authenticated)
+        await client.shutdown()
+    }
+
+    @Test func aNewClientConnectsThroughTheNextListedAddressWhenTheFirstIsDown() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let connector = RecordingConnector()
+        let client = makeClient(server, address: "\(unreachableAddress),\(server.address)", connector: connector)
+        try await client.connect()
+        #expect(await client.state == .authenticated)
+        #expect(await client.serverAddress == server.address)
+        let listed = try [unreachableAddress, server.address].map(Endpoint.init(parsing:))
+        #expect(Array(connector.dialed.withLock { $0 }.prefix(2)) == listed)
+        await client.shutdown()
+    }
+
+    /// A node alone in its roster advertises its own view of its address,
+    /// such as a bind address, which may not reach it. A reconnect dials the
+    /// listed address that reached it, not the first listed one.
+    @Test func aReconnectDialsTheListedAddressThatReachedASingleNode() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let advertised = "127.0.0.1:2"
+        await server.respond { request in
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
+            if request.code == CommandCode.getClusterMetadata.rawValue { return .ok(FakeVSRServer.rosterBody([advertised])) }
+            return .ok([])
+        }
+        let connector = RecordingConnector()
+        let client = makeClient(server, address: "\(unreachableAddress),\(server.address)", connector: connector)
+        try await client.connect()
+        await server.closeAllConnections()
+        try await Task.sleep(for: .milliseconds(20))
+        try await client.ping()
+        #expect(await server.connectionCount == 2)
+        #expect(await client.serverAddress == server.address)
+        let dialed = try [unreachableAddress, server.address, server.address].map(Endpoint.init(parsing:))
+        #expect(connector.dialed.withLock { $0 } == dialed)
+        await client.shutdown()
+    }
+
+    /// A typo in a later address is not hidden by an earlier one that is up.
+    @Test func aMalformedListedAddressFailsTheConnectBeforeAnyDial() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let connector = RecordingConnector()
+        let client = makeClient(server, address: "\(server.address),", connector: connector)
+        await expectCode(.invalidServerAddress) { try await client.connect() }
+        #expect(await client.state == .disconnected)
+        #expect(connector.dialed.withLock { $0 }.isEmpty)
+        await client.shutdown()
+    }
+
+    /// Without a configured domain, each dial presents the host it dials.
+    @Test func eachListedAddressPresentsItsOwnTLSServerName() async {
+        let connector = RefusingConnector()
+        var configuration = ClientConfiguration(address: "node-1.example:8090,node-2.example:8090", tls: TLSOptions())
+        configuration.reconnection = ReconnectionOptions(maxRetries: 0)
+        let client = IggyClient(configuration: configuration, connector: connector, logger: testLogger)
+        await expectCode(.cannotEstablishConnection) { try await client.connect() }
+        #expect(connector.serverNames.withLock { $0 } == ["node-1.example", "node-2.example"])
         await client.shutdown()
     }
 
