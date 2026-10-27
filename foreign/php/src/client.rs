@@ -91,7 +91,8 @@ pub struct IggyClient {
 
 #[php_impl]
 impl IggyClient {
-    /// Constructs a new IggyClient from a TCP server address.
+    /// Constructs a new IggyClient from a TCP server address, or from a comma-separated list of
+    /// the nodes of one cluster, tried in order.
     #[php(constructor)]
     pub fn __construct(conn: Option<String>, pending_operations: Option<&Zval>) -> PhpResult<Self> {
         let pending_operations = pending_operations

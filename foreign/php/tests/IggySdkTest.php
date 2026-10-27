@@ -130,6 +130,16 @@ final class IggySdkTest extends TestCase
         }
     }
 
+    #[TestDox('A TCP client takes the addresses of several nodes of one cluster')]
+    public function testTcpClientTakesAListOfAddresses(): void
+    {
+        assert_instance_of(IggyClient::class, new IggyClient('127.0.0.1:8090,127.0.0.1:8091'));
+        assert_instance_of(
+            IggyClient::class,
+            IggyClient::fromConnectionString('iggy://iggy:iggy@127.0.0.1:8090,127.0.0.1:8091'),
+        );
+    }
+
     #[TestDox('A stream can be created and fetched by name')]
     public function testCreateAndGetStream(): void
     {

@@ -208,6 +208,10 @@ TLS connection strings use the Rust SDK connection-string format, for example:
 iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=/path/to/ca.pem
 ```
 
+A TCP address, in the constructor or a connection string, can list several nodes of one
+cluster, separated by commas, as in `iggy://iggy:iggy@node-1:8090,node-2:8090`. A new
+client tries each in order, then the nodes of the last roster that it read.
+
 ## Resource Options
 
 Streams and topics carry options. A read returns two arrays of option name to value: `options` holds what the creating or updating client set, `derived_options` what the server filled in. Integers above `PHP_INT_MAX`, such as the never-expire and unlimited value 18446744073709551615, are decimal strings, and the 64-bit topic arguments take an int or a decimal string.

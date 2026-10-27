@@ -78,7 +78,8 @@ namespace Iggy {
      */
     class Client {
         /**
-         * Constructs a new IggyClient from a TCP server address.
+         * Constructs a new IggyClient from a TCP server address, or from a comma-separated list of
+         * the nodes of one cluster, tried in order.
          *
          * @param string|null $conn
          * @param mixed $pending_operations
