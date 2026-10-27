@@ -2164,3 +2164,129 @@ class TestConsumerGroup:
         shutdown_event.set()
 
         await consumer.consume_messages(take, shutdown_event)
+
+
+class TestConsumerShutdown:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "timeout_options",
+        [
+            {},
+            {"offset_drain_timeout": None},
+            {"offset_drain_timeout": timedelta(seconds=2)},
+            {"offset_drain_timeout": timedelta(0)},
+        ],
+        ids=["omitted", "none", "custom", "zero"],
+    )
+    async def test_shutdown_drains_offsets_and_releases_partition(
+        self, iggy_client: IggyClient, unique_name, timeout_options
+    ):
+        stream, topic, group = unique_name(), unique_name(), unique_name()
+        first = replacement = replacement_client = consume_task = None
+        stop = asyncio.Event()
+        try:
+            async with asyncio.timeout(15):
+                await iggy_client.create_stream(stream)
+                await iggy_client.create_topic(stream, topic)
+                await iggy_client.send_messages(
+                    stream, topic, 0, [Message(str(i)) for i in range(3)]
+                )
+                first = await iggy_client.consumer_group(
+                    group,
+                    stream,
+                    topic,
+                    polling_strategy=PollingStrategy.First(),
+                    batch_length=1,
+                    auto_commit=AutoCommit.Interval(timedelta(hours=1)),
+                    poll_interval=timedelta(milliseconds=10),
+                    **timeout_options,
+                )
+                await wait_for_consumer_group_assignment(
+                    iggy_client, stream, topic, group, members_count=1
+                )
+                received = []
+
+                async def take(message: ReceiveMessage) -> None:
+                    received.append(message)
+                    if len(received) == 3:
+                        stop.set()
+
+                consume_task = asyncio.ensure_future(first.consume_messages(take, stop))
+                await asyncio.shield(consume_task)
+                assert [message.payload().decode() for message in received] == [
+                    "0",
+                    "1",
+                    "2",
+                ]
+                partition = received[-1].partition_id()
+                final_offset = received[-1].offset()
+                assert final_offset > 0
+                assert first.get_last_consumed_offset(partition) == final_offset
+                stored = first.get_last_stored_offset(partition)
+                assert stored is None or stored < final_offset
+
+                await asyncio.gather(*(first.shutdown() for _ in range(3)))
+                assert first.get_last_stored_offset(partition) == final_offset
+                details = await iggy_client.get_consumer_group(stream, topic, group)
+                assert details is not None
+                assert details.members_count == 0
+                assert details.members == []
+                await first.shutdown()
+                with pytest.raises(StopAsyncIteration):
+                    await first.iter_messages().__anext__()
+
+                await iggy_client.send_messages(stream, topic, 0, [Message("3")])
+
+                # A separate connection cannot reuse the first member's membership.
+                host, port = get_server_config()
+                replacement_client = IggyClient(f"{host}:{port}")
+                await replacement_client.connect()
+                await replacement_client.login_user("iggy", "iggy")
+                replacement = await replacement_client.consumer_group(
+                    group,
+                    stream,
+                    topic,
+                    polling_strategy=PollingStrategy.Next(),
+                    batch_length=1,
+                    auto_commit=AutoCommit.Disabled(),
+                    poll_interval=timedelta(milliseconds=10),
+                )
+                await wait_for_consumer_group_assignment(
+                    iggy_client, stream, topic, group, members_count=1
+                )
+                message = await replacement.iter_messages().__anext__()
+                assert message.partition_id() == partition
+                assert message.offset() == final_offset + 1
+                assert message.payload().decode() == "3"
+        finally:
+            stop.set()
+            try:
+                if consume_task is not None:
+                    await asyncio.wait_for(asyncio.shield(consume_task), timeout=5)
+            finally:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *(
+                                consumer.shutdown()
+                                for consumer in (replacement, first)
+                                if consumer is not None
+                            )
+                        ),
+                        timeout=5,
+                    )
+                finally:
+                    if replacement_client is not None:
+                        await asyncio.wait_for(replacement_client.shutdown(), timeout=5)
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_negative_offset_drain_timeout(self):
+        client = IggyClient("127.0.0.1:8090")
+        with pytest.raises(ValueError, match="duration must not be negative"):
+            await client.consumer_group(
+                "group",
+                "stream",
+                "topic",
+                offset_drain_timeout=timedelta(microseconds=-1),
+            )
