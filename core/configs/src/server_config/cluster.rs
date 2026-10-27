@@ -72,6 +72,12 @@ const MAX_VIEW_PROBE_ATTEMPTS: u32 = 100;
 /// static-asserts it equal to `shard::REPAIR_CHUNK_MAX`.
 pub const DEFAULT_REPAIR_CHUNK_MAX: usize = 128;
 
+/// Maximum number of replicas supported by the VSR implementation.
+///
+/// Duplicated here so `core/configs` does not depend on `core/consensus`;
+/// `core/server` pins the values together at compile time.
+pub const MAX_CLUSTER_REPLICAS: usize = 32;
+
 /// `size_of::<StateChunkHeader>()`. Duplicated here for the same reason as
 /// [`DEFAULT_REPAIR_CHUNK_MAX`]; `core/server`'s bootstrap static-asserts it
 /// against the real header. Used to reject a `[message_bus] max_message_size`
@@ -1063,6 +1069,14 @@ impl Validatable<ConfigurationError> for ClusterConfig {
         if self.nodes.is_empty() {
             eprintln!(
                 "Invalid cluster configuration: cluster.nodes must contain at least one entry when cluster is enabled"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        if self.nodes.len() > MAX_CLUSTER_REPLICAS {
+            eprintln!(
+                "Invalid cluster configuration: cluster.nodes contains {} replicas, but the VSR implementation supports at most {MAX_CLUSTER_REPLICAS}",
+                self.nodes.len()
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -2211,6 +2225,18 @@ mod cluster_validate_tests {
     fn validate_accepts_unique_contiguous_replica_ids() {
         let c = cfg(vec![node("n1", 0), node("n2", 1), node("n3", 2)]);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_the_vsr_replica_limit() {
+        let nodes = (0..32).map(|id| node(&format!("n{id}"), id)).collect();
+        assert!(cfg(nodes).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_rosters_above_the_vsr_replica_limit() {
+        let nodes = (0..33).map(|id| node(&format!("n{id}"), id)).collect();
+        assert!(cfg(nodes).validate().is_err());
     }
 
     #[test]

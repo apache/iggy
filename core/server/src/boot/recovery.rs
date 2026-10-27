@@ -477,6 +477,7 @@ const _: () = assert!(
 );
 const _: () =
     assert!(configs::cluster::DEFAULT_VIEW_PROBE_ATTEMPTS_MAX == consensus::PROBE_ATTEMPTS_MAX);
+const _: () = assert!(configs::cluster::MAX_CLUSTER_REPLICAS == consensus::REPLICAS_MAX);
 const _: () =
     assert!(configs::partition::DEFAULT_EVICTED_RING_CAPACITY == partitions::EVICTED_RING_CAPACITY);
 const _: () = assert!(
