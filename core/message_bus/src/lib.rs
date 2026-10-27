@@ -824,6 +824,9 @@ pub struct IggyMessageBus {
     /// before a registry insert; released by
     /// `Self::notify_connection_lost`. See [`ReplicaOwnerTable`].
     owner_table: Arc<ReplicaOwnerTable>,
+    /// The link of this shard's range. Neither the layout nor the shard id
+    /// changes, so `send_to_replica` reads it instead of dividing per frame.
+    own_link: u16,
     /// Identity + auth parameters for delegated replica handshakes,
     /// installed once at bootstrap via
     /// [`Self::set_replica_handshake_ctx`]. Read by the
@@ -952,6 +955,7 @@ impl IggyMessageBus {
             config.max_batch,
         );
         let (shutdown, token) = Shutdown::new();
+        let own_link = owner_table.layout().range_of(shard_id);
         Self {
             shard_id,
             shutdown,
@@ -966,6 +970,7 @@ impl IggyMessageBus {
             client_connection_lost_fn: RefCell::new(None),
             client_meta: RefCell::new(ahash::AHashMap::new()),
             owner_table,
+            own_link,
             replica_handshake_ctx: OnceCell::new(),
             replica_handshake_slots: RefCell::new(ahash::AHashMap::new()),
             replica_slot_seq: Cell::new(0),
@@ -1790,18 +1795,19 @@ impl MessageBus for IggyMessageBus {
         if !self.owner_table.is_up(replica) {
             return Err(SendError::ReplicaNotConnected(replica));
         }
-        let own_link = self.link_layout().range_of(self.shard_id);
-        let link = if routes_to_metadata(&message) {
+        // Shards of range 0 send every frame over the metadata link, so
+        // only the other shards decode the command.
+        let link = if self.own_link != METADATA_LINK && routes_to_metadata(&message) {
             METADATA_LINK
         } else {
-            own_link
+            self.own_link
         };
         // Fast path: this shard owns the link. A shard owns at most one link
         // per peer, the link of its own range, so the registry entry of the
         // peer is that link. On no-slot the registry returns the message
         // unchanged so the slow path can forward it via the inter-shard
         // channel without a wasted clone.
-        let message = if link == own_link {
+        let message = if link == self.own_link {
             match self.replicas.try_send_or_return(replica, message.into()) {
                 Ok(send_result) => {
                     let result = send_result.map_err(map_try_send_err);
