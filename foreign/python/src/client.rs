@@ -464,8 +464,14 @@ impl IggyClient {
     /// On HTTP, a lost reply raises `RuntimeError` with code 57, and the token may
     /// exist. HTTP has no `resolve_operation`.
     ///
-    /// A replayed create that already committed raises `RuntimeError` with code
-    /// 51 (`PersonalAccessTokenAlreadyExists`). A name clash raises the same code.
+    /// On TCP, QUIC, and WebSocket, a replayed create that already committed, or
+    /// a name clash, raises `RuntimeError` with code 51
+    /// (`PersonalAccessTokenAlreadyExists`). On HTTP, the same case raises
+    /// `RuntimeError` with code 300.
+    ///
+    /// Cancelling the await can leave the token created, and its secret is lost.
+    /// No error is raised. A later metadata call on the same client raises
+    /// `PendingOperationError` with kind `lane_blocked`.
     ///
     /// If the token was created, its secret cannot be recovered. Delete the token
     /// by name over HTTP, then create it again to get a usable secret.
@@ -480,8 +486,8 @@ impl IggyClient {
     /// Raises:
     ///     ValueError: If the expiry is invalid.
     ///     RuntimeError: If the server refuses the request, for example because
-    ///         the expiry is too far in the future. An invalid name is refused
-    ///         before anything is sent.
+    ///         the expiry is too far in the future. On TCP, QUIC, and WebSocket,
+    ///         an invalid name is refused before anything is sent.
     ///     PendingOperationError: If the reply is lost on TCP, QUIC, or WebSocket.
     ///         See above.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[str]", imports=("collections.abc")))]
