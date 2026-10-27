@@ -18,11 +18,10 @@
 use std::str::FromStr;
 
 use iggy::prelude::{IdKind, Identifier};
-use pyo3::{
-    exceptions::{PyRuntimeError, PyValueError},
-    prelude::*,
-};
+use pyo3::{exceptions::PyValueError, prelude::*};
 use pyo3_stub_gen::impl_stub_type;
+
+use crate::client::to_runtime_error;
 
 #[derive(Clone, FromPyObject, IntoPyObject)]
 pub enum PyIdentifier {
@@ -64,11 +63,11 @@ impl TryFrom<&Identifier> for PyIdentifier {
             IdKind::String => val
                 .get_string_value()
                 .map(PyIdentifier::String)
-                .map_err(|e| PyErr::new::<PyRuntimeError, _>(e.to_string())),
+                .map_err(to_runtime_error),
             IdKind::Numeric => val
                 .get_u32_value()
                 .map(PyIdentifier::Int)
-                .map_err(|e| PyErr::new::<PyRuntimeError, _>(e.to_string())),
+                .map_err(to_runtime_error),
         }
     }
 }

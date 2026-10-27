@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 use tokio::spawn;
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::time::{sleep_until, timeout_at};
 use tracing::log::warn;
 use tracing::{debug, error, info};
 
@@ -180,7 +180,6 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///     .consumer("consumer_name", "stream_name", "topic_name", 1)?
 ///     .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
 ///     .polling_strategy(PollingStrategy::next())
-///     .poll_interval(IggyDuration::ONE_SECOND)
 ///     .batch_length(1000)
 ///     .build();
 /// consumer.init().await?;
@@ -649,7 +648,6 @@ impl IggyClient {
     ///     .consumer("consumer_name", "stream_name", "topic_name", 1)? // returns IggyConsumerBuilder from IggyClient
     ///     .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
     ///     .polling_strategy(PollingStrategy::next())
-    ///     .poll_interval(IggyDuration::ONE_SECOND)
     ///     .batch_length(1000)
     ///     .build(); // returns IggyConsumer from IggyConsumerBuilder
     /// # let _ = consumer;
@@ -679,7 +677,6 @@ impl IggyClient {
             Identifier::named(topic)?,
             Some(partition),
             self.encryptor.clone(),
-            None,
         ))
     }
 
@@ -721,7 +718,6 @@ impl IggyClient {
     ///     .consumer_group("group_name", "stream_name", "topic_name")? // returns IggyConsumerBuilder from IggyClient
     ///     .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
     ///     .polling_strategy(PollingStrategy::next())
-    ///     .poll_interval(IggyDuration::ONE_SECOND)
     ///     .batch_length(1000)
     ///     .build(); // returns IggyConsumer from IggyConsumerBuilder
     /// # let _ = consumer;
@@ -750,7 +746,6 @@ impl IggyClient {
             Identifier::named(topic)?,
             None,
             self.encryptor.clone(),
-            None,
         ))
     }
 
@@ -919,6 +914,74 @@ impl IggyClient {
         })
     }
 
+    /// Sends a raw request to the replica `replica_id` and returns its raw
+    /// reply body.
+    ///
+    /// [`send_binary_request`](IggyClient::send_binary_request) lets the client
+    /// pick the replica, the metadata primary for any command it does not
+    /// route by partition. This function sends to the replica the caller names,
+    /// for example to read the stats each node keeps for itself. Replica ids
+    /// are the ones [`get_cluster_metadata`](crate::prelude::ClusterClient::get_cluster_metadata)
+    /// returns. The request carries the session's metadata watermark, so the
+    /// replica answers once it applied the metadata the session saw. The reply
+    /// is that replica's own, a refusal such as [`IggyError::NotPrimary`]
+    /// included: nothing is retried on another replica. A replica that is
+    /// reconnecting is waited for within the operation deadline.
+    ///
+    /// # Examples
+    ///
+    /// Read the stats of replica 1.
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    /// use iggy_binary_protocol::codes::GET_STATS_CODE;
+    /// use bytes::Bytes;
+    ///
+    /// # async fn run() -> Result<(), IggyError> {
+    /// let client = IggyClient::from_connection_string(
+    ///     "iggy+tcp://user:secret@localhost:8090",
+    /// )?;
+    /// client.connect().await?;
+    ///
+    /// let stats = client
+    ///     .send_binary_request_to_replica(GET_STATS_CODE, Bytes::new(), 1)
+    ///     .await?;
+    /// # let _ = stats;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    /// [`IggyError::InvalidCommand`] before anything is sent if `code` is a
+    /// session-control code, a replicated command, a poll, a readiness wait, a
+    /// deferred-request cancel, or a consumer-offset read. Writes and partition reads reach their primary through the typed
+    /// API and [`send_binary_request`](IggyClient::send_binary_request).
+    /// [`IggyError::InvalidIdentifier`] if the roster does not name
+    /// `replica_id`, or names it without an endpoint for this transport.
+    /// [`IggyError::TransientNotAccepted`] if the replica stays unreachable
+    /// until the deadline. [`IggyError::TransientNotCommitted`] if a link was
+    /// lost after the request was written and no later attempt got a reply,
+    /// because the replica may have run it. [`IggyError::FeatureUnavailable`]
+    /// on the HTTP transport, which has no binary path.
+    pub async fn send_binary_request_to_replica(
+        &self,
+        code: u32,
+        payload: Bytes,
+        replica_id: u8,
+    ) -> Result<Bytes, IggyError> {
+        if SESSION_CONTROL_CODES.contains(&code) {
+            return Err(IggyError::InvalidCommand);
+        }
+        super::with_client!(self, client => match &*client {
+            ClientWrapper::Tcp(client) => client.send_raw_to_replica(code, payload, replica_id).await,
+            ClientWrapper::Quic(client) => client.send_raw_to_replica(code, payload, replica_id).await,
+            ClientWrapper::WebSocket(client) => {
+                client.send_raw_to_replica(code, payload, replica_id).await
+            }
+            ClientWrapper::Http(_) | ClientWrapper::Iggy(_) => Err(IggyError::FeatureUnavailable),
+        })
+    }
+
     /// Invokes a HTTP endpoint and returns the raw response body.
     ///
     /// This is the HTTP counterpart to
@@ -999,6 +1062,7 @@ impl IggyClient {
             loop {
                 debug!("Sending the heartbeat...");
                 let keepalive = client.read().await.keepalive().await;
+                let next_tick = tokio::time::Instant::now() + heartbeat_interval.get_duration();
                 match keepalive {
                     Err(error) => {
                         error!("There was an error when sending a heartbeat. {error}");
@@ -1010,15 +1074,25 @@ impl IggyClient {
                     Ok(true) => {
                         debug!("Heartbeat was sent successfully.");
                         // Picks up a widened assignment without waiting for an ownership-fence rejection.
-                        client
-                            .read()
-                            .await
-                            .refresh_consumer_group_assignments()
-                            .await;
+                        // All groups share the time until the next tick, so syncs that the
+                        // coordinator leaves unanswered never delay the keepalive, which
+                        // restarts the stopped links.
+                        let refresh = async {
+                            client
+                                .read()
+                                .await
+                                .refresh_consumer_group_assignments()
+                                .await;
+                        };
+                        if timeout_at(next_tick, refresh).await.is_err() {
+                            warn!(
+                                "The consumer group assignments were not refreshed before the next heartbeat."
+                            );
+                        }
                     }
                     Ok(false) => {}
                 }
-                sleep(heartbeat_interval.get_duration()).await
+                sleep_until(next_tick).await
             }
         }));
     }
@@ -1093,13 +1167,21 @@ impl Client for IggyClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::links::OPERATION_TIMEOUT;
-    use crate::links::fake_cluster::{Answer, FakeCluster, connected, endpoint};
+    use crate::links::fake_cluster::{
+        Answer, FakeCluster, connected, connected_with, endpoint, eventually,
+    };
     use crate::links::test_support::LOCALHOST;
-    use iggy_binary_protocol::codes::{CREATE_STREAM_CODE, GET_STATS_CODE};
-    use iggy_common::{StreamClient, TcpClientConfig};
+    use crate::links::{OPERATION_TIMEOUT, ReconnectPolicy};
+    use iggy_binary_protocol::codes::{
+        CREATE_STREAM_CODE, GET_STATS_CODE, SYNC_CONSUMER_GROUP_CODE,
+    };
+    use iggy_common::{
+        StreamClient, StreamCreateOptions, TcpClientConfig, TcpClientReconnectionConfig,
+    };
+    use std::iter::repeat_n;
     use std::time::Duration;
     use tokio::net::TcpListener;
+    use tokio::time::sleep;
 
     #[tokio::test(start_paused = true)]
     async fn given_nested_client_locks_when_reading_should_share_one_deadline() {
@@ -1140,7 +1222,8 @@ mod tests {
         let client_lock = client.client.clone();
         let guard = client_lock.write().await;
         let start = tokio::time::Instant::now();
-        let (result, ()) = tokio::join!(client.create_stream("stream"), async {
+        let options = StreamCreateOptions::default();
+        let (result, ()) = tokio::join!(client.create_stream("stream", &options), async {
             sleep(Duration::from_secs(20)).await;
             drop(guard);
         });
@@ -1423,6 +1506,54 @@ mod tests {
             !runs_after_disconnect && runs_after_connect,
             "heartbeat after disconnect() {runs_after_disconnect}, \
              after connect() {runs_after_connect}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_coordinator_that_never_answers_syncs_when_the_heartbeat_refreshes_three_groups_should_restart_links_every_tick()
+     {
+        const GROUPS: u32 = 3;
+        const TICKS: u32 = 4;
+        let cluster = FakeCluster::new(2);
+        let stopped = endpoint(1);
+        cluster.down.lock().unwrap().insert(stopped.clone());
+        cluster.script(
+            &endpoint(0),
+            SYNC_CONSUMER_GROUP_CODE,
+            repeat_n(Answer::Silence, (GROUPS * TICKS) as usize),
+        );
+        let no_retry = TcpClientReconnectionConfig {
+            max_retries: Some(0),
+            ..TcpClientReconnectionConfig::default()
+        };
+        let links = connected_with(&cluster, 1, ReconnectPolicy::from(&no_retry)).await;
+        eventually("the link to replica 1 gives up", || {
+            !cluster.dials_to(&stopped).is_empty()
+        })
+        .await;
+        let first_dials = cluster.dials_to(&stopped).len();
+        let tcp = TcpClient::from_links(links);
+        let stream = Identifier::numeric(1).unwrap();
+        let topic = Identifier::numeric(1).unwrap();
+        for group in 1..=GROUPS {
+            let group = Identifier::numeric(group).unwrap();
+            tcp.consumer_group_state().register_group(
+                group.to_string(),
+                stream.clone(),
+                topic.clone(),
+                group,
+            );
+        }
+        let client = IggyClient::new(ClientWrapper::Tcp(tcp));
+        let interval = TcpClientConfig::default().heartbeat_interval.get_duration();
+
+        client.start_heartbeat().await;
+        sleep(interval * TICKS).await;
+
+        let restarts = cluster.dials_to(&stopped).len() - first_dials;
+        assert!(
+            restarts >= TICKS as usize,
+            "{restarts} link restarts in {TICKS} heartbeat ticks"
         );
     }
 

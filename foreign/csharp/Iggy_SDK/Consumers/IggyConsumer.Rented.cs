@@ -30,7 +30,7 @@ public partial class IggyConsumer
     ///     Receives messages asynchronously as an async stream of rented messages. Each yielded
     ///     <see cref="ReceivedRentedMessage" /> shares its underlying pooled buffer with the other messages from the
     ///     same poll and MUST be disposed by the caller when processing is complete. The buffer is returned to the
-    ///     pool once every message of its batch has been disposed.
+    ///     pool once every message of its batch has been disposed. The stream ends once the consumer is disposed.
     /// </summary>
     /// <param name="ct">Cancellation token to stop receiving messages.</param>
     /// <returns>An async enumerable of rented messages.</returns>
@@ -38,6 +38,10 @@ public partial class IggyConsumer
     public async IAsyncEnumerable<ReceivedRentedMessage> ReceiveRentedAsync(
         [EnumeratorCancellation] CancellationToken ct = default)
     {
+        if (IsDisposed)
+        {
+            yield break;
+        }
         if (!_isInitialized)
         {
             throw new ConsumerNotInitializedException();
@@ -47,17 +51,22 @@ public partial class IggyConsumer
         {
             if (!_rentedChannel.Reader.TryRead(out var message))
             {
-                await PollRentedMessagesAsync(ct);
+                await PollRentedMessagesCoreAsync(ct);
                 continue;
             }
 
+            if (!BeginDelivery(message.CurrentOffset, message.PartitionId, message.Context))
+            {
+                message.Dispose();
+                yield break;
+            }
             yield return message;
 
             if (_config.AutoCommitMode == AutoCommitMode.AfterReceive)
             {
-                await StoreOffsetAsync(message.CurrentOffset, message.PartitionId, message.Context, ct);
+                await CommitDeliveredAsync(message.CurrentOffset, message.PartitionId, message.Context, ct);
             }
-        } while (!ct.IsCancellationRequested);
+        } while (!ct.IsCancellationRequested && !IsDisposed);
     }
 
     /// <summary>
@@ -101,8 +110,24 @@ public partial class IggyConsumer
     ///     Handles offset tracking and auto-commit logic. Rental lifetime is managed via
     ///     <see cref="RentedBatchHandle" /> shared by every produced message.
     /// </summary>
+    /// <exception cref="ObjectDisposedException">The consumer is disposed.</exception>
     protected async Task PollRentedMessagesAsync(CancellationToken ct)
     {
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
+        await PollRentedMessagesCoreAsync(ct);
+    }
+
+    /// <summary>
+    ///     The poll of the built-in receive loops. Once the consumer is disposed it returns without polling, and the
+    ///     loop ends instead of failing.
+    /// </summary>
+    private protected async Task PollRentedMessagesCoreAsync(CancellationToken ct)
+    {
+        if (IsDisposed)
+        {
+            return;
+        }
+
         if (!_joinedConsumerGroup || !IsGroupMembershipCurrent())
         {
             LogConsumerGroupNotJoinedYetSkippingPolling();
@@ -212,9 +237,7 @@ public partial class IggyConsumer
         catch (Exception ex) when (ex is not (MalformedResponseException
             or VsrRequestOutcomeUnknownException { OperationId: not null } or VsrLaneBlockedException))
         {
-            ForgetRefusedPollingStrategy(ex, polledPartition);
-            LogFailedToPollMessages(ex);
-            _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(ex, "Failed to poll messages"));
+            await ReportPollFailureAsync(ex, polledPartition, ct);
         }
         finally
         {

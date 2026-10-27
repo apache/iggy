@@ -19,6 +19,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Hashing;
 using System.Runtime.ExceptionServices;
+using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Contracts.Tcp;
@@ -110,62 +111,168 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     /// <inheritdoc />
     ulong ISessionGenerationProvider.SessionGeneration => _consensusSession.Generation;
 
-    private async Task<AuthResponse?> LoginRegisterAsync(int code, byte[] message, CancellationToken token)
+    private ulong BeginExplicitSignIn()
     {
-        CancelSessionRecovery();
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
-        deadline.CancelAfter(VsrRequestTimeoutMs);
-        await _connectGate.WaitAsync(deadline.Token);
-        try
+        lock (_pollRoutingGate)
         {
-            return await LoginRegisterCoreAsync(code, message, deadline.Token);
-        }
-        finally
-        {
-            _connectGate.Release();
+            var owner = _consensusSession.BeginCallerSession();
+            _signInWithdrawn = true;
+            _rememberedLogin = null;
+            _rememberedUserId = null;
+            _sessionRecoveryCancellation?.Cancel();
+            return owner;
         }
     }
 
-    private async Task<AuthResponse?> LoginRegisterCoreAsync(int code, byte[] message, CancellationToken token)
+    private void EnsureSignInOwner(ulong owner)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_consensusSession.Ended(owner) is { } ended)
+        {
+            throw ended;
+        }
+    }
+
+    private async Task<AuthResponse?> LoginRegisterAsync(AutoLoginSettings credentials, bool personalAccessToken,
+        CancellationToken token)
+    {
+        var owner = BeginExplicitSignIn();
+        var acquired = false;
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token, _clientLifetime.Token);
+        deadline.CancelAfter(VsrRequestTimeoutMs);
+        try
+        {
+            var message = SerializeSignIn(credentials, personalAccessToken);
+            if (!personalAccessToken && State == ConnectionState.Disconnected)
+            {
+                throw new NotConnectedException();
+            }
+            await _connectGate.WaitAsync(deadline.Token);
+            acquired = true;
+            EnsureSignInOwner(owner);
+            var code = personalAccessToken ? CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE : CommandCodes.LOGIN_REGISTER_CODE;
+            return await LoginRegisterCoreAsync(code, message, credentials, deadline.Token, owner, continues: true,
+                explicitSignIn: true);
+        }
+        catch (Exception error)
+        {
+            await ResetConsensusSessionAsync(error, owner: owner, interrupt: true);
+            if (deadline.IsCancellationRequested && !token.IsCancellationRequested
+                && !_clientLifetime.IsCancellationRequested
+                && error is VsrRequestOutcomeUnknownException or OperationCanceledException)
+            {
+                throw VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED,
+                    "No primary accepted the sign-in before its deadline.");
+            }
+            throw;
+        }
+        finally
+        {
+            if (acquired)
+            {
+                _connectGate.Release();
+            }
+        }
+    }
+
+    private async Task<AuthResponse?> LoginRegisterCoreAsync(int code, byte[] message, AutoLoginSettings credentials,
+        CancellationToken token, ulong owner, bool continues, bool explicitSignIn = false)
+    {
+        EnsureSignInOwner(owner);
         if (_consensusSession.IsBound)
         {
-            await LogoutCoreAsync(token);
+            await LogoutCoreAsync(token, owner);
+        }
+        else if (explicitSignIn && _consensusSession.RegisterPending)
+        {
+            await ResetConsensusSessionAsync(owner: owner, continues: true, interrupt: true);
         }
         if (ReadyReplicaLinks().Length == 0)
         {
-            await TryEstablishConnectionAsync(false, token);
+            await TryEstablishConnectionAsync(false, token, owner);
         }
+        EnsureSignInOwner(owner);
         SetConnectionState(ConnectionState.Authenticating);
+        var bound = false;
         try
         {
-            using var responseBuffer = await SendWithResponseAsync(code, message, token: token);
+            using var responseBuffer = await SendWithResponseAsync(code, message, token: token, startedUnder: owner);
             var response = LoginRegister.Deserialize(responseBuffer.Memory.Span);
-            _consensusSession.Bind(response.Session, LoginRegister.ReadBindSecret(message));
-            SetConnectionState(ConnectionState.Authenticated);
+            lock (_pollRoutingGate)
+            {
+                EnsureSignInOwner(owner);
+                _consensusSession.Bind(response.Session, LoginRegister.ReadBindSecret(message), continues);
+                owner = _consensusSession.Generation;
+                bound = true;
+                SetConnectionState(ConnectionState.Authenticated);
+            }
             try
             {
                 var metadata = await ReadClusterMetadataOnReadyLinkAsync(token);
-                if (metadata is not null)
+                lock (_pollRoutingGate)
                 {
-                    RememberRoster(metadata);
+                    EnsureSignInOwner(owner);
+                    if (metadata is not null)
+                    {
+                        RememberRoster(metadata);
+                    }
                 }
             }
             catch (IggyInvalidStatusCodeException error) when (error.StatusCode == VsrError.FEATURE_UNAVAILABLE)
             {
             }
-            StartHeartbeat();
+            lock (_pollRoutingGate)
+            {
+                EnsureSignInOwner(owner);
+                // A committed password update can replace the snapshot used by this automatic attempt.
+                if (explicitSignIn || _rememberedLogin is null || ReferenceEquals(_rememberedLogin, credentials))
+                {
+                    _rememberedLogin = credentials;
+                }
+                _rememberedUserId = response.UserId;
+                _signInWithdrawn = false;
+                StartHeartbeat();
+            }
             return new AuthResponse(response.UserId, null);
         }
-        catch
+        catch (Exception error) when (!explicitSignIn)
         {
-            await ResetConsensusSessionAsync();
-            SetConnectionState(ConnectionState.Connected);
+            var refused = !bound && IsSignInRefusal(error);
+            var updated = false;
+            lock (_pollRoutingGate)
+            {
+                if (_consensusSession.Ended(owner) is null)
+                {
+                    updated = refused && _rememberedLogin is { } latest && !ReferenceEquals(credentials, latest);
+                    if (refused && !updated)
+                    {
+                        _signInWithdrawn = true;
+                        _rememberedLogin = null;
+                        _rememberedUserId = null;
+                    }
+                }
+            }
+            var canceled = token.IsCancellationRequested;
+            // A session that the recovery bound outlives a failed roster read, so its next attempt resumes it.
+            if (continues && bound && !canceled && !IsSessionFailure(error))
+            {
+                await DropConnectionAsync();
+                SetConnectionState(ConnectionState.Disconnected);
+                throw;
+            }
+            // After a register that was not sent or admitted, lost its link or has an unknown outcome, the recovery
+            // signs in again under a new client id. A register that did commit leaves an idle session, which lease
+            // expiry retires.
+            var retryable = continues && !bound && (IsTransientFailure(error)
+                || error is VsrRequestOutcomeUnknownException or OperationCanceledException);
+            await ResetConsensusSessionAsync(canceled ? null : error,
+                stops: continues && !canceled && !refused && !retryable, owner: owner,
+                continues: updated || retryable);
             throw;
         }
     }
 
-    private async Task<bool> ResumeSessionAsync(CancellationToken token)
+    private async Task<bool> ResumeSessionAsync(CancellationToken token, ulong owner)
     {
         await _sendingSemaphore.WaitAsync(token);
         try
@@ -174,24 +281,18 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             {
                 return false;
             }
-            var identity = new byte[ConsumerSessionSize];
-            BinaryPrimitives.WriteUInt128LittleEndian(identity, _consensusSession.ClientId);
-            BinaryPrimitives.WriteUInt64LittleEndian(identity.AsSpan(ConsumerSessionEpochOffset), session);
-            lock (_pollRoutingGate)
-            {
-                BinaryPrimitives.WriteUInt64LittleEndian(identity.AsSpan(ConsumerSessionWatermarkOffset), _metadataWatermark);
-            }
-            var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
-            var attempt = await connection.SendAttemptAsync(CommandCodes.BIND_SESSION_CODE,
-                LoginRegister.SerializeBindSession(identity, _consensusSession.BindSecret), deadline, deadline,
-                false, token, retryTransient: false);
+            var attempt = await BindSessionAsync(connection, _consensusSession.ClientId, session, token);
             if (attempt.Error is IggyInvalidStatusCodeException
                 {
                     FromServer: true,
                     StatusCode: VsrError.UNAUTHENTICATED or VsrError.STALE_CLIENT
                 })
             {
-                ResetConsensusSession();
+                lock (_pollRoutingGate)
+                {
+                    EnsureSignInOwner(owner);
+                    ResetConsensusSession(continues: true);
+                }
                 return false;
             }
             if (attempt.Error is { } error)
@@ -204,13 +305,37 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             {
                 throw VsrError.Exception(VsrError.SESSION_MISMATCH, "Bind reply changed the logical session.");
             }
-            SetConnectionState(ConnectionState.Authenticated);
+            lock (_pollRoutingGate)
+            {
+                EnsureSignInOwner(owner);
+                SetConnectionState(ConnectionState.Authenticated);
+            }
             return true;
         }
         finally
         {
             _sendingSemaphore.Release();
         }
+    }
+
+    /// <summary>
+    ///     Sends one BindSession for the session on <paramref name="connection" />, stamped with the metadata
+    ///     watermark. The caller decides what a refusal or another session in the reply means.
+    /// </summary>
+    private ValueTask<VsrAttempt> BindSessionAsync(VsrConnection connection, UInt128 clientId, ulong session,
+        CancellationToken token)
+    {
+        var identity = new byte[ConsumerSessionSize];
+        BinaryPrimitives.WriteUInt128LittleEndian(identity, clientId);
+        BinaryPrimitives.WriteUInt64LittleEndian(identity.AsSpan(ConsumerSessionEpochOffset), session);
+        lock (_pollRoutingGate)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(identity.AsSpan(ConsumerSessionWatermarkOffset), _metadataWatermark);
+        }
+        var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
+        return connection.SendAttemptAsync(CommandCodes.BIND_SESSION_CODE,
+            LoginRegister.SerializeBindSession(identity, _consensusSession.BindSecret), deadline, deadline,
+            true, token, retryTransient: false);
     }
 
     /// <summary>
@@ -226,16 +351,33 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
         Partitioning partitioning, IList<Message> messages, CancellationToken token)
     {
         var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
+        var generation = _consensusSession.Generation;
         using var selection = CancellationTokenSource.CreateLinkedTokenSource(token);
         selection.CancelAfter(VsrRequestTimeoutMs);
         try
         {
             for (var attempt = 0; ; attempt++)
             {
-                var resolved = await ResolvePartitioningAsync(streamId, topicId, partitioning, selection.Token);
+                // The send takes the session it starts under, so a sign-in or sign-out by the caller while the
+                // partition resolves ends the call, whatever the resolution came to.
+                Partitioning resolved;
                 try
                 {
-                    return await SendMessagesCoreAsync(streamId, topicId, resolved, AsSpan(messages), token, deadline);
+                    resolved = await ResolvePartitioningAsync(streamId, topicId, partitioning, selection.Token);
+                }
+                catch (Exception) when (!token.IsCancellationRequested
+                    && _consensusSession.Ended(generation) is { } endedWhileResolving)
+                {
+                    throw endedWhileResolving;
+                }
+                if (_consensusSession.Ended(generation) is { } ended)
+                {
+                    throw ended;
+                }
+                try
+                {
+                    return await SendMessagesCoreAsync(streamId, topicId, resolved, AsSpan(messages), token, deadline,
+                        generation);
                 }
                 catch (IggyInvalidStatusCodeException error) when (attempt == 0 && error.FromServer
                     && error.StatusCode == VsrError.PARTITION_NOT_FOUND)
@@ -311,16 +453,17 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     /// </summary>
     private async Task<PolledMessagesRental> PollGroupMessagesRentedAsync(Identifier streamId, Identifier topicId,
         Consumer consumer, Func<uint, PollingStrategy> pollingStrategyFor, uint count, bool autoCommit,
-        CancellationToken token)
+        CancellationToken token, ulong generation)
     {
         var key = new GroupKey(streamId, topicId, consumer.ConsumerId);
         if (!_groupState.HasAssignment(key))
         {
-            await SyncGroupAssignmentAsync(streamId, topicId, consumer.ConsumerId, token);
+            await SyncGroupAssignmentAsync(streamId, topicId, consumer.ConsumerId, token, startedUnder: generation);
         }
 
         for (var attempt = 0; attempt < VsrGroupPollMaxAttempts; attempt++)
         {
+            EnsureSignInOwner(generation);
             if (_groupState.NextGroupPartition(key) is not { } partitionId)
             {
                 if (!_groupState.IsRegistered(key))
@@ -338,7 +481,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             try
             {
                 rental = await PollPartitionMessagesRentedAsync(streamId, topicId, partitionId, consumer,
-                    pollingStrategy, count, autoCommit, token);
+                    pollingStrategy, count, autoCommit, token, generation);
             }
             catch (IggyInvalidStatusCodeException e) when (e is
             {
@@ -352,7 +495,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                 if (pollingStrategy.Context is not null)
                 {
                     _groupState.InvalidateAssignment(key);
-                    await SyncGroupAssignmentAsync(streamId, topicId, consumer.ConsumerId, token);
+                    await SyncGroupAssignmentAsync(streamId, topicId, consumer.ConsumerId, token, startedUnder: generation);
                     throw;
                 }
             }
@@ -368,7 +511,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             }
 
             _groupState.InvalidateAssignment(key);
-            await SyncGroupAssignmentAsync(streamId, topicId, consumer.ConsumerId, token);
+            await SyncGroupAssignmentAsync(streamId, topicId, consumer.ConsumerId, token, startedUnder: generation);
         }
 
         // Running out of attempts mid-rebalance is not a failure: report it like a member that owns nothing
@@ -382,39 +525,51 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     ///     one holding zero partitions.
     /// </summary>
     private async Task SyncGroupAssignmentAsync(Identifier streamId, Identifier topicId, Identifier groupId,
-        CancellationToken token)
+        CancellationToken token, long? deadline = null, ulong? startedUnder = null)
     {
+        var generation = startedUnder ?? _consensusSession.Generation;
         var message = TcpContracts.GetGroup(streamId, topicId, groupId);
         using IMemoryOwner<byte> responseBuffer =
-            await SendWithResponseAsync(CommandCodes.SYNC_CONSUMER_GROUP_CODE, message, token: token);
+            await SendWithResponseAsync(CommandCodes.SYNC_CONSUMER_GROUP_CODE, message, token: token,
+                deadline: deadline, startedUnder: generation);
 
-        var key = new GroupKey(streamId, topicId, groupId);
-        if (responseBuffer.Memory.Length == 0)
+        lock (_pollRoutingGate)
         {
-            // Deregistering is the only thing that observes a server-side removal (group deleted, member
-            // evicted); without it membership latches true and every later poll returns empty.
-            _groupState.DeregisterGroup(key);
+            EnsureSignInOwner(generation);
+            var key = new GroupKey(streamId, topicId, groupId);
+            if (responseBuffer.Memory.Length == 0)
+            {
+                // Deregistering is the only thing that observes a server-side removal (group deleted, member
+                // evicted); without it membership latches true and every later poll returns empty.
+                _groupState.DeregisterGroup(key);
 
-            return;
+                return;
+            }
+
+            var assignment = SyncConsumerGroupAssignment.Decode(responseBuffer.Memory.Span);
+            _groupState.RegisterGroup(key, streamId, topicId, groupId);
+            _groupState.SetAssignment(key, assignment.Generation, assignment.Partitions);
         }
-
-        var assignment = SyncConsumerGroupAssignment.Decode(responseBuffer.Memory.Span);
-        _groupState.RegisterGroup(key, streamId, topicId, groupId);
-        _groupState.SetAssignment(key, assignment.Generation, assignment.Partitions);
     }
 
     /// <summary>
     ///     Re-syncs every joined group so a widened assignment (a partition-count change, say) is picked up
-    ///     without first hitting an ownership fence. One failing group is logged and skipped so it cannot stall
-    ///     the rest.
+    ///     without first hitting an ownership fence. Failed syncs are logged; all groups share the refresh
+    ///     budget. A sync that outlasts <paramref name="deadline" /> fails as not accepted rather than canceled,
+    ///     so it is logged like any other failure, and the groups after it wait for the next refresh. Only
+    ///     <paramref name="token" /> cancels the refresh.
     /// </summary>
-    private async Task RefreshGroupAssignmentsAsync(CancellationToken token)
+    private async Task RefreshGroupAssignmentsAsync(CancellationToken token, long? deadline = null)
     {
         foreach (var group in _groupState.RegisteredGroups())
         {
+            if (Environment.TickCount64 >= deadline)
+            {
+                return;
+            }
             try
             {
-                await SyncGroupAssignmentAsync(group.StreamId, group.TopicId, group.GroupId, token);
+                await SyncGroupAssignmentAsync(group.StreamId, group.TopicId, group.GroupId, token, deadline);
             }
             catch (Exception e) when (e is not OperationCanceledException)
             {
@@ -499,16 +654,40 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     ///     Drops the consensus session and the group state scoped to it. Consumer-group assignments are fenced by
     ///     a generation the coordinator tracks per session, so carrying them into a new session would fence every
     ///     poll until the first re-sync. The balanced cursors and the partition counts survive: neither is bound
-    ///     to a session, and dropping them costs a metadata round trip per topic on the next produce.
+    ///     to a session, and dropping them costs a metadata round trip per topic on the next produce. When the client
+    ///     signs in again by itself, <paramref name="continues" /> keeps the calls in flight for the next session.
+    ///     When the client <paramref name="stops" /> without signing in again, they end as not connected. Otherwise
+    ///     they end as unauthenticated, with <paramref name="cause" /> as the cause.
     /// </summary>
-    private void ResetConsensusSession()
+    private void ResetConsensusSession(ConnectionState? state = null, bool continues = false, Exception? cause = null,
+        bool stops = false)
     {
         StopHeartbeat();
         lock (_pollRoutingGate)
         {
-            _consensusSession.Reset();
+            // A call that fails on the reset must already see the new state. The replica links report their state
+            // under this lock while the session is bound, so none of them can restore Authenticated in between.
+            if (state is { } next)
+            {
+                SetConnectionState(next);
+            }
+            if (stops)
+            {
+                _consensusSession.Stop();
+            }
+            else
+            {
+                _consensusSession.Reset(continues, cause);
+            }
         }
-        _mutations.Reset();
+        if (continues)
+        {
+            _mutations.DropRetained();
+        }
+        else
+        {
+            _mutations.Reset();
+        }
         StopReplicaLinks();
         _connection?.Dispose();
         _connection = null;
@@ -521,19 +700,35 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     ///     Resets the session on behalf of a caller that does not hold the sending lock, so no request can be
     ///     encoding against the identity while it is re-armed.
     /// </summary>
-    private async ValueTask ResetConsensusSessionAsync()
+    private async ValueTask ResetConsensusSessionAsync(Exception? cause = null, bool stops = false,
+        ulong? owner = null, bool continues = false, bool interrupt = false)
     {
-        // Taking a disposed semaphore would replace the failure the caller is about to rethrow with an
-        // ObjectDisposedException, and a disposed client has nothing left to fence. Dispose can still land
-        // between the check and the wait, so the wait itself has to tolerate it.
-        if (_disposed || !await TryEnterSendingSemaphoreAsync())
+        lock (_pollRoutingGate)
+        {
+            if (_disposed || owner is { } generation && _consensusSession.Ended(generation) is not null)
+            {
+                return;
+            }
+            if (interrupt)
+            {
+                // A failed caller attempt must also release an older registration holding the sending gate.
+                StopReplicaLinks();
+                _connection?.Dispose();
+            }
+        }
+        if (!await TryEnterSendingSemaphoreAsync())
         {
             return;
         }
-
         try
         {
-            ResetConsensusSession();
+            lock (_pollRoutingGate)
+            {
+                if (!_disposed && (owner is null || _consensusSession.Ended(owner.Value) is null))
+                {
+                    ResetConsensusSession(stops ? ConnectionState.Disconnected : ConnectionState.Connected, continues, cause, stops);
+                }
+            }
         }
         finally
         {

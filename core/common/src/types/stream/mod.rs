@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{IggyByteSize, IggyTimestamp, ResourceOptions, Topic};
+use crate::{
+    HeaderKey, IggyByteSize, IggyTimestamp, OptionKey, ResourceOptions, StreamEncryptionSource,
+    Topic,
+};
 use serde::{Deserialize, Serialize};
 
 /// `Stream` represents the highest level of logical separation of data.
@@ -40,7 +43,8 @@ pub struct Stream {
     pub messages_count: u64,
     /// The total number of topics in the stream.
     pub topics_count: u32,
-    /// Creation options, all client-explicit (streams have no derived keys).
+    /// Options by provenance, plus the read-only encryption key source and
+    /// fingerprints as derived entries.
     #[serde(default, with = "crate::resource_options_json")]
     pub options: ResourceOptions,
 }
@@ -70,7 +74,70 @@ pub struct StreamDetails {
     pub topics_count: u32,
     /// The collection of topics in the stream.
     pub topics: Vec<Topic>,
-    /// Creation options, all client-explicit (streams have no derived keys).
+    /// Options by provenance, plus the read-only encryption key source and
+    /// fingerprints as derived entries.
     #[serde(default, with = "crate::resource_options_json")]
     pub options: ResourceOptions,
+}
+
+impl Stream {
+    /// Who chose the stream's at-rest key, `None` when the server reported no
+    /// source.
+    #[must_use]
+    pub fn encryption_key_source(&self) -> Option<StreamEncryptionSource> {
+        encryption_key_source(&self.options)
+    }
+
+    /// Fingerprint of the stream's key, absent for a plaintext stream.
+    #[must_use]
+    pub fn encryption_key_fingerprint(&self) -> Option<String> {
+        text_option(&self.options, OptionKey::EncryptionKeyFingerprint)
+    }
+
+    /// Fingerprints of the server keys that wrap the stream's key: one
+    /// outside a key rotation, empty for a plaintext stream.
+    #[must_use]
+    pub fn encryption_kek_fingerprints(&self) -> Vec<String> {
+        kek_fingerprints(&self.options)
+    }
+}
+
+impl StreamDetails {
+    /// Who chose the stream's at-rest key, `None` when the server reported no
+    /// source.
+    #[must_use]
+    pub fn encryption_key_source(&self) -> Option<StreamEncryptionSource> {
+        encryption_key_source(&self.options)
+    }
+
+    /// Fingerprint of the stream's key, absent for a plaintext stream.
+    #[must_use]
+    pub fn encryption_key_fingerprint(&self) -> Option<String> {
+        text_option(&self.options, OptionKey::EncryptionKeyFingerprint)
+    }
+
+    /// Fingerprints of the server keys that wrap the stream's key: one
+    /// outside a key rotation, empty for a plaintext stream.
+    #[must_use]
+    pub fn encryption_kek_fingerprints(&self) -> Vec<String> {
+        kek_fingerprints(&self.options)
+    }
+}
+
+fn encryption_key_source(options: &ResourceOptions) -> Option<StreamEncryptionSource> {
+    options
+        .get(&HeaderKey::from(OptionKey::EncryptionKeySource))
+        .and_then(|option| option.value.as_str().ok()?.parse().ok())
+}
+
+fn text_option(options: &ResourceOptions, key: OptionKey) -> Option<String> {
+    options
+        .get(&HeaderKey::from(key))
+        .and_then(|option| option.value.as_str().ok().map(str::to_owned))
+}
+
+fn kek_fingerprints(options: &ResourceOptions) -> Vec<String> {
+    text_option(options, OptionKey::EncryptionKekFingerprint).map_or_else(Vec::new, |text| {
+        text.split(',').map(str::to_owned).collect()
+    })
 }

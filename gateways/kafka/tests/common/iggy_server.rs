@@ -361,6 +361,13 @@ impl TestServer {
         port_guard
     }
 
+    /// Kills the server with SIGKILL, skipping its shutdown path the way a crash would. The data
+    /// dir stays, for a new server to start on.
+    pub fn crash(mut self) {
+        self.child.kill().expect("SIGKILL iggy-server");
+        let _ = self.child.wait();
+    }
+
     /// Polls with a bare TCP connect, not a full `IggyBridge::connect`: the latter carries
     /// `RECONNECTION_RETRIES` (3 retries after the first attempt, 4 dials at ~1s apart total) on
     /// every failed attempt, so a poll loop built

@@ -74,12 +74,18 @@ pub async fn run(
 
     // For topic tests, create parent stream first
     if resource_type == ResourceType::Topic {
-        root_client.create_stream(TEST_STREAM_NAME).await.unwrap();
+        root_client
+            .create_stream(TEST_STREAM_NAME, &StreamCreateOptions::default())
+            .await
+            .unwrap();
     }
 
     // For partition and consumer group tests, create parent stream and topic first
     if resource_type == ResourceType::Partition || resource_type == ResourceType::ConsumerGroup {
-        root_client.create_stream(TEST_STREAM_NAME).await.unwrap();
+        root_client
+            .create_stream(TEST_STREAM_NAME, &StreamCreateOptions::default())
+            .await
+            .unwrap();
         let stream_id = Identifier::named(TEST_STREAM_NAME).unwrap();
         root_client
             .create_topic(
@@ -152,7 +158,13 @@ async fn execute_users_hot(
             }
             let username = format!("race-user-{}", client_id);
             client
-                .create_user(&username, USER_PASSWORD, UserStatus::Active, None)
+                .create_user(
+                    &username,
+                    USER_PASSWORD,
+                    UserStatus::Active,
+                    None,
+                    &UserCreateOptions::default(),
+                )
                 .await
                 .map(|_| ())
         }));
@@ -183,7 +195,13 @@ async fn execute_users_cold(
                 b.wait().await;
             }
             client
-                .create_user(DUPLICATE_USER, USER_PASSWORD, UserStatus::Active, None)
+                .create_user(
+                    DUPLICATE_USER,
+                    USER_PASSWORD,
+                    UserStatus::Active,
+                    None,
+                    &UserCreateOptions::default(),
+                )
                 .await
                 .map(|_| ())
         }));
@@ -213,7 +231,10 @@ async fn execute_streams_hot(
                 b.wait().await;
             }
             let stream_name = format!("race-stream-{}", client_id);
-            client.create_stream(&stream_name).await.map(|_| ())
+            client
+                .create_stream(&stream_name, &StreamCreateOptions::default())
+                .await
+                .map(|_| ())
         }));
     }
 
@@ -241,7 +262,10 @@ async fn execute_streams_cold(
             if let Some(b) = barrier {
                 b.wait().await;
             }
-            client.create_stream(DUPLICATE_STREAM).await.map(|_| ())
+            client
+                .create_stream(DUPLICATE_STREAM, &StreamCreateOptions::default())
+                .await
+                .map(|_| ())
         }));
     }
 

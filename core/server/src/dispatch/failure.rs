@@ -17,8 +17,10 @@
 
 //! The wire failure channels and the one send exit for host-built frames.
 //!
-//! Every frame the dispatch host builds, success or rejection, leaves through
-//! [`send_host_frame`], so the send-failure log has one shape. Which channel a
+//! Every frame the dispatch host sends for a request, its own success or
+//! rejection or a reply relayed from the shard that committed the request,
+//! leaves through [`send_host_frame`] to the [`ClientOrigin`] captured when the
+//! request arrived, so the send-failure log has one shape. Which channel a
 //! failure rides is a wire contract with the SDK:
 //!
 //! | channel | carrier | when |
@@ -28,17 +30,21 @@
 //! | [`FrameChannel::ResyncSentinel`] | status-0 poll reply, body carries `RESYNC_REQUIRED_PARTITION_SENTINEL` | a fenced consumer-group poll: the consumer must re-sync its assignment; HTTP mirrors it as `resync_required_polled_messages` in `crate::http::wire` |
 //! | [`FrameChannel::EmptyFrame`] | status 0 with the 40-byte empty poll | fallback for an unexpected owner reply or a poll encoding failure; this does not prove the partition is empty. Missing owner replies and explicit owner rejections use `TypedDeny` |
 //! | [`FrameChannel::Reply`] | status-0 success frame | host-built success replies: login/register, ping, logout, non-replicated read bodies, committed metadata replies |
-//! | silent drop | no frame | two cases. A header `RequestHeader::validate` rejection is a GAP, not a contract - the fields decode, so a deny can be echoed under the transport id, and the client instead waits out its read timeout. A relayed partition write without a verdict is silent by design (`relay_partition_reply`): the owner dropped the reply or `PARTITION_SUBMIT_TIMEOUT` expired, the outcome is unknown, and the client read timeout is the recovery. A metadata submit without a verdict is not silent: it answers `TransientNotCommitted` on `TypedDeny`, which licenses only a replay of the same request id, so it cannot contradict a write that commits moments later |
+//! | silent drop | no frame | one case. A header `RequestHeader::validate` rejection is a GAP, not a contract - the fields decode, so a deny can be echoed under the transport id, and the client instead waits out its read timeout. A metadata submit or a relayed partition write (`relay_partition_reply`) without a verdict is not silent: it answers `TransientNotCommitted` on `TypedDeny`, which licenses only a replay of the same request id, so it cannot contradict a write that commits moments later |
 //! | HTTP status | HTTP status code | the HTTP spine maps the same rejections in `crate::http::error`; it never rides these frames |
 //!
 //! The last two send nothing, so [`FrameChannel`] has no variant for them.
 //!
-//! Scope: the table covers `crate::dispatch` only. Two neighbours answer on
-//! their own paths by design - the partitions engine builds and sends
-//! produce/poll replies, and the shard crate builds client-shaped denies of
-//! its own (`IggyShard::deny_partition_request_transient` and
-//! `stage_transient_deny`, both `TypedDeny`-shaped, the latter shedding the
-//! frame outright when its lifecycle queue is full).
+//! Scope: the table covers `crate::dispatch` only. Two neighbours build
+//! frames of their own by design - the partitions engine builds produce/poll
+//! replies, and the shard crate builds client-shaped denies
+//! (`IggyShard::deny_partition_request_transient` and `stage_transient_deny`,
+//! both `TypedDeny`-shaped, the latter shedding the frame outright when its
+//! lifecycle queue is full). A frame for a client request returns here over
+//! the request's own channel and leaves through [`send_host_frame`]. On the
+//! production bus, a frame they send by client id alone reaches neither a
+//! client socket nor an HTTP reply slot: both need the installation captured
+//! at admission, so the send fails with `ClientNotFound`.
 
 use crate::reply_frame::{build_deny_reply, current_metadata_commit};
 use crate::responses::NonReplicatedResponse;
@@ -56,8 +62,9 @@ use iggy_binary_protocol::{
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
-use message_bus::{BusMessage, SendError};
+use message_bus::{BusMessage, InstanceToken, SendError};
 use server_common::Message;
+use shard::metrics::{frame_drop_reason, frame_drop_variant};
 use std::mem::offset_of;
 use std::rc::Rc;
 use tracing::{debug, warn};
@@ -90,39 +97,111 @@ impl std::fmt::Display for FrameChannel {
     }
 }
 
-/// The one send exit for host-built client frames. Best-effort: a failed
-/// send means the connection is gone (or its queue is full), and there is
-/// nothing left to reply on, so the error is logged and dropped. `frame` is
-/// any bus message: a contiguous frozen frame or the vectored poll reply.
+/// The connection a request arrived on: its transport client id and the
+/// installation the bus served it with at arrival.
+///
+/// Every frame for the request goes to that installation, never by client id.
+/// A reply can outlive its connection, for example a write that commits after
+/// the client went away, and must then be dropped rather than reach, or close
+/// on a full queue, a later connection under the same id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientOrigin {
+    pub id: u128,
+    instance: Option<InstanceToken>,
+    /// The connection's drain took the request from its queue, so a frame
+    /// for it waits for room in a full reply queue.
+    queued: bool,
+}
+
+impl ClientOrigin {
+    /// The installation serving `id` on this shard's bus now. With none, every
+    /// frame for the request is dropped.
+    pub fn capture<B: ShellBus>(bus: &B, id: u128) -> Self {
+        Self {
+            id,
+            instance: bus.client_instance(id),
+            queued: false,
+        }
+    }
+
+    /// This origin for a request that the connection's drain runs. The drain
+    /// runs at most `client_queue_capacity` request tasks and answers one
+    /// frame itself at a time, so the replies that wait for room are bounded.
+    pub(in crate::dispatch) const fn queued(self) -> Self {
+        Self {
+            queued: true,
+            ..self
+        }
+    }
+}
+
+/// The one send exit for client frames. Best-effort: a failed send means the
+/// connection is gone, and there is nothing left to reply on, so the error is
+/// logged, counted and dropped. `frame` is any bus message: a contiguous
+/// frozen frame or the vectored poll reply.
+///
+/// A frame for a queued request waits for room in a full reply queue, so a
+/// client that reads its replies keeps its connection. A queue that stays full
+/// for `message_bus.client_write_stall_timeout` closes it. Any other frame, the
+/// overflow deny and the heartbeat eviction included, closes the connection
+/// on a full queue: nothing bounds how many of them could wait.
 #[allow(clippy::future_not_send)]
-pub(in crate::dispatch) async fn send_host_frame<B: ShellBus>(
-    bus: &B,
-    transport_client_id: u128,
+pub(in crate::dispatch) async fn send_host_frame<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    origin: ClientOrigin,
     frame: impl Into<BusMessage>,
     channel: FrameChannel,
     context: &'static str,
-) {
-    match bus.send_to_client(transport_client_id, frame).await {
-        Ok(()) => {}
-        // Request tasks outlive their connection, and each one fails here.
-        Err(send_error @ SendError::ClientNotFound(_)) => {
-            debug!(
-                transport_client_id,
-                error = %send_error,
-                channel = %channel,
-                context,
-                "host frame target is gone"
-            );
-        }
-        Err(send_error) => {
-            warn!(
-                transport_client_id,
-                error = %send_error,
-                channel = %channel,
-                context,
-                "failed to send host frame to client"
-            );
-        }
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let sent = if origin.queued {
+        shard
+            .bus
+            .send_to_client_instance_waiting(origin.id, origin.instance, frame.into())
+            .await
+    } else {
+        shard
+            .bus
+            .send_to_client_instance(origin.id, origin.instance, frame.into())
+            .await
+    };
+    let Err(send_error) = sent else {
+        return;
+    };
+    let reason = if matches!(send_error, SendError::Backpressure) {
+        frame_drop_reason::FULL
+    } else {
+        frame_drop_reason::DELIVERY_FAILED
+    };
+    shard
+        .metrics()
+        .record_frame_drop(frame_drop_variant::CLIENT_REPLY, reason);
+    if matches!(
+        send_error,
+        SendError::ClientNotFound(_) | SendError::ConnectionClosed
+    ) {
+        // Request tasks outlive their connection, and each one fails here: on
+        // its closed queue until the connection is uninstalled, then by id.
+        debug!(
+            transport_client_id = origin.id,
+            error = %send_error,
+            channel = %channel,
+            context,
+            "host frame target is gone"
+        );
+    } else {
+        warn!(
+            transport_client_id = origin.id,
+            error = %send_error,
+            channel = %channel,
+            context,
+            "failed to send host frame to client"
+        );
     }
 }
 
@@ -135,7 +214,7 @@ pub(in crate::dispatch) async fn send_host_frame<B: ShellBus>(
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn send_deny_reply<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request_header: &RoutedRequestHeader,
     status: u32,
 ) where
@@ -146,10 +225,10 @@ pub(in crate::dispatch) async fn send_deny_reply<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     let commit = current_metadata_commit(shard);
-    let reply = build_deny_reply(request_header, transport_client_id, 0, commit, status);
+    let reply = build_deny_reply(request_header, origin.id, 0, commit, status);
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         reply.into_generic().into_frozen(),
         FrameChannel::TypedDeny,
         "request_denial",
@@ -163,7 +242,7 @@ pub(in crate::dispatch) async fn send_deny_reply<B, MJ, S, SB>(
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn send_unbound_deny_reply<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request_header: &RoutedRequestHeader,
     status: u32,
 ) where
@@ -173,10 +252,10 @@ pub(in crate::dispatch) async fn send_unbound_deny_reply<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let reply = build_deny_reply(request_header, transport_client_id, 0, 0, status);
+    let reply = build_deny_reply(request_header, origin.id, 0, 0, status);
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         reply.into_generic().into_frozen(),
         FrameChannel::TypedDeny,
         "unbound_request_denial",
@@ -197,7 +276,7 @@ pub(in crate::dispatch) async fn send_unbound_deny_reply<B, MJ, S, SB>(
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn send_undeclared_operation_deny<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     mut request_header: [u8; HEADER_SIZE],
 ) where
     B: ShellBus,
@@ -214,7 +293,7 @@ pub(in crate::dispatch) async fn send_undeclared_operation_deny<B, MJ, S, SB>(
             Ok(request_header) => request_header,
             Err(error) => {
                 warn!(
-                    transport_client_id,
+                    transport_client_id = origin.id,
                     operation,
                     error = %error,
                     "dropping client request with invalid header"
@@ -223,12 +302,12 @@ pub(in crate::dispatch) async fn send_undeclared_operation_deny<B, MJ, S, SB>(
             }
         };
     warn!(
-        transport_client_id,
+        transport_client_id = origin.id,
         operation, "denying client request whose operation this build does not declare"
     );
     let reply = build_deny_reply(
         &request_header,
-        transport_client_id,
+        origin.id,
         0,
         0,
         IggyError::InvalidCommand.as_code(),
@@ -237,8 +316,8 @@ pub(in crate::dispatch) async fn send_undeclared_operation_deny<B, MJ, S, SB>(
     let mut reply = reply.into_generic();
     reply.as_mut_slice()[offset_of!(ReplyHeader, operation)] = operation;
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         reply.into_frozen(),
         FrameChannel::TypedDeny,
         "undeclared_operation_denial",
@@ -254,7 +333,7 @@ pub(in crate::dispatch) async fn send_undeclared_operation_deny<B, MJ, S, SB>(
 pub(in crate::dispatch) async fn send_non_replicated_deny<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: &Message<RoutedRequestHeader>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     status: u32,
 ) where
     B: ShellBus,
@@ -272,8 +351,8 @@ pub(in crate::dispatch) async fn send_non_replicated_deny<B, MJ, S, SB>(
         status,
     );
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         reply.into_generic().into_frozen(),
         FrameChannel::TypedDeny,
         "non_replicated_denial",
@@ -288,7 +367,7 @@ pub(in crate::dispatch) async fn send_non_replicated_deny<B, MJ, S, SB>(
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn send_pre_consensus_deny<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request_header: &RoutedRequestHeader,
     error: &IggyError,
     stage: RewriteStage,
@@ -301,23 +380,17 @@ pub(in crate::dispatch) async fn send_pre_consensus_deny<B, MJ, S, SB>(
 {
     let context = stage.as_str();
     warn!(
-        transport_client_id,
+        transport_client_id = origin.id,
         error = %error,
         operation = ?request_header.operation,
         context,
         "denying request pre-consensus"
     );
     let commit = current_metadata_commit(shard);
-    let reply = build_deny_reply(
-        request_header,
-        transport_client_id,
-        0,
-        commit,
-        error.as_code(),
-    );
+    let reply = build_deny_reply(request_header, origin.id, 0, commit, error.as_code());
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         reply.into_generic().into_frozen(),
         FrameChannel::TypedDeny,
         context,
@@ -333,7 +406,7 @@ pub(in crate::dispatch) async fn send_pre_consensus_deny<B, MJ, S, SB>(
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn send_result_rejection<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request_header: &RoutedRequestHeader,
     error: &IggyError,
     context: &'static str,
@@ -347,8 +420,8 @@ pub(in crate::dispatch) async fn send_result_rejection<B, MJ, S, SB>(
     let commit = current_metadata_commit(shard);
     let reply = build_result_rejection_reply(request_header, commit, error.as_code());
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         reply.into_generic().into_frozen(),
         FrameChannel::TypedDeny,
         context,
@@ -367,7 +440,7 @@ pub(in crate::dispatch) async fn send_result_rejection<B, MJ, S, SB>(
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn send_eviction<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     vsr_client_id: u128,
     reason: EvictionReason,
     context: &'static str,
@@ -393,8 +466,8 @@ pub(in crate::dispatch) async fn send_eviction<B, MJ, S, SB>(
         _ => build_eviction_message(ctx, vsr_client_id, reason),
     };
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         eviction.into_generic().into_frozen(),
         FrameChannel::Eviction(reason),
         context,
@@ -410,7 +483,7 @@ pub(in crate::dispatch) async fn send_eviction<B, MJ, S, SB>(
 pub(in crate::dispatch) async fn send_non_replicated_bytes<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: &Message<RoutedRequestHeader>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     bytes: Bytes,
     channel: FrameChannel,
     context: &'static str,
@@ -429,8 +502,8 @@ pub(in crate::dispatch) async fn send_non_replicated_bytes<B, MJ, S, SB>(
         commit,
     );
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         reply.into_generic().into_frozen(),
         channel,
         context,
@@ -447,7 +520,7 @@ mod tests {
     use crate::dispatch::test_support::{
         FIRST_BOOT, SpyBus, TestShard, UNDECLARED_OPERATION, request_message, test_shard,
     };
-    use crate::dispatch::{ClientDrain, handle_client_request};
+    use crate::dispatch::{ClientDrain, ClientRequestQueues, handle_client_request};
     use crate::session_manager::SessionManager;
     use configs::server::ServerConfig;
     use consensus::{LocalPipeline, VsrConsensus};
@@ -568,7 +641,14 @@ mod tests {
         reason: EvictionReason,
     ) -> EvictionHeader {
         bus.client_replies.borrow_mut().clear();
-        send_eviction(shard, TRANSPORT, vsr_client, reason, CONTEXT).await;
+        send_eviction(
+            shard,
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
+            vsr_client,
+            reason,
+            CONTEXT,
+        )
+        .await;
         let (header, _) = sole_frame_to_transport::<EvictionHeader>(bus);
         // Literals, not `metadata_consensus(shard)`: reading the context back
         // from the source the builder read it from cannot catch a mis-mapped
@@ -587,7 +667,13 @@ mod tests {
         let request = poll_request();
         let status = IggyError::Unauthenticated.as_code();
 
-        send_deny_reply(&shard, TRANSPORT, request.header(), status).await;
+        send_deny_reply(
+            &shard,
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
+            request.header(),
+            status,
+        )
+        .await;
 
         let (header, body) = sole_frame_to_transport::<ReplyHeader>(&bus);
         assert_typed_deny(&header, &body, request.header(), status);
@@ -608,7 +694,13 @@ mod tests {
         let request = poll_request();
         let status = IggyError::Unauthenticated.as_code();
 
-        send_unbound_deny_reply(&shard, TRANSPORT, request.header(), status).await;
+        send_unbound_deny_reply(
+            &shard,
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
+            request.header(),
+            status,
+        )
+        .await;
 
         let (header, body) = sole_frame_to_transport::<ReplyHeader>(&bus);
         assert_typed_deny(&header, &body, request.header(), status);
@@ -645,8 +737,9 @@ mod tests {
             &shard,
             &sessions,
             &server_config,
+            &ClientRequestQueues::default(),
             &Rc::new(ClientDrain::new(&server_config)),
-            TRANSPORT,
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
             frame,
             None,
         )
@@ -693,7 +786,13 @@ mod tests {
         let request = poll_request();
         let status = IggyError::Unauthenticated.as_code();
 
-        send_non_replicated_deny(&shard, &request, TRANSPORT, status).await;
+        send_non_replicated_deny(
+            &shard,
+            &request,
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
+            status,
+        )
+        .await;
 
         let (header, body) = sole_frame_to_transport::<ReplyHeader>(&bus);
         assert_typed_deny(&header, &body, request.header(), status);
@@ -719,7 +818,7 @@ mod tests {
 
         send_pre_consensus_deny(
             &shard,
-            TRANSPORT,
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
             request.header(),
             &error,
             RewriteStage::UserPassword,
@@ -745,7 +844,14 @@ mod tests {
         let request = poll_request();
         let error = IggyError::TransientNotAccepted;
 
-        send_result_rejection(&shard, TRANSPORT, request.header(), &error, CONTEXT).await;
+        send_result_rejection(
+            &shard,
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
+            request.header(),
+            &error,
+            CONTEXT,
+        )
+        .await;
 
         let (header, body) = sole_frame_to_transport::<ReplyHeader>(&bus);
         assert_echoes_request(&header, request.header());
@@ -842,7 +948,15 @@ mod tests {
             "the sentinel poll rides the re-sync channel"
         );
 
-        send_non_replicated_bytes(&shard, &request, TRANSPORT, body, channel, CONTEXT).await;
+        send_non_replicated_bytes(
+            &shard,
+            &request,
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
+            body,
+            channel,
+            CONTEXT,
+        )
+        .await;
 
         let (header, body) = sole_frame_to_transport::<ReplyHeader>(&bus);
         assert_echoes_request(&header, request.header());
@@ -891,8 +1005,9 @@ mod tests {
             &shard,
             &sessions,
             &server_config,
+            &ClientRequestQueues::default(),
             &Rc::new(ClientDrain::new(&server_config)),
-            TRANSPORT,
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
             request.into_generic(),
             None,
         )

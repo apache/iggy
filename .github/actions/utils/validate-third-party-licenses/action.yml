@@ -75,6 +75,10 @@ runs:
       shell: bash
       run: ./scripts/ci/third-party-licenses.sh --validate --manifest core/connectors/runtime/Cargo.toml
 
+    - name: Validate iggy-kafka-gateway bundle
+      shell: bash
+      run: ./scripts/ci/third-party-licenses.sh --validate --manifest gateways/kafka/Cargo.toml
+
     - name: Validate Python wheel bundle
       shell: bash
       run: ./scripts/ci/third-party-licenses.sh --validate --manifest foreign/python/Cargo.toml

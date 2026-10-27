@@ -25,7 +25,6 @@ import (
 	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/zeebo/xxh3"
 )
 
 // boundSession returns a session already registered and bound to fence 100.
@@ -81,11 +80,16 @@ func TestEncodeRequest_EncodesALogoutFrame(t *testing.T) {
 	assert.Equal(t, uint64(2), session.CurrentRequestID())
 }
 
-func TestEncodeRequest_ChecksumsDeleteSegmentsPayload(t *testing.T) {
+func TestEncodeRequest_StampsRandomIdentifierForDeleteSegments(t *testing.T) {
 	payload := []byte{1, 2, 3}
-	frame, err := EncodeRequest(boundSession(t), uint32(command.DeleteSegmentsCode), payload)
+	session := boundSession(t)
+	frame, err := EncodeRequest(session, uint32(command.DeleteSegmentsCode), payload)
 	require.NoError(t, err)
-	require.Equal(t, xxh3.Hash(payload), binary.LittleEndian.Uint64(frame[requestOffsetChecksum:]))
+	another, err := EncodeRequest(session, uint32(command.DeleteSegmentsCode), payload)
+	require.NoError(t, err)
+	require.NotEqual(t, [16]byte{}, [16]byte(frame[requestOffsetChecksum:requestOffsetChecksum+16]))
+	require.NotEqual(t, frame[requestOffsetChecksum:requestOffsetChecksum+16],
+		another[requestOffsetChecksum:requestOffsetChecksum+16])
 }
 
 func TestEncodeRequest_CarriesTheCodeOfANonReplicatedCommand(t *testing.T) {

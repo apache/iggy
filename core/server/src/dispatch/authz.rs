@@ -47,6 +47,7 @@ use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use server_common::Message;
+use server_common::sharding::IggyNamespace;
 
 use crate::shell::{ShellBus, ShellShard};
 
@@ -120,14 +121,15 @@ where
                 | Operation::FinalizeSession
                 | Operation::RetireSession
                 | Operation::CompleteLifecycle
+                | Operation::RewrapStreamKeys
                 | Operation::TransitionPartitionHistory
                 | Operation::InstallConsumerGroupOwner
                 | Operation::RetireConsumerGroupOwners
                 | Operation::CreateStream
-                | Operation::UpdateStream
+                | Operation::UpdateStreamResolved
                 | Operation::DeleteStream
                 | Operation::CreateTopic
-                | Operation::UpdateTopic
+                | Operation::UpdateTopicResolved
                 | Operation::DeleteTopic
                 | Operation::CreatePartitions
                 | Operation::DeletePartitions
@@ -135,7 +137,8 @@ where
                 | Operation::CreateConsumerGroup
                 | Operation::DeleteConsumerGroup
                 | Operation::CreateUser
-                | Operation::UpdateUser
+                | Operation::UpdateUserResolved
+                | Operation::UpdateResource
                 | Operation::DeleteUser
                 | Operation::ChangePassword
                 | Operation::UpdatePermissions
@@ -173,7 +176,8 @@ where
 /// Authorize a partition-plane non-replicated read (poll / consumer-offset) on
 /// (stream, topic). `None` proceeds (allowed, or a resolution miss the caller's
 /// own not-found path handles); `Some(status)` denies. A `None` user id fails
-/// closed.
+/// closed. Because a miss proceeds, the check after the read is
+/// [`authorize_served_partition_read`].
 pub(in crate::dispatch) fn authorize_partition_read<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
@@ -205,6 +209,54 @@ where
         .authorize(|permissioner| rule(permissioner, user_id, stream_id, topic_id))
         .err()
         .map(|error| error.as_code())
+}
+
+/// Authorize a partition read again after its owner answered, before the
+/// reply is built. While the read waits, the session can end, a grant can be
+/// revoked, and the stream or topic can be renamed, deleted or recreated. The
+/// request's identifiers may then resolve to nothing or to another entity, so
+/// the rule runs on the namespace the read resolved. A partition that no longer
+/// holds `incarnation`, the history the read was fenced to, fails closed as not
+/// accepted.
+pub(in crate::dispatch) fn authorize_served_partition_read<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    attachment: Option<&SessionAttachment>,
+    namespace: IggyNamespace,
+    incarnation: u64,
+    rule: impl FnOnce(&Permissioner, u32, usize, usize) -> Result<(), IggyError>,
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    authorize_attached(attachment, || {
+        authorize_uid(
+            shard,
+            attachment.map(SessionAttachment::user_id),
+            |permissioner, user_id| {
+                rule(
+                    permissioner,
+                    user_id,
+                    namespace.stream_id(),
+                    namespace.topic_id(),
+                )
+            },
+        )?;
+        let current = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace);
+        if current == Some(incarnation) {
+            Ok(())
+        } else {
+            Err(IggyError::TransientNotAccepted)
+        }
+    })
 }
 
 /// Authorize a non-replicated read routed through `build_non_replicated_response`
@@ -410,11 +462,12 @@ mod tests {
     use crate::dispatch::test_support::{FIRST_BOOT, SpyBus, TestShard, test_shard};
     use iggy_binary_protocol::COMMAND_TABLE;
     use iggy_binary_protocol::codes::{
-        BIND_SESSION_CODE, CREATE_STREAM_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
-        GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_PARTITION_ROUTE_CODE, GET_SNAPSHOT_FILE_CODE,
-        LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE,
-        LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, LOGOUT_USER_CODE, PING_CODE, POLL_MESSAGES_CODE,
-        SYNC_CONSUMER_GROUP_CODE,
+        BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, CREATE_STREAM_CODE, GET_CLIENT_CODE,
+        GET_CLIENTS_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_METADATA_CHANGES_CODE,
+        GET_PARTITION_ROUTE_CODE, GET_SNAPSHOT_FILE_CODE, LOGIN_REGISTER_CODE,
+        LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
+        LOGOUT_USER_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE,
+        SYNC_CONSUMER_GROUP_CODE, WAIT_FOR_MESSAGES_CODE,
     };
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 
@@ -484,6 +537,17 @@ mod tests {
             (POLL_MESSAGES_CODE, invalid_command, invalid_command),
             (BIND_SESSION_CODE, invalid_command, invalid_command),
             (GET_PARTITION_ROUTE_CODE, invalid_command, invalid_command),
+            (
+                POLL_MESSAGES_DEFERRED_CODE,
+                invalid_command,
+                invalid_command,
+            ),
+            (WAIT_FOR_MESSAGES_CODE, invalid_command, invalid_command),
+            (
+                CANCEL_DEFERRED_REQUEST_CODE,
+                invalid_command,
+                invalid_command,
+            ),
             (GET_CONSUMER_OFFSET_CODE, invalid_command, invalid_command),
             (GET_STREAM_CODE, allow, allow),
             (GET_STREAMS_CODE, unauthenticated, allow),
@@ -498,6 +562,7 @@ mod tests {
                 invalid_command,
             ),
             (DESCRIBE_OPTIONS_CODE, unauthenticated, allow),
+            (GET_METADATA_CHANGES_CODE, invalid_command, invalid_command),
         ]
     }
 

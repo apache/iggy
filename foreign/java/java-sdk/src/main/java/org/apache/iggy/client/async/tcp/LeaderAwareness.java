@@ -39,7 +39,6 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -47,8 +46,6 @@ import java.util.function.Supplier;
  * Leader selection logic for cluster-aware TCP clients.
  */
 final class LeaderAwareness {
-
-    static final int MAX_LEADER_REDIRECTS = 3;
 
     /**
      * How long to wait for a transiently leaderless cluster to elect before
@@ -355,25 +352,5 @@ final class LeaderAwareness {
 
         /** No healthy leader is marked, e.g. mid-election; worth re-polling. */
         record NoLeader() implements LeaderCheck {}
-    }
-
-    /**
-     * Counts the redirection hops of a single leader check so two nodes that
-     * both claim leadership cannot ping-pong a client forever. Failed
-     * reconnect attempts do not count. The state lives for one check only;
-     * the next login starts with a fresh budget, so exhausting the cap never
-     * parks the client on a follower for its whole lifetime.
-     */
-    static final class LeaderRedirectionState {
-
-        private final AtomicInteger redirectCount = new AtomicInteger();
-
-        boolean canRedirect() {
-            return redirectCount.get() < MAX_LEADER_REDIRECTS;
-        }
-
-        void recordRedirect() {
-            redirectCount.incrementAndGet();
-        }
     }
 }

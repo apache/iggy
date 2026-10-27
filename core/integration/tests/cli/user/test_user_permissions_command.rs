@@ -24,6 +24,7 @@ use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
 use iggy::prelude::Permissions;
+use iggy::prelude::UserCreateOptions;
 use iggy::prelude::UserId;
 use iggy::prelude::UserStatus;
 use iggy::prelude::{GlobalPermissions, StreamPermissions, TopicPermissions};
@@ -71,7 +72,13 @@ impl IggyCmdTestCase for TestUserPermissionsCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         create_grant_targets(client, self.permissions.expected_permissions.as_ref()).await;
         let create_user = client
-            .create_user(&self.username, "secret", UserStatus::Active, None)
+            .create_user(
+                &self.username,
+                "secret",
+                UserStatus::Active,
+                None,
+                &UserCreateOptions::default(),
+            )
             .await;
         assert!(create_user.is_ok());
         let user = client

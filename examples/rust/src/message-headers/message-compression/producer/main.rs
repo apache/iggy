@@ -35,7 +35,7 @@ async fn main() -> Result<(), IggyError> {
 
     // Create a Stream.
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("Stream was NOT created! Remove /local_data or start a fresh server with the --fresh flag to run this example.");
 

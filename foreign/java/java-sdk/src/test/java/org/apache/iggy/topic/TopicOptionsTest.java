@@ -38,9 +38,8 @@ class TopicOptionsTest {
 
     @Test
     void shouldEmitOnlyTheKeysThatWereSet() {
-        var options = TopicOptions.builder()
-                .durability(org.apache.iggy.topic.Durability.PERSISTED)
-                .build();
+        var options =
+                TopicOptions.builder().durability(Durability.PERSISTED).build().entries();
 
         assertThat(options).containsOnlyKeys("durability", "consumer_offset_durability");
         assertThat(options.get("durability").kind()).isEqualTo(HeaderKind.String);
@@ -51,11 +50,12 @@ class TopicOptionsTest {
     void shouldEncodeEveryKeyInItsCatalogKind() {
         var options = TopicOptions.builder()
                 .segmentSize(BigInteger.valueOf(134_217_728))
-                .durability(org.apache.iggy.topic.Durability.REPLICATED)
+                .durability(Durability.REPLICATED)
                 .messagesRequiredToSave(1024)
                 .sizeOfMessagesRequiredToSave(BigInteger.valueOf(1_048_576))
                 .preallocateSegments(true)
-                .build();
+                .build()
+                .entries();
 
         assertThat(options)
                 .containsOnlyKeys(
@@ -78,8 +78,9 @@ class TopicOptionsTest {
         var options = TopicOptions.builder()
                 .preallocateSegments(true)
                 .segmentSize(BigInteger.valueOf(134_217_728))
-                .durability(org.apache.iggy.topic.Durability.REPLICATED)
-                .build();
+                .durability(Durability.REPLICATED)
+                .build()
+                .entries();
 
         assertThat(options.keySet())
                 .containsExactly("durability", "consumer_offset_durability", "preallocate_segments", "segment_size");

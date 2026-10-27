@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
@@ -36,7 +38,6 @@ public sealed class WireNameLengthContractsTests
     public static TheoryData<string, string, Func<byte[]>> EmptyCases => new()
     {
         { nameof(TcpContracts.CreateStream), "name", () => TcpContracts.CreateStream("") },
-        { nameof(TcpContracts.UpdateStream), "name", () => TcpContracts.UpdateStream(Id, "") },
         { nameof(TcpContracts.CreateGroup), "name", () => TcpContracts.CreateGroup(Id, Id, "") },
         { nameof(TcpContracts.CreatePersonalAccessToken), "name", () => TcpContracts.CreatePersonalAccessToken("", null) },
         { nameof(TcpContracts.DeletePersonalRequestToken), "name", () => TcpContracts.DeletePersonalRequestToken("") },
@@ -48,7 +49,6 @@ public sealed class WireNameLengthContractsTests
     public static TheoryData<string, string, Func<byte[]>> OverLimitCases => new()
     {
         { nameof(TcpContracts.CreateStream), "name", () => TcpContracts.CreateStream(OverLimit) },
-        { nameof(TcpContracts.UpdateStream), "name", () => TcpContracts.UpdateStream(Id, OverLimit) },
         { nameof(TcpContracts.CreateGroup), "name", () => TcpContracts.CreateGroup(Id, Id, OverLimit) },
         { nameof(TcpContracts.CreatePersonalAccessToken), "name", () => TcpContracts.CreatePersonalAccessToken(OverLimit, null) },
         { nameof(TcpContracts.DeletePersonalRequestToken), "name", () => TcpContracts.DeletePersonalRequestToken(OverLimit) },
@@ -61,7 +61,6 @@ public sealed class WireNameLengthContractsTests
     public static TheoryData<string, int, Func<byte[]>> AtLimitCases => new()
     {
         { nameof(TcpContracts.CreateStream), 0, () => TcpContracts.CreateStream(AtLimit) },
-        { nameof(TcpContracts.UpdateStream), 2 + Id.Length, () => TcpContracts.UpdateStream(Id, AtLimit) },
         { nameof(TcpContracts.CreateGroup), 2 * (2 + Id.Length), () => TcpContracts.CreateGroup(Id, Id, AtLimit) },
         { nameof(TcpContracts.CreatePersonalAccessToken), 0, () => TcpContracts.CreatePersonalAccessToken(AtLimit, null) },
         { nameof(TcpContracts.DeletePersonalRequestToken), 0, () => TcpContracts.DeletePersonalRequestToken(AtLimit) },
@@ -78,8 +77,8 @@ public sealed class WireNameLengthContractsTests
         { nameof(TcpContracts.CreateUser) + "/long userName", VsrError.INVALID_USERNAME, () => TcpContracts.CreateUser(new string('a', 51), "pass", UserStatus.Active) },
         { nameof(TcpContracts.CreateUser) + "/empty password", VsrError.INVALID_PASSWORD, () => TcpContracts.CreateUser("user", "", UserStatus.Active) },
         { nameof(TcpContracts.CreateUser) + "/long password", VsrError.INVALID_PASSWORD, () => TcpContracts.CreateUser("user", new string('a', 101), UserStatus.Active) },
-        { nameof(TcpContracts.UpdateUser) + "/empty userName", VsrError.INVALID_USERNAME, () => TcpContracts.UpdateUser(Id, "", null) },
-        { nameof(TcpContracts.UpdateUser) + "/long userName", VsrError.INVALID_USERNAME, () => TcpContracts.UpdateUser(Id, new string('a', 51), null) },
+        { nameof(TcpContracts.UpdateUser) + "/empty userName", VsrError.INVALID_USERNAME, () => TcpContracts.UpdateUser(Id, new UserUpdate { Username = "" }.ToPatch()) },
+        { nameof(TcpContracts.UpdateUser) + "/long userName", VsrError.INVALID_USERNAME, () => TcpContracts.UpdateUser(Id, new UserUpdate { Username = new string('a', 51) }.ToPatch()) },
         { nameof(TcpContracts.ChangePassword) + "/empty current", VsrError.INVALID_PASSWORD, () => TcpContracts.ChangePassword(Id, "", "new") },
         { nameof(TcpContracts.ChangePassword) + "/long current", VsrError.INVALID_PASSWORD, () => TcpContracts.ChangePassword(Id, new string('a', 101), "new") },
         { nameof(TcpContracts.ChangePassword) + "/empty new", VsrError.INVALID_PASSWORD, () => TcpContracts.ChangePassword(Id, "old", "") },
@@ -103,6 +102,16 @@ public sealed class WireNameLengthContractsTests
         Assert.NotEmpty(contract);
         var exception = Assert.Throws<ArgumentException>(serialize);
         Assert.Equal(parameterName, exception.ParamName);
+    }
+
+    [Fact]
+    public void UpdateStream_WithANameNoHeaderValueHolds_RefusesWithTheServerNameError()
+    {
+        foreach (var name in new[] { "", OverLimit })
+        {
+            var exception = Assert.Throws<IggyInvalidStatusCodeException>(() => new StreamUpdate { Name = name }.ToPatch());
+            Assert.Equal(VsrError.INVALID_STREAM_NAME, exception.StatusCode);
+        }
     }
 
     [Theory]
@@ -146,19 +155,27 @@ public sealed class WireNameLengthContractsTests
     }
 
     [Fact]
-    public void UpdateUser_WithStatusOnly_SerializesExactlyOneNameFlagAndStatusPair()
+    public void UpdateUser_WithStatusOnly_SerializesOnlyTheStatusOption()
     {
-        var bytes = TcpContracts.UpdateUser(Id, null, UserStatus.Inactive);
+        var bytes = TcpContracts.UpdateUser(Id, new UserUpdate { Status = UserStatus.Inactive }.ToPatch());
 
-        Assert.Equal(new byte[] { 1, 4, 1, 0, 0, 0, 0, 1, (byte)UserStatus.Inactive }, bytes);
+        Assert.Equal([3, 1, 4, 1, 0, 0, 0, 0, .. StringOption("status", "inactive")], bytes);
     }
 
     [Fact]
-    public void UpdateUser_WithNameOnly_SerializesExactlyOneNameAndStatusFlag()
+    public void UpdateUser_WithNameOnly_SerializesOnlyTheUsernameOption()
     {
-        var bytes = TcpContracts.UpdateUser(Id, "abc", null);
+        var bytes = TcpContracts.UpdateUser(Id, new UserUpdate { Username = "abc" }.ToPatch());
 
-        Assert.Equal(new byte[] { 1, 4, 1, 0, 0, 0, 1, 3, (byte)'a', (byte)'b', (byte)'c', 0 }, bytes);
+        Assert.Equal([3, 1, 4, 1, 0, 0, 0, 0, .. StringOption("username", "abc")], bytes);
+    }
+
+    [Fact]
+    public void UpdateStream_WithANameOfExactly255Bytes_CarriesTheFullLength()
+    {
+        var bytes = TcpContracts.UpdateStream(Id, new StreamUpdate { Name = AtLimit }.ToPatch());
+
+        Assert.Equal([2, 1, 4, 1, 0, 0, 0, 0, .. StringOption("name", AtLimit)], bytes);
     }
 
     [Fact]
@@ -181,14 +198,13 @@ public sealed class WireNameLengthContractsTests
     [Fact]
     public void UpdateStream_WithANonAsciiStringIdentifier_PlacesTheNameAfterTheUtf8Bytes()
     {
-        var bytes = TcpContracts.UpdateStream(Identifier.String("café"), "topic");
+        var bytes = TcpContracts.UpdateStream(Identifier.String("café"), new StreamUpdate { Name = "topic" }.ToPatch());
 
         Assert.Equal(
-            new byte[]
-            {
-                2, 5, (byte)'c', (byte)'a', (byte)'f', 0xC3, 0xA9,
-                5, (byte)'t', (byte)'o', (byte)'p', (byte)'i', (byte)'c'
-            }, bytes);
+        [
+            2, 2, 5, (byte)'c', (byte)'a', (byte)'f', 0xC3, 0xA9, 0,
+            .. StringOption("name", "topic")
+        ], bytes);
     }
 
     [Fact]
@@ -213,5 +229,17 @@ public sealed class WireNameLengthContractsTests
         var identifier = new Identifier { Kind = IdKind.String, Value = new byte[255] };
 
         Assert.Equal(255, identifier.Length);
+    }
+
+    /// <summary>One options block entry with a string key and a string value.</summary>
+    private static byte[] StringOption(string key, string value)
+    {
+        var keyBytes = Encoding.UTF8.GetBytes(key);
+        var valueBytes = Encoding.UTF8.GetBytes(value);
+        return
+        [
+            2, .. BitConverter.GetBytes(keyBytes.Length), .. keyBytes,
+            2, .. BitConverter.GetBytes(valueBytes.Length), .. valueBytes
+        ];
     }
 }

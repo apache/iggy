@@ -96,7 +96,9 @@ impl TestConsumerOffsetSetCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestConsumerOffsetSetCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name).await;
+        let stream = client
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
         let stream_details = stream.unwrap();
         self.stream_id = stream_details.id;

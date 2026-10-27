@@ -78,7 +78,7 @@ fn build_message(payload: &str) -> IggyMessage {
 async fn create_stream_and_topic(harness: &TestHarness) {
     let setup_client = harness.tcp_root_client().await.unwrap();
     setup_client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let options = TopicCreateOptions {

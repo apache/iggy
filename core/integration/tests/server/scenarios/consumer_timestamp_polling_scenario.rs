@@ -129,7 +129,10 @@ fn assert_received_messages(received: &[IggyMessage], strategy_name: &str) {
 }
 
 async fn init_system(client: &IggyClient) {
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     client
         .create_topic(
@@ -183,7 +186,6 @@ async fn consume_with_strategy(
             AutoCommitWhen::ConsumingAllMessages,
         ))
         .polling_strategy(strategy)
-        .poll_interval(IggyDuration::from_str("2ms").unwrap())
         .batch_length(BATCH_LENGTH)
         .build();
 

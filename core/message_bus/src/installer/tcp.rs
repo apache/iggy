@@ -144,7 +144,7 @@ pub fn install_client_conn<C: TransportConn>(
             bus_for_transport
                 .clients()
                 .remove_if_token_matches(client_id, token);
-            bus_for_transport.remove_client_meta(client_id);
+            bus_for_transport.remove_client_meta(client_id, token);
         });
         conn.run(ctx).await;
     });
@@ -172,7 +172,7 @@ pub fn install_client_conn<C: TransportConn>(
         // Sync subset only: drop the registry entry (its stored
         // `Shutdown` drops with it, closing the per-connection broadcast
         // channel and waking the transport's `FusedShutdown.wait()`),
-        // and remove the `client_meta`. The async drain
+        // and remove this installation's `client_meta`. The async drain
         // (`close_peer_if_token_matches`, awaiting the writer handle
         // under `close_peer_timeout`) runs only on clean exit below;
         // when both paths run, the second observes the registry slot
@@ -184,12 +184,10 @@ pub fn install_client_conn<C: TransportConn>(
             let Some(token) = token_for_dispatch_guard.get() else {
                 return;
             };
-            if bus_for_dispatch_guard
+            bus_for_dispatch_guard
                 .clients()
-                .remove_if_token_matches(client_id, token)
-            {
-                bus_for_dispatch_guard.remove_client_meta(client_id);
-            }
+                .remove_if_token_matches(client_id, token);
+            bus_for_dispatch_guard.remove_client_meta(client_id, token);
         });
 
         client_dispatch_loop(
@@ -229,7 +227,7 @@ pub fn install_client_conn<C: TransportConn>(
     ) {
         Ok(token) => {
             install_token.set(Some(token));
-            bus.insert_client_meta(Rc::new(meta));
+            bus.insert_client_meta(Rc::new(meta), token);
         }
         Err(rejected) => {
             // Shard 0 mints client ids with a monotonic sequence that starts

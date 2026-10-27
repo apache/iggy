@@ -56,7 +56,6 @@ jobs:
           task: ${{ inputs.task }}
           test-scope: ${{ inputs.test-scope }}
           save-cache: ${{ inputs.save-cache }}
-          free-disk-space-aggressive: ${{ inputs.test-scope == 'workspace' }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7

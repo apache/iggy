@@ -31,7 +31,7 @@ import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
-import org.apache.iggy.topic.CompressionAlgorithm;
+import org.apache.iggy.stream.StreamUpdate;
 import org.apache.iggy.topic.TopicDetails;
 
 import java.math.BigInteger;
@@ -126,7 +126,11 @@ public class BasicMessagingSteps {
 
     @When("I update the stream name to {string}")
     public void updateStreamName(String streamName) {
-        getClient().streams().updateStream(context.lastStreamId, streamName);
+        getClient()
+                .streams()
+                .updateStream(
+                        context.lastStreamId,
+                        StreamUpdate.builder().name(streamName).build());
     }
 
     @Then("getting the stream by its numeric ID should return name {string}")
@@ -156,15 +160,7 @@ public class BasicMessagingSteps {
 
     @When("I create a topic with name {string} in stream {int} with {int} partitions")
     public void createTopic(String topicName, int streamId, int partitions) {
-        TopicDetails topic = getClient()
-                .topics()
-                .createTopic(
-                        (long) streamId,
-                        (long) partitions,
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        topicName);
+        TopicDetails topic = getClient().topics().createTopic((long) streamId, topicName, (long) partitions);
 
         context.lastTopicId = topic.id();
         context.lastTopicName = topic.name();
@@ -278,6 +274,17 @@ public class BasicMessagingSteps {
         }
     }
 
+    @When("I send a raw command with code {int} and an empty payload to replica {int}")
+    public void sendRawCommandToReplica(int code, int replica) {
+        try {
+            context.lastRawResponse = getClient().sendBinaryRequestToReplica(code, new byte[0], replica);
+            context.lastRawError = null;
+        } catch (RuntimeException error) {
+            context.lastRawResponse = null;
+            context.lastRawError = error;
+        }
+    }
+
     @Then("the raw command should succeed with an empty response")
     public void rawCommandSucceedsWithEmptyResponse() {
         assertNull(context.lastRawError, "Raw command should succeed");
@@ -298,6 +305,59 @@ public class BasicMessagingSteps {
         assertTrue(context.lastRawError instanceof IggyServerException, "Expected an Iggy server error");
         IggyServerException error = (IggyServerException) context.lastRawError;
         assertEquals(IggyErrorCode.INVALID_COMMAND, error.getErrorCode());
+    }
+
+    @Then("the raw command should fail with an invalid identifier error")
+    public void rawCommandFailsWithInvalidIdentifier() {
+        assertNull(context.lastRawResponse, "Raw response should be absent");
+        assertTrue(context.lastRawError instanceof IggyServerException, "Expected an Iggy server error");
+        IggyServerException error = (IggyServerException) context.lastRawError;
+        assertEquals(IggyErrorCode.INVALID_IDENTIFIER, error.getErrorCode());
+    }
+
+    @Given("I have a cluster node that cannot reach quorum")
+    public void clusterNodeWithoutQuorum() {
+        HostPort hostPort = HostPort.parse(TestEnvironment.noQuorumAddress());
+
+        IggyTcpClient client =
+                IggyTcpClient.builder().host(hostPort.host).port(hostPort.port).build();
+
+        client.connect();
+        context.client = client;
+    }
+
+    @When("I sign out")
+    public void signOut() {
+        getClient().users().logout();
+    }
+
+    @When("I request the stream with ID {int}")
+    public void requestStream(int streamId) {
+        recordCallError(() -> getClient().streams().getStream((long) streamId));
+    }
+
+    @When("I sign in to that node as the root user")
+    public void signInToNode() {
+        recordCallError(
+                () -> getClient().users().login(TestEnvironment.rootUsername(), TestEnvironment.rootPassword()));
+    }
+
+    @Then("the call should fail with error code {int}")
+    public void callFailsWithCode(int code) {
+        assertTrue(
+                context.lastCallError instanceof IggyServerException,
+                "Expected an Iggy server error, got " + context.lastCallError);
+        IggyServerException error = (IggyServerException) context.lastCallError;
+        assertEquals(code, error.getRawErrorCode());
+    }
+
+    private void recordCallError(Runnable call) {
+        try {
+            call.run();
+            context.lastCallError = null;
+        } catch (RuntimeException error) {
+            context.lastCallError = error;
+        }
     }
 
     private IggyBaseClient getClient() {

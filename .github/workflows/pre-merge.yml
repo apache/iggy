@@ -83,12 +83,18 @@ jobs:
   test-rust-runtime:
     name: Rust tests
     needs: [detect, runtime, rust-test-build]
-    if: ${{ !cancelled() && !failure() && needs.detect.outputs.rust_runtime_plan != '' }}
+    if: ${{ !cancelled() && !failure() && needs.detect.outputs.rust_runtime_plan != '' && fromJSON(needs.detect.outputs.rust_runtime_plan).tests }}
+    uses: ./.github/workflows/_rust_tests.yml
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  test-rust-runtime-checks:
+    name: Rust runtime checks
+    needs: [detect, runtime]
+    if: ${{ !cancelled() && !failure() && needs.detect.outputs.rust_runtime_plan != '' && fromJSON(needs.detect.outputs.rust_runtime_plan).checks[0] != null }}
     uses: ./.github/workflows/_rust.yml
     with:
       plan: ${{ needs.detect.outputs.rust_runtime_plan }}
-    secrets:
-      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   # Python SDK
   test-python:
@@ -208,9 +214,9 @@ jobs:
 
   # Final status check
   finalize_pr:
-    runs-on: ubuntu-26.04-arm
+    runs-on: ubuntu-slim
     timeout-minutes: 5
-    needs: [common, detect, runtime, rust-test-build, test-rust, test-rust-runtime, test-python, test-php, test-node, test-go, test-java, test-csharp, test-cpp, test-swift, test-bdd, test-examples, test-other]
+    needs: [common, detect, runtime, rust-test-build, test-rust, test-rust-runtime, test-rust-runtime-checks, test-python, test-php, test-node, test-go, test-java, test-csharp, test-cpp, test-swift, test-bdd, test-examples, test-other]
     if: ${{ !cancelled() }}
     steps:
       # The durations only fill the summary table. A GitHub API error here
@@ -237,7 +243,7 @@ jobs:
               go: 'Go', java: 'Java', csharp: 'C#', cpp: 'C++', swift: 'Swift',
               bdd: 'BDD', examples: 'Examples', other: 'Other',
               common: 'Common checks', detect: 'Detect changes', runtime: 'Runtime binaries',
-              rust_test_build: 'Rust test artifacts',
+              rust_test_build: 'Rust test artifacts', rust_runtime_checks: 'Rust runtime checks',
             };
             for (const [key, group] of Object.entries(groups)) {
               const completed = jobs.filter(job =>
@@ -333,6 +339,7 @@ jobs:
           # Language/component tests
           rust_status=$(format_status "${{ needs.test-rust.result }}" "${{ steps.times.outputs.rust_time }}")
           rust_tests_status=$(format_status "${{ needs.test-rust-runtime.result }}" "${{ steps.times.outputs.rust_tests_time }}")
+          rust_runtime_checks_status=$(format_status "${{ needs.test-rust-runtime-checks.result }}" "${{ steps.times.outputs.rust_runtime_checks_time }}")
           python_status=$(format_status "${{ needs.test-python.result }}" "${{ steps.times.outputs.python_time }}")
           php_status=$(format_status "${{ needs.test-php.result }}" "${{ steps.times.outputs.php_time }}")
           node_status=$(format_status "${{ needs.test-node.result }}" "${{ steps.times.outputs.node_time }}")
@@ -347,6 +354,7 @@ jobs:
 
           echo "| 🦀 Rust | $rust_status | ${{ steps.times.outputs.rust_time }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| 🦀 Rust tests | $rust_tests_status | ${{ steps.times.outputs.rust_tests_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🦀 Rust runtime checks | $rust_runtime_checks_status | ${{ steps.times.outputs.rust_runtime_checks_time }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| 🐍 Python | $python_status | ${{ steps.times.outputs.python_time }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| 🐘 PHP | $php_status | ${{ steps.times.outputs.php_time }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| 🟢 Node | $node_status | ${{ steps.times.outputs.node_time }} |" >> "$GITHUB_STEP_SUMMARY"

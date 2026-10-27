@@ -228,7 +228,7 @@ func (s basicMessagingSteps) givenNoStreams(ctx context.Context) error {
 
 func (s basicMessagingSteps) whenCreateStream(ctx context.Context, streamName string) error {
 	c := getBasicMessagingCtx(ctx)
-	stream, err := c.client.CreateStream(ctx, streamName)
+	stream, err := c.client.CreateStream(ctx, streamName, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create stream: %w", err)
 	}
@@ -259,14 +259,12 @@ func (s basicMessagingSteps) whenCreateTopic(ctx context.Context,
 	partitionsCount uint32) error {
 	c := getBasicMessagingCtx(ctx)
 	streamIdentifier, _ := iggcon.NewIdentifier(streamID)
+	expiry := iggcon.IggyExpiryNeverExpire
 	topic, err := c.client.CreateTopic(
 		ctx,
 		streamIdentifier,
 		topicName,
-		partitionsCount,
-		iggcon.CompressionAlgorithmNone,
-		iggcon.IggyExpiryNeverExpire,
-		0,
+		&iggcon.TopicOptions{PartitionsCount: &partitionsCount, MessageExpiry: &expiry},
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create topic: %w", err)

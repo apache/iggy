@@ -26,14 +26,17 @@ use crate::iggy_index_reader::IggyIndexReader;
 use crate::journal::{
     MessageLookup, push_selected_batch_fragments, select_batch_slice, unpin_sparse_source,
 };
-use crate::{PollFragments, PollingConsumer};
+use crate::{Fragment, PollFragments, PollingConsumer};
 use compio::io::AsyncReadAtExt;
+use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader, BatchRef};
+use iggy_binary_protocol::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
 use iggy_binary_protocol::{WireError, batch};
 use iggy_common::{ConsumerKind, IggyError};
 use server_common::iobuf::{Frozen, Owned};
 use server_common::poll::PollHistoryId;
-use server_common::send_messages::{BatchIntegrity, COMMAND_HEADER_SIZE};
+use server_common::send_messages::{BatchIntegrity, COMMAND_HEADER_SIZE, frozen_batch_header};
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -196,9 +199,169 @@ pub struct PollReadResult {
     pub(crate) commit_offset: u64,
     /// Inclusive offset of the last selected message, or `None` for no match.
     pub(crate) last_matching_offset: Option<u64>,
+    pub(crate) message_count: u32,
+    /// A byte limit or a fault stopped the read before the requested count,
+    /// so later offsets may exist past this prefix.
+    pub(crate) truncated: bool,
+    pub(crate) read_error: Option<IggyError>,
 }
 
 impl PollReadResult {
+    /// Cap the encoded selection at `budget` before the owner accepts its
+    /// final offset. The first message passes the budget, so a poll always
+    /// makes progress, but nothing passes `max_bytes`. A sliced batch retains
+    /// its original offset base and receives a new checksum.
+    ///
+    /// # Errors
+    /// Returns `InvalidSizeBytes` when the first message does not fit in
+    /// `max_bytes`, or `CannotReadMessage` if the selected batch framing is
+    /// invalid.
+    pub fn limit_bytes(
+        mut self,
+        max_bytes: usize,
+        budget: usize,
+    ) -> Result<(Self, bool), IggyError> {
+        let ceiling = max_bytes
+            .checked_sub(POLL_RESPONSE_HEADER_SIZE)
+            .ok_or(IggyError::InvalidSizeBytes)?;
+        let mut remaining = ceiling.min(budget.saturating_sub(POLL_RESPONSE_HEADER_SIZE));
+        let mut fragments = std::mem::take(&mut self.fragments).into_iter();
+        self.message_count = 0;
+        self.last_matching_offset = None;
+        let mut limited = false;
+        while let Some(fragment) = fragments.next() {
+            let source = fragment.into_frozen();
+            let mut header =
+                BatchHeader::decode(&source).map_err(|_| IggyError::CannotReadMessage)?;
+            let body = if source.len() == BATCH_HEADER_SIZE {
+                fragments
+                    .next()
+                    .ok_or(IggyError::CannotReadMessage)?
+                    .into_frozen()
+            } else {
+                source.slice(BATCH_HEADER_SIZE..source.len())
+            };
+            if body.len()
+                != header
+                    .blob_len()
+                    .map_err(|_| IggyError::CannotReadMessage)?
+            {
+                return Err(IggyError::CannotReadMessage);
+            }
+            let batch = BatchRef::new(header, &body);
+            let mut selected = 0;
+            let mut end = 0;
+            for record in batch.iter_with_offsets() {
+                let limit = if self.message_count == 0 && selected == 0 {
+                    ceiling
+                } else {
+                    remaining
+                };
+                if BATCH_HEADER_SIZE.saturating_add(record.end) > limit {
+                    limited = true;
+                    break;
+                }
+                selected += 1;
+                end = record.end;
+                self.last_matching_offset = Some(
+                    header
+                        .base_offset
+                        .checked_add(u64::from(record.message.header.offset_delta))
+                        .ok_or(IggyError::CannotReadMessage)?,
+                );
+            }
+            if selected == 0 {
+                if self.message_count == 0 {
+                    return Err(IggyError::InvalidSizeBytes);
+                }
+                break;
+            }
+            self.message_count += selected;
+            remaining = remaining.saturating_sub(BATCH_HEADER_SIZE + end);
+            limited |= remaining == 0;
+            if selected == header.message_count && source.len() != BATCH_HEADER_SIZE {
+                self.fragments.push(Fragment::whole(source));
+            } else {
+                header.message_count = selected;
+                header.batch_length = (BATCH_HEADER_SIZE + end) as u64;
+                header.batch_checksum = header.checksum_for_blob(&body[..end]);
+                self.fragments
+                    .push(Fragment::whole(frozen_batch_header(&header)));
+                self.fragments.push(Fragment::whole(body.slice(..end)));
+            }
+            if limited {
+                break;
+            }
+        }
+        Ok((self, limited))
+    }
+
+    /// Memory this result keeps alive, counting every backing allocation once
+    /// however many fragments slice it.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.fragments
+            .capacity()
+            .saturating_mul(size_of::<crate::Fragment>())
+            .saturating_add(charge_allocations(&mut HashSet::new(), &self.fragments))
+    }
+
+    /// Copy the selection into one exact-size allocation and drop the borrowed
+    /// buffers. A reply that slices a few bytes out of segment-sized journal
+    /// buffers pins all of them, so the copy trades one pass over the reply for
+    /// a charge that tracks the reply itself. Fragment boundaries survive, which
+    /// keeps batch framing intact.
+    #[must_use]
+    pub fn compacted(mut self) -> Self {
+        let mut buffer = Owned::with_capacity(self.encoded_bytes());
+        for fragment in &self.fragments {
+            buffer.extend_from_slice(fragment.as_slice());
+        }
+        let compacted = Frozen::from(buffer);
+        let mut start = 0;
+        self.fragments = self
+            .fragments
+            .iter()
+            .map(|fragment| {
+                let end = start + fragment.len();
+                let piece = Fragment::slice(compacted.clone(), start, end);
+                start = end;
+                piece
+            })
+            .collect();
+        self
+    }
+
+    #[must_use]
+    pub const fn message_count(&self) -> u32 {
+        self.message_count
+    }
+
+    /// The selected bytes with their batch framing, which is what
+    /// [`Self::limit_bytes`] counts against its limits.
+    #[must_use]
+    pub fn encoded_bytes(&self) -> usize {
+        self.fragments.iter().map(Fragment::len).sum()
+    }
+
+    /// Whether a byte limit or a fault stopped the read early. Waiting for
+    /// more messages cannot grow such a result, because the next read stops
+    /// at the same place.
+    #[must_use]
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Reject a read that failed before it matched anything. A valid prefix
+    /// before a fault is served, and the next poll, which starts at the
+    /// fault, reports it.
+    ///
+    /// # Errors
+    /// Returns the underlying read failure.
+    pub fn checked(mut self) -> Result<Self, IggyError> {
+        self.read_error.take().map_or_else(|| Ok(self), Err)
+    }
+
     #[must_use]
     pub const fn consumer_kind(&self) -> ConsumerKind {
         match self.context.consumer {
@@ -260,20 +423,48 @@ impl PollPlan {
     }
 
     /// Read the captured snapshot without changing consumer progress.
-    /// The result still requires owner validation, including when it is empty.
+    /// The owner decides whether legacy prefix results or strict errors apply.
+    ///
+    /// TODO(partitions): the legacy poll reply has no error channel, so a disk
+    /// fault reaches the consumer as an ordinary empty poll. Fair for a
+    /// transient IO fault, wrong for a batch that failed its own checksum: data
+    /// damaged at rest never reads again, so the consumer waits forever.
+    /// Surfacing it needs a status on the poll reply, an SDK-visible change on
+    /// every client. Deferred polls report it through [`PollReadResult::checked`].
     pub async fn execute(self) -> PollReadResult {
-        let commit_offset = self.commit_offset;
-        let (fragments, last_matching_offset) = match self.tier {
-            PollTier::Empty => (PollFragments::new(), None),
+        self.execute_with_limit(usize::MAX, usize::MAX).await
+    }
+
+    /// Read the captured snapshot like [`Self::execute`], holding at most
+    /// `max_bytes` of read buffers once the walk matched a message. Reads are
+    /// sized to what a selection of `max_selected_bytes`, counted as
+    /// [`PollReadResult::limit_bytes`] counts them, can still keep, and stop
+    /// once it is full. The batch that holds the first match is read whatever
+    /// its width, so a poll always makes progress. A walk that a limit or a
+    /// fault stops early returns its contiguous prefix, marked
+    /// [`PollReadResult::truncated`].
+    pub async fn execute_with_limit(
+        self,
+        max_bytes: usize,
+        max_selected_bytes: usize,
+    ) -> PollReadResult {
+        let mut read_error = None;
+        let mut truncated = false;
+        let (fragments, last_matching_offset, message_count) = match self.tier {
+            PollTier::Empty => (PollFragments::new(), None, 0),
             PollTier::Resident {
                 fragments,
                 last_matching_offset,
-            } => (fragments, last_matching_offset),
+                message_count,
+            } => (fragments, last_matching_offset, message_count),
             PollTier::Disk {
                 disk,
                 query,
                 resident_tail,
-            } => match disk.read_disk(query).await {
+            } => match disk
+                .read_disk_with_limit(query, max_bytes, max_selected_bytes)
+                .await
+            {
                 // Disk walked cleanly and matched nothing: the query offset is
                 // below disk retention too, so the match (if any) is journal-
                 // resident. Serve the journal forward (retention-recovery) from
@@ -281,29 +472,32 @@ impl PollPlan {
                 // timestamp); no contiguity gate, this is not a straddle.
                 DiskReadOutcome::Empty => {
                     crate::journal::select_resident(&resident_tail.entries, query)
-                        .unwrap_or_else(|| (PollFragments::new(), None))
+                        .unwrap_or_else(|| (PollFragments::new(), None, 0))
                 }
-                // Disk read stopped on a fault. Fail-closed: return an empty poll
-                // WITHOUT the journal-forward fallback. Falling forward here would
-                // splice the next resident op over the unreadable run and silently
-                // skip live data.
-                //
-                // TODO(partitions): the poll reply has no error channel, so this
-                // reaches the consumer as an ordinary empty poll. Fair for a transient
-                // IO fault, wrong for a batch that failed its own checksum: data
-                // damaged at rest never reads again, so the consumer waits forever.
-                // Surfacing it needs a status on the poll reply, an SDK-visible change
-                // on every client. Until then the ERROR in `walk_disk_chunk` is the
-                // only signal, and it is server-side only.
-                DiskReadOutcome::Faulted => (PollFragments::new(), None),
+                // Disk read stopped on a fault before any match. Fail-closed:
+                // falling forward to the journal here would splice the next
+                // resident op over the unreadable run and silently skip live data.
+                DiskReadOutcome::Faulted(fault) => {
+                    read_error = Some(fault.error());
+                    (PollFragments::new(), None, 0)
+                }
                 // Straddle: continue past the last disk match into the resident
                 // tail (gate + race argument live on `straddle_continuation`).
                 DiskReadOutcome::Matched {
                     mut fragments,
                     last_matching_offset,
                     matched,
+                    faulted,
+                    limited,
                 } => {
-                    let remaining = query.count().saturating_sub(matched);
+                    // A limited prefix stops here. Splicing the journal onto
+                    // it would both skip the offsets still on disk and spend
+                    // bytes past the limit that stopped it.
+                    let remaining = if limited {
+                        0
+                    } else {
+                        query.count().saturating_sub(matched)
+                    };
                     let continuation = last_matching_offset
                         .and_then(|last_offset| {
                             resident_tail.straddle_continuation(
@@ -315,22 +509,28 @@ impl PollPlan {
                         .and_then(|query| {
                             crate::journal::select_resident(&resident_tail.entries, query)
                         });
-                    match continuation {
-                        Some((journal_fragments, journal_last)) => {
-                            fragments.extend(journal_fragments);
-                            (fragments, journal_last.or(last_matching_offset))
-                        }
-                        None => (fragments, last_matching_offset),
+                    if let Some((journal_fragments, journal_last, journal_count)) = continuation {
+                        fragments.extend(journal_fragments);
+                        (
+                            fragments,
+                            journal_last.or(last_matching_offset),
+                            matched + journal_count,
+                        )
+                    } else {
+                        truncated = limited || faulted;
+                        (fragments, last_matching_offset, matched)
                     }
                 }
             },
         };
-
         PollReadResult {
             context: self.context,
-            commit_offset,
+            commit_offset: self.commit_offset,
             fragments,
             last_matching_offset,
+            message_count,
+            truncated,
+            read_error,
         }
     }
 
@@ -341,24 +541,25 @@ impl PollPlan {
     /// Panics if [`Self::needs_off_pump_io`] is true.
     #[must_use]
     pub fn execute_resident(self) -> PollReadResult {
-        let commit_offset = self.commit_offset;
-        let (fragments, last_matching_offset) = match self.tier {
-            PollTier::Empty => (PollFragments::new(), None),
+        let (fragments, last_matching_offset, message_count) = match self.tier {
+            PollTier::Empty => (PollFragments::new(), None, 0),
             PollTier::Resident {
                 fragments,
                 last_matching_offset,
-            } => (fragments, last_matching_offset),
-            // `needs_off_pump_io` is true for every Disk tier, so the dispatch
-            // gate never routes one here.
+                message_count,
+            } => (fragments, last_matching_offset, message_count),
             PollTier::Disk { .. } => {
                 unreachable!("execute_resident on Disk tier; needs_off_pump_io guards this")
             }
         };
         PollReadResult {
             context: self.context,
-            commit_offset,
+            commit_offset: self.commit_offset,
             fragments,
             last_matching_offset,
+            message_count,
+            truncated: false,
+            read_error: None,
         }
     }
 }
@@ -368,6 +569,7 @@ pub enum PollTier {
     Resident {
         fragments: PollFragments<4096>,
         last_matching_offset: Option<u64>,
+        message_count: u32,
     },
     Disk {
         disk: DiskReadPlan,
@@ -378,8 +580,8 @@ pub enum PollTier {
     },
 }
 
-/// Outcome of [`DiskReadPlan::read_disk`], distinguishing a benign empty walk
-/// from an IO fault so the caller can fail-closed.
+/// Outcome of [`DiskReadPlan::read_disk_with_limit`], distinguishing a benign
+/// empty walk from an IO fault so the caller can fail-closed.
 ///
 /// A faulted segment may hold data that is present-but-unreadable right now;
 /// the disk walk stops at the fault (never advancing to later segments) so a
@@ -387,25 +589,57 @@ pub enum PollTier {
 /// a `Faulted` result, or it would splice the next resident op over the
 /// unreadable run and silently skip live messages.
 pub enum DiskReadOutcome {
-    /// Walk produced matches (possibly a partial prefix if a fault stopped it).
+    /// Walk produced matches (possibly a partial prefix if a fault or a byte
+    /// limit stopped it).
     Matched {
         fragments: PollFragments<4096>,
         last_matching_offset: Option<u64>,
         matched: u32,
+        faulted: bool,
+        /// A byte limit stopped the walk. Later offsets exist but are not in
+        /// this result, so nothing may be appended to it.
+        limited: bool,
     },
     /// Walk completed with no fault and matched nothing. The query offset is
     /// below disk retention too, so the caller may serve the journal forward
     /// (retention-recovery) without skipping anything.
     Empty,
     /// Walk stopped on an IO fault before matching anything. Fail-closed: the
-    /// caller returns an empty poll so the consumer cursor does not advance
-    /// past data that may still be present-but-unreadable.
-    Faulted,
+    /// caller returns an empty poll or an error, so the consumer cursor does
+    /// not advance past data that may still be present-but-unreadable.
+    Faulted(DiskFault),
+}
+
+/// Why a disk walk stopped on a fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskFault {
+    /// Open or read retries ran out, or the directory was mid-rotation. A
+    /// later poll may read the same bytes.
+    Retryable,
+    /// A batch failed its checksum or layout, or its bytes are gone. Every
+    /// later poll of the offset fails the same way.
+    Unreadable,
+}
+
+impl DiskFault {
+    /// A retryable fault changed nothing, so the poll is refused like one that
+    /// no replica accepted, and clients retry it without an error.
+    const fn error(self) -> IggyError {
+        match self {
+            Self::Retryable => IggyError::TransientNotAccepted,
+            Self::Unreadable => IggyError::CannotReadMessage,
+        }
+    }
 }
 
 /// Ceiling for ordinary disk reads. An incomplete batch may require one
 /// larger re-read, without widening subsequent chunks or segments.
-const DISK_POLL_CHUNK_MAX: u64 = 1 << 20;
+pub const DISK_POLL_CHUNK_MAX: u64 = 1 << 20;
+
+/// Budget charge per byte a chunk read holds: the read buffer itself, a sparse
+/// copy of its selection, and headroom for the fragment headers and
+/// descriptors that the selection adds.
+const READ_ALLOCATION_FACTOR: usize = 4;
 
 /// Smallest first read of a disk poll. Below this the syscall and the segment
 /// walk cost more than the bytes the smaller read saves, and a poll for a
@@ -419,11 +653,26 @@ enum SegmentWalk {
     Done,
     /// Fail-closed: the segment may hold present-but-unreadable or corrupt
     /// data, so no later segment may be served over it.
-    Faulted,
+    Faulted(DiskFault),
+    /// The byte budget is spent or the selection fills the reply. Whatever
+    /// matched is a contiguous prefix and is serveable, but the walk may not
+    /// continue.
+    Limited,
 }
 
 /// The state one disk walk carries across its segments.
 struct DiskWalk {
+    max_bytes: usize,
+    /// What the reply keeps. Reading past it only fetches bytes that the next
+    /// poll reads again.
+    max_selected_bytes: usize,
+    selected_bytes: usize,
+    retained_bytes: usize,
+    /// Allocations already in `retained_bytes`, so slices of one chunk or one
+    /// sparse copy are charged once.
+    charged: HashSet<usize>,
+    /// Set only after a match, so a limited walk always has a prefix to serve.
+    limited: bool,
     /// Byte offset into the segment being walked; reset at each boundary.
     position: u64,
     /// Messages between the resolved index entry and the requested offset,
@@ -448,6 +697,21 @@ impl DiskWalk {
         (count - self.matched).saturating_add(self.skipped)
     }
 
+    /// Bytes the next read can still use: the rest of the reply, plus the run
+    /// in front of the first match at `bytes_per_message` each. Without a mean
+    /// size that run has no estimate, so nothing caps the read.
+    fn usable_bytes(&self, bytes_per_message: Option<u32>) -> u64 {
+        let reply = self.max_selected_bytes.saturating_sub(self.selected_bytes) as u64;
+        if self.skipped == 0 {
+            return reply;
+        }
+        bytes_per_message.map_or(u64::MAX, |bytes_per_message| {
+            reply.saturating_add(
+                u64::from(bytes_per_message).saturating_mul(u64::from(self.skipped)),
+            )
+        })
+    }
+
     fn starting_at(position: u64, skipped: u32) -> Self {
         Self {
             position,
@@ -456,6 +720,12 @@ impl DiskWalk {
             fragments: PollFragments::new(),
             last_matching_offset: None,
             batch_read_floor: 0,
+            max_bytes: usize::MAX,
+            max_selected_bytes: usize::MAX,
+            selected_bytes: 0,
+            retained_bytes: 0,
+            charged: HashSet::new(),
+            limited: false,
             #[cfg(feature = "poll-diagnostics")]
             requested_bytes: 0,
             #[cfg(feature = "poll-diagnostics")]
@@ -465,7 +735,17 @@ impl DiskWalk {
 }
 
 impl DiskReadPlan {
-    /// Bytes to read for the next `remaining` messages.
+    /// The next read of `walk`, never under a batch width it already learned.
+    fn next_chunk_len(&self, walk: &DiskWalk, count: u32) -> u64 {
+        self.chunk_len(
+            walk.remaining_to_read(count),
+            walk.usable_bytes(self.bytes_per_message),
+        )
+        .max(walk.batch_read_floor)
+    }
+
+    /// Bytes to read for the next `remaining` messages, of which the walk can
+    /// use no more than `usable`.
     ///
     /// A poll asks for a message count and the walk reads bytes, so the two are
     /// bridged by the partition's own mean encoded size. Reading a fixed
@@ -486,13 +766,17 @@ impl DiskReadPlan {
     /// wider than the ceiling still grows through the re-read path. The ceiling
     /// is what every poll read before it was sized at all, so no poll reads
     /// more than it used to.
-    fn chunk_len(&self, remaining: u32) -> u64 {
-        let Some(bytes_per_message) = self.bytes_per_message else {
-            return DISK_POLL_CHUNK_MAX;
-        };
-        u64::from(bytes_per_message)
-            .saturating_mul(u64::from(remaining))
-            .saturating_add(COMMAND_HEADER_SIZE as u64)
+    ///
+    /// `usable` caps the estimate under the same floors, since a smaller read
+    /// costs more than the bytes it saves.
+    fn chunk_len(&self, remaining: u32, usable: u64) -> u64 {
+        self.bytes_per_message
+            .map_or(DISK_POLL_CHUNK_MAX, |bytes_per_message| {
+                u64::from(bytes_per_message)
+                    .saturating_mul(u64::from(remaining))
+                    .saturating_add(COMMAND_HEADER_SIZE as u64)
+            })
+            .min(usable)
             .max(self.widest_batch_bytes)
             .clamp(DISK_POLL_CHUNK_MIN, DISK_POLL_CHUNK_MAX)
     }
@@ -502,18 +786,36 @@ impl DiskReadPlan {
     /// the file IO. Walks stamped `[256B BatchHeader][blob]` batches in
     /// chunked reads, re-reading a batch split across a chunk boundary in the
     /// next chunk.
+    #[cfg(test)]
     pub(crate) async fn read_disk(self, query: MessageLookup) -> DiskReadOutcome {
+        self.read_disk_with_limit(query, usize::MAX, usize::MAX)
+            .await
+    }
+
+    async fn read_disk_with_limit(
+        self,
+        query: MessageLookup,
+        max_bytes: usize,
+        max_selected_bytes: usize,
+    ) -> DiskReadOutcome {
         let count = query.count();
         if count == 0 || self.segments.is_empty() {
             return DiskReadOutcome::Empty;
         }
         let partition_dir = match &self.partition_dir {
             PartitionDirResolution::Resolved(dir) => dir.as_str(),
-            // Simulated in-memory persistence: no files exist, so this is not
-            // an IO fault on present data. `Empty` lets the caller serve the
-            // resident journal tier (the sim's only tier) without skipping
-            // anything.
-            PartitionDirResolution::NoFiles => return DiskReadOutcome::Empty,
+            // Simulated in-memory persistence: no files exist. Until a flush
+            // persists anything, the journal is the only tier and `Empty` lets
+            // the caller serve it without skipping anything. A flush evicts
+            // what it persisted from the journal, and those bytes cannot be
+            // read back, so the journal-forward would skip them: fail closed.
+            PartitionDirResolution::NoFiles => {
+                return if self.segments.iter().any(|segment| segment.persisted > 0) {
+                    DiskReadOutcome::Faulted(DiskFault::Unreadable)
+                } else {
+                    DiskReadOutcome::Empty
+                };
+            }
             // File-backed data exists but the dir was unresolvable at plan
             // time (mid-rotation). Fail-closed like an IO fault: the
             // journal-forward would splice resident ops over the hidden
@@ -526,7 +828,7 @@ impl DiskReadPlan {
                     segment_count = self.segments.len(),
                     "disk poll: file-backed partition has no resolvable dir; failing closed"
                 );
-                return DiskReadOutcome::Faulted;
+                return DiskReadOutcome::Faulted(DiskFault::Retryable);
             }
         };
 
@@ -541,7 +843,10 @@ impl DiskReadPlan {
         // full-scan fallback). An active first segment keeps its
         // resident-index-resolved `start_position` untouched.
         let resolved = match self.segments.first() {
-            Some(first) => self.resolve_sealed_start(first, query, partition_dir).await,
+            Some(first) => {
+                self.resolve_sealed_start(first, query, partition_dir, max_bytes)
+                    .await
+            }
             None => None,
         };
         let position = resolved.map_or(self.start_position, |(position, _)| position);
@@ -559,10 +864,12 @@ impl DiskReadPlan {
             _ => 0,
         };
         let mut walk = DiskWalk::starting_at(position, skipped);
+        walk.max_bytes = max_bytes;
+        walk.max_selected_bytes = max_selected_bytes;
         // Set when an open/read retry exhausts. The walk breaks immediately so
         // later segments are never read into the result (which would leave a
         // gap at the faulted segment). Pre-fault matches are still served.
-        let mut faulted = false;
+        let mut fault = None;
 
         for segment in &self.segments {
             if walk.matched >= count {
@@ -579,19 +886,21 @@ impl DiskReadPlan {
             let Some(file) = self.resolve_segment_file(segment, &path).await else {
                 // Open exhausted retries: the segment may hold present-but-
                 // unreadable data. Stop here rather than walking past it.
-                faulted = true;
+                fault = Some(DiskFault::Retryable);
                 break;
             };
 
-            if matches!(
-                self.walk_segment(&file, query, count, persisted, &mut walk)
-                    .await,
-                SegmentWalk::Faulted
-            ) {
-                faulted = true;
-                break;
+            match self
+                .walk_segment(&file, query, count, persisted, &mut walk)
+                .await
+            {
+                SegmentWalk::Done => walk.position = 0,
+                SegmentWalk::Limited => break,
+                SegmentWalk::Faulted(kind) => {
+                    fault = Some(kind);
+                    break;
+                }
             }
-            walk.position = 0;
         }
 
         // The three ratios a read-sizing change is judged on: bytes asked of
@@ -617,9 +926,11 @@ impl DiskReadPlan {
                 fragments: walk.fragments,
                 last_matching_offset: walk.last_matching_offset,
                 matched: walk.matched,
+                limited: walk.limited,
+                faulted: fault.is_some(),
             }
-        } else if faulted {
-            DiskReadOutcome::Faulted
+        } else if let Some(fault) = fault {
+            DiskReadOutcome::Faulted(fault)
         } else {
             DiskReadOutcome::Empty
         }
@@ -641,15 +952,28 @@ impl DiskReadPlan {
         persisted: u64,
         walk: &mut DiskWalk,
     ) -> SegmentWalk {
-        let mut chunk_len = self
-            .chunk_len(walk.remaining_to_read(count))
-            .max(walk.batch_read_floor);
+        let mut chunk_len = self.next_chunk_len(walk, count);
         while walk.matched < count && walk.position < persisted {
             let len = (persisted - walk.position).min(chunk_len) as usize;
+            // The batch that holds the first match is read whatever its width,
+            // as the legacy poll does: refusing it would refuse the same offset
+            // on every retry. Later reads stop at the budget or once the
+            // selection fills the reply, and the walk serves the prefix it
+            // holds.
+            if walk.matched > 0
+                && (walk.selected_bytes >= walk.max_selected_bytes
+                    || len
+                        .saturating_mul(READ_ALLOCATION_FACTOR)
+                        .saturating_add(walk.retained_bytes)
+                        > walk.max_bytes)
+            {
+                walk.limited = true;
+                return SegmentWalk::Limited;
+            }
             let Some(chunk) = self.read_chunk_with_retry(file, len, walk).await else {
                 // Chunk read exhausted retries: same fail-closed reason as
                 // a failed open.
-                return SegmentWalk::Faulted;
+                return SegmentWalk::Faulted(DiskFault::Retryable);
             };
             let fragments_before_chunk = walk.fragments.len();
             let ChunkWalk {
@@ -677,11 +1001,23 @@ impl DiskReadPlan {
                 &chunk,
                 usize::MAX,
             );
+            let added = &walk.fragments[fragments_before_chunk..];
+            walk.retained_bytes = walk
+                .retained_bytes
+                .saturating_add(charge_allocations(&mut walk.charged, added))
+                .saturating_add(added.len().saturating_mul(size_of::<crate::Fragment>() * 2));
+            walk.selected_bytes = walk
+                .selected_bytes
+                .saturating_add(added.iter().map(Fragment::len).sum());
+            if walk.matched > 0 && walk.retained_bytes > walk.max_bytes {
+                walk.limited = true;
+                return SegmentWalk::Limited;
+            }
             if corrupt {
                 // A batch that does not match its own checksum. Fail closed like
                 // an IO fault: serving it hands a consumer data provably not what
                 // was written, and skipping ahead punches a silent gap.
-                return SegmentWalk::Faulted;
+                return SegmentWalk::Faulted(DiskFault::Unreadable);
             }
             if consumed == 0 {
                 if (len as u64) >= persisted - walk.position {
@@ -689,13 +1025,13 @@ impl DiskReadPlan {
                     // corrupt batch in this segment. Fail-closed like an IO
                     // fault so a later segment is never served over the corrupt
                     // run, which would punch a silent gap into the poll.
-                    return SegmentWalk::Faulted;
+                    return SegmentWalk::Faulted(DiskFault::Unreadable);
                 }
                 // A single batch larger than the chunk. Its own header says
                 // how wide it is, so re-read exactly that; only a header this
                 // read could not reach leaves the old quadrupling.
                 if needed as u64 > persisted - walk.position {
-                    return SegmentWalk::Faulted;
+                    return SegmentWalk::Faulted(DiskFault::Unreadable);
                 }
                 chunk_len = if needed > len {
                     walk.batch_read_floor = walk
@@ -710,9 +1046,7 @@ impl DiskReadPlan {
             if walk.matched > 0 {
                 walk.skipped = 0;
             }
-            chunk_len = self
-                .chunk_len(walk.remaining_to_read(count))
-                .max(walk.batch_read_floor);
+            chunk_len = self.next_chunk_len(walk, count);
             walk.position += consumed as u64;
         }
         SegmentWalk::Done
@@ -758,6 +1092,7 @@ impl DiskReadPlan {
         segment: &DiskSegment,
         query: MessageLookup,
         partition_dir: &str,
+        max_bytes: usize,
     ) -> Option<(u64, u64)> {
         // The active segment grows under the reader, so neither the shared
         // sparse index nor the offset memo can describe it; its own resident
@@ -800,7 +1135,12 @@ impl DiskReadPlan {
                 return None;
             }
         };
-        if entry_count.saturating_mul(IGGY_INDEX_SIZE as u64) <= SEALED_INDEX_RESIDENT_MAX_BYTES {
+        if entry_count.saturating_mul(IGGY_INDEX_SIZE as u64) <= SEALED_INDEX_RESIDENT_MAX_BYTES
+            && entry_count
+                .saturating_mul(IGGY_INDEX_SIZE as u64)
+                .saturating_mul(2)
+                <= max_bytes as u64
+        {
             let index = match reader.load_all().await {
                 Ok(index) => index,
                 Err(error) => {
@@ -942,6 +1282,19 @@ fn resolve_index_position(index: &IggyIndexCache, query: MessageLookup) -> Optio
     .map(|entry| (entry.position, entry.offset))
 }
 
+/// Bytes of the allocations `fragments` keep alive that `charged` did not
+/// count yet, so slices of one allocation charge it once.
+fn charge_allocations<'a>(
+    charged: &mut HashSet<usize>,
+    fragments: impl IntoIterator<Item = &'a Fragment>,
+) -> usize {
+    fragments
+        .into_iter()
+        .filter(|fragment| charged.insert(fragment.allocation_id()))
+        .map(Fragment::allocation_bytes)
+        .fold(0, usize::saturating_add)
+}
+
 /// Walk stamped `[256B BatchHeader][blob]` batches in one disk
 /// chunk, pushing matching fragments. Returns bytes consumed: the start
 /// of the first batch that did not fully fit in the chunk (the caller
@@ -1043,16 +1396,93 @@ struct ChunkWalk {
 mod tests {
     use super::*;
     use crate::iggy_index::IggyIndex;
-    #[cfg(feature = "poll-diagnostics")]
     use bytes::Bytes;
     use compio::io::AsyncWriteAtExt;
     use server_common::iobuf::Owned;
-    #[cfg(feature = "poll-diagnostics")]
     use server_common::send_messages::{
         IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
     };
-    #[cfg(feature = "poll-diagnostics")]
     use server_common::sharding::IggyNamespace;
+
+    #[test]
+    fn byte_limit_rewrites_whole_and_split_batches_with_valid_checksums() {
+        const PAYLOAD: &[u8] = b"payload";
+        let mut messages = IggyMessages::with_capacity(2);
+        for _ in 0..2 {
+            messages.push(IggyMessage {
+                header: IggyMessageHeader {
+                    payload_length: u32::try_from(PAYLOAD.len()).unwrap(),
+                    ..Default::default()
+                },
+                payload: Bytes::from_static(PAYLOAD),
+                user_headers: None,
+            });
+        }
+        let mut batch =
+            SendMessagesOwned::from_messages(IggyNamespace::new(1, 1, 0), &messages).unwrap();
+        batch.header.base_offset = 42;
+        batch.header.batch_checksum = batch.header.checksum_for_blob(&batch.blob);
+        let mut bytes = vec![0; batch.header.total_size()];
+        batch.header.encode_into(&mut bytes);
+        bytes[BATCH_HEADER_SIZE..].copy_from_slice(&batch.blob);
+        let one_message = POLL_RESPONSE_HEADER_SIZE
+            + BATCH_HEADER_SIZE
+            + batch::BATCH_MESSAGE_HEADER_SIZE
+            + PAYLOAD.len();
+        // The first message passes any budget, but never `max_bytes`.
+        let limits = [
+            (one_message, usize::MAX),
+            (usize::MAX, one_message),
+            (usize::MAX, 0),
+        ];
+        for split in [false, true] {
+            for (max_bytes, budget) in limits {
+                let source: Frozen<4096> = Owned::copy_from_slice(&bytes).into();
+                let mut fragments = PollFragments::new();
+                if split {
+                    fragments.push(Fragment::whole(source.slice(..BATCH_HEADER_SIZE)));
+                    fragments.push(Fragment::whole(source.slice(BATCH_HEADER_SIZE..)));
+                } else {
+                    fragments.push(Fragment::whole(source));
+                }
+                let result = PollPlan {
+                    context: PollContext {
+                        history: PollHistoryId::default(),
+                        consumer: PollingConsumer::Consumer(0, 0),
+                        auto_commit: true,
+                        owner: None,
+                        _group_poll: None,
+                    },
+                    commit_offset: 99,
+                    tier: PollTier::Resident {
+                        fragments,
+                        last_matching_offset: Some(43),
+                        message_count: 2,
+                    },
+                }
+                .execute_resident();
+                let (result, limited) = result.limit_bytes(max_bytes, budget).unwrap();
+                assert!(limited);
+                assert_eq!(result.message_count(), 1);
+                assert_eq!(result.last_matching_offset, Some(42));
+                assert_eq!(result.commit_offset, 99);
+                let bytes: Vec<u8> = result
+                    .fragments
+                    .into_iter()
+                    .flat_map(|fragment| fragment.into_frozen().to_vec())
+                    .collect();
+                assert_eq!(bytes.len() + POLL_RESPONSE_HEADER_SIZE, one_message);
+                let header = BatchHeader::decode(&bytes).unwrap();
+                assert_eq!(header.base_offset, 42);
+                assert_eq!(header.message_count, 1);
+                assert_eq!(header.total_size(), bytes.len());
+                assert_eq!(
+                    header.batch_checksum,
+                    header.checksum_for_blob(&bytes[BATCH_HEADER_SIZE..])
+                );
+            }
+        }
+    }
 
     /// Write a sealed-segment index file too large to materialize
     /// (`entry_count * IGGY_INDEX_SIZE > SEALED_INDEX_RESIDENT_MAX_BYTES`), so
@@ -1100,17 +1530,17 @@ mod tests {
         let mean = u32::try_from(batch / 1000).expect("mean fits");
         let plan = sizing_plan(Some(mean), batch);
 
-        assert!(plan.chunk_len(999) >= batch);
-        assert!(plan.chunk_len(500) >= batch);
-        assert!(plan.chunk_len(1) >= batch);
+        assert!(plan.chunk_len(999, u64::MAX) >= batch);
+        assert!(plan.chunk_len(500, u64::MAX) >= batch);
+        assert!(plan.chunk_len(1, u64::MAX) >= batch);
         // The floor never pushes a read above what an unsized poll would take.
         assert_eq!(
-            sizing_plan(Some(mean), 4 << 20).chunk_len(1),
+            sizing_plan(Some(mean), 4 << 20).chunk_len(1, u64::MAX),
             DISK_POLL_CHUNK_MAX
         );
         // A count wide enough to matter still wins over the floor.
         assert_eq!(
-            sizing_plan(Some(10), 2048).chunk_len(1000),
+            sizing_plan(Some(10), 2048).chunk_len(1000, u64::MAX),
             DISK_POLL_CHUNK_MIN
         );
     }
@@ -1120,19 +1550,43 @@ mod tests {
         let plan = |bytes_per_message| sizing_plan(bytes_per_message, 0);
 
         // Nothing committed yet, so nothing bridges a count to bytes.
-        assert_eq!(plan(None).chunk_len(1000), DISK_POLL_CHUNK_MAX);
+        assert_eq!(plan(None).chunk_len(1000, u64::MAX), DISK_POLL_CHUNK_MAX);
         // A thousand small messages used to read a megabyte to return 150 KB.
         assert_eq!(
-            plan(Some(150)).chunk_len(1000),
+            plan(Some(150)).chunk_len(1000, u64::MAX),
             150 * 1000 + COMMAND_HEADER_SIZE as u64
         );
         // The floor keeps a poll for a few messages off a read per batch, the
         // ceiling is what every poll read before it was sized at all.
-        assert_eq!(plan(Some(150)).chunk_len(1), DISK_POLL_CHUNK_MIN);
-        assert_eq!(plan(Some(64 << 10)).chunk_len(1000), DISK_POLL_CHUNK_MAX);
+        assert_eq!(plan(Some(150)).chunk_len(1, u64::MAX), DISK_POLL_CHUNK_MIN);
+        assert_eq!(
+            plan(Some(64 << 10)).chunk_len(1000, u64::MAX),
+            DISK_POLL_CHUNK_MAX
+        );
         // Wide messages and a wide count must clamp, never wrap.
         assert_eq!(
-            plan(Some(u32::MAX)).chunk_len(u32::MAX),
+            plan(Some(u32::MAX)).chunk_len(u32::MAX, u64::MAX),
+            DISK_POLL_CHUNK_MAX
+        );
+    }
+
+    #[test]
+    fn a_reply_byte_limit_caps_the_first_read_but_not_the_run_in_front_of_it() {
+        const REPLY_BYTES: usize = 100 << 10;
+        let plan = sizing_plan(Some(1000), 0);
+        let mut walk = DiskWalk::starting_at(0, 0);
+        walk.max_selected_bytes = REPLY_BYTES;
+        // A thousand messages of a kilobyte do not fit the reply.
+        assert_eq!(plan.next_chunk_len(&walk, 1000), REPLY_BYTES as u64);
+        // The sparse index resolved an entry 500 messages before the target.
+        walk.skipped = 500;
+        assert_eq!(
+            plan.next_chunk_len(&walk, 1000),
+            REPLY_BYTES as u64 + 500 * 1000
+        );
+        // Without a mean size the run has no width, so the reply caps nothing.
+        assert_eq!(
+            sizing_plan(None, 0).next_chunk_len(&walk, 1000),
             DISK_POLL_CHUNK_MAX
         );
     }
@@ -1259,7 +1713,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "poll-diagnostics")]
     fn disk_batch(payload_length: u32, offset: u64) -> Vec<u8> {
         let mut messages = IggyMessages::with_capacity(1);
         messages.push(IggyMessage {
@@ -1323,7 +1776,7 @@ mod tests {
         // First poll pays the on-file lookup and memoizes entry 2's interval
         // [20, 30): offset 25 resolves to entry 2 (offset 20 -> position 200).
         let first = plan
-            .resolve_sealed_start(&segment, offset_query(25), &partition_dir)
+            .resolve_sealed_start(&segment, offset_query(25), &partition_dir, usize::MAX)
             .await;
         // The entry offset rides along so the caller can size its first read
         // to cover the run between that entry and the requested offset.
@@ -1338,14 +1791,14 @@ mod tests {
         // (proof the cursor answered with zero index-file reads)...
         std::fs::remove_dir_all(&dir).expect("remove dir");
         let in_interval = plan
-            .resolve_sealed_start(&segment, offset_query(29), &partition_dir)
+            .resolve_sealed_start(&segment, offset_query(29), &partition_dir, usize::MAX)
             .await;
         assert_eq!(in_interval, Some((200, 20)));
 
         // ...while an offset past the interval misses the cursor, reaches for
         // the (now gone) file, and falls back to the byte-0 scan.
         let past_interval = plan
-            .resolve_sealed_start(&segment, offset_query(30), &partition_dir)
+            .resolve_sealed_start(&segment, offset_query(30), &partition_dir, usize::MAX)
             .await;
         assert_eq!(past_interval, None);
     }
@@ -1379,6 +1832,7 @@ mod tests {
             tier: PollTier::Resident {
                 fragments: placeholder_fragments(),
                 last_matching_offset: Some(last_selected_offset),
+                message_count: 1,
             },
         };
         assert!(!resident_plan.needs_off_pump_io());
@@ -1413,5 +1867,360 @@ mod tests {
         let read_result = empty_plan.execute_resident();
         assert!(read_result.fragments.is_empty());
         assert_eq!(read_result.last_matching_offset, None);
+    }
+    #[compio::test]
+    async fn deferred_disk_result_enforces_byte_limits_and_reports_faults_at_their_offset() {
+        for corrupt_tail in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut bytes = disk_batch(10, 0);
+            let first_batch_bytes = bytes.len();
+            let mut tail = disk_batch(10, 9);
+            if corrupt_tail {
+                *tail.last_mut().unwrap() ^= 1;
+            }
+            bytes.extend(tail);
+            std::fs::write(directory.path().join("00000000000000000000.log"), &bytes).unwrap();
+            let plan = |offset, count| PollPlan {
+                context: PollContext {
+                    history: PollHistoryId::default(),
+                    consumer: PollingConsumer::Consumer(0, 0),
+                    auto_commit: true,
+                    owner: None,
+                    _group_poll: None,
+                },
+                commit_offset: 9,
+                tier: PollTier::Disk {
+                    query: MessageLookup::Offset {
+                        offset,
+                        count,
+                        ceiling: 9,
+                    },
+                    resident_tail: ResidentTailSnapshot {
+                        entries: Vec::new(),
+                        oldest_resident: None,
+                    },
+                    disk: DiskReadPlan {
+                        partition_dir: PartitionDirResolution::Resolved(
+                            directory.path().display().to_string(),
+                        ),
+                        bytes_per_message: None,
+                        widest_batch_bytes: 0,
+                        segments: vec![DiskSegment {
+                            start_offset: 0,
+                            persisted: bytes.len() as u64,
+                            read_state: Rc::default(),
+                            sealed: false,
+                        }],
+                        start_position: 0,
+                        start_index_offset: None,
+                        namespace_raw: 0,
+                        validate_checksum: true,
+                    },
+                },
+            };
+            let result = plan(0, 2).execute_with_limit(1 << 20, usize::MAX).await;
+            if corrupt_tail {
+                // The valid prefix is served, and the poll that starts at the
+                // corrupt batch reports it, so the error names its offset.
+                assert_eq!(result.message_count(), 1);
+                assert!(result.truncated());
+                let result = result.checked().expect("a prefix before a fault is served");
+                assert_eq!(result.last_matching_offset, Some(0));
+                assert!(matches!(
+                    plan(9, 1)
+                        .execute_with_limit(1 << 20, usize::MAX)
+                        .await
+                        .checked(),
+                    Err(IggyError::CannotReadMessage)
+                ));
+                std::fs::remove_file(directory.path().join("00000000000000000000.log")).unwrap();
+                assert!(
+                    matches!(
+                        plan(0, 2)
+                            .execute_with_limit(1 << 20, usize::MAX)
+                            .await
+                            .checked(),
+                        Err(IggyError::TransientNotAccepted)
+                    ),
+                    "a segment that cannot be opened now is retried, not reported"
+                );
+            } else {
+                assert_eq!(
+                    result.message_count(),
+                    2,
+                    "sparse offsets count as two messages"
+                );
+                assert!(!result.truncated());
+                let (result, limited) = result
+                    .checked()
+                    .unwrap()
+                    .limit_bytes(POLL_RESPONSE_HEADER_SIZE + first_batch_bytes, usize::MAX)
+                    .unwrap();
+                assert!(limited);
+                assert_eq!(result.message_count(), 1);
+                assert_eq!(result.last_matching_offset, Some(0));
+                assert_eq!(result.commit_offset, 9);
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn deferred_disk_budget_admits_the_batch_that_holds_the_first_match() {
+        // The batch is wider than the chunk and the whole budget. Refusing it
+        // failed the same offset on every retry, so the consumer stalled.
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = disk_batch(2 << 20, 0);
+        let path = directory.path().join("batch.log");
+        std::fs::write(&path, &bytes).unwrap();
+        let file = compio::fs::File::open(path).await.unwrap();
+        let plan = sizing_plan(Some(1), 0);
+        let mut walk = DiskWalk::starting_at(0, 0);
+        walk.max_bytes = 1 << 20;
+        plan.walk_segment(&file, offset_query(0), 1, bytes.len() as u64, &mut walk)
+            .await;
+        assert_eq!(walk.matched, 1);
+        assert_eq!(walk.last_matching_offset, Some(0));
+        assert_eq!(
+            walk.fragments.iter().map(Fragment::len).sum::<usize>(),
+            bytes.len()
+        );
+    }
+
+    #[compio::test]
+    async fn a_byte_limited_disk_walk_serves_the_prefix_it_already_read() {
+        // The budget admits the first chunk and stops the next one. Before this
+        // was fixed the walk threw away every batch it had matched, so the
+        // consumer polled the same offset again and was refused again.
+        const BATCHES: u32 = 128;
+        let directory = tempfile::tempdir().unwrap();
+        let mut bytes = Vec::new();
+        for offset in 0..u64::from(BATCHES) {
+            bytes.extend(disk_batch(16 << 10, offset));
+        }
+        std::fs::write(directory.path().join("00000000000000000000.log"), &bytes).unwrap();
+        let plan = PollPlan {
+            context: PollContext {
+                history: PollHistoryId::default(),
+                consumer: PollingConsumer::Consumer(0, 0),
+                auto_commit: true,
+                owner: None,
+                _group_poll: None,
+            },
+            commit_offset: u64::from(BATCHES) - 1,
+            tier: PollTier::Disk {
+                query: MessageLookup::Offset {
+                    offset: 0,
+                    count: BATCHES,
+                    ceiling: u64::from(BATCHES) - 1,
+                },
+                resident_tail: ResidentTailSnapshot {
+                    entries: Vec::new(),
+                    oldest_resident: None,
+                },
+                disk: DiskReadPlan {
+                    partition_dir: PartitionDirResolution::Resolved(
+                        directory.path().display().to_string(),
+                    ),
+                    bytes_per_message: None,
+                    widest_batch_bytes: 0,
+                    segments: vec![DiskSegment {
+                        start_offset: 0,
+                        persisted: bytes.len() as u64,
+                        read_state: Rc::default(),
+                        sealed: false,
+                    }],
+                    start_position: 0,
+                    start_index_offset: None,
+                    namespace_raw: 0,
+                    validate_checksum: true,
+                },
+            },
+        };
+        // Chunks are 1 MiB here, and the walk refuses a chunk whose buffer
+        // would put four times its length over the budget. This admits the
+        // first chunk and stops the second, which is the case under test.
+        let result = plan.execute_with_limit(4608 << 10, usize::MAX).await;
+        let served = result.message_count();
+        assert!(
+            served > 0 && served < BATCHES,
+            "expected a partial prefix, got {served} of {BATCHES}"
+        );
+        assert_eq!(result.last_matching_offset, Some(u64::from(served) - 1));
+        assert!(result.truncated());
+        let result = result
+            .checked()
+            .expect("a byte-limited prefix is serveable");
+        assert_eq!(result.message_count(), served);
+    }
+
+    #[compio::test]
+    async fn deferred_disk_read_reads_at_most_one_record_past_max_bytes() {
+        // The walk budget alone admitted a second chunk, so a read fetched
+        // nearly twice what its reply kept and the next poll read it again.
+        const BATCHES: u32 = 64;
+        let directory = tempfile::tempdir().unwrap();
+        let record = disk_batch(128 << 10, 0).len();
+        let mut bytes = Vec::with_capacity(record * BATCHES as usize);
+        for offset in 0..u64::from(BATCHES) {
+            bytes.extend(disk_batch(128 << 10, offset));
+        }
+        std::fs::write(directory.path().join("00000000000000000000.log"), &bytes).unwrap();
+        let max_selected_bytes = DEFAULT_MAX_BYTES - POLL_RESPONSE_HEADER_SIZE;
+        let result = deferred_disk_poll(directory.path(), bytes.len(), BATCHES)
+            .execute_with_limit(DEFAULT_WALK_BUDGET, max_selected_bytes)
+            .await;
+        assert!(result.truncated());
+        assert!(
+            result.encoded_bytes() <= max_selected_bytes + record,
+            "read {} bytes for a reply that keeps {max_selected_bytes}",
+            result.encoded_bytes()
+        );
+        let (reply, limited) = result
+            .limit_bytes(DEFAULT_MAX_BYTES, DEFAULT_MAX_READ_BYTES)
+            .unwrap();
+        assert!(limited);
+        assert_eq!(reply.message_count() as usize, max_selected_bytes / record);
+    }
+
+    #[compio::test]
+    async fn deferred_disk_read_returns_a_record_above_max_bytes_alone() {
+        // The reply refuses such a record with `InvalidSizeBytes`, and the SDK
+        // then fetches it alone with no byte limit. Both reads must hold it
+        // whole, or its partition stalls.
+        const BATCHES: u32 = 16;
+        let directory = tempfile::tempdir().unwrap();
+        let mut bytes = disk_batch(2 << 20, 0);
+        let oversized = bytes.len();
+        for offset in 1..u64::from(BATCHES) {
+            bytes.extend(disk_batch(16 << 10, offset));
+        }
+        std::fs::write(directory.path().join("00000000000000000000.log"), &bytes).unwrap();
+
+        let result = deferred_disk_poll(directory.path(), bytes.len(), BATCHES)
+            .execute_with_limit(
+                DEFAULT_WALK_BUDGET,
+                DEFAULT_MAX_BYTES - POLL_RESPONSE_HEADER_SIZE,
+            )
+            .await;
+        assert_eq!(result.message_count(), 1);
+        assert_eq!(result.encoded_bytes(), oversized);
+        assert!(matches!(
+            result.limit_bytes(DEFAULT_MAX_BYTES, DEFAULT_MAX_READ_BYTES),
+            Err(IggyError::InvalidSizeBytes)
+        ));
+
+        let (alone, _) = deferred_disk_poll(directory.path(), bytes.len(), 1)
+            .execute_with_limit(
+                DEFAULT_WALK_BUDGET,
+                DEFAULT_MAX_READ_BYTES - POLL_RESPONSE_HEADER_SIZE,
+            )
+            .await
+            .limit_bytes(u32::MAX as usize, DEFAULT_MAX_READ_BYTES)
+            .unwrap();
+        assert_eq!(alone.message_count(), 1);
+        assert_eq!(alone.encoded_bytes(), oversized);
+    }
+
+    /// The SDK's default `max_bytes`, the server's default read reservation,
+    /// and the third of it that the walk of a deferred disk read may hold.
+    const DEFAULT_MAX_BYTES: usize = 1 << 20;
+    const DEFAULT_MAX_READ_BYTES: usize = 16 << 20;
+    const DEFAULT_WALK_BUDGET: usize = DEFAULT_MAX_READ_BYTES / 3;
+
+    /// A poll from offset 0 over the one segment in `directory`, for a
+    /// partition without stats.
+    fn deferred_disk_poll(directory: &std::path::Path, persisted: usize, count: u32) -> PollPlan {
+        PollPlan {
+            context: PollContext {
+                history: PollHistoryId::default(),
+                consumer: PollingConsumer::Consumer(0, 0),
+                auto_commit: true,
+                owner: None,
+                _group_poll: None,
+            },
+            commit_offset: u64::MAX,
+            tier: PollTier::Disk {
+                query: MessageLookup::Offset {
+                    offset: 0,
+                    count,
+                    ceiling: u64::MAX,
+                },
+                resident_tail: ResidentTailSnapshot {
+                    entries: Vec::new(),
+                    oldest_resident: None,
+                },
+                disk: DiskReadPlan {
+                    partition_dir: PartitionDirResolution::Resolved(
+                        directory.display().to_string(),
+                    ),
+                    bytes_per_message: None,
+                    widest_batch_bytes: 0,
+                    segments: vec![DiskSegment {
+                        start_offset: 0,
+                        persisted: persisted as u64,
+                        read_state: Rc::default(),
+                        sealed: false,
+                    }],
+                    start_position: 0,
+                    start_index_offset: None,
+                    namespace_raw: 0,
+                    validate_checksum: true,
+                },
+            },
+        }
+    }
+
+    fn resident(fragments: PollFragments) -> PollReadResult {
+        PollPlan {
+            context: PollContext {
+                history: PollHistoryId::default(),
+                consumer: PollingConsumer::Consumer(0, 0),
+                auto_commit: true,
+                owner: None,
+                _group_poll: None,
+            },
+            commit_offset: 0,
+            tier: PollTier::Resident {
+                fragments,
+                last_matching_offset: None,
+                message_count: 0,
+            },
+        }
+        .execute_resident()
+    }
+
+    fn windows(source: &Frozen<4096>, count: usize) -> PollFragments {
+        (0..count)
+            .map(|window| Fragment::slice(source.clone(), window * 4096, window * 4096 + 512))
+            .collect()
+    }
+
+    #[test]
+    fn retained_bytes_counts_one_allocation_once_however_many_slices_borrow_it() {
+        let source: Frozen<4096> = Owned::copy_from_slice(&vec![7; 1 << 20]).into();
+        let one = resident(windows(&source, 1)).retained_bytes();
+        let four = resident(windows(&source, 4)).retained_bytes();
+        assert_eq!(one, four);
+        assert!(four < 2 * source.allocation_bytes());
+    }
+
+    #[test]
+    fn compacting_releases_the_borrowed_allocation_and_preserves_the_selection() {
+        let source: Frozen<4096> = Owned::copy_from_slice(&vec![7; 1 << 20]).into();
+        let borrowed = resident(windows(&source, 4));
+        let selection: Vec<Vec<u8>> = borrowed
+            .fragments
+            .iter()
+            .map(|fragment| fragment.as_slice().to_vec())
+            .collect();
+        let charge = borrowed.retained_bytes();
+        let compacted = borrowed.compacted();
+        assert!(compacted.retained_bytes() < charge);
+        let kept: Vec<Vec<u8>> = compacted
+            .fragments
+            .iter()
+            .map(|fragment| fragment.as_slice().to_vec())
+            .collect();
+        assert_eq!(kept, selection);
     }
 }

@@ -14,8 +14,9 @@ The SDK is built up in stages. The client is a TCP connection with optional TLS 
 speaks the consensus protocol, signs in, keeps the session alive with a heartbeat,
 reconnects, and follows the cluster leader. It manages streams, topics, partitions,
 segments, users, personal access tokens, and consumer groups, sends and polls messages,
-and stores consumer offsets. The producer and consumer, examples, and BDD scenarios
-follow in later changes.
+stores consumer offsets, produces with a batching producer, and consumes with a
+consumer that tracks and commits its position. Examples and BDD scenarios follow in
+later changes.
 
 Swift supports the consensus wire protocol and checks commitment proof during
 automatic retries. It does not yet expose retained-operation resolve/abandon APIs,
@@ -29,8 +30,9 @@ and other native SDKs are outside the current Swift implementation.
 - An Iggy server that speaks the consensus protocol (`iggy-server` from this repository)
 
 The SDK depends on [SwiftNIO](https://github.com/apple/swift-nio),
-[swift-nio-ssl](https://github.com/apple/swift-nio-ssl), and
-[swift-log](https://github.com/apple/swift-log).
+[swift-nio-ssl](https://github.com/apple/swift-nio-ssl),
+[swift-log](https://github.com/apple/swift-log), and
+[swift-crypto](https://github.com/apple/swift-crypto) for the SHA-256 behind stream key fingerprints.
 
 ## Installation
 
@@ -41,7 +43,7 @@ package mirror, which carries every release as a `v<version>` tag:
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/apache/iggy-swift.git", from: "0.1.0")
+    .package(url: "https://github.com/apache/iggy-swift.git", from: "0.1.1")
 ],
 targets: [
     .target(name: "MyApp", dependencies: [.product(name: "Iggy", package: "iggy-swift")])
@@ -94,16 +96,138 @@ let client = IggyClient(configuration: configuration)
 The server certificate is verified against the system roots, or against `caFile` when
 set, and against the host of the address unless `TLSOptions.domain` names another one.
 
+### Resource options
+
+Streams, topics, and users carry options. A create call takes a typed options value, and an update names only the keys it changes, plus the keys to return to their defaults. Every other key keeps its stored value:
+
+```swift
+let key = try EncryptionKey.decode(base64: base64Key)
+let stream = try await client.createStream(name: "payments", options: StreamCreateOptions(encryptionKey: key))
+let topic = try await client.createTopic(
+    streamID: "payments", name: "orders",
+    options: TopicCreateOptions(partitionsCount: 3, messageExpiry: .after(.seconds(604_800)), partitionResizePolicy: .fixed))
+try await client.updateStream("payments", options: StreamUpdateOptions(name: "payments-v2"))
+try await client.updateTopic(
+    streamID: "payments-v2", topicID: "orders", options: TopicUpdateOptions(messageExpiry: .after(.seconds(86_400)), reset: [.maxTopicSize]))
+try await client.updateUser("alice", options: UserUpdateOptions(status: .inactive))
+```
+
+Only `message_expiry` and `max_topic_size` can be reset. Compression and the other topic settings are fixed at create, and no stream or user key is resettable yet. A typed update that breaks these rules fails before anything is sent, with the error the server would return.
+
+Everything else, such as a taken name or a missing resource, is refused by the server. `describeOptions(scope:)` lists every key of a scope with flags saying what an update may do with it. Renaming the signed-in user, through `username` or a raw `username` entry, moves the credentials later reconnects use.
+
+Keys this SDK has no typed member for go in `raw`, values as strings the server parses, and reset names in `rawReset`. The server alone decides on a patch that carries either, since it may know keys this SDK does not:
+
+```swift
+try await client.updateTopic(streamID: "payments-v2", topicID: "orders", options: TopicUpdateOptions(rawReset: ["future_retention"]))
+```
+
+`StreamCreateOptions.encryptionKey` gives the stream its own data key. It must be 32 random bytes, never derived from a password. It travels inside the create request over whatever transport the client uses, so protecting it in transit with TLS is the caller's choice.
+
+The server stores it wrapped and never returns it: reads report `encryptionKeySource`, `encryptionKeyFingerprint`, and `encryptionKekFingerprints`, and `EncryptionKey.fingerprint(_:)` computes the fingerprint of a key to compare. Without a key, a server with encryption enabled generates one for the stream.
+
+### Metadata changes
+
+`getMetadataChanges(_:)` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed, or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manageServers` permission:
+
+```swift
+func follow(_ client: IggyClient, groups: [MetadataChangeGroup]) async throws {
+    var query = MetadataChangesQuery(start: .latest, groups: groups)
+    while true {
+        let page = try await client.getMetadataChanges(query)
+        switch page.status {
+        case .ok:
+            for record in page.records {
+                print("op \(record.op) by \(String(describing: record.actorUserID)): \(record.change)")
+            }
+            if let next = page.next {
+                query.start = .after(next)
+            }
+            if !page.hasMore {
+                try await Task.sleep(for: .seconds(1))
+            }
+        case .behind:
+            try await Task.sleep(for: .milliseconds(100))
+        case .expired, .reset:
+            query.start = try await rebuild(client, groups: groups)
+        }
+    }
+}
+
+/// Pages the current state, then returns the position to follow from.
+func rebuild(_ client: IggyClient, groups: [MetadataChangeGroup]) async throws -> MetadataChangeStart {
+    var query = MetadataChangesQuery(start: .current(nil), groups: groups)
+    while true {
+        let page = try await client.getMetadataChanges(query)
+        switch page.status {
+        case .ok:
+            break
+        case .behind:
+            try await Task.sleep(for: .milliseconds(100))
+            continue
+        case .expired, .reset:
+            query.start = .current(nil)
+            continue
+        }
+        for item in page.items {
+            print(item)
+        }
+        if let token = page.currentPageToken {
+            query.start = .current(token)
+        } else if let anchor = page.next {
+            return .after(anchor)
+        } else {
+            query.start = .current(nil)
+        }
+    }
+}
+```
+
+`expired` means the log no longer holds the history after the cursor, and `reset` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return. A cursor persists as its `description`, `mc1_` and 59 characters of unpadded Base64url, and `MetadataChangeCursor(text:)` reads it back.
+
+Current pages need the parent groups of every selected group, for example `topics` with `streams`. Keep a rebuilt state private until a change page answers `ok` with `hasMore` false and a `headOp` at or above the last current page's. An invalid query fails with `invalidCommand` before anything is sent. A record of a kind this build does not know arrives as `.unknown(group:kind:body:)` with its codes and raw body, and records carry option values as the read routes return them, never key material.
+
 ### Reconnection
 
-A request that hits a dropped connection reconnects, signs in again, and is replayed,
-all within its `requestTimeout`, and only when it provably never reached the log:
-reads, pings, and requests the server never admitted. A replicated write whose outcome
-is unknown fails with `transientNotCommitted` instead of being applied twice. A client
-left disconnected by a timeout or an outage reconnects on its next call or heartbeat
-when it has credentials to sign in with. In a cluster the client reads the roster after
-signing in, moves to the leader, and moves on when a node answers that it is not the
-primary.
+If a request hits a dropped connection, the client reconnects and signs in again within
+the `requestTimeout` of the request. Only a request that provably never reached the log
+goes again: a read, a ping, or a request that the server never admitted. If the server
+refuses a request as a stale client, the request fails with `staleClient` (30). The
+next call binds the same session again, and signs in only if the server no longer holds it.
+
+If the connection of a sent replicated write drops, or an eviction ends its session, the
+outcome of the write is unknown. Only a reconnect that binds the same session sends the
+write again. Otherwise the write fails with `transientNotCommitted`, so that it is never
+applied twice. If a request that was never sent still waits for the reconnect at its
+deadline, it fails with `transientNotAccepted`.
+
+If a timeout or an outage leaves the client disconnected, the next call or heartbeat
+reconnects it. The reconnect needs credentials to sign in with. It signs in as the caller
+last signed in. Before the caller signs in, it uses the configured `autoLogin`. After
+`logout()`, the client does not sign in by itself. Only the next `login`, or the first
+`connect()` after `disconnect()`, ends this. In a cluster, the client signs in, reads the
+roster, and moves to the leader. If a node answers that it is not the primary, the client
+moves to the next node.
+
+A call made before a `login`, `logout`, or `disconnect` never runs under a session that
+opened after it. This holds for every request of the call. A send with balanced or key
+partitioning reads the topic first, and a consumer group poll syncs its assignment first.
+If the caller signs in or out between two requests of a call, the next request is not
+sent. If the outcome of the call is unknown, it fails with `transientNotCommitted`.
+Otherwise it fails with `unauthenticated`.
+
+If the server refuses the credentials of the automatic sign-in, a call that waits for it
+fails with `unauthenticated`. The error has the refusal as its context. For example, the
+server refuses a wrong password, or a personal access token that is invalid or expired.
+Then the client stays signed out, and only a sign-in by the caller ends this.
+
+An explicit `login` supersedes automatic sign-in and uses the credentials supplied by
+the caller. Any failed explicit attempt, including invalid input or a timeout, disables
+automatic sign-in until another explicit sign-in succeeds. A disconnect followed by a
+connect does not lift that restriction. Older or queued sign-ins cannot restore credentials
+after a newer attempt has failed. A public sign-in failure also discards any session
+that Register already created and closes its connection, so reconnect cannot bind that
+session. Best-effort roster discovery does not turn a successful sign-in into a failure.
 
 ### Messages
 
@@ -154,11 +278,100 @@ group poll fails with `consumerGroupMemberNotFound` until it does. In a cluster,
 and offset writes go to the partition's primary over a second connection bound to the
 same session.
 
+### Producer
+
+`IggyProducer` appends to one topic. `initialize()` creates the stream and topic when
+they are named and missing, then a send either writes from the calling task (`direct`,
+the default) or queues the batch for a background worker (`background`):
+
+```swift
+let producer = try client.producer(streamID: "orders", topicID: "created")
+try await producer.initialize()
+let response = try await producer.send(["placed", "paid"])
+
+let background = try client.producer(
+    streamID: "orders", topicID: "created",
+    configuration: ProducerConfiguration(mode: .background(BackgroundSendOptions(lingerTime: .milliseconds(5)))))
+try await background.initialize()
+try await background.send(["queued"])
+await background.shutdown()
+```
+
+A direct send splits a batch into requests of at most `batchLength` messages, each
+within the server's 64 MiB frame limit, and returns their confirmations; a failure,
+cancellation included, throws `ProducerSendError` with the confirmations so far and the
+unconfirmed tail. A background send returns once queued and reports write failures to
+`errorHandler`; `shutdown()` writes what is still buffered, and the producer is closed
+by then, so a resend from `errorHandler` during that final flush fails with
+`producerClosed`.
+
+The producer retries only a request the server refused to admit or that found no
+connection, since a retry is a new request: anything that may have committed, such as
+`transientNotCommitted` or `disconnected`, is left to the caller, and the server does
+not deduplicate a resend. Resend a failed tail only when its `cause` proves the first
+request never committed; `ProducerSendError` lists those causes. The Rust producer has
+since handed these retries to its client's operation lanes, which the Swift client does
+not have yet.
+
+A send belongs to the session it started in. Once the caller signs in or out, what it
+has not written yet, a background batch still queued, or a retry still waiting, fails
+with `unauthenticated` instead of going under the new session, and a queued batch is
+never merged with one from another session.
+
+With the default ordered sharding, the sends to one stream and topic identifier are
+written in order. A topic addressed by name and by numeric id counts as two, and a
+failed request does not hold back the ones after it, so a resend from `errorHandler`
+lands behind them.
+
+### Consumer
+
+`IggyConsumer` reads one topic and hands its messages over one at a time. A standalone
+consumer reads one partition; a member of a consumer group reads the partitions the
+server assigns, joining the group in `initialize()`:
+
+```swift
+let consumer = try client.consumerGroup(name: "billing", streamID: "orders", topicID: "created")
+try await consumer.initialize()
+for try await received in consumer {
+    print(received.partitionID, received.message.offset, received.message.payloadString)
+}
+```
+
+A poll refills the buffer once it runs empty. `pollingStrategy` says where reading a
+partition starts, and each later poll of it continues after the last message handed over
+from it. The exception is `.next` with an `autoCommit` that commits with every poll, as in
+the default configuration. That poll starts after the offset that the previous poll
+stored. A failed poll is thrown after the retry
+interval and leaves the consumer usable, so a caller of `next()` can call it again, and
+`consumeMessages(_:)` logs it and keeps reading until the client cannot come back on its
+own. Without `allowReplay` a message at or below the last one handed over from the same
+partition history is skipped.
+
+`autoCommit` decides when the position is stored. The default commits with every poll,
+before the batch is handed over, and on a one-second interval; `.disabled` leaves it to
+`storePosition(_:)` with the position of a `ReceivedMessage`, the only setting under which a
+message whose handling failed comes back on the next run. `shutdown()` sends the queued
+commits, stores the reading position of every partition read unless auto-commit is
+disabled, and leaves the group.
+
+Unlike the Rust consumer this one has no encryptor, and it does not resolve a group create
+or join whose reply was lost, since the Swift client has no operation lanes yet.
+
+### Raw requests
+
+`sendRawRequest(code:payload:)` sends a command code with an encoded payload and returns the raw reply body. `sendRawRequest(code:payload:replica:)` sends it to one node of a cluster, named by the replica id that cluster metadata returns.
+
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, consumer-offset reads and session-control codes fail with `invalidCommand` before anything is sent. An id that cluster metadata does not name fails with `invalidIdentifier`. An unreachable node is retried until the request timeout, and `notPrimary` is returned rather than sent to another node.
+
 ### Errors
 
-Every operation throws `IggyError`, a value carrying the typed `code`
+Every client operation throws `IggyError`, a value carrying the typed `code`
 (`IggyErrorCode`, one case per server error code), the raw wire code, and optional
-context. A cancelled task gets `CancellationError`:
+context. A cancelled task gets `CancellationError`. A direct producer send is the
+exception: a failure while sending, cancellation included, throws `ProducerSendError`,
+carrying the `IggyError` as `cause`, the confirmations so far, and the unconfirmed
+`failed` tail. A send refused before it starts, such as with `producerClosed` after
+`shutdown()`, throws a plain `IggyError`:
 
 ```swift
 func handle(_ error: IggyError) {
@@ -170,6 +383,29 @@ func handle(_ error: IggyError) {
     }
 }
 ```
+
+Three codes tell what happened to a request that did not complete:
+
+- `transientNotAccepted` (58): the server did not admit the request, so a retry is
+  safe.
+- `transientNotCommitted` (57): the outcome is unknown, and the server possibly applied
+  the write. Read the state before you write it again.
+- `unauthenticated` (40): the request needs a session. Sign in, then retry.
+
+The Rust SDK and the other native SDKs keep a write with an unknown outcome in a
+retained-operation registry and fail it with `operationUncertain` (14006). Swift has no
+such registry, so it reports the same case as `transientNotCommitted` (57).
+
+A lost reply followed by session end remains uncertain, including after account
+reactivation or a new login. Swift has no resolver for that receipt; a fresh send
+can duplicate the earlier write. See the server's
+[session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
+
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 ## Testing
 
@@ -186,8 +422,12 @@ skips when that variable is unset. Start one from the repository root:
 
 ```bash
 cargo build --bin iggy-server
-IGGY_PATH=/tmp/iggy-swift IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy target/debug/iggy-server
+IGGY_PATH=/tmp/iggy-swift IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
+IGGY_ENCRYPTION_ENABLED=true IGGY_ENCRYPTION_KEY=/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE= \
+target/debug/iggy-server
 ```
+
+The resource options scenarios need encryption enabled, so a stream created without a key gets one the server generates.
 
 Then, from `foreign/swift`:
 
@@ -205,6 +445,10 @@ The hash, error-code, model, request, reply, and consensus header tests compare 
 ```bash
 cargo run --manifest-path Tools/golden-vectors/Cargo.toml -- Tests/IggyTests/Fixtures/golden.json
 ```
+
+The resource options tests compare against `Tests/IggyTests/Fixtures/resource_options.json`, the fixture every SDK shares, generated by `core/common/examples/resource_options_fixtures.rs`. Never edit the copy. The metadata changes tests do the same with `Tests/IggyTests/Fixtures/metadata_changes.json`, generated by `core/common/examples/metadata_changes_fixtures.rs`.
+
+The metadata changes scenario that churns the change log past its capacity runs only when `IGGY_METADATA_CHANGE_LOG_RESOURCE_CAPACITY` is set for both the server and the test run, for example to 64.
 
 ## Contributing
 

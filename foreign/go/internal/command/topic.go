@@ -19,28 +19,20 @@ package command
 
 import (
 	"encoding/binary"
-	"fmt"
+	"slices"
 
 	"github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
-const (
-	topicOptionCompressionAlgorithm = "compression_algorithm"
-	topicOptionMessageExpiry        = "message_expiry"
-	topicOptionMaxTopicSize         = "max_topic_size"
-)
+// defaultPartitionsCount is what a topic starts with when the options name
+// no count, as in the other SDKs.
+const defaultPartitionsCount = 1
 
 type CreateTopic struct {
-	StreamId             iggcon.Identifier           `json:"streamId"`
-	PartitionsCount      uint32                      `json:"partitionsCount"`
-	CompressionAlgorithm iggcon.CompressionAlgorithm `json:"compressionAlgorithm"`
-	MessageExpiry        iggcon.Duration             `json:"messageExpiry"`
-	MaxTopicSize         uint64                      `json:"maxTopicSize"`
-	Name                 string                      `json:"name"`
-	// Options carries keys with no field above, for a key the server catalog
-	// gained after this build shipped. Entries reuse HeaderEntry because options
-	// ride the user-headers codec. A field above wins on collision.
-	Options []iggcon.HeaderEntry `json:"-"`
+	StreamId iggcon.Identifier
+	Name     string
+	Options  iggcon.TopicOptions
 }
 
 func (t *CreateTopic) Code() Code {
@@ -57,11 +49,18 @@ func (t *CreateTopic) MarshalBinary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	optionsBytes := iggcon.GetHeadersBytes(options)
+	optionsBytes, err := encodeOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	partitionsCount := uint32(defaultPartitionsCount)
+	if t.Options.PartitionsCount != nil {
+		partitionsCount = *t.Options.PartitionsCount
+	}
 
 	bytes := make([]byte, 0, len(streamIdBytes)+4+1+len(nameBytes)+len(optionsBytes))
 	bytes = append(bytes, streamIdBytes...)
-	bytes = binary.LittleEndian.AppendUint32(bytes, t.PartitionsCount)
+	bytes = binary.LittleEndian.AppendUint32(bytes, partitionsCount)
 	bytes = append(bytes, byte(len(nameBytes)))
 	bytes = append(bytes, nameBytes...)
 	bytes = append(bytes, optionsBytes...)
@@ -72,86 +71,71 @@ func (t *CreateTopic) MarshalBinary() ([]byte, error) {
 // options builds the trailing options block. partitions_count is not an
 // option: it fills the command's own fixed field. Keys carrying the
 // server-default sentinel (expiry 0, size 0, compression none) are omitted so
-// the server derives them and returns them as derived entries.
+// the server derives them and returns them as derived entries. Both
+// durability keys are always sent, replicated unless named otherwise.
 func (t *CreateTopic) options() ([]iggcon.HeaderEntry, error) {
-	var options []iggcon.HeaderEntry
-	compression, err := t.CompressionAlgorithm.OptionValue()
+	typed, err := t.typedOptions()
 	if err != nil {
 		return nil, err
 	}
-	if compression != "" {
-		options = append(options, stringOption(topicOptionCompressionAlgorithm, compression))
-	}
-	if t.MessageExpiry != 0 {
-		options = append(options, uint64Option(topicOptionMessageExpiry, uint64(t.MessageExpiry)))
-	}
-	if t.MaxTopicSize != 0 {
-		options = append(options, uint64Option(topicOptionMaxTopicSize, t.MaxTopicSize))
-	}
-	merged, err := mergeOptions(options, t.Options)
+	merged, err := mergeOptions(typed, t.Options.Raw)
 	if err != nil {
 		return nil, err
 	}
-	for _, key := range []string{"durability", "consumer_offset_durability"} {
-		found := false
-		for _, entry := range merged {
-			if string(entry.Key.Value) == key {
-				found = true
-				if entry.Value.Kind != iggcon.String || (string(entry.Value.Value) != string(iggcon.DurabilityReplicated) && string(entry.Value.Value) != string(iggcon.DurabilityPersisted)) {
-					return nil, fmt.Errorf("invalid %s", key)
-				}
-			}
-		}
-		if !found {
-			merged = append(merged, stringOption(key, string(iggcon.DurabilityReplicated)))
-		}
-	}
-	return merged, nil
-}
-
-// mergeOptions appends the caller's entries to the ones the typed fields
-// produced, dropping any that would duplicate a typed key.
-//
-// The block must not carry a key twice: wire validation refuses the whole
-// request for a duplicate. The typed field wins because it is the specific
-// argument, mirroring how the Rust SDK inserts typed values after raw ones.
-func mergeOptions(typed, extra []iggcon.HeaderEntry) ([]iggcon.HeaderEntry, error) {
-	if len(extra) == 0 {
-		return typed, nil
-	}
-	seen := make(map[string]struct{}, len(typed)+len(extra))
-	for _, entry := range typed {
-		seen[string(entry.Key.Value)] = struct{}{}
-	}
-	merged := typed
-	for _, entry := range extra {
-		if entry.Key.Kind != iggcon.String {
-			return nil, fmt.Errorf("option key kind %d is not a string", entry.Key.Kind)
-		}
-		key := string(entry.Key.Value)
-		if _, duplicate := seen[key]; duplicate {
+	for _, key := range []iggcon.TopicOptionKey{iggcon.TopicOptionDurability, iggcon.TopicOptionConsumerOffsetDurability} {
+		index := slices.IndexFunc(merged, func(entry iggcon.HeaderEntry) bool { return string(entry.Key.Value) == string(key) })
+		if index < 0 {
+			merged = append(merged, stringOption(string(key), string(iggcon.DurabilityReplicated)))
 			continue
 		}
-		seen[key] = struct{}{}
-		merged = append(merged, entry)
+		value := merged[index].Value
+		if value.Kind != iggcon.String || string(value.Value) != string(iggcon.DurabilityReplicated) && string(value.Value) != string(iggcon.DurabilityPersisted) {
+			return nil, ierror.InvalidOptionValue{Key: string(key)}
+		}
 	}
 	return merged, nil
 }
 
-func uint64Option(key string, value uint64) iggcon.HeaderEntry {
-	buf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(buf, value)
-	return iggcon.HeaderEntry{
-		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte(key)},
-		Value: iggcon.HeaderValue{Kind: iggcon.Uint64, Value: buf},
+func (t *CreateTopic) typedOptions() ([]iggcon.HeaderEntry, error) {
+	options := t.Options
+	var typed []iggcon.HeaderEntry
+	if options.CompressionAlgorithm != nil {
+		compression, err := options.CompressionAlgorithm.OptionValue()
+		if err != nil {
+			return nil, ierror.InvalidOptionValue{Key: string(iggcon.TopicOptionCompressionAlgorithm)}
+		}
+		if compression != "" {
+			typed = append(typed, stringOption(string(iggcon.TopicOptionCompressionAlgorithm), compression))
+		}
 	}
-}
-
-func stringOption(key string, value string) iggcon.HeaderEntry {
-	return iggcon.HeaderEntry{
-		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte(key)},
-		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte(value)},
+	if options.MessageExpiry != nil && *options.MessageExpiry != iggcon.IggyExpiryServerDefault {
+		typed = append(typed, uint64Option(string(iggcon.TopicOptionMessageExpiry), uint64(*options.MessageExpiry)))
 	}
+	if options.MaxTopicSize != nil && *options.MaxTopicSize != 0 {
+		typed = append(typed, uint64Option(string(iggcon.TopicOptionMaxTopicSize), *options.MaxTopicSize))
+	}
+	if options.SegmentSize != nil {
+		typed = append(typed, iggcon.SegmentSizeOption(*options.SegmentSize))
+	}
+	if options.Durability != nil {
+		typed = append(typed, iggcon.DurabilityOption(*options.Durability))
+	}
+	if options.ConsumerOffsetDurability != nil {
+		typed = append(typed, iggcon.ConsumerOffsetDurabilityOption(*options.ConsumerOffsetDurability))
+	}
+	if options.PartitionResizePolicy != nil {
+		typed = append(typed, iggcon.PartitionResizePolicyOption(*options.PartitionResizePolicy))
+	}
+	if options.MessagesRequiredToSave != nil {
+		typed = append(typed, iggcon.MessagesRequiredToSaveOption(*options.MessagesRequiredToSave))
+	}
+	if options.SizeOfMessagesRequiredToSave != nil {
+		typed = append(typed, iggcon.SizeOfMessagesRequiredToSaveOption(*options.SizeOfMessagesRequiredToSave))
+	}
+	if options.PreallocateSegments != nil {
+		typed = append(typed, iggcon.PreallocateSegmentsOption(*options.PreallocateSegments))
+	}
+	return typed, nil
 }
 
 type GetTopic struct {
@@ -192,73 +176,39 @@ func (d *DeleteTopic) MarshalBinary() ([]byte, error) {
 	return iggcon.MarshalIdentifiers(d.StreamId, d.TopicId)
 }
 
+// UpdateTopic patches a topic through the generic UpdateResource command.
+// Create-only settings, compression included, have no field here.
 type UpdateTopic struct {
-	StreamId iggcon.Identifier `json:"streamId"`
-	TopicId  iggcon.Identifier `json:"topicId"`
-	Name     string            `json:"name"`
-	// Options carries keys with no field below. The server refuses any key an
-	// update may not change, by name.
-	Options []iggcon.HeaderEntry `json:"-"`
-	// Settings ride the options block. A zero value means "leave it alone",
-	// so a rename does not silently reset the rest.
-	CompressionAlgorithm iggcon.CompressionAlgorithm `json:"compressionAlgorithm"`
-	MessageExpiry        iggcon.Duration             `json:"messageExpiry"`
-	MaxTopicSize         uint64                      `json:"maxTopicSize"`
+	StreamId      iggcon.Identifier
+	TopicId       iggcon.Identifier
+	Name          *string
+	MessageExpiry *iggcon.Duration
+	MaxTopicSize  *uint64
+	Reset         []iggcon.TopicOptionKey
+	RawReset      []string
+	Options       []iggcon.HeaderEntry
 }
 
 func (u *UpdateTopic) Code() Code {
-	return UpdateTopicCode
+	return UpdateResourceCode
 }
 
-// options builds the trailing options block. Only keys an update may change are
-// allowed; the server rejects the create-time knobs by name. A zero value means
-// the caller did not set the key, so it is omitted and the server leaves the
-// topic's current value alone.
-func (u *UpdateTopic) options() ([]iggcon.HeaderEntry, error) {
-	var options []iggcon.HeaderEntry
-	compression, err := u.CompressionAlgorithm.OptionValue()
-	if err != nil {
-		return nil, err
-	}
-	if compression != "" {
-		options = append(options, stringOption(topicOptionCompressionAlgorithm, compression))
-	}
-	if u.MessageExpiry != 0 {
-		options = append(options, uint64Option(topicOptionMessageExpiry, uint64(u.MessageExpiry)))
-	}
-	if u.MaxTopicSize != 0 {
-		options = append(options, uint64Option(topicOptionMaxTopicSize, u.MaxTopicSize))
-	}
-	return mergeOptions(options, u.Options)
-}
-
+// MarshalBinary encodes the patch. A zero expiry or size is the server-default
+// sentinel and changes nothing, Reset returns a key to its default.
 func (u *UpdateTopic) MarshalBinary() ([]byte, error) {
-	streamIdBytes, err := u.StreamId.MarshalBinary()
-	if err != nil {
-		return nil, err
+	var typed []iggcon.HeaderEntry
+	if u.Name != nil {
+		typed = append(typed, textOption(string(iggcon.TopicOptionName), *u.Name))
 	}
-	topicIdBytes, err := u.TopicId.MarshalBinary()
-	if err != nil {
-		return nil, err
+	if u.MessageExpiry != nil && *u.MessageExpiry != iggcon.IggyExpiryServerDefault {
+		typed = append(typed, uint64Option(string(iggcon.TopicOptionMessageExpiry), uint64(*u.MessageExpiry)))
 	}
-
-	options, err := u.options()
-	if err != nil {
-		return nil, err
+	if u.MaxTopicSize != nil && *u.MaxTopicSize != 0 {
+		typed = append(typed, uint64Option(string(iggcon.TopicOptionMaxTopicSize), *u.MaxTopicSize))
 	}
-	optionsBytes := iggcon.GetHeadersBytes(options)
-	buffer := make([]byte, 1+len(streamIdBytes)+len(topicIdBytes)+len(u.Name)+len(optionsBytes))
-
-	offset := 0
-
-	offset += copy(buffer[offset:], streamIdBytes)
-	offset += copy(buffer[offset:], topicIdBytes)
-
-	buffer[offset] = uint8(len(u.Name))
-	offset++
-
-	offset += copy(buffer[offset:], u.Name)
-	copy(buffer[offset:], optionsBytes)
-
-	return buffer, nil
+	reset := make([]string, 0, len(u.Reset))
+	for _, key := range u.Reset {
+		reset = append(reset, string(key))
+	}
+	return encodeUpdateResource(iggcon.OptionsScopeTopic, []iggcon.Identifier{u.StreamId, u.TopicId}, typed, u.Options, reset, u.RawReset)
 }

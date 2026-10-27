@@ -227,7 +227,7 @@ set for a feature that is switched on and no existing Secret was named for it.
 {{- define "iggy.createsSecret" -}}
   {{- $server := .Values.server }}
   {{- $create := false }}
-  {{- if and $server.encryption.enabled (not $server.encryption.existingSecret.name) }}
+  {{- if and $server.encryption.key (not $server.encryption.existingSecret.name) }}
     {{- $create = true }}
   {{- end }}
   {{- if and (or $server.jwt.encodingSecret $server.jwt.decodingSecret) (not $server.jwt.existingSecret.name) }}
@@ -259,13 +259,31 @@ anything that names the cause.
       {{- fail "server.users.root has neither createSecret nor existingSecret.name, so the container receives no IGGY_ROOT_USERNAME or IGGY_ROOT_PASSWORD. The chart requires both for initial root creation. Point existingSecret.name at a Secret holding them, set createSecret with a username and password, or for a throwaway development install add --with-default-root-credentials to server.extraArgs." }}
     {{- end }}
   {{- end }}
-  {{- if $server.encryption.enabled }}
-    {{- if and (not $server.encryption.key) (not $server.encryption.existingSecret.name) }}
-      {{- fail "server.encryption.enabled is true but no key was given. Set server.encryption.key to a base64-encoded 32-byte key, or point server.encryption.existingSecret.name at a Secret holding one." }}
+  {{- if and $server.encryption.enabled (not $server.encryption.key) (not $server.encryption.existingSecret.name) }}
+    {{- fail "server.encryption.enabled is true but no key was given. Set server.encryption.key to a base64-encoded 32-byte key, or point server.encryption.existingSecret.name at a Secret holding one." }}
+  {{- end }}
+  {{- if and $server.encryption.key (not $server.encryption.existingSecret.name) }}
+    {{- if ne (len (b64dec $server.encryption.key)) 32 }}
+      {{- fail (printf "server.encryption.key decodes to %d bytes. AES-256-GCM takes a base64-encoded 32-byte key, and the server refuses the config on anything else, enabled or not." (len (b64dec $server.encryption.key))) }}
     {{- end }}
-    {{- if and $server.encryption.key (not $server.encryption.existingSecret.name) }}
-      {{- if ne (len (b64dec $server.encryption.key)) 32 }}
-        {{- fail (printf "server.encryption.key decodes to %d bytes. AES-256-GCM takes a base64-encoded 32-byte key, and the server fails the boot with 'Invalid encryption key' on anything else." (len (b64dec $server.encryption.key))) }}
+  {{- end }}
+  {{- if and $server.encryption.previousKeys (not $server.encryption.existingSecret.name) }}
+    {{- $previousKeys := $server.encryption.previousKeys }}
+    {{- if not $server.encryption.key }}
+      {{- fail "server.encryption.previousKeys is set without server.encryption.key. A rotation needs the new key in key and the retiring ones in previousKeys." }}
+    {{- end }}
+    {{- if gt (len $previousKeys) 2 }}
+      {{- fail (printf "server.encryption.previousKeys holds %d keys. The server accepts at most two." (len $previousKeys)) }}
+    {{- end }}
+    {{- if ne (len (uniq $previousKeys)) (len $previousKeys) }}
+      {{- fail "server.encryption.previousKeys lists the same key twice, which the server rejects." }}
+    {{- end }}
+    {{- range $previousKeys }}
+      {{- if ne (len (b64dec .)) 32 }}
+        {{- fail (printf "A server.encryption.previousKeys entry decodes to %d bytes. Each must be a base64-encoded 32-byte key." (len (b64dec .))) }}
+      {{- end }}
+      {{- if eq . $server.encryption.key }}
+        {{- fail "server.encryption.previousKeys repeats server.encryption.key, which the server rejects. Leave previousKeys empty outside a rotation." }}
       {{- end }}
     {{- end }}
   {{- end }}
@@ -297,7 +315,7 @@ Secret owns it.
 {{- define "iggy.secretEnv" -}}
   {{- $server := .Values.server }}
   {{- $generated := include "iggy.secretName" . }}
-  {{- if $server.encryption.enabled }}
+  {{- if or $server.encryption.enabled $server.encryption.key $server.encryption.existingSecret.name }}
     {{- $configVersion := $server.encryption.configVersion | default "auto" }}
     {{- if eq $configVersion "auto" }}
       {{- $imageTag := $server.image.tag | default .Chart.AppVersion }}
@@ -314,12 +332,25 @@ Secret owns it.
       {{- fail "server.encryption.configVersion must be auto, legacy, or flat." }}
     {{- end }}
 - name: {{ $prefix }}_ENABLED
-  value: "true"
+  value: {{ $server.encryption.enabled | quote }}
 - name: {{ $prefix }}_KEY
   valueFrom:
     secretKeyRef:
       name: {{ default $generated $server.encryption.existingSecret.name }}
       key: {{ ternary $server.encryption.existingSecret.key "encryptionKey" (ne $server.encryption.existingSecret.name "") }}
+    {{- if and $server.encryption.previousKeys (not $server.encryption.existingSecret.name) }}
+      {{- if eq $configVersion "legacy" }}
+        {{- fail "server.encryption.previousKeys needs a server build using [encryption]. The legacy [system.encryption] layout has no key rotation. Set server.encryption.configVersion to flat for such a build." }}
+      {{- end }}
+    {{- end }}
+    {{- if and (eq $configVersion "flat") (or $server.encryption.previousKeys $server.encryption.existingSecret.name) }}
+- name: IGGY_ENCRYPTION_PREVIOUS_KEYS
+  valueFrom:
+    secretKeyRef:
+      name: {{ default $generated $server.encryption.existingSecret.name }}
+      key: {{ ternary $server.encryption.existingSecret.previousKeysKey "encryptionPreviousKeys" (ne $server.encryption.existingSecret.name "") }}
+      optional: true
+    {{- end }}
   {{- end }}
   {{- if or $server.jwt.existingSecret.name $server.jwt.encodingSecret }}
 - name: IGGY_HTTP_JWT_ENCODING_SECRET

@@ -103,11 +103,15 @@ server:
     # -- PVC storage size
     size: 8Gi
 
-  # -- Server-side encryption of message payloads and state commands, using
-  # AES-256-GCM. Every node of a cluster must hold the identical key, or it
-  # cannot read data another node wrote.
+  # -- Server-side encryption of message data at rest, using AES-256-GCM.
+  # Server builds using the `flat` layout give every encrypted stream its own
+  # key, stored wrapped under a key derived from this one. Every node of a
+  # cluster must hold the identical key, or it cannot read data another node
+  # wrote.
   encryption:
-    # -- Enable encryption at rest
+    # -- Enable encryption at rest. With the `flat` layout, streams created
+    # without their own key get a generated one, and a key set while this is
+    # false still accepts streams created with their own key.
     enabled: false
     # -- Encryption config layout: `auto` selects `legacy` for released image
     # versions through 0.9.0-edge.7. Set `flat` for newer server builds, or
@@ -117,11 +121,19 @@ server:
     # Prefer `existingSecret` outside development: a value here is stored in the
     # Helm release and readable by anyone who can read it.
     key: ""
+    # -- Retiring keys, at most two, base64 encoded, that still unwrap stream
+    # keys while a rotation is in flight. Needs the `flat` layout. Stored in the
+    # generated Secret. Ignored when `existingSecret.name` is set. Leave empty
+    # outside a rotation.
+    previousKeys: []
     existingSecret:
       # -- Name of an existing Secret holding the encryption key
       name: ""
       # -- Key inside that Secret
       key: encryptionKey
+      # -- Optional key inside that Secret holding the retiring keys, one bare
+      # key or a JSON array of at most two. Read with the `flat` layout only.
+      previousKeysKey: encryptionPreviousKeys
 
   # -- Secrets used to sign and validate HTTP bearer tokens. Left unset, each
   # node generates a random secret on every start, which invalidates tokens

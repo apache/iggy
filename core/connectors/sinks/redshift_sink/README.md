@@ -28,7 +28,6 @@ stream = "user_events"
 topics = ["users", "orders"]
 schema = "json"
 batch_length = 100
-poll_interval = "5ms"
 consumer_group = "redshift_sink"
 
 [plugin_config]

@@ -27,7 +27,7 @@ import type {
 } from '../../client/client.type.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { ResponseError } from '../error.utils.js';
-import { LaneBlockedError, OperationUncertainError } from '../../client/client.operation.js';
+import { LaneBlockedError, OPERATION_TIMEOUT_MS, OperationUncertainError } from '../../client/client.operation.js';
 import { Consumer } from '../offset/offset.utils.js';
 import {
   PollingStrategy
@@ -37,6 +37,8 @@ import {
   pollMessages,
   type PollMessages
 } from './poll-messages.command.js';
+
+const UNAUTHENTICATED = 40;
 
 const response = (data: Buffer): CommandResponse => ({
   status: 0,
@@ -277,7 +279,7 @@ describe('VSR consumer-group polling', () => {
       (command, emitter) => {
         if (command === COMMAND_CODE.PollMessages && resetPending) {
           resetPending = false;
-          emitter.emit('sessionReset');
+          emitter.emit('sessionReset', true);
         }
       }
     );
@@ -299,13 +301,78 @@ describe('VSR consumer-group polling', () => {
     );
   });
 
+  it('returns the refused sign-in of a poll that starts signed out', async () => {
+    let resetPending = true;
+    const refusal = new ResponseError(COMMAND_CODE.SyncGroup, UNAUTHENTICATED);
+    const { client, commands } = stubClient([refusal], (_command, emitter) => {
+      // The sign-in that the first command waits for resets a session that was not signed in.
+      if (resetPending) {
+        resetPending = false;
+        emitter.emit('sessionReset', false);
+      }
+    });
+    client.isAuthenticated = false;
+
+    await assert.rejects(pollMessages(async () => client)(groupRequest), (error: unknown) => error === refusal);
+    assert.deepEqual(commands.map(({ command }) => command), [COMMAND_CODE.SyncGroup]);
+  });
+
+  it('retries a poll that starts signed out when the session it signed in to ends', async () => {
+    let sessionEnded = false;
+    const { client, commands } = stubClient(
+      [
+        assignment(1n, [4]),
+        new Error('connection closed while waiting for response'),
+        response(Buffer.alloc(0)),
+        response(Buffer.alloc(0)),
+        assignment(2n, [7]),
+        pollResponse(7)
+      ],
+      (command, emitter) => {
+        if (!client.isAuthenticated) {
+          // The sign-in that the first command waits for resets a session that was not signed in.
+          emitter.emit('sessionReset', false);
+          client.isAuthenticated = true;
+        } else if (command === COMMAND_CODE.PollMessages && !sessionEnded) {
+          sessionEnded = true;
+          emitter.emit('sessionReset', true);
+        }
+      }
+    );
+    client.isAuthenticated = false;
+
+    assert.equal((await pollMessages(async () => client)(groupRequest)).partitionId, 7);
+    assert.deepEqual(commands.map(({ command }) => command), [
+      COMMAND_CODE.SyncGroup, COMMAND_CODE.PollMessages, COMMAND_CODE.SyncGroup,
+      COMMAND_CODE.JoinGroup, COMMAND_CODE.SyncGroup, COMMAND_CODE.PollMessages
+    ]);
+  });
+
+  it('bounds the retries after session ends by one deadline for the whole call', async (context) => {
+    // Each attempt takes a third of the deadline, so the third one ends at it.
+    const attempts = 3;
+    const sessionEnds = attempts + 1;
+    context.mock.timers.enable({ apis: ['Date'] });
+    const deadline = Date.now() + OPERATION_TIMEOUT_MS;
+    const refusal = () => new ResponseError(COMMAND_CODE.SyncGroup, UNAUTHENTICATED);
+    const { client, commands } = stubClient(Array.from({ length: sessionEnds }, refusal), (_command, emitter) => {
+      if (commands.length <= sessionEnds) emitter.emit('sessionReset', true);
+      context.mock.timers.tick(OPERATION_TIMEOUT_MS / attempts);
+    });
+
+    await assert.rejects(pollMessages(async () => client)(groupRequest),
+      (error: unknown) => error instanceof ResponseError && error.errorCode === UNAUTHENTICATED);
+    assert.equal(commands.length, attempts);
+    assert.ok(commands.every(({ options }) => options?.deadline === deadline));
+  });
+
   it('does not replay an ambiguous auto-commit poll when its coordinator also resets', async () => {
     const { client, commands } = stubClient([
       assignment(1n, [4]),
       new ResponseError(COMMAND_CODE.PollMessages, 57)
     ], (command, emitter) => {
       if (command === COMMAND_CODE.PollMessages)
-        emitter.emit('sessionReset');
+        emitter.emit('sessionReset', true);
     });
     await assert.rejects(pollMessages(async () => client)({ ...groupRequest, autocommit: true }),
       (error: unknown) => error instanceof ResponseError && error.errorCode === 57);

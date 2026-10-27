@@ -28,7 +28,6 @@ stream = "example_stream"
 topics = ["example_topic"]
 schema = "json"
 batch_length = 100
-poll_interval = "5ms"
 consumer_group = "iceberg_sink_connector"
 
 # Local S3 example

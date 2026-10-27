@@ -27,13 +27,18 @@
 //! `RangeEvicted`, the repaired window cannot connect to recovered state,
 //! and `complete_repair` returns the `FloorRefused` conversion trigger.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use iggy::prelude::*;
-use integration::harness::TestHarness;
+use integration::harness::{TestHarness, TestServerConfig, resolve_config_paths};
 use integration::iggy_harness;
+use serial_test::parallel;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 const STREAM_NAME: &str = "partition-transfer-stream";
@@ -68,6 +73,9 @@ const KILL_GATE_POLL: Duration = Duration::from_millis(10);
 
 const CONVERSION_MARKER: &str = "partition repair floor unreachable; converting to state transfer";
 const INSTALL_MARKER: &str = "partition state transfer installed";
+const INSTALL_FAILED_MARKER: &str = "partition state transfer install failed";
+/// The `StaleTransfer` reason, logged inside an [`INSTALL_FAILED_MARKER`] line.
+const STALE_INSTALL_MARKER: &str = "is below the local commit frontier";
 /// Logged once per transfer, at the last byte of the last artifact. The
 /// descriptor-time "serving" line only proves a request ARRIVED; this proves the
 /// pull ran.
@@ -83,6 +91,17 @@ const ABANDON_MARKER: &str =
 /// scheduler luck.
 const REARM_ON_VIEW_MARKER: &str =
     "adopted a live view while awaiting transfer; requesting partition state transfer";
+
+/// Sustained-write spec: the node cut off and then healed.
+const LAGGING_NODE: usize = 2;
+/// Sends committed while node 2 is cut off: more than the evicted ring (capacity
+/// 64) holds, so its repair after the heal cannot reach its own commit point.
+const ISOLATED_SENDS: u32 = 100;
+/// Pace of the writer that keeps running after the heal. One message a second
+/// already moves the commit point past every offer before its pull lands.
+const WRITE_INTERVAL: Duration = Duration::from_secs(1);
+/// How long node 2 must go without another conversion once it installed.
+const CAUGHT_UP_WINDOW: Duration = Duration::from_secs(10);
 
 /// Transfer end-to-end: adoption, repair round-trip, conversion, chunk pull,
 /// install, tail repair. CI runners are slow; bound without hanging the suite.
@@ -353,6 +372,103 @@ async fn given_transfer_peer_dies_when_stalled_should_leave_dead_peer_and_recove
     }
 }
 
+/// A backup that falls past the evicted ring must rejoin through one state
+/// transfer while clients keep writing, and then stay caught up.
+///
+/// Node 2 is cut off while the partition commits more ops than the ring holds,
+/// so its repair after the heal hits `RangeEvicted` and converts to a transfer.
+/// One message per second keeps arriving for the whole run. That is enough to
+/// keep the cluster's commit point moving during every pull. No bulky seed is
+/// needed: the pull itself is a few KiB.
+#[tokio::test(flavor = "multi_thread")]
+#[parallel]
+#[ignore = "known bug: under sustained writes the backup refuses every transfer as stale (transfer frontier below the local commit frontier); run with --run-ignored only"]
+async fn given_sustained_writes_when_a_node_falls_past_the_evicted_ring_should_rejoin_through_one_transfer()
+ {
+    let mut harness = relayed_cluster();
+    harness.start().await.expect("start the cluster");
+    let client = harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect a root client to the node");
+    seed_topic(&client, None).await;
+
+    harness
+        .isolate_node(LAGGING_NODE)
+        .expect("cut node 2 off from its peers");
+    produce(&client, ISOLATED_SENDS).await;
+    let writer = SteadyWriter::start(
+        harness
+            .root_client_for_node(0)
+            .await
+            .expect("connect the steady writer"),
+    );
+    harness
+        .heal_node(LAGGING_NODE)
+        .expect("restore node 2's peer links");
+    await_marker(&harness, LAGGING_NODE, CONVERSION_MARKER).await;
+
+    // Today every install is refused with "transfer frontier X is below the
+    // local commit frontier X+1". The first request only pins the offer at the
+    // primary's commit point (the build answers "flush is pending"), and the
+    // pull runs on the next request, one `repair_retry_interval` later. Node 2
+    // journals the op committed in between, and the install refuses an offer
+    // below an op it holds.
+    let deadline = Instant::now() + TRANSFER_BUDGET;
+    while harness
+        .node(LAGGING_NODE)
+        .stdout_occurrences(INSTALL_MARKER)
+        == 0
+    {
+        assert!(
+            Instant::now() < deadline,
+            "node 2 fell past the evicted ring and never installed a state transfer within \
+             {TRANSFER_BUDGET:?} while one message per second was written: the peers fully \
+             served {} pull(s) and node 2 failed {} install(s), {} of them as stale, so a \
+             backup cannot rejoin under sustained writes",
+            fully_served_count(&harness),
+            harness
+                .node(LAGGING_NODE)
+                .stdout_occurrences(INSTALL_FAILED_MARKER),
+            harness
+                .node(LAGGING_NODE)
+                .stdout_occurrences(STALE_INSTALL_MARKER),
+        );
+        sleep(MARKER_POLL).await;
+    }
+
+    // Installed: the tail above the offer is now ordinary journal repair. A
+    // backup that keeps up never converts to a transfer again.
+    let conversions = harness
+        .node(LAGGING_NODE)
+        .stdout_occurrences(CONVERSION_MARKER);
+    let acked_at_install = writer.acked();
+    let window_end = Instant::now() + CAUGHT_UP_WINDOW;
+    while Instant::now() < window_end {
+        let converted = harness
+            .node(LAGGING_NODE)
+            .stdout_occurrences(CONVERSION_MARKER)
+            - conversions;
+        assert_eq!(
+            converted, 0,
+            "node 2 installed a state transfer, then fell past the evicted ring again and \
+             converted to another transfer while writes continued"
+        );
+        sleep(MARKER_POLL).await;
+    }
+    // The markers only say the machinery ran. Every send committed while node
+    // 2 was cut off must be in its own segment bytes, in order.
+    let expected: Vec<String> = (0..ISOLATED_SENDS)
+        .map(|sequence| format!("message-{sequence}"))
+        .collect();
+    await_installed_payloads(&harness, LAGGING_NODE, &expected).await;
+    let acked = writer.stop().await;
+    assert!(
+        acked > acked_at_install,
+        "the steady writer must keep committing through the caught-up window"
+    );
+}
+
 async fn restart_lagging_node_and_await_install(harness: &mut TestHarness) {
     // Node 2 holds a durable prefix, then misses enough traffic that the
     // survivors' ring moves past its durable end: its repaired window cannot
@@ -395,6 +511,89 @@ async fn restart_lagging_node_and_await_install(harness: &mut TestHarness) {
     await_installed_payloads(harness, 2, &expected).await;
 }
 
+/// The specs above go through `iggy_harness`, which cannot relay the replica
+/// links, so the one that cuts a node off builds its cluster here with the same
+/// server settings.
+fn relayed_cluster() -> TestHarness {
+    let overrides = HashMap::from([
+        ("sharding.cpu_allocation".to_owned(), "0..1".to_owned()),
+        (
+            "partition.evicted_ring_capacity".to_owned(),
+            "64".to_owned(),
+        ),
+    ]);
+    let extra_envs = resolve_config_paths(&overrides).expect("valid server config paths");
+    TestHarness::builder()
+        .server(TestServerConfig::builder().extra_envs(extra_envs).build())
+        .cluster_nodes(3)
+        .peer_relays()
+        .build()
+        .expect("build the harness")
+}
+
+/// Sends one small message per [`WRITE_INTERVAL`] from its own task until
+/// stopped. A failed send is not retried: the next tick sends a new message,
+/// and only acknowledged sends are counted.
+struct SteadyWriter {
+    stop: Arc<AtomicBool>,
+    acked: Arc<AtomicU64>,
+    task: JoinHandle<()>,
+}
+
+impl SteadyWriter {
+    fn start(client: IggyClient) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let acked = Arc::new(AtomicU64::new(0));
+        let task = tokio::spawn({
+            let stop = Arc::clone(&stop);
+            let acked = Arc::clone(&acked);
+            async move {
+                let stream = Identifier::named(STREAM_NAME).expect("stream identifier");
+                let topic = Identifier::named(TOPIC_NAME).expect("topic identifier");
+                let mut sequence = 0_u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let mut messages = vec![
+                        IggyMessage::from_str(&format!("steady-{sequence}")).expect("message"),
+                    ];
+                    sequence += 1;
+                    if client
+                        .send_messages(
+                            &stream,
+                            &topic,
+                            &Partitioning::partition_id(PARTITION_ID),
+                            &mut messages,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        acked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    sleep(WRITE_INTERVAL).await;
+                }
+            }
+        });
+        Self { stop, acked, task }
+    }
+
+    fn acked(&self) -> u64 {
+        self.acked.load(Ordering::Relaxed)
+    }
+
+    async fn stop(self) -> u64 {
+        self.stop.store(true, Ordering::Relaxed);
+        self.task.await.expect("the steady writer task ends");
+        self.acked.load(Ordering::Relaxed)
+    }
+}
+
+/// Pulls the survivors served to their last byte, whoever served them.
+fn fully_served_count(harness: &TestHarness) -> usize {
+    (0..harness.cluster_size())
+        .filter(|&node| node != LAGGING_NODE)
+        .map(|node| harness.node(node).stdout_occurrences(FULLY_SERVED_MARKER))
+        .sum()
+}
+
 async fn connect_any(harness: &TestHarness, nodes: &[usize]) -> Option<IggyClient> {
     for &node in nodes {
         if let Ok(builder) = harness.node(node).tcp_client()
@@ -413,7 +612,7 @@ async fn connect_any(harness: &TestHarness, nodes: &[usize]) -> Option<IggyClien
 /// is what marches `repair_retained_from` forward.
 async fn seed_topic(client: &IggyClient, segment_size: Option<u64>) {
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     client

@@ -27,10 +27,14 @@ import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.TokenInfo;
 import org.apache.iggy.user.UserInfo;
 import org.apache.iggy.user.UserInfoDetails;
+import org.apache.iggy.user.UserOptions;
 import org.apache.iggy.user.UserStatus;
+import org.apache.iggy.user.UserUpdate;
 import tools.jackson.core.type.TypeReference;
 
+import java.math.BigInteger;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 class UsersHttpClient implements UsersClient {
@@ -45,20 +49,30 @@ class UsersHttpClient implements UsersClient {
     @Override
     public Optional<UserInfoDetails> getUser(UserId userId) {
         var request = httpClient.prepareGetRequest(USERS + "/" + userId);
-        return httpClient.executeWithOptionalResponse(request, UserInfoDetails.class);
+        return httpClient
+                .executeWithOptionalResponse(request, HttpUserDetails.class)
+                .map(HttpUserDetails::toUserInfoDetails);
     }
 
     @Override
     public List<UserInfo> getUsers() {
         var request = httpClient.prepareGetRequest(USERS);
-        return httpClient.execute(request, new TypeReference<>() {});
+        List<HttpUser> users = httpClient.execute(request, new TypeReference<>() {});
+        return users.stream().map(HttpUser::toUserInfo).toList();
     }
 
     @Override
     public UserInfoDetails createUser(
-            String username, String password, UserStatus status, Optional<Permissions> permissions) {
-        var request = httpClient.preparePostRequest(USERS, new CreateUser(username, password, status, permissions));
-        return httpClient.execute(request, new TypeReference<>() {});
+            String username,
+            String password,
+            UserStatus status,
+            Optional<Permissions> permissions,
+            UserOptions options) {
+        var request = httpClient.preparePostRequest(
+                USERS,
+                new CreateUser(
+                        username, password, status, permissions, HttpOptionValue.requestValues(options.entries())));
+        return httpClient.execute(request, HttpUserDetails.class).toUserInfoDetails();
     }
 
     @Override
@@ -68,8 +82,9 @@ class UsersHttpClient implements UsersClient {
     }
 
     @Override
-    public void updateUser(UserId userId, Optional<String> username, Optional<UserStatus> status) {
-        var request = httpClient.preparePutRequest(USERS + "/" + userId, new UpdateUser(username, status));
+    public void updateUser(UserId userId, UserUpdate update) {
+        var request = httpClient.preparePutRequest(
+                USERS + "/" + userId, HttpOptionValue.updateBody(update.entries(), update.resetKeys()));
         httpClient.execute(request);
     }
 
@@ -106,11 +121,53 @@ class UsersHttpClient implements UsersClient {
 
     record Login(String username, String password, String version, String context) {}
 
-    private record CreateUser(String username, String password, UserStatus status, Optional<Permissions> permissions) {}
-
-    private record UpdateUser(Optional<String> username, Optional<UserStatus> status) {}
+    private record CreateUser(
+            String username,
+            String password,
+            UserStatus status,
+            Optional<Permissions> permissions,
+            Map<String, Object> options) {}
 
     private record UpdatePermissions(Optional<Permissions> permissions) {}
 
     private record ChangePassword(String currentPassword, String newPassword) {}
+
+    /**
+     * The REST shape of a user: one option map with a per-entry provenance flag, split here into the two
+     * blocks the binary protocol sends.
+     */
+    record HttpUser(
+            Long id, BigInteger createdAt, UserStatus status, String username, Map<String, HttpOptionValue> options) {
+
+        UserInfo toUserInfo() {
+            return new UserInfo(
+                    id,
+                    createdAt,
+                    status,
+                    username,
+                    HttpOptionValue.select(options, true),
+                    HttpOptionValue.select(options, false));
+        }
+    }
+
+    /** The REST shape of a user with its permissions. See {@link HttpUser}. */
+    record HttpUserDetails(
+            Long id,
+            BigInteger createdAt,
+            UserStatus status,
+            String username,
+            Optional<Permissions> permissions,
+            Map<String, HttpOptionValue> options) {
+
+        UserInfoDetails toUserInfoDetails() {
+            return new UserInfoDetails(
+                    id,
+                    createdAt,
+                    status,
+                    username,
+                    permissions,
+                    HttpOptionValue.select(options, true),
+                    HttpOptionValue.select(options, false));
+        }
+    }
 }

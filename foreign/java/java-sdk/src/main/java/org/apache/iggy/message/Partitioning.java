@@ -36,12 +36,11 @@ public record Partitioning(PartitioningKind kind, byte[] value) {
         if (kind == null || value == null) {
             throw new IggyInvalidArgumentException("Partitioning kind and value cannot be null");
         }
-        boolean valid =
-                switch (kind) {
-                    case Balanced -> value.length == 0;
-                    case PartitionId -> value.length == PARTITION_ID_LENGTH;
-                    case MessagesKey -> value.length >= 1 && value.length <= MAX_MESSAGES_KEY_LENGTH;
-                };
+        boolean valid = switch (kind) {
+            case Balanced -> value.length == 0;
+            case PartitionId -> value.length == PARTITION_ID_LENGTH;
+            case MessagesKey -> value.length >= 1 && value.length <= MAX_MESSAGES_KEY_LENGTH;
+        };
         if (!valid) {
             throw new IggyInvalidArgumentException(
                     kind + " partitioning value must be " + expectedLength(kind) + " bytes, got " + value.length);

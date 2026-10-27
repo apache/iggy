@@ -53,17 +53,29 @@ func (s OptionsScope) String() string {
 
 // OptionSpec is one entry of a resource's option catalog.
 //
-// This is the discovery surface for the option keys a create command accepts: a
-// key outside the catalog is refused at create, and the binary transports carry
-// only the error code back, so there is no other way to learn which keys a
-// given server knows.
+// This is the discovery surface for the option keys a resource accepts: a key
+// outside the catalog is refused, and the binary transports carry only the
+// error code back, so there is no other way to learn which keys a given server
+// knows and what an update may do with each.
 type OptionSpec struct {
-	// Key is the option key the create command accepts.
+	// Key is the option key.
 	Key string
 	// DefaultValue is the key's default, carrying the kind the server encodes
 	// it under. Empty for a key with no default. Reuses HeaderValue because
 	// options ride the user-headers codec.
 	DefaultValue HeaderValue
+	// Updatable means an update may set the key.
+	Updatable bool
+	// Resettable means an update may reset the key to its default.
+	Resettable bool
+	// Secret means the key is write-only: accepted, never returned.
+	Secret bool
+	// ReadOnly means the server computes the key and returns it on reads, and
+	// never accepts it.
+	ReadOnly bool
+	// Critical means a server that does not understand the key must not serve
+	// the resource.
+	Critical bool
 	// Description says what the option does, including the bounds its value is
 	// checked against.
 	Description string

@@ -19,6 +19,9 @@
 //! stopped gracefully, one file under its data dir is mutated, and the node is
 //! started again. The scenarios split along the durability contract:
 //!
+//! - A stop without surgery, graceful or SIGKILL, tears nothing. Recovery
+//!   still drops the sparse index entries past the WAL checkpoint, because
+//!   the WAL replay indexes that tail again, but it must not report damage.
 //! - A torn tail of a partition segment `.log` or `.index` is the shape a
 //!   crash legitimately leaves behind; recovery must absorb it without the
 //!   replica silently diverging from its peers.
@@ -28,6 +31,7 @@
 //! - Losing a persisted body named by the durable WAL quarantines the partition
 //!   for peer recovery while preserving the damaged files for inspection.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -61,6 +65,8 @@ const GARBAGE_BYTE: u8 = 0xA5;
 /// Metadata ops produced before the WAL surgery, so a flip at one quarter of
 /// the file provably lands ahead of many complete committed entries.
 const WAL_FODDER_STREAMS: usize = 20;
+/// View of a partition group that never left view 0.
+const INITIAL_VIEW: u32 = 0;
 
 /// Sparse index entry layout, mirrored from `partitions::iggy_index::IggyIndex`
 /// (which the `integration` crate does not depend on): three little-endian
@@ -75,6 +81,15 @@ const INDEX_AHEAD_BATCHES: u32 = 30;
 /// Flush chunks the damaged node's index must hold for the surgery to leave a
 /// real surviving prefix behind the one entry it strands past the log end.
 const MIN_INDEX_ENTRIES: usize = 4;
+/// Batches produced before the graceful stop, far below the default
+/// 1024-message flush threshold, so the shutdown flush is what indexes them.
+const GRACEFUL_STOP_BATCHES: u32 = 10;
+/// The recovery WARN lines for a torn or damaged segment. A boot after a stop
+/// that tore nothing must log neither.
+const SEGMENT_DAMAGE_MARKERS: [&str; 2] = [
+    "discarding torn tail bytes",
+    "recovered segment bounds by walking the log",
+];
 /// Infix of the directory the refusal path renames a partition's segment files
 /// into (`partitions::state_transfer::quarantine_partition_files`).
 const FENCED_DIR_MARKER: &str = ".fenced.";
@@ -85,7 +100,7 @@ const PARTITION_WAL_REFUSAL_MARKER: &str = "prepare WAL at";
 
 async fn create_stream_and_topic(client: &IggyClient, durability: Durability) {
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     // Eager flush makes committed batches visible to the on-disk oracles.
@@ -104,6 +119,33 @@ async fn create_stream_and_topic(client: &IggyClient, durability: Durability) {
         )
         .await
         .expect("create topic");
+}
+
+/// Create the test topic, produce `count` batches through the harness root
+/// client and wait until every node's segment files hold them, so surgery
+/// always finds the payloads on disk. The setup client is dropped before
+/// returning.
+async fn seed_flushed_batches(
+    harness: &TestHarness,
+    durability: Durability,
+    payload_prefix: &str,
+    count: u32,
+) -> Vec<(u64, String)> {
+    let client = harness.tcp_root_client().await.unwrap();
+    create_stream_and_topic(&client, durability).await;
+    let acked = produce_acked(&client, payload_prefix, count).await;
+    let payloads: Vec<String> = acked.iter().map(|(_, payload)| payload.clone()).collect();
+    for node in 0..harness.cluster_size() {
+        wait_until_node_holds_payloads(
+            harness,
+            node,
+            &payloads,
+            FLUSH_INSTALL_TIMEOUT,
+            "eager flush before the surgery",
+        )
+        .await;
+    }
+    acked
 }
 
 /// Send `count` single-message batches, returning each confirmed
@@ -279,6 +321,46 @@ async fn pick_backup(harness: &TestHarness) -> (usize, usize) {
     (leader, backup)
 }
 
+/// Primary of the highest partition view any of `nodes` has persisted. The
+/// metadata and partition planes change views independently, so the roster
+/// leader does not name the partition primary.
+fn partition_primary(harness: &TestHarness, nodes: &[usize]) -> usize {
+    let view = nodes
+        .iter()
+        .map(|&node| {
+            disk::read_partition_superblock_state(&harness.node(node).data_path())
+                .map_or(INITIAL_VIEW, |state| state.view)
+        })
+        .max()
+        .unwrap_or(INITIAL_VIEW);
+    view as usize % harness.cluster_size()
+}
+
+/// Poll the survivors' partition superblocks until a view whose primary is not
+/// `former` is persisted; until then `former` still owns the partition.
+async fn wait_for_partition_successor(
+    harness: &TestHarness,
+    former: usize,
+    budget: Duration,
+) -> usize {
+    let survivors: Vec<usize> = (0..harness.cluster_size())
+        .filter(|index| *index != former)
+        .collect();
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let primary = partition_primary(harness, &survivors);
+        if primary != former {
+            return primary;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the survivors did not elect a partition primary to succeed node {former} within \
+             {budget:?}"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// The ACTIVE (highest base offset) partition segment file with `extension`
 /// under a node's data dir.
 fn find_active_segment_file(data_path: &Path, extension: &str) -> PathBuf {
@@ -367,6 +449,38 @@ fn fenced_segment_paths(data_path: &Path) -> Vec<PathBuf> {
     fenced
 }
 
+/// Size of every partition segment file with `extension` under `data_paths`,
+/// keyed by path.
+fn segment_file_sizes(data_paths: &[PathBuf], extension: &str) -> BTreeMap<PathBuf, u64> {
+    let mut sizes = BTreeMap::new();
+    for data_path in data_paths {
+        let _ = disk::walk(data_path, &mut |path| {
+            if disk::is_segment_log(path) {
+                let file = path.with_extension(extension);
+                // A missing file reads as empty, so a removed file shows as truncated.
+                let size = fs::metadata(&file).map_or(0, |meta| meta.len());
+                sizes.insert(file, size);
+            }
+            false
+        });
+    }
+    sizes
+}
+
+/// Under `IGGY_TEST_VERBOSE` no stdout file exists to read, which would make
+/// the check vacuous, so it runs only when the output is captured.
+fn assert_no_segment_damage_reported(harness: &TestHarness, node: usize) {
+    if !stderr_is_captured() {
+        return;
+    }
+    for marker in SEGMENT_DAMAGE_MARKERS {
+        assert!(
+            !harness.node(node).stdout_contains(marker),
+            "node {node} reported segment damage ({marker:?}) after a stop that tore nothing"
+        );
+    }
+}
+
 /// Flip one interior byte at `numerator/denominator` of the file's length.
 fn flip_interior_byte(path: &Path, numerator: u64, denominator: u64) {
     let mut bytes =
@@ -409,6 +523,139 @@ fn assert_segment_logs_identical(data_paths: &[PathBuf], invariant: &str) {
     assert!(problems.is_empty(), "{invariant}:\n{}", problems.join("\n"));
 }
 
+/// A graceful stop tears nothing. Below the default flush thresholds the
+/// committed batches stay unindexed until the shutdown flush writes their
+/// sparse index entry past the WAL checkpoint, and the next boot drops that
+/// entry. The boot must keep every `.log` byte and must not report segment
+/// damage, and every acked offset must still read back.
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_a_graceful_stop_when_the_cluster_restarts_should_not_report_segment_damage(
+    harness: &mut TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    // Not `create_stream_and_topic`: its eager flush indexes every batch at
+    // commit, and this spec needs the shutdown flush to write the index.
+    client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .expect("create topic");
+    let acked = produce_acked(&client, "graceful-stop", GRACEFUL_STOP_BATCHES).await;
+    drop(client);
+
+    let data_paths: Vec<PathBuf> = harness
+        .all_servers()
+        .iter()
+        .map(|server| server.data_path())
+        .collect();
+    harness
+        .stop_all_at_once()
+        .await
+        .expect("stop every node gracefully");
+    let stopped_indexes = segment_file_sizes(&data_paths, "index");
+    assert!(
+        stopped_indexes.values().any(|size| *size > 0),
+        "the graceful stop must index the committed batches; index files: {stopped_indexes:?}"
+    );
+    let stopped_logs = segment_file_sizes(&data_paths, "log");
+
+    harness
+        .start()
+        .await
+        .expect("start every node on its own data");
+    let restarted_logs = segment_file_sizes(&data_paths, "log");
+    let truncated: Vec<String> = stopped_logs
+        .iter()
+        .filter_map(|(path, &stopped_size)| {
+            let restarted_size = restarted_logs.get(path).copied().unwrap_or(0);
+            (restarted_size < stopped_size).then(|| {
+                format!(
+                    "{}: {stopped_size} -> {restarted_size} bytes",
+                    path.display()
+                )
+            })
+        })
+        .collect();
+    assert!(
+        truncated.is_empty(),
+        "the boot after a graceful stop truncated segment logs:\n{}",
+        truncated.join("\n")
+    );
+
+    let client = harness.tcp_root_client().await.unwrap();
+    wait_for_acked_readable(&client, &acked, CONVERGE_TIMEOUT)
+        .await
+        .unwrap_or_else(|state| {
+            panic!("every acked offset must poll back after the graceful restart: {state}")
+        });
+    for node in 0..harness.cluster_size() {
+        assert_no_segment_damage_reported(harness, node);
+    }
+}
+
+/// A SIGKILL without surgery tears nothing, yet it leaves the sparse index
+/// entries that eager flushes wrote past the WAL checkpoint, and the reboot
+/// drops them. The reboot must not report segment damage, and the node must
+/// still converge on every ack.
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_index_entries_past_the_checkpoint_when_a_killed_node_reboots_should_not_report_segment_damage(
+    harness: &mut TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    create_stream_and_topic(&client, Durability::Replicated).await;
+    let acked = produce_acked(&client, "killed-reboot", INDEX_AHEAD_BATCHES).await;
+    let payloads: Vec<String> = acked.iter().map(|(_, payload)| payload.clone()).collect();
+    for node in 0..harness.cluster_size() {
+        wait_until_node_holds_payloads(
+            harness,
+            node,
+            &payloads,
+            FLUSH_INSTALL_TIMEOUT,
+            "eager flush before the kill",
+        )
+        .await;
+    }
+    drop(client);
+
+    let (_, backup) = pick_backup(harness).await;
+    harness.kill_node(backup).expect("SIGKILL the backup");
+    let index_path = find_active_segment_file(&harness.node(backup).data_path(), "index");
+    assert!(
+        !index_positions(&index_path).is_empty(),
+        "the eager flushes must leave index entries for the reboot to drop"
+    );
+
+    harness
+        .restart_node(backup)
+        .unwrap_or_else(|error| panic!("the killed backup must reboot on its own data: {error}"));
+    wait_until_node_holds_payloads(
+        harness,
+        backup,
+        &payloads,
+        CONVERGE_TIMEOUT,
+        "rejoin after the reboot",
+    )
+    .await;
+    let nodes: Vec<usize> = (0..harness.cluster_size()).collect();
+    let client = wait_until_cluster_serves(harness, &nodes, CONVERGE_TIMEOUT).await;
+    wait_for_acked_readable(&client, &acked, CONVERGE_TIMEOUT)
+        .await
+        .unwrap_or_else(|state| {
+            panic!("every acked offset must poll back after the killed node reboots: {state}")
+        });
+    assert_no_segment_damage_reported(harness, backup);
+}
+
 /// A torn tail of garbage on the active segment `.log` must be truncated for
 /// good by recovery: the walked bounds govern both the on-disk length and the
 /// reopened write cursor, so post-recovery appends land exactly where their
@@ -416,32 +663,15 @@ fn assert_segment_logs_identical(data_paths: &[PathBuf], invariant: &str) {
 /// node survives its NEXT restart (a stale cursor bricked it as message/index
 /// divergence), every acked offset still reads back, and the at-rest `.log`
 /// bytes stay identical across replicas (resurrected garbage diverged them).
-// TODO(hubcio): both torn-tail specs tear a BACKUP; add a primary-side
-// variant (tear the leader's segment, restart it) since the leader path
-// exercises different reopen and catch-up code.
 #[iggy_harness(cluster_nodes = 3)]
 async fn given_a_torn_segment_tail_when_a_node_recovers_should_keep_size_counter_consistent(
     harness: &mut TestHarness,
 ) {
-    let client = harness.tcp_root_client().await.unwrap();
-    create_stream_and_topic(&client, Durability::Persisted).await;
-    let mut acked = produce_acked(&client, "pre-torn", 30).await;
-    let pre_payloads: Vec<String> = acked.iter().map(|(_, payload)| payload.clone()).collect();
-    for node in 0..harness.cluster_size() {
-        wait_until_node_holds_payloads(
-            harness,
-            node,
-            &pre_payloads,
-            FLUSH_INSTALL_TIMEOUT,
-            "eager flush before the surgery",
-        )
-        .await;
-    }
+    let mut acked = seed_flushed_batches(harness, Durability::Persisted, "pre-torn", 30).await;
 
-    // The setup client is pinned to node 0, which is the backup whenever the
-    // leader sits elsewhere; harness clients never reconnect, so swap to a
-    // producer on the leader, which stays up across both backup restarts.
-    drop(client);
+    // The setup client was pinned to node 0, which is the backup whenever the
+    // leader sits elsewhere; harness clients never reconnect, so produce
+    // through the leader, which stays up across both backup restarts.
     let (leader, backup) = pick_backup(harness).await;
     let client = harness
         .root_client_for_node(leader)
@@ -509,25 +739,12 @@ async fn given_a_torn_segment_tail_when_a_node_recovers_should_keep_size_counter
 async fn given_a_torn_index_tail_when_a_node_recovers_should_not_misalign_subsequent_entries(
     harness: &mut TestHarness,
 ) {
-    let client = harness.tcp_root_client().await.unwrap();
-    create_stream_and_topic(&client, Durability::Persisted).await;
-    let mut acked = produce_acked(&client, "pre-torn-index", 30).await;
-    let pre_payloads: Vec<String> = acked.iter().map(|(_, payload)| payload.clone()).collect();
-    for node in 0..harness.cluster_size() {
-        wait_until_node_holds_payloads(
-            harness,
-            node,
-            &pre_payloads,
-            FLUSH_INSTALL_TIMEOUT,
-            "eager flush before the surgery",
-        )
-        .await;
-    }
+    let mut acked =
+        seed_flushed_batches(harness, Durability::Persisted, "pre-torn-index", 30).await;
 
-    // The setup client is pinned to node 0, which is the backup whenever the
-    // leader sits elsewhere; harness clients never reconnect, so swap to a
-    // producer on the leader, which stays up across both backup restarts.
-    drop(client);
+    // The setup client was pinned to node 0, which is the backup whenever the
+    // leader sits elsewhere; harness clients never reconnect, so produce
+    // through the leader, which stays up across both backup restarts.
     let (leader, backup) = pick_backup(harness).await;
     let client = harness
         .root_client_for_node(leader)
@@ -568,6 +785,87 @@ async fn given_a_torn_index_tail_when_a_node_recovers_should_not_misalign_subseq
         });
 }
 
+/// Primary-side counterpart of the backup torn-tail specs: the torn file is
+/// the partition primary's. A restarted node rejoins as a backup under an
+/// elected successor, so the post-torn batches reach its reopened segment by
+/// replication. Same contract as the backup `.log` spec: boot over the tear,
+/// survive the NEXT restart after that append, every acked offset reads back,
+/// at-rest segment bytes identical.
+async fn require_torn_primary_recovery(harness: &mut TestHarness, extension: &str, garbage: usize) {
+    let mut acked = seed_flushed_batches(harness, Durability::Persisted, "pre-torn", 30).await;
+
+    let nodes: Vec<usize> = (0..harness.cluster_size()).collect();
+    let primary = partition_primary(harness, &nodes);
+    harness.stop_node(primary).expect("stop the primary");
+    let torn_file = find_active_segment_file(&harness.node(primary).data_path(), extension);
+    append_garbage(&torn_file, garbage);
+
+    harness.restart_node(primary).unwrap_or_else(|error| {
+        panic!("a primary must boot over a torn segment .{extension} tail: {error}")
+    });
+
+    let successor = wait_for_partition_successor(harness, primary, CONVERGE_TIMEOUT).await;
+    let client = harness
+        .root_client_for_node(successor)
+        .await
+        .expect("connect a producer to the successor primary");
+    acked.extend(produce_acked(&client, "post-torn", 30).await);
+    let all_payloads: Vec<String> = acked.iter().map(|(_, payload)| payload.clone()).collect();
+    for node in 0..harness.cluster_size() {
+        wait_until_node_holds_payloads(
+            harness,
+            node,
+            &all_payloads,
+            CONVERGE_TIMEOUT,
+            "replication onto the reopened segment after the torn-tail recovery",
+        )
+        .await;
+    }
+
+    harness.restart_node(primary).unwrap_or_else(|error| {
+        panic!(
+            "a node must restart cleanly over a segment it repaired as the primary and then \
+             appended to as a backup; boot error: {error}"
+        )
+    });
+    let client = wait_until_cluster_serves(harness, &nodes, CONVERGE_TIMEOUT).await;
+    wait_for_acked_readable(&client, &acked, CONVERGE_TIMEOUT)
+        .await
+        .unwrap_or_else(|state| {
+            panic!(
+                "every acked offset must poll back after the primary-side torn-tail recovery: \
+                 {state}"
+            )
+        });
+
+    let data_paths: Vec<PathBuf> = harness
+        .all_servers()
+        .iter()
+        .map(|server| server.data_path())
+        .collect();
+    harness
+        .stop()
+        .await
+        .expect("stop the cluster for the at-rest comparison");
+    disk::assert_replica_data_identical(&data_paths, false);
+}
+
+/// Primary-side `.log` variant; see `TORN_LOG_GARBAGE` for the torn shape.
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_a_torn_segment_tail_when_the_primary_recovers_should_rejoin_without_diverging(
+    harness: &mut TestHarness,
+) {
+    require_torn_primary_recovery(harness, "log", TORN_LOG_GARBAGE).await;
+}
+
+/// Primary-side `.index` variant; see `TORN_INDEX_GARBAGE` for the torn shape.
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_a_torn_index_tail_when_the_primary_recovers_should_rejoin_without_diverging(
+    harness: &mut TestHarness,
+) {
+    require_torn_primary_recovery(harness, "index", TORN_INDEX_GARBAGE).await;
+}
+
 /// Replicated storage rebuilds a stale index from the surviving log and refills
 /// the tail from peers. Persisted storage syncs bodies before publishing WAL
 /// references, so deleting that tail must quarantine the damaged partition.
@@ -578,22 +876,8 @@ async fn given_an_index_ahead_of_a_truncated_log_when_a_node_recovers_should_pre
     harness: &mut TestHarness,
     durability: Durability,
 ) {
-    let client = harness.tcp_root_client().await.unwrap();
-    create_stream_and_topic(&client, durability).await;
-    let acked = produce_acked(&client, "index-ahead", INDEX_AHEAD_BATCHES).await;
+    let acked = seed_flushed_batches(harness, durability, "index-ahead", INDEX_AHEAD_BATCHES).await;
     let payloads: Vec<String> = acked.iter().map(|(_, payload)| payload.clone()).collect();
-    for node in 0..harness.cluster_size() {
-        wait_until_node_holds_payloads(
-            harness,
-            node,
-            &payloads,
-            FLUSH_INSTALL_TIMEOUT,
-            "eager flush before the surgery",
-        )
-        .await;
-    }
-
-    drop(client);
 
     // The leader keeps quorum and serving throughout, so the damaged node
     // always has a peer to catch up from. SIGKILL rather than a graceful stop:
@@ -786,7 +1070,10 @@ async fn given_interior_wal_corruption_when_a_node_boots_should_refuse_and_heal_
     // provably precedes many complete entries.
     for index in 0..WAL_FODDER_STREAMS {
         client
-            .create_stream(&format!("wal-fodder-{index:02}"))
+            .create_stream(
+                &format!("wal-fodder-{index:02}"),
+                &StreamCreateOptions::default(),
+            )
             .await
             .expect("create fodder stream");
     }
@@ -856,21 +1143,7 @@ async fn given_interior_wal_corruption_when_a_node_boots_should_refuse_and_heal_
 async fn given_a_corrupt_superblock_slot_when_a_node_boots_should_refuse_boot(
     harness: &mut TestHarness,
 ) {
-    let client = harness.tcp_root_client().await.unwrap();
-    create_stream_and_topic(&client, Durability::Persisted).await;
-    let mut acked = produce_acked(&client, "pre-fault", 20).await;
-    let pre_payloads: Vec<String> = acked.iter().map(|(_, payload)| payload.clone()).collect();
-    for node in 0..harness.cluster_size() {
-        wait_until_node_holds_payloads(
-            harness,
-            node,
-            &pre_payloads,
-            FLUSH_INSTALL_TIMEOUT,
-            "eager flush before the surgery",
-        )
-        .await;
-    }
-    drop(client);
+    let mut acked = seed_flushed_batches(harness, Durability::Persisted, "pre-fault", 20).await;
 
     // A quiet cluster at view 0 has an EMPTY metadata superblock: the record
     // is first persisted when a replica adopts an advanced view. Force a view

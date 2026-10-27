@@ -91,7 +91,10 @@ async fn given_a_replicating_cluster_when_scraping_should_report_replica_reads_a
         .unwrap();
     let stream = Identifier::named(STREAM).unwrap();
     let topic = Identifier::named(TOPIC).unwrap();
-    client.create_stream(STREAM).await.unwrap();
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &stream,

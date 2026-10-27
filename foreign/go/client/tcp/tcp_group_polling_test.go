@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/binary"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -247,7 +248,7 @@ func TestPollMessages_ResolvedLeaveDoesNotRejoinTheGroup(t *testing.T) {
 	client := signedInClient(t, server, true)
 	streamId, topicId, consumer := groupConsumer(t)
 	require.NoError(t, client.JoinConsumerGroup(context.Background(), streamId, topicId, consumer.Id))
-	var uncertain ierror.UncertainOutcome
+	var uncertain ierror.OperationUncertain
 	require.ErrorAs(t, client.LeaveConsumerGroup(ctx, streamId, topicId, consumer.Id), &uncertain)
 	require.NoError(t, client.ResolveOperation(context.Background(), uncertain.OperationID))
 
@@ -382,10 +383,11 @@ func TestPollMessages_GroupPollResyncsAfterAFencedPoll(t *testing.T) {
 		"the fenced poll re-synced and retried within the same call")
 }
 
-// pauseAtLog holds the goroutine that logs message until resume closes.
+// pauseAtLog holds the goroutine that first logs message until resume closes.
 type pauseAtLog struct {
 	message         string
 	reached, resume chan struct{}
+	once            sync.Once
 }
 
 func (p *pauseAtLog) Enabled(context.Context, slog.Level) bool { return true }
@@ -393,20 +395,24 @@ func (p *pauseAtLog) WithAttrs([]slog.Attr) slog.Handler       { return p }
 func (p *pauseAtLog) WithGroup(string) slog.Handler            { return p }
 func (p *pauseAtLog) Handle(_ context.Context, record slog.Record) error {
 	if record.Message == p.message {
-		close(p.reached)
-		<-p.resume
+		p.once.Do(func() {
+			close(p.reached)
+			<-p.resume
+		})
 	}
 	return nil
 }
 
-func TestPollMessages_GroupPollRetiredAfterItsSyncFailsByTheRecoveryState(t *testing.T) {
+// A recovery overtakes a group poll after its sync. The poll syncs again under
+// the session of the recovery and polls, and only a failed recovery ends it.
+func TestPollMessages_GroupPollSyncsAgainUnderTheSessionOfARecovery(t *testing.T) {
 	for _, test := range []struct {
 		name               string
 		hold, refuseSignIn bool
 		want               error
 	}{
-		{"running", true, false, ierror.ErrTransientNotAccepted},
-		{"bound a new session", false, false, ierror.ErrTransientNotAccepted},
+		{"running", true, false, nil},
+		{"bound a new session", false, false, nil},
 		{"failed", false, true, ierror.ErrUnauthenticated},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -414,10 +420,14 @@ func TestPollMessages_GroupPollRetiredAfterItsSyncFailsByTheRecoveryState(t *tes
 			var registers atomic.Int32
 			node := singleNodeHandler(t, func() string { return server.address() })
 			server = listenVSR(t, nil, func(connection, index int, read request) []byte {
-				if read.code() == uint32(command.SyncGroupCode) {
+				switch {
+				case read.code() == uint32(command.SyncGroupCode):
 					return replyFrame(vsr.OperationNonReplicated, assignmentBody(7, 1))
-				}
-				if read.operation() == vsr.OperationRegister && registers.Add(1) > 1 && test.refuseSignIn {
+				case read.code() == uint32(command.GetPartitionRouteCode):
+					return pollRoutingReply(t, read, 0, 1)
+				case read.code() == uint32(command.PollMessagesCode):
+					return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
+				case read.operation() == vsr.OperationRegister && registers.Add(1) > 1 && test.refuseSignIn:
 					return statusReplyFrame(vsr.OperationRegister, uint32(ierror.ErrInvalidCredentials.Code()), nil)
 				}
 				return node(connection, index, read)
@@ -433,19 +443,27 @@ func TestPollMessages_GroupPollRetiredAfterItsSyncFailsByTheRecoveryState(t *tes
 			case <-time.After(time.Second):
 				t.Fatal("the group poll did not sync its assignment")
 			}
+			var release func()
 			if test.hold {
-				holdRecovery(t, client)
+				release = holdRecovery(t, client)
 			}
 			recoverNow(client)
 			if !test.hold {
 				awaitRecoveryEnd(t, client)
-				client.mtx.Lock()
-				bound := client.session.Bound()
-				client.mtx.Unlock()
-				require.Equal(t, !test.refuseSignIn, bound)
+				require.Equal(t, !test.refuseSignIn, sessionBound(client))
 			}
 			close(resume)
+			if test.hold {
+				require.Never(t, func() bool { return len(done) != 0 }, recoveryWaitDeadline, time.Millisecond,
+					"the poll waits for the running recovery")
+				release()
+			}
 			require.ErrorIs(t, <-done, test.want)
+			if test.want == nil {
+				reads := server.recorded()
+				require.Equal(t, 2, requestCount(reads, command.SyncGroupCode), "the poll syncs again under the new session")
+				require.Equal(t, 1, requestCount(reads, command.PollMessagesCode))
+			}
 		})
 	}
 }

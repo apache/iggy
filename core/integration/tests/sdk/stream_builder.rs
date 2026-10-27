@@ -61,7 +61,6 @@ fn consumer_config() -> IggyConsumerConfig {
         .create_stream_if_not_exists(true)
         .create_topic_if_not_exists(true)
         .partitions_count(1)
-        .polling_interval("1ms".parse().unwrap())
         .polling_strategy(PollingStrategy::first())
         .polling_retry_interval(NonZeroIggyDuration::ONE_SECOND)
         .init_retries(0)

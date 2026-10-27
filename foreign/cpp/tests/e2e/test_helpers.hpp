@@ -123,6 +123,16 @@ inline iggy::ffi::TopicCreateOptions make_topic_create_options(
     return opts;
 }
 
+inline iggy::ffi::UserUpdateOptions make_user_update_options(const std::string &username,
+                                                             const iggy::ffi::UserStatus status) {
+    iggy::ffi::UserUpdateOptions options{};
+    options.has_username = true;
+    options.username     = username;
+    options.has_status   = true;
+    options.status       = status;
+    return options;
+}
+
 // Joining commits the membership at once, but a member owns its partitions only after every
 // affected partition installs it as owner. Until then group polls and group offset calls fail
 // with ConsumerGroupPartitionNotOwned (5009).
@@ -242,7 +252,7 @@ class E2ETestFixture : public ::testing::Test {
                                           iggy::ffi::Permissions permissions = {}) {
         iggy::ffi::ErrorInfo error_info{};
         auto user =
-            client->create_user(username, password, status, has_permissions, std::move(permissions), error_info);
+            client->create_user(username, password, status, has_permissions, std::move(permissions), {}, error_info);
         tracked_user_names_.push_back(username);
         return user;
     }
@@ -251,8 +261,9 @@ class E2ETestFixture : public ::testing::Test {
                                      const std::string &username,
                                      const std::string &password,
                                      const iggy::UserStatus status,
-                                     std::optional<iggy::Permissions> permissions = std::nullopt) {
-        auto user = client.CreateUser(username, password, status, permissions);
+                                     std::optional<iggy::Permissions> permissions = std::nullopt,
+                                     const iggy::UserCreateOptions &options       = {}) {
+        auto user = client.CreateUser(username, password, status, permissions, options);
         tracked_user_names_.push_back(username);
         return user;
     }

@@ -17,11 +17,15 @@
 
 package command
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+)
 
 type CreatePersonalAccessToken struct {
-	Name   string `json:"Name"`
-	Expiry uint32 `json:"Expiry"`
+	Name   string          `json:"Name"`
+	Expiry iggcon.Duration `json:"Expiry"`
 }
 
 func (c *CreatePersonalAccessToken) Code() Code {
@@ -33,7 +37,7 @@ func (c *CreatePersonalAccessToken) MarshalBinary() ([]byte, error) {
 	bytes := make([]byte, length)
 	bytes[0] = byte(len(c.Name))
 	copy(bytes[1:], c.Name)
-	binary.LittleEndian.PutUint32(bytes[len(bytes)-4:], c.Expiry)
+	binary.LittleEndian.PutUint64(bytes[1+len(c.Name):], uint64(c.Expiry))
 	return bytes, nil
 }
 

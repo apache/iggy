@@ -15,11 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGOUT_USER_CODE};
+use crate::codes::{
+    CANCEL_DEFERRED_REQUEST_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
+    LOGOUT_USER_CODE, POLL_MESSAGES_DEFERRED_CODE, WAIT_FOR_MESSAGES_CODE,
+};
 use crate::consensus::{Command, HEADER_SIZE, Operation, RequestHeader};
 use crate::error::WireError;
+use ring::rand::{SecureRandom, SystemRandom};
 use std::ops::Range;
-use twox_hash::XxHash3_64;
 
 /// Where `RequestHeader::reserved` carries the legacy command code of a
 /// `NonReplicated` request, as little-endian `u32`.
@@ -42,14 +45,37 @@ pub fn operation_for_code(code: u32) -> Operation {
 }
 
 impl RequestHeader {
+    /// A fire-and-forget cancellation for this deferred request. It must follow
+    /// the original frame on the same connection, so the server sees the request
+    /// queued or admitted when the cancellation arrives.
+    #[must_use]
+    pub fn deferred_cancellation(&self) -> Option<Self> {
+        if self.operation != Operation::NonReplicated
+            || !matches!(
+                u32::from_le_bytes(self.reserved),
+                POLL_MESSAGES_DEFERRED_CODE | WAIT_FOR_MESSAGES_CODE
+            )
+        {
+            return None;
+        }
+        Self::for_request(
+            CANCEL_DEFERRED_REQUEST_CODE,
+            self.client,
+            self.request,
+            self.session,
+            &[],
+        )
+        .ok()
+    }
+
     /// Builds the header a client sends for `code` with `payload`, given the
     /// identity the session assigned: `client`, `request` and `session`.
     ///
     /// Every rule that depends only on the code and the payload lives here so
     /// that each client, and the fixtures other SDKs verify against, agree on
     /// the bytes: metadata and session operations stamp `request_checksum`
-    /// with the payload hash, partition and non-replicated operations leave
-    /// it zero (send batches carry their own checksum and non-replicated
+    /// with a random per-request identifier, partition and non-replicated
+    /// operations leave it zero (send batches carry their own checksum and non-replicated
     /// requests bypass dedup), and a non-replicated request carries its
     /// command code in `reserved`.
     ///
@@ -62,7 +88,8 @@ impl RequestHeader {
     /// # Errors
     ///
     /// Returns `WireError::PayloadTooLarge` when the frame would not fit the
-    /// `u32` size field.
+    /// `u32` size field, or `WireError::RandomSourceUnavailable` if the secure
+    /// random source fails for a metadata or session request.
     pub fn for_request(
         code: u32,
         client: u128,
@@ -80,7 +107,17 @@ impl RequestHeader {
         {
             0
         } else {
-            u128::from(XxHash3_64::oneshot(payload))
+            let random = SystemRandom::new();
+            loop {
+                let mut bytes = [0u8; 16];
+                random
+                    .fill(&mut bytes)
+                    .map_err(|_| WireError::RandomSourceUnavailable)?;
+                let id = u128::from_le_bytes(bytes);
+                if id != 0 {
+                    break id;
+                }
+            }
         };
         let mut reserved = [0; 4];
         if operation == Operation::NonReplicated {
@@ -107,6 +144,7 @@ impl RequestHeader {
 mod tests {
     use super::*;
     use crate::codes::{CREATE_STREAM_CODE, PING_CODE, SEND_MESSAGES_CODE};
+    use twox_hash::XxHash3_64;
 
     #[test]
     fn login_codes_register_and_logout_logs_out() {
@@ -120,13 +158,16 @@ mod tests {
     }
 
     #[test]
-    fn metadata_requests_are_stamped_with_the_payload_hash() {
+    fn given_identical_metadata_bodies_when_building_requests_should_stamp_distinct_random_ids() {
         let payload = [1, 2, 3];
         let header = RequestHeader::for_request(CREATE_STREAM_CODE, 7, 8, 9, &payload).unwrap();
+        let another = RequestHeader::for_request(CREATE_STREAM_CODE, 7, 9, 9, &payload).unwrap();
         assert_eq!(header.command, Command::Request);
         assert_eq!(header.size as usize, HEADER_SIZE + payload.len());
         assert_eq!((header.client, header.request, header.session), (7, 8, 9));
-        assert_eq!(
+        assert_ne!(header.request_checksum, 0);
+        assert_ne!(header.request_checksum, another.request_checksum);
+        assert_ne!(
             header.request_checksum,
             u128::from(XxHash3_64::oneshot(&payload))
         );

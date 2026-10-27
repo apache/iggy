@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Highest metadata op whose apply has been PUBLISHED on this node, shared by
 /// every shard, plus the wakers of the reads waiting for it to reach them.
@@ -55,6 +55,15 @@ pub struct AppliedFrontier {
     recovered_revision: AtomicU64,
     waiters: Mutex<Waiters>,
     read_budget: Duration,
+    partition_freshness: Option<PartitionFreshness>,
+}
+
+/// Volatile quorum evidence. Recovery restores metadata, never freshness.
+#[derive(Debug)]
+struct PartitionFreshness {
+    epoch: Instant,
+    window: Duration,
+    until_ns: AtomicU64,
 }
 
 impl Default for AppliedFrontier {
@@ -79,6 +88,10 @@ struct Waiter {
 }
 
 impl AppliedFrontier {
+    /// A partition request may use quorum evidence for this long beyond the
+    /// configured metadata heartbeat timeout.
+    pub const PARTITION_FRESHNESS_MARGIN: Duration = Duration::from_secs(3);
+
     /// The budget a held read gets when nothing sizes it from config: six
     /// commit broadcasts at the built-in `COMMIT_MESSAGE_TICKS` interval.
     ///
@@ -99,7 +112,55 @@ impl AppliedFrontier {
                 entries: Vec::new(),
             }),
             read_budget,
+            partition_freshness: None,
         }
+    }
+
+    /// Arm admission for a multi-node process. `epoch` must use the bus clock;
+    /// a newly constructed frontier has no credit, including after recovery.
+    #[must_use]
+    pub const fn with_partition_freshness(
+        mut self,
+        epoch: Instant,
+        heartbeat_timeout: Duration,
+    ) -> Self {
+        self.partition_freshness = Some(PartitionFreshness {
+            epoch,
+            window: heartbeat_timeout.saturating_add(Self::PARTITION_FRESHNESS_MARGIN),
+            until_ns: AtomicU64::new(0),
+        });
+        self
+    }
+
+    /// Unarmed single-node frontiers never require network evidence.
+    #[must_use]
+    pub fn partition_requests_allowed(&self, now: Instant) -> bool {
+        self.partition_freshness.as_ref().is_none_or(|freshness| {
+            freshness.until_ns.load(Ordering::Acquire)
+                > duration_ns(now.saturating_duration_since(freshness.epoch))
+        })
+    }
+
+    /// Publish only after the metadata represented by the evidence is applied.
+    /// Release/Acquire carries that publication to every shard's admission gate.
+    /// Older evidence cannot shorten credit across role or view changes.
+    /// Returns true when this credit opens admission that was closed.
+    pub fn credit_partition_freshness(&self, now: Instant, evidence_age: Duration) -> bool {
+        let Some(freshness) = self.partition_freshness.as_ref() else {
+            return false;
+        };
+        let Some(remaining) = freshness.window.checked_sub(evidence_age) else {
+            return false;
+        };
+        if remaining.is_zero() {
+            return false;
+        }
+        let elapsed = now.saturating_duration_since(freshness.epoch);
+        let previous = freshness.until_ns.fetch_max(
+            duration_ns(elapsed.saturating_add(remaining)),
+            Ordering::Release,
+        );
+        previous <= duration_ns(elapsed)
     }
 
     /// How long a read may be held before it must fail retryable. Read by both
@@ -223,6 +284,10 @@ impl AppliedFrontier {
     }
 }
 
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// Outcome of registering a wait: nothing to wait for, or the id the wait is
 /// listed under.
 #[derive(Debug, Clone, Copy)]
@@ -279,6 +344,71 @@ mod tests {
     use std::pin::pin;
     use std::sync::Arc;
     use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn given_quorum_credit_when_the_deadline_arrives_should_expire_without_an_owner_tick() {
+        let epoch = Instant::now();
+        let heartbeat = Duration::from_secs(5);
+        let frontier = AppliedFrontier::default().with_partition_freshness(epoch, heartbeat);
+        assert!(!frontier.partition_requests_allowed(epoch));
+        frontier.advance(13);
+        frontier.credit_partition_freshness(epoch + Duration::from_secs(2), Duration::from_secs(1));
+        let deadline = epoch + Duration::from_secs(9);
+        assert!(
+            frontier
+                .partition_requests_allowed(deadline.checked_sub(Duration::from_nanos(1)).unwrap())
+        );
+        assert!(!frontier.partition_requests_allowed(deadline));
+        assert!(!frontier.partition_requests_allowed(deadline + heartbeat));
+    }
+
+    #[test]
+    fn given_older_or_expired_evidence_when_credited_should_preserve_the_existing_deadline() {
+        let epoch = Instant::now();
+        let frontier =
+            AppliedFrontier::default().with_partition_freshness(epoch, Duration::from_secs(5));
+        frontier.credit_partition_freshness(epoch + Duration::from_secs(2), Duration::ZERO);
+        frontier.credit_partition_freshness(epoch + Duration::from_secs(3), Duration::from_secs(3));
+        frontier.credit_partition_freshness(epoch + Duration::from_secs(4), Duration::from_secs(8));
+        frontier.credit_partition_freshness(epoch + Duration::from_secs(5), Duration::from_secs(9));
+        assert!(frontier.partition_requests_allowed(epoch + Duration::from_secs(9)));
+        assert!(!frontier.partition_requests_allowed(epoch + Duration::from_secs(10)));
+        frontier
+            .credit_partition_freshness(epoch + Duration::from_secs(11), Duration::from_secs(1));
+        assert!(frontier.partition_requests_allowed(epoch + Duration::from_secs(17)));
+        assert!(!frontier.partition_requests_allowed(epoch + Duration::from_secs(18)));
+    }
+
+    #[test]
+    fn given_closed_admission_when_credited_should_report_only_the_credit_that_opens_it() {
+        let epoch = Instant::now();
+        let frontier =
+            AppliedFrontier::default().with_partition_freshness(epoch, Duration::from_secs(5));
+        assert!(!frontier.credit_partition_freshness(epoch, Duration::from_secs(8)));
+        assert!(
+            frontier.credit_partition_freshness(epoch + Duration::from_secs(2), Duration::ZERO)
+        );
+        assert!(
+            !frontier.credit_partition_freshness(epoch + Duration::from_secs(3), Duration::ZERO)
+        );
+        assert!(
+            frontier.credit_partition_freshness(epoch + Duration::from_secs(12), Duration::ZERO)
+        );
+        assert!(!AppliedFrontier::default().credit_partition_freshness(epoch, Duration::ZERO));
+    }
+
+    #[test]
+    fn given_recovered_metadata_without_quorum_credit_when_multi_node_should_stay_closed() {
+        let epoch = Instant::now();
+        let single = AppliedFrontier::default();
+        assert!(single.partition_requests_allowed(epoch + Duration::from_secs(60)));
+        let restarted =
+            AppliedFrontier::default().with_partition_freshness(epoch, Duration::from_secs(5));
+        restarted.advance(100);
+        assert!(!restarted.partition_requests_allowed(epoch));
+        assert!(!restarted.partition_requests_allowed(epoch + Duration::from_secs(60)));
+    }
 
     /// A frontier already at or above the target is the steady state, and it
     /// must cost neither a wake nor a registration: a gate that parked here

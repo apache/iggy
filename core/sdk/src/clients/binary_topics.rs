@@ -50,10 +50,9 @@ impl TopicClient for IggyClient {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        name: &str,
         options: &TopicUpdateOptions,
     ) -> Result<(), IggyError> {
-        super::with_client!(self, client => client.update_topic(stream_id, topic_id, name, options).await)
+        super::with_client!(self, client => client.update_topic(stream_id, topic_id, options).await)
     }
 
     async fn delete_topic(

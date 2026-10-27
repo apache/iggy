@@ -122,6 +122,20 @@ class VsrRequestEncoderTest {
         ByteBuf first = encoder.encode(alloc, CREATE_STREAM_CODE, Unpooled.EMPTY_BUFFER);
         ByteBuf second = encoder.encode(alloc, CREATE_STREAM_CODE, Unpooled.EMPTY_BUFFER);
         try {
+            byte[] firstIdentifier = new byte[16];
+            byte[] secondIdentifier = new byte[16];
+            first.getBytes(VsrHeaders.REQUEST_CHECKSUM_OFFSET, firstIdentifier);
+            second.getBytes(VsrHeaders.REQUEST_CHECKSUM_OFFSET, secondIdentifier);
+            assertThat(firstIdentifier).isNotEqualTo(new byte[16]);
+            assertThat(firstIdentifier).isNotEqualTo(secondIdentifier);
+            ByteBuf retry = first.retainedDuplicate();
+            try {
+                byte[] retryIdentifier = new byte[16];
+                retry.getBytes(VsrHeaders.REQUEST_CHECKSUM_OFFSET, retryIdentifier);
+                assertThat(retryIdentifier).isEqualTo(firstIdentifier);
+            } finally {
+                retry.release();
+            }
             assertThat(first.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(1);
             assertThat(second.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(2);
             assertThat(second.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(42);

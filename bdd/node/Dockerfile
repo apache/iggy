@@ -20,6 +20,10 @@ FROM node:26-slim
 COPY ./foreign/node .
 COPY ./bdd/scenarios/basic_messaging.feature ./bdd/
 COPY ./bdd/scenarios/raw_command.feature ./bdd/
+COPY ./bdd/scenarios/stream_options.feature ./bdd/
+COPY ./bdd/scenarios/resource_options_patch.feature ./bdd/
+COPY ./bdd/scenarios/session_contract.feature ./bdd/
+COPY ./bdd/scenarios/metadata_changes.feature ./bdd/
 
 RUN npm ci
 

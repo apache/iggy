@@ -43,8 +43,10 @@ interface LoginRoutingHook {
     CompletableFuture<IdentityInfo> loginOnLeader(LongFunction<CompletableFuture<IdentityInfo>> loginAttempt);
 
     /**
-     * Drops any login kept for replay. Called on an explicit sign-out: there
-     * is no session left to restore, and a redial must not resurrect one.
+     * Captures cleanup for the current login owner. A delayed sign-out completion must not discard a
+     * newer explicit sign-in.
      */
-    default void forgetLogin() {}
+    default Runnable logoutCompletion() {
+        return () -> {};
+    }
 }

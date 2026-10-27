@@ -24,11 +24,12 @@ use kafka_protocol::error::ResponseError;
 use kafka_protocol::messages::{
     DescribeAclsRequest, SaslAuthenticateRequest, SaslHandshakeRequest,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedMutexGuard, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::IggyBridge;
+use crate::cluster_id::ClusterId;
 use crate::error::Result;
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig, GroupMember};
 use crate::protocol::acl::{
@@ -42,10 +43,11 @@ use crate::protocol::bounds_guard::{
 use crate::protocol::handlers::api_versions::Advertisement;
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
-    alter_configs, api_versions, create_topics, decode_guarded, delete_topics, describe_configs,
-    describe_groups, dispatch, fetch, find_coordinator, heartbeat, init_producer_id, join_group,
-    leave_group, list_groups, list_offsets, metadata, offset_commit, offset_fetch, produce,
-    respond_or_close, sync_group,
+    alter_configs, api_versions, create_partitions, create_topics, decode_guarded, delete_groups,
+    delete_topics, describe_cluster, describe_configs, describe_groups, dispatch, fetch,
+    find_coordinator, heartbeat, incremental_alter_configs, init_producer_id, join_group,
+    leave_group, list_groups, list_offsets, metadata, offset_commit, offset_delete, offset_fetch,
+    produce, respond_or_close, sync_group,
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::protocol::sasl::{
@@ -74,6 +76,11 @@ pub const API_KEY_DESCRIBE_ACLS: i16 = 29;
 pub const API_KEY_DESCRIBE_CONFIGS: i16 = 32;
 pub const API_KEY_ALTER_CONFIGS: i16 = 33;
 pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
+pub const API_KEY_CREATE_PARTITIONS: i16 = 37;
+pub const API_KEY_DELETE_GROUPS: i16 = 42;
+pub const API_KEY_INCREMENTAL_ALTER_CONFIGS: i16 = 44;
+pub const API_KEY_OFFSET_DELETE: i16 = 47;
+pub const API_KEY_DESCRIBE_CLUSTER: i16 = 60;
 
 pub const DEFAULT_KAFKA_PORT: u16 = 9093;
 
@@ -126,6 +133,16 @@ pub const ERROR_GROUP_ID_NOT_FOUND: i16 = ResponseError::GroupIdNotFound.code();
 pub const ERROR_INVALID_SESSION_TIMEOUT: i16 = 26;
 /// How a follower learns to rejoin: its heartbeat is answered with this while the group prepares.
 pub const ERROR_REBALANCE_IN_PROGRESS: i16 = 27;
+/// `DeleteGroups` and `OffsetDelete`: the principal may not delete groups or their offsets.
+///
+/// `DeleteGroups` also sends it when Iggy refuses the bridge user, either the delete of the Iggy
+/// group that holds the offsets, or the listing of the groups of a topic where it can hold them.
+pub const ERROR_GROUP_AUTHORIZATION_FAILED: i16 = ResponseError::GroupAuthorizationFailed.code();
+/// `DeleteGroups`: the group has members. `OffsetDelete`: it has members of a protocol other than
+/// `consumer`.
+pub const ERROR_NON_EMPTY_GROUP: i16 = ResponseError::NonEmptyGroup.code();
+/// `OffsetDelete`: a member subscribes to the topic, so its offsets stay.
+pub const ERROR_GROUP_SUBSCRIBED_TO_TOPIC: i16 = ResponseError::GroupSubscribedToTopic.code();
 /// Closest fit for an Iggy permission/credential rejection in `bridge`'s error mapping.
 ///
 /// Still not `SASL_AUTHENTICATION_FAILED`, and now for a firmer reason than when this was written:
@@ -193,7 +210,8 @@ pub const ERROR_UNSUPPORTED_COMPRESSION_TYPE: i16 =
 /// this code, and the client rejoins carrying it.
 pub const ERROR_MEMBER_ID_REQUIRED: i16 = 79;
 pub const ERROR_GROUP_MAX_SIZE_REACHED: i16 = 81;
-/// Sent only by `LeaveGroup`: the member id does not hold the `group_instance_id` it named.
+/// The member id does not hold the `group_instance_id` it named, or a static member that
+/// returned has since replaced it.
 pub const ERROR_FENCED_INSTANCE_ID: i16 = 82;
 /// Produce: a record or batch this gateway cannot map.
 ///
@@ -201,6 +219,10 @@ pub const ERROR_FENCED_INSTANCE_ID: i16 = 82;
 /// retriable, so a client would resend a batch that can never decode. A client older than Kafka
 /// 2.4 reads 87 as a generic server error, which is still terminal and still better than a loop.
 pub const ERROR_INVALID_RECORD: i16 = ResponseError::InvalidRecord.code();
+/// `DescribeCluster` v1+ asked a broker for the controller endpoints.
+pub const ERROR_MISMATCHED_ENDPOINT_TYPE: i16 = ResponseError::MismatchedEndpointType.code();
+/// `DescribeCluster` v1+ named an endpoint type Kafka does not define.
+pub const ERROR_UNSUPPORTED_ENDPOINT_TYPE: i16 = ResponseError::UnsupportedEndpointType.code();
 
 /// Kafka's -1 for an offset or a timestamp that is not known.
 pub(crate) const UNKNOWN_OFFSET: i64 = -1;
@@ -291,8 +313,10 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     api_versions::RANGE,
     create_topics::RANGE,
     delete_topics::RANGE,
+    create_partitions::RANGE,
     describe_configs::RANGE,
     alter_configs::RANGE,
+    incremental_alter_configs::RANGE,
     init_producer_id::RANGE,
     find_coordinator::RANGE,
     join_group::RANGE,
@@ -301,6 +325,9 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     sync_group::RANGE,
     describe_groups::RANGE,
     list_groups::RANGE,
+    delete_groups::RANGE,
+    offset_delete::RANGE,
+    describe_cluster::RANGE,
 ];
 
 #[must_use]
@@ -314,8 +341,9 @@ pub fn supported_api_ranges() -> &'static [ApiVersionRange] {
 /// answers with its stub, so APIs can be wired one at a time.
 ///
 /// Produce sends on one Iggy client per producer. Metadata, `CreateTopics`, `DeleteTopics`,
-/// `DescribeConfigs` and `AlterConfigs` share one lockstep `IggyClient`, so those calls run one
-/// at a time across connections. See the README's "Concurrency ceiling".
+/// `CreatePartitions`, `DescribeConfigs`, `AlterConfigs` and `IncrementalAlterConfigs` share one
+/// lockstep `IggyClient`, so those calls run one at a time across connections. See the README's
+/// "Concurrency ceiling".
 pub struct GatewayState {
     pub bridge: Option<Arc<IggyBridge>>,
     pub max_frame_size: usize,
@@ -339,6 +367,15 @@ pub struct GatewayState {
     pub(crate) unproven_empty: Mutex<fetch::Spells>,
     /// Topic probes that every Fetch shares.
     pub(crate) probe_board: ProbeBoard,
+    /// Held by `CreatePartitions` from reading a topic's partition count until its write is
+    /// settled, and by `CreateTopics` and `DeleteTopics` around their writes. Iggy adds a number
+    /// of partitions, Kafka asks for a count to reach, and two requests that read the same count
+    /// would otherwise both add and overshoot it. Per process: other gateways and direct Iggy
+    /// clients are not behind it.
+    pub(crate) partition_growth: Arc<tokio::sync::Mutex<()>>,
+    /// What Metadata and `DescribeCluster` report. Random unless [`Self::with_cluster_id`] sets
+    /// the one stored in Iggy.
+    pub cluster_id: ClusterId,
     /// Present only while `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` is on.
     pub(crate) auto_topic_creation: Option<AutoTopicCreator>,
 }
@@ -375,6 +412,8 @@ impl GatewayState {
             loading: Mutex::default(),
             unproven_empty: Mutex::default(),
             probe_board: ProbeBoard::default(),
+            partition_growth: Arc::default(),
+            cluster_id: ClusterId::random(),
             auto_topic_creation: None,
         }
     }
@@ -408,6 +447,20 @@ impl GatewayState {
             // behind it.
             bridge.discard_auto_create_client();
         }
+    }
+
+    /// Holds back the writes of `CreateTopics`, `DeleteTopics` and `CreatePartitions` on this
+    /// gateway until the guard drops, the way a `CreatePartitions` settling an unknown outcome
+    /// does. For tests that check those handlers wait for it.
+    #[doc(hidden)]
+    pub async fn hold_topic_changes(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.partition_growth).lock_owned().await
+    }
+
+    #[must_use]
+    pub fn with_cluster_id(mut self, cluster_id: ClusterId) -> Self {
+        self.cluster_id = cluster_id;
+        self
     }
 
     /// State with no bridge, so every handler takes its stub path.
@@ -821,6 +874,12 @@ pub fn encode_error_for_key(
             describe_configs::encode_error_response(api_version, error_code)
         }
         API_KEY_ALTER_CONFIGS => alter_configs::encode_error_response(api_version, error_code),
+        API_KEY_INCREMENTAL_ALTER_CONFIGS => {
+            incremental_alter_configs::encode_error_response(api_version, error_code)
+        }
+        API_KEY_DESCRIBE_CLUSTER => {
+            describe_cluster::encode_error_response(api_version, error_code)
+        }
         // Carries the listener's live advertisement, not a hardcoded `NONE`: answering an
         // illegal-state ApiVersions with a SASL-less key set contradicts the advertisement sent
         // one frame earlier on the same connection.

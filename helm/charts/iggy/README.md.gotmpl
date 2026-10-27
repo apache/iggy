@@ -214,13 +214,7 @@ stored values.
   authenticated handshake or be rejected. The key is at least 32 bytes of
   CSPRNG output. Turning it on or off is a coordinated restart of the whole
   cluster: a node that authenticates cannot talk to one that does not.
-* **`server.encryption`** encrypts message payloads and state commands at rest
-  with AES-256-GCM, under a 32-byte base64 key. A node holding a different key
-  cannot read what its peers wrote. The chart selects the legacy configuration
-  for versioned images through `0.9.0-edge.7`, including its pinned image.
-  For newer builds with `[encryption]`, set `server.encryption.configVersion=flat`.
-  Custom tags require an explicit `flat` or `legacy` layout; `legacy` uses
-  `[system.encryption]`.
+* **`server.encryption`** encrypts data at rest with AES-256-GCM under a 32-byte base64 key that every node must hold. A node holding a different key cannot read what its peers wrote. The pinned image uses the legacy `[system.encryption]` layout, encrypts message payloads and state commands under that key, and leaves data unencrypted with `enabled` false. Server builds using `[encryption]`, selected with `server.encryption.configVersion=flat`, give every encrypted stream its own key, stored wrapped under a key derived from the configured one. With `enabled` true, streams created without their own key get a generated one. With `enabled` false and a key set, only streams created with their own key are encrypted. A stream created unencrypted stays unencrypted. A standalone node that cannot open a stored stream key refuses to boot, while a cluster node starts and serves that stream once a wrap it can open has committed. To rotate the server key on such a build, set the new key, put the retiring ones in `server.encryption.previousKeys` (or under `existingSecret.previousKeysKey` in the existing Secret), and follow the procedure in the [server README](https://github.com/apache/iggy/blob/master/core/server/README.md#stream-encryption). The retiring keys reach the server through the Secret, like the key itself. Phase 2 empties `previousKeys` and sets `IGGY_ENCRYPTION_RETIRED_KEK_FINGERPRINTS` to the old key's fingerprint as a JSON array through `server.env`. Once every stream has dropped the old wrap, clear `IGGY_ENCRYPTION_RETIRED_KEK_FINGERPRINTS` from `server.env` on every node. A stream holds at most three wraps, so retire an old fingerprint before adding a fourth key. Fingerprints are not secret, so that entry is a plain value. The chart selects the legacy layout for released images through `0.9.0-edge.7`, including its pinned image. Other image tags require an explicit `flat` or `legacy` layout.
 * **`server.jwt`** makes HTTP bearer tokens valid on every node and survive a
   restart. With `cluster.auth` enabled the server already derives a cluster-wide
   key from the replica PSK, so setting the JWT secrets is an alternative to that
@@ -249,6 +243,10 @@ subpath with no lock between them, which corrupts the data directory while
 `helm --wait` still reports success. The chart ships no HorizontalPodAutoscaler
 for the same reason. Cluster size is a roster decision, so add a node to
 `server.cluster.nodes` and install another release instead.
+
+## Upgrading from chart 0.6
+
+Chart 0.7 acts on `server.encryption.key` and `server.encryption.existingSecret.name` even when `server.encryption.enabled` is false, because a server build with per-stream keys needs the configured key to accept client stream keys and to open the stream keys it already stored. A key left in the values with `enabled` false now creates the `<release>-secrets` Secret and reaches the server, and a key that does not decode to 32 bytes fails the render instead of being ignored. Remove a leftover key before upgrading if the release should run without one. A `server.encryption.existingSecret.name` left set with `enabled` false now renders a required reference to the `server.encryption.existingSecret.key` entry of that Secret, so the server container fails to start when the Secret lacks the entry. Add the entry or remove the name before upgrading.
 
 ## Uninstallation
 

@@ -22,6 +22,7 @@ use crate::session_owner::SessionOwner;
 use iggy_common::{ConnectionString, WebSocketConnectionStringOptions};
 use iggy_common::{IggyError, WebSocketClientConfig};
 use std::sync::Arc;
+use tracing::error;
 
 /// WebSocket client whose replica links share one session and operation driver.
 #[derive(Debug)]
@@ -39,6 +40,11 @@ impl Default for WebSocketClient {
 impl_binary_client!(WebSocketClient);
 
 impl WebSocketClient {
+    /// Creates a WebSocket client from an Iggy connection string.
+    ///
+    /// # Errors
+    ///
+    /// The error of parsing a malformed connection string, else an error of [`Self::create`].
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         let parsed_connection_string =
             ConnectionString::<WebSocketConnectionStringOptions>::new(connection_string)?;
@@ -47,9 +53,18 @@ impl WebSocketClient {
     }
 
     /// Creates the client without spawning tasks or opening sockets.
+    ///
+    /// # Errors
+    ///
+    /// [`IggyError::InvalidConfiguration`] when the WebSocket `max_write_buffer_size` is not
+    /// greater than its `write_buffer_size`.
     pub fn create(config: Arc<WebSocketClientConfig>) -> Result<Self, IggyError> {
         let websocket = config.ws_config.to_tungstenite_config();
         if websocket.max_write_buffer_size <= websocket.write_buffer_size {
+            error!(
+                "WebSocket max_write_buffer_size: {} must be greater than write_buffer_size: {}",
+                websocket.max_write_buffer_size, websocket.write_buffer_size
+            );
             return Err(IggyError::InvalidConfiguration);
         }
         let session = Arc::new(SessionOwner::with_pending_operations(

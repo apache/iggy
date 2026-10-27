@@ -28,7 +28,6 @@ stream = "test_stream"
 topics = ["test_topic"]
 schema = "json"
 batch_length = 100
-poll_interval = "5ms"
 consumer_group = "delta_sink_connector"
 
 # table_uri: Absolute URI of an existing Delta table; bare paths are not accepted.

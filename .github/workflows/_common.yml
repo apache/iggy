@@ -30,7 +30,7 @@ permissions:
 
 jobs:
   rust-versions:
-    name: Check Rust versions sync
+    name: Rust versions sync
     runs-on: ubuntu-slim
     timeout-minutes: 10
     steps:
@@ -40,7 +40,7 @@ jobs:
         run: ./scripts/ci/sync-rustc-version.sh --check
 
   python-versions:
-    name: Check Python SDK versions sync
+    name: Python SDK versions sync
     runs-on: ubuntu-slim
     timeout-minutes: 10
     steps:
@@ -50,7 +50,7 @@ jobs:
         run: ./scripts/ci/python-sdk-version-sync.sh --check
 
   python-interpreter-versions:
-    name: Check Python interpreter versions sync
+    name: Python interpreter versions sync
     runs-on: ubuntu-slim
     timeout-minutes: 10
     steps:
@@ -60,20 +60,20 @@ jobs:
         run: ./scripts/ci/sync-python-interpreter-version.sh --check
 
   python-lockfiles:
-    name: Check Python lockfiles
+    name: Python lockfiles
     runs-on: ubuntu-slim
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Check uv.lock files are in sync with pyproject.toml
         run: ./scripts/ci/uv-lock-check.sh --check
 
   version-consistency:
-    name: Check version consistency
+    name: Version consistency
     runs-on: ubuntu-slim
     timeout-minutes: 10
     steps:
@@ -93,7 +93,7 @@ jobs:
         run: ./scripts/extract-version.sh --check
 
   edge-image-catalog:
-    name: Check edge image catalog
+    name: Edge image catalog
     runs-on: ubuntu-slim
     timeout-minutes: 10
     steps:
@@ -113,7 +113,7 @@ jobs:
         run: ./scripts/ci/edge-image-catalog.sh --check
 
   license-headers:
-    name: Check license headers
+    name: License headers
     runs-on: ubuntu-slim
     timeout-minutes: 10
     steps:
@@ -124,7 +124,7 @@ jobs:
         run: echo "version=$(cat .github/config/hawkeye.version)" >> "$GITHUB_OUTPUT"
 
       - name: Install HawkEye
-        uses: taiki-e/install-action@v2.87.26
+        uses: taiki-e/install-action@v2.87.28
         with:
           tool: hawkeye@${{ steps.hawkeye-version.outputs.version }}
 
@@ -180,7 +180,7 @@ jobs:
         run: ./scripts/ci/shellcheck.sh --check
 
   trailing-whitespace:
-    name: Check trailing whitespace
+    name: Trailing whitespace
     runs-on: ubuntu-slim
     timeout-minutes: 10
     steps:
@@ -193,7 +193,7 @@ jobs:
         run: ./scripts/ci/trailing-whitespace.sh --check --ci
 
   trailing-newline:
-    name: Check trailing newline
+    name: Trailing newline
     runs-on: ubuntu-slim
     timeout-minutes: 10
     steps:
@@ -206,7 +206,7 @@ jobs:
         run: ./scripts/ci/trailing-newline.sh --check --ci
 
   toml-format:
-    name: Check TOML formatting
+    name: TOML formatting
     runs-on: ubuntu-slim
     timeout-minutes: 10
     steps:
@@ -230,7 +230,7 @@ jobs:
         run: ./scripts/ci/taplo.sh --check --ci
 
   binary-artifacts:
-    name: Check binary artifacts
+    name: Binary artifacts
     runs-on: ubuntu-slim
     timeout-minutes: 10
     steps:
@@ -243,7 +243,7 @@ jobs:
         run: ./scripts/ci/binary-artifacts.sh --check --ci
 
   typos:
-    name: Check typos
+    name: Typos
     runs-on: ubuntu-slim
     timeout-minutes: 10
     env:

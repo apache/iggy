@@ -58,9 +58,10 @@ func TestSerialize_TcpCreateStreamRequest(t *testing.T) {
 
 func TestSerialize_UpdateStream(t *testing.T) {
 	streamId, _ := iggcon.NewIdentifier("stream")
+	name := "update_stream"
 	request := UpdateStream{
 		StreamId: streamId,
-		Name:     "update_stream",
+		Name:     &name,
 	}
 
 	serialized1, err := request.MarshalBinary()
@@ -69,14 +70,21 @@ func TestSerialize_UpdateStream(t *testing.T) {
 	}
 
 	expected := []byte{
+		0x02,                               // Scope (stream)
 		0x02,                               // StreamId Kind (StringId)
-		0x06,                               // StreamId Length (2)
+		0x06,                               // StreamId Length (6)
 		0x73, 0x74, 0x72, 0x65, 0x61, 0x6D, // StreamId Value ("stream")
-		0x0D,                                                                         // Name Length (13)
-		0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x5F, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6D, // Name ("update_stream")
+		0x00,                         // Reset count
+		0x02, 0x04, 0x00, 0x00, 0x00, // key kind (String), key length (4)
+		0x6E, 0x61, 0x6D, 0x65, // "name"
+		0x02, 0x0D, 0x00, 0x00, 0x00, // value kind (String), value length (13)
+		0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x5F, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6D, // "update_stream"
 	}
 
 	if !bytes.Equal(serialized1, expected) {
 		t.Errorf("Test case 1 failed. \nExpected:\t%v\nGot:\t\t%v", expected, serialized1)
+	}
+	if request.Code() != UpdateResourceCode {
+		t.Errorf("Code = %d, want the generic update %d", request.Code(), UpdateResourceCode)
 	}
 }

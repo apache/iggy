@@ -305,4 +305,13 @@ async fn kafka_39_admin_client_describes_and_alters_topic_configs() {
         text.contains("altered_retention.ms=8000 source=DYNAMIC_TOPIC_CONFIG"),
         "{text}"
     );
+    assert!(text.contains("incremental_set_retention.ms=9000"), "{text}");
+    assert!(
+        text.contains("incremental_append_rejected=InvalidConfigurationException"),
+        "{text}"
+    );
+    assert!(
+        text.contains("incremental_delete_retention.ms=-1"),
+        "{text}"
+    );
 }

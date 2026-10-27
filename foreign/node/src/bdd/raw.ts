@@ -35,6 +35,23 @@ When(
   }
 );
 
+When(
+  'I send a raw command with code {int} and an empty payload to replica {int}',
+  async function (this: TestWorld, code: number, replica: number) {
+    try {
+      this.rawResponse = await this.client.sendBinaryRequestToReplica(
+        code,
+        Buffer.alloc(0),
+        replica
+      );
+      this.rawError = undefined;
+    } catch (error) {
+      this.rawResponse = undefined;
+      this.rawError = error instanceof Error ? error : new Error(String(error));
+    }
+  }
+);
+
 Then('the raw command should succeed with an empty response', function (this: TestWorld) {
   assert.equal(this.rawError, undefined);
   assert.deepEqual(this.rawResponse, Buffer.alloc(0));
@@ -48,4 +65,9 @@ Then('the raw command should succeed with a non-empty response', function (this:
 Then('the raw command should fail with an invalid command error', function (this: TestWorld) {
   assert.equal(this.rawResponse, undefined);
   assert.match(this.rawError?.message ?? '', /code: 3, message: Invalid command/);
+});
+
+Then('the raw command should fail with an invalid identifier error', function (this: TestWorld) {
+  assert.equal(this.rawResponse, undefined);
+  assert.match(this.rawError?.message ?? '', /code: 6, message: Invalid identifier/);
 });

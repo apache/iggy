@@ -17,8 +17,8 @@
 
 using System.Buffers.Binary;
 using System.Text;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Tcp;
-using Apache.Iggy.Enums;
 using Apache.Iggy.Headers;
 
 namespace Apache.Iggy.Tests.ContractsTests;
@@ -36,8 +36,7 @@ public sealed class TopicContractsTests
             ["segment_size"] = HeaderValue.FromUInt64(1024 * 1024)
         };
 
-        var bytes = TcpContracts.CreateTopic(Identifier.Numeric(StreamId), NonAsciiName, 3,
-            CompressionAlgorithm.None, 0, 0, options);
+        var bytes = TcpContracts.CreateTopic(Identifier.Numeric(StreamId), NonAsciiName, 3, options);
 
         // [stream id: kind + length + 4][partition count: 4][name length: 1][name][options]
         Assert.Equal(3u, BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(6, 4)));
@@ -45,18 +44,18 @@ public sealed class TopicContractsTests
     }
 
     [Fact]
-    public void UpdateTopic_WithANonAsciiName_PrefixesTheUtf8ByteCount()
+    public void UpdateTopic_WithANonAsciiName_SetsTheNameInTheOptionsBlock()
     {
-        var options = new Dictionary<string, HeaderValue>
-        {
-            ["max_topic_size"] = HeaderValue.FromUInt64(2_000_000)
-        };
+        var update = new TopicUpdate { Name = NonAsciiName, MaxTopicSize = 2_000_000 };
 
-        var bytes = TcpContracts.UpdateTopic(Identifier.Numeric(StreamId), Identifier.Numeric(7), NonAsciiName,
-            CompressionAlgorithm.None, 0, 0, options);
+        var bytes = TcpContracts.UpdateTopic(Identifier.Numeric(StreamId), Identifier.Numeric(7), update.ToPatch());
 
-        // [stream id: kind + length + 4][topic id: kind + length + 4][name length: 1][name][options]
-        AssertNameAndOptions(bytes, 12, NonAsciiName, options);
+        // [scope: 1][stream id: kind + length + 4][topic id: kind + length + 4][reset count: 1][options]
+        Assert.Equal((byte)OptionsScope.Topic, bytes[0]);
+        Assert.Equal(0, bytes[13]);
+        var options = Mappers.BinaryMapper.MapHeaders(bytes.AsSpan(14));
+        Assert.Equal(NonAsciiName, options[HeaderKey.FromString("name")].ToString());
+        Assert.Equal(2_000_000UL, options[HeaderKey.FromString("max_topic_size")].ToUInt64());
     }
 
     [Fact]
@@ -65,8 +64,7 @@ public sealed class TopicContractsTests
         // 129 characters, but 258 UTF-8 bytes: a character count would let this through.
         var name = new string('ż', 129);
 
-        Assert.Throws<ArgumentException>(() => TcpContracts.CreateTopic(Identifier.Numeric(StreamId), name, 1,
-            CompressionAlgorithm.None, 0, 0));
+        Assert.Throws<ArgumentException>(() => TcpContracts.CreateTopic(Identifier.Numeric(StreamId), name, 1));
     }
 
     [Fact]
@@ -78,8 +76,7 @@ public sealed class TopicContractsTests
             options[$"option_{i}"] = HeaderValue.FromUInt64((ulong)i);
         }
 
-        var bytes = TcpContracts.CreateTopic(Identifier.Numeric(StreamId), "topic", 1, CompressionAlgorithm.None, 0,
-            0, options);
+        var bytes = TcpContracts.CreateTopic(Identifier.Numeric(StreamId), "topic", 1, options);
 
         AssertNameAndOptions(bytes, 10, "topic", options);
     }

@@ -461,6 +461,25 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn given_change_log_capacity_env_var_when_loading_should_override_the_default() {
+        const NAME: &str = "IGGY_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY";
+        assert!(ServerConfig::all_env_var_names().contains(&NAME));
+        // SAFETY: `serial_test::serial` keeps other tests off the environment.
+        unsafe { env::set_var(NAME, "4096") };
+
+        let cfg: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract();
+
+        // SAFETY: paired with the set above.
+        unsafe { env::remove_var(NAME) };
+        let cfg = cfg.expect("config with the env override deserializes");
+        assert_eq!(cfg.metadata.change_log_activity_capacity, 4096);
+    }
+
+    #[test]
     fn default_impl_validates() {
         let cfg = ServerConfig::default();
         cfg.validate().expect("Default impl validates");

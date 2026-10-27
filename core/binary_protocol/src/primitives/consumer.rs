@@ -65,6 +65,26 @@ impl WireConsumer {
             id,
         }
     }
+
+    pub(crate) fn skip(buf: &[u8]) -> Result<usize, WireError> {
+        Self::decode_kind(buf)?;
+        WireIdentifier::skip(&buf[1..]).map(|consumed| 1 + consumed)
+    }
+
+    fn decode_kind(buf: &[u8]) -> Result<u8, WireError> {
+        let kind = read_u8(buf, 0)?;
+        if !matches!(
+            kind,
+            KIND_CONSUMER | KIND_CONSUMER_GROUP | KIND_EXTERNAL_GROUP
+        ) {
+            return Err(WireError::UnknownDiscriminant {
+                type_name: "WireConsumer",
+                value: kind,
+                offset: 0,
+            });
+        }
+        Ok(kind)
+    }
 }
 
 impl WireEncode for WireConsumer {
@@ -80,17 +100,7 @@ impl WireEncode for WireConsumer {
 
 impl WireDecode for WireConsumer {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
-        let kind = read_u8(buf, 0)?;
-        if !matches!(
-            kind,
-            KIND_CONSUMER | KIND_CONSUMER_GROUP | KIND_EXTERNAL_GROUP
-        ) {
-            return Err(WireError::UnknownDiscriminant {
-                type_name: "WireConsumer",
-                value: kind,
-                offset: 0,
-            });
-        }
+        let kind = Self::decode_kind(buf)?;
         let (id, id_consumed) = WireIdentifier::decode(&buf[1..])?;
         Ok((Self { kind, id }, 1 + id_consumed))
     }

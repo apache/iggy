@@ -98,7 +98,7 @@ func TestTopologyChanges_DropTheCachedDiscoveryOfEveryAlias(t *testing.T) {
 				_, cached := client.topics.partitionsCount(key)
 				assert.False(t, cached, "the count cached under %+v", key)
 				for _, route := range client.polls.routes {
-					assert.True(t, route.stale)
+					assert.NotEqual(t, client.polls.cleared, route.cleared, "the route is stale")
 				}
 			}
 		})
@@ -201,7 +201,7 @@ func TestPartitionRouteRefreshReplacesTheCachedPartitionCount(t *testing.T) {
 }
 
 func TestBalancedSendReselectsOnceAfterPartitionDisappears(t *testing.T) {
-	client, peer := newPipeClient(t)
+	client, peer := newRosterPipeClient(t)
 	client.MessageCompression = iggcon.MESSAGE_COMPRESSION_S2
 	stream, topic, _ := groupConsumer(t)
 	key := newTopicKey(stream, topic)
@@ -211,6 +211,9 @@ func TestBalancedSendReselectsOnceAfterPartitionDisappears(t *testing.T) {
 	}
 	var sends []request
 	server := serve(peer, func(_ int, read request) []byte {
+		if read.code() == uint32(command.GetClusterMetadataCode) {
+			return clusterMetadataFrame(t, 0, "127.0.0.1:8090")
+		}
 		if read.code() == uint32(command.GetPartitionRouteCode) {
 			reply := pollRoutingReply(t, read, 0, 1)
 			binary.LittleEndian.PutUint32(reply[vsr.HeaderSize+20:], 2)
@@ -258,9 +261,12 @@ func TestTopicCacheBoundsCountsAndBalancedCursors(t *testing.T) {
 }
 
 func TestBalancedSendDoesNotReselectAfterUncertaintyThenUnprovedMissingPartition(t *testing.T) {
-	client, peer := newPipeClient(t)
+	client, peer := newRosterPipeClient(t)
 	var sends int
 	server := servePartitionOperations(t, peer, func(_ int, read request) []byte {
+		if read.code() == uint32(command.GetClusterMetadataCode) {
+			return clusterMetadataFrame(t, 0, "127.0.0.1:8090")
+		}
 		sends++
 		code := ierror.TransientNotCommittedCode
 		if sends > 1 {
@@ -272,7 +278,7 @@ func TestBalancedSendDoesNotReselectAfterUncertaintyThenUnprovedMissingPartition
 	message, err := iggcon.NewIggyMessage([]byte("uncertain"))
 	require.NoError(t, err)
 	_, err = client.SendMessages(context.Background(), stream, topic, iggcon.None(), []iggcon.IggyMessage{message})
-	var uncertain ierror.UncertainOutcome
+	var uncertain ierror.OperationUncertain
 	require.ErrorAs(t, err, &uncertain)
 	require.Equal(t, 2, sends)
 	require.Equal(t, 1, requestCount(server.recorded(), command.GetPartitionRouteCode))

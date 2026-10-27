@@ -15,14 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use rumqttc::v5::{
-    AsyncClient as Mqtt5Client, Event as Mqtt5Event, Incoming as Mqtt5Incoming,
-    MqttOptions as Mqtt5Options,
-    mqttbytes::{QoS as Mqtt5Qos, v5::PublishProperties},
+use rumqttc_v4::{
+    AsyncClient as Mqtt311Client, Broker as Mqtt311Broker, Event as Mqtt311Event,
+    Incoming as Mqtt311Incoming, MqttOptions as Mqtt311Options, Outgoing as Mqtt311Outgoing,
+    PublishOptions as Mqtt311PublishOptions, mqttbytes::QoS as MqttQos,
 };
-use rumqttc::{
-    AsyncClient as Mqtt311Client, Event as Mqtt311Event, Incoming as Mqtt311Incoming,
-    MqttOptions as Mqtt311Options, Outgoing, mqttbytes::QoS as Mqtt311Qos,
+use rumqttc_v5::{
+    AsyncClient as Mqtt5Client, Broker as Mqtt5Broker, Event as Mqtt5Event,
+    Incoming as Mqtt5Incoming, MqttOptions as Mqtt5Options, Outgoing as Mqtt5Outgoing,
+    PublishOptions as Mqtt5PublishOptions, mqttbytes::v5::PublishProperties,
 };
 use std::time::Duration;
 use tokio::time::timeout;
@@ -73,7 +74,11 @@ pub(super) async fn publish_batch(
             let (client, mut event_loop) = connect_mqtt311(broker_url, username, password).await?;
             for payload in payloads {
                 client
-                    .publish(topic, qos311(qos)?, false, payload.clone())
+                    .publish(
+                        topic,
+                        payload.clone(),
+                        Mqtt311PublishOptions::new(mqtt_qos(qos)?),
+                    )
                     .await
                     .map_err(|error| {
                         format!("failed to enqueue MQTT 3.1.1 batch publish: {error}")
@@ -85,7 +90,11 @@ pub(super) async fn publish_batch(
             let (client, mut event_loop) = connect_mqtt5(broker_url, username, password).await?;
             for payload in payloads {
                 client
-                    .publish(topic, qos5(qos)?, false, payload.clone())
+                    .publish(
+                        topic,
+                        payload.clone(),
+                        Mqtt5PublishOptions::new(mqtt_qos(qos)?),
+                    )
                     .await
                     .map_err(|error| format!("failed to enqueue MQTT 5 batch publish: {error}"))?;
             }
@@ -107,7 +116,11 @@ pub(super) async fn publish_mixed_batch(
             let (client, mut event_loop) = connect_mqtt311(broker_url, username, password).await?;
             for (qos, payload) in messages {
                 client
-                    .publish(topic, qos311(*qos)?, false, payload.clone())
+                    .publish(
+                        topic,
+                        payload.clone(),
+                        Mqtt311PublishOptions::new(mqtt_qos(*qos)?),
+                    )
                     .await
                     .map_err(|error| {
                         format!("failed to enqueue mixed MQTT 3.1.1 publish: {error}")
@@ -119,7 +132,11 @@ pub(super) async fn publish_mixed_batch(
             let (client, mut event_loop) = connect_mqtt5(broker_url, username, password).await?;
             for (qos, payload) in messages {
                 client
-                    .publish(topic, qos5(*qos)?, false, payload.clone())
+                    .publish(
+                        topic,
+                        payload.clone(),
+                        Mqtt5PublishOptions::new(mqtt_qos(*qos)?),
+                    )
                     .await
                     .map_err(|error| format!("failed to enqueue mixed MQTT 5 publish: {error}"))?;
             }
@@ -138,7 +155,11 @@ async fn publish_mqtt311(
 ) -> Result<(), String> {
     let (client, mut event_loop) = connect_mqtt311(broker_url, username, password).await?;
     client
-        .publish(topic, qos311(qos)?, false, payload.to_vec())
+        .publish(
+            topic,
+            payload.to_vec(),
+            Mqtt311PublishOptions::new(mqtt_qos(qos)?),
+        )
         .await
         .map_err(|error| format!("failed to enqueue MQTT 3.1.1 publish: {error}"))?;
 
@@ -155,7 +176,11 @@ async fn publish_mqtt5(
 ) -> Result<(), String> {
     let (client, mut event_loop) = connect_mqtt5(broker_url, username, password).await?;
     client
-        .publish(topic, qos5(qos)?, false, payload.to_vec())
+        .publish(
+            topic,
+            payload.to_vec(),
+            Mqtt5PublishOptions::new(mqtt_qos(qos)?),
+        )
         .await
         .map_err(|error| format!("failed to enqueue MQTT 5 publish: {error}"))?;
 
@@ -173,33 +198,28 @@ pub(super) async fn publish_mqtt5_with_properties(
 ) -> Result<(), String> {
     let (client, mut event_loop) = connect_mqtt5(broker_url, username, password).await?;
     client
-        .publish_with_properties(topic, qos5(qos)?, false, payload.to_vec(), properties)
+        .publish(
+            topic,
+            payload.to_vec(),
+            Mqtt5PublishOptions::new(mqtt_qos(qos)?).properties(properties),
+        )
         .await
         .map_err(|error| format!("failed to enqueue MQTT 5 publish: {error}"))?;
 
     wait_for_mqtt5_publishes(&mut event_loop, qos, 1).await
 }
 
-fn qos311(qos: u8) -> Result<Mqtt311Qos, String> {
+fn mqtt_qos(qos: u8) -> Result<MqttQos, String> {
     match qos {
-        0 => Ok(Mqtt311Qos::AtMostOnce),
-        1 => Ok(Mqtt311Qos::AtLeastOnce),
-        2 => Ok(Mqtt311Qos::ExactlyOnce),
-        qos => Err(format!("unsupported MQTT QoS: {qos}")),
-    }
-}
-
-fn qos5(qos: u8) -> Result<Mqtt5Qos, String> {
-    match qos {
-        0 => Ok(Mqtt5Qos::AtMostOnce),
-        1 => Ok(Mqtt5Qos::AtLeastOnce),
-        2 => Ok(Mqtt5Qos::ExactlyOnce),
+        0 => Ok(MqttQos::AtMostOnce),
+        1 => Ok(MqttQos::AtLeastOnce),
+        2 => Ok(MqttQos::ExactlyOnce),
         qos => Err(format!("unsupported MQTT QoS: {qos}")),
     }
 }
 
 async fn wait_for_mqtt311_publishes(
-    event_loop: &mut rumqttc::EventLoop,
+    event_loop: &mut rumqttc_v4::EventLoop,
     qos: u8,
     expected: usize,
 ) -> Result<(), String> {
@@ -211,7 +231,7 @@ async fn wait_for_mqtt311_publishes(
                 .await
                 .map_err(|error| format!("failed to publish MQTT 3.1.1 batch: {error}"))?
             {
-                rumqttc::Event::Outgoing(Outgoing::Publish(_)) if qos == 0 => completed += 1,
+                Mqtt311Event::Outgoing(Mqtt311Outgoing::Publish(_)) if qos == 0 => completed += 1,
                 Mqtt311Event::Incoming(Mqtt311Incoming::PubAck(_)) if qos == 1 => completed += 1,
                 Mqtt311Event::Incoming(Mqtt311Incoming::PubComp(_)) if qos == 2 => completed += 1,
                 _ => {}
@@ -224,7 +244,7 @@ async fn wait_for_mqtt311_publishes(
 }
 
 async fn wait_for_mqtt311_mixed_publishes(
-    event_loop: &mut rumqttc::EventLoop,
+    event_loop: &mut rumqttc_v4::EventLoop,
     messages: &[(u8, Vec<u8>)],
 ) -> Result<(), String> {
     // A mixed batch has different broker handshakes, so completion is counted
@@ -245,7 +265,7 @@ async fn wait_for_mqtt311_mixed_publishes(
                 .await
                 .map_err(|error| format!("failed to publish mixed MQTT 3.1.1 batch: {error}"))?
             {
-                rumqttc::Event::Outgoing(Outgoing::Publish(_))
+                Mqtt311Event::Outgoing(Mqtt311Outgoing::Publish(_))
                     if completed_qos0 < expected_qos0 =>
                 {
                     completed_qos0 += 1
@@ -270,7 +290,7 @@ async fn wait_for_mqtt311_mixed_publishes(
 }
 
 async fn wait_for_mqtt5_publishes(
-    event_loop: &mut rumqttc::v5::EventLoop,
+    event_loop: &mut rumqttc_v5::EventLoop,
     qos: u8,
     expected: usize,
 ) -> Result<(), String> {
@@ -282,7 +302,7 @@ async fn wait_for_mqtt5_publishes(
                 .await
                 .map_err(|error| format!("failed to publish MQTT 5 batch: {error}"))?
             {
-                Mqtt5Event::Outgoing(Outgoing::Publish(_)) if qos == 0 => completed += 1,
+                Mqtt5Event::Outgoing(Mqtt5Outgoing::Publish(_)) if qos == 0 => completed += 1,
                 Mqtt5Event::Incoming(Mqtt5Incoming::PubAck(_)) if qos == 1 => completed += 1,
                 Mqtt5Event::Incoming(Mqtt5Incoming::PubComp(_)) if qos == 2 => completed += 1,
                 _ => {}
@@ -295,7 +315,7 @@ async fn wait_for_mqtt5_publishes(
 }
 
 async fn wait_for_mqtt5_mixed_publishes(
-    event_loop: &mut rumqttc::v5::EventLoop,
+    event_loop: &mut rumqttc_v5::EventLoop,
     messages: &[(u8, Vec<u8>)],
 ) -> Result<(), String> {
     // QoS 0, 1, and 2 use different completion packets, so keep separate
@@ -316,7 +336,9 @@ async fn wait_for_mqtt5_mixed_publishes(
                 .await
                 .map_err(|error| format!("failed to publish mixed MQTT 5 batch: {error}"))?
             {
-                Mqtt5Event::Outgoing(Outgoing::Publish(_)) if completed_qos0 < expected_qos0 => {
+                Mqtt5Event::Outgoing(Mqtt5Outgoing::Publish(_))
+                    if completed_qos0 < expected_qos0 =>
+                {
                     completed_qos0 += 1
                 }
                 Mqtt5Event::Incoming(Mqtt5Incoming::PubAck(_))
@@ -342,7 +364,7 @@ async fn connect_mqtt311(
     broker_url: &str,
     username: &str,
     password: &str,
-) -> Result<(Mqtt311Client, rumqttc::EventLoop), String> {
+) -> Result<(Mqtt311Client, rumqttc_v4::EventLoop), String> {
     let url =
         url::Url::parse(broker_url).map_err(|error| format!("invalid MQTT broker URL: {error}"))?;
     let host = url
@@ -353,12 +375,14 @@ async fn connect_mqtt311(
         .ok_or_else(|| "MQTT broker URL has no port".to_string())?;
     let mut options = Mqtt311Options::new(
         format!("iggy-integration-publisher-{}", Uuid::new_v4().simple()),
-        host,
-        port,
+        Mqtt311Broker::tcp(host, port),
     );
-    options.set_credentials(username, password);
-    options.set_keep_alive(Duration::from_secs(5));
-    let (client, mut event_loop) = Mqtt311Client::new(options, 10);
+    options.set_credentials(username, password.to_owned());
+    options.set_keep_alive(5);
+    let (client, mut event_loop) = Mqtt311Client::builder(options)
+        .capacity(10)
+        .try_build()
+        .map_err(|error| format!("failed to build MQTT client: {error}"))?;
 
     timeout(Duration::from_secs(10), async {
         loop {
@@ -381,7 +405,7 @@ async fn connect_mqtt5(
     broker_url: &str,
     username: &str,
     password: &str,
-) -> Result<(Mqtt5Client, rumqttc::v5::EventLoop), String> {
+) -> Result<(Mqtt5Client, rumqttc_v5::EventLoop), String> {
     let url =
         url::Url::parse(broker_url).map_err(|error| format!("invalid MQTT broker URL: {error}"))?;
     let host = url
@@ -392,12 +416,14 @@ async fn connect_mqtt5(
         .ok_or_else(|| "MQTT broker URL has no port".to_string())?;
     let mut options = Mqtt5Options::new(
         format!("iggy-integration-publisher-{}", Uuid::new_v4().simple()),
-        host,
-        port,
+        Mqtt5Broker::tcp(host, port),
     );
-    options.set_credentials(username, password);
-    options.set_keep_alive(Duration::from_secs(5));
-    let (client, mut event_loop) = Mqtt5Client::new(options, 10);
+    options.set_credentials(username, password.to_owned());
+    options.set_keep_alive(5);
+    let (client, mut event_loop) = Mqtt5Client::builder(options)
+        .capacity(10)
+        .try_build()
+        .map_err(|error| format!("failed to build MQTT client: {error}"))?;
 
     timeout(Duration::from_secs(10), async {
         loop {

@@ -358,7 +358,10 @@ async fn setup_resources(client: &IggyClient, durability: Durability) {
         .await
         .unwrap();
 
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     client
         .create_topic(
@@ -553,7 +556,6 @@ async fn should_handle_stale_client_with_auto_reconnection(
         .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
         .batch_length(1)
-        .poll_interval(IggyDuration::from_str("100ms").unwrap())
         .polling_strategy(PollingStrategy::next())
         .auto_join_consumer_group()
         .create_consumer_group_if_not_exists()

@@ -33,12 +33,10 @@ impl IggyCmdTestCase for TestNoCredentialsCmd {
     }
 
     fn verify_command(&self, command_state: Assert) {
-        // Use starts_with without closing bracket (CI tests run with RUST_BACKTRACE which causes rust to emit
-        // longer message with full stack trace at the end of which closing bracket is located).
         command_state
             .failure()
             .stderr(starts_with(
-                "Error: CommandError(Iggy command line tool error\n\nCaused by:\n    Missing iggy server credentials",
+                "Error: Iggy sdk or command error\nCaused by: Iggy command line tool error\nCaused by: Missing iggy server credentials",
             ));
     }
 

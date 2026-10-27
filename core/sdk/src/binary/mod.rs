@@ -28,6 +28,10 @@ macro_rules! impl_binary_client {
                 self.driver.links().keepalive().await
             }
 
+            pub(crate) fn can_recover(&self) -> bool {
+                self.driver.links().can_recover()
+            }
+
             pub(crate) fn connection_address(&self) -> String {
                 self.driver.links().connection_address()
             }
@@ -40,9 +44,10 @@ macro_rules! impl_binary_client {
             }
 
             async fn disconnect(&self) -> Result<(), iggy_common::IggyError> {
-                self.driver.links().disconnect();
                 self.driver.session().forget();
-                self.driver.session().reset().map(|_| ())
+                let result = self.driver.session().reset().map(|_| ());
+                self.driver.links().disconnect();
+                result
             }
 
             async fn shutdown(&self) -> Result<(), iggy_common::IggyError> {
@@ -72,16 +77,24 @@ macro_rules! impl_binary_client {
 
         #[async_trait::async_trait]
         impl iggy_common::BinaryTransport for $client {
+            fn operation_lineage(&self) -> Option<iggy_common::BinaryOperationLineage> {
+                Some(self.driver.session().operation_lineage())
+            }
+
             async fn get_state(&self) -> iggy_common::ClientState {
                 self.driver.links().state()
             }
 
             async fn set_state(&self, state: iggy_common::ClientState) {
-                self.driver.links().set_state(state);
+                self.driver
+                    .session()
+                    .in_operation_lineage(|| self.driver.links().set_state(state));
             }
 
             async fn publish_event(&self, event: iggy_common::DiagnosticEvent) {
-                self.driver.links().publish(event);
+                self.driver
+                    .session()
+                    .in_operation_lineage(|| self.driver.links().publish(event));
             }
 
             async fn send_raw_with_context(
@@ -99,6 +112,15 @@ macro_rules! impl_binary_client {
                     .await
             }
 
+            async fn send_raw_to_replica(
+                &self,
+                code: u32,
+                payload: bytes::Bytes,
+                replica_id: u8,
+            ) -> Result<bytes::Bytes, iggy_common::IggyError> {
+                self.driver.send_to_replica(code, payload, replica_id).await
+            }
+
             async fn send_offset_write_with_response(
                 &self,
                 code: u32,
@@ -114,6 +136,24 @@ macro_rules! impl_binary_client {
                 context: Option<iggy_common::PartitionContext>,
             ) -> Result<bytes::Bytes, iggy_common::IggyError> {
                 self.driver.poll(request, context).await
+            }
+
+            async fn send_wait_with_response(
+                &self,
+                request: &iggy_binary_protocol::requests::messages::WaitForMessagesRequest,
+            ) -> Result<bytes::Bytes, iggy_common::IggyError> {
+                self.driver.wait_for_messages(request).await
+            }
+
+            async fn send_poll_with_response_and_options(
+                &self,
+                request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
+                context: Option<iggy_common::PartitionContext>,
+                options: Option<iggy_common::DeferredPollOptions>,
+            ) -> Result<bytes::Bytes, iggy_common::IggyError> {
+                self.driver
+                    .poll_with_options(request, context, options)
+                    .await
             }
 
             fn routed_partition_count(
@@ -139,6 +179,52 @@ macro_rules! impl_binary_client {
 
         #[async_trait::async_trait]
         impl iggy_common::VsrSessionControl for $client {
+            async fn sign_in_with_credentials(
+                &self,
+                credentials: iggy_common::Credentials,
+            ) -> Result<iggy_common::IdentityInfo, iggy_common::IggyError> {
+                let attempt = self.driver.begin_sign_in()?;
+                let result = iggy_common::with_binary_lineage(Some(attempt.lineage()), async {
+                    tokio::time::timeout_at(
+                        iggy_common::binary_operation_deadline(),
+                        iggy_common::binary_sign_in(self, credentials),
+                    )
+                    .await
+                    .map_err(|_| iggy_common::IggyError::TransientNotAccepted)?
+                })
+                .await;
+                if result.is_ok() {
+                    attempt.complete();
+                }
+                result
+            }
+
+            async fn finish_sign_in(
+                &self,
+                credentials: iggy_common::Credentials,
+                user_id: u32,
+            ) -> Result<(), iggy_common::IggyError> {
+                self.driver.finish_sign_in(credentials, user_id).await
+            }
+
+            async fn finish_sign_out(
+                &self,
+                signing_in: bool,
+            ) -> Result<(), iggy_common::IggyError> {
+                self.driver.session().finish_sign_out(
+                    self.driver.session().operation_lineage().lineage(),
+                    signing_in,
+                    || {
+                        self.driver
+                            .links()
+                            .set_state(iggy_common::ClientState::Connected);
+                        self.driver
+                            .links()
+                            .publish(iggy_common::DiagnosticEvent::SignedOut);
+                    },
+                )
+            }
+
             async fn prepare_sign_in(&self) -> Result<(), iggy_common::IggyError> {
                 self.driver.links().prepare_sign_in().await
             }
@@ -184,16 +270,8 @@ macro_rules! impl_binary_client {
                 self.driver.session().reset().map(|_| ())
             }
 
-            async fn remember_session_credentials(
-                &self,
-                credentials: iggy_common::Credentials,
-                user_id: u32,
-            ) {
-                self.driver.remember(credentials, user_id).await;
-            }
-
             async fn forget_session_credentials(&self) {
-                self.driver.session().forget();
+                self.driver.session().forget_in_operation();
             }
 
             fn sdk_version(&self) -> &'static str {

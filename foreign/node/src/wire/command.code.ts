@@ -24,6 +24,8 @@ export const COMMAND_CODE = {
   GetClusterMetadata: 12,
   DescribeOptions: 13,
   BindSession: 15,
+  UpdateResource: 16,
+  GetMetadataChanges: 17,
   GetMe: 20,
   GetClient: 21,
   GetClients: 22,
@@ -31,7 +33,7 @@ export const COMMAND_CODE = {
   GetUsers: 32,
   CreateUser: 33,
   DeleteUser: 34,
-  UpdateUser: 35,
+  // 35 is retired and must never be reused.
   UpdatePermissions: 36,
   ChangePassword: 37,
   LoginUser: 38,
@@ -46,20 +48,23 @@ export const COMMAND_CODE = {
   SendMessages: 101,
   // 103 and 104 are retired and must never be reused.
   GetPartitionRoute: 105,
+  PollMessagesDeferred: 106,
+  WaitForMessages: 107,
+  CancelDeferredRequest: 108,
   GetOffset: 120,
   StoreOffset: 121,
   DeleteConsumerOffset: 122,
-  // 123 is retired and must never be reused.
+  // 123 and 124 are retired and must never be reused.
   GetStream: 200,
   GetStreams: 201,
   CreateStream: 202,
   DeleteStream: 203,
-  UpdateStream: 204,
+  // 204 is retired and must never be reused.
   GetTopic: 300,
   GetTopics: 301,
   CreateTopic: 302,
   DeleteTopic: 303,
-  UpdateTopic: 304,
+  // 304 is retired and must never be reused.
   CreatePartitions: 402,
   DeletePartitions: 403,
   DeleteSegments: 503,

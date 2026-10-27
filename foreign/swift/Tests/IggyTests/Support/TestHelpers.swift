@@ -60,15 +60,15 @@ func eventually(timeout: Duration = .seconds(5), _ condition: @Sendable () async
     return await condition()
 }
 
-/// Asserts that `body` throws an ``IggyError`` with `code`.
-func expectCode(_ code: IggyErrorCode, sourceLocation: SourceLocation = #_sourceLocation, _ body: () async throws -> Void) async {
+/// Asserts that `body` throws an ``IggyError`` with one of `codes`.
+func expectCode(_ codes: IggyErrorCode..., sourceLocation: SourceLocation = #_sourceLocation, _ body: () async throws -> Void) async {
     do {
         try await body()
-        Issue.record("expected \(code) but nothing was thrown", sourceLocation: sourceLocation)
+        Issue.record("expected \(codes) but nothing was thrown", sourceLocation: sourceLocation)
     } catch let error as IggyError {
-        #expect(error.code == code, "expected \(code), got \(error)", sourceLocation: sourceLocation)
+        #expect(codes.contains(error.code), "expected \(codes), got \(error)", sourceLocation: sourceLocation)
     } catch {
-        Issue.record("expected \(code), got \(error)", sourceLocation: sourceLocation)
+        Issue.record("expected \(codes), got \(error)", sourceLocation: sourceLocation)
     }
 }
 

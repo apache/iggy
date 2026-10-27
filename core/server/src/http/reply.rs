@@ -54,6 +54,12 @@ use crate::reply_frame::reply_body;
 /// number) is always >= 1, so a 0 there is an ack with nothing committed
 /// behind it and must not grade as success.
 ///
+/// `TransientNotCommitted` is the exception to that map: the relay that lost
+/// the write's verdict answers it, and it licenses only a replay of the same
+/// request id. HTTP mints a new id per request, so a resend is a new request
+/// that cannot replay this one: the write may still commit and grades as the
+/// unknown-outcome [`PartitionWriteError::Timeout`].
+///
 /// Grading only, and it hands the graded header back: the committed body is
 /// read separately (see [`send_confirmations`]) because it is
 /// operation-specific - consumer-offset writes commit empty, a produce commits
@@ -70,6 +76,9 @@ pub(in crate::http) fn classify_partition_reply(
         .ok_or(PartitionWriteError::Rejected(IggyError::InvalidCommand))?;
     if header.command != Command::Reply {
         return Err(PartitionWriteError::Rejected(IggyError::InvalidCommand));
+    }
+    if header.status == IggyError::TransientNotCommitted.as_code() {
+        return Err(PartitionWriteError::Timeout(header.operation));
     }
     if header.status != 0 {
         return Err(PartitionWriteError::Rejected(IggyError::from_code(

@@ -26,6 +26,8 @@ const (
 	GetClusterMetadataCode   Code = 12
 	DescribeOptionsCode      Code = 13
 	BindSessionCode          Code = 15
+	UpdateResourceCode       Code = 16
+	GetMetadataChangesCode   Code = 17
 	GetMeCode                Code = 20
 	GetClientCode            Code = 21
 	GetClientsCode           Code = 22
@@ -33,7 +35,6 @@ const (
 	GetUsersCode             Code = 32
 	CreateUserCode           Code = 33
 	DeleteUserCode           Code = 34
-	UpdateUserCode           Code = 35
 	UpdatePermissionsCode    Code = 36
 	ChangePasswordCode       Code = 37
 	LoginUserCode            Code = 38
@@ -46,31 +47,32 @@ const (
 	LoginRegisterWithPATCode Code = 45
 	PollMessagesCode         Code = 100
 	SendMessagesCode         Code = 101
-	// 103, 104 and 123 are retired and must never be reused.
-	GetPartitionRouteCode    Code = 105
-	GetOffsetCode            Code = 120
-	StoreOffsetCode          Code = 121
-	DeleteConsumerOffsetCode Code = 122
-	GetStreamCode            Code = 200
-	GetStreamsCode           Code = 201
-	CreateStreamCode         Code = 202
-	DeleteStreamCode         Code = 203
-	UpdateStreamCode         Code = 204
-	GetTopicCode             Code = 300
-	GetTopicsCode            Code = 301
-	CreateTopicCode          Code = 302
-	DeleteTopicCode          Code = 303
-	UpdateTopicCode          Code = 304
-	CreatePartitionsCode     Code = 402
-	DeletePartitionsCode     Code = 403
-	DeleteSegmentsCode       Code = 503
-	GetGroupCode             Code = 600
-	GetGroupsCode            Code = 601
-	CreateGroupCode          Code = 602
-	DeleteGroupCode          Code = 603
-	JoinGroupCode            Code = 604
-	LeaveGroupCode           Code = 605
-	SyncGroupCode            Code = 606
+	// 35, 103, 104, 123, 124, 204 and 304 are retired and must never be reused.
+	GetPartitionRouteCode     Code = 105
+	PollMessagesDeferredCode  Code = 106
+	WaitForMessagesCode       Code = 107
+	CancelDeferredRequestCode Code = 108
+	GetOffsetCode             Code = 120
+	StoreOffsetCode           Code = 121
+	DeleteConsumerOffsetCode  Code = 122
+	GetStreamCode             Code = 200
+	GetStreamsCode            Code = 201
+	CreateStreamCode          Code = 202
+	DeleteStreamCode          Code = 203
+	GetTopicCode              Code = 300
+	GetTopicsCode             Code = 301
+	CreateTopicCode           Code = 302
+	DeleteTopicCode           Code = 303
+	CreatePartitionsCode      Code = 402
+	DeletePartitionsCode      Code = 403
+	DeleteSegmentsCode        Code = 503
+	GetGroupCode              Code = 600
+	GetGroupsCode             Code = 601
+	CreateGroupCode           Code = 602
+	DeleteGroupCode           Code = 603
+	JoinGroupCode             Code = 604
+	LeaveGroupCode            Code = 605
+	SyncGroupCode             Code = 606
 )
 
 //    internal const int GET_PERSONAL_ACCESS_TOKENS_CODE = 41;

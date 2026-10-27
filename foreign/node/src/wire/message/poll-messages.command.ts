@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { LaneBlockedError, OperationNotRetainedError, OperationUncertainError } from '../../client/client.operation.js';
+import {
+  LaneBlockedError, OPERATION_TIMEOUT_MS, OperationNotRetainedError, OperationUncertainError
+} from '../../client/client.operation.js';
 import { idKey, type Id } from '../identifier.utils.js';
 import type {
   CommandResponse,
   ClientProvider,
   RawClient,
+  SendCommandOptions,
 } from '../../client/client.type.js';
 import {
   ConsumerKind,
@@ -58,6 +61,8 @@ type GroupCursor = {
 type GroupState = {
   cursors: Map<string, GroupCursor>,
   sessionGeneration: number,
+  /** Session resets that ended a signed-in session. */
+  endedSessions: number,
   pendingJoin?: bigint,
 };
 
@@ -71,12 +76,14 @@ const getGroupState = (client: RawClient): GroupState => {
   state = {
     cursors: new Map(),
     sessionGeneration: 0,
+    endedSessions: 0,
   };
   groupStates.set(client, state);
-  client.on('sessionReset', () => {
+  client.on('sessionReset', (signedIn) => {
     state.cursors.clear();
     state.pendingJoin = undefined;
     state.sessionGeneration += 1;
+    if (signedIn) state.endedSessions += 1;
   });
   client.on('heartbeat', () => {
     // Expire instead of delete so an unchanged assignment keeps its
@@ -144,12 +151,13 @@ const syncAssignment = async (
   client: RawClient,
   request: PollMessages,
   state: GroupState,
+  call: SendCommandOptions,
 ): Promise<GroupCursor> => {
   const generation = state.sessionGeneration;
   const pendingJoin = state.pendingJoin;
   if (pendingJoin !== undefined && client.resolveOperation) {
     try {
-      await client.resolveOperation(pendingJoin);
+      await client.resolveOperation(pendingJoin, call);
       if (state.pendingJoin === pendingJoin) state.pendingJoin = undefined;
     } catch (error) {
       if (state.pendingJoin === pendingJoin && (error instanceof OperationNotRetainedError ||
@@ -167,6 +175,7 @@ const syncAssignment = async (
     const response = await client.sendCommand(
       SYNC_GROUP.code,
       SYNC_GROUP.serialize(target),
+      call,
     );
     assignment = SYNC_GROUP.deserialize(response);
   } catch (error) {
@@ -180,6 +189,7 @@ const syncAssignment = async (
       await client.sendCommand(
         JOIN_GROUP.code,
         JOIN_GROUP.serialize(target),
+        call,
       );
     } catch (error) {
       if (error instanceof OperationUncertainError && error.operationId !== undefined &&
@@ -192,6 +202,7 @@ const syncAssignment = async (
     const response = await client.sendCommand(
       SYNC_GROUP.code,
       SYNC_GROUP.serialize(target),
+      call,
     );
     assignment = SYNC_GROUP.deserialize(response);
   }
@@ -220,6 +231,7 @@ const pollConsumerGroup = async (
   client: RawClient,
   request: PollMessages,
   state: GroupState,
+  call: SendCommandOptions,
 ): Promise<PollMessagesResponse> => {
   const key = groupKey(request);
   for (let attempt = 0; attempt < GROUP_POLL_MAX_ATTEMPTS; attempt += 1) {
@@ -232,7 +244,7 @@ const pollConsumerGroup = async (
       cacheAge >= 0 &&
       cacheAge < GROUP_ASSIGNMENT_REFRESH_MS
       ? cached
-      : await syncAssignment(client, request, state);
+      : await syncAssignment(client, request, state, call);
     if (cursor.partitions.length === 0)
       return {
         partitionId: NO_ASSIGNED_PARTITION,
@@ -249,7 +261,7 @@ const pollConsumerGroup = async (
       response = await client.sendCommand(
         POLL_MESSAGES.code,
         POLL_MESSAGES.serialize({ ...request, partitionId }),
-        { context: request.context },
+        { ...call, context: request.context },
       );
     } catch (error) {
       if (!(error instanceof ResponseError) ||
@@ -291,15 +303,23 @@ export const pollMessages = (getClient: ClientProvider) =>
       if (request.consumer.kind === ConsumerKind.Group &&
           request.partitionId === null) {
         const state = getGroupState(client);
+        // As in the Rust SDK, one deadline bounds the whole call, also the
+        // attempts after a session end, and no command of the call runs
+        // under a session that the caller opened after it started.
+        const deadline = Date.now() + OPERATION_TIMEOUT_MS;
+        const call = { deadline, lineage: client.lineage };
         while (true) {
-          const sessionGeneration = state.sessionGeneration;
+          const endedSessions = state.endedSessions;
           try {
-            return await pollConsumerGroup(client, request, state);
+            return await pollConsumerGroup(client, request, state, call);
           } catch (error) {
-            // Retry only when the command stream confirms that the VSR session
-            // was reset. Other command, authorization, and decode errors remain
-            // terminal for the caller.
-            if (error instanceof OperationUncertainError || state.sessionGeneration === sessionGeneration ||
+            // Retry only when the command stream confirms that a signed-in VSR
+            // session ended. Other command, authorization, and decode errors
+            // remain terminal for the caller. A sign-in after a refused one
+            // resets the session too, but it ends no signed-in session, so a
+            // refused sign-in is not repeated without end.
+            if (error instanceof OperationUncertainError || state.endedSessions === endedSessions ||
+                Date.now() >= deadline ||
                 (error instanceof ResponseError &&
                   error.errorCode === TRANSIENT_NOT_COMMITTED))
               throw error;

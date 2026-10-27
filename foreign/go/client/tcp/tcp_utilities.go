@@ -38,6 +38,17 @@ func (c *IggyTcpClient) DescribeOptions(ctx context.Context, scope iggcon.Option
 	return binaryserialization.DeserializeOptionSpecs(buffer)
 }
 
+// GetMetadataChanges reads one page of the server's metadata change log, or
+// of its current state. A query that breaks the request rules is refused with
+// ierror.ErrInvalidCommand before anything is sent.
+func (c *IggyTcpClient) GetMetadataChanges(ctx context.Context, query iggcon.MetadataChangesQuery) (*iggcon.MetadataChanges, error) {
+	buffer, err := c.do(ctx, &command.GetMetadataChanges{Query: query})
+	if err != nil {
+		return nil, err
+	}
+	return binaryserialization.DeserializeMetadataChanges(buffer)
+}
+
 func (c *IggyTcpClient) GetStats(ctx context.Context) (*iggcon.Stats, error) {
 	buffer, err := c.do(ctx, &command.GetStats{})
 	if err != nil {

@@ -23,6 +23,7 @@ import java.util.Properties;
 import java.util.concurrent.ExecutionException;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.AlterConfigOp;
 import org.apache.kafka.clients.admin.AlterConfigsOptions;
 import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.ConfigEntry;
@@ -30,7 +31,8 @@ import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.errors.InvalidConfigurationException;
 
 /**
- * Kafka 3.9 AdminClient probe for DescribeConfigs and the deprecated AlterConfigs API.
+ * Kafka 3.9 AdminClient probe for DescribeConfigs, the deprecated AlterConfigs API and
+ * IncrementalAlterConfigs, the only alter API a 4.x client has.
  * Prints elapsed time for 50 describes and does not fail on a latency threshold.
  */
 public final class ConfigsProbe {
@@ -94,6 +96,32 @@ public final class ConfigsProbe {
                     "altered retention source");
             System.out.println("altered_retention.ms=" + changed.value() + " source=" + changed.source());
 
+            admin.incrementalAlterConfigs(Map.of(resource, List.of(op("retention.ms", "9000", AlterConfigOp.OpType.SET))))
+                    .all()
+                    .get();
+            Config incremented = describe(admin, resource);
+            require("9000".equals(incremented.get("retention.ms").value()), "incremental set retention.ms");
+            System.out.println("incremental_set_retention.ms=" + incremented.get("retention.ms").value());
+
+            try {
+                admin.incrementalAlterConfigs(Map.of(resource, List.of(op("retention.ms", "1", AlterConfigOp.OpType.APPEND))))
+                        .all()
+                        .get();
+                throw new AssertionError("append to a non-list key was accepted");
+            } catch (ExecutionException exception) {
+                if (!(exception.getCause() instanceof InvalidConfigurationException)) {
+                    throw exception;
+                }
+                System.out.println("incremental_append_rejected=" + exception.getCause().getClass().getSimpleName());
+            }
+
+            admin.incrementalAlterConfigs(Map.of(resource, List.of(op("retention.ms", "", AlterConfigOp.OpType.DELETE))))
+                    .all()
+                    .get();
+            Config deleted = describe(admin, resource);
+            require("-1".equals(deleted.get("retention.ms").value()), "incremental delete retention.ms");
+            System.out.println("incremental_delete_retention.ms=" + deleted.get("retention.ms").value());
+
             long started = System.nanoTime();
             for (int i = 0; i < 50; i++) {
                 describe(admin, resource);
@@ -110,6 +138,10 @@ public final class ConfigsProbe {
 
     private static Config config(String name, String value) {
         return new Config(List.of(new ConfigEntry(name, value)));
+    }
+
+    private static AlterConfigOp op(String name, String value, AlterConfigOp.OpType type) {
+        return new AlterConfigOp(new ConfigEntry(name, value), type);
     }
 
     private static void require(boolean condition, String message) {

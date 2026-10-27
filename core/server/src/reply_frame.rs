@@ -577,13 +577,10 @@ pub fn build_consumer_offset_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::test_support::stored_batch_record;
     use iggy_binary_protocol::{Operation, WireDecode};
     use iggy_common::Aes256GcmEncryptor;
-    use server_common::send_messages::{
-        BatchHeader, COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages,
-        PREPARE_SPLIT_POINT, SendMessagesOwned, encrypt_batch_request, frozen_batch_header,
-    };
-    use server_common::sharding::IggyNamespace;
+    use server_common::send_messages::{BatchHeader, COMMAND_HEADER_SIZE, frozen_batch_header};
 
     fn pat_request_header() -> RoutedRequestHeader {
         let zeroed = [0u8; std::mem::size_of::<RoutedRequestHeader>()];
@@ -867,52 +864,12 @@ mod tests {
         ));
     }
 
-    /// A stored record encrypted the way the primary encrypts at ingestion.
-    fn encrypted_record(encryptor: &EncryptorKind) -> Frozen<MESSAGE_ALIGN> {
-        let namespace = IggyNamespace::new(1, 1, 3);
-        let mut messages = IggyMessages::with_capacity(2);
-        for (id, payload) in [(7u128, &b"first-payload"[..]), (8, &b"second-payload"[..])] {
-            messages.push(IggyMessage {
-                header: IggyMessageHeader {
-                    id,
-                    origin_timestamp: 1_000,
-                    ..Default::default()
-                },
-                payload: Bytes::copy_from_slice(payload),
-                user_headers: None,
-            });
-        }
-        let owned = SendMessagesOwned::from_messages(namespace, &messages).expect("build batch");
-        let header_size = std::mem::size_of::<RoutedRequestHeader>();
-        let total = header_size + owned.header.total_size();
-        let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total);
-        {
-            let header: &mut RoutedRequestHeader =
-                bytemuck::checked::try_from_bytes_mut(&mut buffer.as_mut_slice()[..header_size])
-                    .expect("zeroed bytes form a valid RoutedRequestHeader");
-            header.command = Command::Request;
-            header.operation = Operation::SendMessages;
-            header.client = 1;
-            header.session = 1;
-            header.request = 1;
-            header.size = u32::try_from(total).expect("size fits u32");
-        }
-        let bytes = buffer.as_mut_slice();
-        owned
-            .header
-            .encode_into(&mut bytes[header_size..header_size + COMMAND_HEADER_SIZE]);
-        bytes[PREPARE_SPLIT_POINT..].copy_from_slice(&owned.blob);
-        let canonical = Message::try_from(buffer).expect("request message is valid");
-        let encrypted = encrypt_batch_request(canonical, encryptor).expect("encrypt batch");
-        let record = &encrypted.as_slice()[header_size..encrypted.header().size as usize];
-        Owned::<MESSAGE_ALIGN>::copy_from_slice(record).into()
-    }
-
     #[test]
     fn polled_reply_encrypted_records_take_the_flattening_path() {
         let encryptor =
             EncryptorKind::Aes256Gcm(Aes256GcmEncryptor::new(&[7u8; 32]).expect("valid 32B key"));
-        let fragments = PollFragments::from_iter([Fragment::whole(encrypted_record(&encryptor))]);
+        let fragments =
+            PollFragments::from_iter([Fragment::whole(stored_batch_record(Some(&encryptor)))]);
         let expected = flattened_reply(fragments.clone(), Some(&encryptor));
         let reply = vectored_reply(fragments, Some(&encryptor)).expect("decrypting reply");
         assert_eq!(reply.fragments().len(), 1);

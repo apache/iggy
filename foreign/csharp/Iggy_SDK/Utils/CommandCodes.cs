@@ -25,6 +25,8 @@ internal static class CommandCodes
     internal const int GET_CLUSTER_METADATA_CODE = 12;
     internal const int DESCRIBE_OPTIONS_CODE = 13;
     internal const int BIND_SESSION_CODE = 15;
+    internal const int UPDATE_RESOURCE_CODE = 16;
+    internal const int GET_METADATA_CHANGES_CODE = 17;
     internal const int GET_ME_CODE = 20;
     internal const int GET_CLIENT_CODE = 21;
     internal const int GET_CLIENTS_CODE = 22;
@@ -32,7 +34,7 @@ internal static class CommandCodes
     internal const int GET_USERS_CODE = 32;
     internal const int CREATE_USER_CODE = 33;
     internal const int DELETE_USER_CODE = 34;
-    internal const int UPDATE_USER_CODE = 35;
+    // 35 was UpdateUser and must never be reused.
     internal const int UPDATE_PERMISSIONS_CODE = 36;
     internal const int CHANGE_PASSWORD_CODE = 37;
     internal const int LOGIN_USER_CODE = 38;
@@ -47,20 +49,23 @@ internal static class CommandCodes
     internal const int SEND_MESSAGES_CODE = 101;
     // 103 and 104 are retired and must never be reused.
     internal const int GET_PARTITION_ROUTE_CODE = 105;
+    internal const int POLL_MESSAGES_DEFERRED_CODE = 106;
+    internal const int WAIT_FOR_MESSAGES_CODE = 107;
+    internal const int CANCEL_DEFERRED_REQUEST_CODE = 108;
     internal const int GET_CONSUMER_OFFSET_CODE = 120;
     internal const int STORE_CONSUMER_OFFSET_CODE = 121;
     internal const int DELETE_CONSUMER_OFFSET_CODE = 122;
-    // 123 is retired and must never be reused.
+    // 123 and 124 are retired and must never be reused.
     internal const int GET_STREAM_CODE = 200;
     internal const int GET_STREAMS_CODE = 201;
     internal const int CREATE_STREAM_CODE = 202;
     internal const int DELETE_STREAM_CODE = 203;
-    internal const int UPDATE_STREAM_CODE = 204;
+    // 204 was UpdateStream and must never be reused.
     internal const int GET_TOPIC_CODE = 300;
     internal const int GET_TOPICS_CODE = 301;
     internal const int CREATE_TOPIC_CODE = 302;
     internal const int DELETE_TOPIC_CODE = 303;
-    internal const int UPDATE_TOPIC_CODE = 304;
+    // 304 was UpdateTopic and must never be reused.
     internal const int CREATE_PARTITIONS_CODE = 402;
     internal const int DELETE_PARTITIONS_CODE = 403;
     internal const int DELETE_SEGMENTS_CODE = 503;

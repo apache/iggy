@@ -17,7 +17,6 @@
 
 import argparse
 import asyncio
-from datetime import timedelta
 from typing import NamedTuple
 
 from apache_iggy import (
@@ -67,7 +66,6 @@ async def main() -> None:
         polling_strategy=PollingStrategy.First(),
         batch_length=100,
         auto_commit=AutoCommit.After(AutoCommitAfter.ConsumingEachMessage()),
-        poll_interval=timedelta(milliseconds=100),
     )
 
     shutdown_event = asyncio.Event()

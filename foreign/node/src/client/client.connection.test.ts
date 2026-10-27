@@ -26,7 +26,8 @@ import { ResponseFrameDecoder, ProtocolFrameError } from './client.frame.js';
 import type { ClientConfig } from './client.type.js';
 import { Command, HEADER_SIZE, REPLY_OFFSET, REQUEST_OFFSET, encodeRequestHeader } from '../wire/vsr/header.js';
 import { Operation } from '../wire/vsr/operation.js';
-import { FrozenFrame, OPERATION_TIMEOUT_MS } from './client.operation.js';
+import { FrozenFrame, OPERATION_TIMEOUT_MS, VsrResponseTimeoutError } from './client.operation.js';
+import { ConnectionClosedError } from '../index.js';
 
 const TLS_CERTIFICATE = readFileSync(new URL('../../../../core/certs/iggy_cert.pem', import.meta.url));
 const TLS_KEY = readFileSync(new URL('../../../../core/certs/iggy_key.pem', import.meta.url));
@@ -166,6 +167,38 @@ describe('IggyConnection multiplexing', () => {
     } finally { await closeConnection(connection, server); }
   });
 
+  it('times out an expired deadline before building a frame', async () => {
+    const server = await startServer();
+    const connection = new IggyConnection(connectionConfig(server));
+    let built = 0;
+    try {
+      await connection.connect();
+      const result = await connection.exchange(() => { built += 1; return requestFrame(1n); },
+        Date.now() - 1, new AbortController().signal);
+      assert.ok(result.error instanceof VsrResponseTimeoutError);
+      assert.match(String(result.error), /after 0 ms/);
+      assert.equal(result.started, false);
+      assert.equal(built, 0);
+    } finally { await closeConnection(connection, server); }
+  });
+
+  it('reports a caller abort ahead of an expired deadline', async () => {
+    const server = await startServer();
+    const connection = new IggyConnection(connectionConfig(server));
+    const cancel = new AbortController();
+    const reason = new Error('caller canceled');
+    let built = 0;
+    try {
+      await connection.connect();
+      cancel.abort(reason);
+      const result = await connection.exchange(() => { built += 1; return requestFrame(1n); },
+        Date.now() - 1, cancel.signal);
+      assert.equal(result.error, reason);
+      assert.equal(result.started, false);
+      assert.equal(built, 0);
+    } finally { await closeConnection(connection, server); }
+  });
+
   it('assembles partial frames and rejects an oversized declared frame', async () => {
     let count = 0;
     const server = await startServer((frame, socket) => {
@@ -267,7 +300,7 @@ describe('IggyConnection multiplexing', () => {
     const connection = new IggyConnection(connectionConfig(server));
     try {
       await connection.connect();
-      assert.ok((await exchange(connection, 1n)).error);
+      assert.ok((await exchange(connection, 1n)).error instanceof ConnectionClosedError);
       await assert.rejects(connection.connect());
       assert.equal(accepted, 1);
     } finally { await closeConnection(connection, server); }

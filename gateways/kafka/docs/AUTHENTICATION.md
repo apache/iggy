@@ -272,9 +272,10 @@ first frame:
    the name unchecked.
 
 With `requested`, a client that presents no certificate is Kafka's `ANONYMOUS` principal, which holds no
-permissions: `DescribeAcls` describes it as holding nothing, and `DeleteTopics`, `AlterConfigs` and the auto
-topic creation a `Metadata` request asks for, which need a global `manage_topics`, are refused. Everything
-else is served as the bridge's user. With `required`, rustls fails the handshake instead.
+permissions: `DescribeAcls` describes it as holding nothing, and `DeleteTopics`, `AlterConfigs`,
+`DeleteGroups`, `OffsetDelete` and the auto topic creation a `Metadata` request asks for, which need a global
+`manage_topics` or `manage_streams`, are refused. Everything else is served as the bridge's user. With
+`required`, rustls fails the handshake instead.
 
 The same holds on every listener that names nobody once any listener names principals: a `PLAINTEXT`
 listener beside a `SASL_SSL` or mTLS one serves `ANONYMOUS`, so it cannot do what an authenticated user

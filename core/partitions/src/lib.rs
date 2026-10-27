@@ -42,7 +42,17 @@ mod segment;
 pub mod segment_anchor;
 mod segment_recovery;
 pub mod state_transfer;
+mod stream_keyring;
 mod types;
+mod view_fence;
+#[cfg(feature = "simulator")]
+mod wal_storage;
+#[cfg(feature = "simulator")]
+pub use wal_storage::{InjectedFile, InjectedStorage, WalFile, WalStorage};
+
+/// The storage under every partition WAL.
+#[cfg(not(feature = "simulator"))]
+pub type WalStorage = ::journal::durable_storage::DiskStorage;
 
 pub use consumer_offset_capacity::{AutoCommitReservation, ConsumerOffsetCapacityError};
 use iggy_binary_protocol::PrepareHeader;
@@ -57,9 +67,11 @@ pub use io::{
     CapturedPartitionIo, MaterializationIoJob, MaterializationIoResult, PARTITION_IO_DRAIN_TIMEOUT,
     PartitionIncarnation, PartitionIoContinuation, PartitionIoIdentity, PartitionIoJob,
     PartitionIoNotifier, PartitionIoPlan, PartitionIoQuiescence, PartitionIoResources,
-    PartitionIoResult, PartitionIoStep, PartitionTeardown, largest_legal_job_charge,
+    PartitionIoResult, PartitionIoStep, PartitionTeardown, PreparedPrimaryTransfer,
+    largest_legal_job_charge,
 };
 pub use journal::{EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY};
+pub use view_fence::ViewWindowVerdict;
 
 /// Offsets a partition claims in its superblock ahead of the mint counter
 /// before it will append, so a crash-restarted replica resumes above every
@@ -80,7 +92,7 @@ pub const DEFAULT_CONSUMER_OFFSETS_MAX: usize = 4096;
 
 pub(crate) const FILE_SYNC_CONCURRENCY: usize = 16;
 
-pub use iggy_partition::{PollCompletion, PollReplication};
+pub use iggy_partition::{PollCompletion, PollReplication, PollVisibility};
 pub use messages_writer::MessagesWriter;
 pub use offset_storage::delete_persisted_offset;
 pub use partition_storage::{
@@ -89,7 +101,7 @@ pub use partition_storage::{
     hydrate_partition_log, read_created_revision, read_revision_record, write_created_revision,
     write_revision_record,
 };
-pub use poll_plan::{PollPlan, PollReadResult};
+pub use poll_plan::{DISK_POLL_CHUNK_MAX, PollPlan, PollReadResult};
 pub use segment::Segment;
 pub use segment_recovery::{
     PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredSegment, load_persisted_segments,
@@ -98,11 +110,12 @@ pub use segment_recovery::{
 use server_common::Message;
 pub use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessages};
 pub use state_transfer::CONSUMER_OFFSETS_ENTRIES_MAX;
+pub use stream_keyring::{StreamKeyIdentity, StreamKeyring};
 pub use types::{
     AppendResult, COMMIT_WALK_OPS_MAX, FatalCommit, Fragment, PartitionOffsets,
     PartitionPathLayout, PartitionsConfig, PollFragments, PollQueryResult, PollingArgs,
-    PollingConsumer, REPAIR_MAX_STALL_RETRIES, REPAIR_RETRY_TICKS, RepairConclusion, RepairSession,
-    SendMessagesResult,
+    PollingConsumer, REPAIR_MAX_STALL_RETRIES, REPAIR_RETRY_TICKS, RepairConclusion, RepairIngest,
+    RepairSession, SendMessagesResult,
 };
 
 /// A partition's message log, named so a caller can carry one across a rebuild.

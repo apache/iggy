@@ -61,7 +61,7 @@ async function buildClientAndStream(connectionString: string) {
     compressionAlgorithm: 1,
   });
 
-  log(`Stream created: ${stream.id}`);
+  log(`Stream created: ${stream.id}, encryption key source: ${stream.encryptionKeySource}`);
   log(`Topic created: ${topic.id}`);
 
   return { client, stream, topic };
