@@ -189,6 +189,7 @@ These are SDK configuration fields, not Random or Stdout `plugin_config` keys. T
 - **`schema_path`**: Path to the `.proto` file containing message definitions
 - **`message_type`**: Fully qualified name of the protobuf message type to use
 - **`use_any_wrapper`**: Selects the Any fallback when no message descriptor is loaded; a loaded descriptor takes precedence
+- **`field_mappings`**: Maps protobuf field names (keys) to JSON field names (values); JSON field names must be unique
 
 #### Transform Options
 
