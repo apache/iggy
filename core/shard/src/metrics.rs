@@ -237,6 +237,63 @@ fn reason_index(s: &str) -> Option<usize> {
     REASONS.iter().position(|r| *r == s)
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct DeferredPollMetrics {
+    pub pending: Gauge,
+    pub inflight_bytes: Gauge,
+    pub rejected: Counter,
+    pub failed: Counter,
+    pub cancelled: Counter,
+    pub expired: Counter,
+    pub filled: Counter,
+    pub late: Counter,
+}
+
+impl DeferredPollMetrics {
+    fn register(&self, registry: &mut Registry) {
+        registry.register(
+            "deferred_poll_pending",
+            "pending deferred polls",
+            self.pending.clone(),
+        );
+        registry.register(
+            "deferred_poll_inflight_bytes",
+            "reserved bytes for running or queued deferred reads",
+            self.inflight_bytes.clone(),
+        );
+        registry.register(
+            "deferred_poll_rejected",
+            "deferred polls rejected before admission",
+            self.rejected.clone(),
+        );
+        registry.register(
+            "deferred_poll_failed",
+            "admitted deferred polls rejected by a read error, fence, read budget refusal or request deadline",
+            self.failed.clone(),
+        );
+        registry.register(
+            "deferred_poll_cancelled",
+            "deferred polls cancelled by their caller",
+            self.cancelled.clone(),
+        );
+        registry.register(
+            "deferred_poll_expired",
+            "deferred polls completed at their deadline",
+            self.expired.clone(),
+        );
+        registry.register(
+            "deferred_poll_filled",
+            "deferred polls answered before their wait deadline",
+            self.filled.clone(),
+        );
+        registry.register(
+            "deferred_poll_late",
+            "deferred read completions discarded after expiry or cancellation",
+            self.late.clone(),
+        );
+    }
+}
+
 /// Per-shard metric handles.
 ///
 /// Cheap to clone (`Arc` of a `Family` under the hood). Each shard owns
@@ -265,6 +322,7 @@ pub struct ShardMetrics {
     partition_io_fenced: Counter,
     partition_io_timeouts: Counter,
 
+    pub(crate) deferred_polls: DeferredPollMetrics,
     partition_wal_disk_bytes: Gauge,
     partition_wal_retained_bytes: Gauge,
     partition_wal_queued_bytes: Gauge,
@@ -343,6 +401,7 @@ impl ShardMetrics {
             partition_io_quarantined_jobs: Gauge::default(),
             partition_io_fenced: Counter::default(),
             partition_io_timeouts: Counter::default(),
+            deferred_polls: DeferredPollMetrics::default(),
             partition_wal_disk_bytes: Gauge::default(),
             partition_wal_retained_bytes: Gauge::default(),
             partition_wal_queued_bytes: Gauge::default(),
@@ -952,6 +1011,7 @@ impl ShardMetrics {
     #[allow(clippy::too_many_lines)]
     pub fn register(&self, registry: &mut Registry) {
         self.register_persistence(registry);
+        self.deferred_polls.register(registry);
         registry.register(
             "partition_io_capacity",
             "configured partition file-job slots per shard",

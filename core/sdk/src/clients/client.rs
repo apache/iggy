@@ -180,7 +180,6 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///     .consumer("consumer_name", "stream_name", "topic_name", 1)?
 ///     .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
 ///     .polling_strategy(PollingStrategy::next())
-///     .poll_interval(IggyDuration::ONE_SECOND)
 ///     .batch_length(1000)
 ///     .build();
 /// consumer.init().await?;
@@ -649,7 +648,6 @@ impl IggyClient {
     ///     .consumer("consumer_name", "stream_name", "topic_name", 1)? // returns IggyConsumerBuilder from IggyClient
     ///     .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
     ///     .polling_strategy(PollingStrategy::next())
-    ///     .poll_interval(IggyDuration::ONE_SECOND)
     ///     .batch_length(1000)
     ///     .build(); // returns IggyConsumer from IggyConsumerBuilder
     /// # let _ = consumer;
@@ -679,7 +677,6 @@ impl IggyClient {
             Identifier::named(topic)?,
             Some(partition),
             self.encryptor.clone(),
-            None,
         ))
     }
 
@@ -721,7 +718,6 @@ impl IggyClient {
     ///     .consumer_group("group_name", "stream_name", "topic_name")? // returns IggyConsumerBuilder from IggyClient
     ///     .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
     ///     .polling_strategy(PollingStrategy::next())
-    ///     .poll_interval(IggyDuration::ONE_SECOND)
     ///     .batch_length(1000)
     ///     .build(); // returns IggyConsumer from IggyConsumerBuilder
     /// # let _ = consumer;
@@ -750,7 +746,6 @@ impl IggyClient {
             Identifier::named(topic)?,
             None,
             self.encryptor.clone(),
-            None,
         ))
     }
 
@@ -958,8 +953,8 @@ impl IggyClient {
     ///
     /// # Errors
     /// [`IggyError::InvalidCommand`] before anything is sent if `code` is a
-    /// session-control code, a replicated command, a poll, or a consumer-offset
-    /// read. Writes and partition reads reach their primary through the typed
+    /// session-control code, a replicated command, a poll, a readiness wait, a
+    /// deferred-request cancel, or a consumer-offset read. Writes and partition reads reach their primary through the typed
     /// API and [`send_binary_request`](IggyClient::send_binary_request).
     /// [`IggyError::InvalidIdentifier`] if the roster does not name
     /// `replica_id`, or names it without an endpoint for this transport.

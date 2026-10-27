@@ -23,9 +23,10 @@ use crate::tcp::tcp_client::TcpClient;
 use crate::websocket::websocket_client::WebSocketClient;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
-    BinaryOperationLineage, BinarySendPartitioning, BinaryTransport, ClientState, Identifier,
-    IggyError, IggyMessage, MessageClient, SendMessagesResponse, SystemClient,
-    send_binary_messages,
+    AssignmentVersion, BinaryClient, BinaryOperationLineage, BinarySendPartitioning,
+    BinaryTransport, ClientState, Identifier, IggyError, IggyMessage, MessageClient,
+    SendMessagesResponse, SystemClient, group_cache_key, send_binary_messages,
+    sync_group_assignment,
 };
 
 #[allow(clippy::large_enum_variant)]
@@ -124,4 +125,102 @@ impl ClientWrapper {
             Self::WebSocket(client) => client.can_recover(),
         }
     }
+
+    pub(crate) async fn deferred_group_state(
+        &self,
+    ) -> Result<std::sync::Arc<iggy_common::ConsumerGroupClientState>, IggyError> {
+        match self {
+            Self::Tcp(client) => Ok(client.consumer_group_state()),
+            Self::Quic(client) => Ok(client.consumer_group_state()),
+            Self::WebSocket(client) => Ok(client.consumer_group_state()),
+            Self::Http(_) => Err(IggyError::FeatureUnavailable),
+            Self::Iggy(client) => Box::pin(client.client.read().await.deferred_group_state()).await,
+        }
+    }
+
+    /// The partitions grouped by primary endpoint and split to fit one wait
+    /// request each, so that a consumer can keep one readiness wait in flight
+    /// per group.
+    pub(crate) async fn readiness_groups(
+        &self,
+        stream: &Identifier,
+        topic: &Identifier,
+        partitions: &[u32],
+    ) -> Result<Vec<Vec<u32>>, IggyError> {
+        match self {
+            Self::Tcp(client) => {
+                client
+                    .driver
+                    .readiness_groups(stream, topic, partitions)
+                    .await
+            }
+            Self::Quic(client) => {
+                client
+                    .driver
+                    .readiness_groups(stream, topic, partitions)
+                    .await
+            }
+            Self::WebSocket(client) => {
+                client
+                    .driver
+                    .readiness_groups(stream, topic, partitions)
+                    .await
+            }
+            Self::Http(_) => Err(IggyError::FeatureUnavailable),
+            Self::Iggy(client) => {
+                Box::pin(
+                    client
+                        .client
+                        .read()
+                        .await
+                        .readiness_groups(stream, topic, partitions),
+                )
+                .await
+            }
+        }
+    }
+
+    pub(crate) async fn deferred_poll_partitions(
+        &self,
+        stream: &Identifier,
+        topic: &Identifier,
+        group: &Identifier,
+    ) -> Result<(AssignmentVersion, Vec<u32>), IggyError> {
+        match self {
+            Self::Tcp(client) => group_assignment(client, stream, topic, group).await,
+            Self::Quic(client) => group_assignment(client, stream, topic, group).await,
+            Self::WebSocket(client) => group_assignment(client, stream, topic, group).await,
+            Self::Http(_) => Err(IggyError::FeatureUnavailable),
+            Self::Iggy(client) => {
+                Box::pin(
+                    client
+                        .client
+                        .read()
+                        .await
+                        .deferred_poll_partitions(stream, topic, group),
+                )
+                .await
+            }
+        }
+    }
+}
+
+/// Syncs the assignment, then reads it.
+async fn group_assignment<B: BinaryClient>(
+    client: &B,
+    stream: &Identifier,
+    topic: &Identifier,
+    group: &Identifier,
+) -> Result<(AssignmentVersion, Vec<u32>), IggyError> {
+    sync_group_assignment(client, stream, topic, group).await?;
+    let state = client.consumer_group_state();
+    let key = group_cache_key(stream, topic, group);
+    if !state.is_registered(&key) {
+        return Err(IggyError::ConsumerGroupMemberNotFound(
+            0,
+            group.clone(),
+            topic.clone(),
+        ));
+    }
+    Ok(state.assignment_snapshot(&key))
 }

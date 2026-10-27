@@ -33,6 +33,7 @@ use super::register_forwarding::connect_without_login;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use futures::future::join_all;
+use futures::stream::FuturesUnordered;
 use iggy::prelude::*;
 use iggy_binary_protocol::codes::{
     BIND_SESSION_CODE, GET_CONSUMER_GROUP_CODE, GET_PARTITION_ROUTE_CODE, POLL_MESSAGES_CODE,
@@ -63,7 +64,7 @@ use iggy_common::{
 use integration::harness::disk::{
     leader_node_index_via, read_metadata_superblock_state, read_partition_superblock_state,
 };
-use integration::harness::{TestBinary, TestHarness};
+use integration::harness::{TestBinary, TestHarness, wait_for_consumer_group_assignment};
 use integration::iggy_harness;
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use reqwest::StatusCode;
@@ -183,6 +184,8 @@ const FENCE_BOUND: Duration = HEARTBEAT_TIMEOUT
     .saturating_add(FRESHNESS_MARGIN)
     .saturating_add(FENCE_SLACK);
 const FENCE_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+const DEFERRED_PENDING_METRIC: &str = "deferred_poll_pending";
+const DEFERRED_DELIVERY_BUDGET: Duration = Duration::from_secs(5);
 
 fn message(payload: &str) -> IggyMessage {
     IggyMessage::from_str(payload).expect("build message")
@@ -364,6 +367,252 @@ async fn assert_initial_spread(
         vec![total / u32::try_from(replicas).unwrap(); replicas],
         "create batches and growth must count already admitted assignments"
     );
+}
+
+#[iggy_harness(
+    cluster_nodes = 3,
+    test_client_transport = [Tcp, WebSocket, Quic, Http],
+    server(
+        http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+        http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+    )
+)]
+async fn given_spread_primaries_when_polling_deferred_should_wake_each_partition_independently(
+    harness: &TestHarness,
+) {
+    let (client, stream, topic, observers) =
+        spread_deferred_topic(harness, "deferred-spread").await;
+    let producer = harness.root_client().await.unwrap();
+    let consumer = Consumer::default();
+    let strategy = PollingStrategy::next();
+    let mut polls: FuturesUnordered<_> = (0..SPREAD_PARTITIONS)
+        .map(|partition| {
+            client.poll_messages_deferred(
+                &stream,
+                &topic,
+                Some(partition),
+                &consumer,
+                &strategy,
+                2,
+                true,
+                DeferredPollOptions {
+                    min_count: 2,
+                    ..deferred_test_options()
+                },
+            )
+        })
+        .collect();
+    tokio::select! {
+        result = polls.next() => panic!("empty partition completed before publication: {result:?}"),
+        () = wait_for_deferred_pending(&observers, 1) => {}
+    }
+    client
+        .ping()
+        .await
+        .expect("control traffic remains available");
+
+    for partition in (0..SPREAD_PARTITIONS).rev() {
+        let payloads = [format!("{partition}-first"), format!("{partition}-second")];
+        let mut messages: Vec<_> = payloads.iter().map(|payload| message(payload)).collect();
+        producer
+            .send_messages(
+                &stream,
+                &topic,
+                &Partitioning::partition_id(partition),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+        let polled = timeout(DEFERRED_DELIVERY_BUDGET, polls.next())
+            .await
+            .expect("an empty partition must not delay another primary's ready poll")
+            .unwrap()
+            .unwrap();
+        assert_eq!(polled.partition_id, partition);
+        assert_eq!(polled.messages.len(), payloads.len());
+        for (offset, (received, payload)) in polled.messages.iter().zip(&payloads).enumerate() {
+            assert_eq!(received.header.offset, offset as u64);
+            assert_eq!(received.payload.as_ref(), payload.as_bytes());
+        }
+        let stored = client
+            .get_consumer_offset(&consumer, &stream, &topic, Some(partition))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.stored_offset, 1);
+    }
+    assert!(polls.is_empty());
+    wait_for_deferred_pending(&observers, 0).await;
+}
+
+#[iggy_harness(
+    cluster_nodes = 3,
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(
+        http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+        http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+    )
+)]
+async fn given_spread_primaries_when_consuming_deferred_should_route_every_group_partition(
+    harness: &TestHarness,
+) {
+    let producer = harness.root_client().await.unwrap();
+    for (stream_name, auto_commit) in [
+        ("deferred-manual", AutoCommit::Disabled),
+        (
+            "deferred-on-poll",
+            AutoCommit::When(AutoCommitWhen::PollingMessages),
+        ),
+    ] {
+        let (client, stream, topic, observers) = spread_deferred_topic(harness, stream_name).await;
+        let mut consumer = client
+            .consumer_group(GROUP_NAME, stream_name, TOPIC_NAME)
+            .unwrap()
+            .auto_commit(auto_commit)
+            .polling_strategy(PollingStrategy::next())
+            .batch_length(1)
+            .poll_options(deferred_test_options())
+            .build();
+        consumer.init().await.unwrap();
+        let group = Consumer::group(Identifier::named(GROUP_NAME).unwrap());
+        wait_for_consumer_group_assignment(
+            &client,
+            &stream,
+            &topic,
+            &group.id,
+            1,
+            PRECONDITION_BUDGET,
+        )
+        .await;
+
+        for offset in 0..2 {
+            for partition in (0..SPREAD_PARTITIONS).rev() {
+                let mut next = Box::pin(consumer.next());
+                tokio::select! {
+                    result = &mut next => panic!("no message was published for {stream_name}: {result:?}"),
+                    () = wait_for_deferred_pending(&observers, 1) => {}
+                }
+                let payload = format!("{stream_name}-{partition}-{offset}");
+                producer
+                    .send_messages(
+                        &stream,
+                        &topic,
+                        &Partitioning::partition_id(partition),
+                        &mut [message(&payload)],
+                    )
+                    .await
+                    .unwrap();
+                let received = timeout(DEFERRED_DELIVERY_BUDGET, next)
+                    .await
+                    .expect("a group must receive from any ready partition primary")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(received.partition_id, partition, "{stream_name}");
+                assert_eq!(received.message.header.offset, offset, "{stream_name}");
+                assert_eq!(received.message.payload.as_ref(), payload.as_bytes());
+                if matches!(auto_commit, AutoCommit::Disabled) {
+                    let stored = client
+                        .get_consumer_offset(&group, &stream, &topic, Some(partition))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        stored.map(|stored| stored.stored_offset),
+                        offset.checked_sub(1)
+                    );
+                    consumer
+                        .store_offset(offset, Some(partition))
+                        .await
+                        .unwrap();
+                }
+                let stored = client
+                    .get_consumer_offset(&group, &stream, &topic, Some(partition))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(stored.stored_offset, offset, "{stream_name}/{partition}");
+            }
+        }
+        consumer.shutdown().await.unwrap();
+        wait_for_deferred_pending(&observers, 0).await;
+    }
+}
+
+fn deferred_test_options() -> DeferredPollOptions {
+    DeferredPollOptions {
+        max_wait: Duration::from_secs(30).into(),
+        request_timeout: Duration::from_secs(40).into(),
+        ..Default::default()
+    }
+}
+
+async fn spread_deferred_topic(
+    harness: &TestHarness,
+    stream_name: &str,
+) -> (IggyClient, Identifier, Identifier, Vec<HttpClient>) {
+    let client = harness.root_client().await.unwrap();
+    client
+        .create_stream(stream_name, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream = Identifier::named(stream_name).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    client
+        .create_topic(
+            &stream,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(SPREAD_PARTITIONS),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let probe = connect_without_login(harness.node(0).tcp_addr().unwrap()).await;
+    probe
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    assert_initial_spread(
+        &probe,
+        &stream,
+        &[(TOPIC_NAME, SPREAD_PARTITIONS)],
+        harness.cluster_size(),
+    )
+    .await;
+    let observer = HttpClient::login_root(harness).await;
+    let observers = (0..harness.cluster_size())
+        .map(|node| HttpClient {
+            client: observer.client.clone(),
+            base_url: node_url(harness, node),
+            token: observer.token.clone(),
+        })
+        .collect();
+    (client, stream, topic, observers)
+}
+
+async fn wait_for_deferred_pending(observers: &[HttpClient], expected: u64) {
+    let deadline = Instant::now() + DEFERRED_DELIVERY_BUDGET;
+    loop {
+        let counts = join_all(observers.iter().map(async |observer| {
+            let text = metrics(observer).await;
+            let values: Vec<u64> = text
+                .lines()
+                .filter(|line| line.starts_with(DEFERRED_PENDING_METRIC))
+                .map(|line| line.rsplit_once(' ').unwrap().1.parse().unwrap())
+                .collect();
+            assert!(!values.is_empty(), "deferred poll metrics missing: {text}");
+            values.into_iter().sum::<u64>()
+        }))
+        .await;
+        if counts.iter().all(|count| *count == expected) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected {expected} pending waits on each node, got {counts:?}"
+        );
+        sleep(FENCE_PROBE_INTERVAL).await;
+    }
 }
 
 async fn assert_partition_payload(
@@ -2633,9 +2882,11 @@ async fn assert_cached_route_after_primary_loss(
         loop {
             match receiver.next().await.expect("the consumer must stay open") {
                 Ok(message) => break message,
-                // The fixture killed the old owner before polling, so the
-                // uncertain reply cannot hide admission of this new message.
-                Err(IggyError::TransientNotCommitted) => {}
+                // A readiness wait sent to the killed owner times out as not
+                // accepted, and an auto-commit poll as uncertain. The fixture
+                // killed it before polling, so the uncertain reply cannot hide
+                // admission of this new message.
+                Err(IggyError::TransientNotAccepted | IggyError::TransientNotCommitted) => {}
                 Err(error) => panic!("poll could not recover its cached data route: {error:?}"),
             }
         }

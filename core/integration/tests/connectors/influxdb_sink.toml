@@ -28,7 +28,6 @@ stream = "connector_stream"
 topics = ["connector_topic"]
 schema = "json"
 batch_length = 10
-poll_interval = "100ms"
 consumer_group = "influxdb_sink_test"
 
 [plugin_config]

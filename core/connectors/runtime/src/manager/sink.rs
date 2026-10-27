@@ -24,7 +24,6 @@ use crate::metrics::Metrics;
 use crate::sink;
 use dashmap::DashMap;
 use dlopen2::wrapper::Container;
-use iggy::prelude::IggyClient;
 use iggy_connector_sdk::api::{ConnectorError, ConnectorStatus};
 use std::collections::HashMap;
 use std::fmt;
@@ -183,7 +182,6 @@ impl SinkManager {
         &self,
         key: &str,
         config: &SinkConfig,
-        iggy_client: &IggyClient,
         metrics: &Arc<Metrics>,
         context: &Arc<RuntimeContext>,
     ) -> Result<(), RuntimeError> {
@@ -202,20 +200,34 @@ impl SinkManager {
 
         let plugin_id = PLUGIN_ID.fetch_add(1, Ordering::SeqCst);
 
-        sink::init_sink(
-            &container,
-            &config.plugin_config.clone().unwrap_or_default(),
-            plugin_id,
-        )?;
-        info!("Sink connector with ID: {plugin_id} for plugin: {key} initialized successfully.");
-
-        let consumers = sink::setup_sink_consumers(key, config, iggy_client).await?;
+        // Connected before the plugin starts, so a refused connection leaves no
+        // plugin instance behind.
+        let client = context.iggy_clients.connect_sink_client().await?;
+        let setup = async {
+            sink::init_sink(
+                &container,
+                &config.plugin_config.clone().unwrap_or_default(),
+                plugin_id,
+            )?;
+            info!(
+                "Sink connector with ID: {plugin_id} for plugin: {key} initialized successfully."
+            );
+            sink::setup_sink_consumers(key, config, &client).await
+        };
+        let consumers = match setup.await {
+            Ok(consumers) => consumers,
+            Err(error) => {
+                sink::release_sink_client(client, plugin_id).await;
+                return Err(error);
+            }
+        };
 
         let callback = container.iggy_sink_consume;
         let (shutdown_tx, task_handles) = sink::spawn_consume_tasks(
             plugin_id,
             key,
             consumers,
+            client,
             callback,
             config.verbose,
             config.benchmark,
@@ -241,7 +253,6 @@ impl SinkManager {
         &self,
         key: &str,
         config_provider: &dyn ConnectorsConfigProvider,
-        iggy_client: &IggyClient,
         metrics: &Arc<Metrics>,
         context: &Arc<RuntimeContext>,
     ) -> Result<(), RuntimeError> {
@@ -268,8 +279,7 @@ impl SinkManager {
             .map_err(|e| RuntimeError::InvalidConfiguration(e.to_string()))?
             .ok_or_else(|| RuntimeError::SinkNotFound(key.to_string()))?;
 
-        self.start_connector(key, &config, iggy_client, metrics, context)
-            .await?;
+        self.start_connector(key, &config, metrics, context).await?;
         info!("Sink connector: {key} restarted successfully.");
         Ok(())
     }

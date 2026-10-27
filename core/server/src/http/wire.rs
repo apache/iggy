@@ -36,6 +36,7 @@ use iggy_common::wire_conversions::{consumer_to_wire, identifier_to_wire, partit
 use iggy_common::{
     Consumer, ConsumerKind, Identifier, IggyError, IggyMessageView, PollMessages, SendMessages,
 };
+use serde::Deserialize;
 use server_common::Message;
 
 /// Encode a validated HTTP `SendMessages` into the `SendMessagesRequest` wire
@@ -118,6 +119,40 @@ pub(in crate::http) fn poll_wire_request(
         count: query.count,
         auto_commit: query.auto_commit,
     })
+}
+
+/// The limits of `GET .../messages/deferred`. An omitted field takes the default of
+/// [`iggy_common::DeferredPollOptions`].
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub(in crate::http) struct DeferredPollQuery {
+    pub wait_us: u64,
+    pub min_count: u32,
+    pub max_bytes: u32,
+    pub request_timeout_us: u64,
+}
+
+impl Default for DeferredPollQuery {
+    fn default() -> Self {
+        let options = iggy_common::DeferredPollOptions::default();
+        Self {
+            wait_us: options.max_wait.as_micros(),
+            min_count: options.min_count,
+            max_bytes: options.max_bytes,
+            request_timeout_us: options.request_timeout.as_micros(),
+        }
+    }
+}
+
+impl From<DeferredPollQuery> for iggy_common::DeferredPollOptions {
+    fn from(query: DeferredPollQuery) -> Self {
+        Self {
+            max_wait: query.wait_us.into(),
+            min_count: query.min_count,
+            max_bytes: query.max_bytes,
+            request_timeout: query.request_timeout_us.into(),
+        }
+    }
 }
 
 /// Map a validated HTTP consumer-offset query onto the wire

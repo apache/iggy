@@ -14,7 +14,7 @@ Set the broker credentials and connector configuration directory before starting
 
 The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, and can be fetched via `docker pull apache/iggy-connect:edge`.
 
-The runtime opens two Iggy TCP clients, one for producers and one for consumers. Set credentials matching the broker and a connector configuration provider. Omitted settings use the embedded defaults, including file-based source state storage. Save this example as `connectors.toml` in the repository root and replace `path/to/connectors` with your connector configuration directory.
+The runtime opens one Iggy TCP client that all sources share, and each sink opens its own client every time it starts. Set credentials matching the broker and a connector configuration provider. Omitted settings use the embedded defaults, including file-based source state storage. Save this example as `connectors.toml` in the repository root and replace `path/to/connectors` with your connector configuration directory.
 
 ```toml
 [iggy]
@@ -52,6 +52,26 @@ Run `iggy-connectors --list-config-env-vars` to print the supported names and te
 `<FIELD>` sets one lowercased top-level `plugin_config` key with underscores preserved (`A_B` becomes `a_b`, not nested `a.b`); nested plugin configuration keys cannot be set through environment variables. `FORMAT` is reserved and listed separately as `..._PLUGIN_CONFIG_FORMAT`.
 
 Source destination topics must persist every acknowledged batch before the runtime checkpoints the source or invokes its Ack hook. Missing topics are therefore created with `durability = "persisted"` and `messages_required_to_save = 1`. An existing topic must use `durability = "persisted"`; its save threshold may differ because persisted acknowledgments already wait for durable storage.
+
+Sink consumers use long polling. A poll returns when `min_count` messages are
+ready (default 1), when its reply reaches 1 MiB, or when `max_wait` expires
+(default `1s`). Set both on a sink `[[streams]]` entry to batch messages, for
+example `max_wait = "3s"` with `min_count` equal to `batch_length`. `min_count`
+must not exceed `batch_length`. `max_wait` must be above zero and at most 10
+minutes, and the server shortens a wait above its `deferred_poll_max_wait`.
+Use `max_wait` and `min_count` in place of `poll_interval`. If a sink
+`[[streams]]` entry sets `poll_interval`, that sink fails to start. The server
+commits the offset of each sink poll when it answers the poll, before the
+plugin consumes the messages. Sinks need a server that supports deferred polls
+(binary commands 106 and 107).
+
+At each start, a sink connects an Iggy client of its own. After the last
+consumer of that start stops, the sink logs the client out and shuts it down.
+A poll of one sink that waits for messages thus does not delay the polls or
+offset stores of another sink. The consumers inside one sink share its client.
+They share the progress lane of each partition, which orders their polls and
+offset calls. They also share the limit of 64 deferred requests per client.
+The [SDK README](../../sdk/README.md) describes both.
 
 ## State storage
 

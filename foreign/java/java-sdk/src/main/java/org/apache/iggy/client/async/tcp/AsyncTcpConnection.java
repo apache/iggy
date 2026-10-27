@@ -807,7 +807,8 @@ public class AsyncTcpConnection {
     private static boolean isRefusal(IggyServerException serverError) {
         return serverError != null
                 && (serverError.getRawErrorCode() == TRANSIENT_NOT_ACCEPTED
-                        || serverError.getRawErrorCode() == NOT_PRIMARY);
+                        || serverError.getRawErrorCode() == NOT_PRIMARY
+                        || serverError.getRawErrorCode() == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode());
     }
 
     /**
@@ -1063,6 +1064,7 @@ public class AsyncTcpConnection {
     private static boolean isPartitionCommand(int code) {
         return code == CommandCode.Messages.SEND.getValue()
                 || code == CommandCode.Messages.POLL.getValue()
+                || code == CommandCode.Messages.POLL_DEFERRED.getValue()
                 || code == CommandCode.ConsumerOffset.GET.getValue()
                 || isOffsetWriteCode(code);
     }
@@ -1207,15 +1209,24 @@ public class AsyncTcpConnection {
     }
 
     /** Replays transient refusals with the same dedup identity; committed lifecycle refusals need a new id. */
-    @SuppressWarnings("checkstyle:NPathComplexity")
-    private void writeVsrFrame(VsrExchange exchange, ByteBuf frame, boolean uncertain, long lifecycleRetryIntervalMs) {
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
+    private void writeVsrFrame(
+            VsrExchange exchange, ByteBuf retainedFrame, boolean uncertain, long lifecycleRetryIntervalMs) {
         Channel channel = exchange.channel();
         VsrResponseHandler handler = exchange.handler();
         CompletableFuture<ByteBuf> responseFuture = exchange.responseFuture();
         if (exchange.requestDeadlineNanos() - System.nanoTime() <= 0) {
             IggyTimeoutException timeout = responseTimeout(exchange.commandCode());
-            releaseFrame(exchange, frame);
+            releaseFrame(exchange, retainedFrame);
             responseFuture.completeExceptionally(preserveUncertainOutcome(timeout, uncertain));
+            return;
+        }
+        ByteBuf frame;
+        try {
+            frame = frameForAttempt(exchange, retainedFrame);
+        } catch (RuntimeException error) {
+            releaseFrame(exchange, retainedFrame);
+            responseFuture.completeExceptionally(preserveUncertainOutcome(error, uncertain));
             return;
         }
         CompletableFuture<ByteBuf> attempt = new CompletableFuture<>();
@@ -1261,6 +1272,27 @@ public class AsyncTcpConnection {
                 handler.closeChannel(channel, future.cause());
             }
         });
+        pending.sent(channel);
+    }
+
+    private static ByteBuf frameForAttempt(VsrExchange exchange, ByteBuf retainedFrame) {
+        if (exchange.commandCode() != CommandCode.Messages.POLL_DEFERRED.getValue()) {
+            return retainedFrame;
+        }
+        int parameters = retainedFrame.writerIndex() - PollRouter.DEFERRED_PARAMETERS_BYTES;
+        var options = PollRouter.deferredOptions(retainedFrame);
+        var remaining = options.remaining(
+                options.requestTimeout().minusNanos(exchange.requestDeadlineNanos() - System.nanoTime()));
+        if (remaining.isEmpty()) {
+            throw notAccepted();
+        }
+        // A progress ticket and pending writers share the frozen frame. Only this attempt's copy changes.
+        ByteBuf frame = retainedFrame.copy();
+        frame.setLongLE(
+                parameters - retainedFrame.readerIndex(), remaining.get().maxWaitMicros());
+        frame.setLongLE(frame.writerIndex() - Long.BYTES, remaining.get().requestTimeoutMicros());
+        retainedFrame.release();
+        return frame;
     }
 
     private static void releaseFrame(VsrExchange exchange, ByteBuf frame) {
@@ -1558,11 +1590,15 @@ public class AsyncTcpConnection {
         if (isPollRoutingCode(commandCode)
                 || (routed
                         && (commandCode == CommandCode.Messages.POLL.getValue()
+                                || commandCode == CommandCode.Messages.POLL_DEFERRED.getValue()
                                 || commandCode == CommandCode.ConsumerOffset.GET.getValue()))) {
             return false;
         }
         if (serverError.getRawErrorCode() == TRANSIENT_NOT_COMMITTED) {
             return System.nanoTime() < deadlineNanos;
+        }
+        if (serverError.getRawErrorCode() == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode()) {
+            return !routed && System.nanoTime() < deadlineNanos;
         }
         if (serverError.getRawErrorCode() == TRANSIENT_NOT_ACCEPTED) {
             return !routed && System.nanoTime() < notAcceptedDeadlineNanos;

@@ -92,7 +92,7 @@ pub const DEFAULT_CONSUMER_OFFSETS_MAX: usize = 4096;
 
 pub(crate) const FILE_SYNC_CONCURRENCY: usize = 16;
 
-pub use iggy_partition::{PollCompletion, PollReplication};
+pub use iggy_partition::{PollCompletion, PollReplication, PollVisibility};
 pub use messages_writer::MessagesWriter;
 pub use offset_storage::delete_persisted_offset;
 pub use partition_storage::{
@@ -101,7 +101,7 @@ pub use partition_storage::{
     hydrate_partition_log, read_created_revision, read_revision_record, write_created_revision,
     write_revision_record,
 };
-pub use poll_plan::{PollPlan, PollReadResult};
+pub use poll_plan::{DISK_POLL_CHUNK_MAX, PollPlan, PollReadResult};
 pub use segment::Segment;
 pub use segment_recovery::{
     PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredSegment, load_persisted_segments,

@@ -116,7 +116,7 @@ final class ErrorTest extends TestCase
                 AutoCommit::disabled(),
                 true,
                 true,
-                micros(1),
+                null,
                 null,
                 null,
                 null,

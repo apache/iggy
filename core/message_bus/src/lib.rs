@@ -112,8 +112,8 @@ use std::array;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Maximum number of replicas a single cluster supports. Replica ids are
@@ -528,6 +528,13 @@ pub struct ReplicaReadMetrics {
 ///
 /// A bus impl must preserve this divergence - see each method.
 pub trait MessageBus {
+    /// Process-wide monotonic microseconds, on the same timeline as `sleep`.
+    /// Virtual-time implementations must override both methods together.
+    fn monotonic_micros(&self) -> u64 {
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        u64::try_from(ORIGIN.get_or_init(Instant::now).elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+
     /// Queue one frame for `client_id`. Takes anything that converts into a
     /// [`BusMessage`]: a single `Frozen<MESSAGE_ALIGN>` buffer or an
     /// already fragmented frame. [`IggyMessageBus`] refuses every such frame
@@ -1099,11 +1106,16 @@ impl IggyMessageBus {
     fn finish_local_reply(&self, client_id: u128, route: ReplyRoute) -> Result<(), SendError> {
         match route {
             ReplyRoute::Delivered(send_result) => send_result.map_err(map_try_send_err),
-            ReplyRoute::InProcess(message) => {
+            ReplyRoute::InProcess(mut message) => {
                 let request = reply_request_id(&message);
+                let receipt = message.take_write_receipt();
                 self.clients
                     .fire_in_process(client_id, request, message)
-                    .map_err(|_| SendError::ClientNotFound(client_id))
+                    .map_err(|_| SendError::ClientNotFound(client_id))?;
+                if let Some(receipt) = receipt {
+                    receipt.complete();
+                }
+                Ok(())
             }
             ReplyRoute::NoSlot(_message) => Err(SendError::ClientNotFound(client_id)),
             ReplyRoute::Stalled => Err(SendError::Backpressure),
@@ -1431,6 +1443,10 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
     // spawn queue, and virtual clock) would be silently reverted to the defaults
     // through the wrapper. No-op for production, whose `IggyMessageBus` uses those
     // defaults anyway.
+    fn monotonic_micros(&self) -> u64 {
+        (**self).monotonic_micros()
+    }
+
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
         (**self).sleep(duration)
     }
