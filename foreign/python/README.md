@@ -554,6 +554,42 @@ accepted messages before returning. Object destruction does not perform
 asynchronous cleanup; dropping a background producer without `shutdown()` can
 lose buffered messages.
 
+## Consumer Shutdown
+
+Stop a callback consumption loop with its `asyncio.Event`, await the loop, then
+shut down the consumer before shutting down its client:
+
+```python
+stop = asyncio.Event()
+
+
+async def take(message):
+    print(message.payload())
+    stop.set()
+
+
+await consumer.consume_messages(take, stop)
+await consumer.shutdown()
+await client.shutdown()
+```
+
+When another task requests the stop, call `stop.set()` there and await the
+existing consumption task before `consumer.shutdown()`. Do not await shutdown
+inside the callback or while an iterator's next call is pending: they hold the
+same consumer lock. After shutdown, iterators terminate. Repeated and concurrent
+shutdown calls are safe once consumption has stopped.
+
+Shutdown drains background offset work, performs final commits when auto-commit
+is enabled, leaves the group and stops the connection watcher. The Rust SDK logs
+final commit and group-leave failures; successful return does not confirm these
+operations succeeded on the server. `AutoCommit.Disabled()` skips final commits.
+
+`consumer_group(..., offset_drain_timeout=timedelta(seconds=2))` overrides the
+Rust default of five seconds per background offset task. Omit it or pass `None`
+to retain that default. Zero aborts background work that remains pending, but
+final commits and group leave still run. Negative values raise `ValueError`.
+This is not a deadline for the entire shutdown operation.
+
 ## Examples
 
 Refer to the [examples/python/](https://github.com/apache/iggy/tree/master/examples/python) directory for usage examples.
