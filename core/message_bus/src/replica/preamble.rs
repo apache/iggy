@@ -56,7 +56,7 @@ pub enum PreambleError {
     Read(#[source] io::Error),
     #[error("no preamble within {0:?}")]
     TimedOut(Duration),
-    #[error("not a replica link preamble (magic {0:#010x})")]
+    #[error("not a replica link preamble (magic {0:#010x}), likely a peer on an older build")]
     BadMagic(u32),
     #[error("unsupported preamble version {0}")]
     BadVersion(u8),
