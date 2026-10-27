@@ -32,9 +32,10 @@
 use crate::replica::links::LinkClaim;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BundlePhase {
     /// No link of the current epoch is installed.
+    #[default]
     Down,
     /// Some links of the current epoch are installed, the first at `since`.
     Forming { since: Instant },
@@ -44,7 +45,7 @@ pub enum BundlePhase {
     TearingDown,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Bundle {
     epoch: u32,
     phase: BundlePhase,
@@ -62,14 +63,6 @@ pub struct BundleChange {
 }
 
 impl Bundle {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            epoch: 0,
-            phase: BundlePhase::Down,
-        }
-    }
-
     #[must_use]
     pub const fn epoch(&self) -> u32 {
         self.epoch
@@ -164,12 +157,6 @@ impl Bundle {
     }
 }
 
-impl Default for Bundle {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,7 +172,7 @@ mod tests {
     }
 
     fn up_bundle(now: Instant) -> Bundle {
-        let mut bundle = Bundle::new();
+        let mut bundle = Bundle::default();
         assert!(
             bundle
                 .refresh(&[Some(claim(0)), Some(claim(0))], now, LIMIT)
@@ -197,7 +184,7 @@ mod tests {
     #[test]
     fn bundle_is_up_only_with_every_link_of_its_epoch() {
         let now = Instant::now();
-        let mut bundle = Bundle::new();
+        let mut bundle = Bundle::default();
         let change = bundle.refresh(&[Some(claim(0)), None], now, LIMIT);
         assert!(!change.came_up);
         assert_eq!(bundle.phase(), BundlePhase::Forming { since: now });
@@ -245,7 +232,7 @@ mod tests {
     #[test]
     fn forming_bundle_tears_down_past_the_limit() {
         let start = Instant::now();
-        let mut bundle = Bundle::new();
+        let mut bundle = Bundle::default();
         bundle.refresh(&[Some(claim(0)), None], start, LIMIT);
         let change = bundle.refresh(&[Some(claim(0)), None], start + LIMIT / 2, LIMIT);
         assert!(!change.tore_down);
@@ -269,7 +256,7 @@ mod tests {
     #[test]
     fn teardown_with_nothing_installed_goes_straight_down() {
         let now = Instant::now();
-        let mut bundle = Bundle::new();
+        let mut bundle = Bundle::default();
         bundle.refresh(&[Some(claim(0)), None], now, LIMIT);
         let change = bundle.link_closed(0, &[None, None], now, LIMIT);
         assert!(change.tore_down);
