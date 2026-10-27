@@ -44,21 +44,27 @@ use bytes::Bytes;
 use consensus::MetadataHandle;
 use consensus::client_table::SessionAttachment;
 use iggy_binary_protocol::PrepareHeader;
-use iggy_binary_protocol::codes::{GET_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE};
+use iggy_binary_protocol::codes::{
+    GET_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE,
+};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
-use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::messages::{
+    DeferredPollMessagesRequest, PollMessagesRequest, WaitForMessagesRequest,
+};
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::responses::messages::poll_messages::PollMessagesResponseHeader;
 use iggy_binary_protocol::{
     GenericHeader, KIND_CONSUMER, KIND_CONSUMER_GROUP, KIND_EXTERNAL_GROUP, Operation,
     RequestHeader, RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier,
 };
-use iggy_common::{ConsumerKind, IggyError, PollingStrategy, RESYNC_REQUIRED_PARTITION_SENTINEL};
+use iggy_common::{
+    ConsumerKind, IggyError, PollingKind, PollingStrategy, RESYNC_REQUIRED_PARTITION_SENTINEL,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::BusMessage;
@@ -72,7 +78,10 @@ use partitions::{PollingArgs, PollingConsumer};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use shard::shards_table::ShardsTable;
-use shard::{ConsumerAttachment, PartitionRead, PartitionReadReply};
+use shard::{
+    ConsumerAttachment, DeferredPollContext, DeferredPollRequest, PartitionRead,
+    PartitionReadReply, PollQuotaIdentity, ReadinessTarget,
+};
 use std::rc::Rc;
 use tracing::{debug, warn};
 
@@ -434,8 +443,11 @@ where
         {
             GetConsumerOffsetRequest::decode_from(request.body()).ok()?
         }
+        // A deferred poll starts with the same fields and holds the lane until
+        // it answers, so a later store cannot pass the commit of its wait.
         Operation::NonReplicated
-            if request.header().reserved[..4] == POLL_MESSAGES_CODE.to_le_bytes() =>
+            if request.header().reserved[..4] == POLL_MESSAGES_CODE.to_le_bytes()
+                || request.header().reserved[..4] == POLL_MESSAGES_DEFERRED_CODE.to_le_bytes() =>
         {
             let (strategy, auto_commit) =
                 PollMessagesRequest::peek_progress(request.body()).ok()?;
@@ -670,6 +682,204 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
     send_non_replicated_bytes(shard, request, origin, body, channel, "poll_messages").await;
 }
 
+pub(super) fn resolve_deferred_poll<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    wire: &DeferredPollMessagesRequest,
+    header: &RoutedRequestHeader,
+    (consumer_client_id, session, user_id): (u128, SessionAttachment, u32),
+) -> Result<(IggyNamespace, u32, DeferredPollRequest), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    if let Some(status) = authorize_partition_read(
+        shard,
+        &wire.poll.stream_id,
+        &wire.poll.topic_id,
+        Some(user_id),
+        |permissioner, user_id, stream_id, topic_id| {
+            permissioner.poll_messages(user_id, stream_id, topic_id)
+        },
+    ) {
+        return Err(IggyError::from_code(status));
+    }
+    let (namespace, partition_id, consumer, args) =
+        resolve_poll_request(shard, &wire.poll, consumer_client_id)?;
+    let metadata = consumer_poll_metadata(shard, namespace, consumer, consumer_client_id)?;
+    let local = metadata.context(current_metadata_commit(shard));
+    fence_poll_context(
+        PartitionContext {
+            incarnation: header.partition_incarnation,
+            owner_generation: if header.owner_generation == 0 {
+                local.owner_generation
+            } else {
+                header.owner_generation
+            },
+            metadata_op: header.minimum_metadata_op,
+        },
+        local,
+        consumer_client_id,
+        partition_id,
+    )?;
+    let request = DeferredPollRequest::new(
+        consumer,
+        args,
+        metadata,
+        DeferredPollContext {
+            session: Some(session),
+            user_id,
+            user_created_at: None,
+            quota: PollQuotaIdentity::Session(consumer_client_id),
+            primary: true,
+        },
+        wire.into(),
+    );
+    Ok((namespace, partition_id, request))
+}
+
+/// Resolve and authorize every partition of a readiness wait with the fence
+/// and metadata identity of a poll. The owner checks them again at each
+/// evaluation. Returns the caller that every target shares, and the targets.
+pub(super) fn resolve_readiness_wait<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    wire: WaitForMessagesRequest,
+    (consumer_client_id, session, user_id): (u128, SessionAttachment, u32),
+) -> Result<(DeferredPollContext, Vec<ReadinessTarget>), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    if let Some(status) = authorize_partition_read(
+        shard,
+        &wire.stream_id,
+        &wire.topic_id,
+        Some(user_id),
+        |permissioner, user_id, stream_id, topic_id| {
+            permissioner.poll_messages(user_id, stream_id, topic_id)
+        },
+    ) {
+        return Err(IggyError::from_code(status));
+    }
+    let mut poll = PollMessagesRequest {
+        consumer: wire.consumer,
+        stream_id: wire.stream_id,
+        topic_id: wire.topic_id,
+        partition_id: None,
+        strategy: WirePollingStrategy::next(),
+        count: 1,
+        auto_commit: false,
+    };
+    let targets = wire
+        .partitions
+        .into_iter()
+        .map(|target| {
+            poll.partition_id = Some(target.partition_id);
+            poll.strategy = target.strategy;
+            let (namespace, partition_id, consumer, args) =
+                resolve_poll_request(shard, &poll, consumer_client_id)?;
+            if !matches!(args.kind, PollingKind::Offset | PollingKind::Next) {
+                return Err(IggyError::InvalidCommand);
+            }
+            Ok(ReadinessTarget {
+                namespace,
+                partition_id,
+                consumer,
+                strategy: PollingStrategy {
+                    kind: args.kind,
+                    value: args.value,
+                    context: None,
+                },
+                metadata: consumer_poll_metadata(shard, namespace, consumer, consumer_client_id)?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let caller = DeferredPollContext {
+        session: Some(session),
+        user_id,
+        user_created_at: None,
+        quota: PollQuotaIdentity::Session(consumer_client_id),
+        primary: true,
+    };
+    Ok((caller, targets))
+}
+
+fn consumer_poll_metadata<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+    consumer: PollingConsumer,
+    consumer_client_id: u128,
+) -> Result<PollMetadata, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let group_id = match consumer {
+        PollingConsumer::ConsumerGroup(group, _) => Some(group as u64),
+        PollingConsumer::Consumer(..) => None,
+    };
+    shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .poll_metadata(namespace, group_id, consumer_client_id)
+        .ok_or(IggyError::TransientNotAccepted)
+}
+
+#[allow(clippy::future_not_send)]
+pub(super) async fn read_deferred_poll<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    request: &Message<RoutedRequestHeader>,
+    (namespace, partition_id, poll): (IggyNamespace, u32, DeferredPollRequest),
+    attachment: &SessionAttachment,
+) -> Result<BusMessage, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let reply = shard
+        .partition_read(namespace, PartitionRead::DeferredPoll(Box::new(poll)))
+        .await;
+    authorize_served_partition_read(
+        shard,
+        Some(attachment),
+        namespace,
+        request.header().partition_incarnation,
+        Permissioner::poll_messages,
+    )?;
+    match reply {
+        Some(PartitionReadReply::Poll {
+            context,
+            fragments,
+            current_offset,
+            encryptor,
+        }) => build_polled_messages_reply(
+            request.header(),
+            current_metadata_commit(shard),
+            partition_id,
+            current_offset,
+            context,
+            fragments,
+            encryptor.as_deref(),
+        ),
+        Some(PartitionReadReply::Rejected(error)) => Err(error),
+        Some(PartitionReadReply::NotFound) => Err(IggyError::TransientNotAccepted),
+        _ => Err(IggyError::ShardCommunicationError),
+    }
+}
+
 /// Run the resolved poll on the owning shard and re-encode the stored
 /// batches into the wire `PolledMessages` reply. Owner rejections preserve
 /// their error; a missing reply reports a communication error without claiming
@@ -692,28 +902,18 @@ where
     SB: SuperblockStore + 'static,
 {
     let transport_client_id = origin.id;
-    let group_id = match consumer {
-        PollingConsumer::ConsumerGroup(group, _) => Some(group as u64),
-        PollingConsumer::Consumer(..) => None,
-    };
-    let metadata = shard
-        .plane
-        .metadata()
-        .mux_stm
-        .streams()
-        .poll_metadata(namespace, group_id, consumer_client_id)
-        .ok_or(ReadPolledMessagesError::Rejected(
-            IggyError::TransientNotAccepted,
-        ))?;
+    let metadata = consumer_poll_metadata(shard, namespace, consumer, consumer_client_id)
+        .map_err(ReadPolledMessagesError::Rejected)?;
     let header = request.header();
     let local = metadata.context(current_metadata_commit(shard));
     // A group poll with owner 0 captured no owner. The primary then serves
     // only the owner it installed for the caller, and the reply names it.
-    let owner_generation = if group_id.is_some() && header.owner_generation == 0 {
-        local.owner_generation
-    } else {
-        header.owner_generation
-    };
+    let owner_generation =
+        if matches!(consumer, PollingConsumer::ConsumerGroup(..)) && header.owner_generation == 0 {
+            local.owner_generation
+        } else {
+            header.owner_generation
+        };
     fence_poll_context(
         PartitionContext {
             incarnation: header.partition_incarnation,
@@ -2107,7 +2307,7 @@ mod tests {
             (WirePollingStrategy::next(), true),
         ] {
             for auto_commit in [false, true] {
-                let body = PollMessagesRequest {
+                let poll = PollMessagesRequest {
                     consumer: WireConsumer::consumer(WireIdentifier::numeric(CONSUMER)),
                     stream_id: WireIdentifier::numeric(0),
                     topic_id: WireIdentifier::numeric(0),
@@ -2115,23 +2315,34 @@ mod tests {
                     strategy: strategy.clone(),
                     count: 1,
                     auto_commit,
+                };
+                let deferred = DeferredPollMessagesRequest {
+                    poll: poll.clone(),
+                    wait_us: 0,
+                    min_count: 1,
+                    max_bytes: 1024 * 1024,
+                    request_timeout_us: 1_000_000,
+                };
+                for (code, body) in [
+                    (POLL_MESSAGES_CODE, poll.to_bytes()),
+                    (POLL_MESSAGES_DEFERRED_CODE, deferred.to_bytes()),
+                ] {
+                    let mut request = request_message(Operation::NonReplicated, 1, 1, 1, &body);
+                    bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                        &mut request.as_mut_slice()[..size_of::<RequestHeader>()],
+                    )
+                    .reserved[..4]
+                        .copy_from_slice(&code.to_le_bytes());
+                    assert_eq!(
+                        progress_key(&shard, &request.into_generic()),
+                        if reads_stored || auto_commit {
+                            expected
+                        } else {
+                            None
+                        },
+                        "code {code}, strategy {strategy:?}, auto_commit {auto_commit}",
+                    );
                 }
-                .to_bytes();
-                let mut request = request_message(Operation::NonReplicated, 1, 1, 1, &body);
-                bytemuck::checked::from_bytes_mut::<RequestHeader>(
-                    &mut request.as_mut_slice()[..size_of::<RequestHeader>()],
-                )
-                .reserved[..4]
-                    .copy_from_slice(&POLL_MESSAGES_CODE.to_le_bytes());
-                assert_eq!(
-                    progress_key(&shard, &request.into_generic()),
-                    if reads_stored || auto_commit {
-                        expected
-                    } else {
-                        None
-                    },
-                    "strategy {strategy:?}, auto_commit {auto_commit}",
-                );
             }
         }
         let requests = [

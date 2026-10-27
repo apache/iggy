@@ -85,9 +85,9 @@ impl IntoResponse for CustomError {
                     // the op twice: 504, the unknown outcome, never a
                     // retryable 503.
                     IggyError::TransientNotCommitted => StatusCode::GATEWAY_TIMEOUT,
-                    IggyError::TransientNotAccepted | IggyError::NotPrimary => {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    }
+                    IggyError::TransientNotAccepted
+                    | IggyError::DeferredPollCapacityExceeded
+                    | IggyError::NotPrimary => StatusCode::SERVICE_UNAVAILABLE,
                     _ => StatusCode::BAD_REQUEST,
                 };
                 let response =
@@ -97,7 +97,9 @@ impl IntoResponse for CustomError {
                 // (`service_unavailable`, `server_busy`).
                 if matches!(
                     error,
-                    IggyError::TransientNotAccepted | IggyError::NotPrimary
+                    IggyError::TransientNotAccepted
+                        | IggyError::DeferredPollCapacityExceeded
+                        | IggyError::NotPrimary
                 ) {
                     with_retry_after(response)
                 } else {
@@ -386,7 +388,12 @@ fn not_accepted_response(code: &str, reason: &str) -> Response {
     ))
 }
 
-fn coded_error_response(status: StatusCode, id: u32, code: &str, reason: &str) -> Response {
+pub(in crate::http) fn coded_error_response(
+    status: StatusCode,
+    id: u32,
+    code: &str,
+    reason: &str,
+) -> Response {
     (
         status,
         Json(ErrorResponse {
@@ -858,6 +865,20 @@ mod tests {
         let response = CustomError::from(IggyError::TransientNotAccepted).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(response.headers().contains_key(RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn deferred_capacity_refusal_preserves_its_code_and_retry_hint() {
+        let response = CustomError::from(IggyError::DeferredPollCapacityExceeded).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key(RETRY_AFTER));
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            error["id"],
+            IggyError::DeferredPollCapacityExceeded.as_code()
+        );
+        assert_eq!(error["code"], "deferred_poll_capacity_exceeded");
     }
 
     #[test]
