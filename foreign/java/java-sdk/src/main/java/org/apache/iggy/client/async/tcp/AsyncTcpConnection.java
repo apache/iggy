@@ -539,6 +539,22 @@ public class AsyncTcpConnection {
     }
 
     void acquireForCall(Call call, ByteBuf payload, long requiredSessionGeneration) {
+        if (!isLoginCode(call.commandCode()) || !eventLoop.inEventLoop()) {
+            acquireChannel(call, payload, requiredSessionGeneration);
+            return;
+        }
+        // An off-loop discardAuthentication queues the close of the channels it abandons. A Register that a loop
+        // callback starts would take such a channel before that close runs, and the close would fail it. A new loop
+        // task runs after the close, like the acquire that the pool queues for a Register from another thread.
+        try {
+            eventLoop.execute(() -> acquireChannel(call, payload, requiredSessionGeneration));
+        } catch (RejectedExecutionException loopGone) {
+            payload.release();
+            call.fail(loopGone);
+        }
+    }
+
+    private void acquireChannel(Call call, ByteBuf payload, long requiredSessionGeneration) {
         TransientFailoverState failoverState = call.state();
         failoverState.linkFailed = false;
         failoverState.detachedSession = false;
