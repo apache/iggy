@@ -364,7 +364,7 @@ short `session.timeout.ms`, or Java 4.1+ `CloseOptions.LEAVE_GROUP`.
 | `max_member_blob_bytes` | 64 KiB | One JoinGroup's total protocol metadata, and one SyncGroup assignment blob; beyond it, `INVALID_REQUEST` (42) |
 | `max_group_roster_bytes` | 4 MiB | Member ids, instance ids and largest protocol metadata summed across one group, which bounds the leader's JoinGroup response; beyond it, `GROUP_MAX_SIZE_REACHED` (81) |
 
-The frame-level bounds guard (`src/protocol/bounds_guard.rs`) bounds one request. These bound what
+The frame-level bounds guard (`core/kafka_wire/src/bounds_guard.rs`) bounds one request. These bound what
 is *retained*: a member's subscription and assignment outlive the connection that sent them, up to
 `max_session_timeout`. Worst case at the defaults is roughly 1.3 GiB of opaque bytes.
 

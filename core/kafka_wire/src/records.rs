@@ -26,7 +26,7 @@ use std::io::{self, Write};
 use std::sync::{LazyLock, OnceLock};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use iggy::prelude::{HeaderKey, HeaderValue, IggyError, IggyMessage, MAX_PAYLOAD_SIZE};
+use iggy_common::{HeaderKey, HeaderValue, IggyError, IggyMessage, MAX_PAYLOAD_SIZE};
 use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{
@@ -93,7 +93,7 @@ const MAX_VARINT_BYTES: usize = 5;
 const MAX_VARLONG_BYTES: usize = 10;
 /// Base offset, batch length, leader epoch, magic, CRC, attributes, last offset delta, first and
 /// max timestamp, producer id, producer epoch, base sequence and record count.
-pub(crate) const BATCH_HEADER_BYTES: usize = 61;
+pub const BATCH_HEADER_BYTES: usize = 61;
 /// Widest v2 record framing before the key, the value and the header bytes: the length, offset
 /// delta, key length, value length and header count varints, the timestamp delta varlong, and the
 /// attributes byte.
@@ -1053,7 +1053,7 @@ pub fn encode_batch(records: &mut [Record]) -> Result<Bytes> {
 ///
 /// Fetch sums these against its byte budget before it encodes.
 #[must_use]
-pub(crate) fn record_size_bound(record: &Record) -> usize {
+pub fn record_size_bound(record: &Record) -> usize {
     let field = |field: Option<&Bytes>| field.map_or(0, Bytes::len);
     RECORD_FRAMING_BYTES
         + field(record.key.as_ref())
@@ -1276,7 +1276,7 @@ fn inflate_snappy(body: &Bytes, writer: &mut BudgetedWriter<'_>) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy::prelude::HeaderKind;
+    use iggy_common::HeaderKind;
 
     const CREATE_TIME: i64 = 1_700_000_000_123;
 
@@ -2494,5 +2494,55 @@ mod tests {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(body).unwrap();
         encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn given_a_zstd_batch_when_zstd_is_refused_should_reject_before_decompressing() {
+        let records = vec![record_at_offset(0, b"compressed")];
+        let mut encoded = encode_with(&records, Compression::Zstd);
+        let budget = partition_budget(1024, usize::MAX);
+        assert!(matches!(
+            decode_batch(&mut encoded, &budget, Zstd::Refused),
+            Err(RecordCodecError::ZstdTooEarly)
+        ));
+    }
+
+    #[test]
+    fn given_a_batch_from_a_producer_when_its_id_is_read_should_return_it() {
+        let mut records = vec![record_at_offset(0, b"v")];
+        records[0].producer_id = 42;
+        assert_eq!(
+            producer_id(&encode_with(&records, Compression::None)),
+            Some(42)
+        );
+        let unowned = encode_with(&[record_at_offset(0, b"v")], Compression::None);
+        assert_eq!(producer_id(&unowned), None);
+    }
+
+    #[test]
+    fn given_any_record_shape_when_encoded_should_fit_the_size_bound() {
+        let shapes = [
+            record_with(None, None, &[]),
+            record_with(Some(b"key".as_slice()), Some(&[b'v'; 300]), &[]),
+            record_with(
+                Some(&[b'k'; 200]),
+                None,
+                &[("h1", Some(b"x".as_slice())), ("h2", None)],
+            ),
+            record_with(
+                None,
+                Some(b"v".as_slice()),
+                &[("a-long-header-name", Some(&[b'y'; 1000]))],
+            ),
+        ];
+        for record in shapes {
+            let encoded = encode_batch(&mut [record.clone()]).unwrap();
+            let bound = BATCH_HEADER_BYTES + record_size_bound(&record);
+            assert!(
+                encoded.len() <= bound,
+                "{} bytes exceed the bound {bound}",
+                encoded.len()
+            );
+        }
     }
 }

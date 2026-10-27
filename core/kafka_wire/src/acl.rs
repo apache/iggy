@@ -28,9 +28,9 @@ use kafka_protocol::messages::DescribeAclsResponse;
 use kafka_protocol::messages::describe_acls_response::{AclDescription, DescribeAclsResource};
 use kafka_protocol::protocol::StrBytes;
 
+use crate::api::ERROR_NONE;
+use crate::codec::encode_message;
 use crate::error::Result;
-use crate::protocol::api::ERROR_NONE;
-use crate::protocol::handlers::encode_message;
 
 /// Kafka resource types (`org.apache.kafka.common.resource.ResourceType`). `kafka_protocol` carries
 /// these as bare `i8` with no enum, so the values live here.
@@ -334,6 +334,12 @@ pub fn encode_describe_acls_error_response(version: i16, error_code: i16) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    use bytes::Buf;
+    use kafka_protocol::protocol::Decodable;
+
+    use crate::api::ERROR_INVALID_REQUEST;
 
     fn all_permissions() -> PrincipalPermissions {
         PrincipalPermissions {
@@ -596,5 +602,52 @@ mod tests {
                 .all(|binding| binding.resource_type == resource_type::CLUSTER)
         );
         assert_ne!(selected, []);
+    }
+
+    #[test]
+    fn describe_acls_response_groups_bindings_by_resource_at_every_version() {
+        let everything = PrincipalPermissions {
+            read_servers: true,
+            read_topics: true,
+            manage_topics: true,
+            poll_messages: true,
+            send_messages: true,
+        };
+        let bindings = bindings_for(&everything);
+        for version in 1..=3 {
+            let mut body = encode_describe_acls_response(version, "alice", &bindings).unwrap();
+            let decoded = DescribeAclsResponse::decode(&mut body, version).unwrap();
+            assert!(!body.has_remaining(), "v{version}");
+            assert_eq!(decoded.error_code, ERROR_NONE);
+            assert!(decoded.error_message.is_none(), "v{version}");
+            let mut resources = HashSet::new();
+            let mut acls = 0;
+            for resource in &decoded.resources {
+                assert!(
+                    resources.insert((resource.resource_type, resource.resource_name.to_string())),
+                    "v{version}: resource listed twice"
+                );
+                assert_eq!(resource.pattern_type, pattern_type::LITERAL);
+                for acl in &resource.acls {
+                    acls += 1;
+                    assert_eq!(acl.principal.as_str(), "User:alice");
+                    assert_eq!(acl.host.as_str(), ANY_HOST);
+                    assert_eq!(acl.permission_type, permission_type::ALLOW);
+                }
+            }
+            assert_eq!(acls, bindings.len());
+        }
+    }
+
+    #[test]
+    fn describe_acls_error_response_carries_the_code_and_no_resources() {
+        for version in 1..=3 {
+            let mut body =
+                encode_describe_acls_error_response(version, ERROR_INVALID_REQUEST).unwrap();
+            let decoded = DescribeAclsResponse::decode(&mut body, version).unwrap();
+            assert!(!body.has_remaining(), "v{version}");
+            assert_eq!(decoded.error_code, ERROR_INVALID_REQUEST);
+            assert_eq!(decoded.resources, Vec::new(), "v{version}");
+        }
     }
 }

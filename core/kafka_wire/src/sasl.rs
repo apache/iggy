@@ -30,15 +30,13 @@ use bytes::Bytes;
 use kafka_protocol::messages::{SaslAuthenticateResponse, SaslHandshakeResponse};
 use kafka_protocol::protocol::StrBytes;
 
+use crate::codec::encode_message;
 use crate::error::Result as EncodeResult;
-use crate::protocol::handlers::encode_message;
 use std::str::FromStr;
 
 use secrecy::SecretString;
 
-use crate::protocol::api::{
-    API_KEY_API_VERSIONS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE,
-};
+use crate::api::{API_KEY_API_VERSIONS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE};
 
 /// Mechanisms this gateway can answer for.
 ///
@@ -343,6 +341,10 @@ mod tests {
     use secrecy::ExposeSecret;
 
     use super::*;
+    use bytes::Buf;
+    use kafka_protocol::protocol::Decodable;
+
+    use crate::api::{ERROR_SASL_AUTHENTICATION_FAILED, ERROR_UNSUPPORTED_SASL_MECHANISM};
 
     fn plain(payload: &[u8]) -> Result<PlainCredentials, SaslError> {
         parse_plain(payload)
@@ -569,5 +571,45 @@ mod tests {
             state.classify(API_KEY_SASL_AUTHENTICATE, 2, None),
             SaslAction::IllegalStateKeepOpen
         );
+    }
+
+    #[test]
+    fn handshake_response_carries_the_mechanism_list_at_every_version() {
+        for version in 0..=SASL_HANDSHAKE_VERSION {
+            let mut body = encode_sasl_handshake_response(
+                version,
+                ERROR_UNSUPPORTED_SASL_MECHANISM,
+                &["PLAIN"],
+            )
+            .unwrap();
+            let decoded = SaslHandshakeResponse::decode(&mut body, version).unwrap();
+            assert!(!body.has_remaining(), "v{version}");
+            assert_eq!(decoded.error_code, ERROR_UNSUPPORTED_SASL_MECHANISM);
+            assert_eq!(decoded.mechanisms, vec![StrBytes::from_static_str("PLAIN")]);
+        }
+    }
+
+    #[test]
+    fn authenticate_response_keeps_the_message_null_and_the_session_unbounded() {
+        for version in 0..=SASL_AUTHENTICATE_MAX_VERSION {
+            let mut body =
+                encode_sasl_authenticate_response(version, ERROR_SASL_AUTHENTICATION_FAILED, None)
+                    .unwrap();
+            let decoded = SaslAuthenticateResponse::decode(&mut body, version).unwrap();
+            assert!(!body.has_remaining(), "v{version}");
+            assert_eq!(decoded.error_code, ERROR_SASL_AUTHENTICATION_FAILED);
+            assert!(decoded.error_message.is_none(), "v{version}");
+            assert!(decoded.auth_bytes.is_empty());
+            assert_eq!(decoded.session_lifetime_ms, 0);
+        }
+        let mut body = encode_sasl_authenticate_response(
+            SASL_AUTHENTICATE_MAX_VERSION,
+            ERROR_SASL_AUTHENTICATION_FAILED,
+            Some("bad credentials"),
+        )
+        .unwrap();
+        let decoded =
+            SaslAuthenticateResponse::decode(&mut body, SASL_AUTHENTICATE_MAX_VERSION).unwrap();
+        assert_eq!(decoded.error_message.as_deref(), Some("bad credentials"));
     }
 }

@@ -44,7 +44,17 @@
 
 use bytes::{Buf, Bytes};
 
-use crate::error::{KafkaProtocolError, Result};
+use crate::api::{
+    API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_PARTITIONS, API_KEY_CREATE_TOPICS,
+    API_KEY_DELETE_GROUPS, API_KEY_DELETE_TOPICS, API_KEY_DESCRIBE_ACLS, API_KEY_DESCRIBE_CLUSTER,
+    API_KEY_DESCRIBE_CONFIGS, API_KEY_DESCRIBE_GROUPS, API_KEY_FETCH, API_KEY_FIND_COORDINATOR,
+    API_KEY_HEARTBEAT, API_KEY_INCREMENTAL_ALTER_CONFIGS, API_KEY_INIT_PRODUCER_ID,
+    API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS, API_KEY_LIST_OFFSETS,
+    API_KEY_METADATA, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_DELETE, API_KEY_OFFSET_FETCH,
+    API_KEY_PRODUCE, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, API_KEY_SYNC_GROUP,
+    ApiVersionRange,
+};
+use crate::error::{KafkaWireError, Result};
 
 /// Per-array cap: large enough that no single legitimate array (e.g. a topic list) is rejected,
 /// small enough that a `Vec::with_capacity` sized from it is trivial memory regardless of element
@@ -78,6 +88,67 @@ const MAX_REQUEST_ELEMENTS: usize = 4_096;
 /// type's fixed per-element cost without needing a bespoke weight per type.
 const RESPONSE_BYTES_PER_ELEMENT: usize = 64;
 
+/// The versions each validator walks, per API key.
+///
+/// A validator refuses any other version outright: a walk written for one wire layout and run
+/// against another reads the wrong bytes, and could clear a frame the decoder then allocates
+/// from. A host must advertise nothing outside these ranges.
+pub const GUARDED_RANGES: &[ApiVersionRange] = &[
+    range(API_KEY_PRODUCE, 3, 9),
+    range(API_KEY_FETCH, 4, 12),
+    range(API_KEY_LIST_OFFSETS, 1, 7),
+    range(API_KEY_METADATA, 0, 9),
+    range(API_KEY_OFFSET_COMMIT, 2, 9),
+    range(API_KEY_OFFSET_FETCH, 1, 9),
+    range(API_KEY_FIND_COORDINATOR, 0, 4),
+    range(API_KEY_JOIN_GROUP, 0, 9),
+    range(API_KEY_HEARTBEAT, 0, 4),
+    range(API_KEY_LEAVE_GROUP, 0, 5),
+    range(API_KEY_SYNC_GROUP, 0, 5),
+    range(API_KEY_DESCRIBE_GROUPS, 0, 6),
+    range(API_KEY_LIST_GROUPS, 0, 5),
+    range(API_KEY_SASL_HANDSHAKE, 0, 1),
+    range(API_KEY_API_VERSIONS, 0, 3),
+    range(API_KEY_CREATE_TOPICS, 2, 5),
+    range(API_KEY_DELETE_TOPICS, 1, 5),
+    range(API_KEY_INIT_PRODUCER_ID, 0, 5),
+    range(API_KEY_DESCRIBE_ACLS, 1, 3),
+    range(API_KEY_DESCRIBE_CONFIGS, 1, 4),
+    range(API_KEY_ALTER_CONFIGS, 0, 2),
+    range(API_KEY_SASL_AUTHENTICATE, 0, 2),
+    range(API_KEY_CREATE_PARTITIONS, 0, 3),
+    range(API_KEY_DELETE_GROUPS, 0, 2),
+    range(API_KEY_INCREMENTAL_ALTER_CONFIGS, 0, 1),
+    range(API_KEY_OFFSET_DELETE, 0, 0),
+    range(API_KEY_DESCRIBE_CLUSTER, 0, 2),
+];
+
+/// The entry of [`GUARDED_RANGES`] for `api_key`, if the guard walks that API at all.
+#[must_use]
+pub fn guarded_range(api_key: i16) -> Option<ApiVersionRange> {
+    GUARDED_RANGES
+        .iter()
+        .copied()
+        .find(|range| range.api_key == api_key)
+}
+
+const fn range(api_key: i16, min_version: i16, max_version: i16) -> ApiVersionRange {
+    ApiVersionRange {
+        api_key,
+        min_version,
+        max_version,
+    }
+}
+
+fn guard_version(api_key: i16, version: i16) -> Result<()> {
+    match guarded_range(api_key) {
+        Some(range) if version >= range.min_version && version <= range.max_version => Ok(()),
+        _ => Err(KafkaWireError::Malformed(format!(
+            "api key {api_key} version {version} is outside the guarded range"
+        ))),
+    }
+}
+
 struct ShapeCursor {
     bytes: Bytes,
     element_budget: usize,
@@ -107,7 +178,7 @@ impl ShapeCursor {
     fn ensure(&self, needed: usize) -> Result<()> {
         let remaining = self.bytes.remaining();
         if remaining < needed {
-            return Err(KafkaProtocolError::BufferUnderflow { needed, remaining });
+            return Err(KafkaWireError::BufferUnderflow { needed, remaining });
         }
         Ok(())
     }
@@ -171,7 +242,7 @@ impl ShapeCursor {
 
     fn charge_elements(&mut self, count: usize) -> Result<()> {
         self.element_budget = self.element_budget.checked_sub(count).ok_or_else(|| {
-            KafkaProtocolError::Malformed(format!(
+            KafkaWireError::Malformed(format!(
                 "request element budget exceeded: {count} more requested, {} remaining",
                 self.element_budget
             ))
@@ -185,7 +256,7 @@ impl ShapeCursor {
     fn charge_response_bytes(&mut self, bytes: usize) -> Result<()> {
         self.estimated_response_bytes = self.estimated_response_bytes.saturating_add(bytes);
         if self.estimated_response_bytes > self.max_response_bytes {
-            return Err(KafkaProtocolError::Malformed(format!(
+            return Err(KafkaWireError::Malformed(format!(
                 "projected response size {} exceeds max_frame_size {}",
                 self.estimated_response_bytes, self.max_response_bytes
             )));
@@ -199,12 +270,12 @@ impl ShapeCursor {
     /// element budget.
     fn bound_count(&mut self, count: u64) -> Result<usize> {
         let count = usize::try_from(count).map_err(|_| {
-            KafkaProtocolError::Malformed(format!(
+            KafkaWireError::Malformed(format!(
                 "collection length {count} exceeds maximum {MAX_COLLECTION_LEN}"
             ))
         })?;
         if count > MAX_COLLECTION_LEN || count > self.remaining() {
-            return Err(KafkaProtocolError::Malformed(format!(
+            return Err(KafkaWireError::Malformed(format!(
                 "collection length {count} exceeds maximum {MAX_COLLECTION_LEN} or remaining {} bytes",
                 self.remaining()
             )));
@@ -216,7 +287,7 @@ impl ShapeCursor {
     fn legacy_array_count(&mut self) -> Result<usize> {
         let n = self.read_i32()?;
         if n < 0 {
-            return Err(KafkaProtocolError::Malformed(format!(
+            return Err(KafkaWireError::Malformed(format!(
                 "invalid array length: {n}"
             )));
         }
@@ -229,7 +300,7 @@ impl ShapeCursor {
             return Ok(0);
         }
         if n < 0 {
-            return Err(KafkaProtocolError::Malformed(format!(
+            return Err(KafkaWireError::Malformed(format!(
                 "invalid array length: {n}"
             )));
         }
@@ -239,7 +310,7 @@ impl ShapeCursor {
     fn compact_array_count(&mut self) -> Result<usize> {
         let n = self.read_varint()?;
         if n == 0 {
-            return Err(KafkaProtocolError::Malformed(
+            return Err(KafkaWireError::Malformed(
                 "null compact array where a non-null array is required".to_string(),
             ));
         }
@@ -269,7 +340,7 @@ impl ShapeCursor {
             return if nullable {
                 Ok(())
             } else {
-                Err(KafkaProtocolError::Malformed(
+                Err(KafkaWireError::Malformed(
                     "null string where a non-null string is required".to_string(),
                 ))
             };
@@ -288,18 +359,18 @@ impl ShapeCursor {
             return if nullable {
                 Ok(())
             } else {
-                Err(KafkaProtocolError::Malformed(
+                Err(KafkaWireError::Malformed(
                     "null compact string where a non-null string is required".to_string(),
                 ))
             };
         }
         let len = usize::try_from(n - 1).map_err(|_| {
-            KafkaProtocolError::Malformed(format!(
+            KafkaWireError::Malformed(format!(
                 "collection length {n} exceeds maximum {MAX_COLLECTION_LEN}"
             ))
         })?;
         if len > MAX_COLLECTION_LEN || len > self.remaining() {
-            return Err(KafkaProtocolError::Malformed(format!(
+            return Err(KafkaWireError::Malformed(format!(
                 "collection length {len} exceeds maximum {MAX_COLLECTION_LEN} or remaining {} bytes",
                 self.remaining()
             )));
@@ -316,7 +387,7 @@ impl ShapeCursor {
             return if nullable {
                 Ok(())
             } else {
-                Err(KafkaProtocolError::Malformed(
+                Err(KafkaWireError::Malformed(
                     "null bytes where non-null bytes are required".to_string(),
                 ))
             };
@@ -331,13 +402,13 @@ impl ShapeCursor {
             return if nullable {
                 Ok(())
             } else {
-                Err(KafkaProtocolError::Malformed(
+                Err(KafkaWireError::Malformed(
                     "null bytes where non-null bytes are required".to_string(),
                 ))
             };
         }
         let len = usize::try_from(n - 1).map_err(|_| {
-            KafkaProtocolError::Malformed(format!(
+            KafkaWireError::Malformed(format!(
                 "collection length {n} exceeds remaining {} bytes",
                 self.remaining()
             ))
@@ -355,13 +426,13 @@ impl ShapeCursor {
                 return if nullable {
                     Ok(())
                 } else {
-                    Err(KafkaProtocolError::Malformed(
+                    Err(KafkaWireError::Malformed(
                         "null bytes where non-null bytes are required".to_string(),
                     ))
                 };
             }
             usize::try_from(n - 1).map_err(|_| {
-                KafkaProtocolError::Malformed(format!(
+                KafkaWireError::Malformed(format!(
                     "collection length {n} exceeds remaining {} bytes",
                     self.remaining()
                 ))
@@ -372,7 +443,7 @@ impl ShapeCursor {
                 return if nullable {
                     Ok(())
                 } else {
-                    Err(KafkaProtocolError::Malformed(
+                    Err(KafkaWireError::Malformed(
                         "null bytes where non-null bytes are required".to_string(),
                     ))
                 };
@@ -387,12 +458,12 @@ impl ShapeCursor {
     fn tagged_fields(&mut self) -> Result<()> {
         let count = self.read_varint()?;
         let count = usize::try_from(count).map_err(|_| {
-            KafkaProtocolError::Malformed(format!(
+            KafkaWireError::Malformed(format!(
                 "collection length {count} exceeds maximum {MAX_COLLECTION_LEN}"
             ))
         })?;
         if count > MAX_COLLECTION_LEN {
-            return Err(KafkaProtocolError::Malformed(format!(
+            return Err(KafkaWireError::Malformed(format!(
                 "collection length {count} exceeds maximum {MAX_COLLECTION_LEN}"
             )));
         }
@@ -400,7 +471,7 @@ impl ShapeCursor {
             let _tag = self.read_varint()?;
             let size = self.read_varint()?;
             let size = usize::try_from(size).map_err(|_| {
-                KafkaProtocolError::Malformed(format!(
+                KafkaWireError::Malformed(format!(
                     "tagged field size {size} exceeds remaining {} bytes",
                     self.remaining()
                 ))
@@ -419,6 +490,7 @@ impl ShapeCursor {
 /// Returns an error when a declared array/string/bytes length cannot fit in the bytes remaining
 /// in the frame, or the body is truncated or malformed in a way that cannot be walked.
 pub fn validate_produce_shape(version: i16, body: &Bytes, max_frame_size: usize) -> Result<()> {
+    guard_version(API_KEY_PRODUCE, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 9;
 
@@ -474,6 +546,7 @@ pub fn validate_produce_shape(version: i16, body: &Bytes, max_frame_size: usize)
 /// Returns an error when a declared array/string/bytes length cannot fit in the bytes remaining
 /// in the frame, or the body is truncated or malformed in a way that cannot be walked.
 pub fn validate_fetch_shape(version: i16, body: &Bytes, max_frame_size: usize) -> Result<()> {
+    guard_version(API_KEY_FETCH, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 12;
 
@@ -577,6 +650,7 @@ pub fn validate_list_offsets_shape(
     body: &Bytes,
     max_frame_size: usize,
 ) -> Result<()> {
+    guard_version(API_KEY_LIST_OFFSETS, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 6;
 
@@ -635,6 +709,7 @@ pub fn validate_create_topics_shape(
     body: &Bytes,
     max_frame_size: usize,
 ) -> Result<()> {
+    guard_version(API_KEY_CREATE_TOPICS, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 5;
 
@@ -718,6 +793,7 @@ pub fn validate_delete_topics_shape(
     body: &Bytes,
     max_frame_size: usize,
 ) -> Result<()> {
+    guard_version(API_KEY_DELETE_TOPICS, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 4;
 
@@ -755,6 +831,7 @@ pub fn validate_create_partitions_shape(
     body: &Bytes,
     max_frame_size: usize,
 ) -> Result<()> {
+    guard_version(API_KEY_CREATE_PARTITIONS, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 2;
 
@@ -810,6 +887,7 @@ pub fn validate_create_partitions_shape(
 /// Returns an error when a declared array/string/bytes length cannot fit in the bytes remaining
 /// in the frame, or the body is truncated or malformed in a way that cannot be walked.
 pub fn validate_metadata_shape(version: i16, body: &Bytes, max_frame_size: usize) -> Result<()> {
+    guard_version(API_KEY_METADATA, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 9;
 
@@ -858,6 +936,7 @@ pub fn validate_metadata_shape(version: i16, body: &Bytes, max_frame_size: usize
 /// Returns an error when the declared `transactional_id` length cannot fit in the bytes
 /// remaining in the frame, or the body is truncated or malformed in a way that cannot be walked.
 pub fn validate_init_producer_id_shape(version: i16, body: &Bytes) -> Result<()> {
+    guard_version(API_KEY_INIT_PRODUCER_ID, version)?;
     let mut c = ShapeCursor::new(body.clone(), usize::MAX);
     let flexible = version >= 2;
 
@@ -885,6 +964,7 @@ pub fn validate_init_producer_id_shape(version: i16, body: &Bytes) -> Result<()>
 /// Returns an error when a declared string length cannot fit in the bytes remaining in the
 /// frame, or the body is truncated or malformed in a way that cannot be walked.
 pub fn validate_api_versions_shape(version: i16, body: &Bytes) -> Result<()> {
+    guard_version(API_KEY_API_VERSIONS, version)?;
     if version < 3 {
         return Ok(());
     }
@@ -910,6 +990,7 @@ pub fn validate_find_coordinator_shape(
     body: &Bytes,
     max_frame_size: usize,
 ) -> Result<()> {
+    guard_version(API_KEY_FIND_COORDINATOR, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 3;
 
@@ -942,6 +1023,7 @@ pub fn validate_find_coordinator_shape(
 /// Returns an error when a declared array/string/bytes length cannot fit in the bytes remaining
 /// in the frame, or the body is truncated or malformed in a way that cannot be walked.
 pub fn validate_join_group_shape(version: i16, body: &Bytes, max_frame_size: usize) -> Result<()> {
+    guard_version(API_KEY_JOIN_GROUP, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 6;
 
@@ -1008,6 +1090,7 @@ pub fn validate_join_group_shape(version: i16, body: &Bytes, max_frame_size: usi
 /// Returns an error when a declared string length cannot fit in the bytes remaining in the
 /// frame, or the body is truncated or malformed in a way that cannot be walked.
 pub fn validate_heartbeat_shape(version: i16, body: &Bytes) -> Result<()> {
+    guard_version(API_KEY_HEARTBEAT, version)?;
     let mut c = ShapeCursor::new(body.clone(), usize::MAX);
     let flexible = version >= 4;
 
@@ -1045,6 +1128,7 @@ pub fn validate_heartbeat_shape(version: i16, body: &Bytes) -> Result<()> {
 /// Returns an error when a declared array/string length cannot fit in the bytes remaining in the
 /// frame, or the body is truncated or malformed in a way that cannot be walked.
 pub fn validate_leave_group_shape(version: i16, body: &Bytes, max_frame_size: usize) -> Result<()> {
+    guard_version(API_KEY_LEAVE_GROUP, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 4;
 
@@ -1090,6 +1174,7 @@ pub fn validate_leave_group_shape(version: i16, body: &Bytes, max_frame_size: us
 /// Returns an error when a declared array/string/bytes length cannot fit in the bytes remaining
 /// in the frame, or the body is truncated or malformed in a way that cannot be walked.
 pub fn validate_sync_group_shape(version: i16, body: &Bytes, max_frame_size: usize) -> Result<()> {
+    guard_version(API_KEY_SYNC_GROUP, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 4;
 
@@ -1152,6 +1237,7 @@ pub fn validate_offset_commit_shape(
     body: &Bytes,
     max_frame_size: usize,
 ) -> Result<()> {
+    guard_version(API_KEY_OFFSET_COMMIT, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 8;
 
@@ -1228,6 +1314,7 @@ pub fn validate_offset_fetch_shape(
     body: &Bytes,
     max_frame_size: usize,
 ) -> Result<()> {
+    guard_version(API_KEY_OFFSET_FETCH, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 6;
 
@@ -1280,6 +1367,7 @@ pub fn validate_describe_groups_shape(
     body: &Bytes,
     max_frame_size: usize,
 ) -> Result<()> {
+    guard_version(API_KEY_DESCRIBE_GROUPS, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 5;
     let groups_count = if flexible {
@@ -1312,6 +1400,7 @@ pub fn validate_describe_groups_shape(
 /// Returns an error when a declared array/string length cannot fit in the bytes remaining in the
 /// frame, or the body is truncated or malformed in a way that cannot be walked.
 pub fn validate_list_groups_shape(version: i16, body: &Bytes, max_frame_size: usize) -> Result<()> {
+    guard_version(API_KEY_LIST_GROUPS, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     if version >= 4 {
         let states_count = c.compact_array_count()?;
@@ -1344,6 +1433,7 @@ pub fn validate_delete_groups_shape(
     body: &Bytes,
     max_frame_size: usize,
 ) -> Result<()> {
+    guard_version(API_KEY_DELETE_GROUPS, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 2;
     let groups_count = if flexible {
@@ -1374,10 +1464,11 @@ pub fn validate_delete_groups_shape(
 /// Returns an error when a declared array/string length cannot fit in the bytes remaining in the
 /// frame, or the body is truncated or malformed in a way that cannot be walked.
 pub fn validate_offset_delete_shape(
-    _version: i16,
+    version: i16,
     body: &Bytes,
     max_frame_size: usize,
 ) -> Result<()> {
+    guard_version(API_KEY_OFFSET_DELETE, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     c.legacy_string(false)?;
     let topics_count = c.legacy_array_count()?;
@@ -1415,6 +1506,7 @@ pub fn validate_describe_configs_shape(
     body: &Bytes,
     max_frame_size: usize,
 ) -> Result<()> {
+    guard_version(API_KEY_DESCRIBE_CONFIGS, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 4;
 
@@ -1467,6 +1559,7 @@ pub fn validate_alter_configs_shape(
     body: &Bytes,
     max_frame_size: usize,
 ) -> Result<()> {
+    guard_version(API_KEY_ALTER_CONFIGS, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 2;
 
@@ -1519,6 +1612,7 @@ pub fn validate_incremental_alter_configs_shape(
     body: &Bytes,
     max_frame_size: usize,
 ) -> Result<()> {
+    guard_version(API_KEY_INCREMENTAL_ALTER_CONFIGS, version)?;
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 1;
 
@@ -1571,6 +1665,7 @@ pub fn validate_incremental_alter_configs_shape(
 ///
 /// Returns an error when a declared string length does not fit the remaining frame.
 pub fn validate_describe_acls_shape(version: i16, body: &Bytes) -> Result<()> {
+    guard_version(API_KEY_DESCRIBE_ACLS, version)?;
     let mut c = ShapeCursor::new(body.clone(), usize::MAX);
     let flexible = version >= 2;
     c.read_i8()?;
@@ -1604,6 +1699,7 @@ pub fn validate_describe_acls_shape(version: i16, body: &Bytes) -> Result<()> {
 ///
 /// Returns an error when a tagged field's declared length does not fit the remaining frame.
 pub fn validate_describe_cluster_shape(version: i16, body: &Bytes) -> Result<()> {
+    guard_version(API_KEY_DESCRIBE_CLUSTER, version)?;
     let mut c = ShapeCursor::new(body.clone(), usize::MAX);
     c.read_bool()?;
     if version >= 1 {
@@ -1624,7 +1720,8 @@ pub fn validate_describe_cluster_shape(version: i16, body: &Bytes) -> Result<()>
 /// # Errors
 ///
 /// Returns an error when the declared string length does not fit the remaining frame.
-pub fn validate_sasl_handshake_shape(_version: i16, body: &Bytes) -> Result<()> {
+pub fn validate_sasl_handshake_shape(version: i16, body: &Bytes) -> Result<()> {
+    guard_version(API_KEY_SASL_HANDSHAKE, version)?;
     // No response-size guard: the response echoes a fixed mechanism list, never anything decoded
     // from this body, so nothing here can amplify.
     let mut c = ShapeCursor::new(body.clone(), usize::MAX);
@@ -1636,12 +1733,13 @@ pub fn validate_sasl_handshake_shape(_version: i16, body: &Bytes) -> Result<()> 
 ///
 /// # Errors
 ///
-/// Returns [`KafkaProtocolError::FrameTooLarge`] when the body exceeds this module's
+/// Returns [`KafkaWireError::FrameTooLarge`] when the body exceeds this module's
 /// `MAX_SASL_AUTH_BYTES` cap, or an error when the declared length does not fit the remaining
 /// frame.
 pub fn validate_sasl_authenticate_shape(version: i16, body: &Bytes) -> Result<()> {
+    guard_version(API_KEY_SASL_AUTHENTICATE, version)?;
     if body.len() > MAX_SASL_AUTH_BYTES {
-        return Err(KafkaProtocolError::FrameTooLarge {
+        return Err(KafkaWireError::FrameTooLarge {
             max_bytes: MAX_SASL_AUTH_BYTES,
             actual_bytes: body.len(),
         });
@@ -1689,7 +1787,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::protocol::handlers::decode_exhaustive;
+    use crate::codec::decode_exhaustive;
+    use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
+    use kafka_protocol::messages::{ProduceRequest, TopicName};
+    use kafka_protocol::protocol::{Encodable, StrBytes};
 
     const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
 
@@ -1786,7 +1887,7 @@ mod tests {
         let body = oversized.freeze();
         assert!(matches!(
             validate_sasl_authenticate_shape(1, &body),
-            Err(KafkaProtocolError::FrameTooLarge { .. })
+            Err(KafkaWireError::FrameTooLarge { .. })
         ));
     }
 
@@ -2573,5 +2674,35 @@ mod tests {
     fn offset_fetch_v1_null_topics_rejected() {
         let body = Bytes::from_static(&[0x00, 0x01, b'g', 0xFF, 0xFF, 0xFF, 0xFF]);
         assert!(validate_offset_fetch_shape(1, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    fn produce_v9_with_partitions(count: i32) -> Bytes {
+        let partitions = (0..count)
+            .map(|index| PartitionProduceData::default().with_index(index))
+            .collect();
+        let request = ProduceRequest::default()
+            .with_acks(1)
+            .with_timeout_ms(1000)
+            .with_topic_data(vec![
+                TopicProduceData::default()
+                    .with_name(TopicName(StrBytes::from_static_str("t")))
+                    .with_partition_data(partitions),
+            ]);
+        let mut buf = BytesMut::new();
+        request.encode(&mut buf, 9).unwrap();
+        buf.freeze()
+    }
+
+    /// Pins [`MAX_REQUEST_ELEMENTS`] itself. The POC above also fails on a byte underflow once
+    /// the budget check is gone, so only a well-formed body on each side of the budget proves
+    /// the charge is what rejects it. One topic plus the partitions is the whole element count.
+    #[test]
+    fn element_budget_admits_the_cap_and_rejects_one_more() {
+        let cap = i32::try_from(MAX_REQUEST_ELEMENTS).unwrap();
+        let within = produce_v9_with_partitions(cap - 1);
+        assert!(validate_produce_shape(9, &within, TEST_MAX_FRAME_SIZE).is_ok());
+        let over = produce_v9_with_partitions(cap);
+        let error = validate_produce_shape(9, &over, TEST_MAX_FRAME_SIZE).unwrap_err();
+        assert!(error.to_string().contains("element budget"), "{error}");
     }
 }
