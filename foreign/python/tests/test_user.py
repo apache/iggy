@@ -27,6 +27,7 @@ from apache_iggy import (
     HttpConfig,
     IdentityInfo,
     IggyClient,
+    IggyError,
     IggyExpiry,
     Permissions,
     QuicConfig,
@@ -92,6 +93,15 @@ def _delete_personal_access_token(api: str, jwt: str, name: str) -> None:
     )
     with urllib.request.urlopen(delete_req, timeout=10):  # noqa: S310
         pass
+
+
+def _delete_if_present(api: str, jwt: str, name: str) -> None:
+    """Delete a token, treating a token that does not exist as deleted."""
+    try:
+        _delete_personal_access_token(api, jwt, name)
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise
 
 
 class TestCreateUser:
@@ -392,8 +402,43 @@ class TestLoginIdentity:
             finally:
                 if client is not None:
                     await client.shutdown()
-                _delete_personal_access_token(api, jwt, name)
         finally:
+            _delete_if_present(api, jwt, name)
+            _delete_personal_access_token(api, jwt, helper_name)
+
+    @pytest.mark.asyncio
+    async def test_create_personal_access_token_rejects_empty_name(
+        self, iggy_client: IggyClient
+    ):
+        """Test that an empty token name raises code 4 before anything is sent."""
+        with pytest.raises(IggyError) as refusal:
+            await iggy_client.create_personal_access_token("", IggyExpiry.NeverExpire())
+        assert refusal.value.code == 4
+
+    @pytest.mark.asyncio
+    async def test_create_personal_access_token_rejects_duplicate_name(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test that a second token with the same name raises code 51."""
+        name = unique_name(min_bytes=16, max_bytes=30)
+        helper_name = unique_name(min_bytes=16, max_bytes=30)
+        http_host, http_port = get_http_server_config()
+        api = f"http://{http_host}:{http_port}"
+        jwt, _ = _create_personal_access_token(
+            api, "iggy", "iggy", helper_name, NEVER_EXPIRE
+        )
+
+        try:
+            await iggy_client.create_personal_access_token(
+                name, IggyExpiry.NeverExpire()
+            )
+            with pytest.raises(IggyError) as clash:
+                await iggy_client.create_personal_access_token(
+                    name, IggyExpiry.NeverExpire()
+                )
+            assert clash.value.code == 51
+        finally:
+            _delete_if_present(api, jwt, name)
             _delete_personal_access_token(api, jwt, helper_name)
 
     @pytest.mark.parametrize(
