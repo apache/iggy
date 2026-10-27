@@ -47,7 +47,7 @@ use std::sync::{Arc, OnceLock};
 
 use iggy_binary_protocol::Command;
 use iggy_common::ConsumerKind;
-use message_bus::{ReplicaLinkStats, ReplicaReadMetrics};
+use message_bus::{ReplicaLinkMetrics, ReplicaReadMetrics};
 
 /// Label for `frame_drops_total`.
 ///
@@ -492,23 +492,19 @@ impl ShardMetrics {
         self.replica_inbound_frames_total.inc_by(metrics.frames);
     }
 
-    /// Fold one sweep's count of replica frames refused at a full peer
-    /// queue. A delta from a take, as in [`Self::record_replica_reads`].
-    pub fn record_replica_outbound_drops(&self, drops: u64) {
-        self.replica_outbound_drops_total.inc_by(drops);
-    }
-
     /// Fold one sweep's replica link events in. The counters take deltas,
     /// as in [`Self::record_replica_reads`]; `bundles_up` is a gauge.
     /// Bundles, preambles and their refusals live on shard 0 only, so the
     /// other shards report zero there.
-    pub fn record_replica_link_stats(&self, stats: &ReplicaLinkStats) {
+    pub fn record_replica_link_stats(&self, stats: &ReplicaLinkMetrics) {
         self.replica_bundle_teardowns_total
             .inc_by(stats.bundle_teardowns);
         self.replica_preamble_refusals_total
             .inc_by(stats.preamble_refusals);
         self.replica_handshake_failures_total
             .inc_by(stats.handshake_failures);
+        self.replica_outbound_drops_total
+            .inc_by(stats.outbound_drops);
         self.replica_bundles_up
             .set(i64::try_from(stats.bundles_up).unwrap_or(i64::MAX));
     }
@@ -1357,16 +1353,18 @@ mod tests {
     #[test]
     fn replica_link_stats_add_up_and_bundles_up_follows_the_last_sweep() {
         let metrics = ShardMetrics::for_shard();
-        metrics.record_replica_link_stats(&ReplicaLinkStats {
+        metrics.record_replica_link_stats(&ReplicaLinkMetrics {
             bundle_teardowns: 2,
             preamble_refusals: 1,
             handshake_failures: 3,
+            outbound_drops: 2,
             bundles_up: 1,
         });
-        metrics.record_replica_link_stats(&ReplicaLinkStats {
+        metrics.record_replica_link_stats(&ReplicaLinkMetrics {
             bundle_teardowns: 1,
+            outbound_drops: 1,
             bundles_up: 2,
-            ..ReplicaLinkStats::default()
+            ..ReplicaLinkMetrics::default()
         });
         let mut registry = Registry::default();
         metrics.register(&mut registry);
@@ -1377,28 +1375,11 @@ mod tests {
             "replica_bundle_teardowns_total 3",
             "replica_preamble_refusals_total 1",
             "replica_handshake_failures_total 3",
+            "replica_outbound_drops_total 3",
             "replica_bundles_up 2",
         ] {
             assert!(buffer.lines().any(|scraped| scraped == line), "{line}");
         }
-    }
-
-    #[test]
-    fn replica_outbound_drops_from_two_sweeps_add_up_in_the_scrape() {
-        let metrics = ShardMetrics::for_shard();
-        metrics.record_replica_outbound_drops(2);
-        metrics.record_replica_outbound_drops(1);
-        let mut registry = Registry::default();
-        metrics.register(&mut registry);
-        let mut buffer = String::new();
-        prometheus_client::encoding::text::encode(&mut buffer, &registry)
-            .expect("scrape encoding succeeds");
-        assert!(
-            buffer
-                .lines()
-                .any(|line| line == "replica_outbound_drops_total 3"),
-            "both sweep deltas land on the registered counter",
-        );
     }
 
     #[test]

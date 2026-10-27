@@ -8578,8 +8578,6 @@ where
         self.metrics
             .record_replica_reads(&self.bus.take_replica_read_stats());
         self.metrics
-            .record_replica_outbound_drops(self.bus.take_replica_outbound_drops());
-        self.metrics
             .record_replica_link_stats(&self.bus.take_replica_link_stats());
         self.metrics
             .set_repair_ring(repair_ring_entries, repair_ring_bytes);

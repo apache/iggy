@@ -108,12 +108,12 @@ async fn try_send_returns_backpressure_when_queue_full() {
         "expected SendError::Backpressure under sustained send load"
     );
     assert_eq!(
-        bus0.take_replica_outbound_drops(),
+        bus0.take_replica_link_stats().outbound_drops,
         REFUSALS,
         "every Backpressure refusal is one counted drop, and no accepted send counts"
     );
     assert_eq!(
-        bus0.take_replica_outbound_drops(),
+        bus0.take_replica_link_stats().outbound_drops,
         0,
         "a take drains the count"
     );

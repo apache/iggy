@@ -528,7 +528,7 @@ pub struct ReplicaReadMetrics {
 /// Shard 0 tracks the bundles and reads the preambles, so the other shards
 /// report zero for those fields.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct ReplicaLinkStats {
+pub struct ReplicaLinkMetrics {
     pub bundle_teardowns: u64,
     /// Accepted sockets closed before delegation: no preamble in time, or
     /// a preamble this node refuses.
@@ -536,6 +536,10 @@ pub struct ReplicaLinkStats {
     /// Delegated handshakes that failed or ran out of `handshake_grace` on
     /// this shard, refused hellos included.
     pub handshake_failures: u64,
+    /// Frames refused at a full peer queue on the fast path of
+    /// [`MessageBus::send_to_replica`]. Forwarded frames count here too,
+    /// because the link shard re-enters that path for them.
+    pub outbound_drops: u64,
     /// Peers whose bundle is Up at the time of the take. A gauge, not a
     /// delta.
     pub bundles_up: u64,
@@ -754,20 +758,10 @@ pub trait MessageBus {
         ReplicaReadMetrics::default()
     }
 
-    /// Drain the count of replica frames that [`Self::send_to_replica`]
-    /// refused with [`SendError::Backpressure`] since the previous call.
-    ///
-    /// Zero by default for the same reason as
-    /// [`Self::take_replica_read_stats`]: only the production bus owns
-    /// replica peer queues.
-    fn take_replica_outbound_drops(&self) -> u64 {
-        0
-    }
-
     /// Drain the replica link events of this bus. Zero by default for the
     /// same reason as [`Self::take_replica_read_stats`].
-    fn take_replica_link_stats(&self) -> ReplicaLinkStats {
-        ReplicaLinkStats::default()
+    fn take_replica_link_stats(&self) -> ReplicaLinkMetrics {
+        ReplicaLinkMetrics::default()
     }
 }
 
@@ -854,16 +848,12 @@ pub struct IggyMessageBus {
     bundles: RefCell<ahash::AHashMap<u8, Bundle>>,
     /// Drained through [`MessageBus::take_replica_link_stats`]; the
     /// `bundles_up` field is filled at the take.
-    replica_link_stats: Cell<ReplicaLinkStats>,
+    replica_link_stats: Cell<ReplicaLinkMetrics>,
     /// Socket-read counters shared by the reader task of every plaintext
     /// replica link this shard owns. Drained through
     /// [`MessageBus::take_replica_read_stats`] by the shard's tick;
     /// stays at zero on a shard that owns no such link.
     replica_read_stats: Rc<ReplicaReadStats>,
-    /// Replica frames refused at a full peer queue on the fast path of
-    /// [`MessageBus::send_to_replica`]. Forwarded frames count here too,
-    /// because the link shard re-enters that path for them.
-    replica_outbound_drops: Cell<u64>,
 }
 
 impl IggyMessageBus {
@@ -981,9 +971,8 @@ impl IggyMessageBus {
             replica_slot_seq: Cell::new(0),
             pending_dials: RefCell::new(ahash::AHashMap::new()),
             bundles: RefCell::new(ahash::AHashMap::new()),
-            replica_link_stats: Cell::new(ReplicaLinkStats::default()),
+            replica_link_stats: Cell::new(ReplicaLinkMetrics::default()),
             replica_read_stats: Rc::new(ReplicaReadStats::default()),
-            replica_outbound_drops: Cell::new(0),
         }
     }
 
@@ -1330,7 +1319,7 @@ impl IggyMessageBus {
             .count()
     }
 
-    pub(crate) fn count_link_event(&self, count: impl FnOnce(&mut ReplicaLinkStats)) {
+    pub(crate) fn count_link_event(&self, count: impl FnOnce(&mut ReplicaLinkMetrics)) {
         let mut stats = self.replica_link_stats.get();
         count(&mut stats);
         self.replica_link_stats.set(stats);
@@ -1772,11 +1761,7 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
         (**self).take_replica_read_stats()
     }
 
-    fn take_replica_outbound_drops(&self) -> u64 {
-        (**self).take_replica_outbound_drops()
-    }
-
-    fn take_replica_link_stats(&self) -> ReplicaLinkStats {
+    fn take_replica_link_stats(&self) -> ReplicaLinkMetrics {
         (**self).take_replica_link_stats()
     }
 }
@@ -1821,8 +1806,7 @@ impl MessageBus for IggyMessageBus {
                 Ok(send_result) => {
                     let result = send_result.map_err(map_try_send_err);
                     if matches!(result, Err(SendError::Backpressure)) {
-                        self.replica_outbound_drops
-                            .set(self.replica_outbound_drops.get() + 1);
+                        self.count_link_event(|stats| stats.outbound_drops += 1);
                     }
                     return result;
                 }
@@ -1873,12 +1857,8 @@ impl MessageBus for IggyMessageBus {
         self.replica_read_stats.take()
     }
 
-    fn take_replica_outbound_drops(&self) -> u64 {
-        self.replica_outbound_drops.replace(0)
-    }
-
-    fn take_replica_link_stats(&self) -> ReplicaLinkStats {
-        ReplicaLinkStats {
+    fn take_replica_link_stats(&self) -> ReplicaLinkMetrics {
+        ReplicaLinkMetrics {
             bundles_up: self.bundles_up() as u64,
             ..self.replica_link_stats.take()
         }
@@ -2411,9 +2391,9 @@ mod tests {
         );
         assert_eq!(
             bus.take_replica_link_stats(),
-            ReplicaLinkStats {
+            ReplicaLinkMetrics {
                 bundle_teardowns: 1,
-                ..ReplicaLinkStats::default()
+                ..ReplicaLinkMetrics::default()
             }
         );
     }
