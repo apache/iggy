@@ -32,8 +32,8 @@
 //!
 //! Each MAC is `keyed_hash(key, DOMAIN_TAG || binary_identity || placement ||
 //! cluster_id || dialer_id || acceptor_id || nonce_d || nonce_a || mode ||
-//! tls_exporter || dir)`, where `placement` is the shard count, link count
-//! and link index the hello carries ([`LinkPlacement`]).
+//! tls_exporter || dir)`, where `placement` is the link count and link index
+//! the hello carries ([`LinkPlacement`]).
 //! Binding both nonces, the ordered peer pair, and a direction byte
 //! defeats replay and reflection. The MAC key is a subkey derived from
 //! the configured shared secret, so the raw secret never reaches the
@@ -74,7 +74,7 @@ pub const IDENTITY_LEN: usize = 32;
 /// Offset of the [`LinkPlacement`] fields in a `ReplicaHello` frame's
 /// `reserved_command`, right past the build identity.
 pub const PLACEMENT_OFFSET: usize = IDENTITY_OFFSET + IDENTITY_LEN;
-pub const PLACEMENT_LEN: usize = 3 * size_of::<u16>();
+pub const PLACEMENT_LEN: usize = 2 * size_of::<u16>();
 const _: () = assert!(PLACEMENT_OFFSET + PLACEMENT_LEN <= RESERVED_COMMAND_LEN);
 
 /// Domain separation tag mixed into every MAC transcript.
@@ -137,16 +137,16 @@ pub fn has_nonce(reserved_command: &[u8; RESERVED_COMMAND_LEN]) -> bool {
     reserved_command[..NONCE_LEN] != [0u8; NONCE_LEN]
 }
 
-/// Placement fields of a `ReplicaHello`: the dialer's shard count and link
-/// count, and the index of the link the connection carries.
+/// Placement fields of a `ReplicaHello`: the dialer's link count and the
+/// index of the link the connection carries.
 ///
-/// Both ends place links from the shard count and the link count, so the
-/// acceptor refuses a hello whose values differ from its own, and a link
-/// other than the one its preamble named. With auth on, the fields are part
-/// of the MAC transcript.
+/// The acceptor refuses a hello whose link count differs from its own,
+/// because the node with more links would wait for a link that never forms,
+/// and a link other than the one its preamble named. Shard counts may
+/// differ: each node places links on its own shards. With auth on, the
+/// fields are part of the MAC transcript.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LinkPlacement {
-    pub shards: u16,
     pub links: u16,
     pub link: u16,
 }
@@ -160,9 +160,8 @@ impl LinkPlacement {
             u16::from_le_bytes([reserved_command[at], reserved_command[at + 1]])
         };
         Self {
-            shards: field(0),
-            links: field(1),
-            link: field(2),
+            links: field(0),
+            link: field(1),
         }
     }
 
@@ -175,7 +174,7 @@ impl LinkPlacement {
     fn to_le_bytes(self) -> [u8; PLACEMENT_LEN] {
         let mut bytes = [0u8; PLACEMENT_LEN];
         let (fields, _) = bytes.as_chunks_mut::<{ size_of::<u16>() }>();
-        for (chunk, field) in fields.iter_mut().zip([self.shards, self.links, self.link]) {
+        for (chunk, field) in fields.iter_mut().zip([self.links, self.link]) {
             *chunk = field.to_le_bytes();
         }
         bytes
@@ -209,12 +208,10 @@ pub enum HandshakeStatus {
     /// The dialer's finish MAC did not verify (log-only).
     MacMismatch = 5,
     IncompatibleBuild = 6,
-    /// The hello names a shard count other than the acceptor's.
-    ShardCountMismatch = 7,
     /// The hello names a link count other than the acceptor's.
-    LinkCountMismatch = 8,
+    LinkCountMismatch = 7,
     /// The hello names a peer or a link other than its placement preamble.
-    PlacementMismatch = 9,
+    PlacementMismatch = 8,
 }
 
 impl HandshakeStatus {
@@ -229,7 +226,6 @@ impl HandshakeStatus {
             Self::AuthRequired => "auth_required",
             Self::MacMismatch => "mac_mismatch",
             Self::IncompatibleBuild => "incompatible_build",
-            Self::ShardCountMismatch => "shard_count_mismatch",
             Self::LinkCountMismatch => "link_count_mismatch",
             Self::PlacementMismatch => "placement_mismatch",
         }
@@ -238,7 +234,7 @@ impl HandshakeStatus {
 
 /// Decode the `status` byte of a `ReplicaChallenge` response frame.
 ///
-/// Total: byte `0` is [`HandshakeStatus::Ok`]; `1..=9` map to their reason; any
+/// Total: byte `0` is [`HandshakeStatus::Ok`]; `1..=8` map to their reason; any
 /// other (garbage) byte is treated as [`HandshakeStatus::UnknownCommand`] so the
 /// dialer rejects rather than mistaking it for success. Discriminants must stay
 /// in sync with [`HandshakeStatus`]; the `status_round_trips` test enforces it.
@@ -251,9 +247,8 @@ pub const fn read_status(reserved_command: &[u8; RESERVED_COMMAND_LEN]) -> Hands
         4 => HandshakeStatus::AuthRequired,
         5 => HandshakeStatus::MacMismatch,
         6 => HandshakeStatus::IncompatibleBuild,
-        7 => HandshakeStatus::ShardCountMismatch,
-        8 => HandshakeStatus::LinkCountMismatch,
-        9 => HandshakeStatus::PlacementMismatch,
+        7 => HandshakeStatus::LinkCountMismatch,
+        8 => HandshakeStatus::PlacementMismatch,
         // 1 and every unrecognised byte: a reject the dialer must not read as Ok.
         _ => HandshakeStatus::UnknownCommand,
     }
@@ -415,11 +410,7 @@ mod tests {
     fn transcript() -> Transcript {
         Transcript {
             binary_identity: [0x5a; IDENTITY_LEN],
-            placement: LinkPlacement {
-                shards: 8,
-                links: 2,
-                link: 1,
-            },
+            placement: LinkPlacement { links: 2, link: 1 },
             cluster_id: 0xDEAD_BEEF,
             dialer_id: 3,
             acceptor_id: 1,
@@ -523,10 +514,6 @@ mod tests {
         let original = transcript();
         for placement in [
             LinkPlacement {
-                shards: 16,
-                ..original.placement
-            },
-            LinkPlacement {
                 links: 4,
                 ..original.placement
             },
@@ -547,16 +534,15 @@ mod tests {
     #[test]
     fn placement_round_trips_through_the_hello_tail() {
         let placement = LinkPlacement {
-            shards: 0x0102,
-            links: 0x0304,
-            link: 0x0506,
+            links: 0x0102,
+            link: 0x0304,
         };
         let mut reserved = [0u8; RESERVED_COMMAND_LEN];
         placement.write(&mut reserved);
         assert_eq!(LinkPlacement::read(&reserved), placement);
         assert_eq!(
             reserved[PLACEMENT_OFFSET..PLACEMENT_OFFSET + PLACEMENT_LEN],
-            [0x02, 0x01, 0x04, 0x03, 0x06, 0x05]
+            [0x02, 0x01, 0x04, 0x03]
         );
         assert!(
             reserved[IDENTITY_OFFSET..PLACEMENT_OFFSET]
@@ -643,7 +629,7 @@ mod tests {
 
     #[test]
     fn status_round_trips() {
-        const ALL: [HandshakeStatus; 10] = [
+        const ALL: [HandshakeStatus; 9] = [
             HandshakeStatus::Ok,
             HandshakeStatus::UnknownCommand,
             HandshakeStatus::ClusterMismatch,
@@ -651,7 +637,6 @@ mod tests {
             HandshakeStatus::AuthRequired,
             HandshakeStatus::MacMismatch,
             HandshakeStatus::IncompatibleBuild,
-            HandshakeStatus::ShardCountMismatch,
             HandshakeStatus::LinkCountMismatch,
             HandshakeStatus::PlacementMismatch,
         ];

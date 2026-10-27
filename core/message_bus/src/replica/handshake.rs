@@ -133,9 +133,9 @@ pub struct ReplicaTlsCtx {
 /// holds the higher id (see the directional rule). The transcript
 /// therefore binds `dialer_id = peer_id`, `acceptor_id = self_id`.
 ///
-/// The hello must name this node's shard count and link count, the peer
-/// and the link of the preamble. Both ends place links from those
-/// counts, so a node with other values would place this link elsewhere.
+/// The hello must name this node's link count, the peer and the link of
+/// the preamble. With another link count, the node with more links would
+/// wait for a link that never forms.
 ///
 /// Command, cluster, build-identity, direction and placement rejections
 /// send a nonzero-status `ReplicaChallenge`, including when auth is
@@ -215,9 +215,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
         .await;
     }
     let announced = LinkPlacement::read(&header.reserved_command);
-    let placement_status = if announced.shards != placement.shards {
-        HandshakeStatus::ShardCountMismatch
-    } else if announced.links != placement.links {
+    let placement_status = if announced.links != placement.links {
         HandshakeStatus::LinkCountMismatch
     } else if peer_id != expected_peer || announced.link != placement.link {
         HandshakeStatus::PlacementMismatch

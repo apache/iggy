@@ -659,8 +659,8 @@ skip_shard_zero_for_replicas = true
 
 # TCP links to each peer replica, at most the shard count. Link j carries the
 # frames of the shards in range j, so more links spread replication over more
-# shards. Every node must run the same value and the same shard count: the
-# replica handshake refuses a peer that differs.
+# shards. Every node must run the same value: the replica handshake refuses a
+# peer that differs. Shard counts may differ between nodes.
 replica_connections_per_peer = 1
 
 # When the server runs more than one shard, exclude shard 0 from client

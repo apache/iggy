@@ -63,7 +63,10 @@ struct Node {
 #[compio::test]
 #[allow(clippy::future_not_send)]
 async fn links_route_by_shard_range_and_reform_after_one_closes() {
-    let nodes = [start_node(0, LINKS).await, start_node(1, LINKS).await];
+    let nodes = [
+        start_node(0, SHARDS, LINKS).await,
+        start_node(1, SHARDS, LINKS).await,
+    ];
     connect(&nodes).await;
     wait_until("both bundles up", || all_up(&nodes)).await;
     for node in &nodes {
@@ -117,7 +120,10 @@ async fn links_route_by_shard_range_and_reform_after_one_closes() {
 #[compio::test]
 #[allow(clippy::future_not_send)]
 async fn nodes_with_other_link_counts_never_connect() {
-    let nodes = [start_node(0, LINKS).await, start_node(1, 1).await];
+    let nodes = [
+        start_node(0, SHARDS, LINKS).await,
+        start_node(1, SHARDS, 1).await,
+    ];
     connect(&nodes).await;
     compio::time::sleep(SWEEP * 6).await;
 
@@ -138,10 +144,34 @@ async fn nodes_with_other_link_counts_never_connect() {
     shut_down(&nodes).await;
 }
 
+/// Each node places links on its own shards, so nodes with the same link
+/// count but other shard counts connect, with other owners at each end.
+#[compio::test]
 #[allow(clippy::future_not_send)]
-async fn start_node(id: u8, links: u16) -> Node {
+async fn nodes_with_other_shard_counts_connect() {
+    // 2 shards, 2 links: one shard per range, so shard 1 owns link 1.
+    const OTHER_SHARDS: u16 = 2;
+    const OTHER_LINK_1_OWNER: u16 = 1;
+    let nodes = [
+        start_node(0, SHARDS, LINKS).await,
+        start_node(1, OTHER_SHARDS, LINKS).await,
+    ];
+    connect(&nodes).await;
+    wait_until("both bundles up", || all_up(&nodes)).await;
+
+    send(&nodes[0], 3, Command::Prepare).await;
+    send(&nodes[1], OTHER_LINK_1_OWNER, Command::PrepareOk).await;
+    wait_until("frames delivered", || received(&nodes) == [1, 1]).await;
+    assert_received(&nodes[1], (OTHER_LINK_1_OWNER, Command::Prepare));
+    assert_received(&nodes[0], (LINK_OWNERS[1], Command::PrepareOk));
+
+    shut_down(&nodes).await;
+}
+
+#[allow(clippy::future_not_send)]
+async fn start_node(id: u8, shards: u16, links: u16) -> Node {
     let layout =
-        LinkLayout::new(SHARDS, links, true, usize::from(NODES - 1)).expect("valid layout");
+        LinkLayout::new(shards, links, true, usize::from(NODES - 1)).expect("valid layout");
     let table = Arc::new(ReplicaOwnerTable::with_layout(layout));
     let config = MessageBusConfig {
         reconnect_period: SWEEP,
@@ -149,7 +179,7 @@ async fn start_node(id: u8, links: u16) -> Node {
         ..MessageBusConfig::default()
     };
     let shards: Shards = Rc::new(
-        (0..SHARDS)
+        (0..shards)
             .map(|shard| {
                 Rc::new(IggyMessageBus::with_tunables_and_owner_table(
                     shard,

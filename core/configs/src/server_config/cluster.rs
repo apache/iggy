@@ -352,8 +352,9 @@ pub struct ClusterCoordinatorConfig {
     pub skip_shard_zero_for_replicas: bool,
     /// TCP links to each peer replica, at most the shard count. Link `j`
     /// carries the frames of the shards in range `j`, so more links spread
-    /// replication over more shards. Every node must run the same value
-    /// and shard count: the replica handshake refuses a peer that differs.
+    /// replication over more shards. Every node must run the same value:
+    /// the replica handshake refuses a peer that differs. Shard counts may
+    /// differ between nodes.
     #[serde(default = "default_replica_connections_per_peer")]
     pub replica_connections_per_peer: u16,
     /// When `total_shards > 1`, exclude shard 0 from client placement.

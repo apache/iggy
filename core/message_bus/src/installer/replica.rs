@@ -229,10 +229,8 @@ where
 
 /// What the hello of `link` carries: this node's layout and the link.
 fn placement(bus: &IggyMessageBus, link: ReplicaLinkId) -> LinkPlacement {
-    let layout = bus.link_layout();
     LinkPlacement {
-        shards: layout.shards(),
-        links: layout.links(),
+        links: bus.link_layout().links(),
         link: link.link,
     }
 }

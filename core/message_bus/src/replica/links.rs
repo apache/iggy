@@ -28,8 +28,9 @@ use thiserror::Error;
 
 /// Shard count, links per peer and the shard-0 skip flag of one node.
 ///
-/// Every node of a cluster must run the same shard count and link count:
-/// the replica handshake refuses a peer whose values differ.
+/// Every node of a cluster must run the same link count: the replica
+/// handshake refuses a peer whose count differs. Shard counts may differ,
+/// because each node places links on its own shards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LinkLayout {
     shards: u16,
@@ -78,11 +79,6 @@ impl LinkLayout {
             links,
             skip_shard_zero,
         })
-    }
-
-    #[must_use]
-    pub const fn shards(self) -> u16 {
-        self.shards
     }
 
     #[must_use]

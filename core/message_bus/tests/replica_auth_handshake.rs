@@ -49,12 +49,8 @@ const SECRET_A: &[u8] = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const SECRET_B: &[u8] = b"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 const LONG_PERIOD: Duration = Duration::from_secs(30);
 const PREAMBLE_WAIT: Duration = Duration::from_secs(2);
-/// The placement of link 0 between one-shard, one-link nodes.
-const PLACEMENT: LinkPlacement = LinkPlacement {
-    shards: 1,
-    links: 1,
-    link: 0,
-};
+/// The placement of link 0 between one-link nodes.
+const PLACEMENT: LinkPlacement = LinkPlacement { links: 1, link: 0 };
 const LINK_0_OF_REPLICA_0: Preamble = Preamble { dialer: 0, link: 0 };
 
 fn noop_handler() -> MessageHandler {
@@ -390,13 +386,6 @@ async fn acceptor_rejects_wrong_command_on_frame3() {
 #[compio::test]
 async fn acceptor_refuses_a_hello_whose_placement_differs() {
     for (placement, status) in [
-        (
-            LinkPlacement {
-                shards: 2,
-                ..PLACEMENT
-            },
-            HandshakeStatus::ShardCountMismatch,
-        ),
         (
             LinkPlacement {
                 links: 2,

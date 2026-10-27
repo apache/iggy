@@ -247,7 +247,6 @@ pub async fn spawn_stalled_replica(
                 &ctx,
                 preamble.dialer,
                 LinkPlacement {
-                    shards: layout.shards(),
                     links: layout.links(),
                     link: preamble.link,
                 },
