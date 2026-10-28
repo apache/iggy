@@ -7282,18 +7282,15 @@ dependencies = [
 name = "iggy-gateway-kafka"
 version = "0.1.0-edge.1"
 dependencies = [
- "anyhow",
  "arc-swap",
  "async-trait",
  "base64 0.23.1",
  "bytes",
- "crc32c",
- "flate2",
  "futures",
  "iggy",
+ "iggy_kafka_wire",
  "kafka-protocol",
  "libc",
- "lz4",
  "rcgen",
  "regex",
  "regex-syntax",
@@ -7302,7 +7299,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "snap",
  "socket2",
  "tempfile",
  "thiserror 2.0.21",
@@ -7315,7 +7311,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "x509-parser",
- "zstd 0.14.2",
 ]
 
 [[package]]
@@ -7927,6 +7922,23 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "iggy_kafka_wire"
+version = "0.1.0-edge.1"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "crc32c",
+ "flate2",
+ "iggy_common",
+ "kafka-protocol",
+ "lz4",
+ "secrecy",
+ "snap",
+ "thiserror 2.0.21",
+ "zstd 0.14.2",
 ]
 
 [[package]]
@@ -9167,7 +9179,6 @@ dependencies = [
  "iggy_binary_protocol",
  "iggy_common",
  "libc",
- "rand 0.10.3",
  "rcgen",
  "ring",
  "rustls",

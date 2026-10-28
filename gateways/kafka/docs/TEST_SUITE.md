@@ -59,7 +59,7 @@ Rather than re-derive a snapshot that will drift again, this only lists what eac
 
 Primitive encode/decode and adversarial wire-input coverage (varint, compact strings, tagged
 fields, malformed lengths, oversized declared counts) moved with the codec itself: `kafka_protocol`
-covers spec-correct decode/encode, and `src/protocol/bounds_guard.rs` carries its own inline
+covers spec-correct decode/encode, and `core/kafka_wire/src/bounds_guard.rs` carries its own inline
 `#[cfg(test)]` unit tests for the DoS-bound pre-checks it adds on top. Neither has a corresponding
 file under `tests/` anymore.
 
