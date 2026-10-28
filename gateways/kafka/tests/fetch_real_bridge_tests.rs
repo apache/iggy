@@ -21,13 +21,19 @@
 //! `kafka_protocol`'s client-side decoder reads, the way a consumer would.
 
 use std::collections::BTreeMap;
+use std::mem::offset_of;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use futures::future::join_all;
 use iggy::prelude::{
     HeaderKey, HeaderValue, Identifier, IggyMessage, MessageClient, Partitioning, TopicClient,
 };
+use iggy_binary_protocol::WireDecode;
+use iggy_binary_protocol::codes::{POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE};
+use iggy_binary_protocol::consensus::{HEADER_SIZE, Operation, RequestHeader};
+use iggy_binary_protocol::requests::messages::{DeferredPollMessagesRequest, PollMessagesRequest};
 use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
 use kafka_protocol::messages::fetch_response::PartitionData;
@@ -41,10 +47,14 @@ use kafka_protocol::records::{
     RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
 };
 use serial_test::serial;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use iggy_gateway_kafka::bridge::IggyBridge;
+use iggy_gateway_kafka::bridge::{IggyBridge, IggyBridgeConfig};
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_FETCH, API_KEY_PRODUCE, ConnectionState, GatewayState, handle_connection_request,
@@ -68,6 +78,11 @@ const VERSION: i16 = 12;
 const PARTITION_MAX_BYTES: i32 = 1024 * 1024;
 /// A Fetch that finds records or an error answers well inside this.
 const PROMPT: Duration = Duration::from_secs(5);
+/// The handler's limit on one Iggy poll, and how long a partition then answers 6 without a poll.
+const POLL_DEADLINE: Duration = Duration::from_secs(2);
+const UNREACHABLE_FOR: Duration = Duration::from_secs(2);
+/// Room for a request that makes no Iggy call that waits.
+const AT_ONCE: Duration = Duration::from_millis(500);
 
 /// Spelled out rather than imported: a test reading its expected code from the same constant the
 /// handler answers with cannot catch that constant changing.
@@ -81,7 +96,12 @@ const UNKNOWN_OFFSET: i64 = -1;
 
 /// A live gateway with the topic in place, since Fetch creates nothing.
 async fn gateway_with_topic(server: &TestServer, partitions: u32) -> GatewayState {
-    let bridge = IggyBridge::connect(server.test_config())
+    gateway_on(server.test_config(), partitions).await
+}
+
+/// [`gateway_with_topic`], with a bridge built from `config`.
+async fn gateway_on(config: IggyBridgeConfig, partitions: u32) -> GatewayState {
+    let bridge = IggyBridge::connect(config)
         .await
         .expect("bridge should connect to a ready server");
     bridge
@@ -839,4 +859,139 @@ async fn given_read_committed_when_fetching_should_set_last_stable_offset_to_hig
     );
     assert_eq!(partition.aborted_transactions, None);
     assert_eq!(offsets(partition), vec![0, 1]);
+}
+
+/// `server`'s bridge config, with every Iggy connection through a relay that drops each poll of
+/// the `stalled` partitions while `stall` holds `true`. Iggy then never answers those polls, as
+/// when the node of a partition stops.
+async fn relay_stalling(
+    server: &TestServer,
+    stalled: &'static [u32],
+    stall: watch::Receiver<bool>,
+) -> IggyBridgeConfig {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("relay");
+    let mut config = server.test_config();
+    let relay = listener.local_addr().expect("relay address").to_string();
+    let upstream = std::mem::replace(&mut config.address, relay);
+    tokio::spawn(async move {
+        while let Ok((inbound, _)) = listener.accept().await {
+            let outbound = TcpStream::connect(&upstream).await.expect("upstream");
+            let stall = stall.clone();
+            tokio::spawn(async move {
+                let (mut requests, mut replies) = inbound.into_split();
+                let (mut responses, mut writes) = outbound.into_split();
+                tokio::select! {
+                    () = pass_requests(&mut requests, &mut writes, stalled, &stall) => {}
+                    _ = copy(&mut responses, &mut replies) => {}
+                }
+            });
+        }
+    });
+    config
+}
+
+/// Passes request frames on until a side closes, except each poll of a `stalled` partition while
+/// `stall` holds `true`.
+async fn pass_requests(
+    requests: &mut OwnedReadHalf,
+    writes: &mut OwnedWriteHalf,
+    stalled: &[u32],
+    stall: &watch::Receiver<bool>,
+) {
+    let mut header = [0; HEADER_SIZE];
+    let size_at = offset_of!(RequestHeader, size);
+    loop {
+        if requests.read_exact(&mut header).await.is_err() {
+            return;
+        }
+        let size = u32::from_le_bytes(header[size_at..size_at + 4].try_into().expect("4 bytes"));
+        let mut body = vec![0; usize::try_from(size).expect("a frame size") - HEADER_SIZE];
+        if requests.read_exact(&mut body).await.is_err() {
+            return;
+        }
+        if *stall.borrow()
+            && polled_partition(&header, &body).is_some_and(|polled| stalled.contains(&polled))
+        {
+            continue;
+        }
+        if writes.write_all(&header).await.is_err() || writes.write_all(&body).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// The partition that a request frame polls, if it is a poll. The SDK sends a poll with options,
+/// as the bridge's are, as a deferred poll.
+fn polled_partition(header: &[u8; HEADER_SIZE], body: &[u8]) -> Option<u32> {
+    let code_at = offset_of!(RequestHeader, reserved);
+    let code = u32::from_le_bytes(header[code_at..code_at + 4].try_into().ok()?);
+    if header[offset_of!(RequestHeader, operation)] != Operation::NonReplicated as u8 {
+        return None;
+    }
+    match code {
+        POLL_MESSAGES_CODE => PollMessagesRequest::decode(body).ok()?.0.partition_id,
+        POLL_MESSAGES_DEFERRED_CODE => {
+            DeferredPollMessagesRequest::decode(body)
+                .ok()?
+                .0
+                .poll
+                .partition_id
+        }
+        _ => None,
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn given_partitions_whose_polls_go_unanswered_when_fetching_should_serve_the_others_at_once()
+{
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (stall, stalled) = watch::channel(true);
+    let mut config = relay_stalling(&server, &[1, 2], stalled).await;
+    // One read slot, so a poll that keeps it would hold up every other read too.
+    config.fetch_slots = 1;
+    let state = gateway_on(config, 3).await;
+    for (partition, value) in [(0, b"a"), (1, b"b"), (2, b"c")] {
+        store(&server, partition, &[keyed(value)]).await;
+    }
+
+    // The stalled partitions come first, and their polls run at once. Read in turn, each would
+    // hold up the partitions after it.
+    let all = request(TOPIC, &[(1, 0), (2, 0), (0, 0)]).with_max_wait_ms(0);
+    let started = Instant::now();
+    let response = fetch(&state, &all).await;
+    let took = started.elapsed();
+    let partitions = &response.responses[0].partitions;
+    assert_refused(&partitions[0], ERROR_NOT_LEADER_OR_FOLLOWER);
+    assert_refused(&partitions[1], ERROR_NOT_LEADER_OR_FOLLOWER);
+    assert_eq!(values(&partitions[2]), vec![Some(Bytes::from_static(b"a"))]);
+    assert!(
+        took >= POLL_DEADLINE && took < POLL_DEADLINE + AT_ONCE,
+        "the unanswered polls end together, at their own deadline: {took:?}"
+    );
+
+    // Their consumers now get 6 without a poll, and the one slot stays free for partition 0.
+    let stalled_one = request(TOPIC, &[(1, 0)]).with_max_wait_ms(0);
+    let healthy = request(TOPIC, &[(0, 0)]).with_max_wait_ms(0);
+    let started = Instant::now();
+    let (refusals, other) = tokio::join!(
+        join_all((0..8).map(|_| fetch(&state, &stalled_one))),
+        fetch(&state, &healthy),
+    );
+    let took = started.elapsed();
+    for response in &refusals {
+        assert_refused(only(response), ERROR_NOT_LEADER_OR_FOLLOWER);
+    }
+    assert_eq!(values(only(&other)), vec![Some(Bytes::from_static(b"a"))]);
+    assert!(took < AT_ONCE, "nothing waits for partition 1: {took:?}");
+
+    // Once Iggy answers again, the first poll after the pause serves the records.
+    stall.send(false).expect("the relay watches");
+    tokio::time::sleep(UNREACHABLE_FOR).await;
+    let response = fetch(&state, &stalled_one).await;
+    assert_eq!(
+        values(only(&response)),
+        vec![Some(Bytes::from_static(b"b"))]
+    );
 }

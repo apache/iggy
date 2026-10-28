@@ -39,6 +39,8 @@ pub(crate) const DEFAULT_IGGY_ADDR: &str = "127.0.0.1:8090";
 const DEFAULT_IGGY_USERNAME: &str = "iggy";
 /// Iggy's default `message_bus.max_message_size`.
 pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 64 * 1024 * 1024;
+/// Fetch requests that read from Iggy at once, when `IGGY_KAFKA_FETCH_SLOTS` is unset.
+pub const DEFAULT_FETCH_SLOTS: usize = 4;
 
 /// How the gateway reaches Iggy: the bridge's own clients and the SASL credential check alike.
 ///
@@ -117,6 +119,36 @@ impl Default for ProduceSessionLimits {
     }
 }
 
+impl ProduceSessionLimits {
+    /// The defaults, with `IGGY_KAFKA_PRODUCE_SESSIONS` and `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS`
+    /// applied.
+    ///
+    /// # Errors
+    ///
+    /// [`BridgeError::InvalidConfig`] if either does not parse.
+    pub fn from_env() -> Result<Self, BridgeError> {
+        let mut limits = Self::default();
+        if let Ok(value) = std::env::var("IGGY_KAFKA_PRODUCE_SESSIONS") {
+            limits.max = value.parse().map_err(|_| {
+                BridgeError::InvalidConfig(format!(
+                    "IGGY_KAFKA_PRODUCE_SESSIONS '{value}' is not a count, for example 256"
+                ))
+            })?;
+        }
+        if let Ok(value) = std::env::var("IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS") {
+            // 0 would close a session between two requests of a busy producer.
+            let seconds = value.parse().ok().filter(|seconds| *seconds > 0);
+            limits.idle = seconds.map(Duration::from_secs).ok_or_else(|| {
+                BridgeError::InvalidConfig(format!(
+                    "IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS '{value}' is not a number of seconds \
+                     above 0, for example 600"
+                ))
+            })?;
+        }
+        Ok(limits)
+    }
+}
+
 /// Connection + topic-mapping config for [`IggyBridge`](crate::bridge::iggy_bridge::IggyBridge).
 ///
 /// `Debug` is safe to derive: `password` is `SecretString`, which redacts on `Debug` by design
@@ -130,6 +162,8 @@ pub struct IggyBridgeConfig {
     pub topic_mapping: TopicMapping,
     /// Iggy's `message_bus.max_message_size`, in bytes. Larger partitions answer 10.
     pub max_message_size: u64,
+    /// Fetch requests that read from Iggy at once, each on an Iggy client of its own. At least 1.
+    pub fetch_slots: usize,
     /// Transport security of every client the bridge opens.
     pub tls: IggyTls,
     pub produce_sessions: ProduceSessionLimits,
@@ -161,6 +195,7 @@ impl IggyBridgeConfig {
         "IGGY_KAFKA_IGGY_TLS_ENABLED",
         "IGGY_KAFKA_IGGY_TLS_DOMAIN",
         "IGGY_KAFKA_IGGY_TLS_CA_FILE",
+        "IGGY_KAFKA_FETCH_SLOTS",
         "IGGY_KAFKA_PRODUCE_SESSIONS",
         "IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS",
         "IGGY_KAFKA_IDEMPOTENT_PRODUCERS",
@@ -190,8 +225,8 @@ impl IggyBridgeConfig {
     /// `IGGY_KAFKA_IGGY_USERNAME` is set but empty, or if `IGGY_KAFKA_TOPIC_MAP_PATH` is set but
     /// the file is missing, fails to parse, or fails validation (e.g. a malformed mapping key or
     /// an empty `default_stream`), or if `IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE`,
-    /// `IGGY_KAFKA_PRODUCE_SESSIONS`, `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` or
-    /// `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` does not parse.
+    /// `IGGY_KAFKA_FETCH_SLOTS`, `IGGY_KAFKA_PRODUCE_SESSIONS`,
+    /// `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` or `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` does not parse.
     pub fn from_env() -> Result<Self, BridgeError> {
         let address =
             std::env::var("IGGY_KAFKA_IGGY_ADDR").unwrap_or_else(|_| DEFAULT_IGGY_ADDR.to_string());
@@ -260,25 +295,22 @@ impl IggyBridgeConfig {
                 })?,
         };
 
+        let fetch_slots = match std::env::var("IGGY_KAFKA_FETCH_SLOTS") {
+            Err(_) => DEFAULT_FETCH_SLOTS,
+            // With 0, no Fetch could read.
+            Ok(value) => value
+                .parse()
+                .ok()
+                .filter(|slots| *slots > 0)
+                .ok_or_else(|| {
+                    BridgeError::InvalidConfig(format!(
+                        "IGGY_KAFKA_FETCH_SLOTS '{value}' is not a count above 0, for example 4"
+                    ))
+                })?,
+        };
+
         let tls = IggyTls::from_env().map_err(BridgeError::InvalidConfig)?;
-        let mut produce_sessions = ProduceSessionLimits::default();
-        if let Ok(value) = std::env::var("IGGY_KAFKA_PRODUCE_SESSIONS") {
-            produce_sessions.max = value.parse().map_err(|_| {
-                BridgeError::InvalidConfig(format!(
-                    "IGGY_KAFKA_PRODUCE_SESSIONS '{value}' is not a count, for example 256"
-                ))
-            })?;
-        }
-        if let Ok(value) = std::env::var("IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS") {
-            // 0 would close a session between two requests of a busy producer.
-            let seconds = value.parse().ok().filter(|seconds| *seconds > 0);
-            produce_sessions.idle = seconds.map(Duration::from_secs).ok_or_else(|| {
-                BridgeError::InvalidConfig(format!(
-                    "IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS '{value}' is not a number of seconds \
-                     above 0, for example 600"
-                ))
-            })?;
-        }
+        let produce_sessions = ProduceSessionLimits::from_env()?;
 
         let idempotent_producers = match std::env::var("IGGY_KAFKA_IDEMPOTENT_PRODUCERS") {
             Ok(raw) => parse_bool("IGGY_KAFKA_IDEMPOTENT_PRODUCERS", &raw)
@@ -292,6 +324,7 @@ impl IggyBridgeConfig {
             password: SecretString::from(password),
             topic_mapping,
             max_message_size,
+            fetch_slots,
             tls,
             produce_sessions,
             idempotent_producers,
@@ -329,6 +362,7 @@ mod tests {
             topic_mapping: TopicMapping::new("kafka".to_string(), std::collections::HashMap::new())
                 .expect("valid mapping for this test's fixture data"),
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            fetch_slots: DEFAULT_FETCH_SLOTS,
             tls: IggyTls::default(),
             produce_sessions: ProduceSessionLimits::default(),
             idempotent_producers: false,
@@ -370,6 +404,7 @@ mod tests {
             std::env::remove_var("IGGY_KAFKA_IGGY_TLS_ENABLED");
             std::env::remove_var("IGGY_KAFKA_IGGY_TLS_DOMAIN");
             std::env::remove_var("IGGY_KAFKA_IGGY_TLS_CA_FILE");
+            std::env::remove_var("IGGY_KAFKA_FETCH_SLOTS");
             std::env::remove_var("IGGY_KAFKA_PRODUCE_SESSIONS");
             std::env::remove_var("IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS");
         }
@@ -380,6 +415,7 @@ mod tests {
 
         let config = result.expect("valid config from documented defaults alone");
         assert_eq!(config.max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
+        assert_eq!(config.fetch_slots, DEFAULT_FETCH_SLOTS);
         assert!(
             !config.tls.enabled,
             "the Iggy hop is in the clear unless switched on"
@@ -416,6 +452,34 @@ mod tests {
         }
 
         assert_eq!(one_mebibyte.unwrap().max_message_size, 1024 * 1024);
+        assert!(matches!(garbage, Err(BridgeError::InvalidConfig(_))));
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_reads_the_fetch_slot_count() {
+        // Safety: process-wide, not per-variable - see the note on
+        // from_env_uses_documented_defaults_when_only_password_is_set above.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_PASSWORD", "iggy");
+            std::env::set_var("IGGY_KAFKA_FETCH_SLOTS", "16");
+        }
+        let sixteen = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_FETCH_SLOTS", "0");
+        }
+        let none = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_FETCH_SLOTS", "some");
+        }
+        let garbage = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_PASSWORD");
+            std::env::remove_var("IGGY_KAFKA_FETCH_SLOTS");
+        }
+
+        assert_eq!(sixteen.unwrap().fetch_slots, 16);
+        assert!(matches!(none, Err(BridgeError::InvalidConfig(_))));
         assert!(matches!(garbage, Err(BridgeError::InvalidConfig(_))));
     }
 

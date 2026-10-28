@@ -24,6 +24,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::stream::{FuturesUnordered, StreamExt};
 use iggy::prelude::{
     DEFAULT_POLL_MAX_BYTES, IGGY_MESSAGE_HEADER_SIZE, IggyError, IggyMessage, PollOptions,
     PolledMessages,
@@ -78,6 +79,15 @@ const MAX_ROUND_TOPICS: usize = 100;
 const UNPLACED_GRACE: Duration = Duration::from_secs(30);
 /// How long the last good probe of a topic stands in while its refreshes fail.
 const LAST_GOOD_TTL: Duration = Duration::from_secs(30);
+
+/// Longest one Iggy poll may take. A partition whose node stopped then answers 6 long before the
+/// request deadline, and the other partitions of the request still answer.
+const POLL_DEADLINE: Duration = Duration::from_secs(2);
+/// First polls that one request runs at once. See [`Reader::first_polls`].
+const POLLS_AT_ONCE: usize = 8;
+/// How long a partition whose poll ran out of [`POLL_DEADLINE`] answers 6 without a poll, for the
+/// whole gateway. Its consumers then do not each spend a read slot on it.
+const UNREACHABLE_FOR: Duration = Duration::from_secs(2);
 
 /// Most messages one partition read takes from Iggy, over all its polls.
 const MAX_POLL_COUNT: u32 = 1000;
@@ -655,7 +665,7 @@ fn bytes_waiting(offset: u64, probe: PartitionProbe, budget: usize) -> u64 {
 }
 
 /// Where a requested offset stands against the probe.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Position {
     /// Answer this code, with no records.
     Refused(i16),
@@ -716,6 +726,9 @@ fn position(want: &Wanted<'_>, probes: &Probes) -> Position {
 }
 
 /// Reads partitions in request order, as Kafka does from v3, and spends one byte budget on them.
+///
+/// The first poll of each partition runs ahead, at the same time as the others. See
+/// [`Reader::first_polls`].
 struct Reader<'a> {
     fetch: &'a Fetch<'a>,
     bytes_left: usize,
@@ -723,9 +736,15 @@ struct Reader<'a> {
     /// the limits say (KIP-74). A record larger than every limit would stall the consumer
     /// otherwise.
     owes_first_record: bool,
-    /// Taken at the first poll, and freed before the probes that decide empty polls. A poll given
-    /// up on keeps it until the poll ends, and the slot then connects a new Iggy client.
+    /// Taken at the first poll, and freed before the probes that decide empty polls.
     slot: Option<FetchSlot>,
+}
+
+/// One poll's answer, with when it went out.
+struct PollOutcome {
+    asked: Instant,
+    /// `None` once the request ran out of time.
+    page: Option<core::result::Result<PolledMessages, BridgeError>>,
 }
 
 /// What reading one partition gave.
@@ -768,30 +787,29 @@ impl<'a> Reader<'a> {
     /// One answer per requested partition, in request order, and the slot, if taken.
     async fn read_all(mut self, probes: &Probes) -> (Vec<PartitionData>, Option<FetchSlot>) {
         let fetch = self.fetch;
-        let stuck = &fetch.connection.stuck_offsets;
+        let positions: Vec<Position> = fetch
+            .wanted
+            .iter()
+            .map(|want| self.place(want, probes))
+            .collect();
+        let mut first_polls = self.first_polls(&positions).await;
         let mut answers = Vec::with_capacity(fetch.wanted.len());
         let mut empty = Vec::new();
-        for want in &fetch.wanted {
-            let read = match self.place(want, probes) {
+        for ((want, position), first) in fetch.wanted.iter().zip(positions).zip(&mut first_polls) {
+            let read = match position {
                 Position::Refused(code) => Read::Done(refused(want.partition, code)),
                 Position::CaughtUp { at, probe } => {
                     self.placed(want, at);
                     Read::Done(served(want.partition, probe.high_watermark, Bytes::new()))
                 }
-                Position::Behind { at, offset, .. }
-                | Position::Unsure { at, offset, .. }
-                | Position::Loading { at, offset, .. }
-                    if held(stuck, want.topic, at.index, offset, Instant::now()) =>
-                {
-                    Read::Done(refused(want.partition, ERROR_UNKNOWN_SERVER_ERROR))
-                }
                 Position::Behind { at, offset, probe } => {
                     let polled = Polled::new(offset, probe.high_watermark);
-                    self.read(want, at, offset, probe, polled).await
+                    self.read(want, at, offset, probe, polled, first.take())
+                        .await
                 }
                 Position::Unsure { at, offset, probe }
                 | Position::Loading { at, offset, probe } => {
-                    self.settle(want, at, offset, probe).await
+                    self.settle(want, at, offset, probe, first.take()).await
                 }
             };
             let answer = match read {
@@ -812,8 +830,11 @@ impl<'a> Reader<'a> {
         (answers, self.slot)
     }
 
-    /// [`position`], with a partition that reads as loading refused 6 for [`UNPLACED_GRACE`].
-    /// After that a poll decides, so counters that drifted cannot stall a consumer.
+    /// [`position`], refused when no poll may run: 6 for a partition that reads as loading, for
+    /// [`UNPLACED_GRACE`], and for one whose poll ran out of time, for [`UNREACHABLE_FOR`]. -1
+    /// while this connection holds the partition at the offset.
+    ///
+    /// Past the grace a poll decides a load, so counters that drifted cannot stall a consumer.
     fn place(&self, want: &Wanted<'_>, probes: &Probes) -> Position {
         let position = position(want, probes);
         if let Position::Loading { at, .. } = position
@@ -821,7 +842,96 @@ impl<'a> Reader<'a> {
         {
             return Position::Refused(ERROR_NOT_LEADER_OR_FOLLOWER);
         }
-        position
+        let (Position::Behind { at, offset, .. }
+        | Position::Unsure { at, offset, .. }
+        | Position::Loading { at, offset, .. }) = position
+        else {
+            return position;
+        };
+        let (stuck, now) = (&self.fetch.connection.stuck_offsets, Instant::now());
+        if held(stuck, want.topic, at.index, offset, now) {
+            Position::Refused(ERROR_UNKNOWN_SERVER_ERROR)
+        } else if unreachable(&self.fetch.state.unreachable, want.topic, at.index, now) {
+            Position::Refused(ERROR_NOT_LEADER_OR_FOLLOWER)
+        } else {
+            position
+        }
+    }
+
+    /// The first poll of each partition that polls, at most [`POLLS_AT_ONCE`] at a time. Read in
+    /// turn, a partition that Iggy holds up would hold up each partition after it, by up to
+    /// [`POLL_DEADLINE`] each.
+    ///
+    /// Plans the byte budget in request order, the way [`Self::read`] spends it, from what the
+    /// probes expect. A partition with no budget in the plan polls in its turn, if the reads before
+    /// it leave room. A first poll asks for what fits the planned budget, and its read keeps what
+    /// fits the budget it really gets. So a request reads at most one page more per partition than
+    /// it serves.
+    async fn first_polls(&mut self, positions: &[Position]) -> Vec<Option<PollOutcome>> {
+        let fetch = self.fetch;
+        let mut planned = Vec::new();
+        let (mut bytes_left, mut owes_first_record) = (self.bytes_left, self.owes_first_record);
+        for (index, (want, position)) in fetch.wanted.iter().zip(positions).enumerate() {
+            let (at, offset, probe, behind) = match *position {
+                Position::Behind { at, offset, probe } => (at, offset, probe, true),
+                Position::Unsure { at, offset, probe }
+                | Position::Loading { at, offset, probe } => (at, offset, probe, false),
+                Position::Refused(_) | Position::CaughtUp { .. } => continue,
+            };
+            let budget = want.max_bytes.min(bytes_left);
+            if !worth_polling(owes_first_record, budget, probe.average_size) {
+                continue;
+            }
+            let count = if behind {
+                let expected = bytes_waiting(offset, probe, budget);
+                bytes_left =
+                    bytes_left.saturating_sub(usize::try_from(expected).unwrap_or(usize::MAX));
+                owes_first_record &= expected == 0;
+                next_page(
+                    &Polled::new(offset, probe.high_watermark),
+                    budget,
+                    probe.average_size,
+                )
+            } else {
+                Some(poll_count(
+                    budget,
+                    probe.average_size,
+                    u64::from(MAX_POLL_COUNT),
+                ))
+            };
+            if let Some(count) = count {
+                planned.push(PlannedPoll {
+                    index,
+                    topic: want.topic,
+                    partition: at.index,
+                    offset,
+                    options: page_options(count, budget),
+                });
+            }
+        }
+        let mut first_polls: Vec<Option<PollOutcome>> = std::iter::repeat_with(|| None)
+            .take(fetch.wanted.len())
+            .collect();
+        if planned.is_empty() {
+            return first_polls;
+        }
+        // With no slot by the deadline, each read finds none in its turn either.
+        let Some(slot) = self.slot().await else {
+            return first_polls;
+        };
+        let mut planned = planned.into_iter();
+        let mut running: FuturesUnordered<_> = planned
+            .by_ref()
+            .take(POLLS_AT_ONCE)
+            .map(|poll| first_poll(fetch, slot, poll))
+            .collect();
+        while let Some((index, outcome)) = running.next().await {
+            first_polls[index] = Some(outcome);
+            if let Some(poll) = planned.next() {
+                running.push(first_poll(fetch, slot, poll));
+            }
+        }
+        first_polls
     }
 
     /// Ends this connection's spell at `at`: it just read there in range.
@@ -830,6 +940,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Polls one partition that has records waiting, and answers with what its budget holds.
+    /// `first` stands in for its first poll.
     async fn read(
         &mut self,
         want: &Wanted<'_>,
@@ -837,16 +948,23 @@ impl<'a> Reader<'a> {
         offset: u64,
         probe: PartitionProbe,
         mut polled: Polled,
+        mut first: Option<PollOutcome>,
     ) -> Read {
         let budget = want.max_bytes.min(self.bytes_left);
         if worth_polling(self.owes_first_record, budget, probe.average_size) {
             while let Some(count) = next_page(&polled, budget, probe.average_size) {
-                let asked = Instant::now();
                 let left = budget.saturating_sub(polled.bytes);
-                let Some(page) = self
-                    .poll(want.topic, at.index, polled.next, count, left)
-                    .await
-                else {
+                let outcome = self
+                    .poll_or(
+                        first.take(),
+                        want.topic,
+                        at.index,
+                        polled.next,
+                        page_options(count, left),
+                    )
+                    .await;
+                let asked = outcome.asked;
+                let Some(page) = outcome.page else {
                     break;
                 };
                 match page {
@@ -905,13 +1023,15 @@ impl<'a> Reader<'a> {
     /// - Nothing, and Iggy's commit ends just before `offset`: caught up.
     /// - Nothing else: a probe taken after the poll decides. See [`Self::decide`].
     ///
-    /// No poll when nothing that fits could come back and no record is owed.
+    /// No poll when nothing that fits could come back and no record is owed. `first` stands in
+    /// for the poll.
     async fn settle(
         &mut self,
         want: &Wanted<'_>,
         at: ProbeAt,
         offset: u64,
         probe: PartitionProbe,
+        first: Option<PollOutcome>,
     ) -> Read {
         // Sized as a read's first page, since an empty answer costs the same round trip.
         let budget = want.max_bytes.min(self.bytes_left);
@@ -925,14 +1045,22 @@ impl<'a> Reader<'a> {
             return Read::Done(unread);
         }
         let count = poll_count(budget, probe.average_size, u64::from(MAX_POLL_COUNT));
-        let asked = Instant::now();
-        match self.poll(want.topic, at.index, offset, count, budget).await {
+        let PollOutcome { asked, page } = self
+            .poll_or(
+                first,
+                want.topic,
+                at.index,
+                offset,
+                page_options(count, budget),
+            )
+            .await;
+        match page {
             None => Read::Done(unread),
             Some(Err(error)) => Read::Done(self.refuse(want, at, offset, &error)),
             Some(Ok(page)) if !page.messages.is_empty() => {
                 let mut polled = Polled::new(offset, probe.high_watermark);
                 polled.add(page);
-                self.read(want, at, offset, probe, polled).await
+                self.read(want, at, offset, probe, polled, None).await
             }
             Some(Ok(page)) if caught_up(offset, page.current_offset) => {
                 self.placed(want, at);
@@ -1039,47 +1167,95 @@ impl<'a> Reader<'a> {
         refused(want.partition, code)
     }
 
-    /// Polls one page of at most `count` messages and [`page_max_bytes`] bytes, in the read slot.
-    /// `None` once `give_up_at` passes.
-    async fn poll(
+    /// `first`, if the partition polled ahead, or else a poll by `options` at `offset`.
+    async fn poll_or(
         &mut self,
+        first: Option<PollOutcome>,
         topic: &str,
         index: u32,
         offset: u64,
-        count: u32,
-        budget: usize,
-    ) -> Option<core::result::Result<PolledMessages, BridgeError>> {
-        let give_up_at = self.fetch.give_up_at;
-        if Instant::now() >= give_up_at {
-            return None;
+        options: PollOptions,
+    ) -> PollOutcome {
+        if let Some(first) = first {
+            return first;
         }
-        let options = PollOptions {
-            count,
-            max_bytes: page_max_bytes(count, budget),
-            ..PollOptions::default()
+        let asked = Instant::now();
+        let fetch = self.fetch;
+        let page = match self.slot().await {
+            Some(slot) => poll_page(fetch, slot, topic, index, offset, options).await,
+            None => None,
         };
-        let bridge = self.fetch.bridge;
-        let (page, slot) = bridge
-            .poll(
-                self.take_slot().await?,
-                topic,
-                index,
-                offset,
-                options,
-                give_up_at,
-            )
-            .await?;
-        self.slot = Some(slot);
-        Some(page)
+        PollOutcome { asked, page }
     }
 
-    /// The read slot, taken at the first poll. `None` once `give_up_at` passes.
-    async fn take_slot(&mut self) -> Option<FetchSlot> {
-        match self.slot.take() {
-            Some(slot) => Some(slot),
-            None => self.fetch.bridge.fetch_slot(self.fetch.give_up_at).await,
+    /// The read slot, taken at the first poll. `None` if none frees by `give_up_at`.
+    async fn slot(&mut self) -> Option<&FetchSlot> {
+        if self.slot.is_none() {
+            self.slot = self.fetch.bridge.fetch_slot(self.fetch.give_up_at).await;
         }
+        self.slot.as_ref()
     }
+}
+
+/// A first poll that [`Reader::first_polls`] plans for the partition at `index` of the request.
+struct PlannedPoll<'a> {
+    index: usize,
+    topic: &'a str,
+    partition: u32,
+    offset: u64,
+    options: PollOptions,
+}
+
+/// Runs `poll`, and returns it with the place of its partition in the request.
+async fn first_poll(
+    fetch: &Fetch<'_>,
+    slot: &FetchSlot,
+    poll: PlannedPoll<'_>,
+) -> (usize, PollOutcome) {
+    let asked = Instant::now();
+    let page = poll_page(
+        fetch,
+        slot,
+        poll.topic,
+        poll.partition,
+        poll.offset,
+        poll.options,
+    )
+    .await;
+    (poll.index, PollOutcome { asked, page })
+}
+
+/// Polls one page in `slot`, for at most [`POLL_DEADLINE`]. `None` once the request's
+/// `give_up_at` passes.
+///
+/// A poll that runs out of its own time makes the partition unreachable, and one that answers
+/// makes it reachable again. See [`mark_unreachable`].
+async fn poll_page(
+    fetch: &Fetch<'_>,
+    slot: &FetchSlot,
+    topic: &str,
+    partition: u32,
+    offset: u64,
+    options: PollOptions,
+) -> Option<core::result::Result<PolledMessages, BridgeError>> {
+    let now = Instant::now();
+    if now >= fetch.give_up_at {
+        return None;
+    }
+    let deadline = (now + POLL_DEADLINE).min(fetch.give_up_at);
+    let page = fetch
+        .bridge
+        .poll_in(slot, topic, partition, offset, options, deadline)
+        .await;
+    let unreachable = &fetch.state.unreachable;
+    match page {
+        Err(BridgeError::Timeout) if deadline == fetch.give_up_at => return None,
+        Err(BridgeError::Timeout) => {
+            mark_unreachable(unreachable, topic, partition, Instant::now());
+        }
+        _ => mark_reachable(unreachable, topic, partition),
+    }
+    Some(page)
 }
 
 /// Whether an empty poll at `offset` proves the consumer is at the end: Iggy's commit counter,
@@ -1331,6 +1507,54 @@ pub(crate) fn sight_first(
         .unwrap_or_else(PoisonError::into_inner)
         .sight(topic, partition, now)
         .is_new()
+}
+
+/// Per Kafka topic, then partition, until when a partition answers 6 without a poll. See
+/// [`mark_unreachable`].
+pub(crate) type Unreachable = PartitionMap<Instant>;
+
+/// Whether `partition` of `topic` answers 6 without a poll at `now`.
+fn unreachable(map: &Mutex<Unreachable>, topic: &str, partition: u32, now: Instant) -> bool {
+    map.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(topic, partition)
+        .is_some_and(|until| now < *until)
+}
+
+/// Makes `partition` of `topic` answer 6 without a poll for [`UNREACHABLE_FOR`] from `now`: Iggy
+/// did not answer a poll of it within [`POLL_DEADLINE`].
+///
+/// Gateway-wide, since the node behind a partition answers no consumer once it stops. Warns when
+/// the partition answered a poll since, or ran out of time last more than [`UNPLACED_GRACE`] ago.
+fn mark_unreachable(map: &Mutex<Unreachable>, topic: &str, partition: u32, now: Instant) {
+    let before = map.lock().unwrap_or_else(PoisonError::into_inner).insert(
+        topic,
+        partition,
+        now + UNREACHABLE_FOR,
+        |until| now.saturating_duration_since(*until) < UNPLACED_GRACE,
+    );
+    if before.is_none_or(|until| now.saturating_duration_since(until) >= UNPLACED_GRACE) {
+        tracing::warn!(
+            kafka_topic = topic,
+            partition,
+            poll_deadline_ms = POLL_DEADLINE.as_millis(),
+            "Iggy did not answer a Fetch poll in time. Fetch answers 6 for the partition until a \
+             poll answers"
+        );
+    } else {
+        tracing::debug!(
+            kafka_topic = topic,
+            partition,
+            "Iggy still does not answer Fetch polls in time"
+        );
+    }
+}
+
+/// Ends [`mark_unreachable`] for `partition` of `topic`: a poll of it answered.
+fn mark_reachable(map: &Mutex<Unreachable>, topic: &str, partition: u32) {
+    map.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(topic, partition);
 }
 
 /// Per Kafka topic, then partition, the offset that one connection's Fetches cannot place. A read
@@ -1611,6 +1835,15 @@ fn poll_count(budget: usize, average_size: u64, waiting: u64) -> u32 {
     let fits = u64::try_from(budget).unwrap_or(u64::MAX) / average_size.max(1);
     let count = fits.min(waiting).clamp(1, u64::from(MAX_POLL_COUNT));
     u32::try_from(count).unwrap_or(MAX_POLL_COUNT)
+}
+
+/// A poll of one page: at most `count` messages, and [`page_max_bytes`] bytes.
+fn page_options(count: u32, budget: usize) -> PollOptions {
+    PollOptions {
+        count,
+        max_bytes: page_max_bytes(count, budget),
+        ..PollOptions::default()
+    }
 }
 
 /// The byte cap of a poll of `count` messages with `budget` bytes left.
@@ -2422,6 +2655,30 @@ mod tests {
         assert!(
             sight_loading(&spells, "a", 0, at(55) + UNPLACED_GRACE),
             "a quiet grace ends the spell"
+        );
+    }
+
+    #[test]
+    fn given_a_poll_that_ran_out_of_time_when_placed_again_should_refuse_the_partition_for_a_while()
+    {
+        let map = Mutex::default();
+        let start = Instant::now();
+        assert!(!unreachable(&map, "a", 0, start), "never timed out");
+        mark_unreachable(&map, "a", 0, start);
+        assert!(unreachable(&map, "a", 0, start));
+        assert!(unreachable(&map, "a", 0, start + UNREACHABLE_FOR / 2));
+        assert!(!unreachable(&map, "a", 1, start), "per partition");
+        assert!(!unreachable(&map, "b", 0, start), "per topic");
+        assert!(
+            !unreachable(&map, "a", 0, start + UNREACHABLE_FOR),
+            "the next poll then decides"
+        );
+        mark_unreachable(&map, "a", 0, start + UNREACHABLE_FOR);
+        assert!(unreachable(&map, "a", 0, start + UNREACHABLE_FOR));
+        mark_reachable(&map, "a", 0);
+        assert!(
+            !unreachable(&map, "a", 0, start + UNREACHABLE_FOR),
+            "a poll that answers ends it"
         );
     }
 

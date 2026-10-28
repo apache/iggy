@@ -271,9 +271,9 @@ impl IggyBridge {
 
         let bridge = Self {
             client,
+            fetch_pool: Arc::new(FetchPool::new(config.fetch_slots)),
             config,
             produce_pool,
-            fetch_pool: Arc::new(FetchPool::new()),
             probe_client: LazyClient::default(),
             lookup_client: LazyClient::default(),
             auto_create_client: LazyClient::default(),
@@ -571,6 +571,7 @@ impl IggyBridge {
             )
             .expect("a valid mapping"),
             max_message_size: crate::bridge::DEFAULT_MAX_MESSAGE_SIZE,
+            fetch_slots: crate::bridge::DEFAULT_FETCH_SLOTS,
             produce_sessions: crate::bridge::ProduceSessionLimits::default(),
             tls: crate::bridge::IggyTls::default(),
             idempotent_producers: false,
@@ -584,8 +585,8 @@ impl IggyBridge {
             scan_client: LazyClient::holding(Arc::clone(&client)),
             client,
             produce_pool: Arc::new(ProducePool::new(config.produce_sessions)),
+            fetch_pool: Arc::new(FetchPool::new(config.fetch_slots)),
             config,
-            fetch_pool: Arc::new(FetchPool::new()),
             probe_client: LazyClient::default(),
             lookup_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),

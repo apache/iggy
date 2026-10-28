@@ -37,16 +37,12 @@ use super::{
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
 
-/// Fetch reads that poll at once. Each has its own Iggy client, so a poll that Iggy holds up
-/// stalls only its own slot, and only until the request deadline.
-const FETCH_SLOTS: usize = 4;
-
 /// The byte cap of a poll of one message: the smallest Iggy takes. The first message comes
 /// whatever its size, and a larger cap only makes its owner reserve more read budget.
 #[allow(clippy::cast_possible_truncation)]
 pub const ONE_MESSAGE_MAX_BYTES: u32 = MIN_DEFERRED_POLL_MAX_BYTES as u32;
 
-/// The Fetch read slots, with a client for each.
+/// The Fetch read slots, with a client for each. A slot reads for one request at a time.
 pub(super) struct FetchPool {
     permits: Arc<Semaphore>,
     /// The clients of the free slots.
@@ -56,10 +52,10 @@ pub(super) struct FetchPool {
 }
 
 impl FetchPool {
-    pub(super) fn new() -> Self {
-        let all: Vec<LazyClient> = (0..FETCH_SLOTS).map(|_| LazyClient::default()).collect();
+    pub(super) fn new(slots: usize) -> Self {
+        let all: Vec<LazyClient> = (0..slots).map(|_| LazyClient::default()).collect();
         Self {
-            permits: Arc::new(Semaphore::new(FETCH_SLOTS)),
+            permits: Arc::new(Semaphore::new(slots)),
             idle: Mutex::new(all.clone()),
             all,
         }
@@ -90,9 +86,8 @@ impl FetchPool {
 /// An Iggy client that connects at its first call, so a bridge that never needs it opens no
 /// extra connection.
 ///
-/// The SDK cannot cancel a call. One given up on can hold the connection until the SDK's 30 s
-/// read deadline, and every later call on it waits behind. So a call that times out takes the
-/// client with it, and the next call connects a new one.
+/// A call through [`Self::until`] that times out takes the client with it, and the next call
+/// connects a new one. Fetch polls keep theirs. See [`IggyBridge::poll_in`].
 #[derive(Clone, Default)]
 pub(super) struct LazyClient(Arc<AsyncMutex<Option<Arc<IggyClient>>>>);
 
@@ -317,8 +312,15 @@ impl FromIterator<(u32, PartitionProbe)> for TopicProbe {
 
 impl IggyBridge {
     /// A Fetch read slot, with its own client. `None` if none frees by `deadline`.
+    ///
+    /// Connects the slot's client first, by `deadline`, so a slow sign-in never counts against
+    /// the deadline of one poll. A connect that fails is left to the first poll, which reports it.
     pub(crate) async fn fetch_slot(&self, deadline: Instant) -> Option<FetchSlot> {
-        self.fetch_pool.take(deadline).await
+        let slot = self.fetch_pool.take(deadline).await?;
+        if let Ok(Err(error)) = timeout_at(deadline, slot.client.connected(&self.config)).await {
+            tracing::debug!(%error, "a Fetch read slot could not connect to Iggy");
+        }
+        Some(slot)
     }
 
     /// Probes every partition of the topic `kafka_topic` maps to, with one `get_topic` call, or
@@ -371,37 +373,54 @@ impl IggyBridge {
     }
 
     /// Reads up to `options.count` messages and `options.max_bytes` bytes of `partition`, from
-    /// `offset` on, with the client of `slot`. Hands the slot back with the result. `None` if no
-    /// result comes by `deadline`.
+    /// `offset` on, with the client of `slot`.
     ///
     /// A plain consumer without auto commit, so Iggy stores no offset. Always the request's
     /// offset, never `Next`.
     ///
-    /// The errors are those of [`Self::probe`]. A partition the topic lacks is
-    /// [`BridgeError::Iggy`] here. The poll stops at `deadline` too, so a result that comes then
-    /// is [`BridgeError::Timeout`], and the slot connects a new client for its next poll.
-    pub(crate) async fn poll(
-        self: &Arc<Self>,
-        slot: FetchSlot,
+    /// Polls can share a slot at once. The SDK carries them on one connection, and it drops the
+    /// reply of a poll that nobody waits for. So a poll that times out keeps the client.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::probe`]. A partition the topic lacks is [`BridgeError::Iggy`] here.
+    /// [`BridgeError::Timeout`] if the poll does not end by `deadline`.
+    pub(crate) async fn poll_in(
+        &self,
+        slot: &FetchSlot,
         kafka_topic: &str,
         partition: u32,
         offset: u64,
         options: PollOptions,
         deadline: Instant,
-    ) -> Option<(Result<PolledMessages, BridgeError>, FetchSlot)> {
-        self.poll_in_slot(
-            slot,
-            kafka_topic,
-            partition,
-            PollingStrategy::offset(offset),
-            options,
-            deadline,
-        )
-        .await
+    ) -> Result<PolledMessages, BridgeError> {
+        let target = self.topic_target(kafka_topic)?;
+        let (consumer, strategy) = (Consumer::default(), PollingStrategy::offset(offset));
+        let poll = async {
+            let client = slot.client.connected(&self.config).await?;
+            client
+                .poll_messages(
+                    &target.stream_id,
+                    &target.topic_id,
+                    partition,
+                    &consumer,
+                    &strategy,
+                    options,
+                )
+                .await
+                .map_err(BridgeError::Iggy)
+        };
+        timeout_at(deadline, poll)
+            .await
+            .unwrap_or(Err(BridgeError::Timeout))
     }
 
-    /// [`Self::poll`] of one message with any polling strategy, so `ListOffsets` can read by
-    /// timestamp or the last record through the same slots.
+    /// Reads one message of `partition` by `strategy`, with the client of `slot`, so
+    /// `ListOffsets` can read by timestamp or the last record through the Fetch slots. Hands the
+    /// slot back with the result. `None` if no result comes by `deadline`.
+    ///
+    /// The errors are those of [`Self::poll_in`]. A result that comes at `deadline` is
+    /// [`BridgeError::Timeout`], and the slot connects a new client for its next poll.
     pub(crate) async fn poll_by(
         self: &Arc<Self>,
         slot: FetchSlot,
@@ -609,12 +628,14 @@ mod tests {
         assert!(Arc::ptr_eq(&kept, &new));
     }
 
+    const SLOTS: usize = 4;
+
     #[tokio::test]
     async fn given_every_slot_taken_when_one_is_dropped_should_hand_its_client_to_the_next_read() {
-        let pool = Arc::new(FetchPool::new());
+        let pool = Arc::new(FetchPool::new(SLOTS));
         let soon = || Instant::now() + Duration::from_millis(20);
         let mut taken = Vec::new();
-        for _ in 0..FETCH_SLOTS {
+        for _ in 0..SLOTS {
             taken.push(pool.take(soon()).await.expect("a free slot"));
         }
         for (index, slot) in taken.iter().enumerate() {
@@ -640,7 +661,7 @@ mod tests {
 
     #[tokio::test]
     async fn given_a_passed_deadline_when_a_slot_is_free_should_take_none_and_keep_its_client() {
-        let pool = Arc::new(FetchPool::new());
+        let pool = Arc::new(FetchPool::new(SLOTS));
         let held = unconnected();
         for client in &pool.all {
             client.hold(Arc::clone(&held)).await;
