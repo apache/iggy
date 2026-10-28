@@ -544,6 +544,12 @@ class ClusterNode:
     A node in the cluster with its transport endpoints, role, and status.
     """
     @property
+    def replica_id(self) -> builtins.int:
+        r"""
+        The replica id of the node, as accepted by
+        `IggyClient.send_binary_request_to_replica`.
+        """
+    @property
     def name(self) -> builtins.str:
         r"""
         The name of the node.

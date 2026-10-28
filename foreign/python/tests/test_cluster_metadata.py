@@ -41,6 +41,7 @@ class TestClusterMetadata:
         assert len(nodes) == 1
 
         node = nodes[0]
+        assert node.replica_id == 0
         assert node.name
         assert node.ip
         assert node.role == ClusterNodeRole.LEADER
@@ -54,6 +55,7 @@ class TestClusterMetadata:
 
         assert f"name='{metadata.name}'" in repr(metadata)
         assert "nodes_count=1" in repr(metadata)
+        assert "replica_id=0" in repr(node)
         assert f"name='{node.name}'" in repr(node)
         assert "role=ClusterNodeRole.LEADER" in repr(node)
         assert "status=ClusterNodeStatus.HEALTHY" in repr(node)

@@ -124,6 +124,13 @@ impl From<RustClusterNode> for ClusterNode {
 #[gen_stub_pymethods]
 #[pymethods]
 impl ClusterNode {
+    /// The replica id of the node, as accepted by
+    /// `IggyClient.send_binary_request_to_replica`.
+    #[getter]
+    pub fn replica_id(&self) -> u8 {
+        self.inner.replica_id
+    }
+
     /// The name of the node.
     #[getter]
     pub fn name(&self) -> &str {
@@ -162,7 +169,8 @@ impl ClusterNode {
 
     fn __repr__(&self) -> String {
         format!(
-            "ClusterNode(name='{}', ip='{}', endpoints={}, role={ROLE_ENUM}.{}, status={STATUS_ENUM}.{})",
+            "ClusterNode(replica_id={}, name='{}', ip='{}', endpoints={}, role={ROLE_ENUM}.{}, status={STATUS_ENUM}.{})",
+            self.inner.replica_id,
             self.inner.name,
             self.inner.ip,
             TransportEndpoints::from(&self.inner.endpoints).__repr__(),
