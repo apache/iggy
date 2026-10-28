@@ -1,0 +1,52 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "sink"
+key = "scopedb"
+enabled = true
+version = 0
+name = "ScopeDB sink"
+path = "target/release/libiggy_connector_scopedb_sink"
+verbose = false
+
+[[streams]]
+stream = "orders"
+topics = ["events"]
+schema = "json"
+batch_length = 1000
+consumer_group = "scopedb_sink_connector"
+
+[plugin_config]
+endpoint = "https://<workspace-endpoint>"
+# Prefer IGGY_CONNECTORS_SINK_SCOPEDB_PLUGIN_CONFIG_API_KEY for credentials.
+# api_key = "<api-key>"
+database = "scopedb"
+schema = "public"
+table = "events"
+mode = "mapped"
+payload_column = "payload"
+include_metadata = true
+include_headers = false
+batch_size = 100
+max_request_bytes = 8388608
+max_concurrent_requests = 1
+max_retries = 3
+retry_delay = "1s"
+max_retry_delay = "30s"
+retry_unknown = false
+timeout = "30s"
+verbose_logging = false
