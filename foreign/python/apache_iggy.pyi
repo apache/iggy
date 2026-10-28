@@ -102,6 +102,7 @@ __all__ = [
     "PendingOperationError",
     "PendingOperationsConfig",
     "Permissions",
+    "PersonalAccessTokenInfo",
     "PollOptions",
     "PolledMessages",
     "PollingStrategy",
@@ -1324,6 +1325,33 @@ class IggyClient:
 
         Raises:
             RuntimeError: If the request fails.
+        """
+    def get_personal_access_tokens(
+        self,
+    ) -> collections.abc.Awaitable[list[PersonalAccessTokenInfo]]:
+        r"""
+        Get the personal access tokens of the signed-in user.
+
+        Returns:
+            An awaitable that resolves to `list[PersonalAccessTokenInfo]`.
+
+        Raises:
+            RuntimeError: If the request fails.
+        """
+    def delete_personal_access_token(
+        self, name: builtins.str
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Delete a personal access token of the signed-in user by name.
+
+        Args:
+            name: Token name as `str`.
+
+        Returns:
+            An awaitable that resolves to `None` when the token is deleted.
+
+        Raises:
+            RuntimeError: If no token has this name or the request fails.
         """
     def get_user(
         self, user_id: builtins.str | builtins.int
@@ -4093,6 +4121,24 @@ class Permissions:
                 `dict[int, StreamPermissions] | None`; an empty dict is
                 treated as `None`.
         """
+
+@typing.final
+class PersonalAccessTokenInfo:
+    r"""
+    A personal access token. The token value itself is returned only once,
+    when the token is created, so it is not part of this info.
+    """
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        The unique name of the token.
+        """
+    @property
+    def expiry(self) -> builtins.int | None:
+        r"""
+        Expiry in microseconds since the Unix epoch, `None` for a token that never expires.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
 
 @typing.final
 class PollOptions:

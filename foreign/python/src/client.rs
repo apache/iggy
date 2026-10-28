@@ -59,8 +59,8 @@ use crate::stats::Stats as PyStats;
 use crate::stream::{Stream, StreamDetails};
 use crate::topic::{IggyExpiry, MaxTopicSize, Topic, TopicDetails};
 use crate::user::{
-    IdentityInfo as PyIdentityInfo, UserInfo as PyUserInfo, UserInfoDetails as PyUserInfoDetails,
-    UserStatus as PyUserStatus,
+    IdentityInfo as PyIdentityInfo, PersonalAccessTokenInfo as PyPersonalAccessTokenInfo,
+    UserInfo as PyUserInfo, UserInfoDetails as PyUserInfoDetails, UserStatus as PyUserStatus,
 };
 use tokio::sync::{Mutex, watch};
 
@@ -551,6 +551,59 @@ impl IggyClient {
                 .await
                 .map_err(to_runtime_error)?;
             Ok(PyIdentityInfo::from(identity))
+        })
+    }
+
+    /// Get the personal access tokens of the signed-in user.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `list[PersonalAccessTokenInfo]`.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[PersonalAccessTokenInfo]]", imports=("collections.abc")))]
+    fn get_personal_access_tokens<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let tokens = inner
+                .get_personal_access_tokens()
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(tokens
+                .into_iter()
+                .map(|token| PyPersonalAccessTokenInfo {
+                    name: token.name,
+                    expiry: token.expiry_at.map(|expiry| expiry.as_micros()),
+                })
+                .collect::<Vec<_>>())
+        })
+    }
+
+    /// Delete a personal access token of the signed-in user by name.
+    ///
+    /// Args:
+    ///     name: Token name as `str`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the token is deleted.
+    ///
+    /// Raises:
+    ///     RuntimeError: If no token has this name or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn delete_personal_access_token<'a>(
+        &self,
+        py: Python<'a>,
+        name: String,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .delete_personal_access_token(&name)
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(())
         })
     }
 
