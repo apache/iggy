@@ -17,11 +17,11 @@ once you configure a bridge ([#3535](https://github.com/apache/iggy/issues/3535)
 | ------------- | -------- | ---------- |
 | TCP listener on `127.0.0.1:9093` (configurable), one listener per security protocol with TLS on the `SSL` ones | Done | `src/server.rs`, `src/listener.rs`, `src/tls/`, `src/main.rs` |
 | Length-prefixed frame read/write with `max_frame_size` cap | Done | `src/server.rs` |
-| Request header v1/v2 auto-detection | Done | `src/protocol/header.rs` (delegates to `kafka_protocol::messages::ApiKey`) |
+| Request header v1/v2 auto-detection | Done | `core/kafka_wire/src/header.rs` (delegates to `kafka_protocol::messages::ApiKey`) |
 | Version negotiation firewall (`SUPPORTED_RANGES`) | Done | `src/protocol/api.rs` |
 | Request decode + stub encode for 7 API keys | Done | `src/protocol/api.rs`, `src/protocol/handlers/` (via the `kafka_protocol` crate) |
 | Produce hot path: RecordBatch as opaque `Bytes` | Done | `src/protocol/responses.rs` |
-| Pre-decode bounds guard against unbounded allocation | Done | `src/protocol/bounds_guard.rs` |
+| Pre-decode bounds guard against unbounded allocation | Done | `core/kafka_wire/src/bounds_guard.rs` |
 | Graceful errors (corrupt decode, invalid header) | Done | `src/protocol/api.rs`, `src/server.rs` |
 | Regression test suite | Done | `tests/` — see [`TEST_SUITE.md`](TEST_SUITE.md) |
 | Manual testing procedure | Done | [`MANUAL_TESTING.md`](MANUAL_TESTING.md) |
