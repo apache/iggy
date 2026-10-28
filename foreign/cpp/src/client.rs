@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{RUNTIME, ffi, type_conversion::ffi_options_to_raw};
+use crate::{
+    RUNTIME, ffi,
+    type_conversion::{ffi_options_to_raw, parse_message_expiry},
+};
 use bytes::Bytes;
 use iggy::prelude::{
     AutoLogin as RustAutoLogin, Client as IggyConnectionClient, ClusterClient, Consumer,
@@ -24,7 +27,8 @@ use iggy::prelude::{
     IggyDuration as RustIggyDuration, IggyMessage, IggyTimestamp, MessageClient,
     NonZeroIggyDuration as RustNonZeroIggyDuration, OptionsScope as RustOptionsScope,
     PartitionClient, PartitionContext, Partitioning, Permissions as RustPermissions,
-    PollingStrategy, SegmentClient, SnapshotCompression as RustSnapshotCompression, StreamClient,
+    PersonalAccessTokenClient, PollingStrategy, SegmentClient,
+    SnapshotCompression as RustSnapshotCompression, StreamClient,
     StreamCreateOptions as RustStreamCreateOptions, StreamEncryptionKey,
     StreamUpdateOptions as RustStreamUpdateOptions, SystemClient as RustSystemClient,
     SystemSnapshotType as RustSystemSnapshotType, TopicClient,
@@ -1316,6 +1320,23 @@ impl Client {
                 .await
                 .map_err(|error| format!("Could not get cluster metadata: {error}"))?;
             Ok(ffi::ClusterMetadata::from(metadata))
+        })
+    }
+
+    pub fn create_personal_access_token(
+        &self,
+        name: String,
+        expiry_kind: String,
+        expiry_value: u64,
+    ) -> Result<String, String> {
+        let expiry = parse_message_expiry(&expiry_kind, expiry_value)?;
+        RUNTIME.block_on(async {
+            let token = self
+                .inner
+                .create_personal_access_token(&name, expiry)
+                .await
+                .map_err(|error| format!("Could not create personal access token: {error}"))?;
+            Ok(token.token)
         })
     }
 

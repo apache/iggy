@@ -503,6 +503,8 @@ name = "iggy-cluster"
 # death. Must be at least "2s" and at least 4x commit_broadcast_interval: the
 # primary signals liveness through its commit broadcast, and the window must
 # span several broadcasts so one delayed broadcast never trips an election.
+# On Linux it is also the TCP_USER_TIMEOUT of every replica link: sent data
+# or keepalive probes that stay unacknowledged this long close the link.
 heartbeat_timeout = "5s"
 
 # How often the primary broadcasts its commit point to every backup (duration).
@@ -649,11 +651,20 @@ ca_file = ""
 
 # Shard-0 coordinator placement.
 [cluster.coordinator]
-# When the server runs more than one shard, exclude shard 0 from replica
-# placement. Shard 0 already hosts the coordinator, the metadata writer, and
-# both listeners; replica connections are long-lived steady flows, so they are
-# offloaded to peer shards by default.
+# Keep replica links off shard 0 while the shard range of link 0 has another
+# shard. Shard 0 already hosts the coordinator, the metadata writer, and both
+# listeners; replica links are long-lived steady flows, so they are offloaded
+# to peer shards by default.
 skip_shard_zero_for_replicas = true
+
+# TCP links to each peer replica, at most the shard count. Link j carries the
+# frames of the shards in range j, so more links spread replication over more
+# shards. Every node must run the same value: the replica handshake refuses a
+# peer that differs. Shard counts may differ between nodes. A range with fewer
+# shards than there are peers puts links to two peers on one shard. With
+# skip_shard_zero_for_replicas on, range 0 keeps its links off shard 0, so it
+# needs one shard more than there are peers.
+replica_connections_per_peer = 1
 
 # When the server runs more than one shard, exclude shard 0 from client
 # placement. Off by default: client connections are short-lived and benefit
@@ -1239,6 +1250,11 @@ close_grace = "2 s"
 # (TCP-TLS rustls accept, WS HTTP-Upgrade, WSS combined TLS+WS, QUIC
 # connecting.await + accept_bi.await) so a slowloris peer cannot pin
 # per-conn channels + registry slot + spawned task indefinitely.
+# A replica link gets one such window for the placement preamble, TLS and
+# the replica handshake together. The window also bounds how long the links
+# to a peer may stay incomplete before they close and redial, so keep it
+# above reconnect_period: below it, the links to a peer form only when all
+# of them connect in one sweep.
 handshake_grace = "10 s"
 
 # Cap on open client sockets of the node: TCP, TCP-TLS, WebSocket, WSS, HTTP

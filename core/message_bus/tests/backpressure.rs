@@ -17,7 +17,8 @@
 
 //! Verify that the per-peer queue applies backpressure: with a tiny capacity
 //! and a peer whose receiving end never drains, `send_to_replica` returns
-//! `SendError::Backpressure` once the queue is full.
+//! `SendError::Backpressure` once the queue is full, and the bus counts
+//! every such refusal as one outbound drop.
 //!
 //! This proves the bus is fire-and-forget and that VSR can rely on
 //! `Backpressure` as a drop signal rather than a blocking await.
@@ -36,6 +37,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 const CLUSTER: u128 = 0xDEAD;
+const REFUSALS: u64 = 3;
 
 #[compio::test]
 async fn try_send_returns_backpressure_when_queue_full() {
@@ -87,21 +89,33 @@ async fn try_send_returns_backpressure_when_queue_full() {
     // task absorbing some before getting blocked on the wire, we should
     // see Backpressure within a few thousand sends. We are not measuring
     // the exact threshold, only that it is finite and reachable.
-    let mut hit_backpressure = false;
+    let mut refused = 0;
     for _ in 0..100_000 {
         let msg = header_only(Command::Prepare, CLUSTER, 0);
         match bus0.send_to_replica(1, msg.into_frozen()).await {
             Ok(()) => {}
             Err(SendError::Backpressure) => {
-                hit_backpressure = true;
-                break;
+                refused += 1;
+                if refused == REFUSALS {
+                    break;
+                }
             }
             Err(other) => panic!("unexpected error: {other}"),
         }
     }
-    assert!(
-        hit_backpressure,
+    assert_eq!(
+        refused, REFUSALS,
         "expected SendError::Backpressure under sustained send load"
+    );
+    assert_eq!(
+        bus0.take_replica_link_stats().outbound_drops,
+        REFUSALS,
+        "every Backpressure refusal is one counted drop, and no accepted send counts"
+    );
+    assert_eq!(
+        bus0.take_replica_link_stats().outbound_drops,
+        0,
+        "a take drains the count"
     );
 
     bus0.shutdown(Duration::from_secs(2)).await;

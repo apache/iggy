@@ -15,15 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::cache::connection::ShardedState;
+//! Kafka wire protocol pieces shared by every Apache Iggy host of the protocol: the pre-decode
+//! bounds guard, the codec helpers, the SASL and ACL encoders, and record batch conversion.
+//! Nothing here touches a socket or an async runtime, so a separate gateway and an in-process
+//! host run the same code.
 
-/// Allocation strategy that produces deltas for a specific sharded state type.
-pub trait AllocationStrategy<SS>
-where
-    SS: ShardedState,
-{
-    fn allocate(&self, entry: SS::Entry) -> Option<SS::Delta>;
-    fn deallocate(&self, entry: SS::Entry) -> Option<SS::Delta>;
-}
+pub mod acl;
+pub mod api;
+pub mod bounds_guard;
+pub mod codec;
+pub mod dedup;
+pub mod error;
+pub mod header;
+pub mod records;
+pub mod sasl;
+pub mod wire_len;
 
-pub mod connection;
+pub use error::{KafkaWireError, Result};
