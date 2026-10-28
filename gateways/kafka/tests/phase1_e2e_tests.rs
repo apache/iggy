@@ -36,6 +36,7 @@
 //! follow-up rather than bundled into this PR's scope.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use iggy::prelude::{Consumer, Identifier, MessageClient, PollingStrategy};
@@ -338,4 +339,34 @@ async fn phase1_produce_flow_through_real_gateway_process_and_real_iggy_server()
     assert_eq!(polled.len(), 2, "both produced records must be readable");
     assert_eq!(polled[0].payload.as_ref(), b"phase1-hello");
     assert_eq!(polled[1].payload.as_ref(), b"phase1-world");
+}
+
+/// A gateway started before its Iggy node waits for it, instead of exiting.
+#[tokio::test]
+async fn given_iggy_that_starts_late_when_the_gateway_starts_should_wait_for_it() {
+    // Past the longest connect of the bridge, 15 s, after which the gateway used to exit.
+    const IGGY_DELAY: Duration = Duration::from_secs(16);
+
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let config = server.test_config();
+    let port = server.stop();
+
+    let mut gateway = TestGateway::start(&config);
+    tokio::time::sleep(IGGY_DELAY).await;
+    assert!(gateway.is_running(), "the gateway waits for Iggy");
+    let _server = TestServer::spawn_on(data_dir.path(), port).await;
+    gateway.wait_ready().await;
+
+    let addr: SocketAddr = gateway.address.parse().expect("gateway address");
+    let (_, body) = round_trip(
+        addr,
+        API_KEY_CREATE_TOPICS,
+        CREATE_TOPICS_VERSION,
+        1,
+        &build_create_topics_request(TOPIC, 1),
+    )
+    .await;
+    let (error_code, _, _) = decode_create_topics_response(body);
+    assert_eq!(error_code, ERROR_NONE, "the bridge reaches Iggy");
 }
