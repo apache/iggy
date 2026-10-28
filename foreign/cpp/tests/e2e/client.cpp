@@ -1255,22 +1255,10 @@ TEST_F(E2E_Client, GetPersonalAccessTokensAfterLoginSucceeds) {
 TEST_F(E2E_Client, PersonalAccessTokenCanBeListedAndDeleted) {
     RecordProperty("description",
                    "Lists a created personal access token with its expiry, deletes it, and lists again.");
-    constexpr std::uint32_t create_personal_access_token_command_code = 42;
-    constexpr std::uint64_t expiry_micros                             = 3'600'000'000;
-    iggy::ffi::Client *raw_client                                     = GetLoggedInClient();
-    auto client                                                       = GetLoggedInHighLevelClient();
-    const std::string token_name                                      = GetRandomName(50);
+    auto client                  = GetLoggedInHighLevelClient();
+    const std::string token_name = GetRandomName(50);
 
-    rust::Vec<std::uint8_t> payload;
-    payload.push_back(static_cast<std::uint8_t>(token_name.size()));
-    for (const char character : token_name) {
-        payload.push_back(static_cast<std::uint8_t>(character));
-    }
-    for (int shift = 0; shift < 64; shift += 8) {
-        payload.push_back(static_cast<std::uint8_t>(expiry_micros >> shift));
-    }
-    iggy::ffi::ErrorInfo error_info{};
-    ASSERT_NO_THROW(raw_client->send_binary_request(create_personal_access_token_command_code, payload, error_info));
+    ASSERT_NO_THROW((void)client.CreatePersonalAccessToken(token_name, iggy::Expiry::Duration(3'600'000'000)));
 
     const auto tokens = client.GetPersonalAccessTokens();
     const auto found =
