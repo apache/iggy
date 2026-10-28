@@ -356,7 +356,6 @@ pub(in crate::boot) async fn build_shard_for_thread(
             Rc::clone(&bus),
         ),
         CoordinatorConfig {
-            skip_shard_zero_for_replicas: config.cluster.coordinator.skip_shard_zero_for_replicas,
             skip_shard_zero_for_clients: config.cluster.coordinator.skip_shard_zero_for_clients,
         },
         metrics,

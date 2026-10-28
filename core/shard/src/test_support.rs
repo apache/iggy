@@ -15,15 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::cache::connection::ShardedState;
+//! Helpers shared by the unit tests of this crate.
 
-/// Allocation strategy that produces deltas for a specific sharded state type.
-pub trait AllocationStrategy<SS>
-where
-    SS: ShardedState,
-{
-    fn allocate(&self, entry: SS::Entry) -> Option<SS::Delta>;
-    fn deallocate(&self, entry: SS::Entry) -> Option<SS::Delta>;
+use message_bus::{IggyMessageBus, ReplicaLinkId};
+
+/// Make `replica` reachable from `bus` over one link that shard `owner`
+/// holds, the way an installed one-link bundle does: a frame to `replica`
+/// from any other shard is forwarded to `owner`.
+pub fn connect_replica_on(bus: &IggyMessageBus, replica: u8, owner: u16) {
+    let link = ReplicaLinkId {
+        replica,
+        link: 0,
+        epoch: 0,
+    };
+    assert!(bus.owner_table().try_claim(link, owner));
+    bus.refresh_replica_bundle(replica);
 }
-
-pub mod connection;

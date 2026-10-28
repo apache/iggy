@@ -9167,7 +9167,6 @@ dependencies = [
  "iggy_binary_protocol",
  "iggy_common",
  "libc",
- "rand 0.10.3",
  "rcgen",
  "ring",
  "rustls",
