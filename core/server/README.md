@@ -106,6 +106,12 @@ vote as a log without the latest writes and can drop acknowledged writes. Stop
 the cluster and upgrade every replica together. Older builds are not affected,
 because their frames carry incarnation zero and are rejected.
 
+Replica links now open with an 8-byte placement preamble, and the replica hello
+carries the link count. Nodes from earlier builds and newer nodes refuse each
+other's links, so stop the cluster and upgrade every replica together. Every
+node must run the same `cluster.coordinator.replica_connections_per_peer`. A
+node refuses a peer that runs another value. Shard counts may differ.
+
 Cluster metadata includes `replica_id`. Java's `ClusterNode` record adds a leading
 `replicaId` component, changing constructor calls and record patterns. C# callers
 must initialize the required `ReplicaId` property. The CLI's cluster metadata list

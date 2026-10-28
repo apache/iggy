@@ -27,13 +27,10 @@ mod common;
 
 use common::{
     header_only, install_dialed_replicas_locally, install_replicas_locally, loopback,
-    set_replica_ctx,
+    set_replica_ctx, spawn_stalled_replica,
 };
-use compio::net::TcpListener;
-use iggy_binary_protocol::{Command, HEADER_SIZE};
+use iggy_binary_protocol::Command;
 use message_bus::connector::start as start_connector;
-use message_bus::replica::auth::ChannelBinding;
-use message_bus::replica::handshake::{ReplicaHandshakeCtx, acceptor_handshake};
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus, SendError};
 use std::cell::Cell;
@@ -63,29 +60,7 @@ async fn slow_peer_does_not_block_other_peers() {
 
     // Peer B joins through the normal handshake, then stops reading so
     // subsequent Prepare frames backpressure its independent writer.
-    let lb = TcpListener::bind(loopback()).await.unwrap();
-    let addr_b = lb.local_addr().unwrap();
-    let peer_b_ctx = ReplicaHandshakeCtx {
-        self_id: PEER_B_ID,
-        ..bus_a.replica_handshake_ctx().unwrap().clone()
-    };
-    let held_streams: Rc<std::cell::RefCell<Vec<compio::net::TcpStream>>> =
-        Rc::new(std::cell::RefCell::new(Vec::new()));
-    let held_streams_clone = held_streams.clone();
-    let accept_b_handle = compio::runtime::spawn(async move {
-        while let Ok((mut stream, _)) = lb.accept().await {
-            let peer_id = acceptor_handshake(
-                &mut stream,
-                &peer_b_ctx,
-                ChannelBinding::Plaintext,
-                HEADER_SIZE,
-            )
-            .await
-            .expect("slow peer must complete replica admission");
-            assert_eq!(peer_id, 0);
-            held_streams_clone.borrow_mut().push(stream);
-        }
-    });
+    let (addr_b, peer_b) = spawn_stalled_replica(&bus_a, PEER_B_ID).await;
 
     // Sender bus 0 dials both A and B.
     let bus0 = Rc::new(IggyMessageBus::with_capacity(0, 16));
@@ -179,6 +154,5 @@ async fn slow_peer_does_not_block_other_peers() {
 
     bus0.shutdown(Duration::from_secs(2)).await;
     bus_a.shutdown(Duration::from_secs(2)).await;
-    drop(accept_b_handle);
-    drop(held_streams);
+    drop(peer_b);
 }
