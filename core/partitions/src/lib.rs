@@ -101,7 +101,7 @@ pub use partition_storage::{
     hydrate_partition_log, read_created_revision, read_revision_record, write_created_revision,
     write_revision_record,
 };
-pub use poll_plan::{DISK_POLL_CHUNK_MAX, PollPlan, PollReadResult};
+pub use poll_plan::{DISK_POLL_CHUNK_MAX, PollPlan, PollReadResult, RemoteSegmentReader};
 pub use segment::Segment;
 pub use segment_recovery::{
     PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredSegment, load_persisted_segments,

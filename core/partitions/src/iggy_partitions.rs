@@ -17,7 +17,7 @@
 
 #![allow(dead_code)]
 
-use crate::poll_plan::{PollPlan, PollReadResult};
+use crate::poll_plan::{PollPlan, PollReadResult, PollTier, RemoteSegmentReader};
 use crate::stream_keyring::{StreamKeyIdentity, StreamKeyring};
 use crate::types::PartitionsConfig;
 use crate::{IggyPartition, Partition, PollingArgs, PollingConsumer};
@@ -118,6 +118,9 @@ where
     /// Reconciler fences must not borrow a partition held by the pump across await.
     teardown: RefCell<AHashMap<IggyNamespace, crate::PartitionTeardown>>,
     consumer_group_offsets_reconcile_epoch: Rc<Cell<u64>>,
+    /// Tiered storage proof of concept: reads segments evicted to the object
+    /// store. Set once when the shard's tier uploader opens its store.
+    remote_reader: RefCell<Option<Rc<dyn RemoteSegmentReader>>>,
     fence_published: Rc<Cell<bool>>,
     persistence_notifier: RefCell<Option<crate::PersistenceNotifier>>,
     io_notifier: RefCell<Option<(crate::PartitionIoNotifier, usize)>>,
@@ -164,6 +167,7 @@ where
             keyring,
             teardown: RefCell::new(AHashMap::new()),
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
+            remote_reader: RefCell::new(None),
             fence_published: Rc::default(),
             persistence_notifier: RefCell::new(None),
             io_notifier: RefCell::new(None),
@@ -186,6 +190,7 @@ where
             keyring,
             teardown: RefCell::new(AHashMap::new()),
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
+            remote_reader: RefCell::new(None),
             fence_published: Rc::default(),
             persistence_notifier: RefCell::new(None),
             io_notifier: RefCell::new(None),
@@ -665,7 +670,16 @@ where
         // Read the knob first: the `&mut` borrow below covers `self.config` too.
         let validate_checksum = self.config.validate_checksum;
         let partition = self.get_mut_by_ns(namespace)?;
-        Some(partition.build_poll_plan(consumer, args, validate_checksum))
+        let mut plan = partition.build_poll_plan(consumer, args, validate_checksum);
+        if let PollTier::Disk { disk, .. } = &mut plan.tier {
+            disk.remote.clone_from(&self.remote_reader.borrow());
+        }
+        Some(plan)
+    }
+
+    /// Install the reader for segments evicted to the tiered object store.
+    pub fn set_remote_reader(&self, reader: Rc<dyn RemoteSegmentReader>) {
+        *self.remote_reader.borrow_mut() = Some(reader);
     }
 
     /// Validate and accept a poll synchronously on the owning pump.

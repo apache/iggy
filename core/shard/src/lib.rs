@@ -1041,6 +1041,44 @@ pub enum LifecycleFrame {
         namespace: IggyNamespace,
         up_to_offset: u64,
     },
+    /// Tiered storage proof of concept: list the sealed segments of every
+    /// partition this node leads, read on the pump so the snapshot never
+    /// overlaps a mutation.
+    TierSnapshot {
+        cursors: TierCursors,
+        reply: futures::channel::oneshot::Sender<Vec<TierSegment>>,
+    },
+    /// Tiered storage proof of concept: the segment's `.log` is in the object
+    /// store under `key`, so evict the local copy if the partition agrees.
+    TierEvict {
+        namespace: IggyNamespace,
+        /// Incarnation the upload read, so a recreated partition's segment
+        /// at the same offset is never mapped to the old object.
+        created_revision: u64,
+        start_offset: u64,
+        /// Bytes the upload sent.
+        size: u64,
+        key: Arc<str>,
+    },
+}
+
+/// Per raw namespace, the incarnation and the start offset below which the
+/// tier uploader already handled every segment, so a snapshot skips them.
+pub type TierCursors = HashMap<u64, (u64, u64)>;
+
+/// A sealed segment the tier uploader may copy to the object store.
+#[derive(Debug, Clone)]
+pub struct TierSegment {
+    pub namespace: IggyNamespace,
+    /// The partition incarnation the segment belongs to.
+    pub created_revision: u64,
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub start_timestamp: u64,
+    pub end_timestamp: u64,
+    /// Committed bytes of the `.log`, whose file may be longer when
+    /// preallocated.
+    pub size: u64,
 }
 
 /// Reconciler-staged partition mutation.
@@ -2980,6 +3018,44 @@ where
         let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::TruncatePartition {
             namespace,
             up_to_offset,
+        }));
+    }
+
+    /// Ask this shard's pump for the sealed segments of the partitions it
+    /// leads, from each partition's cursor on. `None` when the inbox refused
+    /// the request or the pump dropped it.
+    #[allow(clippy::future_not_send)]
+    pub async fn request_tier_snapshot(&self, cursors: TierCursors) -> Option<Vec<TierSegment>> {
+        let sender = self.senders.get(self.id as usize)?;
+        let (reply, receiver) = futures::channel::oneshot::channel();
+        sender
+            .try_send(ShardFrame::lifecycle(LifecycleFrame::TierSnapshot {
+                cursors,
+                reply,
+            }))
+            .ok()?;
+        receiver.await.ok()
+    }
+
+    /// Ask this shard's pump to evict an uploaded segment's local `.log`.
+    /// Fire and forget: a refusal is retried on the uploader's next pass.
+    pub fn request_tier_evict(
+        &self,
+        namespace: IggyNamespace,
+        created_revision: u64,
+        start_offset: u64,
+        size: u64,
+        key: Arc<str>,
+    ) {
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            return;
+        };
+        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::TierEvict {
+            namespace,
+            created_revision,
+            start_offset,
+            size,
+            key,
         }));
     }
 
@@ -9868,6 +9944,89 @@ where
     {
         partition.clear_state_transfer_offer_cache();
         self.drop_served_state_for(namespace.inner());
+    }
+
+    /// Sealed, non-empty, still local and checkpointed segments of every
+    /// partition this node leads, from each partition's cursor on (see
+    /// `IggyPartition::tierable_segments`).
+    pub(crate) fn tier_snapshot(&self, cursors: &TierCursors) -> Vec<TierSegment>
+    where
+        B: MessageBus,
+    {
+        let partitions = self.plane.partitions();
+        let mut sealed = Vec::new();
+        for namespace in partitions.namespaces() {
+            let Some(partition) = partitions.get_by_ns(namespace) else {
+                continue;
+            };
+            if !partition.consensus().is_primary() {
+                continue;
+            }
+            let created_revision = partition.created_revision();
+            let from_offset = cursors
+                .get(&namespace.inner())
+                .filter(|(revision, _)| *revision == created_revision)
+                .map_or(0, |(_, from_offset)| *from_offset);
+            sealed.extend(
+                partition
+                    .tierable_segments(from_offset)
+                    .iter()
+                    .filter(|segment| {
+                        segment.size.as_bytes_u64() > 0 && segment.remote_key.is_none()
+                    })
+                    .map(|segment| TierSegment {
+                        namespace: *namespace,
+                        created_revision,
+                        start_offset: segment.start_offset,
+                        end_offset: segment.end_offset,
+                        start_timestamp: segment.start_timestamp,
+                        end_timestamp: segment.end_timestamp,
+                        size: segment.size.as_bytes_u64(),
+                    }),
+            );
+        }
+        sealed
+    }
+
+    /// Evict an uploaded segment's local `.log` if its partition agrees, then
+    /// unlink it. The unlink is awaited here on the pump, so evictions finish
+    /// one at a time, oldest first, and a crash leaves at most a missing front,
+    /// which boot accepts, never a hole. A failed unlink puts the segment back
+    /// to local reads; the uploader asks again on its next pass.
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn evict_to_remote(
+        &self,
+        namespace: IggyNamespace,
+        created_revision: u64,
+        start_offset: u64,
+        size: u64,
+        key: Arc<str>,
+    ) where
+        B: MessageBus,
+    {
+        let partitions = self.plane.partitions();
+        let Some(path) = partitions.get_mut_by_ns(&namespace).and_then(|partition| {
+            let path = partition.evict_to_remote(start_offset, created_revision, size, key)?;
+            self.drop_partition_transfer_state(namespace, partition);
+            Some(path)
+        }) else {
+            return;
+        };
+        match compio::fs::remove_file(&path).await {
+            Ok(()) => tracing::debug!(
+                shard = self.id,
+                namespace_raw = namespace.inner(),
+                start_offset,
+                "tiered PoC evicted a segment"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(shard = self.id, path, %error, "tiered PoC: unlinking an evicted segment failed, keeping it local");
+                if let Some(partition) = partitions.get_mut_by_ns(&namespace) {
+                    partition.cancel_eviction(start_offset);
+                }
+            }
+        }
     }
 
     fn drop_served_state_for(&self, namespace: u64) {

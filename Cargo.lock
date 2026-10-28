@@ -7942,6 +7942,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_object_store"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "chrono",
+ "compio",
+ "crc32c",
+ "cyper",
+ "futures",
+ "hex",
+ "http 1.5.0",
+ "md-5 0.10.6",
+ "percent-encoding",
+ "quick-xml 0.42.0",
+ "rand 0.10.3",
+ "ring",
+ "rustls",
+ "send_wrapper",
+ "serde",
+ "server_common",
+ "tempfile",
+ "testcontainers",
+ "thiserror 2.0.21",
+ "url",
+]
+
+[[package]]
 name = "ignore"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13034,6 +13062,7 @@ dependencies = [
  "iggy",
  "iggy_binary_protocol",
  "iggy_common",
+ "iggy_object_store",
  "journal",
  "jsonwebtoken 11.1.0",
  "left-right",

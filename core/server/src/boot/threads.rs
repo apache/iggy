@@ -860,6 +860,8 @@ pub(in crate::boot) struct StopSignals {
     pub(in crate::boot) pat_cleaner: Option<Sender<()>>,
     pub(in crate::boot) stream_key_rewrapper: Option<Sender<()>>,
     pub(in crate::boot) segment_cleaner: Option<Sender<()>>,
+    pub(in crate::boot) tier_uploader: Option<Sender<()>>,
+    pub(in crate::boot) pump_lag_probe: Option<Sender<()>>,
     pub(in crate::boot) sysinfo_printer: Option<Sender<()>>,
     pub(in crate::boot) consumer_group_liveness: Option<Sender<()>>,
 }
@@ -874,6 +876,8 @@ impl StopSignals {
             &self.pat_cleaner,
             &self.stream_key_rewrapper,
             &self.segment_cleaner,
+            &self.tier_uploader,
+            &self.pump_lag_probe,
             &self.sysinfo_printer,
             &self.consumer_group_liveness,
         ]

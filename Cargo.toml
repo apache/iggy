@@ -64,6 +64,7 @@ members = [
     "core/kafka_wire",
     "core/message_bus",
     "core/metadata",
+    "core/object_store",
     "core/partitions",
     "core/sdk",
     "core/server",
@@ -222,6 +223,7 @@ iggy_common = { path = "core/common", version = "0.11.1-edge.5" }
 iggy_connector_doris_sink = { path = "core/connectors/sinks/doris_sink" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.5.1-edge.2" }
 iggy_kafka_wire = { path = "core/kafka_wire" }
+iggy_object_store = { path = "core/object_store" }
 indexmap = "2.14.2"
 integration = { path = "core/integration" }
 ipnet = "2.12.2"
@@ -241,6 +243,7 @@ libc = "0.2.190"
 log = "0.4.34"
 lz4 = "1.28.1"
 lz4_flex = "0.14.0"
+md-5 = "0.10.6"
 meilisearch-sdk = { version = "0.33.0", default-features = false, features = [
     "reqwest",
     "tls",
@@ -289,6 +292,7 @@ prost = "0.14.4"
 prost-types = "0.14.4"
 protox = "0.10.0"
 protox-parse = "0.10.0"
+quick-xml = "0.42.0"
 quinn = "0.11.12"
 quote = "1"
 rand = "0.10.3"

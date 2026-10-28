@@ -70,9 +70,11 @@ pub use partition_reconciler::{
     reconcile_partition_lifecycles, reconcile_pending_revocations,
 };
 pub(crate) mod personal_access_token_cleaner;
+pub(crate) mod pump_lag_probe;
 pub(crate) mod segment_cleaner;
 pub(crate) mod snapshot;
 pub(crate) mod sysinfo_printer;
+pub(crate) mod tier_uploader;
 
 // support: shared plumbing.
 pub(crate) mod cluster_meta;

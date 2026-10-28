@@ -967,6 +967,36 @@ async fn shard_main(
     } else {
         None
     };
+    // Tiered storage proof of concept, off unless a `TIERED_POC_*` backend is set.
+    let tier_uploader_stop =
+        match crate::tier_uploader::TierUploaderConfig::from_env(config.get_system_path()) {
+            Ok(Some(tier_config)) => {
+                let (stop_tx, stop_rx) = channel(1);
+                let uploader_shard = Rc::clone(&shard);
+                let uploader_handle = compio::runtime::spawn(async move {
+                    crate::tier_uploader::run_tier_uploader(uploader_shard, tier_config, stop_rx)
+                        .await;
+                });
+                bus.track_background(uploader_handle);
+                Some(stop_tx)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                // Every shard parses the same environment.
+                if shard_id == 0 {
+                    tracing::warn!(%error, "tiered PoC uploader not started");
+                }
+                None
+            }
+        };
+    let pump_lag_probe_stop = crate::pump_lag_probe::enabled().then(|| {
+        let (stop_tx, stop_rx) = channel(1);
+        let probe_handle = compio::runtime::spawn(async move {
+            crate::pump_lag_probe::run_pump_lag_probe(shard_id, stop_rx).await;
+        });
+        bus.track_background(probe_handle);
+        stop_tx
+    });
     let mut stop_signals = StopSignals {
         pump: stop_tx,
         reconciler: reconcile_stop_tx,
@@ -974,6 +1004,8 @@ async fn shard_main(
         pat_cleaner: pat_cleaner_stop,
         stream_key_rewrapper: stream_key_rewrapper_stop,
         segment_cleaner: segment_cleaner_stop,
+        tier_uploader: tier_uploader_stop,
+        pump_lag_probe: pump_lag_probe_stop,
         sysinfo_printer: None,
         consumer_group_liveness: None,
     };

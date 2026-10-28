@@ -121,6 +121,7 @@ components:
       - "rust-common"
       - "rust-binary-protocol"
       - "rust-cluster"
+      - "rust-object-store"
     paths:
       - "core/server/**"
 
@@ -194,6 +195,14 @@ components:
     paths:
       - "core/kafka_wire/**"
 
+  # Object store behind tiered storage. Its contract tests run against MinIO in
+  # Docker and on the shard executor from server_common.
+  rust-object-store:
+    depends_on:
+      - "rust-workspace"
+    paths:
+      - "core/object_store/**"
+
   # Main Rust workspace testing
   rust:
     depends_on:
@@ -206,6 +215,7 @@ components:
       - "rust-cluster"
       - "rust-simulator"
       - "rust-kafka-wire"
+      - "rust-object-store"
       - "rust-tools"
       - "rust-cli"
       - "rust-bench"

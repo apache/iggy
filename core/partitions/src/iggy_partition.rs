@@ -1972,20 +1972,24 @@ where
         );
         for start_offset in segments {
             // Retention may already have removed a dirty sealed segment.
-            if self
+            let Ok(slot) = self
                 .log
                 .segments()
                 .binary_search_by_key(&start_offset, |segment| segment.start_offset)
-                .is_err()
-            {
+            else {
                 continue;
+            };
+            // Boot marks every recovered segment dirty, so an evicted one can
+            // still be listed here after its `.log` is gone. Its bytes are in
+            // the object store and the `.index` stays local.
+            if self.log.segments()[slot].remote_key.is_none() {
+                paths.push(config.get_messages_path(
+                    namespace.stream_id(),
+                    namespace.topic_id(),
+                    namespace.partition_id(),
+                    start_offset,
+                ));
             }
-            paths.push(config.get_messages_path(
-                namespace.stream_id(),
-                namespace.topic_id(),
-                namespace.partition_id(),
-                start_offset,
-            ));
             paths.push(config.get_index_path(
                 namespace.stream_id(),
                 namespace.topic_id(),
@@ -5628,9 +5632,12 @@ where
                 persisted: segment.size.as_bytes_u64(),
                 read_state: Rc::clone(read_state),
                 sealed: segment.sealed,
+                remote_key: segment.remote_key.clone(),
             })
             .collect();
         let disk = DiskReadPlan {
+            // Attached by the owning `IggyPartitions`, which holds the reader.
+            remote: None,
             partition_dir: self.partition_dir_resolution(),
             segments,
             start_position,
@@ -12047,6 +12054,117 @@ where
         true
     }
 
+    /// Tiered storage proof of concept: record that the sealed segment at
+    /// `start_offset` now lives in the object store under `key`, and return its
+    /// `.log` path for the caller to unlink. The `.index` stays, so polls still
+    /// resolve their start byte locally. `None` refuses for now: the partition
+    /// is another incarnation or has replicas that may still read the file, the
+    /// segment is gone, active, already remote or a different size, or the WAL
+    /// checkpoint has not passed it yet, the same gate retention waits on.
+    pub fn evict_to_remote(
+        &mut self,
+        start_offset: u64,
+        created_revision: u64,
+        size: u64,
+        key: Arc<str>,
+    ) -> Option<String> {
+        if self.created_revision() != created_revision || self.consensus.replica_count() > 1 {
+            return None;
+        }
+        let segments = self.log.segments();
+        let slot = segments
+            .iter()
+            .position(|segment| segment.start_offset == start_offset)?;
+        let segment = &segments[slot];
+        // Only the oldest local segment goes: boot accepts a missing front but
+        // refuses a missing middle as a hole, and uploads finish out of order.
+        if !segment.sealed
+            || slot + 1 == segments.len()
+            || segment.remote_key.is_some()
+            || segment.size.as_bytes_u64() != size
+            || segments[..slot]
+                .iter()
+                .any(|earlier| earlier.remote_key.is_none())
+        {
+            return None;
+        }
+        let end_offset = segment.end_offset;
+        if self.persistence_checkpoint_pending() {
+            return None;
+        }
+        // Boot reads the checkpoint cursor's `.log`, so it never leaves.
+        if let Some(persistence) = &self.persistence
+            && let Some(checkpoint) = persistence.segment_checkpoint()
+            && (end_offset >= checkpoint.next_offset || checkpoint.start_offset == start_offset)
+        {
+            persistence.request_checkpoint();
+            return None;
+        }
+        let path = format!("{}/{start_offset:0>20}.log", self.partition_dir()?);
+        self.log.segments_mut()[slot].remote_key = Some(key);
+        // New polls take a fresh handle and go remote. An in-flight poll that
+        // holds the cached fd keeps reading the unlinked inode; one planned
+        // before this without a cached fd reopens the path and faults as
+        // retryable once the file is gone.
+        self.log.reset_read_state(slot);
+        Some(path)
+    }
+
+    /// Tiered storage proof of concept: undo [`Self::evict_to_remote`] when
+    /// the local `.log` could not be unlinked, so the segment reads from the
+    /// file again and no later segment can be evicted past it.
+    pub fn cancel_eviction(&mut self, start_offset: u64) {
+        if let Some(slot) = self
+            .log
+            .segments()
+            .iter()
+            .position(|segment| segment.start_offset == start_offset)
+        {
+            self.log.segments_mut()[slot].remote_key = None;
+            self.log.reset_read_state(slot);
+        }
+    }
+
+    /// Tiered storage proof of concept: the run of sealed segments from
+    /// `from_offset` on, past the evicted front, that the WAL checkpoint has
+    /// made durable in the segment files. An uncheckpointed sealed segment can
+    /// lose its tail to a power loss, after which its uploaded copy would never
+    /// match again, so one waiting on the checkpoint asks for it. Empty while
+    /// other replicas may still read the files for a state transfer, or
+    /// without segment persistence.
+    pub fn tierable_segments(&self, from_offset: u64) -> &[Segment] {
+        let segments = self.log.segments();
+        if self.consensus.replica_count() > 1 {
+            return &[];
+        }
+        let Some(checkpointed) = self.segment_checkpoint_next_offset() else {
+            return &[];
+        };
+        // Evicted segments are a front prefix, see `evict_to_remote`.
+        let first = segments
+            .partition_point(|segment| segment.start_offset < from_offset)
+            .max(segments.partition_point(|segment| segment.remote_key.is_some()));
+        let tierable = segments[first..]
+            .iter()
+            .take_while(|segment| segment.sealed && segment.end_offset < checkpointed)
+            .count();
+        if segments
+            .get(first + tierable)
+            .is_some_and(|segment| segment.sealed)
+            && let Some(persistence) = &self.persistence
+        {
+            persistence.request_checkpoint();
+        }
+        &segments[first..first + tierable]
+    }
+
+    fn segment_checkpoint_next_offset(&self) -> Option<u64> {
+        self.persistence
+            .as_ref()?
+            .segment_checkpoint()
+            .map(|checkpoint| checkpoint.next_offset)
+    }
+
     fn capture_segment_removal(&mut self) -> Option<crate::PartitionIoJob<SB>> {
         let (segment, storage) = self.log.retire_front()?;
         let (messages, indexes) = storage.segment_and_index_paths();
@@ -15128,6 +15246,148 @@ mod tests {
         assert_eq!(partition.log.segments().len(), 1);
         assert_eq!(partition.log.segments()[0].start_offset, 1);
         assert_eq!(partition.maintenance.retention, None);
+    }
+
+    /// Boot marks every recovered segment dirty while the recovered segment
+    /// checkpoint already lets the oldest one be evicted, so the first
+    /// checkpoint after a restart lists a segment whose `.log` is gone.
+    #[compio::test]
+    async fn given_evicted_segment_marked_dirty_by_boot_when_checkpointing_should_not_fault() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut partition, config, second_checksum) = rotated_partition(root.path(), 1).await;
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        assert!(checkpoint_solo(&mut partition, &config).await.is_ok());
+        assert!(partition.segment_checkpoint_next_offset() > Some(1));
+
+        let evicted_size = partition.log.segments()[0].size.as_bytes_u64();
+        let path = partition
+            .evict_to_remote(
+                0,
+                partition.created_revision(),
+                evicted_size,
+                Arc::from("key"),
+            )
+            .expect("the checkpoint passed the oldest segment");
+        std::fs::remove_file(&path).unwrap();
+        // What `open_persistence` does to every recovered segment.
+        for segment in partition.log.segments() {
+            persistence.mark_segment_dirty(segment.start_offset);
+        }
+        let third = checksummed_segment_prepare(3, second_checksum, 2, b"third");
+        commit_solo_send(&mut partition, &config, third).await;
+        let checkpointed = checkpoint_solo(&mut partition, &config).await;
+
+        assert!(checkpointed.is_ok(), "{checkpointed:?}");
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert_eq!(persistence.checkpoint_op(), 3);
+    }
+
+    #[compio::test]
+    async fn given_sealed_segment_when_listing_tierable_should_wait_for_checkpoint_and_skip_cursor()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let (mut partition, config, _) = rotated_partition(root.path(), 1).await;
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        assert!(!persistence.needs_checkpoint());
+
+        let before_checkpoint = partition.tierable_segments(0).len();
+        let checkpoint_requested = persistence.needs_checkpoint();
+        assert!(checkpoint_solo(&mut partition, &config).await.is_ok());
+        let after_checkpoint: Vec<u64> = partition
+            .tierable_segments(0)
+            .iter()
+            .map(|segment| segment.start_offset)
+            .collect();
+        let past_cursor = partition.tierable_segments(1).len();
+
+        assert_eq!(before_checkpoint, 0);
+        assert!(checkpoint_requested);
+        assert_eq!(after_checkpoint, [0]);
+        assert_eq!(past_cursor, 0);
+    }
+
+    #[compio::test]
+    async fn given_replicated_partition_when_listing_tierable_should_list_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut partition, config, _) = rotated_partition(root.path(), 3).await;
+        assert!(checkpoint_solo(&mut partition, &config).await.is_ok());
+        assert!(partition.segment_checkpoint_next_offset() > Some(1));
+
+        assert!(partition.tierable_segments(0).is_empty());
+    }
+
+    /// A primary whose first send filled segment 0, so the second rotated into
+    /// segment 1. Returns the second send's checksum to chain the next one.
+    async fn rotated_partition(
+        root: &std::path::Path,
+        replica_count: u8,
+    ) -> (IggyPartition<RecordingBus>, PartitionsConfig, u128) {
+        const SEGMENT_BYTES: u64 = 64 * 1024;
+        let mut config = repair_config();
+        config.path_layout.streams_root = root.to_string_lossy().into_owned();
+        let directory = std::path::PathBuf::from(config.get_partition_path(1, 1, 0));
+        std::fs::create_dir_all(&directory).unwrap();
+        let (mut partition, _) = recording_partition_at(0, replica_count);
+        partition.set_partition_dir(directory.to_string_lossy().into_owned());
+        set_offset_dirs_under(&mut partition, &directory);
+        partition.runtime_options.durability = iggy_common::Durability::Replicated;
+        partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Replicated;
+        partition.runtime_options.segment_size = Some(IggyByteSize::from(SEGMENT_BYTES));
+        partition.log.active_segment_mut().max_size = IggyByteSize::from(SEGMENT_BYTES);
+        partition.open_persistence().await.unwrap();
+        partition.log.retire_front().unwrap();
+        partition.install_empty_segment(&config, 0).await.unwrap();
+        let oversized = vec![7; usize::try_from(SEGMENT_BYTES).unwrap()];
+        let first = checksummed_segment_prepare(1, 0, 0, &oversized);
+        let second = checksummed_segment_prepare(2, first.header().checksum, 1, b"second");
+        let second_checksum = second.header().checksum;
+        commit_solo_send(&mut partition, &config, first).await;
+        commit_solo_send(&mut partition, &config, second).await;
+        assert_eq!(partition.log.segments().len(), 2);
+        (partition, config, second_checksum)
+    }
+
+    /// Write and commit one send on a primary without an I/O dispatcher.
+    async fn commit_solo_send(
+        partition: &mut IggyPartition<RecordingBus>,
+        config: &PartitionsConfig,
+        prepare: Message<PrepareHeader>,
+    ) {
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        let header = *prepare.header();
+        persistence
+            .append(prepare.clone().into_frozen(), false)
+            .unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        partition.consensus.with_pipeline_mut(|pipeline| {
+            pipeline.push(PipelineEntry::new(header));
+        });
+        partition
+            .append_repaired_send_messages(prepare)
+            .await
+            .unwrap();
+        partition.consensus.advance_commit_max(header.op);
+        partition.commit_journal(config).await;
+        assert_eq!(
+            partition.consensus.commit_min(),
+            header.op,
+            "{:?}",
+            partition.fatal()
+        );
+    }
+
+    /// Run one checkpoint through `commit_min` to completion.
+    async fn checkpoint_solo(
+        partition: &mut IggyPartition<RecordingBus>,
+        config: &PartitionsConfig,
+    ) -> std::io::Result<()> {
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        persistence.request_checkpoint();
+        partition.checkpoint_persistence(config).await;
+        let drained = persistence.drain().await;
+        partition.drive_persistence().await;
+        drained
     }
 
     /// A dispatched checkpoint covers `commit_min`, which may lead the writer.
@@ -28316,11 +28576,13 @@ mod tests {
         partition.log.touch_sealed_read_state(0);
         let handle = Rc::clone(&partition.log.sealed_read_state()[0]);
         let poll = || DiskReadPlan {
+            remote: None,
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
             bytes_per_message: None,
             widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![DiskSegment {
+                remote_key: None,
                 start_offset: 0,
                 persisted: record_len,
                 read_state: Rc::clone(&handle),
@@ -30227,18 +30489,21 @@ mod tests {
         // First segment claims persisted bytes but its file is absent, so the
         // open exhausts retries -> the walk must fault-close before segment two.
         let plan = DiskReadPlan {
+            remote: None,
             partition_dir: PartitionDirResolution::Resolved(partition_dir),
             bytes_per_message: None,
             widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![
                 DiskSegment {
+                    remote_key: None,
                     start_offset: 0,
                     persisted: 512,
                     read_state: SealedSegmentHandle::default(),
                     sealed: false,
                 },
                 DiskSegment {
+                    remote_key: None,
                     start_offset: 5,
                     persisted: later_len,
                     read_state: SealedSegmentHandle::default(),
@@ -30303,11 +30568,13 @@ mod tests {
         // One byte per message floors the first read at 64 KiB, a quarter of
         // the batch waiting at offset 0.
         let plan = DiskReadPlan {
+            remote: None,
             partition_dir: PartitionDirResolution::Resolved(partition_dir),
             bytes_per_message: Some(1),
             widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![DiskSegment {
+                remote_key: None,
                 start_offset: 0,
                 persisted: record_len,
                 read_state: SealedSegmentHandle::default(),
@@ -30391,18 +30658,21 @@ mod tests {
         }
 
         let plan = DiskReadPlan {
+            remote: None,
             partition_dir: PartitionDirResolution::Resolved(partition_dir),
             bytes_per_message: None,
             widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![
                 DiskSegment {
+                    remote_key: None,
                     start_offset: 0,
                     persisted: corrupt_len,
                     read_state: SealedSegmentHandle::default(),
                     sealed: false,
                 },
                 DiskSegment {
+                    remote_key: None,
                     start_offset: 5,
                     persisted: later_len,
                     read_state: SealedSegmentHandle::default(),
@@ -30469,11 +30739,13 @@ mod tests {
         }
 
         let plan = |validate_checksum| DiskReadPlan {
+            remote: None,
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
             bytes_per_message: None,
             widest_batch_bytes: 0,
             validate_checksum,
             segments: vec![DiskSegment {
+                remote_key: None,
                 start_offset: 0,
                 persisted: record_len,
                 read_state: SealedSegmentHandle::default(),
@@ -30509,10 +30781,12 @@ mod tests {
     /// persisted `persisted` bytes.
     fn file_less_plan(persisted: u64) -> DiskReadPlan {
         DiskReadPlan {
+            remote: None,
             partition_dir: PartitionDirResolution::NoFiles,
             bytes_per_message: None,
             widest_batch_bytes: 0,
             segments: vec![DiskSegment {
+                remote_key: None,
                 start_offset: 0,
                 persisted,
                 read_state: SealedSegmentHandle::default(),
@@ -30570,10 +30844,12 @@ mod tests {
     #[compio::test]
     async fn read_disk_faults_closed_when_partition_dir_unresolvable() {
         let plan = DiskReadPlan {
+            remote: None,
             partition_dir: PartitionDirResolution::Unresolvable,
             bytes_per_message: None,
             widest_batch_bytes: 0,
             segments: vec![DiskSegment {
+                remote_key: None,
                 start_offset: 0,
                 persisted: 512,
                 read_state: SealedSegmentHandle::default(),
@@ -30640,11 +30916,13 @@ mod tests {
         assert!(handle.fd.borrow().is_none(), "fd cache slot starts empty");
 
         let plan = DiskReadPlan {
+            remote: None,
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
             bytes_per_message: None,
             widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![DiskSegment {
+                remote_key: None,
                 start_offset: 0,
                 persisted: record_len,
                 read_state: Rc::clone(&handle),
@@ -30675,11 +30953,13 @@ mod tests {
         std::fs::remove_file(&path).expect("unlink segment file");
 
         let plan = DiskReadPlan {
+            remote: None,
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
             bytes_per_message: None,
             widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![DiskSegment {
+                remote_key: None,
                 start_offset: 0,
                 persisted: record_len,
                 read_state: Rc::clone(&handle),
@@ -30739,11 +31019,13 @@ mod tests {
 
         let handle = SealedSegmentHandle::default();
         let plan = DiskReadPlan {
+            remote: None,
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
             bytes_per_message: None,
             widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![DiskSegment {
+                remote_key: None,
                 start_offset: 0,
                 persisted: record_len,
                 read_state: Rc::clone(&handle),
@@ -30827,11 +31109,13 @@ mod tests {
 
         let handle = SealedSegmentHandle::default();
         let plan = DiskReadPlan {
+            remote: None,
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
             bytes_per_message: None,
             widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![DiskSegment {
+                remote_key: None,
                 start_offset: 0,
                 persisted: log_len,
                 read_state: Rc::clone(&handle),
@@ -30930,11 +31214,13 @@ mod tests {
 
         let handle = SealedSegmentHandle::default();
         let plan = DiskReadPlan {
+            remote: None,
             partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
             bytes_per_message: None,
             widest_batch_bytes: 0,
             validate_checksum: true,
             segments: vec![DiskSegment {
+                remote_key: None,
                 start_offset: 0,
                 persisted: log_len,
                 read_state: Rc::clone(&handle),
@@ -35074,6 +35360,80 @@ mod retention_tests {
         stats.increment_messages_count(sealed_count * MESSAGES_PER_SEGMENT);
         stats.increment_size_bytes(sealed_count * BYTES_PER_SEGMENT);
         partition
+    }
+
+    #[test]
+    fn given_uploaded_segments_when_evicting_should_go_oldest_first_and_spare_the_active_one() {
+        let mut partition = partition_with_sealed_run(3);
+        partition.set_partition_dir("/data/p".to_owned());
+        let key = || Arc::<str>::from("key");
+
+        let revision = partition.created_revision();
+
+        let later_first =
+            partition.evict_to_remote(MESSAGES_PER_SEGMENT, revision, BYTES_PER_SEGMENT, key());
+        let wrong_size = partition.evict_to_remote(0, revision, BYTES_PER_SEGMENT + 1, key());
+        let other_incarnation =
+            partition.evict_to_remote(0, revision + 1, BYTES_PER_SEGMENT, key());
+        let oldest = partition.evict_to_remote(0, revision, BYTES_PER_SEGMENT, key());
+        let again = partition.evict_to_remote(0, revision, BYTES_PER_SEGMENT, key());
+        let next =
+            partition.evict_to_remote(MESSAGES_PER_SEGMENT, revision, BYTES_PER_SEGMENT, key());
+        let active = partition.evict_to_remote(3 * MESSAGES_PER_SEGMENT, revision, 0, key());
+
+        assert_eq!(later_first, None);
+        assert_eq!(wrong_size, None);
+        assert_eq!(other_incarnation, None);
+        assert_eq!(oldest.as_deref(), Some("/data/p/00000000000000000000.log"));
+        assert_eq!(again, None);
+        assert!(next.is_some());
+        assert_eq!(active, None);
+        let remote: Vec<bool> = partition
+            .log
+            .segments()
+            .iter()
+            .map(|segment| segment.remote_key.is_some())
+            .collect();
+        assert_eq!(remote, [true, true, false, false]);
+    }
+
+    #[test]
+    fn given_failed_unlink_when_cancelling_eviction_should_read_locally_and_block_later_evictions()
+    {
+        let mut partition = partition_with_sealed_run(3);
+        partition.set_partition_dir("/data/p".to_owned());
+        let revision = partition.created_revision();
+        let key = || Arc::<str>::from("key");
+        assert!(
+            partition
+                .evict_to_remote(0, revision, BYTES_PER_SEGMENT, key())
+                .is_some()
+        );
+
+        partition.cancel_eviction(0);
+        let next =
+            partition.evict_to_remote(MESSAGES_PER_SEGMENT, revision, BYTES_PER_SEGMENT, key());
+
+        assert!(partition.log.segments()[0].remote_key.is_none());
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn given_replicated_partition_when_evicting_should_refuse() {
+        let (mut partition, _) = super::tests::recording_partition_at(0, 3);
+        partition.set_partition_dir("/data/p".to_owned());
+        partition.log.segments_mut()[0] = sealed_run_segment(0);
+        partition.log.add_persisted_segment(
+            Segment::new(MESSAGES_PER_SEGMENT, IggyByteSize::from(0u64)),
+            SegmentStorage::default(),
+            None,
+            None,
+        );
+        let revision = partition.created_revision();
+
+        let evicted = partition.evict_to_remote(0, revision, BYTES_PER_SEGMENT, Arc::from("key"));
+
+        assert_eq!(evicted, None);
     }
 
     #[test]

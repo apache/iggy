@@ -37,6 +37,8 @@ use server_common::poll::PollHistoryId;
 use server_common::send_messages::{BatchIntegrity, COMMAND_HEADER_SIZE, frozen_batch_header};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -132,12 +134,33 @@ pub struct SealedOffsetCursor {
 
 pub type SealedSegmentHandle = Rc<SealedSegmentReadState>;
 
+/// Reads byte ranges of segments whose `.log` now lives only in the tiered
+/// object store. Set by the server; the partitions crate knows only keys.
+pub trait RemoteSegmentReader {
+    /// Exactly `len` bytes of object `key`, which holds `object_len` bytes,
+    /// starting at `position`.
+    ///
+    /// An error of kind `NotFound`, `InvalidData`, `InvalidInput`,
+    /// `UnexpectedEof` or `Unsupported` is permanent and fails the poll as
+    /// unreadable. `TimedOut` fails it as retryable at once, and any other kind
+    /// is retried before it does.
+    fn read<'a>(
+        &'a self,
+        key: &'a str,
+        position: u64,
+        len: usize,
+        object_len: u64,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<bytes::Bytes>> + 'a>>;
+}
+
 /// Owned, borrow-free inputs for the disk tier of a poll (see module docs). A
 /// sealed segment reuses its cached [`SealedSegmentReadState`] (read fd + sparse
 /// index); the active segment reuses the cached fd but resolves from its
 /// resident index, because sealed segments drop that index at rotation.
 pub struct DiskReadPlan {
     pub(crate) partition_dir: PartitionDirResolution,
+    /// Source of evicted segments' bytes, `None` while tiering is off.
+    pub(crate) remote: Option<Rc<dyn RemoteSegmentReader>>,
     /// Segments to walk, snapshotted from the poll's starting segment onward
     /// (see `build_poll_plan`); `start_position` is the byte offset into the
     /// first one.
@@ -170,6 +193,18 @@ pub struct DiskSegment {
     /// segment resolves its start byte from the shared sparse index; the active
     /// one grows under the reader and uses its resident index instead.
     pub(crate) sealed: bool,
+    /// Object key when the local `.log` was evicted to the tiered store.
+    pub(crate) remote_key: Option<Arc<str>>,
+}
+
+/// Where a walked segment's bytes come from.
+enum SegmentSource<'a> {
+    File(compio::fs::File),
+    Remote {
+        reader: &'a dyn RemoteSegmentReader,
+        key: &'a str,
+        object_len: u64,
+    },
 }
 
 /// Admission inputs carried by a read without access to consumer progress maps.
@@ -882,16 +917,16 @@ impl DiskReadPlan {
                 walk.position = 0;
                 continue;
             }
-            let path = format!("{partition_dir}/{:0>20}.log", segment.start_offset);
-            let Some(file) = self.resolve_segment_file(segment, &path).await else {
-                // Open exhausted retries: the segment may hold present-but-
-                // unreadable data. Stop here rather than walking past it.
+            let Some(source) = self.segment_source(segment, partition_dir).await else {
+                // Open exhausted retries, or the segment was evicted while
+                // nothing can read the store: stop here rather than walking past
+                // possibly present-but-unreadable data.
                 fault = Some(DiskFault::Retryable);
                 break;
             };
 
             match self
-                .walk_segment(&file, query, count, persisted, &mut walk)
+                .walk_segment(&source, query, count, persisted, &mut walk)
                 .await
             {
                 SegmentWalk::Done => walk.position = 0,
@@ -946,7 +981,7 @@ impl DiskReadPlan {
     #[allow(clippy::cast_possible_truncation)]
     async fn walk_segment(
         &self,
-        file: &compio::fs::File,
+        source: &SegmentSource<'_>,
         query: MessageLookup,
         count: u32,
         persisted: u64,
@@ -970,10 +1005,11 @@ impl DiskReadPlan {
                 walk.limited = true;
                 return SegmentWalk::Limited;
             }
-            let Some(chunk) = self.read_chunk_with_retry(file, len, walk).await else {
-                // Chunk read exhausted retries: same fail-closed reason as
-                // a failed open.
-                return SegmentWalk::Faulted(DiskFault::Retryable);
+            let chunk = match self.read_chunk_with_retry(source, len, walk).await {
+                Ok(chunk) => chunk,
+                // Chunk read exhausted retries, or the store says the bytes are
+                // gone: same fail-closed reason as a failed open.
+                Err(fault) => return SegmentWalk::Faulted(fault),
             };
             let fragments_before_chunk = walk.fragments.len();
             let ChunkWalk {
@@ -1050,6 +1086,29 @@ impl DiskReadPlan {
             walk.position += consumed as u64;
         }
         SegmentWalk::Done
+    }
+
+    /// Where `segment`'s bytes come from: the store for an evicted segment,
+    /// otherwise its local file. `None` when neither can be read.
+    async fn segment_source<'a>(
+        &'a self,
+        segment: &'a DiskSegment,
+        partition_dir: &str,
+    ) -> Option<SegmentSource<'a>> {
+        match (&segment.remote_key, &self.remote) {
+            (Some(key), Some(reader)) => Some(SegmentSource::Remote {
+                reader: reader.as_ref(),
+                key,
+                object_len: segment.persisted,
+            }),
+            (Some(_), None) => None,
+            (None, _) => {
+                let path = format!("{partition_dir}/{:0>20}.log", segment.start_offset);
+                self.resolve_segment_file(segment, &path)
+                    .await
+                    .map(SegmentSource::File)
+            }
+        }
     }
 
     /// Resolve the read-only descriptor for `segment`'s file. A hit clones the
@@ -1230,10 +1289,10 @@ impl DiskReadPlan {
     )]
     async fn read_chunk_with_retry(
         &self,
-        file: &compio::fs::File,
+        source: &SegmentSource<'_>,
         len: usize,
         walk: &mut DiskWalk,
-    ) -> Option<Frozen<4096>> {
+    ) -> Result<Frozen<4096>, DiskFault> {
         let position = walk.position;
         for attempt in 0..3u8 {
             #[cfg(feature = "poll-diagnostics")]
@@ -1245,10 +1304,36 @@ impl DiskReadPlan {
             // `read_exact_at` fills the whole capacity in place and advances the
             // length via `SetLen`, so the `zeroed` memset of up to 1MiB per
             // chunk was pure waste - every byte is overwritten by the read.
-            let buffer = Owned::<4096>::with_capacity(len);
-            let compio::BufResult(read, buffer) = file.read_exact_at(buffer, position).await;
+            let read = match source {
+                SegmentSource::File(file) => {
+                    let buffer = Owned::<4096>::with_capacity(len);
+                    let compio::BufResult(read, buffer) =
+                        file.read_exact_at(buffer, position).await;
+                    read.map(|()| Frozen::from(buffer))
+                }
+                SegmentSource::Remote {
+                    reader,
+                    key,
+                    object_len,
+                } => reader
+                    .read(key, position, len, *object_len)
+                    .await
+                    .and_then(|bytes| {
+                        if bytes.len() == len {
+                            Ok(Frozen::from(Owned::<4096>::copy_from_slice(&bytes)))
+                        } else {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                format!(
+                                    "{key}: remote read returned {} of {len} bytes",
+                                    bytes.len()
+                                ),
+                            ))
+                        }
+                    }),
+            };
             match read {
-                Ok(()) => return Some(Frozen::from(buffer)),
+                Ok(chunk) => return Ok(chunk),
                 Err(error) => {
                     warn!(
                         target: "iggy.partitions.diag",
@@ -1259,11 +1344,31 @@ impl DiskReadPlan {
                         %error,
                         "disk poll: segment read failed"
                     );
+                    if let SegmentSource::Remote { .. } = source
+                        && let Some(fault) = remote_read_fault(error.kind())
+                    {
+                        return Err(fault);
+                    }
                     compio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }
         }
-        None
+        Err(DiskFault::Retryable)
+    }
+}
+
+/// The fault a remote read error settles at once, `None` when a retry may
+/// still succeed (see [`RemoteSegmentReader::read`]). A timed-out read is not
+/// retried in place, so one hung store call bounds the poll.
+const fn remote_read_fault(kind: std::io::ErrorKind) -> Option<DiskFault> {
+    match kind {
+        std::io::ErrorKind::NotFound
+        | std::io::ErrorKind::InvalidData
+        | std::io::ErrorKind::InvalidInput
+        | std::io::ErrorKind::UnexpectedEof
+        | std::io::ErrorKind::Unsupported => Some(DiskFault::Unreadable),
+        std::io::ErrorKind::TimedOut => Some(DiskFault::Retryable),
+        _ => None,
     }
 }
 
@@ -1509,6 +1614,7 @@ mod tests {
 
     fn sizing_plan(bytes_per_message: Option<u32>, widest_batch_bytes: u64) -> DiskReadPlan {
         DiskReadPlan {
+            remote: None,
             partition_dir: PartitionDirResolution::NoFiles,
             bytes_per_message,
             widest_batch_bytes,
@@ -1599,6 +1705,7 @@ mod tests {
             .await
             .unwrap();
         let plan = DiskReadPlan {
+            remote: None,
             partition_dir: PartitionDirResolution::NoFiles,
             bytes_per_message: None,
             widest_batch_bytes: 0,
@@ -1610,9 +1717,9 @@ mod tests {
         };
         let mut walk = DiskWalk::starting_at(0, 0);
         assert!(
-            plan.read_chunk_with_retry(&file, 64, &mut walk)
+            plan.read_chunk_with_retry(&SegmentSource::File(file.clone()), 64, &mut walk)
                 .await
-                .is_none()
+                .is_err()
         );
         assert_eq!(walk.chunk_reads, 3);
         assert_eq!(walk.requested_bytes, 192);
@@ -1641,7 +1748,7 @@ mod tests {
         let mut walk = DiskWalk::starting_at(0, 0);
         assert!(matches!(
             plan.walk_segment(
-                &file,
+                &SegmentSource::File(file.clone()),
                 MessageLookup::Offset {
                     offset: 0,
                     count: BATCH_COUNT,
@@ -1689,7 +1796,7 @@ mod tests {
                 walk.position = 0;
                 assert!(matches!(
                     plan.walk_segment(
-                        &file,
+                        &SegmentSource::File(file.clone()),
                         MessageLookup::Offset {
                             offset: 0,
                             count: 2,
@@ -1756,12 +1863,14 @@ mod tests {
 
         let handle: SealedSegmentHandle = Rc::new(SealedSegmentReadState::default());
         let segment = DiskSegment {
+            remote_key: None,
             start_offset: 0,
             persisted: u64::MAX,
             read_state: Rc::clone(&handle),
             sealed: true,
         };
         let plan = DiskReadPlan {
+            remote: None,
             partition_dir: PartitionDirResolution::Resolved(dir.display().to_string()),
             bytes_per_message: None,
             widest_batch_bytes: 0,
@@ -1900,12 +2009,14 @@ mod tests {
                         oldest_resident: None,
                     },
                     disk: DiskReadPlan {
+                        remote: None,
                         partition_dir: PartitionDirResolution::Resolved(
                             directory.path().display().to_string(),
                         ),
                         bytes_per_message: None,
                         widest_batch_bytes: 0,
                         segments: vec![DiskSegment {
+                            remote_key: None,
                             start_offset: 0,
                             persisted: bytes.len() as u64,
                             read_state: Rc::default(),
@@ -1976,8 +2087,14 @@ mod tests {
         let plan = sizing_plan(Some(1), 0);
         let mut walk = DiskWalk::starting_at(0, 0);
         walk.max_bytes = 1 << 20;
-        plan.walk_segment(&file, offset_query(0), 1, bytes.len() as u64, &mut walk)
-            .await;
+        plan.walk_segment(
+            &SegmentSource::File(file.clone()),
+            offset_query(0),
+            1,
+            bytes.len() as u64,
+            &mut walk,
+        )
+        .await;
         assert_eq!(walk.matched, 1);
         assert_eq!(walk.last_matching_offset, Some(0));
         assert_eq!(
@@ -2018,12 +2135,14 @@ mod tests {
                     oldest_resident: None,
                 },
                 disk: DiskReadPlan {
+                    remote: None,
                     partition_dir: PartitionDirResolution::Resolved(
                         directory.path().display().to_string(),
                     ),
                     bytes_per_message: None,
                     widest_batch_bytes: 0,
                     segments: vec![DiskSegment {
+                        remote_key: None,
                         start_offset: 0,
                         persisted: bytes.len() as u64,
                         read_state: Rc::default(),
@@ -2127,6 +2246,142 @@ mod tests {
     const DEFAULT_MAX_READ_BYTES: usize = 16 << 20;
     const DEFAULT_WALK_BUDGET: usize = DEFAULT_MAX_READ_BYTES / 3;
 
+    /// Serves an evicted segment's bytes from memory and counts the reads.
+    /// With `failure` set, every read fails with that kind instead.
+    struct MemoryReader {
+        bytes: Vec<u8>,
+        reads: Cell<usize>,
+        failure: Option<std::io::ErrorKind>,
+    }
+
+    impl MemoryReader {
+        fn serving(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes,
+                reads: Cell::new(0),
+                failure: None,
+            }
+        }
+
+        fn failing(bytes: Vec<u8>, kind: std::io::ErrorKind) -> Self {
+            Self {
+                failure: Some(kind),
+                ..Self::serving(bytes)
+            }
+        }
+    }
+
+    impl RemoteSegmentReader for MemoryReader {
+        fn read<'a>(
+            &'a self,
+            key: &'a str,
+            position: u64,
+            len: usize,
+            object_len: u64,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<Bytes>> + 'a>> {
+            assert_eq!(key, "segment-key");
+            assert_eq!(object_len, self.bytes.len() as u64);
+            self.reads.set(self.reads.get() + 1);
+            if let Some(kind) = self.failure {
+                return Box::pin(async move { Err(std::io::Error::from(kind)) });
+            }
+            let start = usize::try_from(position).unwrap().min(self.bytes.len());
+            let end = (start + len).min(self.bytes.len());
+            let bytes = Bytes::copy_from_slice(&self.bytes[start..end]);
+            Box::pin(async move { Ok(bytes) })
+        }
+    }
+
+    fn evicted(mut plan: PollPlan, reader: Option<Rc<dyn RemoteSegmentReader>>) -> PollPlan {
+        if let PollTier::Disk { disk, .. } = &mut plan.tier {
+            disk.remote = reader;
+            disk.segments[0].sealed = true;
+            disk.segments[0].remote_key = Some(Arc::from("segment-key"));
+        }
+        plan
+    }
+
+    #[compio::test]
+    async fn given_evicted_segment_when_polling_should_read_it_from_the_remote_reader() {
+        const BATCHES: u32 = 8;
+        // No `.log` in the directory: every byte has to come from the reader.
+        let directory = tempfile::tempdir().unwrap();
+        let mut bytes = Vec::new();
+        for offset in 0..u64::from(BATCHES) {
+            bytes.extend(disk_batch(4 << 10, offset));
+        }
+        let persisted = bytes.len();
+        let reader = Rc::new(MemoryReader::serving(bytes));
+        let plan = evicted(
+            deferred_disk_poll(directory.path(), persisted, BATCHES),
+            Some(Rc::clone(&reader) as Rc<dyn RemoteSegmentReader>),
+        );
+
+        let result = plan
+            .execute_with_limit(DEFAULT_WALK_BUDGET, DEFAULT_MAX_BYTES)
+            .await
+            .checked()
+            .unwrap();
+
+        let (reply, _) = result
+            .limit_bytes(DEFAULT_MAX_BYTES, DEFAULT_MAX_READ_BYTES)
+            .unwrap();
+        assert_eq!(reply.message_count(), BATCHES);
+        assert!(reader.reads.get() > 0);
+    }
+
+    #[compio::test]
+    async fn given_evicted_segment_without_reader_when_polling_should_fail_as_transient() {
+        let directory = tempfile::tempdir().unwrap();
+        let persisted = disk_batch(4 << 10, 0).len();
+        let plan = evicted(deferred_disk_poll(directory.path(), persisted, 1), None);
+
+        let result = plan
+            .execute_with_limit(DEFAULT_WALK_BUDGET, DEFAULT_MAX_BYTES)
+            .await
+            .checked();
+
+        assert!(matches!(result, Err(IggyError::TransientNotAccepted)));
+    }
+
+    #[compio::test]
+    async fn given_store_read_error_when_polling_evicted_segment_should_map_permanence_to_the_fault()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = disk_batch(4 << 10, 0);
+        let persisted = bytes.len();
+        for (kind, reads, unreadable) in [
+            (std::io::ErrorKind::NotFound, 1, true),
+            (std::io::ErrorKind::UnexpectedEof, 1, true),
+            (std::io::ErrorKind::Unsupported, 1, true),
+            (std::io::ErrorKind::TimedOut, 1, false),
+            (std::io::ErrorKind::Other, 3, false),
+        ] {
+            let reader = Rc::new(MemoryReader::failing(bytes.clone(), kind));
+            let plan = evicted(
+                deferred_disk_poll(directory.path(), persisted, 1),
+                Some(Rc::clone(&reader) as Rc<dyn RemoteSegmentReader>),
+            );
+
+            let result = plan
+                .execute_with_limit(DEFAULT_WALK_BUDGET, DEFAULT_MAX_BYTES)
+                .await
+                .checked();
+
+            let expected = if unreadable {
+                IggyError::CannotReadMessage
+            } else {
+                IggyError::TransientNotAccepted
+            };
+            assert!(
+                matches!(&result, Err(error) if *error == expected),
+                "{kind:?}: {:?}",
+                result.err()
+            );
+            assert_eq!(reader.reads.get(), reads, "{kind:?}");
+        }
+    }
+
     /// A poll from offset 0 over the one segment in `directory`, for a
     /// partition without stats.
     fn deferred_disk_poll(directory: &std::path::Path, persisted: usize, count: u32) -> PollPlan {
@@ -2150,12 +2405,14 @@ mod tests {
                     oldest_resident: None,
                 },
                 disk: DiskReadPlan {
+                    remote: None,
                     partition_dir: PartitionDirResolution::Resolved(
                         directory.display().to_string(),
                     ),
                     bytes_per_message: None,
                     widest_batch_bytes: 0,
                     segments: vec![DiskSegment {
+                        remote_key: None,
                         start_offset: 0,
                         persisted: persisted as u64,
                         read_state: Rc::default(),

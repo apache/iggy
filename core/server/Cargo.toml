@@ -123,6 +123,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
+iggy_object_store = { workspace = true }
 journal = { workspace = true }
 jsonwebtoken = { workspace = true }
 left-right = { workspace = true }

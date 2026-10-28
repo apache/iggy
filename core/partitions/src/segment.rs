@@ -17,6 +17,7 @@
 
 use iggy_common::{IggyByteSize, IggyExpiry, IggyTimestamp};
 use std::fmt::Display;
+use std::sync::Arc;
 
 #[derive(Default, Debug, Clone)]
 pub struct Segment {
@@ -29,6 +30,9 @@ pub struct Segment {
     pub end_offset: u64,
     pub size: IggyByteSize,
     pub max_size: IggyByteSize,
+    /// Object key of the `.log` once tiered storage evicted the local copy.
+    /// The `.index` stays local, so start resolution is unchanged.
+    pub remote_key: Option<Arc<str>>,
 }
 
 impl Display for Segment {
@@ -61,6 +65,7 @@ impl Segment {
             end_offset: start_offset,
             size: IggyByteSize::default(),
             current_position: 0,
+            remote_key: None,
         }
     }
 

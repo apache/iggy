@@ -1142,6 +1142,19 @@ where
                     }
                 }
             }
+            LifecycleFrame::TierSnapshot { cursors, reply } => {
+                let _ = reply.send(self.tier_snapshot(&cursors));
+            }
+            LifecycleFrame::TierEvict {
+                namespace,
+                created_revision,
+                start_offset,
+                size,
+                key,
+            } => {
+                self.evict_to_remote(namespace, created_revision, start_offset, size, key)
+                    .await;
+            }
             LifecycleFrame::TruncatePartition {
                 namespace,
                 up_to_offset,
