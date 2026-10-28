@@ -22,11 +22,13 @@ use std::time::Duration;
 
 use tokio::signal;
 use tokio::sync::{Semaphore, broadcast};
+use tokio::time::Instant;
 use tracing::{info, warn};
 
 use iggy_gateway_kafka::auth::IggyAuthenticator;
 use iggy_gateway_kafka::bridge::{
-    DEFAULT_TOPIC_PARTITIONS, IggyBridge, IggyBridgeConfig, IggyTls, MAX_TOPIC_PARTITIONS,
+    BridgeError, DEFAULT_TOPIC_PARTITIONS, IggyBridge, IggyBridgeConfig, IggyTls,
+    MAX_TOPIC_PARTITIONS,
 };
 use iggy_gateway_kafka::env::parse_bool;
 use iggy_gateway_kafka::listener::{
@@ -50,10 +52,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .listeners
         .iter()
         .any(|listener| listener.protocol == SecurityProtocol::SaslPlaintext);
-    let bridge = connect_bridge(sasl_enabled).await?;
+    let give_up = Instant::now() + IGGY_STARTUP_LIMIT;
+    let bridge = connect_bridge(sasl_enabled, give_up).await?;
     // Loaded before the listeners bind, so no client waits in the backlog behind Iggy.
     let cluster_id = match &bridge {
-        Some(bridge) => Some(bridge.load_cluster_id().await.map_err(|e| e.to_string())?),
+        Some(bridge) => Some(
+            retry_until("load the Kafka cluster id", give_up, || {
+                bridge.load_cluster_id()
+            })
+            .await
+            .map_err(|e| e.to_string())?,
+        ),
         None => None,
     };
 
@@ -98,6 +107,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     close_bridge(bridge.as_deref()).await;
     Ok(outcome??)
+}
+
+/// How long startup waits for Iggy. A gateway can start before its Iggy node, and one connect of
+/// the bridge gives up within 15 s.
+const IGGY_STARTUP_LIMIT: Duration = Duration::from_secs(60);
+
+/// The pause between two startup attempts to reach Iggy.
+const IGGY_STARTUP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Runs `attempt` until it succeeds. An error that a retry can fix starts a new attempt, until
+/// `give_up`.
+async fn retry_until<T, Attempt>(
+    what: &str,
+    give_up: Instant,
+    mut attempt: impl FnMut() -> Attempt,
+) -> Result<T, BridgeError>
+where
+    Attempt: Future<Output = Result<T, BridgeError>>,
+{
+    loop {
+        match attempt().await {
+            Err(error)
+                if error.is_retriable()
+                    && Instant::now() + IGGY_STARTUP_RETRY_INTERVAL < give_up =>
+            {
+                warn!("cannot {what} yet, retrying in {IGGY_STARTUP_RETRY_INTERVAL:?}: {error}");
+                tokio::time::sleep(IGGY_STARTUP_RETRY_INTERVAL).await;
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 /// How long shutdown waits for the Iggy clients to sign out. The connection drain before it can
@@ -200,10 +240,13 @@ fn reject_unknown_kafka_env_vars() -> Result<(), String> {
 /// Connects the Iggy bridge when `IGGY_KAFKA_BRIDGE_ENABLED` is true, otherwise returns `None`
 /// and every handler keeps answering with its stub.
 ///
-/// Off by default, so wiring one API at a time does not change what an operator sees. A failed
-/// connect is fatal: an operator who turned the bridge on must learn it is unreachable at
-/// startup, not from `NOT_LEADER_OR_FOLLOWER` on every produce.
-async fn connect_bridge(sasl_enabled: bool) -> Result<Option<Arc<IggyBridge>>, String> {
+/// Off by default, so wiring one API at a time does not change what an operator sees. A connect
+/// that still fails at `give_up` is fatal: an operator who turned the bridge on must learn it is
+/// unreachable at startup, not from `NOT_LEADER_OR_FOLLOWER` on every produce.
+async fn connect_bridge(
+    sasl_enabled: bool,
+    give_up: Instant,
+) -> Result<Option<Arc<IggyBridge>>, String> {
     if !bridge_enabled()? {
         let set: Vec<&str> = IggyBridgeConfig::KNOWN_ENV_VARS
             .iter()
@@ -234,9 +277,11 @@ async fn connect_bridge(sasl_enabled: bool) -> Result<Option<Arc<IggyBridge>>, S
              in the clear; set IGGY_KAFKA_IGGY_TLS_ENABLED=true to encrypt it"
         );
     }
-    let bridge = IggyBridge::connect(config)
-        .await
-        .map_err(|e| format!("failed to connect the Iggy bridge: {e}"))?;
+    let bridge = retry_until("connect the Iggy bridge", give_up, || {
+        IggyBridge::connect(config.clone())
+    })
+    .await
+    .map_err(|e| format!("failed to connect the Iggy bridge: {e}"))?;
     info!("Iggy bridge connected");
     Ok(Some(Arc::new(bridge)))
 }
