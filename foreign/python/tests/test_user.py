@@ -403,8 +403,10 @@ class TestLoginIdentity:
                 if client is not None:
                     await client.shutdown()
         finally:
-            _delete_if_present(api, jwt, name)
-            _delete_personal_access_token(api, jwt, helper_name)
+            try:
+                _delete_if_present(api, jwt, name)
+            finally:
+                _delete_personal_access_token(api, jwt, helper_name)
 
     @pytest.mark.asyncio
     async def test_create_personal_access_token_rejects_empty_name(
@@ -438,8 +440,47 @@ class TestLoginIdentity:
                 )
             assert clash.value.code == 51
         finally:
-            _delete_if_present(api, jwt, name)
-            _delete_personal_access_token(api, jwt, helper_name)
+            try:
+                _delete_if_present(api, jwt, name)
+            finally:
+                _delete_personal_access_token(api, jwt, helper_name)
+
+    @pytest.mark.asyncio
+    async def test_create_personal_access_token_refuses_empty_name_on_every_transport(
+        self, transport_client: IggyClient
+    ):
+        """Test that every transport refuses an empty token name with an error."""
+        with pytest.raises(IggyError):
+            await transport_client.create_personal_access_token(
+                "", IggyExpiry.NeverExpire()
+            )
+
+    @pytest.mark.asyncio
+    async def test_create_personal_access_token_refuses_duplicate_on_every_transport(
+        self, transport_client: IggyClient, unique_name
+    ):
+        """Test that every transport refuses a second token with the same name."""
+        name = unique_name(min_bytes=16, max_bytes=30)
+        helper_name = unique_name(min_bytes=16, max_bytes=30)
+        http_host, http_port = get_http_server_config()
+        api = f"http://{http_host}:{http_port}"
+        jwt, _ = _create_personal_access_token(
+            api, "iggy", "iggy", helper_name, NEVER_EXPIRE
+        )
+
+        try:
+            await transport_client.create_personal_access_token(
+                name, IggyExpiry.NeverExpire()
+            )
+            with pytest.raises(IggyError):
+                await transport_client.create_personal_access_token(
+                    name, IggyExpiry.NeverExpire()
+                )
+        finally:
+            try:
+                _delete_if_present(api, jwt, name)
+            finally:
+                _delete_personal_access_token(api, jwt, helper_name)
 
     @pytest.mark.parametrize(
         "token",

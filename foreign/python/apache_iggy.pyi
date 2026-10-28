@@ -1372,13 +1372,14 @@ class IggyClient:
 
         On TCP, QUIC, and WebSocket, a replayed create that already committed, or
         a name clash, raises `RuntimeError` with code 51
-        (`PersonalAccessTokenAlreadyExists`). On HTTP, the same case raises
+        (`PersonalAccessTokenAlreadyExists`). On HTTP, a name clash raises
         `RuntimeError` with code 300. Code 300 is also the generic HTTP error, so
         read the message to tell a name clash from other failures.
 
-        If the token was created, its secret cannot be recovered. Do not delete a
-        token by name after code 51, because code 51 can also mean a token that
-        existed before this call. Create the token again under a new name instead.
+        If the token was created, its secret cannot be recovered. To get a usable
+        secret, delete the token by name and create it again. Code 51 can also
+        mean a token that existed before this call, so delete only a token that
+        this call created.
 
         Args:
             name: Token name as `str`.
@@ -1392,9 +1393,8 @@ class IggyClient:
             RuntimeError: If the server refuses the request, for example because
                 the expiry is too far in the future. On an authenticated client, an
                 empty name, or a name over 255 bytes, raises code 4 on TCP, QUIC,
-                and WebSocket, before anything is sent. On HTTP, the
-                server refuses it with code 300, which is also the generic HTTP
-                error. Read the message to find the cause.
+                and WebSocket, before anything is sent. The server rejects a name
+                outside 3 to 30 bytes with code 50.
             PendingOperationError: If the reply is lost on TCP, QUIC, or WebSocket.
                 See above.
         """
