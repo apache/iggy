@@ -85,6 +85,17 @@ def _create_personal_access_token(
     return jwt, personal_access_token
 
 
+def _login_jwt(api: str, username: str, password: str) -> str:
+    login_req = urllib.request.Request(  # noqa: S310
+        f"{api}/users/login",
+        data=json.dumps({"username": username, "password": password}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(login_req, timeout=10) as response:  # noqa: S310
+        return json.loads(response.read())["access_token"]["token"]
+
+
 def _delete_personal_access_token(api: str, jwt: str, name: str) -> None:
     delete_req = urllib.request.Request(  # noqa: S310
         f"{api}/personal-access-tokens/{name}",
@@ -375,12 +386,9 @@ class TestLoginIdentity:
     ):
         """Test that a token created through the client logs in as the same user."""
         name = unique_name(min_bytes=16, max_bytes=30)
-        helper_name = unique_name(min_bytes=16, max_bytes=30)
         http_host, http_port = get_http_server_config()
         api = f"http://{http_host}:{http_port}"
-        jwt, _ = _create_personal_access_token(
-            api, "iggy", "iggy", helper_name, NEVER_EXPIRE
-        )
+        jwt = _login_jwt(api, "iggy", "iggy")
 
         try:
             personal_access_token = await iggy_client.create_personal_access_token(
@@ -403,10 +411,7 @@ class TestLoginIdentity:
                 if client is not None:
                     await client.shutdown()
         finally:
-            try:
-                _delete_if_present(api, jwt, name)
-            finally:
-                _delete_personal_access_token(api, jwt, helper_name)
+            _delete_if_present(api, jwt, name)
 
     @pytest.mark.asyncio
     async def test_create_personal_access_token_rejects_empty_name(
@@ -423,12 +428,9 @@ class TestLoginIdentity:
     ):
         """Test that a second token with the same name raises code 51."""
         name = unique_name(min_bytes=16, max_bytes=30)
-        helper_name = unique_name(min_bytes=16, max_bytes=30)
         http_host, http_port = get_http_server_config()
         api = f"http://{http_host}:{http_port}"
-        jwt, _ = _create_personal_access_token(
-            api, "iggy", "iggy", helper_name, NEVER_EXPIRE
-        )
+        jwt = _login_jwt(api, "iggy", "iggy")
 
         try:
             await iggy_client.create_personal_access_token(
@@ -440,10 +442,7 @@ class TestLoginIdentity:
                 )
             assert clash.value.code == 51
         finally:
-            try:
-                _delete_if_present(api, jwt, name)
-            finally:
-                _delete_personal_access_token(api, jwt, helper_name)
+            _delete_if_present(api, jwt, name)
 
     @pytest.mark.asyncio
     async def test_create_personal_access_token_refuses_empty_name_on_every_transport(
@@ -461,12 +460,9 @@ class TestLoginIdentity:
     ):
         """Test that every transport refuses a second token with the same name."""
         name = unique_name(min_bytes=16, max_bytes=30)
-        helper_name = unique_name(min_bytes=16, max_bytes=30)
         http_host, http_port = get_http_server_config()
         api = f"http://{http_host}:{http_port}"
-        jwt, _ = _create_personal_access_token(
-            api, "iggy", "iggy", helper_name, NEVER_EXPIRE
-        )
+        jwt = _login_jwt(api, "iggy", "iggy")
 
         try:
             await transport_client.create_personal_access_token(
@@ -477,10 +473,7 @@ class TestLoginIdentity:
                     name, IggyExpiry.NeverExpire()
                 )
         finally:
-            try:
-                _delete_if_present(api, jwt, name)
-            finally:
-                _delete_personal_access_token(api, jwt, helper_name)
+            _delete_if_present(api, jwt, name)
 
     @pytest.mark.parametrize(
         "token",
@@ -515,11 +508,7 @@ class TestLoginIdentity:
             with pytest.raises(RuntimeError):
                 await client.login_with_personal_access_token(personal_access_token)
         finally:
-            try:
-                _delete_personal_access_token(api, jwt, name)
-            except urllib.error.HTTPError as error:
-                if error.code != 404:
-                    raise
+            _delete_if_present(api, jwt, name)
 
     @pytest.mark.asyncio
     async def test_deleted_personal_access_token_fails(self, unique_name):

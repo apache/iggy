@@ -1348,55 +1348,22 @@ class IggyClient:
         self, name: builtins.str, expiry: IggyExpiry
     ) -> collections.abc.Awaitable[str]:
         r"""
-        Create a personal access token for the currently authenticated user.
+        Creates a personal access token for the authenticated user.
 
-        The token is returned only once, so store it when this call completes.
-        `IggyExpiry.ServerDefault()` and `IggyExpiry.NeverExpire()` create a token
-        that never expires.
-
-        Cancelling the await can leave the token created, and its secret is lost.
-        No error is raised. A later metadata call on the same client raises
-        `PendingOperationError` with kind `lane_blocked`, unless the client
-        reconnects first.
-
-        The Python SDK cannot delete a token yet. To delete one, call the server's
-        HTTP API with its name. That call needs a login token.
-
-        On TCP, QUIC, and WebSocket, a lost reply raises `PendingOperationError`
-        with `operation_id`. Call `resolve_operation` with that ID to learn the
-        outcome. When `kind` is `lane_blocked`, `operation_id` names an earlier
-        metadata operation, not this token.
-
-        On HTTP, a lost reply raises `RuntimeError` with code 57, and the token may
-        exist. HTTP has no `resolve_operation`.
-
-        On TCP, QUIC, and WebSocket, a replayed create that already committed, or
-        a name clash, raises `RuntimeError` with code 51
-        (`PersonalAccessTokenAlreadyExists`). On HTTP, a name clash raises
-        `RuntimeError` with code 300. Code 300 is also the generic HTTP error, so
-        read the message to tell a name clash from other failures.
-
-        If the token was created, its secret cannot be recovered. To get a usable
-        secret, delete the token by name and create it again. Code 51 can also
-        mean a token that existed before this call, so delete only a token that
-        this call created.
-
-        Args:
-            name: Token name as `str`.
-            expiry: Token expiry as `IggyExpiry`.
+        The token is returned once, so store it when the call completes.
+        `IggyExpiry.ServerDefault()` and `IggyExpiry.NeverExpire()` create a
+        token that never expires.
 
         Returns:
             An awaitable that resolves to the raw token as `str`.
 
         Raises:
             ValueError: If the expiry is invalid.
-            RuntimeError: If the server refuses the request, for example because
-                the expiry is too far in the future. On an authenticated client, an
-                empty name, or a name over 255 bytes, raises code 4 on TCP, QUIC,
-                and WebSocket, before anything is sent. The server rejects a name
-                outside 3 to 30 bytes with code 50.
             PendingOperationError: If the reply is lost on TCP, QUIC, or WebSocket.
-                See above.
+            RuntimeError: If the server refuses the request. On TCP, QUIC, and
+                WebSocket, an empty name or a name over 255 bytes raises code 4
+                before anything is sent. On HTTP, a name outside 3 to 30 bytes is
+                refused with code 300.
         """
     def get_user(
         self, user_id: builtins.str | builtins.int
