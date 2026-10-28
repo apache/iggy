@@ -140,7 +140,7 @@ pub async fn dispatch(
         API_KEY_FIND_COORDINATOR => {
             find_coordinator::handle(state, connection, api_version, body).await
         }
-        API_KEY_JOIN_GROUP => join_group::handle(state, api_version, body).await,
+        API_KEY_JOIN_GROUP => join_group::handle(state, connection, api_version, body).await,
         API_KEY_HEARTBEAT => heartbeat::handle(state, connection, api_version, body).await,
         API_KEY_LEAVE_GROUP => leave_group::handle(state, api_version, body).await,
         API_KEY_SYNC_GROUP => sync_group::handle(state, api_version, body).await,

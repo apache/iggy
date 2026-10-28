@@ -1553,6 +1553,80 @@ fn consume_as_static_member(gateway: SocketAddr, count: usize) -> String {
     .expect_ran("java console consumer as a static member")
 }
 
+/// `kafka-consumer-groups --describe --members` shows the client id and host of each member, as
+/// Kafka does (#4511). A static member stays in its group for its whole session after its
+/// consumer exits, so the tool still finds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_java_consumer_when_describing_the_members_should_show_its_client_id_and_host() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway, &RECORDS);
+    let consumed = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            &gateway.to_string(),
+            "--topic",
+            TOPIC,
+            "--group",
+            "e2e-members",
+            "--consumer-property",
+            "group.instance.id=e2e-members-0",
+            "--consumer-property",
+            "client.id=e2e-members-client",
+            "--consumer-property",
+            "session.timeout.ms=60000",
+            "--from-beginning",
+            "--max-messages",
+            &RECORDS.len().to_string(),
+            "--timeout-ms",
+            "20000",
+            "--property",
+            "print.offset=true",
+            "--property",
+            "print.key=true",
+        ],
+        &[],
+    )
+    .expect_ran("java console consumer with a client id");
+    assert_eq!(
+        records_read(&consumed).len(),
+        RECORDS.len(),
+        "the consumer must join the group and read every record, got: {consumed}"
+    );
+
+    let described = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-consumer-groups.sh",
+            "--bootstrap-server",
+            &gateway.to_string(),
+            "--describe",
+            "--group",
+            "e2e-members",
+            "--members",
+        ],
+        &[],
+    )
+    .expect_ran("kafka-consumer-groups --describe --members");
+    // GROUP, CONSUMER-ID, GROUP-INSTANCE-ID, HOST, CLIENT-ID, then #PARTITIONS. Matched as a
+    // run of fields, as the reset test above does.
+    let fields: Vec<&str> = described.split_whitespace().collect();
+    let shown = fields.windows(5).any(|row| {
+        row[0] == "e2e-members"
+            && row[1].starts_with("e2e-members-0-")
+            && row[2] == "e2e-members-0"
+            && row[3] == "/127.0.0.1"
+            && row[4] == "e2e-members-client"
+    });
+    assert!(
+        shown,
+        "the member must show its client id and host, got: {described}"
+    );
+}
+
 /// KIP-345 with librdkafka, which sends `JoinGroup` below v9: the returning member is told the
 /// previous leader, acts as a follower, and gets its old assignment back through `SyncGroup`.
 /// Without replacement the second run would wait on a rebalance its old incarnation never rejoins.
