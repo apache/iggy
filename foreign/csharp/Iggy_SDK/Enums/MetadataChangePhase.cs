@@ -15,15 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::cache::connection::ShardedState;
+namespace Apache.Iggy.Enums;
 
-/// Allocation strategy that produces deltas for a specific sharded state type.
-pub trait AllocationStrategy<SS>
-where
-    SS: ShardedState,
+/// <summary>
+///     Whether a metadata changes answer pages change records or current state items.
+/// </summary>
+public enum MetadataChangePhase : byte
 {
-    fn allocate(&self, entry: SS::Entry) -> Option<SS::Delta>;
-    fn deallocate(&self, entry: SS::Entry) -> Option<SS::Delta>;
-}
+    /// <summary>Change records, the answer to earliest, latest and after.</summary>
+    Changes = 0,
 
-pub mod connection;
+    /// <summary>Current state items, the answer to current.</summary>
+    Current = 1
+}

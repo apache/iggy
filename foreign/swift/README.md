@@ -14,8 +14,9 @@ The SDK is built up in stages. The client is a TCP connection with optional TLS 
 speaks the consensus protocol, signs in, keeps the session alive with a heartbeat,
 reconnects, and follows the cluster leader. It manages streams, topics, partitions,
 segments, users, personal access tokens, and consumer groups, sends and polls messages,
-stores consumer offsets, and produces with a batching producer. The consumer, examples,
-and BDD scenarios follow in later changes.
+stores consumer offsets, produces with a batching producer, and consumes with a
+consumer that tracks and commits its position. Examples and BDD scenarios follow in
+later changes.
 
 Swift supports the consensus wire protocol and checks commitment proof during
 automatic retries. It does not yet expose retained-operation resolve/abandon APIs,
@@ -124,6 +125,67 @@ try await client.updateTopic(streamID: "payments-v2", topicID: "orders", options
 `StreamCreateOptions.encryptionKey` gives the stream its own data key. It must be 32 random bytes, never derived from a password. It travels inside the create request over whatever transport the client uses, so protecting it in transit with TLS is the caller's choice.
 
 The server stores it wrapped and never returns it: reads report `encryptionKeySource`, `encryptionKeyFingerprint`, and `encryptionKekFingerprints`, and `EncryptionKey.fingerprint(_:)` computes the fingerprint of a key to compare. Without a key, a server with encryption enabled generates one for the stream.
+
+### Metadata changes
+
+`getMetadataChanges(_:)` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed, or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manageServers` permission:
+
+```swift
+func follow(_ client: IggyClient, groups: [MetadataChangeGroup]) async throws {
+    var query = MetadataChangesQuery(start: .latest, groups: groups)
+    while true {
+        let page = try await client.getMetadataChanges(query)
+        switch page.status {
+        case .ok:
+            for record in page.records {
+                print("op \(record.op) by \(String(describing: record.actorUserID)): \(record.change)")
+            }
+            if let next = page.next {
+                query.start = .after(next)
+            }
+            if !page.hasMore {
+                try await Task.sleep(for: .seconds(1))
+            }
+        case .behind:
+            try await Task.sleep(for: .milliseconds(100))
+        case .expired, .reset:
+            query.start = try await rebuild(client, groups: groups)
+        }
+    }
+}
+
+/// Pages the current state, then returns the position to follow from.
+func rebuild(_ client: IggyClient, groups: [MetadataChangeGroup]) async throws -> MetadataChangeStart {
+    var query = MetadataChangesQuery(start: .current(nil), groups: groups)
+    while true {
+        let page = try await client.getMetadataChanges(query)
+        switch page.status {
+        case .ok:
+            break
+        case .behind:
+            try await Task.sleep(for: .milliseconds(100))
+            continue
+        case .expired, .reset:
+            query.start = .current(nil)
+            continue
+        }
+        for item in page.items {
+            print(item)
+        }
+        if let token = page.currentPageToken {
+            query.start = .current(token)
+        } else if let anchor = page.next {
+            return .after(anchor)
+        } else {
+            query.start = .current(nil)
+        }
+    }
+}
+```
+
+`expired` means the log no longer holds the history after the cursor, and `reset` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return. A cursor persists as its `description`, `mc1_` and 59 characters of unpadded Base64url, and `MetadataChangeCursor(text:)` reads it back.
+
+Current pages need the parent groups of every selected group, for example `topics` with `streams`. Keep a rebuilt state private until a change page answers `ok` with `hasMore` false and a `headOp` at or above the last current page's. An invalid query fails with `invalidCommand` before anything is sent. A record of a kind this build does not know arrives as `.unknown(group:kind:body:)` with its codes and raw body, and records carry option values as the read routes return them, never key material.
 
 ### Reconnection
 
@@ -261,6 +323,46 @@ written in order. A topic addressed by name and by numeric id counts as two, and
 failed request does not hold back the ones after it, so a resend from `errorHandler`
 lands behind them.
 
+### Consumer
+
+`IggyConsumer` reads one topic and hands its messages over one at a time. A standalone
+consumer reads one partition; a member of a consumer group reads the partitions the
+server assigns, joining the group in `initialize()`:
+
+```swift
+let consumer = try client.consumerGroup(name: "billing", streamID: "orders", topicID: "created")
+try await consumer.initialize()
+for try await received in consumer {
+    print(received.partitionID, received.message.offset, received.message.payloadString)
+}
+```
+
+A poll refills the buffer once it runs empty. `pollingStrategy` says where reading a
+partition starts, and each later poll of it continues after the last message handed over
+from it. The exception is `.next` with an `autoCommit` that commits with every poll, as in
+the default configuration. That poll starts after the offset that the previous poll
+stored. A failed poll is thrown after the retry
+interval and leaves the consumer usable, so a caller of `next()` can call it again, and
+`consumeMessages(_:)` logs it and keeps reading until the client cannot come back on its
+own. Without `allowReplay` a message at or below the last one handed over from the same
+partition history is skipped.
+
+`autoCommit` decides when the position is stored. The default commits with every poll,
+before the batch is handed over, and on a one-second interval; `.disabled` leaves it to
+`storePosition(_:)` with the position of a `ReceivedMessage`, the only setting under which a
+message whose handling failed comes back on the next run. `shutdown()` sends the queued
+commits, stores the reading position of every partition read unless auto-commit is
+disabled, and leaves the group.
+
+Unlike the Rust consumer this one has no encryptor, and it does not resolve a group create
+or join whose reply was lost, since the Swift client has no operation lanes yet.
+
+### Raw requests
+
+`sendRawRequest(code:payload:)` sends a command code with an encoded payload and returns the raw reply body. `sendRawRequest(code:payload:replica:)` sends it to one node of a cluster, named by the replica id that cluster metadata returns.
+
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, consumer-offset reads and session-control codes fail with `invalidCommand` before anything is sent. An id that cluster metadata does not name fails with `invalidIdentifier`. An unreachable node is retried until the request timeout, and `notPrimary` is returned rather than sent to another node.
+
 ### Errors
 
 Every client operation throws `IggyError`, a value carrying the typed `code`
@@ -344,7 +446,9 @@ The hash, error-code, model, request, reply, and consensus header tests compare 
 cargo run --manifest-path Tools/golden-vectors/Cargo.toml -- Tests/IggyTests/Fixtures/golden.json
 ```
 
-The resource options tests compare against `Tests/IggyTests/Fixtures/resource_options.json`, the fixture every SDK shares, generated by `core/common/examples/resource_options_fixtures.rs`. Never edit the copy.
+The resource options tests compare against `Tests/IggyTests/Fixtures/resource_options.json`, the fixture every SDK shares, generated by `core/common/examples/resource_options_fixtures.rs`. Never edit the copy. The metadata changes tests do the same with `Tests/IggyTests/Fixtures/metadata_changes.json`, generated by `core/common/examples/metadata_changes_fixtures.rs`.
+
+The metadata changes scenario that churns the change log past its capacity runs only when `IGGY_METADATA_CHANGE_LOG_RESOURCE_CAPACITY` is set for both the server and the test run, for example to 64.
 
 ## Contributing
 

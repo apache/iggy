@@ -180,7 +180,6 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///     .consumer("consumer_name", "stream_name", "topic_name", 1)?
 ///     .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
 ///     .polling_strategy(PollingStrategy::next())
-///     .poll_interval(IggyDuration::ONE_SECOND)
 ///     .batch_length(1000)
 ///     .build();
 /// consumer.init().await?;
@@ -649,7 +648,6 @@ impl IggyClient {
     ///     .consumer("consumer_name", "stream_name", "topic_name", 1)? // returns IggyConsumerBuilder from IggyClient
     ///     .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
     ///     .polling_strategy(PollingStrategy::next())
-    ///     .poll_interval(IggyDuration::ONE_SECOND)
     ///     .batch_length(1000)
     ///     .build(); // returns IggyConsumer from IggyConsumerBuilder
     /// # let _ = consumer;
@@ -679,7 +677,6 @@ impl IggyClient {
             Identifier::named(topic)?,
             Some(partition),
             self.encryptor.clone(),
-            None,
         ))
     }
 
@@ -721,7 +718,6 @@ impl IggyClient {
     ///     .consumer_group("group_name", "stream_name", "topic_name")? // returns IggyConsumerBuilder from IggyClient
     ///     .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
     ///     .polling_strategy(PollingStrategy::next())
-    ///     .poll_interval(IggyDuration::ONE_SECOND)
     ///     .batch_length(1000)
     ///     .build(); // returns IggyConsumer from IggyConsumerBuilder
     /// # let _ = consumer;
@@ -750,7 +746,6 @@ impl IggyClient {
             Identifier::named(topic)?,
             None,
             self.encryptor.clone(),
-            None,
         ))
     }
 
@@ -915,6 +910,74 @@ impl IggyClient {
             ClientWrapper::Tcp(client) => client.send_raw_with_response(code, payload).await,
             ClientWrapper::Quic(client) => client.send_raw_with_response(code, payload).await,
             ClientWrapper::WebSocket(client) => client.send_raw_with_response(code, payload).await,
+            ClientWrapper::Http(_) | ClientWrapper::Iggy(_) => Err(IggyError::FeatureUnavailable),
+        })
+    }
+
+    /// Sends a raw request to the replica `replica_id` and returns its raw
+    /// reply body.
+    ///
+    /// [`send_binary_request`](IggyClient::send_binary_request) lets the client
+    /// pick the replica, the metadata primary for any command it does not
+    /// route by partition. This function sends to the replica the caller names,
+    /// for example to read the stats each node keeps for itself. Replica ids
+    /// are the ones [`get_cluster_metadata`](crate::prelude::ClusterClient::get_cluster_metadata)
+    /// returns. The request carries the session's metadata watermark, so the
+    /// replica answers once it applied the metadata the session saw. The reply
+    /// is that replica's own, a refusal such as [`IggyError::NotPrimary`]
+    /// included: nothing is retried on another replica. A replica that is
+    /// reconnecting is waited for within the operation deadline.
+    ///
+    /// # Examples
+    ///
+    /// Read the stats of replica 1.
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    /// use iggy_binary_protocol::codes::GET_STATS_CODE;
+    /// use bytes::Bytes;
+    ///
+    /// # async fn run() -> Result<(), IggyError> {
+    /// let client = IggyClient::from_connection_string(
+    ///     "iggy+tcp://user:secret@localhost:8090",
+    /// )?;
+    /// client.connect().await?;
+    ///
+    /// let stats = client
+    ///     .send_binary_request_to_replica(GET_STATS_CODE, Bytes::new(), 1)
+    ///     .await?;
+    /// # let _ = stats;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    /// [`IggyError::InvalidCommand`] before anything is sent if `code` is a
+    /// session-control code, a replicated command, a poll, a readiness wait, a
+    /// deferred-request cancel, or a consumer-offset read. Writes and partition reads reach their primary through the typed
+    /// API and [`send_binary_request`](IggyClient::send_binary_request).
+    /// [`IggyError::InvalidIdentifier`] if the roster does not name
+    /// `replica_id`, or names it without an endpoint for this transport.
+    /// [`IggyError::TransientNotAccepted`] if the replica stays unreachable
+    /// until the deadline. [`IggyError::TransientNotCommitted`] if a link was
+    /// lost after the request was written and no later attempt got a reply,
+    /// because the replica may have run it. [`IggyError::FeatureUnavailable`]
+    /// on the HTTP transport, which has no binary path.
+    pub async fn send_binary_request_to_replica(
+        &self,
+        code: u32,
+        payload: Bytes,
+        replica_id: u8,
+    ) -> Result<Bytes, IggyError> {
+        if SESSION_CONTROL_CODES.contains(&code) {
+            return Err(IggyError::InvalidCommand);
+        }
+        super::with_client!(self, client => match &*client {
+            ClientWrapper::Tcp(client) => client.send_raw_to_replica(code, payload, replica_id).await,
+            ClientWrapper::Quic(client) => client.send_raw_to_replica(code, payload, replica_id).await,
+            ClientWrapper::WebSocket(client) => {
+                client.send_raw_to_replica(code, payload, replica_id).await
+            }
             ClientWrapper::Http(_) | ClientWrapper::Iggy(_) => Err(IggyError::FeatureUnavailable),
         })
     }

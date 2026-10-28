@@ -2222,6 +2222,9 @@ fn stamp_metadata_watermark(
 }
 
 #[cfg(test)]
+mod slow_replica_tests;
+
+#[cfg(test)]
 mod stale_prepare_commit_tests;
 
 #[cfg(test)]
@@ -16171,6 +16174,14 @@ mod probe_answer_divergence_tests {
             report.ops_compared > 0,
             "no committed metadata op was witnessed on two replicas, so this seed \
              would pass on a diverged cluster"
+        );
+        assert!(
+            report.change_records_compared > 0,
+            "no change record was compared between replicas"
+        );
+        assert!(
+            report.projection_items_compared > 0,
+            "the leader's change records were never replayed against its current state"
         );
     }
 }

@@ -294,13 +294,23 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
                 table.end_session(CLIENT, USER, table.get_epoch(CLIENT).unwrap(), 100);
             }
             Change::Leave => {
-                streams.remove_consumer_group_member(CLIENT, IggyTimestamp::default(), 0);
+                streams.remove_consumer_group_member(CLIENT, IggyTimestamp::default(), 0, None);
             }
             Change::OtherLeave => {
-                streams.remove_consumer_group_member(OTHER_CLIENT, IggyTimestamp::default(), 0);
+                streams.remove_consumer_group_member(
+                    OTHER_CLIENT,
+                    IggyTimestamp::default(),
+                    0,
+                    None,
+                );
             }
             Change::MissingLeave => {
-                streams.remove_consumer_group_member(OTHER_CLIENT + 1, IggyTimestamp::default(), 0);
+                streams.remove_consumer_group_member(
+                    OTHER_CLIENT + 1,
+                    IggyTimestamp::default(),
+                    0,
+                    None,
+                );
             }
             Change::Rejoin => apply_poll_metadata(
                 &owner,
@@ -1357,7 +1367,7 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
                     .unwrap();
             }
             Change::Leave => {
-                streams.remove_consumer_group_member(PARENT, IggyTimestamp::default(), 0);
+                streams.remove_consumer_group_member(PARENT, IggyTimestamp::default(), 0, None);
             }
             Change::Delete => apply_poll_metadata(
                 &owner,
@@ -1814,7 +1824,7 @@ async fn given_metadata_transfer_when_target_is_unavailable_should_retry_only_un
             captured.borrow_mut().push((peer, frame));
             Ok(())
         }));
-        assert!(bus.owner_table().try_claim(PEER, 1));
+        crate::test_support::connect_replica_on(&bus, PEER, 1);
         let dir = tempfile::tempdir().unwrap();
         let journal = PrepareJournal::open(&dir.path().join("metadata.wal"), 0)
             .await
@@ -2590,7 +2600,7 @@ fn gap_stopped_backup(
         Ok(())
     }));
     for peer in 1..5 {
-        assert!(bus.owner_table().try_claim(peer, 1));
+        crate::test_support::connect_replica_on(&bus, peer, 1);
     }
     let config = partitions_config();
     let metadata = IggyMetadata::new(None, None, None, None, PollTestMetadata::default(), None);
@@ -2685,7 +2695,7 @@ async fn gap_stopped_metadata_backup(commit_max: u64) -> (CompletionTestShard, t
     let bus = Rc::new(IggyMessageBus::new(0));
     bus.set_replica_forward_fn(Box::new(|_, _, _| Ok(())));
     for peer in 1..5 {
-        assert!(bus.owner_table().try_claim(peer, 1));
+        crate::test_support::connect_replica_on(&bus, peer, 1);
     }
     let dir = tempfile::tempdir().unwrap();
     let journal = PrepareJournal::open(&dir.path().join("metadata.wal"), 0)

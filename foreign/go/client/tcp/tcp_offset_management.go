@@ -69,6 +69,6 @@ func (c *IggyTcpClient) DeleteConsumerOffset(ctx context.Context, consumer iggco
 }
 
 func (c *IggyTcpClient) writeOffset(ctx context.Context, cmd command.Command, captured *iggcon.PartitionContext) error {
-	_, err := c.doCaptured(ctx, cmd, captured)
+	_, err := c.doCaptured(ctx, cmd, captured, nil)
 	return err
 }

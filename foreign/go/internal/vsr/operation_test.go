@@ -76,6 +76,7 @@ func TestOperationForCode_FallsBackToNonReplicated(t *testing.T) {
 		command.GetStatsCode,
 		command.GetSnapshotFileCode,
 		command.GetClusterMetadataCode,
+		command.GetMetadataChangesCode,
 		command.PollMessagesCode,
 		command.GetOffsetCode,
 		command.GetStreamCode,

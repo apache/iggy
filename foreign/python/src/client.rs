@@ -42,6 +42,9 @@ use crate::consumer::{
 };
 use crate::duration::{py_delta_to_iggy_duration, reject_zero};
 use crate::identifier::PyIdentifier;
+use crate::metadata_changes::{
+    MetadataChangeGroup, MetadataChangeStart, MetadataChanges, validated_query,
+};
 use crate::options::OptionSpec as PyOptionSpec;
 use crate::partitioning::PyPartitioning;
 use crate::permissions::Permissions as PyPermissions;
@@ -342,6 +345,54 @@ impl IggyClient {
                 .into_iter()
                 .map(PyOptionSpec::from)
                 .collect::<Vec<_>>())
+        })
+    }
+
+    /// Reads one page of the metadata change log, or of the current state.
+    ///
+    /// Requires root or the global `manage_servers` permission. Keep the
+    /// page's `next` cursor and send it back in `MetadataChangeStart.After`.
+    ///
+    /// Args:
+    ///     start: Where to start, as `MetadataChangeStart`.
+    ///     groups: The groups to read as `list[MetadataChangeGroup] | None`.
+    ///         `None` or an empty list reads every group. A current state scan
+    ///         needs the parent groups of each group, for example `Topics`
+    ///         with `Streams`.
+    ///     since: Keep records prepared at or after this Unix time in
+    ///         microseconds. Only with `Earliest` and `After`.
+    ///     until: Keep records prepared at or before this Unix time in
+    ///         microseconds. Only with `Earliest` and `After`.
+    ///     limit: Records or items per page, 1 to 1000. Defaults to 100.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `MetadataChanges`.
+    ///
+    /// Raises:
+    ///     IggyError: With the invalid command code before anything is sent
+    ///         when the query is refused, or when the request fails. A user
+    ///         without the permission gets the unauthorized code.
+    #[pyo3(signature = (start, *, groups=None, since=None, until=None, limit=None))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[MetadataChanges]", imports=("collections.abc")))]
+    fn get_metadata_changes<'a>(
+        &self,
+        py: Python<'a>,
+        start: &MetadataChangeStart,
+        #[gen_stub(override_type(type_repr = "builtins.list[MetadataChangeGroup] | None"))]
+        groups: Option<Vec<MetadataChangeGroup>>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] since: Option<u64>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] until: Option<u64>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] limit: Option<u32>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let query = validated_query(start, groups, since, until, limit)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let changes = inner
+                .get_metadata_changes(&query)
+                .await
+                .map_err(to_runtime_error)?;
+            MetadataChanges::try_from(changes)
         })
     }
 
@@ -1722,10 +1773,11 @@ impl IggyClient {
     /// Creates a new consumer group consumer.
     /// `partition_id` is ignored for a consumer group: the member reads the partitions
     /// the server assigns to it.
+    /// `auto_commit` defaults to `AutoCommit.Disabled()`: the consumer stores no offset,
+    /// so store positions after processing, or each restart reads the same messages again.
     /// Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
-    /// `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
-    /// `AutoCommit` interval is negative, or if any of those except `poll_interval`
-    /// is zero.
+    /// `polling_retry_interval`, `init_retry_interval` or an `AutoCommit` interval
+    /// is negative or zero.
     ///
     /// Consumer groups are not available over HTTP. With `auto_join_consumer_group`
     /// left on, this call fails at the join with `Feature is unavailable`.
@@ -1746,7 +1798,7 @@ impl IggyClient {
         auto_commit=None,
         create_consumer_group_if_not_exists=true,
         auto_join_consumer_group=true,
-        poll_interval=None,
+        *,
         polling_retry_interval=None,
         init_retries=None,
         init_retry_interval=None,
@@ -1769,8 +1821,6 @@ impl IggyClient {
         >,
         create_consumer_group_if_not_exists: bool,
         auto_join_consumer_group: bool,
-        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
-        poll_interval: Option<Py<PyDelta>>,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         polling_retry_interval: Option<Py<PyDelta>>,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] init_retries: Option<u32>,
@@ -1803,11 +1853,6 @@ impl IggyClient {
         };
         if let Some(auto_commit) = auto_commit {
             builder = builder.auto_commit(RustAutoCommit::try_from(auto_commit)?)
-        };
-        if let Some(poll_interval) = poll_interval {
-            builder = builder.poll_interval(py_delta_to_iggy_duration(&poll_interval)?)
-        } else {
-            builder = builder.without_poll_interval()
         };
         if let Some(polling_retry_interval) = polling_retry_interval {
             builder = builder.polling_retry_interval(reject_zero(
@@ -1881,6 +1926,44 @@ impl IggyClient {
         future_into_py(py, async move {
             let response = inner
                 .send_binary_request(code, Bytes::from(payload))
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(Python::attach(|py| PyBytes::new(py, &response).unbind()))
+        })
+    }
+
+    /// Send a command code with a payload to the replica with the given id and
+    /// return the raw response bytes.
+    ///
+    /// The replica id is the one cluster metadata names for the node. Every
+    /// node answers non-replicated commands such as GetStats from its own
+    /// state. Replicated commands, polls, consumer-offset reads and
+    /// session-control codes are rejected client-side, and a replica id that
+    /// cluster metadata does not name fails. HTTP transport does not support
+    /// raw binary commands.
+    ///
+    /// Args:
+    ///     code: Command code as `int`.
+    ///     payload: Request payload as `bytes`.
+    ///     replica_id: Replica id as `int`, as cluster metadata names it.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to the raw response `bytes`.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the command cannot be sent or the replica returns an error.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[bytes]", imports=("collections.abc")))]
+    fn send_binary_request_to_replica<'a>(
+        &self,
+        py: Python<'a>,
+        code: u32,
+        #[gen_stub(override_type(type_repr = "builtins.bytes"))] payload: Vec<u8>,
+        replica_id: u8,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let response = inner
+                .send_binary_request_to_replica(code, Bytes::from(payload), replica_id)
                 .await
                 .map_err(to_runtime_error)?;
             Ok(Python::attach(|py| PyBytes::new(py, &response).unbind()))

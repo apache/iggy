@@ -33,9 +33,10 @@ use chrono::Local;
 use consensus::MetadataHandle;
 use iggy_binary_protocol::codes::{
     DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CONSUMER_GROUP_CODE,
-    GET_CONSUMER_GROUPS_CODE, GET_CONSUMER_OFFSET_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
-    GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
-    GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE, POLL_MESSAGES_CODE,
+    GET_CONSUMER_GROUPS_CODE, GET_CONSUMER_OFFSET_CODE, GET_METADATA_CHANGES_CODE,
+    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, GET_STREAM_CODE,
+    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+    POLL_MESSAGES_CODE,
 };
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_groups::{
@@ -102,10 +103,10 @@ use iggy_common::wire_conversions::{
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, Consumer, ConsumerGroup, ConsumerGroupDetails,
     ConsumerOffsetInfo, DEFAULT_MAX_TOPIC_SIZE, Identifier, IdentityInfo, IggyError, IggyTimestamp,
-    OptionSpec, OptionStorage, OptionsScope, Partitioning, PersonalAccessTokenInfo, PollMessages,
-    PolledMessages, RawPersonalAccessToken, SendMessages, SendMessagesConfirmations, Stats, Stream,
-    StreamDetails, TokenInfo, Topic, TopicDetails, UserInfo, UserInfoDetails, Validatable,
-    descriptors_for, erase_buffer,
+    MetadataChanges, MetadataChangesQuery, OptionSpec, OptionStorage, OptionsScope, Partitioning,
+    PersonalAccessTokenInfo, PollMessages, PolledMessages, RawPersonalAccessToken, SendMessages,
+    SendMessagesConfirmations, Stats, Stream, StreamDetails, TokenInfo, Topic, TopicDetails,
+    UserInfo, UserInfoDetails, Validatable, descriptors_for, erase_buffer,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
@@ -113,8 +114,11 @@ use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretString};
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
-use shard::{PartitionRead, PartitionReadReply};
+use shard::{
+    DeferredPollContext, DeferredPollRequest, PartitionRead, PartitionReadReply, PollQuotaIdentity,
+};
 
+use crate::dispatch::metadata_changes::metadata_changes_page;
 use crate::dispatch::partition::{
     ConsumerOffsetTarget, fence_poll_context, resolve_consumer_offset_request,
     resolve_poll_request, resolve_primary_consumer_offset_request,
@@ -148,8 +152,8 @@ use crate::http::submit::{
     submit_committed, submit_write,
 };
 use crate::http::wire::{
-    consumer_offset_wire_request, delete_offset_wire_request, encode_send_messages,
-    poll_wire_request, store_offset_wire_request,
+    DeferredPollQuery, consumer_offset_wire_request, delete_offset_wire_request,
+    encode_send_messages, poll_wire_request, store_offset_wire_request,
 };
 use crate::reply_frame::{build_polled_messages_body, build_raw_pat_reply};
 use crate::responses::connected_client_to_response;
@@ -822,6 +826,37 @@ pub(in crate::http) async fn get_snapshot(
     Ok((headers, Body::from(archive)))
 }
 
+/// `GET /metadata/changes`: one page of this node's metadata change log, or
+/// of the current state. Local like `/snapshot`: committed records are the
+/// same on every replica of one history, so the page is never redirected.
+/// The query is strict: an unknown, repeated or malformed parameter is a 400.
+pub(in crate::http) async fn get_metadata_changes(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<MetadataChanges>, ReadError> {
+    SendWrapper::new(gate_local_read(
+        &state,
+        &identity,
+        Consistency::Serializable,
+        GET_METADATA_CHANGES_CODE,
+        Permissioner::get_metadata_changes,
+    ))
+    .await?;
+    let query = MetadataChangesQuery::from_http_query(
+        pairs
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    )
+    .map_err(ReadError::Rejected)?;
+    let page = SendWrapper::new(metadata_changes_page(&state.shard, query, identity.user_id))
+        .await
+        .map_err(ReadError::Rejected)?;
+    MetadataChanges::try_from(page)
+        .map(Json)
+        .map_err(ReadError::Rejected)
+}
+
 /// `GET /cluster/metadata`: report the live cluster topology as the same
 /// `ClusterMetadata` JSON the legacy server returns.
 ///
@@ -1178,6 +1213,34 @@ pub(in crate::http) async fn delete_segments(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /streams/{stream_id}/topics/{topic_id}/messages/deferred`: the poll of
+/// [`poll_messages`] with [`DeferredPollQuery`] limits. The primary holds it until
+/// `min_count` messages are ready, the reply reaches `max_bytes`, or `wait_us`
+/// expires. Invalid limits are refused before the poll is resolved.
+pub(in crate::http) async fn poll_messages_deferred(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Query(query): Query<PollMessages>,
+    Query(wait): Query<DeferredPollQuery>,
+    Query(consistency): Query<ConsistencyQuery>,
+    Extension(request): Extension<Arc<PartitionRequest>>,
+) -> Result<Response, ReadError> {
+    let options = iggy_common::DeferredPollOptions::from(wait);
+    options.validate(query.count).map_err(ReadError::Rejected)?;
+    poll_messages_impl(
+        state,
+        identity,
+        stream_id,
+        topic_id,
+        query,
+        consistency,
+        request,
+        Some(options),
+    )
+    .await
+}
+
 /// `GET /streams/{stream_id}/topics/{topic_id}/messages`: poll a batch of
 /// messages as the same `PolledMessages` JSON the legacy server returns. The
 /// query is the same flattened `PollMessages` shape the legacy server accepts
@@ -1203,6 +1266,35 @@ pub(in crate::http) async fn poll_messages(
     Query(consistency): Query<ConsistencyQuery>,
     Extension(request): Extension<Arc<PartitionRequest>>,
 ) -> Result<Response, ReadError> {
+    poll_messages_impl(
+        state,
+        identity,
+        stream_id,
+        topic_id,
+        query,
+        consistency,
+        request,
+        None,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Immediate and deferred polls share one authorization, fencing and relay path"
+)]
+#[allow(clippy::too_many_arguments)]
+async fn poll_messages_impl(
+    state: HttpState,
+    identity: Identity,
+    stream_id: String,
+    topic_id: String,
+    query: PollMessages,
+    consistency: ConsistencyQuery,
+    request: Arc<PartitionRequest>,
+    options: Option<iggy_common::DeferredPollOptions>,
+) -> Result<Response, ReadError> {
+    let started = std::time::Instant::now();
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
     let (consistency, metadata_floor) = SendWrapper::new(partition_read_consistency(
@@ -1287,19 +1379,47 @@ pub(in crate::http) async fn poll_messages(
         // member and names client 0, the HTTP read client.
         fence_poll_context(requested, local, HTTP_UNREGISTERED_CLIENT_ID, partition_id)
             .map_err(ReadError::Rejected)?;
-        let reply = state
-            .shard
-            .partition_read(
-                namespace,
-                PartitionRead::UnboundPollOnPrimary {
-                    consumer,
-                    args: args.clone(),
+        let read = if let Some(options) = options {
+            let mut options = options
+                .remaining(started.elapsed())
+                .map_err(ReadError::Rejected)?;
+            let remaining = request
+                .deadline
+                .saturating_duration_since(std::time::Instant::now());
+            options.request_timeout = options.request_timeout.get_duration().min(remaining).into();
+            // A binding HTTP deadline shortens the wait, not its reply margin.
+            options.max_wait = options
+                .max_wait
+                .get_duration()
+                .min(options.request_timeout.get_duration().saturating_sub(
+                    std::time::Duration::from_micros(
+                        iggy_common::MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+                    ),
+                ))
+                .into();
+            PartitionRead::DeferredPoll(Box::new(DeferredPollRequest::new(
+                consumer,
+                args.clone(),
+                metadata,
+                DeferredPollContext {
+                    session: None,
                     user_id: identity.user_id,
-                    user_created_at: identity.user_created_at.as_micros(),
-                    metadata,
+                    user_created_at: Some(identity.user_created_at.as_micros()),
+                    quota: PollQuotaIdentity::User(identity.user_id),
+                    primary: true,
                 },
-            )
-            .await;
+                options,
+            )))
+        } else {
+            PartitionRead::UnboundPollOnPrimary {
+                consumer,
+                args: args.clone(),
+                user_id: identity.user_id,
+                user_created_at: identity.user_created_at.as_micros(),
+                metadata,
+            }
+        };
+        let reply = state.shard.partition_read(namespace, read).await;
         // The owner may already have auto-committed. At-most-once polls can
         // lose a batch here, but revoked credentials must never receive it.
         authorize_read(&state, &identity, consistency, rule)?;

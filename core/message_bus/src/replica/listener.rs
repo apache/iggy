@@ -30,19 +30,20 @@
 //!
 //! Runs only on shard 0. The listener reads NOTHING from an accepted
 //! connection: every accepted `TcpStream` is handed as-is to the
-//! `on_accepted` callback provided by the shard bootstrap, which
-//! dup-and-ships the raw fd to the owning shard via the inter-shard
-//! channel (blind delegation - the peer id is unknown until the owning
-//! shard reads the `ReplicaHello`). The owning shard runs the full
+//! `on_accepted` callback provided by the shard bootstrap. The callback
+//! reads only the 8-byte placement preamble
+//! (`IggyMessageBus::place_replica_inbound`), which names the dialer and
+//! the link, and dup-and-ships the raw fd to the shard that owns that
+//! link via the inter-shard channel. The owning shard runs the full
 //! handshake (see [`crate::replica::handshake`]) and installs the
-//! connection locally, so no connection state ever crosses shards.
+//! connection locally, so no TLS or handshake state ever crosses shards.
 //!
 //! Admission control also lives in the callback: it acquires a slot
 //! from the shard-0-global in-flight handshake cap
-//! (`IggyMessageBus::try_acquire_replica_handshake_slot`) and drops the
-//! connection when the cap is reached. The slot is released by the
-//! owning shard's handshake-outcome ack, with a deadline-based expiry
-//! as the lost-ack backstop.
+//! (`IggyMessageBus::try_acquire_replica_handshake_slot`) before the
+//! preamble read and drops the connection when the cap is reached. The
+//! slot is released by the owning shard's handshake-outcome ack, with a
+//! deadline-based expiry as the lost-ack backstop.
 //!
 //! Duplicate connections are eliminated by directionality: each replica
 //! only dials peers with strictly greater ids and only accepts inbound
@@ -53,13 +54,17 @@
 use crate::accept::pause_after_accept_error;
 use crate::lifecycle::ShutdownToken;
 use crate::socket_opts::bind_reusable_tcp_listener;
-use crate::{AcceptedReplicaFn, GenericHeader, Message};
-use compio::net::TcpListener;
+use crate::{
+    AcceptedReplicaFn, GenericHeader, IggyMessageBus, MAX_INFLIGHT_REPLICA_HANDSHAKES, Message,
+    ReplicaLinkId,
+};
+use compio::net::{TcpListener, TcpStream};
 use futures::FutureExt;
 use iggy_common::IggyError;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use tracing::{debug, error, info};
+use std::time::Instant;
+use tracing::{debug, error, info, warn};
 
 /// Handler for inbound replica consensus messages.
 ///
@@ -83,16 +88,59 @@ pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyErr
     Ok((listener, actual))
 }
 
+/// Shard 0 side of an accepted replica socket, for the `on_accepted`
+/// callback.
+///
+/// Takes a slot in the in-flight handshake cap, then reads the placement
+/// preamble in a task tracked on `bus`, so a slow dialer never stalls the
+/// accept loop. A placed socket goes to `delegate` with its link, the shard
+/// that owns the link, the slot and the admission deadline: one
+/// `handshake_grace` after the slot was taken. The preamble read and the
+/// owner shard's handshake both end by that deadline, so a live handshake
+/// never outlasts its slot. From there the slot belongs to `delegate`: the
+/// owner shard's handshake ack releases it, and a failed delegation must
+/// release it at once. A full cap or a refused preamble closes the socket.
+pub fn admit_inbound(
+    bus: &Rc<IggyMessageBus>,
+    stream: TcpStream,
+    delegate: impl FnOnce(TcpStream, ReplicaLinkId, u16, u64, Instant) + 'static,
+) {
+    let Some(slot) = bus.try_acquire_replica_handshake_slot() else {
+        warn!(
+            cap = MAX_INFLIGHT_REPLICA_HANDSHAKES,
+            "replica handshake in-flight cap reached; dropping inbound"
+        );
+        return;
+    };
+    let deadline = Instant::now() + bus.config().handshake_grace;
+    let task_bus = Rc::clone(bus);
+    let handle = compio::runtime::spawn(async move {
+        let mut stream = stream;
+        match task_bus.place_replica_inbound(&mut stream, deadline).await {
+            Ok((link, owner)) => delegate(stream, link, owner, slot, deadline),
+            Err(error) => {
+                task_bus.release_replica_handshake_slot(slot);
+                warn!(
+                    peer = ?stream.peer_addr().ok(),
+                    "refusing inbound replica connection: {error}"
+                );
+            }
+        }
+    });
+    bus.track_background(handle);
+}
+
 /// Run the inbound replica listener accept loop until the shutdown token
 /// fires.
 ///
 /// Every accepted connection fires `on_accepted` immediately; no byte is
 /// read here. The callback owns the accepted stream and is responsible
-/// for the in-flight cap check and the fd delegation (see the module
-/// doc). The loop awaits only `accept()` and, after an error that says a
-/// resource is used up, the pause of [`pause_after_accept_error`]. Neither
-/// waits on what a peer sends, so a hostile or slow peer cannot stall
-/// admission of subsequent peers.
+/// for the in-flight cap check, the preamble read and the fd delegation
+/// (see [`admit_inbound`] and the module doc). The loop awaits only
+/// `accept()` and, after an error that says a resource is used up, the
+/// pause of [`pause_after_accept_error`]. Neither waits on what a peer
+/// sends, so a hostile or slow peer cannot stall admission of subsequent
+/// peers.
 #[allow(clippy::future_not_send)]
 pub async fn run(listener: TcpListener, token: ShutdownToken, on_accepted: AcceptedReplicaFn) {
     info!(

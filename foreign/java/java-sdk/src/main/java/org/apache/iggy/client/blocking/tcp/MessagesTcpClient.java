@@ -23,6 +23,7 @@ import org.apache.iggy.client.blocking.MessagesClient;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
@@ -51,6 +52,21 @@ final class MessagesTcpClient implements MessagesClient {
             boolean autoCommit) {
         return FutureUtil.resolve(
                 delegate.pollMessages(streamId, topicId, partitionId, consumer, strategy, count, autoCommit));
+    }
+
+    @Override
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    public PolledMessages pollMessagesDeferred(
+            StreamId streamId,
+            TopicId topicId,
+            Optional<Long> partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            Long count,
+            boolean autoCommit,
+            DeferredPollOptions options) {
+        return FutureUtil.resolveInterruptibly(delegate.pollMessagesDeferred(
+                streamId, topicId, partitionId, consumer, strategy, count, autoCommit, options));
     }
 
     @Override

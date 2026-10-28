@@ -60,6 +60,7 @@ func TestE2E_StreamKeyProjection(t *testing.T) {
 		}
 		assert.Equal(t, created.EncryptionKekFingerprints(), fetched.EncryptionKekFingerprints())
 	})
+	t.Run("given_keyed_stream_when_following_its_creation_should_expose_fingerprints_and_no_key", checkKeyedStreamChange)
 }
 
 func TestE2E_KeylessStream(t *testing.T) {

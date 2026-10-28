@@ -15,10 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::change_log::{
+    ChangeLogCapacities, ChangeLogError, MetadataChangeLog, change_actor, session_closed,
+    session_registered, session_revoked,
+};
 use crate::impls::metadata::IggySnapshot;
-use crate::stm::StateMachine;
 use crate::stm::authz::{GatedApply, reject_stale_session};
 use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, SnapshotError};
+use crate::stm::{ApplyContext, StateMachine};
 use consensus::{
     ClientTable, ClientTableDecodeError, CommitReply, HistoryRecovery, VsrState, VsrStateError,
     build_reply_message, build_reply_message_with,
@@ -43,6 +47,9 @@ pub enum RecoveryError {
     Snapshot(SnapshotError),
     Journal(JournalError),
     StateMachine(IggyError),
+    /// Replay produced change records the log cannot take, which only a bug
+    /// in record production can cause.
+    ChangeLog(ChangeLogError),
     Io(std::io::Error),
     DisconnectedSoloJournal {
         path: PathBuf,
@@ -152,6 +159,7 @@ impl fmt::Display for RecoveryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Snapshot(e) => write!(f, "recovery snapshot error: {e}"),
+            Self::ChangeLog(e) => write!(f, "recovery change log error: {e}"),
             Self::Journal(e) => write!(f, "recovery journal error: {e}"),
             Self::StateMachine(e) => write!(f, "recovery state machine error: {e}"),
             Self::Io(e) => write!(f, "recovery I/O error: {e}"),
@@ -239,6 +247,7 @@ impl std::error::Error for RecoveryError {
             Self::Snapshot(e) => Some(e),
             Self::Journal(e) => Some(e),
             Self::StateMachine(e) => Some(e),
+            Self::ChangeLog(e) => Some(e),
             Self::Io(e) | Self::Superblock { source: e, .. } => Some(e),
             Self::ClientTableDecode(e) => Some(e),
             Self::RetryProtection(e) => Some(e),
@@ -282,6 +291,12 @@ impl From<std::io::Error> for RecoveryError {
     }
 }
 
+impl From<ChangeLogError> for RecoveryError {
+    fn from(e: ChangeLogError) -> Self {
+        Self::ChangeLog(e)
+    }
+}
+
 /// Result of a successful metadata recovery.
 pub struct RecoveredMetadata<M> {
     pub journal: PrepareJournal,
@@ -304,6 +319,9 @@ pub struct RecoveredMetadata<M> {
     /// post-boot view-change superblock write records the real pairing.
     pub snapshot_checkpoint: (u64, u128),
     pub mux_stm: M,
+    /// Change log restored from the checkpoint and advanced by the replayed
+    /// committed suffix, so it equals the log the node held before it stopped.
+    pub change_log: MetadataChangeLog,
     /// Client table restored from the checkpoint and advanced by the replayed
     /// committed suffix: registers carry their own commit op as the epoch, so
     /// replay reads fences out of the log rather than deriving them from replay
@@ -418,7 +436,7 @@ pub async fn recover<M>(
     journal_slots: usize,
     clients_table_max: usize,
     seed_baseline: impl FnOnce(&M),
-    on_replayed_session: impl Fn(&M, &PrepareHeader),
+    change_log_capacities: ChangeLogCapacities,
 ) -> Result<RecoveredMetadata<M>, RecoveryError>
 where
     M: StateMachine<Input = Message<PrepareHeader>, Error = IggyError>
@@ -547,6 +565,16 @@ where
         seed_baseline(&mux_stm);
         mux_stm
     };
+    // Decode already checked the log against the snapshot's sequence number.
+    let change_log = MetadataChangeLog::new(change_log_capacities);
+    if let Some(snapshot) = snapshot.as_ref() {
+        change_log.restore(
+            snapshot
+                .snapshot()
+                .change_log
+                .restore(change_log_capacities)?,
+        )?;
+    }
 
     let journal_path = metadata_dir.join("journal.wal");
     let watermark = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
@@ -681,9 +709,11 @@ where
                 RecoveryError::RetryProtection(consensus::ClientTableWireError::InvalidReply)
             })?;
             if !mux_stm.is_active_account(header.user_id, registration.user_created_at) {
+                change_log.append(header, Vec::new())?;
                 last_applied_op = Some(header.op);
                 continue;
             }
+            let inserted = !client_table.contains(header.client);
             let reply = build_reply_message(header, &bytes::Bytes::new());
             client_table
                 .commit_register(
@@ -693,11 +723,22 @@ where
                     reply,
                 )
                 .map_err(RecoveryError::RetryProtection)?;
-            on_replayed_session(&mux_stm, header);
+            let epoch = client_table.get_epoch(header.client).unwrap_or(header.op);
+            let mut changes: Vec<_> = inserted
+                .then(|| session_registered(header, registration.user_created_at, epoch))
+                .into_iter()
+                .collect();
+            changes.extend(mux_stm.refresh_session(
+                header,
+                epoch,
+                change_actor(&ApplyContext::from(header)),
+            ));
+            change_log.append(header, changes)?;
             last_applied_op = Some(header.op);
             continue;
         }
         if header.operation == Operation::Logout {
+            let mut changes = Vec::new();
             if client_table
                 .commit_logout(
                     header.client,
@@ -707,8 +748,16 @@ where
                 )
                 .map_err(RecoveryError::RetryProtection)?
             {
-                on_replayed_session(&mux_stm, header);
+                // The order the commit walk records: the session, then the
+                // memberships it ended.
+                let closed = mux_stm
+                    .user_key(header.user_id)
+                    .map(|user| session_closed(header, user));
+                let actor = closed.as_ref().and_then(|closed| closed.actor_user_id);
+                changes.extend(closed);
+                changes.extend(mux_stm.end_memberships(&[header.client], header, actor));
             }
+            change_log.append(header, changes)?;
             last_applied_op = Some(header.op);
             continue;
         }
@@ -725,6 +774,7 @@ where
             if mux_stm.namespace_revision() == request.namespace_revision {
                 client_table.finalize_session(request.identity);
             }
+            change_log.append(header, Vec::new())?;
             last_applied_op = Some(header.op);
             continue;
         }
@@ -737,19 +787,20 @@ where
         })?;
         // WAL replay must recompute authorization denials identically to the
         // primary/backup commit paths, so it goes through the same gate.
-        let reply = reject_stale_session(header, &client_table)
+        let mut reply = reject_stale_session(header, &client_table)
             .map_or_else(|| mux_stm.gated_update(entry), Ok)?;
-        if let Some(user_id) = reply.revoked_user {
-            for identity in client_table.end_user_sessions(user_id, header.op) {
-                on_replayed_session(
-                    &mux_stm,
-                    &PrepareHeader {
-                        client: identity.client_id,
-                        session: identity.session,
-                        ..*header
-                    },
-                );
-            }
+        if let Some(user) = reply.revoked_user {
+            let mut sessions = client_table.end_user_sessions(user.user_id, header.op);
+            sessions.sort_by_key(|identity| identity.client_id);
+            let actor = change_actor(&ApplyContext::from(header));
+            let client_ids: Vec<u128> =
+                sessions.iter().map(|identity| identity.client_id).collect();
+            reply.changes.extend(sessions.iter().map(|identity| {
+                session_revoked(user, identity.client_id, identity.session, actor)
+            }));
+            reply
+                .changes
+                .extend(mux_stm.end_memberships(&client_ids, header, actor));
         }
         // Every client commit must restore its original receipt before admission.
         if header.client != consensus::client_table::RESERVED_CLIENT_ID
@@ -780,6 +831,7 @@ where
             user_id = header.user_id,
             "recovery replayed op"
         );
+        change_log.append(header, reply.changes)?;
         last_applied_op = Some(header.op);
     }
 
@@ -790,6 +842,7 @@ where
         recovered_state,
         snapshot_checkpoint: (snapshot_op, snapshot_checksum),
         mux_stm,
+        change_log,
         client_table,
         last_applied_op,
         last_journaled_op,
@@ -903,19 +956,26 @@ fn verify_checkpoint_pairing(
 mod tests {
     use super::*;
     use crate::impls::metadata::{StreamsFrontend, apply_committed_prepare, checkpoint_checksum};
+    use crate::stm::consumer_group::JoinConsumerGroupRequest;
     use crate::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
     use crate::stm::snapshot::{SNAPSHOT_FORMAT_VERSION, Snapshotable};
     use crate::stm::stream::{Streams, StreamsSnapshot};
     use crate::stm::user::{CreatePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES, Users};
     use consensus::{CLIENTS_TABLE_MAX, HistoryCertificate};
     use iggy_binary_protocol::consensus::{Command, Operation};
+    use iggy_binary_protocol::primitives::metadata_changes::WireMetadataChangeKind;
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::primitives::permissions::{WireGlobalPermissions, WirePermissions};
+    use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+    };
     use iggy_binary_protocol::requests::users::{
         CreateUserRequest, DeleteUserRequest, UpdateUserResolvedRequest,
     };
     use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions, result_code};
-    use iggy_common::UserStatus;
+    use iggy_common::{MetadataChangeClass, UserStatus};
     use journal::Journal;
     use server_common::iobuf::Owned;
     use std::cell::RefCell;
@@ -1099,7 +1159,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -1126,7 +1186,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -1162,7 +1222,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -1225,7 +1285,7 @@ mod tests {
                 journal::prepare_journal::DEFAULT_SLOT_COUNT,
                 CLIENTS_TABLE_MAX,
                 |_| {},
-                |_, _| {},
+                ChangeLogCapacities::default(),
             )
             .await
             .unwrap();
@@ -1264,7 +1324,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -1316,7 +1376,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -1370,7 +1430,7 @@ mod tests {
             assert!(matches!(
                 recover::<TestStm>(directory.path(), SOLO,
                     journal::prepare_journal::DEFAULT_SLOT_COUNT, CLIENTS_TABLE_MAX,
-                    |_| {}, |_, _| {}).await,
+                    |_| {}, ChangeLogCapacities::default()).await,
                 Err(RecoveryError::DisconnectedSoloJournal { op, .. })
                     if op == if forked { 101 } else { 179 }
             ));
@@ -1411,7 +1471,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -1524,7 +1584,7 @@ mod tests {
                     journal::prepare_journal::DEFAULT_SLOT_COUNT,
                     CLIENTS_TABLE_MAX,
                     |_| {},
-                    |_, _| {},
+                    ChangeLogCapacities::default(),
                 )
                 .await
                 .unwrap();
@@ -1605,7 +1665,7 @@ mod tests {
                 journal::prepare_journal::DEFAULT_SLOT_COUNT,
                 CLIENTS_TABLE_MAX,
                 |_| {},
-                |_, _| {},
+                ChangeLogCapacities::default(),
             )
             .await
             .unwrap();
@@ -1652,7 +1712,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await;
 
@@ -1703,7 +1763,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -1742,7 +1802,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -1794,7 +1854,7 @@ mod tests {
                 journal::prepare_journal::DEFAULT_SLOT_COUNT,
                 CLIENTS_TABLE_MAX,
                 |_| {},
-                |_, _| {},
+                ChangeLogCapacities::default(),
             )
             .await;
             assert!(matches!(
@@ -1875,7 +1935,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -1970,7 +2030,7 @@ mod tests {
                 journal::prepare_journal::DEFAULT_SLOT_COUNT,
                 CLIENTS_TABLE_MAX,
                 |_| {},
-                |_, _| {},
+                ChangeLogCapacities::default(),
             )
             .await
             .unwrap();
@@ -2026,7 +2086,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -2078,18 +2138,13 @@ mod tests {
             journal.storage_ref().fsync().await.unwrap();
         }
 
-        let replayed_logouts = std::cell::RefCell::new(Vec::new());
         let recovered = recover::<TestStm>(
             dir.path(),
             SOLO,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, header| {
-                if header.operation == Operation::Logout {
-                    replayed_logouts.borrow_mut().push(header.client);
-                }
-            },
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -2111,10 +2166,23 @@ mod tests {
                 .check_request(CLIENT, 1, 2, Operation::CreateStream),
             consensus::client_table::RequestStatus::NoSession
         ));
+        let sessions = recovered
+            .change_log
+            .read(|log| {
+                log.ring(MetadataChangeClass::Activity)
+                    .entries()
+                    .iter()
+                    .map(|entry| (entry.op, entry.kind))
+                    .collect::<Vec<_>>()
+            })
+            .expect("readable");
         assert_eq!(
-            replayed_logouts.into_inner(),
-            vec![CLIENT],
-            "replay must hand the logged-out client to the group-removal hook"
+            sessions,
+            [
+                (1, WireMetadataChangeKind::SessionRegistered),
+                (2, WireMetadataChangeKind::SessionClosed)
+            ],
+            "replay must record the session the logout ended"
         );
         assert_eq!(recovered.last_applied_op, Some(2));
     }
@@ -2309,7 +2377,7 @@ mod tests {
                     ));
                     parent = prepare.header().checksum;
                     let reply =
-                        apply_committed_prepare(&stm, &table, true, |_| {}, prepare.clone());
+                        apply_committed_prepare(&stm, &table, true, |_| {}, prepare.clone()).reply;
                     let status = if operation == Operation::Register {
                         result_code(reply.body()).unwrap_or(0)
                     } else {
@@ -2339,7 +2407,7 @@ mod tests {
                 journal::prepare_journal::DEFAULT_SLOT_COUNT,
                 CLIENTS_TABLE_MAX,
                 |stm| stm.users().ensure_root_user("root", "hash"),
-                |_, _| {},
+                ChangeLogCapacities::default(),
             )
             .await
             .unwrap();
@@ -2453,6 +2521,7 @@ mod tests {
             let stm = UserStm::default();
             stm.users().ensure_root_user("root", "hash");
             let table = RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX));
+            let live_log = MetadataChangeLog::new(ChangeLogCapacities::default());
             let mut last_reply = None;
             let mut parent = 0;
             {
@@ -2484,13 +2553,12 @@ mod tests {
                         },
                     ));
                     parent = prepare.header().checksum;
-                    last_reply = Some(apply_committed_prepare(
-                        &stm,
-                        &table,
-                        true,
-                        |_| {},
-                        prepare.clone(),
-                    ));
+                    let committed =
+                        apply_committed_prepare(&stm, &table, true, |_| {}, prepare.clone());
+                    live_log
+                        .append(prepare.header(), committed.changes)
+                        .expect("live ops append in order");
+                    last_reply = Some(committed.reply);
                     journal.append(prepare).await.unwrap();
                 }
                 journal.storage_ref().fsync().await.unwrap();
@@ -2503,7 +2571,6 @@ mod tests {
             }
             let live = table.borrow().encode();
             ClientTable::decode(&live).expect("the state transfer form must decode");
-            let revoked = RefCell::new(Vec::new());
             let recovered = recover::<UserStm>(
                 directory.path(),
                 SOLO,
@@ -2512,13 +2579,7 @@ mod tests {
                 |stm| {
                     stm.users().ensure_root_user("root", "hash");
                 },
-                |_, header| {
-                    if header.operation == operation {
-                        revoked
-                            .borrow_mut()
-                            .push((header.client, header.session, header.op));
-                    }
-                },
+                ChangeLogCapacities::default(),
             )
             .await
             .unwrap();
@@ -2532,9 +2593,13 @@ mod tests {
                 recovered.client_table.get_epoch(ROOT_CLIENT),
                 Some(ROOT_SESSION)
             );
+            assert_eq!(
+                recovered.change_log.snapshot(),
+                live_log.snapshot(),
+                "{operation:?}: WAL replay must rebuild the live change log"
+            );
             let ended: Vec<_> = recovered.client_table.ended_sessions().collect();
             if register_first {
-                assert_eq!(*revoked.borrow(), vec![(CLIENT, SESSION, REVOCATION_OP)]);
                 assert_eq!(
                     ended,
                     vec![iggy_binary_protocol::requests::system::SessionIdentity {
@@ -2544,7 +2609,6 @@ mod tests {
                     }]
                 );
             } else {
-                assert!(revoked.borrow().is_empty());
                 assert_eq!(
                     ended,
                     [] as [iggy_binary_protocol::requests::system::SessionIdentity; 0]
@@ -2564,7 +2628,7 @@ mod tests {
                 journal::prepare_journal::DEFAULT_SLOT_COUNT,
                 CLIENTS_TABLE_MAX,
                 |stm| stm.users().ensure_root_user("root", "hash"),
-                |_, _| {},
+                ChangeLogCapacities::default(),
             )
             .await
             .expect("restart must accept the checkpointed table");
@@ -2573,6 +2637,216 @@ mod tests {
                 ended
             );
         }
+    }
+
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_memberships_ended_by_logout_and_revocation_when_replaying_wal_should_rebuild_the_live_change_log()
+     {
+        const ROOT_CLIENT: u128 = 0x10;
+        const CLIENT_A: u128 = 0x11;
+        const CLIENT_B: u128 = 0x12;
+        const USER: u32 = 1;
+        // Epochs are the ops of the registrations below.
+        const ROOT_SESSION: u64 = 1;
+        const SESSION_A: u64 = 6;
+        const SESSION_B: u64 = 7;
+        type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
+        let register = |user_created_at| {
+            RegisterRequest {
+                user_created_at,
+                bind_verifier: [0x5a; 32],
+            }
+            .to_bytes()
+        };
+        let join = |client_id, session| {
+            JoinConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                group_id: WireIdentifier::numeric(0),
+                client_id,
+                session,
+            }
+            .to_bytes()
+        };
+        let entries = [
+            (Operation::Register, register(1), ROOT_CLIENT, 0, 0),
+            (
+                Operation::CreateUser,
+                CreateUserRequest {
+                    username: WireName::new("user").unwrap(),
+                    password: "hash".to_owned(),
+                    status: UserStatus::Active.as_code(),
+                    permissions: None,
+                    options: WireOptions::empty(),
+                }
+                .to_bytes(),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            ),
+            (
+                Operation::CreateStream,
+                CreateStreamRequest {
+                    name: WireName::new("orders").unwrap(),
+                    options: WireOptions::empty(),
+                }
+                .to_bytes(),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            ),
+            (
+                Operation::CreateTopicWithAssignments,
+                CreateTopicWithAssignmentsRequest {
+                    request: CreateTopicRequest {
+                        stream_id: WireIdentifier::numeric(0),
+                        partitions_count: 2,
+                        name: WireName::new("events").unwrap(),
+                        options: WireOptions::empty(),
+                    },
+                    derived_options: WireOptions::empty(),
+                    partitions: (0..2)
+                        .map(|partition_id| CreatedPartitionAssignment {
+                            partition_id,
+                            consensus_group_id: u64::from(partition_id) + 1,
+                            initial_view: 0,
+                        })
+                        .collect(),
+                }
+                .to_bytes(),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            ),
+            (
+                Operation::CreateConsumerGroup,
+                CreateConsumerGroupRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    name: WireName::new("billing").unwrap(),
+                }
+                .to_bytes(),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            ),
+            // The user was created at op 2, whose timestamp is 2.
+            (Operation::Register, register(2), CLIENT_A, USER, 0),
+            (Operation::Register, register(2), CLIENT_B, USER, 0),
+            (
+                Operation::JoinConsumerGroup,
+                join(CLIENT_A, SESSION_A),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            ),
+            (
+                Operation::JoinConsumerGroup,
+                join(CLIENT_B, SESSION_B),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            ),
+            (
+                Operation::Logout,
+                bytes::Bytes::new(),
+                CLIENT_A,
+                USER,
+                SESSION_A,
+            ),
+            (
+                Operation::DeleteUser,
+                DeleteUserRequest {
+                    user_id: WireIdentifier::numeric(USER),
+                }
+                .to_bytes(),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            ),
+        ];
+        let directory = tempdir().unwrap();
+        let metadata_dir = directory.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let stm = UserStm::default();
+        stm.users().ensure_root_user("root", "hash");
+        let table = RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX));
+        let live_log = MetadataChangeLog::new(ChangeLogCapacities::default());
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            let mut parent = 0;
+            for (index, (operation, body, client, user_id, session)) in
+                entries.into_iter().enumerate()
+            {
+                let op = index as u64 + 1;
+                let mut prepare = make_prepare(op, body.len());
+                prepare.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
+                let prepare = consensus::seal_prepare_checksum(prepare.transmute_header(
+                    |old, header: &mut PrepareHeader| {
+                        *header = old;
+                        header.operation = operation;
+                        header.timestamp = op;
+                        header.client = client;
+                        header.user_id = user_id;
+                        header.session = session;
+                        header.request = if operation == Operation::Register {
+                            0
+                        } else {
+                            op
+                        };
+                        header.parent = parent;
+                        header.checksum_body = u128::from(iggy_common::calculate_checksum(&body));
+                    },
+                ));
+                parent = prepare.header().checksum;
+                let committed =
+                    apply_committed_prepare(&stm, &table, true, |_| {}, prepare.clone());
+                assert_eq!(result_code(committed.reply.body()).unwrap_or(0), 0);
+                live_log
+                    .append(prepare.header(), committed.changes)
+                    .expect("live ops append in order");
+                journal.append(prepare).await.unwrap();
+            }
+            journal.storage_ref().fsync().await.unwrap();
+        }
+
+        let recovered = recover::<UserStm>(
+            directory.path(),
+            SOLO,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |stm| stm.users().ensure_root_user("root", "hash"),
+            ChangeLogCapacities::default(),
+        )
+        .await
+        .unwrap();
+
+        let live = live_log.snapshot();
+        assert_eq!(recovered.change_log.snapshot(), live);
+        let kinds: Vec<_> = live
+            .activity
+            .entries
+            .iter()
+            .map(|entry| (entry.op, entry.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (1, WireMetadataChangeKind::SessionRegistered.as_u8()),
+                (6, WireMetadataChangeKind::SessionRegistered.as_u8()),
+                (7, WireMetadataChangeKind::SessionRegistered.as_u8()),
+                (8, WireMetadataChangeKind::ConsumerGroupMemberJoined.as_u8()),
+                (9, WireMetadataChangeKind::ConsumerGroupMemberJoined.as_u8()),
+                (10, WireMetadataChangeKind::SessionClosed.as_u8()),
+                (10, WireMetadataChangeKind::ConsumerGroupMemberLeft.as_u8()),
+                (11, WireMetadataChangeKind::SessionClosed.as_u8()),
+                (11, WireMetadataChangeKind::ConsumerGroupMemberLeft.as_u8()),
+            ],
+            "the replayed history must hold every session and membership change"
+        );
     }
 
     #[compio::test]
@@ -2656,7 +2930,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await;
         assert!(matches!(
@@ -2689,7 +2963,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await;
         assert!(matches!(
@@ -2721,7 +2995,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -2774,7 +3048,7 @@ mod tests {
                 journal::prepare_journal::DEFAULT_SLOT_COUNT,
                 CLIENTS_TABLE_MAX,
                 |_| {},
-                |_, _| {},
+                ChangeLogCapacities::default(),
             )
             .await;
             match result {
@@ -2817,7 +3091,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await
         {
@@ -2885,7 +3159,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();
@@ -2937,7 +3211,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();

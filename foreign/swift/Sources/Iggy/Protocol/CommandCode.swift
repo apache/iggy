@@ -26,6 +26,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
     // 14 was attach_consumer_session; the server keeps the code retired.
     case bindSession = 15
     case updateResource = 16
+    case getMetadataChanges = 17
     case getMe = 20
     case getClient = 21
     case getClients = 22
@@ -84,6 +85,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         case .describeOptions: "options.describe"
         case .bindSession: "session.bind"
         case .updateResource: "resource.update"
+        case .getMetadataChanges: "metadata.changes"
         case .getMe: "me"
         case .getClient: "client.get"
         case .getClients: "client.list"

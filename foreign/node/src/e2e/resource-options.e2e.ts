@@ -22,6 +22,7 @@
 import { Client } from '../client/client.js';
 import { getIggyAddress } from '../tcp.sm.utils.js';
 import { EncryptionKeySource } from '../wire/index.js';
+import { describeKeyedMetadataChanges } from './metadata-changes.suite.js';
 import { describeResourceOptions } from './resource-options.suite.js';
 
 const [host, port] = getIggyAddress();
@@ -29,3 +30,7 @@ const [host, port] = getIggyAddress();
 describeResourceOptions('e2e -> resource options', 'e2e-ro', (credentials) => new Client({
   transport: 'TCP', options: { host, port }, credentials
 }), EncryptionKeySource.Server);
+
+describeKeyedMetadataChanges('e2e -> keyed metadata changes', 'e2e-mc', (credentials) => new Client({
+  transport: 'TCP', options: { host, port }, credentials
+}));

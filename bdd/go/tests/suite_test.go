@@ -99,6 +99,18 @@ func TestFeatures(t *testing.T) {
 		})
 	}
 
+	if feature == "all" || feature == "metadata_changes" {
+		suites = append(suites, godog.TestSuite{
+			ScenarioInitializer: initMetadataChangesScenario,
+			Options: &godog.Options{
+				Format:   "pretty",
+				Paths:    []string{"../../scenarios/metadata_changes.feature"},
+				Strict:   true,
+				TestingT: t,
+			},
+		})
+	}
+
 	if len(suites) == 0 {
 		t.Fatalf("unknown BDD_FEATURE=%q", feature)
 	}

@@ -32,7 +32,6 @@ stream = "no_such_stream"
 topics = ["test_topic"]
 schema = "json"
 batch_length = 100
-poll_interval = "5ms"
 consumer_group = "stdout_missing_stream_sink_connector"
 
 [plugin_config]

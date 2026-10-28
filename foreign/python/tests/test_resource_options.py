@@ -41,6 +41,9 @@ from apache_iggy import (
     IggyClient,
     IggyExpiry,
     MaxTopicSize,
+    MetadataChangeGroup,
+    MetadataChangeKind,
+    MetadataStreamChange,
     OptionError,
     OptionKey,
     PartitionResizePolicy,
@@ -66,9 +69,12 @@ from apache_iggy import (
 from apache_iggy import SendMessage as Message
 
 from .utils import (
+    follow_stream_changes,
     get_quic_server_config,
     get_server_config,
     get_websocket_server_config,
+    latest_metadata_cursor,
+    stream_records,
     unique_credentials,
     wait_for_ping,
 )
@@ -211,6 +217,40 @@ class TestStreamOptions:
         assert stream is not None
         assert stream.name == created.name
         assert_encryption_projection(stream, "stream", encryption_key_fingerprint(key))
+
+    @pytest.mark.asyncio
+    async def test_given_stream_key_when_following_metadata_changes_should_expose_fingerprints_without_key(  # noqa: E501
+        self, transport_client: IggyClient, unique_name
+    ):
+        """A change record carries the key projections a stream read does."""
+        key = secrets.token_bytes(STREAM_KEY_LENGTH)
+        streams = [MetadataChangeGroup.Streams]
+        cursor = await latest_metadata_cursor(transport_client, streams)
+
+        created = await transport_client.create_stream(
+            unique_name(), StreamOptions(encryption_key=key)
+        )
+
+        followed = await follow_stream_changes(
+            transport_client, cursor, streams, created.id, 1
+        )
+        records = stream_records(followed, created.id)
+        assert [record.kind for record in records] == [MetadataChangeKind.StreamCreated]
+        change = records[0].change
+        assert isinstance(change, MetadataStreamChange)
+        assert change.options is not None
+        assert change.derived_options is not None
+        explicit = change.options.to_scalar_dict()
+        derived = change.derived_options.to_scalar_dict()
+        assert derived["encryption_key_source"] == "stream"
+        assert derived["encryption_key_fingerprint"] == encryption_key_fingerprint(key)
+        assert derived["encryption_kek_fingerprint"] == ",".join(
+            created.encryption_kek_fingerprints
+        )
+        assert not NEVER_RETURNED_KEYS & (set(explicit) | set(derived))
+        for value in (*explicit.values(), *derived.values()):
+            assert_secret_absent(str(value), key)
+        assert_secret_absent(repr(records[0]), key)
 
 
 @pytest.mark.usefixtures("iggy_client")

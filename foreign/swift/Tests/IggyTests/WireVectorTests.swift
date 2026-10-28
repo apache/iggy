@@ -182,6 +182,12 @@ struct RequestVectorTests {
         #expect(golden.bytes("request.get_cluster_metadata").isEmpty)
         #expect(try Requests.getSnapshot(compression: .deflated, types: [.filesystemOverview, .serverLogs]) == golden.bytes("request.get_snapshot"))
         #expect(Requests.describeOptions(scope: .topic) == golden.bytes("request.describe_options"))
+        let cursor = MetadataChangeCursor(
+            logID: UInt128Value(0x0d4b_8f2a_6e1c_93d7), op: 4187, checksum: UInt128Value(0xf2a4_c6e8_b0d1_f359), ordinal: 1)
+        #expect(
+            Requests.getMetadataChanges(
+                MetadataChangesQuery(start: .after(cursor), groups: [.topics, .streams], since: IggyTimestamp(microseconds: 1_760_356_800_000_000), limit: 500))
+                == golden.bytes("request.get_metadata_changes"))
         let testBindSecret = Array(repeating: UInt8(0x5a), count: Requests.bindSecretSize)
         let testClientID = UInt128Value(low: 1, high: 0)
         #expect(

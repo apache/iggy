@@ -243,6 +243,32 @@ struct ResponseVectorTests {
         #expect(specs[1].description.isEmpty)
     }
 
+    @Test func metadataChanges() throws {
+        let page = try Responses.metadataChanges(body("response.get_metadata_changes"))
+        let cursor = MetadataChangeCursor(
+            logID: UInt128Value(0x0d4b_8f2a_6e1c_93d7), op: 4187, checksum: UInt128Value(0xf2a4_c6e8_b0d1_f359), ordinal: 1)
+        #expect(page.status == .ok)
+        #expect(page.phase == .changes)
+        #expect(page.logID == cursor.logID)
+        #expect(page.oldestOp == 3871)
+        #expect(page.retainedSince == .zero)
+        #expect(page.headOp == 4190)
+        #expect(page.next == cursor)
+        #expect(page.hasMore == false)
+        #expect(page.items.isEmpty)
+        #expect(page.currentPageToken == nil)
+        #expect(
+            page.records == [
+                MetadataChangeRecord(
+                    op: 4121, ordinal: 0, checksum: UInt128Value(0xa5c1_f703_8b9e_3d65), timestamp: IggyTimestamp(microseconds: 1_760_356_800_004_121),
+                    actorUserID: 0,
+                    change: .streamCreated(
+                        MetadataStreamChange(
+                            streamID: 3, streamCreatedOp: 4121, createdAt: IggyTimestamp(microseconds: 1_760_356_800_123_456), name: "telemetry",
+                            options: .readable([:]))))
+            ])
+    }
+
     @Test func sendConfirmations() throws {
         let response = try Responses.sendConfirmations(body("response.send_messages"))
         #expect(

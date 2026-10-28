@@ -21,22 +21,17 @@ Stream options BDD steps for the Python SDK.
 
 import asyncio
 import base64
-import socket
 from pathlib import Path
 
 from apache_iggy import (
     Consumer,
-    IggyClient,
-    IggyExpiry,
     OptionKey,
     PollingStrategy,
     SendMessage,
     StreamDetails,
-    StreamOptions,
-    TopicOptions,
     encryption_key_fingerprint,
 )
-from pytest_bdd import given, parsers, scenarios, then, when
+from pytest_bdd import parsers, scenarios, then, when
 
 FEATURE_FILE = Path("/app/features/stream_options.feature")
 if not FEATURE_FILE.exists():
@@ -45,69 +40,9 @@ if not FEATURE_FILE.exists():
     )
 scenarios(str(FEATURE_FILE))
 
-KEY_LENGTH = 32
 FINGERPRINT_LENGTH = 16
 PARTITION_ID = 0
 NEVER_RETURNED_KEYS = {"encryption_key", "encryption_key_wrapped", "critical_keys"}
-
-
-@given("I have a running Iggy server")
-def running_server(context):
-    async def connect():
-        host, port = context.server_addr.split(":")
-        try:
-            address = f"{socket.gethostbyname(host)}:{port}"
-        except socket.gaierror:
-            address = context.server_addr
-
-        context.client = IggyClient(address)
-        await context.client.connect()
-        await context.client.ping()
-
-    asyncio.run(connect())
-
-
-@given("I am authenticated as the root user")
-def authenticated_root_user(context, root_credentials):
-    async def login():
-        await context.client.login_user(*root_credentials)
-
-    asyncio.run(login())
-
-
-@when(
-    parsers.re(
-        r'I create a stream named "(?P<name>[^"]+)" with an encryption key '
-        r"of 32 bytes valued (?P<byte>\d+)"
-    ),
-    converters={"byte": int},
-)
-def create_stream_with_key(context, name, byte):
-    create_keyed_stream(context, name, byte)
-
-
-@given(
-    parsers.re(
-        r'a stream named "(?P<name>[^"]+)" with an encryption key '
-        r"of 32 bytes valued (?P<byte>\d+) exists"
-    ),
-    converters={"byte": int},
-)
-def keyed_stream_exists(context, name, byte):
-    create_keyed_stream(context, name, byte)
-
-
-@when(
-    parsers.re(r'I create a stream named "(?P<name>[^"]+)" without an encryption key')
-)
-def create_stream_without_key(context, name):
-    async def create():
-        stream = await context.client.create_stream(name)
-        context.last_stream_id = stream.id
-        context.last_stream_name = stream.name
-        context.last_stream_key = None
-
-    asyncio.run(create())
 
 
 @then(parsers.re(r'the stream should report encryption key source "(?P<source>[^"]+)"'))
@@ -146,32 +81,6 @@ def stream_exposes_no_key_material(context):
         assert base64.b64encode(context.last_stream_key).decode() not in values
 
 
-@when(
-    parsers.re(
-        r'I create a topic named "(?P<name>[^"]+)" with (?P<partitions>\d+) '
-        r"partitions? in the stream"
-    ),
-    converters={"partitions": int},
-)
-def create_topic_in_stream(context, name, partitions):
-    async def create():
-        await context.client.create_topic(
-            context.last_stream_id,
-            name,
-            TopicOptions(
-                partitions_count=partitions,
-                message_expiry=IggyExpiry.NeverExpire(),
-            ),
-        )
-        topic = await context.client.get_topic(context.last_stream_id, name)
-        assert topic is not None
-        context.last_topic_id = topic.id
-        context.last_topic_name = topic.name
-        context.last_topic_partitions = partitions
-
-    asyncio.run(create())
-
-
 @when(parsers.re(r'I send a message with payload "(?P<payload>[^"]+)" to the topic'))
 def send_payload(context, payload):
     send_message(context, SendMessage(payload))
@@ -205,14 +114,6 @@ def poll_returns_payload_and_header(context, payload, header, value):
     headers = message.user_headers()
     assert headers is not None
     assert headers.to_scalar_dict()[header] == value
-
-
-@when(parsers.re(r'I rename the stream to "(?P<name>[^"]+)"'))
-def rename_stream(context, name):
-    async def rename():
-        await context.client.update_stream(context.last_stream_id, name=name)
-
-    asyncio.run(rename())
 
 
 @then(parsers.re(r'the stream name should be "(?P<name>[^"]+)"'))
@@ -268,20 +169,6 @@ def option_create_only_secret(context, key):
 def option_read_only(context, key):
     spec = option_spec(context, key)
     assert spec.read_only and not spec.updatable and not spec.secret
-
-
-def create_keyed_stream(context, name: str, byte: int) -> None:
-    key = bytes([byte]) * KEY_LENGTH
-
-    async def create():
-        stream = await context.client.create_stream(
-            name, StreamOptions(encryption_key=key)
-        )
-        context.last_stream_id = stream.id
-        context.last_stream_name = stream.name
-        context.last_stream_key = key
-
-    asyncio.run(create())
 
 
 def fetch_stream(context) -> StreamDetails:

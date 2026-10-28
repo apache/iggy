@@ -26,10 +26,13 @@ import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
+import org.apache.iggy.system.MetadataChanges;
+import org.apache.iggy.system.MetadataChangesQuery;
 import org.apache.iggy.system.OptionSpec;
 import org.apache.iggy.system.OptionsScope;
 import org.apache.iggy.system.Stats;
 import tools.jackson.core.type.TypeReference;
+import tools.jackson.databind.JsonNode;
 
 import java.util.List;
 import java.util.Locale;
@@ -41,6 +44,7 @@ class SystemHttpClient implements SystemClient {
     private static final String CLIENTS = "/clients";
     private static final String PING = "/ping";
     private static final String OPTIONS = "/options";
+    private static final String METADATA_CHANGES = "/metadata/changes";
     private final InternalHttpClient httpClient;
 
     public SystemHttpClient(InternalHttpClient httpClient) {
@@ -64,6 +68,13 @@ class SystemHttpClient implements SystemClient {
         var request = httpClient.prepareGetRequest(OPTIONS + "/" + scope.name().toLowerCase(Locale.ROOT));
         List<HttpOptionSpec> specs = httpClient.execute(request, new TypeReference<>() {});
         return specs.stream().map(HttpOptionSpec::toOptionSpec).toList();
+    }
+
+    @Override
+    public MetadataChanges getMetadataChanges(MetadataChangesQuery query) {
+        query.validate();
+        var request = httpClient.prepareGetRequest(METADATA_CHANGES + "?" + query.httpQuery());
+        return MetadataChangesJson.read(httpClient.execute(request, JsonNode.class));
     }
 
     @Override

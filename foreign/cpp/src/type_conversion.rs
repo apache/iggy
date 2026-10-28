@@ -39,6 +39,11 @@ use iggy::prelude::{
     UserUpdateOptions as RustUserUpdateOptions, Validatable,
 };
 use iggy_binary_protocol::WireUserHeaders;
+use iggy_binary_protocol::primitives::metadata_changes::{
+    WireMemberLeftReason, WireMetadataChangeGroup, WireMetadataChangeKind, WireMetadataChangePhase,
+    WireMetadataChangeStatus, WirePermissionsUpdatedReason, WireSessionClosedReason,
+    WireTokenDeletedReason,
+};
 use iggy_common::{
     CacheMetrics as RustCacheMetrics, CacheMetricsKey as RustCacheMetricsKey,
     ClientInfo as RustClientInfo, ClientInfoDetails as RustClientInfoDetails,
@@ -47,7 +52,15 @@ use iggy_common::{
     ConsumerGroupMember as RustConsumerGroupMember, ConsumerOffsetInfo as RustConsumerOffsetInfo,
     GlobalPermissions as RustGlobalPermissions, HeaderEntry as RustHeaderEntry,
     HeaderField as RustHeaderField, HeaderKind as RustHeaderKind, IdentityInfo as RustIdentityInfo,
-    IggyError, Permissions as RustPermissions, Stats as RustStats,
+    IggyError, IggyTimestamp, MetadataChange, MetadataChangeCursor, MetadataChangeGroup,
+    MetadataChangeRecord, MetadataChangeStart, MetadataChanges, MetadataChangesQuery,
+    MetadataConsumerGroupCreated, MetadataConsumerGroupDeleted, MetadataConsumerGroupItem,
+    MetadataCurrentItem, MetadataCurrentPageToken, MetadataMemberItem, MetadataMemberJoined,
+    MetadataMemberLeft, MetadataOptions, MetadataPartitionHandedOver, MetadataPartitionsChanged,
+    MetadataPartitionsItem, MetadataSession, MetadataSessionClosed, MetadataStreamChange,
+    MetadataStreamDeleted, MetadataTokenChange, MetadataTokenDeleted, MetadataTopicChange,
+    MetadataTopicDeleted, MetadataTopicItem, MetadataUserChange, MetadataUserIdentity,
+    MetadataUserPermissionsUpdated, Permissions as RustPermissions, Stats as RustStats,
     StreamPermissions as RustStreamPermissions, TopicPermissions as RustTopicPermissions,
     TransportEndpoints as RustTransportEndpoints, UserInfo as RustUserInfo,
     UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
@@ -1187,6 +1200,581 @@ impl From<RustSendMessagesResponse> for ffi::SendMessagesResponse {
     }
 }
 
+impl TryFrom<ffi::MetadataChangesQuery> for MetadataChangesQuery {
+    type Error = IggyError;
+
+    fn try_from(query: ffi::MetadataChangesQuery) -> Result<Self, Self::Error> {
+        let timestamp =
+            |micros| IggyTimestamp::checked_from_micros(micros).ok_or(IggyError::InvalidCommand);
+        let start = match query.start {
+            ffi::MetadataChangeStart::Earliest => MetadataChangeStart::Earliest,
+            ffi::MetadataChangeStart::Latest => MetadataChangeStart::Latest,
+            ffi::MetadataChangeStart::After => {
+                MetadataChangeStart::After(MetadataChangeCursor::from_str(&query.cursor)?)
+            }
+            ffi::MetadataChangeStart::Current if query.page_token.is_empty() => {
+                MetadataChangeStart::Current(None)
+            }
+            ffi::MetadataChangeStart::Current => MetadataChangeStart::Current(Some(
+                MetadataCurrentPageToken::from_str(&query.page_token)?,
+            )),
+            _ => return Err(IggyError::InvalidCommand),
+        };
+        let groups = query
+            .groups
+            .iter()
+            .map(|&code| {
+                WireMetadataChangeGroup::from_code(code)
+                    .map(MetadataChangeGroup::from)
+                    .map_err(|_| IggyError::InvalidCommand)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            start,
+            groups,
+            since: query
+                .has_since
+                .then(|| timestamp(query.since))
+                .transpose()?,
+            until: query
+                .has_until
+                .then(|| timestamp(query.until))
+                .transpose()?,
+            limit: query.limit,
+        })
+    }
+}
+
+impl From<MetadataChangeCursor> for ffi::MetadataChangeCursor {
+    fn from(cursor: MetadataChangeCursor) -> Self {
+        ffi::MetadataChangeCursor {
+            log_id_lo: cursor.log_id as u64,
+            log_id_hi: (cursor.log_id >> 64) as u64,
+            op: cursor.op,
+            checksum_lo: cursor.checksum as u64,
+            checksum_hi: (cursor.checksum >> 64) as u64,
+            ordinal: cursor.ordinal,
+            text: cursor.to_string(),
+        }
+    }
+}
+
+impl From<MetadataCurrentPageToken> for ffi::MetadataCurrentPageToken {
+    fn from(token: MetadataCurrentPageToken) -> Self {
+        ffi::MetadataCurrentPageToken {
+            text: token.to_string(),
+            anchor: token.anchor().into(),
+            required_head: token.required_head(),
+            groups_mask: token.groups().mask(),
+            last_group: WireMetadataChangeGroup::from(token.last_group()).as_u8(),
+            last_key: token.last_key().to_vec(),
+        }
+    }
+}
+
+impl From<MetadataChanges> for ffi::MetadataChanges {
+    fn from(changes: MetadataChanges) -> Self {
+        let log_id = changes.log_id.unwrap_or_default();
+        ffi::MetadataChanges {
+            status: WireMetadataChangeStatus::from(changes.status).as_u8(),
+            phase: WireMetadataChangePhase::from(changes.phase).as_u8(),
+            has_log_id: changes.log_id.is_some(),
+            log_id_lo: log_id as u64,
+            log_id_hi: (log_id >> 64) as u64,
+            oldest_op: changes.oldest_op,
+            retained_since: changes.retained_since,
+            head_op: changes.head_op,
+            has_next: changes.next.is_some(),
+            next: changes.next.map(Into::into).unwrap_or_default(),
+            has_more: changes.has_more,
+            records: changes
+                .records
+                .into_iter()
+                .map(ffi::MetadataChangeRecord::from)
+                .collect(),
+            items: changes
+                .items
+                .into_iter()
+                .map(ffi::MetadataCurrentItem::from)
+                .collect(),
+            has_current_page_token: changes.current_page_token.is_some(),
+            current_page_token: changes
+                .current_page_token
+                .map(Into::into)
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl From<MetadataChangeRecord> for ffi::MetadataChangeRecord {
+    fn from(record: MetadataChangeRecord) -> Self {
+        let mut converted = ffi::MetadataChangeRecord {
+            op: record.op,
+            ordinal: record.ordinal,
+            checksum_lo: record.checksum as u64,
+            checksum_hi: (record.checksum >> 64) as u64,
+            timestamp: record.timestamp,
+            has_actor_user_id: record.actor_user_id.is_some(),
+            actor_user_id: record.actor_user_id.unwrap_or_default(),
+            form: ffi::MetadataChangeForm::Known,
+            group: 0,
+            kind: 0,
+            group_name: String::new(),
+            kind_name: String::new(),
+            body: ffi::MetadataChangeBody::default(),
+        };
+        if let Some(kind) = record.change.kind() {
+            converted.kind = WireMetadataChangeKind::from(kind).as_u8();
+            converted.group = WireMetadataChangeGroup::from(kind.group()).as_u8();
+        }
+        converted.body = match record.change {
+            MetadataChange::StreamCreated(body) | MetadataChange::StreamUpdated(body) => {
+                body.into()
+            }
+            MetadataChange::StreamDeleted(body) => body.into(),
+            MetadataChange::TopicCreated(body) | MetadataChange::TopicUpdated(body) => body.into(),
+            MetadataChange::TopicDeleted(body) => body.into(),
+            MetadataChange::PartitionsChanged(body) => body.into(),
+            MetadataChange::ConsumerGroupCreated(body) => body.into(),
+            MetadataChange::ConsumerGroupDeleted(body) => body.into(),
+            MetadataChange::ConsumerGroupMemberJoined(body) => body.into(),
+            MetadataChange::ConsumerGroupMemberLeft(body) => body.into(),
+            MetadataChange::ConsumerGroupPartitionHandedOver(body) => body.into(),
+            MetadataChange::UserCreated(body) | MetadataChange::UserUpdated(body) => body.into(),
+            MetadataChange::UserDeleted(body) | MetadataChange::UserPasswordChanged(body) => {
+                body.into()
+            }
+            MetadataChange::UserPermissionsUpdated(body) => body.into(),
+            MetadataChange::PersonalAccessTokenCreated(body) => body.into(),
+            MetadataChange::PersonalAccessTokenDeleted(body) => body.into(),
+            MetadataChange::SessionRegistered(body) => body.into(),
+            MetadataChange::SessionClosed(body) => body.into(),
+            MetadataChange::Unknown { group, kind, body } => {
+                converted.form = ffi::MetadataChangeForm::Unknown;
+                converted.group = group;
+                converted.kind = kind;
+                ffi::MetadataChangeBody {
+                    unknown_body: body.to_vec(),
+                    ..ffi::MetadataChangeBody::default()
+                }
+            }
+            MetadataChange::UnknownJson { group, kind, body } => {
+                converted.form = ffi::MetadataChangeForm::UnknownJson;
+                converted.group_name = group;
+                converted.kind_name = kind;
+                ffi::MetadataChangeBody {
+                    unknown_body: body.get().as_bytes().to_vec(),
+                    ..ffi::MetadataChangeBody::default()
+                }
+            }
+        };
+        converted
+    }
+}
+
+impl From<MetadataCurrentItem> for ffi::MetadataCurrentItem {
+    fn from(item: MetadataCurrentItem) -> Self {
+        let group = item
+            .group()
+            .map_or(0, |group| WireMetadataChangeGroup::from(group).as_u8());
+        let known = |body: ffi::MetadataChangeBody| ffi::MetadataCurrentItem {
+            form: ffi::MetadataChangeForm::Known,
+            group,
+            group_name: String::new(),
+            body,
+        };
+        match item {
+            MetadataCurrentItem::Stream(body) => known(body.into()),
+            MetadataCurrentItem::Topic(body) => known(body.into()),
+            MetadataCurrentItem::Partitions(body) => known(body.into()),
+            MetadataCurrentItem::ConsumerGroup(body) => known(body.into()),
+            MetadataCurrentItem::ConsumerGroupMember(body) => known(body.into()),
+            MetadataCurrentItem::User(body) => known(body.into()),
+            MetadataCurrentItem::PersonalAccessToken(body) => known(body.into()),
+            MetadataCurrentItem::Session(body) => known(body.into()),
+            MetadataCurrentItem::Unknown { group, body } => ffi::MetadataCurrentItem {
+                form: ffi::MetadataChangeForm::Unknown,
+                group,
+                group_name: String::new(),
+                body: ffi::MetadataChangeBody {
+                    unknown_body: body.to_vec(),
+                    ..ffi::MetadataChangeBody::default()
+                },
+            },
+            MetadataCurrentItem::UnknownJson { group, body } => ffi::MetadataCurrentItem {
+                form: ffi::MetadataChangeForm::UnknownJson,
+                group: 0,
+                group_name: group,
+                body: ffi::MetadataChangeBody {
+                    unknown_body: body.get().as_bytes().to_vec(),
+                    ..ffi::MetadataChangeBody::default()
+                },
+            },
+        }
+    }
+}
+
+impl Default for ffi::MetadataChangeBody {
+    fn default() -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: 0,
+            stream_created_op: 0,
+            topic_id: 0,
+            topic_created_op: 0,
+            group_id: 0,
+            has_member_id: false,
+            member_id: 0,
+            partition_id: 0,
+            created_at: 0,
+            name: String::new(),
+            partitions_count: 0,
+            consumer_groups_count: 0,
+            members_count: 0,
+            client_id_lo: 0,
+            client_id_hi: 0,
+            partition_ids: Vec::new(),
+            has_requested_op: false,
+            requested_op: 0,
+            reason: 0,
+            user_id: 0,
+            user_created_at: 0,
+            status: ffi::UserStatus::Active,
+            has_permissions: false,
+            permissions: ffi::Permissions::from(RustPermissions::default()),
+            options_readable: false,
+            options: Vec::new(),
+            derived_options: Vec::new(),
+            has_expiry: false,
+            expiry: 0,
+            session: 0,
+            unknown_body: Vec::new(),
+        }
+    }
+}
+
+impl From<MetadataOptions> for ffi::MetadataChangeBody {
+    fn from(options: MetadataOptions) -> Self {
+        match options {
+            MetadataOptions::Readable(options) => ffi::MetadataChangeBody {
+                options_readable: true,
+                options: resource_options_to_ffi(&options, true),
+                derived_options: resource_options_to_ffi(&options, false),
+                ..ffi::MetadataChangeBody::default()
+            },
+            MetadataOptions::Unreadable => ffi::MetadataChangeBody::default(),
+        }
+    }
+}
+
+impl From<MetadataStreamChange> for ffi::MetadataChangeBody {
+    fn from(body: MetadataStreamChange) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            created_at: body.created_at,
+            name: body.name,
+            ..body.options.into()
+        }
+    }
+}
+
+impl From<MetadataStreamDeleted> for ffi::MetadataChangeBody {
+    fn from(body: MetadataStreamDeleted) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            created_at: body.created_at,
+            name: body.name,
+            has_requested_op: body.requested_op.is_some(),
+            requested_op: body.requested_op.unwrap_or_default(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataTopicChange> for ffi::MetadataChangeBody {
+    fn from(body: MetadataTopicChange) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            created_at: body.created_at,
+            name: body.name,
+            partitions_count: body.partitions_count,
+            ..body.options.into()
+        }
+    }
+}
+
+impl From<MetadataTopicItem> for ffi::MetadataChangeBody {
+    fn from(body: MetadataTopicItem) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            created_at: body.created_at,
+            name: body.name,
+            ..body.options.into()
+        }
+    }
+}
+
+impl From<MetadataTopicDeleted> for ffi::MetadataChangeBody {
+    fn from(body: MetadataTopicDeleted) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            created_at: body.created_at,
+            name: body.name,
+            has_requested_op: body.requested_op.is_some(),
+            requested_op: body.requested_op.unwrap_or_default(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataPartitionsChanged> for ffi::MetadataChangeBody {
+    fn from(body: MetadataPartitionsChanged) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            partitions_count: body.partitions_count,
+            partition_ids: body.removed_partition_ids,
+            has_requested_op: body.requested_op.is_some(),
+            requested_op: body.requested_op.unwrap_or_default(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataPartitionsItem> for ffi::MetadataChangeBody {
+    fn from(body: MetadataPartitionsItem) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            partitions_count: body.partitions_count,
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataConsumerGroupCreated> for ffi::MetadataChangeBody {
+    fn from(body: MetadataConsumerGroupCreated) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            group_id: body.group_id,
+            name: body.name,
+            consumer_groups_count: body.consumer_groups_count,
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataConsumerGroupDeleted> for ffi::MetadataChangeBody {
+    fn from(body: MetadataConsumerGroupDeleted) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            group_id: body.group_id,
+            name: body.name,
+            consumer_groups_count: body.consumer_groups_count,
+            has_requested_op: body.requested_op.is_some(),
+            requested_op: body.requested_op.unwrap_or_default(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataConsumerGroupItem> for ffi::MetadataChangeBody {
+    fn from(body: MetadataConsumerGroupItem) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            group_id: body.group_id,
+            name: body.name,
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataMemberJoined> for ffi::MetadataChangeBody {
+    fn from(body: MetadataMemberJoined) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            group_id: body.group_id,
+            has_member_id: true,
+            member_id: body.member_id,
+            client_id_lo: body.client_id as u64,
+            client_id_hi: (body.client_id >> 64) as u64,
+            members_count: body.members_count,
+            partition_ids: body.partition_ids,
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataMemberLeft> for ffi::MetadataChangeBody {
+    fn from(body: MetadataMemberLeft) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            group_id: body.group_id,
+            has_member_id: true,
+            member_id: body.member_id,
+            client_id_lo: body.client_id as u64,
+            client_id_hi: (body.client_id >> 64) as u64,
+            members_count: body.members_count,
+            reason: WireMemberLeftReason::from(body.reason).as_u8(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataPartitionHandedOver> for ffi::MetadataChangeBody {
+    fn from(body: MetadataPartitionHandedOver) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            group_id: body.group_id,
+            partition_id: body.partition_id,
+            has_member_id: body.member_id.is_some(),
+            member_id: body.member_id.unwrap_or_default(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataMemberItem> for ffi::MetadataChangeBody {
+    fn from(body: MetadataMemberItem) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            group_id: body.group_id,
+            has_member_id: true,
+            member_id: body.member_id,
+            client_id_lo: body.client_id as u64,
+            client_id_hi: (body.client_id >> 64) as u64,
+            partition_ids: body.partition_ids,
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataUserChange> for ffi::MetadataChangeBody {
+    fn from(body: MetadataUserChange) -> Self {
+        ffi::MetadataChangeBody {
+            user_id: body.user_id,
+            user_created_at: body.user_created_at,
+            name: body.username,
+            status: body.status.into(),
+            has_permissions: body.permissions.is_some(),
+            permissions: ffi::Permissions::from(body.permissions.unwrap_or_default()),
+            ..body.options.into()
+        }
+    }
+}
+
+impl From<MetadataUserIdentity> for ffi::MetadataChangeBody {
+    fn from(body: MetadataUserIdentity) -> Self {
+        ffi::MetadataChangeBody {
+            user_id: body.user_id,
+            user_created_at: body.user_created_at,
+            name: body.username,
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataUserPermissionsUpdated> for ffi::MetadataChangeBody {
+    fn from(body: MetadataUserPermissionsUpdated) -> Self {
+        ffi::MetadataChangeBody {
+            user_id: body.user_id,
+            user_created_at: body.user_created_at,
+            name: body.username,
+            has_permissions: body.permissions.is_some(),
+            permissions: ffi::Permissions::from(body.permissions.unwrap_or_default()),
+            reason: WirePermissionsUpdatedReason::from(body.reason).as_u8(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataTokenChange> for ffi::MetadataChangeBody {
+    fn from(body: MetadataTokenChange) -> Self {
+        ffi::MetadataChangeBody {
+            user_id: body.user_id,
+            user_created_at: body.user_created_at,
+            name: body.name,
+            has_expiry: body.expiry.is_some(),
+            expiry: body.expiry.unwrap_or_default(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataTokenDeleted> for ffi::MetadataChangeBody {
+    fn from(body: MetadataTokenDeleted) -> Self {
+        ffi::MetadataChangeBody {
+            user_id: body.user_id,
+            user_created_at: body.user_created_at,
+            name: body.name,
+            reason: WireTokenDeletedReason::from(body.reason).as_u8(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataSession> for ffi::MetadataChangeBody {
+    fn from(body: MetadataSession) -> Self {
+        ffi::MetadataChangeBody {
+            user_id: body.user_id,
+            user_created_at: body.user_created_at,
+            client_id_lo: body.client_id as u64,
+            client_id_hi: (body.client_id >> 64) as u64,
+            session: body.session,
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataSessionClosed> for ffi::MetadataChangeBody {
+    fn from(body: MetadataSessionClosed) -> Self {
+        ffi::MetadataChangeBody {
+            user_id: body.user_id,
+            user_created_at: body.user_created_at,
+            client_id_lo: body.client_id as u64,
+            client_id_hi: (body.client_id >> 64) as u64,
+            session: body.session,
+            reason: WireSessionClosedReason::from(body.reason).as_u8(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1440,6 +2028,77 @@ mod tests {
         assert_eq!(
             fields(&ffi::PolledMessages::from(polled).context),
             (3, 5, 7)
+        );
+    }
+
+    #[test]
+    fn given_json_record_of_unknown_kind_when_converting_should_keep_names_and_the_whole_object() {
+        let json = r#"{"op":5,"ordinal":1,"checksum":"0000000000000000000000000000002a","timestamp":7,"group":"future_group","kind":"future_kind","extra":true}"#;
+        let record: MetadataChangeRecord = serde_json::from_str(json).expect("record parses");
+
+        let converted = ffi::MetadataChangeRecord::from(record);
+
+        assert!(converted.form == ffi::MetadataChangeForm::UnknownJson);
+        assert_eq!(
+            (converted.group_name.as_str(), converted.kind_name.as_str()),
+            ("future_group", "future_kind")
+        );
+        assert_eq!((converted.op, converted.ordinal), (5, 1));
+        assert_eq!((converted.checksum_lo, converted.checksum_hi), (42, 0));
+        assert!(!converted.has_actor_user_id);
+        assert_eq!(converted.body.unknown_body, json.as_bytes());
+    }
+
+    #[test]
+    fn given_json_item_of_unknown_group_when_converting_should_keep_the_whole_object() {
+        let json = r#"{"group":"future_group","count":3}"#;
+        let item: MetadataCurrentItem = serde_json::from_str(json).expect("item parses");
+
+        let converted = ffi::MetadataCurrentItem::from(item);
+
+        assert!(converted.form == ffi::MetadataChangeForm::UnknownJson);
+        assert_eq!(converted.group_name, "future_group");
+        assert_eq!(converted.body.unknown_body, json.as_bytes());
+    }
+
+    #[test]
+    fn given_bridge_query_when_converting_should_map_every_start_mode_and_refuse_unknown_codes() {
+        let query = |start: ffi::MetadataChangeStart, groups: Vec<u8>| ffi::MetadataChangesQuery {
+            start,
+            cursor: String::new(),
+            page_token: String::new(),
+            groups,
+            has_since: false,
+            since: 9,
+            has_until: true,
+            until: 11,
+            limit: 7,
+        };
+
+        let current =
+            MetadataChangesQuery::try_from(query(ffi::MetadataChangeStart::Current, vec![1]))
+                .expect("current query");
+        assert_eq!(
+            current,
+            MetadataChangesQuery {
+                start: MetadataChangeStart::Current(None),
+                groups: vec![MetadataChangeGroup::Streams],
+                since: None,
+                until: Some(IggyTimestamp::from(11)),
+                limit: 7,
+            }
+        );
+        assert_eq!(
+            MetadataChangesQuery::try_from(query(ffi::MetadataChangeStart { repr: 4 }, Vec::new())),
+            Err(IggyError::InvalidCommand)
+        );
+        assert_eq!(
+            MetadataChangesQuery::try_from(query(ffi::MetadataChangeStart::Earliest, vec![9])),
+            Err(IggyError::InvalidCommand)
+        );
+        assert_eq!(
+            MetadataChangesQuery::try_from(query(ffi::MetadataChangeStart::After, Vec::new())),
+            Err(IggyError::InvalidCommand)
         );
     }
 }

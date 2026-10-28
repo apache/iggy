@@ -88,6 +88,7 @@ internal static class VsrOperations
         CommandCodes.GET_STATS_CODE,
         CommandCodes.GET_SNAPSHOT_CODE,
         CommandCodes.GET_CLUSTER_METADATA_CODE,
+        CommandCodes.GET_METADATA_CHANGES_CODE,
         CommandCodes.GET_ME_CODE,
         CommandCodes.GET_CLIENT_CODE,
         CommandCodes.GET_CLIENTS_CODE,

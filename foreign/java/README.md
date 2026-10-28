@@ -38,7 +38,7 @@ See [Maven Central](https://central.sonatype.com/artifact/org.apache.iggy/iggy) 
 
 ### Snapshot Versions
 
-Development builds of the next release carry the version `0.9.2-SNAPSHOT`. Get them from the ASF snapshot repository:
+Development builds of the next release carry the version `0.9.5-SNAPSHOT`. Get them from the ASF snapshot repository:
 
 **Gradle:**
 
@@ -51,7 +51,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'org.apache.iggy:iggy:0.9.2-SNAPSHOT'
+    implementation 'org.apache.iggy:iggy:0.9.5-SNAPSHOT'
 }
 ```
 
@@ -72,7 +72,7 @@ dependencies {
     <dependency>
         <groupId>org.apache.iggy</groupId>
         <artifactId>iggy</artifactId>
-        <version>0.9.2-SNAPSHOT</version>
+        <version>0.9.5-SNAPSHOT</version>
     </dependency>
 </dependencies>
 ```
@@ -122,6 +122,12 @@ credentials of the automatic sign-in. It also updates the builder credentials
 that `login()` uses when they name that user. This holds for typed calls,
 `sendBinaryRequest` and `resolveOperation`. A rejected change leaves the
 credentials unchanged.
+
+`sendBinaryRequestToReplica(code, payload, replicaId)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
+
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, readiness waits, deferred-request cancels, consumer-offset reads and session-control codes fail with `INVALID_COMMAND` before anything is sent.
+
+An id that cluster metadata does not name fails with `INVALID_IDENTIFIER`. An unreachable node is retried until the request timeout, and a `NOT_PRIMARY` reply is returned rather than sent to another node. The HTTP client throws `IggyOperationNotSupportedException`.
 
 ## Quick Start
 
@@ -343,6 +349,131 @@ client.system().describeOptions(OptionsScope.Topic);  // keys, kinds, defaults a
 The stream key is 32 random bytes. It travels inside the create request over the client's transport, so protecting it on the network is the job of TLS. The server stores it wrapped under its own key and never returns it, reads report only its source and fingerprints. Without a key, a server with encryption enabled generates one for the stream.
 
 The typed builders refuse an update the server would refuse for its shape before anything is sent, with the server's error code. `raw(key, value)` and `rawReset(key)` reach keys this build has no field for, and the server decides whether they are allowed.
+
+### Metadata Changes
+
+`getMetadataChanges` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manageServers` permission and works on blocking TCP, async TCP and HTTP.
+
+```java
+import org.apache.iggy.system.MetadataChangeGroup;
+import org.apache.iggy.system.MetadataChangeStart;
+import org.apache.iggy.system.MetadataChanges;
+import org.apache.iggy.system.MetadataChangesQuery;
+
+var query = MetadataChangesQuery.builder()
+    .groups(MetadataChangeGroup.STREAMS, MetadataChangeGroup.TOPICS)
+    .build();
+while (true) {
+    MetadataChanges page = client.system().getMetadataChanges(query);
+    switch (page.status()) {
+        case OK -> {
+            page.records().forEach(record ->
+                System.out.println("op " + record.op() + " by " + record.actorUserId() + ": " + record.kind()));
+            if (page.next().isPresent()) {
+                query = query.withStart(MetadataChangeStart.after(page.next().get()));
+            }
+            if (!page.hasMore()) {
+                Thread.sleep(1000);
+            }
+        }
+        case BEHIND -> Thread.sleep(100);
+        default -> query = query.withStart(rebuild(client, query.groups()));
+    }
+}
+
+// Pages the current state, then returns the position to follow from.
+static MetadataChangeStart rebuild(IggyBaseClient client, List<MetadataChangeGroup> groups)
+        throws InterruptedException {
+    var query = MetadataChangesQuery.builder()
+        .start(MetadataChangeStart.current())
+        .groups(groups)
+        .build();
+    while (true) {
+        MetadataChanges page = client.system().getMetadataChanges(query);
+        switch (page.status()) {
+            case OK -> {
+                page.items().forEach(item -> System.out.println(item.group() + ": " + item.body()));
+                if (page.currentPageToken().isPresent()) {
+                    query = query.withStart(MetadataChangeStart.current(page.currentPageToken().get()));
+                } else if (page.next().isPresent()) {
+                    return MetadataChangeStart.after(page.next().get());
+                } else {
+                    query = query.withStart(MetadataChangeStart.current());
+                }
+            }
+            case BEHIND -> Thread.sleep(100);
+            default -> query = query.withStart(MetadataChangeStart.current());
+        }
+    }
+}
+```
+
+`EXPIRED` means the log no longer holds the history after the cursor, and `RESET` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return.
+
+Current pages need the parent groups of every selected group, for example `TOPICS` with `STREAMS`. Keep a rebuilt state private until a change page answers `OK` with `hasMore()` false and a `headOp()` at or above the last current page's.
+
+A cursor's `toString()` is its `mc1_` text, which `MetadataChangeCursor.parse` reads back, so a mirror can store it. A query the rules refuse fails with an `IggyValidationException` for invalid command before anything is sent, and a record of a kind this SDK does not know arrives as `MetadataChangeBody.Unknown` or `MetadataChangeBody.UnknownJson`.
+
+## Polling
+
+`pollMessages` returns whatever the server already holds. An empty topic answers
+at once, so the caller has to poll again.
+
+`pollMessagesDeferred` lets the server hold the request instead. It waits up to
+`maxWait` for `minCount` messages, caps the encoded response at `maxBytes`, and
+bounds the whole call by `requestTimeout`.
+
+```java
+import org.apache.iggy.message.DeferredPollOptions;
+
+// Defaults: 1 s wait, 1 message, 1 MiB, 11 s budget.
+var options = DeferredPollOptions.defaults()
+    .withMaxWait(Duration.ofSeconds(5))
+    .withMinCount(10);
+
+var polled = client.messages().pollMessagesDeferred(
+    streamId, topicId, Optional.of(0L), Consumer.of(1L),
+    PollingStrategy.next(), 100L, false, options);
+```
+
+If the readiness wait expires, the server still answers, with a partial batch or
+an empty one. If the request timeout expires, the call fails.
+
+The TCP client multiplexes deferred polls with other requests on its shared
+connections and routes them to the partition primary. Up to 64 deferred polls
+can be in flight per client; further polls wait for a slot in arrival order,
+within their original request timeout. A poll that expires before getting a
+slot fails with the retryable `TRANSIENT_NOT_ACCEPTED`. Queued and active
+requests share the client's 4096 pending request limit.
+Each TCP attempt uses the time remaining before the original call deadline,
+including time spent waiting for a slot, routing, or retrying. A server capacity
+refusal (`DEFERRED_POLL_CAPACITY_EXCEEDED`) backs off without discarding the
+cached partition route.
+The HTTP client accepts a plain consumer only,
+because the server refuses a consumer group over HTTP: without a persistent
+connection the client cannot follow the group's partition assignment.
+Deferred HTTP polls use a separate pool of up to 64 connections. A timeout or
+transport failure before the request can be sent reports `IggyServerException`
+with `TRANSIENT_NOT_ACCEPTED` (58). Once sending starts, those failures report
+`TRANSIENT_NOT_COMMITTED` (57), because the server may already have advanced the
+offset. The original failure is available as the cause. The client retries only
+definite non-admission, including `DEFERRED_POLL_CAPACITY_EXCEEDED` (90), within
+the original request timeout.
+
+A parked `Next` or auto-commit poll does not block sends to its partition.
+Polls that advance progress share a separate partition lane with offset reads,
+stores, and deletes. Stores and deletes also take the mutation lane, after their
+progress turn. A retained uncertain store or delete blocks later progress calls
+until it is resolved or abandoned; an active replay keeps its lanes until it
+finishes. Consumers on the same partition share this ordering, including when
+they name a consumer group by different aliases.
+
+Cancelling a TCP deferred poll sends a per-request cancellation on the same
+authenticated connection. This stops a poll still waiting for readiness;
+cancellation can race an offset update that the server has already accepted.
+With auto-commit, a lost or timed-out reply can leave the stored offset advanced
+without delivering its messages to the caller. Use manual offset commits after
+processing when those messages must remain available for another attempt.
 
 ## Exception Handling
 

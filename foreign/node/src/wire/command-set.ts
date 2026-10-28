@@ -65,6 +65,7 @@ import { deletePartition } from './partition/delete-partition.command.js';
 import { deleteSegments } from './segment/delete-segments.command.js';
 
 import { describeOptions } from './system/describe-options.command.js';
+import { getMetadataChanges } from './system/get-metadata-changes.command.js';
 import { getStats } from './system/get-stats.command.js';
 import { snapshot } from './system/snapshot.command.js';
 import { ping } from './system/ping.command.js';
@@ -187,7 +188,8 @@ const systemAPI = (c: ClientProvider) => ({
   ping: ping(c),
   getStats: getStats(c),
   snapshot: snapshot(c),
-  describeOptions: describeOptions(c)
+  describeOptions: describeOptions(c),
+  getMetadataChanges: getMetadataChanges(c)
 });
 
 type SystemAPI = ReturnType<typeof systemAPI>;
@@ -262,13 +264,44 @@ export abstract class CommandAPI extends AbstractAPI {
     code: number,
     payload: Buffer
   ): Promise<Buffer> {
+    return this.sendRawCommand(code, payload);
+  }
+
+  /**
+   * Sends a command code with a payload to the replica with the given id, as
+   * the cluster metadata names it, and returns the raw response payload. Every
+   * node answers non-replicated commands such as GetStats from its own state.
+   * Replicated commands, polls, consumer-offset reads and session-control codes
+   * are rejected with an invalid-command error, and a replica id the cluster
+   * metadata does not name with an invalid-identifier error. A `NotPrimary`
+   * refusal is returned and not retried on another replica.
+   *
+   * @param code - Command code to send
+   * @param payload - Raw command payload
+   * @param replica - Replica id, as the cluster metadata names it
+   * @returns Raw response payload
+   */
+  async sendBinaryRequestToReplica(
+    code: number,
+    payload: Buffer,
+    replica: number
+  ): Promise<Buffer> {
+    return this.sendRawCommand(code, payload, { replica });
+  }
+
+  private async sendRawCommand(
+    code: number,
+    payload: Buffer,
+    options?: SendCommandOptions
+  ): Promise<Buffer> {
     if (SESSION_CONTROL_CODES.has(code))
       throw responseError(code, INVALID_COMMAND_ERROR_CODE);
 
     const snapshot = Buffer.from(payload);
     const response = await (await this.clientProvider()).sendCommand(
       code,
-      snapshot
+      snapshot,
+      options
     );
     return response.length <= 1 ? Buffer.alloc(0) : response.data;
   }

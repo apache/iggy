@@ -73,6 +73,9 @@ under the License.
         <ReqnrollFeatureFile Include="..\..\..\bdd\scenarios\resource_options_patch.feature">
             <Link>Features\resource_options_patch.feature</Link>
         </ReqnrollFeatureFile>
+        <ReqnrollFeatureFile Include="..\..\..\bdd\scenarios\metadata_changes.feature">
+            <Link>Features\metadata_changes.feature</Link>
+        </ReqnrollFeatureFile>
         <ReqnrollFeatureFile Include="..\..\..\bdd\scenarios\session_contract.feature">
             <Link>Features\session_contract.feature</Link>
         </ReqnrollFeatureFile>

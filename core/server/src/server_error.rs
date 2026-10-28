@@ -66,6 +66,8 @@ pub enum ServerError {
     Config(#[source] configs::ConfigurationError),
     #[error("failed to allocate shards from sharding.cpu_allocation")]
     ShardAllocator(#[source] ShardingError),
+    #[error("cluster.coordinator.replica_connections_per_peer cannot run on this node")]
+    ReplicaLinkLayout(#[source] message_bus::LinkLayoutError),
     #[error("failed to bind shard {shard_id} to its CPU set")]
     CpuAffinityFailed {
         shard_id: u16,

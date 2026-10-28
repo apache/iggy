@@ -70,5 +70,10 @@ name = "resource_options_patch"
 harness = false
 required-features = ["bdd"]
 
+[[test]]
+name = "metadata_changes"
+harness = false
+required-features = ["bdd"]
+
 [lints]
 workspace = true

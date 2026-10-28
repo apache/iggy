@@ -1527,6 +1527,16 @@ impl ClientTable {
     pub fn count(&self) -> usize {
         self.index.len()
     }
+
+    /// Sessions not yet ended, as `(client_id, user_id, epoch)` in slot order.
+    /// Never the bind verifier or a cached reply.
+    pub fn active_sessions(&self) -> impl Iterator<Item = (u128, u32, u64)> + '_ {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|entry| entry.ended_op.is_none())
+            .map(|entry| (entry.client_id, entry.user_id, entry.epoch))
+    }
 }
 
 /// Failure decoding the state-transfer WIRE encoding of a client table
@@ -2031,6 +2041,22 @@ mod tests {
             ..ReplyHeader::default()
         };
         msg
+    }
+
+    #[test]
+    fn given_ended_and_live_sessions_when_listing_active_should_yield_only_live_identities() {
+        let mut table = ClientTable::new(8);
+        for (client, user, epoch) in [(1, 11, 10), (2, 22, 20), (3, 11, 30)] {
+            table
+                .commit_register(client, user, [0x5a; 32], make_register_reply(client, epoch))
+                .unwrap();
+        }
+        table.end_user_sessions(22, 40);
+
+        let mut active: Vec<_> = table.active_sessions().collect();
+        active.sort_unstable();
+
+        assert_eq!(active, [(1, 11, 10), (3, 11, 30)]);
     }
 
     #[test]

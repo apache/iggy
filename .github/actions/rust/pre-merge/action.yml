@@ -65,9 +65,9 @@ runs:
         # Shards download the build artifact. Metadata-only tasks need no target cache.
         read-cache: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'machete' || inputs.task == 'test') && 'false' || 'true' }}
         save-cache: ${{ inputs.save-cache }}
-        # Artifact builders do not pull test containers. Keep cleanup on the
-        # test shards and other disk-heavy jobs.
-        free-disk-space: ${{ (inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'miri' || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'doctest') && 'false' || 'true' }}
+        # Artifact builders do not pull test containers. Test shards have ~78 GB
+        # free when tests start and use ~15 GB, so the cleanup costs minutes.
+        free-disk-space: ${{ (inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'test' || inputs.task == 'miri' || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'doctest') && 'false' || 'true' }}
 
     - name: Install cargo-sort
       if: inputs.task == 'sort'
@@ -262,6 +262,7 @@ runs:
         fi
 
         : > "$ARTIFACT_DIR/runtime-files"
+        KAFKA_MESSAGE_GEN=""
         if [[ "$BUILD_RUNTIME" == true ]]; then
           # Match the cache producer's dependency features even for affected-package runs.
           cargo build --locked --workspace --exclude server --exclude iggy-cli \
@@ -282,6 +283,11 @@ runs:
             while IFS= read -r artifact; do
               realpath --relative-to="$GITHUB_WORKSPACE" "$artifact"
             done > "$ARTIFACT_DIR/runtime-files"
+          # Fixture generation reuses this binary: `cargo run -p` would resolve
+          # features for that one package and rebuild the crates under it.
+          KAFKA_MESSAGE_GEN=$(jq -r '
+            select(.reason == "compiler-artifact" and .target.name == "kafka-message-gen") |
+            .executable // empty' "$ARTIFACT_DIR/build.jsonl")
           rm "$ARTIFACT_DIR/build.jsonl"
         fi
         tar --zstd -cf "$ARTIFACT_DIR/runtime.tar.zst" -T "$ARTIFACT_DIR/runtime-files"
@@ -338,7 +344,7 @@ runs:
         fi
         printf '%s\n' "$NEEDS_KAFKA_FIXTURES" > "$ARTIFACT_DIR/kafka-fixtures"
         if [[ "$NEEDS_KAFKA_FIXTURES" == true ]]; then
-          ./gateways/kafka/scripts/ci-wire-fixtures.sh generate
+          KAFKA_MESSAGE_GEN="$KAFKA_MESSAGE_GEN" ./gateways/kafka/scripts/ci-wire-fixtures.sh generate
           tar --zstd -cf "$ARTIFACT_DIR/kafka-fixtures.tar.zst" gateways/kafka/tools/kafka-tool/kafka_messages
         fi
 
@@ -428,12 +434,23 @@ runs:
         tar --zstd -xf "$ARTIFACT_DIR/nextest.tar.zst"
         tar --zstd -xf "$ARTIFACT_DIR/runtime.tar.zst"
         ./scripts/ci/restore-runtime.sh "$RUNNER_TEMP/rust-runtime"
+        echo "Disk space before tests:"
+        df -h /
+        # The after-test report must survive a failing run: a full disk is one
+        # way to fail.
+        nextest_status=0
+        # slice deals the filtered test list round-robin, so neighbouring slow
+        # tests such as the per-transport variants of one scenario land on
+        # different shards. hash placement can stack them on one shard.
         cargo nextest run \
           --cargo-metadata target/nextest/cargo-metadata.json \
           --binaries-metadata target/nextest/binaries-metadata.json \
           --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
           --no-fail-fast --no-tests="$NO_TESTS" --profile ci \
-          --partition "hash:${PARTITION_INDEX}/${PARTITION_COUNT}"
+          --partition "slice:${PARTITION_INDEX}/${PARTITION_COUNT}" || nextest_status=$?
+        echo "Disk space after tests:"
+        df -h /
+        exit "$nextest_status"
       shell: bash
 
     # Compare the shared HEAD runtime with a separately built baseline server.

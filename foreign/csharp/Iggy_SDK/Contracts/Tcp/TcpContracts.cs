@@ -823,6 +823,46 @@ internal static class TcpContracts
         return bytes.ToArray();
     }
 
+    /// <summary>
+    ///     Encodes a validated metadata changes query:
+    ///     <c>[start:u8][cursor:44][has_since:u8][since:u64]?[has_until:u8][until:u64]?[limit:u32][groups_count:u8][group:u8]*[token_len:u16][token]</c>.
+    ///     The cursor is all zero unless the query starts after one, and groups keep the caller's order.
+    /// </summary>
+    internal static byte[] GetMetadataChanges(MetadataChangesQuery query)
+    {
+        var groups = query.Groups.Count > byte.MaxValue ? query.Groups.Distinct().ToArray() : query.Groups;
+        var groupsCount = groups.Count;
+        var token = query.Start.PageToken is { } pageToken ? pageToken.Payload : ReadOnlySpan<byte>.Empty;
+        var length = 1 + MetadataChangeCursor.SIZE + (query.Since.HasValue ? 9 : 1) + (query.Until.HasValue ? 9 : 1)
+                     + 4 + 1 + groupsCount + 2 + token.Length;
+        var bytes = new byte[length];
+        bytes[0] = (byte)query.Start.Mode;
+        query.Start.Cursor?.WriteTo(bytes.AsSpan(1, MetadataChangeCursor.SIZE));
+        var position = 1 + MetadataChangeCursor.SIZE;
+        foreach (var bound in new[] { query.Since, query.Until })
+        {
+            bytes[position++] = bound.HasValue ? (byte)1 : (byte)0;
+            if (bound is { } value)
+            {
+                BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(position, 8), value);
+                position += 8;
+            }
+        }
+
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position, 4), query.Limit);
+        position += 4;
+        bytes[position++] = (byte)groupsCount;
+        for (var index = 0; index < groupsCount; index++)
+        {
+            bytes[position++] = (byte)groups[index];
+        }
+
+        BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(position, 2), (ushort)token.Length);
+        position += 2;
+        token.CopyTo(bytes.AsSpan(position));
+        return bytes;
+    }
+
     internal static byte[] DeleteOffset(Identifier streamId, Identifier topicId, Consumer consumer, uint? partitionId)
     {
         Span<byte> bytes =

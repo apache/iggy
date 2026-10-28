@@ -29,8 +29,10 @@ use iggy_common::variadic;
 use iggy_common::{IggyByteSize, ServerKeyContext};
 use journal::Journal;
 use message_bus::MessageBus;
+use metadata::change_log::{ChangeLog, MetadataChangeLog};
 use metadata::impls::metadata::IggySnapshot;
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::LeftRightFactory;
 use metadata::stm::mux::WithFactory;
 use metadata::stm::snapshot::RestoreSnapshot;
 use metadata::stm::stream::{Streams, StreamsInner};
@@ -77,13 +79,17 @@ pub type Replica = shard::IggyShard<
     SimSuperblock,
 >;
 
-/// Read-side handoff bundle for the metadata STM.
+/// Read-side handoff bundle for the metadata STM and the change log.
 ///
 /// Shard 0 (the sole writer) mints one via `factory_bundle`; every peer shard
 /// rebuilds a reader-mode mirror from it with `from_factory_bundle`, exactly as
 /// the server bootstrap does with its `ServerMetadataBundle`.
 /// `Clone + Send + Sync`.
-pub type SimMetadataBundle = <variadic!(Users, Streams) as WithFactory>::Bundle;
+#[derive(Clone, Debug)]
+pub struct SimMetadataBundle {
+    pub states: <variadic!(Users, Streams) as WithFactory>::Bundle,
+    pub change_log: LeftRightFactory<ChangeLog>,
+}
 
 /// Capacity of each shard inbox in the simulator.
 ///
@@ -246,7 +252,10 @@ pub fn new_shard(
         .as_ref()
         .and_then(|journal| journal.last_op());
 
-    let mux = reader_bundle.map_or_else(
+    let (reader_states, reader_change_log) = reader_bundle
+        .map(|bundle| (bundle.states, bundle.change_log))
+        .unzip();
+    let mux = reader_states.map_or_else(
         // Most workload tests begin with a root fixture. Bootstrap tests start
         // empty and run the server initializer through metadata replication.
         || {
@@ -361,6 +370,9 @@ pub fn new_shard(
         data_dir,
     )
     .with_applied_frontier(applied_frontier);
+    if let Some(factory) = reader_change_log {
+        metadata = metadata.with_change_log(MetadataChangeLog::from_factory(factory));
+    }
     if let Some(coordinator) = metadata.coordinator.as_mut() {
         coordinator.use_synchronous_io();
     }
@@ -381,6 +393,20 @@ pub fn new_shard(
                 "a freshly built plane holds no sessions, so this must install"
             );
         }
+        let change_log = snapshot
+            .snapshot()
+            .change_log
+            .restore(
+                metadata
+                    .change_log()
+                    .capacities()
+                    .expect("shard 0 owns the change log writer"),
+            )
+            .expect("the local checkpoint's change log restores");
+        metadata
+            .change_log()
+            .restore(change_log)
+            .expect("shard 0 owns the change log writer");
     }
 
     // BEFORE the replay, matching a fresh boot: `CreateStream::apply` takes
@@ -427,20 +453,28 @@ pub fn new_shard(
             // `true`: the frontier is volatile, so a rebuilt plane starts at zero and
             // every op above the floor must mutate the table. A frontier only fences a
             // LIVE table a state transfer just replaced.
-            apply_committed_prepare(
+            let header = *entry.header();
+            let committed = apply_committed_prepare(
                 &*metadata.mux_stm,
                 &metadata.client_table,
                 true,
                 |_| {},
                 entry,
             );
+            metadata
+                .change_log()
+                .append(&header, committed.changes)
+                .expect("replay appends committed ops in order");
         }
     }
     // Same seed the server bootstrap runs after its own replay.
     metadata.seed_applied_frontier_from_consensus();
     // Mint the peers' read-side bundle AFTER reconstruction so it reflects the
     // recovered state. Shard 0 only; peers pass it back in as `reader_bundle`.
-    let metadata_bundle = (shard_idx == 0).then(|| metadata.mux_stm.factory_bundle());
+    let metadata_bundle = (shard_idx == 0).then(|| SimMetadataBundle {
+        states: metadata.mux_stm.factory_bundle(),
+        change_log: metadata.change_log().factory(),
+    });
 
     let partitions_config = PartitionsConfig {
         messages_required_to_save: 1000,

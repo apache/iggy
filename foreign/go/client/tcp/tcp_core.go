@@ -324,12 +324,13 @@ func releaseRequestBuf(bp *[]byte) {
 // do sends the command and returns the response body. Commands implementing
 // the appender interface encode directly into a pooled buffer.
 func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, error) {
-	return c.doCaptured(ctx, cmd, nil)
+	return c.doCaptured(ctx, cmd, nil, nil)
 }
 
 // doCaptured is do for a partition command that carries captured, a context
-// the caller holds, instead of the context its route names.
-func (c *IggyTcpClient) doCaptured(ctx context.Context, cmd command.Command, captured *iggcon.PartitionContext) ([]byte, error) {
+// the caller holds, instead of the context its route names, and for a command
+// sent to the replica the caller chose.
+func (c *IggyTcpClient) doCaptured(ctx context.Context, cmd command.Command, captured *iggcon.PartitionContext, replica *uint8) ([]byte, error) {
 	if ctx == nil {
 		return nil, ierror.ErrNilContext
 	}
@@ -352,9 +353,9 @@ func (c *IggyTcpClient) doCaptured(ctx context.Context, cmd command.Command, cap
 		if poll, ok := cmd.(*command.PollMessages); ok && poll.Strategy.Context != nil {
 			captured = poll.Strategy.Context
 		}
-		return c.drive(ctx, cmd.Code(), query, frame, captured)
+		return c.drive(ctx, cmd.Code(), query, frame, captured, nil)
 	}
-	return c.drive(ctx, cmd.Code(), nil, frame, nil)
+	return c.drive(ctx, cmd.Code(), nil, frame, nil, replica)
 }
 
 // rawRequest carries a SendBinaryRequest through do, so a raw partition
@@ -383,12 +384,31 @@ func (c *IggyTcpClient) SendBinaryRequest(ctx context.Context, code uint32, payl
 	return c.do(ctx, rawRequest{code: command.Code(code), payload: payload})
 }
 
+// SendBinaryRequestToReplica sends a command code and payload to the replica with id
+// replicaID and returns that replica's raw response body. Session-control codes,
+// replicated commands, polls and consumer offset reads return ierror.ErrInvalidCommand
+// without writing to the connection. A replica the roster does not name, after one
+// roster read, returns ierror.ErrInvalidIdentifier. The replica's own refusal, such as
+// ierror.ErrNotPrimary, is returned as it is.
+func (c *IggyTcpClient) SendBinaryRequestToReplica(ctx context.Context, code uint32, payload []byte, replicaID uint8) ([]byte, error) {
+	if _, replicated := vsr.ReplicatedOperation(code); replicated || isSessionControlCode(code) || isPartitionRead(command.Code(code)) {
+		return nil, ierror.ErrInvalidCommand
+	}
+	return c.doCaptured(ctx, rawRequest{code: command.Code(code), payload: payload}, nil, &replicaID)
+}
+
 // reserveHeader returns buf truncated to exactly the header prologue, growing
 // it as needed. The prologue bytes are not zeroed here: EncodeRequestHeader
 // clears the full header when the frame is stamped, and zeroing twice would
 // write four extra cache lines per request.
 func reserveHeader(buf []byte) []byte {
 	return slices.Grow(buf[:0], vsr.HeaderSize)[:vsr.HeaderSize]
+}
+
+// isPartitionRead reports whether code reads a partition through its primary and
+// incarnation, which a request to a chosen replica does not carry.
+func isPartitionRead(code command.Code) bool {
+	return code == command.PollMessagesCode || code == command.GetOffsetCode
 }
 
 func isSessionControlCode(code uint32) bool {
@@ -487,6 +507,24 @@ func (c *IggyTcpClient) connect(ctx context.Context) error {
 
 func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
 	return &iggcon.ConnectionInfo{Protocol: iggcon.Tcp, ServerAddress: c.links.address()}
+}
+
+// GetNoDelay reports whether TCP_NODELAY is set on new connections, which
+// tests and callers can use to observe the parsed nodelay option before a
+// connection exists to read it off.
+func (c *IggyTcpClient) GetNoDelay() bool {
+	// The client configuration does not change after construction, so this
+	// reads the field directly, like the dial path does.
+	return c.config.noDelay
+}
+
+// GetHeartbeatInterval reports the pacing of the managed heartbeat task on
+// ready replica links, which tests and callers can use to observe the
+// parsed heartbeat_interval option before a connection exists.
+func (c *IggyTcpClient) GetHeartbeatInterval() time.Duration {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return c.config.heartbeatInterval
 }
 
 // ResolveOperation replays the retained bytes under their original identity.

@@ -112,6 +112,15 @@ macro_rules! impl_binary_client {
                     .await
             }
 
+            async fn send_raw_to_replica(
+                &self,
+                code: u32,
+                payload: bytes::Bytes,
+                replica_id: u8,
+            ) -> Result<bytes::Bytes, iggy_common::IggyError> {
+                self.driver.send_to_replica(code, payload, replica_id).await
+            }
+
             async fn send_offset_write_with_response(
                 &self,
                 code: u32,
@@ -127,6 +136,24 @@ macro_rules! impl_binary_client {
                 context: Option<iggy_common::PartitionContext>,
             ) -> Result<bytes::Bytes, iggy_common::IggyError> {
                 self.driver.poll(request, context).await
+            }
+
+            async fn send_wait_with_response(
+                &self,
+                request: &iggy_binary_protocol::requests::messages::WaitForMessagesRequest,
+            ) -> Result<bytes::Bytes, iggy_common::IggyError> {
+                self.driver.wait_for_messages(request).await
+            }
+
+            async fn send_poll_with_response_and_options(
+                &self,
+                request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
+                context: Option<iggy_common::PartitionContext>,
+                options: Option<iggy_common::DeferredPollOptions>,
+            ) -> Result<bytes::Bytes, iggy_common::IggyError> {
+                self.driver
+                    .poll_with_options(request, context, options)
+                    .await
             }
 
             fn routed_partition_count(

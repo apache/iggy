@@ -138,6 +138,7 @@ class RuntimeBuildSelection(unittest.TestCase):
             "iggy-connectors": ("bin", "target/debug/iggy-connectors"),
             "iggy_connector_stdout_sink": ("cdylib", "target/debug/libiggy_connector_stdout_sink.so"),
             "iggy-bench-dashboard-server": ("bin", "target/debug/iggy-bench-dashboard-server"),
+            "kafka-message-gen": ("bin", "target/debug/kafka-message-gen"),
         }
         packages = []
         artifacts = []
@@ -172,7 +173,8 @@ elif sys.argv[1] in ('build', 'metadata'):
         cargo.chmod(0o755)
         generator = self.root / "gateways/kafka/scripts/ci-wire-fixtures.sh"
         generator.parent.mkdir(parents=True)
-        generator.write_text("#!/bin/sh\nmkdir -p gateways/kafka/tools/kafka-tool/kafka_messages\n")
+        generator.write_text("#!/bin/sh\nmkdir -p gateways/kafka/tools/kafka-tool/kafka_messages\n"
+                             "printf '%s' \"$KAFKA_MESSAGE_GEN\" > \"$RUNNER_TEMP/kafka-message-gen\"\n")
         generator.chmod(0o755)
 
     def assert_workspace_fallback(self):
@@ -189,6 +191,8 @@ elif sys.argv[1] in ('build', 'metadata'):
                                    "--archive-file", str(artifact / "nextest.tar.zst")])
         self.assert_runtime_archive([filename for _, filename in self.runtime_files.values()])
         self.assertEqual((artifact / "kafka-fixtures").read_text(), "true\n")
+        self.assertEqual((self.root / "kafka-message-gen").read_text(),
+                         str(self.root / "target/debug/kafka-message-gen"))
 
     def assert_runtime_archive(self, files):
         result = run("tar", "--zstd", "-tf", str(self.root / "rust-test-build/runtime.tar.zst"))
@@ -249,6 +253,8 @@ elif sys.argv[1] in ('build', 'metadata'):
         self.assertEqual(calls[0][:2], ["nextest", "archive"])
         self.assert_runtime_archive([])
         self.assertEqual((self.root / "rust-test-build/kafka-fixtures").read_text(), "true\n")
+        # No runtime build means no prebuilt generator, so the script builds its own.
+        self.assertEqual((self.root / "kafka-message-gen").read_text(), "")
 
     def test_skipped_scope_does_not_compile_or_archive(self):
         self.assertEqual(self.select([]), [])

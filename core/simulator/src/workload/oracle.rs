@@ -41,6 +41,7 @@
 
 use crate::client::SimClient;
 use crate::replica::Replica;
+use crate::workload::change_log_oracle::{assert_change_log_projection, assert_change_logs_agree};
 use crate::workload::invariants::Invariants;
 use crate::workload::shadow::Shadow;
 use crate::workload::{
@@ -521,6 +522,7 @@ fn partition_view_is_settled(sim: &Simulator, ns: server_common::sharding::IggyN
 /// If a replica is ahead of the leader, two replicas disagree on a committed op or
 /// on the message data it applied, or the shadow mismatches the leader. The
 /// workload seed is in the message so the failing run replays deterministically.
+#[allow(clippy::too_many_lines)]
 pub fn assert_converged(sim: &Simulator, workload: &mut Workload) -> ConvergenceReport {
     let seed = workload.options.seed;
     let live: Vec<usize> = (0..sim.replica_count)
@@ -604,6 +606,8 @@ pub fn assert_converged(sim: &Simulator, workload: &mut Workload) -> Convergence
     workload.readback.assert_served_committed(sim, seed);
 
     let replicas_compared = assert_committed_metadata_agrees(sim, &live, seed);
+    let change_records_compared = assert_change_logs_agree(sim, &live, seed);
+    let projection_items_compared = assert_change_log_projection(sim, leader, seed);
 
     let owners_compared = assert_settled_owners_installed(sim, workload, leader, seed);
     let retirements_compared = assert_retired_owners_removed(sim, workload, leader, &live, seed);
@@ -616,6 +620,8 @@ pub fn assert_converged(sim: &Simulator, workload: &mut Workload) -> Convergence
         data_namespaces_compared: data.namespaces,
         data_records_compared: data.records,
         replicas_compared,
+        change_records_compared,
+        projection_items_compared,
         namespaces_checked,
         owners_compared,
         offsets_compared_with_shadow,
@@ -683,6 +689,12 @@ pub struct ConvergenceReport {
     /// Live replicas whose committed metadata CONTENT was compared against a peer
     /// sharing its commit point. Zero on a solo cluster.
     pub replicas_compared: usize,
+    /// Change records compared between live replicas for the operations they
+    /// all applied and retain.
+    pub change_records_compared: usize,
+    /// Current state items of the leader a mirror of its change records had to
+    /// reproduce. Zero once the log evicted history the mirror needs.
+    pub projection_items_compared: usize,
     /// Namespaces still present in committed metadata that were required to have a
     /// host and exactly one primary.
     pub namespaces_checked: usize,

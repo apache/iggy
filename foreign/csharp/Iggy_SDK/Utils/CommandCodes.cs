@@ -26,6 +26,7 @@ internal static class CommandCodes
     internal const int DESCRIBE_OPTIONS_CODE = 13;
     internal const int BIND_SESSION_CODE = 15;
     internal const int UPDATE_RESOURCE_CODE = 16;
+    internal const int GET_METADATA_CHANGES_CODE = 17;
     internal const int GET_ME_CODE = 20;
     internal const int GET_CLIENT_CODE = 21;
     internal const int GET_CLIENTS_CODE = 22;
@@ -48,6 +49,9 @@ internal static class CommandCodes
     internal const int SEND_MESSAGES_CODE = 101;
     // 103 and 104 are retired and must never be reused.
     internal const int GET_PARTITION_ROUTE_CODE = 105;
+    internal const int POLL_MESSAGES_DEFERRED_CODE = 106;
+    internal const int WAIT_FOR_MESSAGES_CODE = 107;
+    internal const int CANCEL_DEFERRED_REQUEST_CODE = 108;
     internal const int GET_CONSUMER_OFFSET_CODE = 120;
     internal const int STORE_CONSUMER_OFFSET_CODE = 121;
     internal const int DELETE_CONSUMER_OFFSET_CODE = 122;

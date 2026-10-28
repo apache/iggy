@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::change_log::{AppliedChange, change_actor, stream_body, topic_body};
 use crate::stm::consumer_group::{
     CompleteConsumerGroupRevocationRequest, ConsumerGroup, ConsumerGroupOwnershipTransition,
     ConsumerGroupSnapshot, JoinConsumerGroupRequest, LeaveConsumerGroupRequest,
     RefreshConsumerGroupSessionRequest, RemoveConsumerGroupMemberRequest,
+    RemoveConsumerGroupMembersRequest,
 };
 use crate::stm::id_slab::IdSlab;
 use crate::stm::lifecycle::{
@@ -35,6 +37,9 @@ use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::{AHashMap, AHashSet};
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
+use iggy_binary_protocol::primitives::metadata_changes::{
+    WireMetadataChange, WireStreamBody, WireStreamDeletedBody, WireStreamKey, WireTopicDeletedBody,
+};
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
@@ -177,6 +182,9 @@ pub struct TopicSnapshot {
     pub options: ResourceOptions,
     #[serde(default)]
     pub consumer_group_catalog_op: u64,
+    /// Metadata op that created this topic incarnation. A reused topic id
+    /// gets a new value.
+    pub created_op: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +223,8 @@ pub struct Topic {
     /// set. A partition expects one allocation boundary per op, so a reader
     /// takes the catalog and this op from the same published state.
     pub consumer_group_catalog_op: u64,
+    /// Metadata op that created this topic incarnation.
+    pub created_op: u64,
 }
 
 impl Default for Topic {
@@ -232,6 +242,7 @@ impl Default for Topic {
             consumer_group_index: AHashMap::default(),
             next_consumer_group_id: 0,
             consumer_group_catalog_op: 0,
+            created_op: 0,
         }
     }
 }
@@ -251,6 +262,7 @@ impl Topic {
             consumer_group_index: AHashMap::default(),
             next_consumer_group_id: 0,
             consumer_group_catalog_op: 0,
+            created_op: 0,
         }
     }
 
@@ -783,7 +795,9 @@ define_state! {
         // The keys of `lifecycle_intents` ordered by stream and topic, so a
         // blocker query visits only its own scope. Rebuilt on restore.
         pub(crate) lifecycle_scopes: BTreeSet<LifecycleScope>,
-        pub(crate) finalizing_lifecycle: bool,
+        // The context of the intent a `CompleteLifecycle` is finishing, so its
+        // delete records name the request and the requester.
+        pub(crate) finalizing_lifecycle: Option<ApplyContext>,
         // Rebuilt after membership changes and restore; ticks visit only open transitions.
         pub(crate) pending_revocations: BTreeMap<(usize, usize, u64, usize), ConsumerGroupOwnershipTransition>,
         // Locations are (stream, topic, group, member); never persisted.
@@ -1007,7 +1021,7 @@ collect_handlers! {
         CompleteLifecycle,
         RewrapStreamKeys,
     }
-    internal { RefreshConsumerGroupSession }
+    internal { RefreshConsumerGroupSession, RemoveConsumerGroupMembers }
 }
 
 impl StreamsInner {
@@ -1659,16 +1673,21 @@ impl Streams {
         session: u64,
         metadata_op: u64,
         timestamp: IggyTimestamp,
-    ) {
+        actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange> {
         if session == 0
             || !self
                 .inner
                 .read(|inner| inner.consumer_group_members.contains_key(&client_id))
         {
-            return;
+            return Vec::new();
         }
         let cmd = StreamsCommand::RefreshConsumerGroupSession(
-            RefreshConsumerGroupSessionRequest { client_id, session },
+            RefreshConsumerGroupSessionRequest {
+                client_id,
+                session,
+                actor_user_id,
+            },
             timestamp,
             ApplyContext {
                 metadata_op,
@@ -1677,53 +1696,61 @@ impl Streams {
         );
         if let Err(error) = self.inner.try_apply(cmd) {
             tracing::error!(client_id, %error, "consumer session refresh dispatched to reader-only Streams STM");
+            return Vec::new();
         }
+        self.last_changes()
     }
 
     /// Drop a disconnected client from every consumer group it joined and
     /// rebalance. Applied through the left-right writer as a deterministic
     /// side-effect of the `Logout` commit on each replica (not a separate
     /// replicated op). A no-op on the reader-mode peers, where commits aren't
-    /// applied.
+    /// applied. Returns the removals' change records.
     pub fn remove_consumer_group_member(
         &self,
         client_id: u128,
         timestamp: IggyTimestamp,
         metadata_op: u64,
-    ) {
-        self.remove_consumer_group_members(&[client_id], timestamp, metadata_op);
+        actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange> {
+        self.remove_consumer_group_members(&[client_id], timestamp, metadata_op, actor_user_id)
     }
 
     /// Remove `client_ids` in order, as [`Self::remove_consumer_group_member`]
     /// would, with one publish. The removals of one op decide owners at the
     /// same generation, so a reader that installed an owner between two of
-    /// them could never install the final one.
+    /// them could never install the final one. The records come back in
+    /// canonical order, whatever the order of `client_ids`.
     pub fn remove_consumer_group_members(
         &self,
         client_ids: &[u128],
         timestamp: IggyTimestamp,
         metadata_op: u64,
-    ) {
+        actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange> {
         if client_ids.is_empty() {
-            return;
+            return Vec::new();
         }
-        let cmds = client_ids.iter().map(|&client_id| {
-            StreamsCommand::RemoveConsumerGroupMember(
-                RemoveConsumerGroupMemberRequest { client_id },
-                timestamp,
-                ApplyContext {
-                    metadata_op,
-                    ..ApplyContext::default()
-                },
-            )
-        });
-        if let Err(error) = self.inner.try_apply_all(cmds) {
+        let command = StreamsCommand::RemoveConsumerGroupMembers(
+            RemoveConsumerGroupMembersRequest {
+                client_ids: client_ids.to_vec(),
+                actor_user_id,
+            },
+            timestamp,
+            ApplyContext {
+                metadata_op,
+                ..ApplyContext::default()
+            },
+        );
+        if let Err(error) = self.inner.try_apply(command) {
             tracing::error!(
                 ?client_ids,
                 %error,
                 "remove_consumer_group_members dispatched to reader-only Streams STM"
             );
+            return Vec::new();
         }
+        self.last_changes()
     }
 
     /// Total consumer-group count across all topics (for stats).
@@ -2233,11 +2260,23 @@ impl StateHandler for CreateStreamRequest {
         let inserted = state.items.insert(stream);
         debug_assert_eq!(inserted, id, "vacant_key must match the insert slot");
         state.index.insert(name_arc, id);
+        let changes = state
+            .items
+            .get(id)
+            .and_then(stream_body)
+            .map(|body| {
+                AppliedChange::new(
+                    &WireMetadataChange::StreamCreated(body),
+                    change_actor(&state.apply_context),
+                )
+            })
+            .into_iter()
+            .collect();
 
         // Reply body: a freshly created stream has no topics. The SDK
         // `create_stream` decodes a `GetStreamResponse`. Serialization is
         // local to this state machine (it owns the committed shape).
-        ApplyReply::ok(
+        let reply = ApplyReply::ok(
             GetStreamResponse {
                 stream: StreamResponse {
                     id: id as u32,
@@ -2252,7 +2291,8 @@ impl StateHandler for CreateStreamRequest {
                 topics: Vec::new(),
             }
             .to_bytes(),
-        )
+        );
+        ApplyReply { changes, ..reply }
     }
 }
 
@@ -2290,6 +2330,7 @@ impl StateHandler for UpdateStreamResolvedRequest {
                 return ApplyReply::err(UpdateStreamResult::OptionsBlockTooLarge);
             }
         };
+        let before = stream_body(stream);
 
         let Some(stream) = state.items.get_mut(stream_id) else {
             return ApplyReply::err(UpdateStreamResult::StreamNotFound);
@@ -2300,7 +2341,22 @@ impl StateHandler for UpdateStreamResolvedRequest {
             state.index.insert(name, stream_id);
         }
         stream.options = options;
-        ApplyReply::ok(Bytes::new())
+        // An equal patch commits as ok but changes nothing public.
+        let after = stream_body(stream);
+        let changes = after
+            .filter(|after| before.as_ref() != Some(after))
+            .map(|body| {
+                AppliedChange::new(
+                    &WireMetadataChange::StreamUpdated(body),
+                    change_actor(&state.apply_context),
+                )
+            })
+            .into_iter()
+            .collect();
+        ApplyReply {
+            changes,
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -2318,6 +2374,15 @@ impl StateHandler for DeleteStreamRequest {
             return ApplyReply::err(DeleteStreamResult::StreamNotFound);
         };
         let name = stream.name.clone();
+        let (requested_op, actor) = state.deletion_origin();
+        let deleted = WireName::new(name.as_ref())
+            .ok()
+            .map(|wire_name| WireStreamDeletedBody {
+                key: WireStreamKey::from(stream),
+                created_at: stream.created_at.as_micros(),
+                name: wire_name,
+                requested_op,
+            });
         // Evict registry entries so a reused slab id starts with fresh stats.
         // Before the removal: the committed tree is what names the entries.
         state.stats_registry.remove_stream(stream_id, stream);
@@ -2332,6 +2397,10 @@ impl StateHandler for DeleteStreamRequest {
         state.recompute_consumer_group_metadata();
         ApplyReply {
             deleted_resource: Some(DeletedResource::Stream(stream_id)),
+            changes: deleted
+                .map(|body| AppliedChange::new(&WireMetadataChange::StreamDeleted(body), actor))
+                .into_iter()
+                .collect(),
             ..ApplyReply::ok(Bytes::new())
         }
     }
@@ -2443,6 +2512,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             consumer_group_index: AHashMap::default(),
             next_consumer_group_id: 0,
             consumer_group_catalog_op: 0,
+            created_op: state.apply_context.metadata_op,
         };
 
         let inserted = stream.topics.insert(topic);
@@ -2470,12 +2540,24 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         let Some(topic) = stream.topics.get(topic_id) else {
             return ApplyReply::err(CreateTopicResult::StreamNotFound);
         };
-        ApplyReply::ok(encode_create_topic_reply(
-            &self.request.name,
-            topic_id,
-            topic,
-            state.apply_context.metadata_op,
-        ))
+        let changes = topic_body(stream, topic)
+            .map(|body| {
+                AppliedChange::new(
+                    &WireMetadataChange::TopicCreated(body),
+                    change_actor(&state.apply_context),
+                )
+            })
+            .into_iter()
+            .collect();
+        ApplyReply {
+            changes,
+            ..ApplyReply::ok(encode_create_topic_reply(
+                &self.request.name,
+                topic_id,
+                topic,
+                state.apply_context.metadata_op,
+            ))
+        }
     }
 }
 
@@ -2609,6 +2691,7 @@ impl StateHandler for UpdateTopicResolvedRequest {
         {
             return ApplyReply::err(UpdateTopicResult::InvalidTopicSize);
         }
+        let before = topic_body(stream, topic);
 
         let Some(topic) = stream.topics.get_mut(topic_id) else {
             return ApplyReply::err(UpdateTopicResult::TopicNotFound);
@@ -2619,7 +2702,25 @@ impl StateHandler for UpdateTopicResolvedRequest {
             stream.topic_index.insert(name, topic_id);
         }
         topic.set_options(options);
-        ApplyReply::ok(Bytes::new())
+        // An equal patch commits as ok but changes nothing public.
+        let after = stream
+            .topics
+            .get(topic_id)
+            .and_then(|topic| topic_body(stream, topic));
+        let changes = after
+            .filter(|after| before.as_ref() != Some(after))
+            .map(|body| {
+                AppliedChange::new(
+                    &WireMetadataChange::TopicUpdated(body),
+                    change_actor(&state.apply_context),
+                )
+            })
+            .into_iter()
+            .collect();
+        ApplyReply {
+            changes,
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -2631,6 +2732,9 @@ impl StateHandler for RewrapStreamKeysRequest {
     /// Reply body: the number of sets replaced, `u32` LE.
     fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
         let mut replaced = 0u32;
+        // The record of each rewrapped stream compares its first and last
+        // state in this op, ascending by stream id.
+        let mut before: BTreeMap<usize, Option<WireStreamBody>> = BTreeMap::new();
         for entry in &self.entries {
             let Some(stream) = state.items.get_mut(entry.stream_id as usize) else {
                 continue;
@@ -2653,13 +2757,28 @@ impl StateHandler for RewrapStreamKeysRequest {
             let Ok(value) = HeaderValue::try_from(set.as_ref()) else {
                 continue;
             };
+            before
+                .entry(entry.stream_id as usize)
+                .or_insert_with(|| stream_body(stream));
             stream.options.insert(
                 HeaderKey::from(OptionKey::EncryptionKeyWrapped),
                 OptionValue::explicit(value),
             );
             replaced += 1;
         }
-        ApplyReply::ok(Bytes::copy_from_slice(&replaced.to_le_bytes()))
+        let actor = change_actor(&state.apply_context);
+        let changes = before
+            .into_iter()
+            .filter_map(|(stream_id, before)| {
+                let after = state.items.get(stream_id).and_then(stream_body)?;
+                (before.as_ref() != Some(&after))
+                    .then(|| AppliedChange::new(&WireMetadataChange::StreamUpdated(after), actor))
+            })
+            .collect();
+        ApplyReply {
+            changes,
+            ..ApplyReply::ok(Bytes::copy_from_slice(&replaced.to_le_bytes()))
+        }
     }
 }
 
@@ -2731,6 +2850,7 @@ impl StateHandler for DeleteTopicRequest {
         {
             return reply;
         }
+        let (requested_op, actor) = state.deletion_origin();
         let Some(stream) = state.items.get_mut(stream_id) else {
             return ApplyReply::err(DeleteTopicResult::StreamNotFound);
         };
@@ -2739,6 +2859,14 @@ impl StateHandler for DeleteTopicRequest {
             return ApplyReply::err(DeleteTopicResult::TopicNotFound);
         };
         let name = topic.name.clone();
+        let deleted = WireName::new(name.as_ref())
+            .ok()
+            .map(|wire_name| WireTopicDeletedBody {
+                key: stream.topic_key(topic),
+                created_at: topic.created_at.as_micros(),
+                name: wire_name,
+                requested_op,
+            });
         // Read the ids off the committed topic before it goes: they are what
         // names its registry entries.
         let partition_ids: Vec<usize> = topic
@@ -2763,6 +2891,10 @@ impl StateHandler for DeleteTopicRequest {
                 stream_id,
                 topic_id,
             }),
+            changes: deleted
+                .map(|body| AppliedChange::new(&WireMetadataChange::TopicDeleted(body), actor))
+                .into_iter()
+                .collect(),
             ..ApplyReply::ok(Bytes::new())
         }
     }
@@ -2862,11 +2994,28 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
         // Added partitions are unassigned until the groups rebalance.
         topic.rebalance_consumer_groups(state.apply_context.metadata_op, timestamp);
         state.recompute_consumer_group_metadata();
+        let changes = if self.partitions.is_empty() {
+            Vec::new()
+        } else {
+            state
+                .partitions_changed(stream_id, topic_id, Vec::new(), None)
+                .map(|body| {
+                    AppliedChange::new(
+                        &WireMetadataChange::PartitionsChanged(body),
+                        change_actor(&state.apply_context),
+                    )
+                })
+                .into_iter()
+                .collect()
+        };
 
         // Matches legacy CreatePartitions wire contract: empty-ok body on
         // success. SDK discards the reply payload (resolved ids are derivable
         // from the request's base + count).
-        ApplyReply::ok(Bytes::new())
+        ApplyReply {
+            changes,
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -2912,6 +3061,7 @@ impl StateHandler for DeletePartitionsRequest {
         };
         // Zero count is rejected pre-consensus; a replayed legacy entry still
         // applies as the historical ok no-op.
+        let mut changes = Vec::new();
         if count_to_delete > 0 {
             let retained = topic.partitions.len() - count_to_delete;
             // Read the ids off the removed tail: `retained` is a count, and
@@ -2930,8 +3080,24 @@ impl StateHandler for DeletePartitionsRequest {
             state.revision = state.revision.wrapping_add(1);
             state.namespace_revision = state.revision;
             state.retire_partitions(stream_id, topic_id, &removed);
+            let (requested_op, actor) = state.deletion_origin();
+            let mut removed_ids: Vec<u32> = removed_ids
+                .iter()
+                .filter_map(|&id| u32::try_from(id).ok())
+                .collect();
+            removed_ids.sort_unstable();
+            changes.extend(
+                state
+                    .partitions_changed(stream_id, topic_id, removed_ids, requested_op)
+                    .map(|body| {
+                        AppliedChange::new(&WireMetadataChange::PartitionsChanged(body), actor)
+                    }),
+            );
         }
-        ApplyReply::ok(Bytes::new())
+        ApplyReply {
+            changes,
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -3001,6 +3167,7 @@ impl Snapshotable for Streams {
                                         .collect(),
                                     next_consumer_group_id: topic.next_consumer_group_id,
                                     consumer_group_catalog_op: topic.consumer_group_catalog_op,
+                                    created_op: topic.created_op,
                                 },
                             )
                         })
@@ -3139,6 +3306,7 @@ impl StreamsInner {
                             .unwrap_or(0),
                     ),
                     consumer_group_catalog_op: topic_snap.consumer_group_catalog_op,
+                    created_op: topic_snap.created_op,
                     consumer_groups: topic_snap
                         .consumer_groups
                         .into_iter()
@@ -3184,7 +3352,7 @@ impl StreamsInner {
             namespace_revision: snapshot.namespace_revision,
             lifecycle_intents,
             lifecycle_scopes,
-            finalizing_lifecycle: false,
+            finalizing_lifecycle: None,
             // Recomputed from the restored groups just below.
             pending_revocations: BTreeMap::new(),
             consumer_group_members: AHashMap::new(),

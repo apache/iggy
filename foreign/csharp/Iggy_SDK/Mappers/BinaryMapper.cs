@@ -31,7 +31,7 @@ using Apache.Iggy.Vsr;
 
 namespace Apache.Iggy.Mappers;
 
-internal static class BinaryMapper
+internal static partial class BinaryMapper
 {
     private const int CONSUMER_GROUP_HEADER_SIZE = 13;
     private const int MEMBER_HEADER_SIZE = 8;
@@ -113,7 +113,7 @@ internal static class BinaryMapper
         {
             var permissionLength = ReadLength(payload, position + 1, "User permissions");
             ReadOnlySpan<byte> permissionsPayload = payload[(position + 5)..(position + 5 + permissionLength)];
-            var permissions = MapPermissions(permissionsPayload);
+            var permissions = new WireReader(permissionsPayload).Permissions();
             return new UserResponse
             {
                 Permissions = permissions,
@@ -135,94 +135,6 @@ internal static class BinaryMapper
             Permissions = null,
             Options = response.Options,
             DerivedOptions = response.DerivedOptions
-        };
-    }
-
-    private static Permissions MapPermissions(ReadOnlySpan<byte> bytes)
-    {
-        var streamMap = new Dictionary<uint, StreamPermissions>();
-        var index = 0;
-
-        var globalPermissions = new GlobalPermissions
-        {
-            ManageServers = bytes[index++] == 1,
-            ReadServers = bytes[index++] == 1,
-            ManageUsers = bytes[index++] == 1,
-            ReadUsers = bytes[index++] == 1,
-            ManageStreams = bytes[index++] == 1,
-            ReadStreams = bytes[index++] == 1,
-            ManageTopics = bytes[index++] == 1,
-            ReadTopics = bytes[index++] == 1,
-            PollMessages = bytes[index++] == 1,
-            SendMessages = bytes[index++] == 1
-        };
-
-        if (bytes[index++] == 1)
-        {
-            while (true)
-            {
-                var streamId = BinaryPrimitives.ReadUInt32LittleEndian(bytes[index..(index + 4)]);
-                index += sizeof(uint);
-
-                var manageStream = bytes[index++] == 1;
-                var readStream = bytes[index++] == 1;
-                var manageTopics = bytes[index++] == 1;
-                var readTopics = bytes[index++] == 1;
-                var pollMessagesStream = bytes[index++] == 1;
-                var sendMessagesStream = bytes[index++] == 1;
-                var topicsMap = new Dictionary<uint, TopicPermissions>();
-
-                if (bytes[index++] == 1)
-                {
-                    while (true)
-                    {
-                        var topicId = BinaryPrimitives.ReadUInt32LittleEndian(bytes[index..(index + 4)]);
-                        index += sizeof(uint);
-
-                        var manageTopic = bytes[index++] == 1;
-                        var readTopic = bytes[index++] == 1;
-                        var pollMessagesTopic = bytes[index++] == 1;
-                        var sendMessagesTopic = bytes[index++] == 1;
-
-                        topicsMap.Add(topicId,
-                            new TopicPermissions
-                            {
-                                ManageTopic = manageTopic,
-                                ReadTopic = readTopic,
-                                PollMessages = pollMessagesTopic,
-                                SendMessages = sendMessagesTopic
-                            });
-
-                        if (bytes[index++] == 0)
-                        {
-                            break;
-                        }
-                    }
-                }
-
-                streamMap.Add(streamId,
-                    new StreamPermissions
-                    {
-                        ManageStream = manageStream,
-                        ReadStream = readStream,
-                        ManageTopics = manageTopics,
-                        ReadTopics = readTopics,
-                        PollMessages = pollMessagesStream,
-                        SendMessages = sendMessagesStream,
-                        Topics = topicsMap.Count > 0 ? topicsMap : null
-                    });
-
-                if (bytes[index++] == 0)
-                {
-                    break;
-                }
-            }
-        }
-
-        return new Permissions
-        {
-            Global = globalPermissions,
-            Streams = streamMap.Count > 0 ? streamMap : null
         };
     }
 

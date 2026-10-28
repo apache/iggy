@@ -73,6 +73,12 @@ func (rawCommandSteps) whenSendRawCommand(ctx context.Context, code uint32) erro
 	return nil
 }
 
+func (rawCommandSteps) whenSendRawCommandToReplica(ctx context.Context, code uint32, replica uint8) error {
+	state := getRawCommandCtx(ctx)
+	state.lastResponse, state.lastError = state.client.SendBinaryRequestToReplica(ctx, code, nil, replica)
+	return nil
+}
+
 func (rawCommandSteps) thenEmptyResponse(ctx context.Context) error {
 	state := getRawCommandCtx(ctx)
 	if state.lastError != nil {
@@ -102,6 +108,13 @@ func (rawCommandSteps) thenInvalidCommand(ctx context.Context) error {
 	return nil
 }
 
+func (rawCommandSteps) thenInvalidIdentifier(ctx context.Context) error {
+	if !errors.Is(getRawCommandCtx(ctx).lastError, ierror.ErrInvalidIdentifier) {
+		return fmt.Errorf("expected invalid identifier error, got %v", getRawCommandCtx(ctx).lastError)
+	}
+	return nil
+}
+
 func initRawCommandScenario(sc *godog.ScenarioContext) {
 	sc.Before(func(context.Context, *godog.Scenario) (context.Context, error) {
 		return context.WithValue(context.Background(), rawCommandCtxKey{}, &rawCommandCtx{}), nil
@@ -110,9 +123,11 @@ func initRawCommandScenario(sc *godog.ScenarioContext) {
 	sc.Step(`I have a running Iggy server`, steps.givenRunningServer)
 	sc.Step(`I am authenticated as the root user`, steps.givenAuthenticationAsRoot)
 	sc.Step(`^I send a raw command with code (\d+) and an empty payload$`, steps.whenSendRawCommand)
+	sc.Step(`^I send a raw command with code (\d+) and an empty payload to replica (\d+)$`, steps.whenSendRawCommandToReplica)
 	sc.Step(`the raw command should succeed with an empty response`, steps.thenEmptyResponse)
 	sc.Step(`the raw command should succeed with a non-empty response`, steps.thenNonEmptyResponse)
 	sc.Step(`the raw command should fail with an invalid command error`, steps.thenInvalidCommand)
+	sc.Step(`the raw command should fail with an invalid identifier error`, steps.thenInvalidIdentifier)
 	sc.After(func(ctx context.Context, _ *godog.Scenario, scenarioError error) (context.Context, error) {
 		state := getRawCommandCtx(ctx)
 		if state.client != nil {

@@ -34,6 +34,7 @@ use crate::args::{
     consumer_offset::ConsumerOffsetAction,
     context::ContextAction,
     message::MessageAction,
+    metadata::MetadataAction,
     partition::PartitionAction,
     personal_access_token::PersonalAccessTokenAction,
     stream::StreamAction,
@@ -56,6 +57,7 @@ pub(crate) mod consumer_group;
 pub(crate) mod consumer_offset;
 pub(crate) mod context;
 pub(crate) mod message;
+pub(crate) mod metadata;
 pub(crate) mod partition;
 pub(crate) mod permissions;
 pub(crate) mod personal_access_token;
@@ -191,6 +193,9 @@ pub(crate) enum Command {
     /// collect iggy server troubleshooting data
     #[clap(verbatim_doc_comment)]
     Snapshot(SnapshotArgs),
+    /// metadata change log operations
+    #[command(subcommand, visible_alias = "md")]
+    Metadata(MetadataAction),
     /// personal access token operations
     #[command(subcommand)]
     Pat(PersonalAccessTokenAction),

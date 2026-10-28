@@ -27,8 +27,8 @@ use bytes::Bytes;
 use ext_php_rs::{binary::Binary, exception::PhpResult, php_class, php_impl, types::Zval};
 use iggy::prelude::{
     CompressionAlgorithm, Consumer as RustConsumer, IggyClient as RustIggyClient,
-    IggyClientBuilder, IggyDuration, IggyExpiry, IggyMessage as RustMessage, MaxTopicSize,
-    Partitioning, PollingStrategy as RustPollingStrategy, *,
+    IggyClientBuilder, IggyExpiry, IggyMessage as RustMessage, MaxTopicSize, Partitioning,
+    PollingStrategy as RustPollingStrategy, *,
 };
 use tokio::sync::Mutex;
 
@@ -36,6 +36,7 @@ use crate::consumer::{AutoCommit, IggyConsumer};
 use crate::durability::Durability as PhpDurability;
 use crate::error::to_php_exception;
 use crate::identifier::PhpIdentifier;
+use crate::metadata_changes::{MetadataChangeGroup, MetadataChangeStart, MetadataChanges};
 use crate::options::{OptionSpec, OptionsScope, StreamOptionKey, TopicOptionKey, reset_names};
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::runtime::runtime;
@@ -421,6 +422,47 @@ impl IggyClient {
         })
     }
 
+    /// Reads one page of the metadata change log, or of the current state.
+    ///
+    /// Needs root or the global `manage_servers` permission. `groups` takes
+    /// `Iggy\MetadataChangeGroup` cases, empty for every group, and a current state scan
+    /// needs the parent groups of each group. `since` and `until` are microseconds as an int
+    /// or a decimal string, and only apply to `earliest` and `after`. `limit` is 1 to 1000,
+    /// 100 when null. A query the server would refuse throws `Invalid command` (code 3)
+    /// before anything is sent.
+    #[php(defaults(groups = Vec::<MetadataChangeGroup>::new()))]
+    pub fn get_metadata_changes(
+        &self,
+        start: &MetadataChangeStart,
+        groups: Vec<MetadataChangeGroup>,
+        since: Option<&Zval>,
+        until: Option<&Zval>,
+        limit: Option<&Zval>,
+    ) -> PhpResult<MetadataChanges> {
+        let timestamp = |micros: u64| {
+            IggyTimestamp::checked_from_micros(micros)
+                .ok_or_else(|| to_php_exception(IggyError::InvalidCommand))
+        };
+        let query = MetadataChangesQuery {
+            start: start.inner.clone(),
+            groups: groups.into_iter().map(Into::into).collect(),
+            since: optional_u64(since, "since")?.map(timestamp).transpose()?,
+            until: optional_u64(until, "until")?.map(timestamp).transpose()?,
+            limit: optional_unsigned(limit, "limit")?
+                .unwrap_or(MetadataChangesQuery::default().limit),
+        };
+        query.validate().map_err(to_php_exception)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_metadata_changes(&query)
+                .await
+                .map(MetadataChanges::from)
+                .map_err(to_php_exception)
+        })
+    }
+
     /// Gets a topic by stream and topic id/name.
     pub fn get_topic(
         &self,
@@ -547,7 +589,8 @@ impl IggyClient {
     /// Creates and initializes a consumer group consumer.
     ///
     /// `$partition_id` is ignored for a consumer group: the member reads the partitions
-    /// the server assigns to it.
+    /// the server assigns to it. `$poll_interval_micros` must be null: the consumer waits
+    /// on the server for new messages.
     #[allow(clippy::too_many_arguments)]
     #[php(defaults(
         create_consumer_group_if_not_exists = true,
@@ -571,10 +614,15 @@ impl IggyClient {
         init_retry_interval_micros: Option<&Zval>,
         allow_replay: bool,
     ) -> PhpResult<IggyConsumer> {
+        // The removed setting keeps its slot, so a positional call written for it fails
+        // instead of setting `polling_retry_interval_micros`.
+        if poll_interval_micros.is_some_and(|value| !value.is_null()) {
+            return Err(to_php_exception(
+                "'poll_interval_micros' is no longer supported and must be null: the consumer waits on the server for new messages",
+            ));
+        }
         let partition_id = optional_unsigned::<u32>(partition_id, "partition_id")?;
         let batch_length = optional_unsigned::<u32>(batch_length, "batch_length")?;
-        let poll_interval_micros =
-            optional_unsigned::<u64>(poll_interval_micros, "poll_interval_micros")?;
         let polling_retry_interval_micros = optional_unsigned::<u64>(
             polling_retry_interval_micros,
             "polling_retry_interval_micros",
@@ -608,10 +656,6 @@ impl IggyClient {
         if let Some(auto_commit) = auto_commit {
             builder = builder.auto_commit(auto_commit.into());
         }
-        builder = match poll_interval_micros {
-            Some(micros) => builder.poll_interval(IggyDuration::from(micros)),
-            None => builder.without_poll_interval(),
-        };
         if let Some(micros) = polling_retry_interval_micros {
             builder = builder.polling_retry_interval(non_zero_duration_micros(
                 "polling_retry_interval_micros",
@@ -670,6 +714,32 @@ impl IggyClient {
                 .map_err(to_php_exception)
         })
     }
+
+    /// Sends a command code with a payload to the replica with the given id, as
+    /// cluster metadata names it, and returns the raw response bytes.
+    /// Replicated commands, polls, consumer-offset reads and session-control
+    /// codes return an invalid-command exception, and a replica that cluster
+    /// metadata does not name returns an invalid-identifier exception.
+    pub fn send_binary_request_to_replica(
+        &self,
+        code: u32,
+        payload: Binary<u8>,
+        replica_id: u8,
+    ) -> PhpResult<Binary<u8>> {
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .send_binary_request_to_replica(
+                    code,
+                    Bytes::from(Vec::<u8>::from(payload)),
+                    replica_id,
+                )
+                .await
+                .map(|response| Binary::new(Vec::from(response)))
+                .map_err(to_php_exception)
+        })
+    }
 }
 
 pub(crate) fn non_zero_duration_micros(field: &str, micros: u64) -> PhpResult<NonZeroIggyDuration> {
@@ -697,9 +767,13 @@ fn pending_limit(
 
 // u64 values above PHP_INT_MAX, such as the never-expire sentinel, only fit a decimal string.
 fn optional_u64(value: Option<&Zval>, field: &str) -> PhpResult<Option<u64>> {
-    let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Ok(None);
-    };
+    value
+        .filter(|value| !value.is_null())
+        .map(|value| unsigned_argument(value, field))
+        .transpose()
+}
+
+pub(crate) fn unsigned_argument(value: &Zval, field: &str) -> PhpResult<u64> {
     let number = match (value.long(), value.str()) {
         (Some(number), _) => u64::try_from(number).ok(),
         (None, Some(text))
@@ -709,9 +783,9 @@ fn optional_u64(value: Option<&Zval>, field: &str) -> PhpResult<Option<u64>> {
         }
         _ => None,
     };
-    number.map(Some).ok_or_else(|| {
+    number.ok_or_else(|| {
         to_php_exception(format!(
-            "'{field}' must be a non-negative integer, a decimal string or null"
+            "'{field}' must be a non-negative integer or a decimal string"
         ))
     })
 }

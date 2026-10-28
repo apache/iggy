@@ -3052,3 +3052,52 @@ TEST_F(LowLevelE2E_Client, SendBinaryRequestUnknownCommandCodeThrows) {
     EXPECT_FALSE(error_info.has_operation_id);
     EXPECT_EQ(error_info.operation_id, 0u);
 }
+
+TEST_F(LowLevelE2E_Client, SendBinaryRequestToReplicaGetStatsReturnsNonEmptyBytes) {
+    RecordProperty("description",
+                   "Returns a non-empty response body for a raw get-stats command sent to the server's own replica.");
+    constexpr std::uint32_t get_stats_command_code = 10;
+    constexpr std::uint8_t server_replica_id       = 0;
+    iggy::ffi::Client *client                      = GetLoggedInClient();
+
+    rust::Vec<std::uint8_t> empty_payload;
+    rust::Vec<std::uint8_t> response;
+    ASSERT_NO_THROW({
+        iggy::ffi::ErrorInfo error_info{};
+        response = client->send_binary_request_to_replica(get_stats_command_code, empty_payload, server_replica_id,
+                                                          error_info);
+    });
+    EXPECT_FALSE(response.empty());
+}
+
+TEST_F(LowLevelE2E_Client, SendBinaryRequestToUnknownReplicaThrows) {
+    iggy::ffi::ErrorInfo error_info{};
+    RecordProperty("description",
+                   "Rejects a replica id that cluster metadata does not name with an invalid-identifier error.");
+    constexpr std::uint32_t get_stats_command_code  = 10;
+    constexpr std::uint8_t unknown_replica_id       = 9;
+    constexpr std::uint32_t invalid_identifier_code = 6;
+    iggy::ffi::Client *client                       = GetLoggedInClient();
+
+    rust::Vec<std::uint8_t> empty_payload;
+    ASSERT_THROW(
+        client->send_binary_request_to_replica(get_stats_command_code, empty_payload, unknown_replica_id, error_info),
+        std::exception);
+    EXPECT_EQ(error_info.code, invalid_identifier_code);
+}
+
+TEST_F(LowLevelE2E_Client, SendBinaryRequestToReplicaReplicatedCommandThrows) {
+    iggy::ffi::ErrorInfo error_info{};
+    RecordProperty("description",
+                   "Rejects a replicated command sent to a replica client-side with an invalid-command error.");
+    constexpr std::uint32_t create_stream_command_code = 202;
+    constexpr std::uint8_t server_replica_id           = 0;
+    constexpr std::uint32_t invalid_command_code       = 3;
+    iggy::ffi::Client *client                          = GetLoggedInClient();
+
+    rust::Vec<std::uint8_t> empty_payload;
+    ASSERT_THROW(client->send_binary_request_to_replica(create_stream_command_code, empty_payload, server_replica_id,
+                                                        error_info),
+                 std::exception);
+    EXPECT_EQ(error_info.code, invalid_command_code);
+}
