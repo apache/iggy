@@ -1039,7 +1039,10 @@ async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let connection_state = connection.listener.connection_state();
+    let connection_state = connection
+        .listener
+        .connection_state()
+        .with_peer(connection.peer);
     let bridge = connection.state.bridge.clone();
     let served = serve_frames(stream, connection, certificate_name, &connection_state).await;
     // A producer without a producer id has its Produce session by connection, so it ends here.
@@ -1145,6 +1148,7 @@ where
             client_id = req.client_id.as_deref().unwrap_or(""),
             "received request"
         );
+        connection_state.note_client_id(req.client_id.as_deref());
         // A group request can park for a whole rebalance timeout. `client_id` and the tagged
         // fields are views into the frame, so keeping them would pin the frame for that long
         // after the handler has let go of its own copy.

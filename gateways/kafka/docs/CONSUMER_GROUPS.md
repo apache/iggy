@@ -57,9 +57,12 @@ consumers stopped, because that group is `Empty` while it holds offsets. Without
 `DeleteGroups` and `OffsetDelete` ([below](#deleting-groups-and-offsets)). See
 [OFFSET_STORAGE.md](OFFSET_STORAGE.md) for offset behavior and limits.
 
-Member `client_id` and `client_host` are empty. The coordinator does not keep the request
-header's client id or the connection's peer address. `include_authorized_operations` is answered
-with the omitted sentinel. There is no group ACL bitfield. `ListGroups` v5 sets `group_type` to
+Each member reports the `client_id` and `client_host` of the connection that it last joined
+through, as Kafka does. The client id is the first one that a request header on that connection
+named, cut to 1,024 bytes. The host is a `/` and the peer IP address, for example `/10.0.0.7`. A
+new member id starts with the client id, or with the `group_instance_id` of a static member,
+then a UUID. A client that names neither gets `member-` and a UUID. `include_authorized_operations`
+is answered with the omitted sentinel. There is no group ACL bitfield. `ListGroups` v5 sets `group_type` to
 `classic`, which is the only protocol this coordinator runs.
 
 ## Groups that only hold offsets
