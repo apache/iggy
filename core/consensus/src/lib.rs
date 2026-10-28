@@ -198,6 +198,8 @@ mod impls;
 pub use impls::*;
 mod plane_mux;
 pub use plane_mux::*;
+mod replication;
+pub use replication::{REPLICATION_BATCH_BYTES_MAX, ReplicationProgress, ReplicationWork};
 mod plane_helpers;
 pub use plane_helpers::*;
 mod metadata_helpers;

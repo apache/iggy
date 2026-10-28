@@ -70,20 +70,20 @@ pub mod version;
 
 pub use codec::{WireDecode, WireEncode};
 pub use consensus::{
-    CHECKSUM_UNSEALED, Command, CommitHeader, ConsensusError, ConsensusHeader, ConsumerSession,
-    ConsumerSessionHeartbeatHeader, DVC_HEADERS_MAX, DoViewChangeHeader, EvictionHeader,
-    EvictionReason, ForwardCompletionHeader, ForwardLogoutHeader, ForwardLogoutOutcome,
-    ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
+    CHECKSUM_UNSEALED, Command, CommitHeader, CommitReplyHeader, ConsensusError, ConsensusHeader,
+    ConsumerSession, ConsumerSessionHeartbeatHeader, DVC_HEADERS_MAX, DoViewChangeHeader,
+    EvictionHeader, EvictionReason, ForwardCompletionHeader, ForwardLogoutHeader,
+    ForwardLogoutOutcome, ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
     ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, LIFECYCLE_BATCH_HEADER_SIZE,
     LIFECYCLE_COMPLETION_SIZE, LIFECYCLE_COMPLETIONS_MAX, MAX_CONSUMER_SESSIONS_PER_HEARTBEAT,
-    Operation, PrepareHeader, PrepareOkHeader, PrimaryRebalanceHeader, PrimaryRebalanceKind,
-    REJECTION_SECTION_LEN, RESERVED_COMMAND_LEN, RepairPrepareHeader, RepairRangeReplyHeader,
-    ReplyHeader, RequestHeader, RequestPreparesHeader, RequestStartViewHeader,
-    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader, SIZE_FIELD_OFFSET,
-    SegmentDeleteHeader, SegmentDeleteKind, StartViewChangeHeader, StartViewHeader,
-    StateChunkHeader, StateTransferTargetHeader, frame_body, frame_checksum_bytes,
-    prepare_identity_checksum_bytes, read_size_field, result_code, result_section_len,
-    write_rejection_section,
+    Operation, PrepareHeader, PrepareOkHeader, PrepareProgressHeader, PrimaryRebalanceHeader,
+    PrimaryRebalanceKind, REJECTION_SECTION_LEN, RESERVED_COMMAND_LEN, RepairPrepareHeader,
+    RepairRangeReplyHeader, ReplyHeader, RequestHeader, RequestPreparesHeader,
+    RequestStartViewHeader, RequestStateChunkHeader, RequestStateTransferHeader,
+    RoutedRequestHeader, SIZE_FIELD_OFFSET, SegmentDeleteHeader, SegmentDeleteKind,
+    StartViewChangeHeader, StartViewHeader, StateChunkHeader, StateTransferTargetHeader,
+    frame_body, frame_checksum_bytes, prepare_identity_checksum_bytes, read_size_field,
+    result_code, result_section_len, write_rejection_section,
 };
 pub use dispatch::{
     COMMAND_TABLE, CommandMeta, command_index, lookup_by_operation, lookup_command,

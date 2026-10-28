@@ -235,12 +235,16 @@ mod tests {
         ] {
             std::fs::write(root.join(name), name.as_bytes()).unwrap();
         }
+        // A segment that the transfer reuses reaches its name as a link.
+        std::fs::hard_link(root.join("0.index"), root.join("0.index.staging")).unwrap();
         begin(root, &BTreeSet::new()).await.unwrap();
         // Model the install's unlink and atomic replacement operations.
         for name in ["0.log", "offsets/1", "prepares-1/frontier"] {
             std::fs::remove_file(root.join(name)).unwrap();
             std::fs::write(root.join(name), b"replacement").unwrap();
         }
+        std::fs::remove_file(root.join("0.index")).unwrap();
+        std::fs::rename(root.join("0.index.staging"), root.join("0.index")).unwrap();
         std::fs::write(root.join("99.log"), b"new segment").unwrap();
         recover(root).await.unwrap();
         for name in [
@@ -254,6 +258,7 @@ mod tests {
             assert_eq!(std::fs::read(root.join(name)).unwrap(), name.as_bytes());
         }
         assert!(!root.join("99.log").exists());
+        assert!(!root.join("0.index.staging").exists());
         recover(root).await.unwrap();
     }
 

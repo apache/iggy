@@ -118,9 +118,9 @@ fn default_offset_reservation_lease() -> NonZeroU32 {
 pub const DEFAULT_EVICTED_RING_CAPACITY: usize = 65536;
 
 /// Upper bound on `evicted_ring_capacity`. The ring exists per multi-replica
-/// partition and each retained entry pins a full committed batch, so
-/// worst-case pinned memory scales with the partition count; a typo guard,
-/// not a sizing endorsement.
+/// partition, and each retained entry pins a full committed batch until the
+/// byte cap releases it to its segment, so worst-case pinned memory scales
+/// with the partition count. A typo guard, not a sizing endorsement.
 pub const MAX_EVICTED_RING_CAPACITY: usize = 65536;
 
 /// Mirrors `partitions::EVICTED_RING_BYTES_MAX`.
@@ -164,6 +164,11 @@ fn default_wal_bytes_max() -> IggyByteSize {
     IggyByteSize::from(DEFAULT_PARTITION_WAL_BYTES_MAX)
 }
 
+fn default_repair_memory_bytes_max() -> IggyByteSize {
+    const DEFAULT_REPAIR_MEMORY_BYTES_MAX: u64 = 1024 * 1024 * 1024;
+    IggyByteSize::from(DEFAULT_REPAIR_MEMORY_BYTES_MAX)
+}
+
 /// Ceiling on the group-commit delay. A longer wait costs more than the
 /// barrier it is meant to amortize.
 pub const MAX_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS: u64 = 10_000;
@@ -177,9 +182,19 @@ fn default_wal_group_commit_delay_micros() -> u64 {
 pub struct PartitionConfig {
     /// Active WAL and pending prepare budget per persisted partition.
     /// Temporary generation rewrites may require additional disk space.
+    ///
+    /// It also bounds the memory of a backup that repairs an unproven log from
+    /// the head down: that repair holds up to this many bytes of batches per
+    /// partition, subject to the shared `repair_memory_bytes_max` cap.
     #[serde(default = "default_wal_bytes_max")]
     #[config_env(leaf)]
     pub wal_bytes_max: IggyByteSize,
+    /// Node-wide allocation cap for unproven repair walks and snapshot repair tails.
+    /// Exhausted walks fall back to state transfer; exhausted tails require a fresh snapshot.
+    /// Normal prepare queues and state-transfer buffers have separate limits.
+    #[serde(default = "default_repair_memory_bytes_max")]
+    #[config_env(leaf)]
+    pub repair_memory_bytes_max: IggyByteSize,
     /// Bounded wait, in microseconds, for more prepares before a persisted
     /// partition's WAL writer starts its durability barrier. Zero disables it.
     ///
@@ -248,13 +263,15 @@ pub struct PartitionConfig {
     /// restarting peer can be served from the ring before falling back to
     /// bulk sync, at the cost of pinned memory per partition. Must be > 0 and
     /// <= [`MAX_EVICTED_RING_CAPACITY`]. Single-replica partitions retain
-    /// nothing regardless.
+    /// nothing regardless. The entries whose batches went back to their
+    /// segments have their own cap of 16384.
     pub evicted_ring_capacity: usize,
 
     /// Byte ceiling for the evicted ring per partition; whichever ring cap
     /// (this or [`Self::evicted_ring_capacity`]) trips first evicts. Bounds
     /// the ring memory a burst of large batches can pin. Must be > 0 and <=
-    /// [`MAX_EVICTED_RING_BYTES`].
+    /// [`MAX_EVICTED_RING_BYTES`]. The headers of the batches that went back to
+    /// their segments do not count here.
     #[config_env(leaf)]
     pub evicted_ring_bytes_max: IggyByteSize,
 
@@ -282,6 +299,11 @@ pub struct PartitionConfig {
 
 impl Validatable<ConfigurationError> for PartitionConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
+        let repair_bytes = self.repair_memory_bytes_max.as_bytes_u64();
+        if repair_bytes == 0 || usize::try_from(repair_bytes).is_err() {
+            eprintln!("{COMPONENT} partition.repair_memory_bytes_max must fit in usize and be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         let wal_bytes = self.wal_bytes_max.as_bytes_u64();
         if !(MIN_PARTITION_WAL_BYTES_MAX..=MAX_PARTITION_WAL_BYTES_MAX).contains(&wal_bytes)
             || !wal_bytes.is_multiple_of(4096)
@@ -423,6 +445,33 @@ mod tests {
         assert_eq!(
             config.wal_bytes_max.as_bytes_u64(),
             DEFAULT_PARTITION_WAL_BYTES_MAX
+        );
+    }
+
+    #[test]
+    fn given_a_repair_memory_limit_when_loading_config_should_preserve_overrides_and_reject_zero() {
+        const CUSTOM_BYTES: u64 = 8 * 1024 * 1024;
+        let omitted: PartitionConfig = serde_json::from_str(&partial_table(None)).unwrap();
+        assert_eq!(
+            omitted.repair_memory_bytes_max,
+            PartitionConfig::default().repair_memory_bytes_max,
+            "older configuration files use the shipped node-wide limit"
+        );
+        let mut config = PartitionConfig {
+            repair_memory_bytes_max: IggyByteSize::from(CUSTOM_BYTES),
+            ..PartitionConfig::default()
+        };
+        assert!(config.validate().is_ok());
+        let restored: PartitionConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            restored.repair_memory_bytes_max.as_bytes_u64(),
+            CUSTOM_BYTES
+        );
+        config.repair_memory_bytes_max = IggyByteSize::from(0_u64);
+        assert!(
+            config.validate().is_err(),
+            "a zero repair budget must fail validation"
         );
     }
 

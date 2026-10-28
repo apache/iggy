@@ -345,6 +345,11 @@ pub fn bootstrap(
         &config,
         total_shards,
     )?));
+    let repair_memory = Arc::new(partitions::RepairMemoryBudget::new(
+        usize::try_from(config.partition.repair_memory_bytes_max.as_bytes_u64()).map_err(|_| {
+            ServerError::Config(configs::ConfigurationError::InvalidConfigurationValue)
+        })?,
+    ));
 
     // Single-shot bundle handoff (see `MetadataHandoff`): shard 0 sends
     // one cloned `ServerMetadataBundle` per peer; each peer drains
@@ -407,6 +412,7 @@ pub fn bootstrap(
         let config_for_shard = Arc::clone(&config);
         let shutdown_flag_for_shard = Arc::clone(&shutdown_flag);
         let owner_table_for_shard = Arc::clone(&owner_table);
+        let repair_memory_for_shard = Arc::clone(&repair_memory);
         let metadata_handoff_for_shard = if shard_id == 0 {
             MetadataHandoff::Owner {
                 bundle_tx: metadata_bundle_tx.clone(),
@@ -448,6 +454,7 @@ pub fn bootstrap(
                     metadata_handoff_for_shard,
                     barrier_for_shard,
                     owner_table_for_shard,
+                    repair_memory_for_shard,
                     roster_cells_for_shard,
                     applied_frontier_for_shard,
                     shard_metrics_for_shard,
@@ -522,6 +529,7 @@ async fn shard_main(
     metadata_handoff: MetadataHandoff,
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
+    repair_memory: Arc<partitions::RepairMemoryBudget>,
     roster_cells: RosterCells,
     metadata_applied_frontier: Arc<AppliedFrontier>,
     shard_metrics_all: Vec<ShardMetrics>,
@@ -752,6 +760,7 @@ async fn shard_main(
         reply_inbox,
         shard_metrics,
         &roster_cells,
+        repair_memory,
     ))
     .await?;
 

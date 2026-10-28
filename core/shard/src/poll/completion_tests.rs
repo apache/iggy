@@ -2173,6 +2173,10 @@ where
         artifacts: Vec::new(),
         target_accepted: false,
         idle_ticks: 0,
+        spill: None,
+        scan: None,
+        seed: None,
+        pulled_len: 0,
     });
 }
 

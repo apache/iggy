@@ -118,6 +118,12 @@ impl<const ALIGN: usize> Owned<ALIGN> {
         &self.inner
     }
 
+    /// Capacity of the allocation retained when this buffer is frozen.
+    #[must_use]
+    pub fn backing_capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.inner
     }

@@ -1499,6 +1499,160 @@ impl ConsensusHeader for CommitHeader {
     }
 }
 
+/// Backup -> primary: echo a heartbeat counter for quorum liveness.
+///
+/// This acknowledges connectivity, not journal or state-machine durability.
+/// Nodes using this message require a coordinated cluster upgrade.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
+pub struct CommitReplyHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+    pub timestamp_monotonic: u64,
+    pub group: u64,
+    pub partition_incarnation: u64,
+    pub reserved: [u8; 104],
+}
+
+const _: () = {
+    assert!(size_of::<CommitReplyHeader>() == HEADER_SIZE);
+    assert!(offset_of!(CommitReplyHeader, timestamp_monotonic) == 128);
+    assert!(offset_of!(CommitReplyHeader, partition_incarnation) == 144);
+    assert!(offset_of!(CommitReplyHeader, reserved) + size_of::<[u8; 104]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for CommitReplyHeader {
+    const FRAME_SEALED: bool = true;
+    const COMMAND: Command = Command::CommitReply;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Self::COMMAND {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Self::COMMAND,
+                found: self.command,
+            });
+        }
+        if usize::try_from(self.size) != Ok(HEADER_SIZE) {
+            return Err(ConsensusError::InvalidField(
+                "commit_reply: invalid size".to_string(),
+            ));
+        }
+        if self.release != 0 {
+            return Err(ConsensusError::InvalidField("release != 0".to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// Correlates a replication batch with the backup's contiguous acknowledged prefix.
+///
+/// Progress releases transport credit and never counts toward a commit quorum.
+/// Replies echo the nonce and observed op; `ready` certifies the received prefix.
+/// Probes advertise the primary's applied frontier for retention fallback.
+/// Probes must stay ordered with prepares on the sender's queue.
+/// Nodes using this message require a coordinated cluster upgrade.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
+pub struct PrepareProgressHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+    pub nonce: u64,
+    pub group: u64,
+    pub partition_incarnation: u64,
+    pub observed_op: u64,
+    pub received_op: u64,
+    pub commit_op: u64,
+    pub kind: u8,
+    pub ready: u8,
+    pub reserved: [u8; 78],
+}
+
+const _: () = {
+    assert!(size_of::<PrepareProgressHeader>() == HEADER_SIZE);
+    assert!(offset_of!(PrepareProgressHeader, nonce) == 128);
+    assert!(offset_of!(PrepareProgressHeader, partition_incarnation) == 144);
+    assert!(offset_of!(PrepareProgressHeader, reserved) + size_of::<[u8; 78]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for PrepareProgressHeader {
+    const FRAME_SEALED: bool = true;
+    const COMMAND: Command = Command::PrepareProgress;
+
+    fn checksum(&self) -> u128 {
+        self.checksum
+    }
+    fn set_checksum(&mut self, checksum: u128) {
+        self.checksum = checksum;
+    }
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Self::COMMAND {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Self::COMMAND,
+                found: self.command,
+            });
+        }
+        if usize::try_from(self.size) != Ok(HEADER_SIZE) {
+            return Err(ConsensusError::InvalidField(
+                "prepare_progress: invalid size".to_string(),
+            ));
+        }
+        if self.release != 0 {
+            return Err(ConsensusError::InvalidField("release != 0".to_string()));
+        }
+        if self.kind > Self::REPLY || self.ready > 1 {
+            return Err(ConsensusError::InvalidField(
+                "prepare_progress: invalid fields".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl PrepareProgressHeader {
+    pub const PROBE: u8 = 0;
+    pub const REPLY: u8 = 1;
+}
+
 // StartViewChangeHeader - failure detection (header-only)
 
 /// Replica suspects primary failure. Header-only.
@@ -3156,13 +3310,14 @@ mod tests {
     }
     use super::prepare_identity_checksum_bytes;
     use super::{
-        Command, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, EvictionHeader,
-        EvictionReason, ForwardCompletionHeader, ForwardLogoutHeader, ForwardLogoutOutcome,
-        ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
-        ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, LIFECYCLE_BATCH_HEADER_SIZE,
-        LIFECYCLE_COMPLETION_SIZE, LIFECYCLE_COMPLETIONS_MAX, Operation, PrepareHeader,
-        PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader,
-        RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+        Command, CommitHeader, CommitReplyHeader, ConsensusError, ConsensusHeader,
+        DoViewChangeHeader, EvictionHeader, EvictionReason, ForwardCompletionHeader,
+        ForwardLogoutHeader, ForwardLogoutOutcome, ForwardLogoutResultHeader,
+        ForwardRegisterHeader, ForwardRegisterOutcome, ForwardRegisterResultHeader, GenericHeader,
+        HEADER_SIZE, LIFECYCLE_BATCH_HEADER_SIZE, LIFECYCLE_COMPLETION_SIZE,
+        LIFECYCLE_COMPLETIONS_MAX, Operation, PrepareHeader, PrepareOkHeader,
+        PrepareProgressHeader, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader,
+        RequestHeader, RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
         RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
         StateChunkHeader, StateTransferTargetHeader,
     };
@@ -3226,6 +3381,8 @@ mod tests {
         seals!(
             PrepareOkHeader,
             CommitHeader,
+            CommitReplyHeader,
+            PrepareProgressHeader,
             StartViewChangeHeader,
             DoViewChangeHeader,
             StartViewHeader,
@@ -3292,6 +3449,8 @@ mod tests {
         }
         check_incarnation!(
             CommitHeader,
+            CommitReplyHeader,
+            PrepareProgressHeader,
             StartViewChangeHeader,
             DoViewChangeHeader,
             StartViewHeader,

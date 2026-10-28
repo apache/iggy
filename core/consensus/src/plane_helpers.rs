@@ -31,25 +31,24 @@ use server_common::{
 };
 use std::{error::Error, fmt, mem::size_of, ops::AsyncFnOnce};
 
-/// Failure to route or forward a prepare through the replication chain.
+/// Failure to enqueue a prepare for replication.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum ChainReplicationError {
+pub enum PrepareReplicationError {
     MalformedPrepare,
     UnexpectedCommand { command: Command },
     CommittedPrepare { op: u64, commit_min: u64 },
-    SelfRoute { replica: u8 },
     Transport(SendError),
 }
 
-impl ChainReplicationError {
+impl PrepareReplicationError {
     #[must_use]
     pub const fn is_transport(&self) -> bool {
         matches!(self, Self::Transport(_))
     }
 }
 
-impl fmt::Display for ChainReplicationError {
+impl fmt::Display for PrepareReplicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MalformedPrepare => formatter.write_str("malformed prepare frame"),
@@ -60,18 +59,12 @@ impl fmt::Display for ChainReplicationError {
                 formatter,
                 "prepare op {op} is not above committed op {commit_min}"
             ),
-            Self::SelfRoute { replica } => {
-                write!(
-                    formatter,
-                    "replication chain routes replica {replica} to itself"
-                )
-            }
             Self::Transport(error) => error.fmt(formatter),
         }
     }
 }
 
-impl Error for ChainReplicationError {
+impl Error for PrepareReplicationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Transport(error) => Some(error),
@@ -80,7 +73,7 @@ impl Error for ChainReplicationError {
     }
 }
 
-impl From<SendError> for ChainReplicationError {
+impl From<SendError> for PrepareReplicationError {
     fn from(error: SendError) -> Self {
         Self::Transport(error)
     }
@@ -130,151 +123,137 @@ where
     header.op <= consensus.commit_min()
 }
 
-/// Shared chain-replication forwarding, skipping disconnected replicas.
-///
-/// Borrows the message, makes a deep copy for the wire, and lets the caller
-/// retain ownership for journal append.
+/// Enqueue one shared wire copy for every backup. Backups never forward it.
 ///
 /// # Errors
 ///
-/// Returns an error if the prepare cannot be routed or the bus cannot deliver
-/// it to a connected replica before the end of the chain.
-/// Other transport errors remain covered by VSR prepare retransmission.
+/// Returns the first enqueue error after attempting every backup. The bus
+/// bounds each peer's queue; a full queue must not skip another peer.
 #[allow(clippy::future_not_send)]
-pub async fn replicate_to_next_in_chain<B, P>(
+pub async fn replicate_prepare<B, P>(
     consensus: &VsrConsensus<B, P>,
     message: &Message<PrepareHeader>,
-) -> Result<(), ChainReplicationError>
+) -> Result<(), PrepareReplicationError>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    let Some(next) = replication_target(consensus, message.header())? else {
+    if !primary_sends_prepare(consensus, message.header())? {
         return Ok(());
-    };
+    }
     let frozen = message.deep_copy().into_generic().into_frozen();
-    forward_to_connected_replica(
-        consensus,
-        frozen,
-        next,
-        consensus.primary_index(message.header().view),
-    )
-    .await
+    enqueue_prepare_for_backups(consensus, frozen).await
 }
 
-/// Forward an already validated frozen prepare to the next replica without
-/// copying its payload, skipping disconnected replicas.
+/// Enqueue a frozen prepare for every backup without copying its payload.
 ///
 /// # Errors
 ///
-/// Returns an error if the frame is malformed, cannot be routed, or the bus
-/// cannot deliver it to a connected replica before the end of the chain.
+/// Returns an error for a malformed frame, or the first enqueue error after
+/// attempting every backup.
 #[allow(clippy::future_not_send)]
-pub async fn replicate_frozen_to_next_in_chain<B, P>(
+pub async fn replicate_frozen_prepare<B, P>(
     consensus: &VsrConsensus<B, P>,
     message: Frozen<MESSAGE_ALIGN>,
-) -> Result<(), ChainReplicationError>
+) -> Result<(), PrepareReplicationError>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     let header = frozen_prepare_header(&message)?;
-    let Some(next) = replication_target(consensus, &header)? else {
+    if !primary_sends_prepare(consensus, &header)? {
         return Ok(());
-    };
-    forward_to_connected_replica(
-        consensus,
-        message,
-        next,
-        consensus.primary_index(header.view),
-    )
-    .await
+    }
+    enqueue_prepare_for_backups(consensus, message).await
 }
 
 #[allow(clippy::future_not_send)]
-async fn forward_to_connected_replica<B, P>(
+async fn enqueue_prepare_for_backups<B, P>(
     consensus: &VsrConsensus<B, P>,
     message: Frozen<MESSAGE_ALIGN>,
-    mut next: u8,
-    primary: u8,
-) -> Result<(), ChainReplicationError>
+) -> Result<(), PrepareReplicationError>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    loop {
+    let (op, size) = {
+        let header = frozen_prepare_header(&message)?;
+        (header.op, u64::from(header.size))
+    };
+    let mut first_error = None;
+    for replica in 0..consensus.replica_count() {
+        if replica == consensus.replica() {
+            continue;
+        }
+        if !consensus.admit_replication(replica, op, size, false) {
+            continue;
+        }
         match consensus
             .message_bus()
-            .send_to_replica(next, message.clone())
+            .send_to_replica(replica, message.clone())
             .await
         {
-            Ok(()) => return Ok(()),
-            Err(error @ (SendError::ReplicaNotConnected(_) | SendError::ConnectionClosed)) => {
-                next = (next + 1) % consensus.replica_count();
-                if next == primary {
-                    return Err(error.into());
+            Ok(()) => {
+                consensus.record_replication_send(replica, op, size, false);
+            }
+            Err(error) => {
+                consensus.record_replication_failure(replica, op);
+                if first_error.is_none() {
+                    first_error = Some(error);
                 }
             }
-            Err(error) => return Err(error.into()),
         }
     }
+    first_error.map_or(Ok(()), |error| Err(error.into()))
 }
 
 fn frozen_prepare_header(
     message: &Frozen<MESSAGE_ALIGN>,
-) -> Result<PrepareHeader, ChainReplicationError> {
+) -> Result<PrepareHeader, PrepareReplicationError> {
     let header_bytes = message
         .as_slice()
         .get(..size_of::<PrepareHeader>())
-        .ok_or(ChainReplicationError::MalformedPrepare)?;
+        .ok_or(PrepareReplicationError::MalformedPrepare)?;
     let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
         .copied()
-        .map_err(|_| ChainReplicationError::MalformedPrepare)?;
+        .map_err(|_| PrepareReplicationError::MalformedPrepare)?;
     header
         .validate()
-        .map_err(|_| ChainReplicationError::MalformedPrepare)?;
+        .map_err(|_| PrepareReplicationError::MalformedPrepare)?;
     let frame_size =
-        usize::try_from(header.size).map_err(|_| ChainReplicationError::MalformedPrepare)?;
+        usize::try_from(header.size).map_err(|_| PrepareReplicationError::MalformedPrepare)?;
     if !(size_of::<PrepareHeader>()..=message.len()).contains(&frame_size) {
-        return Err(ChainReplicationError::MalformedPrepare);
+        return Err(PrepareReplicationError::MalformedPrepare);
     }
     Ok(header)
 }
 
-fn replication_target<B, P>(
+fn primary_sends_prepare<B, P>(
     consensus: &VsrConsensus<B, P>,
     header: &PrepareHeader,
-) -> Result<Option<u8>, ChainReplicationError>
+) -> Result<bool, PrepareReplicationError>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     if header.command != Command::Prepare {
-        return Err(ChainReplicationError::UnexpectedCommand {
+        return Err(PrepareReplicationError::UnexpectedCommand {
             command: header.command,
         });
     }
     let commit_min = consensus.commit_min();
     if header.op <= commit_min {
-        return Err(ChainReplicationError::CommittedPrepare {
+        return Err(PrepareReplicationError::CommittedPrepare {
             op: header.op,
             commit_min,
         });
     }
 
-    let next = (consensus.replica() + 1) % consensus.replica_count();
-    let primary = consensus.primary_index(header.view);
-
-    if next == primary {
-        return Ok(None);
-    }
-
-    if next == consensus.replica() {
-        return Err(ChainReplicationError::SelfRoute {
-            replica: consensus.replica(),
-        });
-    }
-    Ok(Some(next))
+    Ok(consensus.is_acting_primary()
+        && !consensus.has_observed_newer_view()
+        && !consensus.is_transferring()
+        && header.view == consensus.view()
+        && consensus.replica() == consensus.primary_index(header.view))
 }
 
 /// Re-stamp a stored prepare with the current view before retransmission.
@@ -370,12 +349,8 @@ where
         return Err(IgnoreReason::NewerView);
     }
 
-    // Deposed-primary prepares can still be in flight after a view change:
-    // replicate_to_next_in_chain stops the ring at primary_index(header.view),
-    // not the current view's primary, so a stale prepare reaches the new
-    // primary and would hit its sequencer invariants. Uncommitted old-view
-    // ops are decided by the view change, never by late delivery. Message
-    // repair, once it lands, fetches prepares via its own path, not here.
+    // Late fanout from a deposed primary must not decide uncommitted old-view
+    // ops. View change and message repair recover them through their own paths.
     if header.view < consensus.view() {
         return Err(IgnoreReason::OlderView);
     }
@@ -1449,103 +1424,125 @@ mod tests {
 
         assert!(matches!(
             frozen_prepare_header(&malformed),
-            Err(ChainReplicationError::MalformedPrepare)
+            Err(PrepareReplicationError::MalformedPrepare)
         ));
     }
 
     #[test]
-    fn given_disconnected_chain_peers_when_forwarding_should_reach_the_next_peer_immediately() {
-        for frozen in [false, true] {
-            for (replica, count, view, disconnected, expected) in [
-                (0, 3, 0, vec![1], 2),
-                (1, 3, 1, vec![2], 0),
-                (2, 5, 1, vec![3, 4], 0),
-            ] {
-                let consensus =
-                    VsrConsensus::new(1, replica, count, 0, SpyBus::new(), LocalPipeline::new());
-                consensus.init();
-                let bus = consensus.message_bus();
-                for peer in &disconnected {
-                    bus.failures
-                        .borrow_mut()
-                        .insert(*peer, SendError::ReplicaNotConnected(*peer));
-                }
-                let message = prepare_message(1, 0, 42).transmute_header(
-                    |old, header: &mut PrepareHeader| {
-                        *header = old;
-                        header.view = view;
-                    },
-                );
-                let result = if frozen {
-                    let prepare = message.deep_copy().into_frozen();
-                    let pointer = prepare.as_slice().as_ptr();
-                    let result = futures::executor::block_on(replicate_frozen_to_next_in_chain(
-                        &consensus, prepare,
-                    ));
-                    if let Some((_, sent)) = bus.sent.borrow().first() {
-                        assert_eq!(
-                            sent.as_slice().as_ptr(),
-                            pointer,
-                            "forwarding must not copy the payload"
+    fn given_a_primary_when_replicating_should_enqueue_every_backup_independently() {
+        for count in [3, 5] {
+            for primary in 0..count {
+                for frozen in [false, true] {
+                    let mut consensus = VsrConsensus::new(
+                        1,
+                        primary,
+                        count,
+                        0,
+                        SpyBus::new(),
+                        LocalPipeline::new(),
+                    );
+                    consensus.set_view(u32::from(primary));
+                    consensus.set_log_view(u32::from(primary));
+                    consensus.init();
+                    let message = prepare_message(1, 0, 42).transmute_header(
+                        |old, header: &mut PrepareHeader| {
+                            *header = old;
+                            header.view = u32::from(primary);
+                        },
+                    );
+                    let result = if frozen {
+                        futures::executor::block_on(replicate_frozen_prepare(
+                            &consensus,
+                            message.deep_copy().into_frozen(),
+                        ))
+                    } else {
+                        futures::executor::block_on(replicate_prepare(&consensus, &message))
+                    };
+                    result.unwrap();
+                    let sent = consensus.message_bus().sent.borrow();
+                    let expected: Vec<_> = (0..count).filter(|peer| *peer != primary).collect();
+                    assert_eq!(
+                        sent.iter().map(|(peer, _)| *peer).collect::<Vec<_>>(),
+                        expected
+                    );
+                    for (_, copy) in sent.iter() {
+                        assert_eq!(copy.as_slice(), message.as_slice());
+                        assert!(
+                            copy.shares_allocation(&sent[0].1),
+                            "fanout shares one wire allocation"
                         );
                     }
-                    result
-                } else {
-                    futures::executor::block_on(replicate_to_next_in_chain(&consensus, &message))
-                };
-                result.expect("a disconnected peer must not delay forwarding to the live suffix");
-                assert_eq!(
-                    bus.attempts.borrow().as_slice(),
-                    [disconnected, vec![expected]].concat()
-                );
-                let sent = bus.sent.borrow();
-                assert_eq!(sent.len(), 1);
-                assert_eq!(sent[0].0, expected);
-                assert_eq!(sent[0].1.as_slice(), message.as_slice());
-                assert_eq!(
-                    consensus.commit_max(),
-                    0,
-                    "forwarding is not an acknowledgement"
-                );
+                    assert_eq!(consensus.commit_max(), 0, "enqueueing is not an ack");
+                }
             }
         }
     }
 
     #[test]
-    fn given_a_chain_boundary_when_forwarding_should_never_wrap_to_the_primary() {
-        for (replica, count, connected, expected_attempts) in [
-            (0, 3, true, vec![1]),
-            (0, 3, false, vec![1, 2]),
-            (1, 3, false, vec![2]),
-            (2, 3, false, vec![]),
-            (0, 1, false, vec![]),
-        ] {
-            let consensus =
-                VsrConsensus::new(1, replica, count, 0, SpyBus::new(), LocalPipeline::new());
-            consensus.init();
-            consensus.message_bus().reject_sends.set(!connected);
-            let result = futures::executor::block_on(replicate_frozen_to_next_in_chain(
-                &consensus,
-                prepare_message(1, 0, 42).into_frozen(),
-            ));
-            assert_eq!(result.is_ok(), connected || expected_attempts.is_empty());
-            assert_eq!(
-                *consensus.message_bus().attempts.borrow(),
-                expected_attempts
-            );
+    fn given_one_full_replica_queue_when_replicating_should_still_enqueue_the_healthy_backup() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, SpyBus::new(), LocalPipeline::new());
+        consensus.init();
+        consensus
+            .message_bus()
+            .failures
+            .borrow_mut()
+            .insert(1, SendError::Backpressure);
+        let result = futures::executor::block_on(replicate_frozen_prepare(
+            &consensus,
+            prepare_message(1, 0, 42).into_frozen(),
+        ));
+        assert!(
+            result.is_err(),
+            "the failed enqueue remains visible for retransmission"
+        );
+        assert_eq!(*consensus.message_bus().attempts.borrow(), [1, 2]);
+        assert_eq!(consensus.message_bus().sent.borrow()[0].0, 2);
+    }
+
+    #[test]
+    fn given_a_backup_or_singleton_when_replicating_should_enqueue_nothing() {
+        for count in [1, 3, 5] {
+            for view in 0..count {
+                for replica in 0..count {
+                    if count > 1 && replica == view {
+                        continue;
+                    }
+                    let consensus = VsrConsensus::new(
+                        1,
+                        replica,
+                        count,
+                        0,
+                        SpyBus::new(),
+                        LocalPipeline::new(),
+                    );
+                    consensus.init();
+                    let prepare = prepare_message(1, 0, 42).transmute_header(
+                        |old, header: &mut PrepareHeader| {
+                            *header = old;
+                            header.view = u32::from(view);
+                        },
+                    );
+                    futures::executor::block_on(replicate_frozen_prepare(
+                        &consensus,
+                        prepare.into_frozen(),
+                    ))
+                    .unwrap();
+                    assert!(consensus.message_bus().attempts.borrow().is_empty());
+                }
+            }
         }
     }
 
     #[test]
-    fn given_a_transport_error_when_forwarding_should_skip_only_disconnected_peers() {
+    fn given_an_enqueue_error_when_replicating_should_attempt_every_other_backup() {
         for error in [
+            SendError::ReplicaNotConnected(1),
             SendError::ConnectionClosed,
             SendError::Backpressure,
             SendError::ReplicaRouteMissing(1),
             SendError::ReplicaForwardFailed(1),
             SendError::BusShuttingDown,
         ] {
-            let skip = matches!(error, SendError::ConnectionClosed);
             let consensus = VsrConsensus::new(1, 0, 3, 0, SpyBus::new(), LocalPipeline::new());
             consensus.init();
             consensus
@@ -1553,15 +1550,13 @@ mod tests {
                 .failures
                 .borrow_mut()
                 .insert(1, error);
-            let result = futures::executor::block_on(replicate_frozen_to_next_in_chain(
+            let result = futures::executor::block_on(replicate_frozen_prepare(
                 &consensus,
                 prepare_message(1, 0, 42).into_frozen(),
             ));
-            assert_eq!(result.is_ok(), skip);
-            assert_eq!(
-                consensus.message_bus().attempts.borrow().as_slice(),
-                if skip { &[1, 2][..] } else { &[1][..] },
-            );
+            assert!(result.is_err());
+            assert_eq!(*consensus.message_bus().attempts.borrow(), [1, 2]);
+            assert_eq!(consensus.message_bus().sent.borrow()[0].0, 2);
         }
     }
 
@@ -1572,8 +1567,8 @@ mod tests {
         let prepare = prepare_message(0, 0, 0);
 
         assert!(matches!(
-            replication_target(&consensus, prepare.header()),
-            Err(ChainReplicationError::CommittedPrepare {
+            primary_sends_prepare(&consensus, prepare.header()),
+            Err(PrepareReplicationError::CommittedPrepare {
                 op: 0,
                 commit_min: 0
             })
@@ -1992,13 +1987,18 @@ mod tests {
         let local = suffix_headers(2, 4, 0);
         consensus.set_local_dvc_suffix(crate::view_change_quorum::DvcSuffix::new(local, 0, 0b110));
 
-        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, 5));
-
         // Two peers abstain, reaching the quorum of 3 and leaving op 4 one nack short.
+        // The first brings this replica into view 5, which it announces, before f
+        // StartViewChanges arrive, so it sends no DoViewChange of its own.
         for replica in [1u8, 2] {
             let (dvc, body) = dvc_numbers_only(replica, 5, 0, 4, 2);
             let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
-            assert!(actions.is_empty());
+            assert!(
+                actions
+                    .iter()
+                    .all(|action| matches!(action, VsrAction::SendStartViewChange { view: 5, .. })),
+                "{actions:?}"
+            );
         }
         assert!(
             consensus.pending_view_log().is_none(),
@@ -2345,9 +2345,10 @@ mod tests {
     ///
     /// A parked merge leaves the replica in `ViewChange` announcing nothing if the
     /// bodies never arrive, which is the intended trade against losing data but has
-    /// to stay recoverable: the status timeout fires, escalates, and drops the parked
-    /// log. Reusing a log merged for a superseded view would leak a truncation
-    /// decided there into a view that never voted for it.
+    /// to stay recoverable: the status timeout votes for the next view, and the
+    /// quorum that joins the vote drops the parked log. Reusing a log merged for a
+    /// superseded view would leak a truncation decided there into a view that never
+    /// voted for it.
     /// A `StartView` from the view's primary, optionally carrying the view's
     /// canonical headers.
     fn start_view_with_suffix(
@@ -2504,7 +2505,8 @@ mod tests {
     }
 
     #[test]
-    fn given_parked_view_change_when_status_timeout_fires_should_escalate_and_drop_merged_log() {
+    fn given_parked_view_change_when_a_quorum_votes_after_its_status_timeout_should_drop_merged_log()
+     {
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
         consensus.init();
         consensus.restore_commit_state(2, 2);
@@ -2520,26 +2522,24 @@ mod tests {
         assert_eq!(consensus.status(), Status::ViewChange);
         let parked_view = consensus.view();
 
-        // `VIEW_CHANGE_STATUS_TICKS` is 500; tick past it. Escalation shows as the
-        // view advancing, since the 50-tick SVC retransmit also emits a send.
-        let mut escalated = false;
-        for _ in 0..600 {
-            let _ = consensus.tick(PlaneKind::Metadata);
-            if consensus.view() > parked_view {
-                escalated = true;
-                break;
-            }
-        }
+        // The status timeout votes for the next view and keeps the parked merge,
+        // which can still start the view once repair covers it.
+        let next_view = parked_view + 1;
+        let voted = (0..crate::TimeoutManager::VIEW_CHANGE_STATUS_TICKS)
+            .flat_map(|_| consensus.tick(PlaneKind::Metadata))
+            .any(|action| {
+                matches!(action, VsrAction::SendStartViewChange { view, .. } if view == next_view)
+            });
+        assert!(
+            voted,
+            "a parked view change must still vote on the status timeout"
+        );
+        assert_eq!(consensus.view(), parked_view);
+        assert!(consensus.pending_view_log().is_some());
 
-        assert!(
-            escalated,
-            "a parked view change must still escalate on the status timeout"
-        );
-        assert!(
-            consensus.view() > parked_view,
-            "escalation must advance the view past {parked_view}, got {}",
-            consensus.view()
-        );
+        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, next_view));
+
+        assert_eq!(consensus.view(), next_view);
         assert!(
             consensus.pending_view_log().is_none(),
             "the superseded merged log must be dropped, not carried into the next view"
