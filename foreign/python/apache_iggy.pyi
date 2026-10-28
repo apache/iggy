@@ -2098,7 +2098,7 @@ class IggyClient:
         auto_commit: AutoCommit | None = None,
         create_consumer_group_if_not_exists: builtins.bool = True,
         auto_join_consumer_group: builtins.bool = True,
-        poll_interval: datetime.timedelta | None = None,
+        *,
         polling_retry_interval: datetime.timedelta | None = None,
         init_retries: builtins.int | None = None,
         init_retry_interval: datetime.timedelta | None = None,
@@ -2108,10 +2108,11 @@ class IggyClient:
         Creates a new consumer group consumer.
         `partition_id` is ignored for a consumer group: the member reads the partitions
         the server assigns to it.
+        `auto_commit` defaults to `AutoCommit.Disabled()`: the consumer stores no offset,
+        so store positions after processing, or each restart reads the same messages again.
         Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
-        `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
-        `AutoCommit` interval is negative, or if any of those except `poll_interval`
-        is zero.
+        `polling_retry_interval`, `init_retry_interval` or an `AutoCommit` interval
+        is negative or zero.
 
         Consumer groups are not available over HTTP. With `auto_join_consumer_group`
         left on, this call fails at the join with `Feature is unavailable`.
@@ -2140,6 +2141,31 @@ class IggyClient:
 
         Raises:
             RuntimeError: If the command cannot be sent or the server returns an error.
+        """
+    def send_binary_request_to_replica(
+        self, code: builtins.int, payload: builtins.bytes, replica_id: builtins.int
+    ) -> collections.abc.Awaitable[bytes]:
+        r"""
+        Send a command code with a payload to the replica with the given id and
+        return the raw response bytes.
+
+        The replica id is the one cluster metadata names for the node. Every
+        node answers non-replicated commands such as GetStats from its own
+        state. Replicated commands, polls, consumer-offset reads and
+        session-control codes are rejected client-side, and a replica id that
+        cluster metadata does not name fails. HTTP transport does not support
+        raw binary commands.
+
+        Args:
+            code: Command code as `int`.
+            payload: Request payload as `bytes`.
+            replica_id: Replica id as `int`, as cluster metadata names it.
+
+        Returns:
+            An awaitable that resolves to the raw response `bytes`.
+
+        Raises:
+            RuntimeError: If the command cannot be sent or the replica returns an error.
         """
 
 @typing.final

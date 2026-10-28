@@ -48,6 +48,7 @@ pub(super) fn partitions_config() -> PartitionsConfig {
         path_layout: PartitionPathLayout::default(),
     }
 }
+const SEGMENT_FLOOR: u64 = 1024 * 1024;
 
 /// Commit one batch starting at offset zero and keep it resident. Each call
 /// creates an independent partition history, even for the same namespace.
@@ -70,8 +71,16 @@ pub(super) async fn partition_with_messages_at_revision<B: MessageBus + Clone>(
     let cluster_id = 1;
     let replica_id = 0;
     let replica_count = 3;
-    let config = partitions_config();
-    let segment_size = config.segment_size;
+    // The batch must fit one segment or it never materialises, and it must stay
+    // under the flush threshold or it stops being resident. Doubling the payload
+    // total covers framing; the floor keeps small fixtures where they were.
+    let payload_bytes: u64 = payloads.iter().map(|payload| payload.len() as u64).sum();
+    let segment_size = IggyByteSize::from(SEGMENT_FLOOR.max(payload_bytes.saturating_mul(2)));
+    let config = PartitionsConfig {
+        segment_size,
+        size_of_messages_required_to_save: segment_size,
+        ..partitions_config()
+    };
     let consensus = VsrConsensus::new(
         cluster_id,
         replica_id,
@@ -93,6 +102,24 @@ pub(super) async fn partition_with_messages_at_revision<B: MessageBus + Clone>(
         ..Default::default()
     });
 
+    commit_messages(&mut partition, &config, namespace, payloads, (1, 0)).await;
+    assert_eq!(partition.consensus().commit_min(), 1);
+    assert_eq!(partition.offsets().commit_offset, payloads.len() as u64 - 1);
+
+    (*partition, config)
+}
+
+/// Append `payloads` as one batch from the fixture client and commit it.
+/// `request` numbers the batch among the client's requests, and
+/// `metadata_watermark` must reach the partition's metadata fences.
+#[allow(clippy::future_not_send)]
+pub(super) async fn commit_messages<B: MessageBus + Clone>(
+    partition: &mut IggyPartition<B>,
+    config: &PartitionsConfig,
+    namespace: IggyNamespace,
+    payloads: &[&str],
+    (request, metadata_watermark): (u64, u64),
+) {
     assert!(!payloads.is_empty(), "fixture requires messages");
     let mut messages = IggyMessages::with_capacity(payloads.len());
     for (index, payload) in payloads.iter().enumerate() {
@@ -113,25 +140,27 @@ pub(super) async fn partition_with_messages_at_revision<B: MessageBus + Clone>(
             operation: Operation::SendMessages,
             client: 1,
             session: 1,
-            request: 1,
+            request,
             group: namespace.inner(),
-            partition_incarnation: created_revision,
+            partition_incarnation: partition.created_revision(),
+            metadata_watermark,
             ..Default::default()
         })
         .expect("encode append request");
     let (append_reply, append_result) = oneshot_channel();
+    let op = partition.consensus().sequencer().current_sequence() + 1;
     partition.on_request(append, Some(append_reply)).await;
-    assert_eq!(partition.consensus().sequencer().current_sequence(), 1);
-    partition.consensus().advance_commit_max(1);
-    partition.commit_journal(&config).await;
-    assert_eq!(partition.consensus().commit_min(), 1);
+    assert_eq!(
+        partition.consensus().sequencer().current_sequence(),
+        op,
+        "fixture append was prepared"
+    );
+    partition.consensus().advance_commit_max(op);
+    partition.commit_journal(config).await;
     assert!(
         matches!(append_result.now_or_never(), Some(Ok(_))),
         "fixture append was committed"
     );
-    assert_eq!(partition.offsets().commit_offset, payloads.len() as u64 - 1);
-
-    (*partition, config)
 }
 
 #[allow(clippy::future_not_send)]

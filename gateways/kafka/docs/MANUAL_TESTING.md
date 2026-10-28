@@ -608,7 +608,7 @@ build a version-correct response against, so it closes the connection rather tha
 ### Response header rules
 
 Header version selection now delegates entirely to `kafka_protocol::messages::ApiKey` (see
-`src/protocol/header.rs`) - there is no lookup table in this codebase to consult.
+`core/kafka_wire/src/header.rs`) - there is no lookup table in this codebase to consult.
 
 | API key | Request flexible? | Response header version |
 | --------- | -------------------- | ------------------------- |

@@ -24,11 +24,14 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
 import org.apache.iggy.exception.IggyAuthenticationException;
 import org.apache.iggy.exception.IggyConnectionException;
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
+import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
@@ -59,6 +62,83 @@ class VsrResponseHandlerTest {
     @AfterEach
     void tearDown() {
         channel.finishAndReleaseAll();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldCancelOnlyAfterTheDeferredFrameHasBeenSent(boolean cancelBeforeWrite) {
+        long requestId = 7;
+        long sessionId = 9;
+        CompletableFuture<ByteBuf> future = new CompletableFuture<>();
+        ByteBuf request = requestFrame(VsrOperation.NON_REPLICATED, requestId);
+        request.setLongLE(VsrHeaders.REQUEST_SESSION_OFFSET, sessionId);
+        request.setIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET, CommandCode.Messages.POLL_DEFERRED.getValue());
+        var pending = handler.registerRequest(
+                channel,
+                request,
+                future,
+                System.nanoTime() + TimeUnit.MINUTES.toNanos(1),
+                CommandCode.Messages.POLL_DEFERRED.getValue());
+        try {
+            if (cancelBeforeWrite) {
+                future.cancel(false);
+                assertThat((Object) channel.readOutbound()).isNull();
+            }
+            channel.writeOutbound(request.retainedDuplicate());
+            pending.sent(channel);
+            if (!cancelBeforeWrite) {
+                future.cancel(false);
+            }
+            channel.runPendingTasks();
+            ByteBuf original = channel.readOutbound();
+            assertThat(original.getIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET))
+                    .isEqualTo(CommandCode.Messages.POLL_DEFERRED.getValue());
+            original.release();
+            ByteBuf cancellation = channel.readOutbound();
+            assertThat(cancellation.readableBytes()).isEqualTo(VsrHeaders.HEADER_SIZE);
+            assertThat(cancellation.getIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET))
+                    .isEqualTo(CommandCode.Messages.CANCEL_DEFERRED_REQUEST.getValue());
+            assertThat(VsrHeaders.readRequestId(cancellation)).isEqualTo(requestId);
+            assertThat(cancellation.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET))
+                    .isEqualTo(sessionId);
+            cancellation.release();
+            assertThat((Object) channel.readOutbound()).isNull();
+            assertThat(channel.isActive()).isTrue();
+        } finally {
+            request.release();
+        }
+    }
+
+    @Test
+    void shouldQueueTheCancellationBehindAnOriginalWriteWaitingForTheLoop() {
+        CompletableFuture<ByteBuf> future = new CompletableFuture<>();
+        ByteBuf request = requestFrame(VsrOperation.NON_REPLICATED, 7);
+        request.setIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET, CommandCode.Messages.POLL_DEFERRED.getValue());
+        var pending = handler.registerRequest(
+                channel,
+                request,
+                future,
+                System.nanoTime() + TimeUnit.MINUTES.toNanos(1),
+                CommandCode.Messages.POLL_DEFERRED.getValue());
+        try {
+            // A write issued off the loop waits in its queue, and a deadline task can run before it.
+            channel.eventLoop().execute(() -> channel.writeAndFlush(request.retainedDuplicate()));
+            pending.sent(channel);
+            future.cancel(false);
+            channel.runPendingTasks();
+
+            ByteBuf first = channel.readOutbound();
+            assertThat(first.getIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET))
+                    .as("a cancellation that overtakes its request cancels nothing")
+                    .isEqualTo(CommandCode.Messages.POLL_DEFERRED.getValue());
+            first.release();
+            ByteBuf second = channel.readOutbound();
+            assertThat(second.getIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET))
+                    .isEqualTo(CommandCode.Messages.CANCEL_DEFERRED_REQUEST.getValue());
+            second.release();
+        } finally {
+            request.release();
+        }
     }
 
     @Test
@@ -522,6 +602,36 @@ class VsrResponseHandlerTest {
         assertThat(channel.isActive()).isFalse();
         assertThatThrownBy(pending::join).hasCauseInstanceOf(IggyConnectionException.class);
         assertThatThrownBy(other::join).hasCauseInstanceOf(IggyConnectionException.class);
+    }
+
+    @ParameterizedTest
+    @EnumSource(
+            value = IggyErrorCode.class,
+            names = {
+                "TRANSIENT_NOT_COMMITTED",
+                "TRANSIENT_NOT_ACCEPTED",
+                "NOT_PRIMARY",
+                "DEFERRED_POLL_CAPACITY_EXCEEDED"
+            })
+    void shouldNotTreatATransientDeferredRefusalAsACommittedOutcome(IggyErrorCode refusal) {
+        long requestId = 7;
+        CompletableFuture<ByteBuf> result = new CompletableFuture<>();
+        ByteBuf request = requestFrame(VsrOperation.NON_REPLICATED, requestId);
+        VsrResponseHandler.PendingRequest pending = handler.registerRequest(
+                channel,
+                request,
+                result,
+                System.nanoTime() + TimeUnit.MINUTES.toNanos(1),
+                CommandCode.Messages.POLL_DEFERRED.getValue());
+        request.release();
+        ByteBuf reply = replyFrame(VsrOperation.NON_REPLICATED, requestId, Unpooled.EMPTY_BUFFER);
+        reply.setIntLE(VsrHeaders.REPLY_STATUS_OFFSET, refusal.getCode());
+
+        channel.writeInbound(reply);
+
+        assertThat(rawErrorCode(result)).isEqualTo(refusal.getCode());
+        assertThat(pending.isCommitted()).isFalse();
+        assertThat(channel.isActive()).isTrue();
     }
 
     @Test

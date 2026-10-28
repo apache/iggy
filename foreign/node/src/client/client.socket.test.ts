@@ -423,6 +423,109 @@ const contextServer = async (state: {
   return server;
 };
 
+describe('raw commands to a chosen replica', () => {
+  const statsCode = 10;
+  const isStats = (frame: Buffer) =>
+    frame[REQUEST_OFFSET.operation] === Operation.NonReplicated &&
+    frame.readUInt32LE(REQUEST_OFFSET.reserved) === statsCode;
+
+  it('sends the command to the chosen replica only, with the metadata watermark', async () => {
+    const cluster = await startPollCluster((frame, socket) => {
+      if (!isStats(frame))
+        return false;
+      socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.from('replica-7')));
+      return true;
+    });
+    try {
+      await cluster.client.sendCommand(statsCode, Buffer.alloc(0), { deadline: Date.now() + 1_000 });
+      const response = await cluster.client.sendCommand(statsCode, Buffer.alloc(0),
+        { replica: 7, deadline: Date.now() + 1_000 });
+      assert.deepEqual(response.data, Buffer.from('replica-7'));
+      const sent = cluster.primary.frames.filter(isStats);
+      const routed = cluster.coordinator.frames.filter(isStats);
+      assert.equal(sent.length, 1);
+      assert.equal(routed.length, 1, 'only the request without a replica reached the metadata primary');
+      assert.equal(stampedContext(sent[0]).incarnation, 0n);
+      assert.equal(stampedContext(sent[0]).metadataOp, stampedContext(routed[0]).metadataOp);
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it('returns 89 from the chosen replica without trying another replica', async () => {
+    const cluster = await startPollCluster((frame, socket) => {
+      if (!isStats(frame))
+        return false;
+      socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), 89));
+      return true;
+    });
+    try {
+      await assert.rejects(cluster.client.sendCommand(statsCode, Buffer.alloc(0),
+        { replica: 7, deadline: Date.now() + 1_000 }),
+      (error: unknown) => error instanceof ResponseError && error.errorCode === 89);
+      assert.equal(cluster.primary.frames.filter(isStats).length, 1);
+      assert.equal(cluster.coordinator.frames.filter(isStats).length, 0);
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it('retries a transient refusal on the same replica', async () => {
+    let refused = false;
+    const cluster = await startPollCluster((frame, socket) => {
+      if (!isStats(frame))
+        return false;
+      socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.from('served'), refused ? 0 : 58));
+      refused = true;
+      return true;
+    });
+    try {
+      const response = await cluster.client.sendCommand(statsCode, Buffer.alloc(0),
+        { replica: 7, deadline: Date.now() + 1_000 });
+      assert.deepEqual(response.data, Buffer.from('served'));
+      assert.equal(cluster.primary.frames.filter(isStats).length, 2);
+      assert.equal(cluster.coordinator.frames.filter(isStats).length, 0);
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it('fails a replica the roster does not name with status 6 after one roster read', async () => {
+    const cluster = await startPollCluster();
+    try {
+      await cluster.client.sendCommand(COMMAND_CODE.GetStreams, Buffer.alloc(0), { deadline: Date.now() + 1_000 });
+      const rosters = countCommand(cluster.coordinator, COMMAND_CODE.GetClusterMetadata) +
+        countCommand(cluster.primary, COMMAND_CODE.GetClusterMetadata);
+      await assert.rejects(cluster.client.sendCommand(statsCode, Buffer.alloc(0),
+        { replica: 200, deadline: Date.now() + 1_000 }),
+      (error: unknown) => error instanceof ResponseError && error.errorCode === 6);
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetClusterMetadata) +
+        countCommand(cluster.primary, COMMAND_CODE.GetClusterMetadata), rosters + 1);
+      assert.equal(cluster.primary.frames.filter(isStats).length + cluster.coordinator.frames.filter(isStats).length, 0);
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it('refuses replicated commands, partition reads, session control and invalid ids before the wire', async () => {
+    const cluster = await startPollCluster();
+    try {
+      for (const command of [COMMAND_CODE.SendMessages, COMMAND_CODE.StoreOffset, COMMAND_CODE.CreateStream,
+        COMMAND_CODE.PollMessages, COMMAND_CODE.GetOffset, LOGIN.code, LOGOUT.code, COMMAND_CODE.LoginRegister,
+        COMMAND_CODE.LoginRegisterWithAccessToken])
+        await assert.rejects(cluster.client.sendCommand(command, Buffer.alloc(0), { replica: 7 }),
+          (error: unknown) => error instanceof ResponseError && error.errorCode === 3);
+      for (const replica of [-1, 1.5, 256])
+        await assert.rejects(cluster.client.sendCommand(statsCode, Buffer.alloc(0), { replica }),
+          (error: unknown) => error instanceof ResponseError && error.errorCode === 6);
+      assert.equal(cluster.primary.frames.length, 0);
+      assert.equal(cluster.coordinator.frames.length, 0);
+    } finally {
+      await cluster.close();
+    }
+  });
+});
+
 describe('unified partition routing', () => {
   const offset = { streamId: 1, topicId: 2, partitionId: 3,
     consumer: { kind: ConsumerKind.Single, id: 1 } };

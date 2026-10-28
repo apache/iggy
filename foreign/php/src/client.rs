@@ -27,8 +27,8 @@ use bytes::Bytes;
 use ext_php_rs::{binary::Binary, exception::PhpResult, php_class, php_impl, types::Zval};
 use iggy::prelude::{
     CompressionAlgorithm, Consumer as RustConsumer, IggyClient as RustIggyClient,
-    IggyClientBuilder, IggyDuration, IggyExpiry, IggyMessage as RustMessage, MaxTopicSize,
-    Partitioning, PollingStrategy as RustPollingStrategy, *,
+    IggyClientBuilder, IggyExpiry, IggyMessage as RustMessage, MaxTopicSize, Partitioning,
+    PollingStrategy as RustPollingStrategy, *,
 };
 use tokio::sync::Mutex;
 
@@ -589,7 +589,8 @@ impl IggyClient {
     /// Creates and initializes a consumer group consumer.
     ///
     /// `$partition_id` is ignored for a consumer group: the member reads the partitions
-    /// the server assigns to it.
+    /// the server assigns to it. `$poll_interval_micros` must be null: the consumer waits
+    /// on the server for new messages.
     #[allow(clippy::too_many_arguments)]
     #[php(defaults(
         create_consumer_group_if_not_exists = true,
@@ -613,10 +614,15 @@ impl IggyClient {
         init_retry_interval_micros: Option<&Zval>,
         allow_replay: bool,
     ) -> PhpResult<IggyConsumer> {
+        // The removed setting keeps its slot, so a positional call written for it fails
+        // instead of setting `polling_retry_interval_micros`.
+        if poll_interval_micros.is_some_and(|value| !value.is_null()) {
+            return Err(to_php_exception(
+                "'poll_interval_micros' is no longer supported and must be null: the consumer waits on the server for new messages",
+            ));
+        }
         let partition_id = optional_unsigned::<u32>(partition_id, "partition_id")?;
         let batch_length = optional_unsigned::<u32>(batch_length, "batch_length")?;
-        let poll_interval_micros =
-            optional_unsigned::<u64>(poll_interval_micros, "poll_interval_micros")?;
         let polling_retry_interval_micros = optional_unsigned::<u64>(
             polling_retry_interval_micros,
             "polling_retry_interval_micros",
@@ -650,10 +656,6 @@ impl IggyClient {
         if let Some(auto_commit) = auto_commit {
             builder = builder.auto_commit(auto_commit.into());
         }
-        builder = match poll_interval_micros {
-            Some(micros) => builder.poll_interval(IggyDuration::from(micros)),
-            None => builder.without_poll_interval(),
-        };
         if let Some(micros) = polling_retry_interval_micros {
             builder = builder.polling_retry_interval(non_zero_duration_micros(
                 "polling_retry_interval_micros",
@@ -707,6 +709,32 @@ impl IggyClient {
         runtime().block_on(async move {
             inner
                 .send_binary_request(code, Bytes::from(Vec::<u8>::from(payload)))
+                .await
+                .map(|response| Binary::new(Vec::from(response)))
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Sends a command code with a payload to the replica with the given id, as
+    /// cluster metadata names it, and returns the raw response bytes.
+    /// Replicated commands, polls, consumer-offset reads and session-control
+    /// codes return an invalid-command exception, and a replica that cluster
+    /// metadata does not name returns an invalid-identifier exception.
+    pub fn send_binary_request_to_replica(
+        &self,
+        code: u32,
+        payload: Binary<u8>,
+        replica_id: u8,
+    ) -> PhpResult<Binary<u8>> {
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .send_binary_request_to_replica(
+                    code,
+                    Bytes::from(Vec::<u8>::from(payload)),
+                    replica_id,
+                )
                 .await
                 .map(|response| Binary::new(Vec::from(response)))
                 .map_err(to_php_exception)

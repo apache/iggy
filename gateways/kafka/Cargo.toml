@@ -33,27 +33,21 @@ name = "iggy-gateway-kafka"
 path = "src/main.rs"
 
 [dependencies]
-# Required by kafka-protocol: its custom-decompression hook is typed on anyhow::Result.
-anyhow = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
-# The four codecs are driven from `records::decompress` rather than through kafka-protocol,
-# whose decompressors materialize the whole stream before a budget can see it.
-flate2 = { workspace = true }
 futures = { workspace = true }
 iggy = { workspace = true }
+iggy_kafka_wire = { workspace = true }
 # The codec features stay on for the encoder, which the batch tests use to build fixtures.
 kafka-protocol = { workspace = true, features = ["gzip", "lz4", "snappy", "zstd"] }
 libc = { workspace = true }
-lz4 = { workspace = true }
 regex = { workspace = true }
 regex-syntax = { workspace = true }
 rustls = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
-snap = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
@@ -73,11 +67,8 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 x509-parser = { workspace = true }
-zstd = { workspace = true }
 
 [dev-dependencies]
-# Repairs the CRC of a batch header a test rewrote, which the decoder checks first.
-crc32c = { workspace = true }
 # Partition route requests for `examples/partition_routes.rs`.
 iggy_binary_protocol = { workspace = true }
 # The client half, so a test encodes requests and decodes responses the way a consumer does.

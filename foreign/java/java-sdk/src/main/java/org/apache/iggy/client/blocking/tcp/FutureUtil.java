@@ -24,6 +24,7 @@ import org.apache.iggy.exception.IggyClientException;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 
 final class FutureUtil {
 
@@ -33,6 +34,30 @@ final class FutureUtil {
         try {
             return future.join();
         } catch (CompletionException e) {
+            throw unwrap(e.getCause());
+        } catch (CancellationException e) {
+            throw new IggyClientException("Operation was cancelled", e);
+        }
+    }
+
+    /**
+     * Waits for a call that can be held by the server for a long time. Unlike
+     * {@link #resolve}, an interrupt reaches the caller: it cancels the
+     * exchange, restores the interrupt flag and reports it, instead of parking
+     * until the server answers.
+     *
+     * @param future the pending call
+     * @param <T>    the result type
+     * @return the resolved value
+     */
+    static <T> T resolveInterruptibly(CompletableFuture<T> future) {
+        try {
+            return future.get();
+        } catch (InterruptedException interrupted) {
+            future.cancel(false);
+            Thread.currentThread().interrupt();
+            throw new IggyClientException("Interrupted while waiting for a response", interrupted);
+        } catch (ExecutionException e) {
             throw unwrap(e.getCause());
         } catch (CancellationException e) {
             throw new IggyClientException("Operation was cancelled", e);

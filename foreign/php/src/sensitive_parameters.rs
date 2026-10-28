@@ -53,6 +53,7 @@ const SENSITIVE_PARAMETERS: &[(&str, &str, u32)] = &[
     ("Iggy\\Client", "fromConnectionString", 0),
     ("Iggy\\Client", "loginUser", 1),
     ("Iggy\\Client", "sendBinaryRequest", 1),
+    ("Iggy\\Client", "sendBinaryRequestToReplica", 1),
     ("Iggy\\Client", "createStream", 1),
     ("Iggy\\Client", "createStream", 2),
     ("Iggy\\Client", "updateStream", 3),

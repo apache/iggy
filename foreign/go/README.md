@@ -232,6 +232,10 @@ those credentials commits, the client updates them. This holds for typed calls,
 `SendBinaryRequest` and `ResolveOperation`. A rejected change leaves the
 credentials unchanged.
 
+`SendBinaryRequestToReplica(ctx, code, payload, replicaID)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
+
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, consumer-offset reads and session-control codes fail with `ErrInvalidCommand` before anything is sent. An id that cluster metadata does not name fails with `ErrInvalidIdentifier`. An unreachable node is retried until the request deadline, and `ErrNotPrimary` is returned rather than sent to another node.
+
 If a mutation remains uncertain when its call ends, `errors.As` exposes
 `errors.OperationUncertain` with an exact `uint64` `OperationID`. The SDK retains
 that request and blocks later mutations on its lane with `errors.LaneBlocked`

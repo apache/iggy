@@ -269,7 +269,11 @@ pub struct StreamConsumerConfig {
     #[config_env(leaf)]
     pub avro_schema_path: Option<PathBuf>,
     pub batch_length: Option<u32>,
+    /// Replaced by `max_wait` and `min_count`. Kept so that a sink that still
+    /// sets it fails to start: without the field, serde ignores the setting.
     pub poll_interval: Option<String>,
+    pub max_wait: Option<String>,
+    pub min_count: Option<u32>,
     pub consumer_group: Option<String>,
 }
 
@@ -444,7 +448,7 @@ impl std::fmt::Display for StreamConsumerConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ stream: {}, topics: {}, schema: {:?}, avro_schema_json: {:?}, avro_schema_path: {:?}, batch_length: {:?}, poll_interval: {:?}, consumer_group: {:?} }}",
+            "{{ stream: {}, topics: {}, schema: {:?}, avro_schema_json: {:?}, avro_schema_path: {:?}, batch_length: {:?}, poll_interval: {:?}, max_wait: {:?}, min_count: {:?}, consumer_group: {:?} }}",
             self.stream,
             self.topics
                 .iter()
@@ -456,6 +460,8 @@ impl std::fmt::Display for StreamConsumerConfig {
             self.avro_schema_path,
             self.batch_length,
             self.poll_interval,
+            self.max_wait,
+            self.min_count,
             self.consumer_group
         )
     }

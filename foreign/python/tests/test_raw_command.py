@@ -49,6 +49,30 @@ async def test_raw_unknown_code_is_rejected_by_server(iggy_client: IggyClient):
         await iggy_client.send_binary_request(60_000, b"")
 
 
+@pytest.mark.asyncio
+async def test_raw_get_stats_to_the_server_replica_returns_non_empty_response(
+    iggy_client: IggyClient,
+):
+    response = await iggy_client.send_binary_request_to_replica(10, b"", 0)
+
+    assert response
+
+
+@pytest.mark.asyncio
+async def test_raw_command_to_an_unknown_replica_is_rejected(iggy_client: IggyClient):
+    with pytest.raises(RuntimeError, match="(?i)invalid identifier"):
+        await iggy_client.send_binary_request_to_replica(10, b"", 9)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [100, 202])
+async def test_raw_replicated_command_or_poll_to_a_replica_is_rejected(
+    iggy_client: IggyClient, code: int
+):
+    with pytest.raises(RuntimeError, match="(?i)invalid command"):
+        await iggy_client.send_binary_request_to_replica(code, b"", 0)
+
+
 @pytest.mark.unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation_id", [2**53 + 17, 2**64 - 1])

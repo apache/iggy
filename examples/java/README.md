@@ -132,10 +132,10 @@ Non-blocking async consumption with advanced patterns:
 
 Shows:
 
-- Backpressure management (don't poll faster than you can process)
+- Deferred polling, so the server holds the request until messages are ready
+- An idle limit that stops the consumer after a quiet period
 - Error recovery with exponential backoff
 - Thread pool separation (Netty I/O threads vs. processing threads)
-- Offset-based polling with CompletableFuture
 
 **CRITICAL ASYNC PATTERN - Thread Pool Management:**
 

@@ -34,7 +34,7 @@ type completedResultError struct{ err error }
 func (e *completedResultError) Error() string { return e.err.Error() }
 func (e *completedResultError) Unwrap() error { return e.err }
 
-func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, frame []byte, exact *iggcon.PartitionContext) ([]byte, error) {
+func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, frame []byte, exact *iggcon.PartitionContext, replica *uint8) ([]byte, error) {
 	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 	epoch := c.callEpoch(ctx)
@@ -144,7 +144,7 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 		if ticket != nil {
 			operation = ticket.freeze(code, query, frozen)
 		} else {
-			operation = &pendingOperation{id: vsr.StampedRequestID(frozen), code: code, query: append([]byte(nil), query...), fence: fence, frame: newOperationFrame(frozen, nil)}
+			operation = &pendingOperation{id: vsr.StampedRequestID(frozen), code: code, query: append([]byte(nil), query...), fence: fence, frame: newOperationFrame(frozen, nil), replica: replica}
 		}
 		response, err := c.driveOperation(ctx, operation, ticket, false, mutation)
 		var completed *completedResultError
@@ -262,6 +262,17 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 					link = c.links.replica(route.primary)
 				}
 			}
+		} else if operation.replica != nil {
+			link = c.links.replica(*operation.replica)
+			if link == nil && !c.links.contains(*operation.replica) {
+				if !rosterRefreshed {
+					rosterRefreshed = c.refreshRoster(ctx, nil) == nil
+				}
+				if rosterRefreshed && !c.links.contains(*operation.replica) {
+					return nil, ierror.ErrInvalidIdentifier
+				}
+				link = c.links.replica(*operation.replica)
+			}
 		} else {
 			link = c.links.metadata()
 			if link == nil && operation.code != command.GetClusterMetadataCode {
@@ -351,7 +362,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 			}
 			if operation.query != nil {
 				c.polls.invalidate(route, false)
-			} else if sent && linkReady(link) {
+			} else if sent && linkReady(link) && operation.replica == nil {
 				c.links.invalidateMetadataPrimary(link)
 			}
 			if ctx.Err() != nil {
@@ -424,9 +435,12 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 		case errors.Is(err, ierror.ErrTransientNotAccepted):
 			if operation.query != nil {
 				c.polls.invalidate(route, false)
-			} else if operation.code != command.GetClusterMetadataCode {
+			} else if operation.code != command.GetClusterMetadataCode && operation.replica == nil {
 				_ = c.refreshRoster(ctx, link)
 			}
+		case errors.Is(err, ierror.ErrNotPrimary) && operation.replica != nil:
+			// The caller chose the replica, so its refusal is the answer.
+			return nil, err
 		case errors.Is(err, ierror.ErrNotPrimary):
 			firstRefusal := !notPrimarySeen
 			notPrimarySeen = true

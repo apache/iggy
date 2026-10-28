@@ -79,6 +79,7 @@ public enum IggyErrorCode {
     /** A committed lifecycle operation prevents this mutation. Retry as a new request. */
     LIFECYCLE_BUSY(88),
     NOT_PRIMARY(89),
+    DEFERRED_POLL_CAPACITY_EXCEEDED(90),
 
     // Client errors
     CLIENT_NOT_FOUND(100),

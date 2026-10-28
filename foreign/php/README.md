@@ -153,7 +153,7 @@ $consumer = $client->consumerGroup(
     \Iggy\AutoCommit::disabled(),
     true,
     true,
-    1_000_000,
+    null,
     null,
     null,
     null,
@@ -357,6 +357,9 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   by default.
 - `iterMessages()` returns a PHP `Iterator` and can be used with `foreach`.
   Break out of the loop when the caller's processing limit or shutdown signal is reached.
+- Without an `AutoCommit` argument, the consumer stores no offset, as with
+  `AutoCommit::disabled()`. Store positions after processing, or each restart
+  reads the same messages again.
 - `AutoCommit::when()` may queue an offset commit before the PHP callback runs.
   If callback success must control commits, use `AutoCommit::disabled()` and call
   `storePosition($message->position())` after the callback work succeeds.
@@ -389,6 +392,7 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   getters return PHP integers and are limited to `PHP_INT_MAX`.
 - `Iggy\Client::sendBinaryRequest(int $code, string $payload): string` sends a
   command code and payload and returns the raw response body.
+- `Iggy\Client::sendBinaryRequestToReplica(int $code, string $payload, int $replica_id): string` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns, for example to read that node's `GetStats`. Replicated commands, polls, consumer-offset reads and session-control codes throw an invalid-command exception before anything is sent. An unknown id throws an invalid-identifier exception, and a `NotPrimary` reply is thrown, never sent to another node.
 - `Iggy\Client` is synchronous and blocks the current PHP thread.
 - The extension owns a lazy global Tokio runtime. Do not call `pcntl_fork()` after
   the first Iggy SDK call; the child process inherits file descriptors but not

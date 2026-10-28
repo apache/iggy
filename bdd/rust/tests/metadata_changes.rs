@@ -24,7 +24,10 @@ use cucumber::World;
 
 #[tokio::main]
 async fn main() {
+    // Every scenario follows the one server-wide change log, and a stream id one scenario
+    // frees can be reused by another, so the scenarios run one at a time.
     GlobalContext::cucumber()
+        .max_concurrent_scenarios(1)
         .fail_on_skipped()
         .run_and_exit("../../bdd/scenarios/metadata_changes.feature")
         .await;

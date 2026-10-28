@@ -104,7 +104,8 @@ namespace Iggy {
          * Creates and initializes a consumer group consumer.
          *
          * `$partition_id` is ignored for a consumer group: the member reads the partitions
-         * the server assigns to it.
+         * the server assigns to it. `$poll_interval_micros` must be null: the consumer waits
+         * on the server for new messages.
          *
          * @param string $name
          * @param string $stream
@@ -312,6 +313,20 @@ namespace Iggy {
          * @return string
          */
         public function sendBinaryRequest(int $code, string $payload): string {}
+
+        /**
+         * Sends a command code with a payload to the replica with the given id, as
+         * cluster metadata names it, and returns the raw response bytes.
+         * Replicated commands, polls, consumer-offset reads and session-control
+         * codes return an invalid-command exception, and a replica that cluster
+         * metadata does not name returns an invalid-identifier exception.
+         *
+         * @param int $code
+         * @param string $payload
+         * @param int $replica_id
+         * @return string
+         */
+        public function sendBinaryRequestToReplica(int $code, string $payload, int $replica_id): string {}
 
         /**
          * Sends messages to a topic and returns the commit confirmations, one per

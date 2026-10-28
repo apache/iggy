@@ -1005,6 +1005,13 @@ mod ffi {
             payload: Vec<u8>,
             error_info: &mut ErrorInfo,
         ) -> Result<Vec<u8>>;
+        fn send_binary_request_to_replica(
+            self: &Client,
+            code: u32,
+            payload: Vec<u8>,
+            replica_id: u8,
+            error_info: &mut ErrorInfo,
+        ) -> Result<Vec<u8>>;
 
         fn disconnect(self: &Client) -> Result<()>;
         fn shutdown(self: &Client) -> Result<()>;
@@ -1057,11 +1064,12 @@ mod ffi {
         ) -> Result<()>;
         fn get_cluster_metadata(self: &Client) -> Result<ClusterMetadata>;
         // fn get_personal_access_tokens(self: &Client) -> Result<Vec<PersonalAccessTokenInfo>>;
-        // fn create_personal_access_token(
-        //     self: &Client,
-        //     name: String,
-        //     expiry: u64,
-        // ) -> Result<RawPersonalAccessToken>;
+        fn create_personal_access_token(
+            self: &Client,
+            name: String,
+            expiry_kind: String,
+            expiry_value: u64,
+        ) -> Result<String>;
         // fn delete_personal_access_token(self: &Client, name: String) -> Result<()>;
         // fn login_with_personal_access_token(self: &Client, token: String) -> Result<IdentityInfo>;
 

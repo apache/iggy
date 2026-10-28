@@ -1773,10 +1773,11 @@ impl IggyClient {
     /// Creates a new consumer group consumer.
     /// `partition_id` is ignored for a consumer group: the member reads the partitions
     /// the server assigns to it.
+    /// `auto_commit` defaults to `AutoCommit.Disabled()`: the consumer stores no offset,
+    /// so store positions after processing, or each restart reads the same messages again.
     /// Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
-    /// `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
-    /// `AutoCommit` interval is negative, or if any of those except `poll_interval`
-    /// is zero.
+    /// `polling_retry_interval`, `init_retry_interval` or an `AutoCommit` interval
+    /// is negative or zero.
     ///
     /// Consumer groups are not available over HTTP. With `auto_join_consumer_group`
     /// left on, this call fails at the join with `Feature is unavailable`.
@@ -1797,7 +1798,7 @@ impl IggyClient {
         auto_commit=None,
         create_consumer_group_if_not_exists=true,
         auto_join_consumer_group=true,
-        poll_interval=None,
+        *,
         polling_retry_interval=None,
         init_retries=None,
         init_retry_interval=None,
@@ -1820,8 +1821,6 @@ impl IggyClient {
         >,
         create_consumer_group_if_not_exists: bool,
         auto_join_consumer_group: bool,
-        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
-        poll_interval: Option<Py<PyDelta>>,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         polling_retry_interval: Option<Py<PyDelta>>,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] init_retries: Option<u32>,
@@ -1854,11 +1853,6 @@ impl IggyClient {
         };
         if let Some(auto_commit) = auto_commit {
             builder = builder.auto_commit(RustAutoCommit::try_from(auto_commit)?)
-        };
-        if let Some(poll_interval) = poll_interval {
-            builder = builder.poll_interval(py_delta_to_iggy_duration(&poll_interval)?)
-        } else {
-            builder = builder.without_poll_interval()
         };
         if let Some(polling_retry_interval) = polling_retry_interval {
             builder = builder.polling_retry_interval(reject_zero(
@@ -1932,6 +1926,44 @@ impl IggyClient {
         future_into_py(py, async move {
             let response = inner
                 .send_binary_request(code, Bytes::from(payload))
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(Python::attach(|py| PyBytes::new(py, &response).unbind()))
+        })
+    }
+
+    /// Send a command code with a payload to the replica with the given id and
+    /// return the raw response bytes.
+    ///
+    /// The replica id is the one cluster metadata names for the node. Every
+    /// node answers non-replicated commands such as GetStats from its own
+    /// state. Replicated commands, polls, consumer-offset reads and
+    /// session-control codes are rejected client-side, and a replica id that
+    /// cluster metadata does not name fails. HTTP transport does not support
+    /// raw binary commands.
+    ///
+    /// Args:
+    ///     code: Command code as `int`.
+    ///     payload: Request payload as `bytes`.
+    ///     replica_id: Replica id as `int`, as cluster metadata names it.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to the raw response `bytes`.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the command cannot be sent or the replica returns an error.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[bytes]", imports=("collections.abc")))]
+    fn send_binary_request_to_replica<'a>(
+        &self,
+        py: Python<'a>,
+        code: u32,
+        #[gen_stub(override_type(type_repr = "builtins.bytes"))] payload: Vec<u8>,
+        replica_id: u8,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let response = inner
+                .send_binary_request_to_replica(code, Bytes::from(payload), replica_id)
                 .await
                 .map_err(to_runtime_error)?;
             Ok(Python::attach(|py| PyBytes::new(py, &response).unbind()))

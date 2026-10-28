@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{RUNTIME, ffi, type_conversion::ffi_options_to_raw};
+use crate::{
+    RUNTIME, ffi,
+    type_conversion::{ffi_options_to_raw, parse_message_expiry},
+};
 use bytes::Bytes;
 use iggy::prelude::{
     AutoLogin as RustAutoLogin, Client as IggyConnectionClient, ClusterClient, Consumer,
@@ -24,7 +27,8 @@ use iggy::prelude::{
     IggyDuration as RustIggyDuration, IggyMessage, IggyTimestamp, MessageClient,
     NonZeroIggyDuration as RustNonZeroIggyDuration, OptionsScope as RustOptionsScope,
     PartitionClient, PartitionContext, Partitioning, Permissions as RustPermissions,
-    PollingStrategy, SegmentClient, SnapshotCompression as RustSnapshotCompression, StreamClient,
+    PersonalAccessTokenClient, PollingStrategy, SegmentClient,
+    SnapshotCompression as RustSnapshotCompression, StreamClient,
     StreamCreateOptions as RustStreamCreateOptions, StreamEncryptionKey,
     StreamUpdateOptions as RustStreamUpdateOptions, SystemClient as RustSystemClient,
     SystemSnapshotType as RustSystemSnapshotType, TopicClient,
@@ -1319,6 +1323,23 @@ impl Client {
         })
     }
 
+    pub fn create_personal_access_token(
+        &self,
+        name: String,
+        expiry_kind: String,
+        expiry_value: u64,
+    ) -> Result<String, String> {
+        let expiry = parse_message_expiry(&expiry_kind, expiry_value)?;
+        RUNTIME.block_on(async {
+            let token = self
+                .inner
+                .create_personal_access_token(&name, expiry)
+                .await
+                .map_err(|error| format!("Could not create personal access token: {error}"))?;
+            Ok(token.token)
+        })
+    }
+
     pub fn get_user(&self, user_id: ffi::Identifier) -> Result<ffi::UserInfoDetails, String> {
         let rust_user_id = RustIdentifier::try_from(user_id)
             .map_err(|error| format!("Could not get user: invalid user identifier: {error}"))?;
@@ -1492,6 +1513,32 @@ impl Client {
                 .await
                 .inspect_err(|error| error_info.record(error))
                 .map_err(|error| format!("Could not send raw command '{code}': {error}"))?;
+            Ok(Vec::from(response))
+        })
+    }
+
+    /// Sends a command code and payload to the replica with `replica_id`, as
+    /// cluster metadata names it, and returns its raw response bytes.
+    /// Replicated commands, polls, consumer-offset reads and session-control
+    /// codes return an invalid-command error, and a replica that cluster
+    /// metadata does not name returns an invalid-identifier error.
+    pub fn send_binary_request_to_replica(
+        &self,
+        code: u32,
+        payload: Vec<u8>,
+        replica_id: u8,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<Vec<u8>, String> {
+        *error_info = ffi::ErrorInfo::default();
+        RUNTIME.block_on(async {
+            let response = self
+                .inner
+                .send_binary_request_to_replica(code, Bytes::from(payload), replica_id)
+                .await
+                .inspect_err(|error| error_info.record(error))
+                .map_err(|error| {
+                    format!("Could not send raw command '{code}' to replica {replica_id}: {error}")
+                })?;
             Ok(Vec::from(response))
         })
     }

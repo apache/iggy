@@ -208,7 +208,7 @@ fn version_info() -> ClientVersionInfo {
     ClientVersionInfo {
         protocol_version: IGGY_PROTOCOL_VERSION,
         sdk_name: name("swift-sdk"),
-        sdk_version: name("0.1.2"),
+        sdk_version: name("0.1.4"),
     }
 }
 

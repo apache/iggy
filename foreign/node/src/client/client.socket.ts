@@ -71,6 +71,17 @@ const LIFECYCLE_BUSY = 88;
 const NOT_PRIMARY = 89;
 const INVALID_COMMAND = 3;
 const FEATURE_UNAVAILABLE = 5;
+const INVALID_IDENTIFIER = 6;
+// Session control, and the partition reads that need the primary and its incarnation.
+const REPLICA_REFUSED_CODES = new Set<number>([
+  COMMAND_CODE.LoginUser,
+  COMMAND_CODE.LogoutUser,
+  COMMAND_CODE.LoginRegister,
+  COMMAND_CODE.LoginWithAccessToken,
+  COMMAND_CODE.LoginRegisterWithAccessToken,
+  COMMAND_CODE.PollMessages,
+  COMMAND_CODE.GetOffset,
+]);
 const INVALID_SESSION_BINDING = 14004;
 const ROUTE_NAMESPACE_MISSING = new Set([1009, 1010, 2010, 2011, 3007]);
 const POLL_OPTIONS_SIZE = 9 + 4 + 1;
@@ -187,6 +198,10 @@ export class CommandResponseStream extends EventEmitter {
   get busy(): boolean { return this.pendingSubmissions > 0; }
 
   async sendCommand(command: number, payload: Buffer, options: SendCommandOptions = {}): Promise<CommandResponse> {
+    if (options.replica !== undefined && !isReplicaCommand(command))
+      throw responseError(command, INVALID_COMMAND);
+    if (options.replica !== undefined && !(Number.isInteger(options.replica) && options.replica >= 0 && options.replica < MAX_REPLICAS))
+      throw responseError(command, INVALID_IDENTIFIER);
     if (isLoginCommand(command)) return this.loginByCaller(command, () => Buffer.from(payload), options);
     const lineage = options.lineage ?? this.lineage;
     payload = Buffer.from(payload);
@@ -371,12 +386,14 @@ export class CommandResponseStream extends EventEmitter {
         try {
           if (refresh && target)
             selected = await this.routeFor(target, deadline, attemptSignal, generation, true);
-          else if (refresh)
+          else if (refresh && options.replica === undefined)
             await this.refreshRoster(deadline, attemptSignal);
           refresh = false;
           const link = target
             ? await this.primaryLink(selected!, deadline, attemptSignal)
-            : await this.readyLink(deadline, attemptSignal, safeRead ? previousLink : undefined);
+            : options.replica !== undefined
+              ? await this.replicaLink(command, options.replica, deadline, attemptSignal)
+              : await this.readyLink(deadline, attemptSignal, safeRead ? previousLink : undefined);
           previousLink = link;
           this.ensureGeneration(generation, command);
           attempt = await this.exchange(link, command, () => {
@@ -444,6 +461,9 @@ export class CommandResponseStream extends EventEmitter {
         } else if (code === OPERATION_NOT_RETAINED) {
           if (operation?.retainable) operation.uncertain = true;
           throw uncertainOutcome(command, operation, error);
+        } else if (code === NOT_PRIMARY && options.replica !== undefined) {
+          // The caller chose the replica, so its refusal is the answer.
+          throw error;
         } else if (code === NOT_PRIMARY || code === TRANSIENT_NOT_ACCEPTED) {
           if (selected) this.invalidateRoute(selected, code === NOT_PRIMARY);
           refresh = true;
@@ -732,6 +752,30 @@ export class CommandResponseStream extends EventEmitter {
       catch (error) {
         if (!(error instanceof VsrResponseTimeoutError)) throw error;
         const refusal = responseError(COMMAND_CODE.GetPartitionRoute, TRANSIENT_NOT_ACCEPTED);
+        refusal.fromServer = true;
+        throw refusal;
+      }
+    }
+  }
+
+  /** The link of the replica the caller chose, waited for while it reconnects. An id the roster does not name is looked up in one fresh roster, then refused. */
+  private async replicaLink(command: number, replica: number, deadline: number, signal: AbortSignal): Promise<IggyConnection> {
+    let rosterRead = false;
+    for (;;) {
+      const slot = this.replicas.get(replica);
+      if (slot?.attached && slot.connection?.connected) return slot.connection;
+      if (slot?.failure instanceof ResponseError) throw slot.failure;
+      if (slot?.failure instanceof TypeError) throw slot.failure;
+      if (!slot) {
+        if (rosterRead) throw responseError(command, INVALID_IDENTIFIER);
+        rosterRead = true;
+        await this.refreshRoster(deadline, signal);
+        continue;
+      }
+      try { await waitWithin(this.changed.promise, deadline, signal); }
+      catch (error) {
+        if (!(error instanceof VsrResponseTimeoutError)) throw error;
+        const refusal = responseError(command, TRANSIENT_NOT_ACCEPTED);
         refusal.fromServer = true;
         throw refusal;
       }
@@ -1329,6 +1373,10 @@ const partitionRoute = (command: number, payload: Buffer): PartitionTarget | und
       : payload.subarray(position + 1, position + 1 + PARTITION_ID_SIZE)]);
   return { query, key: query.toString('hex') };
 };
+
+/** A command the caller may send to a replica it chooses: non-replicated, not a partition read, not session control. */
+const isReplicaCommand = (command: number): boolean =>
+  !REPLICA_REFUSED_CODES.has(command) && operationForCode(command) === Operation.NonReplicated;
 
 const identifierEnd = (payload: Buffer, position: number, command: number): number => {
   if (position + IDENTIFIER_PREFIX_SIZE > payload.length)

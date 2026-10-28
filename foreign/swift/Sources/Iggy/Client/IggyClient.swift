@@ -211,6 +211,34 @@ public final class IggyClient: Sendable {
         return try await core.exchange(code: code, payload: payload, lineage: lineage)
     }
 
+    /// Sends a command code with an already-encoded payload to the replica
+    /// with id `replica`, as the cluster roster names it, and returns its raw
+    /// reply body. Every node answers non-replicated commands such as
+    /// `GetStats` from its own state, so this reads the state of the chosen
+    /// node. The request carries the session's metadata watermark, so the
+    /// replica answers once it applied the metadata this client saw.
+    ///
+    /// Replicated commands, `PollMessages`, `GetConsumerOffset`, and
+    /// session-control codes fail with ``IggyErrorCode/invalidCommand``
+    /// before anything is sent. A
+    /// replica the roster does not list after one more roster read fails with
+    /// ``IggyErrorCode/invalidIdentifier``. A replica that cannot be reached,
+    /// or that answers ``IggyErrorCode/transientNotAccepted``, is asked again
+    /// until the request timeout. Any other refusal,
+    /// ``IggyErrorCode/notPrimary`` included, is returned and never sent to
+    /// another replica.
+    public func sendRawRequest(code: UInt32, payload: [UInt8], replica: UInt8) async throws -> [UInt8] {
+        guard !CommandCode.isSessionControl(code), code != CommandCode.pollMessages.rawValue,
+            code != CommandCode.getConsumerOffset.rawValue, ConsensusOperation.forCode(code) == .nonReplicated
+        else {
+            throw IggyError(.invalidCommand, context: "command \(code) cannot be sent to a chosen replica")
+        }
+        let lineage = try await requireAuthenticated()
+        return try await core.pollRouter.sendToReplica(
+            replica, code: code, payload: payload, lineage: lineage, coordinator: core,
+            deadline: ContinuousClock.now + core.configuration.requestTimeout)
+    }
+
     // MARK: Internals shared by the domain extensions
 
     /// One request of a call that started under `lineage`, or, for a call
@@ -237,6 +265,11 @@ public final class IggyClient: Sendable {
             throw refusal
         }
         return captured
+    }
+
+    /// Whether the client comes back on its own after an outage.
+    var canRecover: Bool {
+        get async { await core.canRecover }
     }
 
     /// The lineage a call that starts now runs under.
