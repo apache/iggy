@@ -234,6 +234,30 @@ impl RouteCache {
         });
     }
 
+    /// Marks the routes of `partitions` stale after a primary answered that
+    /// it is not the primary of one of them. The answer does not name that
+    /// partition, so every floor stays, and each next lookup asks the primary
+    /// of its route first.
+    pub(crate) fn may_have_moved(
+        &mut self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitions: &[u32],
+    ) {
+        for &partition_id in partitions {
+            let Some(route) = self
+                .topic(stream_id, topic_id)
+                .and_then(|routes| routes.get(&partition_id))
+                .map(|entry| entry.route)
+            else {
+                continue;
+            };
+            self.mark_stale(&route, partition_id, |entry| {
+                entry.ask_first = Some(route.primary_replica);
+            });
+        }
+    }
+
     /// Every spelling of one partition history shares its staleness.
     fn mark_stale(
         &mut self,

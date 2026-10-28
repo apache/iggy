@@ -35,22 +35,34 @@ use iggy_binary_protocol::codes::SEND_MESSAGES_CODE;
 use iggy_binary_protocol::codes::SYNC_CONSUMER_GROUP_CODE;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::messages::{
-    PollMessagesRequest, RawMessage, SendMessagesEncoder,
+    PollMessagesRequest, RawMessage, SendMessagesEncoder, WaitForMessagesRequest,
+    WaitForMessagesTarget,
 };
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
+use iggy_binary_protocol::responses::messages::WaitForMessagesResponse;
 use std::borrow::Cow;
 
 /// Max attempts to resolve a fenced consumer-group poll: one re-sync after the
 /// coordinator rejects a stale assignment, then retry once.
 const GROUP_POLL_MAX_ATTEMPTS: usize = 2;
 
-fn group_cache_key(stream_id: &Identifier, topic_id: &Identifier, group_id: &Identifier) -> String {
+/// The key of a group in [`crate::ConsumerGroupClientState`].
+#[doc(hidden)]
+pub fn group_cache_key(
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    group_id: &Identifier,
+) -> String {
     format!("{stream_id}|{topic_id}|{group_id}")
 }
 
 /// Sync the requesting member's assignment from the coordinator into the
 /// transport cache. An empty reply means the client is not a member.
-async fn sync_group_assignment<B: BinaryClient>(
+///
+/// # Errors
+/// Propagates transport and assignment-decoding failures.
+#[doc(hidden)]
+pub async fn sync_group_assignment<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,
     topic_id: &Identifier,
@@ -253,6 +265,7 @@ fn select_partition<B: BinaryClient>(
 /// (round-robin), ask `strategy_for` where to read it from and send an
 /// explicit-partition poll. A coordinator fence rejection (stale assignment
 /// after a rebalance) triggers one re-sync + retry.
+#[allow(clippy::too_many_arguments)]
 async fn poll_group_messages<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,
@@ -261,7 +274,9 @@ async fn poll_group_messages<B: BinaryClient>(
     strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
     count: u32,
     auto_commit: bool,
+    options: Option<crate::DeferredPollOptions>,
 ) -> Result<PolledMessages, IggyError> {
+    let started = std::time::Instant::now();
     let key = group_cache_key(stream_id, topic_id, &consumer.id);
     if !client.consumer_group_state().has_assignment(&key) {
         sync_group_assignment(client, stream_id, topic_id, &consumer.id).await?;
@@ -296,8 +311,11 @@ async fn poll_group_messages<B: BinaryClient>(
             count,
             auto_commit,
         };
+        let remaining = options
+            .map(|options| options.remaining(started.elapsed()))
+            .transpose()?;
         match client
-            .send_poll_with_response(&request, strategy.context)
+            .send_poll_with_response_and_options(&request, strategy.context, remaining)
             .await
         {
             Ok(response) => {
@@ -330,7 +348,37 @@ async fn poll_group_messages<B: BinaryClient>(
     // empty poll rather than `ConsumerGroupPartitionNotOwned(0, 0)`: the (0, 0)
     // ids are fabricated and a normal rebalance must not look like a hard error
     // to a CG app that doesn't special-case 5009. The caller just re-polls.
+    if options.is_some() {
+        return Err(IggyError::TransientNotAccepted);
+    }
     Ok(PolledMessages::empty())
+}
+
+/// The wire form of a readiness wait. The SDK also routes it by partition.
+#[doc(hidden)]
+pub fn wait_for_messages_request(
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    partitions: &[(u32, PollingStrategy)],
+    consumer: &Consumer,
+    options: crate::DeferredPollOptions,
+) -> Result<WaitForMessagesRequest, IggyError> {
+    let request = WaitForMessagesRequest {
+        consumer: consumer_to_wire(consumer)?,
+        stream_id: identifier_to_wire(stream_id)?,
+        topic_id: identifier_to_wire(topic_id)?,
+        wait_us: options.max_wait.as_micros(),
+        request_timeout_us: options.request_timeout.as_micros(),
+        partitions: partitions
+            .iter()
+            .map(|(partition_id, strategy)| WaitForMessagesTarget {
+                partition_id: *partition_id,
+                strategy: polling_strategy_to_wire(strategy),
+            })
+            .collect(),
+    };
+    request.validate().map_err(|_| IggyError::InvalidCommand)?;
+    Ok(request)
 }
 
 /// Map a raw `SendMessages` reply body to its confirmation payload. An empty
@@ -398,9 +446,43 @@ impl<B: BinaryClient> MessageClient for B {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError> {
+        self.poll_messages_with_strategy_for_and_options(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            strategy_for,
+            count,
+            auto_commit,
+            None,
+        )
+        .await
+    }
+
+    async fn poll_messages_with_strategy_for_and_options(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
+        count: u32,
+        auto_commit: bool,
+        options: Option<crate::DeferredPollOptions>,
+    ) -> Result<PolledMessages, IggyError> {
+        if let Some(options) = options {
+            options.validate(count)?;
+        }
+        let deadline = if let Some(options) = options {
+            tokio::time::Instant::now()
+                .checked_add(options.request_timeout.get_duration())
+                .ok_or(IggyError::InvalidCommand)?
+        } else {
+            binary_operation_deadline()
+        };
         with_binary_lineage(
             self.operation_lineage(),
-            with_binary_deadline(binary_operation_deadline(), async {
+            with_binary_deadline(deadline, async {
                 fail_if_not_authenticated(self).await?;
                 // VSR: a consumer-group poll without an explicit partition is resolved
                 // client-side from the member's cached assignment (the broker routes
@@ -414,6 +496,7 @@ impl<B: BinaryClient> MessageClient for B {
                         strategy_for,
                         count,
                         auto_commit,
+                        options,
                     )
                     .await;
                 }
@@ -427,8 +510,36 @@ impl<B: BinaryClient> MessageClient for B {
                     count,
                     auto_commit,
                 };
-                let response = self.send_poll_with_response(&req, strategy.context).await?;
+                let response = self
+                    .send_poll_with_response_and_options(&req, strategy.context, options)
+                    .await?;
                 PolledMessages::from_bytes(response)
+            }),
+        )
+        .await
+    }
+
+    async fn wait_for_messages(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitions: &[(u32, PollingStrategy)],
+        consumer: &Consumer,
+        options: crate::DeferredPollOptions,
+    ) -> Result<Vec<u32>, IggyError> {
+        let request =
+            wait_for_messages_request(stream_id, topic_id, partitions, consumer, options)?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(options.request_timeout.get_duration())
+            .ok_or(IggyError::InvalidCommand)?;
+        with_binary_lineage(
+            self.operation_lineage(),
+            with_binary_deadline(deadline, async {
+                fail_if_not_authenticated(self).await?;
+                let response = self.send_wait_with_response(&request).await?;
+                Ok(WaitForMessagesResponse::decode_from(&response)
+                    .map_err(|_| IggyError::InvalidCommand)?
+                    .partitions)
             }),
         )
         .await

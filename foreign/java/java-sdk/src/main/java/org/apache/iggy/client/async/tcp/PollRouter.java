@@ -41,6 +41,7 @@ import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.PollingKind;
 import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.partition.PartitionRoute;
@@ -50,11 +51,13 @@ import org.apache.iggy.serde.CommandCode;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
@@ -77,9 +80,12 @@ import java.util.function.Supplier;
  */
 final class PollRouter {
     static final int POLL_PARAMETERS_BYTES = 14;
+    static final int DEFERRED_PARAMETERS_BYTES = 2 * Long.BYTES + 2 * Integer.BYTES;
 
     static final Duration POLL_TIMEOUT = Duration.ofSeconds(30);
     static final int MAX_CONCURRENT_DIALS = 4;
+    private static final int MAX_DEFERRED_POLLS = 64;
+
     private static final int MAX_ROUTES = 4096;
     private static final int MAX_CONNECTIONS = 256;
     private static final int MAX_PENDING_POLLS = 4096;
@@ -97,6 +103,8 @@ final class PollRouter {
     private long topologyGeneration;
     private final Map<ConnectionInfo, Slot> connections = new HashMap<>();
     private final Set<Poll> pending = new HashSet<>();
+    private final Set<Poll> deferredWaiting = new LinkedHashSet<>();
+    private int activeDeferredPolls;
     private volatile int rosterSize;
     private final NavigableMap<Integer, ConnectionInfo> replicas = new TreeMap<>();
     // Read without the monitor: a slot opens its link under the slot monitor, and the client reads this there to size
@@ -531,7 +539,9 @@ final class PollRouter {
             if (!explicit) {
                 if (command == CommandCode.ConsumerOffset.STORE.getValue()
                         || command == CommandCode.ConsumerOffset.DELETE.getValue()
-                        || (command == CommandCode.Messages.POLL.getValue() && consumerKind == 2)) {
+                        || ((command == CommandCode.Messages.POLL.getValue()
+                                        || command == CommandCode.Messages.POLL_DEFERRED.getValue())
+                                && consumerKind == 2)) {
                     throw new IggyInvalidArgumentException("A group poll or offset mutation requires a partition id");
                 }
                 partition = 0;
@@ -561,6 +571,16 @@ final class PollRouter {
         } finally {
             payload.release();
         }
+    }
+
+    /** The limits that end a deferred poll request or frame, checked by the {@link DeferredPollOptions} constructor. */
+    static DeferredPollOptions deferredOptions(ByteBuf request) {
+        int parameters = request.writerIndex() - DEFERRED_PARAMETERS_BYTES;
+        return new DeferredPollOptions(
+                Duration.of(request.getLongLE(parameters), ChronoUnit.MICROS),
+                request.getUnsignedIntLE(parameters + Long.BYTES),
+                request.getUnsignedIntLE(parameters + Long.BYTES + Integer.BYTES),
+                Duration.of(request.getLongLE(parameters + Long.BYTES + 2 * Integer.BYTES), ChronoUnit.MICROS));
     }
 
     ConsensusSession sessionOwner() {
@@ -609,12 +629,7 @@ final class PollRouter {
     }
 
     private CompletableFuture<ByteBuf> send(Poll poll) {
-        poll.result.whenComplete((response, error) -> {
-            poll.finish(error);
-            synchronized (this) {
-                pending.remove(poll);
-            }
-        });
+        poll.result.whenComplete((response, error) -> finish(poll, error));
         synchronized (this) {
             if (pending.size() >= MAX_PENDING_POLLS) {
                 poll.result.completeExceptionally(
@@ -630,6 +645,19 @@ final class PollRouter {
                     .eventLoop()
                     .schedule(poll::endPending, Math.max(0, poll.deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
             poll.result.whenComplete((response, error) -> timeout.cancel(false));
+            synchronized (this) {
+                if (poll.result.isDone()) {
+                    return poll.result;
+                }
+                if (poll.dataCommand == CommandCode.Messages.POLL_DEFERRED.getValue()) {
+                    if (activeDeferredPolls >= MAX_DEFERRED_POLLS) {
+                        deferredWaiting.add(poll);
+                        return poll.result;
+                    }
+                    poll.deferredAdmitted = true;
+                    activeDeferredPolls++;
+                }
+            }
             attempt(poll);
         } catch (RuntimeException error) {
             poll.fail(error);
@@ -702,6 +730,53 @@ final class PollRouter {
         return replicas.get(replicaId);
     }
 
+    private void finish(Poll poll, Throwable error) {
+        poll.finish(error);
+        Poll next = null;
+        synchronized (this) {
+            pending.remove(poll);
+            deferredWaiting.remove(poll);
+            if (poll.deferredAdmitted) {
+                activeDeferredPolls--;
+                var waiting = deferredWaiting.iterator();
+                while (waiting.hasNext()) {
+                    Poll candidate = waiting.next();
+                    waiting.remove();
+                    if (!candidate.result.isDone()) {
+                        candidate.deferredAdmitted = true;
+                        activeDeferredPolls++;
+                        next = candidate;
+                        break;
+                    }
+                }
+            }
+        }
+        if (next != null) {
+            startDeferred(next);
+        }
+    }
+
+    private void startDeferred(Poll poll) {
+        try {
+            // Completion can hold another poll's monitor, so admission continues on the client loop.
+            coordinator.get().eventLoop().execute(() -> {
+                try {
+                    attempt(poll);
+                } catch (RuntimeException error) {
+                    poll.fail(error);
+                }
+            });
+        } catch (RuntimeException error) {
+            List<Poll> waiting;
+            synchronized (this) {
+                waiting = List.copyOf(deferredWaiting);
+                deferredWaiting.clear();
+            }
+            poll.fail(error);
+            waiting.forEach(queued -> queued.fail(error));
+        }
+    }
+
     CompletableFuture<Void> clearSession() {
         return clearSession(null);
     }
@@ -713,6 +788,7 @@ final class PollRouter {
             topologyGeneration++;
             clear();
             ending = Set.copyOf(pending);
+            deferredWaiting.clear();
             closing = List.copyOf(connections.values());
             connections.clear();
         }
@@ -727,6 +803,10 @@ final class PollRouter {
         if (poll.result.isDone()) {
             return;
         }
+        if (poll.deadline - System.nanoTime() <= 0) {
+            poll.endPending();
+            return;
+        }
         if (poll.state.signedOut()) {
             poll.fail(poll.state.lineageEnded(null));
             return;
@@ -737,7 +817,7 @@ final class PollRouter {
                 synchronized (this) {
                     Route known = routes.get(poll.key);
                     if (known != null) {
-                        coordinator.get().sessionOwner().checkRetained(poll.laneFor(known.context));
+                        coordinator.get().sessionOwner().checkRetained(poll.laneFor(known.context), poll.isMutation());
                     }
                 }
             } catch (RuntimeException error) {
@@ -772,7 +852,7 @@ final class PollRouter {
         boolean notPrimary = refusal != null && refusal.getRawErrorCode() == AsyncTcpConnection.NOT_PRIMARY;
         boolean lostLink = connectionFailed(error);
         invalidateRoute(poll, error, notPrimary);
-        if ((!poll.requiresLane || poll.isMutation())
+        if (!poll.advancesProgress()
                 && (lostLink
                         || (refusal != null
                                 && refusal.getRawErrorCode() == AsyncTcpConnection.TRANSIENT_NOT_COMMITTED))) {
@@ -795,7 +875,12 @@ final class PollRouter {
             retryLifecycle(poll, refusal);
             return;
         }
-        if (!poll.terminalRoutingRefusal && (isNotAccepted(error) || notPrimary)) {
+        if (!poll.terminalRoutingRefusal
+                && (isNotAccepted(error)
+                        || notPrimary
+                        || (refusal != null
+                                && refusal.getRawErrorCode()
+                                        == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode()))) {
             retry(poll, notPrimary);
         } else {
             poll.fail(error);
@@ -1380,6 +1465,7 @@ final class PollRouter {
         private final CompletableFuture<ByteBuf> result = new CompletableFuture<>();
         private final long deadline;
         private volatile CompletableFuture<ByteBuf> activeExchange;
+        private boolean deferredAdmitted;
         // The caller's context, or else the first route's, stays fixed within one operation.
         private final AtomicReference<PartitionContext> context;
         private final boolean hasCallerContext;
@@ -1414,15 +1500,23 @@ final class PollRouter {
             this.deadline = deadline;
             this.context = new AtomicReference<>(callerContext.orElse(null));
             this.hasCallerContext = callerContext.isPresent();
+            int pollEnd = payload.writerIndex()
+                    - (dataCommand == CommandCode.Messages.POLL_DEFERRED.getValue() ? DEFERRED_PARAMETERS_BYTES : 0);
             this.requiresLane = isMutation()
-                    || (dataCommand == CommandCode.Messages.POLL.getValue()
-                            && (payload.getUnsignedByte(payload.writerIndex() - 1) != 0
-                                    || payload.getUnsignedByte(payload.writerIndex() - POLL_PARAMETERS_BYTES)
+                    || dataCommand == CommandCode.ConsumerOffset.GET.getValue()
+                    || ((dataCommand == CommandCode.Messages.POLL.getValue()
+                                    || dataCommand == CommandCode.Messages.POLL_DEFERRED.getValue())
+                            && (payload.getUnsignedByte(pollEnd - 1) != 0
+                                    || payload.getUnsignedByte(pollEnd - POLL_PARAMETERS_BYTES)
                                             == PollingKind.Next.asCode()));
         }
 
         private boolean isMutation() {
             return VsrOperation.operationForCode(dataCommand) != VsrOperation.NON_REPLICATED;
+        }
+
+        private boolean advancesProgress() {
+            return requiresLane && !isMutation() && dataCommand != CommandCode.ConsumerOffset.GET.getValue();
         }
 
         private ConsensusSession.LaneKey laneFor(PartitionContext fallback) {
@@ -1431,7 +1525,8 @@ final class PollRouter {
             try {
                 return new ConsensusSession.LaneKey(
                         (captured == null ? fallback : captured).incarnation().longValue(),
-                        query.getUnsignedIntLE(query.writerIndex() - Integer.BYTES));
+                        query.getUnsignedIntLE(query.writerIndex() - Integer.BYTES),
+                        dataCommand != CommandCode.Messages.SEND.getValue());
             } finally {
                 query.release();
             }

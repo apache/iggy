@@ -21,7 +21,7 @@ use crate::prelude::IggyError;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use tokio::sync::oneshot;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 #[async_trait]
 impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
@@ -59,6 +59,15 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
     where
         P: MessageConsumer + Sync,
     {
+        // Unlike a caller of `next()`, a message consumer gets no handle to store offsets with.
+        if self.relies_on_manual_commits() {
+            warn!(
+                "Consumer: {name} on topic: {topic} and stream: {stream} never stores offsets, because it runs with AutoCommit::Disabled. With PollingStrategy::next(), each restart reads the same messages again. Set auto_commit to store them.",
+                name = self.name(),
+                topic = self.topic(),
+                stream = self.stream()
+            );
+        }
         let auto_commit = self.auto_commit();
         let store_offset_after_each_message = matches!(
             auto_commit,
@@ -123,6 +132,7 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
                                 err,
                                 IggyError::InvalidServerAddress
                                     | IggyError::InvalidClientAddress
+                                    | IggyError::InvalidConfiguration
                                     | IggyError::LaneBlocked(_)
                                     | IggyError::ClientShutdown
                             ) || !self.client_can_recover().await;

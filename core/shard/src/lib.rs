@@ -29,6 +29,9 @@ pub mod shards_table;
 
 pub use config::CoordinatorConfig;
 pub use host::{NoopHost, ShardHost};
+pub use poll::deferred::{
+    DeferredPollContext, DeferredPollRequest, PollQuotaIdentity, ReadinessTarget, ReadinessWait,
+};
 pub use poll::{ConsumerAttachment, PollCompleted};
 pub use router::CONSENSUS_TICK_INTERVAL;
 
@@ -85,7 +88,7 @@ use server_common::sharding::{
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -397,6 +400,7 @@ pub struct GatheredClients<T = ConnectedClientInfo> {
 #[derive(Debug)]
 pub enum PartitionRead {
     Primary,
+    DeferredPoll(Box<DeferredPollRequest>),
     SessionRetired {
         identity: iggy_binary_protocol::requests::system::SessionIdentity,
         created_revision: u64,
@@ -467,7 +471,8 @@ impl PartitionRead {
     #[must_use]
     pub(crate) const fn reads_messages_or_offset(&self) -> bool {
         match self {
-            Self::ConsumerOffset { .. }
+            Self::DeferredPoll(_)
+            | Self::ConsumerOffset { .. }
             | Self::ConsumerOffsetOnPrimary { .. }
             | Self::ExternalGroupOffsetOnPrimary { .. }
             | Self::PollOnPrimary { .. }
@@ -542,6 +547,34 @@ pub enum PartitionReadReply {
     /// (unknown, tombstoned, or mid-reconcile). Callers surface an error
     /// instead of an empty result.
     NotFound,
+    /// Reply to a [`LifecycleFrame::ReadinessWait`] from the owner `shard`:
+    /// `partitions` hold a message at their start point. If nothing was ready
+    /// at admission, `parked` names the waiter that the origin must cancel.
+    Ready {
+        shard: u16,
+        parked: Option<u64>,
+        partitions: Vec<u32>,
+    },
+}
+
+/// Cancels the waiters that a readiness wait left on owner shards. A cancel
+/// that does not fit into a full inbox is lost. The owner then drops that
+/// waiter at its deadline, at maintenance or at its next evaluation.
+struct ParkedReadiness<'a> {
+    senders: &'a [TaggedSender],
+    waiters: BTreeMap<u16, u64>,
+}
+
+impl Drop for ParkedReadiness<'_> {
+    fn drop(&mut self) {
+        for (shard, waiter) in &self.waiters {
+            if let Some(sender) = self.senders.get(usize::from(*shard)) {
+                let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::ReadinessCancel {
+                    waiter: *waiter,
+                }));
+            }
+        }
+    }
 }
 
 /// Reply budget for [`IggyShard::partition_read`]. Bounds a wedged owning shard;
@@ -931,6 +964,17 @@ pub enum LifecycleFrame {
         namespace: IggyNamespace,
         read: PartitionRead,
         reply: Sender<PartitionReadReply>,
+    },
+    /// Evaluate a readiness wait on the shard that owns its targets. The owner
+    /// answers once at admission and at most once more. See
+    /// [`IggyShard::wait_for_messages`].
+    ReadinessWait {
+        wait: ReadinessWait,
+        reply: Sender<PartitionReadReply>,
+    },
+    /// Drop a parked readiness waiter that its origin no longer needs.
+    ReadinessCancel {
+        waiter: u64,
     },
     /// Admit a partition write (`SendMessages` / consumer-offset write) on
     /// the shard owning its namespace, carrying the channel its committed
@@ -1647,6 +1691,7 @@ where
     poll_completions: poll::completion::PollCompletionLane,
     partition_io: partition_io::PartitionIoLane<SB>,
     cooperative_events: Cell<usize>,
+    deferred_polls: poll::deferred::DeferredPolls,
 
     /// Partition namespace -> owning shard lookup.
     shards_table: T,
@@ -1984,6 +2029,7 @@ where
             poll_completions,
             partition_io,
             cooperative_events: Cell::new(0),
+            deferred_polls: poll::deferred::DeferredPolls::new(metrics.deferred_polls.clone()),
             shards_table,
             partition_consensus,
             coordinator,
@@ -2312,7 +2358,8 @@ where
     /// request, so this read cannot advance progress and is safe to retry.
     ///
     /// `None` means submission succeeded but the reply sender was dropped or
-    /// `PARTITION_READ_TIMEOUT` expired. A timeout drops the reply receiver
+    /// the reply budget expired: `PARTITION_READ_TIMEOUT`, or the request
+    /// timeout of a deferred poll, which also sets its wait deadline. A timeout drops the reply receiver
     /// without canceling a queued request or detached read. The owner discards
     /// a poll completion if it observes disconnection before admission. If
     /// timeout races with that check, completion can still advance progress and
@@ -2323,8 +2370,25 @@ where
     pub async fn partition_read(
         &self,
         namespace: IggyNamespace,
-        read: PartitionRead,
+        mut read: PartitionRead,
     ) -> Option<PartitionReadReply> {
+        let timeout = if let PartitionRead::DeferredPoll(request) = &mut read {
+            let now = self.bus.monotonic_micros();
+            let wait = self
+                .deferred_polls
+                .wait_us(request.options.max_wait.as_micros());
+            let (Some(deadline), Some(request_deadline)) = (
+                now.checked_add(wait),
+                now.checked_add(request.options.request_timeout.as_micros()),
+            ) else {
+                return Some(PartitionReadReply::Rejected(IggyError::InvalidCommand));
+            };
+            request.deadline = deadline;
+            request.request_deadline = request_deadline;
+            request.options.request_timeout.get_duration()
+        } else {
+            PARTITION_READ_TIMEOUT
+        };
         let target = self.shards_table.shard_for(namespace).or_else(|| {
             matches!(read, PartitionRead::SessionRetired { .. }).then(|| {
                 crate::shards_table::calculate_shard_assignment(&namespace, self.shard_count)
@@ -2361,7 +2425,7 @@ where
                 IggyError::TransientNotAccepted,
             ));
         }
-        match bus_timeout(&self.bus, PARTITION_READ_TIMEOUT, reply_rx.recv()).await {
+        match bus_timeout(&self.bus, timeout, reply_rx.recv()).await {
             Some(Ok(reply)) => Some(reply),
             Some(Err(_)) => {
                 tracing::warn!(
@@ -2378,6 +2442,100 @@ where
                     "partition_read: owning shard did not reply within budget"
                 );
                 None
+            }
+        }
+    }
+
+    /// Wait until at least one target holds a message at its start point.
+    ///
+    /// Sends one [`LifecycleFrame::ReadinessWait`] to each owner shard. Every
+    /// owner answers once at admission, so the result covers all targets that
+    /// are ready at the start, also for a zero wait. If none is ready, the
+    /// first later readiness ends the wait. An empty list means that the wait
+    /// expired.
+    ///
+    /// # Errors
+    /// Returns the first owner rejection. A target that no shard owns, or an
+    /// owner inbox that refuses the frame, returns `TransientNotAccepted`. An
+    /// owner that does not answer its admission within `PARTITION_READ_TIMEOUT`
+    /// returns `ShardCommunicationError`, unless another target is ready.
+    #[allow(clippy::future_not_send)]
+    pub async fn wait_for_messages(
+        &self,
+        context: DeferredPollContext,
+        targets: Vec<ReadinessTarget>,
+        wait: std::time::Duration,
+    ) -> Result<Vec<u32>, IggyError> {
+        let deadline = u64::try_from(wait.as_micros())
+            .ok()
+            .and_then(|wait| self.bus.monotonic_micros().checked_add(wait))
+            .ok_or(IggyError::InvalidCommand)?;
+        let mut owners: BTreeMap<u16, Vec<ReadinessTarget>> = BTreeMap::new();
+        for target in targets {
+            let shard = self
+                .shards_table
+                .shard_for(target.namespace)
+                .ok_or(IggyError::TransientNotAccepted)?;
+            owners.entry(shard).or_default().push(target);
+        }
+        // An owner answers at admission and at most once more.
+        let (reply, replies) = channel::<PartitionReadReply>(2 * owners.len());
+        let mut parked = ParkedReadiness {
+            senders: &self.senders,
+            waiters: BTreeMap::new(),
+        };
+        let mut admitting = BTreeSet::new();
+        for (shard, targets) in owners {
+            let frame = ShardFrame::lifecycle(LifecycleFrame::ReadinessWait {
+                wait: ReadinessWait {
+                    context: context.clone(),
+                    targets,
+                    deadline,
+                },
+                reply: reply.clone(),
+            });
+            self.senders
+                .get(usize::from(shard))
+                .ok_or(IggyError::TransientNotAccepted)?
+                .try_send(frame)
+                .map_err(|_| IggyError::TransientNotAccepted)?;
+            admitting.insert(shard);
+        }
+        drop(reply);
+        let mut ready = Vec::new();
+        loop {
+            let mut budget = std::time::Duration::from_micros(
+                deadline.saturating_sub(self.bus.monotonic_micros()),
+            );
+            // Every admission answer counts, even after a short wait expires.
+            if !admitting.is_empty() {
+                budget = budget.max(PARTITION_READ_TIMEOUT);
+            }
+            let reply = bus_timeout(&self.bus, budget, replies.recv()).await;
+            match reply {
+                Some(Ok(PartitionReadReply::Ready {
+                    shard,
+                    parked: waiter,
+                    partitions,
+                })) => {
+                    if admitting.remove(&shard) {
+                        if let Some(waiter) = waiter {
+                            parked.waiters.insert(shard, waiter);
+                        }
+                    } else {
+                        parked.waiters.remove(&shard);
+                    }
+                    ready.extend(partitions);
+                    if admitting.is_empty() && !ready.is_empty() {
+                        return Ok(ready);
+                    }
+                }
+                Some(Ok(PartitionReadReply::Rejected(error))) => return Err(error),
+                // Owners drop an expired waiter without an answer.
+                Some(Err(_)) | None if admitting.is_empty() || !ready.is_empty() => {
+                    return Ok(ready);
+                }
+                Some(_) | None => return Err(IggyError::ShardCommunicationError),
             }
         }
     }
@@ -2586,6 +2744,7 @@ where
             shard_count: 1,
             inbox,
             reply_inbox,
+            deferred_polls: poll::deferred::DeferredPolls::new(metrics.deferred_polls.clone()),
             poll_completions: poll::completion::PollCompletionLane::new(
                 POLL_COMPLETION_CAPACITY,
                 &metrics,

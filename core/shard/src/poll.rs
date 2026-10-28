@@ -47,6 +47,7 @@ use server_common::sharding::IggyNamespace;
 pub mod completion;
 #[cfg(test)]
 mod completion_tests;
+pub mod deferred;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
@@ -95,12 +96,21 @@ pub struct PollCompleted {
     namespace: IggyNamespace,
     /// Snapshot facts that have not yet been accepted as consumer progress.
     result: PollReadResult,
-    /// Return path for the accepted read or a rejection.
-    reply: Sender<PartitionReadReply>,
-    attachment: Option<PollAttachment>,
+    target: PollTarget,
     /// Inbox enqueue time for disk diagnostics, or `None` for resident completion.
     #[cfg(feature = "poll-diagnostics")]
     queued_at: Option<std::time::Instant>,
+}
+
+pub enum PollTarget {
+    Immediate {
+        reply: Sender<PartitionReadReply>,
+        attachment: Option<PollAttachment>,
+    },
+    Deferred {
+        request_id: u64,
+        _reservation: deferred::ReadReservation,
+    },
 }
 
 impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
@@ -156,6 +166,10 @@ where
         read: PartitionRead,
         reply: Sender<PartitionReadReply>,
     ) {
+        if let PartitionRead::DeferredPoll(request) = read {
+            self.admit_deferred_poll(namespace, *request, &reply);
+            return;
+        }
         let partitions = self.plane.partitions();
         if matches!(read, PartitionRead::SessionRetired { .. }) {
             let failed_revision = partitions.failed_revision(&namespace).or_else(|| {
@@ -315,6 +329,7 @@ where
                     )
                 })
                 .unwrap_or(PartitionReadReply::NotFound),
+            PartitionRead::DeferredPoll(_) => unreachable!("deferred admission handled above"),
             PartitionRead::Primary => partitions
                 .with_partition(&namespace, |partition| {
                     let consensus = partition.consensus();
@@ -380,8 +395,7 @@ where
                         self.on_poll_completed(PollCompleted {
                             namespace,
                             result: plan.execute_resident(),
-                            reply,
-                            attachment,
+                            target: PollTarget::Immediate { reply, attachment },
                             #[cfg(feature = "poll-diagnostics")]
                             queued_at: None,
                         })
@@ -450,8 +464,7 @@ where
         let PollCompleted {
             namespace,
             result,
-            reply,
-            attachment,
+            target,
             #[cfg(feature = "poll-diagnostics")]
             queued_at,
         } = completion;
@@ -466,6 +479,16 @@ where
                 "partition poll completion"
             );
         }
+        let (reply, attachment) = match target {
+            PollTarget::Immediate { reply, attachment } => (reply, attachment),
+            PollTarget::Deferred {
+                request_id,
+                _reservation,
+            } => {
+                self.on_deferred_poll_completed(request_id, result).await;
+                return;
+            }
+        };
         if reply.is_disconnected() {
             return;
         }
@@ -509,6 +532,16 @@ where
                 return;
             }
         }
+        self.accept_poll_result(namespace, result, reply).await;
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn accept_poll_result(
+        &self,
+        namespace: IggyNamespace,
+        result: PollReadResult,
+        reply: Sender<PartitionReadReply>,
+    ) {
         let partitions = self.plane.partitions();
         let consumer_kind = result.consumer_kind();
         match partitions.complete_poll(&namespace, result) {
