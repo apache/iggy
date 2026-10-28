@@ -787,6 +787,11 @@ pub fn user_headers_to_wire(
     }
     // Buffer was just encoded from valid HeaderKey/HeaderValue entries,
     // so structural TLV validity is guaranteed by construction.
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        iggy_binary_protocol::validate_user_headers(&buf).is_ok(),
+        "encoded user headers must be structurally valid TLV"
+    );
     WireUserHeaders::from_validated(buf.freeze())
 }
 
