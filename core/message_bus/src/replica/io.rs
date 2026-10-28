@@ -23,7 +23,10 @@
 //! dialed connection is handed to the delegate callback supplied by
 //! the caller (typically wrapping `shard::coordinator::ShardZeroCoordinator`).
 //! Replica, TCP, WS, TCP-TLS and WSS callbacks duplicate the raw fd and
-//! ship it to the owning shard before any bytes are read. TLS configuration
+//! ship it to the owning shard before any bytes are read, except that
+//! shard 0 first reads the placement preamble of an inbound replica link,
+//! which names the link and so the owner shard (see
+//! [`crate::replica::preamble`]). TLS configuration
 //! travels with TCP-TLS and WSS sockets. The owning shard runs handshakes
 //! and subsequent I/O; see [`crate::replica::handshake`] for replica
 //! handshakes. QUIC client callbacks install locally on shard 0 through

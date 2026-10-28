@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use iggy_kafka_wire::KafkaWireError;
 use kafka_protocol::messages::RequestHeader;
 use kafka_protocol::protocol::Decodable;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -1118,10 +1119,11 @@ where
         };
 
         if frame.len() < 8 {
-            return Err(KafkaProtocolError::BufferUnderflow {
+            return Err(KafkaWireError::BufferUnderflow {
                 needed: 8,
                 remaining: frame.len(),
-            });
+            }
+            .into());
         }
         let api_key = i16::from_be_bytes([frame[0], frame[1]]);
         let api_version = i16::from_be_bytes([frame[2], frame[3]]);
@@ -1133,7 +1135,7 @@ where
         // malformed header and closes the connection.
         let mut body = frame;
         let mut req = RequestHeader::decode(&mut body, req_hdr_ver)
-            .map_err(|e| KafkaProtocolError::Malformed(e.to_string()))?;
+            .map_err(|e| KafkaWireError::Malformed(e.to_string()))?;
 
         debug!(
             %peer,
@@ -1583,7 +1585,7 @@ async fn send_response<S: AsyncWrite + Unpin>(
     let header_size = response_header_size(header_version);
     let payload_size = header_size + body.len();
     let payload_len_i32 =
-        i32::try_from(payload_size).map_err(|_| KafkaProtocolError::FrameTooLarge {
+        i32::try_from(payload_size).map_err(|_| KafkaWireError::FrameTooLarge {
             max_bytes: i32::MAX as usize,
             actual_bytes: payload_size,
         })?;
@@ -1627,17 +1629,18 @@ pub async fn read_frame<S: AsyncRead + Unpin>(
 
     let frame_len_i32 = i32::from_be_bytes(len_buf);
     if frame_len_i32 <= 0 {
-        return Err(KafkaProtocolError::InvalidFrameLength(frame_len_i32));
+        return Err(KafkaWireError::InvalidFrameLength(frame_len_i32).into());
     }
     // frame_len_i32 is validated > 0 above, so it always fits usize on every
     // platform this crate targets (32-bit and 64-bit).
     #[allow(clippy::cast_sign_loss)]
     let frame_len = frame_len_i32 as usize;
     if frame_len > max_frame_size {
-        return Err(KafkaProtocolError::FrameTooLarge {
+        return Err(KafkaWireError::FrameTooLarge {
             max_bytes: max_frame_size,
             actual_bytes: frame_len,
-        });
+        }
+        .into());
     }
 
     // In-flight: read_timeout applies only after the length prefix is complete.
@@ -1912,7 +1915,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, KafkaProtocolError::InvalidFrameLength(-1)));
+        assert!(matches!(
+            err,
+            KafkaProtocolError::Wire(KafkaWireError::InvalidFrameLength(-1))
+        ));
     }
 
     #[tokio::test]
@@ -2157,10 +2163,10 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            KafkaProtocolError::FrameTooLarge {
+            KafkaProtocolError::Wire(KafkaWireError::FrameTooLarge {
                 max_bytes: 64,
                 actual_bytes: 65,
-            }
+            })
         ));
     }
 

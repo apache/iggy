@@ -662,6 +662,54 @@ class AsyncTcpConnectionConcurrencyTest {
     }
 
     @Test
+    void shouldNotSendARegisterOnAChannelThatADiscardIsClosing() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket serverSocket = new ServerSocket(0, 1, loopback)) {
+            CompletableFuture<Void> server = CompletableFuture.runAsync(() -> {
+                try (Socket abandoned = serverSocket.accept()) {
+                    abandoned.setSoTimeout((int) TimeUnit.SECONDS.toMillis(2));
+                    Request ping = readRequest(abandoned.getInputStream());
+                    writeResponse(abandoned.getOutputStream(), ping, new byte[0]);
+                    try (Socket replacement = serverSocket.accept()) {
+                        replacement.setSoTimeout((int) TimeUnit.SECONDS.toMillis(2));
+                        Request register = readRequest(replacement.getInputStream());
+                        assertThat(register.operation()).isEqualTo(OPERATION_REGISTER);
+                        writeResponse(replacement.getOutputStream(), register, registerBody());
+                    }
+                } catch (IOException error) {
+                    throw new IllegalStateException("Mock VSR server failed", error);
+                }
+            });
+
+            AsyncTcpConnection connection = newConnection(serverSocket, Duration.ofHours(1), 500);
+            CompletableFuture<Void> replyCallback = new CompletableFuture<>();
+            CompletableFuture<Void> discarded = new CompletableFuture<>();
+            try {
+                connection.connect().get(5, TimeUnit.SECONDS);
+                // The reply callback holds the event loop, so the close that the discard queues waits behind it,
+                // as it waits behind the reply that ends one sign-in and starts the queued one.
+                CompletableFuture<ByteBuf> register = connection
+                        .send(PING_CODE, Unpooled.EMPTY_BUFFER)
+                        .thenCompose(pong -> {
+                            pong.release();
+                            replyCallback.complete(null);
+                            discarded.join();
+                            return connection.send(LOGIN_CODE, loginPayload());
+                        });
+                replyCallback.get(5, TimeUnit.SECONDS);
+                connection.discardAuthentication();
+                discarded.complete(null);
+
+                register.get(5, TimeUnit.SECONDS).release();
+                server.get(5, TimeUnit.SECONDS);
+            } finally {
+                discarded.complete(null);
+                connection.close().get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
     void shouldKeepATicketlessReadOnTheIdentityItStartedEncoding() throws Exception {
         try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
             CompletableFuture<Request> observed = new CompletableFuture<>();

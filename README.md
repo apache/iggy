@@ -198,7 +198,6 @@ stream = "qw"
 topics = ["records"]
 schema = "json"
 batch_length = 1000
-poll_interval = "5ms"
 consumer_group = "qw_sink_connector"
 
 [transforms.add_fields]
@@ -482,7 +481,6 @@ let mut consumer = client
     .create_consumer_group_if_not_exists()
     .auto_join_consumer_group()
     .polling_strategy(PollingStrategy::next())
-    .poll_interval(IggyDuration::from_str("1ms")?)
     .batch_length(1000)
     .build();
 

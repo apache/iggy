@@ -1217,7 +1217,7 @@ mod tests {
         // D = 0 (last disk match), so a straddle would continue at offset 1.
         // A raw snapshot walk from offset 1 falls through to the next resident
         // op (offset 3): exactly the silent skip the gate prevents.
-        let (_, leaky_offset) = crate::journal::select_resident(
+        let (_, leaky_offset, _) = crate::journal::select_resident(
             &entries,
             MessageLookup::Offset {
                 offset: 1,
@@ -1245,7 +1245,7 @@ mod tests {
         let from_offset = 3u64;
         let contiguous = oldest_resident.is_some_and(|oldest| oldest <= from_offset);
         assert!(contiguous, "offset 3 is resident; gate must allow it");
-        let (_, contiguous_offset) = crate::journal::select_resident(
+        let (_, contiguous_offset, _) = crate::journal::select_resident(
             &entries,
             MessageLookup::Offset {
                 offset: from_offset,
@@ -1338,7 +1338,7 @@ mod tests {
         }
 
         let entries = partition.log.journal().inner.resident_entries();
-        let (_, last) = crate::journal::select_resident(
+        let (_, last, _) = crate::journal::select_resident(
             &entries,
             MessageLookup::Offset {
                 offset: 0,

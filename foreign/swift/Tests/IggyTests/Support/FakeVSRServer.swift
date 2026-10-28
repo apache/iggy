@@ -199,6 +199,38 @@ final class FakeVSRServer: @unchecked Sendable {
         return writer.bytes
     }
 
+    /// A poll reply carrying one batch with a message at each of `offsets`,
+    /// whose payload is `message <offset>`. Checksums are left zero, which a
+    /// reply decoded without verification accepts.
+    static func polledBody(partitionID: UInt32, offsets: [UInt64], currentOffset: UInt64? = nil, context: PartitionContext = routeContext) -> [UInt8] {
+        var writer = ByteWriter()
+        writer.write(partitionID)
+        writer.write(currentOffset ?? offsets.max() ?? 0)
+        writer.write(UInt32(offsets.count))
+        context.encode(into: &writer)
+        guard let base = offsets.first else {
+            return writer.bytes
+        }
+        var frames = ByteWriter()
+        for offset in offsets {
+            let payload = Array("message \(offset)".utf8)
+            frames.write(UInt64(0))
+            frames.write(MessageID(0))
+            frames.write(UInt32(offset - base))
+            frames.write(UInt32(0))
+            frames.write(UInt32(0))
+            frames.write(UInt32(payload.count))
+            frames.write(UInt64(0))
+            frames.write(payload)
+        }
+        let header = Batch.Header(
+            partitionID: UInt64(partitionID), baseOffset: base, baseTimestamp: 0, originTimestamp: 0,
+            batchLength: UInt64(Batch.headerSize + frames.count), batchChecksum: 0, messageCount: UInt32(offsets.count))
+        writer.write(header.encode())
+        writer.write(frames.bytes)
+        return writer.bytes
+    }
+
     /// The reply to `SyncConsumerGroup` for a member.
     static func assignmentBody(generation: UInt64, partitions: [UInt32]) -> [UInt8] {
         var writer = ByteWriter()

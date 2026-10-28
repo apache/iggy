@@ -26,7 +26,7 @@ use iggy_binary_protocol::WireEncode;
 use iggy_binary_protocol::codes::{
     DELETE_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
-use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::messages::{PollMessagesRequest, WaitForMessagesRequest};
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
@@ -200,6 +200,31 @@ pub trait BinaryTransport {
         _topic_id: &Identifier,
     ) -> Option<u32> {
         None
+    }
+    /// Route a poll with bounded server wait and response size.
+    async fn send_poll_with_response_and_options(
+        &self,
+        request: &PollMessagesRequest,
+        context: Option<PartitionContext>,
+        options: Option<crate::DeferredPollOptions>,
+    ) -> Result<Bytes, IggyError>
+    where
+        Self: Sync,
+    {
+        if options.is_none() {
+            self.send_poll_with_response(request, context).await
+        } else {
+            Err(IggyError::FeatureUnavailable)
+        }
+    }
+
+    /// A readiness wait shares a multiplexed connection, like a positive poll wait.
+    /// A client runs at most `MAX_DEFERRED_REQUESTS` deferred requests at once.
+    async fn send_wait_with_response(
+        &self,
+        _request: &WaitForMessagesRequest,
+    ) -> Result<Bytes, IggyError> {
+        Err(IggyError::FeatureUnavailable)
     }
 
     fn get_heartbeat_interval(&self) -> NonZeroIggyDuration;

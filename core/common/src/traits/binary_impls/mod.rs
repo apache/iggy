@@ -28,6 +28,7 @@ mod topics;
 mod users;
 
 pub use messages::{BinarySendPartitioning, decode_send_confirmations, send_binary_messages};
+pub use messages::{group_cache_key, sync_group_assignment, wait_for_messages_request};
 
 use crate::IggyError;
 use crate::OptionsPatch;

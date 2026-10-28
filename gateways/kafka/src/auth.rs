@@ -491,7 +491,7 @@ pub(crate) async fn resolve_principal(
         permissions: user
             .permissions
             .as_ref()
-            .map(PrincipalPermissions::from)
+            .map(principal_permissions)
             .unwrap_or_default(),
         permissions_known: true,
     })
@@ -555,7 +555,7 @@ async fn fetch_permissions(
     Ok((
         user.and_then(|user| user.permissions)
             .as_ref()
-            .map(PrincipalPermissions::from)
+            .map(principal_permissions)
             .unwrap_or_default(),
         read,
     ))
@@ -566,24 +566,22 @@ async fn fetch_permissions(
 /// Stream flags fold into the topic ones because Kafka has no resource above a topic and every
 /// Kafka topic lives inside an Iggy stream, so a stream grant is in practice a grant over the
 /// topics a Kafka client can reach. `docs/ACL_MAPPING.md` has the full table.
-impl From<&Permissions> for PrincipalPermissions {
-    fn from(permissions: &Permissions) -> Self {
-        let global = &permissions.global;
-        // Iggy's enforcement is hierarchical, so a flag-for-flag copy describes a principal that
-        // cannot do things Iggy will in fact let it do. The rules are in
-        // `core/metadata/src/permissioner/permissioner_rules/`: polling is granted by any of the
-        // four read/manage flags on topics or streams, appending by either manage flag, and
-        // reading server state by either server flag. Mirroring that here is the difference
-        // between describing a consumer and describing a principal that appears unable to consume.
-        let manages = global.manage_topics || global.manage_streams;
-        let reads = global.read_topics || global.read_streams;
-        Self {
-            read_servers: global.read_servers || global.manage_servers,
-            read_topics: reads || manages,
-            manage_topics: manages,
-            poll_messages: global.poll_messages || reads || manages,
-            send_messages: global.send_messages || manages,
-        }
+pub(crate) const fn principal_permissions(permissions: &Permissions) -> PrincipalPermissions {
+    let global = &permissions.global;
+    // Iggy's enforcement is hierarchical, so a flag-for-flag copy describes a principal that
+    // cannot do things Iggy will in fact let it do. The rules are in
+    // `core/metadata/src/permissioner/permissioner_rules/`: polling is granted by any of the
+    // four read/manage flags on topics or streams, appending by either manage flag, and
+    // reading server state by either server flag. Mirroring that here is the difference
+    // between describing a consumer and describing a principal that appears unable to consume.
+    let manages = global.manage_topics || global.manage_streams;
+    let reads = global.read_topics || global.read_streams;
+    PrincipalPermissions {
+        read_servers: global.read_servers || global.manage_servers,
+        read_topics: reads || manages,
+        manage_topics: manages,
+        poll_messages: global.poll_messages || reads || manages,
+        send_messages: global.send_messages || manages,
     }
 }
 
@@ -644,7 +642,7 @@ mod tests {
     fn given_only_read_topics_when_projected_should_still_be_able_to_poll() {
         let mut permissions = Permissions::default();
         permissions.global.read_topics = true;
-        let projected = PrincipalPermissions::from(&permissions);
+        let projected = principal_permissions(&permissions);
         assert!(
             projected.poll_messages,
             "read_topics grants polling in Iggy"
@@ -658,7 +656,7 @@ mod tests {
         // Managing streams grants appending and polling, and implies the topic-level reads.
         let mut permissions = Permissions::default();
         permissions.global.manage_streams = true;
-        let projected = PrincipalPermissions::from(&permissions);
+        let projected = principal_permissions(&permissions);
         assert!(projected.send_messages);
         assert!(projected.poll_messages);
         assert!(projected.manage_topics);
@@ -668,7 +666,7 @@ mod tests {
     fn given_only_manage_servers_when_projected_should_also_allow_describing_the_cluster() {
         let mut permissions = Permissions::default();
         permissions.global.manage_servers = true;
-        let projected = PrincipalPermissions::from(&permissions);
+        let projected = principal_permissions(&permissions);
         assert!(
             projected.read_servers,
             "managing implies reading, as the permissioner's own rule does"
@@ -677,7 +675,7 @@ mod tests {
 
     #[test]
     fn given_no_grants_when_projected_should_stay_empty() {
-        let projected = PrincipalPermissions::from(&Permissions::default());
+        let projected = principal_permissions(&Permissions::default());
         assert_eq!(projected, PrincipalPermissions::default());
     }
 

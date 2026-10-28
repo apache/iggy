@@ -28,7 +28,7 @@ inputs:
   node-version:
     description: "Node.js version used by the npm path"
     required: false
-    default: "23"
+    default: "24"
 
 runs:
   using: composite
