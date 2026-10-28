@@ -57,6 +57,9 @@ pub fn kafka_string_len(flexible: bool, bytes: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
+    use kafka_protocol::messages::{DeleteGroupsRequest, GroupId};
+    use kafka_protocol::protocol::{Encodable, StrBytes};
 
     #[test]
     fn unsigned_varint_len_matches_kafka_protocols_own_boundaries() {
@@ -79,5 +82,42 @@ mod tests {
     fn kafka_string_len_differs_between_flexible_and_legacy() {
         assert_eq!(kafka_string_len(false, 10), 12); // 2-byte length + bytes
         assert_eq!(kafka_string_len(true, 10), 11); // 1-byte compact prefix + bytes
+    }
+
+    const WIDTH_BOUNDARIES: &[(u32, usize)] = &[
+        (0, 1),
+        (0x7f, 1),
+        (0x80, 2),
+        (0x3fff, 2),
+        (0x4000, 3),
+        (0x001f_ffff, 3),
+        (0x0020_0000, 4),
+        (0x0fff_ffff, 4),
+        (0x1000_0000, 5),
+        (u32::MAX, 5),
+    ];
+
+    #[test]
+    fn unsigned_varint_len_switches_width_at_every_boundary() {
+        for &(value, len) in WIDTH_BOUNDARIES {
+            assert_eq!(unsigned_varint_len(value), len, "{value:#x}");
+        }
+    }
+
+    /// `DeleteGroups` v2 is one compact array of one compact string plus an empty tagged-field
+    /// byte, so its encoded size isolates the string's prefix width at each boundary.
+    #[test]
+    fn kafka_compact_prefix_matches_kafka_protocol_at_the_width_boundaries() {
+        for len in [0, 0x7e, 0x7f, 0x3ffe, 0x3fff, 0x001f_fffe, 0x001f_ffff] {
+            let name = StrBytes::from_string("g".repeat(len));
+            let request = DeleteGroupsRequest::default().with_groups_names(vec![GroupId(name)]);
+            let mut buf = BytesMut::new();
+            request.encode(&mut buf, 2).unwrap();
+            assert_eq!(
+                buf.len(),
+                1 + kafka_string_len(true, len) + 1,
+                "len {len:#x}"
+            );
+        }
     }
 }

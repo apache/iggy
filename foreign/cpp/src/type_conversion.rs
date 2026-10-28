@@ -606,7 +606,7 @@ impl ffi::StreamCreateOptions {
     }
 }
 
-fn parse_message_expiry(kind: &str, value: u64) -> Result<RustIggyExpiry, String> {
+pub(crate) fn parse_message_expiry(kind: &str, value: u64) -> Result<RustIggyExpiry, String> {
     match kind {
         "server_default" | "default" => Ok(RustIggyExpiry::ServerDefault),
         "never_expire" => Ok(RustIggyExpiry::NeverExpire),
