@@ -1841,24 +1841,14 @@ mod tests {
     #[compio::test]
     async fn given_a_read_waiting_on_a_shard_when_the_session_ends_should_refuse_stale_client() {
         for (code, body) in shard_waiting_reads() {
-            Box::pin(assert_read_refused_after_shard_wait(
-                code,
-                &body,
-                ReadRevocation::Session,
-            ))
-            .await;
+            assert_read_refused_after_shard_wait(code, &body, ReadRevocation::Session).await;
         }
     }
 
     #[compio::test]
     async fn given_a_read_waiting_on_a_shard_when_grants_are_revoked_should_refuse_unauthorized() {
         for (code, body) in shard_waiting_reads() {
-            Box::pin(assert_read_refused_after_shard_wait(
-                code,
-                &body,
-                ReadRevocation::Grants(None),
-            ))
-            .await;
+            assert_read_refused_after_shard_wait(code, &body, ReadRevocation::Grants(None)).await;
         }
     }
 
@@ -1874,11 +1864,11 @@ mod tests {
                 Operation::UpdateStreamResolved,
                 Operation::UpdateTopicResolved,
             ] {
-                Box::pin(assert_read_refused_after_shard_wait(
+                assert_read_refused_after_shard_wait(
                     code,
                     &body,
                     ReadRevocation::Grants(Some(rename)),
-                ))
+                )
                 .await;
             }
         }
@@ -1890,12 +1880,7 @@ mod tests {
     async fn given_a_read_waiting_on_a_shard_when_the_connection_is_replaced_should_not_answer_the_new_one()
      {
         for (code, body) in shard_waiting_reads() {
-            Box::pin(assert_read_refused_after_shard_wait(
-                code,
-                &body,
-                ReadRevocation::Connection,
-            ))
-            .await;
+            assert_read_refused_after_shard_wait(code, &body, ReadRevocation::Connection).await;
         }
     }
 
@@ -1908,12 +1893,7 @@ mod tests {
                 GET_PARTITION_ROUTE_CODE | POLL_MESSAGES_CODE | GET_CONSUMER_OFFSET_CODE
             )
         }) {
-            Box::pin(assert_read_refused_after_shard_wait(
-                code,
-                &body,
-                ReadRevocation::Topic,
-            ))
-            .await;
+            assert_read_refused_after_shard_wait(code, &body, ReadRevocation::Topic).await;
         }
     }
 
@@ -1922,11 +1902,11 @@ mod tests {
         let (_, body) =
             partition_namespace_reads(&WireIdentifier::numeric(0), &WireIdentifier::numeric(0))[2]
                 .clone();
-        Box::pin(assert_read_refused_after_shard_wait(
+        assert_read_refused_after_shard_wait(
             GET_PARTITION_ROUTE_CODE,
             &body,
             ReadRevocation::TopicDeleting,
-        ))
+        )
         .await;
     }
 

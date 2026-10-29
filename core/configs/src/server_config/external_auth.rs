@@ -28,6 +28,10 @@ use serde_with::serde_as;
 /// caller to a pre-provisioned Iggy username or denies the login. Local
 /// users never hit the callout. The credential (password) is forwarded
 /// so the external service can verify the requester.
+///
+/// The callout can fire more than once for a single logical login because
+/// the SDK replays after transient failures. The external service must be
+/// idempotent; one-time passwords will not survive a replay.
 #[serde_as]
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct ExternalAuthConfig {

@@ -90,35 +90,6 @@ pub fn warm_dummy_password_hash() {
     LazyLock::force(&DUMMY_PASSWORD_HASH);
 }
 
-/// Run the dummy Argon2 verify so the response timing of a "user not found"
-/// reject is indistinguishable from a "wrong password" reject. The result is
-/// discarded: even presenting the exact dummy plaintext cannot authenticate.
-pub fn dummy_password_verify(password: &str) {
-    let _ = crypto::verify_password(password, DUMMY_PASSWORD_HASH.as_str());
-}
-
-/// Result of a single STM read that checks whether the user store is
-/// populated and whether a given username exists locally.
-pub enum UserProbe {
-    NotCaughtUp,
-    Found,
-    NotFound,
-}
-
-/// Probe the user store for `username` in a single STM read. Returns
-/// `NotCaughtUp` when the store is still empty (replica has not caught up),
-/// `Found` when the user exists, or `NotFound` otherwise.
-pub fn probe_user(users: &metadata::stm::user::UsersInner, username: &str) -> UserProbe {
-    if users.items.is_empty() {
-        return UserProbe::NotCaughtUp;
-    }
-    if users.user_by_name(username).is_some() {
-        UserProbe::Found
-    } else {
-        UserProbe::NotFound
-    }
-}
-
 pub fn verify_login_credentials<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     username: &str,
@@ -1197,121 +1168,71 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
 
     let body_tail = &body[prefix_len..];
 
-    // Route by user existence: if the username resolves to a local Iggy user,
-    // local credential verification handles the login. If it does not and
-    // ext-auth is enabled, the callout handles it. The two pools never
-    // overlap, so there is no fallback from one to the other.
-    //
     // A body that decodes as LoginRegisterRequest is always treated as a
     // password login. A wrong password is final: the handler returns without
-    // trying PAT decode. WireName validation rejects most byte patterns, so
-    // a valid PAT body cannot cross-decode as a LoginRegisterRequest.
+    // trying PAT decode. The context length prevents cross-decode: a PAT
+    // body runs out of bytes before a LoginRegisterRequest can fully parse.
     if let Ok((wire_request, _)) =
         LoginRegisterRequest::decode_after_prefix(version_info.clone(), body_tail)
     {
-        // Single read: check not-caught-up and resolve the user in one lock
-        // acquisition. On the single-threaded shard reactor no committed op
-        // can apply between synchronous reads, but one round-trip is cheaper.
-        let probe = shard
-            .plane
-            .metadata()
-            .mux_stm
-            .users()
-            .read(|users| probe_user(users, wire_request.username.as_str()));
-
-        if matches!(probe, UserProbe::NotCaughtUp) {
-            surface_login_failure(
-                shard,
-                origin,
-                request.header(),
-                &LoginRegisterError::Transient(MetadataSubmitError::NotCaughtUp),
-            )
-            .await;
-            return;
-        }
-
-        if matches!(probe, UserProbe::Found) {
-            match verify_login_credentials(
-                shard,
-                wire_request.username.as_str(),
-                wire_request.password.expose_secret(),
-            ) {
-                Ok(account) => {
-                    if let Err(error) = complete_login_register(
-                        shard,
-                        sessions,
-                        origin,
-                        vsr_client_id,
-                        request.header(),
-                        account,
-                        &wire_request.version_info,
-                        &wire_request.bind_secret,
-                    )
-                    .await
-                    {
-                        warn!(transport_client_id, error = %error, "login/register failed");
-                        surface_login_failure(shard, origin, request.header(), &error).await;
-                    }
-                }
-                Err(error) => {
+        // verify_login_credentials handles not-caught-up (transient),
+        // unknown users (constant-cost dummy hash), and wrong passwords in
+        // one call. On InvalidCredentials with ext-auth enabled, the dummy
+        // hash has already equalized timing before the callout adds to it.
+        match verify_login_credentials(
+            shard,
+            wire_request.username.as_str(),
+            wire_request.password.expose_secret(),
+        ) {
+            Ok(account) => {
+                if let Err(error) = complete_login_register(
+                    shard,
+                    sessions,
+                    origin,
+                    vsr_client_id,
+                    request.header(),
+                    account,
+                    &wire_request.version_info,
+                    &wire_request.bind_secret,
+                )
+                .await
+                {
                     warn!(transport_client_id, error = %error, "login/register failed");
                     surface_login_failure(shard, origin, request.header(), &error).await;
                 }
             }
-            return;
-        }
-
-        if server_config.external_auth.enabled {
-            // Only the primary makes ext-auth callouts. A backup that hasn't
-            // replicated the user's CreateUser yet would see NotFound and fire
-            // the callout with the caller's password, only to fail at
-            // resolve_username anyway. Return transient so the SDK retries
-            // against the primary.
-            if !is_metadata_primary(shard) {
-                surface_login_failure(
-                    shard,
-                    origin,
-                    request.header(),
-                    &LoginRegisterError::ExternalAuthUnavailable,
-                )
-                .await;
-                return;
+            Err(LoginRegisterError::InvalidCredentials) if server_config.external_auth.enabled => {
+                // Only the primary makes ext-auth callouts. A backup with a
+                // partially-replicated user store would leak the password to
+                // the external service and then fail at resolve_username.
+                if is_metadata_primary(shard) {
+                    // Boxed to keep the ext-auth state machine out of the
+                    // handle_client_request future, which every request pays.
+                    Box::pin(try_external_auth_login(
+                        shard,
+                        sessions,
+                        server_config,
+                        origin,
+                        vsr_client_id,
+                        request.header(),
+                        &wire_request,
+                    ))
+                    .await;
+                } else {
+                    surface_login_failure(
+                        shard,
+                        origin,
+                        request.header(),
+                        &LoginRegisterError::ExternalAuthUnavailable,
+                    )
+                    .await;
+                }
             }
-            try_external_auth_login(
-                shard,
-                sessions,
-                server_config,
-                origin,
-                vsr_client_id,
-                request.header(),
-                &wire_request,
-            )
-            .await;
-            return;
+            Err(error) => {
+                warn!(transport_client_id, error = %error, "login/register failed");
+                surface_login_failure(shard, origin, request.header(), &error).await;
+            }
         }
-
-        // No local user, no ext-auth: reject with timing equalization.
-        // Apply the same length guard that verify_login_credentials uses on
-        // the Found path so that a short password rejects fast on both paths,
-        // closing the timing oracle.
-        if (MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH).contains(&wire_request.username.len())
-            && (MIN_PASSWORD_LENGTH..=MAX_PASSWORD_LENGTH)
-                .contains(&wire_request.password.expose_secret().len())
-        {
-            dummy_password_verify(wire_request.password.expose_secret());
-        }
-        warn!(
-            transport_client_id,
-            "rejecting register request: invalid credentials"
-        );
-        send_eviction(
-            shard,
-            origin,
-            vsr_client_id,
-            EvictionReason::InvalidCredentials,
-            "login_rejection",
-        )
-        .await;
         return;
     }
 

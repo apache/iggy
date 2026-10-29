@@ -118,14 +118,13 @@ use shard::{
     DeferredPollContext, DeferredPollRequest, PartitionRead, PartitionReadReply, PollQuotaIdentity,
 };
 
+use crate::dispatch::login_error::LoginRegisterError;
 use crate::dispatch::metadata_changes::metadata_changes_page;
 use crate::dispatch::partition::{
     ConsumerOffsetTarget, fence_poll_context, resolve_consumer_offset_request,
     resolve_poll_request, resolve_primary_consumer_offset_request,
 };
-use crate::dispatch::session_ops::{
-    UserProbe, probe_user, verify_login_credentials, verify_pat_credentials,
-};
+use crate::dispatch::session_ops::{verify_login_credentials, verify_pat_credentials};
 use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
     ReadError, WriteError,
@@ -202,60 +201,31 @@ pub(in crate::http) async fn login_user(
         .await
         .map_err(|_| IggyError::TransientNotAccepted)?;
 
-    // Single read: check not-caught-up and resolve the user in one lock
-    // acquisition, matching the TCP path's pattern.
-    let probe = state
-        .shard
-        .plane
-        .metadata()
-        .mux_stm
-        .users()
-        .read(|users| probe_user(users, &command.username));
-
-    match probe {
-        UserProbe::NotCaughtUp => {
-            return Err(IggyError::TransientNotAccepted.into());
+    // verify_login_credentials handles not-caught-up (transient), unknown
+    // users (constant-cost dummy hash), and wrong passwords in one call.
+    match verify_login_credentials(
+        &state.shard,
+        &command.username,
+        command.password.expose_secret(),
+    ) {
+        Ok((user_id, created_at)) => issue_identity(&state, user_id, created_at),
+        Err(LoginRegisterError::InvalidCredentials)
+            if state.server_config.external_auth.enabled =>
+        {
+            if state.is_metadata_primary() {
+                SendWrapper::new(try_external_auth_http_login(
+                    &state,
+                    &command.username,
+                    command.password.expose_secret(),
+                    &client_addr,
+                ))
+                .await
+            } else {
+                Err(IggyError::TransientNotAccepted.into())
+            }
         }
-        UserProbe::Found => {
-            let (user_id, created_at) = verify_login_credentials(
-                &state.shard,
-                &command.username,
-                command.password.expose_secret(),
-            )
-            .map_err(|error| login_error_to_iggy(&error))?;
-            return issue_identity(&state, user_id, created_at);
-        }
-        UserProbe::NotFound => {}
+        Err(error) => Err(login_error_to_iggy(&error).into()),
     }
-
-    if state.server_config.external_auth.enabled {
-        // Only the primary makes ext-auth callouts. A backup with a
-        // partially-replicated user store would leak the password to the
-        // external service and then fail at resolve_username anyway.
-        if !state.is_metadata_primary() {
-            return Err(IggyError::TransientNotAccepted.into());
-        }
-        return SendWrapper::new(try_external_auth_http_login(
-            &state,
-            &command.username,
-            command.password.expose_secret(),
-            &client_addr,
-        ))
-        .await;
-    }
-
-    // No local user, no ext-auth: reject with timing equalization.
-    // Apply the same length guard that verify_login_credentials uses on
-    // the Found path so that a short password rejects fast on both paths,
-    // closing the timing oracle.
-    if (iggy_common::defaults::MIN_USERNAME_LENGTH..=iggy_common::defaults::MAX_USERNAME_LENGTH)
-        .contains(&command.username.len())
-        && (iggy_common::defaults::MIN_PASSWORD_LENGTH..=iggy_common::defaults::MAX_PASSWORD_LENGTH)
-            .contains(&command.password.expose_secret().len())
-    {
-        crate::dispatch::session_ops::dummy_password_verify(command.password.expose_secret());
-    }
-    Err(IggyError::InvalidCredentials.into())
 }
 
 pub(in crate::http) async fn login_with_personal_access_token(
