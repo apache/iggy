@@ -190,8 +190,12 @@ pub(crate) struct PollMessagesArgs {
     #[arg(value_parser = clap::value_parser!(Identifier))]
     pub(crate) topic_id: Identifier,
     /// Partition ID from which message will be polled
-    #[arg(value_parser = clap::value_parser!(u32).range(0..))]
-    pub(crate) partition_id: u32,
+    ///
+    /// Required unless a consumer group is set with --consumer-group,
+    /// in which case the server assigns the partitions to the group member.
+    #[clap(verbatim_doc_comment)]
+    #[arg(value_parser = clap::value_parser!(u32).range(0..), required_unless_present = "consumer_group")]
+    pub(crate) partition_id: Option<u32>,
     /// Number of messages to poll
     #[clap(verbatim_doc_comment)]
     #[clap(short, long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
@@ -228,8 +232,28 @@ pub(crate) struct PollMessagesArgs {
     ///
     /// Consumer ID can be specified as a consumer name or ID
     #[clap(verbatim_doc_comment)]
-    #[clap(short, long, default_value_t = Identifier::default(), value_parser = clap::value_parser!(Identifier))]
+    #[clap(short, long, default_value_t = Identifier::default(), value_parser = clap::value_parser!(Identifier), conflicts_with = "consumer_group")]
     pub(crate) consumer: Identifier,
+    /// Consumer group which will poll messages
+    ///
+    /// The CLI joins the group, polls the partitions that the server assigns
+    /// to it and leaves the group on exit, also after Ctrl-C or an error.
+    /// The group must already exist. Cannot be combined with --consumer,
+    /// --offset or PARTITION_ID.
+    ///
+    /// With --auto-commit, the group offset moves past the messages that
+    /// are printed, so the other group members never receive them.
+    #[clap(verbatim_doc_comment)]
+    #[clap(short = 'g', long, value_parser = NonEmptyStringValueParser::new(), conflicts_with_all = ["consumer", "offset", "partition_id"])]
+    pub(crate) consumer_group: Option<String>,
+    /// Keep polling until interrupted with Ctrl-C
+    ///
+    /// Requires --consumer-group. Each message is printed as it arrives.
+    /// Without this flag, the command stops after --message-count messages
+    /// or once no message arrives for five seconds.
+    #[clap(verbatim_doc_comment)]
+    #[clap(long, default_value_t = false)]
+    pub(crate) follow: bool,
     /// Include the message headers in the output
     ///
     /// Flag indicates whether to include headers in the output
@@ -248,6 +272,15 @@ pub(crate) struct PollMessagesArgs {
     #[clap(verbatim_doc_comment)]
     #[clap(long, value_parser = NonEmptyStringValueParser::new())]
     pub(crate) output_file: Option<String>,
+}
+
+impl PollMessagesArgs {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if self.follow && self.consumer_group.is_none() {
+            anyhow::bail!("--follow requires --consumer-group");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -281,6 +314,34 @@ mod tests {
             };
             assert_eq!(args.message_key.as_deref(), Some(key.as_str()));
         }
+    }
+
+    #[test]
+    fn given_consumer_group_with_partition_when_polling_should_fail() {
+        let result = IggyConsoleArgs::try_parse_from([
+            "iggy",
+            "message",
+            "poll",
+            "--consumer-group",
+            "group",
+            "--first",
+            "stream",
+            "topic",
+            "0",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn given_follow_without_consumer_group_when_validating_should_fail() {
+        let parsed = IggyConsoleArgs::try_parse_from([
+            "iggy", "message", "poll", "--follow", "--first", "stream", "topic", "0",
+        ])
+        .unwrap();
+        let Some(Command::Message(MessageAction::Poll(args))) = parsed.command else {
+            panic!("Expected the message poll command");
+        };
+        assert!(args.validate().is_err());
     }
 
     #[test]
