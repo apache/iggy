@@ -6030,6 +6030,28 @@ class IggyBlockingClient final {
     void UpdateUser(const Identifier &user, const UserUpdateOptions &options);
 
     /**
+     * @brief Creates a personal access token for the authenticated user.
+     *
+     * The token string is only returned once upon creation and cannot be
+     * retrieved again.
+     *
+     * Token names must contain between 1 and 255 bytes on binary transports
+     * (TCP, QUIC) and between 3 and 30 bytes on HTTP, and must remain unique.
+     *
+     * For personal access tokens, Expiry::ServerDefault() and Expiry::NeverExpire()
+     * both produce a token that never expires. Use Expiry::Duration() to specify
+     * a bounded lifetime.
+     *
+     * @param name Unique token name (1-255 bytes for binary, 3-30 bytes for HTTP).
+     * @param expiry Expiry policy for the token. ServerDefault() and NeverExpire() mean no expiry.
+     * @return The raw token string.
+     * @throws IggyException if the client is unavailable or unauthenticated;
+     *         the name or expiry is invalid; the name is already in use; or the
+     *         request fails.
+     */
+    std::string CreatePersonalAccessToken(std::string name, const Expiry &expiry);
+
+    /**
      * @brief Creates a top-level stream in the cluster metadata.
      *
      * A stream is the top-level namespace for topics. This creates no topics,
