@@ -1099,7 +1099,7 @@ const fn logout_deny_code(error: &MetadataSubmitError) -> IggyError {
 pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
-    server_config: &std::sync::Arc<configs::server::ServerConfig>,
+    ext_auth: &configs::external_auth::ExternalAuthConfig,
     origin: ClientOrigin,
     request: Message<RoutedRequestHeader>,
 ) where
@@ -1201,7 +1201,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                     surface_login_failure(shard, origin, request.header(), &error).await;
                 }
             }
-            Err(LoginRegisterError::InvalidCredentials) if server_config.external_auth.enabled => {
+            Err(LoginRegisterError::InvalidCredentials) if ext_auth.enabled => {
                 // Only the primary makes ext-auth callouts. A backup with a
                 // partially-replicated user store would leak the password to
                 // the external service and then fail at resolve_username.
@@ -1211,7 +1211,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                     Box::pin(try_external_auth_login(
                         shard,
                         sessions,
-                        server_config,
+                        ext_auth,
                         origin,
                         vsr_client_id,
                         request.header(),
@@ -1352,7 +1352,7 @@ fn build_ext_auth_request(
 async fn try_external_auth_login<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
-    server_config: &std::sync::Arc<configs::server::ServerConfig>,
+    ext_auth: &configs::external_auth::ExternalAuthConfig,
     origin: ClientOrigin,
     vsr_client_id: u128,
     header: &RoutedRequestHeader,
@@ -1381,7 +1381,7 @@ async fn try_external_auth_login<B, MJ, S, SB>(
 
     let ext_request = build_ext_auth_request(sessions, transport_client_id, wire_request);
 
-    let decision = match callout_external_auth(&server_config.external_auth, ext_request).await {
+    let decision = match callout_external_auth(ext_auth, ext_request).await {
         Ok(decision) => decision,
         Err(error) => {
             warn!(transport_client_id, error = %error, "external auth callout failed");
@@ -1395,11 +1395,17 @@ async fn try_external_auth_login<B, MJ, S, SB>(
         }
     };
 
-    match decision {
+    let login_error = match decision {
         ExternalAuthDecision::Allow { username } => {
-            match resolve_external_username(shard, &username) {
+            let resolve = shard
+                .plane
+                .metadata()
+                .mux_stm
+                .users()
+                .read(|users| crate::external_auth::resolve_username(users, &username));
+            match resolve {
                 Ok(account) => {
-                    if let Err(error) = complete_login_register(
+                    match complete_login_register(
                         shard,
                         sessions,
                         origin,
@@ -1411,22 +1417,25 @@ async fn try_external_auth_login<B, MJ, S, SB>(
                     )
                     .await
                     {
-                        warn!(
-                            transport_client_id,
-                            error = %error,
-                            "ext-auth login/register failed"
-                        );
-                        surface_login_failure(shard, origin, header, &error).await;
+                        Ok(()) => return,
+                        Err(error) => {
+                            warn!(
+                                transport_client_id,
+                                error = %error,
+                                "ext-auth login/register failed"
+                            );
+                            error
+                        }
                     }
                 }
-                Err(error) => {
+                Err(iggy_error) => {
                     warn!(
                         transport_client_id,
                         ext_username = %username,
-                        error = %error,
+                        error = %iggy_error,
                         "ext-auth user resolution failed"
                     );
-                    surface_login_failure(shard, origin, header, &error).await;
+                    LoginRegisterError::InvalidCredentials
                 }
             }
         }
@@ -1436,38 +1445,10 @@ async fn try_external_auth_login<B, MJ, S, SB>(
                 reason = %reason,
                 "external auth denied login"
             );
-            surface_login_failure(
-                shard,
-                origin,
-                header,
-                &LoginRegisterError::InvalidCredentials,
-            )
-            .await;
+            LoginRegisterError::InvalidCredentials
         }
-    }
-}
-
-/// Resolve an externally authenticated username to a pre-provisioned Iggy
-/// user. Delegates to [`crate::external_auth::resolve_username`] and maps
-/// the error to the TCP login taxonomy.
-fn resolve_external_username<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    username: &str,
-) -> Result<(u32, IggyTimestamp), LoginRegisterError>
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    shard
-        .plane
-        .metadata()
-        .mux_stm
-        .users()
-        .read(|users| crate::external_auth::resolve_username(users, username))
-        .map_err(|_| LoginRegisterError::InvalidCredentials)
+    };
+    surface_login_failure(shard, origin, header, &login_error).await;
 }
 
 #[cfg(test)]
