@@ -20,6 +20,7 @@ mod consumer;
 mod identifier;
 mod messages;
 mod producer;
+mod reader;
 mod type_conversion;
 
 use client::{
@@ -30,8 +31,9 @@ use client::{
     validate_metadata_changes_query,
 };
 use consumer::Consumer;
-use messages::make_message;
+use messages::{BatchPositions, Checkpoint, Continuation, default_poll_options, make_message};
 use producer::Producer;
+use reader::PartitionReader;
 use std::sync::LazyLock;
 
 static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
@@ -77,9 +79,9 @@ mod ffi {
         derived_options: Vec<HeaderEntry>,
     }
 
-    /// Partition incarnation and consumer-group owner captured by a read or a
-    /// poll. Commit an offset under the context that delivered it, so a
-    /// delayed commit fails instead of landing on a recreated partition or
+    /// Partition incarnation and consumer-group owner. Checkpoints and
+    /// continuations keep the context of their batch privately, so a delayed
+    /// commit or read fails instead of landing on a recreated partition or
     /// under a newer owner.
     struct PartitionContext {
         incarnation: u64,
@@ -222,15 +224,86 @@ mod ffi {
         user_headers: Vec<HeaderEntry>,
     }
 
+    /// Who stores the offset of a poll.
+    #[repr(u8)]
+    enum ServerCommitPolicy {
+        /// The caller commits a checkpoint.
+        Disabled = 0,
+        /// The server stores the offset of the last message of a reply as
+        /// part of the reply.
+        OnRead = 1,
+    }
+
+    /// The limits of one poll of one partition. `default_poll_options`
+    /// returns the defaults.
+    struct PollOptions {
+        /// Most messages in one batch. Default 1000.
+        count: u32,
+        /// Zero answers at once. At most 600 s.
+        max_wait_micros: u64,
+        /// At least 1 and at most `count`. Default 1.
+        min_count: u32,
+        /// Default 1 MiB.
+        max_bytes: u32,
+        server_commit: ServerCommitPolicy,
+    }
+
+    /// Where a read starts. `kind` is offset, timestamp, first, last or
+    /// next, and `value` is the offset or the timestamp. To read on after a
+    /// batch, pass its `Continuation` instead.
+    struct PollingStrategy {
+        kind: String,
+        value: u64,
+    }
+
     struct PolledMessages {
         partition_id: u32,
         current_offset: u64,
         count: u32,
         messages: Vec<IggyMessagePolled>,
-        /// Context of the accepted poll. Pass it to `store_consumer_position`
-        /// with an offset from this batch, or to `poll_messages_with_context`
-        /// to continue from one.
-        context: PartitionContext,
+        /// The private part that `checkpoint`, `checkpoint_at` and
+        /// `continuation` read.
+        positions: Box<BatchPositions>,
+    }
+
+    /// The settings of a reader. A setting whose `has_` flag is false keeps
+    /// its default, so a zero-initialized value gives the default reader.
+    struct ReaderOptions {
+        /// The partitions of a standalone consumer, which requires them. Empty
+        /// for a consumer group, which reads the assignment of its member.
+        partitions: Vec<u32>,
+        /// The start of a partition without a position. Default next.
+        has_start: bool,
+        start: PollingStrategy,
+        /// The options of each request. Default: the poll defaults with a
+        /// one-second wait.
+        has_poll_options: bool,
+        poll_options: PollOptions,
+        /// The encoded bytes of the requests in flight and the queued
+        /// batches. Default 16 MiB.
+        has_prefetch_bytes: bool,
+        prefetch_bytes: u32,
+        /// The messages of the requests in flight and the queued batches.
+        /// Default: the larger of 16,000 and `count`.
+        has_prefetch_messages: bool,
+        prefetch_messages: u32,
+    }
+
+    /// Local to one `next` call of a reader. Read after a bridge exception.
+    #[derive(Default)]
+    struct ReadErrorInfo {
+        error: ErrorInfo,
+        /// False for an error of the whole reader.
+        has_partition_id: bool,
+        partition_id: u32,
+        /// For a message that does not decode: one continuation after it. The
+        /// reader reads the message again until a `seek` of its partition to
+        /// this continuation passes it. The messages before it arrive in a
+        /// batch first. Empty for every other error: cxx has no `Option`, and
+        /// a `Box` is never empty.
+        // A `rust::Vec` holds an opaque Rust type only behind a `Box`.
+        #[allow(clippy::vec_box)]
+        skip: Vec<Box<Continuation>>,
     }
 
     /// Commit confirmation for one partition written by `send_messages`.
@@ -725,8 +798,25 @@ mod ffi {
     }
 
     extern "Rust" {
+        /// The private part of a batch: the partition context and the reader
+        /// stamp of its checkpoints, and its continuation.
+        type BatchPositions;
+        /// The position after one delivered message, from `checkpoint` or
+        /// `checkpoint_at` of a batch. A commit stores its offset, which
+        /// covers every earlier message of its partition. It keeps the
+        /// context of its batch, so a delayed commit fails after a change of
+        /// the partition history, and a reader commits only the checkpoints
+        /// that it delivered.
+        type Checkpoint;
         type Client;
         type Consumer;
+        /// The position after a batch, from `continuation` of the batch or
+        /// `skip` of a read error. It keeps the partition and the context of
+        /// its batch: a read of another partition refuses it, and a read after
+        /// a change of the partition history fails with HistoryUnavailable
+        /// (87).
+        type Continuation;
+        type PartitionReader;
         type Producer;
 
         // Client functions
@@ -873,28 +963,31 @@ mod ffi {
             consumer_id: Identifier,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
-        /// Stores `offset` under `context`, normally the one returned with the
-        /// polled batch. Every retry keeps it, so a deleted or recreated
-        /// partition fails with HistoryUnavailable (87) and a lost
-        /// consumer-group owner with ConsumerGroupPartitionNotOwned (5009).
-        #[allow(clippy::too_many_arguments)]
+        /// Stores the offset of `checkpoint` under its context. Every retry
+        /// keeps the context, so a deleted or recreated partition fails with
+        /// HistoryUnavailable (87) and a lost consumer-group owner with
+        /// ConsumerGroupPartitionNotOwned (5009).
         fn store_consumer_position(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
-            partition_id: u32,
             consumer_kind: String,
             consumer_id: Identifier,
-            offset: u64,
-            context: PartitionContext,
+            checkpoint: &Checkpoint,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
 
-        /// The poll takes the context its cached route reports. After another
-        /// client deleted and recreated the partition, one call can fail with
-        /// HistoryUnavailable (87), or ConsumerGroupPartitionNotOwned (5009)
-        /// for a consumer group. The failed route is dropped and the next call
-        /// routes again.
+        fn default_poll_options() -> PollOptions;
+        /// Reads one partition once. A strategy takes the context that the
+        /// cached route reports. After another client deleted and recreated
+        /// the partition, one call can fail with HistoryUnavailable (87), or
+        /// ConsumerGroupPartitionNotOwned (5009) for a consumer group. The
+        /// failed route is dropped and the next call routes again.
+        ///
+        /// With `ServerCommitPolicy::OnRead`, a lost reply fails with
+        /// FetchProgressUncertain (14010) and blocks the partition on this
+        /// client: later polls of it fail with PartitionLaneBlocked (14009)
+        /// until `abandon_operation` of the operation that the error names.
         #[allow(clippy::too_many_arguments)]
         fn poll_messages(
             self: &Client,
@@ -903,29 +996,105 @@ mod ffi {
             partition_id: u32,
             consumer_kind: String,
             consumer_id: Identifier,
-            polling_strategy_kind: String,
-            polling_strategy_value: u64,
-            count: u32,
-            auto_commit: bool,
+            strategy: PollingStrategy,
+            options: PollOptions,
             error_info: &mut ErrorInfo,
         ) -> Result<PolledMessages>;
-        /// Polls under `context`, normally the one returned with the offset the
-        /// poll continues from. Every retry keeps it.
+        /// Reads on from the continuation of a batch of the same partition.
+        /// A continuation of another partition fails with InvalidCommand (3).
+        #[cxx_name = "poll_messages"]
         #[allow(clippy::too_many_arguments)]
-        fn poll_messages_with_context(
+        fn poll_messages_from(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             partition_id: u32,
             consumer_kind: String,
             consumer_id: Identifier,
-            polling_strategy_kind: String,
-            polling_strategy_value: u64,
-            count: u32,
-            auto_commit: bool,
-            context: PartitionContext,
+            continuation: &Continuation,
+            options: PollOptions,
             error_info: &mut ErrorInfo,
         ) -> Result<PolledMessages>;
+        /// The position after the last message, to commit the whole batch.
+        /// Fails for an empty batch.
+        fn checkpoint(self: &PolledMessages) -> Result<Box<Checkpoint>>;
+        /// The position after `messages[index]`, to commit a processed part
+        /// of the batch. Fails for an index out of range.
+        fn checkpoint_at(self: &PolledMessages, index: usize) -> Result<Box<Checkpoint>>;
+        /// The position after the batch, for the next read of its partition.
+        /// An empty batch keeps the start of its request.
+        fn continuation(self: &PolledMessages) -> Box<Continuation>;
+        fn partition_id(self: &Checkpoint) -> u32;
+        /// The offset of the delivered message, which a commit stores.
+        fn offset(self: &Checkpoint) -> u64;
+        /// offset after a batch with messages. After an empty batch, the kind
+        /// of its start: offset, timestamp, last or next, where first becomes
+        /// offset 0.
+        fn kind(self: &Continuation) -> String;
+        /// The offset or the timestamp of the next read, zero for last and
+        /// next.
+        fn value(self: &Continuation) -> u64;
+
+        /// Builds a reader of the partitions of a topic, with routing and
+        /// prefetch. A consumer group reads the assignment of its member: the
+        /// reader joins the group here, joins again after a session loss, and
+        /// leaves it in `close`.
+        fn reader(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            consumer_kind: String,
+            consumer_id: Identifier,
+            options: ReaderOptions,
+            error_info: &mut ErrorInfo,
+        ) -> Result<Box<PartitionReader>>;
+        /// Waits up to `timeout_micros` for the next batch of one partition.
+        /// An empty batch means that the time ran out. It belongs to no
+        /// partition, so take no checkpoint and no continuation from it. A
+        /// batch that arrives later stays in the reader. The reader stays
+        /// usable after an error and retries by itself.
+        fn next(
+            self: &mut PartitionReader,
+            timeout_micros: u64,
+            error_info: &mut ReadErrorInfo,
+        ) -> Result<PolledMessages>;
+        /// Stores the offset of a checkpoint that this reader delivered. A
+        /// checkpoint of an older generation of its partition, or at or below
+        /// the last commit, stores nothing. Refused with
+        /// `ServerCommitPolicy::OnRead`.
+        fn commit(
+            self: &PartitionReader,
+            checkpoint: &Checkpoint,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
+        /// Sets the next read position of a partition and drops its queued
+        /// batches. It stores no offset, and it resumes a stopped partition.
+        fn seek(
+            self: &mut PartitionReader,
+            partition_id: u32,
+            start: PollingStrategy,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
+        /// Moves a partition to the continuation of one of its batches, or
+        /// past a message that does not decode with the `skip` of its read
+        /// error. A continuation of another partition fails with
+        /// InvalidCommand (3).
+        #[cxx_name = "seek"]
+        fn seek_to(
+            self: &mut PartitionReader,
+            partition_id: u32,
+            continuation: &Continuation,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
+        /// The partitions of a standalone consumer, or the current assignment
+        /// of a group member.
+        fn partitions(self: &PartitionReader) -> Result<Vec<u32>>;
+        /// Stops the reader. With `ServerCommitPolicy::OnRead`, it moves the
+        /// offset of each partition back to its last delivered message. A
+        /// group reader then leaves its group. A second call does nothing,
+        /// and every other call on a closed reader fails. Dropping a reader
+        /// without `close` moves no offset back.
+        fn close(self: &mut PartitionReader, error_info: &mut ErrorInfo) -> Result<()>;
 
         fn make_message(payload: Vec<u8>, user_headers: Vec<HeaderEntry>) -> IggyMessageToSend;
 

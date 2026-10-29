@@ -24,14 +24,15 @@ use bytes::Bytes;
 use iggy::prelude::{
     CompressionAlgorithm as RustCompressionAlgorithm,
     ConsumerGroupDetails as RustConsumerGroupDetails, Durability as RustDurability, IdKind,
-    Identifier as RustIdentifier, IggyByteSize as RustIggyByteSize, IggyExpiry as RustIggyExpiry,
-    IggyMessage as RustIggyMessage, MaxTopicSize as RustMaxTopicSize, OptionKey,
-    OptionSpec as RustOptionSpec, Partition as RustPartition,
-    PartitionContext as RustPartitionContext, PartitionResizePolicy as RustPartitionResizePolicy,
-    PolledMessages as RustPolledMessages,
+    Identifier as RustIdentifier, IggyByteSize as RustIggyByteSize,
+    IggyDuration as RustIggyDuration, IggyExpiry as RustIggyExpiry, IggyMessage as RustIggyMessage,
+    MaxTopicSize as RustMaxTopicSize, OptionKey, OptionSpec as RustOptionSpec,
+    Partition as RustPartition, PartitionContext as RustPartitionContext,
+    PartitionResizePolicy as RustPartitionResizePolicy, PollOptions as RustPollOptions,
+    PolledMessages as RustPolledMessages, PollingStrategy as RustPollingStrategy,
     SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
-    SendMessagesResponse as RustSendMessagesResponse, Stream as RustStream,
-    StreamDetails as RustStreamDetails, StreamEncryptionKey,
+    SendMessagesResponse as RustSendMessagesResponse, ServerCommitPolicy as RustServerCommitPolicy,
+    Stream as RustStream, StreamDetails as RustStreamDetails, StreamEncryptionKey,
     StreamEncryptionSource as RustStreamEncryptionSource,
     StreamUpdateOptions as RustStreamUpdateOptions, Topic as RustTopic,
     TopicCreateOptions as RustTopicCreateOptions, TopicDetails as RustTopicDetails,
@@ -66,7 +67,7 @@ use iggy_common::{
     UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
 };
 
-use crate::ffi;
+use crate::{ffi, messages::BatchPositions};
 
 impl From<RustIdentifier> for ffi::Identifier {
     fn from(identifier: RustIdentifier) -> Self {
@@ -489,16 +490,6 @@ impl TryFrom<ffi::Permissions> for RustPermissions {
 impl From<RustPartitionContext> for ffi::PartitionContext {
     fn from(context: RustPartitionContext) -> Self {
         ffi::PartitionContext {
-            incarnation: context.incarnation,
-            owner_generation: context.owner_generation,
-            metadata_op: context.metadata_op,
-        }
-    }
-}
-
-impl From<ffi::PartitionContext> for RustPartitionContext {
-    fn from(context: ffi::PartitionContext) -> Self {
-        RustPartitionContext {
             incarnation: context.incarnation,
             owner_generation: context.owner_generation,
             metadata_op: context.metadata_op,
@@ -1163,6 +1154,7 @@ impl TryFrom<ffi::IggyMessageToSend> for RustIggyMessage {
 
 impl From<RustPolledMessages> for ffi::PolledMessages {
     fn from(messages: RustPolledMessages) -> Self {
+        let positions = Box::new(BatchPositions::from(&messages));
         ffi::PolledMessages {
             partition_id: messages.partition_id,
             current_offset: messages.current_offset,
@@ -1172,7 +1164,71 @@ impl From<RustPolledMessages> for ffi::PolledMessages {
                 .into_iter()
                 .map(ffi::IggyMessagePolled::from)
                 .collect(),
-            context: messages.context.into(),
+            positions,
+        }
+    }
+}
+
+impl From<RustServerCommitPolicy> for ffi::ServerCommitPolicy {
+    fn from(policy: RustServerCommitPolicy) -> Self {
+        match policy {
+            RustServerCommitPolicy::Disabled => ffi::ServerCommitPolicy::Disabled,
+            RustServerCommitPolicy::OnRead => ffi::ServerCommitPolicy::OnRead,
+        }
+    }
+}
+
+impl TryFrom<ffi::ServerCommitPolicy> for RustServerCommitPolicy {
+    type Error = String;
+
+    fn try_from(policy: ffi::ServerCommitPolicy) -> Result<Self, Self::Error> {
+        match policy {
+            ffi::ServerCommitPolicy::Disabled => Ok(RustServerCommitPolicy::Disabled),
+            ffi::ServerCommitPolicy::OnRead => Ok(RustServerCommitPolicy::OnRead),
+            _ => Err("invalid server commit policy".to_owned()),
+        }
+    }
+}
+
+impl From<RustPollOptions> for ffi::PollOptions {
+    fn from(options: RustPollOptions) -> Self {
+        ffi::PollOptions {
+            count: options.count,
+            max_wait_micros: options.max_wait.as_micros(),
+            min_count: options.min_count,
+            max_bytes: options.max_bytes,
+            server_commit: options.server_commit.into(),
+        }
+    }
+}
+
+impl TryFrom<ffi::PollOptions> for RustPollOptions {
+    type Error = String;
+
+    fn try_from(options: ffi::PollOptions) -> Result<Self, Self::Error> {
+        Ok(RustPollOptions {
+            count: options.count,
+            max_wait: RustIggyDuration::from(options.max_wait_micros),
+            min_count: options.min_count,
+            max_bytes: options.max_bytes,
+            server_commit: options.server_commit.try_into()?,
+        })
+    }
+}
+
+impl TryFrom<ffi::PollingStrategy> for RustPollingStrategy {
+    type Error = String;
+
+    fn try_from(strategy: ffi::PollingStrategy) -> Result<Self, Self::Error> {
+        match strategy.kind.as_str() {
+            "offset" => Ok(RustPollingStrategy::offset(strategy.value)),
+            "timestamp" => Ok(RustPollingStrategy::timestamp(IggyTimestamp::from(
+                strategy.value,
+            ))),
+            "first" => Ok(RustPollingStrategy::first()),
+            "last" => Ok(RustPollingStrategy::last()),
+            "next" => Ok(RustPollingStrategy::next()),
+            kind => Err(format!("invalid polling strategy: {kind}")),
         }
     }
 }
@@ -1778,7 +1834,11 @@ impl From<MetadataSessionClosed> for ffi::MetadataChangeBody {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy::prelude::{HeaderKey, HeaderValue, IggyTimestamp, OptionValue, ResourceOptions};
+    use iggy::prelude::{
+        Checkpoint as RustCheckpoint, HeaderKey, HeaderValue, IggyTimestamp, OptionValue,
+        ResourceOptions,
+    };
+    use iggy_common::ReaderStamp as RustReaderStamp;
 
     // Distinct values so a swapped field fails the comparison.
     const CONTEXT: RustPartitionContext = RustPartitionContext {
@@ -1786,6 +1846,20 @@ mod tests {
         owner_generation: 5,
         metadata_op: 7,
     };
+    const PARTITION: u32 = 2;
+    const STAMP: RustReaderStamp = RustReaderStamp {
+        reader: 11,
+        generation: 13,
+    };
+
+    fn message_at(offset: u64) -> RustIggyMessage {
+        let mut message = RustIggyMessage::builder()
+            .payload(Bytes::from_static(b"payload"))
+            .build()
+            .expect("message builds");
+        message.header.offset = offset;
+        message
+    }
 
     fn fields(context: &ffi::PartitionContext) -> (u64, u64, u64) {
         (
@@ -1997,7 +2071,6 @@ mod tests {
         let bridged = ffi::PartitionContext::from(CONTEXT);
 
         assert_eq!(fields(&bridged), (3, 5, 7));
-        assert_eq!(RustPartitionContext::from(bridged), CONTEXT);
     }
 
     #[test]
@@ -2017,17 +2090,119 @@ mod tests {
 
     #[test]
     fn should_keep_the_partition_context_of_polled_messages() {
-        let polled = RustPolledMessages {
-            context: CONTEXT,
-            partition_id: 1,
-            current_offset: 2,
-            count: 0,
-            messages: Vec::new(),
+        let polled = RustPolledMessages::new(CONTEXT, PARTITION, 8, 1, vec![message_at(7)]);
+
+        let bridged = ffi::PolledMessages::from(polled);
+
+        assert_eq!(
+            bridged.checkpoint().map(|checkpoint| checkpoint.0),
+            Ok(RustCheckpoint::new(PARTITION, 7, CONTEXT)),
+            "A batch of poll_messages belongs to no reader"
+        );
+        assert_eq!(bridged.continuation().0.context(), Some(CONTEXT));
+    }
+
+    #[test]
+    fn given_reader_batch_when_bridged_should_keep_its_checkpoints_and_continuation() {
+        let mut polled =
+            RustPolledMessages::new(CONTEXT, PARTITION, 9, 2, vec![message_at(7), message_at(8)]);
+        polled.set_stamp(STAMP);
+        let last = polled.checkpoint();
+        let first = polled.checkpoint_at(0);
+        let continuation = polled.continuation();
+        assert_eq!(last.and_then(|checkpoint| checkpoint.stamp()), Some(STAMP));
+
+        let bridged = ffi::PolledMessages::from(polled);
+
+        assert_eq!(
+            bridged.checkpoint().map(|checkpoint| checkpoint.0).ok(),
+            last
+        );
+        assert_eq!(
+            bridged.checkpoint_at(0).map(|checkpoint| checkpoint.0).ok(),
+            first
+        );
+        assert!(bridged.checkpoint_at(2).is_err());
+        assert_eq!(bridged.continuation().0, continuation);
+    }
+
+    #[test]
+    fn given_empty_batch_when_bridged_should_continue_from_the_start_of_its_request() {
+        for start in [
+            RustPollingStrategy::offset(4),
+            RustPollingStrategy::timestamp(IggyTimestamp::from(5)),
+            RustPollingStrategy::first(),
+            RustPollingStrategy::last(),
+            RustPollingStrategy::next(),
+        ] {
+            let mut polled = RustPolledMessages::new(CONTEXT, PARTITION, 0, 0, Vec::new());
+            polled.set_request_start(&start);
+            let continuation = polled.continuation();
+
+            let bridged = ffi::PolledMessages::from(polled);
+
+            assert!(bridged.checkpoint().is_err(), "{start}");
+            assert_eq!(bridged.continuation().0, continuation, "{start}");
+        }
+    }
+
+    #[test]
+    fn should_convert_each_kind_to_a_strategy_without_partition_or_context() {
+        for (kind, expected) in [
+            ("offset", RustPollingStrategy::offset(9)),
+            (
+                "timestamp",
+                RustPollingStrategy::timestamp(IggyTimestamp::from(9)),
+            ),
+            ("first", RustPollingStrategy::first()),
+            ("last", RustPollingStrategy::last()),
+            ("next", RustPollingStrategy::next()),
+        ] {
+            let strategy = RustPollingStrategy::try_from(ffi::PollingStrategy {
+                kind: kind.to_owned(),
+                value: 9,
+            });
+
+            assert_eq!(strategy, Ok(expected), "{kind}");
+        }
+    }
+
+    #[test]
+    fn should_reject_an_unknown_polling_strategy() {
+        let strategy = ffi::PollingStrategy {
+            kind: "latest".to_owned(),
+            value: 0,
         };
 
         assert_eq!(
-            fields(&ffi::PolledMessages::from(polled).context),
-            (3, 5, 7)
+            RustPollingStrategy::try_from(strategy).err().as_deref(),
+            Some("invalid polling strategy: latest")
+        );
+    }
+
+    #[test]
+    fn should_keep_every_poll_option_across_the_bridge() {
+        let options = RustPollOptions {
+            count: 3,
+            max_wait: RustIggyDuration::from(5),
+            min_count: 2,
+            max_bytes: 7,
+            server_commit: RustServerCommitPolicy::OnRead,
+        };
+
+        assert_eq!(
+            RustPollOptions::try_from(ffi::PollOptions::from(options)),
+            Ok(options)
+        );
+    }
+
+    #[test]
+    fn should_reject_an_unknown_server_commit_policy() {
+        assert_eq!(
+            RustServerCommitPolicy::try_from(ffi::ServerCommitPolicy { repr: 2 })
+                .err()
+                .as_deref(),
+            Some("invalid server commit policy")
         );
     }
 

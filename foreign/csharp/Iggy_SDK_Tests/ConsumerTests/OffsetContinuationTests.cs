@@ -24,7 +24,6 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Kinds;
-using Apache.Iggy.Tests.ContractsTests;
 using Apache.Iggy.Tests.VsrTests;
 using Apache.Iggy.Utils;
 using Apache.Iggy.Vsr;
@@ -136,8 +135,8 @@ public sealed class OffsetContinuationTests
 
         Assert.Equal([(PartitionId, 0ul, Original), (PartitionId, 1ul, Original), (PartitionId, 0ul, Reassigned),
             (PartitionId, 1ul, Reassigned)], received);
-        Assert.Equal([new Poll(PartitionId, MessagePolling.Offset, 2, Original),
-                new Poll(PartitionId, MessagePolling.Offset, 0, PartitionServer.Route(Reassigned))],
+        Assert.Equal([new Poll(PartitionId, MessagePolling.Offset, 2, Fence(Original)),
+                new Poll(PartitionId, MessagePolling.Offset, 0, Fence(PartitionServer.Route(Reassigned)))],
             server.Polls.Skip(1).Take(2));
         Assert.Equal(VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED,
             Assert.IsType<IggyInvalidStatusCodeException>(Assert.Single(errors)).StatusCode);
@@ -161,10 +160,18 @@ public sealed class OffsetContinuationTests
         Assert.Equal([(PartitionId, 0ul), (PartitionId, 1ul), (OtherPartitionId, 0ul), (OtherPartitionId, 1ul),
                 (PartitionId, 2ul), (PartitionId, 3ul), (OtherPartitionId, 2ul), (OtherPartitionId, 3ul)],
             received.Select(message => (message.PartitionId, message.Offset)));
-        Assert.Equal([new Poll(PartitionId, MessagePolling.Offset, 0, PartitionServer.Route(Original)),
-            new Poll(OtherPartitionId, MessagePolling.Offset, 0, PartitionServer.Route(Other)),
-            new Poll(PartitionId, MessagePolling.Offset, 2, Original),
-            new Poll(OtherPartitionId, MessagePolling.Offset, 2, Other)], server.Polls.Take(4));
+        Assert.Equal([new Poll(PartitionId, MessagePolling.Offset, 0, Fence(PartitionServer.Route(Original))),
+            new Poll(OtherPartitionId, MessagePolling.Offset, 0, Fence(PartitionServer.Route(Other))),
+            new Poll(PartitionId, MessagePolling.Offset, 2, Fence(Original)),
+            new Poll(OtherPartitionId, MessagePolling.Offset, 2, Fence(Other))], server.Polls.Take(4));
+        Assert.Equal([[PartitionId, OtherPartitionId], [PartitionId, OtherPartitionId]],
+            server.FetchedPartitions.Take(2));
+    }
+
+    /// <summary>A fetch fences each target with its incarnation and owner, not with a metadata operation.</summary>
+    private static PartitionContext Fence(PartitionContext context)
+    {
+        return context with { MetadataOp = 0 };
     }
 
     private static TcpMessageStream Client(PartitionServer server)
@@ -189,7 +196,6 @@ public sealed class OffsetContinuationTests
             PollingStrategy = strategy,
             BatchSize = 10,
             AutoCommitMode = AutoCommitMode.Disabled,
-            PollingIntervalMs = 0,
             Login = "iggy",
             Password = "iggy"
         }, NullLoggerFactory.Instance);
@@ -201,7 +207,7 @@ public sealed class OffsetContinuationTests
     /// <summary>
     ///     The first <paramref name="count" /> messages, or fewer when the consumer stalls until the timeout.
     /// </summary>
-    private static async Task<List<(uint PartitionId, ulong Offset, PartitionContext Context)>> ReceiveAsync(
+    internal static async Task<List<(uint PartitionId, ulong Offset, PartitionContext Context)>> ReceiveAsync(
         IggyConsumer consumer, bool rented, int count)
     {
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
@@ -252,25 +258,12 @@ public sealed class OffsetContinuationTests
     ///     live context. It refuses a poll stamped with another incarnation with status 87 and one stamped with
     ///     another owner with status 5009. A route reports the live context at an older metadata operation, so a poll
     ///     stamped with the context of its batch tells itself apart from one that took the context of its route.
+    ///     A fetch serves each target as a poll of it, and a refused target fails the whole fetch, as the server does
+    ///     before its first read.
     /// </summary>
     private sealed class PartitionServer : IDisposable
     {
         private const ulong RouteMetadataOp = 50;
-
-        /// <summary>
-        ///     The poll body ends with the partition id, the strategy kind and value, the count and the auto commit
-        ///     flag.
-        /// </summary>
-        private const int PartitionFromEnd = 18;
-
-        private const int KindFromEnd = 14;
-        private const int ValueFromEnd = 13;
-
-        /// <summary>The wire numbers the polling kinds from 1, in the order of <see cref="MessagePolling" />.</summary>
-        private const int FirstWireKind = 1;
-
-        private const int PollContextPosition = 16;
-        private const int BatchBaseOffsetPosition = PollContextPosition + PartitionContext.ENCODED_SIZE + sizeof(ulong);
 
         /// <summary>How many messages the golden poll body holds.</summary>
         private const ulong MessagesPerBatch = 2;
@@ -289,6 +282,9 @@ public sealed class OffsetContinuationTests
         internal ushort Port => _node.Port;
 
         internal ConcurrentQueue<Poll> Polls { get; } = new();
+
+        /// <summary>The partitions of each fetch, in target order.</summary>
+        internal ConcurrentQueue<uint[]> FetchedPartitions { get; } = new();
 
         public void Dispose()
         {
@@ -319,7 +315,8 @@ public sealed class OffsetContinuationTests
                     0, (uint)_live.Count),
                 CommandCodes.SYNC_CONSUMER_GROUP_CODE => Reply(OPERATION_NON_REPLICATED,
                     AssignmentBody(1, [.. _live.Keys.Order()])),
-                CommandCodes.POLL_MESSAGES_CODE => Serve(request),
+                CommandCodes.POLL_MESSAGES_CODE or CommandCodes.POLL_MESSAGES_DEFERRED_CODE => Serve(request),
+                CommandCodes.FETCH_MESSAGES_CODE => ServeFetch(request),
                 _ => request.Operation >= (byte)VsrOperation.CreateStream
                     ? Reply(request.Operation, new byte[4])
                     : Answer(request)
@@ -328,21 +325,59 @@ public sealed class OffsetContinuationTests
 
         private byte[] Serve(MockRequest request)
         {
-            var poll = new Poll(Partition(request), (MessagePolling)(request.Body[^KindFromEnd] - FirstWireKind),
-                BinaryPrimitives.ReadUInt64LittleEndian(request.Body.AsSpan(request.Body.Length - ValueFromEnd)),
-                request.Context);
+            var (partitionId, kind, value, _) = ReadPoll(request);
+            var poll = new Poll(partitionId, kind, value, request.Context);
             Polls.Enqueue(poll);
+            if (Refusal(poll) is { } status)
+            {
+                return Reply(request.Operation, [], status);
+            }
+
+            var (first, live) = Read(poll);
+            return Reply(request.Operation, GoldenPollBody(poll.PartitionId, first, live));
+        }
+
+        private byte[] ServeFetch(MockRequest request)
+        {
+            var polls = ReadFetch(request).Targets.Select(target => new Poll(target.PartitionId, target.Kind,
+                target.Value, new PartitionContext(target.Incarnation, target.OwnerGeneration, 0))).ToList();
+            FetchedPartitions.Enqueue([.. polls.Select(poll => poll.PartitionId)]);
+            foreach (var poll in polls)
+            {
+                Polls.Enqueue(poll);
+            }
+
+            if (polls.Select(Refusal).FirstOrDefault(status => status is not null) is { } refused)
+            {
+                return Reply(request.Operation, [], refused);
+            }
+
+            return Reply(request.Operation, FetchBody([
+                .. polls.Select(poll =>
+                {
+                    var (first, live) = Read(poll);
+                    return GoldenSection(poll.PartitionId, first, live);
+                })
+            ]));
+        }
+
+        private uint? Refusal(Poll poll)
+        {
             var live = _live[poll.PartitionId];
             if (poll.Context.Incarnation != live.Incarnation)
             {
-                return Reply(request.Operation, [], VsrError.HISTORY_UNAVAILABLE);
+                return VsrError.HISTORY_UNAVAILABLE;
             }
 
-            if (poll.Context.OwnerGeneration != 0 && poll.Context.OwnerGeneration != live.OwnerGeneration)
-            {
-                return Reply(request.Operation, [], VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED);
-            }
+            return poll.Context.OwnerGeneration != 0 && poll.Context.OwnerGeneration != live.OwnerGeneration
+                ? VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED
+                : null;
+        }
 
+        /// <summary>The first offset the poll reads and the context it reads under, then moves the partition on.</summary>
+        private (ulong First, PartitionContext Live) Read(Poll poll)
+        {
+            var live = _live[poll.PartitionId];
             var first = poll.Kind switch
             {
                 MessagePolling.Offset => poll.Value,
@@ -355,27 +390,7 @@ public sealed class OffsetContinuationTests
                 _live[poll.PartitionId] = replacement;
             }
 
-            return Reply(request.Operation, Batch(poll.PartitionId, first, live));
-        }
-
-        private static uint Partition(MockRequest request)
-        {
-            return BinaryPrimitives.ReadUInt32LittleEndian(request.Body.AsSpan(request.Body.Length - PartitionFromEnd));
-        }
-
-        /// <summary>The golden poll body moved to another partition, first offset and context.</summary>
-        private static byte[] Batch(uint partitionId, ulong firstOffset, PartitionContext context)
-        {
-            var body = Convert.FromHexString(MessageBatchGoldenVectorTests.POLL_BODY);
-            BinaryPrimitives.WriteUInt32LittleEndian(body, partitionId);
-            BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(PollContextPosition), context.Incarnation);
-            BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(PollContextPosition + sizeof(ulong)),
-                context.OwnerGeneration);
-            BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(PollContextPosition + 2 * sizeof(ulong)),
-                context.MetadataOp);
-            BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(BatchBaseOffsetPosition), firstOffset);
-
-            return body;
+            return (first, live);
         }
     }
 }

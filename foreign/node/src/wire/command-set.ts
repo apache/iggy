@@ -51,6 +51,7 @@ import { deleteOffset } from './offset/delete-offset.command.js';
 
 import { sendMessages } from './message/send-messages.command.js';
 import { pollMessages } from './message/poll-messages.command.js';
+import { fetchMessages, readinessGroups } from './message/fetch-messages.command.js';
 
 import { createStream } from './stream/create-stream.command.js';
 import { updateStream } from './stream/update-stream.command.js';
@@ -179,6 +180,8 @@ type OffsetAPI = ReturnType<typeof offsetAPI>;
 
 const messageAPI = (c: ClientProvider) => ({
   poll: pollMessages(c),
+  fetch: fetchMessages(c),
+  readinessGroups: readinessGroups(c),
   send: sendMessages(c)
 });
 
@@ -254,7 +257,9 @@ export abstract class CommandAPI extends AbstractAPI {
 
   /**
    * Sends a command code with a payload and returns the raw response payload.
-   * Session-control codes are rejected with an invalid-command error.
+   * Session-control codes and the cancellation of a deferred request (108),
+   * which only the client sends for its own requests, are rejected with an
+   * invalid-command error.
    *
    * @param code - Command code to send
    * @param payload - Raw command payload
@@ -271,8 +276,8 @@ export abstract class CommandAPI extends AbstractAPI {
    * Sends a command code with a payload to the replica with the given id, as
    * the cluster metadata names it, and returns the raw response payload. Every
    * node answers non-replicated commands such as GetStats from its own state.
-   * Replicated commands, polls, consumer-offset reads and session-control codes
-   * are rejected with an invalid-command error, and a replica id the cluster
+   * Replicated commands, polls, fetches, consumer-offset reads
+   * and session-control codes are rejected with an invalid-command error, and a replica id the cluster
    * metadata does not name with an invalid-identifier error. A `NotPrimary`
    * refusal is returned and not retried on another replica.
    *
@@ -294,7 +299,8 @@ export abstract class CommandAPI extends AbstractAPI {
     payload: Buffer,
     options?: SendCommandOptions
   ): Promise<Buffer> {
-    if (SESSION_CONTROL_CODES.has(code))
+    // Only a link cancels a deferred request, the one that it sent.
+    if (SESSION_CONTROL_CODES.has(code) || code === COMMAND_CODE.CancelDeferredRequest)
       throw responseError(code, INVALID_COMMAND_ERROR_CODE);
 
     const snapshot = Buffer.from(payload);

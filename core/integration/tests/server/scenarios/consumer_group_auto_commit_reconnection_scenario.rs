@@ -139,13 +139,15 @@ async fn create_auto_commit_consumer(client: &IggyClient) -> IggyConsumer {
     let mut consumer = client
         .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
-        .batch_length(10)
+        .poll_options(PollOptions {
+            count: 10,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .polling_strategy(PollingStrategy::next())
-        .auto_join_consumer_group()
-        .auto_commit(AutoCommit::IntervalOrAfter(
-            NonZeroIggyDuration::from_str("1s").unwrap(),
-            AutoCommitAfter::ConsumingEachMessage,
-        ))
+        .client_commit(ClientCommitPolicy {
+            interval: Some(NonZeroIggyDuration::from_str("1s").unwrap()),
+            on: Some(CommitEvent::EachMessage),
+        })
         .build();
 
     consumer.init().await.unwrap();

@@ -122,23 +122,21 @@ mod tests {
     use iggy_binary_protocol::codes::{
         BIND_SESSION_CODE, CHANGE_PASSWORD_CODE, GET_CLUSTER_METADATA_CODE, GET_STREAMS_CODE,
         GET_TOPIC_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGOUT_USER_CODE,
-        PING_CODE, POLL_MESSAGES_CODE, SEND_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
-        UPDATE_RESOURCE_CODE,
+        PING_CODE, POLL_MESSAGES_DEFERRED_CODE, SEND_MESSAGES_CODE, UPDATE_RESOURCE_CODE,
     };
     use iggy_binary_protocol::consensus::EvictionReason;
     use iggy_binary_protocol::requests::users::{
         ChangePasswordRequest, LoginRegisterRequest, LoginRegisterWithPatRequest,
     };
-    use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
     use iggy_binary_protocol::responses::messages::{
         PartitionRouteResponse, PollMessagesResponseHeader,
     };
     use iggy_binary_protocol::{WireDecode, WireEncode, WireIdentifier};
     use iggy_common::{
         BinaryTransport, Client, ClientState, Consumer, Credentials, Identifier, IggyDuration,
-        IggyMessage, MessageClient, Partitioning, PersonalAccessTokenClient, PollingStrategy,
-        SystemClient, TcpClientReconnectionConfig, TopicClient, TopicUpdateOptions, UserClient,
-        UserUpdateOptions, with_binary_deadline,
+        IggyMessage, MessageClient, Partitioning, PersonalAccessTokenClient, PollOptions,
+        PollingStrategy, ServerCommitPolicy, SystemClient, TcpClientReconnectionConfig,
+        TopicClient, TopicUpdateOptions, UserClient, UserUpdateOptions, with_binary_deadline,
     };
     use secrecy::{ExposeSecret, SecretString};
     use std::time::Duration;
@@ -603,9 +601,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_a_sent_progress_poll_when_signing_in_should_keep_its_lineage_uncertain() {
-        for (auto_commit, strategy) in [
-            (true, PollingStrategy::offset(0)),
-            (false, PollingStrategy::next()),
+        for (server_commit, strategy) in [
+            (ServerCommitPolicy::OnRead, PollingStrategy::offset(0)),
+            (ServerCommitPolicy::Disabled, PollingStrategy::next()),
         ] {
             for answer in [
                 Answer::Body(
@@ -629,37 +627,46 @@ mod tests {
                     partitions_count: 1,
                     primary_replica: 0,
                 });
-                cluster.script(&endpoint(0), POLL_MESSAGES_CODE, [answer]);
-                cluster.hold(POLL_MESSAGES_CODE);
+                cluster.script(&endpoint(0), POLL_MESSAGES_DEFERRED_CODE, [answer]);
+                cluster.hold(POLL_MESSAGES_DEFERRED_CODE);
                 let pending = tokio::spawn({
                     let client = Arc::clone(&client);
                     async move {
                         let id = Identifier::numeric(1).unwrap();
+                        let options = PollOptions {
+                            count: 1,
+                            server_commit,
+                            ..PollOptions::default()
+                        };
                         client
                             .poll_messages(
                                 &id,
                                 &id,
-                                Some(0),
+                                0,
                                 &Consumer::new(id.clone()),
                                 &strategy,
-                                1,
-                                auto_commit,
+                                options,
                             )
                             .await
                     }
                 });
                 eventually("the progress poll arrives", || {
-                    cluster.count(POLL_MESSAGES_CODE) == 1
+                    cluster.count(POLL_MESSAGES_DEFERRED_CODE) == 1
                 })
                 .await;
                 client.login_user(USERNAME, PASSWORD).await.unwrap();
-                cluster.release(POLL_MESSAGES_CODE);
+                cluster.release(POLL_MESSAGES_DEFERRED_CODE);
 
-                assert_eq!(
-                    pending.await.unwrap().unwrap_err(),
-                    IggyError::TransientNotCommitted
-                );
-                assert_eq!(cluster.count(POLL_MESSAGES_CODE), 1);
+                let error = pending.await.unwrap().unwrap_err();
+                if server_commit == ServerCommitPolicy::OnRead {
+                    let operation = cluster.received(POLL_MESSAGES_DEFERRED_CODE)[0]
+                        .header
+                        .request;
+                    assert_eq!(error, IggyError::FetchProgressUncertain(operation));
+                } else {
+                    assert_eq!(error, IggyError::TransientNotCommitted);
+                }
+                assert_eq!(cluster.count(POLL_MESSAGES_DEFERRED_CODE), 1);
             }
         }
     }
@@ -709,144 +716,6 @@ mod tests {
             );
             assert_eq!(cluster.count(SEND_MESSAGES_CODE), 0);
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn given_a_group_sync_when_signing_in_should_end_the_poll_lineage() {
-        let cluster = FakeCluster::new(1);
-        let client = Arc::new(signed_in_client(&cluster).await);
-        *cluster.route.lock().unwrap() = Some(PartitionRouteResponse {
-            incarnation: 7,
-            metadata_op: 11,
-            view: 0,
-            partitions_count: 1,
-            primary_replica: 0,
-        });
-        cluster.script(
-            &endpoint(0),
-            SYNC_CONSUMER_GROUP_CODE,
-            [Answer::Body(
-                SyncConsumerGroupResponse {
-                    generation: 1,
-                    partitions: vec![0],
-                }
-                .to_bytes()
-                .to_vec(),
-            )],
-        );
-        cluster.script(
-            &endpoint(0),
-            POLL_MESSAGES_CODE,
-            [Answer::Body(
-                PollMessagesResponseHeader {
-                    partition_id: 0,
-                    current_offset: 0,
-                    messages_count: 0,
-                    context: Default::default(),
-                }
-                .to_bytes()
-                .to_vec(),
-            )],
-        );
-        cluster.hold(SYNC_CONSUMER_GROUP_CODE);
-        let pending = tokio::spawn({
-            let client = Arc::clone(&client);
-            async move {
-                let id = Identifier::numeric(1).unwrap();
-                client
-                    .poll_messages(
-                        &id,
-                        &id,
-                        None,
-                        &Consumer::group(id.clone()),
-                        &PollingStrategy::offset(0),
-                        1,
-                        false,
-                    )
-                    .await
-            }
-        });
-        eventually("the group sync arrives", || {
-            cluster.count(SYNC_CONSUMER_GROUP_CODE) == 1
-        })
-        .await;
-        client.login_user(USERNAME, PASSWORD).await.unwrap();
-        cluster.release(SYNC_CONSUMER_GROUP_CODE);
-
-        assert_eq!(
-            pending.await.unwrap().unwrap_err(),
-            IggyError::Unauthenticated
-        );
-        assert_eq!(cluster.count(POLL_MESSAGES_CODE), 0);
-        assert!(!client.consumer_group_state().has_assignment("1|1|1"));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn given_a_group_sync_when_the_session_recovers_should_preserve_the_poll_lineage() {
-        let cluster = FakeCluster::new(1);
-        let client = signed_in_client(&cluster).await;
-        *cluster.route.lock().unwrap() = Some(PartitionRouteResponse {
-            incarnation: 7,
-            metadata_op: 11,
-            view: 0,
-            partitions_count: 1,
-            primary_replica: 0,
-        });
-        cluster.script(
-            &endpoint(0),
-            SYNC_CONSUMER_GROUP_CODE,
-            [
-                Answer::Refuse(IggyError::Unauthenticated),
-                Answer::Body(
-                    SyncConsumerGroupResponse {
-                        generation: 1,
-                        partitions: vec![0],
-                    }
-                    .to_bytes()
-                    .to_vec(),
-                ),
-                Answer::Body(
-                    SyncConsumerGroupResponse {
-                        generation: 1,
-                        partitions: vec![0],
-                    }
-                    .to_bytes()
-                    .to_vec(),
-                ),
-            ],
-        );
-        cluster.script(
-            &endpoint(0),
-            POLL_MESSAGES_CODE,
-            [Answer::Body(
-                PollMessagesResponseHeader {
-                    partition_id: 0,
-                    current_offset: 0,
-                    messages_count: 0,
-                    context: Default::default(),
-                }
-                .to_bytes()
-                .to_vec(),
-            )],
-        );
-        *cluster.session.lock().unwrap() = None;
-        let id = Identifier::numeric(1).unwrap();
-        client
-            .poll_messages(
-                &id,
-                &id,
-                None,
-                &Consumer::group(id.clone()),
-                &PollingStrategy::offset(0),
-                1,
-                false,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 2);
-        assert_eq!(cluster.count(SYNC_CONSUMER_GROUP_CODE), 3);
-        assert_eq!(cluster.count(POLL_MESSAGES_CODE), 1);
     }
 
     #[tokio::test(start_paused = true)]

@@ -18,8 +18,10 @@
 using System.Buffers;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
+using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Kinds;
 using Apache.Iggy.Utils;
 using Apache.Iggy.Vsr;
 
@@ -233,13 +235,15 @@ public sealed class MutationLaneTests
         lanes.Complete(await third.WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken));
     }
 
+    /// <summary>A send, retained or not, leaves the progress lane of its partition free.</summary>
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public async Task given_full_mutation_capacity_when_progress_enters_another_lane_should_ignore_mutation_budgets(bool retained)
     {
         var lanes = new MutationLanes(Session(), Configuration(1, VsrHeader.HEADER_SIZE));
-        var mutation = await EnterAsync(lanes, new MutationLane(17, 3));
+        var lane = new MutationLane(17, 3);
+        var mutation = await EnterAsync(lanes, lane);
         if (retained)
         {
             lanes.Retain(mutation);
@@ -247,8 +251,7 @@ public sealed class MutationLaneTests
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         try
         {
-            var progress = await lanes.EnterAsync(new MutationLane(17, 4), CommandCodes.POLL_MESSAGES_CODE,
-                ReadOnlyMemory<byte>.Empty, new PartitionContext(17, 0, 1), false, FirstGeneration, cancellation.Token)
+            var progress = await ProgressAsync(lanes, lane, cancellation.Token)
                 .WaitAsync(TimeSpan.FromSeconds(2), cancellation.Token);
             lanes.Complete(progress);
             Assert.True(lanes.Owns(mutation));
@@ -268,9 +271,9 @@ public sealed class MutationLaneTests
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         try
         {
-            var progress = await lanes.EnterAsync(lane, CommandCodes.POLL_MESSAGES_CODE, new byte[1],
-                new PartitionContext(17, 0, 1), false, FirstGeneration, cancellation.Token);
-            var follower = EnterAsync(lanes, lane, cancellation.Token);
+            var progress = await lanes.EnterAsync(lane with { Progress = true }, CommandCodes.POLL_MESSAGES_CODE,
+                new byte[1], new PartitionContext(17, 0, 1), false, FirstGeneration, cancellation.Token);
+            var follower = ProgressAsync(lanes, lane, cancellation.Token);
             var independent = await EnterAsync(lanes, new MutationLane(17, 4), cancellation.Token)
                 .WaitAsync(TimeSpan.FromSeconds(2), cancellation.Token);
             lanes.Complete(independent);
@@ -286,20 +289,124 @@ public sealed class MutationLaneTests
     }
 
     [Fact]
-    public async Task given_a_retained_operation_when_progress_enters_its_lane_should_report_the_blocker_without_allocating_an_id()
+    public async Task given_a_retained_offset_store_when_progress_enters_should_report_the_blocker_without_allocating_an_id()
     {
         var session = Session();
         var lanes = new MutationLanes(session, Configuration());
         var lane = new MutationLane(17, 3);
-        var mutation = await EnterAsync(lanes, lane);
+        var mutation = await EnterAsync(lanes, lane, code: CommandCodes.STORE_CONSUMER_OFFSET_CODE);
         lanes.Retain(mutation);
         var counter = session.RequestCounter;
-        var blocked = await Assert.ThrowsAsync<VsrLaneBlockedException>(() => lanes.EnterAsync(lane,
-            CommandCodes.POLL_MESSAGES_CODE, ReadOnlyMemory<byte>.Empty, new PartitionContext(17, 0, 1),
-            false, session.Generation, TestContext.Current.CancellationToken));
+        var blocked = await Assert.ThrowsAsync<VsrLaneBlockedException>(() => ProgressAsync(lanes, lane));
         Assert.Equal(mutation.Identity.RequestId, blocked.OperationId);
         Assert.Equal(counter, session.RequestCounter);
         lanes.Complete(mutation);
+    }
+
+    [Fact]
+    public async Task given_a_retained_target_when_a_fetch_enters_should_name_the_partition_and_release_earlier_lanes()
+    {
+        var session = Session();
+        var lanes = new MutationLanes(session, Configuration());
+        var blockedLane = new MutationLane(17, 3);
+        var token = TestContext.Current.CancellationToken;
+        try
+        {
+            var mutation = await EnterAsync(lanes, blockedLane, code: CommandCodes.STORE_CONSUMER_OFFSET_CODE);
+            lanes.Retain(mutation);
+            var counter = session.RequestCounter;
+            var ordinary = await Assert.ThrowsAsync<VsrLaneBlockedException>(() => ProgressAsync(lanes, blockedLane));
+            Assert.Null(ordinary.PartitionId);
+            Assert.Equal(mutation.Identity.RequestId, ordinary.OperationId);
+
+            var blocked = await Assert.ThrowsAsync<VsrLaneBlockedException>(() => FetchAsync(lanes, [5, 1, 3], token));
+            Assert.Equal(3U, blocked.PartitionId);
+            Assert.Equal(mutation.Identity.RequestId, blocked.OperationId);
+            Assert.Equal(counter, session.RequestCounter);
+            lanes.Complete(await FetchAsync(lanes, [1], token).WaitAsync(WaitLimit, token));
+
+            lanes.Abandon(blocked.OperationId);
+            lanes.Complete(await FetchAsync(lanes, [5, 1, 3], token).WaitAsync(WaitLimit, token));
+            Assert.Equal(0, lanes.OperationCount);
+        }
+        finally
+        {
+            lanes.Reset();
+        }
+    }
+
+    /// <summary>
+    ///     An offset store queues for the mutation lane only once the progress lane is its turn, so it never holds
+    ///     back a send while it waits for a poll, and a poll that queues after it waits for it.
+    /// </summary>
+    [Fact]
+    public async Task given_a_progress_lane_in_use_when_a_store_and_a_send_enter_its_partition_should_admit_only_the_send()
+    {
+        var lanes = new MutationLanes(Session(), Configuration());
+        var lane = new MutationLane(17, 3);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        try
+        {
+            var progress = await ProgressAsync(lanes, lane, cancellation.Token);
+            var store = EnterAsync(lanes, lane, cancellation.Token, code: CommandCodes.STORE_CONSUMER_OFFSET_CODE);
+            var send = await EnterAsync(lanes, lane, cancellation.Token).WaitAsync(WaitLimit, cancellation.Token);
+            var poll = ProgressAsync(lanes, lane, cancellation.Token);
+            lanes.Complete(progress);
+            await Task.Delay(SettleTime, cancellation.Token);
+            Assert.False(store.IsCompleted);
+            Assert.False(poll.IsCompleted);
+
+            lanes.Complete(send);
+            var stored = await store.WaitAsync(WaitLimit, cancellation.Token);
+            await Task.Delay(SettleTime, cancellation.Token);
+            Assert.False(poll.IsCompleted);
+            lanes.Complete(stored);
+            lanes.Complete(await poll.WaitAsync(WaitLimit, cancellation.Token));
+        }
+        finally
+        {
+            await cancellation.CancelAsync();
+            lanes.Reset();
+        }
+    }
+
+    /// <summary>
+    ///     A fetch that moves a consumer holds the progress lanes of all its partitions, and takes them in ascending
+    ///     order. A fetch that waits for one of them holds back no lane after it, so two fetches that share partitions
+    ///     never wait for each other in a cycle.
+    /// </summary>
+    [Fact]
+    public async Task given_a_fetch_holding_progress_lanes_when_a_store_a_poll_and_a_fetch_enter_should_wait_only_behind_it()
+    {
+        var lanes = new MutationLanes(Session(), Configuration());
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        try
+        {
+            var fetch = await FetchAsync(lanes, [3, 5], cancellation.Token);
+            var store = EnterAsync(lanes, new MutationLane(17, 5), cancellation.Token,
+                code: CommandCodes.STORE_CONSUMER_OFFSET_CODE);
+            var send = await EnterAsync(lanes, new MutationLane(17, 5), cancellation.Token)
+                .WaitAsync(WaitLimit, cancellation.Token);
+            var overlapping = FetchAsync(lanes, [3, 4], cancellation.Token);
+            var poll = await ProgressAsync(lanes, new MutationLane(17, 4), cancellation.Token)
+                .WaitAsync(WaitLimit, cancellation.Token);
+            await Task.Delay(SettleTime, cancellation.Token);
+            Assert.False(store.IsCompleted);
+            Assert.False(overlapping.IsCompleted);
+
+            lanes.Complete(send);
+            lanes.Complete(fetch);
+            lanes.Complete(await store.WaitAsync(WaitLimit, cancellation.Token));
+            await Task.Delay(SettleTime, cancellation.Token);
+            Assert.False(overlapping.IsCompleted);
+            lanes.Complete(poll);
+            lanes.Complete(await overlapping.WaitAsync(WaitLimit, cancellation.Token));
+        }
+        finally
+        {
+            await cancellation.CancelAsync();
+            lanes.Reset();
+        }
     }
 
     [Fact]
@@ -645,9 +752,28 @@ public sealed class MutationLaneTests
     }
 
     private static Task<ClientOperation> EnterAsync(MutationLanes lanes, MutationLane lane,
-        CancellationToken? token = null, ulong generation = FirstGeneration, ReadOnlyMemory<byte> body = default) =>
-        lanes.EnterAsync(lane, CommandCodes.SEND_MESSAGES_CODE, body, new PartitionContext(lane.Incarnation, 0, 1), true,
-            generation, token ?? TestContext.Current.CancellationToken);
+        CancellationToken? token = null, ulong generation = FirstGeneration, ReadOnlyMemory<byte> body = default,
+        int code = CommandCodes.SEND_MESSAGES_CODE) =>
+        lanes.EnterAsync(lane, code, body, new PartitionContext(lane.Incarnation, 0, 1), true, generation,
+            token ?? TestContext.Current.CancellationToken);
+
+    /// <summary>Enters the progress lane of <paramref name="lane" /> the way a poll that moves a consumer does.</summary>
+    private static Task<ClientOperation> ProgressAsync(MutationLanes lanes, MutationLane lane,
+        CancellationToken? token = null) =>
+        lanes.EnterAsync(lane with { Progress = true }, CommandCodes.POLL_MESSAGES_CODE, ReadOnlyMemory<byte>.Empty,
+            new PartitionContext(lane.Incarnation, 0, 1), false, FirstGeneration,
+            token ?? TestContext.Current.CancellationToken);
+
+    /// <summary>
+    ///     Enters the progress lanes of <paramref name="partitions" /> in ascending order, the way a fetch that moves a
+    ///     consumer does. A fetch sends header context zero.
+    /// </summary>
+    private static Task<ClientOperation> FetchAsync(MutationLanes lanes, uint[] partitions, CancellationToken token) =>
+        lanes.EnterAsync([.. partitions.Order().Select(partition => new MutationLane(17, partition, Progress: true))],
+            CommandCodes.FETCH_MESSAGES_CODE, TcpContracts.FetchMessages(Consumer.New(1), Identifier.Numeric(1),
+                Identifier.Numeric(1), new DeferredPollOptions(), 10, true, DeferredPollOptions.MIN_MAX_BYTES,
+                [.. partitions.Select(partition => (partition, PollingStrategy.Offset(0)
+                    .WithContext(new PartitionContext(17, 0, 1))))]), default, false, FirstGeneration, token);
 
     private static ConsensusSession Session() => new(7, 42, new byte[LoginRegister.BIND_SECRET_BYTES]);
 

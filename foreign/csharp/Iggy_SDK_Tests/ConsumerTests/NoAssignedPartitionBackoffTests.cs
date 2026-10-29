@@ -30,7 +30,7 @@ namespace Apache.Iggy.Tests.ConsumerTests;
 
 /// <summary>
 ///     A group poll that reports <see cref="PolledMessages.NoAssignedPartition" /> must not be re-issued at once:
-///     with <c>PollingIntervalMs</c> at zero that would spin against the coordinator until a partition arrives.
+///     such a poll does not wait on the server, so that would spin against the coordinator until a partition arrives.
 /// </summary>
 public sealed class NoAssignedPartitionBackoffTests
 {
@@ -44,7 +44,7 @@ public sealed class NoAssignedPartitionBackoffTests
         var mock = new Mock<IIggyClient>(MockBehavior.Loose);
         mock.Setup(c => c.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(), It.IsAny<uint?>(),
                 It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(),
-                It.IsAny<CancellationToken>()))
+                It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(() =>
             {
                 polls.Add(stopwatch.ElapsedMilliseconds);
@@ -73,7 +73,7 @@ public sealed class NoAssignedPartitionBackoffTests
         var mock = new Mock<IIggyClient>(MockBehavior.Loose);
         mock.Setup(c => c.PollMessagesRentedAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
                 It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(),
-                It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<bool>(), It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(() =>
             {
                 polls.Add(stopwatch.ElapsedMilliseconds);
@@ -102,7 +102,7 @@ public sealed class NoAssignedPartitionBackoffTests
         var mock = new Mock<IIggyClient>(MockBehavior.Loose);
         mock.Setup(c => c.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(), It.IsAny<uint?>(),
                 It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(),
-                It.IsAny<CancellationToken>()))
+                It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(NoAssignment);
         var consumer = new IggyConsumer(mock.Object, BuildConfig(), NullLoggerFactory.Instance);
         consumer.SubscribeToErrorEvents(_ =>
@@ -133,7 +133,6 @@ public sealed class NoAssignedPartitionBackoffTests
             PartitionId = null,
             AutoCommitMode = AutoCommitMode.Disabled,
             AutoCommit = false,
-            PollingIntervalMs = 0
         };
     }
 

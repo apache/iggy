@@ -16,6 +16,7 @@
 // under the License.
 
 using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Kinds;
 using Microsoft.Extensions.Logging;
@@ -146,9 +147,21 @@ public class IggyConsumerConfig
     public bool JoinConsumerGroup { get; set; } = true;
 
     /// <summary>
-    ///     The interval in milliseconds between message polls. Default is 100ms.
+    ///     The readiness, reply-size and request limits of each poll. The consumer sends deferred polls, so an idle
+    ///     consumer waits on the server for <see cref="DeferredPollOptions.MaxWait" /> instead of polling again.
+    ///     Defaults to one message, a 1 MiB reply, a one-second wait and an eleven-second request timeout. A message
+    ///     wider than the reply limit is fetched alone, without that limit.
     /// </summary>
-    public int PollingIntervalMs { get; set; } = 100;
+    /// <remarks>
+    ///     Over TCP a consumer-group member reads its partitions with one fetch per primary
+    ///     (<see cref="IggyClient.IIggyConsumer.FetchMessagesAsync" />), so <see cref="DeferredPollOptions.MinCount" />
+    ///     and <see cref="DeferredPollOptions.MaxBytes" /> apply to all partitions of the fetch together. A member
+    ///     that commits on poll (<see cref="AutoCommit" />)
+    ///     fetches <see cref="BatchSize" /> messages only while the application waits for messages. Dispose waits
+    ///     for such a fetch, because the server can commit it before a cancel arrives, and then moves the stored
+    ///     offset back before the messages that the application did not take.
+    /// </remarks>
+    public DeferredPollOptions PollOptions { get; set; } = new();
 
     /// <summary>
     ///     Optional logger factory for creating loggers

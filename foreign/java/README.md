@@ -125,7 +125,7 @@ credentials unchanged.
 
 `sendBinaryRequestToReplica(code, payload, replicaId)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
 
-Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, readiness waits, deferred-request cancels, consumer-offset reads and session-control codes fail with `INVALID_COMMAND` before anything is sent.
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, fetches, deferred-request cancels, consumer-offset reads and session-control codes fail with `INVALID_COMMAND` before anything is sent.
 
 An id that cluster metadata does not name fails with `INVALID_IDENTIFIER`. An unreachable node is retried until the request timeout, and a `NOT_PRIMARY` reply is returned rather than sent to another node. The HTTP client throws `IggyOperationNotSupportedException`.
 
@@ -439,12 +439,84 @@ var polled = client.messages().pollMessagesDeferred(
 If the readiness wait expires, the server still answers, with a partial batch or
 an empty one. If the request timeout expires, the call fails.
 
+A deferred poll of a consumer group must name its partition. Without one, the
+TCP client fails with `INVALID_COMMAND` (3) before it sends anything. To read
+the whole assignment of a group, use `readinessGroups` and `fetchMessages`.
+
+`readinessGroups` groups partitions by their primary, with at most 1000
+partitions in a group. A caller can keep one `fetchMessages` in flight per
+group. Each fetch goes to one primary and completes independently.
+
+```java
+List<List<Long>> groups = client.messages()
+    .readinessGroups(streamId, topicId, List.of(0L, 1L, 2L));
+```
+
+The groups show the routes at the time of the call. If a fetch reports
+`NOT_PRIMARY`, group the partitions again before the next fetch. The HTTP client throws
+`IggyOperationNotSupportedException`.
+
+`fetchMessages` reads the partitions of one readiness group in one request to
+their primary. Each target names a partition and its `Next` or `Offset`
+strategy. The call returns one `FetchedMessages` section for each partition
+that the server read, in the order of the reply. A target without a section was
+not read in this request.
+
+```java
+Map<Long, PollingStrategy> targets = new LinkedHashMap<>();
+targets.put(0L, PollingStrategy.next());
+targets.put(1L, PollingStrategy.offset(BigInteger.TEN));
+List<FetchedMessages> sections = client.messages().fetchMessages(
+    streamId, topicId, targets, Consumer.group(groupId), 100L, true, options);
+for (FetchedMessages section : sections) {
+    if (section.status() == FetchedMessages.STATUS_OK) {
+        PolledMessages polled = section.decode();
+    }
+}
+```
+
+The server waits up to `maxWait` for `minCount` messages over all the targets.
+It reads at most `maxBytes` for each target and for the whole reply. A fetch
+needs a `requestTimeout` of at least `maxWait` plus one second. This margin
+applies to a zero `maxWait` too, but not to a deferred poll. The TCP client
+also requires more than one second for a fresh call to leave time for routing.
+It lowers `maxBytes` until the whole reply fits in the largest frame that its
+connections read (`maxVsrFrameSize`).
+
+A section keeps its records undecoded until `decode()`. For an error section,
+`decode()` throws `IggyServerException` with the status of the section, and the
+partition stays where the request put it. To continue after a served section,
+send its partition as `Offset(nextOffset())` with its `context()`, through
+`withContext`. Put the served partitions at the end of the next request, so
+that the other partitions get a turn.
+
+The TCP client sends the fetch to the primary of the first target, so the
+targets must come from one group of `readinessGroups`. A `NOT_PRIMARY` (89)
+section, or a `NOT_PRIMARY` refusal of the whole fetch, marks the routes of its
+partitions moved. The next `readinessGroups` call then groups them again. A
+fetch with auto-commit or with a `Next` target takes the progress lanes of all
+its partitions. The client never sends such a fetch again: if its reply is
+lost, the call fails with `TRANSIENT_NOT_COMMITTED` (57). A fetch that only
+reads goes out again within its request timeout.
+
+A retained mutation blocking a target fails the fetch with
+`PARTITION_LANE_BLOCKED` (14009). The `IggyOperationException` carries that
+target in `getPartitionId()` and the operation to resolve or abandon in
+`getOperationId()`. Other partition lanes remain usable.
+
+`close()` waits for the reply of each pending fetch with auto-commit, and then
+cancels the other requests. A cancel of a fetch with auto-commit can lose the
+messages that the server committed. So the blocking client does not stop such
+a fetch on an interrupt. `sendBinaryRequest` routes a raw `FetchMessages` (code
+109) in the same way and keeps the fences of its targets. A server older than
+0.12.1 refuses the code with `INVALID_COMMAND` (3). The HTTP client throws
+`IggyOperationNotSupportedException`.
+
 The TCP client multiplexes deferred polls with other requests on its shared
-connections and routes them to the partition primary. Up to 64 deferred polls
-can be in flight per client; further polls wait for a slot in arrival order,
-within their original request timeout. A poll that expires before getting a
-slot fails with the retryable `TRANSIENT_NOT_ACCEPTED`. Queued and active
-requests share the client's 4096 pending request limit.
+connections and routes them to the partition primary. Up to 64 deferred polls and fetches can be in flight per client. Further requests wait
+for a slot in arrival order, within their original request timeout. A poll that
+expires before getting a slot fails with the retryable `TRANSIENT_NOT_ACCEPTED`.
+Queued and active requests share the client's 4096 pending request limit.
 Each TCP attempt uses the time remaining before the original call deadline,
 including time spent waiting for a slot, routing, or retrying. A server capacity
 refusal (`DEFERRED_POLL_CAPACITY_EXCEEDED`) backs off without discarding the
@@ -468,9 +540,11 @@ until it is resolved or abandoned; an active replay keeps its lanes until it
 finishes. Consumers on the same partition share this ordering, including when
 they name a consumer group by different aliases.
 
-Cancelling a TCP deferred poll sends a per-request cancellation on the same
-authenticated connection. This stops a poll still waiting for readiness;
-cancellation can race an offset update that the server has already accepted.
+Cancelling a TCP deferred poll or noncommitting fetch sends a per-request
+cancellation on the same authenticated connection. A committing fetch sends no
+cancellation and retains uncertain progress for explicit recovery. This stops a poll still
+waiting for readiness; cancellation can race an offset update that the server
+has already accepted.
 With auto-commit, a lost or timed-out reply can leave the stored offset advanced
 without delivering its messages to the caller. Use manual offset commits after
 processing when those messages must remain available for another attempt.

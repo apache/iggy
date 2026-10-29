@@ -40,10 +40,24 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 	epoch := c.callEpoch(ctx)
 	_, mutation := vsr.ReplicatedOperation(uint32(code))
 	progress := isProgressPoll(code, frame[vsr.HeaderSize:])
+	// Offset calls queue with the progress polls of their partition, so an
+	// offset read does not overtake a poll that moves the offset.
+	progressLane := progress || code == command.GetOffsetCode || changesProgress(code)
 	// A plain read reports a context that is done before its first attempt.
 	// Later, also when a session recovery restarts the call, it ends with 58.
 	if err := ctx.Err(); err != nil && !mutation && !progress {
 		return nil, err
+	}
+	budget := newDeferredBudget(code, frame)
+	if budget != nil {
+		select {
+		case c.deferred <- struct{}{}:
+			defer func() { <-c.deferred }()
+		case <-ctx.Done():
+			return nil, ierror.ErrTransientNotAccepted
+		case <-c.closed:
+			return nil, ierror.ErrClientShutdown
+		}
 	}
 	historyRefreshed := false
 	keptContext := exact
@@ -94,13 +108,29 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 			saved := captured
 			keptContext = &saved
 		}
-		if ticket == nil && (mutation || progress) {
+		if ticket == nil && (mutation || progressLane) {
 			key := laneKey{}
 			if query != nil {
 				key = laneKey{incarnation: captured.Incarnation, partition: route.key.partition}
+				if progressLane && code != command.FetchMessagesCode && key.incarnation == 0 {
+					key.incarnation = route.context.Incarnation
+					if key.incarnation == 0 {
+						return nil, ierror.ErrTransientNotAccepted
+					}
+				}
 			}
 			var err error
-			ticket, err = c.operations.enter(ctx, key)
+			switch {
+			case code == command.FetchMessagesCode:
+				// Each target of a fetch carries its own incarnation.
+				ticket, err = c.operations.enterLanes(ctx, fetchLanes(frame[vsr.HeaderSize:]))
+			case code == command.GetOffsetCode:
+				ticket, err = c.operations.enterLane(ctx, key.progressLane(), true)
+			case progressLane:
+				ticket, err = c.operations.enterProgress(ctx, key, mutation)
+			default:
+				ticket, err = c.operations.enter(ctx, key)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -110,6 +140,11 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 				if c.sessionRecovers(ctx, err) {
 					continue
 				}
+				return nil, err
+			}
+		}
+		if budget != nil && budget.commits {
+			if err := ticket.reserveFetch(); err != nil {
 				return nil, err
 			}
 		}
@@ -146,7 +181,15 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 		} else {
 			operation = &pendingOperation{id: vsr.StampedRequestID(frozen), code: code, query: append([]byte(nil), query...), fence: fence, frame: newOperationFrame(frozen, nil), replica: replica}
 		}
+		operation.budget = budget
+		committing := budget != nil && budget.commits
+		if committing && !c.startCommit() {
+			return nil, ierror.ErrClientShutdown
+		}
 		response, err := c.driveOperation(ctx, operation, ticket, false, mutation)
+		if committing {
+			c.commits.Done()
+		}
 		var completed *completedResultError
 		if errors.As(err, &completed) {
 			return nil, completed.err
@@ -186,7 +229,12 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 	notPrimarySeen := false
 	lookupDelay := replayInterval
 	progress := isProgressPoll(operation.code, operation.frame.data[vsr.HeaderSize:])
+	committing := operation.budget != nil && operation.budget.commits
+	possiblySent := false
 	defer func() {
+		if committing && possiblySent && err != nil {
+			err = ticket.retainFetch(ticket.fetch.keys)
+		}
 		if ticket == nil {
 			operation.frame.release()
 			return
@@ -332,14 +380,27 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				continue
 			}
 		}
-		reply, sent := link.exchange(ctx, operation.frame)
+		attempt := operation.frame
+		if operation.budget != nil {
+			if attempt, err = operation.budget.attempt(ctx, operation.frame.data); err != nil {
+				if uncertain {
+					return nil, ierror.ErrTransientNotCommitted
+				}
+				return nil, err
+			}
+		}
+		reply, sent := link.exchange(ctx, attempt)
+		possiblySent = possiblySent || sent
+		if attempt != operation.frame {
+			attempt.release()
+		}
 		c.mtx.Lock()
 		current = c.sessionFence == operation.fence
 		c.mtx.Unlock()
 		if ticket != nil {
 			current = current && ticket.current()
 		}
-		if !current {
+		if !current && (!committing || reply.err != nil) {
 			return nil, sessionChanged(sent)
 		}
 		if reply.err != nil {
@@ -361,7 +422,11 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				return nil, reply.err
 			}
 			if operation.query != nil {
-				c.polls.invalidate(route, false)
+				// A caller that stopped waiting for a parked deferred request
+				// says nothing about its route.
+				if operation.budget == nil || ctx.Err() == nil {
+					c.polls.invalidate(route, false)
+				}
 			} else if sent && linkReady(link) && operation.replica == nil {
 				c.links.invalidateMetadataPrimary(link)
 			}
@@ -409,7 +474,10 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 			return nil, ierror.ErrInvalidCommand
 		}
 		publishCredentials := outcome.Err == nil && (!uncertain || !mutation || outcome.Committed)
-		if !c.acceptOperationReply(c.callEpoch(ctx), operation, &reply.header, publishCredentials) {
+		// A correlated fetch table settles progress even if recovery replaced
+		// its session. Explicit caller isolation applies after that evidence.
+		accepted := c.acceptOperationReply(c.callEpoch(ctx), operation, &reply.header, publishCredentials)
+		if !accepted && !committing {
 			return nil, sessionChanged(sent)
 		}
 		if outcome.Err == nil {
@@ -419,8 +487,29 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				}
 				continue
 			}
+			if committing {
+				if err = classifyFetchReply(ctx, operation, ticket, outcome.Body); err != nil {
+					return nil, err
+				}
+				possiblySent = false
+				if ended := c.callEpoch(ctx).err(); ended != nil {
+					return nil, ended
+				}
+			}
 			c.refreshMembership(operation.code, operation.frame.data[vsr.HeaderSize:])
 			return outcome.Body, nil
+		}
+		if committing {
+			if !fetchRefusedBeforeAdmission(outcome.Err, false) {
+				return nil, outcome.Err
+			}
+			possiblySent = false
+			if !accepted {
+				if ended := c.callEpoch(ctx).err(); ended != nil {
+					return nil, ended
+				}
+				return nil, outcome.Err
+			}
 		}
 		if uncertain && outcome.Committed {
 			return nil, &completedResultError{err: outcome.Err}
@@ -438,8 +527,17 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 			} else if operation.code != command.GetClusterMetadataCode && operation.replica == nil {
 				_ = c.refreshRoster(ctx, link)
 			}
+		case errors.Is(err, ierror.ErrDeferredPollCapacityExceeded):
+			// The primary parks as many deferred requests of the session as it
+			// admits. The route is right, so the same primary is asked again.
 		case errors.Is(err, ierror.ErrNotPrimary) && operation.replica != nil:
 			// The caller chose the replica, so its refusal is the answer.
+			return nil, err
+		case errors.Is(err, ierror.ErrNotPrimary) &&
+			operation.code == command.FetchMessagesCode:
+			// The refusal does not name the partition that moved, so the
+			// sender of the wait or the fetch marks the route of each of its
+			// partitions.
 			return nil, err
 		case errors.Is(err, ierror.ErrNotPrimary):
 			firstRefusal := !notPrimarySeen
@@ -469,7 +567,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 			} else if isSessionError(err) {
 				c.recoverSession(operation.fence)
 			}
-			if operation.query != nil && (errors.Is(err, ierror.ErrHistoryUnavailable) || errors.Is(err, ierror.ErrConsumerGroupPartitionNotOwned) || isNamespaceMiss(err)) {
+			if operation.query != nil && needsRelookup(err) {
 				c.polls.relookup(route)
 			}
 			if uncertain && mutation {
@@ -503,7 +601,19 @@ func retryBeforeAdmission(err error) bool {
 }
 
 func isProgressPoll(code command.Code, body []byte) bool {
-	if code != command.PollMessagesCode || len(body) < pollParametersSize {
+	switch code {
+	case command.PollMessagesCode:
+	case command.PollMessagesDeferredCode:
+		if len(body) < deferredParametersSize {
+			return false
+		}
+		body = body[:len(body)-deferredParametersSize]
+	case command.FetchMessagesCode:
+		return isProgressFetch(body)
+	default:
+		return false
+	}
+	if len(body) < pollParametersSize {
 		return false
 	}
 	parameters := body[len(body)-pollParametersSize:]

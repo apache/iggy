@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Diagnostics;
 using System.Text;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
@@ -170,6 +171,72 @@ public class VsrConsumerGroupTests
         drained.ShouldBe((int)PartitionsCount);
     }
 
+    /// <summary>
+    ///     A fetch waits on every assigned partition of one primary and reads the one that holds messages. It runs
+    ///     alone, because the load of the other tests stretches a reply past the bound.
+    /// </summary>
+    [Test]
+    [NotInParallel]
+    public async Task Fetch_Should_Read_ThePartitionThatHoldsMessages()
+    {
+        const uint BusyPartition = PartitionsCount - 1;
+        var options = new DeferredPollOptions { MaxWait = TimeSpan.FromSeconds(10) };
+        var promptReply = TimeSpan.FromSeconds(2);
+        var (client, streamName, groupName) = await CreateGroup();
+        await JoinAsync(client, streamName, TopicName, groupName, 1);
+        var partitions = Enumerable.Range(0, (int)PartitionsCount).Select(partitionId => (uint)partitionId).ToList();
+        (await client.ReadinessGroupsAsync(Identifier.String(streamName), Identifier.String(TopicName), partitions))
+            .ShouldHaveSingleItem();
+
+        for (var fetch = 0; fetch < PartitionsCount; fetch++)
+        {
+            await SendAsync(client, streamName, BusyPartition);
+            var started = Stopwatch.StartNew();
+            using var fetched = await FetchGroupAsync(client, streamName, groupName, partitions, 10, options);
+
+            started.Elapsed.ShouldBeLessThan(promptReply);
+            var served = fetched.Sections.Where(section => section.MessagesCount > 0).ShouldHaveSingleItem();
+            served.PartitionId.ShouldBe(BusyPartition);
+            served.Decode().Messages.Count.ShouldBe(1);
+        }
+    }
+
+    /// <summary>
+    ///     The count of a fetch caps its whole reply, so a partition with a backlog fills the reply alone when it
+    ///     comes first. A member names the served partition last in its next fetch, so the backlog cannot hide a
+    ///     partition that gets a message later.
+    /// </summary>
+    [Test]
+    public async Task Fetch_With_ABacklog_Should_Serve_APartitionThatGetsAMessageLater()
+    {
+        const uint BacklogPartition = 0;
+        const uint LatePartition = PartitionsCount - 1;
+        const int BacklogMessages = 10;
+        var options = new DeferredPollOptions { MaxWait = TimeSpan.FromSeconds(10) };
+        var (client, streamName, groupName) = await CreateGroup();
+        await JoinAsync(client, streamName, TopicName, groupName, 1);
+        for (var message = 0; message < BacklogMessages; message++)
+        {
+            await SendAsync(client, streamName, BacklogPartition);
+        }
+
+        var partitions = Enumerable.Range(0, (int)PartitionsCount).Select(partitionId => (uint)partitionId).ToList();
+        using (var backlog = await FetchGroupAsync(client, streamName, groupName, partitions, 1, options))
+        {
+            backlog.Sections.Where(section => section.MessagesCount > 0).ShouldHaveSingleItem().PartitionId
+                .ShouldBe(BacklogPartition);
+        }
+
+        await SendAsync(client, streamName, LatePartition);
+        partitions.Remove(BacklogPartition);
+        partitions.Add(BacklogPartition);
+        using var late = await FetchGroupAsync(client, streamName, groupName, partitions, 1, options);
+
+        var served = late.Sections.Where(section => section.MessagesCount > 0).ShouldHaveSingleItem();
+        served.PartitionId.ShouldBe(LatePartition);
+        served.Decode().Messages.Count.ShouldBe(1);
+    }
+
     /// <summary>Joins, then waits until the members own every partition, so the next group poll syncs them.</summary>
     private static async Task JoinAsync(IIggyClient client, string streamName, string topicName, string groupName,
         uint membersCount)
@@ -211,6 +278,18 @@ public class VsrConsumerGroupTests
         }
 
         return drained;
+    }
+
+    /// <summary>
+    ///     One fetch of the partitions in the given order, which commits what it returns. Each partition starts after
+    ///     the stored offset of the group.
+    /// </summary>
+    private static Task<FetchedMessages> FetchGroupAsync(IIggyClient client, string streamName, string groupName,
+        IEnumerable<uint> partitions, uint count, DeferredPollOptions options)
+    {
+        return client.FetchMessagesAsync(Identifier.String(streamName), Identifier.String(TopicName),
+            [.. partitions.Select(partitionId => (partitionId, PollingStrategy.Next()))], Consumer.Group(groupName),
+            count, true, options);
     }
 
     private static Task<PolledMessages> PollGroupAsync(IIggyClient client, string streamName, string groupName)

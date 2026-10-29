@@ -18,6 +18,11 @@
 export {
   type Id,
   PollingStrategy,
+  DEFAULT_DEFERRED_POLL_OPTIONS,
+  type DeferredPollOptions,
+  decodeFetchSection,
+  type FetchTarget,
+  type FetchMessagesSection,
   Consumer,
   Partitioning,
   HeaderValue,

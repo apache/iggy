@@ -21,6 +21,7 @@ use crate::configs::connectors::{ConfigFormat, ConnectorsConfigProvider, SinkCon
 use crate::context::RuntimeContext;
 use crate::error::RuntimeError;
 use crate::metrics::Metrics;
+use crate::plugin_instance::PluginInstanceGuard;
 use crate::sink;
 use dashmap::DashMap;
 use dlopen2::wrapper::Container;
@@ -203,40 +204,45 @@ impl SinkManager {
         // Connected before the plugin starts, so a refused connection leaves no
         // plugin instance behind.
         let client = context.iggy_clients.connect_sink_client().await?;
-        let setup = async {
-            sink::init_sink(
-                &container,
-                &config.plugin_config.clone().unwrap_or_default(),
-                plugin_id,
-            )?;
-            info!(
-                "Sink connector with ID: {plugin_id} for plugin: {key} initialized successfully."
-            );
-            sink::setup_sink_consumers(key, config, &client).await
-        };
-        let consumers = match setup.await {
+        if let Err(error) = sink::init_sink(
+            &container,
+            &config.plugin_config.clone().unwrap_or_default(),
+            plugin_id,
+        ) {
+            sink::release_sink_client(client, plugin_id).await;
+            return Err(error);
+        }
+        info!("Sink connector with ID: {plugin_id} for plugin: {key} initialized successfully.");
+        // Armed from here until the id is recorded below. `PluginInstanceGuard`
+        // carries why that window strands the instance.
+        let instance_guard = PluginInstanceGuard::for_sink(container.clone(), plugin_id, key);
+
+        let consumers = match sink::setup_sink_consumers(key, config, &client).await {
             Ok(consumers) => consumers,
             Err(error) => {
                 sink::release_sink_client(client, plugin_id).await;
+                instance_guard.close().await;
                 return Err(error);
             }
         };
 
         let callback = container.iggy_sink_consume;
-        let (shutdown_tx, task_handles) = sink::spawn_consume_tasks(
-            plugin_id,
-            key,
-            consumers,
-            client,
-            callback,
-            config.verbose,
-            config.benchmark,
-            metrics,
-            context.clone(),
-        );
-
+        // Locked before the spawn, so no await sits between starting the tasks
+        // and recording the id: a cancellation there would leave the tasks
+        // consuming into an instance the guard has just closed.
         {
             let mut details = details.lock().await;
+            let (shutdown_tx, task_handles) = sink::spawn_consume_tasks(
+                plugin_id,
+                key,
+                consumers,
+                client,
+                callback,
+                config.verbose,
+                config.benchmark,
+                metrics,
+                context.clone(),
+            );
             details.info.id = plugin_id;
             details.info.status = ConnectorStatus::Running;
             details.info.last_error = None;
@@ -245,6 +251,8 @@ impl SinkManager {
             details.task_handles = task_handles;
             metrics.increment_sinks_running();
         }
+        // `details.info.id` now names this instance, so a later stop reaches it.
+        instance_guard.disarm();
 
         Ok(())
     }

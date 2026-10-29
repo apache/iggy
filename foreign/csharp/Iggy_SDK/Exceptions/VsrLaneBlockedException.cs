@@ -20,6 +20,25 @@ namespace Apache.Iggy.Exceptions;
 /// <summary>A retained operation blocks this mutation lane until it is resolved or abandoned.</summary>
 public sealed class VsrLaneBlockedException(ulong operationId) : Exception("A retained operation blocks the mutation lane.")
 {
+    /// <summary>A retained operation blocks a particular fetch target.</summary>
+    public VsrLaneBlockedException(ulong operationId, uint partitionId) : this(operationId)
+    {
+        PartitionId = partitionId;
+    }
+
+    /// <summary>An uncertain committing fetch blocks the partition until the application explicitly abandons it.</summary>
+    public VsrLaneBlockedException(ulong operationId, uint partitionId, bool requiresExplicitRecovery)
+        : this(operationId, partitionId)
+    {
+        RequiresExplicitRecovery = requiresExplicitRecovery;
+    }
+
     /// <summary>The request id of the operation.</summary>
     public ulong OperationId { get; } = operationId;
+
+    /// <summary>The blocked target of a fetch, otherwise null.</summary>
+    public uint? PartitionId { get; }
+
+    /// <summary>The blocker is a committing fetch without a replayable server receipt.</summary>
+    public bool RequiresExplicitRecovery { get; }
 }

@@ -34,6 +34,7 @@ import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyMalformedResponseException;
 import org.apache.iggy.message.BytesMessageId;
+import org.apache.iggy.message.FetchedMessages;
 import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.message.HeaderValue;
@@ -85,8 +86,16 @@ import java.util.function.Supplier;
  */
 public final class BytesDeserializer {
 
+    /** The section count that opens a fetch reply. */
+    public static final int FETCH_SECTIONS_COUNT_BYTES = Integer.BYTES;
+    /** A fetch section: partition id, status, current offset, message count, context, next offset, records length. */
+    public static final int FETCH_SECTION_BYTES = 4 * Integer.BYTES + 2 * Long.BYTES + PartitionContext.ENCODED_SIZE;
+
     private static final int CONSUMER_GROUP_ASSIGNMENT_ENTRY_BYTES = Integer.BYTES;
+    private static final int READY_PARTITION_BYTES = Integer.BYTES;
     private static final int SEND_CONFIRMATION_BYTES = 3 * Integer.BYTES + Long.BYTES;
+    // A fetch names at most this many partitions, MAX_PARTITIONS_PER_REQUEST in core/binary_protocol/src/lib.rs.
+    private static final int MAX_FETCH_SECTIONS = 1000;
     private static final int MIN_CLUSTER_NODE_BYTES = 19;
     // A one-character key (length byte plus a byte of name), kind and flags
     // bytes, and empty length-prefixed default and description.
@@ -256,14 +265,69 @@ public final class BytesDeserializer {
         var currentOffset = readU64AsBigInteger(response);
         var messagesCount = response.readUnsignedIntLE();
         var context = readPartitionContext(response);
+        return new PolledMessages(
+                partitionId, currentOffset, messagesCount, readMessages(response, messagesCount), context);
+    }
+
+    /** Reads the batch records of a poll reply or of a fetch section, which must hold {@code count} messages. */
+    public static List<Message> readMessages(ByteBuf records, long count) {
         var messages = new ArrayList<Message>();
-        while (response.isReadable()) {
-            readBatchRecord(response, messages);
+        while (records.isReadable()) {
+            readBatchRecord(records, messages);
         }
-        if (messages.size() != messagesCount) {
+        if (messages.size() != count) {
             throw new IggyMalformedResponseException("Poll count does not match its messages");
         }
-        return new PolledMessages(partitionId, currentOffset, messagesCount, messages, context);
+        return messages;
+    }
+
+    /**
+     * Reads a fetch reply: the section table, then the records of each section in table order. The
+     * records of each section stay undecoded until {@link FetchedMessages#decode()}.
+     */
+    public static List<FetchedMessages> readFetchedMessages(ByteBuf response) {
+        if (response.readableBytes() < FETCH_SECTIONS_COUNT_BYTES) {
+            throw new IggyMalformedResponseException(
+                    "fetch reply has " + response.readableBytes() + " bytes, too few for its count");
+        }
+        long sectionsCount = response.readUnsignedIntLE();
+        if (sectionsCount > MAX_FETCH_SECTIONS) {
+            throw new IggyMalformedResponseException(
+                    "fetch reply has " + sectionsCount + " sections, more than a request has targets");
+        }
+        int tableBytes = (int) sectionsCount * FETCH_SECTION_BYTES;
+        if (response.readableBytes() < tableBytes) {
+            throw new IggyMalformedResponseException("fetch reply ends inside its section table");
+        }
+        ByteBuf records = response.duplicate().skipBytes(tableBytes);
+        List<FetchedMessages> sections = new ArrayList<>((int) sectionsCount);
+        for (long section = 0; section < sectionsCount; section++) {
+            var partitionId = response.readUnsignedIntLE();
+            var status = response.readUnsignedIntLE();
+            var currentOffset = readU64AsBigInteger(response);
+            var messagesCount = response.readUnsignedIntLE();
+            var context = readPartitionContext(response);
+            var nextOffset = readU64AsBigInteger(response);
+            var recordsLength = response.readUnsignedIntLE();
+            if (status != FetchedMessages.STATUS_OK && recordsLength != 0) {
+                throw new IggyMalformedResponseException(
+                        "fetch section of partition " + partitionId + " has status " + status + " and records");
+            }
+            if (recordsLength > records.readableBytes()) {
+                throw new IggyMalformedResponseException(
+                        "fetch section records of partition " + partitionId + " run past the reply");
+            }
+            byte[] sectionRecords = new byte[(int) recordsLength];
+            records.readBytes(sectionRecords);
+            sections.add(new FetchedMessages(
+                    partitionId, status, currentOffset, messagesCount, context, nextOffset, sectionRecords));
+        }
+        if (records.isReadable()) {
+            throw new IggyMalformedResponseException(
+                    "fetch reply has " + records.readableBytes() + " bytes past its sections");
+        }
+        response.skipBytes(response.readableBytes());
+        return sections;
     }
 
     /**

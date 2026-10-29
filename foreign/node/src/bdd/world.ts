@@ -19,9 +19,15 @@ import type { Stream } from '../wire/stream/stream.utils.js';
 import type { Topic } from '../wire/topic/topic.utils.js';
 import type {
   CreateMessage, Message, MetadataChangeCursor, MetadataChangeGroup, MetadataChangeRecord,
-  MetadataCurrentItem, OptionSpec
+  MetadataCurrentItem, OptionSpec, PollMessagesResponse
 } from 'src/wire/index.js';
 import type { Client } from '../client/index.js';
+
+/** How a call that a step started in the background ended, and when. */
+export type Outcome<T> = { ended: number } & ({ ok: true, value: T } | { ok: false, error: unknown });
+
+/** A call that a step started in the background, with the controller that cancels it. */
+export type BackgroundCall<T> = { started: number, cancel: AbortController, outcome: Promise<Outcome<T>> };
 
 export interface TestWorld {
   client: Client
@@ -44,5 +50,12 @@ export interface TestWorld {
   /** Records of the last stream that the follow step returned */
   followedChanges?: MetadataChangeRecord[],
   /** Items of the last current state scan */
-  currentItems?: MetadataCurrentItem[]
+  currentItems?: MetadataCurrentItem[],
+  /** Consumer group that this client joined on the topic */
+  groupName?: string,
+  lastSentPartition?: number,
+  /** Deferred poll that a step started in the background */
+  deferredPoll?: BackgroundCall<PollMessagesResponse>,
+  /** Fetch that a step started in the background */
+  deferredFetch?: BackgroundCall<PollMessagesResponse[]>
 };

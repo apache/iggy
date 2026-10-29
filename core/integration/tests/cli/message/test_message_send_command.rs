@@ -235,11 +235,13 @@ impl IggyCmdTestCase for TestMessageSendCmd {
                         .poll_messages(
                             &self.actual_stream_id.unwrap().try_into().unwrap(),
                             &self.actual_topic_id.unwrap().try_into().unwrap(),
-                            Some(partition_id),
+                            partition_id,
                             &Consumer::default(),
                             &PollingStrategy::offset(0),
-                            self.messages.len() as u32,
-                            false,
+                            PollOptions {
+                                count: self.messages.len() as u32,
+                                ..PollOptions::default()
+                            },
                         )
                         .await;
                     if let Ok(polled) = polled {
@@ -254,11 +256,13 @@ impl IggyCmdTestCase for TestMessageSendCmd {
                     .poll_messages(
                         &self.actual_stream_id.unwrap().try_into().unwrap(),
                         &self.actual_topic_id.unwrap().try_into().unwrap(),
-                        Some(self.get_partition_id()),
+                        self.get_partition_id(),
                         &Consumer::default(),
                         &PollingStrategy::offset(0),
-                        self.messages.len() as u32,
-                        false,
+                        PollOptions {
+                            count: self.messages.len() as u32,
+                            ..PollOptions::default()
+                        },
                     )
                     .await;
 

@@ -23,7 +23,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use iggy::prelude::{
-    Client, Consumer, IggyClient, IggyError, MessageClient, Partition, PolledMessages,
+    Client, Consumer, IggyClient, IggyError, MessageClient, Partition, PollOptions, PolledMessages,
     PollingStrategy, TopicClient,
 };
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
@@ -40,6 +40,10 @@ use crate::bridge::error::BridgeError;
 /// Fetch reads that poll at once. Each has its own Iggy client, so a poll that Iggy holds up
 /// stalls only its own slot, and only until the request deadline.
 const FETCH_SLOTS: usize = 4;
+
+/// The byte cap of a poll of one message: none, since a cap can only refuse that message, never
+/// trim it.
+pub const ONE_MESSAGE_MAX_BYTES: u32 = u32::MAX;
 
 /// The Fetch read slots, with a client for each.
 pub(super) struct FetchPool {
@@ -365,8 +369,9 @@ impl IggyBridge {
             .collect())
     }
 
-    /// Reads up to `count` messages of `partition`, from `offset` on, with the client of `slot`.
-    /// Hands the slot back with the result. `None` if no result comes by `deadline`.
+    /// Reads up to `options.count` messages and `options.max_bytes` bytes of `partition`, from
+    /// `offset` on, with the client of `slot`. Hands the slot back with the result. `None` if no
+    /// result comes by `deadline`.
     ///
     /// A plain consumer without auto commit, so Iggy stores no offset. Always the request's
     /// offset, never `Next`.
@@ -380,29 +385,46 @@ impl IggyBridge {
         kafka_topic: &str,
         partition: u32,
         offset: u64,
-        count: u32,
+        options: PollOptions,
         deadline: Instant,
     ) -> Option<(Result<PolledMessages, BridgeError>, FetchSlot)> {
-        self.poll_by(
+        self.poll_in_slot(
             slot,
             kafka_topic,
             partition,
             PollingStrategy::offset(offset),
-            count,
+            options,
             deadline,
         )
         .await
     }
 
-    /// [`Self::poll`] with any polling strategy, so `ListOffsets` can read by timestamp or the
-    /// last record through the same slots.
+    /// [`Self::poll`] of one message with any polling strategy, so `ListOffsets` can read by
+    /// timestamp or the last record through the same slots.
     pub(crate) async fn poll_by(
         self: &Arc<Self>,
         slot: FetchSlot,
         kafka_topic: &str,
         partition: u32,
         strategy: PollingStrategy,
-        count: u32,
+        deadline: Instant,
+    ) -> Option<(Result<PolledMessages, BridgeError>, FetchSlot)> {
+        let options = PollOptions {
+            count: 1,
+            max_bytes: ONE_MESSAGE_MAX_BYTES,
+            ..PollOptions::default()
+        };
+        self.poll_in_slot(slot, kafka_topic, partition, strategy, options, deadline)
+            .await
+    }
+
+    async fn poll_in_slot(
+        self: &Arc<Self>,
+        slot: FetchSlot,
+        kafka_topic: &str,
+        partition: u32,
+        strategy: PollingStrategy,
+        options: PollOptions,
         deadline: Instant,
     ) -> Option<(Result<PolledMessages, BridgeError>, FetchSlot)> {
         let (bridge, client, topic) = (
@@ -412,7 +434,7 @@ impl IggyBridge {
         );
         let poll = async move {
             bridge
-                .poll_with(&client, &topic, partition, &strategy, count, deadline)
+                .poll_with(&client, &topic, partition, &strategy, options, deadline)
                 .await
         };
         in_slot(slot, deadline, poll).await
@@ -424,7 +446,7 @@ impl IggyBridge {
         kafka_topic: &str,
         partition: u32,
         strategy: &PollingStrategy,
-        count: u32,
+        options: PollOptions,
         deadline: Instant,
     ) -> Result<PolledMessages, BridgeError> {
         let target = self.topic_target(kafka_topic)?;
@@ -434,11 +456,10 @@ impl IggyBridge {
                 .poll_messages(
                     &target.stream_id,
                     &target.topic_id,
-                    Some(partition),
+                    partition,
                     &consumer,
                     strategy,
-                    count,
-                    false,
+                    options,
                 )
                 .await
                 .map_err(BridgeError::Iggy)

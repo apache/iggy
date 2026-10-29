@@ -94,6 +94,9 @@ pub trait Client:
     /// `OperationUncertain(op)` keeps the original frame and lane:
     /// a later denial without committed-result proof cannot settle an earlier send.
     /// TCP, QUIC and WebSocket support recovery; HTTP returns `FeatureUnavailable`.
+    /// A retained committing fetch instead returns `FetchProgressUncertain(op)`
+    /// without I/O. It has no replayable receipt and remains blocked until
+    /// [`Self::abandon_operation`] explicitly accepts its unknown outcome.
     ///
     /// The client keeps the proved outcomes of its last
     /// [`max_operations`](crate::PendingOperationsConfig::max_operations) replays,
@@ -113,6 +116,9 @@ pub trait Client:
     /// keeps the outcome it proves for [`Self::resolve_operation`]. An operation
     /// that is not retained gives `OperationNotRetained(op)`. A client that
     /// retains no operations returns `FeatureUnavailable`.
+    /// For `FetchProgressUncertain`, this frees every affected progress lane,
+    /// including after reconnect or session replacement. It does not stop an
+    /// old server request; a later offset inspection cannot prove that it stopped.
     async fn abandon_operation(&self, _op: u64) -> Result<(), IggyError> {
         Err(IggyError::FeatureUnavailable)
     }

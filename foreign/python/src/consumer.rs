@@ -16,33 +16,35 @@
 // under the License.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::StreamExt;
 use iggy::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
 use iggy::prelude::{
-    AutoCommit as RustAutoCommit, AutoCommitAfter as RustAutoCommitAfter,
-    AutoCommitWhen as RustAutoCommitWhen, Consumer as RustConsumer,
-    ConsumerGroup as RustConsumerGroup, ConsumerGroupDetails as RustConsumerGroupDetails,
-    ConsumerGroupMember as RustConsumerGroupMember, ConsumerPosition as RustConsumerPosition,
-    Identifier, IggyConsumer as RustIggyConsumer, IggyConsumerState as RustIggyConsumerState,
-    IggyError, NonZeroIggyDuration, ReceivedMessage,
+    ClientCommitPolicy as RustClientCommitPolicy, CommitEvent as RustCommitEvent,
+    Consumer as RustConsumer, ConsumerGroup as RustConsumerGroup,
+    ConsumerGroupDetails as RustConsumerGroupDetails,
+    ConsumerGroupMember as RustConsumerGroupMember, Identifier, IggyConsumer as RustIggyConsumer,
+    IggyConsumerState as RustIggyConsumerState, IggyError, ReadError as RustReadError,
+    ReceivedMessage,
 };
-use pyo3::exceptions::PyStopAsyncIteration;
+use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
+use pyo3::intern;
 use pyo3::types::PyDelta;
 
 use pyo3::prelude::*;
 use pyo3_async_runtimes::TaskLocals;
 use pyo3_async_runtimes::tokio::{future_into_py, get_runtime, into_future, scope};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
-use pyo3_stub_gen::{PyStubType, TypeInfo};
 use tokio::sync::Mutex;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 
-use crate::client::to_runtime_error;
-use crate::duration::{py_delta_to_iggy_duration, reject_zero};
+use crate::client::{to_read_error, to_runtime_error};
+use crate::duration::{iggy_duration_to_py_delta, py_delta_to_iggy_duration, reject_zero};
+use crate::event_loop::on_event_loop;
 use crate::identifier::PyIdentifier;
-use crate::receive_message::{ConsumerPosition, ReceiveMessage};
+use crate::receive_message::{Checkpoint, PollingStrategy, ReceiveMessage};
 
 /// A Python class representing the Iggy consumer.
 /// It provides asynchronous functionality through the contained runtime.
@@ -56,6 +58,9 @@ pub struct IggyConsumer {
     pub(crate) name: String,
     pub(crate) stream: PyIdentifier,
     pub(crate) topic: PyIdentifier,
+    /// Set while `consume_messages()` holds `inner`, so a `seek()` from its callback fails
+    /// instead of waiting for the run that waits for the callback.
+    pub(crate) consuming: Arc<AtomicBool>,
 }
 
 #[gen_stub_pymethods]
@@ -69,7 +74,9 @@ impl IggyConsumer {
     }
 
     /// Get the last offset successfully stored for this partition, or `None` until
-    /// this consumer has stored one. Polling under `AutoCommit.Disabled()` leaves it unset.
+    /// this consumer has stored one. The default `ClientCommitPolicy()` leaves it unset
+    /// until a commit. Under `ServerCommitPolicy.OnRead` it is the end of the last batch
+    /// that the consumer took from its reader.
     #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
     fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
         self.state.get_last_stored_offset(partition_id)
@@ -97,15 +104,12 @@ impl IggyConsumer {
 
     /// Stores the provided offset for the provided partition id or if none is specified
     /// uses the current partition id for the consumer group.
-    /// The offset is stored under the context of the latest message consumed from the
-    /// partition. To commit a message held across a newer poll or an ownership change,
-    /// pass `message.position()` to `store_position()` instead.
-    /// Before a message is consumed from the partition, the write takes the context its
-    /// route reports. After another client deleted and created the partition again, one
-    /// such write can fail with `HistoryUnavailable` (87), or
-    /// `ConsumerGroupPartitionNotOwned` (5009) for a consumer group member. The failed
-    /// route is dropped, and the next call routes again.
-    /// Raises `RuntimeError` if the operation fails.
+    /// It always sends, also an offset below the stored one. The offset is stored under the
+    /// context of the latest message consumed from the partition, or without a context when
+    /// nothing was consumed from it. To commit a message held across a newer read or an
+    /// ownership change, pass `message.checkpoint()` to `commit()` instead.
+    /// Raises `IggyError` if the operation fails, for example `HistoryUnavailable` (87)
+    /// after the partition was deleted and created again.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn store_offset<'a>(
         &self,
@@ -122,28 +126,54 @@ impl IggyConsumer {
         })
     }
 
-    /// Stores the position of a received message, taken from `ReceiveMessage.position()`.
-    /// The write keeps the context that delivered the message, so it fails with
+    /// Stores the offset of a checkpoint that this consumer yielded, taken from
+    /// `ReceiveMessage.checkpoint()`, which covers every earlier message of its partition.
+    /// The write keeps the partition history that delivered the message, so it fails with
     /// `HistoryUnavailable` (87) after the partition was deleted and created again, and
     /// with `ConsumerGroupPartitionNotOwned` (5009) after its consumer group owner
     /// changed, instead of committing the offset to the new partition.
-    /// A position that is not ahead of the last one stored under the same partition
-    /// incarnation and owner is skipped without a request, unless the consumer was
-    /// created with `allow_replay=True`. The same holds for an offset that
-    /// `store_offset()` stored before a message was consumed from the partition,
-    /// but a position at offset 0 is never skipped in that case.
-    /// Raises `RuntimeError` if the operation fails.
+    /// A checkpoint of an older generation of its partition, after `seek()` or a new
+    /// assignment, or at or below the last commit of its generation, stores nothing.
+    /// Raises `IggyError` with `InvalidCommand` (3) under `ServerCommitPolicy.OnRead` and for
+    /// a checkpoint that this consumer did not yield, or if the operation fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
-    fn store_position<'a>(
+    fn commit<'a>(&self, py: Python<'a>, checkpoint: &Checkpoint) -> PyResult<Bound<'a, PyAny>> {
+        let state = self.state.clone();
+        let checkpoint = checkpoint.inner;
+        future_into_py(py, async move {
+            state.commit(checkpoint).await.map_err(to_runtime_error)
+        })
+    }
+
+    /// Sets the next read position of a partition and drops the rest of its batch that the
+    /// consumer yields from. It stores no offset, and it resumes a stopped partition.
+    /// `start` is a new strategy or a continuation of the same partition, such as
+    /// `ReadError.skip`. After `HistoryUnavailable` (87), the partition reads nothing until
+    /// this call picks a start in its new history.
+    /// Raises `IggyError` with `InvalidCommand` (3) for a partition that the consumer does not
+    /// read and for a continuation of another partition, `PendingOperationError` under
+    /// `ServerCommitPolicy.OnRead` while a read of the partition has an unknown outcome
+    /// (abandon its operation first), and `RuntimeError` while `consume_messages()` runs, also
+    /// from its callback: seek after the run ends.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn seek<'a>(
         &self,
         py: Python<'a>,
-        position: &ConsumerPosition,
+        partition_id: u32,
+        start: &PollingStrategy,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let state = self.state.clone();
-        let position = RustConsumerPosition::from(*position);
+        if self.consuming.load(Ordering::SeqCst) {
+            return Err(PyRuntimeError::new_err(
+                "seek() cannot run while consume_messages() runs",
+            ));
+        }
+        let inner = self.inner.clone();
+        let start = start.inner;
         future_into_py(py, async move {
-            state
-                .store_position(position)
+            inner
+                .lock()
+                .await
+                .seek(partition_id, start)
                 .await
                 .map_err(to_runtime_error)
         })
@@ -151,11 +181,8 @@ impl IggyConsumer {
 
     /// Deletes the offset for the provided partition id or if none is specified
     /// uses the current partition id for the consumer group.
-    /// The write takes the context its route reports. After another client deleted and
-    /// created the partition again, one such write can fail with `HistoryUnavailable` (87),
-    /// or `ConsumerGroupPartitionNotOwned` (5009) for a consumer group member. The failed
-    /// route is dropped, and the next call routes again.
-    /// Raises `RuntimeError` if the operation fails.
+    /// Raises `IggyError` if the operation fails, for example `ConsumerOffsetNotFound`
+    /// when nothing is stored for the partition.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn delete_offset<'a>(
         &self,
@@ -171,18 +198,38 @@ impl IggyConsumer {
         })
     }
 
+    /// Shuts the consumer down. It stores the last yielded position of each partition under a
+    /// `ClientCommitPolicy` other than the default, closes the reader and leaves the consumer
+    /// group. With `ServerCommitPolicy.OnRead`, it moves the offset back to the last yielded
+    /// message, which a dropped consumer does not do.
+    /// It waits for a running `consume_messages()` to end, and iterating ends after it.
+    /// Repeated calls are safe.
+    /// Raises `IggyError` for the first failed store of the `OnRead` close, or else
+    /// `PendingOperationError` for a partition with an unknown outcome: abandon its operation
+    /// before another consumer reads the partition.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn shutdown<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .lock()
+                .await
+                .shutdown()
+                .await
+                .map_err(to_runtime_error)
+        })
+    }
+
     /// Asynchronously iterate over `ReceiveMessage`s.
-    /// Returns an async iterator that raises `StopAsyncIteration` when no more messages are available
-    /// or a `RuntimeError` on failure.
-    /// Note: This method does not currently support `AutoCommit.After`.
-    /// For `AutoCommit.IntervalOrAfter(datetime.timedelta, AutoCommitAfter)`,
-    /// only the interval part is applied; the `after` mode is ignored.
-    /// Use `consume_messages()` if you need commit-after-processing semantics.
-    /// After another client deleted and created a partition again, or after the consumer
-    /// group moved a partition to another member, one iteration can raise `RuntimeError`
-    /// with `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009) for a
-    /// consumer group member. The consumer drops the failed route and the position it
-    /// continued from, and the next iteration routes again.
+    /// Returns an async iterator that raises `StopAsyncIteration` when no more messages are
+    /// available or a `ReadError` on a failed read. The consumer stays usable after it and
+    /// retries by itself.
+    /// The `on` event of a `ClientCommitPolicy` counts a message when it is yielded. Use
+    /// `consume_messages()` to count it after its processing.
+    /// After another client deleted and created a partition again, one iteration raises
+    /// `ReadError` with `HistoryUnavailable` (87), and the partition reads nothing until
+    /// `seek()` picks a start in its new history.
+    /// A cancelled iteration leaves its message for the next one.
     #[gen_stub(override_return_type(type_repr="collections.abc.AsyncIterator[ReceiveMessage]", imports=("collections.abc")))]
     fn iter_messages(&self) -> ReceiveMessageIterator {
         let inner = self.inner.clone();
@@ -190,11 +237,16 @@ impl IggyConsumer {
     }
 
     /// Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
-    /// Returns an awaitable that completes when shutdown is signaled or a RuntimeError on failure.
-    /// After another client deleted and created a partition again, one poll can fail with
-    /// `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009) for a consumer
-    /// group member. The error is logged, not raised: the failed route is dropped, and the
-    /// next poll routes again.
+    /// Returns an awaitable that completes when shutdown is signaled. Without an event, a cancel of
+    /// the awaitable ends the run once the running callback returns.
+    /// The `on` event of a `ClientCommitPolicy` counts a message after its callback returns,
+    /// also after a failure. Its interval can store a message whose callback still runs.
+    /// A failed read is logged, and the consumer retries by itself. The run raises `ReadError`
+    /// if the client cannot go on without the caller, or if a read stops its partition until
+    /// `seek()`: `HistoryUnavailable` (87), or an unknown outcome under
+    /// `ServerCommitPolicy.OnRead`. For a stopped partition, `ReadError.partition_id` names it.
+    /// To resume it, abandon the operation of an unknown outcome, seek the partition and consume
+    /// again.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn consume_messages<'a>(
         &self,
@@ -205,6 +257,7 @@ impl IggyConsumer {
         shutdown_event: Option<Bound<'a, PyAny>>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
+        let consuming = self.consuming.clone();
         let callback: Py<PyAny> = callback.unbind();
         let shutdown_event: Option<Py<PyAny>> = shutdown_event.map(|e| e.unbind());
 
@@ -212,8 +265,8 @@ impl IggyConsumer {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
             let task_locals = Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
-            let handle_consume: JoinHandle<PyResult<Result<(), IggyError>>> =
-                get_runtime().spawn(scope(task_locals, async move {
+            let handle_consume: JoinHandle<PyResult<Result<(), RustReadError>>> = get_runtime()
+                .spawn(scope(task_locals, async move {
                     let task_locals =
                         Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
                     let consumer = PyCallbackConsumer {
@@ -221,18 +274,22 @@ impl IggyConsumer {
                         task_locals: Arc::new(Mutex::new(task_locals)),
                     };
                     let mut inner = inner.lock().await;
+                    let _consuming = Consuming::start(consuming);
                     Ok(inner.consume_messages(&consumer, shutdown_rx).await)
                 }));
-            let handle_shutdown = shutdown_event
-                .map(|shutdown_event| -> PyResult<JoinHandle<PyResult<()>>> {
+            // A dropped sender ends the run, so without an event this future keeps the sender
+            // until the run ends or the awaitable is cancelled.
+            let handle_shutdown = match shutdown_event {
+                Some(shutdown_event) => {
                     let task_locals =
                         Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
-                    Ok(get_runtime().spawn(scope(
+                    Some(get_runtime().spawn(scope(
                         task_locals,
                         wait_for_shutdown(shutdown_event, shutdown_tx),
                     )))
-                })
-                .transpose()?;
+                }
+                None => None,
+            };
 
             let consume_result = handle_consume.await;
 
@@ -253,7 +310,7 @@ impl IggyConsumer {
 
             consume_result
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))??
-                .map_err(to_runtime_error)?;
+                .map_err(to_read_error)?;
             Ok(())
         })
     }
@@ -266,6 +323,23 @@ async fn wait_for_shutdown(shutdown_event: Py<PyAny>, shutdown_tx: Sender<()>) -
     // to signal and the result of the run is the one worth reporting.
     let _ = shutdown_tx.send(());
     Ok(())
+}
+
+/// Marks a `consume_messages()` run while it holds the consumer. The drop also clears the mark
+/// of a run that panics.
+struct Consuming(Arc<AtomicBool>);
+
+impl Consuming {
+    fn start(consuming: Arc<AtomicBool>) -> Self {
+        consuming.store(true, Ordering::SeqCst);
+        Self(consuming)
+    }
+}
+
+impl Drop for Consuming {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// The consumer polling the messages. It selects both the consumer kind and the
@@ -428,18 +502,21 @@ pub struct ReceiveMessageIterator {
 
 #[pymethods]
 impl ReceiveMessageIterator {
-    pub fn __anext__<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
-        let inner = self.inner.clone();
-        future_into_py(py, async move {
-            let mut inner = inner.lock().await;
-            if let Some(message) = inner.next().await {
-                Ok(message
-                    .map(ReceiveMessage::from)
-                    .map_err(to_runtime_error)?)
-            } else {
-                Err(PyStopAsyncIteration::new_err("No more messages"))
+    // pyo3 builds no slot from an `async fn`, so the slot returns the coroutine of `_next`.
+    pub fn __anext__<'a>(slf: &Bound<'a, Self>) -> PyResult<Bound<'a, PyAny>> {
+        slf.call_method0(intern!(slf.py(), "_next"))
+    }
+
+    #[pyo3(name = "_next")]
+    async fn next_message(&self) -> PyResult<ReceiveMessage> {
+        on_event_loop(async {
+            let mut inner = self.inner.lock().await;
+            match inner.next().await {
+                Some(message) => message.map(ReceiveMessage::from).map_err(to_read_error),
+                None => Err(PyStopAsyncIteration::new_err("No more messages")),
             }
         })
+        .await
     }
 
     pub fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -474,110 +551,90 @@ impl MessageConsumer for PyCallbackConsumer {
     }
 }
 
-/// The auto-commit configuration for storing the offset on the server.
-// #[derive(Debug, PartialEq, Copy, Clone)]
-#[gen_stub_pyclass_complex_enum]
-#[pyclass]
-pub enum AutoCommit {
-    /// The auto-commit is disabled and the offset must be stored manually by the consumer.
-    Disabled(),
-    /// The auto-commit is enabled and the offset is stored on the server after a certain interval.
-    Interval(Py<PyDelta>),
-    /// The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode when consuming the messages.
-    IntervalOrWhen(Py<PyDelta>, AutoCommitWhen),
-    /// The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode after consuming the messages.
-    IntervalOrAfter(Py<PyDelta>, AutoCommitAfter),
-    /// The auto-commit is enabled and the offset is stored on the server depending on the mode when consuming the messages.
-    When(AutoCommitWhen),
-    /// The auto-commit is enabled and the offset is stored on the server depending on the mode after consuming the messages.
-    After(AutoCommitAfter),
+/// When an `IggyConsumer` stores the position of the last message that it yielded. It never
+/// stores the end of a prefetched batch. The default stores nothing: commit checkpoints with
+/// `IggyConsumer.commit()`.
+#[gen_stub_pyclass]
+#[pyclass(frozen)]
+pub struct ClientCommitPolicy {
+    pub(crate) inner: RustClientCommitPolicy,
 }
 
-impl TryFrom<&AutoCommit> for RustAutoCommit {
-    type Error = PyErr;
-
-    fn try_from(val: &AutoCommit) -> PyResult<RustAutoCommit> {
-        Ok(match val {
-            AutoCommit::Disabled() => RustAutoCommit::Disabled,
-            AutoCommit::Interval(delta) => RustAutoCommit::Interval(auto_commit_interval(delta)?),
-            AutoCommit::IntervalOrWhen(delta, when) => {
-                RustAutoCommit::IntervalOrWhen(auto_commit_interval(delta)?, when.into())
-            }
-            AutoCommit::IntervalOrAfter(delta, after) => {
-                RustAutoCommit::IntervalOrAfter(auto_commit_interval(delta)?, after.into())
-            }
-            AutoCommit::When(when) => RustAutoCommit::When(when.into()),
-            AutoCommit::After(after) => RustAutoCommit::After(after.into()),
+#[gen_stub_pymethods]
+#[pymethods]
+impl ClientCommitPolicy {
+    /// Constructs a client commit policy.
+    ///
+    /// Args:
+    ///     interval: Store the latest position at this interval. Raises `ValueError` if it is
+    ///         negative or zero.
+    ///     on: Also store it on this event.
+    #[new]
+    #[pyo3(signature = (*, interval=None, on=None))]
+    fn new(
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "CommitEvent | None"))] on: Option<&CommitEvent>,
+    ) -> PyResult<Self> {
+        let interval = interval
+            .as_ref()
+            .map(|interval| reject_zero(py_delta_to_iggy_duration(interval)?, "interval"))
+            .transpose()?;
+        Ok(Self {
+            inner: RustClientCommitPolicy {
+                interval,
+                on: on.map(RustCommitEvent::from),
+            },
         })
     }
+
+    /// The interval of the stores, or `None`.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    fn interval<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDelta>>> {
+        self.inner
+            .interval
+            .map(|interval| iggy_duration_to_py_delta(py, interval.get()))
+            .transpose()
+    }
+
+    /// The event of the stores, or `None`.
+    #[gen_stub(override_return_type(type_repr = "CommitEvent | None"))]
+    #[getter]
+    fn on(&self) -> Option<CommitEvent> {
+        self.inner.on.map(CommitEvent::from)
+    }
 }
 
-fn auto_commit_interval(delta: &Py<PyDelta>) -> PyResult<NonZeroIggyDuration> {
-    reject_zero(py_delta_to_iggy_duration(delta)?, "interval")
-}
-
-/// The auto-commit mode for storing the offset on the server.
-#[derive(Debug, PartialEq, Copy, Clone)]
-#[gen_stub_pyclass_complex_enum(skip_stub_type)]
+/// The event of a `ClientCommitPolicy`.
+#[derive(Clone, Copy)]
+#[gen_stub_pyclass_complex_enum]
 #[pyclass(from_py_object)]
-pub enum AutoCommitWhen {
-    /// The offset is stored on the server when the messages are received.
-    PollingMessages(),
-    /// The offset is stored on the server when all the messages are consumed.
-    ConsumingAllMessages(),
-    /// The offset is stored on the server when consuming each message.
-    ConsumingEachMessage(),
-    /// The offset is stored on the server when consuming every Nth message.
-    ConsumingEveryNthMessage(u32),
+pub enum CommitEvent {
+    /// Each message.
+    EachMessage(),
+    /// A message whose offset is a multiple of `n`. The consumer refuses zero.
+    EveryNthMessage(u32),
+    /// The last message of a batch.
+    EachBatch(),
 }
 
-impl From<&AutoCommitWhen> for RustAutoCommitWhen {
-    fn from(val: &AutoCommitWhen) -> RustAutoCommitWhen {
-        match val {
-            AutoCommitWhen::PollingMessages() => RustAutoCommitWhen::PollingMessages,
-            AutoCommitWhen::ConsumingAllMessages() => RustAutoCommitWhen::ConsumingAllMessages,
-            AutoCommitWhen::ConsumingEachMessage() => RustAutoCommitWhen::ConsumingEachMessage,
-            AutoCommitWhen::ConsumingEveryNthMessage(n) => {
-                RustAutoCommitWhen::ConsumingEveryNthMessage(n.to_owned())
-            }
+impl From<&CommitEvent> for RustCommitEvent {
+    fn from(event: &CommitEvent) -> Self {
+        match event {
+            CommitEvent::EachMessage() => Self::EachMessage,
+            CommitEvent::EveryNthMessage(n) => Self::EveryNthMessage(*n),
+            CommitEvent::EachBatch() => Self::EachBatch,
         }
     }
 }
 
-impl PyStubType for AutoCommitWhen {
-    fn type_output() -> TypeInfo {
-        TypeInfo::unqualified("AutoCommitWhen")
-    }
-}
-
-/// The auto-commit mode for storing the offset on the server **after** receiving the messages.
-#[derive(Debug, PartialEq, Copy, Clone)]
-#[gen_stub_pyclass_complex_enum(skip_stub_type)]
-#[pyclass(from_py_object)]
-#[allow(clippy::enum_variant_names)]
-pub enum AutoCommitAfter {
-    /// The offset is stored on the server after all the messages are consumed.
-    ConsumingAllMessages(),
-    /// The offset is stored on the server after consuming each message.
-    ConsumingEachMessage(),
-    /// The offset is stored on the server after consuming every Nth message.
-    ConsumingEveryNthMessage(u32),
-}
-
-impl From<&AutoCommitAfter> for RustAutoCommitAfter {
-    fn from(val: &AutoCommitAfter) -> RustAutoCommitAfter {
-        match val {
-            AutoCommitAfter::ConsumingAllMessages() => RustAutoCommitAfter::ConsumingAllMessages,
-            AutoCommitAfter::ConsumingEachMessage() => RustAutoCommitAfter::ConsumingEachMessage,
-            AutoCommitAfter::ConsumingEveryNthMessage(n) => {
-                RustAutoCommitAfter::ConsumingEveryNthMessage(n.to_owned())
-            }
+impl From<RustCommitEvent> for CommitEvent {
+    fn from(event: RustCommitEvent) -> Self {
+        match event {
+            RustCommitEvent::EachMessage => Self::EachMessage(),
+            RustCommitEvent::EveryNthMessage(n) => Self::EveryNthMessage(n),
+            RustCommitEvent::EachBatch => Self::EachBatch(),
         }
-    }
-}
-
-impl PyStubType for AutoCommitAfter {
-    fn type_output() -> TypeInfo {
-        TypeInfo::unqualified("AutoCommitAfter")
     }
 }

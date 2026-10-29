@@ -85,16 +85,20 @@ and its lane. An `operation_uncertain` result remains retained.
 `AbandonOperation` releases local state without undoing or determining the server
 result. `operation_not_retained` does not prove noncommit, so submitting the old
 payload again can duplicate work. A `lane_blocked` ID belongs to an earlier call;
-resolve it before submitting the new request again. Polls remain transient and
-are never retained or replayed.
+resolve it before submitting the new request again. Polls are never replayed.
+A poll with `ServerCommitPolicy::OnRead` whose reply is lost fails with
+`fetch_progress_uncertain` and blocks its partition on the client: later polls
+of that partition fail with `partition_lane_blocked` until `AbandonOperation`
+releases the operation that the error names.
 
 `Disconnect()` and session reset discard retained operations without settling
 their outcomes. Reconnecting cannot recover those discarded operations.
 The client keeps the proved outcomes of its last `max_operations` replays, also
 across a session reset. A later `ResolveOperation` of a proved operation returns
 the same outcome without a request.
-TCP, QUIC, and WebSocket support `ResolveOperation` and `AbandonOperation`;
-HTTP reports `feature_unavailable` for both.
+TCP, QUIC, and WebSocket support `ResolveOperation` and `AbandonOperation`.
+HTTP reports `feature_unavailable` for `ResolveOperation`, and its
+`AbandonOperation` releases only the poll operations of `fetch_progress_uncertain`.
 
 The blocking wrapper populates `IggyException::Code()` and `Kind()` for Rust SDK
 errors from these methods:
@@ -122,6 +126,24 @@ The `IggyException(const std::string &, const ffi::ErrorInfo &)` constructor is 
 
 Concurrent calls on one client are safe. Moving, assigning, or destroying the
 client while any call is in progress is undefined behavior.
+
+Reads go through the generated bridge. `poll_messages` returns one batch of one
+partition for a `PollingStrategy` and `PollOptions`. `default_poll_options()` returns
+the defaults, which do not wait. To read on after a batch, pass its `continuation()`
+to the `poll_messages` overload that takes a `Continuation`. A continuation belongs to
+the partition of its batch. To store the position after a message, pass the
+`checkpoint()` or `checkpoint_at(index)` of its batch to `store_consumer_position` or
+`IggyBlockingClient::StoreConsumerPosition`. `Checkpoint` and `Continuation` are opaque
+Rust types. Only a polled batch or a read error makes them, so a caller cannot change
+the partition context that they keep.
+
+`Client::reader` builds a `PartitionReader` with routing and prefetch. `next` waits up to
+its timeout. If the time runs out, it returns an empty batch. `commit` stores a
+checkpoint that the reader delivered. `seek` moves a partition to a `PollingStrategy`,
+or to a `Continuation` of that partition. After a message that does not decode, the
+`skip` of `ReadErrorInfo` holds one continuation past it. `close` stops the reader, and
+a second `close` does nothing. A consumer group reader joins its group in
+`Client::reader` and leaves it in `close`.
 
 `StoreConsumerOffset` and `DeleteConsumerOffset` require an explicit partition on
 TCP, QUIC, and WebSocket; an absent partition returns `invalid_identifier`.

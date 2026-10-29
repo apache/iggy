@@ -17,13 +17,16 @@
 
 import argparse
 import asyncio
+from datetime import timedelta
 from typing import NamedTuple
 
 from apache_iggy import (
-    AutoCommit,
-    AutoCommitAfter,
+    ClientCommitPolicy,
+    CommitEvent,
     IggyClient,
     PollingStrategy,
+    PollOptions,
+    ReadError,
     ReceiveMessage,
 )
 from loguru import logger
@@ -32,6 +35,7 @@ STREAM_NAME = "high-level-stream"
 TOPIC_NAME = "high-level-topic"
 CONSUMER_GROUP_NAME = "high-level-consumer"
 MESSAGES_TO_CONSUME = 12
+HISTORY_UNAVAILABLE = 87
 
 
 class ArgNamespace(NamedTuple):
@@ -64,8 +68,8 @@ async def main() -> None:
         STREAM_NAME,
         TOPIC_NAME,
         polling_strategy=PollingStrategy.First(),
-        batch_length=100,
-        auto_commit=AutoCommit.After(AutoCommitAfter.ConsumingEachMessage()),
+        poll_options=PollOptions(count=100, max_wait=timedelta(seconds=1)),
+        client_commit=ClientCommitPolicy(on=CommitEvent.EachMessage()),
     )
 
     shutdown_event = asyncio.Event()
@@ -83,7 +87,20 @@ async def main() -> None:
         if consumed_messages == MESSAGES_TO_CONSUME:
             shutdown_event.set()
 
-    await consumer.consume_messages(handle_message, shutdown_event)
+    while True:
+        try:
+            await consumer.consume_messages(handle_message, shutdown_event)
+            break
+        except ReadError as error:
+            # A partition that another client deleted and created again reads nothing
+            # until a seek picks a start in its new history.
+            if error.partition_id is None or error.code != HISTORY_UNAVAILABLE:
+                raise
+            logger.warning(
+                "Partition {} has a new history: {}", error.partition_id, error
+            )
+            await consumer.seek(error.partition_id, PollingStrategy.Next())
+    await consumer.shutdown()
     logger.info("Consumed {} messages, exiting", consumed_messages)
 
 

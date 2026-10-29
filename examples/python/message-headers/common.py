@@ -30,7 +30,9 @@ from apache_iggy import (
     HeaderValue,
     IggyClient,
     PollingStrategy,
+    PollOptions,
     ReceiveMessage,
+    ServerCommitPolicy,
     StreamDetails,
     TopicDetails,
 )
@@ -188,25 +190,27 @@ async def consume_messages(
     while consumed_batches < BATCHES_LIMIT:
         try:
             logger.debug("Polling for messages...")
-            polled_messages = await client.poll_messages(
+            polled = await client.poll_messages(
                 stream=STREAM_NAME,
                 topic=TOPIC_NAME,
-                consumer=Consumer.Single(consumer_name),
                 partition_id=PARTITION_ID,
+                consumer=Consumer.Single(consumer_name),
                 polling_strategy=PollingStrategy.Next(),
-                count=MESSAGES_PER_BATCH,
-                auto_commit=True,
+                options=PollOptions(
+                    count=MESSAGES_PER_BATCH,
+                    server_commit=ServerCommitPolicy.OnRead,
+                ),
             )
-            if not polled_messages:
+            if not polled.messages:
                 logger.info("No messages found in current poll")
                 await asyncio.sleep(interval)
                 continue
 
-            for message in polled_messages:
+            for message in polled.messages:
                 handle_message(message)
 
             consumed_batches += 1
-            logger.info(f"Consumed {len(polled_messages)} message(s).")
+            logger.info(f"Consumed {len(polled.messages)} message(s).")
             await asyncio.sleep(interval)
         except Exception as error:
             logger.exception(f"Exception occurred while consuming messages: {error}")

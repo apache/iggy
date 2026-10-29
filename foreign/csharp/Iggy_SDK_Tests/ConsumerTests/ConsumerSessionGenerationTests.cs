@@ -156,7 +156,6 @@ public sealed class ConsumerSessionGenerationTests
             BatchSize = 10,
             AutoCommitMode = AutoCommitMode.Disabled,
             AutoCommit = false,
-            PollingIntervalMs = 0
         };
     }
 
@@ -211,7 +210,7 @@ public sealed class ConsumerSessionGenerationTests
                 .Returns(Task.CompletedTask);
             mock.Setup(c => c.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(), It.IsAny<uint?>(),
                     It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(),
-                    It.IsAny<CancellationToken>()))
+                    It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(() => new PolledMessages
                 {
                     PartitionId = 1,

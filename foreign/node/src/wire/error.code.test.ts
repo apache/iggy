@@ -42,6 +42,10 @@ it('translates the lifecycle refusal', () => {
   assert.equal(translateErrorCode(88), 'A committed lifecycle operation prevents this mutation. Retry as a new request.');
 });
 
+it('translates the deferred poll capacity refusal', () => {
+  assert.equal(translateErrorCode(90), 'Deferred poll capacity exceeded; retry after backoff on the same replica');
+});
+
 it('translates the consumer-offset capacity error', () => {
   assert.equal(translateErrorCode(3024), 'Consumer offset limit reached for partition, raise [partition] consumer_offsets_max');
 });

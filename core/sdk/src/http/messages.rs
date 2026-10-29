@@ -26,92 +26,50 @@ use async_trait::async_trait;
 use iggy_common::IggyMessagesBatch;
 use iggy_common::MessageClient;
 use iggy_common::PartitioningKind;
+use iggy_common::PollOptions;
 use iggy_common::SendMessagesConfirmations;
+use iggy_common::ServerCommitPolicy;
 
 #[async_trait]
 impl MessageClient for HttpClient {
-    async fn poll_messages_with_strategy_for_and_options(
+    /// Every poll goes to the deferred endpoint, also with a zero wait, because only that
+    /// endpoint honors `min_count`, `max_bytes` and the request timeout. A first message
+    /// larger than `max_bytes` comes alone in its own read, except at a `Last` start with a
+    /// count above 1.
+    async fn poll_messages(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: u32,
         consumer: &Consumer,
-        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
-        count: u32,
-        auto_commit: bool,
-        options: Option<iggy_common::DeferredPollOptions>,
+        strategy: &PollingStrategy,
+        options: PollOptions,
     ) -> Result<PolledMessages, IggyError> {
-        let Some(options) = options else {
-            return self
-                .poll_messages_with_strategy_for(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    consumer,
-                    strategy_for,
-                    count,
-                    auto_commit,
-                )
-                .await;
-        };
-        if consumer.kind == ConsumerKind::ExternalGroup
-            || (consumer.kind == ConsumerKind::ConsumerGroup && partition_id.is_none())
-        {
+        options.validate()?;
+        strategy.validate_partition(partition_id)?;
+        // HTTP cannot join a consumer group, and an external group only holds offsets.
+        if consumer.kind != ConsumerKind::Consumer {
             return Err(IggyError::FeatureUnavailable);
         }
         let path = format!(
             "{}/deferred",
             get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str())
         );
-        self.get_deferred_poll(
-            &path,
-            &PollMessages {
-                stream_id: stream_id.clone(),
-                topic_id: topic_id.clone(),
-                partition_id,
-                consumer: consumer.clone(),
-                strategy: strategy_for(partition_id.unwrap_or(0)),
-                count,
-                auto_commit,
-            },
-            options,
-        )
-        .await
-    }
-
-    async fn poll_messages(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: Option<u32>,
-        consumer: &Consumer,
-        strategy: &PollingStrategy,
-        count: u32,
-        auto_commit: bool,
-    ) -> Result<PolledMessages, IggyError> {
-        if matches!(consumer.kind, ConsumerKind::ExternalGroup) {
-            return Err(IggyError::FeatureUnavailable);
-        }
-
-        let response = self
-            .get_with_query(
-                &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
-                &PollMessages {
+        options
+            .poll_oversized_alone(strategy, |count, wire_options| {
+                let poll = PollMessages {
                     stream_id: stream_id.clone(),
                     topic_id: topic_id.clone(),
-                    partition_id,
+                    partition_id: Some(partition_id),
                     consumer: consumer.clone(),
                     strategy: *strategy,
                     count,
-                    auto_commit,
-                },
-            )
-            .await?;
-        let messages = response
-            .json()
+                    auto_commit: options.server_commit == ServerCommitPolicy::OnRead,
+                };
+                let path = &path;
+                async move { self.get_deferred_poll(path, &poll, wire_options).await }
+            })
             .await
-            .map_err(|_| IggyError::InvalidJsonResponse)?;
-        Ok(messages)
     }
 
     async fn send_messages(
@@ -275,16 +233,20 @@ fn get_path(stream_id: &str, topic_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SendMessagesConfirmations, SendMessagesResponse};
+    use super::{PolledMessages, SendMessagesConfirmations, SendMessagesResponse};
+    use crate::clients::reader::fixtures::message_at;
     use crate::http::http_client::HttpClient;
     use crate::http::scripted_server::{Recorded, Reply, ScriptedServer};
     use crate::prelude::{
-        Consumer, DeferredPollOptions, Identifier, IggyError, IggyMessage, MessageClient,
-        PartitionClient, PartitionContext, Partitioning, PollingStrategy,
+        Client, Consumer, ConsumerOffsetClient, Identifier, IggyError, IggyMessage, MessageClient,
+        PartitionClient, PartitionContext, Partitioning, PollingKind, PollingStrategy,
         SendMessagesConfirmationResponse, StreamClient, StreamCreateOptions, TopicClient,
         TopicCreateOptions,
     };
     use bytes::Bytes;
+    use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
+    use iggy_common::{Checkpoint, DEFAULT_POLL_MAX_BYTES, PollOptions, ServerCommitPolicy};
+    use std::time::Instant;
 
     const PARTITION_ID: u32 = 2;
     const OTHER_PARTITION_ID: u32 = 3;
@@ -298,13 +260,25 @@ mod tests {
         owner_generation: 0,
         metadata_op: 14,
     };
+    const START: u64 = 5;
+    const STREAM_NAME: &str = "stream";
+    const TOPIC_NAME: &str = "topic";
     const TOPIC_LINE: &str = "GET /streams/1/topics/1 HTTP/1.1";
     const SEND_LINE: &str = "POST /streams/1/topics/1/messages HTTP/1.1";
+    const DEFERRED_POLL_LINE: &str = "GET /streams/1/topics/1/messages/deferred?";
 
     fn ids() -> (Identifier, Identifier) {
         (
             Identifier::numeric(1).unwrap(),
             Identifier::numeric(1).unwrap(),
+        )
+    }
+
+    /// The names of the stream and topic of [`ids`].
+    fn named_ids() -> (Identifier, Identifier) {
+        (
+            Identifier::named(STREAM_NAME).unwrap(),
+            Identifier::named(TOPIC_NAME).unwrap(),
         )
     }
 
@@ -324,6 +298,36 @@ mod tests {
             .await
     }
 
+    async fn poll(
+        client: &HttpClient,
+        strategy: &PollingStrategy,
+        server_commit: ServerCommitPolicy,
+    ) -> Result<PolledMessages, IggyError> {
+        poll_partition(client, &ids(), PARTITION_ID, strategy, server_commit).await
+    }
+
+    async fn poll_partition(
+        client: &HttpClient,
+        (stream_id, topic_id): &(Identifier, Identifier),
+        partition_id: u32,
+        strategy: &PollingStrategy,
+        server_commit: ServerCommitPolicy,
+    ) -> Result<PolledMessages, IggyError> {
+        client
+            .poll_messages(
+                stream_id,
+                topic_id,
+                partition_id,
+                &Consumer::default(),
+                strategy,
+                PollOptions {
+                    server_commit,
+                    ..PollOptions::default()
+                },
+            )
+            .await
+    }
+
     fn lines(requests: &[Recorded]) -> Vec<&str> {
         requests
             .iter()
@@ -331,27 +335,547 @@ mod tests {
             .collect()
     }
 
+    /// Only the deferred endpoint honors every poll option, so a poll that answers at once goes
+    /// there too. An empty batch continues from the start of its request.
     #[tokio::test]
-    async fn given_an_external_group_when_polling_deferred_should_refuse_it_before_sending() {
+    async fn given_a_zero_wait_when_polling_should_use_the_deferred_endpoint_and_keep_its_start() {
+        let server = ScriptedServer::start(vec![Reply::polled()]).await;
+
+        let polled = poll(
+            &server.client(),
+            &PollingStrategy::offset(START),
+            ServerCommitPolicy::Disabled,
+        )
+        .await
+        .unwrap();
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].line.starts_with(DEFERRED_POLL_LINE),
+            "{}",
+            requests[0].line
+        );
+        assert_eq!(requests[0].query("wait_us").as_deref(), Some("0"));
+        assert_eq!(
+            requests[0].query("partition_id"),
+            Some(PARTITION_ID.to_string())
+        );
+        assert_eq!(requests[0].query("auto_commit").as_deref(), Some("false"));
+        let continuation = polled.continuation();
+        assert_eq!(
+            (continuation.kind, continuation.value),
+            (PollingKind::Offset, START)
+        );
+    }
+
+    /// HTTP cannot join a consumer group, and an external group only holds offsets.
+    #[tokio::test]
+    async fn given_a_group_consumer_when_polling_should_refuse_it_before_sending() {
         let server = ScriptedServer::start(vec![]).await;
         let client = server.client();
         let (stream_id, topic_id) = ids();
+        let group_id = Identifier::numeric(1).unwrap();
 
-        let polled = client
-            .poll_messages_deferred(
-                &stream_id,
-                &topic_id,
-                Some(PARTITION_ID),
-                &Consumer::external_group(Identifier::numeric(1).unwrap()),
+        for consumer in [
+            Consumer::group(group_id.clone()),
+            Consumer::external_group(group_id.clone()),
+        ] {
+            let polled = client
+                .poll_messages(
+                    &stream_id,
+                    &topic_id,
+                    PARTITION_ID,
+                    &consumer,
+                    &PollingStrategy::next(),
+                    PollOptions::default(),
+                )
+                .await;
+
+            assert_eq!(
+                polled.map(drop),
+                Err(IggyError::FeatureUnavailable),
+                "{consumer:?}"
+            );
+        }
+        assert!(server.requests().is_empty());
+    }
+
+    /// A continuation of another partition would read this partition at an offset of the
+    /// other one. A continuation of this partition fences the poll with its context.
+    #[tokio::test]
+    async fn given_a_continuation_when_polling_should_send_it_only_to_its_own_partition() {
+        let server = ScriptedServer::start(vec![Reply::polled()]).await;
+        let client = server.client();
+        let other =
+            PollingStrategy::continuation(OTHER_PARTITION_ID, PollingKind::Offset, START, CURRENT);
+        let own = PollingStrategy::continuation(PARTITION_ID, PollingKind::Offset, START, CURRENT);
+
+        let refused = poll(&client, &other, ServerCommitPolicy::Disabled).await;
+        let polled = poll(&client, &own, ServerCommitPolicy::Disabled).await;
+
+        assert_eq!(refused.map(drop), Err(IggyError::InvalidCommand));
+        polled.unwrap();
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        let context = requests[0]
+            .query("context")
+            .map(|context| serde_json::from_str::<PartitionContext>(&context).unwrap());
+        assert_eq!(context, Some(CURRENT));
+    }
+
+    /// The server stores the offset of an `OnRead` poll before it answers, and it can still
+    /// store it after the client gives up. So a poll whose answer does not prove the outcome
+    /// is never sent again, and it blocks the partition. The server checks a poll again after
+    /// the read, so a 4xx other than 404 settles nothing unless binary takes its error as proof
+    /// too.
+    #[tokio::test]
+    async fn given_an_on_read_poll_when_its_outcome_is_unknown_should_block_the_partition() {
+        for (case, unknown) in [
+            ("lost reply", Reply::hang_up()),
+            ("cut body", Reply::polled().cut()),
+            ("401", Reply::error(401, &IggyError::Unauthenticated)),
+            ("403", Reply::error(403, &IggyError::Unauthorized)),
+            ("other 4xx", Reply::error(400, &IggyError::InvalidCommand)),
+            ("4xx without an error id", Reply::empty(400)),
+            ("500", Reply::empty(500)),
+            ("502", Reply::empty(502)),
+            ("504", Reply::error(504, &IggyError::TransientNotCommitted)),
+            ("2xx that does not parse", Reply::empty(200)),
+        ] {
+            let server = ScriptedServer::start(vec![unknown, Reply::polled()]).await;
+            let client = server.client();
+
+            let polled = poll(
+                &client,
                 &PollingStrategy::next(),
-                1,
-                false,
-                DeferredPollOptions::default(),
+                ServerCommitPolicy::OnRead,
+            )
+            .await;
+            let next = poll(
+                &client,
+                &PollingStrategy::next(),
+                ServerCommitPolicy::OnRead,
             )
             .await;
 
-        assert_eq!(polled.map(|_| ()), Err(IggyError::FeatureUnavailable));
-        assert!(server.requests().is_empty());
+            let Err(IggyError::FetchProgressUncertain(op)) = polled else {
+                panic!("{case}: {polled:?}");
+            };
+            assert!(client.retains_operation(op), "{case}");
+            assert_eq!(
+                next.map(drop),
+                Err(IggyError::PartitionLaneBlocked(PARTITION_ID, op)),
+                "{case}"
+            );
+            let requests = server.requests();
+            assert_eq!(requests.len(), 1, "{case}");
+            assert_eq!(
+                requests[0].query("auto_commit").as_deref(),
+                Some("true"),
+                "{case}"
+            );
+        }
+    }
+
+    /// A 503 refuses a poll before the server takes it, and the server sends a 404 only before
+    /// the read. Another 4xx proves the outcome when binary takes its error as proof too, also
+    /// when the client returns it as `HttpResponseError`. None of them leaves a block.
+    /// `HistoryUnavailable` after the read means that the history the poll read is gone. A
+    /// non-admission refusal is sent again within the request timeout.
+    #[tokio::test]
+    async fn given_an_on_read_poll_when_its_refusal_proves_the_outcome_should_leave_no_block() {
+        let server = ScriptedServer::start(vec![
+            Reply::error(503, &IggyError::TransientNotAccepted),
+            Reply::polled(),
+            Reply::empty(503),
+            Reply::error(400, &IggyError::HistoryUnavailable),
+            Reply::error(400, &IggyError::InvalidOffset(START)),
+            Reply::empty(404),
+            Reply::polled(),
+        ])
+        .await;
+        let client = server.client();
+
+        let retried = poll(
+            &client,
+            &PollingStrategy::next(),
+            ServerCommitPolicy::OnRead,
+        )
+        .await;
+        let refused = poll(
+            &client,
+            &PollingStrategy::next(),
+            ServerCommitPolicy::OnRead,
+        )
+        .await;
+        let history_gone = poll(
+            &client,
+            &PollingStrategy::next(),
+            ServerCommitPolicy::OnRead,
+        )
+        .await;
+        let invalid_offset = poll(
+            &client,
+            &PollingStrategy::next(),
+            ServerCommitPolicy::OnRead,
+        )
+        .await;
+        let not_found = poll(
+            &client,
+            &PollingStrategy::next(),
+            ServerCommitPolicy::OnRead,
+        )
+        .await;
+        let next = poll(
+            &client,
+            &PollingStrategy::next(),
+            ServerCommitPolicy::OnRead,
+        )
+        .await;
+
+        retried.unwrap();
+        assert!(
+            matches!(refused, Err(IggyError::HttpResponseError(503, _))),
+            "{refused:?}"
+        );
+        assert_eq!(history_gone.map(drop), Err(IggyError::HistoryUnavailable));
+        assert!(
+            matches!(invalid_offset, Err(IggyError::HttpResponseError(400, _))),
+            "{invalid_offset:?}"
+        );
+        assert!(
+            matches!(not_found, Err(IggyError::ResourceNotFound(_))),
+            "{not_found:?}"
+        );
+        next.unwrap();
+        assert_eq!(server.requests().len(), 7);
+    }
+
+    /// A first message larger than `max_bytes` comes alone in a second read with the consumer,
+    /// the start and the server commit of the first one, so with `OnRead` the server stores the
+    /// offset of that message only. A read without a byte limit is not repeated.
+    #[tokio::test]
+    async fn given_an_oversized_first_message_when_polled_should_read_it_alone_once() {
+        for server_commit in [ServerCommitPolicy::Disabled, ServerCommitPolicy::OnRead] {
+            for max_bytes in [DEFAULT_POLL_MAX_BYTES, u32::MAX] {
+                let case = format!("{server_commit:?} max_bytes={max_bytes}");
+                let alone =
+                    PolledMessages::new(CURRENT, PARTITION_ID, START, 1, vec![message_at(START)]);
+                let server = ScriptedServer::start(vec![
+                    Reply::error(400, &IggyError::InvalidSizeBytes),
+                    Reply::batch(&alone),
+                ])
+                .await;
+                let client = server.client();
+                let (stream_id, topic_id) = ids();
+                let options = PollOptions {
+                    max_bytes,
+                    server_commit,
+                    ..PollOptions::default()
+                };
+
+                let polled = client
+                    .poll_messages(
+                        &stream_id,
+                        &topic_id,
+                        PARTITION_ID,
+                        &Consumer::default(),
+                        &PollingStrategy::offset(START),
+                        options,
+                    )
+                    .await;
+
+                let requests = server.requests();
+                if max_bytes == u32::MAX {
+                    assert_eq!(polled.map(drop), Err(IggyError::InvalidSizeBytes), "{case}");
+                    assert_eq!(requests.len(), 1, "{case}");
+                    continue;
+                }
+                let offsets: Vec<u64> = polled
+                    .unwrap()
+                    .messages
+                    .iter()
+                    .map(|message| message.header.offset)
+                    .collect();
+                assert_eq!(offsets, [START], "{case}");
+                let [first, second] = requests.as_slice() else {
+                    panic!("{case}: one read alone after the refusal, got {requests:?}");
+                };
+                let expected = options.alone();
+                for (key, value) in [
+                    ("count", expected.count),
+                    ("min_count", expected.min_count),
+                    ("max_bytes", expected.max_bytes),
+                ] {
+                    assert_eq!(second.query(key), Some(value.to_string()), "{case}: {key}");
+                }
+                assert_eq!(
+                    second.query("auto_commit"),
+                    Some((server_commit == ServerCommitPolicy::OnRead).to_string()),
+                    "{case}"
+                );
+                for key in ["consumer_id", "kind", "value"] {
+                    assert_eq!(second.query(key), first.query(key), "{case}: {key}");
+                }
+            }
+        }
+    }
+
+    /// With count 1, a `Last` start would begin at the last message and skip the messages
+    /// before it. The refusal proves that the server stored nothing, so the partition polls on.
+    #[tokio::test]
+    async fn given_an_oversized_first_message_of_a_last_start_when_polled_should_return_the_refusal()
+     {
+        for server_commit in [ServerCommitPolicy::Disabled, ServerCommitPolicy::OnRead] {
+            let server = ScriptedServer::start(vec![
+                Reply::error(400, &IggyError::InvalidSizeBytes),
+                Reply::polled(),
+            ])
+            .await;
+            let client = server.client();
+            let last = PollingStrategy::last();
+
+            let refused = poll(&client, &last, server_commit).await;
+            let next = poll(&client, &last, server_commit).await;
+
+            assert_eq!(
+                refused.map(drop),
+                Err(IggyError::InvalidSizeBytes),
+                "{server_commit:?}"
+            );
+            next.unwrap();
+            let requests = server.requests();
+            assert_eq!(requests.len(), 2, "{server_commit:?}: no read alone");
+            for request in &requests {
+                assert_eq!(
+                    request.query("count"),
+                    Some(PollOptions::default().count.to_string()),
+                    "{server_commit:?}"
+                );
+            }
+        }
+    }
+
+    /// The server can still store the offset of a sent `OnRead` poll that its caller dropped.
+    #[tokio::test]
+    async fn given_a_sent_on_read_poll_when_its_caller_drops_it_should_block_the_partition() {
+        let server = ScriptedServer::start(vec![Reply::stall()]).await;
+        let client = server.client();
+        let strategy = PollingStrategy::next();
+
+        tokio::select! {
+            polled = poll(&client, &strategy, ServerCommitPolicy::OnRead) => {
+                panic!("a poll without an answer ended: {polled:?}");
+            }
+            () = server.request_arrived() => {}
+        }
+        let next = poll(&client, &strategy, ServerCommitPolicy::Disabled).await;
+
+        let Err(IggyError::PartitionLaneBlocked(PARTITION_ID, op)) = next else {
+            panic!("{next:?}");
+        };
+        assert!(client.retains_operation(op));
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    /// A name and a numeric id spell the same partition, so the block refuses both. Offset
+    /// reads and polls that neither store the offset nor start at it go on, and so do other
+    /// partitions.
+    #[tokio::test]
+    async fn given_a_blocked_partition_when_reading_on_should_refuse_its_progress_calls() {
+        let server = ScriptedServer::start(vec![
+            Reply::hang_up(),
+            Reply::empty(404),
+            Reply::polled(),
+            Reply::polled(),
+        ])
+        .await;
+        let client = server.client();
+        let consumer = Consumer::default();
+        let (stream_id, topic_id) = ids();
+        let named = named_ids();
+        let checkpoint = Checkpoint::new(PARTITION_ID, START, CURRENT);
+        let lost = poll(
+            &client,
+            &PollingStrategy::next(),
+            ServerCommitPolicy::OnRead,
+        )
+        .await;
+        let Err(IggyError::FetchProgressUncertain(op)) = lost else {
+            panic!("{lost:?}");
+        };
+        let blocked = Err(IggyError::PartitionLaneBlocked(PARTITION_ID, op));
+
+        let next = poll_partition(
+            &client,
+            &named,
+            PARTITION_ID,
+            &PollingStrategy::next(),
+            ServerCommitPolicy::Disabled,
+        )
+        .await;
+        let on_read = poll_partition(
+            &client,
+            &named,
+            PARTITION_ID,
+            &PollingStrategy::offset(START),
+            ServerCommitPolicy::OnRead,
+        )
+        .await;
+        let stored_position = client
+            .store_consumer_position(&consumer, &named.0, &named.1, &checkpoint)
+            .await;
+        let stored_offset = client
+            .store_consumer_offset(&consumer, &stream_id, &topic_id, Some(PARTITION_ID), START)
+            .await;
+        let deleted_offset = client
+            .delete_consumer_offset(&consumer, &stream_id, &topic_id, Some(PARTITION_ID))
+            .await;
+        let deleted_position = client
+            .delete_consumer_position(&consumer, &named.0, &named.1, &checkpoint)
+            .await;
+        let offset = client
+            .get_consumer_offset(&consumer, &named.0, &named.1, Some(PARTITION_ID))
+            .await;
+        let read = poll_partition(
+            &client,
+            &named,
+            PARTITION_ID,
+            &PollingStrategy::offset(START),
+            ServerCommitPolicy::Disabled,
+        )
+        .await;
+        let other = poll_partition(
+            &client,
+            &named,
+            OTHER_PARTITION_ID,
+            &PollingStrategy::next(),
+            ServerCommitPolicy::OnRead,
+        )
+        .await;
+
+        assert_eq!(next.map(drop), blocked);
+        assert_eq!(on_read.map(drop), blocked);
+        assert_eq!(stored_position, blocked);
+        assert_eq!(stored_offset, blocked);
+        assert_eq!(deleted_offset, blocked);
+        assert_eq!(deleted_position, blocked);
+        assert!(matches!(offset, Ok(None)), "{offset:?}");
+        read.unwrap();
+        other.unwrap();
+        assert_eq!(server.requests().len(), 4);
+    }
+
+    /// The server reads an offset call without a partition as one of `DEFAULT_PARTITION_ID`.
+    #[tokio::test]
+    async fn given_a_blocked_default_partition_when_an_offset_call_names_none_should_refuse_it() {
+        let server = ScriptedServer::start(vec![Reply::hang_up()]).await;
+        let client = server.client();
+        let consumer = Consumer::default();
+        let (stream_id, topic_id) = ids();
+        let lost = poll_partition(
+            &client,
+            &ids(),
+            DEFAULT_PARTITION_ID,
+            &PollingStrategy::next(),
+            ServerCommitPolicy::OnRead,
+        )
+        .await;
+        let Err(IggyError::FetchProgressUncertain(op)) = lost else {
+            panic!("{lost:?}");
+        };
+
+        let stored = client
+            .store_consumer_offset(&consumer, &stream_id, &topic_id, None, START)
+            .await;
+        let deleted = client
+            .delete_consumer_offset(&consumer, &stream_id, &topic_id, None)
+            .await;
+
+        let blocked = Err(IggyError::PartitionLaneBlocked(DEFAULT_PARTITION_ID, op));
+        assert_eq!(stored, blocked);
+        assert_eq!(deleted, blocked);
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    /// HTTP cannot learn the outcome of a lost poll, so only an abandon frees its partition.
+    #[tokio::test]
+    async fn given_a_blocked_partition_when_abandoned_should_poll_it_again() {
+        let server = ScriptedServer::start(vec![Reply::hang_up(), Reply::polled()]).await;
+        let client = server.client();
+        let lost = poll(
+            &client,
+            &PollingStrategy::next(),
+            ServerCommitPolicy::OnRead,
+        )
+        .await;
+        let Err(IggyError::FetchProgressUncertain(op)) = lost else {
+            panic!("{lost:?}");
+        };
+
+        let resolved = client.resolve_operation(op, Instant::now()).await;
+        let retained_after_resolve = client.retains_operation(op);
+        let abandoned = client.abandon_operation(op).await;
+        let retained_after_abandon = client.retains_operation(op);
+        let abandoned_again = client.abandon_operation(op).await;
+        let polled = poll(
+            &client,
+            &PollingStrategy::next(),
+            ServerCommitPolicy::OnRead,
+        )
+        .await;
+
+        assert_eq!(resolved, Err(IggyError::FeatureUnavailable));
+        assert!(retained_after_resolve);
+        assert_eq!(abandoned, Ok(()));
+        assert!(!retained_after_abandon);
+        assert_eq!(abandoned_again, Err(IggyError::OperationNotRetained(op)));
+        polled.unwrap();
+        assert_eq!(server.requests().len(), 2);
+    }
+
+    /// A poll without `OnRead` stores nothing, so a failure leaves no block and keeps its error.
+    /// It is not sent again, so a lost `Next` poll reads the same start at the next call.
+    #[tokio::test]
+    async fn given_a_poll_without_on_read_when_it_fails_should_keep_its_error_without_a_block() {
+        for (strategy, failure, expected) in [
+            (
+                PollingStrategy::next(),
+                Reply::hang_up(),
+                IggyError::TransientNotCommitted,
+            ),
+            (
+                PollingStrategy::offset(START),
+                Reply::polled().cut(),
+                IggyError::TransientNotCommitted,
+            ),
+            (
+                PollingStrategy::offset(START),
+                Reply::empty(200),
+                IggyError::InvalidJsonResponse,
+            ),
+            (
+                PollingStrategy::next(),
+                Reply::empty(500),
+                IggyError::HttpResponseError(500, String::new()),
+            ),
+        ] {
+            let server = ScriptedServer::start(vec![failure, Reply::polled()]).await;
+            let client = server.client();
+
+            let polled = poll(&client, &strategy, ServerCommitPolicy::Disabled).await;
+            let next = poll(
+                &client,
+                &PollingStrategy::next(),
+                ServerCommitPolicy::Disabled,
+            )
+            .await;
+
+            assert_eq!(polled.map(drop), Err(expected), "{strategy}");
+            next.unwrap();
+            assert_eq!(server.requests().len(), 2, "{strategy}");
+        }
     }
 
     #[tokio::test]

@@ -79,7 +79,7 @@ async fn test_last_strategy(client: &IggyClient) {
     init_system(client).await;
     produce_messages(client).await;
 
-    // Last strategy with batch_length=100 returns the last 100 messages
+    // Last strategy with count=100 returns the last 100 messages
     let received = consume_with_strategy(client, "last-consumer", PollingStrategy::last()).await;
 
     assert_eq!(
@@ -179,14 +179,18 @@ async fn consume_with_strategy(
     };
 
     let mut consumer = client
-        .consumer(consumer_name, STREAM_NAME, TOPIC_NAME, PARTITION_ID)
+        .consumer(consumer_name, STREAM_NAME, TOPIC_NAME)
         .unwrap()
-        .auto_commit(AutoCommit::IntervalOrWhen(
-            NonZeroIggyDuration::from_str("2ms").unwrap(),
-            AutoCommitWhen::ConsumingAllMessages,
-        ))
+        .partitions([PARTITION_ID])
+        .client_commit(ClientCommitPolicy {
+            interval: Some(NonZeroIggyDuration::from_str("2ms").unwrap()),
+            on: Some(CommitEvent::EachBatch),
+        })
         .polling_strategy(strategy)
-        .batch_length(BATCH_LENGTH)
+        .poll_options(PollOptions {
+            count: BATCH_LENGTH,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .build();
 
     consumer.init().await.unwrap();

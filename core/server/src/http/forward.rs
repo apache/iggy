@@ -2432,6 +2432,7 @@ mod tests {
                 fragments: Vec::new().into(),
                 current_offset: 0,
                 encryptor: None,
+                next_offset: None,
             })
             .expect("the poll waits for its reply");
         assert_eq!(

@@ -295,10 +295,12 @@ async fn create_consumers(
         for id in 1..=consumers_count {
             let mut consumer = client
                 .consumer_group(CONSUMER_GROUP, stream, topic)?
-                .batch_length(batch_length)
                 .polling_strategy(PollingStrategy::next())
-                .auto_join_consumer_group()
-                .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
+                .poll_options(PollOptions {
+                    count: batch_length,
+                    server_commit: ServerCommitPolicy::OnRead,
+                    ..PollOptions::wait(IggyDuration::ONE_SECOND)
+                })
                 .build();
             consumer.init().await?;
             consumers.push(TenantConsumer::new(

@@ -17,6 +17,7 @@
 
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.IO.Hashing;
 using System.Net;
 using System.Net.Http.Headers;
@@ -50,8 +51,12 @@ namespace Apache.Iggy.IggyClient.Implementations;
 public class HttpMessageStream : IIggyClient
 {
     private const string Context = "csharp-sdk";
+    private const int DeferredRetryIntervalMs = 50;
+    private const int DeferredRetryMaxIntervalMs = 1_000;
 
     private readonly bool _allowAutoCommitWithEncryptor;
+    private readonly SemaphoreSlim _deferredRequests =
+        new(DeferredPollOptions.MAX_PARKED_REQUESTS, DeferredPollOptions.MAX_PARKED_REQUESTS);
     private readonly ConsumerGroupClientState _groupState = new();
     private readonly HttpClient _httpClient;
 
@@ -284,9 +289,36 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+    public Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
         Consumer consumer,
         PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
+    {
+        return PollAsync(streamId, topicId, partitionId, consumer, pollingStrategy, count, autoCommit, null, token);
+    }
+
+    /// <inheritdoc />
+    public Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+        Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit, DeferredPollOptions options,
+        CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        options.Validate(count);
+        return PollAsync(streamId, topicId, partitionId, consumer, pollingStrategy, count, autoCommit, options, token);
+    }
+
+    /// <inheritdoc />
+    public async Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
+        uint? partitionId, Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit,
+        DeferredPollOptions options, CancellationToken token = default)
+    {
+        var messages = await PollMessagesAsync(streamId, topicId, partitionId, consumer, pollingStrategy, count,
+            autoCommit, options, token);
+        return BinaryMapper.ToRentedMessages(messages);
+    }
+
+    private async Task<PolledMessages> PollAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+        Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit,
+        DeferredPollOptions? deferred, CancellationToken token)
     {
         if (autoCommit && MessageEncryptor is not null && !_allowAutoCommitWithEncryptor)
         {
@@ -301,13 +333,20 @@ public class HttpMessageStream : IIggyClient
         var contextParam = pollingStrategy.Context is { } context
             ? $"&context={Uri.EscapeDataString(JsonSerializer.Serialize(context, _jsonSerializerOptions))}"
             : string.Empty;
-        var url = CreateUrl($"/streams/{streamId}/topics/{topicId}/messages?consumer_id={consumer.ConsumerId}" +
+        var deferredPath = deferred is null ? string.Empty : "/deferred";
+        var url = CreateUrl($"/streams/{streamId}/topics/{topicId}/messages{deferredPath}?consumer_id={consumer.ConsumerId}" +
                             $"{partitionIdParam}&kind={pollingStrategy.Kind}&value={pollingStrategy.Value}&count={count}&auto_commit={autoCommit}{contextParam}");
 
-        var response = await _httpClient.GetAsync(url, token);
+        var response = deferred is null
+            ? await _httpClient.GetAsync(url, token)
+            : await GetDeferredPollAsync(url, deferred, autoCommit || pollingStrategy.Kind == MessagePolling.Next,
+                token);
         if (response.IsSuccessStatusCode)
         {
-            var pollMessages = await response.Content.ReadFromJsonAsync<PolledMessages>(_jsonSerializerOptions, token)
+            // SendAsync buffered a deferred reply, so its decode does not wait on the server. If the poll moved an
+            // offset, a cancel here hides the batch that it moved past.
+            var pollMessages = await response.Content.ReadFromJsonAsync<PolledMessages>(_jsonSerializerOptions,
+                                   deferred is null ? token : CancellationToken.None)
                                ?? PolledMessages.Empty;
 
             if (MessageEncryptor is not null)
@@ -331,6 +370,68 @@ public class HttpMessageStream : IIggyClient
         var messages = await PollMessagesAsync(streamId, topicId, partitionId, consumer, pollingStrategy, count,
             autoCommit, token);
         return BinaryMapper.ToRentedMessages(messages);
+    }
+
+    /// <summary>
+    ///     Sends a deferred poll until the server admits it or its request timeout passes. Every attempt asks for
+    ///     what is left of the wait and the request timeout, so the server always answers before the client gives
+    ///     up. Only a refusal that admitted nothing (58 or 90) is sent again.
+    /// </summary>
+    /// <exception cref="VsrRequestOutcomeUnknownException">
+    ///     The caller canceled, or the request timeout passed, while a poll that can move an offset was on the wire.
+    /// </exception>
+    private async Task<HttpResponseMessage> GetDeferredPollAsync(string url, DeferredPollOptions options,
+        bool progress, CancellationToken token)
+    {
+        var started = Stopwatch.GetTimestamp();
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(token);
+        budget.CancelAfter(options.RequestTimeout);
+        var sending = false;
+        try
+        {
+            await _deferredRequests.WaitAsync(budget.Token);
+            try
+            {
+                for (var retryDelayMs = DeferredRetryIntervalMs; ;
+                     retryDelayMs = Math.Min(retryDelayMs * 2, DeferredRetryMaxIntervalMs))
+                {
+                    var remaining = options.Remaining(Stopwatch.GetElapsedTime(started));
+                    using var request = new HttpRequestMessage(HttpMethod.Get, CreateUrl(
+                        $"{url}&wait_us={remaining.MaxWaitUs}&min_count={remaining.MinCount}&max_bytes={remaining.MaxBytes}&request_timeout_us={remaining.RequestTimeoutUs}"));
+                    request.Options.Set(TransientHttpRetryHandler.SingleAttempt, true);
+                    sending = true;
+                    var response = await _httpClient.SendAsync(request, budget.Token);
+                    sending = false;
+                    try
+                    {
+                        await HandleResponseAsync(response, true);
+                        return response;
+                    }
+                    catch (IggyInvalidStatusCodeException error) when (error.StatusCode is
+                        VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.DEFERRED_POLL_CAPACITY_EXCEEDED
+                        && Stopwatch.GetElapsedTime(started).TotalMilliseconds + retryDelayMs
+                        < options.RequestTimeout.TotalMilliseconds)
+                    {
+                        response.Dispose();
+                    }
+
+                    await Task.Delay(retryDelayMs, budget.Token);
+                }
+            }
+            finally
+            {
+                _deferredRequests.Release();
+            }
+        }
+        catch (OperationCanceledException error) when (sending && progress)
+        {
+            // The server can move the offset before it sees that the client gave up.
+            throw new VsrRequestOutcomeUnknownException(error);
+        }
+        catch (OperationCanceledException) when (!token.IsCancellationRequested)
+        {
+            throw VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED, "The deferred poll spent its request timeout.");
+        }
     }
 
     /// <inheritdoc />

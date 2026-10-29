@@ -324,7 +324,7 @@ where
         SB: 'static,
     {
         let _completion_pump = self.poll_completions.pump_guard();
-        let _deferred_pump = self.deferred_polls.pump_guard();
+        let _deferred_pump = self.deferred_polls.pump_guard(self.id, &self.senders);
         self.plane.partitions().set_io_notifier(
             self.partition_io.notifier(),
             self.partition_io.limits.bytes_max(),
@@ -386,6 +386,9 @@ where
         let mut deferred_deadline = std::pin::pin!(deadline_timer(None));
         loop {
             self.service_deferred_polls().await;
+            // Here and not at the end of the turn: an idle owner would hold
+            // the pushes of this turn until its next event or tick.
+            self.flush_readiness_pushes();
             let next_deadline = self.deferred_polls.earliest_deadline();
             if next_deadline != armed_deadline {
                 armed_deadline = next_deadline;
@@ -432,6 +435,7 @@ where
                     // drain; parked partition frames then never re-dispatch.
                     self.apply_reconcile_ops();
                     self.deferred_polls.maintenance();
+                    self.sweep_readiness_watches();
                     consensus_tick.set(rearm_tick());
                     self.process_loopback(&mut loopback_buf).await;
                 }
@@ -538,7 +542,7 @@ where
         }
 
         self.poll_completions.close();
-        self.deferred_polls.close();
+        self.deferred_polls.close(self.id, &self.senders);
 
         // A stop can win the select immediately after a frame fenced a
         // partition, before the next tick observes it. Preserve that fault so
@@ -1035,11 +1039,17 @@ where
             } => {
                 self.on_partition_read(namespace, read, reply).await;
             }
-            LifecycleFrame::ReadinessWait { wait, reply } => {
-                self.admit_readiness_wait(wait, &reply);
+            LifecycleFrame::ReadinessWait { wait, reply, watch } => {
+                self.admit_readiness_wait(*wait, &reply, watch);
             }
             LifecycleFrame::ReadinessCancel { waiter } => {
                 self.cancel_readiness_wait(waiter);
+            }
+            LifecycleFrame::ReadinessUpdate { from, states } => {
+                self.apply_readiness_update(from, states);
+            }
+            LifecycleFrame::ReadinessUnwatch { from, watches } => {
+                self.unwatch_readiness(from, watches);
             }
             LifecycleFrame::PartitionSubmit {
                 request,

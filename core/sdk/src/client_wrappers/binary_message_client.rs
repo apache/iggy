@@ -18,7 +18,7 @@
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
 use iggy_common::{
-    Consumer, DeferredPollOptions, Identifier, IggyError, IggyMessage, MessageClient, Partitioning,
+    Consumer, Identifier, IggyError, IggyMessage, MessageClient, Partitioning, PollOptions,
     PolledMessages, PollingStrategy, SendMessagesResponse,
 };
 
@@ -28,85 +28,21 @@ impl MessageClient for ClientWrapper {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: u32,
         consumer: &Consumer,
         strategy: &PollingStrategy,
-        count: u32,
-        auto_commit: bool,
-    ) -> Result<PolledMessages, IggyError> {
-        self.poll_messages_with_strategy_for(
-            stream_id,
-            topic_id,
-            partition_id,
-            consumer,
-            &|_: u32| *strategy,
-            count,
-            auto_commit,
-        )
-        .await
-    }
-
-    async fn poll_messages_with_strategy_for(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: Option<u32>,
-        consumer: &Consumer,
-        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
-        count: u32,
-        auto_commit: bool,
-    ) -> Result<PolledMessages, IggyError> {
-        self.poll_messages_with_strategy_for_and_options(
-            stream_id,
-            topic_id,
-            partition_id,
-            consumer,
-            strategy_for,
-            count,
-            auto_commit,
-            None,
-        )
-        .await
-    }
-
-    async fn poll_messages_with_strategy_for_and_options(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: Option<u32>,
-        consumer: &Consumer,
-        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
-        count: u32,
-        auto_commit: bool,
-        options: Option<DeferredPollOptions>,
+        options: PollOptions,
     ) -> Result<PolledMessages, IggyError> {
         super::dispatch_client!(
             self,
-            MessageClient::poll_messages_with_strategy_for_and_options(
+            MessageClient::poll_messages(
                 stream_id,
                 topic_id,
                 partition_id,
                 consumer,
-                strategy_for,
-                count,
-                auto_commit,
+                strategy,
                 options
             )
-        )
-        .await
-    }
-
-    async fn wait_for_messages(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partitions: &[(u32, PollingStrategy)],
-        consumer: &Consumer,
-        options: DeferredPollOptions,
-    ) -> Result<Vec<u32>, IggyError> {
-        super::dispatch_client!(
-            self,
-            MessageClient::wait_for_messages(stream_id, topic_id, partitions, consumer, options)
         )
         .await
     }

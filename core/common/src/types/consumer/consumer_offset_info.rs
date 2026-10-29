@@ -33,13 +33,68 @@ pub struct ConsumerOffsetInfo {
     pub stored_offset: u64,
 }
 
-/// A checkpoint retains the partition incarnation and owner that delivered its messages.
+/// The position after one delivered message. A commit stores its offset, so it covers all
+/// earlier messages of the partition. A checkpoint retains the partition incarnation and owner
+/// that delivered the message, so a commit after a change of the partition history fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConsumerPosition {
-    /// Partition from which the message was consumed.
-    pub partition_id: u32,
-    /// Inclusive message offset to commit.
-    pub offset: u64,
-    /// Partition incarnation and owner captured by the poll; retain both for a delayed commit.
-    pub context: PartitionContext,
+pub struct Checkpoint {
+    partition_id: u32,
+    offset: u64,
+    context: PartitionContext,
+    #[serde(skip)]
+    stamp: Option<ReaderStamp>,
+}
+
+/// The reader and the partition generation that delivered a message. The SDK reader refuses a
+/// commit of a checkpoint that another reader delivered, and skips one of an older generation.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderStamp {
+    pub reader: u64,
+    pub generation: u64,
+}
+
+impl Checkpoint {
+    /// The checkpoint after the message at `offset`, delivered under `context`.
+    #[doc(hidden)]
+    pub const fn new(partition_id: u32, offset: u64, context: PartitionContext) -> Self {
+        Self::stamped(partition_id, offset, context, None)
+    }
+
+    /// The checkpoint after the message at `offset`, delivered by the reader of `stamp`.
+    #[doc(hidden)]
+    pub const fn stamped(
+        partition_id: u32,
+        offset: u64,
+        context: PartitionContext,
+        stamp: Option<ReaderStamp>,
+    ) -> Self {
+        Self {
+            partition_id,
+            offset,
+            context,
+            stamp,
+        }
+    }
+
+    /// The partition of the delivered message.
+    pub const fn partition_id(&self) -> u32 {
+        self.partition_id
+    }
+
+    /// The offset of the delivered message, which a commit stores.
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Partition incarnation and owner captured by the read; a delayed commit keeps both.
+    #[doc(hidden)]
+    pub const fn context(&self) -> PartitionContext {
+        self.context
+    }
+
+    #[doc(hidden)]
+    pub const fn stamp(&self) -> Option<ReaderStamp> {
+        self.stamp
+    }
 }

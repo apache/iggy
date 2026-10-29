@@ -25,6 +25,7 @@ use crate::prelude::Identifier;
 use crate::prelude::IggyConsumerBuilder;
 use crate::prelude::IggyError;
 use crate::prelude::IggyProducerBuilder;
+use crate::prelude::ReaderBuilder;
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use crate::websocket::websocket_client::WebSocketClient;
@@ -107,6 +108,12 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// Additionally, you can bypass invoking methods from these traits and directly talk to the server with [`send_binary_request`] and [`send_http_request`] for http.
 /// Both trade typed API's safety for low-level control. You need to know the server codes and the wire format.
 ///
+/// On TCP, QUIC and WebSocket, each read with [`ServerCommitPolicy::OnRead`] holds one slot of a
+/// pool with the [`PendingOperationsConfig`] limits (256 operations and 64 MiB by default) for the
+/// whole call, also while the server waits for messages, and after an unknown outcome until
+/// [`abandon_operation`]. When the pool is full, the read returns
+/// [`IggyError::TransientNotAccepted`] at its deadline.
+///
 /// # Usage
 ///
 /// The typical lifecycle of an `IggyClient` is construct, [`connect()`], use, and finally shutdown.
@@ -174,13 +181,16 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///     .send(vec![IggyMessage::from_str("our-first-message")?])
 ///     .await?;
 ///
-/// // A consumer pinned to one partition, committing its offset
-/// // automatically when messages are polled (not consumed!).
+/// // A consumer of one partition, whose offset the server stores
+/// // when it reads a batch (not when the batch is consumed!).
 /// let mut consumer = client
-///     .consumer("consumer_name", "stream_name", "topic_name", 1)?
-///     .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
+///     .consumer("consumer_name", "stream_name", "topic_name")?
+///     .partitions([1])
+///     .poll_options(PollOptions {
+///         server_commit: ServerCommitPolicy::OnRead,
+///         ..PollOptions::wait(IggyDuration::ONE_SECOND)
+///     })
 ///     .polling_strategy(PollingStrategy::next())
-///     .batch_length(1000)
 ///     .build();
 /// consumer.init().await?;
 ///
@@ -229,6 +239,9 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// [`ConsumerOffsetClient`]: crate::prelude::ConsumerOffsetClient
 /// [`ConsumerGroupClient`]: crate::prelude::ConsumerGroupClient
 /// [`ClusterClient`]: crate::prelude::ClusterClient
+/// [`ServerCommitPolicy::OnRead`]: crate::prelude::ServerCommitPolicy::OnRead
+/// [`PendingOperationsConfig`]: crate::prelude::PendingOperationsConfig
+/// [`abandon_operation`]: crate::prelude::Client::abandon_operation
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct IggyClient {
@@ -622,7 +635,8 @@ impl IggyClient {
     /// into a [`IggyConsumerBuilder`] and returns it.
     /// Sets the consumer to [`ConsumerKind::Consumer`], i.e. a single consumer,
     /// with the provided name.
-    /// Registers a consumer for `stream`, `topic` and `partition`.
+    /// Registers a consumer for `stream` and `topic`. It reads the partitions of
+    /// [`IggyConsumerBuilder::partitions`], which a standalone consumer requires.
     ///
     /// To get builder for a load-balanced consumer group, use
     /// [`consumer_group`](IggyClient::consumer_group) instead.
@@ -632,8 +646,8 @@ impl IggyClient {
     ///
     /// # Examples
     ///
-    /// Connect a client, build a consumer pinned to partition 1, and configure
-    /// it to auto-commit when messages are polled.
+    /// Connect a client, build a consumer of partitions 0 and 1, and configure
+    /// it to store the position of each batch that it yields.
     ///
     /// ```no_run
     /// use iggy::prelude::*;
@@ -645,10 +659,13 @@ impl IggyClient {
     /// client.connect().await?;
     ///
     /// let consumer = client
-    ///     .consumer("consumer_name", "stream_name", "topic_name", 1)? // returns IggyConsumerBuilder from IggyClient
-    ///     .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
+    ///     .consumer("consumer_name", "stream_name", "topic_name")? // returns IggyConsumerBuilder from IggyClient
+    ///     .partitions([0, 1])
+    ///     .client_commit(ClientCommitPolicy {
+    ///         on: Some(CommitEvent::EachBatch),
+    ///         ..Default::default()
+    ///     })
     ///     .polling_strategy(PollingStrategy::next())
-    ///     .batch_length(1000)
     ///     .build(); // returns IggyConsumer from IggyConsumerBuilder
     /// # let _ = consumer;
     /// # Ok(())
@@ -667,7 +684,6 @@ impl IggyClient {
         name: &str,
         stream: &str,
         topic: &str,
-        partition: u32,
     ) -> Result<IggyConsumerBuilder, IggyError> {
         Ok(IggyConsumerBuilder::new(
             self.client.clone(),
@@ -675,7 +691,6 @@ impl IggyClient {
             Consumer::new(name.try_into()?),
             Identifier::named(stream)?,
             Identifier::named(topic)?,
-            Some(partition),
             self.encryptor.clone(),
         ))
     }
@@ -694,7 +709,7 @@ impl IggyClient {
     /// Since the new consumer starts reading from the last commit, messages are delivered
     /// at-least-once.
     ///
-    /// For a consumer pinned to a single partition, use
+    /// For a consumer of chosen partitions, use
     /// [`consumer`](IggyClient::consumer) instead.
     ///
     /// Refer to the [`IggyConsumer`] type and the [`IggyConsumerBuilder`]
@@ -703,7 +718,7 @@ impl IggyClient {
     /// # Examples
     ///
     /// Connect a client, build a member of a consumer group, and configure it to
-    /// auto-commit when polled.
+    /// let the server store the offset of each batch that it reads.
     ///
     /// ```no_run
     /// use iggy::prelude::*;
@@ -716,9 +731,11 @@ impl IggyClient {
     ///
     /// let consumer = client
     ///     .consumer_group("group_name", "stream_name", "topic_name")? // returns IggyConsumerBuilder from IggyClient
-    ///     .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
+    ///     .poll_options(PollOptions {
+    ///         server_commit: ServerCommitPolicy::OnRead,
+    ///         ..PollOptions::wait(IggyDuration::ONE_SECOND)
+    ///     })
     ///     .polling_strategy(PollingStrategy::next())
-    ///     .batch_length(1000)
     ///     .build(); // returns IggyConsumer from IggyConsumerBuilder
     /// # let _ = consumer;
     /// # Ok(())
@@ -744,9 +761,55 @@ impl IggyClient {
             Consumer::group(Identifier::named(name)?),
             Identifier::named(stream)?,
             Identifier::named(topic)?,
-            None,
             self.encryptor.clone(),
         ))
+    }
+
+    /// Returns a [`ReaderBuilder`] for a [`PartitionReader`] of `topic` in `stream`, which reads
+    /// as `consumer` and decodes with the encryptor of the client.
+    ///
+    /// A standalone [`Consumer`] reads the partitions of [`ReaderBuilder::partitions`]. A
+    /// consumer group reads the assignment of its member.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use iggy::prelude::*;
+    ///
+    /// # async fn run() -> Result<(), IggyError> {
+    /// let client = IggyClient::from_connection_string(
+    ///     "iggy+tcp://user:secret@localhost:8090",
+    /// )?;
+    /// client.connect().await?;
+    ///
+    /// let (stream, topic) = (Identifier::named("orders")?, Identifier::named("events")?);
+    /// let mut reader = client
+    ///     .reader(&stream, &topic, &Consumer::new(Identifier::named("audit")?))
+    ///     .partitions(0..8)
+    ///     .build()
+    ///     .await?;
+    /// let batch = reader.next().await?;
+    /// if let Some(checkpoint) = batch.checkpoint() {
+    ///     reader.commit(checkpoint).await?;
+    /// }
+    /// reader.close().await
+    /// # }
+    /// ```
+    ///
+    /// [`PartitionReader`]: crate::prelude::PartitionReader
+    pub fn reader(
+        &self,
+        stream: &Identifier,
+        topic: &Identifier,
+        consumer: &Consumer,
+    ) -> ReaderBuilder {
+        ReaderBuilder::new(
+            self.client.clone(),
+            stream.clone(),
+            topic.clone(),
+            consumer.clone(),
+            self.encryptor.clone(),
+        )
     }
 
     /// Returns an [`IggyProducerBuilder`].

@@ -164,14 +164,61 @@ enum Requests {
 
     // MARK: Messages
 
+    /// `MAX_PARTITIONS_PER_REQUEST`: the most partitions one fetch names.
+    static let maxPartitionsPerRequest = 1000
+
+    /// A poll, and with `options` a deferred poll (command 106): the same
+    /// body followed by its options.
     static func pollMessages(
-        consumer: Consumer, streamID: Identifier, topicID: Identifier, partitionID: UInt32?, strategy: PollingStrategy, count: UInt32, autoCommit: Bool
+        consumer: Consumer, streamID: Identifier, topicID: Identifier, partitionID: UInt32?, strategy: PollingStrategy, count: UInt32, autoCommit: Bool,
+        options: DeferredPollOptions? = nil
     ) throws -> [UInt8] {
         var writer = ByteWriter()
         try consumerTarget(consumer, streamID, topicID, partitionID, into: &writer)
         strategy.encode(into: &writer)
         writer.write(count)
         writer.write(autoCommit)
+        try options?.encode(into: &writer)
+        return writer.bytes
+    }
+
+    /// One target of a fetch: where its read starts, the bytes it may fill,
+    /// and the fence of the partition history it reads.
+    struct FetchTarget: Sendable, Hashable {
+        let partitionID: UInt32
+        let strategy: PollingStrategy
+        let maxBytes: UInt32
+        let fence: PartitionContext
+    }
+
+    /// `[consumer][stream][topic][wait_us:8][request_timeout_us:8][min_count:4][count:4][max_bytes:4][auto_commit:1][targets_count:4]`,
+    /// then per target `[partition_id:4][strategy:9][max_bytes:4][incarnation:8][owner_generation:8]`.
+    static func fetchMessages(
+        consumer: Consumer, streamID: Identifier, topicID: Identifier, targets: [FetchTarget], count: UInt32, autoCommit: Bool,
+        options: DeferredPollOptions
+    ) throws -> [UInt8] {
+        guard let targetsCount = UInt32(exactly: targets.count) else {
+            throw IggyError(.invalidCommand, context: "a fetch cannot name \(targets.count) partitions")
+        }
+        var writer = ByteWriter()
+        try consumer.encode(into: &writer)
+        try streamID.encode(into: &writer)
+        try topicID.encode(into: &writer)
+        let (wait, timeout) = try options.fetchWireBudget()
+        writer.write(wait)
+        writer.write(timeout)
+        writer.write(options.minCount)
+        writer.write(count)
+        writer.write(options.maxBytes)
+        writer.write(autoCommit)
+        writer.write(targetsCount)
+        for target in targets {
+            writer.write(target.partitionID)
+            target.strategy.encode(into: &writer)
+            writer.write(target.maxBytes)
+            writer.write(target.fence.incarnation)
+            writer.write(target.fence.ownerGeneration)
+        }
         return writer.bytes
     }
 

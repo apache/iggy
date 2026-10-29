@@ -86,26 +86,34 @@ public enum AutoCommitAfter: Sendable, Hashable {
 
 /// Options of an ``IggyConsumer``, with the Rust SDK's defaults.
 public struct ConsumerConfiguration: Sendable {
-    /// Where reading a partition starts. After the first batch each poll
-    /// continues after the last message handed over from that partition,
-    /// except a ``PollingStrategy/next`` poll that commits with
-    /// ``AutoCommitWhen/pollingMessages``: it starts after the offset the
-    /// previous poll stored.
+    /// Where reading a partition starts. After the first batch each read
+    /// continues after the last batch read from that partition, except a
+    /// ``PollingStrategy/next`` poll of a standalone consumer that commits
+    /// with ``AutoCommitWhen/pollingMessages``: it starts after the offset
+    /// the previous poll stored.
     public var pollingStrategy: PollingStrategy
-    /// Messages asked for per poll.
+    /// Messages asked for per poll, and per fetch of a group member, whose
+    /// partitions share them.
     public var batchLength: UInt32
-    /// Minimum gap between the starts of two polls. Nil polls as soon as the
-    /// buffer is empty.
-    public var pollInterval: Duration?
+    /// The limits of each poll and fetch, which are deferred: the server
+    /// answers once `minCount` messages are readable, the reply would pass
+    /// `maxBytes`, or `maxWait` ran out. One message, a 1 MiB reply, a
+    /// one-second wait and an eleven-second request timeout by default, as
+    /// in the Rust SDK. A message larger than `maxBytes` is polled alone,
+    /// without that limit. A fetch also needs a request timeout above one
+    /// second and at least one second past `maxWait`, in whole microseconds.
+    public var pollOptions: DeferredPollOptions
     public var autoCommit: AutoCommit
     /// Joins the group during ``IggyConsumer/initialize()`` and again before
-    /// a poll once the membership was lost. Off, a poll without a membership
+    /// a read once the membership was lost. Off, a read without a membership
     /// fails with ``IggyErrorCode/consumerGroupMemberNotFound``.
     public var autoJoinConsumerGroup: Bool
     /// Creates the group when it is missing before joining it.
     public var createConsumerGroupIfNotExists: Bool
-    /// The pause after a failed poll or join, and between checks while the
-    /// client is signed out.
+    /// The pause after a failed read or join, before a member that lost its
+    /// membership or holds no partitions reads again, and between checks
+    /// while the client is signed out. Other reads wait on the server
+    /// instead.
     public var pollingRetryInterval: Duration
     /// Lookups of a missing stream or topic during
     /// ``IggyConsumer/initialize()`` before it fails. Nil or zero looks once.
@@ -120,14 +128,14 @@ public struct ConsumerConfiguration: Sendable {
     public var offsetDrainTimeout: Duration
 
     public init(
-        pollingStrategy: PollingStrategy = .next, batchLength: UInt32 = 1000, pollInterval: Duration? = nil,
+        pollingStrategy: PollingStrategy = .next, batchLength: UInt32 = 1000, pollOptions: DeferredPollOptions = DeferredPollOptions(),
         autoCommit: AutoCommit = .intervalOrWhen(.seconds(1), .pollingMessages), autoJoinConsumerGroup: Bool = true,
         createConsumerGroupIfNotExists: Bool = true, pollingRetryInterval: Duration = .seconds(1), initRetries: UInt32? = nil,
         initRetryInterval: Duration = .seconds(1), allowReplay: Bool = false, offsetDrainTimeout: Duration = .seconds(5)
     ) {
         self.pollingStrategy = pollingStrategy
         self.batchLength = batchLength
-        self.pollInterval = pollInterval
+        self.pollOptions = pollOptions
         self.autoCommit = autoCommit
         self.autoJoinConsumerGroup = autoJoinConsumerGroup
         self.createConsumerGroupIfNotExists = createConsumerGroupIfNotExists
@@ -141,18 +149,17 @@ public struct ConsumerConfiguration: Sendable {
     /// Refuses what the Rust SDK's types cannot hold: a zero batch, a zero
     /// or negative retry or commit interval (`NonZeroIggyDuration`), a zero
     /// `n`, and any duration past `UInt64.max` microseconds, which would
-    /// also trap in `Task.sleep`.
+    /// also trap in `Task.sleep`. Poll options that do not fit `batchLength`
+    /// fail with the error of their validation, as in the Rust SDK.
     func validate() throws {
         if batchLength == 0 {
             throw IggyError(.invalidConfiguration, context: "batchLength must be at least 1")
         }
+        try pollOptions.validate(count: batchLength)
         try Self.validatePositive(pollingRetryInterval, named: "pollingRetryInterval")
         try Self.validatePositive(initRetryInterval, named: "initRetryInterval")
         if let interval = autoCommit.interval {
             try Self.validatePositive(interval, named: "the auto-commit interval")
-        }
-        if let pollInterval {
-            try ProducerConfiguration.validate(pollInterval, named: "pollInterval")
         }
         try ProducerConfiguration.validate(offsetDrainTimeout, named: "offsetDrainTimeout")
         if case .consumingEveryNthMessage(0)? = autoCommit.whenTrigger {

@@ -351,6 +351,10 @@
   code: 89
   format: "the replica is not the primary of the target group"
   fields: []
+- name: DeferredPollCapacityExceeded
+  code: 90
+  format: "deferred poll capacity exceeded; retry after backoff on the same replica"
+  fields: []
 - name: ClientNotFound
   code: 100
   format: "client with id: %d was not found."
@@ -1383,6 +1387,20 @@
 - name: OperationNotRetained
   code: 14008
   format: "operation %d is not retained"
+  fields:
+    - name: OperationID
+      type: uint64
+- name: PartitionLaneBlocked
+  code: 14009
+  format: "partition %d lane blocked by operation %d"
+  fields:
+    - name: PartitionID
+      type: uint32
+    - name: OperationID
+      type: uint64
+- name: FetchProgressUncertain
+  code: 14010
+  format: "fetch %d has unknown progress; explicit abandonment is required"
   fields:
     - name: OperationID
       type: uint64

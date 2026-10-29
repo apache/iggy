@@ -471,19 +471,23 @@ producer.init().await?;
 let messages = vec![IggyMessage::from_str("Hello Apache Iggy")?];
 producer.send(messages).await?;
 
-// Create a consumer for the given stream and one of its topics
+// Create a consumer group member for the given stream and one of its topics.
+// It commits the last message that it handed over every second and after each batch.
 let mut consumer = client
     .consumer_group("my_app", "dev01", "events")?
-    .auto_commit(AutoCommit::IntervalOrWhen(
-        NonZeroIggyDuration::from_str("1s")?,
-        AutoCommitWhen::ConsumingAllMessages,
-    ))
+    .client_commit(ClientCommitPolicy {
+        interval: Some(NonZeroIggyDuration::from_str("1s")?),
+        on: Some(CommitEvent::EachBatch),
+    })
     .create_consumer_group_if_not_exists()
-    .auto_join_consumer_group()
     .polling_strategy(PollingStrategy::next())
-    .batch_length(1000)
+    .poll_options(PollOptions {
+        count: 1000,
+        ..PollOptions::wait(IggyDuration::from_str("1s")?)
+    })
     .build();
 
+// Joins the group and starts reading
 consumer.init().await?;
 
 // Start consuming the messages
@@ -491,6 +495,8 @@ while let Some(message) = consumer.next().await {
     // Handle the message
 }
 ```
+
+For batches of many partitions, use `PartitionReader` from `client.reader(...)`. The [Rust SDK README](core/sdk/README.md#reading-messages) describes the three ways to read, the commit options and what to do after a lost reply.
 
 ---
 

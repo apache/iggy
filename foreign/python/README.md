@@ -187,15 +187,9 @@ fresh login.
 `HttpConfig` differs from TCP in two ways. There is no reconnection policy and no
 `AutoLogin`: `connect()` does not dial over HTTP, but it does start the
 heartbeat that `heartbeat_interval` configures, so call it and then
-`login_user(...)`. And HTTP is single-consumer only: the `consumer_group(...)`
-path always fails with `Feature is unavailable`, at the join by default and at
-the returned consumer's first poll if you disable `auto_join_consumer_group`,
-so disabling it is not a workaround. A direct
-`poll_messages(consumer=Consumer.Group(...))` fails the same way unless you
-pass an explicit `partition_id`, and with one it degrades silently instead: the
-consumer kind is not carried on the HTTP wire, so the group is served as an
-ordinary consumer named after it, with no membership or partition assignment
-behind it. Use `Consumer.Single(...)` with `poll_messages(...)`. Delivery is
+`login_user(...)`. And HTTP is single-consumer only: `consumer_group(...)`, and
+`poll_messages(...)` or `reader(...)` with a `Consumer.Group(...)`, fail with
+`Feature is unavailable` (code 5). Use `Consumer.Single(...)`. Delivery is
 also at-least-once: the default `retries=3` replays the full request body, so a
 send whose response was lost is applied twice, and only `retries=0` opts out.
 
@@ -441,24 +435,39 @@ Every error that the Rust SDK reports reaches Python as `IggyError`, a `RuntimeE
 - 57 (`TransientNotCommitted`): the outcome is unknown, and the server possibly applied the write. Read the state before you write it again.
 - 40 (`Unauthenticated`): the request needs a session. Sign in, then retry.
 
-`OptionError`, `PendingOperationError` and `ProducerSendError` are `IggyError` subclasses. An error that the binding raises itself, such as a `ValueError`, a `TypeError`, or a plain `RuntimeError` for an invalid argument or a shut-down producer, is not an `IggyError` and carries no code.
+`OptionError`, `PendingOperationError`, `ProducerSendError` and `ReadError` are `IggyError` subclasses. An error that the binding raises itself, such as a `ValueError`, a `TypeError`, or a plain `RuntimeError` for an invalid argument or a shut-down producer, is not an `IggyError` and carries no code.
 
 `PendingOperationError` exposes the exact integer `operation_id`, the numeric
-`code`, and `kind` (`"uncertain"`, `"lane_blocked"`, or `"not_retained"`). On the
+`code`, and `kind` (`"uncertain"`, `"lane_blocked"`, `"fetch_progress_uncertain"`,
+or `"not_retained"`). Its
+`partition_id` names the blocked partition of a fetch, or is `None` for other
+pending operations. On the
 same live client, `await client.resolve_operation(operation_id,
 timeout=timedelta(seconds=30))` replays the original operation. A committed
 business rejection raises its original error and releases the lane; uncertainty
 keeps the operation retained. The default timeout is 30 seconds; it must be a
 positive `timedelta`. `await client.abandon_operation(operation_id)` releases the
 lane without establishing whether the operation committed. A session reset
-forgets retained operations, so recovery must use the original session.
+forgets replayable retained mutations, so their recovery must use the original session.
 The client keeps the proved outcomes of its last `max_operations` replays, also
 across a session reset. A later `resolve_operation` of a proved operation
 returns the same outcome without a request.
 
+A committing fetch with an unknown outcome raises code 14010 and kind
+`"fetch_progress_uncertain"`. Its local ID and affected progress blocks survive
+reconnect and session replacement. `resolve_operation` returns the same error
+without sending anything. Explicit `abandon_operation` releases all its local
+blocks and accepts the unknown outcome; it does not stop the old server request.
+GetOffset and stateless reads remain available for inspection. Raw partial replies
+preserve their wire section statuses; a later progress call on an affected target
+raises code 14009 with its partition and recovery ID. Consumers report the block
+and stop affected targets; abandon explicitly before starting a replacement consumer.
+
 `TcpConfig`, `QuicConfig`, and `WebSocketConfig` accept `pending_operations=
 PendingOperationsConfig(max_operations=256, max_bytes=64 * 1024 * 1024)`. These
 client-wide defaults bound active and retained mutations across every partition.
+Committing fetch reservations and retained progress blocks use a separate pool
+with those same limits, charging target metadata rather than replay frames.
 Admission waits before allocating a request ID. Queued writer frames keep their
 bytes charged until their last reference is released, even after abandonment.
 TCP, QUIC and WebSocket connection strings accept `max_pending_operations` and
@@ -553,6 +562,111 @@ sends, is safe to call more than once, and rejects later sends with
 accepted messages before returning. Object destruction does not perform
 asynchronous cleanup; dropping a background producer without `shutdown()` can
 lose buffered messages.
+
+## Reading Messages
+
+`poll_messages()` reads one batch of one partition. `PollOptions` sets the
+limits of the read and who stores its offset. The default `PollOptions()`
+returns at most 1,000 messages and 1 MiB, answers at once and stores no offset.
+A message larger than `max_bytes` comes alone in its own batch, except at the
+start of a `Last()` read of more than one message: that read raises error 80
+and stores nothing. To read on, pass `continuation()` of the batch as the next
+`polling_strategy`.
+
+```python
+import asyncio
+
+from apache_iggy import Consumer, IggyClient, PollingStrategy, PollOptions
+
+
+async def main():
+    client = IggyClient.from_connection_string("iggy+tcp://iggy:iggy@127.0.0.1:8090")
+    await client.connect()
+
+    strategy = PollingStrategy.First()
+    for _ in range(3):
+        polled = await client.poll_messages(
+            "orders",
+            "created",
+            partition_id=0,
+            consumer=Consumer.Single("billing"),
+            polling_strategy=strategy,
+            options=PollOptions(count=100),
+        )
+        for message in polled.messages:
+            print(message.offset(), message.payload())
+        strategy = polled.continuation()
+
+
+asyncio.run(main())
+```
+
+A continuation keeps the partition history of its batch. If the partition was
+deleted and created again, the next poll raises `HistoryUnavailable` (87)
+instead of reading the new partition. With
+`PollOptions(server_commit=ServerCommitPolicy.OnRead)`, the server stores the
+offset of the last message as part of the reply, so `PollingStrategy.Next()`
+reads on after a restart. A lost reply then blocks the partition with a
+`PendingOperationError` until `abandon_operation()`, as described above.
+
+`reader()` returns a `PartitionReader`, which reads the partitions of a topic
+with prefetch and keeps the position of each one. A `Consumer.Single` reads the
+`partitions` that you pass. A `Consumer.Group` joins its group and reads the
+partitions that the server assigns to it. `next()` returns the next batch of
+one partition and never an empty one, and `commit()` stores the offset of a
+checkpoint. The default options wait up to one second for messages. `next()`
+has no time limit. To bound it, use `asyncio.wait_for()`: a cancelled `next()`
+leaves its batch in the reader. Call `close()` when you are done.
+
+```python
+from apache_iggy import Consumer, IggyClient, PollingStrategy
+
+
+async def read_batches(client: IggyClient):
+    reader = await client.reader(
+        "orders",
+        "created",
+        consumer=Consumer.Single("billing"),
+        partitions=[0, 1, 2],
+        start=PollingStrategy.First(),
+    )
+    try:
+        for _ in range(10):
+            batch = await reader.next()
+            for message in batch.messages:
+                print(batch.partition_id, message.offset(), message.payload())
+            await reader.commit(batch.messages[-1].checkpoint())
+    finally:
+        await reader.close()
+```
+
+`consumer_group()` returns an `IggyConsumer`, which joins a consumer group and
+yields its messages one at a time. By default it stores no offset. Commit the
+checkpoint of a message after you process it, or pass a `ClientCommitPolicy` to
+store the position of the last yielded message at an interval or on a
+`CommitEvent`. Call `shutdown()` before you drop the consumer.
+
+```python
+from apache_iggy import IggyClient
+
+
+async def consume(client: IggyClient):
+    consumer = await client.consumer_group("billing", "orders", "created")
+    try:
+        async for message in consumer.iter_messages():
+            print(message.partition_id(), message.offset(), message.payload())
+            await consumer.commit(message.checkpoint())
+    finally:
+        await consumer.shutdown()
+```
+
+A failed read of a reader or a consumer raises `ReadError`. Its `partition_id`
+names the partition, or is `None` for the whole reader, and `error` is the
+underlying `IggyError`. The reader or the consumer stays usable and retries by
+itself. A partition that was deleted and created again stops with
+`HistoryUnavailable` (87) until `seek(partition_id, start)` picks a new start.
+`consume_messages()` then raises the error and stops. Call it again after the
+seek. If a message does not decode, pass `skip` to `seek()` to read past it.
 
 ## Examples
 

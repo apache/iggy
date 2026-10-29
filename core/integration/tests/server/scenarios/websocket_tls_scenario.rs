@@ -69,11 +69,14 @@ pub async fn run(client: &IggyClient) {
         .poll_messages(
             &Identifier::named(stream_name).unwrap(),
             &Identifier::named(topic_name).unwrap(),
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            true,
+            PollOptions {
+                count: 1,
+                server_commit: ServerCommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();

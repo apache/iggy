@@ -231,6 +231,51 @@ final class FakeVSRServer: @unchecked Sendable {
         return writer.bytes
     }
 
+    /// One section of a ``fetchedBody(_:)`` reply. A refused one carries its
+    /// `status` and nothing else.
+    struct FetchedSection {
+        var partitionID: UInt32
+        /// A message at each offset, as
+        /// ``polledBody(partitionID:offsets:currentOffset:context:)`` writes them.
+        var offsets: [UInt64] = []
+        var status: UInt32 = 0
+        /// After the last message when nil, or zero without one.
+        var nextOffset: UInt64?
+        var context = FakeVSRServer.routeContext
+        /// Records that replace the batch of `offsets`, for a section that
+        /// does not decode.
+        var records: [UInt8]?
+    }
+
+    /// `[partition_id:4][current_offset:8][count:4][context:24]`, the head of a
+    /// poll reply, which the records of a fetch section leave out.
+    static let polledHeadSize = 40
+
+    /// The reply to `FetchMessages`: the section table, then the records of
+    /// each section in table order.
+    static func fetchedBody(_ sections: [FetchedSection]) -> [UInt8] {
+        var table = ByteWriter()
+        var records = ByteWriter()
+        table.write(UInt32(sections.count))
+        for section in sections {
+            table.write(section.partitionID)
+            table.write(section.status)
+            guard section.status == 0 else {
+                table.write([UInt8](repeating: 0, count: Responses.fetchSectionHeaderSize - 2 * MemoryLayout<UInt32>.size))
+                continue
+            }
+            let batch = section.records ?? Array(polledBody(partitionID: section.partitionID, offsets: section.offsets).dropFirst(polledHeadSize))
+            table.write(section.offsets.max() ?? 0)
+            table.write(UInt32(section.offsets.count))
+            section.context.encode(into: &table)
+            table.write(section.nextOffset ?? section.offsets.last.map { $0 + 1 } ?? 0)
+            table.write(UInt32(batch.count))
+            records.write(batch)
+        }
+        table.write(records.bytes)
+        return table.bytes
+    }
+
     /// The reply to `SyncConsumerGroup` for a member.
     static func assignmentBody(generation: UInt64, partitions: [UInt32]) -> [UInt8] {
         var writer = ByteWriter()
@@ -342,8 +387,9 @@ final class FakeVSRServer: @unchecked Sendable {
 
     /// Answers every request successfully with an empty body, a bound
     /// session for a register and a bind, a single-node roster for the
-    /// metadata read, routes to this server under ``routeContext``, and an
-    /// empty poll.
+    /// metadata read, routes to this server under ``routeContext``, an empty
+    /// poll, deferred or not, and an empty fetch.
+    /// A cancellation gets no answer, as from the server.
     static func defaultReply(_ request: Request, address: String) -> Reply {
         if request.operation == .register {
             return .ok(registerBody())
@@ -355,11 +401,81 @@ final class FakeVSRServer: @unchecked Sendable {
             return .ok(registerBody(session: request.session))
         case .getPartitionRoute:
             return .ok(partitionRouteBody(routeContext))
-        case .pollMessages:
+        case .pollMessages, .pollMessagesDeferred:
             return .ok(polledBody(partitionID: 0, context: routeContext))
+        case .fetchMessages:
+            return .ok(fetchedBody([]))
+        case .cancelDeferredRequest:
+            return .stall
         default:
             return .ok([])
         }
+    }
+}
+
+extension FakeVSRServer.Request {
+    /// One target of a `FetchMessages` request.
+    struct FetchTarget: Equatable {
+        var partitionID: UInt32
+        var kind: PollingStrategy.Kind
+        var value: UInt64
+        var maxBytes: UInt32
+        var incarnation: UInt64
+        var ownerGeneration: UInt64
+    }
+
+    /// A `FetchMessages` request without its consumer, stream and topic.
+    struct Fetch {
+        var wait: UInt64
+        var timeout: UInt64
+        var minCount: UInt32
+        var count: UInt32
+        var maxBytes: UInt32
+        var autoCommit: Bool
+        var targets: [FetchTarget]
+    }
+
+    /// This request read as a `FetchMessages` request.
+    var fetch: Fetch {
+        get throws {
+            var reader = ByteReader(payload)
+            _ = try reader.readUInt8()
+            for _ in 0..<3 {
+                _ = try Identifier.decode(from: &reader)
+            }
+            let wait = try reader.readUInt64()
+            let timeout = try reader.readUInt64()
+            let minCount = try reader.readUInt32()
+            let count = try reader.readUInt32()
+            let maxBytes = try reader.readUInt32()
+            let autoCommit = try reader.readBool()
+            let targets = try (0..<reader.readUInt32()).map { _ in
+                let partitionID = try reader.readUInt32()
+                guard let kind = PollingStrategy.Kind(rawValue: try reader.readUInt8()) else {
+                    throw IggyError(.invalidCommand, context: "a fetch target of partition \(partitionID) has no start point")
+                }
+                return FetchTarget(
+                    partitionID: partitionID, kind: kind, value: try reader.readUInt64(), maxBytes: try reader.readUInt32(),
+                    incarnation: try reader.readUInt64(), ownerGeneration: try reader.readUInt64())
+            }
+            guard reader.isAtEnd else {
+                throw IggyError(.invalidCommand, context: "a fetch request has \(reader.remaining) bytes after its targets")
+            }
+            return Fetch(wait: wait, timeout: timeout, minCount: minCount, count: count, maxBytes: maxBytes, autoCommit: autoCommit, targets: targets)
+        }
+    }
+
+    /// `[wait_us:8][min_count:4][max_bytes:4][request_timeout_us:8]`, which
+    /// ends every deferred poll.
+    static let deferredOptionsSize = 24
+
+    /// The options this deferred poll ends with.
+    var deferredOptions: (wait: UInt64, minCount: UInt32, maxBytes: UInt32, timeout: UInt64) {
+        let start = payload.count - Self.deferredOptionsSize
+        return (
+            UInt64(littleEndianBytes: payload[start..<start + 8]), UInt32(littleEndianBytes: payload[start + 8..<start + 12]),
+            UInt32(littleEndianBytes: payload[start + 12..<start + 16]), UInt64(littleEndianBytes: payload[start + 16..<start + 24])
+        )
     }
 }
 

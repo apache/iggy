@@ -85,7 +85,9 @@ pub use consensus::{
     prepare_identity_checksum_bytes, read_size_field, result_code, result_section_len,
     write_rejection_section,
 };
-pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
+pub use dispatch::{
+    COMMAND_TABLE, CommandMeta, command_index, lookup_by_operation, lookup_command,
+};
 pub use error::WireError;
 pub use framing::{RequestFrame, ResponseFrame, STATUS_OK};
 pub use primitives::ack_level::AckLevel;

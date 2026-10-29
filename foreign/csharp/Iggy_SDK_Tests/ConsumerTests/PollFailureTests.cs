@@ -22,6 +22,7 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
+using Apache.Iggy.Messages;
 using Apache.Iggy.Vsr;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -75,8 +76,7 @@ public sealed class PollFailureTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task given_a_failing_client_when_receiving_without_a_polling_interval_should_wait_before_polling_again(
-        bool rented)
+    public async Task given_a_failing_client_when_receiving_should_wait_before_polling_again(bool rented)
     {
         const int WindowMs = 300;
         // The window is shorter than the retry delay, so only a starved scheduler lets a second poll in.
@@ -273,6 +273,85 @@ public sealed class PollFailureTests
             consumer.PollAsync(TestContext.Current.CancellationToken));
     }
 
+    /// <summary>
+    ///     A record wider than the byte limit of the poll options would stall its partition. The consumer reads it
+    ///     alone, without the limit, and reports only a failure of that read.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task given_a_record_wider_than_the_byte_limit_when_receiving_should_read_it_alone(bool aloneFails)
+    {
+        var polls = new ConcurrentQueue<(uint? PartitionId, uint Count, DeferredPollOptions Options)>();
+        var mock = new Mock<IIggyClient>(MockBehavior.Loose);
+        mock.Setup(c => c.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(), It.IsAny<uint?>(),
+                It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(),
+                It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
+            .Returns((Identifier _, Identifier _, uint? partitionId, Consumer _,
+                Func<uint, PollingStrategy> strategyFor, uint count, bool _, DeferredPollOptions options,
+                CancellationToken _) =>
+            {
+                strategyFor(partitionId ?? 0);
+                polls.Enqueue((partitionId, count, options));
+                return polls.Count == 1 || aloneFails
+                    ? Task.FromException<PolledMessages>(VsrError.FromServer(VsrError.INVALID_SIZE_BYTES,
+                        "The first record is wider than the byte limit."))
+                    : Task.FromResult(OneMessage());
+            });
+        var consumer = new IggyConsumer(mock.Object, Config(), NullLoggerFactory.Instance);
+        var errors = new ConcurrentQueue<Exception>();
+        var reported = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        consumer.SubscribeToErrorEvents(error =>
+        {
+            errors.Enqueue(error.Exception);
+            reported.TrySetResult();
+            return Task.CompletedTask;
+        });
+        await consumer.InitAsync(TestContext.Current.CancellationToken);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+
+        var receiving = MoveNextAsync(consumer, cancellation.Token);
+        if (aloneFails)
+        {
+            await reported.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await cancellation.CancelAsync();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => receiving);
+            var error = Assert.IsType<IggyInvalidStatusCodeException>(Assert.Single(errors));
+            Assert.Equal(VsrError.INVALID_SIZE_BYTES, error.StatusCode);
+        }
+        else
+        {
+            Assert.True(await receiving);
+            Assert.Empty(errors);
+        }
+
+        var attempts = polls.ToArray();
+        Assert.True(attempts.Length >= 2);
+        Assert.Equal((1u, 10u, new DeferredPollOptions()), ((uint)attempts[0].PartitionId!, attempts[0].Count,
+            attempts[0].Options));
+        Assert.Equal((1u, 1u, new DeferredPollOptions { MaxBytes = uint.MaxValue }),
+            ((uint)attempts[1].PartitionId!, attempts[1].Count, attempts[1].Options));
+        await consumer.DisposeAsync();
+    }
+
+    private static PolledMessages OneMessage()
+    {
+        return new PolledMessages
+        {
+            PartitionId = 1,
+            CurrentOffset = 0,
+            Messages =
+            [
+                new MessageResponse
+                {
+                    Header = new MessageHeader { Offset = 0, PayloadLength = 1 },
+                    Payload = [1],
+                    UserHeaders = null
+                }
+            ]
+        };
+    }
+
     private static void SetupPoll(Mock<IIggyClient> mock, bool rented,
         Func<CancellationToken, Task<PolledMessages>> poll, Func<CancellationToken, Task<PolledMessagesRental>> rental)
     {
@@ -280,17 +359,17 @@ public sealed class PollFailureTests
         {
             mock.Setup(c => c.PollMessagesRentedAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
                     It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(),
-                    It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                    It.IsAny<bool>(), It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
                 .Returns((Identifier _, Identifier _, uint? _, Consumer _, Func<uint, PollingStrategy> _, uint _,
-                    bool _, CancellationToken token) => rental(token));
+                    bool _, DeferredPollOptions _, CancellationToken token) => rental(token));
             return;
         }
 
         mock.Setup(c => c.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(), It.IsAny<uint?>(),
                 It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(),
-                It.IsAny<CancellationToken>()))
+                It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .Returns((Identifier _, Identifier _, uint? _, Consumer _, Func<uint, PollingStrategy> _, uint _, bool _,
-                CancellationToken token) => poll(token));
+                DeferredPollOptions _, CancellationToken token) => poll(token));
     }
 
     private static async Task<bool> MoveNextAsync(IggyConsumer consumer, CancellationToken token)
@@ -317,7 +396,6 @@ public sealed class PollFailureTests
             PartitionId = 1,
             AutoCommitMode = AutoCommitMode.Disabled,
             AutoCommit = false,
-            PollingIntervalMs = 0
         };
     }
 

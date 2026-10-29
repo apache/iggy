@@ -20,10 +20,10 @@
 use crate::session_owner::SessionOwner;
 use crate::vsr::{decode_reply, encode_request_header};
 use bytes::Bytes;
+use iggy_binary_protocol::WireDecode;
+use iggy_binary_protocol::codes::{FETCH_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE};
 use iggy_binary_protocol::consensus::{HEADER_SIZE, RequestHeader};
-use iggy_binary_protocol::{
-    WireDecode, codes::POLL_MESSAGES_DEFERRED_CODE, requests::messages::DeferredPollMessagesRequest,
-};
+use iggy_binary_protocol::requests::messages::{DeferredPollMessagesRequest, FetchMessagesRequest};
 #[cfg(test)]
 use iggy_common::DiagnosticEvent;
 use iggy_common::IggyError;
@@ -193,12 +193,13 @@ pub(crate) struct Frame {
 impl Frame {
     pub(crate) fn response_body_limit(&self) -> Option<usize> {
         let code = u32::from_le_bytes(self.header.reserved[..size_of::<u32>()].try_into().ok()?);
-        if code != POLL_MESSAGES_DEFERRED_CODE {
-            return None;
+        match code {
+            POLL_MESSAGES_DEFERRED_CODE => DeferredPollMessagesRequest::decode_from(&self.body)
+                .ok()
+                .map(|request| request.max_bytes as usize),
+            FETCH_MESSAGES_CODE => FetchMessagesRequest::peek_reply_limit(&self.body),
+            _ => None,
         }
-        DeferredPollMessagesRequest::decode_from(&self.body)
-            .ok()
-            .map(|request| request.max_bytes as usize)
     }
 }
 

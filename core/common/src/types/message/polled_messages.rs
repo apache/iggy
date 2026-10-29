@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{IggyMessage, IggyMessageHeader, error::IggyError};
+use crate::{
+    Checkpoint, IggyMessage, IggyMessageHeader, PollingKind, PollingStrategy, ReaderStamp,
+    error::IggyError,
+};
 use bytes::Bytes;
 use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::batch::{
@@ -35,12 +38,10 @@ use tracing::error;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PolledMessages {
     /// Partition incarnation and owner captured by the accepted poll.
-    pub context: PartitionContext,
-    /// The identifier of the partition. An empty reply can carry a sentinel instead of a real
-    /// id: [`NO_ASSIGNED_PARTITION`](crate::NO_ASSIGNED_PARTITION) for a consumer-group member
-    /// that holds no partitions, or
-    /// [`RESYNC_REQUIRED_PARTITION_SENTINEL`](crate::RESYNC_REQUIRED_PARTITION_SENTINEL) when
-    /// the server fenced a stale group assignment.
+    context: PartitionContext,
+    /// The identifier of the partition. An empty reply can carry
+    /// [`RESYNC_REQUIRED_PARTITION_SENTINEL`](crate::RESYNC_REQUIRED_PARTITION_SENTINEL) instead
+    /// of a real id when the server fenced a stale group assignment.
     pub partition_id: u32,
     /// The current offset of the partition.
     pub current_offset: u64,
@@ -48,30 +49,134 @@ pub struct PolledMessages {
     pub count: u32,
     /// The collection of messages.
     pub messages: Vec<IggyMessage>,
+    /// The start of the request that read the batch, for the continuation of an empty batch.
+    /// The HTTP JSON form has no such field.
+    #[serde(skip)]
+    request_start: Option<PollingStrategy>,
+    /// Set by the SDK reader, and copied into each checkpoint of the batch.
+    #[serde(skip)]
+    stamp: Option<ReaderStamp>,
 }
 
 impl PolledMessages {
     pub fn empty() -> Self {
+        Self::new(PartitionContext::default(), 0, 0, 0, Vec::new())
+    }
+
+    /// A batch that no request read, so it has no request start.
+    #[doc(hidden)]
+    pub fn new(
+        context: PartitionContext,
+        partition_id: u32,
+        current_offset: u64,
+        count: u32,
+        messages: Vec<IggyMessage>,
+    ) -> Self {
         Self {
-            context: PartitionContext::default(),
-            partition_id: 0,
-            current_offset: 0,
-            count: 0,
-            messages: Vec::new(),
+            context,
+            partition_id,
+            current_offset,
+            count,
+            messages,
+            request_start: None,
+            stamp: None,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn context(&self) -> PartitionContext {
+        self.context
+    }
+
+    /// Records the start of the request that read a batch decoded from JSON.
+    #[doc(hidden)]
+    pub fn set_request_start(&mut self, start: &PollingStrategy) {
+        self.request_start = Some(*start);
+    }
+
+    #[doc(hidden)]
+    pub fn stamp(&self) -> Option<ReaderStamp> {
+        self.stamp
+    }
+
+    #[doc(hidden)]
+    pub fn set_stamp(&mut self, stamp: ReaderStamp) {
+        self.stamp = Some(stamp);
+    }
+
+    /// The position after the last message, to commit the whole batch. `None` for an empty
+    /// batch.
+    pub fn checkpoint(&self) -> Option<Checkpoint> {
+        self.messages
+            .last()
+            .map(|message| self.checkpoint_of(message))
+    }
+
+    /// The position after `messages[index]`, to commit a processed part of the batch. `None`
+    /// for an index out of range.
+    pub fn checkpoint_at(&self, index: usize) -> Option<Checkpoint> {
+        self.messages
+            .get(index)
+            .map(|message| self.checkpoint_of(message))
+    }
+
+    /// The position after the batch, for the next read of its partition.
+    ///
+    /// After the last message, the continuation is `Offset(last + 1)`. An empty batch keeps the
+    /// start of its request, so a start can take more than one read:
+    /// - `Offset(n)` stays `Offset(n)`.
+    /// - `First` becomes `Offset(0)`, because the server reads both from offset 0.
+    /// - `Timestamp(t)` keeps `t`.
+    /// - `Last` stays `Last`.
+    /// - `Next` stays `Next`, and the next read resolves it again from the stored offset.
+    ///
+    /// An empty batch without a recorded start, such as a batch that the caller deserialized,
+    /// continues with `Next`.
+    ///
+    /// The continuation belongs to the partition of the batch, and a read of another partition
+    /// refuses it. Serde drops that partition, so a deserialized continuation fits every
+    /// partition: read it only from the partition of its batch. It carries the context of the
+    /// batch, so a read after a change of the partition history returns
+    /// [`IggyError::HistoryUnavailable`].
+    ///
+    /// An empty batch with a zero context is the reply of a partition that could not serve the
+    /// read, and it names no partition history. Its continuation takes nothing from the reply:
+    /// it is the start of the request as it was, or `Next` without a recorded start.
+    pub fn continuation(&self) -> PollingStrategy {
+        let start = match (self.messages.last(), self.request_start) {
+            (Some(last), _) => PollingStrategy::offset(last.header.offset.saturating_add(1)),
+            // The server refuses a read that carries the zero context with `HistoryUnavailable`.
+            (None, start) if self.context == PartitionContext::default() => {
+                return start.unwrap_or_else(PollingStrategy::next);
+            }
+            (None, Some(start)) if start.kind == PollingKind::First => PollingStrategy::offset(0),
+            (None, Some(start)) => start,
+            (None, None) => PollingStrategy::next(),
+        };
+        PollingStrategy::continuation(self.partition_id, start.kind, start.value, self.context)
+    }
+
+    fn checkpoint_of(&self, message: &IggyMessage) -> Checkpoint {
+        Checkpoint::stamped(
+            self.partition_id,
+            message.header.offset,
+            self.context,
+            self.stamp,
+        )
     }
 }
 
 impl PolledMessages {
     /// Decode a `PollMessages` response body: the 40-byte prefix followed by
     /// the served batch records (`[256B batch header][frames]`, deltas
-    /// resolved against the stamped bases).
+    /// resolved against the stamped bases). `strategy` is the start of the
+    /// request, which the [continuation](Self::continuation) of an empty batch keeps.
     ///
     /// # Errors
     /// [`IggyError::InvalidNumberEncoding`] on a short prefix;
     /// [`IggyError::InvalidMessagePayloadLength`] on a malformed record;
     /// [`IggyError::InvalidMessagesCount`] when the records hold another count than the prefix.
-    pub fn from_bytes(bytes: Bytes) -> Result<Self, IggyError> {
+    pub fn from_bytes(bytes: Bytes, strategy: &PollingStrategy) -> Result<Self, IggyError> {
         let (header, consumed) = PollMessagesResponseHeader::decode(&bytes)
             .map_err(|_| IggyError::InvalidNumberEncoding)?;
         let PollMessagesResponseHeader {
@@ -88,6 +193,8 @@ impl PolledMessages {
             current_offset,
             count,
             messages,
+            request_start: Some(*strategy),
+            stamp: None,
         })
     }
 }
@@ -95,7 +202,10 @@ impl PolledMessages {
 /// Walk the served batch records, resolving each frame's deltas to absolute
 /// values. Payload and user-header `Bytes` are zero-copy slices of the
 /// response buffer.
-fn messages_from_batches(buffer: Bytes, count: u32) -> Result<Vec<IggyMessage>, IggyError> {
+pub(super) fn messages_from_batches(
+    buffer: Bytes,
+    count: u32,
+) -> Result<Vec<IggyMessage>, IggyError> {
     if count as usize > buffer.len() / BATCH_MESSAGE_HEADER_SIZE {
         return Err(IggyError::InvalidMessagesCount);
     }
@@ -164,7 +274,182 @@ fn messages_from_batches(buffer: Bytes, count: u32) -> Result<Vec<IggyMessage>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{IggyTimestamp, RESYNC_REQUIRED_PARTITION_SENTINEL};
     use iggy_binary_protocol::WireEncode;
+
+    const PARTITION: u32 = 1;
+    const CURRENT_OFFSET: u64 = 5;
+    const CONTEXT: PartitionContext = PartitionContext {
+        incarnation: 3,
+        owner_generation: 9,
+        metadata_op: 12,
+    };
+    /// Today's JSON form of an empty batch of `PARTITION` under `CONTEXT`.
+    const EMPTY_BATCH_JSON: &str = r#"{"context":{"incarnation":3,"owner_generation":9,"metadata_op":12},"partition_id":1,"current_offset":5,"count":0,"messages":[]}"#;
+
+    fn message_at(offset: u64) -> IggyMessage {
+        IggyMessage {
+            header: IggyMessageHeader {
+                offset,
+                ..Default::default()
+            },
+            payload: Bytes::new(),
+            user_headers: None,
+        }
+    }
+
+    fn batch(offsets: &[u64]) -> PolledMessages {
+        PolledMessages::new(
+            CONTEXT,
+            PARTITION,
+            CURRENT_OFFSET,
+            u32::try_from(offsets.len()).unwrap(),
+            offsets.iter().copied().map(message_at).collect(),
+        )
+    }
+
+    fn empty_reply(start: &PollingStrategy) -> PolledMessages {
+        let header = PollMessagesResponseHeader {
+            partition_id: PARTITION,
+            current_offset: CURRENT_OFFSET,
+            messages_count: 0,
+            context: CONTEXT,
+        };
+        PolledMessages::from_bytes(header.to_bytes(), start).unwrap()
+    }
+
+    fn continuation(kind: PollingKind, value: u64) -> PollingStrategy {
+        PollingStrategy::continuation(PARTITION, kind, value, CONTEXT)
+    }
+
+    #[test]
+    fn given_an_empty_reply_when_continuing_should_keep_the_start_of_its_request() {
+        const OFFSET: u64 = 7;
+        const TIMESTAMP: u64 = 1_000;
+        let cases = [
+            (
+                PollingStrategy::offset(OFFSET),
+                continuation(PollingKind::Offset, OFFSET),
+            ),
+            (
+                PollingStrategy::first(),
+                continuation(PollingKind::Offset, 0),
+            ),
+            (
+                PollingStrategy::timestamp(IggyTimestamp::from(TIMESTAMP)),
+                continuation(PollingKind::Timestamp, TIMESTAMP),
+            ),
+            (PollingStrategy::last(), continuation(PollingKind::Last, 0)),
+            (PollingStrategy::next(), continuation(PollingKind::Next, 0)),
+            (
+                continuation(PollingKind::Offset, OFFSET),
+                continuation(PollingKind::Offset, OFFSET),
+            ),
+        ];
+
+        for (start, expected) in cases {
+            assert_eq!(empty_reply(&start).continuation(), expected, "{start:?}");
+        }
+    }
+
+    #[test]
+    fn given_a_batch_with_messages_when_continuing_should_start_after_the_last_message() {
+        let mut polled = batch(&[4, 5]);
+        polled.set_request_start(&PollingStrategy::last());
+
+        let next = polled.continuation();
+
+        assert_eq!(next, continuation(PollingKind::Offset, 6));
+        assert_eq!(next.partition_id(), Some(PARTITION));
+        assert_eq!(next.context(), Some(CONTEXT));
+    }
+
+    #[test]
+    fn given_an_empty_batch_without_a_start_when_continuing_should_continue_with_next() {
+        assert_eq!(
+            batch(&[]).continuation(),
+            continuation(PollingKind::Next, 0)
+        );
+    }
+
+    /// The server answers a partition that cannot serve the read with an empty reply and a zero
+    /// context, under the re-sync sentinel for a fenced group member.
+    #[test]
+    fn given_a_fail_fast_empty_reply_when_continuing_should_repeat_the_start_of_its_request() {
+        const OFFSET: u64 = 7;
+        let fail_fast = |partition_id, start: &PollingStrategy| {
+            let header = PollMessagesResponseHeader {
+                partition_id,
+                current_offset: 0,
+                messages_count: 0,
+                context: PartitionContext::default(),
+            };
+            PolledMessages::from_bytes(header.to_bytes(), start).unwrap()
+        };
+
+        for start in [
+            PollingStrategy::offset(OFFSET),
+            PollingStrategy::first(),
+            PollingStrategy::last(),
+            PollingStrategy::next(),
+            continuation(PollingKind::Offset, OFFSET),
+        ] {
+            for partition_id in [PARTITION, RESYNC_REQUIRED_PARTITION_SENTINEL] {
+                assert_eq!(
+                    fail_fast(partition_id, &start).continuation(),
+                    start,
+                    "{start:?} from partition {partition_id}"
+                );
+            }
+        }
+        assert_eq!(
+            PolledMessages::empty().continuation(),
+            PollingStrategy::next(),
+            "a batch without a start"
+        );
+    }
+
+    #[test]
+    fn given_a_batch_when_taking_checkpoints_should_follow_the_delivered_messages() {
+        let polled = batch(&[4, 5]);
+        let after = |offset| Some(Checkpoint::new(PARTITION, offset, CONTEXT));
+
+        assert_eq!(polled.checkpoint(), after(5));
+        assert_eq!(polled.checkpoint_at(0), after(4));
+        assert_eq!(polled.checkpoint_at(1), after(5));
+        assert_eq!(polled.checkpoint_at(2), None);
+        let empty = batch(&[]);
+        assert_eq!(empty.checkpoint(), None);
+        assert_eq!(empty.checkpoint_at(0), None);
+    }
+
+    #[test]
+    fn given_a_batch_when_serialized_should_keep_the_json_form_without_its_start() {
+        let decoded = empty_reply(&PollingStrategy::offset(CURRENT_OFFSET));
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), EMPTY_BATCH_JSON);
+
+        let deserialized: PolledMessages = serde_json::from_str(EMPTY_BATCH_JSON).unwrap();
+
+        assert_eq!(
+            (
+                deserialized.context(),
+                deserialized.partition_id,
+                deserialized.current_offset,
+                deserialized.count,
+                deserialized.messages.len()
+            ),
+            (CONTEXT, PARTITION, CURRENT_OFFSET, 0, 0)
+        );
+        assert_eq!(
+            deserialized.continuation(),
+            continuation(PollingKind::Next, 0),
+            "a deserialized batch has no start"
+        );
+        assert_eq!(
+            serde_json::to_string(&deserialized).unwrap(),
+            EMPTY_BATCH_JSON
+        );
+    }
 
     #[test]
     fn rejects_impossible_count_before_allocating_messages() {
@@ -176,7 +461,7 @@ mod tests {
         }
         .to_bytes();
         assert!(matches!(
-            PolledMessages::from_bytes(prefix),
+            PolledMessages::from_bytes(prefix, &PollingStrategy::next()),
             Err(IggyError::InvalidMessagesCount)
         ));
     }

@@ -17,10 +17,10 @@
 
 use bytes::Bytes;
 use iggy::prelude::{
-    AutoCommit as RustAutoCommit, Consumer as RustConsumer, IggyClient as RustIggyClient,
-    IggyExpiry as RustIggyExpiry, IggyMessage as RustMessage, MaxTopicSize as RustMaxTopicSize,
-    OptionKey as RustOptionKey, Partitioning as RustPartitioning,
-    PollingStrategy as RustPollingStrategy, *,
+    Consumer as RustConsumer, IggyClient as RustIggyClient, IggyExpiry as RustIggyExpiry,
+    IggyMessage as RustMessage, MaxTopicSize as RustMaxTopicSize, OptionKey as RustOptionKey,
+    Partitioning as RustPartitioning, PollOptions as RustPollOptions,
+    PollingStrategy as RustPollingStrategy, ReadError as RustReadError, *,
 };
 use pyo3::PyRef;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::PyClientConfig;
 use crate::consumer::{
-    AutoCommit, Consumer as PyConsumer, ConsumerGroup as PyConsumerGroup,
+    ClientCommitPolicy, Consumer as PyConsumer, ConsumerGroup as PyConsumerGroup,
     ConsumerGroupDetails as PyConsumerGroupDetails, IggyConsumer,
 };
 use crate::duration::{py_delta_to_iggy_duration, reject_zero};
@@ -48,8 +48,10 @@ use crate::metadata_changes::{
 use crate::options::OptionSpec as PyOptionSpec;
 use crate::partitioning::PyPartitioning;
 use crate::permissions::Permissions as PyPermissions;
+use crate::poll_options::PollOptions;
 use crate::producer::{IggyProducer, ProducerMode, u32_param as producer_u32_param};
-use crate::receive_message::{PartitionContext, PollingStrategy, ReceiveMessage};
+use crate::reader::PartitionReader;
+use crate::receive_message::{PolledBatch, PollingStrategy};
 use crate::resource_options::{OptionKey, StreamOptions, TopicOptions, UserOptions};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
 use crate::stats::Stats as PyStats;
@@ -96,6 +98,8 @@ pub struct PendingOperationError {
     operation_id: u64,
     #[pyo3(get)]
     kind: &'static str,
+    #[pyo3(get)]
+    partition_id: Option<u32>,
 }
 
 /// An option refusal, with the server error code and its snake_case name as `kind`.
@@ -104,6 +108,39 @@ pub struct PendingOperationError {
 pub struct OptionError {
     #[pyo3(get)]
     kind: &'static str,
+}
+
+/// A failed read of a `PartitionReader` or an `IggyConsumer`. The reader stays usable after
+/// it and retries by itself. `code` is the code of `error`.
+#[gen_stub_pyclass]
+#[pyclass(frozen, extends=PyIggyError)]
+pub struct ReadError {
+    /// The partition of the error, or `None` for an error of the whole reader.
+    #[pyo3(get)]
+    partition_id: Option<u32>,
+    error: Py<PyAny>,
+    skip: Option<RustPollingStrategy>,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl ReadError {
+    /// The error as the client raises it for any other call: an `IggyError`, or a
+    /// `PendingOperationError` with the operation to abandon.
+    #[gen_stub(override_return_type(type_repr = "IggyError"))]
+    #[getter]
+    fn error(&self, py: Python<'_>) -> Py<PyAny> {
+        self.error.clone_ref(py)
+    }
+
+    /// For a message that does not decode: the continuation after it. The messages before it
+    /// arrive in a batch before this error, and the reader reads the message again until
+    /// `seek()` to this continuation skips it.
+    #[gen_stub(override_return_type(type_repr = "PollingStrategy | None"))]
+    #[getter]
+    fn skip(&self) -> Option<PollingStrategy> {
+        self.skip.map(PollingStrategy::from)
+    }
 }
 
 /// The JSON error body the HTTP API returns.
@@ -117,9 +154,15 @@ struct HttpErrorBody {
 /// identity, rather than requiring callers to parse an error message.
 pub(crate) fn to_runtime_error(error: IggyError) -> PyErr {
     let pending = match error {
-        IggyError::OperationUncertain(operation_id) => Some((operation_id, "uncertain")),
-        IggyError::LaneBlocked(operation_id) => Some((operation_id, "lane_blocked")),
-        IggyError::OperationNotRetained(operation_id) => Some((operation_id, "not_retained")),
+        IggyError::OperationUncertain(operation_id) => Some((operation_id, "uncertain", None)),
+        IggyError::FetchProgressUncertain(operation_id) => {
+            Some((operation_id, "fetch_progress_uncertain", None))
+        }
+        IggyError::LaneBlocked(operation_id) => Some((operation_id, "lane_blocked", None)),
+        IggyError::PartitionLaneBlocked(partition_id, operation_id) => {
+            Some((operation_id, "lane_blocked", Some(partition_id)))
+        }
+        IggyError::OperationNotRetained(operation_id) => Some((operation_id, "not_retained", None)),
         _ => {
             if let Some(refusal) = to_option_error(&error) {
                 return refusal;
@@ -130,10 +173,13 @@ pub(crate) fn to_runtime_error(error: IggyError) -> PyErr {
     Python::attach(|py| {
         let coded = PyIggyError::from(&error);
         let instance = match pending {
-            Some((operation_id, kind)) => Bound::new(
+            Some((operation_id, kind, partition_id)) => Bound::new(
                 py,
-                PyClassInitializer::from(coded)
-                    .add_subclass(PendingOperationError { operation_id, kind }),
+                PyClassInitializer::from(coded).add_subclass(PendingOperationError {
+                    operation_id,
+                    kind,
+                    partition_id,
+                }),
             )
             .map(Bound::into_any),
             None => Bound::new(py, coded).map(Bound::into_any),
@@ -146,6 +192,29 @@ pub(crate) fn to_runtime_error(error: IggyError) -> PyErr {
             return error;
         }
         PyErr::from_value(instance)
+    })
+}
+
+/// Raises a read error with its partition and skip, and its cause as `to_runtime_error` raises it.
+pub(crate) fn to_read_error(error: RustReadError) -> PyErr {
+    let message = error.to_string();
+    let coded = PyIggyError::from(&error.error);
+    let cause = to_runtime_error(error.error);
+    Python::attach(|py| {
+        let read_error = ReadError {
+            partition_id: error.partition_id,
+            error: cause.into_value(py).into_any(),
+            skip: error.skip,
+        };
+        let instance =
+            match Bound::new(py, PyClassInitializer::from(coded).add_subclass(read_error)) {
+                Ok(instance) => instance,
+                Err(error) => return error,
+            };
+        if let Err(error) = instance.setattr("args", (message,)) {
+            return error;
+        }
+        PyErr::from_value(instance.into_any())
     })
 }
 
@@ -745,6 +814,8 @@ impl IggyClient {
     /// Replays the exact retained operation until its final result or the deadline.
     /// A committed rejection raises its original error and frees the lane.
     /// Uncertainty keeps the operation retained. HTTP does not support this operation.
+    /// A fetch progress block raises code 14010 without replaying; only explicit
+    /// abandon_operation releases it, accepting the unknown server outcome.
     /// `timeout` must be a positive timedelta; omission or None uses 30 seconds.
     #[pyo3(signature = (operation_id, *, timeout=None))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -777,6 +848,7 @@ impl IggyClient {
     }
 
     /// Releases a retained operation without claiming whether it committed.
+    /// For a fetch, this releases every affected partition without stopping the old request.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn abandon_operation<'a>(
         &self,
@@ -1702,103 +1774,159 @@ impl IggyClient {
         })
     }
 
-    /// Polls for messages from the specified topic on behalf of the given consumer.
-    /// Omitting `partition_id` reads partition 0 for a regular consumer, and
-    /// polls the member's assigned partitions for a consumer group.
-    /// `context` continues from a message received earlier, usually with
-    /// `PollingStrategy.Offset`: pass that message's `context()` and `partition_id()`.
-    /// The poll is then refused if the partition was deleted and created again, or if its
-    /// consumer group owner changed, instead of reading the new partition at that offset.
-    /// Without `context`, the poll takes the context its route reports. After another
-    /// client deleted and created the partition again, one such poll can fail with
-    /// `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009) for a
-    /// consumer group member. The failed route is dropped, and the next call routes again.
-    /// Returns a list of received messages or a RuntimeError on failure.
+    /// Polls one batch of messages of a partition on behalf of the given consumer.
+    ///
+    /// `options` defaults to `PollOptions()`: at most 1000 messages and 1 MiB, answered at
+    /// once, and no offset stored. With `ServerCommitPolicy.OnRead`, the server stores the
+    /// offset of the last message as part of the reply. If that reply is lost, the poll raises
+    /// `PendingOperationError` of kind `fetch_progress_uncertain`, and every later poll of the
+    /// partition raises it of kind `lane_blocked` until `abandon_operation()` releases it.
+    ///
+    /// To read on, pass `polled.continuation()` as the next `polling_strategy`. The poll is
+    /// then refused with `HistoryUnavailable` (87) if the partition was deleted and created
+    /// again, or if its consumer group owner changed, instead of reading the new partition at
+    /// that offset. A continuation of another partition is refused with `InvalidCommand` (3).
+    ///
+    /// A consumer group member reads only the partitions assigned to it: another partition
+    /// raises `ConsumerGroupPartitionNotOwned` (5009).
+    /// Returns the batch, or raises `IggyError` on failure.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (stream, topic, *, consumer, polling_strategy, count, auto_commit, partition_id = None, context = None))]
-    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[ReceiveMessage]]", imports=("collections.abc")))]
+    #[pyo3(signature = (stream, topic, *, partition_id, consumer, polling_strategy, options=None))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[PolledMessages]", imports=("collections.abc")))]
     fn poll_messages<'a>(
         &self,
         py: Python<'a>,
         stream: PyIdentifier,
         topic: PyIdentifier,
+        partition_id: u32,
         consumer: &PyConsumer,
         polling_strategy: &PollingStrategy,
-        count: u32,
-        auto_commit: bool,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))] partition_id: Option<u32>,
-        #[gen_stub(override_type(type_repr = "PartitionContext | None"))] context: Option<
-            &PartitionContext,
+        #[gen_stub(override_type(type_repr = "PollOptions | None"))] options: Option<PollOptions>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let consumer = RustConsumer::try_from(consumer)?;
+        let stream = Identifier::try_from(stream)?;
+        let topic = Identifier::try_from(topic)?;
+        let strategy = polling_strategy.inner;
+        let options = options.map_or_else(RustPollOptions::default, |options| options.inner);
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let polled = inner
+                .poll_messages(&stream, &topic, partition_id, &consumer, &strategy, options)
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(PolledBatch(polled))
+        })
+    }
+
+    /// Builds a `PartitionReader` of `topic` in `stream` that reads as `consumer`.
+    ///
+    /// A `Consumer.Single` reads `partitions`, which it requires. A `Consumer.Group` reads the
+    /// assignment of its member, so `partitions` must be `None`: the reader joins the group
+    /// here. Consumer groups are not available over HTTP.
+    ///
+    /// `start` is where a partition without a stored position starts, `PollingStrategy.Next()`
+    /// by default. A continuation is refused, because it belongs to one partition. `options`
+    /// sets each request, and defaults to `PollOptions(max_wait=timedelta(seconds=1))`: a
+    /// reader without a wait polls an idle topic in a busy loop. `prefetch_bytes` (16 MiB by
+    /// default) and `prefetch_messages` (the larger of 16,000 and `options.count` by default)
+    /// bound the requests in flight and the queued batches.
+    ///
+    /// Raises `IggyError` with `InvalidCommand` (3) for partitions of a group, a
+    /// `Consumer.Single` without partitions or a continuation as `start`,
+    /// `FeatureUnavailable` for a consumer group over HTTP, the errors of `options`, and the
+    /// error of the group join. A join with an unknown outcome raises `PendingOperationError`:
+    /// the client keeps it, so a new `reader()` raises `lane_blocked` until
+    /// `resolve_operation()` or `abandon_operation()` settles it.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        stream,
+        topic,
+        *,
+        consumer,
+        partitions=None,
+        start=None,
+        options=None,
+        prefetch_bytes=None,
+        prefetch_messages=None,
+    ))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[PartitionReader]", imports=("collections.abc")))]
+    fn reader<'a>(
+        &self,
+        py: Python<'a>,
+        stream: PyIdentifier,
+        topic: PyIdentifier,
+        consumer: &PyConsumer,
+        #[gen_stub(override_type(type_repr = "list[builtins.int] | None"))] partitions: Option<
+            Vec<u32>,
+        >,
+        #[gen_stub(override_type(type_repr = "PollingStrategy | None"))] start: Option<
+            PollingStrategy,
+        >,
+        #[gen_stub(override_type(type_repr = "PollOptions | None"))] options: Option<PollOptions>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] prefetch_bytes: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] prefetch_messages: Option<
+            u32,
         >,
     ) -> PyResult<Bound<'a, PyAny>> {
         let consumer = RustConsumer::try_from(consumer)?;
         let stream = Identifier::try_from(stream)?;
         let topic = Identifier::try_from(topic)?;
-        let strategy = RustPollingStrategy::from(polling_strategy);
-        let strategy = match context {
-            Some(context) => strategy.with_context((*context).into()),
-            None => strategy,
-        };
-
-        let inner = self.inner.clone();
+        let mut builder = self.inner.reader(&stream, &topic, &consumer);
+        if let Some(partitions) = partitions {
+            builder = builder.partitions(partitions);
+        }
+        if let Some(start) = start {
+            builder = builder.start(start.inner);
+        }
+        if let Some(options) = options {
+            builder = builder.options(options.inner);
+        }
+        if let Some(prefetch_bytes) = prefetch_bytes {
+            builder = builder.prefetch_bytes(prefetch_bytes);
+        }
+        if let Some(prefetch_messages) = prefetch_messages {
+            builder = builder.prefetch_messages(prefetch_messages);
+        }
 
         future_into_py(py, async move {
-            let polled_messages = inner
-                .poll_messages(
-                    &stream,
-                    &topic,
-                    partition_id,
-                    &consumer,
-                    &strategy,
-                    count,
-                    auto_commit,
-                )
-                .await
-                .map_err(to_runtime_error)?;
-            let partition_id = polled_messages.partition_id;
-            let context = PartitionContext::from(polled_messages.context);
-            let messages = polled_messages
-                .messages
-                .into_iter()
-                .map(|m| ReceiveMessage {
-                    inner: m,
-                    partition_id,
-                    context,
-                })
-                .collect::<Vec<_>>();
-            Ok(messages)
+            // The reader starts Tokio tasks, so it must be built on the Rust runtime.
+            let reader = builder.build().await.map_err(to_runtime_error)?;
+            Ok(PartitionReader::new(reader))
         })
     }
 
-    /// Creates a new consumer group consumer.
-    /// `partition_id` is ignored for a consumer group: the member reads the partitions
-    /// the server assigns to it.
-    /// `auto_commit` defaults to `AutoCommit.Disabled()`: the consumer stores no offset,
-    /// so store positions after processing, or each restart reads the same messages again.
-    /// Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
-    /// `polling_retry_interval`, `init_retry_interval` or an `AutoCommit` interval
-    /// is negative or zero.
+    /// Creates a new consumer group consumer, which joins the group before it returns.
+    /// The member reads the partitions the server assigns to it.
     ///
-    /// Consumer groups are not available over HTTP. With `auto_join_consumer_group`
-    /// left on, this call fails at the join with `Feature is unavailable`.
-    /// Turning it off is not a workaround: the join is skipped, but a group
-    /// member always polls without a partition, so the first poll fails with
-    /// the same error. Use `Consumer.Single(...)` with `poll_messages(...)`
-    /// instead - a `Consumer.Group(...)` poll with an explicit `partition_id`
-    /// does reach the server, but is served as an ordinary consumer named
-    /// after the group.
+    /// `polling_strategy` is where a partition without a stored offset starts,
+    /// `PollingStrategy.Next()` by default. `poll_options` sets each request, and defaults to
+    /// `PollOptions(max_wait=timedelta(seconds=1))`: a consumer without a wait polls an idle
+    /// topic in a busy loop. `ServerCommitPolicy.OnRead` makes the server store the offset of
+    /// each reply, and it needs the default `client_commit`.
+    ///
+    /// `client_commit` defaults to `ClientCommitPolicy()`: the consumer stores no offset, so
+    /// commit checkpoints after processing, or each restart reads the same messages again.
+    /// `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (the larger of 16,000 and
+    /// the poll count by default) bound the requests in flight and the queued batches.
+    /// Call `shutdown()` before dropping the consumer.
+    /// Returns the consumer or raises `IggyError` on failure. Raises `ValueError` if
+    /// `polling_retry_interval` or `init_retry_interval` is negative or zero.
+    ///
+    /// Consumer groups are not available over HTTP: this call raises `FeatureUnavailable`.
+    /// Use `Consumer.Single(...)` with `poll_messages(...)` or `reader(...)` there.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         name,
         stream,
         topic,
-        partition_id=None,
-        polling_strategy=None,
-        batch_length=None,
-        auto_commit=None,
-        create_consumer_group_if_not_exists=true,
-        auto_join_consumer_group=true,
         *,
+        polling_strategy=None,
+        poll_options=None,
+        client_commit=None,
+        prefetch_bytes=None,
+        prefetch_messages=None,
+        create_consumer_group_if_not_exists=true,
         polling_retry_interval=None,
         init_retries=None,
         init_retry_interval=None,
@@ -1811,16 +1939,20 @@ impl IggyClient {
         name: &str,
         stream: &str,
         topic: &str,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))] partition_id: Option<u32>,
         #[gen_stub(override_type(type_repr = "PollingStrategy | None"))] polling_strategy: Option<
             &PollingStrategy,
         >,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))] batch_length: Option<u32>,
-        #[gen_stub(override_type(type_repr = "AutoCommit | None"))] auto_commit: Option<
-            &AutoCommit,
+        #[gen_stub(override_type(type_repr = "PollOptions | None"))] poll_options: Option<
+            PollOptions,
+        >,
+        #[gen_stub(override_type(type_repr = "ClientCommitPolicy | None"))] client_commit: Option<
+            &ClientCommitPolicy,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] prefetch_bytes: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] prefetch_messages: Option<
+            u32,
         >,
         create_consumer_group_if_not_exists: bool,
-        auto_join_consumer_group: bool,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         polling_retry_interval: Option<Py<PyDelta>>,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] init_retries: Option<u32>,
@@ -1832,27 +1964,27 @@ impl IggyClient {
             .inner
             .consumer_group(name, stream, topic)
             .map_err(to_runtime_error)?
-            .without_encryptor()
-            .partition(partition_id);
+            .without_encryptor();
 
         if create_consumer_group_if_not_exists {
             builder = builder.create_consumer_group_if_not_exists()
         } else {
             builder = builder.do_not_create_consumer_group_if_not_exists()
         };
-        if auto_join_consumer_group {
-            builder = builder.auto_join_consumer_group()
-        } else {
-            builder = builder.do_not_auto_join_consumer_group()
-        };
         if let Some(polling_strategy) = polling_strategy {
-            builder = builder.polling_strategy(polling_strategy.into())
+            builder = builder.polling_strategy(polling_strategy.inner)
         };
-        if let Some(batch_length) = batch_length {
-            builder = builder.batch_length(batch_length)
+        if let Some(poll_options) = poll_options {
+            builder = builder.poll_options(poll_options.inner)
         };
-        if let Some(auto_commit) = auto_commit {
-            builder = builder.auto_commit(RustAutoCommit::try_from(auto_commit)?)
+        if let Some(client_commit) = client_commit {
+            builder = builder.client_commit(client_commit.inner)
+        };
+        if let Some(prefetch_bytes) = prefetch_bytes {
+            builder = builder.prefetch_bytes(prefetch_bytes)
+        };
+        if let Some(prefetch_messages) = prefetch_messages {
+            builder = builder.prefetch_messages(prefetch_messages)
         };
         if let Some(polling_retry_interval) = polling_retry_interval {
             builder = builder.polling_retry_interval(reject_zero(
@@ -1897,6 +2029,7 @@ impl IggyClient {
                 name,
                 stream,
                 topic,
+                consuming: Arc::default(),
             })
         })
     }
@@ -2000,12 +2133,27 @@ mod tests {
         Python::initialize();
         Python::attach(|py| {
             for operation_id in [(1u64 << 53) + 17, u64::MAX] {
-                for (error, kind) in [
-                    (IggyError::OperationUncertain(operation_id), "uncertain"),
-                    (IggyError::LaneBlocked(operation_id), "lane_blocked"),
+                for (error, kind, partition_id) in [
+                    (
+                        IggyError::OperationUncertain(operation_id),
+                        "uncertain",
+                        None,
+                    ),
+                    (IggyError::LaneBlocked(operation_id), "lane_blocked", None),
+                    (
+                        IggyError::FetchProgressUncertain(operation_id),
+                        "fetch_progress_uncertain",
+                        None,
+                    ),
+                    (
+                        IggyError::PartitionLaneBlocked(u32::MAX, operation_id),
+                        "lane_blocked",
+                        Some(u32::MAX),
+                    ),
                     (
                         IggyError::OperationNotRetained(operation_id),
                         "not_retained",
+                        None,
                     ),
                 ] {
                     let code = error.as_code();
@@ -2030,9 +2178,94 @@ mod tests {
                         value.getattr("kind").unwrap().extract::<String>().unwrap(),
                         kind
                     );
+                    assert_eq!(
+                        value
+                            .getattr("partition_id")
+                            .unwrap()
+                            .extract::<Option<u32>>()
+                            .unwrap(),
+                        partition_id
+                    );
                     assert!(value.setattr("operation_id", 0).is_err());
+                    assert!(value.setattr("partition_id", 0).is_err());
                 }
             }
+        });
+    }
+
+    #[test]
+    fn given_read_error_when_mapping_should_keep_partition_skip_and_cause() {
+        const PARTITION_ID: u32 = 7;
+        const OPERATION_ID: u64 = 42;
+        const SKIP_OFFSET: u64 = 11;
+        Python::initialize();
+        Python::attach(|py| {
+            let cause = IggyError::FetchProgressUncertain(OPERATION_ID);
+            let code = cause.as_code();
+            let read_error = RustReadError {
+                partition_id: Some(PARTITION_ID),
+                error: cause,
+                skip: Some(RustPollingStrategy::offset(SKIP_OFFSET)),
+            };
+            let message = read_error.to_string();
+
+            let error = to_read_error(read_error);
+
+            assert!(error.is_instance_of::<ReadError>(py));
+            assert!(error.is_instance_of::<PyIggyError>(py));
+            assert!(error.is_instance_of::<PyRuntimeError>(py));
+            let value = error.value(py);
+            assert_eq!(
+                value.getattr("code").unwrap().extract::<u32>().unwrap(),
+                code
+            );
+            assert_eq!(
+                value
+                    .getattr("partition_id")
+                    .unwrap()
+                    .extract::<Option<u32>>()
+                    .unwrap(),
+                Some(PARTITION_ID)
+            );
+            assert_eq!(value.str().unwrap().to_str().unwrap(), message);
+            let skip = value.getattr("skip").unwrap();
+            assert_eq!(
+                skip.extract::<PollingStrategy>().unwrap().inner,
+                RustPollingStrategy::offset(SKIP_OFFSET)
+            );
+            let cause = value.getattr("error").unwrap();
+            assert!(cause.is_instance_of::<PendingOperationError>());
+            assert_eq!(
+                cause
+                    .getattr("operation_id")
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                OPERATION_ID
+            );
+            assert_eq!(
+                cause.getattr("code").unwrap().extract::<u32>().unwrap(),
+                code
+            );
+        });
+    }
+
+    #[test]
+    fn given_read_error_of_the_whole_reader_when_mapping_should_have_no_partition_or_skip() {
+        Python::initialize();
+        Python::attach(|py| {
+            let error = to_read_error(RustReadError {
+                partition_id: None,
+                error: IggyError::Disconnected,
+                skip: None,
+            });
+
+            let value = error.value(py);
+            assert!(value.getattr("partition_id").unwrap().is_none());
+            assert!(value.getattr("skip").unwrap().is_none());
+            let cause = value.getattr("error").unwrap();
+            assert!(cause.is_instance_of::<PyIggyError>());
+            assert!(!cause.is_instance_of::<PendingOperationError>());
         });
     }
 

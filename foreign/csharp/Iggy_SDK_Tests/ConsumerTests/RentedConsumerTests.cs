@@ -43,9 +43,9 @@ public class RentedConsumerTests
         var attempts = 0;
         client.Setup(mock => mock.PollMessagesRentedAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
                 It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(),
-                It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<bool>(), It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .Returns(async (Identifier _, Identifier _, uint? partition, Consumer _, Func<uint, PollingStrategy> strategy,
-                uint _, bool _, CancellationToken token) =>
+                uint _, bool _, DeferredPollOptions _, CancellationToken token) =>
             {
                 strategy(partition ?? 0);
                 if (++attempts > 1)
@@ -79,9 +79,9 @@ public class RentedConsumerTests
         var unknown = new VsrRequestOutcomeUnknownException(new IOException());
         client.Setup(mock => mock.PollMessagesRentedAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
                 It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(),
-                It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<bool>(), It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .Returns((Identifier _, Identifier _, uint? partition, Consumer _, Func<uint, PollingStrategy> strategy,
-                uint _, bool _, CancellationToken _) =>
+                uint _, bool _, DeferredPollOptions _, CancellationToken _) =>
             {
                 strategy(partition ?? 0);
                 return ++attempts > 1
@@ -219,7 +219,7 @@ public class RentedConsumerTests
         client.Setup(c => c.ConnectAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
         client.Setup(c => c.PollMessagesRentedAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
                 It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(),
-                It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<bool>(), It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new MessageDecryptionException(0, 1, new InvalidOperationException("decrypt fail")));
         var consumer = new IggyConsumer(client.Object, BuildConfig(), NullLoggerFactory.Instance);
         await consumer.InitAsync(TestContext.Current.CancellationToken);
@@ -406,7 +406,6 @@ public class RentedConsumerTests
             PartitionId = 1,
             AutoCommitMode = AutoCommitMode.Disabled,
             AutoCommit = false,
-            PollingIntervalMs = 0
         };
     }
 
@@ -452,7 +451,7 @@ public class RentedConsumerTests
         mock.Setup(c => c.ConnectAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
         mock.Setup(c => c.PollMessagesRentedAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(), It.IsAny<uint?>(),
                 It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(),
-                It.IsAny<CancellationToken>()))
+                It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(() =>
             {
                 if (rentals.Count > 0)

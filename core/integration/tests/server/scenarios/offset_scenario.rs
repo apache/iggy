@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{PARTITION_ID, poll_until_expected_count};
+use super::{PARTITION_ID, POLL_REPLY_MAX_BYTES, poll_until_expected_count};
 use bytes::BytesMut;
 use iggy::prelude::*;
 use iggy_binary_protocol::WireUserHeaders;
@@ -207,7 +207,7 @@ async fn verify_all_messages_from_start(
     topic_name: &str,
     total_messages: u32,
 ) {
-    let polled = poll_until_expected_count(
+    let messages = poll_until_expected_count(
         client,
         stream_name,
         topic_name,
@@ -217,11 +217,11 @@ async fn verify_all_messages_from_start(
     .await;
 
     assert_eq!(
-        polled.messages.len() as u32,
+        messages.len() as u32,
         total_messages,
         "Expected {} messages from start, got {}",
         total_messages,
-        polled.messages.len()
+        messages.len()
     );
 }
 
@@ -238,7 +238,7 @@ async fn verify_messages_from_middle(
         let prior_batches_sum: u32 = batch_lengths[..3].iter().sum();
         let remaining_messages = total_messages - prior_batches_sum;
 
-        let polled = poll_until_expected_count(
+        let messages = poll_until_expected_count(
             client,
             stream_name,
             topic_name,
@@ -248,11 +248,11 @@ async fn verify_messages_from_middle(
         .await;
 
         assert_eq!(
-            polled.messages.len() as u32,
+            messages.len() as u32,
             remaining_messages,
             "Expected {} messages from middle, got {}",
             remaining_messages,
-            polled.messages.len()
+            messages.len()
         );
     }
 }
@@ -268,11 +268,13 @@ async fn verify_no_messages_beyond_end(
             .poll_messages(
                 &Identifier::named(stream_name).unwrap(),
                 &Identifier::named(topic_name).unwrap(),
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &Consumer::default(),
                 &PollingStrategy::offset(final_offset + 1),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -298,11 +300,13 @@ async fn verify_small_subset_from_start(
         .poll_messages(
             &Identifier::named(stream_name).unwrap(),
             &Identifier::named(topic_name).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            subset_size,
-            false,
+            PollOptions {
+                count: subset_size,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -330,11 +334,13 @@ async fn verify_messages_spanning_batches(
             .poll_messages(
                 &Identifier::named(stream_name).unwrap(),
                 &Identifier::named(topic_name).unwrap(),
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &Consumer::default(),
                 &PollingStrategy::offset(span_offset),
-                span_size,
-                false,
+                PollOptions {
+                    count: span_size,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -364,11 +370,13 @@ async fn verify_message_content(
             .poll_messages(
                 &Identifier::named(stream_name).unwrap(),
                 &Identifier::named(topic_name).unwrap(),
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &Consumer::default(),
                 &PollingStrategy::offset(span_offset),
-                span_size,
-                false,
+                PollOptions {
+                    count: span_size,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -432,11 +440,14 @@ async fn verify_sequential_chunk_reads(
             .poll_messages(
                 &Identifier::named(stream_name).unwrap(),
                 &Identifier::named(topic_name).unwrap(),
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &Consumer::default(),
                 &PollingStrategy::offset(chunk_start as u64),
-                read_size,
-                false,
+                PollOptions {
+                    count: read_size,
+                    max_bytes: POLL_REPLY_MAX_BYTES,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();

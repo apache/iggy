@@ -20,12 +20,15 @@ mod config;
 mod consumer;
 mod durability;
 mod duration;
+mod event_loop;
 mod identifier;
 mod metadata_changes;
 mod options;
 mod partitioning;
 mod permissions;
+mod poll_options;
 mod producer;
+mod reader;
 mod receive_message;
 mod resource_options;
 mod send_message;
@@ -35,13 +38,13 @@ mod topic;
 mod user;
 mod user_headers;
 
-use client::{IggyClient, OptionError, PendingOperationError, PyIggyError};
+use client::{IggyClient, OptionError, PendingOperationError, PyIggyError, ReadError};
 use config::{
     AutoLogin, HttpConfig, PendingOperationsConfig, QuicConfig, QuicReconnectionConfig, TcpConfig,
     TcpReconnectionConfig, WebSocketConfig, WebSocketFramingConfig, WebSocketReconnectionConfig,
 };
 use consumer::{
-    AutoCommit, AutoCommitAfter, AutoCommitWhen, Consumer, ConsumerGroup, ConsumerGroupDetails,
+    ClientCommitPolicy, CommitEvent, Consumer, ConsumerGroup, ConsumerGroupDetails,
     ConsumerGroupMember, IggyConsumer, ReceiveMessageIterator,
 };
 use metadata_changes::{
@@ -59,12 +62,16 @@ use metadata_changes::{
 use options::OptionSpec;
 use partitioning::Partitioning;
 use permissions::{GlobalPermissions, Permissions, StreamPermissions, TopicPermissions};
+use poll_options::{PollOptions, ServerCommitPolicy};
 use producer::{
     BackgroundProducerConfig, BackpressureMode, DirectProducerConfig, IggyProducer,
     ProducerSendError, ProducerSharding,
 };
 use pyo3::prelude::*;
-use receive_message::{ConsumerPosition, PartitionContext, PollingStrategy, ReceiveMessage};
+use reader::PartitionReader;
+use receive_message::{
+    Checkpoint, PartitionContext, PolledMessages, PollingStrategy, ReceiveMessage,
+};
 use resource_options::{
     OptionKey, PartitionResizePolicy, StreamOptions, TopicOptions, UserOptions,
     encryption_key_fingerprint,
@@ -85,11 +92,15 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SendMessagesConfirmation>()?;
     m.add_class::<ReceiveMessage>()?;
     m.add_class::<PartitionContext>()?;
-    m.add_class::<ConsumerPosition>()?;
+    m.add_class::<Checkpoint>()?;
+    m.add_class::<PolledMessages>()?;
+    m.add_class::<PollOptions>()?;
+    m.add_class::<ServerCommitPolicy>()?;
     m.add_class::<IggyClient>()?;
     m.add_class::<PyIggyError>()?;
     m.add_class::<PendingOperationError>()?;
     m.add_class::<OptionError>()?;
+    m.add_class::<ReadError>()?;
     m.add_class::<IggyProducer>()?;
     m.add_class::<ProducerSendError>()?;
     m.add_class::<DirectProducerConfig>()?;
@@ -129,10 +140,10 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ConsumerGroupDetails>()?;
     m.add_class::<ConsumerGroupMember>()?;
     m.add_class::<PollingStrategy>()?;
+    m.add_class::<PartitionReader>()?;
     m.add_class::<IggyConsumer>()?;
-    m.add_class::<AutoCommit>()?;
-    m.add_class::<AutoCommitAfter>()?;
-    m.add_class::<AutoCommitWhen>()?;
+    m.add_class::<ClientCommitPolicy>()?;
+    m.add_class::<CommitEvent>()?;
     m.add_class::<ReceiveMessageIterator>()?;
     m.add_class::<IdentityInfo>()?;
     m.add_class::<TokenInfo>()?;

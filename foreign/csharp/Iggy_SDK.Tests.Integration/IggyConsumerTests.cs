@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Diagnostics;
 using System.Text;
 using Apache.Iggy.Consumers;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
@@ -354,15 +356,22 @@ public class IggyConsumerTests
         await consumer.DisposeAsync();
     }
 
+    /// <summary>
+    ///     The poll after the backlog waits on the server, so a message sent after an idle period wakes it long
+    ///     before its max wait ends, and no sleep between polls delays it. It runs alone, because the load of the other
+    ///     tests stretches the delivery past the bound.
+    /// </summary>
     [Test]
+    [NotInParallel]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task ReceiveAsync_WithPollingInterval_Should_RespectInterval(Protocol protocol)
+    public async Task ReceiveAsync_After_AnIdlePeriod_Should_Deliver_ANewMessage_Promptly(Protocol protocol)
     {
+        var idlePeriod = TimeSpan.FromSeconds(1);
+        var promptDelivery = TimeSpan.FromSeconds(2);
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        var testStream = await CreateTestStreamWithMessages(client, protocol);
+        var testStream = await CreateTestStreamWithMessages(client, protocol, 1, 1);
 
-        var pollingInterval = TimeSpan.FromMilliseconds(100);
         var consumer = IggyConsumerBuilder
             .Create(client,
                 Identifier.String(testStream.StreamId),
@@ -370,27 +379,30 @@ public class IggyConsumerTests
                 Consumer.New(12))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(5)
-            .WithPartitionId(1)
-            .WithPollingInterval(pollingInterval)
+            .WithPartitionId(0)
+            .WithPollOptions(new DeferredPollOptions { MaxWait = TimeSpan.FromSeconds(10) })
             .WithAutoCommitMode(AutoCommitMode.Disabled)
             .Build();
 
         await consumer.InitAsync();
 
-        var receivedCount = 0;
-        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await using var messages = consumer.ReceiveAsync(cts.Token).GetAsyncEnumerator(cts.Token);
+        (await messages.MoveNextAsync()).ShouldBeTrue();
+        messages.Current.Message.Header.Offset.ShouldBe(0ul);
 
-        await foreach (var message in consumer.ReceiveAsync(cts.Token))
-        {
-            message.ShouldNotBeNull();
-            receivedCount++;
-            if (receivedCount >= 3)
-            {
-                break;
-            }
-        }
+        var next = messages.MoveNextAsync().AsTask();
+        await Task.Delay(idlePeriod);
+        next.IsCompleted.ShouldBeFalse();
+        var sent = Stopwatch.StartNew();
+        await client.SendMessagesAsync(Identifier.String(testStream.StreamId),
+            Identifier.String(testStream.TopicId),
+            Partitioning.PartitionId(0),
+            new Message(Guid.NewGuid(), "after the idle period"u8.ToArray()));
 
-        receivedCount.ShouldBeGreaterThanOrEqualTo(3);
+        (await next).ShouldBeTrue();
+        sent.Elapsed.ShouldBeLessThan(promptDelivery);
+        messages.Current.Message.Header.Offset.ShouldBe(1ul);
         await consumer.DisposeAsync();
     }
 

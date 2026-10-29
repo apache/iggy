@@ -33,6 +33,7 @@ use iggy_binary_protocol::ConsumerSession;
 use iggy_common::IggyError;
 use message_bus::installer::conn_info::ClientTransportKind;
 use shard::ConnectedClientInfo;
+use shard::config::DeferredPollConfig;
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -133,6 +134,8 @@ pub struct Connection {
 pub struct SessionManager {
     connections: AHashMap<u128, Connection>,
     next_deferred_request: u64,
+    /// The fetch reads that this shard runs per session and owner shard.
+    fetch_reads: AHashMap<(u128, u16), FetchReads>,
     /// This shard's copy of the configured cluster roster, served by the
     /// `GetClusterMetadata` read. Lives here because it is the
     /// per-shard context already threaded to the non-replicated read path;
@@ -146,6 +149,7 @@ impl SessionManager {
         Self {
             connections: AHashMap::new(),
             next_deferred_request: 0,
+            fetch_reads: AHashMap::new(),
             cluster_roster: Rc::new(ClusterRoster::disabled()),
         }
     }
@@ -341,6 +345,40 @@ impl SessionManager {
             }
         }
         true
+    }
+
+    /// Reserves one fetch read of the session `client_id` on the owner shard
+    /// `owner`, which takes `cost` bytes of the owner's read budget. Refused
+    /// when the reads that this shard runs there for the session would pass
+    /// the per-session quota or the read budget of `limits`. The owner also
+    /// counts the parked waits and the reads that other shards send for the
+    /// session, so it can still refuse a reserved read.
+    #[must_use]
+    pub fn reserve_fetch_read(
+        sessions: &Rc<RefCell<Self>>,
+        (client_id, owner): (u128, u16),
+        cost: usize,
+        limits: &DeferredPollConfig,
+    ) -> Option<FetchReadGuard> {
+        let key = (client_id, owner);
+        let mut manager = sessions.borrow_mut();
+        let running = manager.fetch_reads.get(&key).copied().unwrap_or_default();
+        let bytes = running.bytes.checked_add(cost)?;
+        if running.reads >= limits.max_pending_per_session || bytes > limits.max_inflight_bytes {
+            return None;
+        }
+        manager.fetch_reads.insert(
+            key,
+            FetchReads {
+                reads: running.reads + 1,
+                bytes,
+            },
+        );
+        Some(FetchReadGuard {
+            sessions: Rc::clone(sessions),
+            key,
+            cost,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -562,6 +600,34 @@ impl Drop for DeferredRequestGuard {
             .get_mut(&self.connection_id)
         {
             connection.deferred_requests.remove(&self.request_id);
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct FetchReads {
+    reads: usize,
+    bytes: usize,
+}
+
+/// One read that [`SessionManager::reserve_fetch_read`] reserved, released on
+/// drop.
+pub struct FetchReadGuard {
+    sessions: Rc<RefCell<SessionManager>>,
+    key: (u128, u16),
+    cost: usize,
+}
+
+impl Drop for FetchReadGuard {
+    fn drop(&mut self) {
+        let mut manager = self.sessions.borrow_mut();
+        let Some(running) = manager.fetch_reads.get_mut(&self.key) else {
+            return;
+        };
+        running.reads -= 1;
+        running.bytes -= self.cost;
+        if running.reads == 0 {
+            manager.fetch_reads.remove(&self.key);
         }
     }
 }

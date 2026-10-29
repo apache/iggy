@@ -42,12 +42,14 @@ internal static class VsrError
     internal const int PERSONAL_ACCESS_TOKEN_EXPIRED = 54;
     internal const int TRANSIENT_NOT_COMMITTED = 57;
     internal const int TRANSIENT_NOT_ACCEPTED = 58;
+    internal const int REQUEST_ALREADY_APPLIED = 59;
     internal const int INVALID_ENCRYPTION_KEY = 70;
     internal const int INVALID_SIZE_BYTES = 80;
     internal const int REQUEST_TOO_OLD = 85;
     internal const int HISTORY_UNAVAILABLE = 87;
     internal const int LIFECYCLE_BUSY = 88;
     internal const int NOT_PRIMARY = 89;
+    internal const int DEFERRED_POLL_CAPACITY_EXCEEDED = 90;
     internal const int EMPTY_RESPONSE = 304;
     internal const int STREAM_ID_NOT_FOUND = 1009;
     internal const int STREAM_NAME_NOT_FOUND = 1010;
@@ -59,7 +61,9 @@ internal static class VsrError
     internal const int PARTITION_NOT_FOUND = 3007;
     internal const int CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009;
     internal const int TOO_MANY_CONSUMER_GROUPS = 5010;
+    internal const int INVALID_MESSAGES_COUNT = 4009;
     internal const int UNSUPPORTED_OPTION_KEY = 4041;
+    internal const int INVALID_OFFSET = 4100;
     internal const int OPTION_NOT_UPDATABLE = 4103;
     internal const int OPTION_NOT_RESETTABLE = 4104;
     internal const int READ_ONLY_OPTION = 4105;

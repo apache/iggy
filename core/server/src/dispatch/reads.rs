@@ -35,13 +35,13 @@ use crate::dispatch::failure::{
     ClientOrigin, FrameChannel, send_host_frame, send_non_replicated_bytes,
     send_non_replicated_deny,
 };
+use crate::dispatch::fetch::fetch_messages;
 use crate::dispatch::metadata_changes::metadata_changes_reply;
 use crate::dispatch::partition::{
     handle_get_consumer_offset, handle_poll_messages, read_deferred_poll, resolve_deferred_poll,
-    resolve_readiness_wait,
 };
 use crate::namespace::resolve_partition_namespace;
-use crate::reply_frame::{build_empty_reply, build_reply_from_bytes, current_metadata_commit};
+use crate::reply_frame::{build_empty_reply, current_metadata_commit};
 use crate::responses::{
     build_get_me_response, build_get_personal_access_tokens_response,
     build_non_replicated_response, connected_client_to_response,
@@ -57,16 +57,16 @@ use consensus::client_table::SessionAttachment;
 use futures::future::{Abortable, Either, select};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
-    BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE,
-    GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE,
-    GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
-    GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, PING_CODE, POLL_MESSAGES_CODE,
-    POLL_MESSAGES_DEFERRED_CODE, SYNC_CONSUMER_GROUP_CODE, WAIT_FOR_MESSAGES_CODE,
+    BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, DESCRIBE_OPTIONS_CODE, FETCH_MESSAGES_CODE,
+    GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
+    GET_ME_CODE, GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE,
+    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, PING_CODE,
+    POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE, SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::dispatch::lookup_command;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::messages::{
-    DeferredPollMessagesRequest, GetPartitionRouteRequest, WaitForMessagesRequest,
+    DeferredPollMessagesRequest, FetchMessagesRequest, GetPartitionRouteRequest,
 };
 use iggy_binary_protocol::requests::system::BindSessionRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
@@ -75,7 +75,7 @@ use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfo
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
-use iggy_binary_protocol::responses::messages::{PartitionRouteResponse, WaitForMessagesResponse};
+use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
 use iggy_binary_protocol::responses::system::get_snapshot::GetSnapshotResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{HEADER_SIZE, RoutedRequestHeader, WireDecode, WireEncode};
@@ -198,8 +198,8 @@ pub fn read_frontier_budget(config: &ServerConfig) -> Duration {
 /// - `GetClusterMetadata` answers from the configured roster plus the
 ///   consensus view, and sits on the SDK's leader-discovery path, where the
 ///   wait would be real.
-/// - `PollMessages`, `PollMessagesDeferred`, `WaitForMessages` and
-///   `GetConsumerOffset` are partition-plane reads: their answer comes from a
+/// - `PollMessages`, `PollMessagesDeferred`,
+///   `FetchMessages` and `GetConsumerOffset` are partition-plane reads: their answer comes from a
 ///   partition group's own log, not the metadata STM, and holding them would
 ///   put metadata lag on the data path.
 /// - `CancelDeferredRequest` reads nothing and gets no reply.
@@ -219,7 +219,7 @@ pub const fn read_needs_metadata_frontier(code: u32) -> bool {
             | GET_CLUSTER_METADATA_CODE
             | POLL_MESSAGES_CODE
             | POLL_MESSAGES_DEFERRED_CODE
-            | WAIT_FOR_MESSAGES_CODE
+            | FETCH_MESSAGES_CODE
             | CANCEL_DEFERRED_REQUEST_CODE
             | GET_CONSUMER_OFFSET_CODE
             | GET_SNAPSHOT_FILE_CODE
@@ -587,7 +587,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 }
             }
         }
-        POLL_MESSAGES_CODE | POLL_MESSAGES_DEFERRED_CODE | WAIT_FOR_MESSAGES_CODE => {
+        POLL_MESSAGES_CODE | POLL_MESSAGES_DEFERRED_CODE | FETCH_MESSAGES_CODE => {
             let consumer_client = bound
                 .zip(attachment)
                 .map(|((client_id, _), attachment)| (client_id, attachment))
@@ -656,7 +656,16 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     }
 }
 
-#[allow(clippy::future_not_send, clippy::too_many_arguments)]
+enum DeferredRequest {
+    Poll(DeferredPollMessagesRequest),
+    Fetch(FetchMessagesRequest),
+}
+
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 async fn handle_deferred_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
@@ -673,18 +682,20 @@ async fn handle_deferred_request<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let decoded = if code == POLL_MESSAGES_DEFERRED_CODE {
-        DeferredPollMessagesRequest::decode_from(request_body(request)).map(Either::Left)
-    } else {
-        WaitForMessagesRequest::decode_from(request_body(request)).map(Either::Right)
+    let body = request_body(request);
+    let decoded = match code {
+        POLL_MESSAGES_DEFERRED_CODE => {
+            DeferredPollMessagesRequest::decode_from(body).map(DeferredRequest::Poll)
+        }
+        _ => FetchMessagesRequest::decode_from(body).map(DeferredRequest::Fetch),
     };
     let Ok(wire) = decoded else {
         send_non_replicated_deny(shard, request, origin, IggyError::InvalidCommand.as_code()).await;
         return;
     };
     let timeout_us = match &wire {
-        Either::Left(poll) => poll.request_timeout_us,
-        Either::Right(wait) => wait.request_timeout_us,
+        DeferredRequest::Poll(poll) => poll.request_timeout_us,
+        DeferredRequest::Fetch(fetch) => fetch.request_timeout_us,
     };
     serve_deferred_request(
         shard,
@@ -706,7 +717,7 @@ async fn handle_deferred_request<B, MJ, S, SB>(
                 return Err(IggyError::TransientNotAccepted);
             }
             match wire {
-                Either::Left(poll) => {
+                DeferredRequest::Poll(poll) => {
                     let resolved = resolve_deferred_poll(
                         shard,
                         &poll,
@@ -715,43 +726,15 @@ async fn handle_deferred_request<B, MJ, S, SB>(
                     )?;
                     read_deferred_poll(shard, request, resolved, attachment).await
                 }
-                Either::Right(wait) => {
-                    let duration = Duration::from_micros(shard.deferred_wait_us(wait.wait_us));
-                    let (caller, targets) = resolve_readiness_wait(
+                DeferredRequest::Fetch(fetch) => {
+                    Box::pin(fetch_messages(
                         shard,
-                        wait,
-                        (consumer_client_id, attachment.clone(), user_id),
-                    )?;
-                    let contexts: Vec<_> = targets
-                        .iter()
-                        .map(|target| {
-                            (
-                                target.namespace,
-                                target.metadata.context(current_metadata_commit(shard)),
-                            )
-                        })
-                        .collect();
-                    let partitions = shard.wait_for_messages(caller, targets, duration).await?;
-                    for (namespace, context) in contexts {
-                        authorize_served_partition_read(
-                            shard,
-                            Some(attachment),
-                            namespace,
-                            context.incarnation,
-                            Permissioner::poll_messages,
-                        )?;
-                    }
-                    let header = request.header();
-                    Ok(build_reply_from_bytes(
-                        header,
-                        header.client,
-                        header.session,
-                        current_metadata_commit(shard),
-                        &WaitForMessagesResponse { partitions }.to_bytes(),
-                    )
-                    .into_generic()
-                    .into_frozen()
-                    .into())
+                        sessions,
+                        request,
+                        &fetch,
+                        (consumer_client_id, attachment, user_id),
+                    ))
+                    .await
                 }
             }
         },
@@ -1232,10 +1215,10 @@ mod tests {
     };
     use configs::server::ServerConfig;
     use iggy_binary_protocol::codes::{
-        CANCEL_DEFERRED_REQUEST_CODE, DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE,
-        GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_SNAPSHOT_FILE_CODE, GET_STREAM_CODE, PING_CODE,
-        POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE, SYNC_CONSUMER_GROUP_CODE,
-        WAIT_FOR_MESSAGES_CODE,
+        CANCEL_DEFERRED_REQUEST_CODE, DESCRIBE_OPTIONS_CODE, FETCH_MESSAGES_CODE,
+        GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_SNAPSHOT_FILE_CODE,
+        GET_STREAM_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE,
+        SYNC_CONSUMER_GROUP_CODE,
     };
     use iggy_common::IggyDuration;
     use metadata::AppliedFrontier;
@@ -1356,7 +1339,7 @@ mod tests {
             GET_CLUSTER_METADATA_CODE,
             POLL_MESSAGES_CODE,
             POLL_MESSAGES_DEFERRED_CODE,
-            WAIT_FOR_MESSAGES_CODE,
+            FETCH_MESSAGES_CODE,
             CANCEL_DEFERRED_REQUEST_CODE,
             GET_CONSUMER_OFFSET_CODE,
             GET_SNAPSHOT_FILE_CODE,

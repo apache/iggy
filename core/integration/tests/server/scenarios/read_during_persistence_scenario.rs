@@ -110,11 +110,13 @@ async fn should_read_messages_still_in_the_journal(harness: &integration::harnes
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                Some(0),
+                0,
                 &consumer_kind,
                 &PollingStrategy::offset(next_offset),
-                messages_per_batch,
-                false,
+                PollOptions {
+                    count: messages_per_batch,
+                    ..PollOptions::default()
+                },
             )
             .await;
 

@@ -1180,11 +1180,13 @@ async fn poll_window(
         .poll_messages(
             stream,
             topic,
-            Some(SEEDED_PARTITION),
+            SEEDED_PARTITION,
             consumer,
             &PollingStrategy::offset(offset),
-            count,
-            false,
+            PollOptions {
+                count,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap_or_else(|error| panic!("poll {count} message(s) from offset {offset}: {error}"));

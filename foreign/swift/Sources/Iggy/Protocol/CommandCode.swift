@@ -50,6 +50,10 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
     // 102 was flush_unsaved_buffer; the server keeps the code reserved.
     // 103 and 104 are retired and must never be reused.
     case getPartitionRoute = 105
+    case pollMessagesDeferred = 106
+    // 107 was wait_for_messages and must never be reused.
+    case cancelDeferredRequest = 108
+    case fetchMessages = 109
     case getConsumerOffset = 120
     case storeConsumerOffset = 121
     case deleteConsumerOffset = 122
@@ -106,6 +110,9 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         case .pollMessages: "message.poll"
         case .sendMessages: "message.send"
         case .getPartitionRoute: "partition.route"
+        case .pollMessagesDeferred: "message.poll_deferred"
+        case .cancelDeferredRequest: "message.cancel_deferred"
+        case .fetchMessages: "message.fetch"
         case .getConsumerOffset: "consumer_offset.get"
         case .storeConsumerOffset: "consumer_offset.store"
         case .deleteConsumerOffset: "consumer_offset.delete"
@@ -141,6 +148,12 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         default:
             false
         }
+    }
+
+    /// Codes of requests that the server parks until their wait ends. Their
+    /// deadline is their own request timeout, and command 108 cancels them.
+    static func isDeferred(_ code: UInt32) -> Bool {
+        code == CommandCode.pollMessagesDeferred.rawValue || code == CommandCode.fetchMessages.rawValue
     }
 
     /// Codes that carry the sign-in handshake.

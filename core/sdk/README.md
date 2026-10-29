@@ -21,7 +21,7 @@
   <a href="https://github.com/apache/iggy/blob/master/LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-blue.svg?style=flat-square"></a>
 </p>
 
-Official Rust client SDK for [Apache Iggy](https://iggy.apache.org), the persistent message streaming platform written in Rust. The SDK ships a low-level transport client (QUIC, TCP, HTTP, WebSocket) for direct command access and a high-level producer/consumer API with batching, consumer groups, and auto-commit.
+Official Rust client SDK for [Apache Iggy](https://iggy.apache.org), the persistent message streaming platform written in Rust. The SDK ships a low-level transport client (QUIC, TCP, HTTP, WebSocket) for direct command access and a high-level producer/consumer API with batching, consumer groups, and commit policies.
 
 ## Features
 
@@ -30,13 +30,14 @@ Official Rust client SDK for [Apache Iggy](https://iggy.apache.org), the persist
 - **Connection strings**: `iggy://` (TCP default), `iggy+tcp://`, `iggy+quic://`, `iggy+http://`, `iggy+ws://`. Binary transports apply credentials on `connect()`; HTTP requires an explicit login. Option keys and reconnection support differ by transport.
 - **Authentication**: username/password and Personal Access Tokens (PAT).
 - **Async, non-blocking** client built on Tokio with custom zero-copy (de)serialization.
-- **High-level builders** on `IggyClient`: `producer(stream, topic)`, `consumer(name, stream, topic, partition)`, and `consumer_group(name, stream, topic)`.
+- **High-level builders** on `IggyClient`: `producer(stream, topic)`, `consumer(name, stream, topic)`, `consumer_group(name, stream, topic)`, and `reader(stream, topic, consumer)`.
 - **Producer modes**: `direct` (awaited send) and `background` (buffered with parallel shard workers using `OrderedSharding` or `BalancedSharding`). Configurable batch length / size and linger time.
 - **Partitioning**: `balanced`, `messages_key`, or explicit `partition_id`. Custom `Partitioner` is pluggable.
 - **Consumer**: standalone or consumer-group over binary transports; HTTP supports standalone consumers only. Consumed as an async `Stream`. Polling strategies: `next`, `offset`, `timestamp`, `first`, `last`.
-- **Auto-commit** offset policies: `Interval`, `When`, `After`, `IntervalOrWhen`, `IntervalOrAfter`, or disabled.
+- **Reader**: `PartitionReader` returns batches of many partitions, with routing, prefetch and the position of each partition inside.
+- **Commits**: explicit commits of a `Checkpoint`, or a `ClientCommitPolicy` on an interval or a `CommitEvent`. With `ServerCommitPolicy::OnRead`, the server stores the offset of each read. See [reading messages](#reading-messages).
 - **Stream builder** (`IggyStream`, `IggyStreamProducer`, `IggyStreamConsumer`) for declarative producer + consumer setup on shared or separate stream/topic.
-- **Reliability**: managed replica connections, heartbeat, ordered mutation lanes, explicit recovery of uncertain mutations, and offset auto-commit.
+- **Reliability**: managed replica connections, heartbeat, ordered mutation lanes, explicit recovery of uncertain mutations and lost committing reads.
 - **Message features**: optional headers (`HeaderKey` / `HeaderValue`), client-side AES-256-GCM encryption (via `Aes256GcmEncryptor`), topic compression metadata (`None` and `Gzip`; no runtime compression yet), server-honored message expiry, and server-side deduplication.
 - **Admin**: stream/topic/partition CRUD, consumer-group management, server-side consumer offsets, system stats.
 - **Resource options**: typed create and update options for streams, topics and users (`StreamCreateOptions`, `TopicUpdateOptions`, `UserUpdateOptions` and friends). An update sends only the settings it names and resets others by key. A stream can carry its own at-rest key (`StreamCreateOptions::encryption_key`), reads report only its source and fingerprints.
@@ -51,8 +52,9 @@ directories are refused without modification; `--fresh` deletes existing data
 in the configured directory. See the [server recovery guide](../server/README.md#upgrade-recovery).
 Mixed versions and rolling upgrades are unsupported. Binary clients share one
 logical session across replica links using BindSession (15) and discover
-partition primaries with GetPartitionRoute (105). Commands 14, 103, 104, 123 and 124
-are retired. HTTP clients use server-side forwarding.
+partition primaries with GetPartitionRoute (105). The minimum binary protocol
+version is 0.12.1. Commands 14, 103, 104, 107, 123 and 124 are retired. HTTP clients
+use server-side forwarding.
 
 ```bash
 cargo add iggy
@@ -159,11 +161,18 @@ abandonment and session reset release operation capacity; bytes remain charged
 while a writer still holds the frame. Replaying a retained request reuses its
 reservation.
 
-Auto-commit and `Next` polls share their partition's mutation barrier while the
-call is active. They retain their weak acknowledgement: cancellation or failover
-can leave progress unknown. Error 57 or a lost reply after send ends the call
-immediately without replay; errors 58/89 still retry known non-admission.
-These polls are not retained for recovery.
+Reads with `ServerCommitPolicy::OnRead` use a second pool with the same limits.
+Each such read holds one slot for the whole call, also while the server waits
+for messages. After an unknown outcome, its block keeps the slot until
+`abandon_operation`. When the pool is full, the read returns
+`TransientNotAccepted` at its deadline.
+
+If a `next` poll without `OnRead` loses its reply after the send, or gets error
+57, it ends at once with `TransientNotCommitted`. It is not sent again.
+Errors 58 and 89 still retry a request that the server did not admit.
+Polls are not retained for recovery. After an unknown outcome, a read with
+`OnRead` keeps a local progress block instead, as described under
+[reading messages](#reading-messages).
 
 ## Quick start
 
@@ -212,9 +221,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut consumer = client
         .consumer_group(CONSUMER_GROUP, STREAM, TOPIC)?
         .create_consumer_group_if_not_exists()
-        .auto_join_consumer_group()
         .polling_strategy(PollingStrategy::next())
-        .batch_length(1000)
         .build();
     consumer.init().await?;
 
@@ -234,11 +241,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         println!("  header {key} = {value:?}");
                     }
                 }
-                consumer
-                    .store_offset(message.message.header.offset, Some(message.partition_id))
-                    .await?;
+                consumer.commit(message.checkpoint()).await?;
             }
-            Err(error) => eprintln!("poll error: {error}"),
+            Err(error) => eprintln!("read error: {error}"),
         }
     }
     Ok(())
@@ -249,141 +254,293 @@ For lower-level control over individual commands (login, stream/topic management
 
 `IggyClient::send_binary_request_to_replica(code, payload, replica_id)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
 
-Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. The request carries the session's metadata watermark. Replicated commands, polls, readiness waits, deferred-request cancels, consumer-offset reads and session-control codes fail with `InvalidCommand` before anything is sent.
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. The request carries the session's metadata watermark. Replicated commands, polls, fetches, deferred-request cancels, consumer-offset reads and session-control codes fail with `InvalidCommand` before anything is sent.
 
 An id that cluster metadata does not name fails with `InvalidIdentifier`. An unreachable node is retried until the request deadline, and a `NotPrimary` reply is returned rather than sent to another node.
 
 HTTP clients return `FeatureUnavailable` for this call, as for `send_binary_request`.
 
-For `IggyConsumerConfig`, `partitions_count` controls topic creation only. An ordinary consumer uses partition `0` unless the builder's `partition_id` or the config's `with_partition_id` selects another partition. Code that previously used `partitions_count` to select an existing partition must set `partition_id` explicitly. Consumer-group assignment ignores `partition_id`.
+For `IggyConsumerConfig`, `partitions_count` controls topic creation only. An ordinary consumer from the config reads partition `0` unless `with_partitions` selects others, and a consumer group ignores that setting. Code that previously used `partitions_count` to select an existing partition must call `with_partitions`. `IggyConsumerBuilder` has no default partition: a standalone consumer must set `partitions`, and `init()` refuses them for a group.
 
-## Deferred polling
+## Reading messages
 
-High-level consumers use long polling by default. `DeferredPollOptions` separates
-readiness from batch limits: `min_count = 1`, `max_wait = 1s`, `max_bytes = 1 MiB`
-and `request_timeout = 11s`. `batch_length` remains the maximum message count.
-Use `.poll_options(options)` on either consumer builder, or pass options to the
-low-level `poll_messages_deferred` method. A zero `max_wait` skips readiness
-waiting while preserving the same byte limits and request budget.
+The SDK reads in three ways. Each one takes `PollOptions` and starts from a `PollingStrategy`:
+`next`, `offset`, `timestamp`, `first` or `last`.
 
-The server responds when the minimum is readable, the byte cap is reached, or the
-readiness wait expires. Expiry allows a final bounded read; the separate request
-timeout bounds routing, waiting, I/O and response handling. It returns partial or
-empty data when appropriate. Read failures and exhausted request budgets return
-errors. `max_bytes` covers the binary body, including response metadata and batch
-framing; HTTP applies the same selection limit before JSON encoding. The server
-also stops a reply at `sharding.deferred_poll_max_read_bytes`, unless its first
-record alone is wider. A first record that cannot fit returns `InvalidSizeBytes`,
-without advancing its offset.
-The high-level consumer then fetches that record alone, without the byte limit.
+- `poll_messages(stream, topic, partition, consumer, strategy, options)` reads one batch of one
+  partition. The partition is required.
+- `PartitionReader` reads many partitions and returns batches. Build one with
+  `client.reader(stream, topic, consumer)`. A standalone `Consumer` reads the partitions of
+  `.partitions(...)`. A consumer group member reads its assignment: the reader joins the group,
+  joins again after a session loss, and leaves the group in `close()`.
+- `IggyConsumer` is a `Stream` of messages over one `PartitionReader`, with commit policies, group
+  creation, init retries and a replay filter. A standalone consumer needs `.partitions(...)`.
 
-Both builders default to `Next` and manual commits. Process messages in partition order,
-then call `store_offset(offset, Some(partition_id))`. Fetch positions advance
-independently of stored offsets. An initial `Next` is resolved once per partition.
-A partition that a rebalance leaves with its group member continues after the last
-message that the application took. The member resolves `Next` again for a partition
-that it gets back from another member. After the client starts a new session, the
-member resolves `Next` again for every partition. Restarting before a commit can replay work.
-Explicit auto-commit policies remain available and can commit messages before processing.
+The reader and the consumer route each read, prefetch, and keep the position of each partition. The
+[rustdoc](https://docs.rs/iggy) of `MessageClient::poll_messages`, `PollOptions`, `PartitionReader`
+and `IggyConsumer` gives the full contracts.
 
-This default is incompatible with earlier releases. The builder used to commit
-with `AutoCommit::IntervalOrWhen(1s, PollingMessages)`, and `IggyConsumerConfig`
-used `AutoCommit::When(PollingMessages)` with `Last`. Code that relied on those
-defaults must set `auto_commit` explicitly, or each restart reads the same
-messages again. `IggyConsumerConfig::with_auto_commit` sets it on a `default` or
-`from_stream_topic` config. A consumer that delivered messages but stored no
-offset logs a warning at shutdown. With `AutoCommit::Disabled` and `Next`,
-`consume_messages` also warns at its start, because its message consumer cannot
-store offsets.
+```rust
+use iggy::prelude::*;
+use tokio::sync::watch;
 
-Under `PollingMessages` the server commits every batch that it reads, so the
-consumer does not prefetch. It fetches one batch when the application asks for a
-message and its buffer is empty. A group member first waits until one of its
-partitions holds a message. It sends one readiness wait (binary command 107) per
-partition primary, which watches every assigned partition, and then fetches from
-a ready partition.
+// Reads partition 0 until it is empty, and commits after each batch.
+async fn read_one(client: &IggyClient, consumer: &Consumer) -> Result<(), IggyError> {
+    let (stream, topic) = (Identifier::named("orders")?, Identifier::named("events")?);
+    let mut strategy = PollingStrategy::next();
+    loop {
+        let batch = client
+            .poll_messages(&stream, &topic, 0, consumer, &strategy, PollOptions::default())
+            .await?;
+        let Some(checkpoint) = batch.checkpoint() else {
+            return Ok(());
+        };
+        // Process batch.messages here.
+        client
+            .store_consumer_position(consumer, &stream, &topic, &checkpoint)
+            .await?;
+        strategy = batch.continuation();
+    }
+}
 
-Prefetch reserves both byte and message capacity before each request and holds
-it through queued and partially consumed batches. Defaults are 16 MiB of encoded
-response bytes and 16,000 messages, or `batch_length` messages when that is
-larger; use `.prefetch_bytes(...)` and
-`.prefetch_messages(...)` to change them. Each must fit at least one maximum
-response. Decoded message metadata and bounded HTTP JSON overhead are additional;
-these limits are not process RSS limits. Memory handed to application code is
-outside the consumer budget. Assignment refresh, reconnection and cancellation
-continue while the application stalls. Revoked generations are discarded before
-delivery. The normal `poll_interval` setting has been removed; error backoff is
-still configurable.
+// Reads partitions 0 to 7 of a standalone consumer until `shutdown` changes, and commits after
+// each batch.
+async fn read_many(
+    client: &IggyClient,
+    consumer: &Consumer,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), IggyError> {
+    let (stream, topic) = (Identifier::named("orders")?, Identifier::named("events")?);
+    let mut reader = client
+        .reader(&stream, &topic, consumer)
+        .partitions(0..8)
+        .build()
+        .await?;
+    loop {
+        // next() is cancel safe, so select! can drop it.
+        let result = tokio::select! {
+            result = reader.next() => result,
+            _ = shutdown.changed() => break,
+        };
+        let batch = match result {
+            Ok(batch) => batch,
+            // A recreated partition stops until a seek picks a start in its new history.
+            Err(ReadError {
+                partition_id: Some(partition),
+                error: IggyError::HistoryUnavailable,
+                ..
+            }) => {
+                reader.seek(partition, PollingStrategy::first()).await?;
+                continue;
+            }
+            // The reader retries by itself after the other errors.
+            Err(error) => {
+                eprintln!("{error}");
+                continue;
+            }
+        };
+        // Process batch.messages here.
+        if let Some(checkpoint) = batch.checkpoint() {
+            reader.commit(checkpoint).await?;
+        }
+    }
+    reader.close().await
+}
+```
 
-Binary data requests share multiplexed connections with control traffic.
-A client admits at most 64 deferred requests, and each high-level consumer admits
-at most 16 across fetches and readiness waits, including waits split across replicas.
-Requests waiting for admission spend their original request budget. A group member with more
-partitions than prefetch slots fetches only the partitions that hold a message,
-and one readiness wait per partition primary watches the others. Cancellation
-sends command 108 for the original request on the
-same authenticated connection. QUIC stream cancellation is translated into that
-command by the server transport. It stops a poll still waiting for readiness.
-The binary transport retries a poll that does not commit and does not use
-`next` with the same request identity, reducing its wait and timeout before each attempt.
-A poll that can move an offset is not resent after a lost reply: it fails with
-`TransientNotCommitted`, and the high-level worker retries its explicit
-position. With opt-in server auto-commit, a lost reply, timeout or cancellation
-may race an accepted offset update. `TransientNotCommitted` means the offset may
-already have advanced; it does not prove that the server rejected the poll.
-Timing margins cannot remove this uncertainty. Use manual commits after processing
-when a lost response must not skip messages.
+### Poll options
 
-Progress polls (`Next` or auto-commit), offset reads, stores and deletes share a
-progress lane per partition. Sends use the separate mutation lane, so a parked
-poll does not delay a producer sharing the client. Offset stores and deletes
-hold both lanes; an unresolved store or delete blocks later progress until it is
-resolved or abandoned. Different consumers on one partition still share the
-progress lane.
+`PollOptions` sets the limits of one request:
 
-A parked progress poll holds the progress lane of its partition for up to
-`max_wait`. Offset reads, stores and deletes of the same client on that
-partition wait for it. Each of these calls waits for at most the 30-second
-operation timeout. If the poll holds the lane longer, the call fails with
-`TransientNotAccepted`. The client did not send the call, so it is safe to
-retry.
+- `count`: the most messages in one batch. Default 1000.
+- `max_wait`: how long the server waits for `min_count` messages, at most 600 s. Default zero,
+  which answers at once.
+- `min_count`: from 1 to `count`. Default 1.
+- `max_bytes`: the most bytes in one reply, with the response metadata and the batch framing.
+  Default 1 MiB.
+- `server_commit`: `ServerCommitPolicy::Disabled` (default) or `OnRead`.
 
-HTTP uses `GET /streams/{stream}/topics/{topic}/messages/deferred` with the ordinary
-poll fields plus `wait_us`, `min_count`, `max_bytes` and `request_timeout_us`.
-Omitted options use the SDK defaults. Binary command 106 carries the same
-contract. `wait_for_messages` (binary command 107) waits until any of several
-partitions holds a message and reads nothing. It has no HTTP route. Upgrade
-servers before SDKs; unsupported servers reject these requests.
-SDK retries, server forwarding and the high-level worker deduct the elapsed
-time from the original budgets. Routing and admission waits also spend that
-budget, and the caller keeps its original request timeout. Proxy timeouts
-should exceed the configured request timeout. The low-level immediate poll API retains
-its existing command and route.
+`PollOptions::wait(max_wait)` keeps the other defaults. `PartitionReader` and `IggyConsumer` use
+`PollOptions::wait` of one second unless `.options(...)` on the reader builder or
+`.poll_options(...)` on the consumer builder sets others. `IggyConsumerConfig` defaults to 100
+messages and a one-second wait, and `with_poll_options` changes them.
 
-The server defaults to a 30-second maximum readiness wait, 1024 pending polls per
-shard, 64 per logical session (or HTTP user), 16 MiB per read reservation and
-64 MiB of in-flight read reservations. A longer requested wait is shortened to
-the server maximum. A disk read stops after the messages that fill `max_bytes`,
-capped at the read reservation. If its buffers fill their share of that
-reservation first, it stops there. It returns what it read, even below
-`min_count`. Configure
-`sharding.deferred_poll_*` accordingly. The response cap is applied to the selected
-result; it does not cap all storage work. Capacity refusal returns
-`DeferredPollCapacityExceeded` (90); clients back off on the same route. Over
-HTTP, a partition primary with no free relay slot refuses a relayed deferred poll
-with the same code. If the caller's credential holds its whole share of slots,
-the status is 429. In all other cases, it is 503. A
-high-level consumer whose poll is still refused when its request timeout ends
-returns the error to the application and polls that partition again after
-`polling_retry_interval`. A replica
-that cannot serve a partition still returns `TransientNotAccepted` (58) or
-`NotPrimary` (89), prompting route refresh. Upgrade clients with code 90 support
-before enabling deferred polling against this server. Metrics expose pending polls, read reservations and
-completion outcomes.
+The server answers at the first of three events: `min_count` messages are ready, the reply reaches
+`max_bytes`, or the wait ends. After the wait it makes one last bounded read, so a reply can hold
+fewer than `min_count` messages, or none. A fetch of a reader checks `min_count` against all its
+partitions together, so one batch can hold fewer. HTTP applies the same byte limit before JSON
+encoding. The server also stops a reply at `sharding.deferred_poll_max_read_bytes`, unless its first
+message alone is larger. A message larger than `max_bytes` comes alone in its own read. A `last`
+read of more than one message is the exception: it returns `InvalidSizeBytes` (80) and stores
+nothing, because a second read of one message would start at the last message.
 
-Bench exposes `--max-wait`, `--min-count`, `--max-bytes` and `--request-timeout`
-for both consumer APIs and records them in report names. Intentional batching
-waits contribute to measured latency.
+### Positions and commits
+
+A batch (`PolledMessages`) gives two positions:
+
+- `continuation()` is the position after the batch, for the next read of its partition. An empty
+  batch keeps the start of its request, so `next` stays `next`. A continuation belongs to its
+  partition, so a read of another partition refuses it with `InvalidCommand`. It also carries the
+  partition history: after another client deletes and recreates the partition, a read from it
+  returns `HistoryUnavailable` (87).
+- `checkpoint()` is a `Checkpoint`, the position after the last message of the batch.
+  `checkpoint_at(index)` covers a processed part of the batch, and `ReceivedMessage::checkpoint()`
+  covers one message. A commit stores its offset under the partition history that delivered it, and
+  it covers every earlier message of the partition.
+
+Only a commit or `ServerCommitPolicy::OnRead` moves the stored offset. The reader and the consumer
+keep their own read position. They resolve a `next` start once per partition: after the stored
+offset, or at offset 0 without one. Both default to `next` and store nothing, so a restart before a
+commit reads the same messages again. There are three ways to commit:
+
+- Explicitly, after processing and in partition order: `store_consumer_position(...)` after
+  `poll_messages`, `reader.commit(checkpoint)` or `consumer.commit(received.checkpoint())`. This
+  gives at-least-once delivery. The reader skips a checkpoint at or below its last commit. It also
+  skips a checkpoint from before a `seek` or a new assignment of its partition.
+- With a `ClientCommitPolicy` on `IggyConsumer` (`.client_commit(...)`). It stores the position of
+  the last message that the consumer yielded: on an `interval`, `on` a `CommitEvent` (`EachMessage`,
+  `EveryNthMessage(n)` for offsets that are a multiple of `n`, or `EachBatch`), or both. The stream
+  counts a message at its yield, and `consume_messages()` counts it after its handler returns, also
+  after a failure. So a policy can commit a message that the application did not process.
+- With `ServerCommitPolicy::OnRead`: the server stores the offset of the last message of each
+  reply, as part of the reply. This gives at-most-once delivery. The reader does not prefetch. When
+  the application asks for a batch and none is queued, the reader sends new reads. `commit`
+  returns `InvalidCommand`, and `init()` refuses a client policy. An encryptor is refused too,
+  because the server stores the offset before the client decrypts the batch. `close()` and
+  `shutdown()` move the offset back to the last delivered message.
+
+A consumer that delivered messages but stored no offset logs a warning at shutdown. With the default
+policy and `next`, `consume_messages()` also warns at its start, because its handler cannot commit.
+
+Earlier releases committed by default: the builder used
+`AutoCommit::IntervalOrWhen(1s, PollingMessages)`, and `IggyConsumerConfig` used
+`AutoCommit::When(PollingMessages)` with `Last`. Code that relied on this must now set `OnRead` or a
+client policy, or each restart reads the same messages again. On `IggyConsumerConfig`,
+`with_poll_options` and `with_client_commit` set them. The old types map like this: `Interval(d)`
+sets `interval`, `When(e)` and `After(e)` set `on`, `IntervalOrWhen` and `IntervalOrAfter` set both,
+and `When(PollingMessages)` becomes `OnRead`.
+
+### Errors and lost replies
+
+`PartitionReader::next()` and the consumer stream return a `ReadError` with `partition_id` (`None`
+for an error of the whole reader), `error` and `skip`. The reader stays usable after it:
+
+- It follows a moved primary without an error. Connection loss and transient refusals come out as
+  errors, and the reader retries by itself. An error of one partition does not drop the batches of
+  the other partitions.
+- `HistoryUnavailable` (87) stops its partition until `seek(partition, start)`, because an old
+  offset names no position in the new history. The other partitions go on.
+- A message that does not decode or decrypt comes out as an error after the batch of the messages
+  before it. Its `skip` is the continuation after the message. The reader reads the message again
+  until `seek(partition, skip)` moves past it.
+
+A read without `OnRead` stores nothing, so a retry after a lost reply is safe. The binary transport
+sends such a poll again, with less wait and time left, unless it starts from `next`. A one-shot poll
+from `next` returns `TransientNotCommitted` (57) instead.
+
+With `OnRead`, the server can still store the offset after the client gives up. So a read with
+`OnRead` whose reply is lost, or reports an unknown outcome, returns `FetchProgressUncertain(op)`
+(14010). A dropped call that already sent its request leaves the same state. The SDK never sends an
+`OnRead` read again. The partition stays blocked on this client, also after a reconnect or a new
+sign-in: later progress calls on it return `PartitionLaneBlocked(partition_id, op)` (14009). Offset
+reads still work during this block, but they do not prove the outcome.
+
+`client.abandon_operation(op)` frees the partition and accepts the unknown outcome. It does not stop
+the old server request or prove what it stored. `resolve_operation(op)` cannot prove the outcome of
+a read, and it returns `FetchProgressUncertain` without I/O. `PartitionLaneBlocked` can also name an
+offset store or delete with an unknown outcome, and `resolve_operation` can prove that one (see
+[mutation recovery](#mutation-recovery)).
+
+`PartitionReader` and `IggyConsumer` stop a blocked partition, and the other partitions go on. Call
+`abandon_operation(op)`, then `seek`. `close()` and `shutdown()` wait for each `OnRead` read in
+flight until its deadline, because a timeout around a committing read loses its outcome. They return
+`PartitionLaneBlocked` for a partition that is still blocked. Abandon its operation before a new
+reader reads that partition.
+
+### Timeouts, admission and prefetch
+
+The request timeout of a read is `max_wait` plus 10 s. One deadline covers admission, route
+refreshes, retries and server forwarding. If the deadline passes before the request leaves the
+client, the call returns `TransientNotAccepted` (58), and a retry is safe. A proxy between the
+client and the server must allow more than `max_wait` plus 10 s for one request.
+
+A client admits at most 64 waiting reads, and each reader at most 16 of them. A read that waits for
+admission spends its own deadline. On TCP, QUIC and WebSocket, reads share the multiplexed
+connections with other traffic. There, a read with `OnRead` also holds a slot of a pending pool (see
+[mutation recovery](#mutation-recovery)). A dropped binary read sends command 108, which stops a
+request that still waits on the server. The server turns a cancelled QUIC stream into the same
+command.
+
+The reader keeps reads in flight and batches queued within a budget of encoded bytes and messages:
+`prefetch_bytes` (default 16 MiB) and `prefetch_messages` (default: the larger of 16,000 and
+`count`). Each request reserves `count` messages and `max_bytes` bytes until `next()` hands its
+batch over, and one request always fits. A full budget stops new requests. A batch that the
+application holds is outside the budget, but `IggyConsumer` keeps the batch that it yields from
+until its last message. The budget counts encoded bytes, not process memory: decoded metadata and
+HTTP JSON overhead come on top. Routing, reconnection and cancellation go on while the application
+stalls.
+
+### Routing and lanes
+
+On TCP, QUIC and WebSocket, the reader groups its partitions by primary and sends one fetch (command
+109) for each group. After a rebalance, a partition that stays with the member continues after its
+last delivered message. A newly assigned partition starts at the start of the builder: `.start(...)`
+on the reader, `.polling_strategy(...)` on the consumer. In a new session, a group member starts
+every partition there again. `last` and `timestamp` starts read with single polls until the first
+message.
+
+On these transports, progress calls of one partition share a progress lane: polls and fetches from
+`next` or with `OnRead`, and offset reads, stores and deletes. Sends use a separate mutation lane,
+so a waiting poll does not delay a producer of the same client. Offset stores and deletes hold both
+lanes, so an unresolved store or delete blocks later progress until it is resolved or abandoned. All
+consumers of one partition on one client share its progress lane.
+
+A waiting progress poll holds the lane of its partition until it ends. Offset reads, stores and
+deletes of the same client on that partition wait for it, each for at most the 30-second operation
+timeout. Then the call fails with `TransientNotAccepted`. The client did not send it, so a retry is
+safe.
+
+### HTTP
+
+HTTP has no fetch. A standalone reader on HTTP keeps one waiting poll for each partition, within its
+budget. HTTP cannot join a consumer group, so a group reader or consumer, and a poll as a group,
+return `FeatureUnavailable`. `resolve_operation` is unavailable too. HTTP keys the block of a lost
+`OnRead` read by the partition id alone. So the block stops progress calls on that partition id in
+every stream and topic of the client. HTTP does not order the progress calls of one partition, so a
+call that started before a block can overlap the lost read.
+
+HTTP polls use `GET /streams/{stream}/topics/{topic}/messages/deferred` with the poll fields plus
+`wait_us`, `min_count`, `max_bytes` and `request_timeout_us`. A field that the query leaves out
+takes the server default: a 1 s wait, a `min_count` of 1, 1 MiB and an 11 s timeout. Binary command
+106 carries the same contract. The fetch (109) has no HTTP route, and it replaces the retired
+`wait_for_messages` API and command 107. Upgrade servers before SDKs.
+
+### Server limits
+
+The server defaults to a 30-second maximum wait, and to 1024 pending polls per shard and 64 per
+logical session (or HTTP user). A read reservation is at most 16 MiB, and the reservations in flight
+of one shard at most 64 MiB. A longer requested wait is shortened to the server maximum. A disk read
+stops after the messages that fill `max_bytes`, capped at the read reservation. If its buffers fill
+their share of that reservation first, it stops there and returns what it read, even below
+`min_count`. Configure `sharding.deferred_poll_*` accordingly. The reply limit applies to the
+selected result, not to all storage work.
+
+A full server refuses a poll with `DeferredPollCapacityExceeded` (90), and the client backs off on
+the same route. Over HTTP, a partition primary without a free relay slot refuses a relayed poll with
+the same code: 429 if the credential of the caller holds its whole share of slots, else 503. If a
+read is still refused at its deadline, the reader returns the error. It reads that partition again
+after its retry interval (`polling_retry_interval` on the consumer). A replica that cannot serve a
+partition returns `TransientNotAccepted` (58) or `NotPrimary` (89), and the client refreshes the
+route. Upgrade clients to support code 90 before you enable deferred polling against this server.
+Metrics expose pending polls, read reservations and completion outcomes.
+
+### Benchmarks
+
+iggy-bench sets the options of both consumer APIs with `--max-wait` (default 1 s), `--min-count`
+(default 1) and `--max-bytes`. The default of `--max-bytes` is the larger of 1 MiB and one full
+batch. Report names record them with the derived request timeout. `--request-timeout` is gone,
+because the timeout is always `max_wait` plus 10 s. Intentional batching waits count in the measured
+latency.
 
 ## Metadata changes
 

@@ -53,6 +53,7 @@ import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
 import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.BytesDeserializer;
+import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -71,6 +72,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Deque;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.Callable;
@@ -287,7 +289,12 @@ class PollRouterTest {
                 () -> new ConnectionInfo(InetAddress.getLoopbackAddress().getHostAddress(), PRIMARY_PORT + 1));
         var holder = coordinator
                 .sessionOwner()
-                .acquire(PARTITION_LANE, true, LANE_FRAME_BYTES, System.nanoTime() + NEVER.toNanos(), group.next())
+                .acquire(
+                        List.of(PARTITION_LANE),
+                        true,
+                        LANE_FRAME_BYTES,
+                        System.nanoTime() + NEVER.toNanos(),
+                        group.next())
                 .join();
         try {
             var sent = sendMessage(coordinator, router);
@@ -412,7 +419,7 @@ class PollRouterTest {
             var next = coordinator
                     .sessionOwner()
                     .acquire(
-                            new ConsensusSession.LaneKey(INCARNATION, 0),
+                            List.of(new ConsensusSession.LaneKey(INCARNATION, 0)),
                             true,
                             frameBytes,
                             System.nanoTime() + NEVER.toNanos(),
@@ -542,6 +549,41 @@ class PollRouterTest {
             await(() -> primary.sentContexts.size() == DEFERRED_POLL_CAPACITY + 1, "next live queued poll", TIMEOUT);
             nextReply.complete(emptyPoll(0));
             next.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS).release();
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldShareTheDeferredRequestSlotsWithFetches() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        try {
+            List<CompletableFuture<ByteBuf>> polls = new ArrayList<>();
+            for (int index = 0; index < DEFERRED_POLL_CAPACITY; index++) {
+                primary.replies.add(new CompletableFuture<>());
+                polls.add(routedPoll(router, tracked(pollPayload()), true));
+            }
+            var fetched = new CompletableFuture<ByteBuf>();
+            primary.replies.add(fetched);
+            ByteBuf payload =
+                    tracked(Unpooled.wrappedBuffer(HexFormat.of().parseHex(FetchMessagesTest.GOLDEN_REQUEST)));
+            byte[] topic = PollRouter.takeBytes(Unpooled.wrappedBuffer(
+                    BytesSerializer.toBytes(StreamId.of(1L)), BytesSerializer.toBytes(TopicId.of("orders"))));
+            var fetch = router.fetchRequest(payload, topic, 1, router.operationDeadline(), router.startCall());
+            assertThat(primary.sentContexts).hasSize(DEFERRED_POLL_CAPACITY);
+            assertThat(fetch).isNotDone();
+
+            assertThat(polls.get(0).cancel(false)).isTrue();
+            await(() -> primary.sentContexts.size() == DEFERRED_POLL_CAPACITY + 1, "the queued fetch", TIMEOUT);
+            fetched.complete(Unpooled.buffer().writeIntLE(0));
+            fetch.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS).release();
+            assertThat(payload.refCnt()).isZero();
         } finally {
             router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
             timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
@@ -1464,7 +1506,7 @@ class PollRouterTest {
         var owner = connection.sessionOwner();
         owner.configurePendingOperations(1, frameBytes);
         var ticket = owner.acquire(
-                        new ConsensusSession.LaneKey(INCARNATION, 0, true),
+                        List.of(new ConsensusSession.LaneKey(INCARNATION, 0, true)),
                         true,
                         frameBytes,
                         System.nanoTime() + NEVER.toNanos(),
@@ -1749,7 +1791,7 @@ class PollRouterTest {
             }
             if (laneTimers != null && commandCode == CommandCode.Messages.SEND.getValue()) {
                 return sessionOwner()
-                        .acquire(PARTITION_LANE, true, LANE_FRAME_BYTES, deadline, laneTimers)
+                        .acquire(List.of(PARTITION_LANE), true, LANE_FRAME_BYTES, deadline, laneTimers)
                         .thenApply(ticket -> {
                             ticket.complete();
                             return Unpooled.EMPTY_BUFFER;

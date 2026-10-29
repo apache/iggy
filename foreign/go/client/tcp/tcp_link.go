@@ -92,13 +92,16 @@ func (l *tcpLink) exchange(ctx context.Context, frame *operationFrame) (linkRepl
 	l.pending[id] = pending
 	l.senders.Add(1)
 	l.mu.Unlock()
+	cancelled := false
 	defer func() {
 		l.mu.Lock()
 		if l.pending[id] == pending {
 			delete(l.pending, id)
 		}
 		l.mu.Unlock()
-		<-l.capacity
+		if !cancelled {
+			<-l.capacity
+		}
 	}()
 	queued := frame.acquire()
 	sent := false
@@ -114,10 +117,15 @@ func (l *tcpLink) exchange(ctx context.Context, frame *operationFrame) (linkRepl
 	if !sent {
 		return linkReply{err: ierror.ErrTransientNotAccepted}, false
 	}
+	ctx, stopWaiting := replyContext(ctx, frame)
+	defer stopWaiting()
 	select {
 	case reply := <-pending.reply:
 		return reply, true
 	case <-ctx.Done():
+		if !frame.uncancellable {
+			cancelled = l.cancelDeferred(id, pending, frame.data)
+		}
 		return linkReply{err: ierror.ErrTransientNotCommitted}, true
 	case <-l.closed:
 		select {
@@ -127,6 +135,49 @@ func (l *tcpLink) exchange(ctx context.Context, frame *operationFrame) (linkRepl
 		}
 		return linkReply{err: ierror.ErrTransientNotCommitted}, true
 	}
+}
+
+// replyContext is the context of the wait for the reply of frame once it is
+// sent. The caller of an uncancellable frame waits for its reply until the
+// deadline of ctx, also after ctx is cancelled.
+func replyContext(ctx context.Context, frame *operationFrame) (context.Context, context.CancelFunc) {
+	if !frame.uncancellable {
+		return ctx, func() {}
+	}
+	detached := context.WithoutCancel(ctx)
+	if deadline, bounded := ctx.Deadline(); bounded {
+		return context.WithDeadline(detached, deadline)
+	}
+	return detached, func() {}
+}
+
+// cancelDeferred removes the pending entry of a deferred poll or fetch whose caller stopped waiting, and queues its cancellation behind it,
+// so that the server frees the parked request. A reply that comes later
+// finds no entry and is dropped. The cancellation keeps the capacity slot of
+// the request until it is queued, so a stalled writer holds a bounded number
+// of them. It returns false when nothing was cancelled.
+func (l *tcpLink) cancelDeferred(id uint64, pending *linkPending, frame []byte) bool {
+	cancellation, deferred := vsr.DeferredCancellation(frame)
+	if !deferred {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// The reply or the close of the link came first.
+	if l.pending[id] != pending {
+		return false
+	}
+	delete(l.pending, id)
+	l.senders.Add(1)
+	go func() {
+		defer func() { <-l.capacity }()
+		defer l.senders.Done()
+		select {
+		case l.writes <- newOperationFrame(cancellation, nil):
+		case <-l.closed:
+		}
+	}()
+	return true
 }
 
 func (l *tcpLink) close(err error) {

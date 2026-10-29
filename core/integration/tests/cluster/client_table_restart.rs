@@ -1031,42 +1031,47 @@ async fn given_full_registry_when_new_clients_arrive_should_preserve_live_member
             .partitions,
         vec![0]
     );
+    let options = PollOptions {
+        count: 1,
+        ..PollOptions::default()
+    };
+    let refusal = replacement
+        .poll_messages(
+            &stream,
+            &topic,
+            0,
+            &consumer,
+            &PollingStrategy::next(),
+            options,
+        )
+        .await;
     assert!(
-        replacement
-            .poll_messages(
-                &stream,
-                &topic,
-                None,
-                &consumer,
-                &PollingStrategy::next(),
-                1,
-                false
-            )
-            .await
-            .unwrap()
-            .messages
-            .is_empty(),
-        "replacement must wait while the original owns the only partition"
+        matches!(refusal, Err(IggyError::ConsumerGroupPartitionNotOwned(..))),
+        "replacement must wait while the original owns the only partition: {refusal:?}"
     );
     drop(member);
     let deadline = Instant::now() + RESUME_BUDGET;
     loop {
-        let recovered = replacement
+        match replacement
             .poll_messages(
                 &stream,
                 &topic,
-                None,
+                0,
                 &consumer,
                 &PollingStrategy::next(),
-                1,
-                false,
+                options,
             )
             .await
-            .unwrap();
-        if let Some(message) = recovered.messages.first() {
-            assert_eq!(message.header.offset, 1);
-            assert_eq!(message.payload, messages[1].payload);
-            break;
+        {
+            Ok(recovered) => {
+                if let Some(message) = recovered.messages.first() {
+                    assert_eq!(message.header.offset, 1);
+                    assert_eq!(message.payload, messages[1].payload);
+                    break;
+                }
+            }
+            Err(IggyError::ConsumerGroupPartitionNotOwned(..)) => {}
+            Err(error) => panic!("replacement poll failed: {error}"),
         }
         assert!(
             Instant::now() < deadline,

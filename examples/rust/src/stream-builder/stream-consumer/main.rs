@@ -26,8 +26,12 @@ async fn main() -> Result<(), IggyError> {
     println!("Build iggy client & consumer");
     //For customization, use the `new` or `from_stream_topic` constructor
     // Stores the offset of each polled batch, so a restart continues after it.
-    let config = IggyConsumerConfig::default()
-        .with_auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages));
+    let config = IggyConsumerConfig::default();
+    let poll_options = PollOptions {
+        server_commit: ServerCommitPolicy::OnRead,
+        ..config.poll_options()
+    };
+    let config = config.with_poll_options(poll_options);
     let (client, mut consumer) =
         IggyStreamConsumer::with_client_from_url(IGGY_URL, &config).await?;
 

@@ -19,10 +19,10 @@ use iggy::prelude::{
     Client, ClusterClient, CompressionAlgorithm, Consumer, ConsumerGroupClient,
     ConsumerOffsetClient, Identifier, IggyClient, IggyError, IggyExpiry, IggyMessage,
     IggyTimestamp, MaxTopicSize, MessageClient, OptionKey, PartitionClient, Partitioning,
-    PersonalAccessTokenClient, PollingKind, PollingStrategy, SegmentClient, StreamClient,
-    StreamCreateOptions, StreamUpdateOptions, SystemClient, SystemSnapshotType, TopicClient,
-    TopicCreateOptions, TopicUpdateOptions, UserClient, UserCreateOptions, UserStatus,
-    UserUpdateOptions,
+    PersonalAccessTokenClient, PollOptions, PollingKind, PollingStrategy, SegmentClient,
+    ServerCommitPolicy, StreamClient, StreamCreateOptions, StreamUpdateOptions, SystemClient,
+    SystemSnapshotType, TopicClient, TopicCreateOptions, TopicUpdateOptions, UserClient,
+    UserCreateOptions, UserStatus, UserUpdateOptions,
 };
 use requests::*;
 use rmcp::{
@@ -43,6 +43,8 @@ use crate::Permissions;
 mod requests;
 
 const OPERATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// An omitted `partition_id` reads partition 0, as the server does for a standalone consumer.
+const DEFAULT_PARTITION_ID: u32 = 0;
 
 #[derive(Debug, Clone)]
 pub struct IggyService {
@@ -318,20 +320,26 @@ impl IggyService {
             PollingStrategy::offset(offset)
         };
         let auto_commit = auto_commit.unwrap_or(false) || strategy.kind == PollingKind::Next;
-        if auto_commit {
+        let server_commit = if auto_commit {
             self.permissions.ensure_update()?;
-        }
+            ServerCommitPolicy::OnRead
+        } else {
+            ServerCommitPolicy::Disabled
+        };
 
         request(
             self.client
                 .poll_messages(
                     &id(&stream_id)?,
                     &id(&topic_id)?,
-                    partition_id,
+                    partition_id.unwrap_or(DEFAULT_PARTITION_ID),
                     &self.consumer,
                     &strategy,
-                    count,
-                    auto_commit,
+                    PollOptions {
+                        count,
+                        server_commit,
+                        ..PollOptions::default()
+                    },
                 )
                 .await,
         )
@@ -405,7 +413,7 @@ impl IggyService {
     }
 
     #[tool(
-        description = "Resolve a retained write using operation_id from an uncertain or blocked tool error. Success proves the original write committed and releases its lane; it does not return the original response body. An uncertain result keeps the operation available for another resolve. Requires write permission."
+        description = "Resolve a retained write using operation_id from an uncertain or blocked tool error. Success proves the original write committed and releases its lane; it does not return the original response body. An uncertain result keeps the operation available for another resolve. A committing poll (auto_commit=true or strategy=next) cannot be resolved and stays uncertain; use abandon_operation for it. Requires write permission."
     )]
     pub async fn resolve_operation(
         &self,
@@ -423,7 +431,7 @@ impl IggyService {
     }
 
     #[tool(
-        description = "Explicitly abandon a retained write using operation_id from an uncertain or blocked tool error. Releases local recovery state without undoing the write or establishing its outcome. Requires write permission."
+        description = "Explicitly abandon a retained write or a committing poll using operation_id from an uncertain or blocked tool error. A committing poll (auto_commit=true or strategy=next) with an unknown outcome, such as a lost reply, blocks later polls and offset writes of its partition until it is abandoned. Releases local recovery state without undoing the operation or establishing its outcome, so the stored offset of such a poll stays unknown. Requires write permission."
     )]
     pub async fn abandon_operation(
         &self,

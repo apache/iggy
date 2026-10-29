@@ -337,6 +337,13 @@ impl PollReadResult {
         self.message_count
     }
 
+    /// The offset of the last selected message, `None` if the read selected
+    /// nothing.
+    #[must_use]
+    pub const fn last_matching_offset(&self) -> Option<u64> {
+        self.last_matching_offset
+    }
+
     /// The selected bytes with their batch framing, which is what
     /// [`Self::limit_bytes`] counts against its limits.
     #[must_use]

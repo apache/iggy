@@ -44,18 +44,21 @@ public partial class IggyConsumer : IAsyncDisposable
     private const int GroupRejoinRetryDelayMs = 1_000;
 
     /// <summary>
-    ///     Backoff after a group poll reported <see cref="PolledMessages.NoAssignedPartition" />. Without it a
-    ///     member holding zero partitions re-polls in a hot loop whenever <c>PollingIntervalMs</c> is zero.
+    ///     Backoff after a group poll reported <see cref="PolledMessages.NoAssignedPartition" />. Such a poll does
+    ///     not wait on the server, so without it a member holding zero partitions re-polls in a hot loop.
     /// </summary>
     private const int NoAssignedPartitionBackoffMs = 100;
 
     /// <summary>
-    ///     Delay after a failed poll, the default polling retry interval of the Rust consumer. Without it a client
-    ///     that keeps failing, for example while it is disconnected, is polled in a hot loop whenever
-    ///     <c>PollingIntervalMs</c> is zero.
+    ///     Delay after a failed poll, the default polling retry interval of the Rust consumer. A failed poll does not
+    ///     wait on the server, so without it a client that keeps failing, for example while it is disconnected, is
+    ///     polled in a hot loop.
     /// </summary>
     private const int PollRetryDelayMs = 1_000;
     private const int OperationTimeoutMs = 30_000;
+
+    /// <summary>The receive buffers hold this many batches.</summary>
+    private const uint ReceiveBufferBatches = 2;
 
     private readonly Channel<ReceivedMessage> _channel;
     private readonly IIggyClient _client;
@@ -104,7 +107,12 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     private ulong _joinedSessionGeneration;
 
-    private long _lastPolledAtMs;
+    /// <summary>
+    ///     The partition whose first record was wider than the byte limit of <see cref="IggyConsumerConfig.PollOptions" />.
+    ///     The next poll reads that record alone, without the limit, so it cannot stall the partition, and only a
+    ///     failure of that poll is reported. Polls run one at a time under <see cref="_pollingSemaphore" />.
+    /// </summary>
+    private uint? _oversizedPartition;
 
     /// <summary>Whether this consumer has been initialized via <see cref="InitAsync" />.</summary>
     protected bool IsInitialized => _isInitialized;
@@ -122,11 +130,17 @@ public partial class IggyConsumer : IAsyncDisposable
     {
         _client = client;
         _config = config;
+        if (AssignmentProvider is not null)
+        {
+            config.PollOptions.ValidateFetch(config.BatchSize);
+        }
+
         _logger = loggerFactory.CreateLogger<IggyConsumer>();
 
-        _channel = Channel.CreateBounded<ReceivedMessage>(new BoundedChannelOptions((int)config.BatchSize * 2));
-        _rentedChannel
-            = Channel.CreateBounded<ReceivedRentedMessage>(new BoundedChannelOptions((int)config.BatchSize * 2));
+        _channel = Channel.CreateBounded<ReceivedMessage>(
+            new BoundedChannelOptions((int)(config.BatchSize * ReceiveBufferBatches)));
+        _rentedChannel = Channel.CreateBounded<ReceivedRentedMessage>(
+            new BoundedChannelOptions((int)(config.BatchSize * ReceiveBufferBatches)));
         _consumerErrorEvents = new EventAggregator<ConsumerErrorEventArgs>(loggerFactory);
     }
 
@@ -145,6 +159,7 @@ public partial class IggyConsumer : IAsyncDisposable
         }
         _lifetime.Cancel();
         CompleteReceiveChannels();
+        await FinishFetchesAsync();
         await _connectionStateSemaphore.WaitAsync();
         try
         {
@@ -157,10 +172,15 @@ public partial class IggyConsumer : IAsyncDisposable
             try
             {
                 using var checkpoint = new CancellationTokenSource(OperationTimeoutMs);
+                await RewindUndeliveredOffsetsAsync(checkpoint.Token);
                 if (_config.AutoCommitMode != AutoCommitMode.Disabled)
                 {
                     foreach (var (partition, position) in _deliveredOffsets)
                     {
+                        if (_blockedFetchPartitions.Contains(partition))
+                        {
+                            continue;
+                        }
                         if (checkpoint.IsCancellationRequested)
                         {
                             break;
@@ -178,6 +198,10 @@ public partial class IggyConsumer : IAsyncDisposable
                         }
                         catch (Exception error)
                         {
+                            if (RequiresFetchRecovery(error))
+                            {
+                                RecordFetchRecovery(error, [partition]);
+                            }
                             _logger.LogWarning(error, "Failed to checkpoint consumed offset {Offset} for partition {PartitionId}",
                                 position.Offset, partition);
                         }
@@ -220,6 +244,10 @@ public partial class IggyConsumer : IAsyncDisposable
         finally
         {
             _connectionStateSemaphore.Release();
+        }
+        if (_fetchRecoveryFailure is { } recovery)
+        {
+            ExceptionDispatchInfo.Throw(recovery);
         }
     }
 
@@ -618,19 +646,24 @@ public partial class IggyConsumer : IAsyncDisposable
         await _pollingSemaphore.WaitAsync(ct);
 
         var polledPartition = PolledMessages.NoAssignedPartition;
+        PollPlan poll = default;
         try
         {
-            if (_config.PollingIntervalMs > 0)
+            if (await NextPollAsync(false, ct) is not { } next)
             {
-                await WaitBeforePollingAsync(ct);
+                return;
             }
 
+            poll = next;
+            // Disposal cancels a parked poll, which would otherwise hold the progress lane of its partition and a
+            // parked slot of a shared client until it expires.
+            using var polling = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
             var messages = await _client.PollMessagesAsync(_config.StreamId, _config.TopicId,
-                _config.PartitionId, _config.Consumer, partitionId =>
+                poll.PartitionId, _config.Consumer, partitionId =>
                 {
                     polledPartition = partitionId;
                     return PollingStrategyFor(partitionId);
-                }, _config.BatchSize, _config.AutoCommit, ct);
+                }, poll.Count, _config.AutoCommit, poll.Options, polling.Token);
 
             if (messages.Messages.Count == 0)
             {
@@ -645,48 +678,10 @@ public partial class IggyConsumer : IAsyncDisposable
                 return;
             }
 
-            RememberPolledContext(messages.PartitionId, messages.Context);
-            var hasLastOffset = _lastPolledOffset.TryGetValue(messages.PartitionId,
-                out var lastPolledPartitionOffset);
-
-            var currentOffset = 0ul;
-            var anyNewMessages = false;
-            foreach (var message in messages.Messages)
+            if (await PublishPolledAsync(messages, ct) is { } lastOffset)
             {
-                if (hasLastOffset && message.Header.Offset <= lastPolledPartitionOffset)
-                {
-                    continue;
-                }
-
-                var receivedMessage = new ReceivedMessage
-                {
-                    Message = message,
-                    CurrentOffset = message.Header.Offset,
-                    PartitionId = messages.PartitionId,
-                    Context = messages.Context,
-                    Status = MessageStatus.Success,
-                    Error = null
-                };
-
-                await _channel.Writer.WriteAsync(receivedMessage, ct);
-                currentOffset = receivedMessage.CurrentOffset;
-                anyNewMessages = true;
+                RememberNextPollingStrategy(messages.PartitionId, lastOffset, messages.Context);
             }
-
-            if (!anyNewMessages)
-            {
-                if (_config.AutoCommitMode != AutoCommitMode.Disabled)
-                {
-                    _logger.LogDebug("No new messages found, committing offset {Offset} for partition {PartitionId}",
-                        lastPolledPartitionOffset, messages.PartitionId);
-                    await StoreOffsetAsync(lastPolledPartitionOffset, messages.PartitionId, messages.Context, ct);
-                }
-
-                return;
-            }
-
-            _lastPolledOffset[messages.PartitionId] = currentOffset;
-            RememberNextPollingStrategy(messages.PartitionId, currentOffset, messages.Context);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -701,13 +696,98 @@ public partial class IggyConsumer : IAsyncDisposable
         catch (Exception ex) when (ex is not (MalformedResponseException
             or VsrRequestOutcomeUnknownException { OperationId: not null } or VsrLaneBlockedException))
         {
-            await ReportPollFailureAsync(ex, polledPartition, ct);
+            if (!DefersOversizedRecord(ex, poll, polledPartition))
+            {
+                await ReportPollFailureAsync(ex, polledPartition, ct);
+            }
         }
         finally
         {
             _pollingSemaphore.Release();
         }
     }
+
+    /// <summary>
+    ///     Writes the messages of a poll or a fetch section that this consumer has not delivered yet to the channel,
+    ///     and returns the offset of the last one. When none is new, the consumer stores the offset it delivered
+    ///     last, unless it commits nothing, and returns null.
+    /// </summary>
+    private async Task<ulong?> PublishPolledAsync(PolledMessages messages, CancellationToken ct)
+    {
+        RememberPolledContext(messages.PartitionId, messages.Context);
+        var hasLastOffset = _lastPolledOffset.TryGetValue(messages.PartitionId, out var lastPolledPartitionOffset);
+
+        ulong? currentOffset = null;
+        foreach (var message in messages.Messages)
+        {
+            if (hasLastOffset && message.Header.Offset <= lastPolledPartitionOffset)
+            {
+                continue;
+            }
+
+            var receivedMessage = new ReceivedMessage
+            {
+                Message = message,
+                CurrentOffset = message.Header.Offset,
+                PartitionId = messages.PartitionId,
+                Context = messages.Context,
+                Status = MessageStatus.Success,
+                Error = null
+            };
+
+            await _channel.Writer.WriteAsync(receivedMessage, ct);
+            currentOffset = receivedMessage.CurrentOffset;
+        }
+
+        if (currentOffset is not { } lastOffset)
+        {
+            if (_config.AutoCommitMode != AutoCommitMode.Disabled)
+            {
+                _logger.LogDebug("No new messages found, committing offset {Offset} for partition {PartitionId}",
+                    lastPolledPartitionOffset, messages.PartitionId);
+                await StoreOffsetAsync(lastPolledPartitionOffset, messages.PartitionId, messages.Context, ct);
+            }
+
+            return null;
+        }
+
+        _lastPolledOffset[messages.PartitionId] = lastOffset;
+        return lastOffset;
+    }
+
+    /// <summary>
+    ///     The partition, count and options of the next poll: the configured ones, or the record of
+    ///     <see cref="_oversizedPartition" /> alone.
+    /// </summary>
+    private PollPlan NextPoll()
+    {
+        if (_oversizedPartition is not { } partitionId)
+        {
+            return new PollPlan(_config.PartitionId, _config.BatchSize, _config.PollOptions, false);
+        }
+
+        _oversizedPartition = null;
+        return new PollPlan(partitionId, 1, _config.PollOptions with { MinCount = 1, MaxBytes = uint.MaxValue }, true);
+    }
+
+    /// <summary>
+    ///     Whether a failed poll stays unreported because the first record of its partition is wider than its byte
+    ///     limit. The next poll then reads that record alone.
+    /// </summary>
+    private bool DefersOversizedRecord(Exception error, PollPlan poll, uint polledPartition)
+    {
+        if (poll.Alone || polledPartition == PolledMessages.NoAssignedPartition
+            || error is not IggyInvalidStatusCodeException { FromServer: true, StatusCode: VsrError.INVALID_SIZE_BYTES })
+        {
+            return false;
+        }
+
+        _oversizedPartition = polledPartition;
+        return true;
+    }
+
+    /// <summary>What one poll reads. <see cref="Alone" /> marks the poll of an oversized record.</summary>
+    private readonly record struct PollPlan(uint? PartitionId, uint Count, DeferredPollOptions Options, bool Alone);
 
     /// <summary>
     ///     Publishes a failed poll as an error event and waits <see cref="PollRetryDelayMs" /> before the next poll.
@@ -744,7 +824,7 @@ public partial class IggyConsumer : IAsyncDisposable
             {
                 await operation(cancellation.Token);
             }
-            catch (VsrLaneBlockedException blocked)
+            catch (VsrLaneBlockedException blocked) when (!blocked.RequiresExplicitRecovery)
             {
                 ct.ThrowIfCancellationRequested();
                 var remainingMs = deadline - Environment.TickCount64;
@@ -801,11 +881,12 @@ public partial class IggyConsumer : IAsyncDisposable
     }
 
     /// <summary>
-    ///     Under <see cref="MessagePolling.Next" /> the server keeps the position, so nothing is recorded.
+    ///     Under <see cref="MessagePolling.Next" /> the server keeps the position, so nothing is recorded, unless the
+    ///     consumer fetches: a fetch sends a partition as <see cref="MessagePolling.Offset" /> after its first read.
     /// </summary>
     private void RememberNextPollingStrategy(uint partitionId, ulong lastOffset, PartitionContext context)
     {
-        if (_config.PollingStrategy.Kind != MessagePolling.Next)
+        if (AssignmentProvider is not null || _config.PollingStrategy.Kind != MessagePolling.Next)
         {
             _nextPollingStrategies[partitionId] = PollingStrategy.Offset(lastOffset + 1).WithContext(context);
         }
@@ -900,48 +981,6 @@ public partial class IggyConsumer : IAsyncDisposable
         }
 
         await Task.Delay(GroupRejoinRetryDelayMs, ct);
-    }
-
-    /// <summary>
-    ///     Implements polling interval throttling to avoid excessive server requests.
-    ///     Uses monotonic time tracking to ensure proper intervals even with clock adjustments.
-    /// </summary>
-    private async Task WaitBeforePollingAsync(CancellationToken ct)
-    {
-        var intervalMs = _config.PollingIntervalMs;
-        if (intervalMs <= 0)
-        {
-            return;
-        }
-
-        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        var lastPolledAtMs = Interlocked.Read(ref _lastPolledAtMs);
-
-        if (nowMs < lastPolledAtMs)
-        {
-            LogMonotonicTimeWentBackwards(nowMs, lastPolledAtMs);
-            await Task.Delay(intervalMs, ct);
-            Interlocked.Exchange(ref _lastPolledAtMs, nowMs);
-            return;
-        }
-
-        var elapsedMs = nowMs - lastPolledAtMs;
-        if (elapsedMs >= intervalMs)
-        {
-            LogNoNeedToWaitBeforePolling(nowMs, lastPolledAtMs, elapsedMs);
-            Interlocked.Exchange(ref _lastPolledAtMs, nowMs);
-            return;
-        }
-
-        var remainingMs = intervalMs - elapsedMs;
-        LogWaitingBeforePolling(remainingMs);
-
-        if (remainingMs > 0)
-        {
-            await Task.Delay((int)remainingMs, ct);
-        }
-
-        Interlocked.Exchange(ref _lastPolledAtMs, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
     }
 
     /// <summary>

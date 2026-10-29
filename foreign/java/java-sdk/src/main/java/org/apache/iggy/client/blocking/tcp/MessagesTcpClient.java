@@ -24,6 +24,7 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.DeferredPollOptions;
+import org.apache.iggy.message.FetchedMessages;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
@@ -31,6 +32,7 @@ import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 final class MessagesTcpClient implements MessagesClient {
@@ -67,6 +69,25 @@ final class MessagesTcpClient implements MessagesClient {
             DeferredPollOptions options) {
         return FutureUtil.resolveInterruptibly(delegate.pollMessagesDeferred(
                 streamId, topicId, partitionId, consumer, strategy, count, autoCommit, options));
+    }
+
+    @Override
+    public List<List<Long>> readinessGroups(StreamId streamId, TopicId topicId, List<Long> partitions) {
+        return FutureUtil.resolve(delegate.readinessGroups(streamId, topicId, partitions));
+    }
+
+    @Override
+    public List<FetchedMessages> fetchMessages(
+            StreamId streamId,
+            TopicId topicId,
+            Map<Long, PollingStrategy> targets,
+            Consumer consumer,
+            Long count,
+            boolean autoCommit,
+            DeferredPollOptions options) {
+        var fetched = delegate.fetchMessages(streamId, topicId, targets, consumer, count, autoCommit, options);
+        // A cancel of a committing fetch can lose what the server committed, so only its reply ends the wait.
+        return autoCommit ? FutureUtil.resolve(fetched) : FutureUtil.resolveInterruptibly(fetched);
     }
 
     @Override

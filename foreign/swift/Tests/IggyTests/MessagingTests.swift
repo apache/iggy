@@ -1032,7 +1032,7 @@ struct MessagingTests {
         let started = ContinuousClock.now
         await expectCode(.transientNotAccepted) {
             _ = try await client.core.pollRouter.send(
-                .pollMessages, payload: payload, key: key, context: nil, lineage: await client.core.lineage, coordinator: client.core,
+                .pollMessages, body: .fixed(payload), key: key, context: nil, lineage: await client.core.lineage, coordinator: client.core,
                 deadline: started + budget)
         }
         #expect(ContinuousClock.now - started < .seconds(5))
@@ -1068,7 +1068,7 @@ struct MessagingTests {
             consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: false)
         let key = PollRouter.RouteKey(stream: 1, topic: 2, partitionID: 0)
         _ = try await client.core.pollRouter.send(
-            .pollMessages, payload: payload, key: key, context: nil, lineage: await client.core.lineage, coordinator: client.core,
+            .pollMessages, body: .fixed(payload), key: key, context: nil, lineage: await client.core.lineage, coordinator: client.core,
             deadline: .now + .seconds(10))
         let timeouts = connector.timeouts.withLock { $0 }
         #expect(timeouts.count == 1)
@@ -1116,11 +1116,11 @@ struct MessagingTests {
 
         await expectCode(.transientNotAccepted) {
             _ = try await client.core.pollRouter.send(
-                .pollMessages, payload: payload, key: key, context: nil, lineage: await client.core.lineage, coordinator: client.core,
+                .pollMessages, body: .fixed(payload), key: key, context: nil, lineage: await client.core.lineage, coordinator: client.core,
                 deadline: .now + .milliseconds(300))
         }
         _ = try await client.core.pollRouter.send(
-            .pollMessages, payload: payload, key: key, context: nil, lineage: await client.core.lineage, coordinator: client.core,
+            .pollMessages, body: .fixed(payload), key: key, context: nil, lineage: await client.core.lineage, coordinator: client.core,
             deadline: .now + .seconds(10))
 
         #expect(await requests(coordinator, .getPartitionRoute).isEmpty)
@@ -1574,7 +1574,7 @@ struct MessagingTests {
         let key = PollRouter.RouteKey(stream: 1, topic: 2, partitionID: 0)
         await expectCode(.transientNotAccepted) {
             _ = try await client.core.pollRouter.send(
-                .pollMessages, payload: payload, key: key, context: nil, lineage: await client.core.lineage, coordinator: client.core,
+                .pollMessages, body: .fixed(payload), key: key, context: nil, lineage: await client.core.lineage, coordinator: client.core,
                 deadline: .now + .milliseconds(500))
         }
         // Every miss dropped the route, so every poll took a new lookup.
@@ -1614,7 +1614,8 @@ struct MessagingTests {
             consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: false)
         let key = PollRouter.RouteKey(stream: 1, topic: 2, partitionID: 0)
         _ = try await client.core.pollRouter.send(
-            .pollMessages, payload: payload, key: key, context: nil, lineage: await client.core.lineage, coordinator: client.core, deadline: .now + .seconds(3))
+            .pollMessages, body: .fixed(payload), key: key, context: nil, lineage: await client.core.lineage, coordinator: client.core,
+            deadline: .now + .seconds(3))
         #expect(await requests(coordinator, .getPartitionRoute).count == 1)
         #expect(await requests(primary, .pollMessages).count == 1)
         await client.shutdown()
@@ -1652,7 +1653,8 @@ struct MessagingTests {
             consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: false)
         let key = PollRouter.RouteKey(stream: 1, topic: 2, partitionID: 0)
         _ = try await client.core.pollRouter.send(
-            .pollMessages, payload: payload, key: key, context: nil, lineage: await client.core.lineage, coordinator: client.core, deadline: .now + .seconds(3))
+            .pollMessages, body: .fixed(payload), key: key, context: nil, lineage: await client.core.lineage, coordinator: client.core,
+            deadline: .now + .seconds(3))
         #expect(await requests(coordinator, .getPartitionRoute).count == 2)
         #expect(await requests(primary, .pollMessages).count == 1)
         await client.shutdown()

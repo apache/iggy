@@ -424,21 +424,22 @@ actor ClientCore {
     /// cancelled request, or an outage longer than the request timeout leaves
     /// the client disconnected, and with credentials to sign in again the
     /// next typed call reconnects instead of failing until ``connect()``. A
-    /// reconnect that outlasts the request timeout refuses the call as not
-    /// accepted, since nothing was sent, and one whose sign-in the server
-    /// refused ends it as unauthenticated.
+    /// reconnect that outlasts the request timeout, or `limit` of a caller
+    /// with a budget of its own, refuses the call as not accepted, since
+    /// nothing was sent, and one whose sign-in the server refused ends it as
+    /// unauthenticated.
     ///
     /// Returns the lineage the call started under, read before the reconnect
     /// can wait for a sign-in of the caller, so that no request of the call
     /// is written under the session that sign-in opens.
-    func requireAuthenticated() async throws -> UInt64 {
+    func requireAuthenticated(within limit: ContinuousClock.Instant? = nil) async throws -> UInt64 {
         let started = lineage
         switch state {
         case .disconnected, .connecting, .authenticating:
             if !disconnectedByCaller, configuration.reconnection.enabled, signInCredentials() != nil {
                 let reconnected: Void?
                 do {
-                    reconnected = try await withDeadline(ContinuousClock.now + configuration.requestTimeout) { [self] in
+                    reconnected = try await withDeadline(requestDeadline(within: limit)) { [self] in
                         try await self.connect()
                     }
                 } catch {

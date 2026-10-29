@@ -140,21 +140,25 @@ public partial class IggyConsumer
         await _pollingSemaphore.WaitAsync(ct);
 
         PolledMessagesRental? rental = null;
-        RentedBatchHandle? batchHandle = null;
         var polledPartition = PolledMessages.NoAssignedPartition;
+        PollPlan poll = default;
         try
         {
-            if (_config.PollingIntervalMs > 0)
+            if (await NextPollAsync(true, ct) is not { } next)
             {
-                await WaitBeforePollingAsync(ct);
+                return;
             }
 
+            poll = next;
+            // Disposal cancels a parked poll, which would otherwise hold the progress lane of its partition and a
+            // parked slot of a shared client until it expires.
+            using var polling = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
             rental = await _client.PollMessagesRentedAsync(_config.StreamId, _config.TopicId,
-                _config.PartitionId, _config.Consumer, partitionId =>
+                poll.PartitionId, _config.Consumer, partitionId =>
                 {
                     polledPartition = partitionId;
                     return PollingStrategyFor(partitionId);
-                }, _config.BatchSize, _config.AutoCommit, ct);
+                }, poll.Count, _config.AutoCommit, poll.Options, polling.Token);
 
             if (rental.Messages.Count == 0)
             {
@@ -175,54 +179,12 @@ public partial class IggyConsumer
                 return;
             }
 
-            RememberPolledContext(rental.PartitionId, rental.Context);
-            var hasLastOffset = _lastPolledOffset.TryGetValue(rental.PartitionId, out var lastPolledPartitionOffset);
-
-            var currentOffset = 0ul;
-
-            batchHandle = new RentedBatchHandle(rental);
-            var anyNewMessages = false;
-            foreach (var message in rental.Messages)
+            var published = rental;
+            rental = null;
+            if (await PublishRentedBatchAsync(published, ct) is { } lastOffset)
             {
-                if (hasLastOffset && message.Header.Offset <= lastPolledPartitionOffset)
-                {
-                    continue;
-                }
-
-                currentOffset = message.Header.Offset;
-                batchHandle.Acquire();
-                try
-                {
-                    await PublishRentedAsync(batchHandle, message, rental.PartitionId, MessageStatus.Success, null, ct);
-                }
-                catch
-                {
-                    batchHandle.Release();
-                    throw;
-                }
-
-                anyNewMessages = true;
+                RememberNextPollingStrategy(published.PartitionId, lastOffset, published.Context);
             }
-
-            if (!anyNewMessages)
-            {
-                if (_config.AutoCommitMode != AutoCommitMode.Disabled)
-                {
-                    if (_logger.IsEnabled(LogLevel.Debug))
-                    {
-                        _logger.LogDebug(
-                            "No new messages found, committing offset {Offset} for partition {PartitionId}",
-                            lastPolledPartitionOffset, rental.PartitionId);
-                    }
-
-                    await StoreOffsetAsync(lastPolledPartitionOffset, rental.PartitionId, rental.Context, ct);
-                }
-
-                return;
-            }
-
-            _lastPolledOffset[rental.PartitionId] = currentOffset;
-            RememberNextPollingStrategy(rental.PartitionId, currentOffset, rental.Context);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -237,20 +199,69 @@ public partial class IggyConsumer
         catch (Exception ex) when (ex is not (MalformedResponseException
             or VsrRequestOutcomeUnknownException { OperationId: not null } or VsrLaneBlockedException))
         {
-            await ReportPollFailureAsync(ex, polledPartition, ct);
+            if (!DefersOversizedRecord(ex, poll, polledPartition))
+            {
+                await ReportPollFailureAsync(ex, polledPartition, ct);
+            }
         }
         finally
         {
-            if (batchHandle is not null)
-            {
-                batchHandle.Release();
-            }
-            else
-            {
-                rental?.Dispose();
-            }
-
+            rental?.Dispose();
             _pollingSemaphore.Release();
         }
+    }
+
+    /// <summary>
+    ///     Publishes the messages of a rented batch that this consumer has not delivered yet through
+    ///     <see cref="PublishRentedAsync" />, and returns the offset of the last one. When none is new, the consumer
+    ///     stores the offset it delivered last, unless it commits nothing, and returns null. The batch goes back to
+    ///     the pool once every published message is disposed.
+    /// </summary>
+    private async Task<ulong?> PublishRentedBatchAsync(PolledMessagesRental rental, CancellationToken ct)
+    {
+        using var batchHandle = new RentedBatchHandle(rental);
+        RememberPolledContext(rental.PartitionId, rental.Context);
+        var hasLastOffset = _lastPolledOffset.TryGetValue(rental.PartitionId, out var lastPolledPartitionOffset);
+
+        ulong? currentOffset = null;
+        foreach (var message in rental.Messages)
+        {
+            if (hasLastOffset && message.Header.Offset <= lastPolledPartitionOffset)
+            {
+                continue;
+            }
+
+            currentOffset = message.Header.Offset;
+            batchHandle.Acquire();
+            try
+            {
+                await PublishRentedAsync(batchHandle, message, rental.PartitionId, MessageStatus.Success, null, ct);
+            }
+            catch
+            {
+                batchHandle.Release();
+                throw;
+            }
+        }
+
+        if (currentOffset is not { } lastOffset)
+        {
+            if (_config.AutoCommitMode != AutoCommitMode.Disabled)
+            {
+                if (_logger.IsEnabled(LogLevel.Debug))
+                {
+                    _logger.LogDebug(
+                        "No new messages found, committing offset {Offset} for partition {PartitionId}",
+                        lastPolledPartitionOffset, rental.PartitionId);
+                }
+
+                await StoreOffsetAsync(lastPolledPartitionOffset, rental.PartitionId, rental.Context, ct);
+            }
+
+            return null;
+        }
+
+        _lastPolledOffset[rental.PartitionId] = lastOffset;
+        return lastOffset;
     }
 }

@@ -209,7 +209,6 @@ public class IggyTypedConsumerTests
             PartitionId = 1,
             AutoCommitMode = autoCommitMode,
             AutoCommit = autoCommitMode != AutoCommitMode.Disabled,
-            PollingIntervalMs = 0,
             Deserializer = deserializer
         };
         return new IggyConsumer<string>(client, config, NullLoggerFactory.Instance);

@@ -146,7 +146,7 @@ func routeReply(t testing.TB, read request, replica uint8) []byte {
 
 func pollRoutingReply(t testing.TB, read request, replica uint8, watermark uint64) []byte {
 	t.Helper()
-	body := binary.LittleEndian.AppendUint64(nil, 0)
+	body := binary.LittleEndian.AppendUint64(nil, 17)
 	body = binary.LittleEndian.AppendUint64(body, watermark)
 	body = binary.LittleEndian.AppendUint32(body, 0)
 	body = binary.LittleEndian.AppendUint32(body, 2)

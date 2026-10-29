@@ -63,7 +63,7 @@ Use `max_wait` and `min_count` in place of `poll_interval`. If a sink
 `[[streams]]` entry sets `poll_interval`, that sink fails to start. The server
 commits the offset of each sink poll when it answers the poll, before the
 plugin consumes the messages. Sinks need a server that supports deferred polls
-(binary commands 106 and 107).
+(binary commands 106 and 109 in protocol 0.12.1).
 
 At each start, a sink connects an Iggy client of its own. After the last
 consumer of that start stops, the sink logs the client out and shuts it down.

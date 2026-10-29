@@ -21,7 +21,10 @@ use crate::connectors::fixtures::{
     Mqtt311Qos0Fixture, Mqtt311Qos1Fixture, Mqtt311Qos2Fixture,
 };
 use base64::Engine;
-use iggy_common::{Consumer, Identifier, MessageClient, PollingStrategy};
+use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
+use iggy_common::{
+    Consumer, Identifier, MessageClient, PollOptions, PollingStrategy, ServerCommitPolicy,
+};
 use integration::harness::{TestBinary, TestHarness, seeds};
 use integration::iggy_harness;
 use reqwest::Client;
@@ -395,11 +398,14 @@ async fn assert_payloads_are_persisted(harness: &TestHarness, expected: HashSet<
                 .poll_messages(
                     &stream_id,
                     &topic_id,
-                    None,
+                    DEFAULT_PARTITION_ID,
                     &Consumer::new(consumer_id.clone()),
                     &PollingStrategy::next(),
-                    10,
-                    true,
+                    PollOptions {
+                        count: 10,
+                        server_commit: ServerCommitPolicy::OnRead,
+                        ..PollOptions::default()
+                    },
                 )
                 .await
             {
@@ -597,11 +603,14 @@ where
                 .poll_messages(
                     &stream_id,
                     &topic_id,
-                    None,
+                    DEFAULT_PARTITION_ID,
                     &Consumer::new(consumer_id.clone()),
                     &PollingStrategy::next(),
-                    10,
-                    true,
+                    PollOptions {
+                        count: 10,
+                        server_commit: ServerCommitPolicy::OnRead,
+                        ..PollOptions::default()
+                    },
                 )
                 .await
                 && let Some(message) = polled
@@ -636,11 +645,14 @@ async fn poll_first_message(
                 .poll_messages(
                     &stream_id,
                     &topic_id,
-                    None,
+                    DEFAULT_PARTITION_ID,
                     &Consumer::new(consumer_id.clone()),
                     &PollingStrategy::next(),
-                    10,
-                    true,
+                    PollOptions {
+                        count: 10,
+                        server_commit: ServerCommitPolicy::OnRead,
+                        ..PollOptions::default()
+                    },
                 )
                 .await
                 && let Some(message) = polled.messages.into_iter().next()
@@ -668,11 +680,14 @@ async fn assert_message_is_not_persisted(harness: &TestHarness, payload: &[u8]) 
                 .poll_messages(
                     &stream_id,
                     &topic_id,
-                    None,
+                    DEFAULT_PARTITION_ID,
                     &Consumer::new(consumer_id.clone()),
                     &PollingStrategy::next(),
-                    10,
-                    true,
+                    PollOptions {
+                        count: 10,
+                        server_commit: ServerCommitPolicy::OnRead,
+                        ..PollOptions::default()
+                    },
                 )
                 .await
                 && polled

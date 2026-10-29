@@ -45,30 +45,28 @@ pub(crate) async fn build_iggy_consumer(
     trace!("Extract config fields.");
     let stream = config.stream_name();
     let topic = config.topic_name();
-    let auto_commit = config.auto_commit();
+    let client_commit = config.client_commit();
     let consumer_kind = config.consumer_kind();
     let consumer_name = config.consumer_name();
-    let batch_length = config.batch_length();
     let poll_options = config.poll_options();
     let polling_strategy = config.polling_strategy();
-    let partition = config.partition_id();
     let polling_retry_interval = config.polling_retry_interval();
 
     trace!("Build iggy consumer");
     let mut builder = match consumer_kind {
-        ConsumerKind::Consumer => client.consumer(consumer_name, stream, topic, partition)?,
+        ConsumerKind::Consumer => client
+            .consumer(consumer_name, stream, topic)?
+            .partitions(config.partitions().iter().copied()),
         ConsumerKind::ConsumerGroup => client.consumer_group(consumer_name, stream, topic)?,
         // Holds offsets only, it cannot poll. `IggyConsumerConfig::validate` refuses it, with a
         // log, before the entry points make any server call.
         ConsumerKind::ExternalGroup => return Err(IggyError::FeatureUnavailable),
     }
-    .auto_commit(auto_commit)
+    .client_commit(client_commit)
     .create_consumer_group_if_not_exists()
-    .auto_join_consumer_group()
     .polling_strategy(polling_strategy)
     .poll_options(poll_options)
     .prefetch_bytes(config.prefetch_bytes())
-    .batch_length(batch_length)
     .polling_retry_interval(polling_retry_interval);
 
     if let Some(prefetch_messages) = config.prefetch_messages() {

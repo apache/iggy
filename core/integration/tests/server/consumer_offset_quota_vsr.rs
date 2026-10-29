@@ -115,11 +115,14 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
         .poll_messages(
             &stream,
             &topic,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &first_consumer,
             &PollingStrategy::first(),
-            1,
-            true,
+            PollOptions {
+                count: 1,
+                server_commit: ServerCommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("new auto-commit consumer fits");
@@ -141,11 +144,14 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
             .poll_messages(
                 &stream,
                 &topic,
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &first_consumer,
                 &PollingStrategy::next(),
-                1,
-                true
+                PollOptions {
+                    count: 1,
+                    server_commit: ServerCommitPolicy::OnRead,
+                    ..PollOptions::default()
+                }
             )
             .await
             .expect("next poll")
@@ -191,11 +197,14 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
         .poll_messages(
             &stream,
             &topic,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &rejected_consumer,
             &PollingStrategy::first(),
-            1,
-            true,
+            PollOptions {
+                count: 1,
+                server_commit: ServerCommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await;
     assert!(
@@ -206,11 +215,13 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
         .poll_messages(
             &stream,
             &topic,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &rejected_consumer,
             &PollingStrategy::first(),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("the same poll succeeds when auto-commit is disabled");

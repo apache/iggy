@@ -23,6 +23,8 @@ pub mod identifier;
 pub mod message_iterator;
 pub mod metadata_changes;
 pub mod options;
+pub mod poll_options;
+pub mod reader;
 pub mod receive_message;
 pub mod runtime;
 pub mod send_message;
@@ -33,10 +35,10 @@ pub mod topic;
 use ext_php_rs::prelude::*;
 
 use crate::client::{IggyClient, PendingOperationsConfig};
-use crate::consumer::{AutoCommit, AutoCommitWhen, IggyConsumer};
+use crate::consumer::{ClientCommitPolicy, CommitEvent, IggyConsumer};
 use crate::error::{
     AuthenticationException, ConnectionException, IggyException, NotFoundException,
-    PendingOperationException, TransientException,
+    PendingOperationException, ReadException, TransientException,
 };
 use crate::message_iterator::MessageIterator;
 use crate::metadata_changes::{
@@ -52,7 +54,9 @@ use crate::metadata_changes::{
     MetadataUnknownItem, MetadataUserChange, MetadataUserIdentity, MetadataUserPermissionsUpdated,
 };
 use crate::options::{OptionSpec, OptionsScope, StreamOptionKey, TopicOptionKey};
-use crate::receive_message::{ConsumerPosition, PartitionContext, PollingStrategy, ReceiveMessage};
+use crate::poll_options::{PollOptions, ServerCommitPolicy};
+use crate::reader::PartitionReader;
+use crate::receive_message::{Checkpoint, PolledMessages, PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
 use crate::stream::StreamDetails;
 use crate::topic::TopicDetails;
@@ -65,6 +69,7 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .enumeration::<StreamOptionKey>()
         .enumeration::<TopicOptionKey>()
         .enumeration::<OptionsScope>()
+        .enumeration::<ServerCommitPolicy>()
         .enumeration::<MetadataChangeGroup>()
         .enumeration::<MetadataChangeKind>()
         .enumeration::<MetadataChangeStatus>()
@@ -81,16 +86,19 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .class::<NotFoundException>()
         .class::<TransientException>()
         .class::<PendingOperationException>()
+        .class::<ReadException>()
         .class::<PendingOperationsConfig>()
         .class::<IggyClient>()
         .class::<IggyConsumer>()
         .class::<MessageIterator>()
-        .class::<AutoCommit>()
-        .class::<AutoCommitWhen>()
-        .class::<PartitionContext>()
-        .class::<ConsumerPosition>()
+        .class::<ClientCommitPolicy>()
+        .class::<CommitEvent>()
+        .class::<PollOptions>()
         .class::<PollingStrategy>()
+        .class::<Checkpoint>()
         .class::<ReceiveMessage>()
+        .class::<PolledMessages>()
+        .class::<PartitionReader>()
         .class::<SendMessage>()
         .class::<SendMessagesConfirmation>()
         .class::<SendMessagesResponse>()

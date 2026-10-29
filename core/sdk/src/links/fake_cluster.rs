@@ -24,8 +24,8 @@ use super::{Dialer, ReconnectPolicy, ReplicaLinks};
 use crate::session_owner::SessionOwner;
 use futures::FutureExt;
 use iggy_binary_protocol::codes::{
-    BIND_SESSION_CODE, GET_CLUSTER_METADATA_CODE, GET_PARTITION_ROUTE_CODE, GET_STATS_CODE,
-    LOGIN_REGISTER_CODE, LOGOUT_USER_CODE,
+    BIND_SESSION_CODE, FETCH_MESSAGES_CODE, GET_CLUSTER_METADATA_CODE, GET_PARTITION_ROUTE_CODE,
+    GET_STATS_CODE, LOGIN_REGISTER_CODE, LOGOUT_USER_CODE,
 };
 use iggy_binary_protocol::consensus::{
     EvictionHeader, EvictionReason, HEADER_SIZE, NON_REPLICATED_CODE_RANGE, Operation,
@@ -41,10 +41,11 @@ use iggy_binary_protocol::{PartitionContext, WireDecode, WireEncode, WireName, W
 use iggy_common::{AutoLogin, ClusterNodeRole, ClusterNodeStatus, Credentials, IggyError};
 use secrecy::SecretString;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::sync::Notify;
 use tokio::task::AbortHandle;
 use tokio::time::{Instant, sleep, timeout};
 
@@ -62,6 +63,12 @@ const POLL_STEP: Duration = Duration::from_millis(10);
 #[derive(Debug, Clone)]
 pub(crate) enum Answer {
     Body(Vec<u8>),
+    /// Keeps the old operation live independently of its connection until released.
+    GatedBody {
+        release: Arc<Notify>,
+        completed: Arc<AtomicBool>,
+        body: Vec<u8>,
+    },
     /// A refusal with the status of this error.
     Refuse(IggyError),
     /// The reply of a committed metadata request at this commit.
@@ -297,6 +304,19 @@ impl FakeCluster {
                 ));
                 let frame = match self.answer(&endpoint, &request, code, username.as_deref()) {
                     Answer::Body(body) => reply(request.request, &body),
+                    Answer::GatedBody {
+                        release,
+                        completed,
+                        body,
+                    } => {
+                        let replies = replies.clone();
+                        tokio::spawn(async move {
+                            release.notified().await;
+                            completed.store(true, Ordering::SeqCst);
+                            let _ = replies.send(reply(request.request, &body));
+                        });
+                        continue;
+                    }
                     Answer::Refuse(error) => refusal(request.request, &error),
                     Answer::Detached => refusal(request.request, &IggyError::StaleClient),
                     Answer::Commit(commit) => committed(&request, commit, None, &[]),
@@ -391,6 +411,7 @@ impl FakeCluster {
                 None => Answer::Refuse(IggyError::TransientNotAccepted),
             },
             UNANSWERED_CODE => Answer::Silence,
+            FETCH_MESSAGES_CODE => Answer::Body(0_u32.to_le_bytes().to_vec()),
             _ if !matches!(
                 request.operation,
                 Operation::NonReplicated | Operation::Logout

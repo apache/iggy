@@ -33,6 +33,7 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -65,6 +66,17 @@ class DeferredPollCompatibilityTest {
                         false,
                         DeferredPollOptions.defaults()))
                 .isInstanceOf(IggyOperationNotSupportedException.class);
+        assertThatThrownBy(() -> client.readinessGroups(StreamId.of(1L), TopicId.of(1L), List.of(0L)))
+                .isInstanceOf(IggyOperationNotSupportedException.class);
+        assertThatThrownBy(() -> client.fetchMessages(
+                        StreamId.of(1L),
+                        TopicId.of(1L),
+                        Map.of(0L, PollingStrategy.next()),
+                        Consumer.of(0L),
+                        10L,
+                        false,
+                        DeferredPollOptions.defaults()))
+                .isInstanceOf(IggyOperationNotSupportedException.class);
         assertThat(client.immediatePolls).isZero();
     }
 
@@ -78,6 +90,21 @@ class DeferredPollCompatibilityTest {
                                 Optional.of(0L),
                                 0L,
                                 PollingStrategy.next(),
+                                10L,
+                                false,
+                                DeferredPollOptions.defaults())
+                        .get())
+                .isInstanceOf(ExecutionException.class)
+                .hasCauseInstanceOf(IggyOperationNotSupportedException.class);
+        assertThatThrownBy(() -> client.readinessGroups(StreamId.of(1L), TopicId.of(1L), List.of(0L))
+                        .get())
+                .isInstanceOf(ExecutionException.class)
+                .hasCauseInstanceOf(IggyOperationNotSupportedException.class);
+        assertThatThrownBy(() -> client.fetchMessages(
+                                StreamId.of(1L),
+                                TopicId.of(1L),
+                                Map.of(0L, PollingStrategy.next()),
+                                Consumer.of(0L),
                                 10L,
                                 false,
                                 DeferredPollOptions.defaults())

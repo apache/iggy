@@ -104,9 +104,9 @@ use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, Consumer, ConsumerGroup, ConsumerGroupDetails,
     ConsumerOffsetInfo, DEFAULT_MAX_TOPIC_SIZE, Identifier, IdentityInfo, IggyError, IggyTimestamp,
     MetadataChanges, MetadataChangesQuery, OptionSpec, OptionStorage, OptionsScope, Partitioning,
-    PersonalAccessTokenInfo, PollMessages, PolledMessages, RawPersonalAccessToken, SendMessages,
-    SendMessagesConfirmations, Stats, Stream, StreamDetails, TokenInfo, Topic, TopicDetails,
-    UserInfo, UserInfoDetails, Validatable, descriptors_for, erase_buffer,
+    PersonalAccessTokenInfo, PollMessages, PolledMessages, PollingStrategy, RawPersonalAccessToken,
+    SendMessages, SendMessagesConfirmations, Stats, Stream, StreamDetails, TokenInfo, Topic,
+    TopicDetails, UserInfo, UserInfoDetails, Validatable, descriptors_for, erase_buffer,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
@@ -1315,7 +1315,7 @@ async fn poll_messages_impl(
     let requested = request
         .route()
         .map(|route| route.context)
-        .or(query.strategy.context)
+        .or_else(|| query.strategy.context())
         .unwrap_or(local);
     let requested = PartitionContext {
         metadata_op: requested.metadata_op.max(metadata_floor),
@@ -1379,7 +1379,7 @@ async fn poll_messages_impl(
         // lose a batch here, but revoked credentials must never receive it.
         authorize_read(&state, &identity, consistency, rule)?;
         check_partition_incarnation(&state, namespace, local.incarnation)?;
-        polled_messages_reply(&state, partition_id, reply)
+        polled_messages_reply(&state, partition_id, &query.strategy, reply)
     };
     SendWrapper::new(serve_partition(
         &state,
@@ -1393,10 +1393,11 @@ async fn poll_messages_impl(
     .await
 }
 
-/// The HTTP answer to the owner's reply to a poll.
+/// The HTTP answer to the owner's reply to a poll from `strategy`.
 fn polled_messages_reply(
     state: &HttpInner,
     partition_id: u32,
+    strategy: &PollingStrategy,
     reply: Option<PartitionReadReply>,
 ) -> Result<Response, ReadError> {
     match reply {
@@ -1405,6 +1406,7 @@ fn polled_messages_reply(
             fragments,
             current_offset,
             encryptor,
+            ..
         }) => {
             // TCP parity (`build_polled_messages_reply`): the served context
             // carries at least the metadata this node applied, so a later poll
@@ -1424,7 +1426,7 @@ fn polled_messages_reply(
             )
             .map_err(ReadError::Rejected)?;
             Ok(
-                Json(PolledMessages::from_bytes(body).map_err(ReadError::Rejected)?)
+                Json(PolledMessages::from_bytes(body, strategy).map_err(ReadError::Rejected)?)
                     .into_response(),
             )
         }

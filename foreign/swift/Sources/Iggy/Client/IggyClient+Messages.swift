@@ -81,32 +81,270 @@ extension IggyClient {
     /// With `autoCommit` the server stores the offset of the last polled
     /// message as consumed. A `strategy` with a ``PollingStrategy/context``
     /// is refused once its partition was recreated.
+    ///
+    /// With `options` the poll is deferred: the server answers once
+    /// `minCount` messages are readable, the next one would pass `maxBytes`,
+    /// or `maxWait` ran out, and then returns what there is, possibly
+    /// nothing. Invalid options fail before anything is sent. A deferred
+    /// consumer-group poll with `partitionID` nil fails before anything is
+    /// sent too, with ``IggyErrorCode/invalidCommand``. To wait on many
+    /// partitions, fetch each group of
+    /// ``readinessGroups(streamID:topicID:partitions:)`` with
+    /// ``fetchMessages(streamID:topicID:targets:consumer:count:autoCommit:options:)``.
     public func pollMessages(
         streamID: Identifier, topicID: Identifier, partitionID: UInt32?, consumer: Consumer = .default, strategy: PollingStrategy, count: UInt32,
-        autoCommit: Bool
+        autoCommit: Bool, options: DeferredPollOptions? = nil
     ) async throws -> PolledMessages {
-        try await pollMessages(streamID: streamID, topicID: topicID, partitionID: partitionID, consumer: consumer, count: count, autoCommit: autoCommit) {
-            _ in strategy
-        }
+        try await pollMessages(
+            streamID: streamID, topicID: topicID, partitionID: partitionID, consumer: consumer, count: count, autoCommit: autoCommit, options: options
+        ) { _ in strategy }
     }
 
-    /// ``pollMessages(streamID:topicID:partitionID:consumer:strategy:count:autoCommit:)``
+    /// ``pollMessages(streamID:topicID:partitionID:consumer:strategy:count:autoCommit:options:)``
     /// with the strategy chosen once the partition is known, so a caller can
     /// continue each partition from its own position.
     public func pollMessages(
         streamID: Identifier, topicID: Identifier, partitionID: UInt32?, consumer: Consumer = .default, count: UInt32, autoCommit: Bool,
-        strategyFor: @Sendable (UInt32) -> PollingStrategy
+        options: DeferredPollOptions? = nil, strategyFor: @Sendable (UInt32) -> PollingStrategy
     ) async throws -> PolledMessages {
-        let lineage = try await requireAuthenticated()
+        let started = ContinuousClock.now
+        try options?.validate(count: count)
         if consumer.kind == .consumerGroup, partitionID == nil {
+            guard options == nil else {
+                throw IggyError(
+                    .invalidCommand, context: "a deferred consumer-group poll names its partition; use fetchMessages for a readiness group instead")
+            }
+            let lineage = try await requireAuthenticated()
             return try await pollGroup(
                 streamID: streamID, topicID: topicID, consumer: consumer, count: count, autoCommit: autoCommit, lineage: lineage, strategyFor: strategyFor)
         }
-        let strategy = strategyFor(partitionID ?? 0)
+        let lineage = try await requireAuthenticated(within: options.map { started + $0.requestTimeout })
+        return try await poll(
+            consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID, strategy: strategyFor(partitionID ?? 0), count: count,
+            autoCommit: autoCommit, options: options, started: started, lineage: lineage)
+    }
+
+    /// Fetches up to `count` messages from the partitions of one readiness
+    /// group, in one request to the primary of the group, as
+    /// `fetch_messages` in the Rust SDK. Group the partitions with
+    /// ``readinessGroups(streamID:topicID:partitions:)``.
+    ///
+    /// The server holds the fetch until the targets hold `minCount` messages
+    /// together or `maxWait` ran out. Then it reads the targets that hold
+    /// messages, in the order of `targets`, while `count` and `maxBytes`,
+    /// which cap the whole reply, leave room: a target is read up to its
+    /// share or not at all in this fetch. A caller that moves the targets
+    /// that returned messages to the end of its next fetch reads every target
+    /// in turn.
+    ///
+    /// Each start point is ``PollingStrategy/offset(_:context:)`` or
+    /// ``PollingStrategy/next``, and each partition appears once, at most
+    /// 1000 of them. A target without a ``PollingStrategy/context``, or with
+    /// one of incarnation zero, is fenced with the incarnation of its route.
+    /// Invalid options fail before routing. At wire microsecond precision,
+    /// the initial request timeout must exceed one second and be at least
+    /// one second past `maxWait`.
+    ///
+    /// The reply holds a section per target that was read or failed, in
+    /// reply order. The next fetch of a partition that was read starts at
+    /// its ``FetchSection/nextOffset``, under the context of the section. A
+    /// section with an error, and a target the reply has no section for,
+    /// keep the start point of this fetch. A ``IggyErrorCode/notPrimary``
+    /// section or refusal marks the routes of its partitions moved, so the
+    /// next grouping finds their new primaries. A
+    /// ``IggyErrorCode/historyUnavailable`` or
+    /// ``IggyErrorCode/consumerGroupPartitionNotOwned`` one drops their
+    /// routes, so the next fetch fences them with fresh contexts.
+    ///
+    /// With `autoCommit` the server stores the offset of the last message of
+    /// each section as consumed. A fetch with `autoCommit` or a `next` target
+    /// orders progress polls and offset stores/deletes on every target of
+    /// this client, across connections and identifier spellings. Waiting for
+    /// that order is cancellable and consumes the request timeout. Once an
+    /// auto-committing fetch is admitted, a cancelled caller waits for its
+    /// reply, since it can hold messages the server stored as consumed.
+    /// An unknown committing outcome is never replayed. It fails with
+    /// ``IggyErrorCode/fetchProgressUncertain`` and a local recovery handle,
+    /// retaining progress blocks on every uncertain target across reconnects.
+    /// Later progress calls fail with ``IggyErrorCode/partitionLaneBlocked``
+    /// and the target and handle. ``abandonOperation(_:)`` explicitly accepts
+    /// that the old read can still complete and releases those local blocks.
+    /// A partial reply keeps healthy sections and attaches the handle to each
+    /// uncertain section's error. A noncommitting fetch keeps its existing
+    /// ``IggyErrorCode/transientNotCommitted`` behavior without retention.
+    public func fetchMessages(
+        streamID: Identifier, topicID: Identifier, targets: [(partitionID: UInt32, strategy: PollingStrategy)], consumer: Consumer = .default,
+        count: UInt32, autoCommit: Bool, options: DeferredPollOptions = DeferredPollOptions()
+    ) async throws -> [FetchSection] {
+        let started = ContinuousClock.now
+        try Self.validateFetch(targets, count: count, options: options)
+        let lineage = try await requireAuthenticated(within: started + options.requestTimeout)
+        var options = options
+        options.maxBytes = Self.fetchMaxBytes(options.maxBytes, targets: targets.count)
+        // Each target may fill the whole reply: the server sizes the reads by
+        // the bytes each target holds, and a smaller cap would slice batches.
+        let wire = targets.map { target in
+            Requests.FetchTarget(
+                partitionID: target.partitionID, strategy: target.strategy, maxBytes: options.maxBytes, fence: target.strategy.context ?? .empty)
+        }
+        return try await fetch(
+            streamID: streamID, topicID: topicID, consumer: consumer, targets: wire, count: count, autoCommit: autoCommit, options: options,
+            started: started, lineage: lineage
+        ).sections
+    }
+
+    /// `partitions` grouped by the replica that is their primary, as
+    /// `readiness_groups` in the Rust SDK: one group per primary, in replica
+    /// order, split into groups of at most 1000 partitions, each in the
+    /// order of `partitions`. On a single node they form one group. Fetch
+    /// each group with one
+    /// ``fetchMessages(streamID:topicID:targets:consumer:count:autoCommit:options:)``.
+    /// A route that cannot be looked up fails the call.
+    public func readinessGroups(streamID: Identifier, topicID: Identifier, partitions: [UInt32]) async throws -> [[UInt32]] {
+        let lineage = try await requireAuthenticated()
+        return try await core.pollRouter.primaryGroups(
+            stream: streamID, topic: topicID, partitions: partitions, lineage: lineage, coordinator: core,
+            deadline: ContinuousClock.now + PollRouter.pollTimeout)
+    }
+
+    /// A wait and a fetch name 1 to 1000 partitions, each once.
+    fileprivate static func validateTargets(_ partitions: [(partitionID: UInt32, strategy: PollingStrategy)], of request: String) throws {
+        guard (1...Requests.maxPartitionsPerRequest).contains(partitions.count), Set(partitions.map(\.partitionID)).count == partitions.count else {
+            throw IggyError(.invalidCommand, context: "\(request) names 1 to \(Requests.maxPartitionsPerRequest) partitions, each once")
+        }
+    }
+
+    fileprivate static func validateFetch(_ targets: [(partitionID: UInt32, strategy: PollingStrategy)], count: UInt32, options: DeferredPollOptions) throws {
+        try validateTargets(targets, of: "a fetch")
+        guard targets.allSatisfy({ fetchTakes($0.strategy) }) else {
+            throw IggyError(.invalidCommand, context: "a fetch starts each partition at an offset or after its stored offset")
+        }
+        try options.validateFetch(count: count)
+    }
+
+    /// A fetch takes only these start points. The others would loop or
+    /// misread under a count that the reply splits between its targets.
+    static func fetchTakes(_ strategy: PollingStrategy) -> Bool {
+        strategy.kind == .next || strategy.kind == .offset
+    }
+
+    /// A reply larger than a frame fails the connection that reads it, so the
+    /// records of a fetch leave room for its section table.
+    fileprivate static func fetchMaxBytes(_ maxBytes: UInt32, targets: Int) -> UInt32 {
+        min(maxBytes, DeferredPollOptions.maxReplyBytes - UInt32(Responses.fetchHeadSize(targets)))
+    }
+
+    /// One fetch on the route of its first target, the primary of its group.
+    /// Each target carries its own fence, so the header carries no partition
+    /// context. A fetch with `autoCommit` runs as a task of its own, which
+    /// the cancellation of its caller does not reach.
+    private func fetch(
+        streamID: Identifier, topicID: Identifier, consumer: Consumer, targets: [Requests.FetchTarget], count: UInt32, autoCommit: Bool,
+        options: DeferredPollOptions, started: ContinuousClock.Instant, lineage: UInt64
+    ) async throws -> (body: [UInt8], sections: [FetchSection]) {
+        let core = self.core
+        let router = core.pollRouter
+        let keys = targets.map { PollRouter.RouteKey(stream: streamID, topic: topicID, partitionID: $0.partitionID) }
+        guard let routing = keys.first else {
+            throw IggyError(.invalidCommand, context: "a fetch names at least one partition")
+        }
+        let fences = try await router.fences(
+            zip(keys, targets).map { ($0, $1.fence) }, lineage: lineage, coordinator: core, deadline: started + options.requestTimeout)
+        let targets = zip(targets, fences).map { target, fence in
+            Requests.FetchTarget(partitionID: target.partitionID, strategy: target.strategy, maxBytes: target.maxBytes, fence: fence)
+        }
+        let progress = autoCommit || targets.contains { $0.strategy.kind == .next }
+        let progressKeys = progress ? targets.map { PollRouter.ProgressKey(partitionID: $0.partitionID, incarnation: $0.fence.incarnation) } : []
+        let result: (body: [UInt8], sections: [FetchSection])
+        do {
+            result = try await router.withProgress(progressKeys, deadline: started + options.requestTimeout) {
+                let attempt = autoCommit ? try router.reserveFetch(progressKeys) : nil
+                defer {
+                    if let attempt { router.releaseFetch(attempt) }
+                }
+                let deferred = PollRouter.Deferred(options: options, started: started, fetchAttempt: attempt) { remaining in
+                    try Requests.fetchMessages(
+                        consumer: consumer, streamID: streamID, topicID: topicID, targets: targets, count: count, autoCommit: autoCommit, options: remaining)
+                }
+                @Sendable func send() async throws -> [UInt8] {
+                    try await router.send(
+                        .fetchMessages, body: .deferred(deferred), key: routing, context: .empty, lineage: lineage, coordinator: core,
+                        deadline: deferred.deadline)
+                }
+                do {
+                    let body = autoCommit ? try await Task { try await send() }.value : try await send()
+                    var sections = try Responses.fetchSections(body[...])
+                    let requested = Set(targets.map(\.partitionID))
+                    let returned = Set(sections.map(\.partitionID))
+                    guard returned.count == sections.count, returned.isSubset(of: requested) else {
+                        throw IggyError(.invalidCommand, context: "a fetch reply repeats or adds a partition")
+                    }
+                    if let attempt {
+                        let uncertain = Set(
+                            sections.compactMap { section in
+                                section.error.flatMap { PollRouter.fetchSectionRefused($0.code) ? nil : section.partitionID }
+                            })
+                        if !uncertain.isEmpty {
+                            _ = router.retainFetch(attempt, keys: progressKeys.filter { uncertain.contains($0.partitionID) })
+                            for index in sections.indices where uncertain.contains(sections[index].partitionID) {
+                                sections[index].uncertainty = IggyError(
+                                    .fetchProgressUncertain, context: sections[index].error?.description, operationID: attempt.id,
+                                    partitionID: sections[index].partitionID)
+                            }
+                        }
+                    }
+                    return (body, sections)
+                } catch {
+                    if let attempt, attempt.mayHaveCommitted {
+                        throw router.retainFetch(attempt, keys: progressKeys, cause: "\(error)")
+                    }
+                    throw error
+                }
+            }
+        } catch let error as IggyError where error.code == .notPrimary {
+            router.mayHaveMoved(keys)
+            throw error
+        } catch let error as IggyError where Self.staleRoute(error.code) {
+            router.dropRoutes(keys)
+            throw error
+        }
+        let sections = result.sections
+        let failed = { (matches: (IggyErrorCode) -> Bool) in
+            sections.filter { $0.error.map { matches($0.code) } ?? false }.map {
+                PollRouter.RouteKey(stream: streamID, topic: topicID, partitionID: $0.partitionID)
+            }
+        }
+        router.mayHaveMoved(failed { $0 == .notPrimary })
+        router.dropRoutes(failed(Self.staleRoute))
+        return result
+    }
+
+    /// The server refuses a fence this way once the partition was recreated
+    /// or its owner changed, so the route is looked up again.
+    private static func staleRoute(_ code: IggyErrorCode) -> Bool {
+        code == .historyUnavailable || code == .consumerGroupPartitionNotOwned
+    }
+
+    /// One poll of one partition. With `options` it is deferred: command 106,
+    /// the body of a poll followed by the options left for each attempt.
+    private func poll(
+        consumer: Consumer, streamID: Identifier, topicID: Identifier, partitionID: UInt32?, strategy: PollingStrategy, count: UInt32,
+        autoCommit: Bool, options: DeferredPollOptions?, started: ContinuousClock.Instant, lineage: UInt64
+    ) async throws -> PolledMessages {
         let payload = try Requests.pollMessages(
             consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID, strategy: strategy, count: count, autoCommit: autoCommit)
-        return try Responses.polledMessages(
-            try await routedPartitionRequest(.pollMessages, payload: payload, context: strategy.context, lineage: lineage)[...])
+        guard let options else {
+            return try Responses.polledMessages(
+                try await routedPartitionRequest(.pollMessages, payload: payload, context: strategy.context, lineage: lineage)[...])
+        }
+        let deferred = PollRouter.Deferred(options: options, started: started) { remaining in
+            try Requests.pollMessages(
+                consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID, strategy: strategy, count: count,
+                autoCommit: autoCommit, options: remaining)
+        }
+        let body = try await routedPartitionRequest(
+            .pollMessagesDeferred, payload: payload, deferred: deferred, context: strategy.context, lineage: lineage)
+        return try Responses.polledMessages(body[...])
     }
 
     // MARK: Partition contexts
@@ -153,21 +391,41 @@ extension IggyClient {
     /// A poll or a consumer-offset request on the route of the partition its
     /// payload names, as `OperationDriver::send_raw` in the Rust SDK picks
     /// it. A plain consumer's poll and an offset read without a partition go
-    /// to partition 0. A group poll, a store, and a delete must name one.
-    func routedPartitionRequest(_ code: CommandCode, payload: [UInt8], context: PartitionContext?, lineage: UInt64) async throws -> [UInt8] {
+    /// to partition 0. A group poll, a store, and a delete must name one. A
+    /// `deferred` poll sends its own body, `payload` only routes it, and its
+    /// request timeout is its deadline.
+    func routedPartitionRequest(
+        _ code: CommandCode, payload: [UInt8], deferred: PollRouter.Deferred? = nil, context: PartitionContext?, lineage: UInt64
+    ) async throws -> [UInt8] {
         let target = try RawRequest.consumerTarget(payload)
+        let poll = code == .pollMessages || code == .pollMessagesDeferred
         let partitionID: UInt32
         if let named = target.partitionID {
             partitionID = named
-        } else if code == .getConsumerOffset || (code == .pollMessages && target.consumerKind == Consumer.Kind.consumer.rawValue) {
+        } else if code == .getConsumerOffset || (poll && target.consumerKind == Consumer.Kind.consumer.rawValue) {
             partitionID = 0
         } else {
             throw IggyError(.invalidIdentifier, context: "command \(code.rawValue) needs a partition id")
         }
         let key = PollRouter.RouteKey(stream: target.stream, topic: target.topic, partitionID: partitionID)
-        return try await core.pollRouter.send(
-            code, payload: payload, key: key, context: context, lineage: lineage, coordinator: core,
-            deadline: ContinuousClock.now + PollRouter.pollTimeout)
+        let deadline = deferred?.deadline ?? ContinuousClock.now + PollRouter.pollTimeout
+        let router = core.pollRouter
+        let progress = try code == .storeConsumerOffset || code == .deleteConsumerOffset || (poll && RawRequest.pollChangesProgress(payload))
+        let captured: PartitionContext?
+        let keys: [PollRouter.ProgressKey]
+        if progress {
+            let resolved = try await router.progressContext(key, context: context, lineage: lineage, coordinator: core, deadline: deadline)
+            captured = resolved
+            keys = [PollRouter.ProgressKey(partitionID: partitionID, incarnation: resolved.incarnation)]
+        } else {
+            captured = context
+            keys = []
+        }
+        return try await router.withProgress(keys, deadline: deadline) {
+            try await router.send(
+                code, body: deferred.map { .deferred($0) } ?? .fixed(payload), key: key, context: captured, lineage: lineage, coordinator: core,
+                deadline: deadline)
+        }
     }
 
     // MARK: Client-side partitioning
@@ -206,7 +464,12 @@ extension IggyClient {
     func syncGroupAssignment(streamID: Identifier, topicID: Identifier, groupID: Identifier, lineage: UInt64?) async throws {
         let state = core.groupState
         let scope = state.sessionScope
-        let body = try await send(.syncConsumerGroup, Requests.consumerGroup(streamID: streamID, topicID: topicID, groupID: groupID), lineage: lineage)
+        let payload = try Requests.consumerGroup(streamID: streamID, topicID: topicID, groupID: groupID)
+        // A cancelled exchange takes the coordinator connection with it, so a
+        // caller cancelled meanwhile lets the sync finish.
+        let body = try await Task {
+            try await self.core.exchange(code: CommandCode.syncConsumerGroup.rawValue, payload: payload, lineage: lineage)
+        }.value
         let key = ConsumerGroupState.GroupKey(stream: streamID, topic: topicID, group: groupID)
         if body.isEmpty {
             // The coordinator answers any member, even one holding no
@@ -285,6 +548,7 @@ extension IggyClient {
         // a normal rebalance look like a failure.
         return .empty
     }
+
 }
 
 // MARK: - Consumer offsets
@@ -336,11 +600,18 @@ extension IggyClient {
     /// `partitionID` fails with ``IggyErrorCode/invalidIdentifier`` before
     /// anything is sent.
     public func deleteConsumerOffset(consumer: Consumer = .default, streamID: Identifier, topicID: Identifier, partitionID: UInt32?) async throws {
+        try await deleteConsumerOffset(consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID, context: nil)
+    }
+
+    /// Deletes the offset under the context of a poll, so the server refuses
+    /// it once the partition was recreated or, for a consumer group,
+    /// reassigned since. A nil context takes the one of the route.
+    func deleteConsumerOffset(consumer: Consumer, streamID: Identifier, topicID: Identifier, partitionID: UInt32?, context: PartitionContext?) async throws {
         let lineage = try await requireAuthenticated()
         _ = try await routedPartitionRequest(
             .deleteConsumerOffset,
             payload: Requests.deleteConsumerOffset(consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID, ack: .quorum),
-            context: nil, lineage: lineage)
+            context: context, lineage: lineage)
     }
 }
 
@@ -362,6 +633,31 @@ extension IggyClient {
         case .pollMessages:
             try RawRequest.validatePoll(payload)
             return try await routedPartitionRequest(.pollMessages, payload: payload, context: nil, lineage: lineage)
+        case .pollMessagesDeferred:
+            let started = ContinuousClock.now
+            let request = try RawRequest.deferredPoll(payload)
+            let deferred = PollRouter.Deferred(options: request.options, started: started) { remaining in
+                var writer = ByteWriter(capacity: payload.count)
+                writer.write(request.poll)
+                try remaining.encode(into: &writer)
+                return writer.bytes
+            }
+            return try await routedPartitionRequest(.pollMessagesDeferred, payload: request.poll, deferred: deferred, context: nil, lineage: lineage)
+        case .fetchMessages:
+            // The fences and limits of the targets are the caller's, as the
+            // payload carries them.
+            let started = ContinuousClock.now
+            let request = try RawRequest.fetch(payload)
+            var options = request.options
+            options.maxBytes = Self.fetchMaxBytes(options.maxBytes, targets: request.targets.count)
+            let targets = request.targets.map { target in
+                Requests.FetchTarget(
+                    partitionID: target.partitionID, strategy: target.strategy, maxBytes: min(target.maxBytes, options.maxBytes), fence: target.fence)
+            }
+            return try await fetch(
+                streamID: request.stream, topicID: request.topic, consumer: request.consumer, targets: targets, count: request.count,
+                autoCommit: request.autoCommit, options: options, started: started, lineage: lineage
+            ).body
         case .getConsumerOffset, .storeConsumerOffset, .deleteConsumerOffset:
             return try await routedPartitionRequest(command, payload: payload, context: nil, lineage: lineage)
         default:
@@ -373,8 +669,8 @@ extension IggyClient {
 /// Reads the partition a raw request names. A payload that does not decode
 /// fails with ``IggyErrorCode/invalidCommand`` before anything is sent.
 private enum RawRequest {
-    /// Strategy kind and value, count, and the auto-commit flag.
-    static let pollParametersSize = 9 + 4 + 1
+    /// `[kind:1][value:8]`.
+    static let strategySize = 9
 
     struct SendTarget {
         let stream: Identifier
@@ -388,6 +684,22 @@ private enum RawRequest {
         let topic: Identifier
         /// Nil when the request names no partition.
         let partitionID: UInt32?
+    }
+
+    struct DeferredPoll {
+        /// The poll without its options.
+        let poll: [UInt8]
+        let options: DeferredPollOptions
+    }
+
+    struct Fetch {
+        let consumer: Consumer
+        let stream: Identifier
+        let topic: Identifier
+        let options: DeferredPollOptions
+        let count: UInt32
+        let autoCommit: Bool
+        let targets: [Requests.FetchTarget]
     }
 
     /// `[metadata_len:u32][stream][topic][partitioning][messages_count:u32]`
@@ -417,10 +729,74 @@ private enum RawRequest {
     }
 
     static func validatePoll(_ payload: [UInt8]) throws {
+        try decode(payload) { reader in _ = try readPollCount(&reader) }
+    }
+
+    static func pollChangesProgress(_ payload: [UInt8]) throws -> Bool {
         try decode(payload) { reader in
             _ = try readConsumerTarget(&reader)
-            try reader.skip(pollParametersSize)
+            let strategy = try readStrategy(&reader)
+            _ = try reader.readUInt32()
+            let autoCommit = try reader.readBool()
+            return autoCommit || strategy.kind == .next
         }
+    }
+
+    /// A poll followed by `[wait_us:8][min_count:4][max_bytes:4][request_timeout_us:8]`.
+    /// Options the wire refuses fail as a payload that does not decode, as in
+    /// the Rust SDK.
+    static func deferredPoll(_ payload: [UInt8]) throws -> DeferredPoll {
+        try decode(payload) { reader in
+            let count = try readPollCount(&reader)
+            let poll = Array(payload[..<reader.position])
+            let options = DeferredPollOptions(
+                maxWait: .microseconds(try reader.readUInt64()), minCount: try reader.readUInt32(), maxBytes: try reader.readUInt32(),
+                requestTimeout: .microseconds(try reader.readUInt64()))
+            try requireEnd(reader)
+            try options.validate(count: count)
+            return DeferredPoll(poll: poll, options: options)
+        }
+    }
+
+    /// `[consumer][stream][topic][wait_us:8][request_timeout_us:8][min_count:4][count:4][max_bytes:4][auto_commit:1][targets_count:4]`,
+    /// then `targets_count` x `[partition_id:4][strategy:9][max_bytes:4][incarnation:8][owner_generation:8]`.
+    static func fetch(_ payload: [UInt8]) throws -> Fetch {
+        try decode(payload) { reader in
+            let consumer = try readConsumer(&reader)
+            let stream = try Identifier.decode(from: &reader)
+            let topic = try Identifier.decode(from: &reader)
+            let wait = Duration.microseconds(try reader.readUInt64())
+            let timeout = Duration.microseconds(try reader.readUInt64())
+            let minCount = try reader.readUInt32()
+            let count = try reader.readUInt32()
+            let options = DeferredPollOptions(maxWait: wait, minCount: minCount, maxBytes: try reader.readUInt32(), requestTimeout: timeout)
+            let autoCommit = try reader.readBool()
+            let targetsCount = try reader.readUInt32()
+            // Compared as `UInt32` so a hostile count never traps a 32-bit `Int`.
+            guard targetsCount <= UInt32(Requests.maxPartitionsPerRequest) else {
+                throw WireError.validation("a fetch cannot name \(targetsCount) partitions")
+            }
+            let targets = try (0..<targetsCount).map { _ in
+                Requests.FetchTarget(
+                    partitionID: try reader.readUInt32(), strategy: try readStrategy(&reader), maxBytes: try reader.readUInt32(),
+                    fence: PartitionContext(incarnation: try reader.readUInt64(), ownerGeneration: try reader.readUInt64(), metadataOp: 0))
+            }
+            try requireEnd(reader)
+            try IggyClient.validateFetch(targets.map { ($0.partitionID, $0.strategy) }, count: count, options: options)
+            guard targets.allSatisfy({ $0.maxBytes >= DeferredPollOptions.minMaxBytes && $0.maxBytes <= options.maxBytes }) else {
+                throw WireError.validation("a fetch target fills \(DeferredPollOptions.minMaxBytes) bytes up to the limit of the fetch")
+            }
+            return Fetch(consumer: consumer, stream: stream, topic: topic, options: options, count: count, autoCommit: autoCommit, targets: targets)
+        }
+    }
+
+    /// Reads a poll to its end and returns the count it asks for.
+    private static func readPollCount(_ reader: inout ByteReader) throws -> UInt32 {
+        _ = try readConsumerTarget(&reader)
+        try reader.skip(strategySize)
+        let count = try reader.readUInt32()
+        _ = try reader.readBool()
+        return count
     }
 
     private static func readConsumerTarget(_ reader: inout ByteReader) throws -> ConsumerTarget {
@@ -431,6 +807,30 @@ private enum RawRequest {
         let hasPartition = try reader.readUInt8() != 0
         let partitionID = try reader.readUInt32()
         return ConsumerTarget(consumerKind: consumerKind, stream: stream, topic: topic, partitionID: hasPartition ? partitionID : nil)
+    }
+
+    private static func readConsumer(_ reader: inout ByteReader) throws -> Consumer {
+        let kind = try reader.readUInt8()
+        guard let consumerKind = Consumer.Kind(rawValue: kind) else {
+            throw WireError.validation("unknown consumer kind \(kind)")
+        }
+        return Consumer(kind: consumerKind, id: try Identifier.decode(from: &reader))
+    }
+
+    private static func readStrategy(_ reader: inout ByteReader) throws -> PollingStrategy {
+        let kind = try reader.readUInt8()
+        guard let strategyKind = PollingStrategy.Kind(rawValue: kind) else {
+            throw WireError.validation("unknown polling strategy kind \(kind)")
+        }
+        return PollingStrategy(kind: strategyKind, value: try reader.readUInt64())
+    }
+
+    /// A request the client sends again with fresh options must hold nothing
+    /// that the next attempt would drop.
+    private static func requireEnd(_ reader: ByteReader) throws {
+        guard reader.isAtEnd else {
+            throw WireError.validation("\(reader.remaining) bytes follow the request")
+        }
     }
 
     private static func decode<T>(_ payload: [UInt8], _ body: (inout ByteReader) throws -> T) throws -> T {

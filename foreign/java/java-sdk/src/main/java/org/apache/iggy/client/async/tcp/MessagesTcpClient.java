@@ -24,12 +24,15 @@ import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.MessagesClient;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyResourceNotFoundException;
 import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.exception.IggyValidationException;
 import org.apache.iggy.hash.XxHash32;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.DeferredPollOptions;
+import org.apache.iggy.message.FetchedMessages;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PartitioningKind;
@@ -43,7 +46,10 @@ import org.slf4j.LoggerFactory;
 
 import java.math.BigInteger;
 import java.time.Duration;
+import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -79,6 +85,14 @@ public class MessagesTcpClient implements MessagesClient {
      * a background refresher thread.
      */
     private static final Duration ROUTING_CACHE_REFRESH = Duration.ofSeconds(5);
+
+    // The requests that name partitions in a partition id error.
+    private static final String READINESS_GROUPS = "readiness group";
+    private static final String FETCH = "fetch";
+
+    // A 106 names one partition, so the server answers INVALID_COMMAND for a group poll without one.
+    private static final String DEFERRED_GROUP_POLL_WITHOUT_PARTITION = "A deferred group poll needs a partition id."
+            + " Use readinessGroups and fetchMessages to read the whole assignment.";
 
     private final ClientRoutingState routingState;
     private final ConsumerGroupsTcpClient consumerGroupsClient;
@@ -126,6 +140,14 @@ public class MessagesTcpClient implements MessagesClient {
             Long count,
             boolean autoCommit,
             DeferredPollOptions options) {
+        if (consumer.kind() == Consumer.Kind.ConsumerGroup && partitionId.isEmpty()) {
+            throw new IggyValidationException(
+                    IggyErrorCode.INVALID_COMMAND,
+                    IggyErrorCode.INVALID_COMMAND.getCode(),
+                    DEFERRED_GROUP_POLL_WITHOUT_PARTITION,
+                    Optional.empty(),
+                    Optional.empty());
+        }
         options.validate(count);
         return pollMessagesImpl(streamId, topicId, partitionId, consumer, strategy, count, autoCommit, options);
     }
@@ -156,7 +178,6 @@ public class MessagesTcpClient implements MessagesClient {
                     strategy,
                     count,
                     autoCommit,
-                    options,
                     GROUP_POLL_MAX_ATTEMPTS,
                     cancellation,
                     deadline,
@@ -234,6 +255,45 @@ public class MessagesTcpClient implements MessagesClient {
 
     CompletableFuture<ByteBuf> sendPoll(ByteBuf payload, Optional<PartitionContext> context) {
         return pollRouter.poll(payload, context);
+    }
+
+    @Override
+    public CompletableFuture<List<List<Long>>> readinessGroups(
+            StreamId streamId, TopicId topicId, List<Long> partitions) {
+        requireWirePartitionIds(partitions, READINESS_GROUPS);
+        ByteBuf topic = toBytes(streamId);
+        writeAndRelease(topic, toBytes(topicId));
+        return pollRouter.onClientLoop(pollRouter.readinessGroups(
+                PollRouter.takeBytes(topic),
+                List.copyOf(partitions),
+                pollRouter.operationDeadline(),
+                pollRouter.startCall()));
+    }
+
+    @Override
+    public CompletableFuture<List<FetchedMessages>> fetchMessages(
+            StreamId streamId,
+            TopicId topicId,
+            Map<Long, PollingStrategy> targets,
+            Consumer consumer,
+            Long count,
+            boolean autoCommit,
+            DeferredPollOptions options) {
+        requireWirePartitionIds(targets.keySet(), FETCH);
+        FetchMessages.validate(targets, count, options);
+        long deadline = System.nanoTime() + options.requestTimeout().toNanos();
+        ByteBuf topic = toBytes(streamId);
+        writeAndRelease(topic, toBytes(topicId));
+        return pollRouter.onClientLoop(FetchMessages.start(
+                pollRouter,
+                PollRouter.takeBytes(toBytes(consumer)),
+                PollRouter.takeBytes(topic),
+                new LinkedHashMap<>(targets),
+                count,
+                autoCommit,
+                options,
+                deadline,
+                pollRouter.startCall()));
     }
 
     @Override
@@ -355,6 +415,16 @@ public class MessagesTcpClient implements MessagesClient {
         }
     }
 
+    // A wider id would wrap around on the wire and name another partition.
+    private static void requireWirePartitionIds(Collection<Long> partitions, String request) {
+        for (Long partition : partitions) {
+            if (partition == null || partition < 0 || partition > FetchMessages.MAX_PARTITION_ID) {
+                throw new IggyInvalidArgumentException("Partition id " + partition + " of a " + request
+                        + " is not between 0 and " + FetchMessages.MAX_PARTITION_ID);
+            }
+        }
+    }
+
     /**
      * One group-poll attempt: sync the assignment when missing or stale, pick
      * the next assigned partition round-robin, poll it explicitly, and on a
@@ -371,7 +441,6 @@ public class MessagesTcpClient implements MessagesClient {
             PollingStrategy strategy,
             Long count,
             boolean autoCommit,
-            DeferredPollOptions options,
             int attemptsLeft,
             CallCancellation cancellation,
             long deadline,
@@ -412,7 +481,7 @@ public class MessagesTcpClient implements MessagesClient {
                             strategy,
                             count,
                             autoCommit,
-                            options,
+                            null,
                             deadline,
                             state);
                     cancellation.track(polledPartition);
@@ -428,7 +497,6 @@ public class MessagesTcpClient implements MessagesClient {
                                             strategy,
                                             count,
                                             autoCommit,
-                                            options,
                                             attemptsLeft - 1,
                                             cancellation,
                                             deadline,

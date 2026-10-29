@@ -16,8 +16,11 @@
 // under the License.
 
 macro_rules! with_client {
-    ($self:expr, $client:ident => $body:expr) => {{
-        let deadline = iggy_common::binary_operation_deadline();
+    ($self:expr, $client:ident => $body:expr) => {
+        $crate::clients::with_client!($self, iggy_common::binary_operation_deadline(), $client => $body)
+    };
+    ($self:expr, $deadline:expr, $client:ident => $body:expr) => {{
+        let deadline = $deadline;
         iggy_common::with_binary_deadline(deadline, async {
             let $client = tokio::time::timeout_at(deadline, $self.client.read())
                 .await
@@ -51,6 +54,8 @@ pub mod producer_config;
 pub mod producer_dispatcher;
 pub mod producer_error_callback;
 pub mod producer_sharding;
+pub mod reader;
+pub mod reader_builder;
 
 const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
 

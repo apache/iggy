@@ -76,10 +76,8 @@ use compio_quic::{
 use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::stream::{FuturesUnordered, StreamExt};
-use iggy_binary_protocol::codes::{POLL_MESSAGES_DEFERRED_CODE, WAIT_FOR_MESSAGES_CODE};
-use iggy_binary_protocol::requests::messages::{
-    DeferredPollMessagesRequest, WaitForMessagesRequest,
-};
+use iggy_binary_protocol::codes::{FETCH_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE};
+use iggy_binary_protocol::requests::messages::{DeferredPollMessagesRequest, FetchMessagesRequest};
 use iggy_binary_protocol::{
     Command, GenericHeader, HEADER_SIZE, ReplyHeader, RequestHeader, WireDecode,
 };
@@ -339,11 +337,8 @@ fn deferred_timeout(code: u32, body: &[u8]) -> Option<Duration> {
                 .ok()?
                 .request_timeout_us
         }
-        WAIT_FOR_MESSAGES_CODE => {
-            WaitForMessagesRequest::decode_from(body)
-                .ok()?
-                .request_timeout_us
-        }
+        // The server decodes the targets anyway, so the transport thread reads only the timers.
+        FETCH_MESSAGES_CODE => FetchMessagesRequest::peek_request_timeout_us(body)?,
         _ => return None,
     };
     Some(Duration::from_micros(micros))
@@ -744,7 +739,14 @@ mod tests {
     use compio::io::AsyncWrite;
     use compio::net::UdpSocket;
     use compio_quic::ClientBuilder;
-    use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE, Operation, SIZE_FIELD_OFFSET};
+    use iggy_binary_protocol::requests::messages::{
+        FetchMessagesTarget, MAX_DEFERRED_POLL_TIMEOUT_US, MAX_DEFERRED_POLL_WAIT_US,
+        MIN_DEFERRED_POLL_MAX_BYTES, MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+    };
+    use iggy_binary_protocol::{
+        Command, GenericHeader, HEADER_SIZE, Operation, SIZE_FIELD_OFFSET, WireConsumer,
+        WireEncode, WireIdentifier, WirePollingStrategy,
+    };
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use server_common::iobuf::Frozen;
     use server_common::{MESSAGE_ALIGN, Message};
@@ -771,6 +773,13 @@ mod tests {
     /// No `Operation` has this discriminant.
     const UNDECLARED_OPERATION: u8 = u8::MAX;
     const UNCLAIMED_MAX: usize = 16;
+    const NO_SESSION: u64 = 0;
+    const NO_WAIT_US: u64 = 0;
+    /// Many times `SHORT_BACKSTOP`, so only its own request timeout can keep a
+    /// fetch stream open past the backstop.
+    const FETCH_REQUEST_TIMEOUT_US: u64 = 5_000_000;
+    /// No consumer kind has this value.
+    const UNKNOWN_CONSUMER_KIND: u8 = u8::MAX;
 
     fn install_crypto_provider() {
         // Idempotent. Tests in the same process race on
@@ -895,6 +904,48 @@ mod tests {
             .into_frozen()
     }
 
+    /// A fetch with the given timers, whose other fields only need to pass
+    /// `FetchMessagesRequest::validate`.
+    fn fetch(wait_us: u64, request_timeout_us: u64) -> FetchMessagesRequest {
+        let max_bytes = u32::try_from(MIN_DEFERRED_POLL_MAX_BYTES).expect("a u32 byte limit");
+        FetchMessagesRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: WireIdentifier::numeric(1),
+            topic_id: WireIdentifier::numeric(1),
+            wait_us,
+            request_timeout_us,
+            min_count: 1,
+            count: 1,
+            max_bytes,
+            auto_commit: false,
+            targets: vec![FetchMessagesTarget {
+                partition_id: 1,
+                strategy: WirePollingStrategy::next(),
+                max_bytes,
+                incarnation: 1,
+                owner_generation: 1,
+            }],
+        }
+    }
+
+    /// The frame an SDK sends for a fetch.
+    fn fetch_request(request_id: u64, payload: &FetchMessagesRequest) -> Frozen<MESSAGE_ALIGN> {
+        let body = payload.to_bytes();
+        let header = RequestHeader::for_request(
+            FETCH_MESSAGES_CODE,
+            TEST_CLIENT,
+            request_id,
+            NO_SESSION,
+            &body,
+        )
+        .expect("a fetch fits one frame");
+        let mut frame = Message::<RequestHeader>::new(HEADER_SIZE + body.len());
+        let (head, tail) = frame.as_mut_slice().split_at_mut(HEADER_SIZE);
+        head.copy_from_slice(bytemuck::bytes_of(&header));
+        tail.copy_from_slice(&body);
+        frame.into_frozen()
+    }
+
     /// A reply to `request_id`. `commit` tells two replies to one id apart.
     #[allow(clippy::cast_possible_truncation)]
     fn reply_message(request_id: u64, commit: u64) -> Message<GenericHeader> {
@@ -920,8 +971,13 @@ mod tests {
     /// answer.
     #[allow(clippy::future_not_send)]
     async fn send_request(client: &Connection, request_id: u64) -> RecvStream {
+        send_frame(client, request(request_id)).await
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn send_frame(client: &Connection, frame: Frozen<MESSAGE_ALIGN>) -> RecvStream {
         let (mut send, recv) = client.open_bi_wait().await.expect("open_bi");
-        let BufResult(result, _) = send.write_all(request(request_id)).await;
+        let BufResult(result, _) = send.write_all(frame).await;
         result.expect("write");
         send.finish().expect("finish");
         recv
@@ -1191,6 +1247,36 @@ mod tests {
         let _ = server.await;
     }
 
+    /// A fetch keeps its stream past the backstop up to its own request
+    /// timeout, so a long wait gets its reply instead of a reset and a cancel.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn given_a_fetch_within_its_request_timeout_when_the_backstop_passes_should_keep_its_stream()
+     {
+        let (mut conn, client, _endpoints) = connect(ONE_STREAM).await;
+        conn.reply_backstop = SHORT_BACKSTOP;
+        let (outbound, inbound, shutdown, server) = drive(conn);
+        let request = fetch_request(FIRST_REQUEST, &fetch(NO_WAIT_US, FETCH_REQUEST_TIMEOUT_US));
+        let mut waiting = send_frame(&client, request).await;
+        assert_eq!(forwarded(&inbound).await, FIRST_REQUEST);
+        assert!(
+            compio::time::timeout(2 * SHORT_BACKSTOP, inbound.recv())
+                .await
+                .is_err(),
+            "the backstop must not cancel a fetch before its request timeout"
+        );
+
+        outbound
+            .send(reply(FIRST_REQUEST, ANY_COMMIT))
+            .await
+            .unwrap();
+        let answer = read_answer(&mut waiting).await;
+        assert_eq!(reply_header(answer.as_slice()).request, FIRST_REQUEST);
+
+        shutdown.trigger();
+        let _ = server.await;
+    }
+
     #[test]
     fn given_two_streams_with_one_request_id_when_two_replies_arrive_should_answer_them_in_stream_order()
      {
@@ -1321,6 +1407,67 @@ mod tests {
             reply_route(&deny),
             ReplyRoute::Keyed(FIRST_REQUEST)
         ));
+    }
+
+    /// Only the timers of a fetch are read, so a fetch that the server refuses
+    /// for its targets still gives its timeout.
+    #[test]
+    fn given_a_fetch_body_when_its_deferred_timeout_is_read_should_give_its_request_timeout() {
+        for (wait_us, request_timeout_us) in [
+            (NO_WAIT_US, MIN_DEFERRED_POLL_REPLY_MARGIN_US),
+            (MAX_DEFERRED_POLL_WAIT_US, MAX_DEFERRED_POLL_TIMEOUT_US),
+        ] {
+            let without_targets = FetchMessagesRequest {
+                targets: Vec::new(),
+                ..fetch(wait_us, request_timeout_us)
+            }
+            .to_bytes();
+            assert!(
+                FetchMessagesRequest::decode_from(&without_targets).is_err(),
+                "the server refuses a fetch without targets"
+            );
+            for body in [
+                fetch(wait_us, request_timeout_us).to_bytes(),
+                without_targets,
+            ] {
+                assert_eq!(
+                    deferred_timeout(FETCH_MESSAGES_CODE, &body),
+                    Some(Duration::from_micros(request_timeout_us)),
+                    "wait {wait_us}, timeout {request_timeout_us}"
+                );
+            }
+        }
+    }
+
+    /// A fetch whose timers cannot be read, or that the server refuses for
+    /// them, keeps the default backstop.
+    #[test]
+    fn given_a_truncated_or_malformed_fetch_body_when_its_deferred_timeout_is_read_should_give_none()
+     {
+        let request = fetch(NO_WAIT_US, MIN_DEFERRED_POLL_REPLY_MARGIN_US);
+        let body = request.to_bytes();
+        let timers_end = request.consumer.encoded_size()
+            + request.stream_id.encoded_size()
+            + request.topic_id.encoded_size()
+            + 2 * size_of::<u64>();
+        let mut unknown_consumer = body.to_vec();
+        unknown_consumer[0] = UNKNOWN_CONSUMER_KIND;
+        let above_ceiling = fetch(NO_WAIT_US, MAX_DEFERRED_POLL_TIMEOUT_US + 1).to_bytes();
+        for (case, malformed) in [
+            ("empty", &body[..0]),
+            ("cut inside the request timeout", &body[..timers_end - 1]),
+            ("unknown consumer kind", &unknown_consumer[..]),
+            (
+                "request timeout above the protocol ceiling",
+                &above_ceiling[..],
+            ),
+        ] {
+            assert_eq!(
+                deferred_timeout(FETCH_MESSAGES_CODE, malformed),
+                None,
+                "{case}"
+            );
+        }
     }
 
     #[test]

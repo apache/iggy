@@ -23,7 +23,9 @@ require_once __DIR__ . '/TestEnvironment.php';
 
 use Iggy\Client as IggyClient;
 use Iggy\PollingStrategy;
+use Iggy\PollOptions;
 use Iggy\SendMessage;
+use Iggy\ServerCommitPolicy;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\TestDox;
@@ -31,6 +33,8 @@ use PHPUnit\Framework\TestCase;
 
 final class BasicMessagingFeatureTest extends TestCase
 {
+    private const CONSUMER_ID = 1;
+
     private ?IggyClient $client = null;
     private ?int $lastStreamId = null;
     private ?string $lastStreamName = null;
@@ -179,10 +183,10 @@ final class BasicMessagingFeatureTest extends TestCase
                 (int) $matches[1],
                 (int) $matches[2],
                 (int) $matches[3],
+                self::CONSUMER_ID,
                 PollingStrategy::offset((int) $matches[4]),
-                $this->requireSentMessageCount(),
-                true,
-            );
+                new PollOptions(count: $this->requireSentMessageCount(), server_commit: ServerCommitPolicy::OnRead),
+            )->messages;
 
             return;
         }

@@ -49,9 +49,9 @@ public sealed partial class PartitionIncarnationTests
         var client = ClientMock(stores);
         client.Setup(mock => mock.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
                 It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(),
-                It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<bool>(), It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .Returns((Identifier _, Identifier _, uint? _, Consumer _, Func<uint, PollingStrategy> _, uint _, bool _,
-                CancellationToken token) => polls.TryDequeue(out var polled) ? Task.FromResult(polled) : Idle<PolledMessages>(token));
+                DeferredPollOptions _, CancellationToken token) => polls.TryDequeue(out var polled) ? Task.FromResult(polled) : Idle<PolledMessages>(token));
         await using var consumer = new IggyConsumer(client.Object, Config(), NullLoggerFactory.Instance);
         await consumer.InitAsync(TestContext.Current.CancellationToken);
         using var cancellation = Timeout();
@@ -74,9 +74,9 @@ public sealed partial class PartitionIncarnationTests
         var client = ClientMock(stores);
         client.Setup(mock => mock.PollMessagesRentedAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
                 It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(),
-                It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<bool>(), It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .Returns((Identifier _, Identifier _, uint? _, Consumer _, Func<uint, PollingStrategy> _, uint _, bool _,
-                CancellationToken token) => polls.TryDequeue(out var polled) ? Task.FromResult(polled) : Idle<PolledMessagesRental>(token));
+                DeferredPollOptions _, CancellationToken token) => polls.TryDequeue(out var polled) ? Task.FromResult(polled) : Idle<PolledMessagesRental>(token));
         await using var consumer = new IggyConsumer(client.Object, Config(), NullLoggerFactory.Instance);
         await consumer.InitAsync(TestContext.Current.CancellationToken);
         using var cancellation = Timeout();
@@ -101,9 +101,9 @@ public sealed partial class PartitionIncarnationTests
         var client = ClientMock(stores);
         client.Setup(mock => mock.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
                 It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(),
-                It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<bool>(), It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .Returns((Identifier _, Identifier _, uint? _, Consumer _, Func<uint, PollingStrategy> _, uint _, bool _,
-                CancellationToken token) => polls.TryDequeue(out var polled) ? Task.FromResult(polled) : Idle<PolledMessages>(token));
+                DeferredPollOptions _, CancellationToken token) => polls.TryDequeue(out var polled) ? Task.FromResult(polled) : Idle<PolledMessages>(token));
         await using var consumer = new IggyConsumer(client.Object, Config(AutoCommitMode.Disabled),
             NullLoggerFactory.Instance);
         await consumer.InitAsync(TestContext.Current.CancellationToken);
@@ -354,9 +354,9 @@ public sealed partial class PartitionIncarnationTests
         var attempts = 0;
         client.Setup(mock => mock.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
                 It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(),
-                It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<bool>(), It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .Returns((Identifier _, Identifier _, uint? _, Consumer _, Func<uint, PollingStrategy> strategy, uint _,
-                bool _, CancellationToken token) =>
+                bool _, DeferredPollOptions _, CancellationToken token) =>
             {
                 strategy(PartitionId);
                 return ++attempts > 1
@@ -384,9 +384,9 @@ public sealed partial class PartitionIncarnationTests
         var unknown = new VsrRequestOutcomeUnknownException(new IOException());
         client.Setup(mock => mock.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
                 It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(),
-                It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<bool>(), It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .Returns((Identifier _, Identifier _, uint? _, Consumer _, Func<uint, PollingStrategy> strategy, uint _,
-                bool _, CancellationToken _) =>
+                bool _, DeferredPollOptions _, CancellationToken _) =>
             {
                 strategy(PartitionId);
                 return ++attempts > 1
@@ -451,7 +451,6 @@ public sealed partial class PartitionIncarnationTests
             BatchSize = 10,
             AutoCommit = false,
             AutoCommitMode = mode,
-            PollingIntervalMs = 0
         };
     }
 

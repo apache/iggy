@@ -906,12 +906,8 @@ impl QuicConfig {
 /// There is no `AutoLogin` and no reconnection policy, and `connect()` does not
 /// dial: it only starts the heartbeat, so `login_user(...)` has to follow it.
 ///
-/// HTTP is single-consumer only. `consumer_group(...)` fails with
-/// `Feature is unavailable`, and so does a `Consumer.Group(...)` poll unless it
-/// names an explicit `partition_id`. With one, the consumer kind is not carried
-/// on the HTTP wire, so the poll is served as an ordinary consumer named after
-/// the group, with no membership, no partition assignment, and no rebalancing
-/// behind it. Pass `Consumer.Single(...)` explicitly.
+/// HTTP is single-consumer only. `consumer_group(...)`, and a `Consumer.Group(...)`
+/// poll or reader, fail with `Feature is unavailable`. Pass `Consumer.Single(...)`.
 #[gen_stub_pyclass]
 #[pyclass(from_py_object)]
 #[derive(Clone)]

@@ -31,6 +31,7 @@ use tokio::time::{Instant, timeout};
 use tracing::{error, warn};
 
 const TOPIC_ID: &str = "topic-1";
+const PARTITION_ID: u32 = 0;
 const PREFETCH_BATCHES: u32 = 16;
 
 pub struct HighLevelConsumerClient {
@@ -56,45 +57,35 @@ impl HighLevelConsumerClient {
         }
     }
 
-    fn build_consumer(
-        &self,
-        client: &IggyClient,
-        group_polling_strategy: PollingStrategy,
-    ) -> Result<IggyConsumer, IggyError> {
+    fn build_consumer(&self, client: &IggyClient) -> Result<IggyConsumer, IggyError> {
         let stream_id_str = &self.config.stream_id;
+        let options = PollOptions {
+            count: self.config.messages_per_batch.get(),
+            ..self.config.poll_options
+        };
         let builder = if let Some(cg_id) = self.config.consumer_group_id {
             client
                 .consumer_group(&format!("cg_{cg_id}"), stream_id_str, TOPIC_ID)?
-                .polling_strategy(group_polling_strategy)
-                .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
+                .polling_strategy(PollingStrategy::next())
+                .poll_options(PollOptions {
+                    server_commit: ServerCommitPolicy::OnRead,
+                    ..options
+                })
                 .create_consumer_group_if_not_exists()
-                .auto_join_consumer_group()
         } else {
             client
                 .consumer(
                     &format!("hl_consumer_{}", self.config.consumer_id),
                     stream_id_str,
                     TOPIC_ID,
-                    0,
                 )?
+                .partitions([PARTITION_ID])
                 .polling_strategy(PollingStrategy::offset(0))
-                .auto_commit(AutoCommit::Disabled)
+                .poll_options(options)
         };
         Ok(builder
-            .batch_length(self.config.messages_per_batch.get())
-            .poll_options(self.config.poll_options)
-            .prefetch_messages(
-                self.config
-                    .messages_per_batch
-                    .get()
-                    .saturating_mul(PREFETCH_BATCHES),
-            )
-            .prefetch_bytes(
-                self.config
-                    .poll_options
-                    .max_bytes
-                    .saturating_mul(PREFETCH_BATCHES),
-            )
+            .prefetch_messages(options.count.saturating_mul(PREFETCH_BATCHES))
+            .prefetch_bytes(options.max_bytes.saturating_mul(PREFETCH_BATCHES))
             .build())
     }
 }
@@ -109,7 +100,7 @@ impl ConsumerClient for HighLevelConsumerClient {
 
         // One poll can wait up to its request timeout, so a shorter timeout would restart the
         // batch clock in the middle of a deliberate wait.
-        let poll_timeout = self.config.poll_options.request_timeout.get_duration();
+        let poll_timeout = self.config.poll_options.request_timeout().get_duration();
         let batch_start = Instant::now();
         let mut batch_messages = 0;
         let mut batch_user_bytes = 0;
@@ -162,21 +153,31 @@ impl ConsumerClient for HighLevelConsumerClient {
         }
     }
 
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "The replacement must finish initialization before taking over the consumer slot"
-    )]
     async fn reset_offsets(&mut self) -> Result<(), IggyError> {
         let client = self.client.as_deref().expect("Client not initialized");
+        let consumer = self.consumer.as_mut().expect("Consumer not initialized");
+        let Some(topic) = client
+            .get_topic(consumer.stream(), consumer.topic())
+            .await?
+        else {
+            return Err(IggyError::TopicNameNotFound(
+                TOPIC_ID.to_owned(),
+                self.config.stream_id.clone(),
+            ));
+        };
 
-        let mut replacement = self.build_consumer(client, PollingStrategy::offset(0))?;
-
-        // Dropping the old consumer stops its polling. A bare drop does not leave the
-        // group, so the re-join below is the same member and keeps its partitions.
-        self.consumer = None;
-        replacement.init().await?;
-
-        self.consumer = Some(replacement);
+        // A replacement consumer would leave the group and join it again, and each change
+        // rebalances the members that already measure. The consumer exposes no assignment, so
+        // it seeks every partition, and `seek` refuses one that it does not read.
+        for partition in topic.partitions {
+            match consumer
+                .seek(partition.id, PollingStrategy::offset(0))
+                .await
+            {
+                Ok(()) | Err(IggyError::InvalidCommand) => {}
+                Err(error) => return Err(error),
+            }
+        }
         Ok(())
     }
 }
@@ -188,7 +189,7 @@ impl BenchmarkInit for HighLevelConsumerClient {
     )]
     async fn setup(&mut self) -> Result<(), IggyError> {
         let client = self.client_factory.create_authenticated_client().await?;
-        let mut consumer = self.build_consumer(&client, PollingStrategy::next())?;
+        let mut consumer = self.build_consumer(&client)?;
         consumer.init().await?;
         self.consumer = Some(consumer);
         self.client = Some(Box::new(client));

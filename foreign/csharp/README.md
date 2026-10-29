@@ -28,7 +28,7 @@ The package installation and API examples target server/SDK 0.9.0. For source bu
 from the same checkout. The SDK targets .NET 8 and .NET 10; repository examples require .NET 10.
 `0.9.0` includes the independent message and consumer-offset durability options.
 
-This checkout uses binary protocol 0.12.0. Servers and applicable SDKs must deploy together. Mixed versions and
+This checkout uses binary protocol 0.12.1. Servers and applicable SDKs must deploy together. Mixed versions and
 rolling upgrades are unsupported. This checkout requires fresh storage and refuses older data directories
 without modification. `--fresh` deletes existing data in the configured directory.
 See the [server recovery guide](../../core/server/README.md#upgrade-recovery).
@@ -303,6 +303,7 @@ by incarnation and partition id, including requests using different names for th
 - `VsrRequestOutcomeUnknownException.OperationId` identifies a retained replicated mutation after its call
   ends without proof. Its lane stays blocked. `VsrLaneBlockedException.OperationId` identifies the operation
   blocking a subsequent mutation in the same lane; independent groups and pure reads can continue.
+  For a blocked fetch target, its optional `PartitionId` identifies the partition needing repair.
 - `ResolveOperationAsync(operationId, timeout, token)` replays that frozen operation. A proved success or
   business rejection releases the lane; a rejection throws its original status. Further uncertainty retains it.
   The client keeps the proved outcomes of its last `MaxPendingOperations` replays, also across a session
@@ -315,13 +316,37 @@ by incarnation and partition id, including requests using different names for th
   before a session reset, such as logout or session replacement, or an abandon. A proved outcome that aged
   out also causes it. It never proves non-commit and never authorizes an automatic fresh resend.
 
-Auto-commit and `Next` polls hold a transient partition lane but are not retained or replayed after uncertainty.
-Their unknown-outcome error has no operation id. `IggyConsumer` reports it through its error event and polls again.
-Under `AutoCommitMode.Auto`, the server can store the offset of a batch whose reply was lost. A `Next` poll then
-starts after that batch, so the consumer skips it. Behind a retained mutation these polls throw
-`VsrLaneBlockedException`. `IggyConsumer` propagates it without resolving the blocker and ends its polling loop.
-The application decides how to resume. Background `IggyPublisher` sends report unknown outcomes through the
-message-batch-failed event; direct sends throw them to the caller.
+Auto-commit and `Next` polls, offset stores and offset deletes also share a progress lane per partition. Stores
+and deletes hold both lanes of their partition, and sends hold only the partition lane, so a poll that waits on the
+server never delays a send.
+
+Auto-commit and `Next` polls (100/106), and non-committing fetches, hold the progress lane only while they run, and are not retained or replayed after
+uncertainty. Their unknown-outcome error has no operation id. `IggyConsumer` reports it through its error event and
+polls again. Under `AutoCommitMode.Auto`, the server can store the offset of a batch whose reply was lost. A `Next`
+poll then starts after that batch, so the consumer skips it. Behind a retained offset store or delete these polls
+throw `VsrLaneBlockedException`, and a retained send does not block them. `IggyConsumer` propagates the exception
+without resolving the blocker and ends its polling loop. The application decides how to resume.
+
+An uncertain committing fetch (109) throws `VsrFetchProgressUncertainException` with local status 14010
+and a client-lifetime `OperationId`. It retains progress blocks for every affected partition history.
+Later polls, committing fetches, stores and deletes throw `VsrLaneBlockedException` with that ID,
+`PartitionId` and `RequiresExplicitRecovery`. Stateless reads, offset inspection and sends remain available.
+Reconnect, sign-in and late replies do not clear these blocks. `ResolveOperationAsync` returns the same
+uncertainty without I/O; `AbandonOperationAsync` releases the blocks locally while accepting that the old
+server request may still commit. Offset inspection does not prove that the old request finished.
+
+Valid partial replies preserve healthy sections. An uncertain section has `Status` 14010 and `ProgressError`.
+Record decode and decrypt failures keep their rewind behavior. `IggyConsumer` delivers healthy sections and
+reports the recovery error. Disposal finishes cleanup and reports the same recovery identity without writing
+through blocked targets or abandoning them. A newly constructed independent client does not inherit the blocks.
+
+Committing fetches reserve a separate recovery pool using `MaxPendingOperations` and `MaxPendingOperationBytes`
+before send. The request size bounds the charge, while retained state holds only target identities and the local
+ID. Capacity refusal occurs before send. Proved results and explicit abandonment release reservations;
+session reset does not release retained fetch blocks.
+
+Background `IggyPublisher` sends report unknown outcomes through the message-batch-failed event; direct sends throw
+them to the caller.
 
 `IggyConsumer` offset stores and deletes resolve any blocking operation before their own request. A background
 `IggyPublisher` send resolves only a blocking batch of its own. Both continue after a proved commit or committed
@@ -352,6 +377,8 @@ roster names this replica as the metadata primary, the reply is final. Otherwise
 
 Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, consumer-offset reads and session-control codes fail with status 3 before anything is sent. An id that cluster metadata does not name fails with status 6. An unreachable node is retried until the request timeout, and a `NotPrimary` (89) reply is returned rather than sent to another node.
 
+The deferred poll (106), deferred cancel (108) and fetch (109) codes fail with status 3 in `SendBinaryRequestAsync` and `SendBinaryRequestToReplicaAsync`. Use the typed deferred calls instead.
+
 ### Limitations
 
 - TCP uses VSR framing; HTTP uses the separate REST API. Join/leave, `GetMeAsync`, segment deletion,
@@ -365,6 +392,17 @@ Each node answers non-replicated commands such as `GetStats` from its own state,
 
 - `IIggyPublisher.FlushUnsavedBufferAsync` was removed. Set `TopicOptions.Durability` to
   `Durability.Persisted` when creating a topic to wait for message persistence.
+- `IggyConsumerConfig.PollingIntervalMs` and `IggyConsumerBuilder.WithPollingInterval` were removed. The
+  consumer does not sleep after an empty poll. It waits on the server with deferred polls instead. Set the wait
+  with `IggyConsumerConfig.PollOptions` or `IggyConsumerBuilder.WithPollOptions`.
+- `IIggyConsumer` has deferred overloads of `PollMessagesAsync` and `PollMessagesRentedAsync`. Their default
+  implementations throw `FeatureUnavailableException`, so `IggyConsumer`
+  cannot poll through a custom `IIggyClient` that does not implement them.
+- `IIggyConsumer` has `FetchMessagesAsync` and `ReadinessGroupsAsync`, and `IIggyOffset` has a
+  `DeleteOffsetAsync` overload that takes a `PartitionContext`. Their default implementations throw
+  `FeatureUnavailableException`. Over TCP, a consumer-group poll without a partition id that passes
+  `DeferredPollOptions` fails with status 3 (`InvalidCommand`). `IggyConsumer` fetches the partitions of a group
+  member instead.
 - `MaxResponseFrameSize` bounds the reply frames the **VSR** reader accepts. A reply larger than the 64 MiB
   default is refused and the connection is dropped, so raise it if a single response legitimately exceeds that
   - a large `GetSnapshotAsync` is the usual case.
@@ -669,6 +707,54 @@ PollingStrategy.Last();
 // Start from the next unread message
 PollingStrategy.Next();
 ```
+
+### Deferred Polls
+
+A deferred poll waits on the server for messages. Pass `DeferredPollOptions` to `PollMessagesAsync` or
+`PollMessagesRentedAsync`:
+
+```c#
+var polledMessages = await client.PollMessagesAsync(streamId, topicId, 0, Consumer.New(1),
+    PollingStrategy.Next(), 10, true,
+    new DeferredPollOptions { MaxWait = TimeSpan.FromSeconds(5), RequestTimeout = TimeSpan.FromSeconds(6) });
+```
+
+The server replies when `MinCount` messages are ready, when the reply reaches `MaxBytes`, or when `MaxWait`
+ends. The reply holds the messages that are ready, which can be none. `RequestTimeout` bounds the whole call.
+The client refuses options that break these rules before it sends the poll:
+
+| Option           | Default | Rule                                                                                  |
+| ---------------- | ------- | ------------------------------------------------------------------------------------- |
+| `MaxWait`        | `1s`    | 0 to 600 seconds. Zero replies at once                                                |
+| `MinCount`       | `1`     | 1 to the poll count, else status 4009                                                 |
+| `MaxBytes`       | `1 MiB` | At least 344 bytes, else status 80. A first record wider than the limit fails with 80 |
+| `RequestTimeout` | `11s`   | 1 microsecond to 630 seconds, and 1 second longer than a non-zero `MaxWait`, else 3   |
+
+- A client keeps at most 64 deferred polls and fetches parked. A call over the limit waits in
+  the client for a free place, within its own request timeout.
+- If you cancel a parked call, the client sends a cancel on the same link and the server drops the request.
+  A canceled poll that can move an offset (`Next` or auto commit) ends with `VsrRequestOutcomeUnknownException`,
+  as a normal poll does. Other canceled calls end with `OperationCanceledException`. A fetch with auto commit is
+  not canceled after it is sent, because the server can commit its messages before the cancel arrives. It ends
+  with its reply or its request timeout.
+- A parked poll that can move an offset holds the progress lane of its partition for up to `MaxWait`. The offset
+  stores and deletes of the same client on that partition wait for it, and its sends do not.
+- Over TCP, a group poll without a partition id fails with status 3 (`InvalidCommand`) when it passes
+  `DeferredPollOptions`, because it would park on one partition while another holds messages. Fetch the
+  partitions of the member instead.
+- `FetchMessagesAsync` reads 1 to 1000 partitions of one primary in one deferred request. `ReadinessGroupsAsync`
+  splits partitions into such groups. The server waits until `MinCount` messages are ready over all partitions,
+  or until `MaxWait` ends, and returns one section per partition that it read or refused. `count` and `MaxBytes`
+  bound the whole reply, and each partition can take up to `MaxBytes`. Each partition starts at `Offset` or
+  `Next`, and the next fetch sends it as `Offset` of the section's `NextOffset` with the section's `Context`.
+  Move the partitions that got messages to the end of the next fetch, so that every partition gets its turn. A
+  partition without a section, or with a nonzero section `Status`, keeps its position. The request timeout must
+  exceed one second and cover `MaxWait` plus one second, leaving time for client-side setup even when `MaxWait`
+  is zero. The caller disposes the reply.
+- A fetch that can move an offset (`Next` or auto commit) holds the progress lanes of all its partitions and is
+  not sent again after a lost reply. The fetch is TCP-only.
+- Over HTTP, a deferred poll uses `GET .../messages/deferred`. The SDK `HttpClient` times out after 100 seconds,
+  so a deferred poll with a longer request timeout fails at 100 seconds.
 
 ## Offset Management
 
@@ -1003,6 +1089,19 @@ await foreach (var message in consumer.ReceiveAsync())
 }
 ```
 
+The consumer polls with deferred polls, so a new message reaches the loop without a delay in the client. Set
+the wait with `WithPollOptions(new DeferredPollOptions { MaxWait = TimeSpan.FromSeconds(5), RequestTimeout =
+TimeSpan.FromSeconds(6) })`. With `MaxWait` zero, the consumer polls again at once after an empty poll. If the
+first record of a partition is wider than `MaxBytes`, the consumer reads that record alone without the byte limit.
+
+Over TCP a consumer-group member fetches the partitions of each primary in one request, and polls one partition
+alone only for an oversized record or for a `First`, `Last` or `Timestamp` start. With `AutoCommitMode.Auto` it
+keeps one fetch per primary and sends it only while the receive loop waits for messages, because the server
+commits what the fetch returns. A crash then loses at most one batch per primary.
+
+Disposal cancels the fetches that do not commit and waits for the reply of each fetch that commits, at most its
+request timeout. For every polling strategy it then moves the stored offset back before the committed messages
+that the loop did not take.
 Disposal cancels and drains pending offset stores, then checkpoints the last message delivered
 from each partition before leaving the group. Buffered messages are excluded, and each checkpoint
 keeps the delivered message's partition context. `AutoCommitMode.Disabled` skips this final

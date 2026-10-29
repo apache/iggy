@@ -19,6 +19,7 @@ import type { Readable } from 'stream';
 import { type TcpNetConnectOpts } from 'node:net';
 import { type ConnectionOptions } from 'node:tls';
 import type { PartitionContext } from '../wire/vsr/header.js';
+import type { Id } from '../wire/identifier.utils.js';
 
 /**
  * TCP socket connection options.
@@ -43,7 +44,9 @@ export type CommandResponse = {
   /** Length of the response data in bytes */
   length: number,
   /** Response payload data */
-  data: Buffer
+  data: Buffer,
+  /** Local recovery metadata for uncertain sections; the wire bytes stay unchanged. */
+  fetchProgress?: { operationId: bigint, partitions: ReadonlySet<number> }
 };
 
 export type SendCommandOptions = {
@@ -121,6 +124,12 @@ export type RawClient = {
    * client keeps the outcome that it proves.
    */
   abandonOperation?: (operationId: bigint) => void,
+  /**
+   * Groups partitions of a topic by their primary, from the cached routes,
+   * as `message.readinessGroups` returns them.
+   */
+  readinessGroups?: (streamId: Id, topicId: Id, partitions: number[], options?: SendCommandOptions) =>
+    Promise<number[][]>,
   /** Destroys the client connection */
   destroy: () => void,
   /** Tracks one facade operation across multiple command submissions. */

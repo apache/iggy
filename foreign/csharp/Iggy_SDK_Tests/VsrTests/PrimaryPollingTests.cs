@@ -17,6 +17,7 @@
 
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.ExceptionServices;
@@ -45,6 +46,8 @@ public sealed class PrimaryPollingTests
     private static readonly Identifier Topic = Identifier.Numeric(2);
     private static readonly Identifier Group = Identifier.Numeric(3);
     private const ulong MetadataCommit = 50;
+
+    private static readonly TimeSpan PromptLimit = TimeSpan.FromSeconds(5);
 
     [Theory]
     [InlineData(false)]
@@ -702,7 +705,8 @@ public sealed class PrimaryPollingTests
 
         Assert.True(await receiving);
         Assert.Single(errors);
-        Assert.Equal(3, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_CODE));
+        Assert.Equal(1, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_CODE));
+        Assert.Equal(2, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_DEFERRED_CODE));
         Assert.Equal(1, cluster.Primaries[1].Connections);
         Assert.Equal(1, cluster.Coordinator.Registrations);
         Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
@@ -1949,15 +1953,12 @@ public sealed class PrimaryPollingTests
     private static byte[] Batch(MockRequest request)
     {
         var body = new byte[40];
-        BinaryPrimitives.WriteUInt32LittleEndian(body, Partition(request));
+        BinaryPrimitives.WriteUInt32LittleEndian(body, PolledPartition(request));
         return Reply(request.Operation, body);
     }
 
     private static bool IsOffsetWrite(MockRequest request) =>
         request.Operation is (byte)VsrOperation.StoreConsumerOffset or (byte)VsrOperation.DeleteConsumerOffset;
-
-    private static uint Partition(MockRequest request) =>
-        BinaryPrimitives.ReadUInt32LittleEndian(request.Body.AsSpan(request.Body.Length - 18));
 
     private static byte[] BindIdentity(byte[] body)
     {
@@ -1982,7 +1983,6 @@ public sealed class PrimaryPollingTests
             Consumer = Consumer.New(3),
             PollingStrategy = strategy,
             AutoCommitMode = AutoCommitMode.Disabled,
-            PollingIntervalMs = 0
         }, NullLoggerFactory.Instance);
 
     private static ConcurrentQueue<ConnectionState> RecordStates(TcpMessageStream client)
@@ -2087,7 +2087,11 @@ public sealed class PrimaryPollingTests
                     {
                         return OnPrimarySend(request);
                     }
-                    return request.Code == CommandCodes.POLL_MESSAGES_CODE
+                    if (request.Code == CommandCodes.CANCEL_DEFERRED_REQUEST_CODE)
+                    {
+                        return null;
+                    }
+                    return request.Code is CommandCodes.POLL_MESSAGES_CODE or CommandCodes.POLL_MESSAGES_DEFERRED_CODE
                         ? OnPrimaryPoll(request)
                         : OnPrimaryControl?.Invoke(request) ?? DefaultControl(request) ?? Answer(request);
                 });
@@ -2168,7 +2172,7 @@ public sealed class PrimaryPollingTests
             }
         }
 
-        private static uint RoutedPartition(MockRequest request) =>
+        internal static uint RoutedPartition(MockRequest request) =>
             BinaryPrimitives.ReadUInt32LittleEndian(request.Body.AsSpan(request.Body.Length - sizeof(uint)));
     }
 }

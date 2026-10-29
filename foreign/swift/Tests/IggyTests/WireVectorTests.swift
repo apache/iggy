@@ -136,6 +136,33 @@ struct RequestVectorTests {
         #expect(encoded == golden.bytes("request.send_messages"))
     }
 
+    @Test func deferredMessages() throws {
+        func poll(_ options: DeferredPollOptions) throws -> [UInt8] {
+            try Requests.pollMessages(
+                consumer: .group(7), streamID: 1, topicID: "orders", partitionID: 3, strategy: .next, count: 100, autoCommit: true, options: options)
+        }
+        #expect(try poll(DeferredPollOptions()) == golden.bytes("request.poll_messages_deferred"))
+        let limits = DeferredPollOptions(maxWait: .seconds(600), minCount: 100, maxBytes: 344, requestTimeout: .seconds(630))
+        try limits.validate(count: 100)
+        #expect(try poll(limits) == golden.bytes("request.poll_messages_deferred.limits"))
+        // A deferred poll is the poll with its options appended.
+        let plain = try Requests.pollMessages(
+            consumer: .group(7), streamID: 1, topicID: "orders", partitionID: 3, strategy: .next, count: 100, autoCommit: true)
+        #expect(golden.bytes("request.poll_messages_deferred").starts(with: plain))
+    }
+
+    @Test func fetchMessages() throws {
+        let fence = PartitionContext(incarnation: 3, ownerGeneration: 9, metadataOp: 0)
+        let targets = [(UInt32(1), PollingStrategy.offset(41)), (2, .next)].map { partitionID, strategy in
+            Requests.FetchTarget(partitionID: partitionID, strategy: strategy, maxBytes: 524_288, fence: fence)
+        }
+        let options = DeferredPollOptions(maxWait: .seconds(5), maxBytes: 1_048_576, requestTimeout: .seconds(6))
+        try options.validateFetch(count: 100)
+        #expect(
+            try Requests.fetchMessages(consumer: .group(7), streamID: 1, topicID: "orders", targets: targets, count: 100, autoCommit: true, options: options)
+                == golden.bytes("request.fetch_messages"))
+    }
+
     @Test func users() throws {
         #expect(
             try Requests.createUser(username: "admin", password: "p@ssw0rd", status: .active, permissions: samplePermissions)
@@ -291,6 +318,44 @@ struct VSRHeaderVectorTests {
         #expect(header(request) == golden.bytes("vsr.request.send_messages.fenced"))
         #expect(Array(request.bytes[VSRFrame.headerSize...]) == [9, 9, 9, 9])
         #expect(request.bytes.count == VSRFrame.headerSize + 4)
+    }
+
+    /// A cancellation repeats the header of the request it cancels, with its
+    /// own code, no body and no partition context.
+    @Test func deferredPollAndItsCancellation() throws {
+        var session = ConsensusSession(clientID: clientID)
+        try session.bind(99)
+        for _ in 0..<5 {
+            _ = try session.nextRequestID()
+        }
+        let request = try VSRFrame.encodeRequest(
+            session: &session, code: CommandCode.pollMessagesDeferred.rawValue, payload: golden.bytes("request.poll_messages_deferred"),
+            partitionContext: PartitionContext(incarnation: 17, ownerGeneration: 9, metadataOp: 52))
+        #expect(header(request) == golden.bytes("vsr.request.poll_messages_deferred"))
+        #expect(request.requestID == 6)
+        #expect(request.operation == .nonReplicated)
+        #expect(request.deferredCancellation == golden.bytes("vsr.request.cancel_deferred"))
+        #expect(request.deferredCancellation.flatMap { VSRFrame.readRequestID($0[...]) } == 6)
+
+        let poll = try VSRFrame.encodeRequest(session: &session, code: CommandCode.pollMessages.rawValue, payload: [])
+        #expect(poll.deferredCancellation == nil)
+    }
+
+    /// Each target of a fetch carries its own fence, so the header of the
+    /// fetch carries no partition context.
+    @Test func fetchAndItsCancellation() throws {
+        var session = ConsensusSession(clientID: clientID)
+        try session.bind(99)
+        for _ in 0..<6 {
+            _ = try session.nextRequestID()
+        }
+        let request = try VSRFrame.encodeRequest(
+            session: &session, code: CommandCode.fetchMessages.rawValue, payload: golden.bytes("request.fetch_messages"))
+        #expect(header(request) == golden.bytes("vsr.request.fetch_messages"))
+        #expect(request.requestID == 7)
+        #expect(request.operation == .nonReplicated)
+        #expect(request.deferredCancellation == golden.bytes("vsr.request.cancel_fetch"))
+        #expect(request.deferredCancellation.flatMap { VSRFrame.readRequestID($0[...]) } == 7)
     }
 
     @Test func logoutAndUnknownCodes() throws {

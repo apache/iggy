@@ -17,7 +17,10 @@
 
 use std::time::Duration;
 
-use iggy_common::{Consumer, Identifier, MessageClient, PollingStrategy};
+use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
+use iggy_common::{
+    Consumer, Identifier, MessageClient, PollOptions, PollingStrategy, ServerCommitPolicy,
+};
 use integration::harness::{TestHarness, seeds};
 use tokio::time::{sleep, timeout};
 
@@ -38,11 +41,14 @@ pub(crate) async fn assert_produces_messages(harness: &TestHarness) {
                 .poll_messages(
                     &stream_id,
                     &topic_id,
-                    None,
+                    DEFAULT_PARTITION_ID,
                     &Consumer::new(consumer_id.clone()),
                     &PollingStrategy::next(),
-                    POLL_BATCH,
-                    true,
+                    PollOptions {
+                        count: POLL_BATCH,
+                        server_commit: ServerCommitPolicy::OnRead,
+                        ..PollOptions::default()
+                    },
                 )
                 .await
                 && !polled.messages.is_empty()

@@ -764,6 +764,17 @@ func (e NotPrimary) Is(target error) bool {
 	return ok
 }
 
+type DeferredPollCapacityExceeded struct{}
+
+func (e DeferredPollCapacityExceeded) Error() string {
+	return "deferred poll capacity exceeded; retry after backoff on the same replica"
+}
+func (e DeferredPollCapacityExceeded) Code() Code { return 90 }
+func (e DeferredPollCapacityExceeded) Is(target error) bool {
+	_, ok := target.(DeferredPollCapacityExceeded)
+	return ok
+}
+
 type ClientNotFound struct {
 	ID uint32
 }
@@ -2871,6 +2882,33 @@ func (e OperationNotRetained) Is(target error) bool {
 	return ok
 }
 
+type PartitionLaneBlocked struct {
+	PartitionID uint32
+	OperationID uint64
+}
+
+func (e PartitionLaneBlocked) Error() string {
+	return fmt.Sprintf("partition %d lane blocked by operation %d", e.PartitionID, e.OperationID)
+}
+func (e PartitionLaneBlocked) Code() Code { return 14009 }
+func (e PartitionLaneBlocked) Is(target error) bool {
+	_, ok := target.(PartitionLaneBlocked)
+	return ok
+}
+
+type FetchProgressUncertain struct {
+	OperationID uint64
+}
+
+func (e FetchProgressUncertain) Error() string {
+	return fmt.Sprintf("fetch %d has unknown progress; explicit abandonment is required", e.OperationID)
+}
+func (e FetchProgressUncertain) Code() Code { return 14010 }
+func (e FetchProgressUncertain) Is(target error) bool {
+	_, ok := target.(FetchProgressUncertain)
+	return ok
+}
+
 var (
 	ErrError                                      = Error{}
 	ErrInvalidConfiguration                       = InvalidConfiguration{}
@@ -2944,6 +2982,7 @@ var (
 	ErrHistoryUnavailable                         = HistoryUnavailable{}
 	ErrLifecycleBusy                              = LifecycleBusy{}
 	ErrNotPrimary                                 = NotPrimary{}
+	ErrDeferredPollCapacityExceeded               = DeferredPollCapacityExceeded{}
 	ErrClientNotFound                             = ClientNotFound{}
 	ErrInvalidClientId                            = InvalidClientId{}
 	ErrConnectionClosed                           = ConnectionClosed{}
@@ -3130,6 +3169,8 @@ var (
 	ErrOperationUncertain                         = OperationUncertain{}
 	ErrLaneBlocked                                = LaneBlocked{}
 	ErrOperationNotRetained                       = OperationNotRetained{}
+	ErrPartitionLaneBlocked                       = PartitionLaneBlocked{}
+	ErrFetchProgressUncertain                     = FetchProgressUncertain{}
 )
 
 type Code uint32
@@ -3207,6 +3248,7 @@ const (
 	HistoryUnavailableCode                         Code = 87
 	LifecycleBusyCode                              Code = 88
 	NotPrimaryCode                                 Code = 89
+	DeferredPollCapacityExceededCode               Code = 90
 	ClientNotFoundCode                             Code = 100
 	InvalidClientIdCode                            Code = 101
 	ConnectionClosedCode                           Code = 206
@@ -3393,6 +3435,8 @@ const (
 	OperationUncertainCode                         Code = 14006
 	LaneBlockedCode                                Code = 14007
 	OperationNotRetainedCode                       Code = 14008
+	PartitionLaneBlockedCode                       Code = 14009
+	FetchProgressUncertainCode                     Code = 14010
 )
 
 func (c Code) String() string {
@@ -3541,6 +3585,8 @@ func (c Code) String() string {
 		return "LifecycleBusy"
 	case NotPrimaryCode:
 		return "NotPrimary"
+	case DeferredPollCapacityExceededCode:
+		return "DeferredPollCapacityExceeded"
 	case ClientNotFoundCode:
 		return "ClientNotFound"
 	case InvalidClientIdCode:
@@ -3913,6 +3959,10 @@ func (c Code) String() string {
 		return "LaneBlocked"
 	case OperationNotRetainedCode:
 		return "OperationNotRetained"
+	case PartitionLaneBlockedCode:
+		return "PartitionLaneBlocked"
+	case FetchProgressUncertainCode:
+		return "FetchProgressUncertain"
 	default:
 		return "Unknown error code"
 	}
@@ -4064,6 +4114,8 @@ func FromCode(code Code) IggyError {
 		return ErrLifecycleBusy
 	case NotPrimaryCode:
 		return ErrNotPrimary
+	case DeferredPollCapacityExceededCode:
+		return ErrDeferredPollCapacityExceeded
 	case ClientNotFoundCode:
 		return ErrClientNotFound
 	case InvalidClientIdCode:
@@ -4436,6 +4488,10 @@ func FromCode(code Code) IggyError {
 		return ErrLaneBlocked
 	case OperationNotRetainedCode:
 		return ErrOperationNotRetained
+	case PartitionLaneBlockedCode:
+		return ErrPartitionLaneBlocked
+	case FetchProgressUncertainCode:
+		return ErrFetchProgressUncertain
 	default:
 		return ErrError
 	}

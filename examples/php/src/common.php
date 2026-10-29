@@ -20,7 +20,11 @@ declare(strict_types=1);
 
 use Iggy\Client;
 use Iggy\PollingStrategy;
+use Iggy\PollOptions;
 use Iggy\SendMessage;
+use Iggy\ServerCommitPolicy;
+
+const CONSUMER_ID = 1;
 
 function iggy_client(): Client
 {
@@ -64,7 +68,14 @@ function send_payloads(Client $client, string $stream, string $topic, array $pay
 
 function print_polled_messages(Client $client, string $stream, string $topic, int $count): void
 {
-    $messages = $client->pollMessages($stream, $topic, 0, PollingStrategy::first(), $count, true);
+    $messages = $client->pollMessages(
+        $stream,
+        $topic,
+        0,
+        CONSUMER_ID,
+        PollingStrategy::first(),
+        new PollOptions(count: $count, server_commit: ServerCommitPolicy::OnRead),
+    )->messages;
 
     if (count($messages) < $count) {
         throw new RuntimeException("Expected {$count} messages, received " . count($messages));

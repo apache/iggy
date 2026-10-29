@@ -17,6 +17,7 @@
 
 using System.Text;
 using Apache.Iggy.Consumers;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.IggyClient;
@@ -30,6 +31,22 @@ public class IggyConsumerBuilderTests
 {
     private static readonly Identifier StreamId = Identifier.Numeric(1);
     private static readonly Identifier TopicId = Identifier.Numeric(1);
+
+    [Fact]
+    public void Build_WithAGroupFetchWithoutClientSetupTime_Throws()
+    {
+        var client = new Mock<IIggyClient>();
+        var builder = IggyConsumerBuilder.Create(client.Object, StreamId, TopicId, Consumer.Group(1))
+            .WithPollOptions(new DeferredPollOptions
+            {
+                MaxWait = TimeSpan.Zero,
+                RequestTimeout = TimeSpan.FromSeconds(1)
+            });
+
+        var error = Assert.Throws<InvalidOperationException>(() => builder.Build());
+
+        Assert.Contains("PollOptions", error.Message);
+    }
 
     [Fact]
     public void Build_WithDefaultSocketBufferSizes_CreatesTheClient()

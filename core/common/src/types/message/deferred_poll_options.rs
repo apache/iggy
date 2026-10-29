@@ -17,12 +17,13 @@
 
 use std::time::Duration;
 
+use iggy_binary_protocol::requests::messages::{
+    DeferredPollMessagesRequest, FetchMessagesRequest, deferred_timeout_covers_wait,
+};
+
 use crate::{
     IggyDuration, IggyError, MAX_DEFERRED_POLL_TIMEOUT_US, MAX_DEFERRED_POLL_WAIT_US,
-    MIN_DEFERRED_POLL_MAX_BYTES,
-};
-use iggy_binary_protocol::requests::messages::{
-    DeferredPollMessagesRequest, deferred_timeout_covers_wait,
+    MIN_DEFERRED_POLL_MAX_BYTES, MIN_DEFERRED_POLL_REPLY_MARGIN_US,
 };
 
 pub const DEFAULT_POLL_MAX_BYTES: u32 = 1024 * 1024;
@@ -78,6 +79,21 @@ impl DeferredPollOptions {
         Ok(())
     }
 
+    /// Validates the options before starting a fetch, including an immediate one.
+    /// The timeout must exceed the reply margin at wire precision, because
+    /// routing and admission consume part of it before the first send.
+    ///
+    /// # Errors
+    /// Returns the errors from [`Self::validate`], or [`IggyError::InvalidCommand`]
+    /// when the timeout leaves no budget beyond the fetch reply margin.
+    pub fn validate_fetch(&self, count: u32) -> Result<(), IggyError> {
+        self.validate(count)?;
+        if self.request_timeout.as_micros() <= MIN_DEFERRED_POLL_REPLY_MARGIN_US {
+            return Err(IggyError::InvalidCommand);
+        }
+        Ok(())
+    }
+
     /// Preserve one client budget across assignment refreshes and routing retries.
     /// Both limits shrink by `elapsed`, so a wait keeps its reply margin.
     ///
@@ -85,16 +101,26 @@ impl DeferredPollOptions {
     /// Returns `TransientNotAccepted` once the budget is spent, because this
     /// attempt never left the client.
     pub fn remaining(self, elapsed: Duration) -> Result<Self, IggyError> {
-        let request_timeout = self.request_timeout.get_duration().saturating_sub(elapsed);
+        // The wire carries whole microseconds. Without their fractions, both
+        // limits lose the same whole microseconds to `elapsed`, so the gap that
+        // `validate` checked stays on the wire.
+        let request_timeout =
+            whole_micros(self.request_timeout.get_duration()).saturating_sub(elapsed);
         if request_timeout.as_micros() == 0 {
             return Err(IggyError::TransientNotAccepted);
         }
         Ok(Self {
-            max_wait: self.max_wait.get_duration().saturating_sub(elapsed).into(),
+            max_wait: whole_micros(self.max_wait.get_duration())
+                .saturating_sub(elapsed)
+                .into(),
             request_timeout: request_timeout.into(),
             ..self
         })
     }
+}
+
+fn whole_micros(duration: Duration) -> Duration {
+    Duration::from_micros(u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
 }
 
 impl From<&DeferredPollMessagesRequest> for DeferredPollOptions {
@@ -108,10 +134,20 @@ impl From<&DeferredPollMessagesRequest> for DeferredPollOptions {
     }
 }
 
+impl From<&FetchMessagesRequest> for DeferredPollOptions {
+    fn from(request: &FetchMessagesRequest) -> Self {
+        Self {
+            max_wait: request.wait_us.into(),
+            min_count: request.min_count,
+            max_bytes: request.max_bytes,
+            request_timeout: request.request_timeout_us.into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MIN_DEFERRED_POLL_REPLY_MARGIN_US;
 
     fn options(max_wait: Duration, request_timeout: Duration) -> DeferredPollOptions {
         DeferredPollOptions {
@@ -155,5 +191,40 @@ mod tests {
             options.remaining(Duration::from_secs(3)),
             Err(IggyError::TransientNotAccepted)
         ));
+    }
+
+    #[test]
+    fn given_fetch_options_when_validating_should_leave_budget_beyond_the_reply_margin() {
+        let margin = Duration::from_micros(MIN_DEFERRED_POLL_REPLY_MARGIN_US);
+        for timeout in [
+            Duration::from_micros(1),
+            margin,
+            margin + Duration::from_nanos(999),
+        ] {
+            let options = options(Duration::ZERO, timeout);
+            assert_eq!(options.validate(1), Ok(()));
+            assert_eq!(options.validate_fetch(1), Err(IggyError::InvalidCommand));
+        }
+        assert_eq!(
+            options(Duration::ZERO, margin + Duration::from_micros(1)).validate_fetch(1),
+            Ok(())
+        );
+        assert_eq!(options(margin, margin * 2).validate_fetch(1), Ok(()));
+    }
+
+    #[test]
+    fn given_a_wait_with_a_fraction_of_a_microsecond_when_the_budget_shrinks_should_keep_the_reply_margin()
+     {
+        let margin = Duration::from_micros(MIN_DEFERRED_POLL_REPLY_MARGIN_US);
+        let wait = Duration::from_secs(1);
+        let options = options(wait + Duration::from_nanos(999), wait + margin);
+        assert!(options.validate(1).is_ok());
+
+        let remaining = options.remaining(Duration::from_nanos(500)).unwrap();
+
+        assert!(
+            remaining.validate(1).is_ok(),
+            "lost the margin: {remaining:?}"
+        );
     }
 }

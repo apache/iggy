@@ -46,6 +46,8 @@ from apache_iggy import (
     MetadataChangeGroup,
     MetadataChangeKind,
     PollingStrategy,
+    PollOptions,
+    ServerCommitPolicy,
 )
 from apache_iggy import SendMessage as Message
 
@@ -154,20 +156,19 @@ class TestTlsConnectivity:
 
         # Consume messages
         polled = await tls_client.poll_messages(
-            stream=stream_name,
-            topic=topic_name,
+            stream_name,
+            topic_name,
             consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
-            count=10,
-            auto_commit=True,
+            options=PollOptions(count=10, server_commit=ServerCommitPolicy.OnRead),
         )
-        assert len(polled) >= len(test_messages)
+        assert len(polled.messages) >= len(test_messages)
 
         # Verify message payloads
         for i, expected_msg in enumerate(test_messages):
-            if i < len(polled):
-                assert polled[i].payload().decode("utf-8") == expected_msg
+            if i < len(polled.messages):
+                assert polled.messages[i].payload().decode("utf-8") == expected_msg
 
     @pytest.mark.asyncio
     async def test_follow_metadata_changes_over_tls(

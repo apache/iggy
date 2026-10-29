@@ -204,6 +204,53 @@ public struct PolledMessages: Sendable, Hashable {
     static let resyncRequiredPartition: UInt32 = UInt32.max
 }
 
+/// One partition of a fetch reply, as `FetchMessagesSection` in the Rust
+/// SDK. A section with a nonzero ``status`` holds no position: its offsets
+/// and context are zero, and the partition stays where the fetch started it.
+public struct FetchSection: Sendable, Hashable {
+    public var partitionID: UInt32
+    /// Zero for a partition that was read, else the code of the error the
+    /// server answered for this partition alone.
+    public var status: UInt32
+    /// The newest offset the partition had when it was read.
+    public var currentOffset: UInt64
+    public var messagesCount: UInt32
+    public var context: PartitionContext
+    /// Where the next fetch of the partition starts: after the last message
+    /// read, or, with nothing read, where this fetch started, past messages
+    /// that retention removed.
+    public var nextOffset: UInt64
+    /// The undecoded batch records, as a poll reply carries them after its
+    /// header. They share the buffer of the whole reply.
+    public var records: ArraySlice<UInt8>
+    var uncertainty: IggyError? = nil
+
+    /// The error of the partition, nil for one that was read.
+    public var error: IggyError? {
+        status == 0 ? nil : uncertainty ?? IggyError(wireCode: status)
+    }
+
+    /// The messages of the section. A section with an error throws it.
+    public func decode() throws -> PolledMessages {
+        if let error {
+            throw error
+        }
+        let messages = try Responses.decode(records) { reader in try Batch.decodeMessages(reader.rest, expectedCount: messagesCount) }
+        return PolledMessages(partitionID: partitionID, currentOffset: currentOffset, count: messagesCount, messages: messages, context: context)
+    }
+
+    /// The offset of the first message, read from the table alone. Nil
+    /// without messages. The offsets of a partition have no gaps, so the
+    /// messages end right before ``nextOffset``.
+    var firstOffset: UInt64? {
+        let count = UInt64(messagesCount)
+        guard count > 0, count <= nextOffset else {
+            return nil
+        }
+        return nextOffset - count
+    }
+}
+
 /// One confirmation of a committed batch.
 public struct SendConfirmation: Sendable, Hashable {
     public var streamID: UInt32

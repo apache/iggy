@@ -107,21 +107,6 @@ public partial class IggyConsumer
         Message = "Client connection state changed: {PreviousState} -> {CurrentState}")]
     private partial void LogConnectionStateChanged(ConnectionState previousState, ConnectionState currentState);
 
-    [LoggerMessage(EventId = 300,
-        Level = LogLevel.Warning,
-        Message = "Returned monotonic time went backwards, now < lastPolledAt: ({Now} < {LastPolledAt})")]
-    private partial void LogMonotonicTimeWentBackwards(long now, long lastPolledAt);
-
-    [LoggerMessage(EventId = 201,
-        Level = LogLevel.Trace,
-        Message = "No need to wait before polling messages. {Now} - {LastPolledAt} = {Elapsed}")]
-    private partial void LogNoNeedToWaitBeforePolling(long now, long lastPolledAt, long elapsed);
-
-    [LoggerMessage(EventId = 202,
-        Level = LogLevel.Trace,
-        Message = "Waiting for {Remaining} milliseconds before polling messages")]
-    private partial void LogWaitingBeforePolling(long remaining);
-
     [LoggerMessage(EventId = 203,
         Level = LogLevel.Debug,
         Message = "No partition assigned to this group member, backing off for {BackoffMs} milliseconds")]

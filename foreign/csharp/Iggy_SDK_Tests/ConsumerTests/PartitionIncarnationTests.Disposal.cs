@@ -68,10 +68,10 @@ public sealed partial class PartitionIncarnationTests
             Messages = [.. Batch(0, Original).Messages, .. Batch(1, Original).Messages, .. Batch(2, Original).Messages]
         };
         client.Setup(mock => mock.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
-                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(), It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(polled);
         client.Setup(mock => mock.PollMessagesRentedAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
-                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(), It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(rental);
         var config = new IggyConsumerConfig<string>
         {
@@ -81,7 +81,6 @@ public sealed partial class PartitionIncarnationTests
             PollingStrategy = PollingStrategy.Next(),
             BatchSize = 10,
             AutoCommitMode = mode,
-            PollingIntervalMs = 0,
             Deserializer = new DisposalDeserializer(),
             CreateIggyClient = true
         };
@@ -133,7 +132,7 @@ public sealed partial class PartitionIncarnationTests
         var stores = new ConcurrentQueue<(ulong Offset, PartitionContext Context)>();
         var client = ClientMock(stores);
         client.Setup(mock => mock.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
-                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(), It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new PolledMessages
             {
                 Context = Original,
@@ -169,7 +168,7 @@ public sealed partial class PartitionIncarnationTests
         var client = ClientMock(new());
         SetupDisposalGroup(client, events);
         client.Setup(mock => mock.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
-                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(), It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(Batch(OriginalOffset, Original));
         var stores = new ConcurrentQueue<ulong>();
         client.Setup(mock => mock.StoreOffsetAsync(It.IsAny<Consumer>(), It.IsAny<Identifier>(), It.IsAny<Identifier>(),
@@ -207,7 +206,7 @@ public sealed partial class PartitionIncarnationTests
         var client = ClientMock(new());
         SetupDisposalGroup(client, events);
         client.Setup(mock => mock.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
-                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(), It.IsAny<DeferredPollOptions>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(Batch(OriginalOffset, Original));
         var storing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var cancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

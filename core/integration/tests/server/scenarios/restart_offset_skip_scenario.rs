@@ -178,11 +178,14 @@ pub async fn run(harness: &mut TestHarness) {
                 .poll_messages(
                     &stream,
                     &topic,
-                    Some(0),
+                    0,
                     &consumer,
                     &PollingStrategy::next(),
-                    CONSUMER_BATCH_SIZE,
-                    true, // auto_commit
+                    PollOptions {
+                        count: CONSUMER_BATCH_SIZE,
+                        server_commit: ServerCommitPolicy::OnRead,
+                        ..PollOptions::default()
+                    },
                 )
                 .await;
 

@@ -532,7 +532,8 @@ where
                 return;
             }
         }
-        self.accept_poll_result(namespace, result, reply).await;
+        self.accept_poll_result(namespace, result, reply, None)
+            .await;
     }
 
     #[allow(clippy::future_not_send)]
@@ -541,6 +542,7 @@ where
         namespace: IggyNamespace,
         result: PollReadResult,
         reply: Sender<PartitionReadReply>,
+        next_offset: Option<u64>,
     ) {
         let partitions = self.plane.partitions();
         let consumer_kind = result.consumer_kind();
@@ -560,6 +562,7 @@ where
                     fragments,
                     current_offset,
                     encryptor,
+                    next_offset,
                 });
                 if let Some(replication) = replication {
                     partitions
@@ -580,7 +583,9 @@ where
 /// Serve a group read only to the partition's installed owner. The serving
 /// node's metadata can lag an install the partition already applied, for
 /// example on a new primary after a view change, and the partition commits a
-/// read's progress under the installed owner.
+/// read's progress under the installed owner. `TransientNotAccepted` means
+/// only that the partition has not applied the install yet, and a readiness
+/// mirror reads it as not ready.
 fn group_owner_rejection(
     namespace: IggyNamespace,
     group_id: u64,

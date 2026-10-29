@@ -114,6 +114,19 @@ inline iggy::ffi::Identifier make_numeric_identifier(const std::uint32_t value) 
     return identifier;
 }
 
+inline iggy::ffi::PollingStrategy make_offset_strategy(const std::uint64_t offset) {
+    iggy::ffi::PollingStrategy strategy{};
+    strategy.kind  = "offset";
+    strategy.value = offset;
+    return strategy;
+}
+
+inline iggy::ffi::PollOptions make_poll_options(const std::uint32_t count) {
+    iggy::ffi::PollOptions options = iggy::ffi::default_poll_options();
+    options.count                  = count;
+    return options;
+}
+
 inline rust::Vec<std::uint8_t> to_payload(const std::string &value) {
     rust::Vec<std::uint8_t> bytes;
     for (const char c : value) {

@@ -164,7 +164,6 @@ public class RentedTypedConsumerTests
             PartitionId = 1,
             AutoCommitMode = AutoCommitMode.Disabled,
             AutoCommit = false,
-            PollingIntervalMs = 0,
             Deserializer = deserializer
         };
     }

@@ -32,10 +32,9 @@ from datetime import timedelta
 import pytest
 
 from apache_iggy import (
-    AutoCommit,
-    AutoCommitAfter,
-    AutoCommitWhen,
     AutoLogin,
+    ClientCommitPolicy,
+    CommitEvent,
     IggyClient,
     IggyExpiry,
     PendingOperationsConfig,
@@ -344,38 +343,11 @@ class TestClientConstruction:
                 **interval_kwargs,
             )
 
-    @pytest.mark.parametrize(
-        "auto_commit",
-        [
-            AutoCommit.Interval(timedelta(0)),
-            AutoCommit.IntervalOrWhen(timedelta(0), AutoCommitWhen.PollingMessages()),
-            AutoCommit.IntervalOrAfter(
-                timedelta(0), AutoCommitAfter.ConsumingEachMessage()
-            ),
-        ],
-        ids=["interval", "interval_or_when", "interval_or_after"],
-    )
-    def test_zero_auto_commit_interval_is_rejected(self, auto_commit: AutoCommit):
-        """Test that a zero auto-commit interval fails at the call.
+    def test_arguments_after_topic_are_keyword_only(self):
+        """Test that a positional argument after topic fails.
 
-        Zero there stores the offsets in a busy loop. Committing on every poll
-        is spelled AutoCommit.When or AutoCommit.After instead.
-        """
-        client = IggyClient()
-
-        with pytest.raises(ValueError, match="zero"):
-            client.consumer_group(
-                name="group",
-                stream="stream",
-                topic="topic",
-                auto_commit=auto_commit,
-            )
-
-    def test_arguments_after_auto_join_are_keyword_only(self):
-        """Test that a positional argument after auto_join_consumer_group fails.
-
-        The removed poll_interval was the tenth argument. A positional call
-        written for it would otherwise set polling_retry_interval.
+        The removed partition_id was the fourth argument. A positional None
+        written for it would otherwise pass as polling_strategy.
         """
         client = IggyClient()
 
@@ -384,15 +356,28 @@ class TestClientConstruction:
                 "group",
                 "stream",
                 "topic",
-                None,
-                None,
-                None,
-                None,
-                True,
-                True,
                 # pyrefly: ignore  # bad-argument-count
-                timedelta(seconds=1),
+                None,
             )
+
+
+@pytest.mark.unit
+class TestClientCommitPolicy:
+    """Test when a consumer stores its offsets."""
+
+    @pytest.mark.parametrize(
+        "on",
+        [None, CommitEvent.EachMessage()],
+        ids=["interval", "interval_or_event"],
+    )
+    def test_zero_interval_is_rejected(self, on: CommitEvent | None):
+        """Test that a zero commit interval fails at construction.
+
+        Zero stores the offsets in a busy loop. Committing on each message is
+        spelled with `on` and no interval instead.
+        """
+        with pytest.raises(ValueError, match="zero"):
+            ClientCommitPolicy(interval=timedelta(0), on=on)
 
 
 @pytest.mark.integration

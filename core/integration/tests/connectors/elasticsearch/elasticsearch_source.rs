@@ -18,7 +18,8 @@
 use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::connectors::fixtures::ElasticsearchSourcePreCreatedFixture;
 use iggy_common::MessageClient;
-use iggy_common::{Consumer, Identifier, PollingStrategy};
+use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
+use iggy_common::{Consumer, Identifier, PollOptions, PollingStrategy, ServerCommitPolicy};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use std::time::Duration;
@@ -58,11 +59,14 @@ async fn elasticsearch_source_produces_messages_to_iggy(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                None,
+                DEFAULT_PARTITION_ID,
                 &Consumer::new(consumer_id.clone()),
                 &PollingStrategy::next(),
-                10,
-                true,
+                PollOptions {
+                    count: 10,
+                    server_commit: ServerCommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
         {
@@ -127,11 +131,13 @@ async fn elasticsearch_source_handles_empty_index(
         .poll_messages(
             &stream_id,
             &topic_id,
-            None,
+            DEFAULT_PARTITION_ID,
             &Consumer::new(consumer_id),
             &PollingStrategy::next(),
-            10,
-            false,
+            PollOptions {
+                count: 10,
+                ..PollOptions::default()
+            },
         )
         .await;
 
@@ -167,11 +173,14 @@ async fn elasticsearch_source_produces_bulk_messages(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                None,
+                DEFAULT_PARTITION_ID,
                 &Consumer::new(consumer_id.clone()),
                 &PollingStrategy::next(),
-                100,
-                true,
+                PollOptions {
+                    count: 100,
+                    server_commit: ServerCommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
         {
@@ -219,11 +228,14 @@ async fn state_persists_across_connector_restart(
                 .poll_messages(
                     &stream_id,
                     &topic_id,
-                    None,
+                    DEFAULT_PARTITION_ID,
                     &Consumer::new(consumer_id.clone()),
                     &PollingStrategy::next(),
-                    10,
-                    true,
+                    PollOptions {
+                        count: 10,
+                        server_commit: ServerCommitPolicy::OnRead,
+                        ..PollOptions::default()
+                    },
                 )
                 .await
             {
@@ -276,11 +288,14 @@ async fn state_persists_across_connector_restart(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                None,
+                DEFAULT_PARTITION_ID,
                 &Consumer::new(consumer_id.clone()),
                 &PollingStrategy::next(),
-                10,
-                true,
+                PollOptions {
+                    count: 10,
+                    server_commit: ServerCommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
         {

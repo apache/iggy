@@ -234,7 +234,7 @@ credentials unchanged.
 
 `SendBinaryRequestToReplica(ctx, code, payload, replicaID)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
 
-Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, consumer-offset reads and session-control codes fail with `ErrInvalidCommand` before anything is sent. An id that cluster metadata does not name fails with `ErrInvalidIdentifier`. An unreachable node is retried until the request deadline, and `ErrNotPrimary` is returned rather than sent to another node.
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, fetches, deferred-request cancellations, consumer-offset reads and session-control codes fail with `ErrInvalidCommand` before anything is sent. An id that cluster metadata does not name fails with `ErrInvalidIdentifier`. An unreachable node is retried until the request deadline, and `ErrNotPrimary` is returned rather than sent to another node.
 
 If a mutation remains uncertain when its call ends, `errors.As` exposes
 `errors.OperationUncertain` with an exact `uint64` `OperationID`. The SDK retains
@@ -315,6 +315,114 @@ application poll is a new operation and may skip messages whose progress already
 advanced. Pure reads retry within their deadline. Known non-admission replies 58
 and 89 can retry without changing the frozen request. Manual offset writes are
 replicated mutations and use the exact-ID recovery API above.
+
+Each partition also has a progress lane, which admits one call at a time in
+arrival order. Progress polls and consumer offset reads, stores and deletes
+take it. Sends take only the mutation lane of the partition, so a parked
+progress poll does not delay a send of the same client. An offset store or
+delete takes both lanes. If it stays uncertain, it blocks the later progress
+polls and offset calls of its partition with `errors.LaneBlocked` until you
+resolve or abandon it. An uncertain send blocks only later mutations.
+
+## Deferred polls
+
+`PollMessagesDeferred` takes the arguments of `PollMessages` and a
+`contracts.DeferredPollOptions`. The server holds the poll until `MinCount`
+messages are ready, until `MaxBytes` stops it from selecting more, or until
+`MaxWait` passes. `DefaultDeferredPollOptions` waits up to 1 second for one
+message, reads up to 1 MiB and gives the call 11 seconds. Options that the
+server refuses fail before anything is sent.
+
+`RequestTimeout` bounds the call and its retries, in place of the 30-second
+operation budget. A context deadline that comes first shortens the wait. If the
+context ends while the server holds the poll, the client sends a cancellation
+(code 108) on the same connection and drops a late reply. The client holds at
+most 64 deferred polls and fetches at once, and a call waits
+for a free slot within its deadline. The server refuses a request over its own
+limit with code 90, and the client retries it within the deadline.
+
+A parked progress poll holds the progress lane of its partition for up to
+`MaxWait`. The offset reads, stores and deletes of the same client on that
+partition wait for it within their own deadline. If the deadline ends first,
+the call fails with `ErrTransientNotAccepted`. The client did not send the
+call, so a retry is safe.
+
+A group poll with `PollMessagesDeferred` must name its partition. Without one,
+the call fails with `ErrInvalidCommand` before anything is sent. To read
+the whole assignment, call `ReadinessGroups` with the assigned partitions, and
+then call `FetchMessages` once for each group.
+
+`ReadinessGroups` groups partitions by their primary, in primary order, with at
+most 1000 partitions in a group. `FetchMessages` takes the partitions of one
+group, each with a `Next` or `Offset` position, in one request (code 109) to
+their primary. The server holds the fetch until the partitions hold `MinCount`
+messages or until `MaxWait` passes. Then it reads at most `count` messages and
+`MaxBytes` record bytes over all partitions.
+
+The call returns a section for each partition that the server read or refused,
+in reply order. A partition without a section keeps its position. The next
+fetch of a partition reads from `Offset(NextOffset)` with the `Context` of its
+section. `binaryserialization.DeserializeSectionMessages` decodes the messages
+of a section. The server can refuse the fetch or a section with `NotPrimary`,
+`HistoryUnavailable`, `ConsumerGroupPartitionNotOwned` or a missing stream,
+topic or partition. Then the next `ReadinessGroups` and the next fetch look up
+the routes of those partitions again. A partition that lost its history
+continues without a `Context`, so the fetch takes the incarnation of its new
+route.
+
+A fetch without auto-commit sets `count` to the messages that its caller has
+room for. A fetch with auto-commit sets `count` to its batch size, because
+`count` bounds the messages that a crash loses. `RequestTimeout`, truncated to
+whole microseconds, must exceed 1 second to leave time for local setup, even
+when `MaxWait` is zero. A positive `MaxWait` also requires at least 1 second
+between it and `RequestTimeout`.
+
+A fetch with auto-commit or a `Next` position is a progress fetch. It holds the
+progress lanes of all its partitions, and the client never sends it again after
+a lost reply. The server stores the offsets of a fetch with auto-commit when it
+reads, so a cancel after the read loses those messages. So the client never
+cancels such a fetch. The call waits for the reply until its deadline, also
+after its context ends, and `Close` waits for it.
+
+An unknown outcome after a possibly sent auto-committing fetch retains local
+progress blocks for its affected partitions. `errors.FetchProgressUncertain`
+(14010) carries an `OperationID` unique within that client, including across
+reconnect and sign-in. A later progress request or offset write on a blocked
+partition fails with `errors.PartitionLaneBlocked` (14009), naming both
+`PartitionID` and `OperationID`. Offset inspection, stateless reads, sends and
+unrelated partitions remain usable. Noncommitting `Next` fetches retain their
+previous unknown-outcome behavior and do not create these blocks.
+
+`ResolveOperation` returns the same 14010 without sending or replaying a fetch.
+After explicitly accepting the unknown outcome, call `AbandonOperation` to
+release its local blocks. This cannot stop or prove completion of the old server
+read; an inspected offset is not a completion barrier. `Close` finishes cleanup
+and reports an unresolved fetch identity without automatically abandoning it.
+
+A valid partial reply keeps healthy sections and records available. Only its
+uncertain sections carry 14010 and remain blocked. A malformed section table or
+lost whole reply blocks every target. Record decoding after a healthy table does
+not create a block, so the section's context remains available for checkpoint
+repair. Raw fetch replies preserve their bytes; inspect each section status and
+use the identity from a later 14009 to recover a blocked target. Zero target
+incarnations are resolved before admission; explicit nonzero fences are preserved.
+
+Fetch recovery retains only IDs and target keys in an independent pool bounded
+by the configured `WithPendingOperations` count and byte limits. Capacity is
+reserved before send, survives session replacement and is released by a known
+outcome or explicit abandon. A full pool refuses new committing fetches with
+`ErrTransientNotAccepted` before they reach the wire.
+
+If a retained offset operation blocks a fetch target, `errors.PartitionLaneBlocked`
+names its `PartitionID` and `OperationID` with code 14009. Resolve or abandon
+that operation before retrying the target. The error also unwraps to
+`errors.LaneBlocked`, so existing `errors.As` and `errors.Is` handling still works.
+
+`SendBinaryRequest` sends codes 106 and 109 the same way and refuses code
+108. It sends a fetch with the byte limit and the context of each partition as
+they are. External implementations, wrappers and mocks of `contracts.Client`
+must implement `PollMessagesDeferred`, `FetchMessages` and
+`ReadinessGroups`.
 
 ## Testing
 

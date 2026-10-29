@@ -387,16 +387,16 @@ async fn given_spread_primaries_when_polling_deferred_should_wake_each_partition
     let strategy = PollingStrategy::next();
     let mut polls: FuturesUnordered<_> = (0..SPREAD_PARTITIONS)
         .map(|partition| {
-            client.poll_messages_deferred(
+            client.poll_messages(
                 &stream,
                 &topic,
-                Some(partition),
+                partition,
                 &consumer,
                 &strategy,
-                2,
-                true,
-                DeferredPollOptions {
+                PollOptions {
+                    count: 2,
                     min_count: 2,
+                    server_commit: ServerCommitPolicy::OnRead,
                     ..deferred_test_options()
                 },
             )
@@ -457,21 +457,20 @@ async fn given_spread_primaries_when_consuming_deferred_should_route_every_group
     harness: &TestHarness,
 ) {
     let producer = harness.root_client().await.unwrap();
-    for (stream_name, auto_commit) in [
-        ("deferred-manual", AutoCommit::Disabled),
-        (
-            "deferred-on-poll",
-            AutoCommit::When(AutoCommitWhen::PollingMessages),
-        ),
+    for (stream_name, server_commit) in [
+        ("deferred-manual", ServerCommitPolicy::Disabled),
+        ("deferred-on-poll", ServerCommitPolicy::OnRead),
     ] {
         let (client, stream, topic, observers) = spread_deferred_topic(harness, stream_name).await;
         let mut consumer = client
             .consumer_group(GROUP_NAME, stream_name, TOPIC_NAME)
             .unwrap()
-            .auto_commit(auto_commit)
             .polling_strategy(PollingStrategy::next())
-            .batch_length(1)
-            .poll_options(deferred_test_options())
+            .poll_options(PollOptions {
+                count: 1,
+                server_commit,
+                ..deferred_test_options()
+            })
             .build();
         consumer.init().await.unwrap();
         let group = Consumer::group(Identifier::named(GROUP_NAME).unwrap());
@@ -510,7 +509,7 @@ async fn given_spread_primaries_when_consuming_deferred_should_route_every_group
                 assert_eq!(received.partition_id, partition, "{stream_name}");
                 assert_eq!(received.message.header.offset, offset, "{stream_name}");
                 assert_eq!(received.message.payload.as_ref(), payload.as_bytes());
-                if matches!(auto_commit, AutoCommit::Disabled) {
+                if server_commit == ServerCommitPolicy::Disabled {
                     let stored = client
                         .get_consumer_offset(&group, &stream, &topic, Some(partition))
                         .await
@@ -537,12 +536,8 @@ async fn given_spread_primaries_when_consuming_deferred_should_route_every_group
     }
 }
 
-fn deferred_test_options() -> DeferredPollOptions {
-    DeferredPollOptions {
-        max_wait: Duration::from_secs(30).into(),
-        request_timeout: Duration::from_secs(40).into(),
-        ..Default::default()
-    }
+fn deferred_test_options() -> PollOptions {
+    PollOptions::wait(Duration::from_secs(30).into())
 }
 
 async fn spread_deferred_topic(
@@ -626,11 +621,13 @@ async fn assert_partition_payload(
         .poll_messages(
             stream,
             topic,
-            Some(partition_id),
+            partition_id,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -927,11 +924,13 @@ async fn append_and_assert_partition_sentinels(
                 .poll_messages(
                     stream,
                     topic,
-                    Some(PARTITION_ID),
+                    PARTITION_ID,
                     &Consumer::default(),
                     &PollingStrategy::offset(0),
-                    u32::try_from(phases.len() + 1).unwrap(),
-                    false,
+                    PollOptions {
+                        count: u32::try_from(phases.len() + 1).unwrap(),
+                        ..PollOptions::default()
+                    },
                 )
                 .await
                 .unwrap();
@@ -1130,11 +1129,13 @@ async fn read_sequences(client: &TcpClient, stream: &Identifier, topic: &Identif
             .poll_messages(
                 stream,
                 topic,
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &Consumer::default(),
                 &PollingStrategy::offset(offset),
-                READBACK_BATCH,
-                false,
+                PollOptions {
+                    count: READBACK_BATCH,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -1371,11 +1372,13 @@ async fn assert_isolated_primary_fence(harness: &TestHarness, leads_metadata: bo
         .poll_messages(
             &stream,
             &topic,
-            Some(partition_id),
+            partition_id,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            u32::try_from(ADMITTED.len() + 1).unwrap(),
-            false,
+            PollOptions {
+                count: u32::try_from(ADMITTED.len() + 1).unwrap(),
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -1743,11 +1746,14 @@ async fn given_split_primaries_when_http_auto_commits_on_a_backup_should_replica
         client.poll_messages(
             &stream,
             &topic,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::first(),
-            GROUP_PAYLOADS.len() as u32,
-            true,
+            PollOptions {
+                count: GROUP_PAYLOADS.len() as u32,
+                server_commit: ServerCommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         ),
     )
     .await
@@ -1832,9 +1838,9 @@ async fn given_split_primaries_when_http_calls_a_partition_backup_should_serve_o
     let expected: Vec<&[u8]> = expected.iter().map(|payload| payload.as_bytes()).collect();
     assert_eq!(payloads, expected);
     assert!(
-        polled.context.metadata_op >= primary_applied_op,
+        polled.context().metadata_op >= primary_applied_op,
         "the relayed poll context {:?} must cover the primary's applied op {primary_applied_op}",
-        polled.context
+        polled.context()
     );
 
     let offsets = http.url(&format!(
@@ -2017,9 +2023,9 @@ async fn given_split_primaries_when_polling_linearizable_off_the_metadata_primar
         let polled: PolledMessages = serde_json::from_str(&body).expect("decode PolledMessages");
         assert_eq!(polled.messages.len(), GROUP_PAYLOADS.len());
         assert!(
-            polled.context.metadata_op >= committed,
+            polled.context().metadata_op >= committed,
             "the poll on node {node} served at {:?}, below the committed op {committed}",
-            polled.context
+            polled.context()
         );
         assert_eq!(
             RoutingCost::of(&http).await.since(before),
@@ -2584,24 +2590,30 @@ async fn assert_group_offset_routing(
         .await
         .unwrap();
     assert_routed_offset_from_each_node(harness, &consumer, None).await;
-    for (group_name, policy) in [
+    for (group_name, client_commit, server_commit) in [
         (
             "interval-offset-group",
-            AutoCommit::Interval(NonZeroIggyDuration::ONE_SECOND),
+            ClientCommitPolicy {
+                interval: Some(NonZeroIggyDuration::ONE_SECOND),
+                on: None,
+            },
+            ServerCommitPolicy::Disabled,
         ),
         (
             "default-offset-group",
-            AutoCommit::IntervalOrWhen(
-                NonZeroIggyDuration::ONE_SECOND,
-                AutoCommitWhen::PollingMessages,
-            ),
+            ClientCommitPolicy::default(),
+            ServerCommitPolicy::OnRead,
         ),
     ] {
         let mut interval_consumer = member
             .consumer_group(group_name, STREAM_NAME, TOPIC_NAME)
             .unwrap()
-            .batch_length(GROUP_PAYLOADS.len() as u32)
-            .auto_commit(policy)
+            .poll_options(PollOptions {
+                count: GROUP_PAYLOADS.len() as u32,
+                server_commit,
+                ..PollOptions::wait(IggyDuration::ONE_SECOND)
+            })
+            .client_commit(client_commit)
             .build();
         interval_consumer.init().await.unwrap();
         for _ in GROUP_PAYLOADS {
@@ -2774,11 +2786,13 @@ async fn assert_group_auto_commit_routing(harness: &mut TestHarness, transport: 
                 .poll_messages(
                     &stream,
                     &topic,
-                    Some(PARTITION_ID),
+                    PARTITION_ID,
                     &Consumer::default(),
                     &PollingStrategy::first(),
-                    u32::try_from(GROUP_PAYLOADS.len()).unwrap(),
-                    false,
+                    PollOptions {
+                        count: u32::try_from(GROUP_PAYLOADS.len()).unwrap(),
+                        ..PollOptions::default()
+                    },
                 )
                 .await
                 .expect("the metadata leader can read the backup without committing offsets");
@@ -2834,11 +2848,14 @@ async fn assert_group_auto_commit_routing(harness: &mut TestHarness, transport: 
             member.poll_messages(
                 &stream,
                 &topic,
-                None,
+                PARTITION_ID,
                 &consumer,
                 &PollingStrategy::next(),
-                1,
-                true,
+                PollOptions {
+                    count: 1,
+                    server_commit: ServerCommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             ),
         )
         .await
@@ -2904,8 +2921,11 @@ async fn assert_cached_route_after_primary_loss(
     let mut receiver = member
         .consumer_group(GROUP_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
-        .batch_length(1)
-        .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
+        .poll_options(PollOptions {
+            count: 1,
+            server_commit: ServerCommitPolicy::OnRead,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .build();
     receiver.init().await.unwrap();
     assert!(
@@ -2913,11 +2933,14 @@ async fn assert_cached_route_after_primary_loss(
             .poll_messages(
                 stream,
                 topic,
-                None,
+                PARTITION_ID,
                 consumer,
                 &PollingStrategy::next(),
-                1,
-                true
+                PollOptions {
+                    count: 1,
+                    server_commit: ServerCommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap()
@@ -2977,11 +3000,34 @@ async fn assert_cached_route_after_primary_loss(
         loop {
             match receiver.next().await.expect("the consumer must stay open") {
                 Ok(message) => break message,
-                // A readiness wait sent to the killed owner times out as not
-                // accepted, and an auto-commit poll as uncertain. The fixture
-                // killed it before polling, so the uncertain reply cannot hide
-                // admission of this new message.
-                Err(IggyError::TransientNotAccepted | IggyError::TransientNotCommitted) => {}
+                // A read that never reached the killed owner fails as not
+                // accepted.
+                Err(ReadError {
+                    error: IggyError::TransientNotAccepted,
+                    ..
+                }) => {}
+                // A read lost with the killed owner has an unknown outcome, so
+                // the client blocks its partition until the caller abandons
+                // it. The fixture killed the owner before the read, so the
+                // read stored nothing and cannot hide this new message.
+                Err(ReadError {
+                    error: IggyError::FetchProgressUncertain(operation),
+                    ..
+                }) => {
+                    assert!(
+                        matches!(
+                            receiver.seek(PARTITION_ID, PollingStrategy::next()).await,
+                            Err(IggyError::PartitionLaneBlocked(partition, blocking))
+                                if partition == PARTITION_ID && blocking == operation
+                        ),
+                        "an uncertain read must block its partition until it is abandoned"
+                    );
+                    member.abandon_operation(operation).await.unwrap();
+                    receiver
+                        .seek(PARTITION_ID, PollingStrategy::next())
+                        .await
+                        .unwrap();
+                }
                 Err(error) => panic!("poll could not recover its cached data route: {error:?}"),
             }
         }
@@ -3013,12 +3059,13 @@ async fn assert_data_session_fences(
 ) {
     const OTHER_USER: &str = "routing-other-user";
     const OTHER_PASSWORD: &str = "routing-other-password";
+    let strategy = PollingStrategy::next();
     let poll = PollMessagesRequest {
         consumer: consumer_to_wire(consumer).unwrap(),
         stream_id: identifier_to_wire(stream).unwrap(),
         topic_id: identifier_to_wire(topic).unwrap(),
         partition_id: Some(PARTITION_ID),
-        strategy: polling_strategy_to_wire(&PollingStrategy::next()),
+        strategy: polling_strategy_to_wire(&strategy),
         count: 1,
         auto_commit: true,
     }
@@ -3149,7 +3196,9 @@ async fn assert_data_session_fences(
     )
     .await
     .unwrap();
-    let context = PolledMessages::from_bytes(first_poll).unwrap().context;
+    let context = PolledMessages::from_bytes(first_poll, &strategy)
+        .unwrap()
+        .context();
     assert_ne!(context.owner_generation, 0);
     // A caller without the owner generation sends 0, and the primary binds it
     // to the owner it installed for this session.
@@ -3165,7 +3214,9 @@ async fn assert_data_session_fences(
     .await
     .expect("owner 0 must bind to the owner installed for this session");
     assert_eq!(
-        PolledMessages::from_bytes(response).unwrap().partition_id,
+        PolledMessages::from_bytes(response, &strategy)
+            .unwrap()
+            .partition_id,
         PARTITION_ID
     );
 
@@ -3208,7 +3259,7 @@ async fn assert_data_session_fences(
     )
     .await
     .unwrap();
-    let polled = PolledMessages::from_bytes(response).unwrap();
+    let polled = PolledMessages::from_bytes(response, &strategy).unwrap();
     assert_eq!(
         polled.partition_id, RESYNC_REQUIRED_PARTITION_SENTINEL,
         "the attached session must respect the member leaving"
@@ -3224,7 +3275,9 @@ async fn assert_data_session_fences(
     .await
     .unwrap();
     assert_eq!(
-        PolledMessages::from_bytes(response).unwrap().partition_id,
+        PolledMessages::from_bytes(response, &strategy)
+            .unwrap()
+            .partition_id,
         RESYNC_REQUIRED_PARTITION_SENTINEL,
         "owner 0 must not outlive the membership"
     );
@@ -3271,16 +3324,18 @@ async fn assert_data_session_fences(
                 .poll_messages(
                     stream,
                     topic,
-                    Some(PARTITION_ID),
+                    PARTITION_ID,
                     consumer,
                     &PollingStrategy::first(),
-                    1,
-                    false,
+                    PollOptions {
+                        count: 1,
+                        ..PollOptions::default()
+                    },
                 )
                 .await
             {
-                Ok(polled) if polled.context.owner_generation > context.owner_generation => {
-                    break polled.context;
+                Ok(polled) if polled.context().owner_generation > context.owner_generation => {
+                    break polled.context();
                 }
                 Ok(_)
                 | Err(

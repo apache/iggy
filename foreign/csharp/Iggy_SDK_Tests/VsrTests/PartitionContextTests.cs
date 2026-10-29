@@ -256,7 +256,7 @@ public sealed class PartitionContextTests
         var stores = new ConcurrentQueue<MockRequest>();
         node.Serve(request =>
         {
-            if (request.Code == CommandCodes.POLL_MESSAGES_CODE)
+            if (request.Code == CommandCodes.POLL_MESSAGES_DEFERRED_CODE)
             {
                 return Reply(OPERATION_NON_REPLICATED, Convert.FromHexString(MessageBatchGoldenVectorTests.POLL_BODY));
             }
@@ -278,7 +278,6 @@ public sealed class PartitionContextTests
             Consumer = Consumer.New(1),
             PollingStrategy = PollingStrategy.Next(),
             AutoCommitMode = AutoCommitMode.AfterReceive,
-            PollingIntervalMs = 0,
             Login = "iggy",
             Password = "iggy"
         }, NullLoggerFactory.Instance);

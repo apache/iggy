@@ -22,6 +22,8 @@ use Iggy\Client as IggyClient;
 use Iggy\ReceiveMessage;
 use PHPUnit\Framework\Assert;
 
+const READ_UNTIL_POLL_MICROS = 10_000;
+
 function assert_true(bool $condition, string $message = 'expected condition to be true'): void
 {
     Assert::assertTrue($condition, $message);
@@ -263,6 +265,23 @@ function collect_offsets(array $messages): array
 function micros(int $seconds): int
 {
     return $seconds * 1_000_000;
+}
+
+/**
+ * Calls $read until it returns $expected or the timeout ends, and returns the last value read.
+ */
+function read_until(callable $read, mixed $expected, float $timeoutSeconds): mixed
+{
+    $deadline = microtime(true) + $timeoutSeconds;
+
+    while (true) {
+        $value = $read();
+        if ($value === $expected || microtime(true) >= $deadline) {
+            return $value;
+        }
+
+        usleep(READ_UNTIL_POLL_MICROS);
+    }
 }
 
 if (!extension_loaded('iggy-php')) {

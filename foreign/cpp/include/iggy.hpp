@@ -1444,18 +1444,19 @@ class Topic final {
 };
 
 /**
- * @brief Partition incarnation and consumer-group owner captured by a read or
- *        a poll.
+ * @brief Partition incarnation and consumer-group owner that
+ *        Partition::Context() reports.
  *
- * Store an offset under the context that delivered it with
- * IggyBlockingClient::StoreConsumerPosition(). The store then fails instead of
- * landing on a recreated partition or under a newer consumer-group owner. The
- * server refuses a context whose incarnation is zero.
+ * A checkpoint keeps the context of its batch privately, and
+ * IggyBlockingClient::StoreConsumerPosition() stores under it. The store then
+ * fails instead of landing on a recreated partition or under a newer
+ * consumer-group owner.
  */
 class PartitionContext final {
   public:
     /**
-     * @brief Creates a context from the values a poll or a read returned.
+     * @brief Creates a context from the values that Partition::Context()
+     *        reports.
      * @param incarnation Creation revision of the partition. It changes when a
      *        deleted partition ID is created again.
      * @param owner_generation Consumer-group owner generation, or zero outside
@@ -1484,11 +1485,9 @@ class PartitionContext final {
     [[nodiscard]] std::uint64_t MetadataOp() const noexcept { return metadata_op_; }
 
   private:
-    [[nodiscard]] ffi::PartitionContext ToFfi() const;
     static PartitionContext FromFfi(ffi::PartitionContext context);
 
     friend class Partition;
-    friend class IggyBlockingClient;
 
     std::uint64_t incarnation_;
     std::uint64_t owner_generation_;
@@ -6428,30 +6427,30 @@ class IggyBlockingClient final {
                              std::uint64_t offset);
 
     /**
-     * @brief Stores an offset under the partition context that delivered it.
+     * @brief Stores the offset of a checkpoint under the partition context
+     *        that delivered it.
      *
-     * Every retry keeps @p context. The store fails instead of landing on a
-     * recreated partition or under a newer consumer-group owner. Otherwise it
-     * behaves as StoreConsumerOffset() with @p partition_id set.
+     * Every retry keeps the context of @p checkpoint. The store fails instead
+     * of landing on a recreated partition or under a newer consumer-group
+     * owner. Otherwise it behaves as StoreConsumerOffset() with the partition
+     * of @p checkpoint.
      *
      * @param consumer Consumer identity that owns the offset.
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Parent topic, addressed by numeric ID or name.
-     * @param partition_id Partition that delivered @p offset.
-     * @param offset Message offset to store.
-     * @param context Context the poll that delivered @p offset returned.
+     * @param checkpoint Position after a delivered message, from checkpoint()
+     *        or checkpoint_at() of a batch that ffi::Client::poll_messages()
+     *        or ffi::PartitionReader::next() returned.
      * @throws IggyException if the partition was deleted or recreated after
-     *         @p context was captured (HistoryUnavailable, 87); this client no
-     *         longer owns the partition in the consumer group
-     *         (ConsumerGroupPartitionNotOwned, 5009); or for any reason
+     *         the context of @p checkpoint was captured (HistoryUnavailable,
+     *         87); this client no longer owns the partition in the consumer
+     *         group (ConsumerGroupPartitionNotOwned, 5009); or for any reason
      *         StoreConsumerOffset() throws.
      */
     void StoreConsumerPosition(const Consumer &consumer,
                                const Identifier &stream,
                                const Identifier &topic,
-                               std::uint32_t partition_id,
-                               std::uint64_t offset,
-                               const PartitionContext &context);
+                               const ffi::Checkpoint &checkpoint);
 
     /**
      * @brief Retrieves the stored offset for a consumer or consumer group.
@@ -6636,10 +6635,12 @@ class IggyBlockingClient final {
     /**
      * @brief Releases a retained operation and its local lane.
      *
-     * Abandonment does not undo or determine the server result. HTTP reports
-     * feature_unavailable because it does not retain operations.
+     * Abandonment does not undo or determine the server result. HTTP retains
+     * only the poll operations of fetch_progress_uncertain, so it reports
+     * operation_not_retained for every other operation.
      *
-     * @param operation_id ID carried by operation_uncertain or lane_blocked.
+     * @param operation_id ID carried by operation_uncertain, lane_blocked,
+     *        fetch_progress_uncertain, or partition_lane_blocked.
      * @throws IggyException if the operation is not retained, recovery is
      *         unsupported, or the client handle is unavailable.
      */

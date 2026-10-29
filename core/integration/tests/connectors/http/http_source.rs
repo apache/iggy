@@ -22,7 +22,8 @@ use crate::connectors::fixtures::{
 };
 use iggy::prelude::IggyClient;
 use iggy_common::MessageClient;
-use iggy_common::{Consumer, Identifier, PollingStrategy};
+use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
+use iggy_common::{Consumer, Identifier, PollOptions, PollingStrategy, ServerCommitPolicy};
 use iggy_connector_sdk::api::{ConnectorStatus, SourceInfoResponse};
 use integration::harness::{TestHarness, seeds};
 use integration::iggy_harness;
@@ -578,11 +579,14 @@ async fn poll_payloads(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                None,
+                DEFAULT_PARTITION_ID,
                 &Consumer::new(consumer_id.clone()),
                 &PollingStrategy::next(),
-                10,
-                true,
+                PollOptions {
+                    count: 10,
+                    server_commit: ServerCommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
         {

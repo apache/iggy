@@ -202,7 +202,33 @@ func (c *IggyTcpClient) PollMessages(
 	if consumer.Kind == iggcon.ConsumerKindGroup && partitionId == nil {
 		return c.pollGroup(ctx, streamId, topicId, consumer, strategy, count, autoCommit)
 	}
-	return c.pollPartition(ctx, streamId, topicId, consumer, strategy, count, autoCommit, partitionId)
+	return c.pollPartition(ctx, streamId, topicId, consumer, strategy, count, autoCommit, partitionId, nil)
+}
+
+func (c *IggyTcpClient) PollMessagesDeferred(
+	ctx context.Context,
+	streamId iggcon.Identifier,
+	topicId iggcon.Identifier,
+	consumer iggcon.Consumer,
+	strategy iggcon.PollingStrategy,
+	count uint32,
+	autoCommit bool,
+	partitionId *uint32,
+	options iggcon.DeferredPollOptions,
+) (*iggcon.PolledMessage, error) {
+	if ctx == nil {
+		return nil, ierror.ErrNilContext
+	}
+	if consumer.Kind == iggcon.ConsumerKindGroup && partitionId == nil {
+		return nil, fmt.Errorf("%w: a deferred group poll needs a partition id; "+
+			"use ReadinessGroups and FetchMessages to read the whole assignment", ierror.ErrInvalidCommand)
+	}
+	if err := options.Validate(count); err != nil {
+		return nil, err
+	}
+	ctx, cancel := c.deferredContext(ctx, options.RequestTimeout)
+	defer cancel()
+	return c.pollPartition(ctx, streamId, topicId, consumer, strategy, count, autoCommit, partitionId, &options)
 }
 
 // pollPartition issues one poll against the partition the caller named.
@@ -215,6 +241,7 @@ func (c *IggyTcpClient) pollPartition(
 	count uint32,
 	autoCommit bool,
 	partitionId *uint32,
+	options *iggcon.DeferredPollOptions,
 ) (*iggcon.PolledMessage, error) {
 	request := &command.PollMessages{
 		StreamId:    streamId,
@@ -224,6 +251,7 @@ func (c *IggyTcpClient) pollPartition(
 		Strategy:    strategy,
 		Count:       count,
 		PartitionId: partitionId,
+		Deferred:    options,
 	}
 	buffer, err := c.do(ctx, request)
 	if err != nil {
@@ -289,7 +317,8 @@ func sendTarget(cmd command.Command) (topicKey, uint32, error) {
 
 func isPartitionCommand(code command.Code) bool {
 	switch code {
-	case command.SendMessagesCode, command.PollMessagesCode, command.GetOffsetCode, command.StoreOffsetCode, command.DeleteConsumerOffsetCode:
+	case command.SendMessagesCode, command.PollMessagesCode, command.PollMessagesDeferredCode,
+		command.FetchMessagesCode, command.GetOffsetCode, command.StoreOffsetCode, command.DeleteConsumerOffsetCode:
 		return true
 	default:
 		return false
@@ -306,26 +335,25 @@ func partitionQuery(code command.Code, payload []byte) ([]byte, error) {
 		}
 		return binary.LittleEndian.AppendUint32([]byte(key.stream+key.topic), partition), nil
 	}
-	if len(payload) < 1 {
-		return nil, ierror.ErrInvalidCommand
+	topic, position, err := pollTarget(payload)
+	if err != nil {
+		return nil, err
 	}
-	var fields [3][]byte
-	position := 1
-	for index := range fields {
-		if len(payload)-position < fieldPrefixSize {
+	if code == command.FetchMessagesCode {
+		// A fetch goes to the primary of its first target.
+		// Its sender groups the targets by primary.
+		targets := position + fetchParametersSize
+		if len(payload)-targets < fetchTargetSize {
 			return nil, ierror.ErrInvalidCommand
 		}
-		end := position + fieldPrefixSize + int(payload[position+1])
-		if end > len(payload) {
-			return nil, ierror.ErrInvalidCommand
-		}
-		fields[index] = payload[position:end]
-		position = end
+		return routeQuery(topic, binary.LittleEndian.Uint32(payload[targets:])), nil
 	}
 	suffix := 0
 	switch code {
 	case command.PollMessagesCode:
 		suffix = pollParametersSize
+	case command.PollMessagesDeferredCode:
+		suffix = pollParametersSize + deferredParametersSize
 	case command.StoreOffsetCode:
 		suffix = storeOffsetSuffixSize
 	case command.DeleteConsumerOffsetCode:
@@ -336,12 +364,44 @@ func partitionQuery(code command.Code, payload []byte) ([]byte, error) {
 	}
 	partition := binary.LittleEndian.Uint32(payload[position+1:])
 	if payload[position] == 0 {
+		poll := code == command.PollMessagesCode || code == command.PollMessagesDeferredCode
 		if code == command.StoreOffsetCode || code == command.DeleteConsumerOffsetCode ||
-			(code == command.PollMessagesCode && payload[0] == byte(iggcon.ConsumerKindGroup)) {
+			(poll && payload[0] == byte(iggcon.ConsumerKindGroup)) {
 			return nil, ierror.ErrInvalidCommand
 		}
 		partition = 0
 	}
-	query := append(append(make([]byte, 0, len(fields[1])+len(fields[2])+partitionIdSize), fields[1]...), fields[2]...)
-	return binary.LittleEndian.AppendUint32(query, partition), nil
+	return routeQuery(topic, partition), nil
+}
+
+// pollTarget reads the consumer, the stream and the topic that start a poll,
+// a fetch and an offset command. It returns the encoded
+// stream and topic, which start the route query of each of their partitions,
+// and the position after them.
+func pollTarget(payload []byte) ([]byte, int, error) {
+	if len(payload) < 1 {
+		return nil, 0, ierror.ErrInvalidCommand
+	}
+	position, streamStart := 1, 0
+	for index := range 3 {
+		if len(payload)-position < fieldPrefixSize {
+			return nil, 0, ierror.ErrInvalidCommand
+		}
+		end := position + fieldPrefixSize + int(payload[position+1])
+		if end > len(payload) {
+			return nil, 0, ierror.ErrInvalidCommand
+		}
+		if index == 0 {
+			streamStart = end
+		}
+		position = end
+	}
+	return payload[streamStart:position], position, nil
+}
+
+// routeQuery is the route cache key of a partition: the encoded stream and
+// topic, then the partition id.
+func routeQuery(topic []byte, partition uint32) []byte {
+	query := append(make([]byte, 0, len(topic)+partitionIdSize), topic...)
+	return binary.LittleEndian.AppendUint32(query, partition)
 }

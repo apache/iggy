@@ -19,7 +19,8 @@ use super::TEST_MESSAGE_COUNT;
 use crate::connectors::fixtures::InfluxDb3SourceFixture;
 use iggy_common::MessageClient;
 use iggy_common::Utc;
-use iggy_common::{Consumer, Identifier, PollingStrategy};
+use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
+use iggy_common::{Consumer, Identifier, PollOptions, PollingStrategy, ServerCommitPolicy};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use serde_json::Value;
@@ -61,11 +62,14 @@ async fn influxdb3_source_polls_and_produces_messages(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                None,
+                DEFAULT_PARTITION_ID,
                 &consumer,
                 &PollingStrategy::next(),
-                100,
-                true,
+                PollOptions {
+                    count: 100,
+                    server_commit: ServerCommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
             .expect("poll_messages failed");
@@ -108,11 +112,14 @@ async fn influxdb3_source_message_payload_structure(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                None,
+                DEFAULT_PARTITION_ID,
                 &consumer,
                 &PollingStrategy::next(),
-                10,
-                true,
+                PollOptions {
+                    count: 10,
+                    server_commit: ServerCommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
             .expect("poll_messages failed");
@@ -160,11 +167,13 @@ async fn influxdb3_source_empty_db_produces_no_messages(
         .poll_messages(
             &stream_id,
             &topic_id,
-            None,
+            DEFAULT_PARTITION_ID,
             &consumer,
             &PollingStrategy::next(),
-            100,
-            false,
+            PollOptions {
+                count: 100,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll_messages failed");
@@ -203,11 +212,14 @@ async fn influxdb3_source_multiple_rows(harness: &TestHarness, fixture: InfluxDb
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                None,
+                DEFAULT_PARTITION_ID,
                 &consumer,
                 &PollingStrategy::next(),
-                100,
-                true,
+                PollOptions {
+                    count: 100,
+                    server_commit: ServerCommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
             .expect("poll_messages failed");

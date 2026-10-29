@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::consumer_ext::MessageConsumer;
-use crate::prelude::IggyError;
+use crate::prelude::ReadError;
 use async_trait::async_trait;
 use tokio::sync::oneshot;
 
@@ -25,7 +25,12 @@ pub trait IggyConsumerMessageExt<'a> {
     /// This function starts an event loop that consumes messages from the stream and
     /// applies the provided consumer. The loop will exit when the shutdown receiver is triggered.
     ///
-    /// This can be combined with `AutoCommitAfter` to automatically commit offsets after consuming.
+    /// The event of a `ClientCommitPolicy` counts a message after the consumer returns, also
+    /// after a failure. Its interval can store a message whose consumer still runs, because the
+    /// delivery of a message counts when the stream yields it.
+    ///
+    /// An error that ends the loop names its partition, if it has one, so the caller can
+    /// recover that partition and consume again.
     ///
     /// # Arguments
     ///
@@ -36,7 +41,7 @@ pub trait IggyConsumerMessageExt<'a> {
         &mut self,
         message_consumer: &'a P,
         shutdown_rx: oneshot::Receiver<()>,
-    ) -> Result<(), IggyError>
+    ) -> Result<(), ReadError>
     where
         P: MessageConsumer + Sync;
 }

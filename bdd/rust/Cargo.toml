@@ -75,5 +75,10 @@ name = "metadata_changes"
 harness = false
 required-features = ["bdd"]
 
+[[test]]
+name = "deferred_polling"
+harness = false
+required-features = ["bdd"]
+
 [lints]
 workspace = true

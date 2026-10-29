@@ -42,6 +42,42 @@ internal static class TcpContracts
     /// <summary>Offset mutations always request quorum acknowledgement.</summary>
     private const byte AckQuorum = 1;
 
+    /// <summary>The bytes a deferred poll (code 106) appends to the body of code 100.</summary>
+    internal const int DEFERRED_POLL_TAIL_SIZE = sizeof(ulong) + sizeof(uint) + sizeof(uint) + sizeof(ulong);
+
+    /// <summary>The most partitions one fetch names.</summary>
+    internal const int MAX_PARTITIONS_PER_REQUEST = 1000;
+
+    /// <summary>The wait and the request timeout that follow the fetch topic.</summary>
+    private const int WaitBudgetSize = sizeof(ulong) + sizeof(ulong);
+
+    private const int ConsumerKindSize = 1;
+    private const int IdentifierPrefixSize = 2;
+    private const int PollingStrategySize = 1 + sizeof(ulong);
+    private const int PartitionStrategySize = sizeof(uint) + PollingStrategySize;
+
+    private const int FetchMinCountOffset = WaitBudgetSize;
+    private const int FetchCountOffset = FetchMinCountOffset + sizeof(uint);
+    private const int FetchMaxBytesOffset = FetchCountOffset + sizeof(uint);
+    private const int FetchAutoCommitOffset = FetchMaxBytesOffset + sizeof(uint);
+    private const int FetchTargetsCountOffset = FetchAutoCommitOffset + 1;
+
+    /// <summary>
+    ///     What a fetch (code 109) carries between its topic and its targets: the wait, the request timeout, the
+    ///     minimum count, the count, the byte limit, the commit flag and the target count.
+    /// </summary>
+    private const int FetchFieldsSize = FetchTargetsCountOffset + sizeof(uint);
+
+    /// <summary>
+    ///     A fetch target: the partition id, the strategy, its own byte limit, then its fence, the incarnation and
+    ///     the owner generation that a poll carries in its request header.
+    /// </summary>
+    private const int FetchTargetSize = PartitionStrategySize + sizeof(uint) + sizeof(ulong) + sizeof(ulong);
+
+    private const int FetchTargetStrategyOffset = sizeof(uint);
+    private const int FetchTargetMaxBytesOffset = PartitionStrategySize;
+    private const int FetchTargetFenceOffset = FetchTargetMaxBytesOffset + sizeof(uint);
+
     internal static byte[] LoginWithPersonalAccessToken(string token)
     {
         var tokenLength = WireName.ByteCount(token, nameof(token));
@@ -264,15 +300,15 @@ internal static class TcpContracts
         writer.Advance(1);
     }
 
+    /// <summary>
+    ///     Encodes a PollMessages body (code 100), or with <paramref name="deferred" /> a PollMessagesDeferred body
+    ///     (code 106): the same body followed by the wait, the minimum count, the byte limit and the request timeout.
+    /// </summary>
     internal static void GetMessages(Span<byte> bytes, Consumer consumer, Identifier streamId, Identifier topicId,
         PollingStrategy pollingStrategy,
-        uint count, bool autoCommit, uint? partitionId)
+        uint count, bool autoCommit, uint? partitionId, DeferredPollOptions? deferred = null)
     {
-        bytes[0] = GetConsumerTypeByte(consumer.Type);
-        bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
-        var position = 1 + consumer.ConsumerId.Length + 2;
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, position);
-        position += 2 + streamId.Length + 2 + topicId.Length;
+        var position = WriteConsumerStreamAndTopic(bytes, consumer, streamId, topicId);
 
         // Encode partition_id with a flag byte: 1 = Some, 0 = None
         if (partitionId.HasValue)
@@ -286,11 +322,133 @@ internal static class TcpContracts
             BinaryPrimitives.WriteUInt32LittleEndian(bytes[(position + 1)..(position + 5)], 0); // Padding
         }
 
-        bytes[position + 5] = GetPollingStrategyByte(pollingStrategy.Kind);
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 6)..(position + 14)], pollingStrategy.Value);
+        WritePollingStrategy(bytes[(position + 5)..], pollingStrategy);
         BinaryPrimitives.WriteUInt32LittleEndian(bytes[(position + 14)..(position + 18)], count);
 
         bytes[position + 18] = autoCommit ? (byte)1 : (byte)0;
+        if (deferred is not null)
+        {
+            var tail = bytes[(position + 19)..];
+            BinaryPrimitives.WriteUInt64LittleEndian(tail, deferred.MaxWaitUs);
+            BinaryPrimitives.WriteUInt32LittleEndian(tail[8..], deferred.MinCount);
+            BinaryPrimitives.WriteUInt32LittleEndian(tail[12..], deferred.MaxBytes);
+            BinaryPrimitives.WriteUInt64LittleEndian(tail[16..], deferred.RequestTimeoutUs);
+        }
+    }
+
+    /// <summary>
+    ///     Encodes a FetchMessages body (code 109): the consumer, stream and topic as code 100 carries them, the
+    ///     budget and the limits of the whole reply, then each target with its position, the byte limit
+    ///     <paramref name="targetMaxBytes" /> and the fence of <see cref="PollingStrategy.Context" />.
+    /// </summary>
+    internal static byte[] FetchMessages(Consumer consumer, Identifier streamId, Identifier topicId,
+        DeferredPollOptions options, uint count, bool autoCommit, uint targetMaxBytes,
+        IReadOnlyList<(uint PartitionId, PollingStrategy Strategy)> targets)
+    {
+        var fieldsOffset = ConsumerStreamAndTopicSize(consumer, streamId, topicId);
+        var bytes = new byte[fieldsOffset + FetchFieldsSize + targets.Count * FetchTargetSize];
+        WriteConsumerStreamAndTopic(bytes, consumer, streamId, topicId);
+        var fields = bytes.AsSpan(fieldsOffset);
+        BinaryPrimitives.WriteUInt64LittleEndian(fields, options.MaxWaitUs);
+        BinaryPrimitives.WriteUInt64LittleEndian(fields[sizeof(ulong)..], options.RequestTimeoutUs);
+        BinaryPrimitives.WriteUInt32LittleEndian(fields[FetchMinCountOffset..], options.MinCount);
+        BinaryPrimitives.WriteUInt32LittleEndian(fields[FetchCountOffset..], count);
+        BinaryPrimitives.WriteUInt32LittleEndian(fields[FetchMaxBytesOffset..], options.MaxBytes);
+        fields[FetchAutoCommitOffset] = autoCommit ? (byte)1 : (byte)0;
+        BinaryPrimitives.WriteUInt32LittleEndian(fields[FetchTargetsCountOffset..], (uint)targets.Count);
+        var target = fields[FetchFieldsSize..];
+        foreach (var (partitionId, strategy) in targets)
+        {
+            var fence = strategy.Context ?? default;
+            BinaryPrimitives.WriteUInt32LittleEndian(target, partitionId);
+            WritePollingStrategy(target[FetchTargetStrategyOffset..], strategy);
+            BinaryPrimitives.WriteUInt32LittleEndian(target[FetchTargetMaxBytesOffset..], targetMaxBytes);
+            BinaryPrimitives.WriteUInt64LittleEndian(target[FetchTargetFenceOffset..], fence.Incarnation);
+            BinaryPrimitives.WriteUInt64LittleEndian(target[(FetchTargetFenceOffset + sizeof(ulong))..],
+                fence.OwnerGeneration);
+            target = target[FetchTargetSize..];
+        }
+
+        return bytes;
+    }
+
+    /// <summary>Whether a FetchMessages body commits the offsets of what it reads.</summary>
+    internal static bool FetchAutoCommits(ReadOnlySpan<byte> body)
+    {
+        return body[FetchFieldsOffset(body) + FetchAutoCommitOffset] != 0;
+    }
+
+    /// <summary>Whether a FetchMessages body moves its consumer: it commits, or a target starts at Next.</summary>
+    internal static bool FetchMovesConsumer(ReadOnlySpan<byte> body)
+    {
+        if (FetchAutoCommits(body))
+        {
+            return true;
+        }
+
+        var next = GetPollingStrategyByte(MessagePolling.Next);
+        for (var targets = FetchTargets(body); !targets.IsEmpty; targets = targets[FetchTargetSize..])
+        {
+            if (targets[FetchTargetStrategyOffset] == next)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>The partition and the incarnation of each target of a FetchMessages body, in body order.</summary>
+    internal static (uint PartitionId, ulong Incarnation)[] FetchTargetFences(ReadOnlySpan<byte> body)
+    {
+        var targets = FetchTargets(body);
+        var fences = new (uint PartitionId, ulong Incarnation)[targets.Length / FetchTargetSize];
+        for (var index = 0; index < fences.Length; index++)
+        {
+            var target = targets[(index * FetchTargetSize)..];
+            fences[index] = (BinaryPrimitives.ReadUInt32LittleEndian(target),
+                BinaryPrimitives.ReadUInt64LittleEndian(target[FetchTargetFenceOffset..]));
+        }
+
+        return fences;
+    }
+
+    private static ReadOnlySpan<byte> FetchTargets(ReadOnlySpan<byte> body)
+    {
+        return body[(FetchFieldsOffset(body) + FetchFieldsSize)..];
+    }
+
+    private static int FetchFieldsOffset(ReadOnlySpan<byte> body)
+    {
+        var streamId = ConsumerKindSize + IdentifierSize(body, ConsumerKindSize);
+        var topicId = streamId + IdentifierSize(body, streamId);
+        return topicId + IdentifierSize(body, topicId);
+    }
+
+    private static int IdentifierSize(ReadOnlySpan<byte> body, int position)
+    {
+        return IdentifierPrefixSize + body[position + 1];
+    }
+
+    private static int ConsumerStreamAndTopicSize(Consumer consumer, Identifier streamId, Identifier topicId)
+    {
+        return 1 + 2 + consumer.ConsumerId.Length + 2 + streamId.Length + 2 + topicId.Length;
+    }
+
+    private static int WriteConsumerStreamAndTopic(Span<byte> bytes, Consumer consumer, Identifier streamId,
+        Identifier topicId)
+    {
+        bytes[0] = GetConsumerTypeByte(consumer.Type);
+        bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
+        var position = 1 + consumer.ConsumerId.Length + 2;
+        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, position);
+        return position + 2 + streamId.Length + 2 + topicId.Length;
+    }
+
+    private static void WritePollingStrategy(Span<byte> bytes, PollingStrategy pollingStrategy)
+    {
+        bytes[0] = GetPollingStrategyByte(pollingStrategy.Kind);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[1..PollingStrategySize], pollingStrategy.Value);
     }
 
     /// <summary>
@@ -701,13 +859,8 @@ internal static class TcpContracts
     internal static byte[] UpdateOffset(Identifier streamId, Identifier topicId, Consumer consumer, ulong offset,
         uint? partitionId)
     {
-        Span<byte> bytes =
-            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 14 + 1 + 2 + consumer.ConsumerId.Length];
-        bytes[0] = GetConsumerTypeByte(consumer.Type);
-        bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
-        var position = 1 + consumer.ConsumerId.Length + 2;
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, position);
-        position += 2 + streamId.Length + 2 + topicId.Length;
+        Span<byte> bytes = stackalloc byte[ConsumerStreamAndTopicSize(consumer, streamId, topicId) + 14];
+        var position = WriteConsumerStreamAndTopic(bytes, consumer, streamId, topicId);
 
         // Encode partition_id with a flag byte: 1 = Some, 0 = None
         if (partitionId.HasValue)
@@ -728,13 +881,8 @@ internal static class TcpContracts
 
     internal static byte[] GetOffset(Identifier streamId, Identifier topicId, Consumer consumer, uint? partitionId)
     {
-        Span<byte> bytes =
-            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 5 + 1 + 2 + consumer.ConsumerId.Length];
-        bytes[0] = GetConsumerTypeByte(consumer.Type);
-        bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
-        var position = 1 + consumer.ConsumerId.Length + 2;
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, position);
-        position += 2 + streamId.Length + 2 + topicId.Length;
+        Span<byte> bytes = stackalloc byte[ConsumerStreamAndTopicSize(consumer, streamId, topicId) + 5];
+        var position = WriteConsumerStreamAndTopic(bytes, consumer, streamId, topicId);
 
         // Encode partition_id with a flag byte: 1 = Some, 0 = None
         if (partitionId.HasValue)
@@ -865,13 +1013,8 @@ internal static class TcpContracts
 
     internal static byte[] DeleteOffset(Identifier streamId, Identifier topicId, Consumer consumer, uint? partitionId)
     {
-        Span<byte> bytes =
-            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 6 + 1 + 2 + consumer.ConsumerId.Length];
-        bytes[0] = GetConsumerTypeByte(consumer.Type);
-        bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
-        var position = 1 + consumer.ConsumerId.Length + 2;
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, position);
-        position += 2 + streamId.Length + 2 + topicId.Length;
+        Span<byte> bytes = stackalloc byte[ConsumerStreamAndTopicSize(consumer, streamId, topicId) + 6];
+        var position = WriteConsumerStreamAndTopic(bytes, consumer, streamId, topicId);
 
         // Encode partition_id with a flag byte: 1 = Some, 0 = None
         if (partitionId.HasValue)

@@ -77,8 +77,10 @@ await client.shutdown()
 ```
 
 One client owns one connection and is safe to share between tasks: requests are
-serialized on the connection. `disconnect()` closes the connection until the next
-`connect()`, `shutdown()` is final.
+serialized on the connection. A deferred poll or fetch is the
+exception. The server can hold it for its whole wait, so it goes over a connection of its
+own, bound to the same session. `disconnect()` closes the connection until the next `connect()`,
+`shutdown()` is final.
 
 ### Configuration
 
@@ -257,11 +259,98 @@ either with `historyUnavailable` once the partition was recreated, and a consume
 checkpoint with `consumerGroupPartitionNotOwned` once the partition moved to another
 member.
 
+### Deferred polls
+
+A poll with `options` is deferred (binary command 106). The server holds it until
+`minCount` messages are readable, the next message does not fit in `maxBytes`, or
+`maxWait` runs out. Then it returns what the partition holds, which can be nothing.
+`DeferredPollOptions()` uses the defaults of the Rust SDK: a one-second `maxWait`, a
+`minCount` of 1, a `maxBytes` of 1 MiB and an eleven-second `requestTimeout`:
+
+```swift
+let options = DeferredPollOptions(maxWait: .seconds(5), requestTimeout: .seconds(15))
+let polled = try await client.pollMessages(
+    streamID: "orders", topicID: "created", partitionID: 0, consumer: .consumer(1), strategy: .next, count: 100, autoCommit: true,
+    options: options)
+```
+
+`requestTimeout` bounds the whole call: the route lookup, the wait for a free slot, the
+server wait, the reply and every retry. It also bounds a reconnect or a sync of the group
+assignment that the call needs first. Each attempt carries what is left of the wait and of
+the timeout. If `maxWait` is above zero, `requestTimeout` must be at least one second
+longer. The server needs that second for the final read and the reply. The client refuses
+options out of range before it sends anything:
+
+- A `minCount` outside `1...count` fails with `invalidMessagesCount`.
+- A wait or a timeout out of range fails with `invalidCommand`.
+- A `maxBytes` below 344 fails with `invalidSizeBytes`.
+
+`maxBytes` covers the whole reply body, with the poll metadata and the batch framing. If
+the first message is larger, the poll fails with `invalidSizeBytes` and the offset does not
+move.
+
+`fetchMessages(streamID:topicID:targets:consumer:count:autoCommit:options:)` (binary
+command 109) reads up to 1000 partitions of one primary with one deferred request. Each
+target is a partition with a start point, `.next` or `.offset`. The server holds the
+request until the targets together hold `minCount` messages, or until `maxWait` runs out.
+The reply holds one section for each target that the server read or refused. A section
+carries the partition id, its status, the next offset and the undecoded messages, which
+`decode()` reads. A target without a section keeps its position. `count` caps the
+messages of the whole reply, and each target can fill all of `maxBytes`.
+
+`readinessGroups(streamID:topicID:partitions:)` groups partitions by their primary, at
+most 1000 to a group. Send one fetch for each group. The client fills the fence of each
+target from its route. A fetch needs an initial `requestTimeout` above one second and
+at least one second longer than `maxWait`, measured in whole microseconds. A fetch with
+`autoCommit` or any `.next` target orders progress polls and offset stores/deletes on all
+its partitions within this client, including calls using another identifier spelling.
+Waiting for those partitions is cancellable and consumes the same timeout. Once an
+auto-committing fetch is admitted, it waits for its reply even if its caller is cancelled,
+because the server stores its messages as consumed. Offset lookups, noncommitting
+`.offset` reads and sends can proceed independently. A `notPrimary`
+refusal marks the routes of the fetch as moved, so the next `readinessGroups` call groups
+them again.
+
+A deferred consumer-group poll without a partition id fails with `invalidCommand`
+before anything is sent. Fetch the readiness groups of the assignment instead.
+
+To cancel a deferred poll or a noncommitting fetch, cancel its task. The client then sends
+command 108 on the connection of the request. The server drops the request and sends no
+reply to either frame. If a reply to the cancelled request still arrives, the client drops
+it.
+
+A client keeps at most 64 deferred requests in flight. A request waits for a free slot
+within its `requestTimeout`. If no slot frees up in time, it fails with
+`transientNotAccepted`. The client also keeps at most 64 connections for deferred
+requests open. A request that needs a new connection closes an idle one to another node.
+If the server refuses to admit a request with `deferredPollCapacityExceeded`, the client
+pauses and sends it again within the same timeout. A deferred poll or noncommitting fetch
+that lost its reply fails with `transientNotCommitted` and is not sent again, as an
+immediate poll.
+
+An unknown committing fetch fails with `fetchProgressUncertain` and an `operationID`.
+It blocks progress on every uncertain partition, including after reconnect or sign-in.
+Later progress polls and offset stores/deletes fail with `partitionLaneBlocked`, naming
+the partition and the same recovery handle. A partial reply keeps healthy sections and
+attaches the handle to each uncertain section's error. Raw fetches keep their wire bytes;
+inspect section statuses and obtain the handle from the next blocked progress call.
+
+`try client.abandonOperation(operationID)` explicitly releases those local blocks. It
+accepts that the old server request can still complete; it sends nothing and proves no
+commit outcome. Reading the current offset is not proof that the old request stopped.
+The client reserves room for at most 64 active or retained committing fetches before
+sending, so uncertainty can always be recorded. Explicit recovery frees that capacity.
+Consumers deliver healthy sections, surface the recovery error, and stop fetching until
+the application abandons it. Shutdown reports the handle and completes without abandoning
+or sending a rewind through the block.
+
 ### Consumer groups
 
 A member polls without a partition id and the client takes the next partition of its
-assignment, round-robin, syncing the assignment from the server when it changes. The
-heartbeat syncs every joined group, so a member picks up new partitions on its own:
+assignment, round-robin, syncing the assignment from the server when it changes. A
+deferred group poll without a partition id fails with `invalidCommand`. Fetch the
+readiness groups of the assignment instead, as described in Deferred polls. The heartbeat
+syncs every joined group, so a member picks up new partitions on its own:
 
 ```swift
 try await client.joinConsumerGroup(streamID: "orders", topicID: "created", groupID: "billing")
@@ -337,37 +426,69 @@ for try await received in consumer {
 }
 ```
 
-A poll refills the buffer once it runs empty. `pollingStrategy` says where reading a
-partition starts, and each later poll of it continues after the last message handed over
-from it. The exception is `.next` with an `autoCommit` that commits with every poll, as in
-the default configuration. That poll starts after the offset that the previous poll
-stored. A failed poll is thrown after the retry
-interval and leaves the consumer usable, so a caller of `next()` can call it again, and
-`consumeMessages(_:)` logs it and keeps reading until the client cannot come back on its
-own. Without `allowReplay` a message at or below the last one handed over from the same
-partition history is skipped.
+A standalone consumer polls its partition once the buffer runs empty. A group member
+fetches the partitions of each readiness group with one request. Each request is deferred
+with `pollOptions`, which has the defaults of `DeferredPollOptions()`. The server holds
+the request until a message arrives or `maxWait` runs out. So an idle consumer gets a new
+message at once and does not poll in a loop. `pollInterval` was removed for this reason. A
+message larger than `pollOptions.maxBytes` is polled alone, without that limit.
+`pollingStrategy` says where reading a partition starts, and each later read of it
+continues after the last batch read from it. A standalone consumer has one exception:
+`.next` with an `autoCommit` that commits with every poll, as in the default
+configuration. That poll starts after the offset that the previous poll stored. A failed
+poll of a standalone consumer is thrown after `pollingRetryInterval`, one second by
+default, and leaves the consumer usable. A group member throws a failed read at once, and
+it reads those partitions again after `pollingRetryInterval`. A caller of `next()` can
+call it again, and `consumeMessages(_:)` logs the error and keeps reading until the client
+cannot come back on its own. A group member that lost its membership waits as long before
+it joins again, and a member without partitions waits as long between reads. Without
+`allowReplay` a message at or below the last one handed over from the same partition
+history is skipped.
+
+A group member that does not commit with every poll sends the next fetch of a group when
+the reply before it arrives. It does this before it hands that reply over. A partition
+that becomes idle while that fetch waits goes into a second fetch. A member that commits
+with every poll fetches a group only after it handed over everything. So the server
+stores at most one batch per group as consumed before the reader asked for it. A partition that starts
+at `.first`, `.last` or a timestamp is polled alone until it has a position. A member that
+commits with every poll finds that position with a poll that commits nothing. A group
+member continues after an offset that you store at or after its position, so a store can
+skip messages. A fetched batch that does not decode is thrown, and the member reads it
+again from its first message after `pollingRetryInterval`.
 
 `autoCommit` decides when the position is stored. The default commits with every poll,
 before the batch is handed over, and on a one-second interval; `.disabled` leaves it to
 `storePosition(_:)` with the position of a `ReceivedMessage`, the only setting under which a
 message whose handling failed comes back on the next run. `shutdown()` sends the queued
 commits, stores the reading position of every partition read unless auto-commit is
-disabled, and leaves the group.
+disabled, and leaves the group. It cancels a poll in flight at once, unless the server
+stores the offset with the poll. Such a poll gets `offsetDrainTimeout` to return. A fetch
+of a group member that commits is never cancelled, so `shutdown()` waits for its reply,
+at most its `requestTimeout`. A batch that was not handed over makes the final store move
+the offset back to the last message handed over. A `.next` consumer that handed over nothing from that partition moves it back
+before the batch. A group member does not move the offset of a partition that left its
+assignment, because another member reads it now.
 
 Unlike the Rust consumer this one has no encryptor, and it does not resolve a group create
-or join whose reply was lost, since the Swift client has no operation lanes yet.
+or join whose reply was lost, since the Swift client has no operation lanes yet. For the
+same reason, a store or delete of a partition waits for a group read in flight that reads
+or moves the stored offset of that partition. Such a read commits, or it starts after the
+stored offset. No such read of the partition starts while the store waits.
 
 ### Raw requests
 
 `sendRawRequest(code:payload:)` sends a command code with an encoded payload and returns the raw reply body. `sendRawRequest(code:payload:replica:)` sends it to one node of a cluster, named by the replica id that cluster metadata returns.
 
-Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, consumer-offset reads and session-control codes fail with `invalidCommand` before anything is sent. An id that cluster metadata does not name fails with `invalidIdentifier`. An unreachable node is retried until the request timeout, and `notPrimary` is returned rather than sent to another node.
+A raw deferred poll (106) or fetch (109) takes the route and the limits of its typed call. A raw fetch keeps the fences and the target limits of its payload. If its payload does not decode or its options are out of range, it fails with `invalidCommand`. A raw cancellation (108) fails with `invalidCommand`: cancel the task of the deferred request instead.
+
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, deferred polls, fetches, cancellations, consumer-offset reads and session-control codes fail with `invalidCommand` before anything is sent. An id that cluster metadata does not name fails with `invalidIdentifier`. An unreachable node is retried until the request timeout, and `notPrimary` is returned rather than sent to another node.
 
 ### Errors
 
 Every client operation throws `IggyError`, a value carrying the typed `code`
 (`IggyErrorCode`, one case per server error code), the raw wire code, and optional
-context. A cancelled task gets `CancellationError`. A direct producer send is the
+context. Fetch recovery errors also carry `operationID` and, for a blocked target,
+`partitionID`. A cancelled task gets `CancellationError`. A direct producer send is the
 exception: a failure while sending, cancellation included, throws `ProducerSendError`,
 carrying the `IggyError` as `cause`, the confirmations so far, and the unconfirmed
 `failed` tail. A send refused before it starts, such as with `producerClosed` after

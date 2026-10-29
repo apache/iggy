@@ -155,7 +155,7 @@ impl IggyBridge {
             RecordLookup::Last => PollingStrategy::last(),
         };
         let (polled, slot) = self
-            .poll_by(slot, kafka_topic, partition, strategy, 1, deadline)
+            .poll_by(slot, kafka_topic, partition, strategy, deadline)
             .await?;
         let located = polled.map(|polled| polled.messages.first().map(LocatedRecord::from));
         Some((located, slot))

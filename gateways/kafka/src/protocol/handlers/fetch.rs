@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use iggy::prelude::{
-    IGGY_MESSAGE_HEADER_SIZE, IggyError, IggyMessage, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE,
-    PolledMessages,
+    DEFAULT_POLL_MAX_BYTES, IGGY_MESSAGE_HEADER_SIZE, IggyError, IggyMessage, MAX_PAYLOAD_SIZE,
+    MAX_USER_HEADERS_SIZE, PollOptions, PolledMessages,
 };
 use kafka_protocol::indexmap::IndexSet;
 use kafka_protocol::messages::fetch_response::{FetchableTopicResponse, PartitionData};
@@ -36,7 +36,7 @@ use kafka_protocol::records::Record;
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
 
-use crate::bridge::iggy_bridge::{FetchSlot, PartitionProbe, TopicProbe};
+use crate::bridge::iggy_bridge::{FetchSlot, ONE_MESSAGE_MAX_BYTES, PartitionProbe, TopicProbe};
 use crate::bridge::topic_map::validate_kafka_topic_name;
 use crate::bridge::{BridgeError, IggyBridge};
 use crate::error::Result;
@@ -81,8 +81,7 @@ const LAST_GOOD_TTL: Duration = Duration::from_secs(30);
 
 /// Most messages one partition read takes from Iggy, over all its polls.
 const MAX_POLL_COUNT: u32 = 1000;
-/// Most messages one poll asks for. Iggy caps a poll by count, not by bytes, so this caps what one
-/// poll can load: about 1 GB of the largest messages. A byte cap in Iggy would lift it.
+/// Most messages one poll asks for. With the largest messages, one poll can load about 1 GB.
 const MAX_PAGE_COUNT: u32 = 16;
 /// The largest message Iggy stores, header included.
 const LARGEST_MESSAGE_BYTES: u64 =
@@ -851,7 +850,11 @@ impl<'a> Reader<'a> {
         if worth_polling(self.owes_first_record, budget, probe.average_size) {
             while let Some(count) = next_page(&polled, budget, probe.average_size) {
                 let asked = Instant::now();
-                let Some(page) = self.poll(want.topic, at.index, polled.next, count).await else {
+                let left = budget.saturating_sub(polled.bytes);
+                let Some(page) = self
+                    .poll(want.topic, at.index, polled.next, count, left)
+                    .await
+                else {
                     break;
                 };
                 match page {
@@ -931,7 +934,7 @@ impl<'a> Reader<'a> {
         }
         let count = poll_count(budget, probe.average_size, u64::from(MAX_PAGE_COUNT));
         let asked = Instant::now();
-        match self.poll(want.topic, at.index, offset, count).await {
+        match self.poll(want.topic, at.index, offset, count, budget).await {
             None => Read::Done(unread),
             Some(Err(error)) => Read::Done(self.refuse(want, at, offset, &error)),
             Some(Ok(page)) if !page.messages.is_empty() => {
@@ -1044,18 +1047,25 @@ impl<'a> Reader<'a> {
         refused(want.partition, code)
     }
 
-    /// Polls one page, in the read slot. `None` once `give_up_at` passes.
+    /// Polls one page of at most `count` messages and [`page_max_bytes`] bytes, in the read slot.
+    /// `None` once `give_up_at` passes.
     async fn poll(
         &mut self,
         topic: &str,
         index: u32,
         offset: u64,
         count: u32,
+        budget: usize,
     ) -> Option<core::result::Result<PolledMessages, BridgeError>> {
         let give_up_at = self.fetch.give_up_at;
         if Instant::now() >= give_up_at {
             return None;
         }
+        let options = PollOptions {
+            count,
+            max_bytes: page_max_bytes(count, budget),
+            ..PollOptions::default()
+        };
         let bridge = self.fetch.bridge;
         let (page, slot) = bridge
             .poll(
@@ -1063,7 +1073,7 @@ impl<'a> Reader<'a> {
                 topic,
                 index,
                 offset,
-                count,
+                options,
                 give_up_at,
             )
             .await?;
@@ -1612,6 +1622,20 @@ fn poll_count(budget: usize, average_size: u64, waiting: u64) -> u32 {
     u32::try_from(count).unwrap_or(MAX_POLL_COUNT)
 }
 
+/// The byte cap of a poll of `count` messages with `budget` bytes left.
+///
+/// The budget, but never below Iggy's default cap: Iggy refuses a cap too small for the first
+/// message, and the encoder trims the page to the budget anyway. One message gets
+/// [`ONE_MESSAGE_MAX_BYTES`].
+fn page_max_bytes(count: u32, budget: usize) -> u32 {
+    if count == 1 {
+        return ONE_MESSAGE_MAX_BYTES;
+    }
+    u32::try_from(budget)
+        .unwrap_or(u32::MAX)
+        .max(DEFAULT_POLL_MAX_BYTES)
+}
+
 /// Bytes Iggy stores for `message`, header included, as the probe's average counts them.
 fn stored_bytes(message: &IggyMessage) -> usize {
     IGGY_MESSAGE_HEADER_SIZE
@@ -1904,6 +1928,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn given_a_budget_when_capping_a_page_should_send_it_but_never_below_the_default_cap() {
+        let budget = 4 * 1024 * 1024;
+        assert_eq!(
+            page_max_bytes(MAX_PAGE_COUNT, budget),
+            u32::try_from(budget).unwrap()
+        );
+        assert_eq!(
+            page_max_bytes(MAX_PAGE_COUNT, 10),
+            DEFAULT_POLL_MAX_BYTES,
+            "Iggy refuses a cap too small for the first message"
+        );
+        assert_eq!(page_max_bytes(2, usize::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn given_one_message_when_capping_the_page_should_send_no_cap() {
+        for budget in [0, 10, 4 * 1024 * 1024, usize::MAX] {
+            assert_eq!(
+                page_max_bytes(1, budget),
+                u32::MAX,
+                "a cap can only refuse the one message, never trim it"
+            );
+        }
+    }
+
     /// A page of messages from `first` on, one per payload size.
     fn page(first: u64, sizes: &[usize], current_offset: u64) -> PolledMessages {
         let messages: Vec<IggyMessage> = sizes
@@ -1918,13 +1968,13 @@ mod tests {
                 message
             })
             .collect();
-        PolledMessages {
-            partition_id: 0,
+        PolledMessages::new(
+            iggy::prelude::PartitionContext::default(),
+            0,
             current_offset,
-            count: u32::try_from(messages.len()).unwrap(),
+            u32::try_from(messages.len()).unwrap(),
             messages,
-            context: iggy::prelude::PartitionContext::default(),
-        }
+        )
     }
 
     #[test]

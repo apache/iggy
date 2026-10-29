@@ -24,6 +24,7 @@ import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.DeferredPollOptions;
+import org.apache.iggy.message.FetchedMessages;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
@@ -31,6 +32,7 @@ import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 public interface MessagesClient {
@@ -129,9 +131,13 @@ public interface MessagesClient {
      * consumer over HTTP: without a persistent connection the client cannot follow the group's
      * partition assignment. A group consumer is rejected before any request is sent.
      *
+     * <p>A group poll must name its partition. Without one, the TCP client fails with
+     * {@link org.apache.iggy.exception.IggyErrorCode#INVALID_COMMAND} before it sends anything.
+     * {@link #readinessGroups} and {@link #fetchMessages} read the whole assignment of a group.
+     *
      * @param streamId    the stream identifier (numeric or string-based)
      * @param topicId     the topic identifier (numeric or string-based)
-     * @param partitionId optional partition ID to poll from
+     * @param partitionId the partition ID to poll from, which only a plain consumer can leave empty
      * @param consumer    the consumer identity
      * @param strategy    the polling strategy controlling where to start reading
      * @param count       the maximum number of messages to return
@@ -151,6 +157,53 @@ public interface MessagesClient {
             DeferredPollOptions options) {
         throw new IggyOperationNotSupportedException(
                 "pollMessagesDeferred", getClass().getSimpleName());
+    }
+
+    /**
+     * Groups {@code partitions} by their primary, with at most 1000 partitions in a group.
+     *
+     * <p>See {@link org.apache.iggy.client.async.MessagesClient#readinessGroups} for full
+     * documentation. The HTTP client does not support it, because the server has no HTTP route
+     * for grouping partitions by primary.
+     *
+     * @param streamId   the stream identifier (numeric or string-based)
+     * @param topicId    the topic identifier (numeric or string-based)
+     * @param partitions partition IDs from 0 to 4294967295
+     * @return the groups, each in the order of {@code partitions}
+     */
+    default List<List<Long>> readinessGroups(StreamId streamId, TopicId topicId, List<Long> partitions) {
+        throw new IggyOperationNotSupportedException(
+                "readinessGroups", getClass().getSimpleName());
+    }
+
+    /**
+     * Fetches messages from several partitions of one primary in one request.
+     *
+     * <p>See {@link org.apache.iggy.client.async.MessagesClient#fetchMessages} for full
+     * documentation. The HTTP client does not support it, because the server has no HTTP route
+     * for a fetch. An interrupt cancels a fetch without {@code autoCommit}. A fetch with
+     * {@code autoCommit} ignores interrupts and waits for its reply, because a cancel can lose
+     * the messages that the server committed.
+     *
+     * @param streamId   the stream identifier (numeric or string-based)
+     * @param topicId    the topic identifier (numeric or string-based)
+     * @param targets    1 to 1000 partition IDs from 0 to 4294967295, each with an Offset or Next
+     *                   strategy, in the order that the server reads them
+     * @param consumer   the consumer identity, either individual or group
+     * @param count      the maximum number of messages of all sections together
+     * @param autoCommit whether the server commits the consumer offset of each read partition
+     * @param options    the wait, message count, byte and request time limits
+     * @return the sections of the reply, in its order
+     */
+    default List<FetchedMessages> fetchMessages(
+            StreamId streamId,
+            TopicId topicId,
+            Map<Long, PollingStrategy> targets,
+            Consumer consumer,
+            Long count,
+            boolean autoCommit,
+            DeferredPollOptions options) {
+        throw new IggyOperationNotSupportedException("fetchMessages", getClass().getSimpleName());
     }
 
     default SendMessagesResponse sendMessages(

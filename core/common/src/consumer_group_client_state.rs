@@ -18,13 +18,12 @@
 //! Client-side consumer-group + partitioning state for the VSR transport.
 //!
 //! The SDK resolves partition operations locally before encoding their namespace:
-//! - consumer-group polls select the next of the member's assigned partitions
-//!   (round-robin) from the cached assignment synced from the coordinator;
+//! - a consumer-group member reads the assignment synced from the coordinator;
 //! - `Balanced` produce round-robins per topic; `MessagesKey` hashes the key.
 //!
 //! Cursors must persist across calls, so this lives on the long-lived
-//! transport. The coordinator fences stale selections (rebalance), prompting a
-//! re-sync that resets the cursor.
+//! transport. The coordinator fences stale assignments (rebalance), prompting
+//! a re-sync.
 
 use crate::{Identifier, IggyError};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
@@ -36,7 +35,6 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 struct GroupAssignment {
     partitions: Vec<u32>,
     generation: u64,
-    cursor: usize,
 }
 
 #[derive(Debug, Default)]
@@ -79,12 +77,13 @@ struct GroupState {
 
 impl GroupState {
     fn set_assignment(&mut self, key: String, generation: u64, partitions: Vec<u32>) {
-        let entry = self.assignments.entry(key).or_default();
-        if entry.generation != generation {
-            entry.cursor = 0;
-        }
-        entry.generation = generation;
-        entry.partitions = partitions;
+        self.assignments.insert(
+            key,
+            GroupAssignment {
+                partitions,
+                generation,
+            },
+        );
     }
 }
 
@@ -141,32 +140,15 @@ impl ConsumerGroupClientState {
             .is_some_and(|assignment| !assignment.partitions.is_empty())
     }
 
-    /// Replace the cached assignment for a group. A generation change (a
-    /// rebalance) resets the round-robin cursor so selection restarts cleanly.
+    /// Replace the cached assignment for a group.
     pub fn set_assignment(&self, key: String, generation: u64, partitions: Vec<u32>) {
         self.groups_mut()
             .set_assignment(key, generation, partitions);
     }
 
-    /// Drop a group's cached assignment (after a fence rejection) so the next
-    /// poll re-syncs.
+    /// Drop a group's cached assignment, so it must be synced again.
     pub fn invalidate_assignment(&self, key: &str) {
         self.groups_mut().assignments.remove(key);
-    }
-
-    /// The next assigned partition for a group poll, advancing the cursor.
-    /// `None` when nothing is cached / the assignment is empty.
-    #[must_use]
-    pub fn next_group_partition(&self, key: &str) -> Option<u32> {
-        let mut groups = self.groups();
-        let map = &mut groups.assignments;
-        let assignment = map.get_mut(key)?;
-        if assignment.partitions.is_empty() {
-            return None;
-        }
-        let index = assignment.cursor % assignment.partitions.len();
-        assignment.cursor = assignment.cursor.wrapping_add(1);
-        Some(assignment.partitions[index])
     }
 
     /// The next `Balanced` produce partition for a topic, advancing the cursor.
@@ -427,13 +409,13 @@ mod tests {
 
         state.set_assignment(KEY.to_owned(), 1, vec![0, 1]);
         assert!(changed(&state));
-        assert_eq!(state.next_group_partition(KEY), Some(0));
+        assert_eq!(state.assignment_snapshot(KEY).1, [0, 1]);
         let version = AssignmentVersion {
             session: 0,
             generation: 1,
         };
         assert!(!state.is_current_assignment(KEY, version, 0));
-        assert!(!changed(&state), "reads and cursor moves keep the count");
+        assert!(!changed(&state), "reads keep the count");
         state.register_group(
             KEY.to_owned(),
             identifier.clone(),
@@ -451,27 +433,6 @@ mod tests {
         assert!(changed(&state));
         state.clear_session_scoped();
         assert!(changed(&state));
-    }
-
-    #[test]
-    fn group_partition_round_robins_then_wraps() {
-        let state = ConsumerGroupClientState::new();
-        state.set_assignment("s|t|g".to_owned(), 1, vec![0, 1, 2]);
-        let picks: Vec<u32> = (0..4)
-            .map(|_| state.next_group_partition("s|t|g").unwrap())
-            .collect();
-        assert_eq!(picks, vec![0, 1, 2, 0]);
-    }
-
-    #[test]
-    fn generation_change_resets_cursor() {
-        let state = ConsumerGroupClientState::new();
-        state.set_assignment("s|t|g".to_owned(), 1, vec![0, 1, 2]);
-        assert_eq!(state.next_group_partition("s|t|g"), Some(0));
-        assert_eq!(state.next_group_partition("s|t|g"), Some(1));
-        // Rebalance: new generation, one partition, cursor reset.
-        state.set_assignment("s|t|g".to_owned(), 2, vec![5]);
-        assert_eq!(state.next_group_partition("s|t|g"), Some(5));
     }
 
     #[test]
@@ -514,7 +475,7 @@ mod tests {
     fn missing_assignment_yields_none() {
         let state = ConsumerGroupClientState::new();
         assert!(!state.has_assignment("s|t|g"));
-        assert_eq!(state.next_group_partition("s|t|g"), None);
+        assert!(state.assignment_snapshot("s|t|g").1.is_empty());
     }
 
     #[test]

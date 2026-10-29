@@ -22,6 +22,7 @@ use futures::StreamExt;
 use iggy::prelude::IggyConsumer as RustIggyConsumer;
 use tokio::sync::Mutex;
 
+use crate::consumer::lock_consumer;
 use crate::error::to_php_exception;
 use crate::receive_message::ReceiveMessage;
 use crate::runtime::runtime;
@@ -47,12 +48,10 @@ impl MessageIterator {
     }
 
     fn poll_next(&mut self) -> PhpResult {
-        let inner = self.inner.clone();
+        let mut consumer = lock_consumer(&self.inner, "iterMessages()")?;
 
-        self.current = runtime().block_on(async move {
-            let mut inner = inner.lock().await;
-
-            match inner.next().await {
+        self.current = runtime().block_on(async {
+            match consumer.next().await {
                 Some(Ok(message)) => Ok(Some(ReceiveMessage::from(message))),
                 Some(Err(err)) => Err(to_php_exception(err)),
                 None => Ok(None),

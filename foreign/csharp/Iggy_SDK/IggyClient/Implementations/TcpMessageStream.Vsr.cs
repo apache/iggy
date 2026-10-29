@@ -40,7 +40,7 @@ namespace Apache.Iggy.IggyClient.Implementations;
 ///     assignment the broker does not
 ///     resolve server-side. The command surface lives in <see cref="TcpMessageStream" />.
 /// </summary>
-public sealed partial class TcpMessageStream : ISessionGenerationProvider
+public sealed partial class TcpMessageStream : ISessionGenerationProvider, IConsumerGroupAssignmentProvider
 {
     /// <summary>
     ///     Admission, routing, and retries share one call deadline. Each link also bounds incomplete frame
@@ -517,6 +517,25 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
         // Running out of attempts mid-rebalance is not a failure: report it like a member that owns nothing
         // yet, so the consumer backs off and polls again.
         return NoAssignedPartitionPolledMessages;
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<uint>> GetAssignedPartitionsAsync(Identifier streamId, Identifier topicId,
+        Identifier groupId, bool resync, CancellationToken token = default)
+    {
+        var generation = _consensusSession.Generation;
+        var key = new GroupKey(streamId, topicId, groupId);
+        if (resync)
+        {
+            _groupState.InvalidateAssignment(key);
+        }
+
+        if (!_groupState.HasAssignment(key))
+        {
+            await SyncGroupAssignmentAsync(streamId, topicId, groupId, token, startedUnder: generation);
+        }
+
+        return _groupState.AssignedPartitions(key);
     }
 
     /// <summary>

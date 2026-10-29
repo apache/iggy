@@ -28,17 +28,19 @@ use ext_php_rs::{binary::Binary, exception::PhpResult, php_class, php_impl, type
 use iggy::prelude::{
     CompressionAlgorithm, Consumer as RustConsumer, IggyClient as RustIggyClient,
     IggyClientBuilder, IggyExpiry, IggyMessage as RustMessage, MaxTopicSize, Partitioning,
-    PollingStrategy as RustPollingStrategy, *,
+    PollOptions as RustPollOptions, PollingStrategy as RustPollingStrategy, *,
 };
 use tokio::sync::Mutex;
 
-use crate::consumer::{AutoCommit, IggyConsumer};
+use crate::consumer::{ClientCommitPolicy, IggyConsumer};
 use crate::durability::Durability as PhpDurability;
 use crate::error::to_php_exception;
 use crate::identifier::PhpIdentifier;
 use crate::metadata_changes::{MetadataChangeGroup, MetadataChangeStart, MetadataChanges};
 use crate::options::{OptionSpec, OptionsScope, StreamOptionKey, TopicOptionKey, reset_names};
-use crate::receive_message::{PollingStrategy, ReceiveMessage};
+use crate::poll_options::PollOptions;
+use crate::reader::PartitionReader;
+use crate::receive_message::{PolledMessages, PollingStrategy};
 use crate::runtime::runtime;
 use crate::send_message::{SendMessage, SendMessagesResponse};
 use crate::stream::StreamDetails;
@@ -162,6 +164,8 @@ impl IggyClient {
 
     /// Replays an exact retained operation. A committed rejection raises its original error
     /// and releases its lane; uncertainty keeps it retained. HTTP is unsupported.
+    /// A fetch progress block raises code 14010 without replay. Only explicit
+    /// abandonOperation releases it, accepting the unknown server outcome.
     /// Operation IDs use decimal strings to preserve the full unsigned 64-bit range.
     pub fn resolve_operation(
         &self,
@@ -509,54 +513,102 @@ impl IggyClient {
         })
     }
 
-    /// Polls messages from the specified topic and partition.
+    /// Polls messages from one partition of a topic, as the standalone consumer `consumer`.
     ///
-    /// Each message keeps the partition context of this poll. To continue at an offset under
-    /// that context, pass PollingStrategy::offset($offset)->withContext($message->context()).
-    /// A stale context fails with HistoryUnavailable (87).
+    /// PollingStrategy::next() starts at the stored offset of `consumer`. `options` defaults to
+    /// `new PollOptions()`: up to 1000 messages and no wait. With ServerCommitPolicy::OnRead,
+    /// the server stores the offset of the batch for `consumer`.
     ///
-    /// Without a context, the poll uses the context of its route. It can fail once with
+    /// To read on, pass `$polled->continuation()` as the next strategy. It keeps the partition
+    /// history of the batch, so a read after the partition was recreated fails with
+    /// HistoryUnavailable (87), and a read of another partition refuses it with InvalidCommand
+    /// (3).
+    ///
+    /// A fresh strategy uses the context of its route. It can fail once with
     /// HistoryUnavailable (87) after another client deleted and recreated the partition. The
     /// failed route is dropped, and the next call routes again.
+    ///
+    /// Under ServerCommitPolicy::OnRead, a lost reply throws FetchProgressUncertain (14010),
+    /// because the server can still store the offset. The partition stays blocked, and the
+    /// next poll of it throws PartitionLaneBlocked (14009), until abandonOperation().
     pub fn poll_messages(
         &self,
         stream: PhpIdentifier,
         topic: PhpIdentifier,
         partition_id: u32,
+        consumer: PhpIdentifier,
         polling_strategy: &PollingStrategy,
-        count: u32,
-        auto_commit: bool,
-    ) -> PhpResult<Vec<ReceiveMessage>> {
-        let consumer = RustConsumer::default();
+        options: Option<&PollOptions>,
+    ) -> PhpResult<PolledMessages> {
+        let consumer = RustConsumer::new(consumer.try_into()?);
         let stream: Identifier = stream.try_into()?;
         let topic: Identifier = topic.try_into()?;
         let strategy: RustPollingStrategy = polling_strategy.into();
+        let options = options.map_or_else(RustPollOptions::default, |options| options.inner);
         let inner = self.inner.clone();
 
         runtime().block_on(async move {
-            let polled_messages = inner
-                .poll_messages(
-                    &stream,
-                    &topic,
-                    Some(partition_id),
-                    &consumer,
-                    &strategy,
-                    count,
-                    auto_commit,
-                )
+            inner
+                .poll_messages(&stream, &topic, partition_id, &consumer, &strategy, options)
                 .await
-                .map_err(to_php_exception)?;
-
-            Ok(polled_messages
-                .messages
-                .into_iter()
-                .map(|message| ReceiveMessage {
-                    inner: message,
-                    partition_id,
-                    context: polled_messages.context,
-                })
-                .collect())
+                .map(PolledMessages::from)
+                .map_err(to_php_exception)
         })
+    }
+
+    /// Builds a reader of chosen partitions as a standalone consumer.
+    ///
+    /// `partitions` must not be empty. `start` is the start of a partition without a stored
+    /// offset, PollingStrategy::next() when null, and a continuation is refused. `options`
+    /// defaults to a wait of 1 second for up to 1000 messages per request: a reader that waits
+    /// 0 polls an idle topic in a busy loop. `prefetch_bytes`, 16 MiB when null, and
+    /// `prefetch_messages`, the larger of 16000 and `count` when null, bound the requests in
+    /// flight and the queued batches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reader(
+        &self,
+        stream: PhpIdentifier,
+        topic: PhpIdentifier,
+        consumer: PhpIdentifier,
+        partitions: Vec<u32>,
+        start: Option<&PollingStrategy>,
+        options: Option<&PollOptions>,
+        prefetch_bytes: Option<&Zval>,
+        prefetch_messages: Option<&Zval>,
+    ) -> PhpResult<PartitionReader> {
+        let stream: Identifier = stream.try_into()?;
+        let topic: Identifier = topic.try_into()?;
+        let consumer = RustConsumer::new(consumer.try_into()?);
+        let builder = self
+            .inner
+            .reader(&stream, &topic, &consumer)
+            .partitions(partitions);
+
+        build_reader(builder, start, options, prefetch_bytes, prefetch_messages)
+    }
+
+    /// Builds a reader of the partitions that a consumer group assigns to this member.
+    ///
+    /// The group must exist: the reader joins it, joins again after a session loss, and leaves
+    /// it in close(). HTTP cannot join a group, so it throws FeatureUnavailable. The other
+    /// arguments are those of reader().
+    #[allow(clippy::too_many_arguments)]
+    pub fn group_reader(
+        &self,
+        stream: PhpIdentifier,
+        topic: PhpIdentifier,
+        group: PhpIdentifier,
+        start: Option<&PollingStrategy>,
+        options: Option<&PollOptions>,
+        prefetch_bytes: Option<&Zval>,
+        prefetch_messages: Option<&Zval>,
+    ) -> PhpResult<PartitionReader> {
+        let stream: Identifier = stream.try_into()?;
+        let topic: Identifier = topic.try_into()?;
+        let group = RustConsumer::group(group.try_into()?);
+        let builder = self.inner.reader(&stream, &topic, &group);
+
+        build_reader(builder, start, options, prefetch_bytes, prefetch_messages)
     }
 
     /// Deletes a stream by id or name.
@@ -588,41 +640,35 @@ impl IggyClient {
 
     /// Creates and initializes a consumer group consumer.
     ///
-    /// `$partition_id` is ignored for a consumer group: the member reads the partitions
-    /// the server assigns to it. `$poll_interval_micros` must be null: the consumer waits
-    /// on the server for new messages.
+    /// The member reads the partitions that the server assigns to it. `polling_strategy` is
+    /// the start of a partition without a stored offset, PollingStrategy::next() when null, and
+    /// a continuation is refused. `poll_options` defaults to a wait of 1 second for up to 1000
+    /// messages per request: a consumer that waits 0 polls an idle topic in a busy loop.
+    /// `client_commit` defaults to storing nothing: commit checkpoints after processing, or
+    /// each restart reads the same messages again. With ServerCommitPolicy::OnRead in
+    /// `poll_options`, the server stores the offset of each batch that it reads, and a
+    /// `client_commit` other than the default is refused with InvalidConfiguration.
+    /// `prefetch_bytes` and `prefetch_messages` are those of reader().
     #[allow(clippy::too_many_arguments)]
-    #[php(defaults(
-        create_consumer_group_if_not_exists = true,
-        auto_join_consumer_group = true,
-        allow_replay = false
-    ))]
+    #[php(defaults(create_consumer_group_if_not_exists = true, allow_replay = false))]
     pub fn consumer_group(
         &self,
         name: String,
         stream: String,
         topic: String,
-        partition_id: Option<&Zval>,
         polling_strategy: Option<&PollingStrategy>,
-        batch_length: Option<&Zval>,
-        auto_commit: Option<&AutoCommit>,
+        poll_options: Option<&PollOptions>,
+        client_commit: Option<&ClientCommitPolicy>,
+        prefetch_bytes: Option<&Zval>,
+        prefetch_messages: Option<&Zval>,
         create_consumer_group_if_not_exists: bool,
-        auto_join_consumer_group: bool,
-        poll_interval_micros: Option<&Zval>,
         polling_retry_interval_micros: Option<&Zval>,
         init_retries: Option<&Zval>,
         init_retry_interval_micros: Option<&Zval>,
         allow_replay: bool,
     ) -> PhpResult<IggyConsumer> {
-        // The removed setting keeps its slot, so a positional call written for it fails
-        // instead of setting `polling_retry_interval_micros`.
-        if poll_interval_micros.is_some_and(|value| !value.is_null()) {
-            return Err(to_php_exception(
-                "'poll_interval_micros' is no longer supported and must be null: the consumer waits on the server for new messages",
-            ));
-        }
-        let partition_id = optional_unsigned::<u32>(partition_id, "partition_id")?;
-        let batch_length = optional_unsigned::<u32>(batch_length, "batch_length")?;
+        let prefetch_bytes = optional_unsigned(prefetch_bytes, "prefetch_bytes")?;
+        let prefetch_messages = optional_unsigned(prefetch_messages, "prefetch_messages")?;
         let polling_retry_interval_micros = optional_unsigned::<u64>(
             polling_retry_interval_micros,
             "polling_retry_interval_micros",
@@ -634,27 +680,27 @@ impl IggyClient {
             .inner
             .consumer_group(&name, &stream, &topic)
             .map_err(to_php_exception)?
-            .without_encryptor()
-            .partition(partition_id);
+            .without_encryptor();
 
         builder = if create_consumer_group_if_not_exists {
             builder.create_consumer_group_if_not_exists()
         } else {
             builder.do_not_create_consumer_group_if_not_exists()
         };
-        builder = if auto_join_consumer_group {
-            builder.auto_join_consumer_group()
-        } else {
-            builder.do_not_auto_join_consumer_group()
-        };
         if let Some(polling_strategy) = polling_strategy {
             builder = builder.polling_strategy(polling_strategy.into());
         }
-        if let Some(batch_length) = batch_length {
-            builder = builder.batch_length(batch_length);
+        if let Some(poll_options) = poll_options {
+            builder = builder.poll_options(poll_options.inner);
         }
-        if let Some(auto_commit) = auto_commit {
-            builder = builder.auto_commit(auto_commit.into());
+        if let Some(client_commit) = client_commit {
+            builder = builder.client_commit(client_commit.inner);
+        }
+        if let Some(bytes) = prefetch_bytes {
+            builder = builder.prefetch_bytes(bytes);
+        }
+        if let Some(messages) = prefetch_messages {
+            builder = builder.prefetch_messages(messages);
         }
         if let Some(micros) = polling_retry_interval_micros {
             builder = builder.polling_retry_interval(non_zero_duration_micros(
@@ -692,8 +738,10 @@ impl IggyClient {
             let name = consumer.name().to_string();
             let stream = consumer.stream().to_string();
             let topic = consumer.topic().to_string();
+            let state = consumer.state();
             Ok(IggyConsumer {
                 inner: Arc::new(Mutex::new(consumer)),
+                state,
                 name,
                 stream,
                 topic,
@@ -740,6 +788,32 @@ impl IggyClient {
                 .map_err(to_php_exception)
         })
     }
+}
+
+fn build_reader(
+    mut builder: ReaderBuilder,
+    start: Option<&PollingStrategy>,
+    options: Option<&PollOptions>,
+    prefetch_bytes: Option<&Zval>,
+    prefetch_messages: Option<&Zval>,
+) -> PhpResult<PartitionReader> {
+    if let Some(start) = start {
+        builder = builder.start(start.into());
+    }
+    if let Some(options) = options {
+        builder = builder.options(options.inner);
+    }
+    if let Some(bytes) = optional_unsigned(prefetch_bytes, "prefetch_bytes")? {
+        builder = builder.prefetch_bytes(bytes);
+    }
+    if let Some(messages) = optional_unsigned(prefetch_messages, "prefetch_messages")? {
+        builder = builder.prefetch_messages(messages);
+    }
+
+    runtime()
+        .block_on(builder.build())
+        .map(PartitionReader::from)
+        .map_err(to_php_exception)
 }
 
 pub(crate) fn non_zero_duration_micros(field: &str, micros: u64) -> PhpResult<NonZeroIggyDuration> {
@@ -807,7 +881,10 @@ fn stream_key(key: Binary<u8>) -> PhpResult<StreamEncryptionKey> {
         .map_err(to_php_exception)
 }
 
-fn optional_unsigned<T: TryFrom<i64>>(value: Option<&Zval>, field: &str) -> PhpResult<Option<T>> {
+pub(crate) fn optional_unsigned<T: TryFrom<i64>>(
+    value: Option<&Zval>,
+    field: &str,
+) -> PhpResult<Option<T>> {
     optional_integer(value, field)?
         .map(|value| {
             T::try_from(value).map_err(|_| {

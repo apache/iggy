@@ -110,27 +110,31 @@
 //!
 //! The [`IggyConsumer`] has:
 //! - A [`futures::Stream`] implementation, so a `while let Some(message) =
-//!   consumer.next().await` loop drives polling, paging, and the poll interval
-//!   for you.
-//! - A **polling strategy** ([`PollingStrategy`]: `next`, `offset`, or
-//!   `timestamp`) that tracks position.
-//! - **Auto-commit** ([`AutoCommit`]) stores the offset on an interval, or when
-//!   messages are polled, consumed one by one, consumed in full, or every Nth
-//!   message. A restart resumes from that last commit.
+//!   consumer.next().await` loop drives the reads, the prefetch, and the retries
+//!   of a [`PartitionReader`] for you.
+//! - A **start** ([`PollingStrategy`]: `next`, `offset`, `first`, `last`, or
+//!   `timestamp`) for each partition without a stored offset.
+//! - **Commits**: [`commit`] stores the checkpoint of a yielded message. A
+//!   [`ClientCommitPolicy`] commits the last yielded position on an interval,
+//!   after each message, every Nth message, or at the end of each batch. With
+//!   [`ServerCommitPolicy::OnRead`], the server stores the offset of each read
+//!   instead. A restart resumes from the last commit.
 //! - **Manual offset control** to store, read, or delete the offset of any
-//!   partition yourself when auto-commit is disabled or not enough.
+//!   partition yourself.
 //! - A **shared state handle** ([`IggyConsumerState`]) that another task can clone
 //!   to read offsets or commit while the consuming loop holds the consumer.
 //! - **Replay control** drops messages this consumer already consumed, unless you
 //!   opt into replaying them with `allow_replay`.
-//! - **Auto-join** of the consumer group, optionally creating it, plus a rejoin
-//!   once the server revokes membership or the connection comes back.
+//! - **Consumer group membership**: `init()` joins the group, optionally creating
+//!   it, the consumer joins again after a session loss, and `shutdown()` leaves it.
 //! - **Reconnection handling** pauses polling while the client is disconnected and
 //!   resumes it after the reconnect and the rejoin have gone through.
 //! - **Init retries** wait for the stream and topic to appear instead of failing
 //!   right away when the consumer starts before they exist.
 //! - Payload **decryption**.
-//! - **Graceful shutdown** flushes pending offsets and leaves the consumer group.
+//! - **Graceful shutdown** commits the last yielded positions under a client
+//!   commit policy, moves the offsets of `OnRead` back to them, and leaves the
+//!   consumer group.
 //!
 //! For details on the specific behavior of each feature, reach for the type-level
 //! documentation.
@@ -167,8 +171,8 @@
 //!   type, not changing a connection-string scheme.
 //! - **No producer or consumer helpers.** [`IggyProducer`] and [`IggyConsumer`]
 //!   are spawned from an [`IggyClient`], so a raw transport client gives you no
-//!   background batching, retries, polling loop, auto-commit, consumer-group
-//!   auto-join, or payload encryption. You get the request-response primitives
+//!   background batching, retries, polling loop, commit policies, consumer-group
+//!   membership, or payload encryption. You get the request-response primitives
 //!   ([`send_messages`], [`poll_messages`]) and nothing layered on top.
 //! - **Raw wire access.** [`BinaryTransport::send_raw_with_response`] sends an
 //!   arbitrary command code and payload and returns the raw response bytes.
@@ -228,7 +232,8 @@
 //!         .await?;
 //!
 //!     let mut consumer = client
-//!         .consumer("consumer_name", "stream_name", "topic_name", 1)?
+//!         .consumer("consumer_name", "stream_name", "topic_name")?
+//!         .partitions([1])
 //!         .build();
 //!     consumer.init().await?;
 //!     while let Some(message) = consumer.next().await {
@@ -258,7 +263,10 @@
 //! [`ErrorCallback`]: crate::clients::producer_error_callback::ErrorCallback
 //! [`Partitioner`]: crate::prelude::Partitioner
 //! [`PollingStrategy`]: crate::prelude::PollingStrategy
-//! [`AutoCommit`]: crate::prelude::AutoCommit
+//! [`PartitionReader`]: crate::prelude::PartitionReader
+//! [`commit`]: crate::prelude::IggyConsumer::commit
+//! [`ClientCommitPolicy`]: crate::prelude::ClientCommitPolicy
+//! [`ServerCommitPolicy::OnRead`]: crate::prelude::ServerCommitPolicy::OnRead
 //! [`IggyConsumerState`]: crate::prelude::IggyConsumerState
 //! [`futures::Stream`]: https://docs.rs/futures/latest/futures/stream/trait.Stream.html
 //! [`TcpClient`]: crate::prelude::TcpClient

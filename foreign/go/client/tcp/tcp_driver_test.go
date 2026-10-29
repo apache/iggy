@@ -695,6 +695,139 @@ func TestDriverProgressUncertaintyEndsCallAndReleasesLane(t *testing.T) {
 	}
 }
 
+// laneCalls makes the calls of the lane tests, all on one partition.
+type laneCalls struct {
+	stream, topic iggcon.Identifier
+	consumer      iggcon.Consumer
+	partition     uint32
+	message       iggcon.IggyMessage
+}
+
+func newLaneCalls(t *testing.T) laneCalls {
+	t.Helper()
+	message, err := iggcon.NewIggyMessage([]byte("payload"))
+	require.NoError(t, err)
+	return laneCalls{
+		stream:    numericIdentifier(t, 1),
+		topic:     numericIdentifier(t, 2),
+		consumer:  iggcon.NewSingleConsumer(numericIdentifier(t, 3)),
+		partition: 1,
+		message:   message,
+	}
+}
+
+func (c laneCalls) send(ctx context.Context, client *IggyTcpClient) error {
+	_, err := client.SendMessages(ctx, c.stream, c.topic, iggcon.PartitionId(c.partition), []iggcon.IggyMessage{c.message})
+	return err
+}
+
+func (c laneCalls) poll(ctx context.Context, client *IggyTcpClient, strategy iggcon.PollingStrategy, autoCommit bool) error {
+	_, err := client.PollMessages(ctx, c.stream, c.topic, c.consumer, strategy, 1, autoCommit, &c.partition)
+	return err
+}
+
+func (c laneCalls) getOffset(ctx context.Context, client *IggyTcpClient) error {
+	_, err := client.GetConsumerOffset(ctx, c.consumer, c.stream, c.topic, &c.partition)
+	return err
+}
+
+func (c laneCalls) storeOffset(ctx context.Context, client *IggyTcpClient) error {
+	return client.StoreConsumerOffset(ctx, c.consumer, c.stream, c.topic, 7, &c.partition)
+}
+
+func (c laneCalls) deleteOffset(ctx context.Context, client *IggyTcpClient) error {
+	return client.DeleteConsumerOffset(ctx, c.consumer, c.stream, c.topic, &c.partition)
+}
+
+// consumerOffsetBody builds the reply of an offset read: the partition, its
+// current offset and the stored offset.
+func consumerOffsetBody(partition uint32) []byte {
+	body := binary.LittleEndian.AppendUint32(nil, partition)
+	body = binary.LittleEndian.AppendUint64(body, 0)
+	return binary.LittleEndian.AppendUint64(body, 0)
+}
+
+// progressLaneWaiters counts the calls that wait for a progress lane.
+func progressLaneWaiters(client *IggyTcpClient) int {
+	client.operations.mu.Lock()
+	defer client.operations.mu.Unlock()
+	waiters := 0
+	for key, lane := range client.operations.lanes {
+		if key.progress {
+			waiters += len(lane.waiters)
+		}
+	}
+	return waiters
+}
+
+// An uncertain offset store or delete blocks the progress of its partition
+// until it is resolved or abandoned, because a replay can still move the
+// offset. An uncertain send blocks only the later writes.
+func TestDriverOnlyARetainedOffsetWriteBlocksProgress(t *testing.T) {
+	calls := newLaneCalls(t)
+	for _, test := range []struct {
+		name           string
+		write          func(context.Context, *IggyTcpClient) error
+		blocksProgress bool
+	}{
+		{"store", calls.storeOffset, true},
+		{"delete", calls.deleteOffset, true},
+		{"send", calls.send, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, serverConn := newPipeClient(t)
+			attempts := make(map[uint64]int)
+			servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+				switch {
+				case read.operation() != vsr.OperationNonReplicated:
+					// 57 makes the write uncertain, and the refusal of its
+					// replay does not prove the outcome.
+					status := ierror.UnauthorizedCode
+					if attempts[read.requestID()] == 0 {
+						status = ierror.TransientNotCommittedCode
+					}
+					attempts[read.requestID()]++
+					return statusReplyFrame(read.operation(), uint32(status), nil)
+				case read.code() == uint32(command.GetOffsetCode):
+					return replyFrame(vsr.OperationNonReplicated, consumerOffsetBody(calls.partition))
+				default:
+					return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(calls.partition))
+				}
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), deferredTestTimeout)
+			defer cancel()
+			var uncertain ierror.OperationUncertain
+			require.ErrorAs(t, test.write(ctx, client), &uncertain)
+			requireBlocked := func(err error, call string) {
+				t.Helper()
+				var blocked ierror.LaneBlocked
+				require.ErrorAs(t, err, &blocked, call)
+				require.Equal(t, uncertain.OperationID, blocked.OperationID, call)
+			}
+
+			requireBlocked(calls.send(ctx, client), "a send")
+			requireBlocked(calls.storeOffset(ctx, client), "an offset store")
+			for _, progress := range []struct {
+				call string
+				err  error
+			}{
+				{"an offset read", calls.getOffset(ctx, client)},
+				{"a Next poll", calls.poll(ctx, client, iggcon.NextPollingStrategy(), false)},
+				{"an auto-commit poll", calls.poll(ctx, client, iggcon.OffsetPollingStrategy(0), true)},
+			} {
+				if test.blocksProgress {
+					requireBlocked(progress.err, progress.call)
+				} else {
+					require.NoError(t, progress.err, progress.call)
+				}
+			}
+			require.NoError(t, calls.poll(ctx, client, iggcon.OffsetPollingStrategy(0), false), "a plain poll takes no lane")
+			require.NoError(t, client.AbandonOperation(ctx, uncertain.OperationID))
+			require.NoError(t, calls.poll(ctx, client, iggcon.NextPollingStrategy(), false))
+		})
+	}
+}
+
 func TestDriverPureReadRetriesUncertainReply(t *testing.T) {
 	client, peer := newPipeClient(t)
 	server := serve(peer, func(index int, read request) []byte {

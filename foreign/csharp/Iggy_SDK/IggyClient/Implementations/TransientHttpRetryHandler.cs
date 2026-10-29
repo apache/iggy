@@ -28,6 +28,12 @@ namespace Apache.Iggy.IggyClient.Implementations;
 /// </summary>
 internal sealed class TransientHttpRetryHandler : DelegatingHandler
 {
+    /// <summary>
+    ///     Marks a request whose caller sends it again itself. A deferred poll does: each attempt asks for what is
+    ///     left of its wait, so a copy of an earlier attempt would wait past the request timeout.
+    /// </summary>
+    internal static readonly HttpRequestOptionsKey<bool> SingleAttempt = new(nameof(SingleAttempt));
+
     private static readonly TimeSpan RetryDeadline = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan RetryInterval = TimeSpan.FromMilliseconds(50);
 
@@ -38,6 +44,11 @@ internal sealed class TransientHttpRetryHandler : DelegatingHandler
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,
         CancellationToken cancellationToken)
     {
+        if (request.Options.TryGetValue(SingleAttempt, out var single) && single)
+        {
+            return await base.SendAsync(request, cancellationToken);
+        }
+
         var deadline = Environment.TickCount64 + (long)RetryDeadline.TotalMilliseconds;
         byte[]? bufferedContent = null;
         if (request.Content is not null)

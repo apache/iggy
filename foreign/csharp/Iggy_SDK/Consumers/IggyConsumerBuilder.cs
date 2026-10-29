@@ -16,8 +16,10 @@
 // under the License.
 
 using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
+using Apache.Iggy.Exceptions;
 using Apache.Iggy.Factory;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
@@ -244,13 +246,17 @@ public class IggyConsumerBuilder
     }
 
     /// <summary>
-    ///     Sets the interval between polling attempts to control the rate of server requests
+    ///     Sets the readiness, reply-size and request limits of each poll. See <see cref="IggyConsumerConfig.PollOptions" />.
     /// </summary>
-    /// <param name="interval">The polling interval as a TimeSpan. Set to TimeSpan.Zero to disable throttling.</param>
+    /// <param name="options">
+    ///     The limits of each poll. <see cref="DeferredPollOptions.MinCount" /> must not exceed the batch size. For a
+    ///     consumer group, the request timeout must exceed the wait by one second, also without a wait.
+    /// </param>
     /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining</returns>
-    public IggyConsumerBuilder WithPollingInterval(TimeSpan interval)
+    public IggyConsumerBuilder WithPollOptions(DeferredPollOptions options)
     {
-        Config.PollingIntervalMs = (int)interval.TotalMilliseconds;
+        ArgumentNullException.ThrowIfNull(options);
+        Config.PollOptions = options;
         return this;
     }
 
@@ -383,9 +389,26 @@ public class IggyConsumerBuilder
             throw new InvalidOperationException($"BatchSize must be less than or equal to {int.MaxValue / 2}.");
         }
 
-        if (Config.PollingIntervalMs < 0)
+        if (Config.PollOptions is null)
         {
-            throw new InvalidOperationException("PollingIntervalMs cannot be negative.");
+            throw new InvalidOperationException("PollOptions must be set.");
+        }
+
+        try
+        {
+            if (Config.Consumer.Type == ConsumerType.ConsumerGroup)
+            {
+                Config.PollOptions.ValidateFetch(Config.BatchSize);
+            }
+            else
+            {
+                Config.PollOptions.Validate(Config.BatchSize);
+            }
+        }
+        catch (IggyInvalidStatusCodeException error)
+        {
+            throw new InvalidOperationException($"PollOptions do not fit BatchSize {Config.BatchSize}: {error.Message}",
+                error);
         }
 
         if (Config.Consumer.Type == ConsumerType.ConsumerGroup)

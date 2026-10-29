@@ -18,6 +18,7 @@
  */
 
 #include <cstddef>
+#include <optional>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -1847,20 +1848,59 @@ TEST_F(E2E_ConsumerGroup, GetConsumerOffsetReflectsAutoCommittedPoll) {
                                                   make_string_identifier(topic_name), "partition_id",
                                                   partition_id_bytes(0), std::move(messages), error_info));
 
-    iggy::ffi::PolledMessages polled{};
+    std::optional<iggy::ffi::PolledMessages> polled;
     ASSERT_NO_THROW(polled = message_client->poll_messages(
                         make_string_identifier(stream_name), make_string_identifier(topic_name), 0, "consumer",
-                        make_numeric_identifier(77), "next", 0, 3, true, error_info));
-    ASSERT_EQ(polled.count, 3u);
-    ASSERT_EQ(polled.messages.size(), 3u);
-    EXPECT_EQ(polled.messages.front().offset, 0u);
-    EXPECT_EQ(polled.messages.back().offset, 2u);
+                        make_numeric_identifier(77), make_polling_strategy("next", 0),
+                        make_poll_options(3, iggy::ffi::ServerCommitPolicy::OnRead), error_info));
+    ASSERT_EQ(polled->count, 3u);
+    ASSERT_EQ(polled->messages.size(), 3u);
+    EXPECT_EQ(polled->messages.front().offset, 0u);
+    EXPECT_EQ(polled->messages.back().offset, 2u);
 
     const auto offset = client.GetConsumerOffset(consumer, iggy::Identifier::String(stream_name),
                                                  iggy::Identifier::String(topic_name), 0);
     EXPECT_EQ(offset.PartitionId(), 0u);
     EXPECT_EQ(offset.CurrentOffset(), 4u);
     EXPECT_EQ(offset.StoredOffset(), 2u);
+}
+
+TEST_F(E2E_ConsumerGroup, StoreConsumerPositionStoresTheOffsetOfTheCheckpoint) {
+    iggy::ffi::ErrorInfo error_info{};
+    RecordProperty("description", "Stores the checkpoint of a polled message and reads its offset back.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    auto client                   = GetLoggedInHighLevelClient();
+    auto *message_client          = GetLoggedInClient();
+    const auto consumer           = iggy::Consumer::Single(iggy::Identifier::Numeric(99));
+
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    for (std::uint32_t index = 0; index < 5; ++index) {
+        messages.push_back(iggy::ffi::make_message(to_payload("position-test-" + std::to_string(index)),
+                                                   rust::Vec<iggy::ffi::HeaderEntry>{}));
+    }
+    ASSERT_NO_THROW(message_client->send_messages(make_string_identifier(stream_name),
+                                                  make_string_identifier(topic_name), "partition_id",
+                                                  partition_id_bytes(0), std::move(messages), error_info));
+
+    std::optional<iggy::ffi::PolledMessages> polled;
+    ASSERT_NO_THROW(
+        polled = message_client->poll_messages(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                               0, "consumer", make_numeric_identifier(99),
+                                               make_polling_strategy("offset", 0), make_poll_options(5), error_info));
+    ASSERT_EQ(polled->messages.size(), 5u);
+
+    ASSERT_NO_THROW(client.StoreConsumerPosition(consumer, iggy::Identifier::String(stream_name),
+                                                 iggy::Identifier::String(topic_name), *polled->checkpoint_at(2)));
+    EXPECT_EQ(
+        client
+            .GetConsumerOffset(consumer, iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name), 0)
+            .StoredOffset(),
+        2u);
 }
 
 TEST_F(E2E_ConsumerGroup, DeleteConsumerOffsetForMissingOffsetThrows) {
@@ -2218,11 +2258,12 @@ TEST_F(E2E_ConsumerGroup, DeleteConsumerOffsetRemovesAutoCommittedOffset) {
                                                   make_string_identifier(topic_name), "partition_id",
                                                   partition_id_bytes(0), std::move(messages), error_info));
 
-    iggy::ffi::PolledMessages polled{};
+    std::optional<iggy::ffi::PolledMessages> polled;
     ASSERT_NO_THROW(polled = message_client->poll_messages(
                         make_string_identifier(stream_name), make_string_identifier(topic_name), 0, "consumer",
-                        make_numeric_identifier(88), "next", 0, 3, true, error_info));
-    ASSERT_EQ(polled.count, 3u);
+                        make_numeric_identifier(88), make_polling_strategy("next", 0),
+                        make_poll_options(3, iggy::ffi::ServerCommitPolicy::OnRead), error_info));
+    ASSERT_EQ(polled->count, 3u);
     EXPECT_EQ(
         client
             .GetConsumerOffset(consumer, iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name), 0)
