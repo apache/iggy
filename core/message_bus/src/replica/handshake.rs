@@ -17,14 +17,16 @@
 
 //! Replica handshake halves, run on the OWNING shard.
 //!
-//! Shard 0 accepts / dials raw TCP and delegates the fd before any byte
-//! is read or written (blind delegation); the owning shard then runs one
-//! of the two halves here. The acceptor half reads the `ReplicaHello`,
-//! enforces command / cluster / directional checks, and (when auth is
-//! configured) the acceptor side of the 3-message mutual BLAKE3
-//! keyed-MAC handshake over the `reserved_command` bytes (see
-//! [`crate::replica::auth`]). The dialer half announces this replica's
-//! id and runs the dialer side of the same exchange.
+//! Shard 0 accepts / dials raw TCP and delegates the fd to the shard that
+//! owns the link; on the accepting node it first reads the placement
+//! preamble (see [`crate::replica::preamble`]) and nothing else. The
+//! owning shard then runs one of the two halves here. The acceptor half
+//! reads the `ReplicaHello`, enforces command / cluster / directional /
+//! placement checks, and (when auth is configured) the acceptor side of
+//! the 3-message mutual BLAKE3 keyed-MAC handshake over the
+//! `reserved_command` bytes (see [`crate::replica::auth`]). The dialer
+//! half announces this replica's id and link placement and runs the
+//! dialer side of the same exchange.
 //!
 //! # Trust boundary (PSK handshake)
 //!
@@ -62,7 +64,9 @@
 //! [`ReplicaAuth`] rustdoc for the procedure.
 
 use crate::framing;
-use crate::replica::auth::{self, ChannelBinding, HandshakeStatus, ReplicaAuth, Transcript};
+use crate::replica::auth::{
+    self, ChannelBinding, HandshakeStatus, LinkPlacement, ReplicaAuth, Transcript,
+};
 use crate::{GenericHeader, Message};
 use compio::io::{AsyncRead, AsyncWrite};
 use iggy_binary_protocol::{Command, HEADER_SIZE};
@@ -113,23 +117,30 @@ pub struct ReplicaTlsCtx {
     pub peer_names: HashMap<u8, ServerName<'static>>,
 }
 
-/// Run the acceptor half on a delegated inbound stream and return the
-/// compatible peer id.
+/// Run the acceptor half on a delegated inbound stream of link
+/// `placement.link` from `expected_peer`, both named by the placement
+/// preamble.
 ///
 /// Reads the 256 B `ReplicaHello` frame, enforces command, cluster and
-/// build-identity matches and the directional rule, then (when `auth` is
-/// configured) runs the acceptor side of the mutual MAC handshake with `binding`
-/// folded into every MAC (the TLS exporter on a TLS link, see
-/// [`ChannelBinding`]). With `auth = None` it sends a build-identity
-/// challenge and returns the announced id without authenticating it.
+/// build-identity matches, the directional rule and the link placement,
+/// then (when `auth` is configured) runs the acceptor side of the mutual
+/// MAC handshake with `binding` folded into every MAC (the TLS exporter
+/// on a TLS link, see [`ChannelBinding`]). With `auth = None` it sends a
+/// build-identity challenge and accepts the announced id without
+/// authenticating it.
 ///
 /// The dialer (the peer) holds the strictly lower id; this acceptor
 /// holds the higher id (see the directional rule). The transcript
 /// therefore binds `dialer_id = peer_id`, `acceptor_id = self_id`.
 ///
-/// Command, cluster, build-identity and direction rejections send a
-/// nonzero-status `ReplicaChallenge`, including when auth is disabled.
-/// Missing-nonce and post-challenge failures close without a response.
+/// The hello must name this node's link count, the peer and the link of
+/// the preamble. With another link count, the node with more links would
+/// wait for a link that never forms.
+///
+/// Command, cluster, build-identity, direction and placement rejections
+/// send a nonzero-status `ReplicaChallenge`, including when auth is
+/// disabled. Missing-nonce and post-challenge failures close without a
+/// response.
 ///
 /// # Errors
 ///
@@ -139,9 +150,11 @@ pub struct ReplicaTlsCtx {
 pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     stream: &mut S,
     ctx: &ReplicaHandshakeCtx,
+    expected_peer: u8,
+    placement: LinkPlacement,
     binding: ChannelBinding,
     max_message_size: usize,
-) -> Result<u8, IggyError> {
+) -> Result<(), IggyError> {
     let our_cluster = ctx.cluster_id;
     let self_id = ctx.self_id;
     let auth = ctx.auth.as_deref();
@@ -201,6 +214,32 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
         )
         .await;
     }
+    let announced = LinkPlacement::read(&header.reserved_command);
+    let placement_status = if announced.links != placement.links {
+        HandshakeStatus::LinkCountMismatch
+    } else if peer_id != expected_peer || announced.link != placement.link {
+        HandshakeStatus::PlacementMismatch
+    } else {
+        HandshakeStatus::Ok
+    };
+    if placement_status != HandshakeStatus::Ok {
+        warn!(
+            replica = peer_id,
+            expected_peer,
+            ?announced,
+            expected = ?placement,
+            "replica link placement differs from this node"
+        );
+        return reject(
+            stream,
+            our_cluster,
+            self_id,
+            peer_id,
+            placement_status,
+            true,
+        )
+        .await;
+    }
 
     let Some(auth) = auth else {
         framing::write_message(
@@ -211,7 +250,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
             ),
         )
         .await?;
-        return Ok(peer_id);
+        return Ok(());
     };
 
     if !has_nonce {
@@ -230,6 +269,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     let nonce_a = auth::random_nonce()?;
     let transcript = Transcript {
         binary_identity: ctx.binary_identity,
+        placement,
         cluster_id: our_cluster,
         dialer_id: peer_id,
         acceptor_id: self_id,
@@ -287,16 +327,19 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
         )
         .await;
     }
-    Ok(peer_id)
+    Ok(())
 }
 
-/// Run the dialer half on a delegated outbound stream.
+/// Run the dialer half on a delegated outbound stream of link
+/// `placement.link`.
 ///
 /// Logs and returns `Err(())` on any failure; the caller drops the
 /// stream and the shard-0 periodic sweep retries once the pending-dial
 /// entry clears. With `auth = None` it sends `ReplicaHello` and waits
 /// for a compatible build-identity challenge. `binding` is folded into every
 /// MAC; both ends must derive it from the same channel (see [`ChannelBinding`]).
+/// The hello announces `placement`, which the acceptor compares with its
+/// own.
 ///
 /// The dialer holds the strictly lower id, the acceptor the higher; the
 /// transcript binds `dialer_id = self_id`, `acceptor_id = peer_id`. If
@@ -312,6 +355,7 @@ pub(crate) async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
     stream: &mut S,
     ctx: &ReplicaHandshakeCtx,
     peer_id: u8,
+    placement: LinkPlacement,
     binding: ChannelBinding,
     max_message_size: usize,
 ) -> Result<(), ()> {
@@ -330,7 +374,7 @@ pub(crate) async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
         }
     };
     let hello = with_identity(
-        build_hello_message(cluster_id, self_id, auth.map(|_| &nonce_d)),
+        build_hello_message(cluster_id, self_id, placement, auth.map(|_| &nonce_d)),
         &ctx.binary_identity,
     );
     if let Err(e) = framing::write_message(stream, hello).await {
@@ -383,6 +427,7 @@ pub(crate) async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
     let mac_a = auth::read_mac(&challenge.header().reserved_command);
     let transcript = Transcript {
         binary_identity: ctx.binary_identity,
+        placement,
         cluster_id,
         dialer_id: self_id,
         acceptor_id: peer_id,
@@ -428,7 +473,7 @@ async fn reject<S: AsyncRead + AsyncWrite>(
     peer_id: u8,
     reason: HandshakeStatus,
     nack: bool,
-) -> Result<u8, IggyError> {
+) -> Result<(), IggyError> {
     warn!(
         replica = peer_id,
         reason = reason.as_str(),
@@ -477,13 +522,14 @@ fn build_challenge_message(
     )
 }
 
-/// Build a `ReplicaHello` frame announcing this replica's id and `cluster_id`.
-/// When `nonce_d` is set it is placed in `reserved_command[0..32]` to open
-/// the authenticated handshake; otherwise the caller adds only the build
-/// identity for the unauthenticated exchange.
+/// Build a `ReplicaHello` frame announcing this replica's id, `cluster_id`
+/// and the link `placement`. When `nonce_d` is set it is placed in
+/// `reserved_command[0..32]` to open the authenticated handshake; otherwise
+/// the caller adds only the build identity for the unauthenticated exchange.
 fn build_hello_message(
     cluster_id: u128,
     replica_id: u8,
+    placement: LinkPlacement,
     nonce_d: Option<&[u8; auth::NONCE_LEN]>,
 ) -> Message<GenericHeader> {
     #[allow(clippy::cast_possible_truncation)]
@@ -496,6 +542,7 @@ fn build_hello_message(
             if let Some(nonce) = nonce_d {
                 h.reserved_command[..auth::NONCE_LEN].copy_from_slice(nonce);
             }
+            placement.write(&mut h.reserved_command);
         },
     )
 }

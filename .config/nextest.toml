@@ -59,6 +59,7 @@ filter = '''
     + binary_id(iggy-gateway-kafka::metadata_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::offsets_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::phase1_e2e_tests)
+    + binary_id(iggy-gateway-kafka::sasl_real_server_tests)
 '''
 test-group = "kafka_bridge"
 
