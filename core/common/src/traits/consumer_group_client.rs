@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ConsumerGroup, ConsumerGroupDetails, Identifier, IggyError};
+use crate::{ConsumerGroup, ConsumerGroupAssignment, ConsumerGroupDetails, Identifier, IggyError};
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the consumer group module.
@@ -74,4 +74,20 @@ pub trait ConsumerGroupClient {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<(), IggyError>;
+    /// Get this client's own assignment in a consumer group by unique ID or name for the given stream and topic by unique IDs or names.
+    ///
+    /// Returns `None` when this client is not a member of the group. A partition that the group
+    /// hands to another member leaves the assignment as soon as the handoff starts, before it
+    /// completes.
+    ///
+    /// Authentication is required. TCP, QUIC and WebSocket support it. HTTP keeps no membership
+    /// and returns `FeatureUnavailable`.
+    async fn get_consumer_group_assignment(
+        &self,
+        _stream_id: &Identifier,
+        _topic_id: &Identifier,
+        _group_id: &Identifier,
+    ) -> Result<Option<ConsumerGroupAssignment>, IggyError> {
+        Err(IggyError::FeatureUnavailable)
+    }
 }

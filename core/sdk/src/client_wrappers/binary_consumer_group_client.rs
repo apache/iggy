@@ -19,7 +19,8 @@ use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_dropper::AsyncDrop;
 use async_trait::async_trait;
 use iggy_common::{
-    ConsumerGroup, ConsumerGroupClient, ConsumerGroupDetails, Identifier, IggyError, UserClient,
+    ConsumerGroup, ConsumerGroupAssignment, ConsumerGroupClient, ConsumerGroupDetails, Identifier,
+    IggyError, UserClient,
 };
 
 #[async_trait]
@@ -97,6 +98,19 @@ impl ConsumerGroupClient for ClientWrapper {
         super::dispatch_client!(
             self,
             ConsumerGroupClient::leave_consumer_group(stream_id, topic_id, group_id)
+        )
+        .await
+    }
+
+    async fn get_consumer_group_assignment(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        group_id: &Identifier,
+    ) -> Result<Option<ConsumerGroupAssignment>, IggyError> {
+        super::dispatch_client!(
+            self,
+            ConsumerGroupClient::get_consumer_group_assignment(stream_id, topic_id, group_id)
         )
         .await
     }

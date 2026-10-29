@@ -16,9 +16,11 @@
 // under the License.
 
 use crate::traits::binary_auth::fail_if_not_authenticated;
+use crate::traits::binary_impls::messages::{group_cache_key, sync_group_assignment};
 use crate::wire_conversions::{consumer_groups_from_wire, identifier_to_wire};
 use crate::{
-    BinaryClient, ConsumerGroup, ConsumerGroupClient, ConsumerGroupDetails, Identifier, IggyError,
+    BinaryClient, ConsumerGroup, ConsumerGroupAssignment, ConsumerGroupClient,
+    ConsumerGroupDetails, Identifier, IggyError,
 };
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
@@ -191,5 +193,28 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
             self.consumer_group_state().deregister_group(&key);
         }
         Ok(())
+    }
+
+    async fn get_consumer_group_assignment(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        group_id: &Identifier,
+    ) -> Result<Option<ConsumerGroupAssignment>, IggyError> {
+        fail_if_not_authenticated(self).await?;
+        // Through the cache that group polls read, so the answer and the next poll agree, and an
+        // answer of a replaced session is never returned.
+        sync_group_assignment(self, stream_id, topic_id, group_id).await?;
+        let key = group_cache_key(stream_id, topic_id, group_id);
+        let state = self.consumer_group_state();
+        if !state.is_registered(&key) {
+            return Ok(None);
+        }
+        let (version, mut partitions) = state.assignment_snapshot(&key);
+        partitions.sort_unstable();
+        Ok(Some(ConsumerGroupAssignment {
+            generation: version.generation,
+            partitions,
+        }))
     }
 }
