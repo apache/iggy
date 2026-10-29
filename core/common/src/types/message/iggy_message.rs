@@ -887,9 +887,23 @@ mod tests {
 
     #[test]
     fn deserializing_message_with_malformed_typed_headers_fails() {
+        let header = serde_json::to_value(IggyMessageHeader::default()).unwrap();
+
+        // Valid headers deserialize successfully
+        let json_valid = serde_json::json!({
+            "header": header,
+            "payload": "aGVsbG8=",
+            "user_headers": [{
+                "key": { "kind": "string", "value": "a2V5" },
+                "value": { "kind": "string", "value": "dmFs" }
+            }]
+        });
+        let result: Result<IggyMessage, _> = serde_json::from_value(json_valid);
+        assert!(result.is_ok());
+
         // Wrong size value (int32 with 1 byte)
         let json_wrong_val = serde_json::json!({
-            "id": 1,
+            "header": header,
             "payload": "aGVsbG8=",
             "user_headers": [{
                 "key": { "kind": "string", "value": "a2V5" },
@@ -901,7 +915,7 @@ mod tests {
 
         // Empty value
         let json_empty_val = serde_json::json!({
-            "id": 1,
+            "header": header,
             "payload": "aGVsbG8=",
             "user_headers": [{
                 "key": { "kind": "string", "value": "a2V5" },
@@ -913,7 +927,7 @@ mod tests {
 
         // Wrong size key
         let json_wrong_key = serde_json::json!({
-            "id": 1,
+            "header": header,
             "payload": "aGVsbG8=",
             "user_headers": [{
                 "key": { "kind": "int32", "value": "AQ==" },

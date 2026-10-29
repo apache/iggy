@@ -586,6 +586,15 @@ mod tests {
     }
 
     #[test]
+    fn typed_header_with_valid_headers_is_accepted_at_the_http_boundary() {
+        let parsed = send(serde_json::json!([{
+            "key":   { "kind": "string", "value": "a2V5" },
+            "value": { "kind": "string", "value": "dmFs" }
+        }]));
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
     fn typed_header_with_wrong_size_value_is_rejected_at_the_http_boundary() {
         let parsed = send(serde_json::json!([{
             "key":   { "kind": "string", "value": "a2V5" },

@@ -190,7 +190,7 @@ impl<'de, T: HeaderFieldMarker> Deserialize<'de> for HeaderField<T> {
         D: serde::Deserializer<'de>,
     {
         let raw = RawHeaderField::deserialize(deserializer)?;
-        Self::from_raw(raw.kind, &raw.value).map_err(serde::de::Error::custom)
+        Self::from_raw_bytes(raw.kind, raw.value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -396,7 +396,7 @@ impl<T> Hash for HeaderField<T> {
     }
 }
 
-impl<T> FromStr for HeaderField<T> {
+impl<T: HeaderFieldMarker> FromStr for HeaderField<T> {
     type Err = IggyError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::try_from(s)
@@ -673,16 +673,39 @@ impl<T: HeaderFieldMarker> HeaderField<T> {
     /// fixed-size kind's payload is the wrong length, or the payload exceeds
     /// the field length limit.
     pub fn from_raw(kind: HeaderKind, value: &[u8]) -> Result<Self, IggyError> {
+        Self::validate_raw(kind, value.len())?;
+        Ok(Self::new_unchecked(kind, value))
+    }
+
+    /// Wrap owned wire `Bytes` as a field of `kind`.
+    ///
+    /// Validates length constraints and moves `value` without copying.
+    ///
+    /// # Errors
+    ///
+    /// `IggyError::InvalidHeaderKey` or `IggyError::InvalidHeaderValue` when a
+    /// fixed-size kind's payload is the wrong length, or the payload exceeds
+    /// the field length limit.
+    pub fn from_raw_bytes(kind: HeaderKind, value: Bytes) -> Result<Self, IggyError> {
+        Self::validate_raw(kind, value.len())?;
+        Ok(Self {
+            kind,
+            value,
+            _marker: PhantomData,
+        })
+    }
+
+    fn validate_raw(kind: HeaderKind, len: usize) -> Result<(), IggyError> {
         // 255 is the field length the TLV codec's own `TryFrom` impls enforce.
-        if value.is_empty() || value.len() > 255 {
+        if len == 0 || len > 255 {
             return Err(T::invalid_error());
         }
         if let Some(expected) = kind.expected_size()
-            && value.len() != expected
+            && len != expected
         {
             return Err(T::invalid_error());
         }
-        Ok(Self::new_unchecked(kind, value))
+        Ok(())
     }
 }
 
@@ -698,34 +721,34 @@ impl<T: Eq> PartialOrd for HeaderField<T> {
     }
 }
 
-impl<T> TryFrom<&str> for HeaderField<T> {
+impl<T: HeaderFieldMarker> TryFrom<&str> for HeaderField<T> {
     type Error = IggyError;
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         if value.is_empty() || value.len() > 255 {
-            return Err(IggyError::InvalidHeaderValue);
+            return Err(T::invalid_error());
         }
         Ok(Self::new_unchecked(HeaderKind::String, value.as_bytes()))
     }
 }
 
-impl<T> TryFrom<String> for HeaderField<T> {
+impl<T: HeaderFieldMarker> TryFrom<String> for HeaderField<T> {
     type Error = IggyError;
     fn try_from(value: String) -> Result<Self, Self::Error> {
         Self::try_from(value.as_str())
     }
 }
 
-impl<T> TryFrom<&[u8]> for HeaderField<T> {
+impl<T: HeaderFieldMarker> TryFrom<&[u8]> for HeaderField<T> {
     type Error = IggyError;
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.is_empty() || value.len() > 255 {
-            return Err(IggyError::InvalidHeaderValue);
+            return Err(T::invalid_error());
         }
         Ok(Self::new_unchecked(HeaderKind::Raw, value))
     }
 }
 
-impl<T> TryFrom<Vec<u8>> for HeaderField<T> {
+impl<T: HeaderFieldMarker> TryFrom<Vec<u8>> for HeaderField<T> {
     type Error = IggyError;
     fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
         Self::try_from(value.as_slice())
@@ -1087,7 +1110,35 @@ mod tests {
         let header_key = HeaderKey::try_from(value);
         assert!(header_key.is_err());
         let error = header_key.unwrap_err();
-        assert_eq!(error.as_code(), IggyError::InvalidHeaderValue.as_code());
+        assert_eq!(error.as_code(), IggyError::InvalidHeaderKey.as_code());
+
+        let from_str_res = HeaderKey::from_str(value);
+        assert!(from_str_res.is_err());
+        assert_eq!(
+            from_str_res.unwrap_err().as_code(),
+            IggyError::InvalidHeaderKey.as_code()
+        );
+
+        let from_string_res = HeaderKey::try_from(value.to_string());
+        assert!(from_string_res.is_err());
+        assert_eq!(
+            from_string_res.unwrap_err().as_code(),
+            IggyError::InvalidHeaderKey.as_code()
+        );
+
+        let from_slice_res = HeaderKey::try_from([].as_slice());
+        assert!(from_slice_res.is_err());
+        assert_eq!(
+            from_slice_res.unwrap_err().as_code(),
+            IggyError::InvalidHeaderKey.as_code()
+        );
+
+        let from_vec_res = HeaderKey::try_from(Vec::<u8>::new());
+        assert!(from_vec_res.is_err());
+        assert_eq!(
+            from_vec_res.unwrap_err().as_code(),
+            IggyError::InvalidHeaderKey.as_code()
+        );
     }
 
     #[test]
@@ -1096,7 +1147,35 @@ mod tests {
         let header_key = HeaderKey::try_from(value.as_str());
         assert!(header_key.is_err());
         let error = header_key.unwrap_err();
-        assert_eq!(error.as_code(), IggyError::InvalidHeaderValue.as_code());
+        assert_eq!(error.as_code(), IggyError::InvalidHeaderKey.as_code());
+
+        let from_str_res = HeaderKey::from_str(value.as_str());
+        assert!(from_str_res.is_err());
+        assert_eq!(
+            from_str_res.unwrap_err().as_code(),
+            IggyError::InvalidHeaderKey.as_code()
+        );
+
+        let from_string_res = HeaderKey::try_from(value.clone());
+        assert!(from_string_res.is_err());
+        assert_eq!(
+            from_string_res.unwrap_err().as_code(),
+            IggyError::InvalidHeaderKey.as_code()
+        );
+
+        let from_slice_res = HeaderKey::try_from(vec![0u8; 256].as_slice());
+        assert!(from_slice_res.is_err());
+        assert_eq!(
+            from_slice_res.unwrap_err().as_code(),
+            IggyError::InvalidHeaderKey.as_code()
+        );
+
+        let from_vec_res = HeaderKey::try_from(vec![0u8; 256]);
+        assert!(from_vec_res.is_err());
+        assert_eq!(
+            from_vec_res.unwrap_err().as_code(),
+            IggyError::InvalidHeaderKey.as_code()
+        );
     }
 
     #[test]
@@ -1744,6 +1823,64 @@ mod tests {
         );
         assert_eq!(
             HeaderValue::from_raw(HeaderKind::Int32, &[1, 2])
+                .unwrap_err()
+                .as_code(),
+            IggyError::InvalidHeaderValue.as_code()
+        );
+    }
+
+    #[test]
+    fn header_key_from_raw_bytes_accepts_valid_and_rejects_invalid() {
+        let valid = HeaderKey::from_raw_bytes(HeaderKind::String, Bytes::from_static(b"my-key"));
+        assert!(valid.is_ok());
+        let key = valid.unwrap();
+        assert_eq!(key.as_str().unwrap(), "my-key");
+        assert_eq!(key.value(), Bytes::from_static(b"my-key"));
+
+        assert_eq!(
+            HeaderKey::from_raw_bytes(HeaderKind::String, Bytes::new())
+                .unwrap_err()
+                .as_code(),
+            IggyError::InvalidHeaderKey.as_code()
+        );
+        assert_eq!(
+            HeaderKey::from_raw_bytes(HeaderKind::String, Bytes::copy_from_slice(&[0u8; 256]))
+                .unwrap_err()
+                .as_code(),
+            IggyError::InvalidHeaderKey.as_code()
+        );
+        assert_eq!(
+            HeaderKey::from_raw_bytes(HeaderKind::Int32, Bytes::from_static(&[1, 2]))
+                .unwrap_err()
+                .as_code(),
+            IggyError::InvalidHeaderKey.as_code()
+        );
+    }
+
+    #[test]
+    fn header_value_from_raw_bytes_accepts_valid_and_rejects_invalid() {
+        let valid = HeaderValue::from_raw_bytes(
+            HeaderKind::Int32,
+            Bytes::copy_from_slice(&42i32.to_le_bytes()),
+        );
+        assert!(valid.is_ok());
+        let value = valid.unwrap();
+        assert_eq!(value.as_int32().unwrap(), 42);
+
+        assert_eq!(
+            HeaderValue::from_raw_bytes(HeaderKind::Raw, Bytes::new())
+                .unwrap_err()
+                .as_code(),
+            IggyError::InvalidHeaderValue.as_code()
+        );
+        assert_eq!(
+            HeaderValue::from_raw_bytes(HeaderKind::Raw, Bytes::copy_from_slice(&[0u8; 256]))
+                .unwrap_err()
+                .as_code(),
+            IggyError::InvalidHeaderValue.as_code()
+        );
+        assert_eq!(
+            HeaderValue::from_raw_bytes(HeaderKind::Int32, Bytes::from_static(&[1, 2]))
                 .unwrap_err()
                 .as_code(),
             IggyError::InvalidHeaderValue.as_code()
