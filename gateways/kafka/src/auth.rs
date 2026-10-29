@@ -195,11 +195,12 @@ pub enum AuthError {
 
 /// Who authenticated, and what Iggy already allows them to do.
 ///
-/// The permissions are a snapshot taken during the login that verified the credentials, not a live
-/// view. Refreshing them would mean either holding an Iggy session open per connection, which the
-/// authentication design rejects on cost, or keeping the password, which it rejects outright. A
-/// permission changed mid-connection is therefore invisible until the client reconnects, the same
-/// way Iggy's own data plane lags a revocation until the owning shard applies it.
+/// The permissions are a snapshot taken during the login that verified the credentials. Reading
+/// them again would mean either holding an Iggy session open per connection, which the
+/// authentication design rejects on cost, or keeping the password, which it rejects outright. So
+/// the connection applies the later changes that Iggy's metadata change log shows for the user
+/// instead (`PermissionFollow` in `server.rs`). When the bridge user cannot read that log, a
+/// permission changed mid-connection is invisible until the client reconnects.
 #[derive(Debug, Clone)]
 pub struct AuthenticatedPrincipal {
     pub username: String,

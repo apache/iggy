@@ -162,6 +162,18 @@ pub async fn dispatch(
     }
 }
 
+/// Whether another gateway is the controller. Kafka admin clients send `CreateTopics`,
+/// `DeleteTopics` and `CreatePartitions` to the controller, and retry on `NOT_CONTROLLER` after a
+/// Metadata refresh. One controller keeps two requests from adding partitions to one topic at
+/// once. While no gateway is known as controller, each gateway serves the request.
+pub(crate) fn another_controller(state: &GatewayState) -> bool {
+    state.coordination.as_ref().is_some_and(|coordination| {
+        coordination
+            .controller()
+            .is_some_and(|node_id| node_id != coordination.node_id())
+    })
+}
+
 /// Whether a request carries a transactional id, which this gateway never serves.
 ///
 /// An empty id reads as absent: `kafka_protocol` decodes a null wire string to `None` but its

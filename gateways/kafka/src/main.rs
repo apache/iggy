@@ -195,6 +195,7 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_INSTANCE_ID",
     "IGGY_KAFKA_NODE_ID",
     "IGGY_KAFKA_BROKERS",
+    "IGGY_KAFKA_COORDINATOR_LOG",
     "IGGY_KAFKA_SASL_ENABLED",
     "IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS",
     "IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS",
@@ -380,6 +381,7 @@ fn load_config() -> Result<GatewayConfig, String> {
              Iggy cluster needs its own value, or they hand out colliding producer ids"
         );
     }
+    config.coordinator_log = load_coordinator_log(&config, bridge_enabled()?)?;
     config.auto_topic_creation = load_auto_topic_creation(bridge_enabled()?)?;
     if config.auto_topic_creation.enabled {
         info!(
@@ -394,6 +396,26 @@ fn load_config() -> Result<GatewayConfig, String> {
     )?;
 
     Ok(config)
+}
+
+/// Whether the gateways share their groups through the coordinator log. On by default when
+/// `IGGY_KAFKA_BROKERS` lists the gateways and the bridge is on.
+fn load_coordinator_log(config: &GatewayConfig, bridge_enabled: bool) -> Result<bool, String> {
+    let Some(raw) = env_var("IGGY_KAFKA_COORDINATOR_LOG") else {
+        return Ok(bridge_enabled && !config.brokers.is_empty());
+    };
+    let enabled = parse_bool("IGGY_KAFKA_COORDINATOR_LOG", &raw)?;
+    if enabled && !bridge_enabled {
+        return Err("IGGY_KAFKA_COORDINATOR_LOG needs IGGY_KAFKA_BRIDGE_ENABLED=true".to_string());
+    }
+    if !enabled && config.brokers.len() > 1 {
+        warn!(
+            "IGGY_KAFKA_COORDINATOR_LOG is false while IGGY_KAFKA_BROKERS lists several \
+             gateways: the gateway with the lowest node id coordinates every group, and its \
+             groups do not move when it stops"
+        );
+    }
+    Ok(enabled)
 }
 
 /// This gateway's node id and the list of every gateway, from `IGGY_KAFKA_NODE_ID` and

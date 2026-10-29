@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The Kafka groups that hold offsets in Iggy, for the group admin APIs. Finding them costs one
+//! The Kafka groups that hold offsets in Iggy, for the group admin APIs. The change log follower
+//! (`change_log.rs`) keeps them. When the bridge user cannot read that log, finding them costs one
 //! Iggy call per topic, so one scan answers every request for a while.
 
 use std::collections::{BTreeSet, HashMap};
@@ -23,7 +24,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 use tokio::time::{Instant, timeout_at};
 use tracing::warn;
 
@@ -50,10 +51,14 @@ const STORED_TOPICS_MAX_AGE: Duration = Duration::from_mins(1);
 /// that request for up to 60 s (`default.api.timeout.ms`).
 const DELETED_MAX_AGE: Duration = Duration::from_mins(1);
 
-/// The Kafka groups one scan found holding offsets in Iggy.
+/// How long a group that this gateway stored offsets for, or deleted, keeps that state while the
+/// change log does not show it. The log can lag the write, and a newer write elsewhere can hide it.
+const UNCONFIRMED_MAX_AGE: Duration = Duration::from_secs(10);
+
+/// The Kafka groups that one scan, or one read of the change log, found holding offsets in Iggy.
 #[derive(Debug, Clone)]
 pub struct OffsetGroups {
-    /// When the scan ended.
+    /// When the scan or the read ended.
     ended: Instant,
     groups: BTreeSet<String>,
 }
@@ -77,12 +82,22 @@ impl OffsetGroups {
 /// What a caller learns about the Kafka groups that hold offsets in Iggy.
 #[derive(Debug, Clone)]
 pub enum ScannedGroups {
-    /// The groups of the last scan that found them.
+    /// The groups of the change log, or of the last scan that found them.
     Found(Arc<OffsetGroups>),
-    /// The first scan has not ended yet.
+    /// The first read of the change log, or the first scan, has not ended yet.
     Pending,
-    /// Every scan that ended failed, so no scan found the groups.
+    /// Every read or scan that ended failed, so none found the groups.
     Failed,
+}
+
+/// Where the Kafka groups that hold offsets come from.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum OffsetGroupSource {
+    /// A scan that lists the groups of every Kafka topic, one Iggy call per topic.
+    #[default]
+    Scans,
+    /// Iggy's change log, which the bridge follows.
+    ChangeLog,
 }
 
 /// What one scan found.
@@ -92,13 +107,21 @@ pub(super) struct Scanned {
     pub(super) whole: bool,
 }
 
-/// The groups of the last scan that ended, and at most one scan that runs.
+/// The groups of the change log, or of the last scan that ended. At most one scan runs.
 pub(super) struct GroupIndex {
-    published: Arc<watch::Sender<Published>>,
+    feed: GroupFeed,
     /// One permit, held by the scan that runs.
     scanning: Arc<Semaphore>,
     stored: StoredTopics,
     deleted: DeletedGroups,
+}
+
+/// How the change log follower updates a [`GroupIndex`].
+#[derive(Clone)]
+pub(super) struct GroupFeed {
+    published: Arc<watch::Sender<Published>>,
+    /// Ends the follower's pause, for a caller that waits for its first view.
+    wake: Arc<Notify>,
 }
 
 /// Per group, the topics that commits through this gateway stored offsets to. See
@@ -144,12 +167,33 @@ struct Published {
     /// (`true`) or deleted them (`false`). `None` while none runs. The scan can list a topic
     /// before such a change, so the changes go on top of what it finds.
     changes: Option<HashMap<String, bool>>,
+    source: OffsetGroupSource,
+    /// With the change log, the last change of each group that the log did not show yet, and
+    /// when. It goes on top of what the log shows, until the log agrees or `UNCONFIRMED_MAX_AGE`.
+    unconfirmed: HashMap<String, (bool, Instant)>,
 }
 
 impl GroupIndex {
+    /// An index that scans for the groups, as a bridge with no follower does.
+    #[cfg(test)]
     pub(super) fn new() -> Self {
+        Self::from_source(OffsetGroupSource::Scans)
+    }
+
+    /// An index that a change log follower keeps, through [`Self::feed`].
+    pub(super) fn following() -> Self {
+        Self::from_source(OffsetGroupSource::ChangeLog)
+    }
+
+    fn from_source(source: OffsetGroupSource) -> Self {
         Self {
-            published: Arc::new(watch::Sender::new(Published::default())),
+            feed: GroupFeed {
+                published: Arc::new(watch::Sender::new(Published {
+                    source,
+                    ..Published::default()
+                })),
+                wake: Arc::new(Notify::new()),
+            },
             scanning: Arc::new(Semaphore::new(1)),
             stored: StoredTopics(Arc::new(Mutex::new(Stores {
                 groups: HashMap::new(),
@@ -159,6 +203,63 @@ impl GroupIndex {
         }
     }
 
+    pub(super) fn feed(&self) -> GroupFeed {
+        self.feed.clone()
+    }
+
+    pub(super) fn source(&self) -> OffsetGroupSource {
+        self.feed.published.borrow().source
+    }
+
+    /// The groups of the change log, at once. Before its first view, the caller wakes the
+    /// follower and waits for its next read, until `deadline`. A read that failed then answers
+    /// [`ScannedGroups::Failed`], and none that ended [`ScannedGroups::Pending`], as a scan does.
+    ///
+    /// Once the follower fell back to scans, as [`Self::scanned`] with `scan`.
+    pub(super) async fn groups<F, S>(&self, deadline: Instant, scan: F) -> ScannedGroups
+    where
+        F: FnOnce() -> S,
+        S: Future<Output = Result<Scanned, BridgeError>> + Send + 'static,
+    {
+        match self.followed(deadline).await {
+            Some(groups) => groups,
+            None => self.scanned(deadline, scan).await,
+        }
+    }
+
+    /// See [`Self::groups`]. `None` when the groups come from scans.
+    async fn followed(&self, deadline: Instant) -> Option<ScannedGroups> {
+        let mut published = self.feed.published.subscribe();
+        let ended = {
+            let current = published.borrow_and_update();
+            if current.source == OffsetGroupSource::Scans {
+                return None;
+            }
+            if let Some(groups) = &current.groups {
+                return Some(ScannedGroups::Found(Arc::clone(groups)));
+            }
+            current.ended
+        };
+        self.feed.wake.notify_one();
+        // A timeout leaves what the follower published as the answer.
+        let _ = timeout_at(
+            deadline,
+            published.wait_for(|current| {
+                current.ended > ended || current.source == OffsetGroupSource::Scans
+            }),
+        )
+        .await;
+        let current = published.borrow();
+        if current.source == OffsetGroupSource::Scans {
+            return None;
+        }
+        Some(match &current.groups {
+            Some(groups) => ScannedGroups::Found(Arc::clone(groups)),
+            None if current.ended == 0 => ScannedGroups::Pending,
+            None => ScannedGroups::Failed,
+        })
+    }
+
     /// The groups of the last scan, at once while that scan ended less than `SCAN_MAX_AGE` ago.
     /// An older scan starts a new one with `scan`, unless one runs. The groups of a scan that ended
     /// less than `SCAN_STALE_LIMIT` ago still answer at once. Otherwise the caller waits for the
@@ -166,12 +267,12 @@ impl GroupIndex {
     ///
     /// A scan that fails, or that does not end by `deadline`, leaves the groups of the last scan
     /// that found them, and those are the answer.
-    pub(super) async fn groups<F, S>(&self, deadline: Instant, scan: F) -> ScannedGroups
+    async fn scanned<F, S>(&self, deadline: Instant, scan: F) -> ScannedGroups
     where
         F: FnOnce() -> S,
         S: Future<Output = Result<Scanned, BridgeError>> + Send + 'static,
     {
-        let mut published = self.published.subscribe();
+        let mut published = self.feed.published.subscribe();
         let (last, ended) = {
             let current = published.borrow_and_update();
             (current.groups.clone(), current.ended)
@@ -198,9 +299,9 @@ impl GroupIndex {
         }
     }
 
-    /// The groups of the last scan that found them, without a scan.
+    /// The groups of the change log, or of the last scan that found them, without a scan.
     pub(super) fn last(&self) -> Option<Arc<OffsetGroups>> {
-        self.published.borrow().groups.clone()
+        self.feed.published.borrow().groups.clone()
     }
 
     /// Adds `group` to the groups of the last scan. A commit of this gateway created its offsets,
@@ -246,13 +347,18 @@ impl GroupIndex {
     }
 
     fn change(&self, group: &str, holds: bool) {
-        self.published.send_if_modified(|current| {
+        self.feed.published.send_if_modified(|current| {
             if let Some(changes) = current.changes.as_mut() {
                 if let Some(held) = changes.get_mut(group) {
                     *held = holds;
                 } else {
                     changes.insert(group.to_owned(), holds);
                 }
+            }
+            if current.source == OffsetGroupSource::ChangeLog {
+                current
+                    .unconfirmed
+                    .insert(group.to_owned(), (holds, Instant::now()));
             }
             let Some(groups) = current.groups.as_mut() else {
                 return false;
@@ -275,7 +381,7 @@ impl GroupIndex {
         let Ok(permit) = Arc::clone(&self.scanning).try_acquire_owned() else {
             return;
         };
-        let published = Arc::clone(&self.published);
+        let published = Arc::clone(&self.feed.published);
         published.send_if_modified(|current| {
             current.changes = Some(HashMap::new());
             false
@@ -306,6 +412,46 @@ impl GroupIndex {
             });
             drop(permit);
         });
+    }
+}
+
+impl GroupFeed {
+    /// The Kafka groups that the change log shows now, with this gateway's changes that it does
+    /// not show yet on top.
+    pub(super) fn publish(&self, mut groups: BTreeSet<String>) {
+        let now = Instant::now();
+        self.published.send_modify(|current| {
+            current.ended += 1;
+            current.unconfirmed.retain(|group, &mut (holds, at)| {
+                groups.contains(group) != holds && now.duration_since(at) < UNCONFIRMED_MAX_AGE
+            });
+            for (group, &(holds, _)) in &current.unconfirmed {
+                apply(&mut groups, group.clone(), holds);
+            }
+            current.groups = Some(Arc::new(OffsetGroups { ended: now, groups }));
+        });
+    }
+
+    /// A read of the change log failed. Wakes the callers that wait for the first view.
+    pub(super) fn failed(&self) {
+        self.published.send_if_modified(|current| {
+            current.ended += 1;
+            current.groups.is_none()
+        });
+    }
+
+    /// The bridge user cannot read the change log, so the groups come from scans from now on.
+    /// The groups the log showed answer until they are as old as a scan's would be.
+    pub(super) fn fall_back(&self) {
+        self.published.send_modify(|current| {
+            current.source = OffsetGroupSource::Scans;
+            current.unconfirmed.clear();
+        });
+    }
+
+    /// Ends once a caller wakes the follower.
+    pub(super) async fn woken(&self) {
+        self.wake.notified().await;
     }
 }
 
@@ -847,5 +993,142 @@ mod tests {
         assert!(!deleted.take("orders-app"), "only once");
         tokio::time::advance(DELETED_MAX_AGE).await;
         assert!(!deleted.take("payments-app"), "too old");
+    }
+
+    fn set(groups: &[&str]) -> BTreeSet<String> {
+        groups.iter().map(|group| (*group).to_owned()).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_view_of_the_change_log_should_answer_it_without_a_scan() {
+        let index = GroupIndex::following();
+        let runs = Arc::new(AtomicUsize::new(0));
+        index.feed().publish(set(&["orders"]));
+        tokio::time::advance(SCAN_STALE_LIMIT * 2).await;
+
+        let groups = index.groups(later(), counted(&runs, &["payments"])).await;
+
+        assert_eq!(names(groups), ["orders"]);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_no_view_of_the_change_log_when_a_read_fails_should_answer_failed() {
+        let index = GroupIndex::following();
+        let feed = index.feed();
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let (groups, ()) = tokio::join!(index.groups(later(), counted(&runs, &[])), async {
+            feed.woken().await;
+            feed.failed();
+        });
+
+        assert!(matches!(groups, ScannedGroups::Failed), "{groups:?}");
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_no_view_of_the_change_log_by_the_deadline_should_answer_pending() {
+        let index = GroupIndex::following();
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let groups = index
+            .groups(
+                Instant::now() + Duration::from_millis(20),
+                counted(&runs, &[]),
+            )
+            .await;
+
+        assert!(matches!(groups, ScannedGroups::Pending), "{groups:?}");
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_caller_waiting_for_the_first_view_should_answer_it() {
+        let index = GroupIndex::following();
+        let feed = index.feed();
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let (groups, ()) = tokio::join!(index.groups(later(), counted(&runs, &[])), async {
+            feed.woken().await;
+            feed.publish(set(&["orders"]));
+        });
+
+        assert_eq!(names(groups), ["orders"]);
+    }
+
+    /// The change log can show a commit of this gateway after it answered. Until it does, the
+    /// group stays, and a later view that does not show it yet keeps it too.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_noted_group_the_change_log_does_not_show_yet_should_keep_it() {
+        let index = GroupIndex::following();
+        let feed = index.feed();
+        let runs = Arc::new(AtomicUsize::new(0));
+        feed.publish(set(&["orders"]));
+
+        index.note("payments");
+        feed.publish(set(&["orders"]));
+        let kept = index.groups(later(), counted(&runs, &[])).await;
+        feed.publish(set(&["orders", "payments"]));
+        feed.publish(set(&["orders"]));
+        let deleted_elsewhere = index.groups(later(), counted(&runs, &[])).await;
+
+        assert_eq!(names(kept), ["orders", "payments"]);
+        assert_eq!(
+            names(deleted_elsewhere),
+            ["orders"],
+            "once the log showed it, the log decides"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_forgotten_group_the_change_log_still_shows_should_leave_it_out_for_a_while() {
+        let index = GroupIndex::following();
+        let feed = index.feed();
+        let runs = Arc::new(AtomicUsize::new(0));
+        feed.publish(set(&["orders", "payments"]));
+
+        index.forget("orders");
+        feed.publish(set(&["orders", "payments"]));
+        let hidden = index.groups(later(), counted(&runs, &[])).await;
+        tokio::time::advance(UNCONFIRMED_MAX_AGE).await;
+        feed.publish(set(&["orders", "payments"]));
+        let shown = index.groups(later(), counted(&runs, &[])).await;
+
+        assert_eq!(names(hidden), ["payments"]);
+        assert_eq!(
+            names(shown),
+            ["orders", "payments"],
+            "a newer commit elsewhere can have stored offsets again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_follower_that_fell_back_should_scan() {
+        let index = GroupIndex::following();
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        index.feed().fall_back();
+        let groups = index.groups(later(), counted(&runs, &["orders"])).await;
+
+        assert_eq!(names(groups), ["orders"]);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(index.source(), OffsetGroupSource::Scans);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_caller_waiting_when_the_follower_falls_back_should_scan() {
+        let index = GroupIndex::following();
+        let feed = index.feed();
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let (groups, ()) =
+            tokio::join!(index.groups(later(), counted(&runs, &["orders"])), async {
+                feed.woken().await;
+                feed.fall_back();
+            });
+
+        assert_eq!(names(groups), ["orders"]);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 }

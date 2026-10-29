@@ -19,6 +19,10 @@
 //!
 //! Reads committed offsets from Iggy (`docs/OFFSET_STORAGE.md`). A failure goes at group level
 //! from v2: the Java consumer treats most partition errors as fatal, even retriable ones.
+//!
+//! With the coordinator log, only the coordinator of a group answers for it. The log answers each
+//! partition it holds an offset or a deletion for, with the commit metadata. Iggy answers the
+//! others, which hold offsets from before the log.
 
 use bytes::Bytes;
 use futures::future::join_all;
@@ -31,6 +35,8 @@ use kafka_protocol::protocol::StrBytes;
 use tokio::time::Instant;
 
 use crate::bridge::{BridgeError, IggyBridge, KafkaTopicMetadata, OffsetCalls, TopicTarget};
+use crate::coordinator::record::CommittedOffset;
+use crate::coordinator::replay::GroupOffsets;
 use crate::error::Result;
 use crate::group::is_valid_group_id;
 use crate::protocol::api::{
@@ -117,12 +123,63 @@ struct TopicAnswer {
     partitions: Vec<PartitionAnswer>,
 }
 
-/// `offset` is -1 when nothing is committed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `offset` is -1 when nothing is committed. `metadata` is the commit's, which only the
+/// coordinator log keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PartitionAnswer {
     index: i32,
     offset: i64,
     error: i16,
+    leader_epoch: i32,
+    metadata: Option<StrBytes>,
+}
+
+impl From<&PartitionAnswer> for OffsetFetchResponsePartitions {
+    fn from(partition: &PartitionAnswer) -> Self {
+        Self::default()
+            .with_partition_index(partition.index)
+            .with_committed_offset(partition.offset)
+            .with_committed_leader_epoch(partition.leader_epoch)
+            .with_metadata(Some(partition.metadata.clone().unwrap_or_default()))
+            .with_error_code(partition.error)
+    }
+}
+
+impl From<&PartitionAnswer> for OffsetFetchResponsePartition {
+    fn from(partition: &PartitionAnswer) -> Self {
+        Self::default()
+            .with_partition_index(partition.index)
+            .with_committed_offset(partition.offset)
+            .with_committed_leader_epoch(partition.leader_epoch)
+            .with_metadata(Some(partition.metadata.clone().unwrap_or_default()))
+            .with_error_code(partition.error)
+    }
+}
+
+impl PartitionAnswer {
+    const fn new(index: i32, offset: i64, error: i16) -> Self {
+        Self {
+            index,
+            offset,
+            error,
+            leader_epoch: -1,
+            metadata: None,
+        }
+    }
+
+    /// The answer the log gives: the commit, or -1 for an offset it deleted.
+    fn logged(index: i32, committed: Option<&CommittedOffset>) -> Self {
+        committed.map_or_else(
+            || Self::new(index, UNKNOWN_OFFSET, ERROR_NONE),
+            |committed| Self {
+                index,
+                offset: committed.offset,
+                error: ERROR_NONE,
+                leader_epoch: committed.leader_epoch,
+                metadata: committed.metadata.clone().map(StrBytes::from_string),
+            },
+        )
+    }
 }
 
 pub async fn handle(
@@ -150,12 +207,7 @@ pub async fn handle(
     let queries = GroupQuery::all(api_version, &request);
     let calls = OffsetCalls::new(offset_deadline(state, connection).await);
     // The groups read at once, so a slow group cannot spend the time of the others.
-    let answers = join_all(
-        queries
-            .iter()
-            .map(|query| answer(state.bridge.as_deref(), query, &calls)),
-    )
-    .await;
+    let answers = join_all(queries.iter().map(|query| answer(state, query, &calls))).await;
     respond_or_close(
         encode_response(api_version, &queries, answers),
         "OffsetFetch",
@@ -164,17 +216,31 @@ pub async fn handle(
 
 /// One failed read fails the whole group, so a client never reads a lost answer as "nothing
 /// committed" and resets its position.
-async fn answer(
-    bridge: Option<&IggyBridge>,
-    query: &GroupQuery,
-    calls: &OffsetCalls,
-) -> GroupAnswer {
+async fn answer(state: &GatewayState, query: &GroupQuery, calls: &OffsetCalls) -> GroupAnswer {
     if !is_valid_group_id(&query.group_id) {
         return GroupAnswer::error(ERROR_INVALID_GROUP_ID);
     }
-    let Some(bridge) = bridge else {
+    let Some(bridge) = state.bridge.as_deref() else {
         return GroupAnswer::error(ERROR_COORDINATOR_LOAD_IN_PROGRESS);
     };
+    let logged = match &state.coordination {
+        Some(coordination) => match coordination.offsets(&query.group_id).await {
+            Ok(logged) => logged,
+            Err(code) => return GroupAnswer::error(code),
+        },
+        None => None,
+    };
+    // The log holds every offset of a group it deleted, so Iggy has nothing to add. Nor does it
+    // for a request whose every partition the log answers.
+    if let Some(logged) = logged
+        .as_ref()
+        .filter(|logged| logged.complete || answers_all(logged, query.topics.as_deref()))
+    {
+        return GroupAnswer {
+            error: ERROR_NONE,
+            topics: from_log(logged, query.topics.as_deref()),
+        };
+    }
     // A group the deadline leaves out costs no Iggy call.
     if Instant::now() >= calls.deadline() {
         return GroupAnswer::error(ERROR_COORDINATOR_LOAD_IN_PROGRESS);
@@ -185,12 +251,108 @@ async fn answer(
         None => read_every_topic(bridge, &query.group_id, calls).await,
     };
     match read {
-        Ok(topics) => GroupAnswer {
-            error: ERROR_NONE,
-            topics,
-        },
+        Ok(mut topics) => {
+            if let Some(logged) = &logged {
+                overlay(&mut topics, logged, query.topics.is_none());
+            }
+            GroupAnswer {
+                error: ERROR_NONE,
+                topics,
+            }
+        }
         Err(error) => GroupAnswer::error(refusal(&query.group_id, &error)),
     }
+}
+
+/// Whether the log holds an offset or a deletion for each partition of `topics`. A request with
+/// no topic list asks for every topic, which only Iggy can list.
+fn answers_all(logged: &GroupOffsets, topics: Option<&[(TopicName, Vec<i32>)]>) -> bool {
+    topics.is_some_and(|topics| {
+        topics.iter().all(|(name, indexes)| {
+            indexes
+                .iter()
+                .all(|index| logged.entries.contains_key(&(name.0.to_string(), *index)))
+        })
+    })
+}
+
+/// The answers the log alone gives: each requested partition, or with no topic list each
+/// partition that holds an offset.
+fn from_log(logged: &GroupOffsets, topics: Option<&[(TopicName, Vec<i32>)]>) -> Vec<TopicAnswer> {
+    let Some(topics) = topics else {
+        let mut answers: Vec<TopicAnswer> = Vec::new();
+        for ((topic, index), committed) in &logged.entries {
+            let Some(committed) = committed else {
+                continue;
+            };
+            let answer = PartitionAnswer::logged(*index, Some(committed));
+            match answers.last_mut() {
+                Some(last) if last.name.0.as_str() == topic => last.partitions.push(answer),
+                _ => answers.push(TopicAnswer {
+                    name: TopicName(StrBytes::from_string(topic.clone())),
+                    partitions: vec![answer],
+                }),
+            }
+        }
+        return answers;
+    };
+    topics
+        .iter()
+        .map(|(name, indexes)| TopicAnswer {
+            name: name.clone(),
+            partitions: indexes
+                .iter()
+                .map(|&index| {
+                    let key = (name.0.to_string(), index);
+                    PartitionAnswer::logged(
+                        index,
+                        logged.entries.get(&key).and_then(Option::as_ref),
+                    )
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Puts the log's answer on each partition it holds an entry for. With no topic list, the log's
+/// offsets that Iggy does not hold join the answer, and its deletions leave it.
+fn overlay(topics: &mut Vec<TopicAnswer>, logged: &GroupOffsets, every_topic: bool) {
+    for topic in topics.iter_mut() {
+        for partition in &mut topic.partitions {
+            let key = (topic.name.0.to_string(), partition.index);
+            if let Some(committed) = logged.entries.get(&key) {
+                *partition = PartitionAnswer::logged(partition.index, committed.as_ref());
+            }
+        }
+    }
+    if !every_topic {
+        return;
+    }
+    for topic in topics.iter_mut() {
+        topic
+            .partitions
+            .retain(|partition| partition.offset != UNKNOWN_OFFSET);
+    }
+    for ((name, index), committed) in &logged.entries {
+        let Some(committed) = committed else {
+            continue;
+        };
+        let found = topics
+            .iter()
+            .position(|topic| topic.name.0.as_str() == name);
+        let at = found.unwrap_or_else(|| {
+            topics.push(TopicAnswer {
+                name: TopicName(StrBytes::from_string(name.clone())),
+                partitions: Vec::new(),
+            });
+            topics.len() - 1
+        });
+        let partitions = &mut topics[at].partitions;
+        if !partitions.iter().any(|partition| partition.index == *index) {
+            partitions.push(PartitionAnswer::logged(*index, Some(committed)));
+        }
+    }
+    topics.retain(|topic| !topic.partitions.is_empty());
 }
 
 /// The group code for a failed read. A -1 is logged, since the client sees no more.
@@ -228,11 +390,7 @@ async fn read_topics(
             name: name.clone(),
             partitions: indexes
                 .iter()
-                .map(|&index| PartitionAnswer {
-                    index,
-                    offset: UNKNOWN_OFFSET,
-                    error: ERROR_NONE,
-                })
+                .map(|&index| PartitionAnswer::new(index, UNKNOWN_OFFSET, ERROR_NONE))
                 .collect(),
         })
         .collect();
@@ -303,11 +461,11 @@ async fn read_listed_topic(
     for (partition, read) in (0..topic.partitions_count).zip(offsets) {
         let offset = committed(read)?;
         if offset != UNKNOWN_OFFSET {
-            partitions.push(PartitionAnswer {
-                index: i32::try_from(partition).unwrap_or(i32::MAX),
+            partitions.push(PartitionAnswer::new(
+                i32::try_from(partition).unwrap_or(i32::MAX),
                 offset,
-                error: ERROR_NONE,
-            });
+                ERROR_NONE,
+            ));
         }
     }
     Ok((!partitions.is_empty()).then(|| TopicAnswer {
@@ -367,12 +525,7 @@ fn encode_response(
                                         topic
                                             .partitions
                                             .iter()
-                                            .map(|partition| {
-                                                OffsetFetchResponsePartitions::default()
-                                                    .with_partition_index(partition.index)
-                                                    .with_committed_offset(partition.offset)
-                                                    .with_error_code(partition.error)
-                                            })
+                                            .map(OffsetFetchResponsePartitions::from)
                                             .collect(),
                                     )
                             })
@@ -402,11 +555,7 @@ fn encode_response(
                 name: name.clone(),
                 partitions: indexes
                     .iter()
-                    .map(|&index| PartitionAnswer {
-                        index,
-                        offset: UNKNOWN_OFFSET,
-                        error,
-                    })
+                    .map(|&index| PartitionAnswer::new(index, UNKNOWN_OFFSET, error))
                     .collect(),
             })
             .collect()
@@ -422,12 +571,7 @@ fn encode_response(
                     topic
                         .partitions
                         .iter()
-                        .map(|partition| {
-                            OffsetFetchResponsePartition::default()
-                                .with_partition_index(partition.index)
-                                .with_committed_offset(partition.offset)
-                                .with_error_code(partition.error)
-                        })
+                        .map(OffsetFetchResponsePartition::from)
                         .collect(),
                 )
         })

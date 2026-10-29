@@ -132,6 +132,7 @@ async fn delete_offsets(
     if !is_valid_group_id(group) {
         return Err(ERROR_INVALID_GROUP_ID);
     }
+    state.groups.serves(group)?;
     // Until this drops, the group takes no join and no commit.
     let (deletable, deletion) = state.groups.offset_deletion(group).await;
     let Some(bridge) = &state.bridge else {
@@ -152,10 +153,14 @@ async fn delete_offsets(
     if !deletion.commits_ended(calls.deadline()).await {
         return Err(ERROR_COORDINATOR_LOAD_IN_PROGRESS);
     }
+    let logged = match &state.coordination {
+        Some(coordination) => coordination.logged_groups().await.contains(group.as_str()),
+        None => false,
+    };
     let subscribed = match subscribed {
         Some(subscribed) => subscribed,
         // No members here, so the group exists only while it holds offsets.
-        None if holds_offsets(bridge, group, &topics, &calls).await? => {
+        None if logged || holds_offsets(bridge, group, &topics, &calls).await? => {
             Subscribed::Topics(HashSet::new())
         }
         None => return Err(ERROR_GROUP_ID_NOT_FOUND),
@@ -163,7 +168,27 @@ async fn delete_offsets(
     // Each delete keeps the group fenced until it can no longer land, also past the deadline, so
     // no commit lands while a delete can still land.
     let calls = calls.keeping(deletion);
-    delete_unsubscribed(bridge, request, &topics, &subscribed, &calls).await
+    let mut deleted = Vec::new();
+    let mut topics =
+        delete_unsubscribed(bridge, request, &topics, &subscribed, &calls, &mut deleted).await?;
+    if let Some(coordination) = &state.coordination {
+        let keys = deleted
+            .iter()
+            .map(|(topic_at, partition_at)| {
+                let topic = &request.topics[*topic_at];
+                (
+                    topic.name.0.to_string(),
+                    topic.partitions[*partition_at].partition_index,
+                )
+            })
+            .collect();
+        if let Err(code) = coordination.delete_offsets(group, keys).await {
+            for (topic_at, partition_at) in deleted {
+                topics[topic_at].partitions[partition_at].error_code = code;
+            }
+        }
+    }
+    Ok(topics)
 }
 
 /// Whether `group`, which has no members here, holds offsets in Iggy. The last scan answers when
@@ -261,6 +286,7 @@ async fn delete_unsubscribed(
     requested: &HashMap<&str, core::result::Result<(TopicTarget, u32), i16>>,
     subscribed: &Subscribed,
     calls: &OffsetCalls,
+    deleted: &mut Vec<(usize, usize)>,
 ) -> core::result::Result<Vec<OffsetDeleteResponseTopic>, i16> {
     let group = request.group_id.0.as_str();
     let mut topics = same_code(request, ERROR_NONE);
@@ -296,6 +322,7 @@ async fn delete_unsubscribed(
     let mut first_refusal = None;
     for ((topic_at, partition_at), result) in positions.into_iter().zip(results) {
         let Err(error) = result else {
+            deleted.push((topic_at, partition_at));
             continue;
         };
         let code = error.to_offset_error_code();

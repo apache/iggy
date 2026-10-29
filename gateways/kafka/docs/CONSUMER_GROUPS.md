@@ -10,7 +10,7 @@ live in Iggy ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)).
 
 | API key | Name | Versions | Notes |
 | --- | --- | --- | --- |
-| 10 | FindCoordinator | 0-4 | Always answers "this gateway", the same node the Metadata broker list advertises |
+| 10 | FindCoordinator | 0-4 | The gateway that owns the group's coordinator log partition, or `COORDINATOR_NOT_AVAILABLE` (15) while none is known. Without the log, the gateway with the lowest node id |
 | 11 | JoinGroup | 0-9 | Parks until the group's join barrier completes |
 | 12 | Heartbeat | 0-4 | Refreshes a session; `REBALANCE_IN_PROGRESS` is how a follower learns to rejoin |
 | 13 | LeaveGroup | 0-5 | Removes members; survivors' parked joins and syncs are released at once |
@@ -73,13 +73,42 @@ that holds offsets in Iggy and has no members here. Such a group is `Empty`, wit
 `consumer` and no members. Iggy stores no protocol type. Kafka keeps `consumer` for a group whose
 consumers left, and the Java admin client takes `consumer` or an empty type as a consumer group.
 
-The gateway finds these groups with a scan. A scan lists the Kafka topics, then calls
-`get_consumer_groups` once per topic and keeps the Iggy groups named `kafka.cg.<group>`
-([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)). It runs on an Iggy client of its own, which sends the
-calls for 16 topics at once. So it never waits behind Produce, and no offset call waits behind it.
-At most one scan runs at a time. A commit through this gateway adds its group at once. A deletion
-through it removes the group at once. Neither waits for the next scan. A group that another gateway
-created appears with the next scan.
+The gateway learns these groups from Iggy's metadata change log. Iggy keeps a log of its committed
+metadata changes, and the SDK reads it with `get_metadata_changes`. The bridge reads it in one
+background task, on an Iggy client of its own. At start, the task reads the current state of the
+streams, topics and consumer groups. Then it reads the changes after that state, every 250
+milliseconds. It keeps each Iggy group named `kafka.cg.<group>`
+([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)) on a topic that a Kafka name lists. When Iggy deletes a
+topic or a stream, the groups on it go too. So a group that another gateway commits for appears
+here within about a second, and no request costs an Iggy call per topic.
+
+When Iggy no longer holds the changes after the task's position, the task reads the current state
+again and goes on from there. A read that fails is tried again after a pause. The pause starts at
+250 milliseconds and doubles up to 10 seconds. While reads fail, the groups of the last read that
+ended stay the answer.
+
+A commit through this gateway adds its group at once. A deletion through it removes the group at
+once. Neither waits for the change log. Such a change stays on top of what the log shows until the
+log shows it too, or for 10 seconds.
+
+Until the first read of the current state ends, `ListGroups` answers `COORDINATOR_LOAD_IN_PROGRESS`
+(14), and `DescribeGroups` answers 14 for each named group that is not in the map. The Java admin
+client retries that code. A request then waits for that read until its offset deadline, 3 seconds
+by default. If every read so far failed, for example because Iggy is down, both APIs report only the
+groups in the map, as without a bridge. A `ListGroups` state filter without `Empty`, or a type
+filter without `classic`, needs no groups from Iggy. `DescribeGroups` needs them only for a named
+group that is not in the map.
+
+### Without the change log
+
+The change log needs root or the global `manage_servers` permission. When the bridge's Iggy user has
+neither, Iggy refuses the read with `Unauthorized`. The gateway then logs one warning and finds the
+groups with a scan for as long as it runs. A scan lists the Kafka topics, then calls
+`get_consumer_groups` once per topic and keeps the Iggy groups named `kafka.cg.<group>`. It runs on
+an Iggy client of its own, which sends the calls for 16 topics at once. So it never waits behind
+Produce, and no offset call waits behind it. At most one scan runs at a time. A commit or a deletion
+through this gateway changes the groups at once, as above. A group that another gateway created
+appears with the next scan. A topic whose groups the bridge user cannot list is left out of a scan.
 
 The groups of a scan answer at once for 10 seconds after the scan ends. So the `ListGroups` and the
 `DescribeGroups` of one `kafka-consumer-groups.sh` run share one scan, which costs one Iggy call per
@@ -91,11 +120,8 @@ older ones, waits for the new scan until its offset deadline, 3 seconds by defau
 A scan keeps running after its request stops waiting, for up to 30 seconds, and serves the next
 request. A scan that reaches that limit keeps the groups it found, and the groups of the last scan
 stay too. If a scan fails, the groups of the last scan that found them stay the answer. While the
-first scan runs, `ListGroups` answers `COORDINATOR_LOAD_IN_PROGRESS` (14), and `DescribeGroups`
-answers 14 for each named group that is not in the map. The Java admin client retries that code.
-If every scan so far failed, for example because Iggy is down, both APIs report only the groups in
-the map, as without a bridge. A `ListGroups` state filter without `Empty`, or a type filter without
-`classic`, needs no scan. `DescribeGroups` scans only for a named group that is not in the map.
+first scan runs, both APIs answer 14 as above. If every scan so far failed, both APIs report only
+the groups in the map.
 
 A negative commit, or `OffsetDelete`, deletes an offset but not the Iggy group. So a group whose
 offsets were all deleted that way still shows as `Empty`, until `DeleteGroups` deletes it. Without
@@ -137,10 +163,11 @@ gateway then looks up the id on the topic every 5 to 100 milliseconds. It looks 
 deleted the group, which reads what it wrote. When the id is gone, or names another group, the
 gateway answers. Then `OffsetFetch` returns -1 for the group, and the admin APIs no longer find it.
 
-`OffsetDelete` first finds out whether a group with no members here holds offsets. When the last
-scan found the group, that scan answers. Otherwise the gateway asks each requested topic, which also
-finds a group that another gateway committed for since that scan. Only a group that no requested
-topic holds waits for a scan, which tells whether the group holds offsets on another topic.
+`OffsetDelete` first finds out whether a group with no members here holds offsets. When the change
+log, or the last scan, shows the group, that answers. Otherwise the gateway asks each requested
+topic, which also finds a group that another gateway committed for a moment ago. Only a group that
+no requested topic holds then takes the groups of the change log, or waits for a scan. They tell
+whether the group holds offsets on another topic.
 
 While a deletion runs, the group takes no join and no commit. `JoinGroup` and `OffsetCommit` answer
 `COORDINATOR_LOAD_IN_PROGRESS` (14), and clients retry. The deletion waits for each commit that
@@ -219,11 +246,58 @@ can pin it.
 
 ## More than one gateway
 
-Group membership is process memory, and gateways do not share it. With `IGGY_KAFKA_BROKERS`,
-every gateway's `FindCoordinator` names the gateway with the lowest node id, so the members of a
-group meet on that one gateway. The other gateways answer `ListGroups` with no groups, since the
-admin client asks every broker and keeps one answer per group. While the coordinating gateway is
-down, the groups wait for it.
+The gateways share their groups through the coordinator log, the Iggy topic `coordinators` in the
+stream `<default stream>.meta`. The log is on by default with `IGGY_KAFKA_BROKERS`
+(`IGGY_KAFKA_COORDINATOR_LOG`). The code is in `src/coordinator/`.
+
+- Each group belongs to one of 16 log partitions, by an FNV-1a hash of its id. The count never
+  changes, since a new count would move nearly every group.
+- Every gateway joins the Iggy consumer group `kafka-gateways` on the log topic, and Iggy spreads
+  the partitions over the gateways. No gateway polls through that group. It only tells each
+  gateway which partitions to claim. A partition that no member polled has nothing to drain, so
+  Iggy hands it to another member at once. Each gateway reads its own share every second
+  (`ConsumerGroupClient::get_consumer_group_assignment`). A partition leaves that share as soon
+  as Iggy starts to hand it over.
+- A gateway that Iggy gives a partition reads the partition from its last checkpoint. Then it
+  appends a claim, numbered above every claim before it, and reads on to the claim. The first
+  claim with the highest number owns the partition. The owner restores the groups of the
+  partition and announces itself on the topic `coordinator_owners`. Every gateway reads the
+  announcements to answer `FindCoordinator` and to name partition leaders.
+- The owner stores the state of each completed generation when the leader's `SyncGroup` arrives:
+  members, subscriptions in the selected protocol, assignments and static instance ids. The group
+  stays `CompletingRebalance` until the record is read back, so no member learns its assignment
+  before it is stored. Kafka does the same. Joins and leaves between generations are not stored,
+  as in Kafka. A group whose members are all gone leaves the log within 5 s.
+- Every write is checked. The owner reads each record it appends. When a newer claim comes before
+  the record, the record does not count, and the owner answers `NOT_COORDINATOR` (16) and stops
+  serving the partition. A load skips each record of an older claim that comes after a newer
+  claim. So a gateway that lost a partition can still append, but nothing it appends then counts.
+  The owner also follows its partitions with a waiting read (#4629), so another gateway's claim
+  ends its coordination at once, also for heartbeats and offset reads, which write nothing.
+- The owner stops serving a partition when Iggy takes it away, when its reads or appends fail,
+  or when it cannot read its share for 10 s.
+- A new owner restores each group `Stable` in its stored generation, and starts each member's
+  session again. A member that heartbeats within its session timeout keeps its assignment, with
+  no rebalance.
+- After 10,000 records, and at least once a day, the owner writes a checkpoint: every live group
+  and offset again, between a begin and an end record. Each record names where the last complete
+  checkpoint begins, so a load reads only from there. Iggy keeps the log for 7 days.
+- Each record carries a format version and a kind. A gateway skips a record it does not know, so
+  two versions can share the log during a rolling upgrade.
+- On SIGTERM, the gateway leaves the Iggy group before its drain, so the others take its
+  partitions over at once. Its group requests in flight answer `NOT_COORDINATOR`, and their
+  clients go to the new coordinator.
+- `ListGroups`, `DescribeGroups`, `DeleteGroups` and `OffsetDelete` answer only for the groups of
+  this gateway. The others get `NOT_COORDINATOR` per group. The Java admin client asks every
+  broker and keeps one answer per group.
+
+Not tested: the takeover time after a crash. It waits for the Iggy session timeout, 1.2 times
+`heartbeat.interval`, 36 s by default.
+
+With `IGGY_KAFKA_COORDINATOR_LOG=false`, group membership is process memory alone. With
+`IGGY_KAFKA_BROKERS`, every gateway's `FindCoordinator` then names the gateway with the lowest node
+id, so the members of a group meet on that one gateway. The other gateways answer `ListGroups`
+with no groups. While the coordinating gateway is down, the groups wait for it.
 
 Without `IGGY_KAFKA_BROKERS`, each gateway names itself as the coordinator. A client that can
 reach two such gateways ends up in two independent groups under one name:
@@ -235,13 +309,12 @@ reach two such gateways ends up in two independent groups under one name:
 3. Both groups commit against the same Iggy key, so committed offsets flip between the two
    groups' positions.
 
-So run several gateways for consumers only with `IGGY_KAFKA_BROKERS`. A coordinator that moves
-when a gateway stops needs group state in Iggy, which is later work.
+So run several gateways for consumers only with `IGGY_KAFKA_BROKERS`.
 
-Group state also does not survive a gateway restart. Clients recover on their own - a member id
-the coordinator does not know is answered with `UNKNOWN_MEMBER_ID`, which is what makes the Java
-and librdkafka clients discard it and join from scratch - and committed offsets are unaffected
-because they live in Iggy.
+Without the coordinator log, group state does not survive a gateway restart. Clients recover on
+their own. A member id the coordinator does not know is answered with `UNKNOWN_MEMBER_ID`, which
+makes the Java and librdkafka clients discard it and join from scratch. Committed offsets are not
+lost, because they live in Iggy.
 
 ## Timeouts without a background task
 
