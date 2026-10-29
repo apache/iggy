@@ -21,7 +21,7 @@
 //! external HTTP service during login. The service decides whether to map the
 //! caller to a pre-provisioned Iggy user (by username) or deny the login.
 //!
-//! Per-thread in-flight callouts are capped at [`MAX_IN_FLIGHT_CALLOUTS`]
+//! Per-thread in-flight callouts are capped at [`ExternalAuthConfig::max_concurrent_callouts`]
 //! via [`CalloutGuard`]. There is no per-client rate limit: operators should
 //! rate-limit brute-force attempts at the network layer or inside the
 //! external auth service itself.
@@ -36,8 +36,7 @@ use serde::{Deserialize, Serialize};
 const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
 
 /// Reject credentials longer than this before serializing them into the
-/// callout body. A multi-MB PAT passes the built-in hash check (mismatch)
-/// and would otherwise be forwarded verbatim to the external service.
+/// callout body.
 const MAX_CREDENTIAL_BYTES: usize = 8_192;
 
 thread_local! {
@@ -99,24 +98,14 @@ fn serialize_secret<S: serde::Serializer>(
 
 /// Connection and credential metadata sent to the external auth service.
 ///
-/// Manual `Debug` redacts credentials so secrets never appear in log output.
-#[derive(Serialize)]
-pub struct ExternalAuthRequest {
-    pub transport: String,
-    pub client_address: String,
-    pub connection_id: String,
-    pub credentials: Credentials,
-}
-
-impl fmt::Debug for ExternalAuthRequest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ExternalAuthRequest")
-            .field("transport", &self.transport)
-            .field("client_address", &self.client_address)
-            .field("connection_id", &self.connection_id)
-            .field("credentials", &self.credentials)
-            .finish()
-    }
+/// Borrows transport metadata and the credential from the caller to avoid
+/// copying the secret. `SecretString` redacts itself in `Debug`.
+#[derive(Debug, Serialize)]
+pub struct ExternalAuthRequest<'a> {
+    pub transport: &'a str,
+    pub client_address: &'a str,
+    pub connection_id: &'a str,
+    pub credentials: Credentials<'a>,
 }
 
 /// Credential payload for the external auth callout.
@@ -124,50 +113,35 @@ impl fmt::Debug for ExternalAuthRequest {
 /// Internally tagged on `"type"` so each variant carries exactly the fields
 /// it needs. Future credential kinds (bearer tokens, client certificates)
 /// add a variant here without touching the request envelope.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum Credentials {
+pub enum Credentials<'a> {
     UsernamePassword {
-        username: String,
+        username: &'a str,
         #[serde(serialize_with = "serialize_secret")]
-        password: SecretString,
+        password: &'a SecretString,
     },
 }
 
-impl fmt::Debug for Credentials {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UsernamePassword { username, .. } => f
-                .debug_struct("UsernamePassword")
-                .field("username", username)
-                .field("password", &"[REDACTED]")
-                .finish(),
-        }
-    }
+fn default_deny_reason() -> String {
+    "denied by external auth".to_owned()
 }
 
-/// JSON response from the external auth service.
+/// Decision from the external auth service, deserialized directly from the
+/// JSON response. Tagged on `"decision"`.
 #[derive(Debug, Deserialize)]
-struct ExternalAuthResponse {
-    decision: DecisionTag,
-    username: Option<String>,
-    reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum DecisionTag {
-    Allow,
-    Deny,
-}
-
-/// Parsed decision from the external auth service.
-#[derive(Debug)]
+#[serde(tag = "decision", rename_all = "snake_case")]
 pub enum ExternalAuthDecision {
     /// Map the caller to a pre-provisioned Iggy user by username.
-    Allow { username: String },
+    Allow {
+        #[serde(default)]
+        username: Option<String>,
+    },
     /// Reject the login.
-    Deny { reason: String },
+    Deny {
+        #[serde(default = "default_deny_reason")]
+        reason: String,
+    },
 }
 
 /// Callout failure (network, timeout, bad response, or rejected request).
@@ -230,23 +204,15 @@ impl fmt::Display for ExternalAuthError {
 
 impl std::error::Error for ExternalAuthError {}
 
-fn redact_url_userinfo(url: &str) -> std::borrow::Cow<'_, str> {
+/// Extract `scheme://host` from a URL, dropping path, query, and fragment.
+/// Falls back to the full URL if the scheme separator is absent.
+fn scheme_and_host(url: &str) -> &str {
     let Some((scheme, rest)) = url.split_once("://") else {
-        return std::borrow::Cow::Borrowed(url);
+        return url;
     };
-    // Restrict the '@' search to the authority segment (before the first
-    // '/') so an '@' in a query parameter does not strip the real host.
-    let (authority, tail) = rest.split_once('/').unwrap_or((rest, ""));
-    match authority.rsplit_once('@') {
-        Some((_, after_at)) => {
-            if tail.is_empty() {
-                std::borrow::Cow::Owned(format!("{scheme}://{after_at}"))
-            } else {
-                std::borrow::Cow::Owned(format!("{scheme}://{after_at}/{tail}"))
-            }
-        }
-        None => std::borrow::Cow::Borrowed(url),
-    }
+    // The authority ends at the first of '/', '?', or '#'.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    &url[..scheme.len() + 3 + authority_end]
 }
 
 /// Boot-time checks that need server-side dependencies (TLS roots, tracing).
@@ -255,6 +221,8 @@ pub fn preflight(config: &ExternalAuthConfig) -> Result<(), crate::server_error:
     if !config.enabled {
         return Ok(());
     }
+    // The callout is async and yields while waiting, so a large timeout
+    // stalls only this login attempt, not the shard reactor.
     if config.timeout.get_duration().as_secs() > 30 {
         tracing::warn!(
             timeout = %config.timeout,
@@ -264,7 +232,7 @@ pub fn preflight(config: &ExternalAuthConfig) -> Result<(), crate::server_error:
     }
     if config.url.starts_with("http://") {
         tracing::warn!(
-            url = %redact_url_userinfo(&config.url),
+            url = %scheme_and_host(&config.url),
             "external auth URL uses plain HTTP; credentials will be sent in cleartext"
         );
     }
@@ -276,7 +244,7 @@ pub fn preflight(config: &ExternalAuthConfig) -> Result<(), crate::server_error:
     Ok(())
 }
 
-fn validate_credential_size(credentials: &Credentials) -> Result<(), ExternalAuthError> {
+fn validate_credential_size(credentials: &Credentials<'_>) -> Result<(), ExternalAuthError> {
     match credentials {
         Credentials::UsernamePassword { username, password } => {
             if username.len() > MAX_CREDENTIAL_BYTES {
@@ -296,6 +264,28 @@ fn validate_credential_size(credentials: &Credentials) -> Result<(), ExternalAut
     Ok(())
 }
 
+/// Validate the `Allow` decision: username must be present and non-empty.
+fn validate_allow(
+    decision: ExternalAuthDecision,
+) -> Result<ExternalAuthDecision, ExternalAuthError> {
+    if let ExternalAuthDecision::Allow { ref username } = decision {
+        match username {
+            None => {
+                return Err(ExternalAuthError::BadResponse(
+                    "allow decision missing username".to_owned(),
+                ));
+            }
+            Some(name) if name.is_empty() => {
+                return Err(ExternalAuthError::BadResponse(
+                    "allow decision has empty username".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(decision)
+}
+
 /// Call the external auth service and parse the response.
 ///
 /// # Errors
@@ -304,7 +294,7 @@ fn validate_credential_size(credentials: &Credentials) -> Result<(), ExternalAut
 /// Fail-closed: every error variant denies the login.
 pub async fn callout_external_auth(
     config: &ExternalAuthConfig,
-    request: ExternalAuthRequest,
+    request: ExternalAuthRequest<'_>,
 ) -> Result<ExternalAuthDecision, ExternalAuthError> {
     use futures::StreamExt;
 
@@ -342,12 +332,9 @@ pub async fn callout_external_auth(
             });
         }
 
-        if let Some(len) = response
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<usize>().ok())
-            && len > MAX_RESPONSE_BODY_BYTES
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_RESPONSE_BODY_BYTES as u64)
         {
             return Err(ExternalAuthError::BadResponse(
                 "response body too large".to_owned(),
@@ -374,50 +361,27 @@ pub async fn callout_external_auth(
         .await
         .map_err(|_| ExternalAuthError::Timeout)??;
 
-    let resp: ExternalAuthResponse = serde_json::from_slice(&bytes)
+    let decision: ExternalAuthDecision = serde_json::from_slice(&bytes)
         .map_err(|e| ExternalAuthError::BadResponse(format!("invalid JSON: {e}")))?;
 
-    into_decision(resp)
-}
-
-/// Validate required fields per decision variant and convert to the
-/// public type. Extracted so tests can exercise the mapping without
-/// an HTTP round-trip.
-fn into_decision(resp: ExternalAuthResponse) -> Result<ExternalAuthDecision, ExternalAuthError> {
-    match resp.decision {
-        DecisionTag::Allow => {
-            let username = resp.username.ok_or_else(|| {
-                ExternalAuthError::BadResponse("allow decision missing username".to_owned())
-            })?;
-            if username.is_empty() {
-                return Err(ExternalAuthError::BadResponse(
-                    "allow decision has empty username".to_owned(),
-                ));
-            }
-            Ok(ExternalAuthDecision::Allow { username })
-        }
-        DecisionTag::Deny => {
-            let reason = resp
-                .reason
-                .unwrap_or_else(|| "denied by external auth".to_owned());
-            Ok(ExternalAuthDecision::Deny { reason })
-        }
-    }
+    validate_allow(decision)
 }
 
 /// Validate that a pre-provisioned user is eligible for external login:
-/// exists, active, and not root. Reused by the trusted-issuer JWT path.
+/// exists, active, not root, and carries no unrecognized critical options.
+/// Reused by the trusted-issuer JWT path.
 pub fn validate_provisioned_account(
     user: Option<&metadata::stm::user::User>,
 ) -> Option<(u32, iggy_common::IggyTimestamp)> {
-    use iggy_common::UserStatus;
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+    use iggy_common::{UserStatus, check_critical_options};
 
     let user = user?;
     if user.id == DEFAULT_ROOT_USER_ID {
         return None;
     }
-    (user.status == UserStatus::Active).then_some((user.id, user.created_at))
+    (user.status == UserStatus::Active && check_critical_options(&user.options).is_ok())
+        .then_some((user.id, user.created_at))
 }
 
 /// Resolve an externally authenticated username to a pre-provisioned Iggy
@@ -436,25 +400,26 @@ pub fn resolve_username(
 mod tests {
     use super::*;
 
-    /// Deserialize JSON and convert to a decision, same as
-    /// `callout_external_auth` does after receiving the HTTP body.
+    /// Deserialize JSON and validate, same as `callout_external_auth` does
+    /// after receiving the HTTP body.
     fn parse_response(json: &str) -> Result<ExternalAuthDecision, ExternalAuthError> {
-        let resp: ExternalAuthResponse = serde_json::from_str(json)
+        let decision: ExternalAuthDecision = serde_json::from_str(json)
             .map_err(|e| ExternalAuthError::BadResponse(format!("invalid JSON: {e}")))?;
-        into_decision(resp)
+        validate_allow(decision)
     }
 
     // ── request serialization ───────────────────────────────────────
 
     #[test]
     fn request_username_password_round_trip() {
+        let password = SecretString::from("s3cret".to_owned());
         let req = ExternalAuthRequest {
-            transport: "tcp".to_owned(),
-            client_address: "10.0.0.1:5000".to_owned(),
-            connection_id: "0195f4d7-57d3-7c21-a711-08a147ad6c90".to_owned(),
+            transport: "tcp",
+            client_address: "10.0.0.1:5000",
+            connection_id: "0195f4d7-57d3-7c21-a711-08a147ad6c90",
             credentials: Credentials::UsernamePassword {
-                username: "alice".to_owned(),
-                password: SecretString::from("s3cret".to_owned()),
+                username: "alice",
+                password: &password,
             },
         };
         let val: serde_json::Value = serde_json::to_value(&req).unwrap();
@@ -474,7 +439,9 @@ mod tests {
     fn response_allow_with_username() {
         let json = r#"{"decision": "allow", "username": "ext-alice"}"#;
         match parse_response(json).unwrap() {
-            ExternalAuthDecision::Allow { username } => assert_eq!(username, "ext-alice"),
+            ExternalAuthDecision::Allow { username } => {
+                assert_eq!(username.as_deref(), Some("ext-alice"));
+            }
             ExternalAuthDecision::Deny { .. } => panic!("expected Allow, got Deny"),
         }
     }
@@ -491,6 +458,17 @@ mod tests {
         let json = r#"{"decision": "allow", "username": ""}"#;
         let err = parse_response(json).unwrap_err();
         assert!(err.to_string().contains("empty username"));
+    }
+
+    #[test]
+    fn response_allow_with_stray_reason_should_parse() {
+        let json = r#"{"decision": "allow", "username": "ext-bob", "reason": "extra"}"#;
+        match parse_response(json).unwrap() {
+            ExternalAuthDecision::Allow { username } => {
+                assert_eq!(username.as_deref(), Some("ext-bob"));
+            }
+            ExternalAuthDecision::Deny { .. } => panic!("expected Allow, got Deny"),
+        }
     }
 
     // ── response deserialization: deny ───────────────────────────────
@@ -545,6 +523,30 @@ mod tests {
         assert!(parse_response("{}").is_err());
     }
 
+    // ── scheme_and_host ────────────────────────────────────────────
+
+    #[test]
+    fn scheme_and_host_strips_path_and_query() {
+        assert_eq!(
+            scheme_and_host("https://auth.example.com/verify?token=secret"),
+            "https://auth.example.com"
+        );
+        assert_eq!(
+            scheme_and_host("http://localhost:8080/auth#frag"),
+            "http://localhost:8080"
+        );
+        assert_eq!(scheme_and_host("https://host"), "https://host");
+    }
+
+    #[test]
+    fn scheme_and_host_does_not_leak_query_at_in_authority() {
+        // An '@' in the query must not be mistaken for a userinfo separator.
+        assert_eq!(
+            scheme_and_host("http://auth.local?next=a@b"),
+            "http://auth.local"
+        );
+    }
+
     // ── runtime probe ───────────────────────────────────────────────
 
     #[test]
@@ -571,13 +573,14 @@ mod tests {
 
     #[test]
     fn request_credentials_nested_under_tagged_envelope() {
+        let password = SecretString::from("pw".to_owned());
         let req = ExternalAuthRequest {
-            transport: "http".to_owned(),
-            client_address: "10.0.0.1:443".to_owned(),
-            connection_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            transport: "http",
+            client_address: "10.0.0.1:443",
+            connection_id: "00000000-0000-0000-0000-000000000001",
             credentials: Credentials::UsernamePassword {
-                username: "bob".to_owned(),
-                password: SecretString::from("pw".to_owned()),
+                username: "bob",
+                password: &password,
             },
         };
         let json = serde_json::to_string(&req).unwrap();

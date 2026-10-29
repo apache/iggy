@@ -83,6 +83,10 @@ impl Validatable<ConfigurationError> for ExternalAuthConfig {
             eprintln!("external_auth.timeout must be greater than zero");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
+        if self.max_concurrent_callouts == 0 {
+            eprintln!("external_auth.max_concurrent_callouts must be greater than zero");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         Ok(())
     }
 }
@@ -153,6 +157,17 @@ mod tests {
             enabled: true,
             url: "https://auth.example.com/verify".to_owned(),
             timeout: "0 s".parse().expect("valid duration"),
+            ..ExternalAuthConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_enabled_config_with_zero_max_concurrent_callouts_when_validating_should_reject() {
+        let config = ExternalAuthConfig {
+            enabled: true,
+            url: "https://auth.example.com/verify".to_owned(),
+            max_concurrent_callouts: 0,
             ..ExternalAuthConfig::default()
         };
         assert!(config.validate().is_err());

@@ -64,7 +64,7 @@ use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::MetadataSubmitError;
 use metadata::impls::metadata::{BoundSession, StreamsFrontend};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 use server_common::Message;
 use server_common::crypto;
 use std::cell::RefCell;
@@ -1305,44 +1305,6 @@ where
         .is_some_and(consensus::VsrConsensus::is_primary)
 }
 
-/// Build the ext-auth callout request from the wire login and session state.
-fn build_ext_auth_request(
-    sessions: &RefCell<SessionManager>,
-    transport_client_id: u128,
-    wire_request: &LoginRegisterRequest,
-) -> crate::external_auth::ExternalAuthRequest {
-    use crate::external_auth::{Credentials, ExternalAuthRequest};
-    use message_bus::installer::conn_info::ClientTransportKind;
-
-    let (transport, client_address) = sessions
-        .borrow()
-        .client_record(transport_client_id)
-        .map_or_else(
-            || ("unknown", "unknown".to_owned()),
-            |r| {
-                let transport = match r.transport {
-                    ClientTransportKind::Tcp => "tcp",
-                    ClientTransportKind::TcpTls => "tcp_tls",
-                    ClientTransportKind::Ws => "ws",
-                    ClientTransportKind::Wss => "wss",
-                    ClientTransportKind::Quic => "quic",
-                    _ => "unknown",
-                };
-                (transport, r.address.to_string())
-            },
-        );
-
-    ExternalAuthRequest {
-        transport: transport.to_owned(),
-        client_address,
-        connection_id: uuid::Uuid::from_u128(transport_client_id).to_string(),
-        credentials: Credentials::UsernamePassword {
-            username: wire_request.username.to_string(),
-            password: SecretString::from(wire_request.password.expose_secret().to_owned()),
-        },
-    }
-}
-
 /// Attempt external auth callout and, on success, resolve the returned
 /// username to a pre-provisioned Iggy user and complete the login.
 ///
@@ -1364,22 +1326,41 @@ async fn try_external_auth_login<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    use crate::external_auth::{ExternalAuthDecision, callout_external_auth};
+    use crate::external_auth::{
+        Credentials, ExternalAuthDecision, ExternalAuthRequest, callout_external_auth,
+    };
+    use message_bus::installer::conn_info::ClientTransportKind;
 
     let transport_client_id = origin.id;
 
     // If the client disconnected while queued, the session slot is gone.
     // Firing the callout would waste a round-trip and widen the window where
     // a committed Register holds a slot for a gone connection.
-    if sessions
-        .borrow()
-        .client_record(transport_client_id)
-        .is_none()
-    {
-        return;
-    }
+    let (transport, client_address) = match sessions.borrow().client_record(transport_client_id) {
+        Some(r) => {
+            let transport = match r.transport {
+                ClientTransportKind::Tcp => "tcp",
+                ClientTransportKind::TcpTls => "tcp_tls",
+                ClientTransportKind::Ws => "ws",
+                ClientTransportKind::Wss => "wss",
+                ClientTransportKind::Quic => "quic",
+                _ => "unknown",
+            };
+            (transport, r.address.to_string())
+        }
+        None => return,
+    };
+    let connection_id = uuid::Uuid::from_u128(transport_client_id).to_string();
 
-    let ext_request = build_ext_auth_request(sessions, transport_client_id, wire_request);
+    let ext_request = ExternalAuthRequest {
+        transport,
+        client_address: &client_address,
+        connection_id: &connection_id,
+        credentials: Credentials::UsernamePassword {
+            username: wire_request.username.as_str(),
+            password: &wire_request.password,
+        },
+    };
 
     let decision = match callout_external_auth(ext_auth, ext_request).await {
         Ok(decision) => decision,
@@ -1396,7 +1377,9 @@ async fn try_external_auth_login<B, MJ, S, SB>(
     };
 
     let login_error = match decision {
+        // validate_allow guarantees username is Some(non-empty) on Allow.
         ExternalAuthDecision::Allow { username } => {
+            let username = username.expect("validated by callout_external_auth");
             let resolve = shard
                 .plane
                 .metadata()

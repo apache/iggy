@@ -2268,13 +2268,16 @@ async fn try_external_auth_http_login(
     };
 
     let ext_config = &state.server_config.external_auth;
+    let client_address = client_addr.addr.to_string();
+    let connection_id = uuid::Uuid::now_v7().to_string();
+    let password_secret = SecretString::from(password.to_owned());
     let ext_request = ExternalAuthRequest {
-        transport: "http".to_owned(),
-        client_address: client_addr.addr.to_string(),
-        connection_id: uuid::Uuid::now_v7().to_string(),
+        transport: "http",
+        client_address: &client_address,
+        connection_id: &connection_id,
         credentials: Credentials::UsernamePassword {
-            username: username.to_owned(),
-            password: SecretString::from(password.to_owned()),
+            username,
+            password: &password_secret,
         },
     };
 
@@ -2290,9 +2293,11 @@ async fn try_external_auth_http_login(
         })?;
 
     match decision {
+        // validate_allow guarantees username is Some(non-empty) on Allow.
         ExternalAuthDecision::Allow {
             username: ext_username,
         } => {
+            let ext_username = ext_username.expect("validated by callout_external_auth");
             let (user_id, created_at) = state
                 .shard
                 .plane
