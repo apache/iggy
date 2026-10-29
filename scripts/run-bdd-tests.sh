@@ -35,7 +35,7 @@ log(){ printf "%b\n" "$*"; }
 usage(){
   log "Usage: $0 [--coverage] <sdk> [feature]"
   log ""
-  log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | all | clean (default: all)"
+  log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | swift | all | clean (default: all)"
   log "  feature: basic_messaging | leader_redirection | raw_command | session_contract | stream_crud | stream_options | resource_options_patch | metadata_changes | all  (default: all)"
   log ""
   log "  Every suite runs against iggy-server, taken from IGGY_SERVER_PATH"
@@ -162,6 +162,7 @@ case "$SDK" in
   csharp)   run_suite csharp-bdd "🔷"   "Running C# BDD tests"     ;;
   java)     run_suite java-bdd   "☕"   "Running Java BDD tests"   ;;
   cpp)      run_suite cpp-bdd    "⚙️"   "Running C++ BDD tests"    ;;
+  swift)    run_suite swift-bdd  "🐦"   "Running Swift BDD tests"  ;;
   all)
     run_suite rust-bdd   "🦀"   "Running Rust BDD tests"                       || exit $?
     run_suite python-bdd "🐍"   "Running Python BDD tests"                     || exit $?
@@ -173,6 +174,7 @@ case "$SDK" in
     run_suite csharp-bdd "🔷"   "Running C# BDD tests"                         || exit $?
     run_suite java-bdd   "☕"   "Running Java BDD tests"                       || exit $?
     run_suite cpp-bdd    "⚙️"   "Running C++ BDD tests"                        || exit $?
+    run_suite swift-bdd  "🐦"   "Running Swift BDD tests"                      || exit $?
     ;;
   clean)
     cleanup

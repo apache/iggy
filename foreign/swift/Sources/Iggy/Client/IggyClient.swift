@@ -76,6 +76,13 @@ public final class IggyClient: Sendable {
         self.init(configuration: ClientConfiguration(address: address, tls: tls, autoLogin: autoLogin))
     }
 
+    /// Creates a client from a connection string such as
+    /// `iggy://iggy:iggy@localhost:8090?tls=true`, whose credentials become the
+    /// auto-login. See ``ClientConfiguration/init(connectionString:)``.
+    public convenience init(connectionString: String, logger: Logger = Logger(label: "org.apache.iggy")) throws {
+        self.init(configuration: try ClientConfiguration(connectionString: connectionString), logger: logger)
+    }
+
     init(configuration: ClientConfiguration, connector: any IggyConnector, logger: Logger) {
         self.configuration = configuration
         self.logger = logger

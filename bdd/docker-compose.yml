@@ -224,6 +224,18 @@ services:
     networks:
       - iggy-bdd-network
 
+  swift-bdd:
+    image: iggy-bdd-swift
+    build:
+      context: ..
+      dockerfile: bdd/swift/Dockerfile
+    environment:
+      - IGGY_ROOT_USERNAME=iggy
+      - IGGY_ROOT_PASSWORD=iggy
+      - BDD_FEATURE=${BDD_FEATURE:-all}
+    networks:
+      - iggy-bdd-network
+
   cpp-bdd:
     image: iggy-bdd-cpp
     build:

@@ -33,13 +33,18 @@ runs:
       uses: ./.github/actions/utils/setup-swift
 
     # swift-format ships with the toolchain; the configuration lives in
-    # foreign/swift/.swift-format.
+    # foreign/swift/.swift-format and covers the examples and the BDD runner
+    # too, which compile in their own lanes.
     - name: Format Check
       shell: bash
       if: inputs.task == 'lint'
       run: |
         cd foreign/swift
         swift format lint --strict --recursive Sources Tests Package.swift
+        cd ../..
+        for package in examples/swift/getting-started bdd/swift/tests; do
+          swift format lint --strict --recursive --configuration foreign/swift/.swift-format "$package/Sources" "$package/Package.swift"
+        done
 
     # A warning-free build is the lint gate the Swift compiler provides: the
     # SDK builds in Swift 6 language mode with strict concurrency checking.

@@ -159,7 +159,7 @@ This checkout moves the binary protocol to 0.12.0 and the metadata snapshot form
 - [Node.js (TypeScript)](https://www.npmjs.com/package/apache-iggy)
 - [Go](https://pkg.go.dev/github.com/apache/iggy/foreign/go)
 
-[C++](https://github.com/apache/iggy/tree/master/foreign/cpp) and [PHP](https://github.com/apache/iggy/tree/master/foreign/php) are work in progress.
+[C++](https://github.com/apache/iggy/tree/master/foreign/cpp), [PHP](https://github.com/apache/iggy/tree/master/foreign/php), and [Swift](https://github.com/apache/iggy/tree/master/foreign/swift) are work in progress.
 
 ---
 
