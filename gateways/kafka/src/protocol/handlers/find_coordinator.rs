@@ -17,7 +17,8 @@
 
 //! `FindCoordinator` (API key 10).
 //!
-//! The answer is always this gateway, matching the single broker entry Metadata advertises. No
+//! The answer is the gateway with the lowest node id among the brokers Metadata lists, so every
+//! gateway names the same one and the members of a group never split over two coordinators. No
 //! group state is consulted: where the coordinator lives does not depend on which group is asked
 //! about.
 
@@ -48,9 +49,6 @@ const COORDINATOR_TYPE_GROUP: i8 = 0;
 
 const COORDINATOR_TYPE_TRANSACTION: i8 = 1;
 
-/// The node id this gateway advertises for itself, in Metadata and here alike.
-const SELF_NODE_ID: i32 = 1;
-
 const UNSUPPORTED_KEY_TYPE_MESSAGE: &str = "only group coordination is supported";
 
 #[expect(
@@ -72,7 +70,11 @@ pub async fn handle(
         validate_find_coordinator_shape(version, body, state.max_frame_size)
     }) {
         Ok(request) => respond_or_close(
-            encode_response(api_version, &request, &connection.broker),
+            encode_response(
+                api_version,
+                &request,
+                connection.brokers.coordinator(&connection.broker),
+            ),
             "FindCoordinator",
         ),
         Err(error) => {
@@ -91,13 +93,15 @@ pub async fn handle(
     }
 }
 
+/// Names `coordinator`, a node id and its endpoint, for every group key.
+///
 /// # Errors
 ///
 /// Returns an error when `kafka_protocol` cannot encode the response at `version`.
 pub fn encode_response(
     version: i16,
     request: &FindCoordinatorRequest,
-    broker: &BrokerAdvertise,
+    coordinator: (i32, &BrokerAdvertise),
 ) -> Result<Bytes> {
     let keys = if version >= 4 {
         request.coordinator_keys.clone()
@@ -106,7 +110,7 @@ pub fn encode_response(
     };
     let error_code = match request.key_type {
         COORDINATOR_TYPE_GROUP => {
-            return encode_inner(version, &keys, ERROR_NONE, None, Some(broker));
+            return encode_inner(version, &keys, ERROR_NONE, None, Some(coordinator));
         }
         // Transactions are out of scope for good, so the producer must fail rather than retry.
         COORDINATOR_TYPE_TRANSACTION => ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
@@ -135,15 +139,15 @@ fn encode_inner(
     keys: &[StrBytes],
     error_code: i16,
     error_message: Option<StrBytes>,
-    broker: Option<&BrokerAdvertise>,
+    coordinator: Option<(i32, &BrokerAdvertise)>,
 ) -> Result<Bytes> {
-    let (node_id, host, port) = broker.map_or_else(
+    let (node_id, host, port) = coordinator.map_or_else(
         || (-1, StrBytes::new(), -1),
-        |broker| {
+        |(node_id, endpoint)| {
             (
-                SELF_NODE_ID,
-                StrBytes::from_string(broker.host.clone()),
-                broker.port,
+                node_id,
+                StrBytes::from_string(endpoint.host.clone()),
+                endpoint.port,
             )
         },
     );
@@ -171,4 +175,70 @@ fn encode_inner(
             .with_port(port)
     };
     encode_message(&response, version, 128)
+}
+
+#[cfg(test)]
+mod tests {
+    use kafka_protocol::protocol::Decodable;
+
+    use super::*;
+    use crate::protocol::api::Brokers;
+
+    fn endpoint(node: i32) -> BrokerAdvertise {
+        BrokerAdvertise {
+            host: format!("gateway-{node}.example"),
+            port: 9090 + node,
+        }
+    }
+
+    #[test]
+    fn given_a_gateway_with_a_lower_node_id_when_finding_a_group_coordinator_should_name_it() {
+        let brokers = Brokers {
+            node_id: 2,
+            peers: vec![(1, endpoint(1)), (3, endpoint(3))],
+        };
+        let own = endpoint(2);
+        let key = StrBytes::from_static_str("payments");
+        let request = FindCoordinatorRequest::default()
+            .with_key(key.clone())
+            .with_coordinator_keys(vec![key]);
+        for version in RANGE.min_version..=RANGE.max_version {
+            let mut body =
+                encode_response(version, &request, brokers.coordinator(&own)).expect("encode");
+            let response = FindCoordinatorResponse::decode(&mut body, version)
+                .expect("a FindCoordinator response");
+            let named = if version >= 4 {
+                let coordinator = &response.coordinators[0];
+                (
+                    coordinator.node_id,
+                    coordinator.host.to_string(),
+                    coordinator.port,
+                )
+            } else {
+                (response.node_id, response.host.to_string(), response.port)
+            };
+            assert_eq!(
+                named,
+                (BrokerId(1), "gateway-1.example".to_string(), 9091),
+                "v{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_the_lowest_node_id_when_finding_a_group_coordinator_should_name_itself() {
+        let brokers = Brokers {
+            node_id: 1,
+            peers: vec![(2, endpoint(2))],
+        };
+        let own = endpoint(1);
+        let (node_id, named) = brokers.coordinator(&own);
+        assert_eq!((node_id, named.host.as_str()), (1, "gateway-1.example"));
+        assert!(brokers.coordinates_groups());
+        let follower = Brokers {
+            node_id: 2,
+            peers: vec![(1, endpoint(1))],
+        };
+        assert!(!follower.coordinates_groups());
+    }
 }
