@@ -1,0 +1,60 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "sink"
+key = "otlp"
+enabled = true
+version = 0
+name = "OTLP sink"
+path = "../../target/release/libiggy_connector_otlp_sink"
+verbose = false
+
+[[streams]]
+stream = "telemetry"
+topics = ["logs"]
+# Each message holds one protobuf ExportLogsServiceRequest, as the Collector's
+# Kafka exporter writes it with the otlp_proto encoding.
+schema = "raw"
+batch_length = 500
+consumer_group = "otlp_sink"
+
+[plugin_config]
+# Required. The base URL, http(s)://host:4318. The sink appends /v1/logs.
+endpoint = "http://localhost:4318"
+
+# "none" (default) or "gzip".
+compression = "none"
+
+# Per-attempt timeout (default: 10s). Must be greater than zero.
+timeout = "10s"
+
+# Total attempts per request, including the first (default: 8, about 45 s of
+# backoff in total). 1 disables retries.
+max_retries = 8
+retry_delay = "1s"
+max_retry_delay = "10s"
+
+# Upper bound on one request's encoded size (default: 4000000, under the 4 MiB
+# limit most receivers use). Messages are never split across requests.
+max_request_bytes = 4000000
+
+verbose_logging = false
+
+# Sent with every export as HTTP headers. Values are treated as secrets. Do not
+# commit real credentials.
+# [plugin_config.headers]
+# authorization = "Bearer <YOUR_TOKEN_HERE>"
