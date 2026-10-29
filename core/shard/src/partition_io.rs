@@ -964,7 +964,7 @@ mod tests {
                 captured.borrow_mut().push(frame);
                 Ok(())
             }));
-            assert!(bus.owner_table().try_claim(PEER, 1));
+            crate::test_support::connect_replica_on(&bus, PEER, 1);
             let group = if incarnation == 0 {
                 METADATA_GROUP
             } else {
@@ -1055,7 +1055,7 @@ mod tests {
             captured.borrow_mut().push(frame);
             Ok(())
         }));
-        assert!(bus.owner_table().try_claim(REQUESTER, 1));
+        crate::test_support::connect_replica_on(&bus, REQUESTER, 1);
         let (mut owner, _sender) = test_owner(&bus, None);
         owner.partition_consensus.replica_count = 2;
         let namespace = IggyNamespace::new(0, 0, 0);
@@ -1145,7 +1145,7 @@ mod tests {
                     captured.borrow_mut().push(frame);
                     Ok(())
                 }));
-                assert!(bus.owner_table().try_claim(REQUESTER, 1));
+                crate::test_support::connect_replica_on(&bus, REQUESTER, 1);
                 let (mut owner, _sender) = test_owner(&bus, None);
                 owner.partition_consensus.replica_count = 3;
                 let partitions = owner.plane.partitions();
@@ -1233,7 +1233,7 @@ mod tests {
                     captured.borrow_mut().push(frame);
                     Ok(())
                 }));
-                assert!(bus.owner_table().try_claim(REPAIR_PRIMARY, 1));
+                crate::test_support::connect_replica_on(&bus, REPAIR_PRIMARY, 1);
                 let (mut owner, _sender) = test_owner(&bus, None);
                 owner.partition_consensus.replica_count = 3;
                 let partitions = owner.plane.partitions();
@@ -2110,7 +2110,7 @@ mod tests {
             Ok(())
         }));
         for replica in 1..3 {
-            assert!(bus.owner_table().try_claim(replica, 1));
+            crate::test_support::connect_replica_on(&bus, replica, 1);
         }
         let (owner, _sender) = test_owner(&bus, None);
         let partitions = owner.plane.partitions();
@@ -4228,7 +4228,7 @@ mod tests {
             }));
             for peer in 0..REPLICAS {
                 if peer != replica {
-                    assert!(bus.owner_table().try_claim(peer, 1));
+                    crate::test_support::connect_replica_on(&bus, peer, 1);
                 }
             }
             let (mut owner, inbox_owner) = test_owner(&bus, None);
@@ -4616,7 +4616,7 @@ mod tests {
             Ok(())
         }));
         for replica in [1, 2] {
-            assert!(bus.owner_table().try_claim(replica, 1));
+            crate::test_support::connect_replica_on(&bus, replica, 1);
         }
         let (mut owner, _sender) = test_owner(&bus, None);
         let mut consensus = VsrConsensus::new(
@@ -4711,7 +4711,7 @@ mod tests {
             }
             Ok(())
         }));
-        assert!(bus.owner_table().try_claim(0, 1));
+        crate::test_support::connect_replica_on(&bus, 0, 1);
         let (mut owner, _sender) = test_owner(&bus, None);
         let mut consensus = VsrConsensus::new(
             1,
@@ -4781,7 +4781,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let bus = Rc::new(IggyMessageBus::new(0));
         bus.set_replica_forward_fn(Box::new(|_, _, _| Ok(())));
-        assert!(bus.owner_table().try_claim(0, 1));
+        crate::test_support::connect_replica_on(&bus, 0, 1);
         let (mut owner, _sender) = test_owner(&bus, None);
         let mut consensus = VsrConsensus::new(
             1,
@@ -5137,7 +5137,7 @@ mod tests {
             Ok(())
         }));
         for replica in [0, 2] {
-            assert!(bus.owner_table().try_claim(replica, 1));
+            crate::test_support::connect_replica_on(&bus, replica, 1);
         }
         let (mut owner, _sender) = test_owner(&bus, None);
         owner.partition_consensus.replica_count = 3;
@@ -5223,7 +5223,7 @@ mod tests {
             }
             Ok(())
         }));
-        assert!(bus.owner_table().try_claim(NEW_PRIMARY, 1));
+        crate::test_support::connect_replica_on(&bus, NEW_PRIMARY, 1);
         let (owner, _sender) = test_owner(&bus, None);
         let namespace = IggyNamespace::new(0, 0, 0);
         let prepares = primary_prepares(&bus, namespace, NEW_HEAD).await;
@@ -5391,7 +5391,7 @@ mod tests {
                 Ok(())
             }));
             for peer in (0..HEADLESS_REPLICAS).filter(|peer| *peer != replica) {
-                assert!(bus.owner_table().try_claim(peer, 1));
+                crate::test_support::connect_replica_on(&bus, peer, 1);
             }
             let (owner, sender) = test_owner(&bus, None);
             let mut partition = repairing_replica(
@@ -7069,7 +7069,7 @@ mod tests {
             captured.borrow_mut().push(frame);
             Ok(())
         }));
-        assert!(bus.owner_table().try_claim(REPAIR_PRIMARY, 1));
+        crate::test_support::connect_replica_on(&bus, REPAIR_PRIMARY, 1);
         let (owner, _sender) = test_owner(&bus, None);
         let namespace = IggyNamespace::new(0, 0, 0);
         let prepares = primary_prepares(&bus, namespace, HEAD).await;
@@ -7142,7 +7142,7 @@ mod tests {
             Ok(())
         }));
         for requester in [BACKUP, NEXT_PRIMARY] {
-            assert!(bus.owner_table().try_claim(requester, 1));
+            crate::test_support::connect_replica_on(&bus, requester, 1);
         }
         let (owner, _sender) = test_owner(&bus, None);
         let namespace = IggyNamespace::new(0, 0, 0);
@@ -7206,7 +7206,7 @@ mod tests {
      {
         let bus = Rc::new(IggyMessageBus::new(0));
         let requests = capture_repair_requests(&bus);
-        assert!(bus.owner_table().try_claim(STALE_SHAPE_PRIMARY, 1));
+        crate::test_support::connect_replica_on(&bus, STALE_SHAPE_PRIMARY, 1);
         let (owner, _sender) = test_owner(&bus, None);
         let namespace = IggyNamespace::new(0, 0, 0);
         let (abandoned, committed) = Box::pin(requester_past_an_abandoned_op(
@@ -7276,7 +7276,7 @@ mod tests {
      {
         let bus = Rc::new(IggyMessageBus::new(0));
         let requests = capture_repair_requests(&bus);
-        assert!(bus.owner_table().try_claim(STALE_SHAPE_PRIMARY, 1));
+        crate::test_support::connect_replica_on(&bus, STALE_SHAPE_PRIMARY, 1);
         let (owner, _sender) = test_owner(&bus, None);
         let namespace = IggyNamespace::new(0, 0, 0);
         let (abandoned, committed) = Box::pin(requester_past_an_abandoned_op(
@@ -7324,7 +7324,7 @@ mod tests {
         const CHUNK: u64 = 4;
         let bus = Rc::new(IggyMessageBus::new(0));
         let requests = capture_repair_requests(&bus);
-        assert!(bus.owner_table().try_claim(PRIMARY, 1));
+        crate::test_support::connect_replica_on(&bus, PRIMARY, 1);
         let (owner, _sender) = test_owner(&bus, None);
         owner.set_repair_chunk_max(CHUNK);
         let namespace = IggyNamespace::new(0, 0, 0);
@@ -7572,7 +7572,7 @@ mod tests {
             Ok(())
         }));
         let primary = u8::try_from(BLANK_HEAD_VIEW % 3).unwrap();
-        assert!(bus.owner_table().try_claim(primary, 1));
+        crate::test_support::connect_replica_on(&bus, primary, 1);
         (bus, probes)
     }
 

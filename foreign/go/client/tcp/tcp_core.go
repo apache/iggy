@@ -509,6 +509,24 @@ func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
 	return &iggcon.ConnectionInfo{Protocol: iggcon.Tcp, ServerAddress: c.links.address()}
 }
 
+// GetNoDelay reports whether TCP_NODELAY is set on new connections, which
+// tests and callers can use to observe the parsed nodelay option before a
+// connection exists to read it off.
+func (c *IggyTcpClient) GetNoDelay() bool {
+	// The client configuration does not change after construction, so this
+	// reads the field directly, like the dial path does.
+	return c.config.noDelay
+}
+
+// GetHeartbeatInterval reports the pacing of the managed heartbeat task on
+// ready replica links, which tests and callers can use to observe the
+// parsed heartbeat_interval option before a connection exists.
+func (c *IggyTcpClient) GetHeartbeatInterval() time.Duration {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return c.config.heartbeatInterval
+}
+
 // ResolveOperation replays the retained bytes under their original identity.
 // A committed business rejection is returned unchanged and releases the lane.
 // For an operation that is no longer retained, it returns what a replay proved.

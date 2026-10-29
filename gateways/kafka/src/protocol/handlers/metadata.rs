@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use iggy_kafka_wire::KafkaWireError;
 use kafka_protocol::messages::metadata_response::{
     MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
 };
@@ -30,7 +31,7 @@ use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::IggyBridge;
 use crate::bridge::topic_map::is_valid_kafka_topic_name;
 use crate::cluster_id::ClusterId;
-use crate::error::{KafkaProtocolError, Result};
+use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_METADATA, ApiVersionRange, BrokerAdvertise, ConnectionState,
     ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_REQUEST_TIMED_OUT,
@@ -173,7 +174,7 @@ pub async fn handle(
         .await
         .unwrap_or_else(|join_error| {
             tracing::error!(%join_error, "Metadata all-topics encode task panicked");
-            Err(KafkaProtocolError::Malformed(join_error.to_string()))
+            Err(KafkaWireError::Malformed(join_error.to_string()).into())
         })
     } else {
         encode_real_response(api_version, &results, &connection.broker, &state.cluster_id)
@@ -553,7 +554,7 @@ fn decode_topics(api_version: i16, body: Bytes, max_frame_size: usize) -> Result
             topic
                 .name
                 .map(|name| name.0)
-                .ok_or(KafkaProtocolError::NullTopicName)
+                .ok_or_else(|| KafkaWireError::NullTopicName.into())
         })
         .collect()
 }
@@ -587,7 +588,7 @@ fn decode_requested_topics(
                     topic
                         .name
                         .map(|name| name.0)
-                        .ok_or(KafkaProtocolError::NullTopicName)
+                        .ok_or_else(|| KafkaWireError::NullTopicName.into())
                 })
                 .collect::<Result<Vec<_>>>()
         })
@@ -605,6 +606,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::error::KafkaProtocolError;
     use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
     use crate::protocol::auto_topic_creation::AutoTopicCreationConfig;
 
@@ -617,7 +619,10 @@ mod tests {
             0xff, 0xff, // null topic name
         ]);
         let err = decode_topics(0, body, TEST_MAX_FRAME_SIZE).unwrap_err();
-        assert!(matches!(err, KafkaProtocolError::NullTopicName));
+        assert!(matches!(
+            err,
+            KafkaProtocolError::Wire(KafkaWireError::NullTopicName)
+        ));
     }
 
     #[test]

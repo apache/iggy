@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use iggy_kafka_wire::KafkaWireError;
 use kafka_protocol::messages::RequestHeader;
 use kafka_protocol::protocol::Decodable;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -439,9 +440,10 @@ impl KafkaGateway {
     ///
     /// # Errors
     ///
-    /// Returns an error on invalid config, unusable TLS material, or a non-transient `accept()`
-    /// error on any listener. With a bridge and no [`Self::with_cluster_id`], also returns the
-    /// bridge's error when it cannot load the cluster id from Iggy.
+    /// Returns an error on invalid config, unusable TLS material, or a panic in the accept loop of
+    /// a listener. An `accept()` error ends nothing: the loop retries it. With a bridge and no
+    /// [`Self::with_cluster_id`], also returns the bridge's error when it cannot load the cluster
+    /// id from Iggy.
     pub async fn run(
         self,
         listeners: Vec<BoundListener>,
@@ -541,10 +543,10 @@ impl KafkaGateway {
                 }
                 Ok(())
             }
-            // An accept loop ends early only on a non-transient accept error, since shutdown is
-            // what the other branch is for.
+            // An accept loop ends early only by a panic, since shutdown is what the other branch
+            // is for.
             Some(finished) = accept_loops.join_next() => match finished {
-                Ok(result) => result,
+                Ok(()) => Ok(()),
                 Err(join_error) => Err(io::Error::other(join_error).into()),
             },
         };
@@ -683,18 +685,22 @@ struct AcceptLoop {
     tls: Option<Arc<TlsState>>,
 }
 
-/// Accepts on one listener until the cancel token fires or `accept()` fails for good.
-async fn accept_loop(this: AcceptLoop) -> Result<()> {
+/// Accepts on one listener until the cancel token fires. No `accept()` error ends it, because the
+/// listener cannot come back without a restart of the gateway, which ends every connection and
+/// all group state.
+async fn accept_loop(this: AcceptLoop) {
+    let mut backoff = AcceptBackoff::default();
     loop {
         let accepted = tokio::select! {
-            () = this.cancel.cancelled() => return Ok(()),
+            () = this.cancel.cancelled() => return,
             accepted = this.socket.accept() => accepted,
         };
         if this.cancel.is_cancelled() {
-            return Ok(());
+            return;
         }
         match accepted {
             Ok((stream, peer)) => {
+                backoff.reset();
                 let Ok(permit) = Arc::clone(&this.conn_limiter).try_acquire_owned() else {
                     warn!(%peer, protocol = %this.listener.protocol, max_connections = this.config.max_connections, "listener connection limit reached, rejecting");
                     continue;
@@ -719,15 +725,51 @@ async fn accept_loop(this: AcceptLoop) -> Result<()> {
                     serve_connection(stream, connection).await;
                 });
             }
-            Err(e) if is_transient_accept_error(&e) => {
-                // Brief backoff on fd exhaustion to avoid busy-spinning.
-                if matches!(e.raw_os_error(), Some(23 | 24)) {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+            Err(e) => {
+                let Some(delay) = backoff.after(&e) else {
+                    debug!(%e, protocol = %this.listener.protocol, "accept failed for one connection, continuing");
+                    continue;
+                };
+                warn!(%e, protocol = %this.listener.protocol, ?delay, "accept failed, retrying");
+                tokio::select! {
+                    () = this.cancel.cancelled() => return,
+                    () = tokio::time::sleep(delay) => {}
                 }
-                warn!(%e, "transient accept error, continuing");
             }
-            Err(e) => return Err(e.into()),
         }
+    }
+}
+
+/// The first wait of [`AcceptBackoff`].
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
+/// The longest wait of [`AcceptBackoff`], so the listener takes connections again soon after the
+/// error ends.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// The wait before the next `accept()` after an error.
+///
+/// An error of one pending connection retries at once. Any other error, such as no free file
+/// descriptor, waits, and the wait doubles while the errors continue. So an error that lasts
+/// neither spins a core nor floods the log.
+#[derive(Debug, Default)]
+struct AcceptBackoff {
+    /// `None` until an error waits, and again after an accept succeeds.
+    next: Option<Duration>,
+}
+
+impl AcceptBackoff {
+    /// How long to wait after `error`. `None` to accept again at once.
+    fn after(&mut self, error: &io::Error) -> Option<Duration> {
+        if is_connection_accept_error(error) {
+            return None;
+        }
+        let delay = self.next.unwrap_or(ACCEPT_BACKOFF_MIN);
+        self.next = Some((delay * 2).min(ACCEPT_BACKOFF_MAX));
+        Some(delay)
+    }
+
+    const fn reset(&mut self) {
+        self.next = None;
     }
 }
 
@@ -822,14 +864,23 @@ async fn drain(tracker: &TaskTracker, cancel: &CancellationToken, deadline: Dura
     }
 }
 
-fn is_transient_accept_error(err: &std::io::Error) -> bool {
+/// Whether an `accept()` error belongs to one pending connection, not to the listener. Linux
+/// `accept(2)` returns the network errors of a pending connection, and its manual says to retry
+/// them like `EAGAIN`.
+fn is_connection_accept_error(error: &io::Error) -> bool {
     matches!(
-        err.kind(),
-        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted | io::ErrorKind::WouldBlock
+        error.kind(),
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
     ) || matches!(
-        err.raw_os_error(),
-        // EMFILE / ENFILE are common across Unix platforms when fd limits are hit.
-        Some(23 | 24)
+        error.raw_os_error(),
+        Some(libc::EPROTO | libc::ENOPROTOOPT | libc::EHOSTDOWN | libc::EOPNOTSUPP)
     )
 }
 
@@ -988,7 +1039,10 @@ async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let connection_state = connection.listener.connection_state();
+    let connection_state = connection
+        .listener
+        .connection_state()
+        .with_peer(connection.peer);
     let bridge = connection.state.bridge.clone();
     let served = serve_frames(stream, connection, certificate_name, &connection_state).await;
     // A producer without a producer id has its Produce session by connection, so it ends here.
@@ -1068,10 +1122,11 @@ where
         };
 
         if frame.len() < 8 {
-            return Err(KafkaProtocolError::BufferUnderflow {
+            return Err(KafkaWireError::BufferUnderflow {
                 needed: 8,
                 remaining: frame.len(),
-            });
+            }
+            .into());
         }
         let api_key = i16::from_be_bytes([frame[0], frame[1]]);
         let api_version = i16::from_be_bytes([frame[2], frame[3]]);
@@ -1083,7 +1138,7 @@ where
         // malformed header and closes the connection.
         let mut body = frame;
         let mut req = RequestHeader::decode(&mut body, req_hdr_ver)
-            .map_err(|e| KafkaProtocolError::Malformed(e.to_string()))?;
+            .map_err(|e| KafkaWireError::Malformed(e.to_string()))?;
 
         debug!(
             %peer,
@@ -1093,6 +1148,7 @@ where
             client_id = req.client_id.as_deref().unwrap_or(""),
             "received request"
         );
+        connection_state.note_client_id(req.client_id.as_deref());
         // A group request can park for a whole rebalance timeout. `client_id` and the tagged
         // fields are views into the frame, so keeping them would pin the frame for that long
         // after the handler has let go of its own copy.
@@ -1533,7 +1589,7 @@ async fn send_response<S: AsyncWrite + Unpin>(
     let header_size = response_header_size(header_version);
     let payload_size = header_size + body.len();
     let payload_len_i32 =
-        i32::try_from(payload_size).map_err(|_| KafkaProtocolError::FrameTooLarge {
+        i32::try_from(payload_size).map_err(|_| KafkaWireError::FrameTooLarge {
             max_bytes: i32::MAX as usize,
             actual_bytes: payload_size,
         })?;
@@ -1577,17 +1633,18 @@ pub async fn read_frame<S: AsyncRead + Unpin>(
 
     let frame_len_i32 = i32::from_be_bytes(len_buf);
     if frame_len_i32 <= 0 {
-        return Err(KafkaProtocolError::InvalidFrameLength(frame_len_i32));
+        return Err(KafkaWireError::InvalidFrameLength(frame_len_i32).into());
     }
     // frame_len_i32 is validated > 0 above, so it always fits usize on every
     // platform this crate targets (32-bit and 64-bit).
     #[allow(clippy::cast_sign_loss)]
     let frame_len = frame_len_i32 as usize;
     if frame_len > max_frame_size {
-        return Err(KafkaProtocolError::FrameTooLarge {
+        return Err(KafkaWireError::FrameTooLarge {
             max_bytes: max_frame_size,
             actual_bytes: frame_len,
-        });
+        }
+        .into());
     }
 
     // In-flight: read_timeout applies only after the length prefix is complete.
@@ -1787,24 +1844,41 @@ mod tests {
     }
 
     #[test]
-    fn transient_accept_error_classification_covers_all_branches() {
-        for kind in [
-            io::ErrorKind::Interrupted,
-            io::ErrorKind::ConnectionAborted,
-            io::ErrorKind::WouldBlock,
+    fn given_an_error_of_one_connection_when_accepting_should_retry_at_once() {
+        let mut backoff = AcceptBackoff::default();
+        for error in [
+            io::Error::from(io::ErrorKind::Interrupted),
+            io::Error::from(io::ErrorKind::ConnectionAborted),
+            io::Error::from(io::ErrorKind::ConnectionReset),
+            io::Error::from_raw_os_error(libc::ENETUNREACH),
+            io::Error::from_raw_os_error(libc::EHOSTUNREACH),
+            io::Error::from_raw_os_error(libc::EPROTO),
+            io::Error::from_raw_os_error(libc::EHOSTDOWN),
         ] {
-            assert!(is_transient_accept_error(&io::Error::from(kind)));
+            assert_eq!(backoff.after(&error), None, "{error}");
         }
+    }
 
-        #[cfg(unix)]
-        {
-            assert!(is_transient_accept_error(&io::Error::from_raw_os_error(23)));
-            assert!(is_transient_accept_error(&io::Error::from_raw_os_error(24)));
+    #[test]
+    fn given_errors_of_the_listener_when_accepting_should_retry_after_a_growing_wait() {
+        let mut backoff = AcceptBackoff::default();
+        let waits: Vec<_> = [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM]
+            .into_iter()
+            .map(|code| backoff.after(&io::Error::from_raw_os_error(code)))
+            .collect();
+        assert_eq!(
+            waits,
+            [10, 20, 40, 80].map(|millis| Some(Duration::from_millis(millis)))
+        );
+
+        let unknown = io::Error::other("an error no list names");
+        for _ in 0..10 {
+            backoff.after(&unknown);
         }
+        assert_eq!(backoff.after(&unknown), Some(ACCEPT_BACKOFF_MAX));
 
-        assert!(!is_transient_accept_error(&io::Error::from(
-            io::ErrorKind::ConnectionRefused,
-        )));
+        backoff.reset();
+        assert_eq!(backoff.after(&unknown), Some(ACCEPT_BACKOFF_MIN));
     }
 
     #[tokio::test]
@@ -1845,7 +1919,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, KafkaProtocolError::InvalidFrameLength(-1)));
+        assert!(matches!(
+            err,
+            KafkaProtocolError::Wire(KafkaWireError::InvalidFrameLength(-1))
+        ));
     }
 
     #[tokio::test]
@@ -2090,10 +2167,10 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            KafkaProtocolError::FrameTooLarge {
+            KafkaProtocolError::Wire(KafkaWireError::FrameTooLarge {
                 max_bytes: 64,
                 actual_bytes: 65,
-            }
+            })
         ));
     }
 

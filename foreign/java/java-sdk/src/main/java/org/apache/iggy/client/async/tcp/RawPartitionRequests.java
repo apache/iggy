@@ -25,6 +25,7 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.PartitioningKind;
 import org.apache.iggy.serde.CommandCode;
 
@@ -36,14 +37,21 @@ import java.util.function.Supplier;
 /**
  * Stamps raw partition commands with the partition context the server fences
  * them by, as Rust's raw API does: a send to an explicit partition shares the
- * typed sends' context cache, and polls and offset writes take the routed path
- * of a typed poll or offset write. Other commands go out as they are.
+ * typed sends' context cache, and polls, deferred polls and offset writes take
+ * the routed path of a typed poll or offset write. Readiness waits, which Rust
+ * routes to the primary of each partition they name, and deferred-request
+ * cancels are refused. Other commands go out as they are.
  */
 final class RawPartitionRequests {
     private static final int SEND_MESSAGES = CommandCode.Messages.SEND.getValue();
     private static final int POLL_MESSAGES = CommandCode.Messages.POLL.getValue();
+    private static final int POLL_MESSAGES_DEFERRED = CommandCode.Messages.POLL_DEFERRED.getValue();
+    private static final int WAIT_FOR_MESSAGES = CommandCode.Messages.WAIT_FOR_MESSAGES.getValue();
+    private static final int CANCEL_DEFERRED_REQUEST = CommandCode.Messages.CANCEL_DEFERRED_REQUEST.getValue();
     private static final int STORE_CONSUMER_OFFSET = CommandCode.ConsumerOffset.STORE.getValue();
     private static final int DELETE_CONSUMER_OFFSET = CommandCode.ConsumerOffset.DELETE.getValue();
+    // A poll's count and auto-commit flag end its polling parameters.
+    private static final int COUNT_AND_AUTO_COMMIT_BYTES = Integer.BYTES + 1;
     private static final int SEND_METADATA_LENGTH_BYTES = Integer.BYTES;
     // An identifier and a partitioning both lead with a kind byte and a length byte.
     private static final int KIND_AND_LENGTH_BYTES = 2;
@@ -55,6 +63,8 @@ final class RawPartitionRequests {
     private static final int DELETE_OFFSET_SUFFIX_BYTES = 1;
     private static final String UNPARTITIONED_SEND = "A raw SendMessages request needs an explicit partition id."
             + " Send balanced or messages-key batches with MessagesClient.sendMessages.";
+    private static final String UNROUTED_WAIT = "A raw WaitForMessages request needs the primary of each partition"
+            + " it names, and this client does not route readiness waits.";
 
     private final Supplier<AsyncTcpConnection> connection;
     private final PollRouter pollRouter;
@@ -75,7 +85,9 @@ final class RawPartitionRequests {
     /**
      * Fails a partition command whose payload does not follow the layout the
      * typed API writes, and a send without an explicit partition, before
-     * anything is sent: either would otherwise go out with no context.
+     * anything is sent: either would otherwise go out with no context. A
+     * deferred poll with limits that the server's decoder refuses fails the
+     * same way.
      */
     CompletableFuture<ByteBuf> send(int code, byte[] payload) {
         try {
@@ -84,6 +96,18 @@ final class RawPartitionRequests {
             }
             if (code == POLL_MESSAGES) {
                 return pollMessages(payload);
+            }
+            if (code == POLL_MESSAGES_DEFERRED) {
+                return pollMessagesDeferred(payload);
+            }
+            if (code == WAIT_FOR_MESSAGES) {
+                throw IggyServerException.fromTcpResponse(
+                        IggyErrorCode.FEATURE_UNAVAILABLE.getCode(), UNROUTED_WAIT.getBytes(StandardCharsets.UTF_8));
+            }
+            if (code == CANCEL_DEFERRED_REQUEST) {
+                // A cancel names a pending request by its id, and the server answers no cancel,
+                // so a new raw request could only wait for its deadline.
+                throw IggyServerException.fromTcpResponse(IggyErrorCode.INVALID_COMMAND.getCode(), new byte[0]);
             }
             if (code == CommandCode.ConsumerOffset.GET.getValue()) {
                 targetEnd(payload, code);
@@ -124,6 +148,30 @@ final class RawPartitionRequests {
             throw malformed(POLL_MESSAGES, "polling parameters", parameters);
         }
         return messages.sendPoll(Unpooled.copiedBuffer(payload), Optional.empty());
+    }
+
+    private CompletableFuture<ByteBuf> pollMessagesDeferred(byte[] payload) {
+        int parameters = targetEnd(payload, POLL_MESSAGES_DEFERRED);
+        int limits = parameters + PollRouter.POLL_PARAMETERS_BYTES;
+        if (payload.length - limits != PollRouter.DEFERRED_PARAMETERS_BYTES) {
+            throw malformed(POLL_MESSAGES_DEFERRED, "polling parameters", parameters);
+        }
+        ByteBuf request = Unpooled.copiedBuffer(payload);
+        DeferredPollOptions options;
+        try {
+            options = PollRouter.deferredOptions(request);
+            options.validate(request.getUnsignedIntLE(limits - COUNT_AND_AUTO_COMMIT_BYTES));
+        } catch (IggyInvalidArgumentException refused) {
+            request.release();
+            throw refused;
+        }
+        // As for a typed deferred poll, the request's own budget sets the deadline,
+        // and each attempt sends what is left of that budget.
+        return pollRouter.partitionRequest(
+                POLL_MESSAGES_DEFERRED,
+                request,
+                Optional.empty(),
+                System.nanoTime() + options.requestTimeout().toNanos());
     }
 
     private CompletableFuture<ByteBuf> writeOffset(int code, byte[] payload) {

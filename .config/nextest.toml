@@ -27,18 +27,6 @@ nextest-version = { required = "0.9.127" }
 filter = 'package(integration) and test(cli::system::test_cli_session_scenario::should_be_successful)'
 threads-required = "num-cpus"
 
-# Elasticsearch tests share one reusable container (fixed name
-# `iggy-test-elasticsearch`, ReuseDirective::Always). Serializing the group
-# lets the first test create it and the rest attach by name, instead of racing
-# to create the same name concurrently (Docker 409 Conflict). Per-test
-# isolation comes from a unique index per fixture, not a fresh container.
-[test-groups.elasticsearch]
-max-threads = 1
-
-[[profile.default.overrides]]
-filter = 'package(integration) and test(/connectors::elasticsearch::/)'
-test-group = "elasticsearch"
-
 # Each test in these binaries spawns its own real iggy-server subprocess (isolated data dir, port
 # from PortGuard's own flock, so no two ever share a port). #[serial] on them is a dead letter
 # under nextest - nextest runs every test as its own process, and #[serial]'s mutex only excludes
@@ -71,6 +59,7 @@ filter = '''
     + binary_id(iggy-gateway-kafka::metadata_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::offsets_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::phase1_e2e_tests)
+    + binary_id(iggy-gateway-kafka::sasl_real_server_tests)
 '''
 test-group = "kafka_bridge"
 

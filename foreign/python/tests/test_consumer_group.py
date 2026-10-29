@@ -789,7 +789,6 @@ class TestConsumerGroup:
             PollingStrategy.Next(),
             10,
             auto_commit=AutoCommit.Interval(timedelta(seconds=5)),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         assert consumer.name() == consumer_name
@@ -824,7 +823,6 @@ class TestConsumerGroup:
             PollingStrategy.First(),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         async def take(received: ReceiveMessage) -> None:
@@ -881,7 +879,6 @@ class TestConsumerGroup:
             PollingStrategy.First(),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         async def take(received: ReceiveMessage) -> None:
@@ -935,7 +932,6 @@ class TestConsumerGroup:
             PollingStrategy.First(),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         assert consumer.get_last_consumed_offset(partition_id) is None
@@ -1007,7 +1003,6 @@ class TestConsumerGroup:
             PollingStrategy.First(),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         assert consumer.get_last_stored_offset(partition_id) is None
@@ -1074,7 +1069,6 @@ class TestConsumerGroup:
             PollingStrategy.First(),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
         await wait_for_consumer_group_assignment(
             iggy_client, stream_name, topic_name, consumer_name, members_count=1
@@ -1130,7 +1124,6 @@ class TestConsumerGroup:
             PollingStrategy.Next(),
             10,
             auto_commit=AutoCommit.Interval(timedelta(seconds=5)),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         async def take(message: ReceiveMessage) -> None:
@@ -1177,7 +1170,6 @@ class TestConsumerGroup:
             PollingStrategy.Next(),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         async def take(message: ReceiveMessage) -> None:
@@ -1219,7 +1211,6 @@ class TestConsumerGroup:
             PollingStrategy.Next(),
             10,
             auto_commit=AutoCommit.Interval(timedelta(seconds=5)),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         await iggy_client.send_messages(
@@ -1261,7 +1252,6 @@ class TestConsumerGroup:
             PollingStrategy.Next(),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         await iggy_client.send_messages(
@@ -1310,7 +1300,6 @@ class TestConsumerGroup:
             PollingStrategy.First(),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         iterator = consumer.iter_messages()
@@ -1350,7 +1339,6 @@ class TestConsumerGroup:
             PollingStrategy.Last(),
             1,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         iterator = consumer.iter_messages()
@@ -1395,7 +1383,6 @@ class TestConsumerGroup:
             PollingStrategy.Last(),
             2,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         iterator = consumer.iter_messages()
@@ -1436,7 +1423,6 @@ class TestConsumerGroup:
             PollingStrategy.Last(),
             1,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         async def take(message: ReceiveMessage) -> None:
@@ -1483,7 +1469,6 @@ class TestConsumerGroup:
             PollingStrategy.First(),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         iterator = first_consumer.iter_messages()
@@ -1501,7 +1486,6 @@ class TestConsumerGroup:
             PollingStrategy.Offset(value=start_offset),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         iterator = offset_consumer.iter_messages()
@@ -1549,7 +1533,6 @@ class TestConsumerGroup:
             PollingStrategy.First(),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         iterator = first_consumer.iter_messages()
@@ -1567,7 +1550,6 @@ class TestConsumerGroup:
             PollingStrategy.Offset(value=start_offset),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         async def take(message: ReceiveMessage) -> None:
@@ -1620,7 +1602,6 @@ class TestConsumerGroup:
             PollingStrategy.First(),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         iterator = first_consumer.iter_messages()
@@ -1638,7 +1619,6 @@ class TestConsumerGroup:
             PollingStrategy.Timestamp(value=start_timestamp),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         iterator = timestamp_consumer.iter_messages()
@@ -1690,7 +1670,6 @@ class TestConsumerGroup:
             PollingStrategy.First(),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         iterator = first_consumer.iter_messages()
@@ -1708,7 +1687,6 @@ class TestConsumerGroup:
             PollingStrategy.Timestamp(value=start_timestamp),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         async def take(message: ReceiveMessage) -> None:
@@ -1750,7 +1728,6 @@ class TestConsumerGroup:
             PollingStrategy.First(),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         assert consumer.get_last_consumed_offset(partition_id) is None
@@ -1811,7 +1788,6 @@ class TestConsumerGroup:
             PollingStrategy.First(),
             2,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         iterator = consumer.iter_messages()
@@ -1849,7 +1825,6 @@ class TestConsumerGroup:
             PollingStrategy.First(),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
             allow_replay=allow_replay,
         )
 
@@ -1882,7 +1857,6 @@ class TestConsumerGroup:
             PollingStrategy.Next(),
             1,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
             allow_replay=allow_replay,
         )
 
@@ -1915,7 +1889,6 @@ class TestConsumerGroup:
                 PollingStrategy.Next(),
                 10,
                 auto_commit=AutoCommit.Disabled(),
-                poll_interval=timedelta(milliseconds=25),
                 init_retries=10,
                 init_retry_interval=timedelta(milliseconds=50),
             )
@@ -1954,7 +1927,6 @@ class TestConsumerGroup:
             10,
             auto_commit=AutoCommit.Disabled(),
             auto_join_consumer_group=False,
-            poll_interval=timedelta(milliseconds=25),
         )
 
         assert consumer.name() == consumer_name
@@ -1982,7 +1954,6 @@ class TestConsumerGroup:
             PollingStrategy.Next(),
             10,
             auto_commit=AutoCommit.Disabled(),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         consumer = await iggy_client.consumer_group(
@@ -1994,7 +1965,6 @@ class TestConsumerGroup:
             10,
             auto_commit=AutoCommit.Disabled(),
             create_consumer_group_if_not_exists=False,
-            poll_interval=timedelta(milliseconds=25),
         )
 
         assert consumer.name() == consumer_name
@@ -2031,7 +2001,6 @@ class TestConsumerGroup:
                 PollingStrategy.Next(),
                 10,
                 auto_commit=AutoCommit.Disabled(),
-                poll_interval=timedelta(milliseconds=25),
             )
 
     @pytest.mark.asyncio
@@ -2055,7 +2024,6 @@ class TestConsumerGroup:
                 10,
                 auto_commit=AutoCommit.Disabled(),
                 create_consumer_group_if_not_exists=False,
-                poll_interval=timedelta(milliseconds=25),
             )
 
     @pytest.mark.asyncio
@@ -2091,7 +2059,6 @@ class TestConsumerGroup:
                 PollingStrategy.Next(),
                 10,
                 auto_commit=AutoCommit.Disabled(),
-                poll_interval=timedelta(milliseconds=25),
                 **kwargs,
             )
 
@@ -2110,7 +2077,6 @@ class TestConsumerGroup:
                 PollingStrategy.Next(),
                 10,
                 auto_commit=AutoCommit.Disabled(),
-                poll_interval=timedelta(milliseconds=25),
             )
 
     @pytest.mark.asyncio
@@ -2132,7 +2098,6 @@ class TestConsumerGroup:
                 PollingStrategy.Next(),
                 10,
                 auto_commit=AutoCommit.Disabled(),
-                poll_interval=timedelta(milliseconds=25),
             )
 
     @pytest.mark.asyncio
@@ -2155,7 +2120,6 @@ class TestConsumerGroup:
             PollingStrategy.Next(),
             10,
             auto_commit=AutoCommit.Interval(timedelta(seconds=5)),
-            poll_interval=timedelta(milliseconds=25),
         )
 
         async def take(_: ReceiveMessage) -> None:
