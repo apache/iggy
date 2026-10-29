@@ -217,22 +217,26 @@ with the most first-preference votes; a tie is broken by the leader's own list o
 that tie by set iteration order, which is not deterministic - this one is, deliberately, so tests
 can pin it.
 
-## One gateway per bootstrap endpoint
+## More than one gateway
 
-Group membership is process memory. Two gateway instances fronting one Iggy cluster do **not**
-share it, and a client that can reach both ends up in two independent groups under one name:
+Group membership is process memory, and gateways do not share it. With `IGGY_KAFKA_BROKERS`,
+every gateway's `FindCoordinator` names the gateway with the lowest node id, so the members of a
+group meet on that one gateway. The other gateways answer `ListGroups` with no groups, since the
+admin client asks every broker and keeps one answer per group. While the coordinating gateway is
+down, the groups wait for it.
 
-1. Each gateway advertises itself as the coordinator. A client that joined on gateway A and later
-   connects to B is told `UNKNOWN_MEMBER_ID` and rejoins on B with a fresh id.
+Without `IGGY_KAFKA_BROKERS`, each gateway names itself as the coordinator. A client that can
+reach two such gateways ends up in two independent groups under one name:
+
+1. A client that joined on gateway A and later connects to B is told `UNKNOWN_MEMBER_ID` and
+   rejoins on B with a fresh id.
 2. Each group's leader assigns **all** partitions to its own members, so every partition has two
    consumers and every record is delivered twice.
 3. Both groups commit against the same Iggy key, so committed offsets flip between the two
    groups' positions.
 
-The rule that follows: one gateway per Kafka bootstrap endpoint, with
-`IGGY_KAFKA_ADVERTISED_HOST`/`_PORT` routing back to that same instance, and no load balancer in
-front of more than one gateway for consumers. Fixing this needs a shared coordinator (Iggy-backed
-group state, or gateway-to-gateway forwarding) and is out of scope here.
+So run several gateways for consumers only with `IGGY_KAFKA_BROKERS`. A coordinator that moves
+when a gateway stops needs group state in Iggy, which is later work.
 
 Group state also does not survive a gateway restart. Clients recover on their own - a member id
 the coordinator does not know is answered with `UNKNOWN_MEMBER_ID`, which is what makes the Java
