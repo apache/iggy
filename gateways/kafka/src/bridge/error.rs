@@ -196,6 +196,22 @@ impl BridgeError {
         }
     }
 
+    /// [`Self::to_kafka_error_code`] for Produce. The SDK returns `HistoryUnavailable`,
+    /// `LifecycleBusy` and `ClientShutdown` only for a send that wrote nothing, because a send
+    /// that may have landed ends as `OperationUncertain`. So these answer 6, which clients retry,
+    /// not -1, which loses the records.
+    #[must_use]
+    pub const fn to_produce_error_code(&self) -> i16 {
+        match self {
+            Self::Iggy(
+                IggyError::HistoryUnavailable
+                | IggyError::LifecycleBusy
+                | IggyError::ClientShutdown,
+            ) => ERROR_NOT_LEADER_OR_FOLLOWER,
+            _ => self.to_kafka_error_code(),
+        }
+    }
+
     /// True when the same call can succeed later: Kafka clients retry its code, 6 or 7. A wrong
     /// password, a missing permission or a bad configuration is not.
     #[must_use]
@@ -418,6 +434,47 @@ mod tests {
                 "{err}"
             );
             assert_eq!(err.to_list_offsets_error_code(), code, "{err}");
+        }
+    }
+
+    #[test]
+    fn given_a_send_that_wrote_nothing_when_mapped_for_produce_should_answer_retriable() {
+        let wrote_nothing = [
+            IggyError::HistoryUnavailable,
+            IggyError::LifecycleBusy,
+            IggyError::ClientShutdown,
+        ];
+        for error in wrote_nothing {
+            let err = BridgeError::Iggy(error);
+            assert_eq!(
+                err.to_kafka_error_code(),
+                ERROR_UNKNOWN_SERVER_ERROR,
+                "{err}"
+            );
+            assert_eq!(
+                err.to_produce_error_code(),
+                ERROR_NOT_LEADER_OR_FOLLOWER,
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_send_that_may_have_landed_when_mapped_for_produce_should_keep_the_shared_code() {
+        let may_have_landed = [
+            (
+                BridgeError::Iggy(IggyError::OperationUncertain(1)),
+                ERROR_REQUEST_TIMED_OUT,
+            ),
+            (BridgeError::Timeout, ERROR_REQUEST_TIMED_OUT),
+            // A retry after the client was evicted could write it twice.
+            (
+                BridgeError::Iggy(IggyError::RequestTooOld),
+                ERROR_UNKNOWN_SERVER_ERROR,
+            ),
+        ];
+        for (err, code) in may_have_landed {
+            assert_eq!(err.to_produce_error_code(), code, "{err}");
         }
     }
 
