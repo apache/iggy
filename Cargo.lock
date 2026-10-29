@@ -7289,6 +7289,7 @@ dependencies = [
  "futures",
  "iggy",
  "iggy_binary_protocol",
+ "iggy_common",
  "iggy_kafka_wire",
  "kafka-protocol",
  "libc",
