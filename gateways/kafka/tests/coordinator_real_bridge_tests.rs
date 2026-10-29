@@ -425,7 +425,7 @@ async fn given_checkpoints_in_the_log_when_the_gateway_restarts_should_load_the_
     let ends = polled
         .messages
         .iter()
-        .filter_map(|message| Record::decode(&message.payload).ok().flatten())
+        .filter_map(|message| Record::decode(&message.payload).ok())
         .filter(|record| matches!(record.body, Body::CheckpointEnd { .. }))
         .count();
     assert!(

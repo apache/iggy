@@ -79,7 +79,7 @@ use crate::bridge::iggy_bridge::in_slot;
 use crate::bridge::{BridgeError, IggyBridge, MAX_TOPIC_PARTITIONS};
 use crate::error::Result;
 use crate::protocol::api::{
-    API_KEY_CREATE_PARTITIONS, ApiVersionRange, ERROR_INVALID_PARTITIONS,
+    API_KEY_CREATE_PARTITIONS, ApiVersionRange, ConnectionState, ERROR_INVALID_PARTITIONS,
     ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_NOT_CONTROLLER,
     ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_AUTHORIZATION_FAILED,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome,
@@ -132,6 +132,7 @@ type Verdict = (i16, Option<StrBytes>);
 
 pub async fn handle(
     state: &GatewayState,
+    connection: &ConnectionState,
     principal: Option<&AuthenticatedPrincipal>,
     api_version: i16,
     body: Bytes,
@@ -171,7 +172,7 @@ pub async fn handle(
             );
         }
     };
-    if another_controller(state) {
+    if another_controller(state, &connection.brokers) {
         return respond_or_close(
             encode_inner(api_version, &req.topics, ERROR_NOT_CONTROLLER),
             "CreatePartitions",
@@ -1046,6 +1047,7 @@ mod tests {
     fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
         AuthenticatedPrincipal {
             username: "alice".to_string(),
+            user: None,
             permissions: PrincipalPermissions {
                 manage_topics,
                 ..PrincipalPermissions::default()

@@ -36,7 +36,7 @@ use tokio::time::Instant;
 
 use crate::bridge::{BridgeError, IggyBridge, KafkaTopicMetadata, OffsetCalls, TopicTarget};
 use crate::coordinator::record::CommittedOffset;
-use crate::coordinator::replay::GroupOffsets;
+use crate::coordinator::replay::{GroupOffsets, TopicPartition};
 use crate::error::Result;
 use crate::group::is_valid_group_id;
 use crate::protocol::api::{
@@ -224,10 +224,16 @@ async fn answer(state: &GatewayState, query: &GroupQuery, calls: &OffsetCalls) -
         return GroupAnswer::error(ERROR_COORDINATOR_LOAD_IN_PROGRESS);
     };
     let logged = match &state.coordination {
-        Some(coordination) => match coordination.offsets(&query.group_id).await {
-            Ok(logged) => logged,
-            Err(code) => return GroupAnswer::error(code),
-        },
+        Some(coordination) => {
+            let requested = query.topics.as_deref().map(requested_partitions);
+            match coordination
+                .offsets(&query.group_id, requested.as_deref())
+                .await
+            {
+                Ok(logged) => logged,
+                Err(code) => return GroupAnswer::error(code),
+            }
+        }
         None => None,
     };
     // The log holds every offset of a group it deleted, so Iggy has nothing to add. Nor does it
@@ -246,22 +252,94 @@ async fn answer(state: &GatewayState, query: &GroupQuery, calls: &OffsetCalls) -
         return GroupAnswer::error(ERROR_COORDINATOR_LOAD_IN_PROGRESS);
     }
     // Each Iggy call stops at the deadline on its own, so none is cut off holding its slot.
-    let read = match &query.topics {
-        Some(topics) => read_topics(bridge, &query.group_id, topics, calls).await,
-        None => read_every_topic(bridge, &query.group_id, calls).await,
+    let read = match (&query.topics, &logged) {
+        // Iggy reads only the partitions the log holds no entry for.
+        (Some(topics), Some(logged)) => {
+            read_topics(bridge, &query.group_id, &unlogged(topics, logged), calls)
+                .await
+                .map(|read| merged(topics, logged, read))
+        }
+        (Some(topics), None) => read_topics(bridge, &query.group_id, topics, calls).await,
+        (None, _) => read_every_topic(bridge, &query.group_id, calls)
+            .await
+            .map(|mut read| {
+                if let Some(logged) = &logged {
+                    overlay(&mut read, logged);
+                }
+                read
+            }),
     };
     match read {
-        Ok(mut topics) => {
-            if let Some(logged) = &logged {
-                overlay(&mut topics, logged, query.topics.is_none());
-            }
-            GroupAnswer {
-                error: ERROR_NONE,
-                topics,
-            }
-        }
+        Ok(topics) => GroupAnswer {
+            error: ERROR_NONE,
+            topics,
+        },
         Err(error) => GroupAnswer::error(refusal(&query.group_id, &error)),
     }
+}
+
+/// Each partition `topics` asks for, as the log keys it.
+fn requested_partitions(topics: &[(TopicName, Vec<i32>)]) -> Vec<TopicPartition> {
+    topics
+        .iter()
+        .flat_map(|(name, indexes)| {
+            indexes
+                .iter()
+                .map(move |index| (name.0.to_string(), *index))
+        })
+        .collect()
+}
+
+/// `topics` without the partitions the log holds an entry for. Each topic stays, so the read
+/// answers in the same order.
+fn unlogged(topics: &[(TopicName, Vec<i32>)], logged: &GroupOffsets) -> Vec<(TopicName, Vec<i32>)> {
+    topics
+        .iter()
+        .map(|(name, indexes)| {
+            let indexes = indexes
+                .iter()
+                .copied()
+                .filter(|index| !logged.entries.contains_key(&(name.0.to_string(), *index)))
+                .collect();
+            (name.clone(), indexes)
+        })
+        .collect()
+}
+
+/// The answer to `topics`, in request order: the log's for each partition it holds an entry
+/// for, else the next of `read`, which answers [`unlogged`] in that order.
+fn merged(
+    topics: &[(TopicName, Vec<i32>)],
+    logged: &GroupOffsets,
+    read: Vec<TopicAnswer>,
+) -> Vec<TopicAnswer> {
+    topics
+        .iter()
+        .zip(read)
+        .map(|((name, indexes), read)| {
+            let mut from_iggy = read.partitions.into_iter();
+            let partitions = indexes
+                .iter()
+                .map(|&index| {
+                    logged
+                        .entries
+                        .get(&(name.0.to_string(), index))
+                        .map_or_else(
+                            || {
+                                from_iggy.next().unwrap_or_else(|| {
+                                    PartitionAnswer::new(index, UNKNOWN_OFFSET, ERROR_NONE)
+                                })
+                            },
+                            |committed| PartitionAnswer::logged(index, committed.as_ref()),
+                        )
+                })
+                .collect();
+            TopicAnswer {
+                name: name.clone(),
+                partitions,
+            }
+        })
+        .collect()
 }
 
 /// Whether the log holds an offset or a deletion for each partition of `topics`. A request with
@@ -314,9 +392,9 @@ fn from_log(logged: &GroupOffsets, topics: Option<&[(TopicName, Vec<i32>)]>) -> 
         .collect()
 }
 
-/// Puts the log's answer on each partition it holds an entry for. With no topic list, the log's
-/// offsets that Iggy does not hold join the answer, and its deletions leave it.
-fn overlay(topics: &mut Vec<TopicAnswer>, logged: &GroupOffsets, every_topic: bool) {
+/// Puts the log's answer on each partition of Iggy's answer to a request with no topic list.
+/// The log's offsets that Iggy does not hold join the answer, and its deletions leave it.
+fn overlay(topics: &mut Vec<TopicAnswer>, logged: &GroupOffsets) {
     for topic in topics.iter_mut() {
         for partition in &mut topic.partitions {
             let key = (topic.name.0.to_string(), partition.index);
@@ -324,9 +402,6 @@ fn overlay(topics: &mut Vec<TopicAnswer>, logged: &GroupOffsets, every_topic: bo
                 *partition = PartitionAnswer::logged(partition.index, committed.as_ref());
             }
         }
-    }
-    if !every_topic {
-        return;
     }
     for topic in topics.iter_mut() {
         topic
@@ -687,6 +762,70 @@ mod tests {
             lost.to_offset_error_code(),
             ERROR_COORDINATOR_LOAD_IN_PROGRESS
         );
+    }
+
+    #[test]
+    fn given_a_log_that_holds_some_partitions_should_read_the_rest_from_iggy_in_order() {
+        let committed = |offset| CommittedOffset {
+            offset,
+            leader_epoch: 3,
+            metadata: Some("logged".to_string()),
+            commit_timestamp_ms: 0,
+        };
+        let logged = GroupOffsets {
+            complete: false,
+            entries: [
+                (("orders".to_string(), 1), Some(committed(10))),
+                (("payments".to_string(), 0), None),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let topics = vec![
+            (topic("orders"), vec![0, 1, 2]),
+            (topic("payments"), vec![0]),
+        ];
+
+        let unread = unlogged(&topics, &logged);
+        assert_eq!(unread[0].1, [0, 2]);
+        assert_eq!(
+            unread[1].1,
+            Vec::<i32>::new(),
+            "a topic the log answers stays"
+        );
+
+        let read = vec![
+            TopicAnswer {
+                name: topic("orders"),
+                partitions: vec![
+                    PartitionAnswer::new(0, 5, ERROR_NONE),
+                    PartitionAnswer::new(2, UNKNOWN_OFFSET, ERROR_NONE),
+                ],
+            },
+            TopicAnswer {
+                name: topic("payments"),
+                partitions: Vec::new(),
+            },
+        ];
+        let answer = merged(&topics, &logged, read);
+        let offsets: Vec<Vec<(i32, i64)>> = answer
+            .iter()
+            .map(|topic| {
+                topic
+                    .partitions
+                    .iter()
+                    .map(|partition| (partition.index, partition.offset))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            offsets,
+            [
+                vec![(0, 5), (1, 10), (2, UNKNOWN_OFFSET)],
+                vec![(0, UNKNOWN_OFFSET)]
+            ]
+        );
+        assert_eq!(answer[0].partitions[1].leader_epoch, 3, "the log's commit");
     }
 
     #[tokio::test]

@@ -24,6 +24,7 @@
 //! nothing it appends after a newer claim counts, and it learns so when it reads its own record.
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
 
 use crate::coordinator::record::{Body, CommittedOffset, NO_CHECKPOINT, Record};
 use crate::group::GroupSnapshot;
@@ -56,10 +57,16 @@ pub enum Applied {
 /// The state of one coordinator log partition after the records read so far.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionState {
-    /// The highest claim so far, and the gateway that made it. `None` before the first claim.
+    /// The last winning claim, or the claim a checkpoint names, and the gateway that made it.
+    /// `None` before either.
     pub owner: Option<(u64, u16)>,
+    /// The highest claim of any record so far.
+    pub highest: u64,
     /// Where the last complete checkpoint begins, or [`NO_CHECKPOINT`].
     pub checkpoint: u64,
+    /// When Iggy stored the end of that checkpoint, or the first record read before one
+    /// completed, in microseconds since the Unix epoch. A load reads nothing older.
+    pub checkpointed_at: Option<u64>,
     /// Valid records since that checkpoint completed.
     pub since_checkpoint: u64,
     pub groups: HashMap<String, GroupSnapshot>,
@@ -70,7 +77,9 @@ impl Default for PartitionState {
     fn default() -> Self {
         Self {
             owner: None,
+            highest: 0,
             checkpoint: NO_CHECKPOINT,
+            checkpointed_at: None,
             since_checkpoint: 0,
             groups: HashMap::new(),
             offsets: HashMap::new(),
@@ -79,19 +88,22 @@ impl Default for PartitionState {
 }
 
 impl PartitionState {
-    /// The highest claim so far, 0 before the first.
+    /// The highest claim so far, 0 before the first. A new claim goes above it.
     #[must_use]
-    pub fn claim(&self) -> u64 {
-        self.owner.map_or(0, |(claim, _)| claim)
+    pub const fn claim(&self) -> u64 {
+        self.highest
     }
 
-    /// Applies `record`, read at `offset` of the partition.
-    pub fn apply(&mut self, offset: u64, record: Record) -> Applied {
-        let highest = self.claim();
+    /// Applies `record`, read at `offset` of the partition, which Iggy stored at `stored_at`
+    /// microseconds since the Unix epoch.
+    pub fn apply(&mut self, offset: u64, stored_at: u64, record: Record) -> Applied {
+        self.checkpointed_at.get_or_insert(stored_at);
+        let highest = self.highest;
         if let Body::Claim { node_id } = record.body {
             if record.claim <= highest {
                 return Applied::Void;
             }
+            self.highest = record.claim;
             self.owner = Some((record.claim, node_id));
             self.since_checkpoint += 1;
             return Applied::Claimed {
@@ -102,13 +114,16 @@ impl PartitionState {
         if record.claim < highest {
             return Applied::Void;
         }
+        // Only the winner of a claim writes under it. So the claim counts even when its own
+        // record expired, and a later claim must go above it.
+        self.highest = record.claim;
         self.since_checkpoint += 1;
         match record.body {
-            Body::Claim { .. } => {}
+            Body::Claim { .. } | Body::Unknown { .. } => {}
             // A load that starts at a checkpoint learns the owner here. The writer checked its
             // claim when it appended this record, so no higher claim comes before it.
             Body::CheckpointBegin { node_id } => {
-                if record.claim > highest {
+                if self.owner.is_none_or(|(claim, _)| record.claim > claim) {
                     self.owner = Some((record.claim, node_id));
                 }
             }
@@ -116,6 +131,7 @@ impl PartitionState {
                 // Only an end that follows its begin completes a checkpoint.
                 if begin < offset {
                     self.checkpoint = begin;
+                    self.checkpointed_at = Some(stored_at);
                     self.since_checkpoint = 0;
                 }
             }
@@ -148,8 +164,51 @@ impl PartitionState {
                     },
                 );
             }
+            // Removed, not marked deleted: Iggy deleted its copies with the topic, and holds the
+            // copy of a commit to a new topic of that name that lands before this record.
+            Body::TopicOffsetsDeleted { topic } => {
+                for offsets in self.offsets.values_mut() {
+                    offsets.entries.retain(|(name, _), _| *name != topic);
+                }
+                self.offsets
+                    .retain(|_, offsets| offsets.complete || !offsets.entries.is_empty());
+            }
         }
         Applied::Valid
+    }
+
+    /// Whether a checkpoint is due at `now`, in microseconds since the Unix epoch. After
+    /// `records` valid records, once they also outnumber the entries a checkpoint rewrites, so a
+    /// checkpoint never costs more than the records it saves a load. And once the records a load
+    /// needs are `age` old, so they never expire, also when the owner changes each day.
+    #[must_use]
+    pub fn checkpoint_due(&self, records: u64, age: Duration, now: u64) -> bool {
+        let age = u64::try_from(age.as_micros()).unwrap_or(u64::MAX);
+        self.since_checkpoint >= records.max(self.live_entries())
+            || self
+                .checkpointed_at
+                .is_some_and(|at| now.saturating_sub(at) >= age)
+    }
+
+    /// The records a checkpoint writes, without building them.
+    #[must_use]
+    pub fn live_entries(&self) -> u64 {
+        let offsets: usize = self
+            .offsets
+            .values()
+            .map(|offsets| {
+                if offsets.complete {
+                    1 + offsets
+                        .entries
+                        .values()
+                        .filter(|entry| entry.is_some())
+                        .count()
+                } else {
+                    offsets.entries.len()
+                }
+            })
+            .sum();
+        u64::try_from(self.groups.len() + offsets).unwrap_or(u64::MAX)
     }
 
     /// The records that rewrite every live group and offset, for a checkpoint. A deletion that
@@ -252,7 +311,7 @@ mod tests {
         let applied: Vec<Applied> = records
             .into_iter()
             .enumerate()
-            .map(|(at, record)| state.apply(at as u64, record))
+            .map(|(at, record)| state.apply(at as u64, 0, record))
             .collect();
         assert_eq!(
             applied,
@@ -277,14 +336,14 @@ mod tests {
     #[test]
     fn given_two_claims_with_one_number_when_replayed_should_give_the_partition_to_the_first() {
         let mut state = PartitionState::default();
-        state.apply(0, record(3, Body::Claim { node_id: 1 }));
+        state.apply(0, 0, record(3, Body::Claim { node_id: 1 }));
         assert_eq!(
-            state.apply(1, record(3, Body::Claim { node_id: 2 })),
+            state.apply(1, 0, record(3, Body::Claim { node_id: 2 })),
             Applied::Void
         );
         assert_eq!(state.owner, Some((3, 1)));
         assert_eq!(
-            state.apply(2, record(3, offset("orders", 4))),
+            state.apply(2, 0, record(3, offset("orders", 4))),
             Applied::Valid,
             "the winner's records count"
         );
@@ -294,6 +353,7 @@ mod tests {
     fn given_group_records_when_replayed_should_keep_the_last_state_and_drop_an_emptied_group() {
         let mut state = PartitionState::default();
         state.apply(
+            0,
             0,
             record(
                 1,
@@ -305,6 +365,7 @@ mod tests {
         );
         state.apply(
             1,
+            0,
             record(
                 1,
                 Body::Group {
@@ -316,6 +377,7 @@ mod tests {
         assert_eq!(state.groups["a"].generation_id, 2);
         state.apply(
             2,
+            0,
             record(
                 1,
                 Body::Group {
@@ -330,9 +392,10 @@ mod tests {
     #[test]
     fn given_a_checkpoint_when_replayed_from_its_begin_should_rebuild_the_same_state() {
         let mut state = PartitionState::default();
-        state.apply(0, record(1, Body::Claim { node_id: 1 }));
+        state.apply(0, 0, record(1, Body::Claim { node_id: 1 }));
         state.apply(
             1,
+            0,
             record(
                 1,
                 Body::Group {
@@ -341,9 +404,10 @@ mod tests {
                 },
             ),
         );
-        state.apply(2, record(1, offset("a", 7)));
+        state.apply(2, 0, record(1, offset("a", 7)));
         state.apply(
             3,
+            0,
             record(
                 1,
                 Body::GroupOffsetsDeleted {
@@ -351,7 +415,7 @@ mod tests {
                 },
             ),
         );
-        state.apply(4, record(1, offset("b", 2)));
+        state.apply(4, 0, record(1, offset("b", 2)));
 
         let begin = 5;
         let mut log = vec![record(1, Body::CheckpointBegin { node_id: 1 })];
@@ -363,18 +427,18 @@ mod tests {
         );
         log.push(record(1, Body::CheckpointEnd { begin }));
         for (at, entry) in log.iter().cloned().enumerate() {
-            state.apply(begin + at as u64, entry);
+            state.apply(begin + at as u64, 0, entry);
         }
         assert_eq!(state.checkpoint, begin);
         assert_eq!(state.since_checkpoint, 0);
 
         let mut rebuilt = PartitionState::default();
         for (at, entry) in log.into_iter().enumerate() {
-            rebuilt.apply(begin + at as u64, entry);
+            rebuilt.apply(begin + at as u64, 0, entry);
         }
         assert_eq!(rebuilt.owner, Some((1, 1)), "the begin names the owner");
         assert_eq!(
-            rebuilt.apply(99, record(0, offset("a", 1))),
+            rebuilt.apply(99, 0, record(0, offset("a", 1))),
             Applied::Void,
             "a record of an older claim after the checkpoint is void"
         );
@@ -386,7 +450,124 @@ mod tests {
     #[test]
     fn given_an_end_without_its_begin_before_it_should_not_move_the_checkpoint() {
         let mut state = PartitionState::default();
-        state.apply(4, record(0, Body::CheckpointEnd { begin: 9 }));
+        state.apply(4, 0, record(0, Body::CheckpointEnd { begin: 9 }));
         assert_eq!(state.checkpoint, NO_CHECKPOINT);
+    }
+
+    #[test]
+    fn given_records_of_a_claim_whose_record_expired_should_claim_above_it() {
+        let mut state = PartitionState::default();
+        assert_eq!(
+            state.apply(10, 0, record(5, offset("a", 1))),
+            Applied::Valid
+        );
+        assert_eq!(state.claim(), 5, "a new claim goes above the owner's");
+        assert_eq!(
+            state.apply(11, 0, record(5, Body::Claim { node_id: 2 })),
+            Applied::Void,
+            "a claim at the owner's number loses"
+        );
+        assert_eq!(state.apply(12, 0, record(4, offset("a", 2))), Applied::Void);
+        assert_eq!(committed(&state, "a"), Some(1));
+    }
+
+    #[test]
+    fn given_an_unknown_record_should_count_its_claim_only() {
+        let mut state = PartitionState::default();
+        state.apply(0, 0, record(1, Body::Claim { node_id: 1 }));
+        assert_eq!(
+            state.apply(1, 0, record(2, Body::Unknown { kind: 99 })),
+            Applied::Valid
+        );
+        assert_eq!(state.claim(), 2);
+        assert_eq!(state.apply(2, 0, record(1, offset("a", 1))), Applied::Void);
+    }
+
+    #[test]
+    fn given_a_deleted_topic_should_remove_its_offsets_from_every_group() {
+        let mut state = PartitionState::default();
+        let topic_offset = |group_id: &str, topic: &str| Body::Offset {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partition: 0,
+            committed: None,
+        };
+        state.apply(0, 0, record(1, offset("a", 1)));
+        state.apply(1, 0, record(1, topic_offset("a", "payments")));
+        state.apply(2, 0, record(1, offset("b", 2)));
+        state.apply(
+            3,
+            0,
+            record(
+                1,
+                Body::GroupOffsetsDeleted {
+                    group_id: "c".to_string(),
+                },
+            ),
+        );
+        state.apply(4, 0, record(1, offset("c", 3)));
+
+        let deleted = Body::TopicOffsetsDeleted {
+            topic: "orders".to_string(),
+        };
+        assert_eq!(state.apply(5, 0, record(1, deleted)), Applied::Valid);
+        assert_eq!(
+            state.offsets["a"].entries.keys().collect::<Vec<_>>(),
+            [&("payments".to_string(), 0)]
+        );
+        assert!(!state.offsets.contains_key("b"), "an emptied group goes");
+        assert!(
+            state.offsets["c"].complete && state.offsets["c"].entries.is_empty(),
+            "a deleted group stays complete"
+        );
+    }
+
+    #[test]
+    fn given_fewer_records_than_live_entries_should_wait_for_the_checkpoint() {
+        let mut state = PartitionState::default();
+        for at in 0..4 {
+            state.apply(at, 0, record(1, offset(&format!("g{at}"), 1)));
+        }
+        state.apply(4, 0, record(1, Body::CheckpointBegin { node_id: 1 }));
+        state.apply(5, 0, record(1, Body::CheckpointEnd { begin: 4 }));
+        assert_eq!(state.since_checkpoint, 0);
+        assert_eq!(state.live_entries(), 4);
+
+        let day = Duration::from_hours(24);
+        for at in 6..9 {
+            state.apply(at, 0, record(1, offset("g0", 2)));
+        }
+        assert!(
+            !state.checkpoint_due(2, day, 0),
+            "3 records do not pay for rewriting 4 entries"
+        );
+        state.apply(9, 0, record(1, offset("g0", 3)));
+        assert!(state.checkpoint_due(2, day, 0));
+        assert!(
+            !state.checkpoint_due(5, day, 0),
+            "nor before the configured count"
+        );
+    }
+
+    #[test]
+    fn given_an_old_checkpoint_should_make_one_due_whatever_the_count() {
+        let day = Duration::from_hours(24);
+        let day_micros = 86_400_000_000;
+        let mut state = PartitionState::default();
+        assert!(!state.checkpoint_due(10, day, day_micros), "nothing read");
+
+        state.apply(0, 1_000, record(1, Body::Claim { node_id: 1 }));
+        assert_eq!(state.checkpointed_at, Some(1_000), "the first record read");
+        assert!(!state.checkpoint_due(10, day, 1_000 + day_micros - 1));
+        assert!(state.checkpoint_due(10, day, 1_000 + day_micros));
+
+        state.apply(1, 2_000, record(1, Body::CheckpointBegin { node_id: 1 }));
+        state.apply(2, 3_000, record(1, Body::CheckpointEnd { begin: 1 }));
+        assert_eq!(
+            state.checkpointed_at,
+            Some(3_000),
+            "the end of the checkpoint"
+        );
+        assert!(!state.checkpoint_due(10, day, 1_000 + day_micros));
     }
 }

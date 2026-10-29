@@ -45,6 +45,8 @@
 //! An id repeated in one request is answered once, as in `DescribeGroups`. The response has no
 //! top-level error, so a request that cannot be decoded closes the connection.
 
+use std::collections::HashSet;
+
 use bytes::Bytes;
 use kafka_protocol::messages::delete_groups_response::DeletableGroupResult;
 use kafka_protocol::messages::{DeleteGroupsRequest, DeleteGroupsResponse, GroupId};
@@ -148,10 +150,14 @@ async fn delete(
     let (removals, deletion) = state.groups.group_deletion(&valid).await;
     let mut removals = removals.into_iter();
     // With the coordinator log, a group whose members are gone can hold offsets there alone.
-    let logged = match &state.coordination {
-        Some(coordination) => coordination.logged_groups().await,
-        None => std::collections::BTreeSet::new(),
-    };
+    let mut logged = HashSet::new();
+    if let Some(coordination) = &state.coordination {
+        for group_id in &valid {
+            if coordination.holds(group_id).await {
+                logged.insert(group_id.as_str());
+            }
+        }
+    }
     let plans: Vec<Plan> = group_ids
         .iter()
         .map(|group_id| {
@@ -394,6 +400,7 @@ mod tests {
     fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
         AuthenticatedPrincipal {
             username: "alice".to_string(),
+            user: None,
             permissions: PrincipalPermissions {
                 manage_topics,
                 ..PrincipalPermissions::default()

@@ -24,7 +24,7 @@ use iggy::prelude::{
     AutoLogin, Client, ClusterClient, Credentials, Identifier, IggyClient, IggyClientBuilder,
     IggyError, UserClient,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval, timeout_at};
 use tokio_util::sync::CancellationToken;
@@ -46,12 +46,12 @@ mod offsets;
 mod produce;
 mod topics;
 
-use change_log::Follower;
+use change_log::{Follower, TOPIC_DELETIONS_CAPACITY};
 pub use change_log::{PermissionBoard, UserAccess};
 pub use cluster_id::{CLUSTER_ID_TOPIC, ClusterIdCall, cluster_id_stream};
 pub use coordinator_log::{
     COORDINATOR_LEASE_GROUP, COORDINATOR_LOG_TOPIC, COORDINATOR_OWNER_TOPIC, CoordinatorLink,
-    LoggedRecord,
+    CoordinatorLogCall, LoggedRecord,
 };
 use fetch::{FetchPool, LazyClient};
 pub(crate) use fetch::{FetchSlot, PartitionProbe, TopicProbe};
@@ -191,6 +191,8 @@ pub struct IggyBridge {
     /// Moves after each stream, topic or partition change the change log shows.
     topic_changes: Arc<watch::Sender<u64>>,
     permissions: Arc<PermissionBoard>,
+    /// Gets the Kafka name of each topic that the change log shows deleted.
+    topic_deletions: broadcast::Sender<String>,
 }
 
 /// The task that follows the change log. Dropping it stops the task.
@@ -274,6 +276,7 @@ impl IggyBridge {
             follower: FollowerTask::default(),
             topic_changes: Arc::new(watch::Sender::new(0)),
             permissions: Arc::default(),
+            topic_deletions: broadcast::Sender::new(TOPIC_DELETIONS_CAPACITY),
         };
         bridge.follow_change_log().await;
         Ok(bridge)
@@ -300,6 +303,13 @@ impl IggyBridge {
         &self.permissions
     }
 
+    /// The Kafka name of each topic that Iggy's change log shows deleted, as it reads them.
+    /// Nothing arrives while the bridge user cannot read the change log.
+    #[must_use]
+    pub fn topic_deletions(&self) -> broadcast::Receiver<String> {
+        self.topic_deletions.subscribe()
+    }
+
     /// Starts the task that follows Iggy's metadata change log (`change_log.rs`).
     ///
     /// Its client connects here, before `connect` returns, so the bridge opens its connections
@@ -313,6 +323,7 @@ impl IggyBridge {
             groups: self.group_index.feed(),
             topics: Arc::clone(&self.topic_changes),
             permissions: Arc::clone(&self.permissions),
+            deletions: self.topic_deletions.clone(),
         };
         let run = follower.run(
             self.config.clone(),
@@ -532,6 +543,7 @@ impl IggyBridge {
             follower: FollowerTask::default(),
             topic_changes: Arc::new(watch::Sender::new(0)),
             permissions: Arc::default(),
+            topic_deletions: broadcast::Sender::new(TOPIC_DELETIONS_CAPACITY),
         }
     }
 }

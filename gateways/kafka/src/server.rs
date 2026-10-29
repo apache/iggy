@@ -1332,7 +1332,7 @@ impl<'a> PermissionFollow<'a> {
         let Some(principal) = principal.filter(|_| self.follows) else {
             return Some(revision);
         };
-        match board.changed_since(&principal.username, &mut self.seen) {
+        match board.changed_since(principal.user, &principal.username, &mut self.seen) {
             Some(UserAccess::Active(permissions)) => {
                 principal.permissions = permissions;
                 principal.permissions_known = true;
@@ -1341,7 +1341,7 @@ impl<'a> PermissionFollow<'a> {
                 info!(
                     %peer,
                     username = principal.username,
-                    "the Iggy user was deleted or deactivated; closing its connection"
+                    "the Iggy user was deleted, deactivated or renamed; closing its connection"
                 );
                 return None;
             }

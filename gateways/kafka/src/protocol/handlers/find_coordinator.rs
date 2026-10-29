@@ -81,9 +81,11 @@ pub async fn handle(
                         coordination
                             .coordinator_of(key)
                             .and_then(|node_id| {
-                                brokers
-                                    .endpoint(own, node_id)
-                                    .map(|endpoint| (i32::from(node_id), endpoint))
+                                let endpoint = brokers.endpoint(own, node_id);
+                                if endpoint.is_none() {
+                                    coordination.warn_unlisted(node_id);
+                                }
+                                endpoint.map(|endpoint| (i32::from(node_id), endpoint))
                             })
                             .ok_or(ERROR_COORDINATOR_NOT_AVAILABLE)
                     },

@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use iggy::prelude::{
     AutoLogin, Client, Credentials, Identifier, IggyError, Permissions, TcpClient,
-    TcpClientConfigBuilder, UserClient, UserStatus,
+    TcpClientConfigBuilder, UserClient, UserInfoDetails, UserStatus,
 };
 use tokio::sync::SemaphorePermit;
 use tracing::{debug, warn};
@@ -204,6 +204,9 @@ pub enum AuthError {
 #[derive(Debug, Clone)]
 pub struct AuthenticatedPrincipal {
     pub username: String,
+    /// The Iggy user, as the change log names it. `None` for `ANONYMOUS`, and when the read of
+    /// the user failed.
+    pub user: Option<UserKey>,
     pub permissions: PrincipalPermissions,
     /// Whether [`Self::permissions`] is a real answer or a fallback.
     ///
@@ -228,8 +231,27 @@ impl AuthenticatedPrincipal {
     pub fn anonymous() -> Self {
         Self {
             username: Self::ANONYMOUS.to_string(),
+            user: None,
             permissions: PrincipalPermissions::default(),
             permissions_known: true,
+        }
+    }
+}
+
+/// One Iggy user. Iggy gives the id and name of a deleted user to new users, never its creation
+/// time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UserKey {
+    pub user_id: u32,
+    /// In microseconds.
+    pub created_at: u64,
+}
+
+impl From<&UserInfoDetails> for UserKey {
+    fn from(user: &UserInfoDetails) -> Self {
+        Self {
+            user_id: user.id,
+            created_at: user.created_at.as_micros(),
         }
     }
 }
@@ -470,10 +492,11 @@ impl SaslAuthenticator for IggyAuthenticator {
             }
         }
 
-        outcome.map(|(permissions, read)| AuthenticatedPrincipal {
+        outcome.map(|(permissions, user)| AuthenticatedPrincipal {
             username: credentials.username.clone(),
+            user,
             permissions,
-            permissions_known: read == PermissionRead::Resolved,
+            permissions_known: user.is_some(),
         })
     }
 }
@@ -530,6 +553,7 @@ pub(crate) async fn resolve_principal(
     }
     Ok(AuthenticatedPrincipal {
         username: username.to_string(),
+        user: Some(UserKey::from(&user)),
         permissions: user
             .permissions
             .as_ref()
@@ -539,16 +563,8 @@ pub(crate) async fn resolve_principal(
     })
 }
 
-/// How the permission read after a login ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PermissionRead {
-    /// The record resolved, so the permissions are a real answer, possibly an empty one.
-    Resolved,
-    /// The read answered but gave no usable record.
-    Failed,
-}
-
-/// Reads the just-authenticated user's own record and projects its global permissions.
+/// Reads the just-authenticated user's own record: its global permissions, projected, and its
+/// key. The key is `None` when the read gave no usable record, so the permissions are a fallback.
 ///
 /// A missing record or absent permissions both yield an empty set rather than an error: the
 /// credentials were already accepted, so refusing the connection here would reject a valid login
@@ -556,13 +572,13 @@ enum PermissionRead {
 async fn fetch_permissions(
     client: &impl Client,
     username: &str,
-) -> Result<(PrincipalPermissions, PermissionRead), AuthError> {
+) -> Result<(PrincipalPermissions, Option<UserKey>), AuthError> {
     // Unreachable in practice: a username that reached a successful login is already inside
     // Identifier's own length bounds. Propagating rather than degrading is still the wrong shape
     // for this function, so it degrades like every other failure below.
     let Ok(identifier) = Identifier::named(username) else {
         warn!("authenticated, but the principal's name is not a valid Iggy identifier");
-        return Ok((PrincipalPermissions::default(), PermissionRead::Failed));
+        return Ok((PrincipalPermissions::default(), None));
     };
     // Deliberately not propagated as a failure. The credentials were already accepted by the login
     // above, so turning a stumble on this second round trip into a rejection would answer a correct
@@ -574,10 +590,8 @@ async fn fetch_permissions(
     // future would stop only the waiting, not the read, and leave a live session behind the slot
     // this login already gave back. The caller's pre-authentication budget still bounds the wait.
     let fetched = client.get_user(&identifier).await;
-    let mut read = PermissionRead::Resolved;
     let user = match fetched {
         Ok(None) => {
-            read = PermissionRead::Failed;
             // Distinct from an error: the login succeeded, so the account exists. A record that
             // resolves to nothing here means the read raced a deletion, and silently reporting an
             // empty ACL view for it would look identical to a principal with no grants.
@@ -586,7 +600,6 @@ async fn fetch_permissions(
         }
         Ok(user) => user,
         Err(error) => {
-            read = PermissionRead::Failed;
             warn!(%error, "authenticated, but could not read the principal's permissions");
             None
         }
@@ -595,11 +608,11 @@ async fn fetch_permissions(
     // A record that resolved but carries no permissions is a real answer: the principal holds
     // nothing. Only a read that did not resolve is unknown.
     Ok((
-        user.and_then(|user| user.permissions)
-            .as_ref()
+        user.as_ref()
+            .and_then(|user| user.permissions.as_ref())
             .map(principal_permissions)
             .unwrap_or_default(),
-        read,
+        user.as_ref().map(UserKey::from),
     ))
 }
 

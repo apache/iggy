@@ -29,6 +29,7 @@
 //! (`i32::MIN`): there is no group ACL bitfield to report, and any other value fails the
 //! encoder below v3.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -109,12 +110,14 @@ pub async fn handle(
         Absent::Dead
     };
     // With the coordinator log, a group whose members are gone can hold offsets there alone.
-    let logged = match &state.coordination {
-        Some(coordination) if described.iter().any(Option::is_none) => {
-            coordination.logged_groups().await
+    let mut logged = HashSet::new();
+    if let Some(coordination) = &state.coordination {
+        for (group_id, group) in group_ids.iter().zip(&described) {
+            if group.is_none() && coordination.holds(group_id).await {
+                logged.insert(group_id.as_str());
+            }
         }
-        _ => std::collections::BTreeSet::new(),
-    };
+    }
     let groups = group_ids
         .iter()
         .zip(described)

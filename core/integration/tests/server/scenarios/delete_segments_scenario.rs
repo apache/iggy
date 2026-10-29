@@ -22,6 +22,7 @@ use iggy_common::Credentials;
 use integration::harness::TestHarness;
 use secrecy::SecretString;
 use std::fs::{metadata, read_dir};
+use std::future::Future;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -826,11 +827,33 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
 
     // Cleanup: drop high-level consumer, delete stream resources
     drop(fast_consumer);
-    client
-        .delete_topic(&stream_ident, &topic_ident)
-        .await
-        .unwrap();
-    client.delete_stream(&stream_ident).await.unwrap();
+    settled(&client, || client.delete_topic(&stream_ident, &topic_ident)).await;
+    settled(&client, || client.delete_stream(&stream_ident)).await;
+}
+
+/// Runs the metadata write `write` on `client`, after settling a write the client left in doubt.
+/// The consumer joins its group again after each restart, and dropped mid-join it leaves that
+/// join on the shared client, which refuses later metadata writes until it settles.
+async fn settled<F>(client: &IggyClient, write: impl Fn() -> F)
+where
+    F: Future<Output = Result<(), IggyError>>,
+{
+    let deadline = tokio::time::Instant::now() + CONVERGENCE_TIMEOUT;
+    loop {
+        match write().await {
+            Err(IggyError::LaneBlocked(operation)) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "operation {operation} did not settle within {CONVERGENCE_TIMEOUT:?}"
+                );
+                // A proved refusal settles it too, so only the retry decides.
+                let _ = client
+                    .resolve_operation(operation, deadline.into_std())
+                    .await;
+            }
+            written => return written.unwrap(),
+        }
+    }
 }
 
 /// Wait until the server-visible stored offset for `consumer` reaches

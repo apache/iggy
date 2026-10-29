@@ -26,18 +26,23 @@
 //! Who owns which partition is announced on the one-partition topic
 //! [`COORDINATOR_OWNER_TOPIC`], which every gateway reads.
 
+use std::fmt;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::future::join_all;
 use iggy::prelude::{
-    Consumer, ConsumerGroupClient, DeferredPollOptions, Durability, Identifier, IggyClient,
-    IggyDuration, IggyError, IggyExpiry, IggyMessage, MaxTopicSize, MessageClient, Partitioning,
-    PollingStrategy, TopicClient, TopicCreateOptions,
+    Consumer, ConsumerGroupClient, DeferredPollOptions, Durability, Identifier, IggyByteSize,
+    IggyClient, IggyDuration, IggyError, IggyExpiry, IggyMessage, MaxTopicSize, MessageClient,
+    Partitioning, PollingStrategy, TopicClient, TopicCreateOptions, TopicDetails,
 };
+use iggy_common::MIN_TOPIC_SEGMENT_SIZE;
+use tokio::time::Instant;
 use tracing::{debug, info};
 
 use super::{
-    IggyBridge, cluster_id_stream, connect_client, sign_out_and_shut_down, with_request_timeout,
+    IggyBridge, REQUEST_TIMEOUT, cluster_id_stream, connect_client, metadata_write_on,
+    resolve_blocker, sign_out_and_shut_down, with_request_timeout,
 };
 use crate::bridge::error::BridgeError;
 
@@ -58,6 +63,10 @@ const LOG_EXPIRY: Duration = Duration::from_hours(24 * 7);
 /// How long Iggy keeps an announcement. Owners announce again well inside it.
 const OWNER_EXPIRY: Duration = Duration::from_hours(24);
 
+/// The segment size of the owner topic. Iggy expires only sealed segments, and announcements
+/// fill the smallest one in days, so a start reads only the last few days of them.
+const OWNER_SEGMENT_BYTES: u64 = MIN_TOPIC_SEGMENT_SIZE;
+
 /// Records a read returns at most.
 const READ_COUNT: u32 = 1_000;
 
@@ -72,7 +81,57 @@ const READ_REPLY_MARGIN: Duration = Duration::from_secs(10);
 pub struct LoggedRecord {
     pub offset: u64,
     pub id: u128,
+    /// When Iggy stored the record, in microseconds since the Unix epoch.
+    pub timestamp: u64,
     pub payload: Bytes,
+}
+
+/// The call to Iggy that failed while preparing the coordinator log, named in
+/// [`BridgeError::CoordinatorLogCall`] with the permission it takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinatorLogCall {
+    ReadTopic,
+    CreateTopic,
+    ReadGroup,
+    CreateGroup,
+}
+
+impl CoordinatorLogCall {
+    /// What to grant when Iggy refused the call, or nothing for any other failure.
+    pub(crate) fn permission_hint(self, source: &BridgeError, stream: &str) -> String {
+        if !matches!(source, BridgeError::Iggy(IggyError::Unauthorized)) {
+            return String::new();
+        }
+        let needed = match self {
+            Self::CreateTopic => "manage_topics",
+            Self::ReadTopic | Self::ReadGroup | Self::CreateGroup => "read_topics",
+        };
+        format!(
+            " (the bridge's Iggy user needs {needed} on stream '{stream}', or an operator \
+             creates topics '{COORDINATOR_LOG_TOPIC}' and '{COORDINATOR_OWNER_TOPIC}' there \
+             and grants the user read_topics, poll_messages and send_messages on it)"
+        )
+    }
+}
+
+impl fmt::Display for CoordinatorLogCall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ReadTopic => "read Iggy topic",
+            Self::CreateTopic => "create Iggy topic",
+            Self::ReadGroup => "read the Iggy consumer group of",
+            Self::CreateGroup => "create the Iggy consumer group of",
+        })
+    }
+}
+
+/// A topic of the coordinator log, as a gateway creates it.
+struct LogTopic {
+    name: &'static str,
+    partitions: u32,
+    expiry: Duration,
+    durability: Durability,
+    segment_bytes: Option<u64>,
 }
 
 /// The Iggy calls of the coordinator log, on clients of their own.
@@ -89,6 +148,7 @@ pub struct CoordinatorLink {
     lease: IggyClient,
     reader: IggyClient,
     writers: Vec<IggyClient>,
+    max_send_bytes: u64,
 }
 
 impl IggyBridge {
@@ -99,7 +159,8 @@ impl IggyBridge {
     ///
     /// [`BridgeError::InvalidConfig`] when the log topic exists with another partition count than
     /// `partitions`, since every gateway must map each group to the same partition.
-    /// [`BridgeError::Iggy`] or [`BridgeError::Timeout`] when a call to Iggy fails.
+    /// [`BridgeError::CoordinatorLogCall`] when a call to Iggy fails, with the permission it
+    /// takes. [`BridgeError::Iggy`] or [`BridgeError::Timeout`] when a client does not connect.
     pub async fn coordinator_link(
         &self,
         partitions: u32,
@@ -111,28 +172,21 @@ impl IggyBridge {
         let owner_topic = Identifier::named(COORDINATOR_OWNER_TOPIC).map_err(BridgeError::Iggy)?;
         let group_id = Identifier::named(COORDINATOR_LEASE_GROUP).map_err(BridgeError::Iggy)?;
 
-        self.create_coordinator_topic(
-            &stream_id,
-            COORDINATOR_LOG_TOPIC,
-            partitions,
-            LOG_EXPIRY,
-            Durability::Persisted,
-        )
-        .await?;
-        self.create_coordinator_topic(
-            &stream_id,
-            COORDINATOR_OWNER_TOPIC,
-            1,
-            OWNER_EXPIRY,
-            Durability::Replicated,
-        )
-        .await?;
-        let found = with_request_timeout(self.client.get_topic(&stream_id, &log_topic))
-            .await?
-            .ok_or(BridgeError::Iggy(IggyError::TopicNameNotFound(
-                COORDINATOR_LOG_TOPIC.to_string(),
-                stream_name.clone(),
-            )))?;
+        let found = self
+            .coordinator_topic(
+                &stream_name,
+                &stream_id,
+                &LogTopic {
+                    name: COORDINATOR_LOG_TOPIC,
+                    partitions,
+                    expiry: LOG_EXPIRY,
+                    // A claim that a crash of a quorum loses would let two gateways own one
+                    // partition. So each append waits for stable storage on a quorum.
+                    durability: Durability::Persisted,
+                    segment_bytes: None,
+                },
+            )
+            .await?;
         if found.partitions_count != partitions {
             return Err(BridgeError::InvalidConfig(format!(
                 "Iggy topic '{stream_name}/{COORDINATOR_LOG_TOPIC}' has {} partitions, but the \
@@ -141,16 +195,20 @@ impl IggyBridge {
                 found.partitions_count
             )));
         }
-        match self
-            .metadata_write(|| {
-                self.client
-                    .create_consumer_group(&stream_id, &log_topic, COORDINATOR_LEASE_GROUP)
-            })
-            .await
-        {
-            Ok(_) | Err(BridgeError::Iggy(IggyError::ConsumerGroupNameAlreadyExists(_, _))) => {}
-            Err(error) => return Err(error),
-        }
+        self.coordinator_topic(
+            &stream_name,
+            &stream_id,
+            &LogTopic {
+                name: COORDINATOR_OWNER_TOPIC,
+                partitions: 1,
+                expiry: OWNER_EXPIRY,
+                durability: Durability::Replicated,
+                segment_bytes: Some(OWNER_SEGMENT_BYTES),
+            },
+        )
+        .await?;
+        self.lease_group(&stream_name, &stream_id, &log_topic, &group_id)
+            .await?;
 
         let lease = connect_client(&self.config).await?;
         let reader = connect_client(&self.config).await?;
@@ -170,46 +228,122 @@ impl IggyBridge {
             lease,
             reader,
             writers: clients,
+            max_send_bytes: self.max_send_bytes(),
         })
     }
 
-    async fn create_coordinator_topic(
+    /// The topic `topic`, created when the read finds none: Iggy checks the permission to create
+    /// before it checks whether the name exists, so a topic an operator created needs no
+    /// `manage_topics`.
+    async fn coordinator_topic(
         &self,
+        stream: &str,
         stream_id: &Identifier,
-        name: &str,
-        partitions: u32,
-        expiry: Duration,
-        durability: Durability,
-    ) -> Result<(), BridgeError> {
+        topic: &LogTopic,
+    ) -> Result<TopicDetails, BridgeError> {
+        let topic_id = Identifier::named(topic.name).map_err(BridgeError::Iggy)?;
+        let failed = |call, source| coordinator_call_failed(call, stream, topic.name, source);
+        let read = || async {
+            with_request_timeout(self.client.get_topic(stream_id, &topic_id))
+                .await
+                .map_err(|error| failed(CoordinatorLogCall::ReadTopic, error))
+        };
+        if let Some(found) = read().await? {
+            return Ok(found);
+        }
         let options = TopicCreateOptions {
-            partitions_count: Some(partitions),
-            message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::from(expiry))),
+            partitions_count: Some(topic.partitions),
+            message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::from(topic.expiry))),
             max_topic_size: Some(MaxTopicSize::Unlimited),
-            durability,
+            segment_size: topic.segment_bytes.map(IggyByteSize::from),
+            durability: topic.durability,
             ..TopicCreateOptions::default()
         };
         match self
-            .metadata_write(|| self.client.create_topic(stream_id, name, &options))
+            .metadata_write(|| self.client.create_topic(stream_id, topic.name, &options))
             .await
         {
-            Ok(_) | Err(BridgeError::Iggy(IggyError::TopicNameAlreadyExists(_, _))) => Ok(()),
-            Err(error) => Err(error),
+            Ok(created) => return Ok(created),
+            // Another gateway created it first.
+            Err(BridgeError::Iggy(IggyError::TopicNameAlreadyExists(_, _))) => {}
+            Err(error) => return Err(failed(CoordinatorLogCall::CreateTopic, error)),
+        }
+        read().await?.ok_or_else(|| {
+            failed(
+                CoordinatorLogCall::ReadTopic,
+                BridgeError::Iggy(IggyError::TopicNameNotFound(
+                    topic.name.to_string(),
+                    stream.to_string(),
+                )),
+            )
+        })
+    }
+
+    /// The lease group, created when the read finds none.
+    async fn lease_group(
+        &self,
+        stream: &str,
+        stream_id: &Identifier,
+        log_topic: &Identifier,
+        group_id: &Identifier,
+    ) -> Result<(), BridgeError> {
+        let failed =
+            |call, source| coordinator_call_failed(call, stream, COORDINATOR_LOG_TOPIC, source);
+        let found = with_request_timeout(
+            self.client
+                .get_consumer_group(stream_id, log_topic, group_id),
+        )
+        .await
+        .map_err(|error| failed(CoordinatorLogCall::ReadGroup, error))?;
+        if found.is_some() {
+            return Ok(());
+        }
+        match self
+            .metadata_write(|| {
+                self.client
+                    .create_consumer_group(stream_id, log_topic, COORDINATOR_LEASE_GROUP)
+            })
+            .await
+        {
+            Ok(_) | Err(BridgeError::Iggy(IggyError::ConsumerGroupNameAlreadyExists(_, _))) => {
+                Ok(())
+            }
+            Err(error) => Err(failed(CoordinatorLogCall::CreateGroup, error)),
         }
     }
 }
 
+fn coordinator_call_failed(
+    call: CoordinatorLogCall,
+    stream: &str,
+    topic: &'static str,
+    source: BridgeError,
+) -> BridgeError {
+    BridgeError::CoordinatorLogCall {
+        call,
+        stream: stream.to_string(),
+        topic,
+        source: Box::new(source),
+    }
+}
+
 impl CoordinatorLink {
+    /// The message bytes one append sends at most: Iggy's message size, less its frame.
+    #[must_use]
+    pub const fn max_send_bytes(&self) -> u64 {
+        self.max_send_bytes
+    }
+
     /// Joins the lease group. Iggy then gives this gateway a share of the partitions.
     ///
     /// # Errors
     ///
     /// [`BridgeError`] when the call to Iggy fails.
     pub async fn join_lease(&self) -> Result<(), BridgeError> {
-        with_request_timeout(self.lease.join_consumer_group(
-            &self.stream_id,
-            &self.log_topic,
-            &self.group_id,
-        ))
+        metadata_write_on(&self.lease, || {
+            self.lease
+                .join_consumer_group(&self.stream_id, &self.log_topic, &self.group_id)
+        })
         .await
     }
 
@@ -219,11 +353,10 @@ impl CoordinatorLink {
     ///
     /// [`BridgeError`] when the call to Iggy fails.
     pub async fn leave_lease(&self) -> Result<(), BridgeError> {
-        with_request_timeout(self.lease.leave_consumer_group(
-            &self.stream_id,
-            &self.log_topic,
-            &self.group_id,
-        ))
+        metadata_write_on(&self.lease, || {
+            self.lease
+                .leave_consumer_group(&self.stream_id, &self.log_topic, &self.group_id)
+        })
         .await
     }
 
@@ -260,14 +393,14 @@ impl CoordinatorLink {
             .collect::<Result<Vec<_>, IggyError>>()
             .map_err(BridgeError::Iggy)?;
         let writer = &self.writers[partition as usize % self.writers.len()];
-        with_request_timeout(writer.send_messages(
+        send_settled(
+            writer,
             &self.stream_id,
             &self.log_topic,
-            &Partitioning::partition_id(partition),
+            partition,
             &mut messages,
-        ))
+        )
         .await
-        .map(drop)
     }
 
     /// The records of `partition` from offset `from`. With a `wait`, Iggy holds the read until a
@@ -309,15 +442,7 @@ impl CoordinatorLink {
             false,
         ))
         .await?;
-        Ok(polled
-            .messages
-            .into_iter()
-            .last()
-            .map(|message| LoggedRecord {
-                offset: message.header.offset,
-                id: message.header.id,
-                payload: message.payload,
-            }))
+        Ok(polled.messages.into_iter().last().map(LoggedRecord::from))
     }
 
     /// Announces that this gateway owns a partition.
@@ -332,14 +457,14 @@ impl CoordinatorLink {
                 .build()
                 .map_err(BridgeError::Iggy)?,
         ];
-        with_request_timeout(self.writers[0].send_messages(
+        send_settled(
+            &self.writers[0],
             &self.stream_id,
             &self.owner_topic,
-            &Partitioning::partition_id(0),
+            0,
             &mut messages,
-        ))
+        )
         .await
-        .map(drop)
     }
 
     /// The announcements from offset `from`, waiting as [`Self::read`] does.
@@ -363,13 +488,12 @@ impl CoordinatorLink {
         .await
     }
 
-    /// Signs every client out. The lease client goes last, so the other gateways take the
-    /// partitions only once this one writes nothing more.
+    /// Signs every client out, the writers and the reader at once. The lease client goes last,
+    /// so the other gateways take the partitions only once this one writes nothing more.
     pub async fn close(&self) {
-        let mut clients: Vec<&IggyClient> = self.writers.iter().collect();
-        clients.push(&self.reader);
-        for client in clients {
-            if let Err(error) = sign_out_and_shut_down(client).await {
+        let clients = self.writers.iter().chain([&self.reader]);
+        for closed in join_all(clients.map(sign_out_and_shut_down)).await {
+            if let Err(error) = closed {
                 debug!(%error, "coordinator log client did not close cleanly");
             }
         }
@@ -377,6 +501,35 @@ impl CoordinatorLink {
             debug!(%error, "coordinator lease client did not close cleanly");
         }
     }
+}
+
+/// Sends `messages` to `partition` on `client`. A send of the client that timed out or ended in
+/// doubt keeps its lane, and fails each later send there at once. So that send is settled first:
+/// it lands or proves refused before these messages go, and the log keeps their order.
+async fn send_settled(
+    client: &IggyClient,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    partition: u32,
+    messages: &mut [IggyMessage],
+) -> Result<(), BridgeError> {
+    let deadline = (Instant::now() + REQUEST_TIMEOUT).into_std();
+    let partitioning = Partitioning::partition_id(partition);
+    with_request_timeout(async {
+        loop {
+            match client
+                .send_messages(stream_id, topic_id, &partitioning, messages)
+                .await
+            {
+                Err(IggyError::LaneBlocked(operation)) => {
+                    resolve_blocker(client, operation, deadline).await?;
+                }
+                sent => return sent,
+            }
+        }
+    })
+    .await
+    .map(drop)
 }
 
 async fn read_topic(
@@ -427,12 +580,19 @@ async fn read_topic(
     Ok(polled
         .messages
         .into_iter()
-        .map(|message| LoggedRecord {
+        .map(LoggedRecord::from)
+        .collect())
+}
+
+impl From<IggyMessage> for LoggedRecord {
+    fn from(message: IggyMessage) -> Self {
+        Self {
             offset: message.header.offset,
             id: message.header.id,
+            timestamp: message.header.timestamp,
             payload: message.payload,
-        })
-        .collect())
+        }
+    }
 }
 
 impl std::fmt::Debug for CoordinatorLink {

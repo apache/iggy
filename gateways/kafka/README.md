@@ -351,10 +351,18 @@ cargo run -p iggy-gateway-kafka
   the controller.
 - The bridge's Iggy user creates the topics `coordinators` and `coordinator_owners` and the Iggy
   consumer group `kafka-gateways` in the stream `<default stream>.meta`, where the cluster id
-  lives. It needs `manage_topics` there, or an operator creates them first and grants it
-  `poll_messages` and `send_messages`.
+  lives. It needs `manage_topics` there, or an operator creates the topics first and grants it
+  `read_topics`, `poll_messages` and `send_messages`. `read_topics` also covers the group.
 - With `IGGY_KAFKA_COORDINATOR_LOG=false`, the gateway with the lowest node id coordinates every
   group, and while it is down the groups wait for it.
+- Gateways with and without the log name different coordinators for a group. To upgrade from a
+  build without the log, set `IGGY_KAFKA_COORDINATOR_LOG=false` until every gateway runs this
+  build, then turn it on with every gateway stopped. Turned on one gateway at a time, a group
+  can have two coordinators until the last restart, and its records can be read twice.
+- To add a gateway, restart the others with an `IGGY_KAFKA_BROKERS` that lists it, then start
+  it. A gateway that owns log partitions but is missing from a list leaves their groups without
+  a coordinator there: `FindCoordinator` answers `COORDINATOR_NOT_AVAILABLE` (15), and the
+  gateway log names it.
 - To lower the takeover time after a crash, lower Iggy's `heartbeat.interval`. It must stay above
   (3 times `consumer_group.heartbeat_interval` + 6.2 s) / 1.2. With
   `consumer_group.heartbeat_interval = "1s"`, that is about 7.7 s, so a takeover after about 9 s

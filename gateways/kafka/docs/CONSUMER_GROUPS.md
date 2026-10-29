@@ -279,11 +279,17 @@ stream `<default stream>.meta`. The log is on by default with `IGGY_KAFKA_BROKER
 - A new owner restores each group `Stable` in its stored generation, and starts each member's
   session again. A member that heartbeats within its session timeout keeps its assignment, with
   no rebalance.
-- After 10,000 records, and at least once a day, the owner writes a checkpoint: every live group
-  and offset again, between a begin and an end record. Each record names where the last complete
-  checkpoint begins, so a load reads only from there. Iggy keeps the log for 7 days.
-- Each record carries a format version and a kind. A gateway skips a record it does not know, so
-  two versions can share the log during a rolling upgrade.
+- The owner writes a checkpoint: every live group and offset again, between a begin and an end
+  record. It writes one after 10,000 records, or after as many records as there are live
+  entries when that is more, and when the last one is a day old, also across a change of owner.
+  Each record names where the last complete checkpoint begins, so a load reads only from there.
+  Iggy keeps the log for 7 days.
+- Every record starts with a format version, a kind, its claim and the last checkpoint, and a
+  claim's body starts with its node id, in every version. A gateway reads these of any record, so
+  an older gateway still sees a newer gateway's claim during a rolling upgrade.
+- The log topic is `persisted`: a claim that a crash of a quorum loses would let two gateways
+  own one partition. So each commit and each stored generation also waits for a stable-storage
+  write on a quorum. The owner topic is `replicated`.
 - On SIGTERM, the gateway leaves the Iggy group before its drain, so the others take its
   partitions over at once. Its group requests in flight answer `NOT_COORDINATOR`, and their
   clients go to the new coordinator.

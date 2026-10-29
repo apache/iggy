@@ -19,8 +19,9 @@
 //! hold offsets, when a topic changes and what its users can do, without listing any of them.
 //! `docs/OFFSET_STORAGE.md` has the reasoning.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
+use std::mem;
 use std::ops::BitOrAssign;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -32,7 +33,7 @@ use iggy::prelude::{
     MetadataChangesQuery, MetadataCurrentItem, MetadataUserChange, Permissions, SystemClient,
     UserStatus,
 };
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -40,7 +41,7 @@ use tracing::{debug, info, warn};
 use super::group_index::GroupFeed;
 use super::group_offsets::kafka_group_of;
 use super::{LazyClient, REQUEST_TIMEOUT};
-use crate::auth::principal_permissions;
+use crate::auth::{UserKey, principal_permissions};
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::TopicMapping;
@@ -64,6 +65,9 @@ const FOLLOW_INTERVAL: Duration = Duration::from_millis(250);
 const RETRY_PAUSE_FIRST: Duration = Duration::from_millis(250);
 const RETRY_PAUSE_MAX: Duration = Duration::from_secs(10);
 
+/// The deleted topics a receiver can fall behind by before it lags.
+pub(super) const TOPIC_DELETIONS_CAPACITY: usize = 1024;
+
 /// What the follower keeps up to date from the change log.
 pub(super) struct Follower {
     pub(super) mapping: TopicMapping,
@@ -71,6 +75,8 @@ pub(super) struct Follower {
     /// Moves after each read that showed a stream, topic or partition change.
     pub(super) topics: Arc<watch::Sender<u64>>,
     pub(super) permissions: Arc<PermissionBoard>,
+    /// Gets the Kafka name of each topic that the change log shows deleted.
+    pub(super) deletions: broadcast::Sender<String>,
 }
 
 /// What the change log last said of each Iggy user, for the connections that authenticated as
@@ -79,8 +85,7 @@ pub(super) struct Follower {
 pub struct PermissionBoard {
     /// Moves with each change, so a connection looks a user up only after one.
     revision: AtomicU64,
-    /// Per username, the revision of its last change and what it can do since.
-    users: Mutex<HashMap<String, (u64, UserAccess)>>,
+    users: Mutex<Users>,
 }
 
 /// What an Iggy user can do, as the change log last said.
@@ -92,57 +97,168 @@ pub enum UserAccess {
     Revoked,
 }
 
+/// The board's users, by key: Iggy gives the name of a deleted user to new users.
+#[derive(Debug, Default)]
+struct Users {
+    by_key: HashMap<UserKey, UserEntry>,
+    /// Per username, the revision of the last revoke of a user of that name. A rename counts,
+    /// since a connection that knows only the old name loses its user there.
+    revoked_names: HashMap<String, u64>,
+    /// The revision of the last rebuild that dropped revokes. A connection that looked before it
+    /// cannot tell whether one was of its user.
+    dropped: u64,
+}
+
+#[derive(Debug)]
+struct UserEntry {
+    username: String,
+    /// The revision of its last change.
+    changed: u64,
+    /// The revision of its last revoke, 0 if none.
+    revoked: u64,
+    access: UserAccess,
+}
+
 impl PermissionBoard {
     #[must_use]
     pub fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
     }
 
-    /// What changed for `username` after revision `seen`, if anything did. Moves `seen` on.
-    pub fn changed_since(&self, username: &str, seen: &mut u64) -> Option<UserAccess> {
+    /// What changed for Iggy user `user`, named `username`, after revision `seen`, if anything
+    /// did. Moves `seen` on.
+    ///
+    /// A revoke after `seen` shows even when a later change undid it, so the connection closes.
+    /// Without `user`, only a revoke of any user named `username` shows: which user of that name
+    /// it is was never read, so no permission change can apply.
+    pub fn changed_since(
+        &self,
+        user: Option<UserKey>,
+        username: &str,
+        seen: &mut u64,
+    ) -> Option<UserAccess> {
         let revision = self.revision();
         if revision == *seen {
             return None;
         }
-        let changed = lock(&self.users)
-            .get(username)
-            .filter(|(changed, _)| *changed > *seen)
-            .map(|&(_, access)| access);
+        let changed = lock(&self.users).changed_since(user, username, *seen);
         *seen = revision;
         changed
     }
 
-    /// What the change log last said of `username`. `None` before it said anything.
+    /// What the change log last said of the newest user named `username`. `None` before it said
+    /// anything.
     #[must_use]
     pub fn access(&self, username: &str) -> Option<UserAccess> {
-        lock(&self.users).get(username).map(|&(_, access)| access)
-    }
-
-    fn set(&self, username: &str, access: UserAccess) {
-        let mut users = lock(&self.users);
-        // Under the lock, so a reader that sees the revision also sees the entry.
-        let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
-        users.insert(username.to_owned(), (revision, access));
-    }
-
-    /// The users of a current state read. A user that it left out is gone. Revoked users that it
-    /// left out are dropped, so names that never come back do not pile up.
-    fn replace(&self, current: HashMap<String, UserAccess>) {
-        let mut users = lock(&self.users);
-        users.retain(|username, (_, access)| {
-            current.contains_key(username) || *access != UserAccess::Revoked
-        });
-        let mut changes: Vec<(String, UserAccess)> = users
+        lock(&self.users)
+            .by_key
             .iter()
-            .filter(|(username, _)| !current.contains_key(*username))
-            .map(|(username, _)| (username.clone(), UserAccess::Revoked))
+            .filter(|(_, entry)| entry.username == username)
+            .max_by_key(|(user, _)| user.created_at)
+            .map(|(_, entry)| entry.access)
+    }
+
+    fn set(&self, user: UserKey, username: &str, access: UserAccess) {
+        let mut users = lock(&self.users);
+        let revision = self.next_revision();
+        users.set(user, username, access, revision);
+    }
+
+    /// Sets the permissions of `user` while it is active. The change has no status, so it neither
+    /// re-activates a revoked user nor adds one the board does not hold.
+    fn set_permissions(&self, user: UserKey, username: &str, permissions: PrincipalPermissions) {
+        let mut users = lock(&self.users);
+        let active = users
+            .by_key
+            .get(&user)
+            .is_some_and(|entry| entry.access != UserAccess::Revoked);
+        if active {
+            let revision = self.next_revision();
+            users.set(user, username, UserAccess::Active(permissions), revision);
+        }
+    }
+
+    /// The users of a current state read. A user that it left out is revoked. Revoked users that
+    /// it left out are dropped, so users that never come back do not pile up.
+    fn replace(&self, current: HashMap<UserKey, (String, UserAccess)>) {
+        let mut users = lock(&self.users);
+        let held = users.by_key.len();
+        users.by_key.retain(|user, entry| {
+            current.contains_key(user) || entry.access != UserAccess::Revoked
+        });
+        if users.by_key.len() < held || !users.revoked_names.is_empty() {
+            users.revoked_names.clear();
+            users.dropped = self.next_revision();
+        }
+        let mut changes: Vec<(UserKey, String, UserAccess)> = users
+            .by_key
+            .iter()
+            .filter(|(user, _)| !current.contains_key(*user))
+            .map(|(user, entry)| (*user, entry.username.clone(), UserAccess::Revoked))
             .collect();
-        changes.extend(current.into_iter().filter(|(username, access)| {
-            users.get(username).is_none_or(|(_, known)| known != access)
-        }));
-        for (username, access) in changes {
-            let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
-            users.insert(username, (revision, access));
+        changes.extend(
+            current
+                .into_iter()
+                .filter(|(user, (username, access))| {
+                    users
+                        .by_key
+                        .get(user)
+                        .is_none_or(|known| known.username != *username || known.access != *access)
+                })
+                .map(|(user, (username, access))| (user, username, access)),
+        );
+        for (user, username, access) in changes {
+            let revision = self.next_revision();
+            users.set(user, &username, access, revision);
+        }
+    }
+
+    /// Under the users lock only, so a reader that sees the revision also sees the entry.
+    fn next_revision(&self) -> u64 {
+        self.revision.fetch_add(1, Ordering::AcqRel) + 1
+    }
+}
+
+impl Users {
+    fn changed_since(
+        &self,
+        user: Option<UserKey>,
+        username: &str,
+        seen: u64,
+    ) -> Option<UserAccess> {
+        let revoked = |at: u64| (at > seen).then_some(UserAccess::Revoked);
+        let Some(user) = user else {
+            let named = self
+                .revoked_names
+                .get(username)
+                .copied()
+                .unwrap_or_default();
+            return revoked(named.max(self.dropped));
+        };
+        self.by_key.get(&user).map_or_else(
+            || revoked(self.dropped),
+            |entry| {
+                revoked(entry.revoked).or_else(|| (entry.changed > seen).then_some(entry.access))
+            },
+        )
+    }
+
+    fn set(&mut self, user: UserKey, username: &str, access: UserAccess, revision: u64) {
+        let entry = self.by_key.entry(user).or_insert_with(|| UserEntry {
+            username: username.to_owned(),
+            changed: revision,
+            revoked: 0,
+            access,
+        });
+        if entry.username != username {
+            let renamed = mem::replace(&mut entry.username, username.to_owned());
+            self.revoked_names.insert(renamed, revision);
+        }
+        entry.changed = revision;
+        entry.access = access;
+        if access == UserAccess::Revoked {
+            entry.revoked = revision;
+            self.revoked_names.insert(username.to_owned(), revision);
         }
     }
 }
@@ -306,9 +422,12 @@ impl Follower {
             };
             token = page.current_page_token;
             if token.is_none() {
+                // A gap in the log can hide deletes.
+                let deleted = mirror.kafka_topics_left_out(&current, &self.mapping);
                 *mirror = current;
                 self.permissions.replace(users);
                 self.publish(mirror, Changed::ALL);
+                self.report(deleted);
                 return Ok(Next::Rebuilt(anchor));
             }
         }
@@ -342,10 +461,17 @@ impl Follower {
                 }
             }
             let mut changed = Changed::default();
+            let mut deleted = Vec::new();
             for record in &page.records {
-                changed |= mirror.apply(&record.change, &self.permissions);
+                changed |= mirror.apply(
+                    &record.change,
+                    &self.permissions,
+                    &self.mapping,
+                    &mut deleted,
+                );
             }
             self.publish(mirror, changed);
+            self.report(deleted);
             // Without a cursor, the next read repeats these records, and applying them again
             // changes nothing.
             let Some(next) = page.next else {
@@ -364,6 +490,14 @@ impl Follower {
         }
         if changed.topics {
             self.topics.send_modify(|version| *version += 1);
+        }
+    }
+
+    /// Sends the Kafka name of each deleted topic.
+    fn report(&self, deleted: Vec<String>) {
+        for kafka_topic in deleted {
+            // Fails only without a receiver, and then no one keeps offsets to drop.
+            let _ = self.deletions.send(kafka_topic);
         }
     }
 }
@@ -445,10 +579,27 @@ struct TopicKey {
     topic_created_op: u64,
 }
 
+impl TopicKey {
+    /// Whether the topic is in that incarnation of stream `stream_id`.
+    const fn in_stream(&self, stream_id: u32, created_op: u64) -> bool {
+        self.stream_id == stream_id && self.stream_created_op == created_op
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GroupKey {
     topic: TopicKey,
     group_id: u32,
+}
+
+/// [`UserKey`] from the fields every user record carries.
+macro_rules! user_key {
+    ($record:expr) => {
+        UserKey {
+            user_id: $record.user_id,
+            created_at: $record.user_created_at,
+        }
+    };
 }
 
 /// [`TopicKey`] from the fields every topic and group record carries.
@@ -474,15 +625,28 @@ macro_rules! group_key {
 }
 
 impl Mirror {
-    /// Applies one change. User changes go to `permissions`.
-    fn apply(&mut self, change: &MetadataChange, permissions: &PermissionBoard) -> Changed {
+    /// Applies one change. User changes go to `permissions`, and the Kafka name by `mapping` of
+    /// each topic it deletes to `deleted`.
+    fn apply(
+        &mut self,
+        change: &MetadataChange,
+        permissions: &PermissionBoard,
+        mapping: &TopicMapping,
+        deleted: &mut Vec<String>,
+    ) -> Changed {
         match change {
             MetadataChange::StreamCreated(stream) | MetadataChange::StreamUpdated(stream) => {
                 self.put_stream(stream.stream_id, stream.stream_created_op, &stream.name);
                 Changed::ALL
             }
             MetadataChange::StreamDeleted(stream) => {
-                self.drop_stream(stream.stream_id, stream.stream_created_op);
+                let (stream_id, created_op) = (stream.stream_id, stream.stream_created_op);
+                deleted.extend(
+                    self.kafka_topics(mapping)
+                        .filter(|(key, _)| key.in_stream(stream_id, created_op))
+                        .map(|(_, kafka_topic)| kafka_topic.to_owned()),
+                );
+                self.drop_stream(stream_id, created_op);
                 Changed::ALL
             }
             MetadataChange::TopicCreated(topic) | MetadataChange::TopicUpdated(topic) => {
@@ -490,7 +654,9 @@ impl Mirror {
                 Changed::ALL
             }
             MetadataChange::TopicDeleted(topic) => {
-                self.drop_topic(topic_key!(topic));
+                let key = topic_key!(topic);
+                deleted.extend(self.kafka_topic_of(key, mapping).map(str::to_owned));
+                self.drop_topic(key);
                 Changed::ALL
             }
             MetadataChange::PartitionsChanged(_) => Changed::TOPICS,
@@ -501,16 +667,16 @@ impl Mirror {
                 Changed::groups(self.groups.remove(&group_key!(group)).is_some())
             }
             MetadataChange::UserCreated(user) | MetadataChange::UserUpdated(user) => {
-                permissions.set(&user.username, UserAccess::of(user));
+                permissions.set(user_key!(user), &user.username, UserAccess::of(user));
                 Changed::default()
             }
             MetadataChange::UserPermissionsUpdated(user) => {
-                let access = UserAccess::Active(granted(user.permissions.as_ref()));
-                permissions.set(&user.username, access);
+                let granted = granted(user.permissions.as_ref());
+                permissions.set_permissions(user_key!(user), &user.username, granted);
                 Changed::default()
             }
             MetadataChange::UserDeleted(user) => {
-                permissions.set(&user.username, UserAccess::Revoked);
+                permissions.set(user_key!(user), &user.username, UserAccess::Revoked);
                 Changed::default()
             }
             _ => Changed::default(),
@@ -518,7 +684,11 @@ impl Mirror {
     }
 
     /// Adds one item of a current state read. Users go to `users`.
-    fn insert(&mut self, item: &MetadataCurrentItem, users: &mut HashMap<String, UserAccess>) {
+    fn insert(
+        &mut self,
+        item: &MetadataCurrentItem,
+        users: &mut HashMap<UserKey, (String, UserAccess)>,
+    ) {
         match item {
             MetadataCurrentItem::Stream(stream) => {
                 self.put_stream(stream.stream_id, stream.stream_created_op, &stream.name);
@@ -528,7 +698,10 @@ impl Mirror {
                 self.put_group(group_key!(group), &group.name);
             }
             MetadataCurrentItem::User(user) => {
-                users.insert(user.username.clone(), UserAccess::of(user));
+                users.insert(
+                    user_key!(user),
+                    (user.username.clone(), UserAccess::of(user)),
+                );
             }
             _ => {}
         }
@@ -540,6 +713,29 @@ impl Mirror {
             .iter()
             .filter(|(key, _)| self.kafka_topic_of(key.topic, mapping).is_some())
             .map(|(_, group)| group.clone())
+            .collect()
+    }
+
+    /// Each topic held that `mapping` lists, with its Kafka name.
+    fn kafka_topics<'a>(
+        &'a self,
+        mapping: &'a TopicMapping,
+    ) -> impl Iterator<Item = (TopicKey, &'a str)> {
+        self.topics
+            .values()
+            .filter_map(move |topic| Some((topic.key, self.kafka_topic_of(topic.key, mapping)?)))
+    }
+
+    /// The Kafka names that this mirror lists under `mapping` and `newer` does not.
+    fn kafka_topics_left_out(&self, newer: &Self, mapping: &TopicMapping) -> Vec<String> {
+        let kept: HashSet<&str> = newer
+            .kafka_topics(mapping)
+            .map(|(_, kafka_topic)| kafka_topic)
+            .collect();
+        self.kafka_topics(mapping)
+            .map(|(_, kafka_topic)| kafka_topic)
+            .filter(|kafka_topic| !kept.contains(kafka_topic))
+            .map(str::to_owned)
             .collect()
     }
 
@@ -584,10 +780,10 @@ impl Mirror {
         {
             self.streams.remove(&stream_id);
         }
-        let in_stream =
-            |key: &TopicKey| key.stream_id == stream_id && key.stream_created_op == created_op;
-        self.topics.retain(|_, topic| !in_stream(&topic.key));
-        self.groups.retain(|key, _| !in_stream(&key.topic));
+        self.topics
+            .retain(|_, topic| !topic.key.in_stream(stream_id, created_op));
+        self.groups
+            .retain(|key, _| !key.topic.in_stream(stream_id, created_op));
     }
 
     /// As [`Self::put_stream`], by the op that created the topic.
@@ -736,15 +932,61 @@ mod tests {
         })
     }
 
-    fn user(name: &str, status: UserStatus, manage_topics: bool) -> MetadataUserChange {
+    const ALICE: UserKey = UserKey {
+        user_id: 1,
+        created_at: 100,
+    };
+    /// A new user named alice, after the first was deleted. Iggy gives it the same id.
+    const ALICE_AGAIN: UserKey = UserKey {
+        user_id: 1,
+        created_at: 200,
+    };
+    const BOB: UserKey = UserKey {
+        user_id: 2,
+        created_at: 100,
+    };
+    const CAROL: UserKey = UserKey {
+        user_id: 3,
+        created_at: 100,
+    };
+
+    fn user(
+        key: UserKey,
+        name: &str,
+        status: UserStatus,
+        manage_topics: bool,
+    ) -> MetadataUserChange {
         MetadataUserChange {
-            user_id: 7,
-            user_created_at: 0,
+            user_id: key.user_id,
+            user_created_at: key.created_at,
             username: name.to_owned(),
             status,
             permissions: Some(permissions(manage_topics)),
             options: MetadataOptions::Unreadable,
         }
+    }
+
+    fn user_deleted(key: UserKey, name: &str) -> MetadataChange {
+        MetadataChange::UserDeleted(MetadataUserIdentity {
+            user_id: key.user_id,
+            user_created_at: key.created_at,
+            username: name.to_owned(),
+        })
+    }
+
+    fn permissions_updated(
+        key: UserKey,
+        name: &str,
+        manage_topics: bool,
+        reason: MetadataPermissionsUpdatedReason,
+    ) -> MetadataChange {
+        MetadataChange::UserPermissionsUpdated(MetadataUserPermissionsUpdated {
+            user_id: key.user_id,
+            user_created_at: key.created_at,
+            username: name.to_owned(),
+            permissions: Some(permissions(manage_topics)),
+            reason,
+        })
     }
 
     fn permissions(manage_topics: bool) -> Permissions {
@@ -780,10 +1022,37 @@ mod tests {
     }
 
     fn apply_all(mirror: &mut Mirror, records: &[MetadataChange]) -> Changed {
-        let board = PermissionBoard::default();
+        apply_to(
+            mirror,
+            records,
+            &PermissionBoard::default(),
+            &mut Vec::new(),
+        )
+    }
+
+    /// Applies user `records` to `board`.
+    fn apply_users(board: &PermissionBoard, records: &[MetadataChange]) {
+        apply_to(&mut Mirror::default(), records, board, &mut Vec::new());
+    }
+
+    /// The Kafka names of the topics that applying `records` reports deleted, sorted.
+    fn deleted_by(mirror: &mut Mirror, records: &[MetadataChange]) -> Vec<String> {
+        let mut deleted = Vec::new();
+        apply_to(mirror, records, &PermissionBoard::default(), &mut deleted);
+        deleted.sort();
+        deleted
+    }
+
+    fn apply_to(
+        mirror: &mut Mirror,
+        records: &[MetadataChange],
+        board: &PermissionBoard,
+        deleted: &mut Vec<String>,
+    ) -> Changed {
+        let mapping = mapping();
         let mut changed = Changed::default();
         for change in records {
-            changed |= mirror.apply(change, &board);
+            changed |= mirror.apply(change, board, &mapping, deleted);
         }
         changed
     }
@@ -962,30 +1231,92 @@ mod tests {
     }
 
     #[test]
-    fn given_user_records_should_set_what_each_user_may_do() {
+    fn given_a_deleted_topic_when_applied_should_report_its_kafka_name() {
+        let (mut mirror, _) = seeded();
+
+        let deleted = deleted_by(&mut mirror, &[topic_deleted(KAFKA, 1, 10)]);
+
+        assert_eq!(deleted, ["orders"]);
+    }
+
+    /// Iggy records no delete of their own for the topics of a deleted stream.
+    #[test]
+    fn given_a_deleted_stream_when_applied_should_report_each_of_its_topics() {
+        let (mut mirror, _) = seeded();
+        apply_all(
+            &mut mirror,
+            &[MetadataChange::TopicCreated(topic(
+                KAFKA, 2, 11, "payments",
+            ))],
+        );
+
+        let deleted = deleted_by(&mut mirror, &[stream_deleted(KAFKA, u64::from(KAFKA))]);
+
+        assert_eq!(deleted, ["orders", "payments"]);
+    }
+
+    #[test]
+    fn given_a_deleted_topic_outside_every_kafka_name_when_applied_should_report_nothing() {
+        let (mut mirror, _) = seeded();
+        apply_all(
+            &mut mirror,
+            &[
+                MetadataChange::StreamCreated(stream(OTHER, u64::from(OTHER), "logs")),
+                MetadataChange::TopicCreated(topic(OTHER, 1, 12, "orders")),
+                MetadataChange::TopicCreated(topic(OTHER, 2, 13, "audit_log")),
+            ],
+        );
+
+        let unmapped = deleted_by(&mut mirror, &[topic_deleted(OTHER, 1, 12)]);
+        let stream = deleted_by(&mut mirror, &[stream_deleted(OTHER, u64::from(OTHER))]);
+
+        assert_eq!(unmapped, NONE);
+        assert_eq!(
+            stream,
+            ["audit"],
+            "only the override names a topic of stream `logs`"
+        );
+    }
+
+    /// A current state read can page a topic newer than its anchor. The changes after the anchor
+    /// then replay the delete of the older topic of the same id.
+    #[test]
+    fn given_a_delete_of_an_older_topic_when_applied_should_report_nothing() {
         let mut mirror = Mirror::default();
+        apply_all(
+            &mut mirror,
+            &[
+                MetadataChange::StreamCreated(stream(KAFKA, u64::from(KAFKA), "kafka")),
+                MetadataChange::TopicCreated(topic(KAFKA, 1, 30, "orders")),
+            ],
+        );
+
+        let deleted = deleted_by(&mut mirror, &[topic_deleted(KAFKA, 1, 10)]);
+
+        assert_eq!(deleted, NONE);
+        assert_eq!(mirror.topics.len(), 1, "the newer topic stays");
+    }
+
+    #[test]
+    fn given_user_records_should_set_what_each_user_may_do() {
         let board = PermissionBoard::default();
 
-        for change in [
-            MetadataChange::UserCreated(user("alice", UserStatus::Active, false)),
-            MetadataChange::UserCreated(user("bob", UserStatus::Active, false)),
-            MetadataChange::UserPermissionsUpdated(MetadataUserPermissionsUpdated {
-                user_id: 7,
-                user_created_at: 0,
-                username: "alice".to_owned(),
-                permissions: Some(permissions(true)),
-                reason: MetadataPermissionsUpdatedReason::Updated,
-            }),
-            MetadataChange::UserUpdated(user("bob", UserStatus::Inactive, false)),
-            MetadataChange::UserCreated(user("carol", UserStatus::Active, false)),
-            MetadataChange::UserDeleted(MetadataUserIdentity {
-                user_id: 8,
-                user_created_at: 0,
-                username: "carol".to_owned(),
-            }),
-        ] {
-            mirror.apply(&change, &board);
-        }
+        apply_users(
+            &board,
+            &[
+                MetadataChange::UserCreated(user(ALICE, "alice", UserStatus::Active, false)),
+                MetadataChange::UserCreated(user(BOB, "bob", UserStatus::Active, false)),
+                permissions_updated(
+                    ALICE,
+                    "alice",
+                    true,
+                    MetadataPermissionsUpdatedReason::Updated,
+                ),
+                MetadataChange::UserUpdated(user(BOB, "bob", UserStatus::Inactive, false)),
+                MetadataChange::UserCreated(user(CAROL, "carol", UserStatus::Active, false)),
+                user_deleted(CAROL, "carol"),
+            ],
+        );
 
         assert_eq!(board.access("alice"), Some(manages_topics()));
         assert_eq!(board.access("bob"), Some(UserAccess::Revoked));
@@ -996,47 +1327,246 @@ mod tests {
     #[test]
     fn given_a_change_after_the_seen_revision_should_report_it_once() {
         let board = PermissionBoard::default();
-        board.set("alice", reads_nothing());
+        board.set(ALICE, "alice", reads_nothing());
         let mut seen = board.revision();
 
-        assert_eq!(board.changed_since("alice", &mut seen), None);
-        board.set("bob", manages_topics());
+        assert_eq!(board.changed_since(Some(ALICE), "alice", &mut seen), None);
+        board.set(BOB, "bob", manages_topics());
         assert_eq!(
-            board.changed_since("alice", &mut seen),
+            board.changed_since(Some(ALICE), "alice", &mut seen),
             None,
             "another user"
         );
-        board.set("alice", manages_topics());
+        board.set(ALICE, "alice", manages_topics());
         assert_eq!(
-            board.changed_since("alice", &mut seen),
+            board.changed_since(Some(ALICE), "alice", &mut seen),
             Some(manages_topics())
         );
-        assert_eq!(board.changed_since("alice", &mut seen), None, "only once");
+        assert_eq!(
+            board.changed_since(Some(ALICE), "alice", &mut seen),
+            None,
+            "only once"
+        );
+    }
+
+    /// A stream delete prunes the grants of every user on it, active or not.
+    #[test]
+    fn given_a_deactivated_user_when_its_permissions_change_should_stay_revoked() {
+        let board = PermissionBoard::default();
+        apply_users(
+            &board,
+            &[MetadataChange::UserCreated(user(
+                ALICE,
+                "alice",
+                UserStatus::Active,
+                true,
+            ))],
+        );
+        let mut seen = board.revision();
+
+        apply_users(
+            &board,
+            &[
+                MetadataChange::UserUpdated(user(ALICE, "alice", UserStatus::Inactive, true)),
+                permissions_updated(
+                    ALICE,
+                    "alice",
+                    false,
+                    MetadataPermissionsUpdatedReason::ResourceDeleted,
+                ),
+            ],
+        );
+
+        assert_eq!(board.access("alice"), Some(UserAccess::Revoked));
+        assert_eq!(
+            board.changed_since(Some(ALICE), "alice", &mut seen),
+            Some(UserAccess::Revoked)
+        );
     }
 
     #[test]
-    fn given_a_current_state_without_a_known_user_should_revoke_it() {
+    fn given_a_revoke_undone_in_one_read_when_a_connection_saw_neither_should_close_it() {
         let board = PermissionBoard::default();
-        board.set("alice", reads_nothing());
-        board.set("bob", reads_nothing());
-        board.set("gone-before", UserAccess::Revoked);
+        apply_users(
+            &board,
+            &[MetadataChange::UserCreated(user(
+                ALICE,
+                "alice",
+                UserStatus::Active,
+                false,
+            ))],
+        );
         let mut seen = board.revision();
 
-        board.replace(HashMap::from([("bob".to_owned(), reads_nothing())]));
+        apply_users(
+            &board,
+            &[
+                MetadataChange::UserUpdated(user(ALICE, "alice", UserStatus::Inactive, false)),
+                MetadataChange::UserUpdated(user(ALICE, "alice", UserStatus::Active, true)),
+            ],
+        );
 
+        assert_eq!(board.access("alice"), Some(manages_topics()));
         assert_eq!(
-            board.changed_since("alice", &mut seen),
+            board.changed_since(Some(ALICE), "alice", &mut seen),
             Some(UserAccess::Revoked)
         );
-        let mut seen_before = 0;
+    }
+
+    #[test]
+    fn given_a_username_deleted_and_created_again_when_following_should_close_only_the_old_user() {
+        let board = PermissionBoard::default();
+        apply_users(
+            &board,
+            &[MetadataChange::UserCreated(user(
+                ALICE,
+                "alice",
+                UserStatus::Active,
+                false,
+            ))],
+        );
+        // The new user can sign in before the board shows it.
+        let mut old_seen = board.revision();
+        let mut new_seen = old_seen;
+
+        apply_users(
+            &board,
+            &[
+                user_deleted(ALICE, "alice"),
+                MetadataChange::UserCreated(user(ALICE_AGAIN, "alice", UserStatus::Active, true)),
+            ],
+        );
+
         assert_eq!(
-            board.changed_since("bob", &mut seen_before),
-            Some(reads_nothing()),
+            board.changed_since(Some(ALICE), "alice", &mut old_seen),
+            Some(UserAccess::Revoked)
+        );
+        assert_eq!(
+            board.changed_since(Some(ALICE_AGAIN), "alice", &mut new_seen),
+            Some(manages_topics())
+        );
+        assert_eq!(board.access("alice"), Some(manages_topics()), "the newest");
+    }
+
+    /// A connection whose permission read failed knows only its username.
+    #[test]
+    fn given_a_connection_without_its_user_when_any_user_of_its_name_is_revoked_should_close_it() {
+        let board = PermissionBoard::default();
+        apply_users(
+            &board,
+            &[
+                MetadataChange::UserCreated(user(ALICE_AGAIN, "alice", UserStatus::Active, false)),
+                MetadataChange::UserCreated(user(BOB, "bob", UserStatus::Active, false)),
+            ],
+        );
+        let mut by_name = board.revision();
+        let mut by_user = by_name;
+
+        apply_users(
+            &board,
+            &[
+                permissions_updated(
+                    ALICE_AGAIN,
+                    "alice",
+                    true,
+                    MetadataPermissionsUpdatedReason::Updated,
+                ),
+                user_deleted(BOB, "bob"),
+            ],
+        );
+        let unrelated = board.changed_since(None, "alice", &mut by_name);
+        // A replayed delete of the older alice.
+        apply_users(&board, &[user_deleted(ALICE, "alice")]);
+
+        assert_eq!(
+            unrelated, None,
+            "neither a permission change nor a revoke of another name"
+        );
+        assert_eq!(
+            board.changed_since(None, "alice", &mut by_name),
+            Some(UserAccess::Revoked)
+        );
+        assert_eq!(
+            board.changed_since(Some(ALICE_AGAIN), "alice", &mut by_user),
+            Some(manages_topics()),
+            "a connection that knows its user"
+        );
+    }
+
+    #[test]
+    fn given_a_renamed_user_when_following_should_keep_its_key_and_close_its_old_name() {
+        let board = PermissionBoard::default();
+        board.set(ALICE, "alice", reads_nothing());
+        let mut by_user = board.revision();
+        let mut by_name = by_user;
+
+        apply_users(
+            &board,
+            &[MetadataChange::UserUpdated(user(
+                ALICE,
+                "alicia",
+                UserStatus::Active,
+                true,
+            ))],
+        );
+
+        assert_eq!(
+            board.changed_since(Some(ALICE), "alice", &mut by_user),
+            Some(manages_topics())
+        );
+        assert_eq!(
+            board.changed_since(None, "alice", &mut by_name),
+            Some(UserAccess::Revoked)
+        );
+    }
+
+    #[test]
+    fn given_a_current_state_without_a_known_user_when_rebuilt_should_revoke_it() {
+        let board = PermissionBoard::default();
+        board.set(ALICE, "alice", reads_nothing());
+        board.set(BOB, "bob", reads_nothing());
+        board.set(CAROL, "carol", UserAccess::Revoked);
+        let mut alice_seen = board.revision();
+        let mut bob_seen = alice_seen;
+
+        board.replace(HashMap::from([(BOB, ("bob".to_owned(), reads_nothing()))]));
+
+        assert_eq!(
+            board.changed_since(Some(ALICE), "alice", &mut alice_seen),
+            Some(UserAccess::Revoked)
+        );
+        assert_eq!(
+            board.changed_since(Some(BOB), "bob", &mut bob_seen),
+            None,
             "an unchanged user keeps its revision"
         );
-        assert!(
-            board.access("gone-before").is_none(),
+        assert_eq!(
+            board.access("carol"),
+            None,
             "a revoked user the state left out is dropped"
+        );
+    }
+
+    #[test]
+    fn given_a_revoke_that_a_rebuild_dropped_when_a_connection_looks_should_close_it() {
+        let board = PermissionBoard::default();
+        board.set(ALICE, "alice", reads_nothing());
+        board.set(BOB, "bob", reads_nothing());
+        let mut alice_seen = board.revision();
+        let mut bob_seen = alice_seen;
+        board.set(ALICE, "alice", UserAccess::Revoked);
+
+        board.replace(HashMap::from([(BOB, ("bob".to_owned(), reads_nothing()))]));
+
+        assert_eq!(board.access("alice"), None, "dropped");
+        assert_eq!(
+            board.changed_since(Some(ALICE), "alice", &mut alice_seen),
+            Some(UserAccess::Revoked)
+        );
+        assert_eq!(
+            board.changed_since(Some(BOB), "bob", &mut bob_seen),
+            None,
+            "a user the board still holds"
         );
     }
 
@@ -1090,7 +1620,7 @@ mod tests {
                     group_id: 1,
                     name: name.to_owned(),
                 }),
-                MetadataCurrentItem::User(user("alice", UserStatus::Active, false)),
+                MetadataCurrentItem::User(user(ALICE, "alice", UserStatus::Active, false)),
             ],
             ..page(MetadataChangeStatus::Ok, Some(cursor(anchor)))
         }
@@ -1163,6 +1693,7 @@ mod tests {
         index: GroupIndex,
         topics: watch::Receiver<u64>,
         permissions: Arc<PermissionBoard>,
+        deleted: broadcast::Receiver<String>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -1170,11 +1701,14 @@ mod tests {
         let index = GroupIndex::following();
         let topics = Arc::new(watch::Sender::new(0));
         let permissions = Arc::new(PermissionBoard::default());
+        let deletions = broadcast::Sender::new(TOPIC_DELETIONS_CAPACITY);
+        let deleted = deletions.subscribe();
         let follower = Follower {
             mapping: mapping(),
             groups: index.feed(),
             topics: Arc::clone(&topics),
             permissions: Arc::clone(&permissions),
+            deletions,
         };
         let read = log.read();
         let task = tokio::spawn(async move { follower.follow(read).await });
@@ -1182,6 +1716,7 @@ mod tests {
             index,
             topics: topics.subscribe(),
             permissions,
+            deleted,
             task,
         }
     }
@@ -1322,6 +1857,32 @@ mod tests {
 
         assert!(*followed.topics.borrow() > rebuilt);
         assert_eq!(names(&groups_now(&followed.index).await), NONE);
+        followed.task.abort();
+    }
+
+    /// A gap in the log can hide a delete.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_rebuild_without_a_known_topic_when_following_should_report_it_deleted() {
+        let payments = topic(KAFKA, 2, 11, "payments");
+        let log = FakeLog::new(vec![
+            Ok(current(5, "kafka.cg.first-app")),
+            Ok(changes(6, vec![MetadataChange::TopicCreated(payments)])),
+            Ok(page(MetadataChangeStatus::Expired, None)),
+            Ok(current(50, "kafka.cg.first-app")),
+        ]);
+        let mut followed = follow(&log);
+
+        sleep(FOLLOW_INTERVAL * 4).await;
+
+        assert_eq!(&log.starts()[..4], ["current", "after", "after", "current"]);
+        assert_eq!(
+            followed.deleted.try_recv().ok().as_deref(),
+            Some("payments")
+        );
+        assert!(
+            followed.deleted.try_recv().is_err(),
+            "the first read of the current state reports nothing"
+        );
         followed.task.abort();
     }
 }

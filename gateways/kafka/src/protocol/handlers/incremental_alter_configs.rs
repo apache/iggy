@@ -349,6 +349,7 @@ mod tests {
     fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
         AuthenticatedPrincipal {
             username: "alice".to_string(),
+            user: None,
             permissions: PrincipalPermissions {
                 manage_topics,
                 ..PrincipalPermissions::default()

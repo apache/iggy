@@ -17,9 +17,10 @@
 
 //! The records of the coordinator log and of the owner topic.
 //!
-//! Each record starts with a format version and a kind. A gateway skips a record of a newer
-//! version or of a kind it does not know, so two gateway versions can share one log during a
-//! rolling upgrade. Every number is little endian.
+//! Each record starts with a format version, a kind, its claim and its checkpoint. Every version
+//! keeps that header, and a claim's body starts with its node id in every version. A gateway reads
+//! the header of every record and the body of the kinds it knows, so during a rolling upgrade an
+//! older gateway still sees a newer gateway's claim. Every number is little endian.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
@@ -38,6 +39,7 @@ const KIND_CHECKPOINT_END: u8 = 3;
 const KIND_GROUP: u8 = 4;
 const KIND_OFFSET: u8 = 5;
 const KIND_GROUP_OFFSETS_DELETED: u8 = 6;
+const KIND_TOPIC_OFFSETS_DELETED: u8 = 7;
 
 const KIND_ANNOUNCEMENT: u8 = 1;
 
@@ -80,6 +82,10 @@ pub enum Body {
     },
     /// Every offset of the group is deleted.
     GroupOffsetsDeleted { group_id: String },
+    /// Iggy deleted the topic, so every offset of it, in every group, is gone.
+    TopicOffsetsDeleted { topic: String },
+    /// A kind or a version this gateway does not know. Only its header counts.
+    Unknown { kind: u8 },
 }
 
 /// One committed offset, with what Kafka keeps beside it.
@@ -156,27 +162,28 @@ impl Record {
                 }
             }
             Body::GroupOffsetsDeleted { group_id } => put_str(&mut buf, group_id, "group id")?,
+            Body::TopicOffsetsDeleted { topic } => put_str(&mut buf, topic, "topic")?,
+            Body::Unknown { .. } => {}
         }
         Ok(buf.freeze())
     }
 
-    /// The record in `bytes`, or `None` for a version or a kind this gateway does not know.
+    /// The record in `bytes`. A kind or a version this gateway does not know gives
+    /// [`Body::Unknown`], except a claim, whose body every version starts the same way.
     ///
     /// # Errors
     ///
-    /// [`RecordError`] when a known record is cut short or holds a string that is not UTF-8.
-    pub fn decode(mut bytes: &[u8]) -> Result<Option<Self>, RecordError> {
+    /// [`RecordError`] when the header or a known body is cut short, or a string is not UTF-8.
+    pub fn decode(mut bytes: &[u8]) -> Result<Self, RecordError> {
         let version = get_u8(&mut bytes, "version")?;
         let kind = get_u8(&mut bytes, "kind")?;
-        if version != FORMAT_VERSION {
-            return Ok(None);
-        }
         let claim = get_u64(&mut bytes, "claim")?;
         let checkpoint = get_u64(&mut bytes, "checkpoint")?;
         let body = match kind {
             KIND_CLAIM => Body::Claim {
                 node_id: get_u16(&mut bytes, "node id")?,
             },
+            _ if version != FORMAT_VERSION => Body::Unknown { kind },
             KIND_CHECKPOINT_BEGIN => Body::CheckpointBegin {
                 node_id: get_u16(&mut bytes, "node id")?,
             },
@@ -214,13 +221,16 @@ impl Record {
             KIND_GROUP_OFFSETS_DELETED => Body::GroupOffsetsDeleted {
                 group_id: get_str(&mut bytes, "group id")?,
             },
-            _ => return Ok(None),
+            KIND_TOPIC_OFFSETS_DELETED => Body::TopicOffsetsDeleted {
+                topic: get_str(&mut bytes, "topic")?,
+            },
+            _ => Body::Unknown { kind },
         };
-        Ok(Some(Self {
+        Ok(Self {
             claim,
             checkpoint,
             body,
-        }))
+        })
     }
 }
 
@@ -233,6 +243,8 @@ impl Body {
             Self::Group { .. } => KIND_GROUP,
             Self::Offset { .. } => KIND_OFFSET,
             Self::GroupOffsetsDeleted { .. } => KIND_GROUP_OFFSETS_DELETED,
+            Self::TopicOffsetsDeleted { .. } => KIND_TOPIC_OFFSETS_DELETED,
+            Self::Unknown { kind } => *kind,
         }
     }
 
@@ -243,7 +255,11 @@ impl Body {
             Self::Group { group_id, .. }
             | Self::Offset { group_id, .. }
             | Self::GroupOffsetsDeleted { group_id } => Some(group_id),
-            Self::Claim { .. } | Self::CheckpointBegin { .. } | Self::CheckpointEnd { .. } => None,
+            Self::Claim { .. }
+            | Self::CheckpointBegin { .. }
+            | Self::CheckpointEnd { .. }
+            | Self::TopicOffsetsDeleted { .. }
+            | Self::Unknown { .. } => None,
         }
     }
 }
@@ -501,6 +517,9 @@ mod tests {
             Body::GroupOffsetsDeleted {
                 group_id: "orders".to_string(),
             },
+            Body::TopicOffsetsDeleted {
+                topic: "payments".to_string(),
+            },
         ];
         for body in bodies {
             let record = Record {
@@ -509,24 +528,65 @@ mod tests {
                 body,
             };
             let bytes = record.encode().expect("encodes");
-            assert_eq!(Record::decode(&bytes), Ok(Some(record)));
+            assert_eq!(Record::decode(&bytes), Ok(record));
         }
     }
 
     #[test]
-    fn given_a_newer_version_or_an_unknown_kind_when_decoded_should_skip_it() {
-        let record = Record {
+    fn given_a_newer_version_when_decoded_should_keep_its_header_and_read_a_claim() {
+        let newer = |body: Body| {
+            let mut bytes = Record {
+                claim: 4,
+                checkpoint: 9,
+                body,
+            }
+            .encode()
+            .unwrap()
+            .to_vec();
+            bytes[0] = FORMAT_VERSION + 1;
+            // A newer body can grow past what this version reads.
+            bytes.extend_from_slice(b"newer");
+            Record::decode(&bytes)
+        };
+        assert_eq!(
+            newer(Body::Claim { node_id: 2 }),
+            Ok(Record {
+                claim: 4,
+                checkpoint: 9,
+                body: Body::Claim { node_id: 2 },
+            })
+        );
+        assert_eq!(
+            newer(Body::CheckpointEnd { begin: 1 }),
+            Ok(Record {
+                claim: 4,
+                checkpoint: 9,
+                body: Body::Unknown {
+                    kind: KIND_CHECKPOINT_END
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn given_an_unknown_kind_when_decoded_should_keep_its_header() {
+        let mut bytes = Record {
             claim: 1,
             checkpoint: 0,
-            body: Body::Claim { node_id: 1 },
-        };
-        let mut newer = record.encode().unwrap().to_vec();
-        newer[0] = FORMAT_VERSION + 1;
-        assert_eq!(Record::decode(&newer), Ok(None));
-
-        let mut unknown = record.encode().unwrap().to_vec();
-        unknown[1] = 200;
-        assert_eq!(Record::decode(&unknown), Ok(None));
+            body: Body::CheckpointEnd { begin: 3 },
+        }
+        .encode()
+        .unwrap()
+        .to_vec();
+        bytes[1] = 200;
+        assert_eq!(
+            Record::decode(&bytes),
+            Ok(Record {
+                claim: 1,
+                checkpoint: 0,
+                body: Body::Unknown { kind: 200 },
+            })
+        );
     }
 
     #[test]

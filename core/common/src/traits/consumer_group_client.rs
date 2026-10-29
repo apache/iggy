@@ -76,9 +76,9 @@ pub trait ConsumerGroupClient {
     ) -> Result<(), IggyError>;
     /// Get this client's own assignment in a consumer group by unique ID or name for the given stream and topic by unique IDs or names.
     ///
-    /// Returns `None` when this client is not a member of the group. A partition that the group
-    /// hands to another member leaves the assignment as soon as the handoff starts, before it
-    /// completes.
+    /// Returns `None` when this client is not a member of the group, or the stream, the topic or
+    /// the group does not exist. A partition that the group hands to another member leaves the
+    /// assignment as soon as the handoff starts, before it completes.
     ///
     /// Authentication is required. TCP, QUIC and WebSocket support it. HTTP keeps no membership
     /// and returns `FeatureUnavailable`.
