@@ -71,7 +71,7 @@ use crate::protocol::api::{
     API_KEY_HEARTBEAT, API_KEY_INCREMENTAL_ALTER_CONFIGS, API_KEY_INIT_PRODUCER_ID,
     API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS, API_KEY_LIST_OFFSETS,
     API_KEY_METADATA, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_DELETE, API_KEY_OFFSET_FETCH,
-    API_KEY_PRODUCE, API_KEY_SYNC_GROUP, ConnectionState, ERROR_INVALID_REQUEST,
+    API_KEY_PRODUCE, API_KEY_SYNC_GROUP, Brokers, ConnectionState, ERROR_INVALID_REQUEST,
     ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, is_supported_version,
     supported_max_version,
 };
@@ -127,10 +127,12 @@ pub async fn dispatch(
         API_KEY_OFFSET_COMMIT => offset_commit::handle(state, connection, api_version, body).await,
         API_KEY_OFFSET_FETCH => offset_fetch::handle(state, connection, api_version, body).await,
         API_KEY_API_VERSIONS => api_versions::handle(connection, api_version, body).await,
-        API_KEY_CREATE_TOPICS => create_topics::handle(state, api_version, body).await,
-        API_KEY_DELETE_TOPICS => delete_topics::handle(state, principal, api_version, body).await,
+        API_KEY_CREATE_TOPICS => create_topics::handle(state, connection, api_version, body).await,
+        API_KEY_DELETE_TOPICS => {
+            delete_topics::handle(state, connection, principal, api_version, body).await
+        }
         API_KEY_CREATE_PARTITIONS => {
-            create_partitions::handle(state, principal, api_version, body).await
+            create_partitions::handle(state, connection, principal, api_version, body).await
         }
         API_KEY_DESCRIBE_CONFIGS => describe_configs::handle(state, api_version, body).await,
         API_KEY_ALTER_CONFIGS => alter_configs::handle(state, principal, api_version, body).await,
@@ -162,15 +164,17 @@ pub async fn dispatch(
     }
 }
 
-/// Whether another gateway is the controller. Kafka admin clients send `CreateTopics`,
-/// `DeleteTopics` and `CreatePartitions` to the controller, and retry on `NOT_CONTROLLER` after a
-/// Metadata refresh. One controller keeps two requests from adding partitions to one topic at
-/// once. While no gateway is known as controller, each gateway serves the request.
-pub(crate) fn another_controller(state: &GatewayState) -> bool {
+/// Whether another gateway that `brokers` lists is the controller. Kafka admin clients send
+/// `CreateTopics`, `DeleteTopics` and `CreatePartitions` to the controller, and retry on
+/// `NOT_CONTROLLER` after a Metadata refresh. One controller keeps two requests from adding
+/// partitions to one topic at once. While no gateway is known as controller, or the controller is
+/// not listed, each gateway serves the request: Metadata then names this gateway, and a client
+/// told to look elsewhere would come back here until it times out.
+pub(crate) fn another_controller(state: &GatewayState, brokers: &Brokers) -> bool {
     state.coordination.as_ref().is_some_and(|coordination| {
         coordination
             .controller()
-            .is_some_and(|node_id| node_id != coordination.node_id())
+            .is_some_and(|node_id| brokers.listed_or_own(node_id) != brokers.node_id)
     })
 }
 

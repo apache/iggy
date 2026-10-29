@@ -657,11 +657,19 @@ impl GroupCoordinator {
         state::evict(&mut groups, leaves)
     }
 
-    /// Expires what is overdue in every group and drops the ones that emptied. Returns the ids
-    /// of the groups left.
-    pub async fn sweep(&self) -> HashSet<StrBytes> {
+    /// Expires what is overdue in every group and drops the ones that emptied.
+    pub async fn sweep(&self) {
         let mut groups = self.groups.lock().await;
-        state::sweep(&mut groups, Instant::now())
+        state::sweep(&mut groups, Instant::now());
+    }
+
+    /// The ids among `group_ids` that name no group here now.
+    pub async fn absent(&self, group_ids: Vec<String>) -> Vec<String> {
+        let groups = self.groups.lock().await;
+        group_ids
+            .into_iter()
+            .filter(|group_id| !groups.contains_key(group_id.as_bytes()))
+            .collect()
     }
 
     /// Joins `request`'s member, parking until the group's join barrier completes.
@@ -774,12 +782,19 @@ impl GroupCoordinator {
             None => Ok(()),
         };
         let mut groups = self.groups.lock().await;
+        // A release drops the group after this gateway stops serving it. The leader then looks
+        // for the new coordinator, which restores a stored generation, and keeps its member id.
+        let gone = self
+            .serves(&request.group_id)
+            .err()
+            .unwrap_or(ERROR_UNKNOWN_MEMBER_ID);
         state::finish_store(
             &mut groups,
             &request.group_id,
             &request.member_id,
             request.generation_id,
             stored,
+            gone,
             Instant::now(),
         )
     }
@@ -1190,6 +1205,71 @@ mod tests {
             ..standalone_commit("orders")
         };
         assert!(coordinator.validate_commit(&commit).await.is_ok());
+    }
+
+    /// A home whose partition moves away during a store, as a release does.
+    struct MovingHome {
+        groups: GroupCoordinator,
+        served: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl GroupHome for MovingHome {
+        fn serves(&self, _group_id: &str) -> Result<(), i16> {
+            if self.served.load(std::sync::atomic::Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(ERROR_NOT_COORDINATOR)
+            }
+        }
+
+        async fn store(&self, _group_id: &str, _snapshot: GroupSnapshot) -> Result<(), i16> {
+            self.served
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.groups.evict(|_| true).await;
+            Ok(())
+        }
+    }
+
+    /// `UNKNOWN_MEMBER_ID` would make the leader drop its id and rejoin, and the new coordinator
+    /// would then wait a session timeout for the old id.
+    #[tokio::test]
+    async fn given_a_release_during_the_store_should_send_the_leader_to_the_new_coordinator() {
+        let coordinator = coordinator();
+        coordinator.set_home(Arc::new(MovingHome {
+            groups: coordinator.clone(),
+            served: std::sync::atomic::AtomicBool::new(true),
+        }));
+        let joined = coordinator.join(&join_request("orders")).await;
+        assert_eq!(joined.error, ERROR_NONE);
+
+        let synced = coordinator
+            .sync(SyncRequest {
+                group_id: id("orders"),
+                generation_id: joined.generation_id,
+                member_id: joined.member_id.clone(),
+                group_instance_id: None,
+                protocol_type: None,
+                protocol_name: None,
+                assignments: vec![(joined.member_id, Bytes::new())],
+            })
+            .await;
+        assert_eq!(synced.error, ERROR_NOT_COORDINATOR);
+    }
+
+    #[tokio::test]
+    async fn given_group_ids_should_name_those_without_a_group_here() {
+        let coordinator = coordinator();
+        assert_eq!(
+            coordinator.join(&join_request("orders")).await.error,
+            ERROR_NONE
+        );
+        assert_eq!(
+            coordinator
+                .absent(vec!["orders".to_string(), "payments".to_string()])
+                .await,
+            ["payments"]
+        );
     }
 
     /// The first join of a member that must claim its id first. The answer carries that id.

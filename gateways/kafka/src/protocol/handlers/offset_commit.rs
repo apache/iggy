@@ -92,7 +92,7 @@ pub async fn handle(
             let logged = state.coordination.as_deref();
             let mut topics = commit_all(bridge, &request, &calls, logged.is_some()).await;
             if let Some(coordination) = logged {
-                log_commits(coordination, &request, &mut topics).await;
+                log_commits(coordination, &request, &mut topics, &calls).await;
             }
             topics
         }
@@ -175,11 +175,13 @@ async fn commit_all(
 }
 
 /// Appends each offset that Iggy stored to the coordinator log, with its metadata. A partition
-/// gets the log's code when the append fails, since the commit counts only in the log.
+/// gets the log's code when the append fails, since the commit counts only in the log. Stops at
+/// the deadline of `calls`, as the Iggy commits do.
 async fn log_commits(
     coordination: &Coordination,
     request: &OffsetCommitRequest,
     topics: &mut [OffsetCommitResponseTopic],
+    calls: &OffsetCalls,
 ) {
     let commit_timestamp_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -213,7 +215,7 @@ async fn log_commits(
         return;
     }
     if let Err(code) = coordination
-        .commit_offsets(request.group_id.0.as_str(), offsets)
+        .commit_offsets(request.group_id.0.as_str(), offsets, calls.deadline())
         .await
     {
         for (topic_at, partition_at) in positions {

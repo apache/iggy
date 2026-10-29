@@ -1070,13 +1070,12 @@ pub fn restore_groups(
     }
 }
 
-/// Ticks every group and drops the ones that emptied. Returns the ids of the groups left.
-pub fn sweep(groups: &mut Groups, now: Instant) -> HashSet<StrBytes> {
+/// Ticks every group and drops the ones that emptied.
+pub fn sweep(groups: &mut Groups, now: Instant) {
     groups.retain(|_, group| {
         group.tick(now);
         !group.is_empty()
     });
-    groups.keys().cloned().collect()
 }
 
 /// Removes every group that `leaves` names, and wakes its parked members so they ask again.
@@ -1621,17 +1620,19 @@ pub fn sync_or_store_step(
 /// Ends the store that [`sync_or_store_step`] asked for, and answers the leader. Once stored, the
 /// group turns `Stable` and its parked members get their assignments. A refused store opens a
 /// rebalance, and the leader gets `refusal`. A group that moved on during the store, because a
-/// member left or a session ended, answers `REBALANCE_IN_PROGRESS`.
+/// member left or a session ended, answers `REBALANCE_IN_PROGRESS`. A group that is gone answers
+/// the refusal of the store, else `gone`.
 pub fn finish_store(
     groups: &mut Groups,
     group_id: &StrBytes,
     member_id: &StrBytes,
     generation_id: i32,
     stored: Result<(), i16>,
+    gone: i16,
     now: Instant,
 ) -> SyncResult {
     let Some(group) = groups.get_mut(group_id) else {
-        return SyncResult::error(ERROR_UNKNOWN_MEMBER_ID);
+        return SyncResult::error(stored.err().unwrap_or(gone));
     };
     if group.phase != Phase::CompletingRebalance || group.generation_id != generation_id {
         return SyncResult::error(ERROR_REBALANCE_IN_PROGRESS);

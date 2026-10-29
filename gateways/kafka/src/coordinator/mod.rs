@@ -32,11 +32,12 @@ mod partition;
 pub mod record;
 pub mod replay;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
@@ -45,7 +46,7 @@ use tracing::{debug, info, warn};
 use crate::bridge::{BridgeError, CoordinatorLink, IggyBridge};
 use crate::coordinator::partition::{PartitionLog, Stop, Stopped, TAIL_WAIT};
 use crate::coordinator::record::{Announcement, Body, CommittedOffset};
-use crate::coordinator::replay::GroupOffsets;
+use crate::coordinator::replay::{GroupOffsets, PartitionState, TopicPartition};
 use crate::group::{GroupCoordinator, GroupHome, GroupSnapshot};
 use crate::protocol::api::{ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_NOT_COORDINATOR};
 
@@ -75,11 +76,17 @@ const ANNOUNCE_EVERY: Duration = Duration::from_mins(10);
 /// Clients that append to the log. A client sends one append at a time.
 const WRITERS: usize = 4;
 
+/// How long a load still removes the offsets of a topic Iggy deleted. A partition that changes
+/// owner meanwhile has no owner to remove them, and a takeover after a crash waits for Iggy's
+/// session timeout, 36 s by default.
+const DELETION_MEMORY: Duration = Duration::from_mins(2);
+
 /// How the coordinator log behaves. No environment variable maps onto it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoordinationConfig {
     /// Records after which an owner writes a checkpoint, so a load reads at most about this many
-    /// records past the state. An owner also writes one every 24 hours.
+    /// records past the state, or as many as the state holds when that is more. An owner also
+    /// writes one when the last is 24 hours old.
     pub checkpoint_records: u64,
 }
 
@@ -185,6 +192,10 @@ pub struct Coordination {
     rested: Mutex<HashMap<u32, Instant>>,
     /// The newest announced claim and owner of each partition.
     owners: RwLock<HashMap<u32, (u64, u16)>>,
+    /// The topics Iggy deleted within [`DELETION_MEMORY`], with when this gateway learned it.
+    deleted_topics: Mutex<VecDeque<(Instant, String)>>,
+    /// The owners that a listener of this gateway does not list, each warned of once.
+    unlisted: Mutex<HashSet<u16>>,
     stopped: mpsc::UnboundedSender<Stopped>,
     cancel: CancellationToken,
 }
@@ -204,6 +215,8 @@ impl Coordination {
         cancel: CancellationToken,
     ) -> Result<Arc<Self>, BridgeError> {
         let link = Arc::new(bridge.coordinator_link(PARTITIONS, WRITERS).await?);
+        // Before the join, so no deletion slips between a load and this.
+        let deletions = bridge.topic_deletions();
         link.join_lease().await?;
         let (stopped, stops) = mpsc::unbounded_channel();
         let this = Arc::new(Self {
@@ -215,6 +228,8 @@ impl Coordination {
             loading: Mutex::new(HashSet::new()),
             rested: Mutex::new(HashMap::new()),
             owners: RwLock::new(HashMap::new()),
+            deleted_topics: Mutex::new(VecDeque::new()),
+            unlisted: Mutex::new(HashSet::new()),
             stopped,
             cancel,
         });
@@ -222,6 +237,7 @@ impl Coordination {
         tokio::spawn(Arc::clone(&this).lease_on(stops));
         tokio::spawn(Arc::clone(&this).follow_owners());
         tokio::spawn(Arc::clone(&this).sweep_on());
+        tokio::spawn(Arc::clone(&this).forget_deleted_topics(deletions));
         info!(
             node_id,
             "coordinating consumer groups with the other gateways"
@@ -263,6 +279,24 @@ impl Coordination {
         self.owner_of(0)
     }
 
+    /// Warns, once per gateway, that `node_id` owns partitions but a listener of this gateway does
+    /// not list it. Its groups get `COORDINATOR_NOT_AVAILABLE` here until every list names it.
+    pub fn warn_unlisted(&self, node_id: u16) {
+        let first = self
+            .unlisted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(node_id);
+        if first {
+            warn!(
+                node_id,
+                "a gateway that IGGY_KAFKA_BROKERS does not list coordinates groups; \
+                 FindCoordinator answers COORDINATOR_NOT_AVAILABLE (15) for them until this \
+                 gateway restarts with a list that names it"
+            );
+        }
+    }
+
     /// Who owns each partition now.
     #[must_use]
     pub fn placement(&self) -> Placement {
@@ -288,15 +322,19 @@ impl Coordination {
         nodes
     }
 
-    /// Appends the offsets of `group_id`, each with its metadata, and waits until they count.
+    /// Appends the offsets of `group_id`, each with its metadata, and waits until they count, at
+    /// most until `deadline`: a heartbeat on the connection waits behind the commit.
     ///
     /// # Errors
     ///
-    /// The Kafka code for every partition of the commit. See `Self::serving`.
+    /// The Kafka code for every partition of the commit: `COORDINATOR_LOAD_IN_PROGRESS` when the
+    /// log does not confirm it by `deadline`, else as `Self::serving` and
+    /// `PartitionLog::append_by`.
     pub async fn commit_offsets(
         &self,
         group_id: &str,
         offsets: Vec<(String, i32, CommittedOffset)>,
+        deadline: Instant,
     ) -> Result<(), i16> {
         let log = self.serving(group_id)?;
         let bodies = offsets
@@ -308,7 +346,9 @@ impl Coordination {
                 committed: Some(committed),
             })
             .collect();
-        log.append(bodies).await.map(drop)
+        log.append_by(bodies, deadline, ERROR_COORDINATOR_LOAD_IN_PROGRESS)
+            .await
+            .map(drop)
     }
 
     /// Deletes the offsets of `group_id` for each of `keys`.
@@ -357,15 +397,33 @@ impl Coordination {
         .map(drop)
     }
 
-    /// The offsets of `group_id` the log holds, or `None` when it holds none.
+    /// The offsets the log holds of `group_id` for `partitions`, or for every partition with
+    /// `None`. `None` when the log holds none of the group.
     ///
     /// # Errors
     ///
     /// The Kafka code that sends the client elsewhere. See `Self::serving`.
-    pub async fn offsets(&self, group_id: &str) -> Result<Option<GroupOffsets>, i16> {
+    pub async fn offsets(
+        &self,
+        group_id: &str,
+        partitions: Option<&[TopicPartition]>,
+    ) -> Result<Option<GroupOffsets>, i16> {
         let log = self.serving(group_id)?;
         Ok(log
-            .with_state(|state| state.offsets.get(group_id).cloned())
+            .with_state(|state| {
+                let offsets = state.offsets.get(group_id)?;
+                let Some(partitions) = partitions else {
+                    return Some(offsets.clone());
+                };
+                let entries = partitions
+                    .iter()
+                    .filter_map(|key| Some((key.clone(), offsets.entries.get(key)?.clone())))
+                    .collect();
+                Some(GroupOffsets {
+                    complete: offsets.complete,
+                    entries,
+                })
+            })
             .await)
     }
 
@@ -375,18 +433,27 @@ impl Coordination {
         let mut groups = BTreeSet::new();
         for log in logs {
             log.with_state(|state| {
-                groups.extend(state.groups.keys().cloned());
                 groups.extend(
                     state
-                        .offsets
-                        .iter()
-                        .filter(|(_, offsets)| offsets.entries.values().any(Option::is_some))
-                        .map(|(group_id, _)| group_id.clone()),
+                        .groups
+                        .keys()
+                        .chain(state.offsets.keys())
+                        .filter(|group_id| logs_group(state, group_id))
+                        .cloned(),
                 );
             })
             .await;
         }
         groups
+    }
+
+    /// Whether the log holds state or offsets for `group_id`, in a partition this gateway serves.
+    pub async fn holds(&self, group_id: &str) -> bool {
+        let log = self.served().get(&partition_of_group(group_id)).cloned();
+        match log {
+            Some(log) => log.with_state(|state| logs_group(state, group_id)).await,
+            None => false,
+        }
     }
 
     /// The log of the partition that holds `group_id`, when this gateway serves it.
@@ -527,7 +594,7 @@ impl Coordination {
                     &self.cancel,
                 );
                 let claim = log.claim;
-                let previous = self.served_mut().insert(partition, log);
+                let previous = self.served_mut().insert(partition, Arc::clone(&log));
                 if let Some(previous) = previous {
                     previous.stop();
                 }
@@ -539,6 +606,9 @@ impl Coordination {
                     "took the coordinator log partition over"
                 );
                 self.announce(partition, claim).await;
+                for topic in self.recent_deletions() {
+                    forget_topic(&log, &topic).await;
+                }
             }
             Ok(None) => {
                 info!(
@@ -684,25 +754,15 @@ impl Coordination {
                 () = self.cancel.cancelled() => return,
                 _ = tick.tick() => {}
             }
-            let live: HashSet<String> = self
-                .groups
-                .sweep()
-                .await
-                .into_iter()
-                .map(|group_id| group_id.to_string())
-                .collect();
+            self.groups.sweep().await;
             let logs: Vec<Arc<PartitionLog>> = self.served().values().cloned().collect();
             for log in logs {
-                let gone: Vec<String> = log
-                    .with_state(|state| {
-                        state
-                            .groups
-                            .keys()
-                            .filter(|group_id| !live.contains(*group_id))
-                            .cloned()
-                            .collect()
-                    })
+                let logged: Vec<String> = log
+                    .with_state(|state| state.groups.keys().cloned().collect())
                     .await;
+                // Read now, not before the appends of the other partitions: a group that formed
+                // meanwhile must keep its state.
+                let gone = self.groups.absent(logged).await;
                 if gone.is_empty() {
                     continue;
                 }
@@ -723,6 +783,48 @@ impl Coordination {
         }
     }
 
+    /// Removes the offsets of each topic Iggy deletes from the partitions this gateway serves, so
+    /// a new topic of that name starts with none, as in Kafka.
+    async fn forget_deleted_topics(self: Arc<Self>, mut deletions: broadcast::Receiver<String>) {
+        loop {
+            let topic = tokio::select! {
+                () = self.cancel.cancelled() => return,
+                deleted = deletions.recv() => match deleted {
+                    Ok(topic) => topic,
+                    Err(RecvError::Lagged(missed)) => {
+                        warn!(missed, "missed topic deletions; the coordinator log keeps their offsets");
+                        continue;
+                    }
+                    Err(RecvError::Closed) => return,
+                },
+            };
+            self.remember_deletion(&topic);
+            let logs: Vec<Arc<PartitionLog>> = self.served().values().cloned().collect();
+            for log in logs {
+                forget_topic(&log, &topic).await;
+            }
+        }
+    }
+
+    fn remember_deletion(&self, topic: &str) {
+        let mut deleted = self
+            .deleted_topics
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        deleted.retain(|(at, _)| at.elapsed() < DELETION_MEMORY);
+        deleted.push_back((Instant::now(), topic.to_string()));
+    }
+
+    fn recent_deletions(&self) -> Vec<String> {
+        self.deleted_topics
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(at, _)| at.elapsed() < DELETION_MEMORY)
+            .map(|(_, topic)| topic.clone())
+            .collect()
+    }
+
     fn served(&self) -> std::sync::RwLockReadGuard<'_, HashMap<u32, Arc<PartitionLog>>> {
         self.served.read().unwrap_or_else(PoisonError::into_inner)
     }
@@ -741,6 +843,42 @@ impl Coordination {
 
     fn owners(&self) -> std::sync::RwLockReadGuard<'_, HashMap<u32, (u64, u16)>> {
         self.owners.read().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Whether `state` holds the state of `group_id`, or an offset of it.
+fn logs_group(state: &PartitionState, group_id: &str) -> bool {
+    state.groups.contains_key(group_id)
+        || state
+            .offsets
+            .get(group_id)
+            .is_some_and(|offsets| offsets.entries.values().any(Option::is_some))
+}
+
+/// Removes the offsets of `topic` from `log`, when it holds any.
+async fn forget_topic(log: &PartitionLog, topic: &str) {
+    let holds = log
+        .with_state(|state| {
+            state
+                .offsets
+                .values()
+                .any(|offsets| offsets.entries.keys().any(|(name, _)| name == topic))
+        })
+        .await;
+    if !holds {
+        return;
+    }
+    let partition = log.partition;
+    if let Err(error) = log
+        .append(vec![Body::TopicOffsetsDeleted {
+            topic: topic.to_string(),
+        }])
+        .await
+    {
+        warn!(
+            partition,
+            topic, error, "could not remove a deleted topic's offsets from the coordinator log"
+        );
     }
 }
 

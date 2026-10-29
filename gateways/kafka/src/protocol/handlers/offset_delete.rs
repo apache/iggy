@@ -154,7 +154,7 @@ async fn delete_offsets(
         return Err(ERROR_COORDINATOR_LOAD_IN_PROGRESS);
     }
     let logged = match &state.coordination {
-        Some(coordination) => coordination.logged_groups().await.contains(group.as_str()),
+        Some(coordination) => coordination.holds(group).await,
         None => false,
     };
     let subscribed = match subscribed {
@@ -463,6 +463,7 @@ mod tests {
     fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
         AuthenticatedPrincipal {
             username: "alice".to_string(),
+            user: None,
             permissions: PrincipalPermissions {
                 manage_topics,
                 ..PrincipalPermissions::default()

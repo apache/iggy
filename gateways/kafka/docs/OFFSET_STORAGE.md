@@ -111,7 +111,9 @@ log decides each offset:
 
 - The coordinator of the group stores each commit in Iggy as above, then appends it to the log
   with its metadata, its leader epoch and the commit time. The commit counts only once the log
-  holds it. The Iggy copy goes first, because that write checks the topic and the partition.
+  holds it, and answers `COORDINATOR_LOAD_IN_PROGRESS` (14) when the log does not confirm it in
+  the request's time. The Iggy copy goes first, because that write checks the topic and the
+  partition.
 - A coordinator that lost the group's log partition can append, but its record does not count,
   and the commit answers `NOT_COORDINATOR` (16). Its Iggy copy can still land, so the copy can
   hold an older offset than the log. The log answers `OffsetFetch`.
@@ -119,6 +121,10 @@ log decides each offset:
   with the commit metadata. Iggy answers the other partitions, which hold offsets from before the
   log. After `DeleteGroups`, the log holds every offset of the group, so Iggy answers none.
 - `DeleteGroups` and `OffsetDelete` delete in Iggy and in the log, while the group's commits wait.
+- When Iggy deletes a topic, each owner removes its offsets from the log, so a new topic of that
+  name starts with none, as in Kafka. The gateway learns of it from Iggy's change log, which needs
+  `manage_servers` on the bridge's Iggy user. Without it, a new topic of the name starts at the
+  old offsets.
 - Only the coordinator answers offset requests for a group, so a commit made through another
   gateway answers `NOT_COORDINATOR`, and the client asks the coordinator.
 

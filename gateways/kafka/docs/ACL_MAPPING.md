@@ -159,16 +159,18 @@ follows Iggy's metadata change log ([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md#gr
 which records each change of a user's permissions with the new set. Before each request, a
 connection takes the last set that the log showed for its user. So a change reaches open
 connections within about a second. A connection whose user is deleted or deactivated closes before
-its next request, as Iggy ends the sessions of such a user. `ANONYMOUS` names no Iggy user, so no
-change applies to it.
+its next request, as Iggy ends the sessions of such a user, also when the user comes back before
+the connection looks. `ANONYMOUS` names no Iggy user, so no change applies to it.
 
 The log needs root or the global `manage_servers` permission on the bridge's Iggy user. Without
 it, a connection keeps the permissions it authenticated with until the client reconnects. The
 gateway holds no Iggy session per connection and keeps no password, so it has no other way to read
 them again.
 
-A change follows a username. When a user is renamed, a connection that authenticated under the old
-name keeps its permissions until it closes.
+A change follows the Iggy user, by its id and creation time, not its name. So a connection keeps
+following its user after a rename, and never takes the permissions of a new user of the same name.
+A connection whose login could not read its user takes no change, and closes when a user of its
+name is revoked or renamed.
 
 Say so in the README rather than leaving an operator to discover that an ACL view can lag.
 
