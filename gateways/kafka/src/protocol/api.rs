@@ -15,14 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
 use kafka_protocol::messages::{
     DescribeAclsRequest, SaslAuthenticateRequest, SaslHandshakeRequest,
 };
+use kafka_protocol::protocol::StrBytes;
 use tokio::sync::{OwnedMutexGuard, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -30,7 +32,7 @@ use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::IggyBridge;
 use crate::cluster_id::ClusterId;
 use crate::error::Result;
-use crate::group::{GroupCoordinator, GroupCoordinatorConfig, GroupMember};
+use crate::group::{GroupCoordinator, GroupCoordinatorConfig, GroupMember, MAX_CLIENT_ID_BYTES};
 use crate::protocol::acl::{
     self, AclBinding, AclFilter, PrincipalPermissions, encode_describe_acls_error_response,
     encode_describe_acls_response,
@@ -124,6 +126,60 @@ impl Default for BrokerAdvertise {
     }
 }
 
+/// The node id of a gateway that `IGGY_KAFKA_NODE_ID` does not set.
+pub const DEFAULT_NODE_ID: u16 = 1;
+
+/// The gateways that one listener lists in Metadata. A gateway alone lists itself, as node 1.
+#[derive(Debug, Clone)]
+pub struct Brokers {
+    /// This gateway's node id.
+    pub node_id: i32,
+    /// The other gateways, each with its endpoint for this listener, in node id order.
+    pub peers: Vec<(i32, BrokerAdvertise)>,
+}
+
+impl Default for Brokers {
+    fn default() -> Self {
+        Self {
+            node_id: i32::from(DEFAULT_NODE_ID),
+            peers: Vec::new(),
+        }
+    }
+}
+
+impl Brokers {
+    /// Every gateway in node id order, with `own` as the endpoint of this one.
+    #[must_use]
+    pub fn listed<'a>(&'a self, own: &'a BrokerAdvertise) -> Vec<(i32, &'a BrokerAdvertise)> {
+        let mut listed: Vec<(i32, &BrokerAdvertise)> = self
+            .peers
+            .iter()
+            .map(|(node, endpoint)| (*node, endpoint))
+            .collect();
+        listed.push((self.node_id, own));
+        listed.sort_by_key(|(node, _)| *node);
+        listed
+    }
+
+    /// The gateway that coordinates every consumer group: the lowest node id. Every gateway names
+    /// the same one, so the members of a group never split over two coordinators.
+    #[must_use]
+    pub fn coordinator<'a>(&'a self, own: &'a BrokerAdvertise) -> (i32, &'a BrokerAdvertise) {
+        match self.peers.first() {
+            Some((node, endpoint)) if *node < self.node_id => (*node, endpoint),
+            _ => (self.node_id, own),
+        }
+    }
+
+    /// Whether this gateway coordinates the consumer groups.
+    #[must_use]
+    pub fn coordinates_groups(&self) -> bool {
+        self.peers
+            .first()
+            .is_none_or(|(node, _)| *node > self.node_id)
+    }
+}
+
 /// The version firewall, and the exact set `ApiVersions` advertises.
 ///
 /// Absence is load-bearing for the transaction keys (24, 25, 26, 28): a conforming client that
@@ -202,6 +258,9 @@ pub struct GatewayState {
     /// What Metadata and `DescribeCluster` report. Random unless [`Self::with_cluster_id`] sets
     /// the one stored in Iggy.
     pub cluster_id: ClusterId,
+    /// This gateway's node id: the one replica Metadata names for each partition, so the one
+    /// broker a manual replica assignment may name.
+    pub node_id: i32,
     /// Present only while `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` is on.
     pub(crate) auto_topic_creation: Option<AutoTopicCreator>,
 }
@@ -240,6 +299,7 @@ impl GatewayState {
             probe_board: ProbeBoard::default(),
             partition_growth: Arc::default(),
             cluster_id: ClusterId::random(),
+            node_id: i32::from(DEFAULT_NODE_ID),
             auto_topic_creation: None,
         }
     }
@@ -289,6 +349,13 @@ impl GatewayState {
         self
     }
 
+    /// Names `node_id` as this gateway, in place of [`DEFAULT_NODE_ID`].
+    #[must_use]
+    pub fn with_node_id(mut self, node_id: u16) -> Self {
+        self.node_id = i32::from(node_id);
+        self
+    }
+
     /// State with no bridge, so every handler takes its stub path.
     ///
     /// The coordinator is real but fresh, so two calls never share group state.
@@ -316,6 +383,8 @@ impl GatewayState {
 pub struct ConnectionState {
     /// The broker address this connection's listener advertises.
     pub broker: BrokerAdvertise,
+    /// The gateways this connection's listener lists in Metadata.
+    pub brokers: Arc<Brokers>,
     /// Whether `SaslHandshake` and `SaslAuthenticate` are advertised and routed on this
     /// connection's listener.
     pub sasl_enabled: bool,
@@ -329,6 +398,11 @@ pub struct ConnectionState {
     /// The member that last sent a Heartbeat here. An offset call caps its hold by that member's
     /// session, since its next heartbeat waits behind the call.
     heartbeat_member: Mutex<Option<GroupMember>>,
+    /// The first `client_id` that a request header on this connection named, cut to
+    /// [`MAX_CLIENT_ID_BYTES`]. A Kafka client sends one id in every header of a connection.
+    client_id: OnceLock<StrBytes>,
+    /// The peer's IP address as Kafka reports a member's `client_host`: a `/`, then the address.
+    client_host: StrBytes,
     /// Keys the Produce session of a producer without a producer id that this gateway gave out.
     id: ConnectionId,
 }
@@ -357,6 +431,40 @@ impl ConnectionState {
             acls_enabled: acls_enabled || sasl_enabled,
             ..Self::default()
         }
+    }
+
+    /// The same state, with `brokers` as the gateways that Metadata lists.
+    #[must_use]
+    pub fn with_brokers(mut self, brokers: Arc<Brokers>) -> Self {
+        self.brokers = brokers;
+        self
+    }
+
+    /// The same state, for a connection from `peer`. An IPv4 client of a dual-stack listener is
+    /// reported by its IPv4 address, as Kafka does.
+    #[must_use]
+    pub fn with_peer(mut self, peer: SocketAddr) -> Self {
+        self.client_host = StrBytes::from_string(format!("/{}", peer.ip().to_canonical()));
+        self
+    }
+
+    /// Keeps `client_id` if no earlier header named one. The copy is owned: the header is a view
+    /// into its frame, and a group member keeps the id for as long as it stays in the group.
+    pub fn note_client_id(&self, client_id: Option<&str>) {
+        if let Some(client_id) = client_id.filter(|client_id| !client_id.is_empty()) {
+            self.client_id.get_or_init(|| {
+                let end = client_id.floor_char_boundary(MAX_CLIENT_ID_BYTES);
+                StrBytes::from_string(client_id[..end].to_owned())
+            });
+        }
+    }
+
+    pub(crate) fn client_id(&self) -> StrBytes {
+        self.client_id.get().cloned().unwrap_or_default()
+    }
+
+    pub(crate) fn client_host(&self) -> StrBytes {
+        self.client_host.clone()
     }
 
     /// What `ApiVersions` tells this connection about the listener-dependent keys.
@@ -743,5 +851,58 @@ mod tests {
                 guarded.max_version
             );
         }
+    }
+
+    #[test]
+    fn given_request_headers_should_keep_the_first_client_id_that_one_names() {
+        let connection = ConnectionState::default();
+        connection.note_client_id(None);
+        connection.note_client_id(Some(""));
+        assert_eq!(connection.client_id().as_str(), "");
+
+        connection.note_client_id(Some("consumer-g-1"));
+        connection.note_client_id(Some("consumer-g-2"));
+        assert_eq!(connection.client_id().as_str(), "consumer-g-1");
+    }
+
+    /// A 2-byte character that crosses the cap is left out whole, so the id stays UTF-8.
+    #[test]
+    fn given_a_client_id_past_the_cap_should_keep_its_start() {
+        let connection = ConnectionState::default();
+        let client_id = format!("{}é", "c".repeat(MAX_CLIENT_ID_BYTES - 1));
+        connection.note_client_id(Some(&client_id));
+        assert_eq!(
+            connection.client_id().as_str(),
+            &client_id[..MAX_CLIENT_ID_BYTES - 1]
+        );
+    }
+
+    /// Kafka shows a member's host as `/` and the address, without the port.
+    #[test]
+    fn given_a_peer_should_report_its_address_as_kafka_does() {
+        let peer: SocketAddr = "192.0.2.10:51234".parse().unwrap();
+        assert_eq!(
+            ConnectionState::default()
+                .with_peer(peer)
+                .client_host()
+                .as_str(),
+            "/192.0.2.10"
+        );
+        let peer: SocketAddr = "[::ffff:192.0.2.10]:51234".parse().unwrap();
+        assert_eq!(
+            ConnectionState::default()
+                .with_peer(peer)
+                .client_host()
+                .as_str(),
+            "/192.0.2.10"
+        );
+        let peer: SocketAddr = "[2001:db8::1]:51234".parse().unwrap();
+        assert_eq!(
+            ConnectionState::default()
+                .with_peer(peer)
+                .client_host()
+                .as_str(),
+            "/2001:db8::1"
+        );
     }
 }

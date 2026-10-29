@@ -29,12 +29,13 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use iggy::prelude::{
     AutoLogin, Client, Credentials, Identifier, IggyError, Permissions, TcpClient,
-    TcpClientConfigBuilder, UserStatus,
+    TcpClientConfigBuilder, UserClient, UserStatus,
 };
 use tokio::sync::SemaphorePermit;
 use tracing::{debug, warn};
 
 use crate::bridge::config::{DEFAULT_IGGY_ADDR, IggyTls};
+use crate::bridge::nodes::{KnownNodes, is_unreachable};
 use crate::protocol::acl::PrincipalPermissions;
 use crate::protocol::sasl::PlainCredentials;
 
@@ -64,12 +65,12 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 /// would only hide the failure underneath one the client cannot see.
 const VERIFY_RECONNECTION_RETRIES: u32 = 0;
 
-/// Budget for tearing the verification client down again.
+/// Budget for signing the verification client out and tearing it down again.
 ///
 /// Deliberately far shorter than [`VERIFY_TIMEOUT`]. The authentication slot is already released by
 /// the time teardown runs, but every second here still comes out of the caller's own
-/// pre-authentication budget. Nothing is lost by cutting it short: dropping the client closes the
-/// socket regardless.
+/// pre-authentication budget. Little is lost by cutting it short: dropping the client closes the
+/// socket regardless, and Iggy ends a session that did not sign out when its lease runs out.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Delay imposed on a peer after its first rejected login, doubled on every further rejection.
@@ -289,6 +290,8 @@ pub trait PrincipalResolver: Send + Sync + std::fmt::Debug {
 pub struct IggyAuthenticator {
     address: String,
     tls: IggyTls,
+    /// The nodes a login dials after `address`. Empty unless the bridge shares its roster.
+    nodes: KnownNodes,
 }
 
 impl IggyAuthenticator {
@@ -306,7 +309,7 @@ impl IggyAuthenticator {
     ];
 
     #[must_use]
-    pub const fn new(address: String) -> Self {
+    pub fn new(address: String) -> Self {
         Self {
             address,
             tls: IggyTls {
@@ -314,7 +317,16 @@ impl IggyAuthenticator {
                 domain: String::new(),
                 ca_file: None,
             },
+            nodes: KnownNodes::default(),
         }
+    }
+
+    /// Dials `nodes` after the configured address, so that a login still succeeds while that
+    /// node is down. `main` passes the roster that the bridge keeps.
+    #[must_use]
+    pub fn with_nodes(mut self, nodes: KnownNodes) -> Self {
+        self.nodes = nodes;
+        self
     }
 
     #[must_use]
@@ -343,6 +355,38 @@ impl IggyAuthenticator {
             std::env::var("IGGY_KAFKA_IGGY_ADDR").unwrap_or_else(|_| DEFAULT_IGGY_ADDR.to_string());
         Ok(Self::new(address).with_tls(IggyTls::from_env()?))
     }
+
+    /// A client that dials `address` and signs in with `credentials`.
+    ///
+    /// A bare transport client, not an `IggyClient`. The wrapper starts a heartbeat the moment it
+    /// connects, and on a lockstep connection that ping queues the permission read behind it.
+    /// Nothing here needs a heartbeat anyway: the client lives for one login and one read.
+    fn verifier(
+        &self,
+        address: &str,
+        credentials: &PlainCredentials,
+    ) -> Result<TcpClient, IggyError> {
+        let auto_login = AutoLogin::Enabled(Credentials::UsernamePassword(
+            credentials.username.clone(),
+            credentials.password.clone(),
+        ));
+        let mut builder = TcpClientConfigBuilder::new()
+            .with_server_address(address.to_owned())
+            .with_auto_sign_in(auto_login)
+            .with_reconnection_max_retries(Some(VERIFY_RECONNECTION_RETRIES));
+        if self.tls.enabled {
+            builder = builder.with_tls_enabled(true);
+            if !self.tls.domain.is_empty() {
+                builder = builder.with_tls_domain(self.tls.domain.clone());
+            }
+            if let Some(ref ca_file) = self.tls.ca_file {
+                builder = builder.with_tls_ca_file(ca_file.clone());
+            }
+        }
+        builder
+            .build()
+            .and_then(|config| TcpClient::create(Arc::new(config)))
+    }
 }
 
 impl std::fmt::Display for IggyAuthenticator {
@@ -362,35 +406,33 @@ impl SaslAuthenticator for IggyAuthenticator {
         credentials: &PlainCredentials,
         slot: SemaphorePermit<'_>,
     ) -> Result<AuthenticatedPrincipal, AuthError> {
-        let auto_login = AutoLogin::Enabled(Credentials::UsernamePassword(
-            credentials.username.clone(),
-            credentials.password.clone(),
-        ));
-        // A bare transport client, not an `IggyClient`. The wrapper starts a heartbeat the moment it
-        // connects, and on a lockstep connection that ping queues the permission read behind it.
-        // Nothing here needs a heartbeat anyway: the client lives for one login and one read.
-        let mut builder = TcpClientConfigBuilder::new()
-            .with_server_address(self.address.clone())
-            .with_auto_sign_in(auto_login)
-            .with_reconnection_max_retries(Some(VERIFY_RECONNECTION_RETRIES));
-        if self.tls.enabled {
-            builder = builder.with_tls_enabled(true);
-            if !self.tls.domain.is_empty() {
-                builder = builder.with_tls_domain(self.tls.domain.clone());
+        // The configured node first, then the others. A node that answers ends the dial, whatever
+        // it says about the credentials, since every node would say the same.
+        let mut attempt = None;
+        for address in self.nodes.dial_order(&self.address) {
+            let client = self
+                .verifier(&address, credentials)
+                .map_err(|error| classify(&error))?;
+            let connected = tokio::time::timeout(VERIFY_TIMEOUT, client.connect()).await;
+            let answered =
+                matches!(&connected, Ok(result) if !result.as_ref().is_err_and(is_unreachable));
+            if answered {
+                self.nodes.mark_reachable(&address);
+            } else {
+                self.nodes.mark_unreachable(&address);
             }
-            if let Some(ref ca_file) = self.tls.ca_file {
-                builder = builder.with_tls_ca_file(ca_file.clone());
+            attempt = Some((client, connected));
+            if answered {
+                break;
             }
         }
-        let client = builder
-            .build()
-            .and_then(|config| TcpClient::create(Arc::new(config)))
-            .map_err(|error| classify(&error))?;
-
-        let connected = tokio::time::timeout(VERIFY_TIMEOUT, client.connect()).await;
+        let Some((client, connected)) = attempt else {
+            return Err(AuthError::Unavailable);
+        };
         // The password verify the slot bounds is done. Holding it across the permission read and
         // teardown would keep a slot busy for two more round trips per login.
         drop(slot);
+        let signed_in = matches!(connected, Ok(Ok(())));
         let outcome = match connected {
             Err(_elapsed) => Err(AuthError::Unavailable),
             Ok(Err(error)) => Err(classify(&error)),
@@ -402,20 +444,28 @@ impl SaslAuthenticator for IggyAuthenticator {
             Ok(Ok(())) => fetch_permissions(&client, &credentials.username).await,
         };
 
-        // Shut down rather than drop, so the socket closes cleanly and Iggy releases the session
-        // now instead of noticing the dead peer later.
+        // Sign out first: a shutdown only closes the socket, and Iggy keeps the session in its
+        // clients table until the lease runs out, 36 s by default. A full table refuses every new
+        // login, so a burst of Kafka logins would lock out the cluster's other clients. Then shut
+        // down rather than drop, so the socket closes cleanly.
         //
         // Both failure shapes are reported, and separately: the outer `Elapsed` and the inner
         // `IggyError` mean different things, and folding them together would log "timed out" for a
         // shutdown that failed immediately. Neither leaks the client, since dropping it closes the
         // socket regardless, but an invisible failure here would hide a real one.
-        match tokio::time::timeout(TEARDOWN_TIMEOUT, client.shutdown()).await {
+        let teardown = async {
+            if signed_in && let Err(error) = client.logout_user().await {
+                debug!(%error, "a credential-verification client did not sign out");
+            }
+            client.shutdown().await
+        };
+        match tokio::time::timeout(TEARDOWN_TIMEOUT, teardown).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 warn!(%error, "failed to shut down a credential-verification client");
             }
             Err(_elapsed) => {
-                warn!("timed out shutting down a credential-verification client");
+                warn!("timed out signing out and shutting down a credential-verification client");
             }
         }
 
