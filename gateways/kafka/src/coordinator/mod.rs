@@ -292,7 +292,7 @@ impl Coordination {
     ///
     /// # Errors
     ///
-    /// The Kafka code for every partition of the commit. See [`Self::serving`].
+    /// The Kafka code for every partition of the commit. See `Self::serving`.
     pub async fn commit_offsets(
         &self,
         group_id: &str,
@@ -315,7 +315,7 @@ impl Coordination {
     ///
     /// # Errors
     ///
-    /// The Kafka code that refuses the deletion. See [`Self::serving`].
+    /// The Kafka code that refuses the deletion. See `Self::serving`.
     pub async fn delete_offsets(
         &self,
         group_id: &str,
@@ -341,7 +341,7 @@ impl Coordination {
     ///
     /// # Errors
     ///
-    /// The Kafka code that refuses the deletion. See [`Self::serving`].
+    /// The Kafka code that refuses the deletion. See `Self::serving`.
     pub async fn delete_group(&self, group_id: &str) -> Result<(), i16> {
         let log = self.serving(group_id)?;
         log.append(vec![
@@ -361,7 +361,7 @@ impl Coordination {
     ///
     /// # Errors
     ///
-    /// The Kafka code that sends the client elsewhere. See [`Self::serving`].
+    /// The Kafka code that sends the client elsewhere. See `Self::serving`.
     pub async fn offsets(&self, group_id: &str) -> Result<Option<GroupOffsets>, i16> {
         let log = self.serving(group_id)?;
         Ok(log
