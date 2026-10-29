@@ -675,6 +675,8 @@ skip_shard_zero_for_clients = false
 # node's identity is resolved at launch from the '--replica-id <N>' CLI
 # flag, which selects the entry in this list that describes the current
 # node. All other entries are remote peers.
+# VSR currently supports at most 32 nodes in this roster; larger rosters
+# are rejected during server startup.
 #
 # 'ip' is the node's roster address. Replica-to-replica traffic and
 # follower-to-primary HTTP forwarding use it. It is not the bind interface for
