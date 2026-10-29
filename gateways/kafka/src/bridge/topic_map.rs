@@ -303,6 +303,25 @@ impl TopicMapping {
         )
     }
 
+    /// The Kafka name that lists Iggy topic `topic` of stream `stream`, by the rules of
+    /// `IggyBridge::list_kafka_topics`: an override's key for its target, else the topic's own name
+    /// in the default stream when no override claims that name and Kafka accepts it. `None` for a
+    /// topic that no Kafka name lists.
+    #[must_use]
+    pub fn kafka_topic_of<'a>(&'a self, stream: &str, topic: &'a str) -> Option<&'a str> {
+        if let Some((kafka_topic, _)) = self
+            .topics
+            .iter()
+            .find(|(_, over)| over.stream == stream && over.topic == topic)
+        {
+            return Some(kafka_topic);
+        }
+        (stream == self.default_stream
+            && !self.topics.contains_key(topic)
+            && is_valid_kafka_topic_name(topic))
+        .then_some(topic)
+    }
+
     /// Whether `kafka_topic` is no override's key yet resolves to the Iggy stream and topic an
     /// override targets, so writing through it would land in that override's data.
     #[must_use]
@@ -709,5 +728,53 @@ mod tests {
         };
         assert!(mapping.aliases_an_override("orders_v2"));
         assert!(!mapping.aliases_an_override("orders"));
+    }
+
+    #[test]
+    fn given_iggy_topics_should_name_the_kafka_topic_that_lists_each() {
+        let mut topics = HashMap::new();
+        topics.insert(
+            "orders".to_string(),
+            TopicOverride {
+                stream: "billing".to_string(),
+                topic: "orders_v2".to_string(),
+            },
+        );
+        topics.insert(
+            "audit".to_string(),
+            TopicOverride {
+                stream: "kafka".to_string(),
+                topic: "audit_log".to_string(),
+            },
+        );
+        topics.insert(
+            "audit_log".to_string(),
+            TopicOverride {
+                stream: "logs".to_string(),
+                topic: "audit_log".to_string(),
+            },
+        );
+        let mapping = mapping_with("kafka", topics);
+
+        assert_eq!(
+            mapping.kafka_topic_of("kafka", "payments"),
+            Some("payments")
+        );
+        assert_eq!(
+            mapping.kafka_topic_of("billing", "orders_v2"),
+            Some("orders")
+        );
+        assert_eq!(mapping.kafka_topic_of("kafka", "audit_log"), Some("audit"));
+        assert_eq!(
+            mapping.kafka_topic_of("logs", "audit_log"),
+            Some("audit_log")
+        );
+        assert_eq!(
+            mapping.kafka_topic_of("kafka", "orders"),
+            None,
+            "an override's key in the default stream is not its topic"
+        );
+        assert_eq!(mapping.kafka_topic_of("billing", "payments"), None);
+        assert_eq!(mapping.kafka_topic_of("kafka", "not kafka"), None);
     }
 }

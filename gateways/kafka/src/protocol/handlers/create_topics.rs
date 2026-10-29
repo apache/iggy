@@ -44,8 +44,8 @@ use crate::protocol::handlers::topic_config::{
     MAX_CONFIG_TOPICS, find_duplicate_names, topic_cap_message,
 };
 use crate::protocol::handlers::{
-    clamp_request_timeout, decode_guarded, encode_message, handle_versioned_request,
-    is_supported_version, respond_or_close, unsupported_version_response,
+    another_controller, clamp_request_timeout, decode_guarded, encode_message,
+    handle_versioned_request, is_supported_version, respond_or_close, unsupported_version_response,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -90,6 +90,12 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
             );
         }
     };
+    if another_controller(state) {
+        return respond_or_close(
+            encode_inner(api_version, &req.topics, ERROR_NOT_CONTROLLER),
+            "CreateTopics",
+        );
+    }
 
     let topic_names: Vec<&str> = req.topics.iter().map(|topic| topic.name.as_str()).collect();
     let duplicate_names = find_duplicate_names(topic_names.iter().copied());

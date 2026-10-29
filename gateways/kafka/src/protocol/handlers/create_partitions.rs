@@ -89,7 +89,7 @@ use crate::protocol::handlers::topic_config::{
     exceeds_topic_cap, find_duplicate_names, topic_cap_message,
 };
 use crate::protocol::handlers::{
-    MAX_REQUEST_TIMEOUT, clamp_request_timeout, decode_guarded, encode_message,
+    MAX_REQUEST_TIMEOUT, another_controller, clamp_request_timeout, decode_guarded, encode_message,
     handle_versioned_request, is_supported_version, respond_or_close, unsupported_version_response,
 };
 
@@ -171,6 +171,12 @@ pub async fn handle(
             );
         }
     };
+    if another_controller(state) {
+        return respond_or_close(
+            encode_inner(api_version, &req.topics, ERROR_NOT_CONTROLLER),
+            "CreatePartitions",
+        );
+    }
 
     // Kafka's `ControllerApis.createPartitions` order: duplicates are answered first, once per
     // name, before authorization looks at the rest.

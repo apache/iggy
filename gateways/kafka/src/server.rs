@@ -39,8 +39,9 @@ use tracing_subscriber::filter::LevelFilter;
 use crate::auth::{
     AuthError, AuthenticatedPrincipal, FailedLoginThrottle, PrincipalResolver, SaslAuthenticator,
 };
-use crate::bridge::IggyBridge;
+use crate::bridge::{IggyBridge, PermissionBoard, UserAccess};
 use crate::cluster_id::ClusterId;
+use crate::coordinator::{Coordination, CoordinationConfig};
 use crate::error::{KafkaProtocolError, Result};
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::listener::{BrokerEntry, ListenerConfig, SecurityProtocol, check_brokers, peers_of};
@@ -173,6 +174,12 @@ pub struct GatewayConfig {
     /// Every gateway in front of the Iggy cluster, this one included (`IGGY_KAFKA_BROKERS`).
     /// Empty for a gateway alone.
     pub brokers: Vec<BrokerEntry>,
+    /// Whether the gateways share the consumer groups through the coordinator log in Iggy
+    /// (`IGGY_KAFKA_COORDINATOR_LOG`). Needs the bridge. On by default when `brokers` lists the
+    /// gateways. Off, this gateway keeps its groups in memory alone.
+    pub coordinator_log: bool,
+    /// How the coordinator log behaves. No environment variable maps onto it yet.
+    pub coordination: CoordinationConfig,
 }
 
 impl Default for GatewayConfig {
@@ -196,6 +203,8 @@ impl Default for GatewayConfig {
             auto_topic_creation: AutoTopicCreationConfig::default(),
             node_id: DEFAULT_NODE_ID,
             brokers: Vec::new(),
+            coordinator_log: false,
+            coordination: CoordinationConfig::default(),
         }
     }
 }
@@ -521,7 +530,7 @@ impl KafkaGateway {
         // otherwise hold the drain open for a full rebalance timeout.
         let cancel = CancellationToken::new();
         let cluster_id = self.cluster_id().await?;
-        let state = Arc::new(self.shared_state(cluster_id, &cancel)?);
+        let state = Arc::new(self.shared_state(cluster_id, &cancel).await?);
         let shared_auth = Arc::new(SharedAuth::new(
             self.authenticator.clone(),
             resolver,
@@ -573,7 +582,7 @@ impl KafkaGateway {
         // The accept loops stop first, so no connection is spawned after the drain starts waiting.
         cancel.cancel();
         accept_loops.shutdown().await;
-        drain(&tracker, &cancel, drain_timeout).await;
+        drain(&state, &tracker, &cancel, drain_timeout).await;
         // After the drain, so no connection starts one after it, and before `run` returns, so
         // none still runs when the bridge signs out.
         state
@@ -583,13 +592,13 @@ impl KafkaGateway {
     }
 
     /// The state every connection of [`Self::run`] shares. The group coordinator stops with
-    /// `cancel`.
-    fn shared_state(
+    /// `cancel`. With the coordinator log, the groups are shared with the other gateways.
+    async fn shared_state(
         &self,
         cluster_id: ClusterId,
         cancel: &CancellationToken,
     ) -> Result<GatewayState> {
-        GatewayState::new(
+        let mut state = GatewayState::new(
             self.bridge.clone(),
             self.config.max_frame_size,
             self.config.instance_id,
@@ -597,7 +606,38 @@ impl KafkaGateway {
         )
         .with_cluster_id(cluster_id)
         .with_node_id(self.config.node_id)
-        .with_auto_topic_creation(self.config.auto_topic_creation)
+        .with_auto_topic_creation(self.config.auto_topic_creation)?;
+        if let Some(coordination) = self.start_coordination(&state.groups).await? {
+            state = state.with_coordination(coordination);
+        }
+        Ok(state)
+    }
+
+    /// Starts coordinating `groups` with the other gateways, when the coordinator log is on.
+    async fn start_coordination(
+        &self,
+        groups: &GroupCoordinator,
+    ) -> Result<Option<Arc<Coordination>>> {
+        if !self.config.coordinator_log {
+            return Ok(None);
+        }
+        let Some(bridge) = &self.bridge else {
+            return Err(KafkaProtocolError::InvalidConfig(
+                "the coordinator log needs the bridge; set IGGY_KAFKA_BRIDGE_ENABLED=true, or \
+                 set IGGY_KAFKA_COORDINATOR_LOG=false"
+                    .into(),
+            ));
+        };
+        // Its own token, not the drain's: the shutdown hands the groups over before the drain.
+        let coordination = Coordination::start(
+            bridge,
+            groups.clone(),
+            self.config.node_id,
+            self.config.coordination,
+            CancellationToken::new(),
+        )
+        .await?;
+        Ok(Some(coordination))
     }
 
     /// The id set by [`Self::with_cluster_id`], else the one stored in Iggy, else a random one.
@@ -917,10 +957,18 @@ async fn serve_connection(stream: TcpStream, connection: Connection) {
     }
 }
 
-/// Cancel in-flight connections, close the tracker to new spawns, and wait for tasks to finish
-/// (bounded by `deadline`). Cancellation is what actually drops idle sockets; `tracker.wait`
-/// alone would leave tasks parked in `read_frame` until `idle_timeout`.
-async fn drain(tracker: &TaskTracker, cancel: &CancellationToken, deadline: Duration) {
+/// Hand the groups to the other gateways, cancel in-flight connections, close the tracker to new
+/// spawns, and wait for tasks to finish (bounded by `deadline`). The groups go first, so their
+/// requests in flight send their clients to the new coordinators. Cancellation is what actually
+/// drops idle sockets; `tracker.wait` alone would leave tasks parked in `read_frame` until
+/// `idle_timeout`.
+async fn drain(
+    state: &GatewayState,
+    tracker: &TaskTracker,
+    cancel: &CancellationToken,
+    deadline: Duration,
+) {
+    state.hand_over_groups().await;
     cancel.cancel();
     tracker.close();
     if timeout(deadline, tracker.wait()).await.is_err() {
@@ -1165,6 +1213,8 @@ where
         peer: &peer,
         cancel: &cancel,
     };
+    let mut permissions =
+        PermissionFollow::new(state.bridge.as_deref(), certificate_name.is_some());
     let mut principal = if let Some(username) = certificate_name {
         let Some(resolved) = resolve_certificate_principal(&ctx, &username).await else {
             return Ok(());
@@ -1222,9 +1272,16 @@ where
         req.client_id = None;
         req.unknown_tagged_fields.clear();
 
+        let Some(revision) = permissions.apply(principal.as_mut(), &peer) else {
+            return Ok(());
+        };
+        let signed_in = principal.is_some();
         // `RequestHeader::decode` advances `body` past the header fields it consumed via
         // `Buf::advance`, so `body` is already exactly the request payload.
         let outcome = route_frame(&ctx, &mut sasl_state, &mut principal, &req, body).await;
+        if !signed_in && principal.is_some() {
+            permissions.signed_in(revision);
+        }
         if dispatch_outcome(
             &mut stream,
             &peer,
@@ -1238,6 +1295,66 @@ where
         {
             return Ok(());
         }
+    }
+}
+
+/// One connection's place on the bridge's [`PermissionBoard`], which the change log keeps.
+struct PermissionFollow<'a> {
+    board: Option<&'a PermissionBoard>,
+    /// The board's revision that the principal's permissions are as new as.
+    seen: u64,
+    /// Whether the principal is an Iggy user. `ANONYMOUS` names none, so no change applies to it.
+    follows: bool,
+}
+
+impl<'a> PermissionFollow<'a> {
+    fn new(bridge: Option<&'a IggyBridge>, follows: bool) -> Self {
+        let board = bridge.map(IggyBridge::permission_board);
+        Self {
+            board,
+            seen: board.map_or(0, PermissionBoard::revision),
+            follows,
+        }
+    }
+
+    /// Applies to `principal` what the change log said of its Iggy user since the last call. The
+    /// board's revision from before that. `None` when the user was deleted or is no longer
+    /// active: the connection then closes, as Iggy ends the sessions of such a user.
+    fn apply(
+        &mut self,
+        principal: Option<&mut AuthenticatedPrincipal>,
+        peer: &SocketAddr,
+    ) -> Option<u64> {
+        let Some(board) = self.board else {
+            return Some(0);
+        };
+        let revision = board.revision();
+        let Some(principal) = principal.filter(|_| self.follows) else {
+            return Some(revision);
+        };
+        match board.changed_since(&principal.username, &mut self.seen) {
+            Some(UserAccess::Active(permissions)) => {
+                principal.permissions = permissions;
+                principal.permissions_known = true;
+            }
+            Some(UserAccess::Revoked) => {
+                info!(
+                    %peer,
+                    username = principal.username,
+                    "the Iggy user was deleted or deactivated; closing its connection"
+                );
+                return None;
+            }
+            None => {}
+        }
+        Some(revision)
+    }
+
+    /// A login set the principal. Changes after `revision`, from before the login, apply to it,
+    /// so a change while the login ran does too.
+    const fn signed_in(&mut self, revision: u64) {
+        self.follows = true;
+        self.seen = revision;
     }
 }
 

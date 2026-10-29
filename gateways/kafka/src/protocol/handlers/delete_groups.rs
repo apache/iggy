@@ -147,16 +147,26 @@ async fn delete(
     // Until this drops, the groups whose offsets go take no join and no commit.
     let (removals, deletion) = state.groups.group_deletion(&valid).await;
     let mut removals = removals.into_iter();
+    // With the coordinator log, a group whose members are gone can hold offsets there alone.
+    let logged = match &state.coordination {
+        Some(coordination) => coordination.logged_groups().await,
+        None => std::collections::BTreeSet::new(),
+    };
     let plans: Vec<Plan> = group_ids
         .iter()
         .map(|group_id| {
             if !is_valid_group_id(group_id) {
                 return Plan::Answer(ERROR_INVALID_GROUP_ID);
             }
-            match removals.next() {
+            let removal = removals.next();
+            if let Err(code) = state.groups.serves(group_id) {
+                return Plan::Answer(code);
+            }
+            match removal {
                 Some(GroupRemoval::Live) => Plan::Answer(ERROR_NON_EMPTY_GROUP),
                 removal => Plan::Delete {
-                    held: removal == Some(GroupRemoval::Empty),
+                    held: removal == Some(GroupRemoval::Empty)
+                        || logged.contains(group_id.as_str()),
                 },
             }
         })
@@ -184,6 +194,8 @@ async fn delete(
                 // deadline, so no commit lands while a delete can still land.
                 let calls = OffsetCalls::new(deadline).keeping(deletion);
                 let found = delete_offsets(bridge, &names, &calls).await;
+                // Still fenced by `calls`, so no commit lands between the two deletions.
+                let found = forget_logged(state, &names, &plans, &deletable, found).await;
                 // Still fenced by `calls`, so no member joins before the removal.
                 remove_emptied(state, group_ids, &plans, &deletable, &found).await;
                 found
@@ -209,6 +221,29 @@ async fn delete(
         };
     }
     codes
+}
+
+/// Deletes from the coordinator log each group of `names` that Iggy deleted or this coordinator
+/// holds, so the next coordinator does not restore it. A group the log refuses gets its code.
+async fn forget_logged(
+    state: &GatewayState,
+    names: &[&str],
+    plans: &[Plan],
+    deletable: &[usize],
+    found: Vec<core::result::Result<bool, i16>>,
+) -> Vec<core::result::Result<bool, i16>> {
+    let Some(coordination) = &state.coordination else {
+        return found;
+    };
+    let mut forgotten = Vec::with_capacity(found.len());
+    for ((name, &at), found) in names.iter().zip(deletable).zip(found) {
+        let held = matches!(plans[at], Plan::Delete { held: true });
+        forgotten.push(match found {
+            Ok(found) if found || held => coordination.delete_group(name).await.map(|()| found),
+            other => other,
+        });
+    }
+    forgotten
 }
 
 /// Removes from the coordinator each group of `deletable` that it holds and whose offsets went,

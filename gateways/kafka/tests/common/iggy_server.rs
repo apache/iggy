@@ -497,3 +497,128 @@ pub async fn raw_client(server: &TestServer) -> IggyClient {
     client.connect().await.expect("connect raw test client");
     client
 }
+
+/// One node of a [`TestCluster`]. The ports stay claimed while the node is stopped, so a restart
+/// binds them again.
+struct ClusterNode {
+    child: Option<Child>,
+    tcp: PortGuard,
+    replica: PortGuard,
+}
+
+/// `iggy-server` processes that form one cluster, each with its own data dir, TCP port and
+/// replica port. Node `n` runs with replica id `n`.
+pub struct TestCluster {
+    data_dir: PathBuf,
+    nodes: Vec<ClusterNode>,
+}
+
+impl TestCluster {
+    /// Starts `count` nodes and waits until each accepts connections. The cluster can still be
+    /// without a metadata primary then, so a first bridge can need a retry.
+    pub async fn spawn(data_dir: &std::path::Path, count: usize) -> Self {
+        let nodes = (0..count)
+            .map(|_| ClusterNode {
+                child: None,
+                tcp: PortGuard::acquire(),
+                replica: PortGuard::acquire(),
+            })
+            .collect();
+        let mut cluster = Self {
+            data_dir: data_dir.to_path_buf(),
+            nodes,
+        };
+        for node in 0..count {
+            cluster.start(node).await;
+        }
+        cluster
+    }
+
+    /// Starts node `node` on its data dir and ports, and waits until it accepts connections.
+    pub async fn start(&mut self, node: usize) {
+        let mut command = Command::new(iggy_server_binary());
+        command.env_clear();
+        if let Some(llvm_profile_file) = env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", llvm_profile_file);
+        }
+        let address = self.address(node);
+        command
+            .arg("--replica-id")
+            .arg(node.to_string())
+            .env(
+                "IGGY_PATH",
+                self.data_dir
+                    .join(format!("node-{node}"))
+                    .display()
+                    .to_string(),
+            )
+            .env("IGGY_TCP_ADDRESS", &address)
+            .env("IGGY_HTTP_ENABLED", "false")
+            .env("IGGY_QUIC_ENABLED", "false")
+            .env("IGGY_WEBSOCKET_ENABLED", "false")
+            .env("IGGY_SHARDING_PIN_CORES", "false")
+            .env("IGGY_SHARDING_CPU_ALLOCATION", "2")
+            .env("IGGY_ROOT_USERNAME", "iggy")
+            .env("IGGY_ROOT_PASSWORD", "iggy")
+            .env("IGGY_CLUSTER_ENABLED", "true")
+            .env("IGGY_CLUSTER_NAME", "kafka-gateway-test");
+        for (peer, peer_node) in self.nodes.iter().enumerate() {
+            command
+                .env(
+                    format!("IGGY_CLUSTER_NODES_{peer}_NAME"),
+                    format!("node-{peer}"),
+                )
+                .env(format!("IGGY_CLUSTER_NODES_{peer}_IP"), "127.0.0.1")
+                .env(
+                    format!("IGGY_CLUSTER_NODES_{peer}_REPLICA_ID"),
+                    peer.to_string(),
+                )
+                .env(
+                    format!("IGGY_CLUSTER_NODES_{peer}_PORTS_TCP"),
+                    peer_node.tcp.port.to_string(),
+                )
+                .env(
+                    format!("IGGY_CLUSTER_NODES_{peer}_PORTS_TCP_REPLICA"),
+                    peer_node.replica.port.to_string(),
+                );
+        }
+        let mut child = command.spawn().expect("spawn an iggy-server node");
+        wait_for_listener(&mut child, &address, &format!("iggy-server node {node}")).await;
+        self.nodes[node].child = Some(child);
+    }
+
+    /// Stops node `node` with SIGTERM, as an orchestrator does. Its data dir stays.
+    pub fn stop(&mut self, node: usize) {
+        if let Some(mut child) = self.nodes[node].child.take() {
+            graceful_kill(&mut child);
+            let _ = child.wait();
+        }
+    }
+
+    pub fn address(&self, node: usize) -> String {
+        format!("127.0.0.1:{}", self.nodes[node].tcp.port)
+    }
+
+    /// A bridge config that dials node `node` first.
+    pub fn bridge_config(&self, node: usize) -> IggyBridgeConfig {
+        IggyBridgeConfig {
+            address: self.address(node),
+            username: "iggy".to_string(),
+            password: SecretString::from("iggy"),
+            topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
+                .expect("valid mapping for this test's fixture data"),
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            tls: IggyTls::default(),
+            produce_sessions: ProduceSessionLimits::default(),
+            nodes: KnownNodes::default(),
+        }
+    }
+}
+
+impl Drop for TestCluster {
+    fn drop(&mut self) {
+        for node in 0..self.nodes.len() {
+            self.stop(node);
+        }
+    }
+}

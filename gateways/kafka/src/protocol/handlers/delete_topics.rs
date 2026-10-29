@@ -48,8 +48,8 @@ use crate::protocol::api::{
 };
 use crate::protocol::bounds_guard::validate_delete_topics_shape;
 use crate::protocol::handlers::{
-    clamp_request_timeout, decode_guarded, encode_message, handle_versioned_request,
-    is_supported_version, respond_or_close, unsupported_version_response,
+    another_controller, clamp_request_timeout, decode_guarded, encode_message,
+    handle_versioned_request, is_supported_version, respond_or_close, unsupported_version_response,
 };
 
 /// This bridge never advertises v6 (the `topics: Vec<DeleteTopicState>`, topic-id-based shape).
@@ -111,6 +111,12 @@ pub async fn handle(
             );
         }
     };
+    if another_controller(state) {
+        return respond_or_close(
+            encode_inner(api_version, &req.topic_names, ERROR_NOT_CONTROLLER),
+            "DeleteTopics",
+        );
+    }
 
     if let Some(results) = authorize(principal, &req.topic_names) {
         let resp = DeleteTopicsResponse::default().with_responses(results);

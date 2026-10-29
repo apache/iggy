@@ -345,11 +345,16 @@ impl IggyBridge {
         self.read_in_slot(LISTING_SLOT, calls, listing).await
     }
 
-    /// The Kafka groups that hold offsets in Iggy, from the last scan, plus the groups that this
-    /// gateway stored offsets for since, less those it deleted. The groups of a scan answer at once
-    /// for 10 s after it ends. After that a caller starts a new scan, and still gets the older
-    /// groups at once for up to 1 min after their scan ended. Otherwise the caller waits for the
-    /// new scan, until `deadline`.
+    /// The Kafka groups that hold offsets in Iggy, plus the groups that this gateway stored offsets
+    /// for since, less those it deleted.
+    ///
+    /// They come from Iggy's metadata change log, which the bridge follows (`change_log.rs`), at
+    /// once. Before the first read of the log ends, the caller waits for it, until `deadline`.
+    ///
+    /// When the bridge user cannot read the log, they come from the last scan. The groups of a
+    /// scan answer at once for 10 s after it ends. After that a caller starts a new scan, and still
+    /// gets the older groups at once for up to 1 min after their scan ended. Otherwise the caller
+    /// waits for the new scan, until `deadline`.
     ///
     /// A scan lists the Kafka topics, then the Iggy groups of each topic, so it costs one call per
     /// topic. It runs on a client of its own, a few topics at once, so no offset call waits behind
@@ -361,7 +366,7 @@ impl IggyBridge {
         self.group_index.groups(deadline, scan).await
     }
 
-    /// The groups of the last scan, if one found them, without a scan.
+    /// The groups of the change log, or of the last scan that found them, without a scan.
     #[must_use]
     pub fn last_offset_groups(&self) -> Option<Arc<OffsetGroups>> {
         self.group_index.last()
@@ -1068,7 +1073,7 @@ fn retries(error: &IggyError) -> bool {
 }
 
 /// The Kafka group whose offsets the Iggy group `name` holds. `None` for any other Iggy group.
-fn kafka_group_of(name: &str) -> Option<String> {
+pub(super) fn kafka_group_of(name: &str) -> Option<String> {
     name.strip_prefix(OFFSET_GROUP_PREFIX)
         .filter(|group| is_valid_group_id(group))
         .map(str::to_owned)

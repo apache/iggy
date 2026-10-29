@@ -20,6 +20,7 @@
 pub mod auth;
 pub mod bridge;
 pub mod cluster_id;
+pub mod coordinator;
 pub mod env;
 pub mod error;
 pub mod group;
