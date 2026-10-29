@@ -797,8 +797,8 @@ mod tests {
 
     use consensus::{
         ArtifactProgress, Consensus, DvcSuffix, LocalPipeline, PartitionsHandle, Pipeline, Plane,
-        Sequencer, StateArtifact, StateTransferStage, TimeoutManager, VsrAction, VsrConsensus,
-        artifact_kind,
+        REPLICATION_BATCH_BYTES_MAX, ReplicationSend, Sequencer, StateArtifact, StateTransferStage,
+        TimeoutManager, VsrAction, VsrConsensus, artifact_kind,
     };
     use futures::FutureExt;
     use futures::channel::oneshot;
@@ -3980,12 +3980,14 @@ mod tests {
         }
     }
 
-    /// A prefix read that has not landed by its bound gives up the seed. The
-    /// pull then asks for the whole artifact while the serving offer still
-    /// lives and burns no retry of the peer. From then on the stall sweep runs
-    /// as for any pull.
+    /// A prefix read that has not landed by its bound is asked to stop. The
+    /// pull waits until the read lands, so the read frees its artifact buffer
+    /// before the pull fetches the whole artifact into a new one. The pull
+    /// then asks for the whole artifact while the serving offer still lives
+    /// and burns no retry of the peer. From then on the stall sweep runs as
+    /// for any pull.
     #[compio::test]
-    async fn given_a_prefix_read_that_does_not_land_when_its_bound_passes_should_pull_the_artifact_whole()
+    async fn given_a_prefix_read_that_does_not_land_by_its_bound_when_it_lands_should_pull_the_artifact_whole()
      {
         const INCARNATION: u64 = 7;
         const NONCE: u128 = 7;
@@ -4058,16 +4060,39 @@ mod tests {
             / crate::LOCAL_WORK_WAIT_DIVISOR;
         let whole = (0, 0, u32::try_from(segment.len()).unwrap());
 
-        stall_rounds(&owner, namespace, bound as usize - 1).await;
+        stall_rounds(&owner, namespace, bound as usize).await;
         assert!(
             requests.borrow().is_empty(),
             "the pull must wait for its read"
         );
+        let read = || {
+            let Some(PrefixSeed::Reading { read, .. }) = &partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .transfer
+                .as_ref()
+                .unwrap()
+                .seed
+            else {
+                panic!("the session must keep the read until it lands");
+            };
+            read
+        };
+        assert!(!read().stop(), "the bound must ask the read to stop");
+        stall_rounds(&owner, namespace, RETRY_TICKS as usize).await;
+        assert!(
+            requests.borrow().is_empty(),
+            "the pull must not fetch the artifact while the stopped read holds its buffer"
+        );
+        *read().result.borrow_mut() = Some(Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "the transfer gave up this prefix read",
+        )));
         stall_rounds(&owner, namespace, 1).await;
         assert_eq!(
             *requests.borrow(),
             [whole],
-            "the pull must ask for the whole artifact at the bound"
+            "the pull must ask for the whole artifact once the read lands"
         );
         assert_eq!(
             partitions
@@ -8817,6 +8842,90 @@ mod tests {
         );
     }
 
+    /// A replay to a backup reads no released body that the replication
+    /// window refuses. A window with room for op 1 reads op 1 only, and a full
+    /// window reads nothing. The body of op 2 is corrupt, so a read of it
+    /// would drop ops 1..=2 from the ring.
+    #[compio::test]
+    async fn given_released_bodies_when_the_replication_window_refuses_them_should_not_read_them() {
+        const HEAD: u64 = 3;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let replayed = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&replayed);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            let message =
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            if message.header().command == Command::Prepare {
+                let prepare: Message<PrepareHeader> = message.try_into_typed().unwrap();
+                captured.borrow_mut().push(prepare.header().op);
+            }
+            Ok(())
+        }));
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let (mut primary, prepares) = journaling_primary(&bus, namespace, HEAD, 1).await;
+        let directory = tempfile::tempdir().unwrap();
+        let (log_path, _) = attach_segment_files(&mut primary, directory.path(), false).await;
+        let positions = release_bodies_to_segment(&primary, &log_path, &prepares);
+        let mut segment = std::fs::read(&log_path).unwrap();
+        segment[usize::try_from(positions[&2]).unwrap()] ^= 0xFF;
+        std::fs::write(&log_path, &segment).unwrap();
+        let partitions = owner.plane.partitions();
+        partitions.remove(&namespace).unwrap();
+        partitions.insert(namespace, primary);
+        connect_replica_on(&bus, REPAIR_BACKUP, 1);
+        let first = u64::from(prepares[0].header().size);
+        let incarnation = {
+            let consensus = partitions.get_by_ns(&namespace).unwrap().consensus();
+            assert!(consensus.admit_replication(REPAIR_BACKUP, 1, first, ReplicationSend::Live));
+            consensus.record_replication_failure(REPAIR_BACKUP, 1);
+            let _checkpoint = consensus.record_replication_send(
+                REPAIR_BACKUP,
+                1,
+                REPLICATION_BATCH_BYTES_MAX - first,
+                ReplicationSend::Retransmit,
+            );
+            consensus.partition_incarnation()
+        };
+        let replay = |from_op| {
+            Message::<RequestPreparesHeader>::new(size_of::<RequestPreparesHeader>())
+                .transmute_header(|_, header: &mut RequestPreparesHeader| {
+                    header.command = Command::RequestPrepares;
+                    header.size = u32::try_from(size_of::<RequestPreparesHeader>()).unwrap();
+                    header.replica = REPAIR_BACKUP;
+                    header.group = namespace.inner();
+                    header.partition_incarnation = incarnation;
+                    header.from_op = from_op;
+                    header.to_op = HEAD;
+                })
+        };
+        let retained_from = || {
+            partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .log
+                .journal()
+                .inner
+                .repair_retained_from()
+        };
+
+        assert_eq!(owner.serve_prepares(&replay(1), true).await, 1);
+        assert_eq!(*replayed.borrow(), [1], "the window must take op 1 only");
+        assert_eq!(
+            retained_from(),
+            Some(1),
+            "the replay must not read the body of op 2 that the window refuses"
+        );
+        assert_eq!(owner.serve_prepares(&replay(2), true).await, 1);
+        assert_eq!(*replayed.borrow(), [1], "a full window must take nothing");
+        assert_eq!(
+            retained_from(),
+            Some(1),
+            "a full window must not read a body"
+        );
+    }
+
     /// A log file that cannot be opened for now fails the read with an error
     /// that can pass, like a file descriptor limit. A link that points at
     /// itself stands in for it, because a lower limit would reach the other
@@ -10262,6 +10371,21 @@ mod tests {
         ops: u64,
         payload_len: usize,
     ) -> Vec<Message<PrepareHeader>> {
+        journaling_primary(bus, namespace, ops, payload_len).await.1
+    }
+
+    /// The primary of [`REPAIR_VIEW`] after it journaled the first `ops` sends
+    /// of `payload_len` bytes each, with a copy of each prepare.
+    #[allow(clippy::future_not_send)]
+    async fn journaling_primary(
+        bus: &Rc<IggyMessageBus>,
+        namespace: IggyNamespace,
+        ops: u64,
+        payload_len: usize,
+    ) -> (
+        IggyPartition<Rc<IggyMessageBus>, HeldSuperblock>,
+        Vec<Message<PrepareHeader>>,
+    ) {
         let mut consensus = VsrConsensus::new(
             1,
             REPAIR_PRIMARY,
@@ -10289,7 +10413,7 @@ mod tests {
             origin.consensus().clear_pipeline();
             origin.consensus().drain_loopback_into(&mut Vec::new());
         }
-        prepares
+        (origin, prepares)
     }
 
     const SCANNING_INCARNATION: u64 = 7;

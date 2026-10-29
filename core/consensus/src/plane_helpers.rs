@@ -238,8 +238,7 @@ where
     Ok(consensus.is_acting_primary()
         && !consensus.has_observed_newer_view()
         && !consensus.is_transferring()
-        && header.view == consensus.view()
-        && consensus.replica() == consensus.primary_index(header.view))
+        && header.view == consensus.view())
 }
 
 /// Re-stamp a stored prepare with the current view before retransmission.

@@ -67,6 +67,14 @@ impl PeerReplication {
     const fn outstanding(&self) -> u64 {
         self.sent_bytes.saturating_sub(self.credited_bytes)
     }
+
+    /// Whether the window takes a frame of `size` once `queued` more bytes are
+    /// sent. An empty window takes any frame, so one legal frame larger than
+    /// the window still makes progress.
+    const fn window_takes(&self, queued: u64, size: u64) -> bool {
+        let outstanding = self.outstanding().saturating_add(queued);
+        outstanding == 0 || outstanding.saturating_add(size) <= REPLICATION_BATCH_BYTES_MAX
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -122,7 +130,8 @@ pub struct ReplicationStats {
 /// A backup's answer to a checkpoint.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BackupPrefix {
-    /// Every op through it is in the journal with proof in the current view.
+    /// Every op through it is applied, or is in the journal with proof in the
+    /// current view. An op above the commit need not be durable yet.
     pub held_op: u64,
     /// The part of the held prefix that also meets the `PrepareOk` rules.
     pub received_op: u64,
@@ -147,10 +156,7 @@ impl ReplicationFlow {
 
     fn admit(&mut self, replica: u8, op: u64, size: u64, send: ReplicationSend) -> bool {
         let peer = &mut self.peers[usize::from(replica)];
-        let outstanding = peer.outstanding();
-        // One legal frame larger than the window must still make progress.
-        let window_full =
-            outstanding > 0 && outstanding.saturating_add(size) > REPLICATION_BATCH_BYTES_MAX;
+        let window_full = !peer.window_takes(0, size);
         let out_of_order = match send {
             ReplicationSend::Live => peer.replay_from.is_some_and(|from| from != op),
             ReplicationSend::Replay => peer.replay_from != Some(op),
@@ -198,6 +204,12 @@ impl ReplicationFlow {
         let peer = &mut self.peers[usize::from(replica)];
         peer.replay_from = Some(peer.replay_from.map_or(op, |from| from.min(op)));
         peer.due = 0;
+    }
+
+    fn defer(&mut self, replica: u8, now: u64) {
+        let peer = &mut self.peers[usize::from(replica)];
+        peer.due = 0;
+        peer.retry_at = now.saturating_add(PROGRESS_INTERVAL_MICROS);
     }
 
     /// A checkpoint counts only once its frame is queued. Dropping one that the
@@ -288,13 +300,15 @@ impl ReplicationFlow {
         peer.busy = false;
         peer.retry_at = 0;
         peer.due = now.saturating_add(PROGRESS_INTERVAL_MICROS);
-        // A newer head alone never starts a replay.
         let held_op = header.held_op.min(head);
-        if held_op < checkpoint.through {
-            let gap = held_op + 1;
-            if checkpoint.replay_from.is_none_or(|from| gap < from) {
-                peer.replay_from = Some(peer.replay_from.map_or(gap, |from| from.min(gap)));
-            }
+        // A newer head alone never starts a replay.
+        let gap = held_op < checkpoint.through
+            && checkpoint.replay_from.is_none_or(|from| held_op + 1 < from);
+        // Repair or a state transfer can carry the backup past the cursor. The
+        // primary can drop the op at the cursor by then, and a replay from it
+        // would block live sends for good.
+        if gap || peer.replay_from.is_some_and(|from| from <= held_op) {
+            peer.replay_from = Some(held_op + 1);
         }
         Some(ReplicationProgress::Ready {
             received_op: header.received_op.min(head),
@@ -354,6 +368,14 @@ where
         flow.admit(replica, op, size, send)
     }
 
+    /// Whether the window of `replica` takes a frame of `size` behind `queued`
+    /// bytes that are not sent yet. A replay asks before it reads a body, so
+    /// it reads no body that the window of [`Self::send_replicated_prepare`]
+    /// then refuses.
+    pub fn replication_window_takes(&self, replica: u8, queued: u64, size: u64) -> bool {
+        self.replication.borrow().peers[usize::from(replica)].window_takes(queued, size)
+    }
+
     /// Returns the checkpoint that must follow the sent copy.
     #[must_use]
     pub fn record_replication_send(
@@ -377,13 +399,8 @@ where
     }
 
     pub fn defer_replication(&self, replica: u8) {
-        let mut flow = self.replication.borrow_mut();
-        let peer = &mut flow.peers[usize::from(replica)];
-        peer.due = 0;
-        peer.retry_at = self
-            .message_bus()
-            .monotonic_micros()
-            .saturating_add(PROGRESS_INTERVAL_MICROS);
+        let now = self.message_bus().monotonic_micros();
+        self.replication.borrow_mut().defer(replica, now);
     }
 
     pub fn replication_work(&self, replica: u8) -> Option<ReplicationWork> {
@@ -754,6 +771,94 @@ mod tests {
         );
     }
 
+    /// Busy replies during a state transfer park the cursor on an op that the
+    /// primary later drops from memory. A replay from there never succeeds, so
+    /// the cursor would refuse every live send.
+    #[test]
+    fn given_a_backup_that_repair_moved_past_the_cursor_when_it_answers_ready_should_replay_after_its_held_prefix()
+     {
+        const SIZE: u64 = 100;
+        let mut flow = ReplicationFlow::new(3);
+        flow.in_epoch(0, 1);
+        for op in 1..=3 {
+            assert!(send(&mut flow, 1, op, SIZE, ReplicationSend::Live, 0).is_none());
+        }
+        let mut now = PROGRESS_INTERVAL_MICROS;
+        let Some(ReplicationWork::Probe { nonce, through, .. }) = flow.work(1, 3, now) else {
+            panic!("the timer must checkpoint outstanding bytes");
+        };
+        assert_eq!(
+            flow.reply(busy(1, nonce, through).header(), 3, now),
+            Some(ReplicationProgress::Busy)
+        );
+        assert!(!flow.admit(1, 4, SIZE, ReplicationSend::Live));
+        let Some(ReplicationWork::Probe {
+            nonce: repaired,
+            through: 3,
+            ..
+        }) = flow.work(1, 10, now)
+        else {
+            panic!("the next tick must ask a busy backup again");
+        };
+        assert_eq!(
+            flow.reply(ready(1, repaired, 3, 8, 8).header(), 10, now),
+            Some(ReplicationProgress::Ready { received_op: 8 })
+        );
+        assert!(
+            matches!(
+                flow.work(1, 10, now),
+                Some(ReplicationWork::Replay { from_op: 9, .. })
+            ),
+            "replay must resume after the held prefix, not at the parked cursor"
+        );
+        for op in 9..=10 {
+            assert!(send(&mut flow, 1, op, SIZE, ReplicationSend::Replay, now).is_none());
+        }
+        assert!(send(&mut flow, 1, 11, SIZE, ReplicationSend::Live, now).is_none());
+
+        now += PROGRESS_INTERVAL_MICROS;
+        let Some(ReplicationWork::Probe {
+            nonce: installed,
+            through: 11,
+            ..
+        }) = flow.work(1, 11, now)
+        else {
+            panic!("the timer must checkpoint outstanding bytes");
+        };
+        assert!(
+            flow.reply(ready(1, installed, 11, 5, 5).header(), 11, now)
+                .is_some()
+        );
+        assert!(
+            matches!(
+                flow.work(1, 11, now),
+                Some(ReplicationWork::Replay { from_op: 6, .. })
+            ),
+            "an install that drops held ops must restart replay at the first lost op"
+        );
+
+        now += PROGRESS_INTERVAL_MICROS;
+        let Some(ReplicationWork::Probe {
+            nonce: caught_up,
+            through: 11,
+            ..
+        }) = flow.work(1, 11, now)
+        else {
+            panic!("the timer must checkpoint a waiting replay");
+        };
+        assert!(
+            flow.reply(ready(1, caught_up, 11, 6, 6).header(), 11, now)
+                .is_some()
+        );
+        assert!(
+            matches!(
+                flow.work(1, 11, now),
+                Some(ReplicationWork::Replay { from_op: 7, .. })
+            ),
+            "a backup that holds the op at the cursor must not get it again"
+        );
+    }
+
     #[test]
     fn given_a_silent_backup_when_sends_continue_should_bound_its_bytes_and_keep_other_peers_sending()
      {
@@ -881,9 +986,10 @@ mod tests {
         Probe { nonce: u64, through: u64 },
     }
 
-    /// A primary that sends to one backup over a FIFO link. While faults are
-    /// on, the backup drops frames, sends fail, replies get lost, and the
-    /// backup answers Busy.
+    /// A primary that sends to one backup over a FIFO link, and replays only
+    /// its newest ops. While faults are on, the backup drops frames, sends
+    /// fail, replies get lost, the backup answers Busy, and repair from another
+    /// replica moves the backup forward.
     struct Model {
         flow: ReplicationFlow,
         random: u64,
@@ -902,6 +1008,7 @@ mod tests {
         const TICK_MICROS: u64 = 10_000;
         const SIZE_MAX: u64 = 4 * MIB;
         const REPLAY_OPS_MAX: u64 = 8;
+        const RETAINED_OPS: u64 = 16;
         const FAULT_ONE_IN: u64 = 10;
 
         fn new(seed: u64) -> Self {
@@ -935,7 +1042,7 @@ mod tests {
         }
 
         fn step(&mut self) {
-            match self.below(5) {
+            match self.below(6) {
                 0 => {
                     self.head += 1;
                     let size = 1 + self.below(Self::SIZE_MAX);
@@ -943,14 +1050,23 @@ mod tests {
                     self.send(self.head, ReplicationSend::Live);
                 }
                 1 if self.head > 0 => {
-                    let op = 1 + self.below(self.head);
+                    let op = self.head - self.below(self.head.min(Self::RETAINED_OPS));
                     self.send(op, ReplicationSend::Retransmit);
                 }
                 2 => self.tick(),
                 3 => self.deliver_frame(),
+                4 if self.fault() => {
+                    let behind = self.below(Self::RETAINED_OPS);
+                    self.repair(behind);
+                }
                 _ => self.deliver_reply(),
             }
             self.check();
+        }
+
+        /// The backup holds every op up to `behind` ops before the head.
+        fn repair(&mut self, behind: u64) {
+            self.held = self.held.max(self.head.saturating_sub(behind));
         }
 
         fn tick(&mut self) {
@@ -968,6 +1084,11 @@ mod tests {
                     } else {
                         self.link.push_back(Frame::Probe { nonce, through });
                     }
+                }
+                ReplicationWork::Replay { from_op, .. }
+                    if from_op + Self::RETAINED_OPS <= self.head =>
+                {
+                    self.flow.defer(MODEL_BACKUP, self.now);
                 }
                 ReplicationWork::Replay { from_op, .. } => {
                     let to_op = self.head.min(from_op + Self::REPLAY_OPS_MAX - 1);
@@ -1062,6 +1183,8 @@ mod tests {
                  {stats:?}"
             );
             model.faults = false;
+            // Only repair delivers the ops that the primary no longer holds.
+            model.repair(Model::RETAINED_OPS);
             for _ in 0..SETTLE_TICKS {
                 if model.held == model.head {
                     break;

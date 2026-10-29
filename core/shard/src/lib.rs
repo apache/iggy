@@ -6376,6 +6376,12 @@ where
                 let Some(entry_header) = journal.header(op as usize).map(|h| *h) else {
                     break;
                 };
+                // Each earlier frame of this loop is already sent.
+                if live
+                    && !consensus.replication_window_takes(target, 0, u64::from(entry_header.size))
+                {
+                    break;
+                }
                 let Some(entry) = journal.entry(&entry_header).await else {
                     break;
                 };
@@ -6513,10 +6519,18 @@ where
             }) {
                 break;
             }
-            if response_bytes > 0 && response_bytes + u64::from(held.size) > REPAIR_BYTES_MAX {
+            let size = u64::from(held.size);
+            if response_bytes > 0 && response_bytes + size > REPAIR_BYTES_MAX {
                 break;
             }
-            response_bytes += u64::from(held.size);
+            if live
+                && !partition
+                    .consensus()
+                    .replication_window_takes(target, response_bytes, size)
+            {
+                break;
+            }
+            response_bytes += size;
             if let Some(evicted) = evicted {
                 released.push(evicted);
                 entries.push(None);
@@ -9776,12 +9790,12 @@ where
                         local_work_keepalive = Some((session.peer, session.nonce));
                     }
                     // Local work, not the peer, holds the pull, so a slow disk
-                    // burns no retry of the peer. A prefix read that outlives
-                    // its bound gives up the seed, and the artifact pulls whole.
-                    // A reuse scan that outlives its bound is asked to stop,
-                    // and the pull fetches what it did not reuse once it lands.
-                    // Work that landed resumes the pull here when no I/O turn
-                    // did.
+                    // burns no retry of the peer. Work that outlives its bound
+                    // is asked to stop, and the pull goes on once it lands. A
+                    // stopped prefix read thus frees its artifact buffer before
+                    // the pull fetches the whole artifact into a new one, and a
+                    // stopped reuse scan leaves the rest to the pull. Work that
+                    // landed resumes the pull here when no I/O turn did.
                     if let Some(scan) = &session.scan {
                         if scan.landed() {
                             local_work_landed = true;
@@ -9797,8 +9811,7 @@ where
                     if let Some(PrefixSeed::Reading { read, .. }) = &session.seed {
                         if read.landed() {
                             local_work_landed = true;
-                        } else if session.idle_ticks >= local_work_ticks_max {
-                            session.seed = None;
+                        } else if session.idle_ticks >= local_work_ticks_max && read.stop() {
                             prefix_read_expired = true;
                         }
                         return None;
@@ -9822,8 +9835,8 @@ where
                 tracing::info!(
                     shard = self.id,
                     namespace_raw = namespace.inner(),
-                    "the local segment prefix read outlived its bound, so the pull fetches \
-                     the whole artifact"
+                    "the local segment prefix read outlived its bound, so it is asked to \
+                     stop before the pull goes on"
                 );
             }
             if let Some((peer, nonce)) = local_work_keepalive
@@ -9832,7 +9845,7 @@ where
                 self.send_request_state_transfer(partition.consensus(), peer, nonce)
                     .await;
             }
-            if prefix_read_expired || local_work_landed {
+            if local_work_landed {
                 self.on_partition_transfer_progress(namespace.inner()).await;
             }
             if let Some((peer, nonce, target_accepted)) = transfer_stalled {

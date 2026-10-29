@@ -221,10 +221,10 @@ impl<T> LocalWork<T> {
 
 /// Asks local work to stop when the state that waits for it drops.
 ///
-/// That state drops with its session, or when its wait passes its bound. The
+/// That state drops with its session. A wait that passes its bound asks with
+/// [`LocalWork::stop`] instead, and keeps the state until the work lands. The
 /// task checks the flag between its steps. A prefix read then frees its
-/// buffer of up to one segment early, instead of holding it next to the
-/// buffer of the next read.
+/// buffer of up to one segment early.
 #[derive(Debug, Default)]
 pub struct LocalWorkCancel(Rc<Cell<bool>>);
 
