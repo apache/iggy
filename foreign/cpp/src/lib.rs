@@ -29,7 +29,7 @@ use client::{
     parse_metadata_change_cursor, parse_metadata_current_page_token,
     validate_metadata_changes_query,
 };
-use consumer::Consumer;
+use consumer::IggyConsumer;
 use messages::make_message;
 use producer::Producer;
 use std::sync::LazyLock;
@@ -307,6 +307,22 @@ mod ffi {
         partition_id: u32,
         current_offset: u64,
         stored_offset: u64,
+    }
+
+    /// Kind of the consumer a poll or a consumer-offset call names.
+    #[repr(u8)]
+    enum ConsumerKind {
+        Consumer = 1,
+        ConsumerGroup = 2,
+    }
+
+    /// The consumer a poll or a consumer-offset call names. It carries both the
+    /// kind and the identifier the server keys the stored offset on. Two callers
+    /// sharing one identifier share one offset, so under the `next` strategy with
+    /// auto-commit each of them reads only what the other has not read yet.
+    struct Consumer {
+        kind: ConsumerKind,
+        id: Identifier,
     }
 
     struct ClientInfo {
@@ -726,7 +742,7 @@ mod ffi {
 
     extern "Rust" {
         type Client;
-        type Consumer;
+        type IggyConsumer;
         type Producer;
 
         // Client functions
@@ -851,8 +867,7 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             partition_id: u32,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
             offset: u64,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
@@ -861,16 +876,14 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             partition_id: u32,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
         ) -> Result<ConsumerOffsetInfo>;
         fn delete_consumer_offset(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             partition_id: u32,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         /// Stores `offset` under `context`, normally the one returned with the
@@ -883,8 +896,7 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             partition_id: u32,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
             offset: u64,
             context: PartitionContext,
             error_info: &mut ErrorInfo,
@@ -901,8 +913,7 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             partition_id: u32,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
             polling_strategy_kind: String,
             polling_strategy_value: u64,
             count: u32,
@@ -917,8 +928,7 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             partition_id: u32,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
             polling_strategy_kind: String,
             polling_strategy_value: u64,
             count: u32,
@@ -1079,18 +1089,18 @@ mod ffi {
         fn set_string(self: &mut Identifier, id: String) -> Result<()>;
         fn set_numeric(self: &mut Identifier, id: u32) -> Result<()>;
 
-        // Consumer methods
-        // fn name(self: &Consumer) -> Result<String>;
-        // fn topic(self: &Consumer) -> Result<Identifier>;
-        // fn stream(self: &Consumer) -> Result<Identifier>;
-        // fn partition_id(self: &Consumer) -> u32;
-        // fn store_offset(self: &Consumer, offset: u64, partition_id: u32) -> Result<()>;
-        // fn delete_offset(self: &Consumer, partition_id: u32) -> Result<()>;
-        // fn get_last_consumed_offset(self: &Consumer, partition_id: u32) -> Result<u64>;
-        // fn get_last_stored_offset(self: &Consumer, partition_id: u32) -> Result<u64>;
-        // fn init(self: &mut Consumer) -> Result<()>;
-        // fn shutdown(self: &mut Consumer) -> Result<()>;
-        // unsafe fn delete_consumer(consumer: *mut Consumer) -> Result<()>;
+        // IggyConsumer methods
+        // fn name(self: &IggyConsumer) -> Result<String>;
+        // fn topic(self: &IggyConsumer) -> Result<Identifier>;
+        // fn stream(self: &IggyConsumer) -> Result<Identifier>;
+        // fn partition_id(self: &IggyConsumer) -> u32;
+        // fn store_offset(self: &IggyConsumer, offset: u64, partition_id: u32) -> Result<()>;
+        // fn delete_offset(self: &IggyConsumer, partition_id: u32) -> Result<()>;
+        // fn get_last_consumed_offset(self: &IggyConsumer, partition_id: u32) -> Result<u64>;
+        // fn get_last_stored_offset(self: &IggyConsumer, partition_id: u32) -> Result<u64>;
+        // fn init(self: &mut IggyConsumer) -> Result<()>;
+        // fn shutdown(self: &mut IggyConsumer) -> Result<()>;
+        // unsafe fn delete_consumer(consumer: *mut IggyConsumer) -> Result<()>;
 
         // Producer methods
         // fn stream(self: &Producer) -> Result<Identifier>;

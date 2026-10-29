@@ -256,27 +256,20 @@ class E2E_ResourceOptionsTransport : public E2ETestFixture,
     }
 
     void SendPayload(std::uint32_t stream_id, std::uint32_t topic_id, const std::string &payload) {
-        iggy::ffi::Client *client = GetLoggedInClient();
-        ASSERT_NE(client, nullptr);
-        rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-        messages.push_back(iggy::ffi::make_message(to_payload(payload), rust::Vec<iggy::ffi::HeaderEntry>()));
-        iggy::ffi::ErrorInfo error_info{};
-        ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id),
-                                              "partition_id", partition_id_bytes(0), std::move(messages), error_info));
+        auto client = GetLoggedInHighLevelClient();
+        const std::vector<iggy::IggyMessageToSend> messages{iggy::IggyMessageToSend::Create(payload, {})};
+        ASSERT_NO_THROW(client.SendMessages(iggy::Identifier::Numeric(stream_id), iggy::Identifier::Numeric(topic_id),
+                                            iggy::Partitioning::PartitionId(0), messages));
     }
 
     std::vector<std::string> PollPayloads(std::uint32_t stream_id, std::uint32_t topic_id) {
-        iggy::ffi::Client *client = GetLoggedInClient();
+        auto client = GetLoggedInHighLevelClient();
         std::vector<std::string> payloads;
-        if (client == nullptr) {
-            return payloads;
-        }
-        iggy::ffi::ErrorInfo error_info{};
-        const auto polled =
-            client->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
-                                  make_numeric_identifier(1), "offset", 0, 10, false, error_info);
-        for (const auto &message : polled.messages) {
-            payloads.emplace_back(message.payload.begin(), message.payload.end());
+        const auto polled = client.PollMessages(
+            iggy::Identifier::Numeric(stream_id), iggy::Identifier::Numeric(topic_id), 0,
+            iggy::Consumer::Single(iggy::Identifier::Numeric(1)), iggy::PollingStrategy::Offset(0), 10, false);
+        for (const auto &message : polled.Messages()) {
+            payloads.emplace_back(message.Payload().begin(), message.Payload().end());
         }
         return payloads;
     }

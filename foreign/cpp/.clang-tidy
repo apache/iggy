@@ -1,5 +1,6 @@
 Checks: [
   '*',
+  '-altera-id-dependent-backward-branch',
   '-altera-unroll-loops',
   '-bugprone-easily-swappable-parameters',
   '-fuchsia-default-arguments-calls',
@@ -24,9 +25,11 @@ HeaderFileExtensions:
 ImplementationFileExtensions:
 - 'cpp'
 
-HeaderFilterRegex: '.*\.hpp$'
+HeaderFilterRegex: '(^include/|/(foreign/cpp|_main)/include/).*\.hpp$'
 
 CheckOptions:
+  readability-identifier-naming.ConstexprVariableCase: CamelCase
+  readability-identifier-naming.ConstexprVariablePrefix: k
   readability-identifier-naming.ClassCase: CamelCase
   readability-identifier-naming.EnumCase: CamelCase
   readability-identifier-naming.LocalVariableCase: lower_case
