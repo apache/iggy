@@ -30,6 +30,7 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 
 use configs::external_auth::ExternalAuthConfig;
+use futures::StreamExt;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -301,8 +302,6 @@ pub async fn callout_external_auth(
     config: &ExternalAuthConfig,
     request: ExternalAuthRequest<'_>,
 ) -> Result<ValidatedDecision, ExternalAuthError> {
-    use futures::StreamExt;
-
     validate_credential_size(&request.credentials)?;
 
     let _guard = CalloutGuard::acquire(config.max_concurrent_callouts)?;
@@ -389,16 +388,56 @@ pub fn validate_provisioned_account(
         .then_some((user.id, user.created_at))
 }
 
+/// Why a pre-provisioned account was rejected. Logged for debugging but
+/// never exposed on the wire (the caller maps every variant to
+/// `InvalidCredentials`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountRejection {
+    NotFound,
+    Root,
+    Inactive,
+    CriticalOptions,
+}
+
+impl std::fmt::Display for AccountRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotFound => "user not found",
+            Self::Root => "root account cannot be used for external auth",
+            Self::Inactive => "user account is inactive",
+            Self::CriticalOptions => "user has unrecognized critical options",
+        })
+    }
+}
+
 /// Resolve an externally authenticated username to a pre-provisioned Iggy
-/// user. Guards: the user must exist, be active, and not be root.
-/// Transport-independent so both the TCP and HTTP login paths share one
-/// implementation.
+/// user. Logs the specific rejection reason; the wire error is always
+/// `InvalidCredentials`.
 pub fn resolve_username(
     users: &metadata::stm::user::UsersInner,
     username: &str,
 ) -> Result<(u32, iggy_common::IggyTimestamp), iggy_common::IggyError> {
-    validate_provisioned_account(users.user_by_name(username))
-        .ok_or(iggy_common::IggyError::InvalidCredentials)
+    use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+    use iggy_common::{UserStatus, check_critical_options};
+
+    let Some(user) = users.user_by_name(username) else {
+        tracing::warn!(username, reason = %AccountRejection::NotFound, "ext-auth account rejected");
+        return Err(iggy_common::IggyError::InvalidCredentials);
+    };
+    let rejection = if user.id == DEFAULT_ROOT_USER_ID {
+        Some(AccountRejection::Root)
+    } else if user.status != UserStatus::Active {
+        Some(AccountRejection::Inactive)
+    } else if check_critical_options(&user.options).is_err() {
+        Some(AccountRejection::CriticalOptions)
+    } else {
+        None
+    };
+    if let Some(reason) = rejection {
+        tracing::warn!(username, user_id = user.id, reason = %reason, "ext-auth account rejected");
+        return Err(iggy_common::IggyError::InvalidCredentials);
+    }
+    Ok((user.id, user.created_at))
 }
 
 #[cfg(test)]
@@ -631,5 +670,60 @@ mod tests {
         assert!(!ExternalAuthError::HttpStatus(401).is_transient());
         assert!(!ExternalAuthError::BadResponse("bad json".to_owned()).is_transient());
         assert!(!ExternalAuthError::BadRequest("too large".to_owned()).is_transient());
+    }
+
+    // ── account validation ─────────────────────────────────────────
+
+    fn test_user(id: u32, status: iggy_common::UserStatus) -> metadata::stm::user::User {
+        metadata::stm::user::User {
+            id,
+            status,
+            created_at: iggy_common::IggyTimestamp::from(1_700_000_000_000_000),
+            ..metadata::stm::user::User::default()
+        }
+    }
+
+    #[test]
+    fn given_absent_user_when_validating_account_should_reject() {
+        assert!(validate_provisioned_account(None).is_none());
+    }
+
+    #[test]
+    fn given_root_user_when_validating_account_should_reject() {
+        let root = test_user(
+            iggy_common::defaults::DEFAULT_ROOT_USER_ID,
+            iggy_common::UserStatus::Active,
+        );
+        assert!(validate_provisioned_account(Some(&root)).is_none());
+    }
+
+    #[test]
+    fn given_inactive_user_when_validating_account_should_reject() {
+        let inactive = test_user(1, iggy_common::UserStatus::Inactive);
+        assert!(validate_provisioned_account(Some(&inactive)).is_none());
+    }
+
+    #[test]
+    fn given_active_user_when_validating_account_should_accept() {
+        let active = test_user(1, iggy_common::UserStatus::Active);
+        let result = validate_provisioned_account(Some(&active));
+        assert_eq!(result.unwrap().0, 1);
+    }
+
+    #[test]
+    fn given_user_with_critical_options_when_validating_account_should_reject() {
+        use iggy_common::{HeaderKey, HeaderValue, OptionKey, OptionValue, ResourceOptions};
+        let mut user = test_user(2, iggy_common::UserStatus::Active);
+        user.options = ResourceOptions::from([
+            (
+                HeaderKey::from(OptionKey::CriticalKeys),
+                OptionValue::explicit(HeaderValue::try_from("a_future_key").expect("marker fits")),
+            ),
+            (
+                HeaderKey::try_from("a_future_key").expect("key fits"),
+                OptionValue::explicit(HeaderValue::from(7u64)),
+            ),
+        ]);
+        assert!(validate_provisioned_account(Some(&user)).is_none());
     }
 }
