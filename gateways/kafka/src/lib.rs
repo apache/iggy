@@ -25,8 +25,8 @@ pub mod error;
 pub mod group;
 pub mod listener;
 pub mod protocol;
-pub mod records;
 pub mod server;
 pub mod tls;
 
+pub use iggy_kafka_wire::records;
 pub use server::{GatewayConfig, KafkaGateway};

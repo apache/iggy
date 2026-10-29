@@ -197,6 +197,13 @@ void IggyBlockingClient::UpdateUser(const Identifier &user, const UserUpdateOpti
     });
 }
 
+std::string IggyBlockingClient::CreatePersonalAccessToken(std::string name, const Expiry &expiry) {
+    return RethrowAsIggyException([this, &name, &expiry] {
+        return std::string(
+            Handle()->create_personal_access_token(std::move(name), std::string(expiry.Kind()), expiry.Value()));
+    });
+}
+
 StreamDetails IggyBlockingClient::CreateStream(std::string name, const StreamCreateOptions &options) {
     return RethrowAsIggyException([this, &name, &options](ffi::ErrorInfo &error_info) {
         ffi::StreamCreateOptions ffi_options{};

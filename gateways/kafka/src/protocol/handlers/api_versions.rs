@@ -143,7 +143,7 @@ pub fn encode_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::handlers::decode_exhaustive;
+    use iggy_kafka_wire::codec::decode_exhaustive;
 
     #[test]
     fn decode_v3_requires_software_fields() {

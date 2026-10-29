@@ -50,10 +50,12 @@ pub mod produce;
 pub mod sync_group;
 pub(crate) mod topic_config;
 
+use std::fmt::Display;
 use std::time::Duration;
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::Bytes;
 use iggy::prelude::IggyError;
+use iggy_kafka_wire::codec;
 use kafka_protocol::messages::TransactionalId;
 use kafka_protocol::protocol::{Decodable, Encodable};
 use tokio::runtime::{Handle, RuntimeFlavor};
@@ -61,7 +63,7 @@ use tokio::time::Instant;
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::BridgeError;
-use crate::error::{KafkaProtocolError, Result};
+use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_PARTITIONS, API_KEY_CREATE_TOPICS,
     API_KEY_DELETE_GROUPS, API_KEY_DELETE_TOPICS, API_KEY_DESCRIBE_CLUSTER,
@@ -138,7 +140,7 @@ pub async fn dispatch(
         API_KEY_FIND_COORDINATOR => {
             find_coordinator::handle(state, connection, api_version, body).await
         }
-        API_KEY_JOIN_GROUP => join_group::handle(state, api_version, body).await,
+        API_KEY_JOIN_GROUP => join_group::handle(state, connection, api_version, body).await,
         API_KEY_HEARTBEAT => heartbeat::handle(state, connection, api_version, body).await,
         API_KEY_LEAVE_GROUP => leave_group::handle(state, api_version, body).await,
         API_KEY_SYNC_GROUP => sync_group::handle(state, api_version, body).await,
@@ -221,55 +223,30 @@ const fn offset_refusal_cause(error: &BridgeError) -> &'static str {
     }
 }
 
-/// Encode a `kafka_protocol` message, mapping its `anyhow::Error` (the crate has no stable
-/// decode/encode error taxonomy) to a variant callers can log or fold into
-/// [`HandleOutcome::Close`].
+/// [`codec::encode_message`] with the error lifted into this crate's [`Result`].
 pub(crate) fn encode_message<T: Encodable>(
     msg: &T,
     version: i16,
     capacity: usize,
 ) -> Result<Bytes> {
-    let mut buf = BytesMut::with_capacity(capacity);
-    msg.encode(&mut buf, version)
-        .map_err(|e| KafkaProtocolError::Malformed(e.to_string()))?;
-    Ok(buf.freeze())
+    codec::encode_message(msg, version, capacity).map_err(Into::into)
 }
 
-/// Decode `T` from the whole request body and reject unconsumed trailing bytes.
-///
-/// `kafka_protocol`'s `Decodable` stops once it has read the fields its schema defines; it does
-/// not know (or care) whether the caller handed it an exact-length body, so the trailing-bytes
-/// check has to live here.
-pub(crate) fn decode_exhaustive<T: Decodable>(version: i16, mut body: Bytes) -> Result<T> {
-    let value =
-        T::decode(&mut body, version).map_err(|e| KafkaProtocolError::Malformed(e.to_string()))?;
-    if body.has_remaining() {
-        return Err(KafkaProtocolError::Malformed(
-            "unexpected trailing bytes in request body".to_string(),
-        ));
-    }
-    Ok(value)
-}
-
-/// Runs `validate` (see [`crate::protocol::bounds_guard`]) before [`decode_exhaustive`].
-///
-/// `kafka_protocol` validates wire-declared array/string lengths as non-negative but never
-/// against the bytes actually remaining in the frame, so a tiny frame declaring a huge count
-/// drives an allocation attempt that aborts the whole process (`handle_alloc_error`, not a
-/// panic - uncatchable, and it kills every connection, not just the offending one). `validate`
-/// rejects that class of frame first, on a walk that never allocates a collection.
+/// [`codec::decode_guarded`] with the error lifted into this crate's [`Result`].
 pub(crate) fn decode_guarded<T: Decodable>(
     version: i16,
     body: Bytes,
-    validate: impl FnOnce(i16, &Bytes) -> Result<()>,
+    validate: impl FnOnce(i16, &Bytes) -> iggy_kafka_wire::Result<()>,
 ) -> Result<T> {
-    validate(version, &body)?;
-    decode_exhaustive(version, body)
+    codec::decode_guarded(version, body, validate).map_err(Into::into)
 }
 
 /// Turn an encode [`Result`] into a [`HandleOutcome`], closing the connection when encoding
 /// fails rather than propagating - there is no parseable response to send in that case.
-pub(crate) fn respond_or_close(result: Result<Bytes>, api_name: &str) -> HandleOutcome {
+pub(crate) fn respond_or_close<E: Display>(
+    result: core::result::Result<Bytes, E>,
+    api_name: &str,
+) -> HandleOutcome {
     match result {
         Ok(body) => HandleOutcome::Respond(body),
         Err(error) => {

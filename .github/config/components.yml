@@ -184,6 +184,16 @@ components:
     paths:
       - "core/simulator/**"
 
+  # Runtime-free Kafka wire layer the gateway consumes. Listed on its own so a
+  # change confined to the crate still starts the Rust jobs and reruns the
+  # gateway, which no gateways/** glob would otherwise catch.
+  rust-kafka-wire:
+    depends_on:
+      - "rust-workspace"
+      - "rust-common" # the record codec maps onto iggy_common message types
+    paths:
+      - "core/kafka_wire/**"
+
   # Main Rust workspace testing
   rust:
     depends_on:
@@ -195,6 +205,7 @@ components:
       - "rust-server"
       - "rust-cluster"
       - "rust-simulator"
+      - "rust-kafka-wire"
       - "rust-tools"
       - "rust-cli"
       - "rust-bench"
@@ -580,6 +591,7 @@ components:
   rust-gateway:
     depends_on:
       - "rust-sdk"
+      - "rust-kafka-wire"
       - "rust-workspace"
       - "ci-infrastructure"
     paths:

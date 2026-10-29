@@ -29,6 +29,9 @@
 //! `classic` needs no scan. While the first scan runs, the answer is
 //! `COORDINATOR_LOAD_IN_PROGRESS` (14), which clients retry. When no scan could find the groups,
 //! the answer has only the groups this coordinator holds, as before the gateway knew of them.
+//!
+//! With several gateways, only the one that `FindCoordinator` names lists groups. The others
+//! answer with an empty list.
 
 use std::collections::HashSet;
 
@@ -85,6 +88,11 @@ pub async fn handle(
             );
         }
     };
+    // The admin client asks every broker and keeps one answer per group. Only the coordinator's
+    // answer is current, so the other gateways list nothing.
+    if !connection.brokers.coordinates_groups() {
+        return respond_or_close(encode_response(api_version, Vec::new()), "ListGroups");
+    }
 
     let mut listings = state.groups.list_groups().await;
     let lists_offsets_only = selected(&request.states_filter, GROUP_STATE_EMPTY)
@@ -287,6 +295,8 @@ mod tests {
                 rebalance_timeout: Duration::from_secs(10),
                 member_id: StrBytes::new(),
                 group_instance_id: None,
+                client_id: StrBytes::new(),
+                client_host: StrBytes::new(),
                 protocol_type: StrBytes::from_static_str(CONSUMER_PROTOCOL_TYPE),
                 protocols: vec![(StrBytes::from_static_str("range"), Bytes::new())],
                 require_known_member_id: false,

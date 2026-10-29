@@ -42,10 +42,10 @@
 //! per-peer queue depth, close-grace, reconnect period,
 //! handshake-grace).
 //!
-//! Liveness detection is NOT done via TCP keepalive on the bus: SDK
-//! clients manage their own keepalive policy; replica<->replica
-//! liveness is observed by VSR heartbeats. No keepalive knobs live in
-//! this section.
+//! Client sockets get no TCP keepalive: SDK clients manage their own
+//! keepalive policy. Replica sockets get keepalive probes, and on Linux
+//! `cluster.heartbeat_timeout` bounds how long they may go unanswered.
+//! No keepalive knobs live in this section.
 //!
 //! Construction of the runtime type from this struct happens in the
 //! follow-up PR that wires `core/server` to call
@@ -162,6 +162,12 @@ pub struct MessageBusConfig {
     /// Threaded into `compio::time::timeout(handshake_grace, ...)` at
     /// each handshake site so a slowloris peer cannot pin per-conn
     /// channels + registry slot + spawned task indefinitely.
+    ///
+    /// A replica link gets one such window for the placement preamble,
+    /// TLS and the replica handshake together. The window also bounds how
+    /// long the links to a peer may stay incomplete before they close and
+    /// redial, so a value below [`Self::reconnect_period`] lets them form
+    /// only when all of them connect in one sweep.
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub handshake_grace: IggyDuration,
