@@ -7204,6 +7204,7 @@ dependencies = [
  "iggy_common",
  "keyring-core",
  "passterm",
+ "reqwest 0.13.5",
  "secrecy",
  "serde",
  "serde_json",

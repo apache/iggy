@@ -184,6 +184,13 @@ impl ShowContextCmd {
         Self::add_masked(&mut table, "Password", &config.password);
         Self::add_masked(&mut table, "Token", &config.token);
         Self::add_opt_str(&mut table, "Token Name", &config.token_name);
+        Self::add_opt_str(&mut table, "Connectors API URL", &config.connectors_api_url);
+        Self::add_masked(&mut table, "Connectors API Key", &config.connectors_api_key);
+        Self::add_opt_str(
+            &mut table,
+            "Connectors TLS CA File",
+            &config.connectors_tls_ca_file,
+        );
 
         for (key, value) in &config.extra {
             table.add_row(vec![key.as_str(), &value.to_string()]);
