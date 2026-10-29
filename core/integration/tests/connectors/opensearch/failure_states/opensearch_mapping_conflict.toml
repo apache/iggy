@@ -1,0 +1,54 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Opens and indexes successfully, then receives a document that violates its
+# own explicit mapping (count is pinned to integer at index-creation time, so
+# the conflict is deterministic rather than dependent on dynamic-mapping
+# inference order). Asserts the real OpenSearch 400 mapper_parsing_exception
+# propagates as Error::PermanentHttpError and consume() returns Err, but the
+# connectors runtime discards that return value (see opensearch_sink_failures.rs
+# module doc), so the connector stays Running and keeps indexing later
+# messages; this failure is only visible in its own tracing output. Subscribes
+# to test_topic_2, distinct from the healthy sink's test_topic, so it never
+# receives the healthy sink's messages or vice versa.
+
+type = "sink"
+key = "opensearch_mapping_conflict"
+enabled = true
+version = 0
+name = "OpenSearch mapping-conflict sink"
+path = "../../target/debug/libiggy_connector_opensearch_sink"
+verbose = true
+
+[[streams]]
+stream = "test_stream"
+topics = ["test_topic_2"]
+schema = "json"
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "opensearch_mapping_conflict"
+
+[plugin_config]
+url = "http://localhost:9200"
+index = "iggy_mapping_conflict"
+create_index_if_not_exists = true
+# Small enough that one consume() batch spans several _bulk calls, so the test
+# can prove a failing chunk does not abandon the chunks queued behind it.
+batch_size = 2
+
+[plugin_config.index_mapping.mappings.properties.count]
+type = "integer"

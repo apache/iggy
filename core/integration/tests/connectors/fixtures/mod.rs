@@ -28,6 +28,7 @@ mod influxdb;
 mod meilisearch;
 mod mongodb;
 mod mqtt;
+mod opensearch;
 mod postgres;
 mod quickwit;
 mod rabbitmq;
@@ -89,6 +90,7 @@ pub use mqtt::{
     Mqtt5Qos0Fixture, Mqtt5Qos1Fixture, Mqtt5Qos2Fixture, Mqtt311InvalidCredentialsFixture,
     Mqtt311Qos0Fixture, Mqtt311Qos1Fixture, Mqtt311Qos2Fixture,
 };
+pub use opensearch::{OpenSearchFailureFixture, OpenSearchOps, OpenSearchSinkFixture};
 pub use postgres::{
     POSTGRES_LARGE_BATCH_SIZE, PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture,
     PostgresSinkJsonFixture, PostgresSinkLargeBatchFixture, PostgresSourceByteaFixture,
