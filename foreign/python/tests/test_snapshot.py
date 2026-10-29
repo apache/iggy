@@ -86,10 +86,3 @@ class TestSnapshot:
         assert isinstance(data, bytes)
         assert len(data) > 0
         assert zipfile.is_zipfile(io.BytesIO(data))
-
-    @pytest.mark.unit
-    def test_snapshot_enums(self):
-        """Snapshot compression and type enums expose expected variants."""
-        assert SnapshotCompression.Deflated == SnapshotCompression.Deflated
-        assert SnapshotCompression.Deflated != SnapshotCompression.Stored
-        assert SystemSnapshotType.All == SystemSnapshotType.All

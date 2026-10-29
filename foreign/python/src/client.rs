@@ -354,14 +354,14 @@ impl IggyClient {
 
         let mut parsed_types = Vec::with_capacity(snapshot_types.len());
         for snapshot_type in snapshot_types {
-            let rust_type: SystemSnapshotType = snapshot_type.into();
+            let rust_type = SystemSnapshotType::from(snapshot_type);
             if !parsed_types.contains(&rust_type) {
                 parsed_types.push(rust_type);
             }
         }
 
         let inner = self.inner.clone();
-        let compression: SnapshotCompression = snapshot_compression.into();
+        let compression = SnapshotCompression::from(snapshot_compression);
         future_into_py(py, async move {
             let snapshot = inner
                 .snapshot(compression, parsed_types)
