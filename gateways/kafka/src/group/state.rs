@@ -359,6 +359,8 @@ impl GroupState {
             let session_timeout = Duration::from_millis(u64::from(stored.session_timeout_ms));
             let member = Member {
                 group_instance_id: stored.group_instance_id.as_deref().map(str_bytes),
+                client_id: str_bytes(&stored.client_id),
+                client_host: str_bytes(&stored.client_host),
                 session_timeout,
                 rebalance_timeout: Duration::from_millis(u64::from(stored.rebalance_timeout_ms))
                     .min(max_rebalance_timeout),
@@ -399,6 +401,8 @@ impl GroupState {
                 .map(|(member_id, member)| MemberSnapshot {
                     member_id: member_id.to_string(),
                     group_instance_id: member.group_instance_id.as_ref().map(ToString::to_string),
+                    client_id: member.client_id.to_string(),
+                    client_host: member.client_host.to_string(),
                     session_timeout_ms: duration_millis(member.session_timeout),
                     rebalance_timeout_ms: duration_millis(member.rebalance_timeout),
                     metadata: member.metadata_for(&selected),

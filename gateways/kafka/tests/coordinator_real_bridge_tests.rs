@@ -37,7 +37,8 @@ use iggy::prelude::{
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
 use kafka_protocol::messages::{
-    CreateTopicsRequest, CreateTopicsResponse, MetadataRequest, MetadataResponse, TopicName,
+    CreateTopicsRequest, CreateTopicsResponse, DescribeGroupsRequest, DescribeGroupsResponse,
+    GroupId, MetadataRequest, MetadataResponse, TopicName,
 };
 use kafka_protocol::protocol::StrBytes;
 use serial_test::serial;
@@ -48,8 +49,8 @@ use iggy_gateway_kafka::coordinator::record::{Body, Record};
 use iggy_gateway_kafka::coordinator::{CoordinationConfig, partition_of_group};
 use iggy_gateway_kafka::listener::parse_brokers;
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_CREATE_TOPICS, API_KEY_METADATA, ERROR_NONE, ERROR_NOT_CONTROLLER,
-    ERROR_NOT_COORDINATOR,
+    API_KEY_CREATE_TOPICS, API_KEY_DESCRIBE_GROUPS, API_KEY_METADATA, ERROR_NONE,
+    ERROR_NOT_CONTROLLER, ERROR_NOT_COORDINATOR,
 };
 use iggy_gateway_kafka::server::bind_listener;
 
@@ -140,6 +141,16 @@ async fn given_a_stable_group_when_its_coordinator_stops_should_keep_its_member_
         fetch(successor.addr, group).await,
         (ERROR_NONE, 42, "partition time 17".to_string()),
         "the offset and its metadata move with the group"
+    );
+    let request = DescribeGroupsRequest::default()
+        .with_groups(vec![GroupId(StrBytes::from_static_str(group))]);
+    let described: DescribeGroupsResponse =
+        call(successor.addr, API_KEY_DESCRIBE_GROUPS, 5, &request).await;
+    let member = &described.groups[0].members[0];
+    assert_eq!(
+        (member.member_id.as_str(), member.client_id.as_str()),
+        (member_id.as_str(), "coordinator-test"),
+        "the member keeps the client id of its join"
     );
 
     for gateway in gateways {

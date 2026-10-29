@@ -290,6 +290,8 @@ fn put_snapshot(buf: &mut BytesMut, snapshot: &GroupSnapshot) -> Result<(), Reco
     for member in &snapshot.members {
         put_str(buf, &member.member_id, "member id")?;
         put_optional_str(buf, member.group_instance_id.as_deref(), "instance id")?;
+        put_str(buf, &member.client_id, "client id")?;
+        put_str(buf, &member.client_host, "client host")?;
         buf.put_u32_le(member.session_timeout_ms);
         buf.put_u32_le(member.rebalance_timeout_ms);
         put_blob(buf, &member.metadata, "member metadata")?;
@@ -304,12 +306,14 @@ fn get_snapshot(bytes: &mut &[u8]) -> Result<GroupSnapshot, RecordError> {
     let protocol_name = get_optional_str(bytes, "protocol name")?;
     let leader = get_optional_str(bytes, "leader")?;
     let count = get_u32(bytes, "member count")?;
-    // Each member takes at least 18 bytes, so a count the record cannot hold allocates nothing.
-    let mut members = Vec::with_capacity((count as usize).min(bytes.len() / 18));
+    // Each member takes at least 22 bytes, so a count the record cannot hold allocates nothing.
+    let mut members = Vec::with_capacity((count as usize).min(bytes.len() / 22));
     for _ in 0..count {
         members.push(MemberSnapshot {
             member_id: get_str(bytes, "member id")?,
             group_instance_id: get_optional_str(bytes, "instance id")?,
+            client_id: get_str(bytes, "client id")?,
+            client_host: get_str(bytes, "client host")?,
             session_timeout_ms: get_u32(bytes, "session timeout")?,
             rebalance_timeout_ms: get_u32(bytes, "rebalance timeout")?,
             metadata: get_blob(bytes, "member metadata")?,
@@ -442,6 +446,8 @@ mod tests {
                 MemberSnapshot {
                     member_id: "member-1".to_string(),
                     group_instance_id: None,
+                    client_id: "consumer-orders-1".to_string(),
+                    client_host: "/192.0.2.10".to_string(),
                     session_timeout_ms: 45_000,
                     rebalance_timeout_ms: 300_000,
                     metadata: Bytes::from_static(b"subscription"),
@@ -450,6 +456,8 @@ mod tests {
                 MemberSnapshot {
                     member_id: "member-2".to_string(),
                     group_instance_id: Some("static-2".to_string()),
+                    client_id: String::new(),
+                    client_host: String::new(),
                     session_timeout_ms: 10_000,
                     rebalance_timeout_ms: 60_000,
                     metadata: Bytes::new(),
