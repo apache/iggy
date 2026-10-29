@@ -414,8 +414,8 @@ pub enum ServerError {
     Panicked { description: String },
     #[error("Failed to list config environment variables")]
     ListConfigEnvVars(#[source] std::io::Error),
-    #[error("invalid external auth configuration: {reason}")]
-    InvalidExternalAuthConfig { reason: String },
+    #[error("failed to build the external auth HTTP client: {reason}")]
+    ExternalAuthClient { reason: String },
 }
 
 /// Per-shard outcome captured by [`crate::boot::ShardHandles::join_all`]

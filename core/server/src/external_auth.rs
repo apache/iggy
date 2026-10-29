@@ -41,8 +41,8 @@ const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
 const MAX_CREDENTIAL_BYTES: usize = 8_192;
 
 thread_local! {
-    // Lazily built per shard thread. `validate_config` probes the build at
-    // boot so a missing CA store fails startup, not the first login.
+    // Lazily built per shard thread. `preflight` probes the build at boot
+    // so a missing CA store fails startup, not the first login.
     static HTTP_CLIENT: RefCell<Option<cyper::Client>> = const { RefCell::new(None) };
 
     static IN_FLIGHT_CALLOUTS: Cell<u32> = const { Cell::new(0) };
@@ -249,57 +249,12 @@ fn redact_url_userinfo(url: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// # Errors
-///
-/// Returns [`ServerError::InvalidExternalAuthConfig`](crate::server_error::ServerError::InvalidExternalAuthConfig)
-/// when the URL is empty or uses an unsupported scheme.
-pub fn validate_config(
-    config: &ExternalAuthConfig,
-) -> Result<(), crate::server_error::ServerError> {
+/// Boot-time checks that need server-side dependencies (TLS roots, tracing).
+/// Called after `Validatable::validate` has checked the config values.
+pub fn preflight(config: &ExternalAuthConfig) -> Result<(), crate::server_error::ServerError> {
     if !config.enabled {
         return Ok(());
     }
-    if config.url.is_empty() {
-        return Err(
-            crate::server_error::ServerError::InvalidExternalAuthConfig {
-                reason: "external_auth.url must be set when external_auth.enabled = true"
-                    .to_owned(),
-            },
-        );
-    }
-    if !config.url.starts_with("http://") && !config.url.starts_with("https://") {
-        return Err(
-            crate::server_error::ServerError::InvalidExternalAuthConfig {
-                reason: format!(
-                    "external_auth.url must start with http:// or https://, got: {}",
-                    redact_url_userinfo(&config.url)
-                ),
-            },
-        );
-    }
-    // Catch bare schemes ("http://") with no host at boot instead of on
-    // first callout. The scheme prefix check above already guarantees the
-    // split will succeed.
-    let after_scheme = config.url.split_once("://").map_or("", |(_, rest)| rest);
-    if after_scheme.is_empty() || after_scheme.starts_with('/') {
-        return Err(
-            crate::server_error::ServerError::InvalidExternalAuthConfig {
-                reason: format!(
-                    "external_auth.url has no host: {}",
-                    redact_url_userinfo(&config.url)
-                ),
-            },
-        );
-    }
-    if config.timeout.get_duration().is_zero() {
-        return Err(
-            crate::server_error::ServerError::InvalidExternalAuthConfig {
-                reason: "external_auth.timeout must be greater than zero".to_owned(),
-            },
-        );
-    }
-    // The callout runs inline on the single-threaded shard reactor; a very
-    // large timeout blocks the entire shard for its duration. Warn above 30 s.
     if config.timeout.get_duration().as_secs() > 30 {
         tracing::warn!(
             timeout = %config.timeout,
@@ -307,21 +262,18 @@ pub fn validate_config(
              a callout stalls that login attempt for its full duration"
         );
     }
-    // Build a throwaway client to verify system TLS roots are loadable.
-    // Each shard thread builds its own later; this catches the failure at
-    // boot instead of panicking on the first callout.
-    build_http_client()
-        .map_err(|reason| crate::server_error::ServerError::InvalidExternalAuthConfig { reason })?;
-    Ok(())
-}
-
-pub fn warn_insecure_url(config: &ExternalAuthConfig) {
-    if config.enabled && config.url.starts_with("http://") {
+    if config.url.starts_with("http://") {
         tracing::warn!(
             url = %redact_url_userinfo(&config.url),
             "external auth URL uses plain HTTP; credentials will be sent in cleartext"
         );
     }
+    // Build a throwaway client to verify system TLS roots are loadable.
+    // Each shard thread builds its own later; this catches the failure at
+    // boot instead of panicking on the first callout.
+    build_http_client()
+        .map_err(|reason| crate::server_error::ServerError::ExternalAuthClient { reason })?;
+    Ok(())
 }
 
 fn validate_credential_size(credentials: &Credentials) -> Result<(), ExternalAuthError> {
@@ -593,58 +545,28 @@ mod tests {
         assert!(parse_response("{}").is_err());
     }
 
-    // ── config validation ───────────────────────────────────────────
+    // ── runtime probe ───────────────────────────────────────────────
 
     #[test]
-    fn given_disabled_config_when_validating_should_accept_empty_url() {
-        let config = ExternalAuthConfig {
-            enabled: false,
-            ..ExternalAuthConfig::default()
-        };
-        assert!(validate_config(&config).is_ok());
-    }
-
-    #[test]
-    fn given_enabled_config_with_empty_url_when_validating_should_reject() {
-        let config = ExternalAuthConfig {
-            enabled: true,
-            ..ExternalAuthConfig::default()
-        };
-        let err = validate_config(&config).unwrap_err();
-        assert!(err.to_string().contains("external_auth.url must be set"));
-    }
-
-    #[test]
-    fn given_enabled_config_with_invalid_scheme_when_validating_should_reject() {
-        let config = ExternalAuthConfig {
-            enabled: true,
-            url: "ftp://auth.example.com".to_owned(),
-            ..ExternalAuthConfig::default()
-        };
-        let err = validate_config(&config).unwrap_err();
-        assert!(err.to_string().contains("must start with http://"));
-    }
-
-    #[test]
-    fn given_enabled_config_with_https_url_when_validating_should_accept() {
+    fn given_enabled_config_with_https_url_when_probing_runtime_should_accept() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = ExternalAuthConfig {
             enabled: true,
             url: "https://auth.example.com/verify".to_owned(),
             ..ExternalAuthConfig::default()
         };
-        assert!(validate_config(&config).is_ok());
+        assert!(preflight(&config).is_ok());
     }
 
     #[test]
-    fn given_enabled_config_with_http_url_when_validating_should_accept() {
+    fn given_enabled_config_with_http_url_when_probing_runtime_should_accept() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = ExternalAuthConfig {
             enabled: true,
             url: "http://localhost:8080/auth".to_owned(),
             ..ExternalAuthConfig::default()
         };
-        assert!(validate_config(&config).is_ok());
+        assert!(preflight(&config).is_ok());
     }
 
     #[test]
@@ -661,43 +583,6 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"credentials\":{"));
         assert!(json.contains("\"type\":\"username_password\""));
-    }
-
-    #[test]
-    fn given_enabled_config_with_zero_timeout_when_validating_should_reject() {
-        let config = ExternalAuthConfig {
-            enabled: true,
-            url: "https://auth.example.com/verify".to_owned(),
-            timeout: "0 s".parse().expect("valid duration"),
-            ..ExternalAuthConfig::default()
-        };
-        let err = validate_config(&config).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("timeout must be greater than zero"),
-        );
-    }
-
-    #[test]
-    fn given_enabled_config_with_bare_scheme_when_validating_should_reject() {
-        let config = ExternalAuthConfig {
-            enabled: true,
-            url: "https://".to_owned(),
-            ..ExternalAuthConfig::default()
-        };
-        let err = validate_config(&config).unwrap_err();
-        assert!(err.to_string().contains("has no host"));
-    }
-
-    #[test]
-    fn given_enabled_config_with_scheme_and_path_only_when_validating_should_reject() {
-        let config = ExternalAuthConfig {
-            enabled: true,
-            url: "http:///path".to_owned(),
-            ..ExternalAuthConfig::default()
-        };
-        let err = validate_config(&config).unwrap_err();
-        assert!(err.to_string().contains("has no host"));
     }
 
     // ── callout guard ──────────────────────────────────────────────

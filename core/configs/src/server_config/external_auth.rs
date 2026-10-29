@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::ConfigurationError;
 use configs::ConfigEnv;
-use iggy_common::IggyDuration;
+use iggy_common::{IggyDuration, Validatable};
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
@@ -59,10 +60,111 @@ impl Default for ExternalAuthConfig {
     }
 }
 
+impl Validatable<ConfigurationError> for ExternalAuthConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.url.is_empty() {
+            eprintln!("external_auth.url must be set when external_auth.enabled = true");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if !self.url.starts_with("http://") && !self.url.starts_with("https://") {
+            eprintln!("external_auth.url must start with http:// or https://");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        // Catch bare schemes ("http://") with no host.
+        let after_scheme = self.url.split_once("://").map_or("", |(_, rest)| rest);
+        if after_scheme.is_empty() || after_scheme.starts_with('/') {
+            eprintln!("external_auth.url has no host");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.timeout.get_duration().is_zero() {
+            eprintln!("external_auth.timeout must be greater than zero");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        Ok(())
+    }
+}
+
 fn default_external_auth_timeout() -> IggyDuration {
     IggyDuration::new_from_secs(5)
 }
 
 const fn default_max_concurrent_callouts() -> u32 {
     64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_disabled_config_when_validating_should_accept_empty_url() {
+        let config = ExternalAuthConfig {
+            enabled: false,
+            ..ExternalAuthConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_enabled_config_with_empty_url_when_validating_should_reject() {
+        let config = ExternalAuthConfig {
+            enabled: true,
+            ..ExternalAuthConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_enabled_config_with_invalid_scheme_when_validating_should_reject() {
+        let config = ExternalAuthConfig {
+            enabled: true,
+            url: "ftp://auth.example.com".to_owned(),
+            ..ExternalAuthConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_enabled_config_with_bare_scheme_when_validating_should_reject() {
+        let config = ExternalAuthConfig {
+            enabled: true,
+            url: "https://".to_owned(),
+            ..ExternalAuthConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_enabled_config_with_scheme_and_path_only_when_validating_should_reject() {
+        let config = ExternalAuthConfig {
+            enabled: true,
+            url: "http:///path".to_owned(),
+            ..ExternalAuthConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_enabled_config_with_zero_timeout_when_validating_should_reject() {
+        let config = ExternalAuthConfig {
+            enabled: true,
+            url: "https://auth.example.com/verify".to_owned(),
+            timeout: "0 s".parse().expect("valid duration"),
+            ..ExternalAuthConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_enabled_config_with_valid_url_when_validating_should_accept() {
+        let config = ExternalAuthConfig {
+            enabled: true,
+            url: "https://auth.example.com/verify".to_owned(),
+            ..ExternalAuthConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
 }
