@@ -27,6 +27,8 @@ import typing
 
 __all__ = [
     "Durability",
+    "ClusterNodeRole",
+    "ClusterNodeStatus",
     "AutoCommit",
     "AutoCommitAfter",
     "AutoCommitWhen",
@@ -35,6 +37,8 @@ __all__ = [
     "BackpressureMode",
     "CacheMetrics",
     "CacheMetricsKey",
+    "ClusterMetadata",
+    "ClusterNode",
     "Consumer",
     "ConsumerGroup",
     "ConsumerGroupDetails",
@@ -120,6 +124,7 @@ __all__ = [
     "TopicDetails",
     "TopicOptions",
     "TopicPermissions",
+    "TransportEndpoints",
     "UserHeaders",
     "UserInfo",
     "UserInfoDetails",
@@ -509,6 +514,70 @@ class CacheMetricsKey:
     def __new__(
         cls, stream_id: builtins.int, topic_id: builtins.int, partition_id: builtins.int
     ) -> CacheMetricsKey: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class ClusterMetadata:
+    r"""
+    Metadata of all nodes in the cluster.
+
+    A server running without clustering reports itself as the only node.
+    """
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        The name of the cluster.
+        """
+    @property
+    def nodes(self) -> builtins.list[ClusterNode]:
+        r"""
+        The list of all nodes in the cluster.
+
+        Each access builds a fresh list of new `ClusterNode` objects, so cache
+        the result when reading it more than once.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class ClusterNode:
+    r"""
+    A node in the cluster with its transport endpoints, role, and status.
+    """
+    @property
+    def replica_id(self) -> builtins.int:
+        r"""
+        The replica id of the node, as accepted by
+        `IggyClient.send_binary_request_to_replica`.
+        """
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        The name of the node.
+        """
+    @property
+    def ip(self) -> builtins.str:
+        r"""
+        The address clients should use to reach the node.
+
+        This is a bare host (a hostname or an IP address) with no port and no
+        brackets, so an IPv6 address needs brackets before a port is appended,
+        for example `[::1]:8090`.
+        """
+    @property
+    def endpoints(self) -> TransportEndpoints:
+        r"""
+        The transport endpoints of the node.
+        """
+    @property
+    def role(self) -> ClusterNodeRole:
+        r"""
+        The role of the node in the cluster.
+        """
+    @property
+    def status(self) -> ClusterNodeStatus:
+        r"""
+        The current status of the node.
+        """
     def __repr__(self) -> builtins.str: ...
 
 class Consumer:
@@ -1259,6 +1328,20 @@ class IggyClient:
             RuntimeError: If the client is not connected, the session is not
                 authenticated, the user lacks the permission, or the request
                 fails.
+        """
+    def get_cluster_metadata(self) -> collections.abc.Awaitable[ClusterMetadata]:
+        r"""
+        Get the metadata of all nodes in the cluster.
+
+        Any authenticated user may call this; no global permission is needed.
+        A server running without clustering reports itself as the only node.
+
+        Returns:
+            An awaitable that resolves to `ClusterMetadata`.
+
+        Raises:
+            RuntimeError: If the client is not connected, the session is not
+                authenticated, or the request fails.
         """
     def describe_options(
         self, scope: builtins.str
@@ -4995,6 +5078,35 @@ class TopicPermissions:
         """
 
 @typing.final
+class TransportEndpoints:
+    r"""
+    Transport endpoints exposed by a cluster node.
+
+    A port of 0 means the node does not advertise that transport.
+    """
+    @property
+    def tcp(self) -> builtins.int:
+        r"""
+        TCP port.
+        """
+    @property
+    def quic(self) -> builtins.int:
+        r"""
+        QUIC port.
+        """
+    @property
+    def http(self) -> builtins.int:
+        r"""
+        HTTP port.
+        """
+    @property
+    def websocket(self) -> builtins.int:
+        r"""
+        WebSocket port.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class UserHeaders(dict):
     r"""
     User headers dictionary returned by `ReceiveMessage.user_headers`.
@@ -5340,3 +5452,19 @@ def encryption_key_fingerprint(key: builtins.bytes | builtins.str) -> builtins.s
 class Durability(str, enum.Enum):  # noqa: UP042
     REPLICATED = "replicated"
     PERSISTED = "persisted"
+
+class ClusterNodeRole(str, enum.Enum):  # noqa: UP042
+    """The role of a node within the cluster."""
+
+    LEADER = "leader"
+    FOLLOWER = "follower"
+
+class ClusterNodeStatus(str, enum.Enum):  # noqa: UP042
+    """The current status of a node."""
+
+    HEALTHY = "healthy"
+    STARTING = "starting"
+    STOPPING = "stopping"
+    UNREACHABLE = "unreachable"
+    MAINTENANCE = "maintenance"
+    UNKNOWN = "unknown"

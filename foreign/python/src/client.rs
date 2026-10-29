@@ -35,6 +35,7 @@ use std::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::cluster::ClusterMetadata as PyClusterMetadata;
 use crate::config::PyClientConfig;
 use crate::consumer::{
     AutoCommit, Consumer as PyConsumer, ConsumerGroup as PyConsumerGroup,
@@ -312,6 +313,29 @@ impl IggyClient {
         future_into_py(py, async move {
             let stats = inner.get_stats().await.map_err(to_runtime_error)?;
             Ok(PyStats::from(stats))
+        })
+    }
+
+    /// Get the metadata of all nodes in the cluster.
+    ///
+    /// Any authenticated user may call this; no global permission is needed.
+    /// A server running without clustering reports itself as the only node.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `ClusterMetadata`.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the client is not connected, the session is not
+    ///         authenticated, or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[ClusterMetadata]", imports=("collections.abc")))]
+    fn get_cluster_metadata<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let metadata = inner
+                .get_cluster_metadata()
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(PyClusterMetadata::from(metadata))
         })
     }
 
