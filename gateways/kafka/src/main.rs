@@ -32,7 +32,8 @@ use iggy_gateway_kafka::bridge::{
 };
 use iggy_gateway_kafka::env::parse_bool;
 use iggy_gateway_kafka::listener::{
-    ListenerConfig, SecurityProtocol, apply_advertised_listeners, parse_listeners,
+    ListenerConfig, SecurityProtocol, apply_advertised_listeners, check_brokers, parse_brokers,
+    parse_listeners,
 };
 use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
 use iggy_gateway_kafka::server::{bind_listeners, init_tracing};
@@ -72,7 +73,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server = server.with_cluster_id(cluster_id);
     }
     if sasl_enabled {
-        let authenticator = IggyAuthenticator::from_env()?;
+        let mut authenticator = IggyAuthenticator::from_env()?;
+        if let Some(bridge) = &bridge {
+            authenticator = authenticator.with_nodes(bridge.known_nodes());
+        }
         if plaintext_sasl {
             // This is the hop the Kafka client's password actually crosses. The warning is tied
             // to the listener that exposes it, not to the Iggy hop, so encrypting the Iggy side
@@ -189,6 +193,8 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS",
     "IGGY_KAFKA_BRIDGE_ENABLED",
     "IGGY_KAFKA_INSTANCE_ID",
+    "IGGY_KAFKA_NODE_ID",
+    "IGGY_KAFKA_BROKERS",
     "IGGY_KAFKA_SASL_ENABLED",
     "IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS",
     "IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS",
@@ -357,11 +363,15 @@ fn load_config() -> Result<GatewayConfig, String> {
             .map_err(|e| format!("invalid IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS `{raw}`: {e}"))?;
         config.shutdown_drain_timeout = Duration::from_secs(secs);
     }
+    load_brokers(&mut config)?;
     // Not `parse_positive`: 0 is the default, and the right value for a single gateway.
     if let Some(raw) = env_var("IGGY_KAFKA_INSTANCE_ID") {
         config.instance_id = raw
             .parse()
             .map_err(|e| format!("invalid IGGY_KAFKA_INSTANCE_ID `{raw}`: {e}"))?;
+    } else if env_var("IGGY_KAFKA_NODE_ID").is_some() {
+        // The node id is already unique among the gateways, so it keeps their producer ids apart.
+        config.instance_id = config.node_id;
     } else {
         // A second gateway left on the default hands out the same producer ids as the first,
         // and nothing in the cluster can detect it, so an unset value is surfaced at startup.
@@ -384,6 +394,28 @@ fn load_config() -> Result<GatewayConfig, String> {
     )?;
 
     Ok(config)
+}
+
+/// This gateway's node id and the list of every gateway, from `IGGY_KAFKA_NODE_ID` and
+/// `IGGY_KAFKA_BROKERS`. The list needs the node id, since it names this gateway too.
+fn load_brokers(config: &mut GatewayConfig) -> Result<(), String> {
+    let node_id = env_var("IGGY_KAFKA_NODE_ID");
+    if let Some(raw) = &node_id {
+        config.node_id = raw
+            .parse()
+            .map_err(|e| format!("invalid IGGY_KAFKA_NODE_ID `{raw}`: {e}"))?;
+    }
+    let Some(raw) = env_var("IGGY_KAFKA_BROKERS") else {
+        return Ok(());
+    };
+    if node_id.is_none() {
+        return Err(
+            "IGGY_KAFKA_BROKERS lists every gateway, so IGGY_KAFKA_NODE_ID must name this one"
+                .to_string(),
+        );
+    }
+    config.brokers = parse_brokers(&raw).map_err(|e| e.to_string())?;
+    check_brokers(&config.brokers, &config.listeners, config.node_id).map_err(|e| e.to_string())
 }
 
 /// The listeners, from `IGGY_KAFKA_LISTENERS` or from the single-listener variables.
@@ -775,6 +807,50 @@ mod tests {
             overflow.is_err(),
             "an instance id above u16::MAX must be rejected, not truncated"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn given_a_node_id_and_every_gateway_when_loading_config_should_list_them_and_reuse_the_id() {
+        let config = load_with(&[
+            ("IGGY_KAFKA_NODE_ID", "2"),
+            ("IGGY_KAFKA_BROKERS", "1@gw-1:9093,2@gw-2:9093,3@gw-3:9093"),
+        ])
+        .expect("a node id listed among the gateways must load");
+
+        assert_eq!(config.node_id, 2);
+        assert_eq!(config.brokers.len(), 3);
+        assert_eq!(
+            config.instance_id, 2,
+            "the producer id instance follows the node id when no instance id is set"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn given_an_instance_id_beside_a_node_id_when_loading_config_should_keep_both() {
+        let config = load_with(&[("IGGY_KAFKA_NODE_ID", "2"), ("IGGY_KAFKA_INSTANCE_ID", "9")])
+            .expect("both ids must load");
+
+        assert_eq!((config.node_id, config.instance_id), (2, 9));
+    }
+
+    #[test]
+    #[serial]
+    fn given_brokers_that_do_not_name_this_gateway_when_loading_config_should_refuse_them() {
+        let without_node_id = load_with(&[("IGGY_KAFKA_BROKERS", "1@gw-1:9093")])
+            .expect_err("the list needs this gateway's node id");
+        let not_listed = load_with(&[
+            ("IGGY_KAFKA_NODE_ID", "4"),
+            ("IGGY_KAFKA_BROKERS", "1@gw-1:9093,2@gw-2:9093"),
+        ])
+        .expect_err("node 4 is not in the list");
+
+        assert!(
+            without_node_id.contains("IGGY_KAFKA_NODE_ID"),
+            "{without_node_id}"
+        );
+        assert!(not_listed.contains("node 4"), "{not_listed}");
     }
 
     /// A bad instance id must fail startup loudly. Silently defaulting to 0 would let two

@@ -43,15 +43,16 @@ use crate::bridge::IggyBridge;
 use crate::cluster_id::ClusterId;
 use crate::error::{KafkaProtocolError, Result};
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
-use crate::listener::{ListenerConfig, SecurityProtocol};
+use crate::listener::{BrokerEntry, ListenerConfig, SecurityProtocol, check_brokers, peers_of};
 use crate::protocol::api::{
     API_KEY_DESCRIBE_ACLS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, BrokerAdvertise,
-    ConnectionState, DEFAULT_KAFKA_PORT, ERROR_ILLEGAL_SASL_STATE, ERROR_INVALID_REQUEST,
-    ERROR_NONE, ERROR_SASL_AUTHENTICATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNSUPPORTED_SASL_MECHANISM, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
-    SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS, decode_acl_filter, decode_sasl_auth_bytes,
-    decode_sasl_mechanism, describe_acls_outcome, encode_error_for_key, handle_connection_request,
-    respond_describe_acls_error, sasl_authenticate_outcome, sasl_handshake_outcome,
+    Brokers, ConnectionState, DEFAULT_KAFKA_PORT, DEFAULT_NODE_ID, ERROR_ILLEGAL_SASL_STATE,
+    ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_SASL_AUTHENTICATION_FAILED,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNSUPPORTED_SASL_MECHANISM, ERROR_UNSUPPORTED_VERSION,
+    GatewayState, HandleOutcome, SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS, decode_acl_filter,
+    decode_sasl_auth_bytes, decode_sasl_mechanism, describe_acls_outcome, encode_error_for_key,
+    handle_connection_request, respond_describe_acls_error, sasl_authenticate_outcome,
+    sasl_handshake_outcome,
 };
 use crate::protocol::auto_topic_creation::{self, AutoTopicCreationConfig};
 use crate::protocol::handlers::api_versions::Advertisement;
@@ -166,6 +167,12 @@ pub struct GatewayConfig {
     /// Whether a `Metadata` lookup of a missing topic creates it, and with how many partitions
     /// (`IGGY_KAFKA_AUTO_CREATE_TOPICS_*`). Off by default.
     pub auto_topic_creation: AutoTopicCreationConfig,
+    /// This gateway's node id among `brokers` (`IGGY_KAFKA_NODE_ID`). Metadata names it as the
+    /// leader of every partition.
+    pub node_id: u16,
+    /// Every gateway in front of the Iggy cluster, this one included (`IGGY_KAFKA_BROKERS`).
+    /// Empty for a gateway alone.
+    pub brokers: Vec<BrokerEntry>,
 }
 
 impl Default for GatewayConfig {
@@ -187,6 +194,8 @@ impl Default for GatewayConfig {
             pre_auth_timeout: Duration::from_secs(15),
             max_concurrent_authentications: 4,
             auto_topic_creation: AutoTopicCreationConfig::default(),
+            node_id: DEFAULT_NODE_ID,
+            brokers: Vec::new(),
         }
     }
 }
@@ -351,6 +360,8 @@ impl SharedAuth {
 struct Listener {
     protocol: SecurityProtocol,
     broker: BrokerAdvertise,
+    /// The gateways this listener lists in Metadata.
+    brokers: Arc<Brokers>,
     /// Whether this listener names a principal, by SASL or by a verified client certificate.
     /// Decides whether `DescribeAcls` is advertised and answered.
     acls_enabled: bool,
@@ -367,6 +378,7 @@ impl Listener {
             self.protocol.uses_sasl(),
             self.acls_enabled,
         )
+        .with_brokers(Arc::clone(&self.brokers))
     }
 
     const fn advertisement(&self) -> Advertisement {
@@ -470,6 +482,7 @@ impl KafkaGateway {
         let any_names_principals = listeners
             .iter()
             .any(|listener| names_principals(listener.config.protocol));
+        self.check_broker_list(&listeners)?;
 
         let mut bound = Vec::with_capacity(listeners.len());
         for BoundListener { config, socket } in listeners {
@@ -480,14 +493,21 @@ impl KafkaGateway {
             // default collide silently, and a config file cannot be diffed against a live
             // deployment.
             info!(
-                "kafka {} listener bound on {} (advertised as {}:{}, instance id {})",
-                config.protocol, local_addr, broker.host, broker.port, self.config.instance_id
+                "kafka {} listener bound on {} (advertised as {}:{}, node id {}, instance id {})",
+                config.protocol,
+                local_addr,
+                broker.host,
+                broker.port,
+                self.config.node_id,
+                self.config.instance_id
             );
             let protocol = config.protocol;
+            let brokers = self.brokers_of(protocol, &broker);
             bound.push((
                 Arc::new(Listener {
                     protocol,
                     broker,
+                    brokers,
                     acls_enabled: names_principals(protocol),
                     anonymous_without_principal: any_names_principals && !protocol.uses_sasl(),
                 }),
@@ -576,6 +596,7 @@ impl KafkaGateway {
             GroupCoordinator::new(self.config.group.clone(), cancel.child_token()),
         )
         .with_cluster_id(cluster_id)
+        .with_node_id(self.config.node_id)
         .with_auto_topic_creation(self.config.auto_topic_creation)
     }
 
@@ -669,6 +690,52 @@ impl KafkaGateway {
             ));
         }
         TlsState::load(tls_config).map(|state| Some(Arc::new(state)))
+    }
+
+    /// Checks `IGGY_KAFKA_BROKERS` against the listeners, when it lists any gateway.
+    fn check_broker_list(&self, listeners: &[BoundListener]) -> Result<()> {
+        if self.config.brokers.is_empty() {
+            return Ok(());
+        }
+        let configs: Vec<ListenerConfig> = listeners
+            .iter()
+            .map(|listener| listener.config.clone())
+            .collect();
+        check_brokers(&self.config.brokers, &configs, self.config.node_id)
+    }
+
+    /// The gateways that the `protocol` listener lists in Metadata, this one at `advertised`.
+    fn brokers_of(&self, protocol: SecurityProtocol, advertised: &BrokerAdvertise) -> Arc<Brokers> {
+        let node_id = self.config.node_id;
+        warn_on_own_entry(&self.config.brokers, protocol, node_id, advertised);
+        Arc::new(Brokers {
+            node_id: i32::from(node_id),
+            peers: peers_of(&self.config.brokers, protocol, node_id),
+        })
+    }
+}
+
+/// Warns when the entry of `brokers` for this gateway's `protocol` listener names another
+/// address than the one the listener advertises. Each gateway lists itself at the address it
+/// advertises, so its clients and the clients of the other gateways would see two addresses.
+fn warn_on_own_entry(
+    brokers: &[BrokerEntry],
+    protocol: SecurityProtocol,
+    node_id: u16,
+    advertised: &BrokerAdvertise,
+) {
+    let Some(entry) = brokers
+        .iter()
+        .find(|entry| entry.node_id == node_id && entry.serves(protocol))
+    else {
+        return;
+    };
+    if entry.host != advertised.host || i32::from(entry.port) != advertised.port {
+        warn!(
+            "IGGY_KAFKA_BROKERS lists this gateway's {protocol} listener as {}:{}, but it \
+             advertises {}:{}",
+            entry.host, entry.port, advertised.host, advertised.port
+        );
     }
 }
 
