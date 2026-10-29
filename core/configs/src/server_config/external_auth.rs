@@ -45,6 +45,9 @@ pub struct ExternalAuthConfig {
     #[serde(default = "default_external_auth_timeout")]
     #[config_env(leaf)]
     pub timeout: IggyDuration,
+    /// Per-shard-thread cap on concurrent ext-auth callouts. TCP and WS
+    /// logins round-robin across shards, so the external service can see up
+    /// to `shards * max_concurrent_callouts` requests in flight.
     #[serde(default = "default_max_concurrent_callouts")]
     pub max_concurrent_callouts: u32,
 }

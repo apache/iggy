@@ -265,25 +265,30 @@ fn validate_credential_size(credentials: &Credentials<'_>) -> Result<(), Externa
 }
 
 /// Validate the `Allow` decision: username must be present and non-empty.
-fn validate_allow(
+/// Validated decision: `Allow` carries a guaranteed non-empty username.
+#[derive(Debug)]
+pub enum ValidatedDecision {
+    Allow { username: String },
+    Deny { reason: String },
+}
+
+fn validate_decision(
     decision: ExternalAuthDecision,
-) -> Result<ExternalAuthDecision, ExternalAuthError> {
-    if let ExternalAuthDecision::Allow { ref username } = decision {
-        match username {
-            None => {
-                return Err(ExternalAuthError::BadResponse(
-                    "allow decision missing username".to_owned(),
-                ));
-            }
-            Some(name) if name.is_empty() => {
+) -> Result<ValidatedDecision, ExternalAuthError> {
+    match decision {
+        ExternalAuthDecision::Allow { username } => {
+            let username = username.ok_or_else(|| {
+                ExternalAuthError::BadResponse("allow decision missing username".to_owned())
+            })?;
+            if username.is_empty() {
                 return Err(ExternalAuthError::BadResponse(
                     "allow decision has empty username".to_owned(),
                 ));
             }
-            _ => {}
+            Ok(ValidatedDecision::Allow { username })
         }
+        ExternalAuthDecision::Deny { reason } => Ok(ValidatedDecision::Deny { reason }),
     }
-    Ok(decision)
 }
 
 /// Call the external auth service and parse the response.
@@ -295,7 +300,7 @@ fn validate_allow(
 pub async fn callout_external_auth(
     config: &ExternalAuthConfig,
     request: ExternalAuthRequest<'_>,
-) -> Result<ExternalAuthDecision, ExternalAuthError> {
+) -> Result<ValidatedDecision, ExternalAuthError> {
     use futures::StreamExt;
 
     validate_credential_size(&request.credentials)?;
@@ -364,7 +369,7 @@ pub async fn callout_external_auth(
     let decision: ExternalAuthDecision = serde_json::from_slice(&bytes)
         .map_err(|e| ExternalAuthError::BadResponse(format!("invalid JSON: {e}")))?;
 
-    validate_allow(decision)
+    validate_decision(decision)
 }
 
 /// Validate that a pre-provisioned user is eligible for external login:
@@ -402,10 +407,10 @@ mod tests {
 
     /// Deserialize JSON and validate, same as `callout_external_auth` does
     /// after receiving the HTTP body.
-    fn parse_response(json: &str) -> Result<ExternalAuthDecision, ExternalAuthError> {
+    fn parse_response(json: &str) -> Result<ValidatedDecision, ExternalAuthError> {
         let decision: ExternalAuthDecision = serde_json::from_str(json)
             .map_err(|e| ExternalAuthError::BadResponse(format!("invalid JSON: {e}")))?;
-        validate_allow(decision)
+        validate_decision(decision)
     }
 
     // ── request serialization ───────────────────────────────────────
@@ -439,10 +444,10 @@ mod tests {
     fn response_allow_with_username() {
         let json = r#"{"decision": "allow", "username": "ext-alice"}"#;
         match parse_response(json).unwrap() {
-            ExternalAuthDecision::Allow { username } => {
-                assert_eq!(username.as_deref(), Some("ext-alice"));
+            ValidatedDecision::Allow { username } => {
+                assert_eq!(username, "ext-alice");
             }
-            ExternalAuthDecision::Deny { .. } => panic!("expected Allow, got Deny"),
+            ValidatedDecision::Deny { .. } => panic!("expected Allow, got Deny"),
         }
     }
 
@@ -464,10 +469,10 @@ mod tests {
     fn response_allow_with_stray_reason_should_parse() {
         let json = r#"{"decision": "allow", "username": "ext-bob", "reason": "extra"}"#;
         match parse_response(json).unwrap() {
-            ExternalAuthDecision::Allow { username } => {
-                assert_eq!(username.as_deref(), Some("ext-bob"));
+            ValidatedDecision::Allow { username } => {
+                assert_eq!(username, "ext-bob");
             }
-            ExternalAuthDecision::Deny { .. } => panic!("expected Allow, got Deny"),
+            ValidatedDecision::Deny { .. } => panic!("expected Allow, got Deny"),
         }
     }
 
@@ -477,10 +482,10 @@ mod tests {
     fn response_deny_with_reason() {
         let json = r#"{"decision": "deny", "reason": "certificate revoked"}"#;
         match parse_response(json).unwrap() {
-            ExternalAuthDecision::Deny { reason } => {
+            ValidatedDecision::Deny { reason } => {
                 assert_eq!(reason, "certificate revoked");
             }
-            ExternalAuthDecision::Allow { .. } => panic!("expected Deny, got Allow"),
+            ValidatedDecision::Allow { .. } => panic!("expected Deny, got Allow"),
         }
     }
 
@@ -488,10 +493,10 @@ mod tests {
     fn response_deny_without_reason_uses_default() {
         let json = r#"{"decision": "deny"}"#;
         match parse_response(json).unwrap() {
-            ExternalAuthDecision::Deny { reason } => {
+            ValidatedDecision::Deny { reason } => {
                 assert_eq!(reason, "denied by external auth");
             }
-            ExternalAuthDecision::Allow { .. } => panic!("expected Deny, got Allow"),
+            ValidatedDecision::Allow { .. } => panic!("expected Deny, got Allow"),
         }
     }
 
@@ -513,8 +518,8 @@ mod tests {
     fn response_extra_fields_accepted() {
         let json = r#"{"decision": "deny", "reason": "no", "audit_id": "abc", "trace": [1,2,3]}"#;
         match parse_response(json).unwrap() {
-            ExternalAuthDecision::Deny { reason } => assert_eq!(reason, "no"),
-            ExternalAuthDecision::Allow { .. } => panic!("expected Deny, got Allow"),
+            ValidatedDecision::Deny { reason } => assert_eq!(reason, "no"),
+            ValidatedDecision::Allow { .. } => panic!("expected Deny, got Allow"),
         }
     }
 

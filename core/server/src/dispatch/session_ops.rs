@@ -1327,9 +1327,8 @@ async fn try_external_auth_login<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     use crate::external_auth::{
-        Credentials, ExternalAuthDecision, ExternalAuthRequest, callout_external_auth,
+        Credentials, ExternalAuthRequest, ValidatedDecision, callout_external_auth,
     };
-    use message_bus::installer::conn_info::ClientTransportKind;
 
     let transport_client_id = origin.id;
 
@@ -1337,17 +1336,7 @@ async fn try_external_auth_login<B, MJ, S, SB>(
     // Firing the callout would waste a round-trip and widen the window where
     // a committed Register holds a slot for a gone connection.
     let (transport, client_address) = match sessions.borrow().client_record(transport_client_id) {
-        Some(r) => {
-            let transport = match r.transport {
-                ClientTransportKind::Tcp => "tcp",
-                ClientTransportKind::TcpTls => "tcp_tls",
-                ClientTransportKind::Ws => "ws",
-                ClientTransportKind::Wss => "wss",
-                ClientTransportKind::Quic => "quic",
-                _ => "unknown",
-            };
-            (transport, r.address.to_string())
-        }
+        Some(r) => (r.transport.as_str(), r.address.to_string()),
         None => return,
     };
     let connection_id = uuid::Uuid::from_u128(transport_client_id).to_string();
@@ -1377,9 +1366,7 @@ async fn try_external_auth_login<B, MJ, S, SB>(
     };
 
     let login_error = match decision {
-        // validate_allow guarantees username is Some(non-empty) on Allow.
-        ExternalAuthDecision::Allow { username } => {
-            let username = username.expect("validated by callout_external_auth");
+        ValidatedDecision::Allow { username } => {
             let resolve = shard
                 .plane
                 .metadata()
@@ -1422,7 +1409,7 @@ async fn try_external_auth_login<B, MJ, S, SB>(
                 }
             }
         }
-        ExternalAuthDecision::Deny { reason } => {
+        ValidatedDecision::Deny { reason } => {
             warn!(
                 transport_client_id,
                 reason = %reason,

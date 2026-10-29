@@ -2264,7 +2264,7 @@ async fn try_external_auth_http_login(
     client_addr: &crate::http::ClientAddr,
 ) -> Result<Json<IdentityInfo>, CustomError> {
     use crate::external_auth::{
-        Credentials, ExternalAuthDecision, ExternalAuthRequest, callout_external_auth,
+        Credentials, ExternalAuthRequest, ValidatedDecision, callout_external_auth,
     };
 
     let ext_config = &state.server_config.external_auth;
@@ -2293,11 +2293,9 @@ async fn try_external_auth_http_login(
         })?;
 
     match decision {
-        // validate_allow guarantees username is Some(non-empty) on Allow.
-        ExternalAuthDecision::Allow {
+        ValidatedDecision::Allow {
             username: ext_username,
         } => {
-            let ext_username = ext_username.expect("validated by callout_external_auth");
             let (user_id, created_at) = state
                 .shard
                 .plane
@@ -2313,7 +2311,7 @@ async fn try_external_auth_http_login(
                 })?;
             issue_identity(state, user_id, created_at)
         }
-        ExternalAuthDecision::Deny { reason } => {
+        ValidatedDecision::Deny { reason } => {
             tracing::warn!(reason = %reason, "external auth denied login");
             Err(IggyError::InvalidCredentials.into())
         }
