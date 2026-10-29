@@ -209,6 +209,8 @@ mod tests {
             members: vec![MemberSnapshot {
                 member_id: "m-1".to_string(),
                 group_instance_id: None,
+                client_id: String::new(),
+                client_host: String::new(),
                 session_timeout_ms: 45_000,
                 rebalance_timeout_ms: 45_000,
                 metadata: Bytes::new(),

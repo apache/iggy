@@ -167,6 +167,10 @@ pub struct GroupSnapshot {
 pub struct MemberSnapshot {
     pub member_id: String,
     pub group_instance_id: Option<String>,
+    /// The `client_id` and `client_host` of the member's last join, as `DescribeGroups` reports
+    /// them.
+    pub client_id: String,
+    pub client_host: String,
     pub session_timeout_ms: u32,
     pub rebalance_timeout_ms: u32,
     /// The member's subscription for the selected protocol.
