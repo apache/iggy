@@ -638,6 +638,101 @@ async fn assert_partition_payload(
     assert_eq!(polled.messages[0].payload.as_ref(), expected.as_bytes());
 }
 
+/// One producer alternates sends between partitions with primaries on
+/// different nodes. No send may wait out a refusal window or sign the
+/// session in again (#4436).
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "2"))]
+async fn given_partitions_on_different_primaries_when_sending_round_robin_should_keep_the_session(
+    harness: &mut TestHarness,
+) {
+    const PARTITIONS: u32 = 3;
+    const ROUND_ROBIN_SENDS: usize = 12;
+    /// How long the SDK replayed a refused send before it moved the session
+    /// in #4436. It did that twice per send.
+    const REFUSAL_WINDOW: Duration = Duration::from_secs(2);
+
+    let producer = connect_without_login(harness.node(0).tcp_addr().unwrap()).await;
+    producer
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    producer
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    producer
+        .create_topic(
+            &stream,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut primaries = Vec::new();
+    for partition_id in 0..PARTITIONS {
+        let route = partition_route(&producer, &stream, &topic, partition_id).await;
+        primaries.push(route.primary_replica);
+    }
+    assert_eq!(
+        primaries,
+        [0, 1, 2],
+        "precondition: a fresh cluster places each partition's primary on its own node"
+    );
+
+    // The first send to each partition opens the link to its primary.
+    for partition_id in 0..PARTITIONS {
+        producer
+            .send_messages(
+                &stream,
+                &topic,
+                &Partitioning::partition_id(partition_id),
+                &mut [message("warm-up")],
+            )
+            .await
+            .expect("warm-up send");
+    }
+    let identity = producer.session_identity().await.unwrap();
+    let mut events = producer.subscribe_events().await;
+    // A subscription starts with every event the client published before it.
+    while events.try_recv().is_ok() {}
+
+    let mut sends = Vec::with_capacity(ROUND_ROBIN_SENDS);
+    for partition_id in (0..PARTITIONS).cycle().take(ROUND_ROBIN_SENDS) {
+        let started = Instant::now();
+        producer
+            .send_messages(
+                &stream,
+                &topic,
+                &Partitioning::partition_id(partition_id),
+                &mut [message("round-robin")],
+            )
+            .await
+            .expect("round-robin send");
+        sends.push((partition_id, started.elapsed()));
+    }
+
+    let current = producer.session_identity().await.unwrap();
+    assert_eq!(
+        (current.client_id, current.session),
+        (identity.client_id, identity.session),
+        "the producer must keep its session across sends to different primaries"
+    );
+    let reconnects: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    assert!(
+        reconnects.is_empty(),
+        "sends to different primaries must not reconnect or sign in again: {reconnects:?}"
+    );
+    assert!(
+        sends.iter().all(|(_, elapsed)| *elapsed < REFUSAL_WINDOW),
+        "no send may wait out a refusal window (partition, send time): {sends:?}"
+    );
+}
+
 #[iggy_harness(cluster_nodes = 5, server(sharding.cpu_allocation = "2"))]
 async fn given_balanced_primaries_when_a_replica_fails_and_returns_should_rebalance_without_data_loss(
     harness: &mut TestHarness,

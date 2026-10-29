@@ -53,10 +53,10 @@ use tokio::task::JoinHandle;
 
 use iggy_gateway_kafka::auth::IggyAuthenticator;
 use iggy_gateway_kafka::bridge::{
-    DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls, ProduceSessionLimits,
-    TopicMapping,
+    DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls, KnownNodes,
+    ProduceSessionLimits, TopicMapping,
 };
-use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol};
+use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol, parse_brokers};
 use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
 use iggy_gateway_kafka::server::{BoundListener, bind_listener};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
@@ -83,6 +83,11 @@ const RECORDS: [(&str, &str); 3] = [("k1", "alpha"), ("k2", "beta"), ("k3", "gam
 /// The topic the group member test shares. Two partitions, so two members get one each.
 const GROUP_TOPIC: &str = "payments";
 const GROUP_TOPIC_PARTITIONS: u32 = 2;
+/// The topic the producer writes while one of two gateways stops.
+const FAILOVER_TOPIC: &str = "failover";
+/// Records the producer writes there, at [`FAILOVER_RATE`] a second.
+const FAILOVER_RECORDS: u32 = 600;
+const FAILOVER_RATE: u32 = 60;
 
 /// Budget for `iggy-server` to start listening. Generous: it is a cold process start, and a debug
 /// build on a loaded machine is not quick.
@@ -352,6 +357,47 @@ async fn start_bridged_gateway_with(
     start_gateway(server, topics, false, gateway_config).await
 }
 
+/// Two bridged gateways that list each other in `IGGY_KAFKA_BROKERS`, as nodes 1 and 2. A short
+/// drain lets a stop take effect at once.
+async fn start_listed_gateways(server: &TestServer) -> (BridgedGateway, BridgedGateway) {
+    let sockets = [
+        bind_listener("127.0.0.1:0").expect("bind ephemeral port"),
+        bind_listener("127.0.0.1:0").expect("bind ephemeral port"),
+    ];
+    let addrs = sockets
+        .each_ref()
+        .map(|socket| socket.local_addr().expect("local addr"));
+    let brokers =
+        parse_brokers(&format!("1@{},2@{}", addrs[0], addrs[1])).expect("two listed gateways");
+    let mut gateways = Vec::with_capacity(2);
+    for ((node_id, socket), addr) in (1_u16..).zip(sockets).zip(addrs) {
+        let config = GatewayConfig {
+            node_id,
+            brokers: brokers.clone(),
+            shutdown_drain_timeout: Duration::from_secs(1),
+            ..GatewayConfig::default()
+        };
+        let listener = BoundListener::new(
+            ListenerConfig::new(SecurityProtocol::Plaintext, addr.to_string()),
+            socket,
+        );
+        let bridge = Arc::new(root_bridge(server).await);
+        let gateway = KafkaGateway::new(config).with_bridge(Some(bridge));
+        let (shutdown, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(async move {
+            let _ = gateway.run(vec![listener], receiver).await;
+        });
+        gateways.push(BridgedGateway {
+            addr,
+            shutdown,
+            task,
+        });
+    }
+    let second = gateways.pop().expect("the second gateway");
+    let first = gateways.pop().expect("the first gateway");
+    (first, second)
+}
+
 /// A bridge to `server` as the root user, with the default topic mapping.
 async fn root_bridge(server: &TestServer) -> IggyBridge {
     let config = IggyBridgeConfig {
@@ -363,6 +409,7 @@ async fn root_bridge(server: &TestServer) -> IggyBridge {
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
+        nodes: KnownNodes::default(),
     };
     IggyBridge::connect(config)
         .await
@@ -1553,6 +1600,80 @@ fn consume_as_static_member(gateway: SocketAddr, count: usize) -> String {
     .expect_ran("java console consumer as a static member")
 }
 
+/// `kafka-consumer-groups --describe --members` shows the client id and host of each member, as
+/// Kafka does (#4511). A static member stays in its group for its whole session after its
+/// consumer exits, so the tool still finds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_java_consumer_when_describing_the_members_should_show_its_client_id_and_host() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway, &RECORDS);
+    let consumed = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            &gateway.to_string(),
+            "--topic",
+            TOPIC,
+            "--group",
+            "e2e-members",
+            "--consumer-property",
+            "group.instance.id=e2e-members-0",
+            "--consumer-property",
+            "client.id=e2e-members-client",
+            "--consumer-property",
+            "session.timeout.ms=60000",
+            "--from-beginning",
+            "--max-messages",
+            &RECORDS.len().to_string(),
+            "--timeout-ms",
+            "20000",
+            "--property",
+            "print.offset=true",
+            "--property",
+            "print.key=true",
+        ],
+        &[],
+    )
+    .expect_ran("java console consumer with a client id");
+    assert_eq!(
+        records_read(&consumed).len(),
+        RECORDS.len(),
+        "the consumer must join the group and read every record, got: {consumed}"
+    );
+
+    let described = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-consumer-groups.sh",
+            "--bootstrap-server",
+            &gateway.to_string(),
+            "--describe",
+            "--group",
+            "e2e-members",
+            "--members",
+        ],
+        &[],
+    )
+    .expect_ran("kafka-consumer-groups --describe --members");
+    // GROUP, CONSUMER-ID, GROUP-INSTANCE-ID, HOST, CLIENT-ID, then #PARTITIONS. Matched as a
+    // run of fields, as the reset test above does.
+    let fields: Vec<&str> = described.split_whitespace().collect();
+    let shown = fields.windows(5).any(|row| {
+        row[0] == "e2e-members"
+            && row[1].starts_with("e2e-members-0-")
+            && row[2] == "e2e-members-0"
+            && row[3] == "/127.0.0.1"
+            && row[4] == "e2e-members-client"
+    });
+    assert!(
+        shown,
+        "the member must show its client id and host, got: {described}"
+    );
+}
+
 /// KIP-345 with librdkafka, which sends `JoinGroup` below v9: the returning member is told the
 /// previous leader, acts as a follower, and gets its old assignment back through `SyncGroup`.
 /// Without replacement the second run would wait on a rebalance its old incarnation never rejoins.
@@ -2181,6 +2302,7 @@ async fn tls_stack() -> Option<TlsStack> {
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         produce_sessions: ProduceSessionLimits::default(),
         tls: IggyTls::default(),
+        nodes: KnownNodes::default(),
     })
     .await
     .expect("the bridge connects to a ready server");
@@ -2469,5 +2591,93 @@ async fn given_the_java_client_with_a_client_certificate_should_be_described_as_
     assert!(
         grants(&listing, "TOPIC", "READ"),
         "the mapped user's read_topics grant renders, got: {listing}"
+    );
+}
+
+/// A Java producer that knows only the first gateway learns the second from Metadata. When the
+/// first stops, the producer goes on through the second, and every record lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_two_listed_gateways_when_the_first_stops_should_keep_producing_through_the_second() {
+    let Some(server) = ready_server() else {
+        return;
+    };
+    root_bridge(&server)
+        .await
+        .ensure_stream_and_topic(FAILOVER_TOPIC, 1)
+        .await
+        .expect("create the topic");
+    let (first, second) = start_listed_gateways(&server).await;
+    let (first_addr, second_addr) = (first.addr.to_string(), second.addr.to_string());
+
+    let listing = run_client(KCAT_IMAGE, &["-b", &first_addr, "-L"], &[]).expect_ran("kcat -L");
+    assert!(
+        listing.contains(&format!("broker 1 at {first_addr}"))
+            && listing.contains(&format!("broker 2 at {second_addr}")),
+        "the first gateway must list both gateways: {listing}"
+    );
+
+    let bootstrap = format!("bootstrap.servers={first_addr}");
+    let (records, rate) = (FAILOVER_RECORDS.to_string(), FAILOVER_RATE.to_string());
+    let mut producer = RunningClient::start(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-producer-perf-test.sh",
+            "--topic",
+            FAILOVER_TOPIC,
+            "--num-records",
+            &records,
+            "--throughput",
+            &rate,
+            "--record-size",
+            "64",
+            "--producer-props",
+            &bootstrap,
+            "acks=all",
+            "request.timeout.ms=10000",
+            "delivery.timeout.ms=60000",
+        ],
+    );
+    producer.wait_for("the producer reports progress", |line| {
+        line.contains("records sent").then_some(())
+    });
+    first.stop().await;
+
+    let output = producer.wait_exit("the producer finishes");
+    assert!(
+        output
+            .iter()
+            .any(|line| line.starts_with(&format!("{FAILOVER_RECORDS} records sent"))),
+        "every record must be acknowledged: {output:#?}"
+    );
+    assert!(
+        !output.iter().any(|line| line.contains("Exception")),
+        "no send may fail: {output:#?}"
+    );
+    let read = run_client(
+        KCAT_IMAGE,
+        &[
+            "-b",
+            &second_addr,
+            "-C",
+            "-t",
+            FAILOVER_TOPIC,
+            "-p",
+            "0",
+            "-o",
+            "beginning",
+            "-e",
+            "-f",
+            "%o\n",
+        ],
+        &[],
+    )
+    .expect_ran("kcat reads the topic through the second gateway");
+    let stored = read
+        .lines()
+        .filter(|line| line.parse::<u64>().is_ok())
+        .count();
+    assert!(
+        stored >= FAILOVER_RECORDS as usize,
+        "{stored} of {FAILOVER_RECORDS} records stored"
     );
 }

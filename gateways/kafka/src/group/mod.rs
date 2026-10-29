@@ -30,7 +30,7 @@ mod offset_work;
 mod state;
 
 pub use offset_work::{RunningCommit, RunningDeletion};
-pub use state::{MAX_GROUP_ID_BYTES, is_valid_group_id};
+pub use state::{MAX_CLIENT_ID_BYTES, MAX_GROUP_ID_BYTES, is_valid_group_id};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -157,6 +157,10 @@ pub struct JoinRequest {
     pub rebalance_timeout: Duration,
     pub member_id: StrBytes,
     pub group_instance_id: Option<StrBytes>,
+    /// The `client_id` of the connection's request headers, and its peer address in Kafka's
+    /// `client_host` form. Empty when the request did not come through a connection.
+    pub client_id: StrBytes,
+    pub client_host: StrBytes,
     pub protocol_type: StrBytes,
     /// `(name, metadata)` in request order; the order is this member's preference vote.
     pub protocols: Vec<(StrBytes, Bytes)>,
@@ -185,6 +189,8 @@ impl From<(i16, &JoinGroupRequest)> for JoinRequest {
             },
             member_id: owned_str(&request.member_id),
             group_instance_id: request.group_instance_id.as_ref().map(owned_str),
+            client_id: StrBytes::new(),
+            client_host: StrBytes::new(),
             protocol_type: owned_str(&request.protocol_type),
             protocols: request
                 .protocols
@@ -380,6 +386,8 @@ impl LeaveResult {
 pub struct MemberDescription {
     pub member_id: StrBytes,
     pub group_instance_id: Option<StrBytes>,
+    pub client_id: StrBytes,
+    pub client_host: StrBytes,
     /// Subscription metadata for the group's selected protocol. Empty until a protocol is chosen.
     pub metadata: Bytes,
     pub assignment: Bytes,
@@ -959,6 +967,8 @@ mod tests {
             rebalance_timeout: Duration::from_secs(10),
             member_id: StrBytes::new(),
             group_instance_id: None,
+            client_id: StrBytes::new(),
+            client_host: StrBytes::new(),
             protocol_type: StrBytes::from_static_str(CONSUMER_PROTOCOL_TYPE),
             protocols: vec![(StrBytes::from_static_str("range"), Bytes::new())],
             require_known_member_id: false,

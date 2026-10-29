@@ -21,6 +21,7 @@
 //! the same way in both directions cannot pass.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -35,9 +36,11 @@ use kafka_protocol::records::{
     RecordBatchEncoder, RecordEncodeOptions, TimestampType,
 };
 use serial_test::serial;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use iggy_gateway_kafka::bridge::{IggyBridge, Producer};
+use iggy_gateway_kafka::bridge::{IggyBridge, IggyBridgeConfig, Producer};
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_INIT_PRODUCER_ID, API_KEY_PRODUCE, ERROR_NONE, ERROR_NOT_LEADER_OR_FOLLOWER,
@@ -68,7 +71,12 @@ const ERROR_INVALID_RECORD: i16 = 87;
 
 /// A live gateway with the topic already provisioned, since Produce creates nothing.
 async fn gateway_with_topic(server: &TestServer, partitions: u32) -> GatewayState {
-    let bridge = IggyBridge::connect(server.test_config())
+    gateway_on(server.test_config(), partitions).await
+}
+
+/// [`gateway_with_topic`], with a bridge that dials as `config` says.
+async fn gateway_on(config: IggyBridgeConfig, partitions: u32) -> GatewayState {
+    let bridge = IggyBridge::connect(config)
         .await
         .expect("bridge should connect to a ready server");
     bridge
@@ -662,6 +670,142 @@ async fn given_a_stopped_server_when_handled_should_answer_retriable() {
         matches!(code, ERROR_NOT_LEADER_OR_FOLLOWER | ERROR_REQUEST_TIMED_OUT),
         "a lost server is retriable, got {code}"
     );
+}
+
+/// The SDK stops a send that cannot reach Iggy by its request's deadline. Otherwise the send lands
+/// once Iggy is back, after the client got its answer, and the client's retry writes the batch a
+/// second time.
+#[tokio::test]
+#[serial]
+async fn given_iggy_out_of_reach_past_the_deadline_when_the_client_retries_should_store_the_batch_once()
+ {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let relay = OutageRelay::start(&server).await;
+    let mut config = server.test_config();
+    config.address.clone_from(&relay.address);
+    let state = gateway_on(config, 1).await;
+    // Each request here comes on a new connection, so only a producer id keeps one Iggy session.
+    let id = issued_producer_id(&state).await;
+    let first = [(0, idempotent_batch(id, b"first"))];
+    assert_eq!(
+        produce(&state, 3, 1, TOPIC, &first).await,
+        vec![(0, ERROR_NONE, 0)],
+        "the producer's Iggy session is open"
+    );
+
+    relay.go_down().await;
+    let retried = [(0, idempotent_batch(id, b"retried"))];
+    let body = encode_timed_request(3, 1, 1_000, TOPIC, &retried);
+    let response = handle_request_bounded(&state, API_KEY_PRODUCE, 3, body)
+        .await
+        .expect_response("acks=1 is answered");
+    assert_eq!(
+        partition_results(3, response),
+        vec![(0, ERROR_NOT_LEADER_OR_FOLLOWER, -1)],
+        "the send never went out, so the answer tells the client that a retry is safe"
+    );
+
+    relay.come_up();
+    tokio::time::sleep(SDK_RECONNECT).await;
+    assert_eq!(
+        produce(&state, 3, 1, TOPIC, &retried).await,
+        vec![(0, ERROR_NONE, 1)],
+        "the client's retry lands right after the first batch"
+    );
+    let payloads: Vec<Bytes> = stored(&server, 0, 10)
+        .await
+        .into_iter()
+        .map(|message| message.payload)
+        .collect();
+    assert_eq!(
+        payloads,
+        [&b"first"[..], b"retried"],
+        "one copy of each batch"
+    );
+}
+
+/// Longer than the SDK takes to connect again and send what it still holds.
+const SDK_RECONNECT: Duration = Duration::from_secs(3);
+
+/// A TCP relay to a server that can go down. Down, it cuts its connections, and holds the ones that
+/// open until it is up again. So a client behind it cannot send, and does not learn why.
+struct OutageRelay {
+    address: String,
+    up: watch::Sender<bool>,
+    connections: Arc<Connections>,
+}
+
+#[derive(Default)]
+struct Connections {
+    accepted: AtomicUsize,
+    open: AtomicUsize,
+}
+
+impl OutageRelay {
+    async fn start(server: &TestServer) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the relay");
+        let address = listener.local_addr().expect("relay address").to_string();
+        let upstream = server.test_config().address;
+        let (up, _) = watch::channel(true);
+        let connections = Arc::new(Connections::default());
+        let (switch, counts) = (up.clone(), Arc::clone(&connections));
+        tokio::spawn(async move {
+            while let Ok((inbound, _)) = listener.accept().await {
+                counts.accepted.fetch_add(1, Ordering::SeqCst);
+                counts.open.fetch_add(1, Ordering::SeqCst);
+                let (upstream, up, counts) =
+                    (upstream.clone(), switch.subscribe(), Arc::clone(&counts));
+                tokio::spawn(async move {
+                    relay_while_up(inbound, &upstream, up).await;
+                    counts.open.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        Self {
+            address,
+            up,
+            connections,
+        }
+    }
+
+    /// Goes down, and returns once each client it cut off dialed again. A client that has not
+    /// seen the cut yet can still write a request into its old connection, and then cannot know
+    /// whether the request arrived.
+    async fn go_down(&self) {
+        let cut = self.connections.open.load(Ordering::SeqCst);
+        let redialed = self.connections.accepted.load(Ordering::SeqCst) + cut;
+        self.up.send_replace(false);
+        let reached = async {
+            while self.connections.accepted.load(Ordering::SeqCst) < redialed {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(STEP, reached)
+            .await
+            .expect("every client that the relay cut off dials again");
+    }
+
+    fn come_up(&self) {
+        self.up.send_replace(true);
+    }
+}
+
+/// Copies both ways between a client and the server while the relay is up. A connection that
+/// opens while it is down waits, and one that is open ends when it goes down.
+async fn relay_while_up(mut inbound: TcpStream, upstream: &str, mut up: watch::Receiver<bool>) {
+    if up.wait_for(|up| *up).await.is_err() {
+        return;
+    }
+    let Ok(mut outbound) = TcpStream::connect(upstream).await else {
+        return;
+    };
+    tokio::select! {
+        _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+        _ = up.wait_for(|up| !*up) => {}
+    }
 }
 
 /// Long enough for any one step against a local server.
