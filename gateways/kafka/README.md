@@ -44,10 +44,7 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > resumes from its last commit, also after a gateway restart
 > ([docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md)). Every Iggy server must run a build with the
 > external group consumer kind ([#4392](https://github.com/apache/iggy/pull/4392)) before the first
-> commit. In a partly upgraded cluster, one commit can make a partition stop committing. In a
-> cluster, a node that has not applied a group's first commit answers "no offset", so a consumer on
-> `auto.offset.reset=latest` can skip records until
-> [#4409](https://github.com/apache/iggy/issues/4409).
+> commit. In a partly upgraded cluster, one commit can make a partition stop committing.
 
 ## Run
 
@@ -76,7 +73,9 @@ Default bind: a `PLAINTEXT` listener on `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_READ_TIMEOUT_SECS` | `15` | Seconds allowed to read a frame body once its length prefix arrives |
 | `IGGY_KAFKA_WRITE_TIMEOUT_SECS` | `10` | Seconds allowed to write a response frame |
 | `IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Seconds graceful shutdown waits for in-flight connections before abandoning them. The bridge then signs its Iggy clients out, 5 s at most |
-| `IGGY_KAFKA_INSTANCE_ID` | `0` | This gateway's number among the gateways fronting one Iggy cluster. It is the high half of every producer id `InitProducerId` hands out, and Kafka requires those to be cluster-unique, so give every gateway its own value. A single gateway can leave it at `0`. |
+| `IGGY_KAFKA_INSTANCE_ID` | `IGGY_KAFKA_NODE_ID`, else `0` | This gateway's number among the gateways fronting one Iggy cluster. It is the high half of every producer id `InitProducerId` hands out, and Kafka requires those to be cluster-unique, so give every gateway its own value. Unset, it follows `IGGY_KAFKA_NODE_ID`. A single gateway can leave both unset. |
+| `IGGY_KAFKA_NODE_ID` | `1` | This gateway's broker id in Metadata, 0 to 65535. Beside each Iggy node, use that node's replica id. Required with `IGGY_KAFKA_BROKERS` |
+| `IGGY_KAFKA_BROKERS` | unset | Every gateway in front of the Iggy cluster, this one included, as `id@host:port` entries separated by commas. With several listeners, one `id@PROTOCOL://host:port` entry per gateway and listener. Give every gateway the same list. See [Several gateways](#several-gateways-4515) |
 | `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. If Iggy does not answer, startup tries again 1 s after each failed connect, for up to 60 s, and then the gateway stops. A wrong password or a missing permission stops it at once. It never falls back to stubs. |
 | `IGGY_KAFKA_SASL_ENABLED` | `false` | Single-listener form: require SASL/PLAIN before serving any other API (`true` or `false`, nothing else). With `IGGY_KAFKA_LISTENERS`, a `SASL_PLAINTEXT` or `SASL_SSL` listener says the same |
 | `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` | `15` | Seconds an unauthenticated connection may sit between frames. Waiting for an authentication slot and the verification itself each get this budget, the verification's starting once it holds a slot. Separate from the 10-minute idle timeout that applies once authenticated |
@@ -255,7 +254,7 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 - [docs/BRIDGE_MAPPING.md](docs/BRIDGE_MAPPING.md) — how a Kafka record becomes an Iggy message, and back
 - [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) — InitProducerId, and why delivery is at-least-once
 - [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md) — where Kafka consumer group offsets live
-- [docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md) — group membership, rebalances, and why one gateway per bootstrap endpoint
+- [docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md) — group membership, rebalances, and which gateway coordinates a group
 - [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — how a Kafka client authenticates, and why PLAIN only
 - [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) — how Iggy permissions are described as Kafka ACLs
 - [docs/CONFIGS.md](docs/CONFIGS.md) — DescribeConfigs, AlterConfigs and IncrementalAlterConfigs for topic `retention.ms`
@@ -288,7 +287,8 @@ member that leaves hands its partition to the other at its commit.
 
 Limits:
 
-- One gateway per bootstrap endpoint. Group membership is gateway memory
+- Group membership is gateway memory. With several gateways, the one with the lowest node id
+  coordinates every group, and while it is down the groups wait for it
   ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)).
 - Classic protocol only. A consumer with `group.protocol=consumer` (KIP-848) fails.
 - Offsets never expire. `kafka-consumer-groups.sh --delete` and `--delete-offsets` delete them
@@ -299,6 +299,35 @@ Limits:
   not the principal, lacks the permission to read the topics that the line names. `--list` still
   shows the group as `Empty`, because its scan leaves those topics out.
 - Delivery is at-least-once. A consumer that stops before it commits reads those records again.
+
+## Several gateways ([#4515](https://github.com/apache/iggy/issues/4515))
+
+Run one gateway beside each Iggy node, and list every gateway in the clients'
+`bootstrap.servers`. Give each gateway the same `IGGY_KAFKA_BROKERS` and its own
+`IGGY_KAFKA_NODE_ID`, and point its `IGGY_KAFKA_IGGY_ADDR` at the node beside it:
+
+```bash
+# The gateway beside Iggy node 1.
+IGGY_KAFKA_NODE_ID=1 \
+IGGY_KAFKA_BROKERS=0@gateway-0:9093,1@gateway-1:9093,2@gateway-2:9093 \
+IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 \
+cargo run -p iggy-gateway-kafka
+```
+
+- Metadata lists every gateway and names the one that answers as the leader of every partition.
+  Any gateway can serve any partition, because the Iggy SDK sends each partition request to its
+  primary. A client of a stopped gateway goes on through the others.
+- `FindCoordinator` names the gateway with the lowest node id for every consumer group, so a
+  group never splits over two gateways. While that gateway is down, the groups wait for it.
+  Committed offsets stay in Iggy.
+- A new Iggy client dials `IGGY_KAFKA_IGGY_ADDR` first, then the other nodes of the roster that
+  the bridge read. Beside a stopped node, new producers and SASL logins go on through the other
+  nodes. The bridge itself needs that address at startup. To start while that node is down,
+  point it at a load balancer in front of the cluster. A DNS name with one record per node can
+  bind a client's first link to the wrong node (not tested).
+- An idempotent producer can still write a batch twice when it moves to another gateway.
+- With TLS to Iggy, the SDK dials each node at the address the roster advertises, so each
+  node's certificate must name that address, or set `IGGY_KAFKA_IGGY_TLS_DOMAIN`.
 
 ## Listeners and TLS ([#4510](https://github.com/apache/iggy/issues/4510))
 
@@ -480,7 +509,7 @@ One partition, one Iggy send. Each partition answers for itself.
 | `acks` | `0`, `1`, `-1` write the same. Other values: 21, before any per-partition check. |
 | `acks=0` | Writes, answers nothing. Any failed partition closes the connection. |
 | Topics | Creates none. Missing: 3. Bad name: 17. |
-| `timeout_ms` | Honored, max 20 s. Past it: 7. |
+| `timeout_ms` | Honored, max 20 s. The Iggy send stops by then too. Past it: 7. A send that never went out: 6. |
 | Compression | gzip, snappy, lz4. zstd from v7, else 76. |
 | Producer id | Picks the producer's Iggy session. See [Concurrency ceiling](#concurrency-ceiling). |
 | Producer epoch, sequence | Ignored, so a retry writes twice. |
@@ -498,8 +527,8 @@ One partition, one Iggy send. Each partition answers for itself.
 | 10 | Record, send or partition too large, even alone | Java splits multi-record batches. Else fails. |
 | 87 | Record the gateway cannot map. Reason in `error_message` from v8. | Fails. |
 | 35 | Transactional or control batch | Fails. |
-| 6 | Request budget ran out. Nothing written. | Retries. |
-| 7 | Deadline passed: in the send, waiting for decode memory, or behind the producer's own earlier send. Or connection lost mid-send. May be written. | Retries. Can duplicate. |
+| 6 | Request budget ran out. Or the send did not reach Iggy by the deadline, or Iggy refused it: no primary, partition busy or recreated, client shut down. Nothing written. | Retries. |
+| 7 | Deadline passed: after the send went out, waiting for decode memory, or behind the producer's own earlier send. Or connection lost mid-send. Possibly written. | Retries. Can duplicate. |
 
 Partition cap: `max_frame_size` decompressed bytes, `max_frame_size / 64` record slots, 3 headers
 per slot. Past it: 10.
@@ -589,7 +618,7 @@ Limits:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `IGGY_KAFKA_IGGY_ADDR` | `127.0.0.1:8090` | Address of the Iggy server to bridge to |
+| `IGGY_KAFKA_IGGY_ADDR` | `127.0.0.1:8090` | Address of the Iggy server to bridge to. Each new Iggy client dials it first, then the other nodes of the roster that the bridge read. Beside each Iggy node, set it to that node |
 | `IGGY_KAFKA_IGGY_USERNAME` | `iggy` | Iggy username |
 | `IGGY_KAFKA_IGGY_PASSWORD` | none - **required** | Iggy password. No default: `iggy-server` only uses the well-known `iggy`/`iggy` root credentials when started with `--with-default-root-credentials` (dev-only). Otherwise the operator sets the root password, so a hardcoded default here could never be right and would invite running as root unnoticed |
 | `IGGY_KAFKA_IGGY_STREAM` | `kafka` | Default Iggy stream for a Kafka topic with no explicit mapping override |
@@ -613,8 +642,10 @@ Iggy becomes unreachable later.
 `send_records` uses the Produce deadline instead:
 
 - One request of a producer runs at a time, on that producer's client.
-- A send past its deadline keeps the producer's turn until it ends. That producer's requests answer
-  7 meanwhile. Other producers send on.
+- The SDK stops retrying the send 50 ms before the deadline. So it sends nothing after the request
+  answered, and the client's retry is the only copy of a send that never went out.
+- A send still running past its deadline keeps the producer's turn until it ends. That producer's
+  requests answer 7 meanwhile. Other producers send on.
 - After 45 s the gateway gives up on the send. It then closes that connection before the turn
   frees, so the send cannot land after a later one. The SDK ends its write within 30 s more,
   unless Iggy stopped reading: the producer then waits until that connection breaks.
@@ -823,6 +854,10 @@ instead of -1, because the Java `AdminClient` fails a partition on any non-retri
 (`to_list_offsets_error_code`). `HistoryUnavailable` refuses a read routed to an older
 incarnation of the partition, as after a delete and recreate; the retry probes again and answers 3
 if the topic is gone. ListOffsets reads do not get `RequestTooOld` today, so that arm is defensive.
+
+Produce also answers `HistoryUnavailable`, `LifecycleBusy` and `ClientShutdown` with 6 instead of
+-1 (`to_produce_error_code`). The SDK returns them only for a send that wrote nothing. A send that
+possibly landed ends as `OperationUncertain`, which answers 7.
 
 ### Server limits the gateway inherits
 

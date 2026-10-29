@@ -39,6 +39,9 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 iggy = { workspace = true }
+# `with_binary_deadline`, which hands a Produce request's deadline to the SDK. The prelude does not
+# export it.
+iggy_common = { workspace = true }
 iggy_kafka_wire = { workspace = true }
 # The codec features stay on for the encoder, which the batch tests use to build fixtures.
 kafka-protocol = { workspace = true, features = ["gzip", "lz4", "snappy", "zstd"] }
@@ -69,6 +72,8 @@ uuid = { workspace = true }
 x509-parser = { workspace = true }
 
 [dev-dependencies]
+# Partition route requests for `examples/partition_routes.rs`.
+iggy_binary_protocol = { workspace = true }
 # The client half, so a test encodes requests and decodes responses the way a consumer does.
 kafka-protocol = { workspace = true, features = ["client"] }
 # Certificates for the TLS listener tests, minted per test so nothing in the tree expires.

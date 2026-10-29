@@ -126,6 +126,60 @@ impl Default for BrokerAdvertise {
     }
 }
 
+/// The node id of a gateway that `IGGY_KAFKA_NODE_ID` does not set.
+pub const DEFAULT_NODE_ID: u16 = 1;
+
+/// The gateways that one listener lists in Metadata. A gateway alone lists itself, as node 1.
+#[derive(Debug, Clone)]
+pub struct Brokers {
+    /// This gateway's node id.
+    pub node_id: i32,
+    /// The other gateways, each with its endpoint for this listener, in node id order.
+    pub peers: Vec<(i32, BrokerAdvertise)>,
+}
+
+impl Default for Brokers {
+    fn default() -> Self {
+        Self {
+            node_id: i32::from(DEFAULT_NODE_ID),
+            peers: Vec::new(),
+        }
+    }
+}
+
+impl Brokers {
+    /// Every gateway in node id order, with `own` as the endpoint of this one.
+    #[must_use]
+    pub fn listed<'a>(&'a self, own: &'a BrokerAdvertise) -> Vec<(i32, &'a BrokerAdvertise)> {
+        let mut listed: Vec<(i32, &BrokerAdvertise)> = self
+            .peers
+            .iter()
+            .map(|(node, endpoint)| (*node, endpoint))
+            .collect();
+        listed.push((self.node_id, own));
+        listed.sort_by_key(|(node, _)| *node);
+        listed
+    }
+
+    /// The gateway that coordinates every consumer group: the lowest node id. Every gateway names
+    /// the same one, so the members of a group never split over two coordinators.
+    #[must_use]
+    pub fn coordinator<'a>(&'a self, own: &'a BrokerAdvertise) -> (i32, &'a BrokerAdvertise) {
+        match self.peers.first() {
+            Some((node, endpoint)) if *node < self.node_id => (*node, endpoint),
+            _ => (self.node_id, own),
+        }
+    }
+
+    /// Whether this gateway coordinates the consumer groups.
+    #[must_use]
+    pub fn coordinates_groups(&self) -> bool {
+        self.peers
+            .first()
+            .is_none_or(|(node, _)| *node > self.node_id)
+    }
+}
+
 /// The version firewall, and the exact set `ApiVersions` advertises.
 ///
 /// Absence is load-bearing for the transaction keys (24, 25, 26, 28): a conforming client that
@@ -204,6 +258,9 @@ pub struct GatewayState {
     /// What Metadata and `DescribeCluster` report. Random unless [`Self::with_cluster_id`] sets
     /// the one stored in Iggy.
     pub cluster_id: ClusterId,
+    /// This gateway's node id: the one replica Metadata names for each partition, so the one
+    /// broker a manual replica assignment may name.
+    pub node_id: i32,
     /// Present only while `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` is on.
     pub(crate) auto_topic_creation: Option<AutoTopicCreator>,
 }
@@ -242,6 +299,7 @@ impl GatewayState {
             probe_board: ProbeBoard::default(),
             partition_growth: Arc::default(),
             cluster_id: ClusterId::random(),
+            node_id: i32::from(DEFAULT_NODE_ID),
             auto_topic_creation: None,
         }
     }
@@ -291,6 +349,13 @@ impl GatewayState {
         self
     }
 
+    /// Names `node_id` as this gateway, in place of [`DEFAULT_NODE_ID`].
+    #[must_use]
+    pub fn with_node_id(mut self, node_id: u16) -> Self {
+        self.node_id = i32::from(node_id);
+        self
+    }
+
     /// State with no bridge, so every handler takes its stub path.
     ///
     /// The coordinator is real but fresh, so two calls never share group state.
@@ -318,6 +383,8 @@ impl GatewayState {
 pub struct ConnectionState {
     /// The broker address this connection's listener advertises.
     pub broker: BrokerAdvertise,
+    /// The gateways this connection's listener lists in Metadata.
+    pub brokers: Arc<Brokers>,
     /// Whether `SaslHandshake` and `SaslAuthenticate` are advertised and routed on this
     /// connection's listener.
     pub sasl_enabled: bool,
@@ -364,6 +431,13 @@ impl ConnectionState {
             acls_enabled: acls_enabled || sasl_enabled,
             ..Self::default()
         }
+    }
+
+    /// The same state, with `brokers` as the gateways that Metadata lists.
+    #[must_use]
+    pub fn with_brokers(mut self, brokers: Arc<Brokers>) -> Self {
+        self.brokers = brokers;
+        self
     }
 
     /// The same state, for a connection from `peer`. An IPv4 client of a dual-stack listener is
