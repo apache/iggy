@@ -40,6 +40,7 @@ jobs:
     name: ${{ matrix.name || matrix.task }}
     strategy:
       fail-fast: ${{ inputs.fail-fast }}
+      max-parallel: 1
       matrix: ${{ fromJSON(inputs.matrix) }}
     # Select runner based on build target
     runs-on: ${{

@@ -37,6 +37,7 @@ jobs:
     name: ${{ matrix.name || matrix.task }}
     strategy:
       fail-fast: true
+      max-parallel: 3
       matrix: ${{ fromJSON(inputs.matrix) }}
     runs-on: ubuntu-26.04
     timeout-minutes: 60
