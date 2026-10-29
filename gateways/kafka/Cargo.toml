@@ -69,6 +69,8 @@ uuid = { workspace = true }
 x509-parser = { workspace = true }
 
 [dev-dependencies]
+# Partition route requests for `examples/partition_routes.rs`.
+iggy_binary_protocol = { workspace = true }
 # The client half, so a test encodes requests and decodes responses the way a consumer does.
 kafka-protocol = { workspace = true, features = ["client"] }
 # Certificates for the TLS listener tests, minted per test so nothing in the tree expires.
