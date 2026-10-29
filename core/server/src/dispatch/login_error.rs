@@ -32,6 +32,11 @@ use metadata::MetadataSubmitError;
 #[non_exhaustive]
 pub enum LoginRegisterError {
     InvalidCredentials,
+    /// The username does not exist in the local user store. Distinguished
+    /// from `InvalidCredentials` so the ext-auth guard can enter the callout
+    /// only for unknown users, not for wrong passwords. On the wire both
+    /// surface as `InvalidCredentials`.
+    UserNotFound,
     InvalidToken,
     UserInactive,
     Binding(IggyError),
@@ -69,7 +74,9 @@ impl LoginRegisterError {
 impl std::fmt::Display for LoginRegisterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidCredentials => write!(f, "invalid username or password"),
+            Self::InvalidCredentials | Self::UserNotFound => {
+                write!(f, "invalid username or password")
+            }
             Self::InvalidToken => write!(f, "invalid or expired personal access token"),
             Self::UserInactive => write!(f, "user account is inactive"),
             Self::Binding(error) => write!(f, "session binding: {error}"),

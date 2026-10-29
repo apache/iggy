@@ -110,10 +110,28 @@ async fn given_ext_auth_when_deny_login_should_reject(transport: TransportProtoc
         .connect()
         .await
         .expect("connect");
-    let result = client
+    let err = client
         .login_user(EXT_DENIED_USERNAME, EXT_DENIED_PASSWORD)
-        .await;
-    assert!(result.is_err(), "denied ext-auth login should fail");
+        .await
+        .expect_err("denied ext-auth login should fail");
+    match transport {
+        // Binary transports surface the eviction reason as InvalidCredentials.
+        TransportProtocol::Tcp | TransportProtocol::Quic | TransportProtocol::WebSocket => {
+            assert!(
+                matches!(err, IggyError::InvalidCredentials),
+                "expected InvalidCredentials, got: {err}"
+            );
+        }
+        // HTTP maps InvalidCredentials to 400; the SDK wraps it as
+        // HttpResponseError since InvalidCredentials is not in the
+        // typed_refusal set.
+        TransportProtocol::Http => {
+            assert!(
+                matches!(err, IggyError::HttpResponseError(400, _)),
+                "expected HTTP 400, got: {err}"
+            );
+        }
+    }
 }
 
 // ── allow with unknown iggy user (all transports) ──────────────────
@@ -178,6 +196,11 @@ async fn given_ext_auth_when_local_user_wrong_password_should_reject_without_cal
         result.is_err(),
         "local user with wrong password should be rejected"
     );
+    assert_eq!(
+        ext_server.request_count(),
+        0,
+        "local user login must not reach the ext-auth service"
+    );
 }
 
 // ── local user correct password (all transports) ───────────────────
@@ -228,10 +251,18 @@ async fn given_ext_auth_when_server_fails_should_deny_login() {
         .connect()
         .await
         .expect("connect");
-    let result = client
+    let err = client
         .login_user(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
-        .await;
-    assert!(result.is_err(), "ext-auth server failure should deny login");
+        .await
+        .expect_err("ext-auth server failure should deny login");
+    // 5xx is transient, so the server returns TransientNotAccepted.
+    assert!(
+        matches!(
+            err,
+            IggyError::TransientNotAccepted | IggyError::TransientNotCommitted
+        ),
+        "5xx callout failure should be retryable, got: {err}"
+    );
 }
 
 // ── server timeout (TCP only, transport-independent behavior) ──────
@@ -255,10 +286,18 @@ async fn given_ext_auth_when_server_timeout_should_deny_login() {
         .connect()
         .await
         .expect("connect");
-    let result = client
+    let err = client
         .login_user(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
-        .await;
-    assert!(result.is_err(), "ext-auth timeout should deny login");
+        .await
+        .expect_err("ext-auth timeout should deny login");
+    // Timeout is transient.
+    assert!(
+        matches!(
+            err,
+            IggyError::TransientNotAccepted | IggyError::TransientNotCommitted
+        ),
+        "timeout callout failure should be retryable, got: {err}"
+    );
 }
 
 // ── callout cap saturation (TCP only, transport-independent) ───────
@@ -272,6 +311,8 @@ async fn given_ext_auth_when_callout_cap_saturated_should_return_retryable_error
         "IGGY_EXTERNAL_AUTH_MAX_CONCURRENT_CALLOUTS".to_owned(),
         "2".to_owned(),
     );
+    // Pin to one shard so all logins hit the same per-shard cap.
+    envs.insert("IGGY_SHARDING_CPU_ALLOCATION".to_owned(), "1".to_owned());
 
     let mut harness = TestHarness::builder()
         .server(TestServerConfig::builder().extra_envs(envs).build())
@@ -297,6 +338,13 @@ async fn given_ext_auth_when_callout_cap_saturated_should_return_retryable_error
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
+    // The two slow callouts above should have reached the mock.
+    assert_eq!(
+        ext_server.request_count(),
+        2,
+        "both slot-filling logins must reach the ext-auth service"
+    );
+
     let overflow_client = harness
         .client_builder_for(TransportProtocol::Tcp)
         .expect("tcp builder")
@@ -314,5 +362,11 @@ async fn given_ext_auth_when_callout_cap_saturated_should_return_retryable_error
             IggyError::TransientNotAccepted | IggyError::TransientNotCommitted
         ),
         "overloaded callout must return a retryable error, got: {err}"
+    );
+    // The overflow login must have been rejected before reaching the service.
+    assert_eq!(
+        ext_server.request_count(),
+        2,
+        "the overflow login must not reach the ext-auth service"
     );
 }

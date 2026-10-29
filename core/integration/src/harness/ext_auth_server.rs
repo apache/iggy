@@ -26,6 +26,7 @@
 //! create the Iggy user before attempting the ext-auth login.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -33,7 +34,7 @@ use tokio::sync::Notify;
 
 /// External identity presented to the ext-auth service. This username must
 /// NOT exist as a local Iggy user, so `verify_login_credentials` returns
-/// `InvalidCredentials` (user not found) and falls through to the callout.
+/// `InvalidCredentials` and the ext-auth guard enters the callout path.
 pub const EXT_AUTH_USERNAME: &str = "ext-alice";
 pub const EXT_AUTH_PASSWORD: &str = "ext-pass";
 /// The pre-provisioned Iggy user the ext-auth service maps `ext-alice` to.
@@ -84,6 +85,7 @@ enum Mode {
 pub struct ExtAuthServer {
     pub port: u16,
     shutdown: Arc<Notify>,
+    request_count: Arc<AtomicU32>,
 }
 
 impl ExtAuthServer {
@@ -106,24 +108,39 @@ impl ExtAuthServer {
         let port = listener.local_addr().unwrap().port();
         let shutdown = Arc::new(Notify::new());
         let shutdown_rx = Arc::clone(&shutdown);
+        let request_count = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&request_count);
 
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     accept = listener.accept() => {
                         let Ok((stream, _)) = accept else { continue };
-                        tokio::spawn(handle_connection(stream, mode));
+                        let counter = Arc::clone(&counter);
+                        tokio::spawn(async move {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                            handle_connection(stream, mode).await;
+                        });
                     }
                     () = shutdown_rx.notified() => break,
                 }
             }
         });
 
-        Self { port, shutdown }
+        Self {
+            port,
+            shutdown,
+            request_count,
+        }
     }
 
     pub fn url(&self) -> String {
         format!("http://127.0.0.1:{}/auth", self.port)
+    }
+
+    /// Number of HTTP requests the server has received.
+    pub fn request_count(&self) -> u32 {
+        self.request_count.load(Ordering::Relaxed)
     }
 }
 

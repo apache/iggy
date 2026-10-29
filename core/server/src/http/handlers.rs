@@ -209,9 +209,7 @@ pub(in crate::http) async fn login_user(
         command.password.expose_secret(),
     ) {
         Ok((user_id, created_at)) => issue_identity(&state, user_id, created_at),
-        Err(LoginRegisterError::InvalidCredentials)
-            if state.server_config.external_auth.enabled =>
-        {
+        Err(LoginRegisterError::UserNotFound) if state.server_config.external_auth.enabled => {
             if state.is_metadata_primary() {
                 SendWrapper::new(try_external_auth_http_login(
                     &state,

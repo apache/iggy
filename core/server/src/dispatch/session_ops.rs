@@ -120,9 +120,10 @@ where
         let Some(user) = users.user_by_name(username) else {
             // Constant-cost path: verify against a dummy hash so a missing
             // username is indistinguishable by response timing from a wrong
-            // password (both return InvalidCredentials).
+            // password. UserNotFound lets the ext-auth guard distinguish the
+            // two cases; on the wire both surface as InvalidCredentials.
             let _ = crypto::verify_password(password, DUMMY_PASSWORD_HASH.as_str());
-            return Err(LoginRegisterError::InvalidCredentials);
+            return Err(LoginRegisterError::UserNotFound);
         };
         // Verify before the status check and collapse inactive to
         // InvalidCredentials: an inactive account must answer exactly like a
@@ -378,7 +379,9 @@ const fn transient_login_code(error: &LoginRegisterError) -> IggyError {
 /// `SessionError`; the SDK maps it to `Unauthenticated`.
 const fn eviction_reason_for(error: &LoginRegisterError) -> EvictionReason {
     match error {
-        LoginRegisterError::InvalidCredentials => EvictionReason::InvalidCredentials,
+        LoginRegisterError::InvalidCredentials | LoginRegisterError::UserNotFound => {
+            EvictionReason::InvalidCredentials
+        }
         LoginRegisterError::InvalidToken => EvictionReason::InvalidToken,
         LoginRegisterError::UserInactive => EvictionReason::UserInactive,
         _ => EvictionReason::SessionError,
@@ -1201,11 +1204,20 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                     surface_login_failure(shard, origin, request.header(), &error).await;
                 }
             }
-            Err(LoginRegisterError::InvalidCredentials) if ext_auth.enabled => {
-                // Only the primary makes ext-auth callouts. A backup with a
-                // partially-replicated user store would leak the password to
-                // the external service and then fail at resolve_username.
-                if is_metadata_primary(shard) {
+            Err(LoginRegisterError::UserNotFound) if ext_auth.enabled => {
+                // A backup with a partially-replicated user store would leak
+                // the password to the external service and then fail at
+                // resolve_username. Block only confirmed backups; non-metadata
+                // shards and nodes still initializing fall through.
+                if is_metadata_backup(shard) {
+                    surface_login_failure(
+                        shard,
+                        origin,
+                        request.header(),
+                        &LoginRegisterError::ExternalAuthUnavailable,
+                    )
+                    .await;
+                } else {
                     // Boxed to keep the ext-auth state machine out of the
                     // handle_client_request future, which every request pays.
                     Box::pin(try_external_auth_login(
@@ -1217,14 +1229,6 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                         request.header(),
                         &wire_request,
                     ))
-                    .await;
-                } else {
-                    surface_login_failure(
-                        shard,
-                        origin,
-                        request.header(),
-                        &LoginRegisterError::ExternalAuthUnavailable,
-                    )
                     .await;
                 }
             }
@@ -1288,8 +1292,10 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     .await;
 }
 
-/// `true` when this shard owns the metadata consensus primary.
-fn is_metadata_primary<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ, S, SB>>) -> bool
+/// `true` when this shard hosts metadata consensus and that consensus is a
+/// healthy backup in normal status. Non-metadata shards (no local consensus)
+/// and nodes still initializing return `false`, allowing the ext-auth path.
+fn is_metadata_backup<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ, S, SB>>) -> bool
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -1302,7 +1308,7 @@ where
         .metadata()
         .consensus
         .as_ref()
-        .is_some_and(consensus::VsrConsensus::is_primary)
+        .is_some_and(|c| c.is_normal() && !c.is_primary())
 }
 
 /// Attempt external auth callout and, on success, resolve the returned
