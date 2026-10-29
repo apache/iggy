@@ -477,7 +477,7 @@ One partition, one Iggy send. Each partition answers for itself.
 | `acks` | `0`, `1`, `-1` write the same. Other values: 21, before any per-partition check. |
 | `acks=0` | Writes, answers nothing. Any failed partition closes the connection. |
 | Topics | Creates none. Missing: 3. Bad name: 17. |
-| `timeout_ms` | Honored, max 20 s. Past it: 7. |
+| `timeout_ms` | Honored, max 20 s. The Iggy send stops by then too. Past it: 7. A send that never went out: 6. |
 | Compression | gzip, snappy, lz4. zstd from v7, else 76. |
 | Producer id | Picks the producer's Iggy session. See [Concurrency ceiling](#concurrency-ceiling). |
 | Producer epoch, sequence | Ignored, so a retry writes twice. |
@@ -495,8 +495,8 @@ One partition, one Iggy send. Each partition answers for itself.
 | 10 | Record, send or partition too large, even alone | Java splits multi-record batches. Else fails. |
 | 87 | Record the gateway cannot map. Reason in `error_message` from v8. | Fails. |
 | 35 | Transactional or control batch | Fails. |
-| 6 | Request budget ran out. Nothing written. | Retries. |
-| 7 | Deadline passed: in the send, waiting for decode memory, or behind the producer's own earlier send. Or connection lost mid-send. May be written. | Retries. Can duplicate. |
+| 6 | Request budget ran out. Or the send did not reach Iggy by the deadline, or Iggy refused it: no primary, partition busy or recreated, client shut down. Nothing written. | Retries. |
+| 7 | Deadline passed: after the send went out, waiting for decode memory, or behind the producer's own earlier send. Or connection lost mid-send. Possibly written. | Retries. Can duplicate. |
 
 Partition cap: `max_frame_size` decompressed bytes, `max_frame_size / 64` record slots, 3 headers
 per slot. Past it: 10.
@@ -610,8 +610,10 @@ Iggy becomes unreachable later.
 `send_records` uses the Produce deadline instead:
 
 - One request of a producer runs at a time, on that producer's client.
-- A send past its deadline keeps the producer's turn until it ends. That producer's requests answer
-  7 meanwhile. Other producers send on.
+- The SDK stops retrying the send 50 ms before the deadline. So it sends nothing after the request
+  answered, and the client's retry is the only copy of a send that never went out.
+- A send still running past its deadline keeps the producer's turn until it ends. That producer's
+  requests answer 7 meanwhile. Other producers send on.
 - After 45 s the gateway gives up on the send. It then closes that connection before the turn
   frees, so the send cannot land after a later one. The SDK ends its write within 30 s more,
   unless Iggy stopped reading: the producer then waits until that connection breaks.
@@ -820,6 +822,10 @@ instead of -1, because the Java `AdminClient` fails a partition on any non-retri
 (`to_list_offsets_error_code`). `HistoryUnavailable` refuses a read routed to an older
 incarnation of the partition, as after a delete and recreate; the retry probes again and answers 3
 if the topic is gone. ListOffsets reads do not get `RequestTooOld` today, so that arm is defensive.
+
+Produce also answers `HistoryUnavailable`, `LifecycleBusy` and `ClientShutdown` with 6 instead of
+-1 (`to_produce_error_code`). The SDK returns them only for a send that wrote nothing. A send that
+possibly landed ends as `OperationUncertain`, which answers 7.
 
 ### Server limits the gateway inherits
 
