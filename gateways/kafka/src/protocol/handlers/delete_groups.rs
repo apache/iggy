@@ -335,6 +335,8 @@ mod tests {
             rebalance_timeout: Duration::from_secs(10),
             member_id: StrBytes::new(),
             group_instance_id: None,
+            client_id: StrBytes::new(),
+            client_host: StrBytes::new(),
             protocol_type: StrBytes::from_static_str("consumer"),
             protocols: vec![(StrBytes::from_static_str("range"), Bytes::new())],
             require_known_member_id,

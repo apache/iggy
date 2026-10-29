@@ -85,7 +85,6 @@ use crate::protocol::api::{
     ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_create_partitions_shape;
-use crate::protocol::handlers::create_topics::SINGLE_BROKER_ID;
 use crate::protocol::handlers::topic_config::{
     exceeds_topic_cap, find_duplicate_names, topic_cap_message,
 };
@@ -213,6 +212,7 @@ pub async fn handle(
             &topics,
             req.validate_only,
             deadline,
+            state.node_id,
         )
         .await,
     );
@@ -344,6 +344,7 @@ async fn grow_all_topics<B: GrowthBridge>(
     topics: &[&CreatePartitionsTopic],
     validate_only: bool,
     deadline: Instant,
+    node_id: i32,
 ) -> Vec<CreatePartitionsTopicResult> {
     let mut results = Vec::with_capacity(topics.len());
     let mut deadline_exceeded = false;
@@ -360,9 +361,9 @@ async fn grow_all_topics<B: GrowthBridge>(
             continue;
         }
         let result = if validate_only {
-            validate_one_topic(bridge.as_ref(), topic, deadline).await
+            validate_one_topic(bridge.as_ref(), topic, deadline, node_id).await
         } else {
-            grow_one_topic(bridge, partition_growth, topic, deadline).await
+            grow_one_topic(bridge, partition_growth, topic, deadline, node_id).await
         };
         results.push(result);
     }
@@ -377,8 +378,9 @@ async fn validate_one_topic<B: GrowthBridge>(
     bridge: &B,
     topic: &CreatePartitionsTopic,
     deadline: Instant,
+    node_id: i32,
 ) -> CreatePartitionsTopicResult {
-    match timeout_at(deadline, plan_growth(bridge, topic)).await {
+    match timeout_at(deadline, plan_growth(bridge, topic, node_id)).await {
         Ok(Ok(_plan)) => topic_result(topic, ERROR_NONE, None),
         Ok(Err((error_code, error_message))) => {
             topic_result(topic, error_code, Some(error_message))
@@ -403,9 +405,10 @@ async fn grow_one_topic<B: GrowthBridge>(
     partition_growth: &Arc<Mutex<()>>,
     topic: &CreatePartitionsTopic,
     deadline: Instant,
+    node_id: i32,
 ) -> CreatePartitionsTopicResult {
     let kafka_topic = topic.name.as_str();
-    let grow = grow_locked(Arc::clone(bridge), topic.clone(), deadline);
+    let grow = grow_locked(Arc::clone(bridge), topic.clone(), deadline, node_id);
     let Some(guard) = lock_by(partition_growth, deadline).await else {
         tracing::warn!(
             kafka_topic,
@@ -451,9 +454,10 @@ async fn grow_locked<B: GrowthBridge>(
     bridge: Arc<B>,
     topic: CreatePartitionsTopic,
     deadline: Instant,
+    node_id: i32,
 ) -> Verdict {
     let kafka_topic = topic.name.as_str();
-    let plan = match timeout_at(deadline, plan_growth(bridge.as_ref(), &topic)).await {
+    let plan = match timeout_at(deadline, plan_growth(bridge.as_ref(), &topic, node_id)).await {
         Ok(Ok(plan)) => plan,
         Ok(Err((error_code, error_message))) => return (error_code, Some(error_message)),
         Err(_elapsed) => return nothing_added(kafka_topic),
@@ -736,6 +740,7 @@ impl Plan {
 async fn plan_growth<B: GrowthBridge>(
     bridge: &B,
     topic: &CreatePartitionsTopic,
+    node_id: i32,
 ) -> core::result::Result<Plan, (i16, StrBytes)> {
     let kafka_topic = topic.name.as_str();
     let before = match bridge.read_topic(kafka_topic).await {
@@ -751,7 +756,9 @@ async fn plan_growth<B: GrowthBridge>(
     };
 
     let added = partitions_to_add(kafka_topic, before.partitions_count, topic.count)
-        .and_then(|added| validate_assignments(topic.assignments.as_deref(), added).map(|()| added))
+        .and_then(|added| {
+            validate_assignments(topic.assignments.as_deref(), added, node_id).map(|()| added)
+        })
         .and_then(|added| within_per_request_cap(added).map(|()| added))
         .and_then(|added| resizable(&before).map(|()| added))
         .inspect_err(|(error_code, _)| {
@@ -831,8 +838,8 @@ fn partitions_to_add(
 ///
 /// A null list means "let the broker place them", which is what every client sends unless the
 /// caller named replicas. A present list must hold exactly one entry per new partition, as real
-/// Kafka requires, and each entry must name this gateway's single broker (node id 1) exactly
-/// once: that is the only replica list Metadata ever advertises, the same ceiling
+/// Kafka requires, and each entry must name this gateway (`node_id`) exactly once: that is the
+/// only replica list Metadata advertises, the same ceiling
 /// `create_topics::assignment_replicas_are_valid` holds `CreateTopics` to. Both failures are
 /// `INVALID_REPLICA_ASSIGNMENT` (39), real Kafka's code for each.
 ///
@@ -843,6 +850,7 @@ fn partitions_to_add(
 fn validate_assignments(
     assignments: Option<&[CreatePartitionsAssignment]>,
     added: u32,
+    node_id: i32,
 ) -> core::result::Result<(), (i16, StrBytes)> {
     let Some(assignments) = assignments else {
         return Ok(());
@@ -859,13 +867,13 @@ fn validate_assignments(
     }
     if assignments
         .iter()
-        .any(|assignment| assignment.broker_ids != [BrokerId(SINGLE_BROKER_ID)])
+        .any(|assignment| assignment.broker_ids != [BrokerId(node_id)])
     {
         return Err((
             ERROR_INVALID_REPLICA_ASSIGNMENT,
             StrBytes::from(format!(
-                "each new partition must be assigned to broker {SINGLE_BROKER_ID} exactly once, \
-                 the only broker this gateway advertises"
+                "each new partition must be assigned to broker {node_id} exactly once, the one \
+                 replica this gateway advertises"
             )),
         ));
     }
@@ -1011,6 +1019,9 @@ mod tests {
     use kafka_protocol::messages::TopicName;
 
     use super::*;
+
+    /// The node id of the gateway under test.
+    const NODE_ID: i32 = 1;
     use crate::protocol::acl::PrincipalPermissions;
     use crate::protocol::api::{ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_SERVER_ERROR};
 
@@ -1098,22 +1109,19 @@ mod tests {
 
     #[test]
     fn a_null_assignment_list_passes() {
-        assert_eq!(validate_assignments(None, 2), Ok(()));
+        assert_eq!(validate_assignments(None, 2, NODE_ID), Ok(()));
     }
 
     #[test]
     fn an_assignment_per_new_partition_naming_the_single_broker_passes() {
-        let assignments = [
-            assignment(&[SINGLE_BROKER_ID]),
-            assignment(&[SINGLE_BROKER_ID]),
-        ];
-        assert_eq!(validate_assignments(Some(&assignments), 2), Ok(()));
+        let assignments = [assignment(&[NODE_ID]), assignment(&[NODE_ID])];
+        assert_eq!(validate_assignments(Some(&assignments), 2, NODE_ID), Ok(()));
     }
 
     #[test]
     fn an_assignment_list_of_the_wrong_length_is_rejected() {
-        let assignments = [assignment(&[SINGLE_BROKER_ID])];
-        let (code, message) = validate_assignments(Some(&assignments), 2).unwrap_err();
+        let assignments = [assignment(&[NODE_ID])];
+        let (code, message) = validate_assignments(Some(&assignments), 2, NODE_ID).unwrap_err();
         assert_eq!(code, ERROR_INVALID_REPLICA_ASSIGNMENT);
         assert_eq!(
             message.as_str(),
@@ -1125,15 +1133,15 @@ mod tests {
     fn an_empty_but_present_assignment_list_is_rejected() {
         // Kafka checks a present list's length even when it is empty: `increaseTo(n)` sends a
         // null list, so an empty one is a client that meant to name replicas and named none.
-        let (code, _) = validate_assignments(Some(&[]), 1).unwrap_err();
+        let (code, _) = validate_assignments(Some(&[]), 1, NODE_ID).unwrap_err();
         assert_eq!(code, ERROR_INVALID_REPLICA_ASSIGNMENT);
     }
 
     #[test]
     fn an_assignment_naming_another_broker_or_an_empty_list_is_rejected() {
-        for broker_ids in [&[][..], &[7][..], &[SINGLE_BROKER_ID, SINGLE_BROKER_ID][..]] {
+        for broker_ids in [&[][..], &[7][..], &[NODE_ID, NODE_ID][..]] {
             let assignments = [assignment(broker_ids)];
-            let (code, _) = validate_assignments(Some(&assignments), 1).unwrap_err();
+            let (code, _) = validate_assignments(Some(&assignments), 1, NODE_ID).unwrap_err();
             assert_eq!(code, ERROR_INVALID_REPLICA_ASSIGNMENT, "{broker_ids:?}");
         }
     }
@@ -1413,7 +1421,7 @@ mod tests {
 
     /// Grows "orders" from 3 to 5 through `bridge`.
     async fn grow_orders(bridge: &Arc<ScriptedIggy>, deadline: Instant) -> Verdict {
-        grow_locked(Arc::clone(bridge), topic("orders", 5), deadline).await
+        grow_locked(Arc::clone(bridge), topic("orders", 5), deadline, NODE_ID).await
     }
 
     fn may_have_been_added() -> Verdict {
@@ -1653,7 +1661,8 @@ mod tests {
         assert!(lock_by(&lock, Instant::now()).await.is_none());
 
         let bridge = ScriptedIggy::new(|_| at(3), |_| Reply::Now(Ok(())));
-        let result = grow_one_topic(&bridge, &lock, &topic("orders", 5), Instant::now()).await;
+        let result =
+            grow_one_topic(&bridge, &lock, &topic("orders", 5), Instant::now(), NODE_ID).await;
         assert_eq!(result.error_code, ERROR_REQUEST_TIMED_OUT);
         assert_eq!(result.error_message.as_deref(), Some(NOTHING_ADDED));
         assert_eq!((bridge.reads(), bridge.writes()), (0, 0));
@@ -1670,6 +1679,7 @@ mod tests {
             &lock,
             &topic("orders", 5),
             Instant::now() + Duration::from_secs(1),
+            NODE_ID,
         )
         .await;
         assert_eq!(result.error_code, ERROR_REQUEST_TIMED_OUT);
@@ -1694,7 +1704,7 @@ mod tests {
             StrBytes::from_static_str(FIXED_PARTITION_COUNT),
         );
         assert_eq!(
-            plan_growth(bridge.as_ref(), &topic("orders", 5)).await,
+            plan_growth(bridge.as_ref(), &topic("orders", 5), NODE_ID).await,
             Err(expected)
         );
         assert_eq!(bridge.writes(), 0);

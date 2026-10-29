@@ -23,11 +23,31 @@ use crate::cluster_meta::{
 };
 use crate::server_error::ServerError;
 use configs::server::ServerConfig;
+use message_bus::LinkLayout;
 use message_bus::replica::auth;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tracing::warn;
+
+/// Placement of this node's replica links. A node outside a cluster has no
+/// peer, so it ignores the link count.
+pub(in crate::boot) fn replica_link_layout(
+    config: &ServerConfig,
+    total_shards: u16,
+) -> Result<LinkLayout, ServerError> {
+    if !config.cluster.enabled {
+        return Ok(LinkLayout::default());
+    }
+    let coordinator = &config.cluster.coordinator;
+    LinkLayout::new(
+        total_shards,
+        coordinator.replica_connections_per_peer,
+        coordinator.skip_shard_zero_for_replicas,
+        config.cluster.nodes.len().saturating_sub(1),
+    )
+    .map_err(ServerError::ReplicaLinkLayout)
+}
 
 pub(in crate::boot) struct TcpTopology {
     /// Domain-separation cluster id derived from `cluster.name`; threaded to

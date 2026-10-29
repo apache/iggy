@@ -120,7 +120,8 @@ InitProducerId with no `transactional_id`:
   leaving bit 63 clear. `producer_id` is an `i64` and `-1` means no producer id, so the value has
   to stay non-negative. That leaves room for 65536 instances holding 140 trillion ids each
 
-The instance number comes from configuration (`IGGY_KAFKA_INSTANCE_ID`, default 0), not from a
+The instance number comes from configuration (`IGGY_KAFKA_INSTANCE_ID`, else
+`IGGY_KAFKA_NODE_ID`, else 0), not from a
 draw at startup. A random 16-bit number collides with even odds at around 300 instances. That is
 a birthday collision, not a remote one.
 
@@ -144,7 +145,8 @@ must first either persist a high-water mark and seed the counter above it, or bu
 `producer_epoch` on every gateway start. Either one makes a replayed
 `(producer_id, producer_epoch)` pair impossible rather than unlikely.
 
-`IGGY_KAFKA_INSTANCE_ID` defaults to 0 so a single gateway needs no configuration. Two gateways
+`IGGY_KAFKA_INSTANCE_ID` follows `IGGY_KAFKA_NODE_ID` when only that one is set, and is 0
+otherwise, so a single gateway needs no configuration. Two gateways
 left on the default draw from the same 47-bit space and can hand out identical ids, on the first
 allocation if they start in the same millisecond. Nothing in the cluster detects that, so a gateway started without the
 variable logs a warning, and the running value is in the startup log line.
