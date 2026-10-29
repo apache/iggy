@@ -97,12 +97,14 @@ Each tool checks these MCP permissions before forwarding the request. The broker
 
 | Permission | Tools |
 | --- | --- |
-| `read` | `ping`, `get_cluster_metadata`, `get_stream`, `get_streams`, `get_topic`, `get_topics`, `poll_messages`, `get_stats`, `get_me`, `get_client`, `get_clients`, `snapshot`, `get_consumer_group`, `get_consumer_groups`, `get_consumer_offset`, `get_personal_access_tokens`, `get_user`, `get_users` |
+| `read` | `ping`, `get_cluster_metadata`, `get_stream`, `get_streams`, `get_topic`, `get_topics`, `poll_messages`, `get_stats`, `get_me`, `get_client`, `get_clients`, `snapshot`, `get_consumer_group`, `get_consumer_groups`, `get_consumer_offset`, `store_consumer_offset`, `delete_consumer_offset`, `get_personal_access_tokens`, `get_user`, `get_users` |
 | `create` | `create_stream`, `create_topic`, `create_partitions`, `send_messages`, `create_consumer_group`, `create_personal_access_token`, `create_user` |
-| `update` | `update_stream`, `update_topic`, `store_consumer_offset`, `update_user`, `update_permissions`, `change_password` |
-| `delete` | `delete_stream`, `delete_topic`, `delete_partitions`, `delete_segments`, `delete_consumer_group`, `delete_consumer_offset`, `delete_personal_access_token`, `delete_user` |
+| `update` | `update_stream`, `update_topic`, `update_user`, `update_permissions`, `change_password` |
+| `delete` | `delete_stream`, `delete_topic`, `delete_partitions`, `delete_segments`, `delete_consumer_group`, `delete_personal_access_token`, `delete_user` |
 
-`poll_messages` additionally requires `update` when `auto_commit = true` or `strategy = "next"`. The `next` strategy enables auto-commit even when `auto_commit` is omitted or false. For read-only polling, use `offset`, `first`, `last`, or `timestamp` with auto-commit disabled.
+`poll_messages` stores the consumer offset when `auto_commit = true` or `strategy = "next"`. The `next` strategy enables auto-commit even when `auto_commit` is omitted or false.
+
+The offset tools and auto-committing `poll_messages` need only `read`, like the broker, which asks only for poll permission. They act on the server's own consumer (`iggy.consumer`, default `iggy-mcp`), so an agent can only move that consumer's offsets. Don't give `iggy.consumer` the same name as an application's consumer: with `read` alone, the MCP server can move that application's offsets.
 
 ## Recovering uncertain writes
 
