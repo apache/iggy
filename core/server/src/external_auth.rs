@@ -26,7 +26,7 @@
 //! rate-limit brute-force attempts at the network layer or inside the
 //! external auth service itself.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 
 use configs::external_auth::ExternalAuthConfig;
@@ -41,11 +41,9 @@ const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
 const MAX_CREDENTIAL_BYTES: usize = 8_192;
 
 thread_local! {
-    static HTTP_CLIENT: cyper::Client =
-        cyper::Client::builder()
-            .redirect(cyper::redirect::Policy::none())
-            .build()
-            .expect("failed to build cyper HTTP client for external auth");
+    // Lazily built per shard thread. `validate_config` probes the build at
+    // boot so a missing CA store fails startup, not the first login.
+    static HTTP_CLIENT: RefCell<Option<cyper::Client>> = const { RefCell::new(None) };
 
     static IN_FLIGHT_CALLOUTS: Cell<u32> = const { Cell::new(0) };
 }
@@ -72,8 +70,24 @@ impl Drop for CalloutGuard {
     }
 }
 
-fn get_http_client() -> cyper::Client {
-    HTTP_CLIENT.with(cyper::Client::clone)
+fn build_http_client() -> Result<cyper::Client, String> {
+    cyper::Client::builder()
+        .redirect(cyper::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("failed to build HTTP client (missing CA roots?): {e}"))
+}
+
+fn get_http_client() -> Result<cyper::Client, ExternalAuthError> {
+    HTTP_CLIENT.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if let Some(client) = slot.as_ref() {
+            return Ok(client.clone());
+        }
+        let client = build_http_client().map_err(ExternalAuthError::HttpError)?;
+        let cloned = client.clone();
+        *slot = Some(client);
+        Ok(cloned)
+    })
 }
 
 fn serialize_secret<S: serde::Serializer>(
@@ -157,9 +171,20 @@ pub enum ExternalAuthDecision {
 }
 
 /// Callout failure (network, timeout, bad response, or rejected request).
+///
+/// The SDK stores credentials after a successful login and drops them on a
+/// terminal failure. Transient variants ([`is_transient`](Self::is_transient))
+/// surface as `TransientNotAccepted` so the SDK retries instead of discarding
+/// stored credentials during a brief auth-service outage.
 #[derive(Debug)]
 pub enum ExternalAuthError {
+    /// Connect error, TLS failure, or other transport-level fault.
     HttpError(String),
+    /// The external service returned 5xx or 429.
+    ServiceUnavailable(u16),
+    /// The external service returned a non-retryable non-success status (4xx
+    /// other than 429).
+    HttpStatus(u16),
     Timeout,
     BadResponse(String),
     /// The request was rejected before the callout was made (e.g. credential
@@ -172,8 +197,14 @@ pub enum ExternalAuthError {
 }
 
 impl ExternalAuthError {
-    pub const fn is_overloaded(&self) -> bool {
-        matches!(self, Self::Overloaded(_))
+    /// Transient failures are retryable. The caller maps these to
+    /// `TransientNotAccepted` so the SDK backs off instead of dropping
+    /// stored credentials.
+    pub const fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::Overloaded(_) | Self::Timeout | Self::HttpError(_) | Self::ServiceUnavailable(_)
+        )
     }
 }
 
@@ -181,6 +212,12 @@ impl fmt::Display for ExternalAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HttpError(msg) => write!(f, "external auth HTTP error: {msg}"),
+            Self::ServiceUnavailable(status) => {
+                write!(f, "external auth service unavailable: HTTP {status}")
+            }
+            Self::HttpStatus(status) => {
+                write!(f, "external auth non-success status: HTTP {status}")
+            }
             Self::Timeout => write!(f, "external auth callout timed out"),
             Self::BadResponse(msg) => write!(f, "external auth bad response: {msg}"),
             Self::BadRequest(msg) => write!(f, "external auth bad request: {msg}"),
@@ -270,6 +307,11 @@ pub fn validate_config(
              a callout stalls that login attempt for its full duration"
         );
     }
+    // Build a throwaway client to verify system TLS roots are loadable.
+    // Each shard thread builds its own later; this catches the failure at
+    // boot instead of panicking on the first callout.
+    build_http_client()
+        .map_err(|reason| crate::server_error::ServerError::InvalidExternalAuthConfig { reason })?;
     Ok(())
 }
 
@@ -317,7 +359,7 @@ pub async fn callout_external_auth(
     validate_credential_size(&request.credentials)?;
 
     let _guard = CalloutGuard::acquire(config.max_concurrent_callouts)?;
-    let client = get_http_client();
+    let client = get_http_client()?;
     let timeout = config.timeout.get_duration();
 
     let body = serde_json::to_vec(&request)
@@ -340,9 +382,12 @@ pub async fn callout_external_auth(
 
         let status = response.status();
         if !status.is_success() {
-            return Err(ExternalAuthError::HttpError(format!(
-                "non-success status: {status}"
-            )));
+            let code = status.as_u16();
+            return Err(if status.is_server_error() || code == 429 {
+                ExternalAuthError::ServiceUnavailable(code)
+            } else {
+                ExternalAuthError::HttpStatus(code)
+            });
         }
 
         if let Some(len) = response
@@ -408,6 +453,21 @@ fn into_decision(resp: ExternalAuthResponse) -> Result<ExternalAuthDecision, Ext
     }
 }
 
+/// Validate that a pre-provisioned user is eligible for external login:
+/// exists, active, and not root. Reused by the trusted-issuer JWT path.
+pub fn validate_provisioned_account(
+    user: Option<&metadata::stm::user::User>,
+) -> Option<(u32, iggy_common::IggyTimestamp)> {
+    use iggy_common::UserStatus;
+    use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+
+    let user = user?;
+    if user.id == DEFAULT_ROOT_USER_ID {
+        return None;
+    }
+    (user.status == UserStatus::Active).then_some((user.id, user.created_at))
+}
+
 /// Resolve an externally authenticated username to a pre-provisioned Iggy
 /// user. Guards: the user must exist, be active, and not be root.
 /// Transport-independent so both the TCP and HTTP login paths share one
@@ -416,19 +476,8 @@ pub fn resolve_username(
     users: &metadata::stm::user::UsersInner,
     username: &str,
 ) -> Result<(u32, iggy_common::IggyTimestamp), iggy_common::IggyError> {
-    use iggy_common::UserStatus;
-    use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
-
-    let Some(user) = users.user_by_name(username) else {
-        return Err(iggy_common::IggyError::InvalidCredentials);
-    };
-    if user.id == DEFAULT_ROOT_USER_ID {
-        return Err(iggy_common::IggyError::InvalidCredentials);
-    }
-    if user.status != UserStatus::Active {
-        return Err(iggy_common::IggyError::InvalidCredentials);
-    }
-    Ok((user.id, user.created_at))
+    validate_provisioned_account(users.user_by_name(username))
+        .ok_or(iggy_common::IggyError::InvalidCredentials)
 }
 
 #[cfg(test)]
@@ -578,6 +627,7 @@ mod tests {
 
     #[test]
     fn given_enabled_config_with_https_url_when_validating_should_accept() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let config = ExternalAuthConfig {
             enabled: true,
             url: "https://auth.example.com/verify".to_owned(),
@@ -588,6 +638,7 @@ mod tests {
 
     #[test]
     fn given_enabled_config_with_http_url_when_validating_should_accept() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let config = ExternalAuthConfig {
             enabled: true,
             url: "http://localhost:8080/auth".to_owned(),
@@ -662,7 +713,8 @@ mod tests {
         }
 
         let err = CalloutGuard::acquire(CAP).unwrap_err();
-        assert!(err.is_overloaded());
+        assert!(matches!(err, ExternalAuthError::Overloaded(_)));
+        assert!(err.is_transient());
         assert!(err.to_string().contains("too many concurrent"));
 
         // Drop one guard and verify the next acquire succeeds.
@@ -673,17 +725,18 @@ mod tests {
     }
 
     #[test]
-    fn given_overloaded_error_when_checked_should_report_overloaded() {
-        let err = ExternalAuthError::Overloaded(64);
-        assert!(err.is_overloaded());
+    fn given_transient_errors_when_checked_should_report_transient() {
+        assert!(ExternalAuthError::Overloaded(64).is_transient());
+        assert!(ExternalAuthError::Timeout.is_transient());
+        assert!(ExternalAuthError::HttpError("connection refused".to_owned()).is_transient());
+        assert!(ExternalAuthError::ServiceUnavailable(503).is_transient());
+        assert!(ExternalAuthError::ServiceUnavailable(429).is_transient());
     }
 
     #[test]
-    fn given_non_overloaded_error_when_checked_should_not_report_overloaded() {
-        let err = ExternalAuthError::Timeout;
-        assert!(!err.is_overloaded());
-
-        let err = ExternalAuthError::HttpError("connection refused".to_owned());
-        assert!(!err.is_overloaded());
+    fn given_terminal_errors_when_checked_should_not_report_transient() {
+        assert!(!ExternalAuthError::HttpStatus(401).is_transient());
+        assert!(!ExternalAuthError::BadResponse("bad json".to_owned()).is_transient());
+        assert!(!ExternalAuthError::BadRequest("too large".to_owned()).is_transient());
     }
 }

@@ -229,6 +229,12 @@ pub(in crate::http) async fn login_user(
     }
 
     if state.server_config.external_auth.enabled {
+        // Only the primary makes ext-auth callouts. A backup with a
+        // partially-replicated user store would leak the password to the
+        // external service and then fail at resolve_username anyway.
+        if !state.is_metadata_primary() {
+            return Err(IggyError::TransientNotAccepted.into());
+        }
         return SendWrapper::new(try_external_auth_http_login(
             &state,
             &command.username,
@@ -2306,7 +2312,7 @@ async fn try_external_auth_http_login(
         .await
         .map_err(|error| {
             tracing::warn!(error = %error, "external auth callout failed");
-            if error.is_overloaded() {
+            if error.is_transient() {
                 IggyError::TransientNotAccepted
             } else {
                 IggyError::InvalidCredentials

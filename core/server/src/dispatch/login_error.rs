@@ -38,6 +38,9 @@ pub enum LoginRegisterError {
     /// Recoverable consensus failure. The connection stays `Connected`; the
     /// SDK read-timeout replays.
     Transient(MetadataSubmitError),
+    /// The external auth callout failed transiently (timeout, connect error,
+    /// 5xx, 429, or overloaded). The SDK retries after backoff.
+    ExternalAuthUnavailable,
 }
 
 impl LoginRegisterError {
@@ -57,6 +60,7 @@ impl LoginRegisterError {
                 error,
                 IggyError::TransientNotAccepted | IggyError::TransientNotCommitted
             ),
+            Self::ExternalAuthUnavailable => false,
             _ => true,
         }
     }
@@ -70,6 +74,9 @@ impl std::fmt::Display for LoginRegisterError {
             Self::UserInactive => write!(f, "user account is inactive"),
             Self::Binding(error) => write!(f, "session binding: {error}"),
             Self::Transient(e) => write!(f, "transient consensus failure: {e}"),
+            Self::ExternalAuthUnavailable => {
+                write!(f, "external auth service temporarily unavailable")
+            }
         }
     }
 }

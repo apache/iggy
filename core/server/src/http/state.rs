@@ -34,7 +34,6 @@ use configs::server::ServerConfig;
 use consensus::{MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
 use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
-use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{ClusterMetadata, IggyError, IggyTimestamp, UserStatus};
 use message_bus::InstanceToken;
 use metadata::MetadataSubmitError;
@@ -789,11 +788,7 @@ pub(in crate::http) fn insert_view_header(state: &HttpInner, mut response: Respo
 /// not root. A deleted user's id goes to the next user created, so the issuer
 /// is matched by username, and an external issuer never holds root.
 fn trusted_issuer_account(user: Option<&User>) -> Option<(u32, IggyTimestamp)> {
-    let user = user?;
-    if user.id == DEFAULT_ROOT_USER_ID {
-        return None;
-    }
-    (user.status == UserStatus::Active).then_some((user.id, user.created_at))
+    crate::external_auth::validate_provisioned_account(user)
 }
 
 #[cfg(test)]
