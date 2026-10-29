@@ -56,7 +56,7 @@ impl Default for ExternalAuthConfig {
 }
 
 fn default_external_auth_timeout() -> IggyDuration {
-    "5 s".parse().expect("hardcoded timeout expected to parse")
+    IggyDuration::new_from_secs(5)
 }
 
 const fn default_max_concurrent_callouts() -> u32 {
