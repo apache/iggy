@@ -17,7 +17,7 @@
 
 use crate::{
     Consensus, DvcHeaderKind, IgnoreReason, MergedLog, Pipeline, PipelineEntry, PlaneKind,
-    PrepareOkOutcome, Sequencer, Status, VsrConsensus, dvc_header_kind,
+    PrepareOkOutcome, ReplicationSend, Sequencer, Status, VsrConsensus, dvc_header_kind,
 };
 use iggy_binary_protocol::consensus::{REJECTION_SECTION_LEN, write_rejection_section};
 use iggy_binary_protocol::{
@@ -176,32 +176,18 @@ where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    let (op, size) = {
-        let header = frozen_prepare_header(&message)?;
-        (header.op, u64::from(header.size))
-    };
+    let op = frozen_prepare_header(&message)?.op;
     let mut first_error = None;
     for replica in 0..consensus.replica_count() {
         if replica == consensus.replica() {
             continue;
         }
-        if !consensus.admit_replication(replica, op, size, false) {
-            continue;
-        }
-        match consensus
-            .message_bus()
-            .send_to_replica(replica, message.clone())
+        if let Err(error) = consensus
+            .send_replicated_prepare(replica, op, message.clone(), ReplicationSend::Live)
             .await
+            && first_error.is_none()
         {
-            Ok(()) => {
-                consensus.record_replication_send(replica, op, size, false);
-            }
-            Err(error) => {
-                consensus.record_replication_failure(replica, op);
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
+            first_error = Some(error);
         }
     }
     first_error.map_or(Ok(()), |error| Err(error.into()))

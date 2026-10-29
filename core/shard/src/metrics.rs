@@ -47,6 +47,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use consensus::ReplicationStats;
 use iggy_binary_protocol::{COMMAND_TABLE, Command, command_index};
 use iggy_common::ConsumerKind;
 use message_bus::{ReplicaLinkMetrics, ReplicaReadMetrics};
@@ -376,6 +377,8 @@ pub struct ShardMetrics {
     replica_socket_reads_total: Counter,
     replica_inbound_frames_total: Counter,
     replica_outbound_drops_total: Counter,
+    replication_live_refusals_total: Counter,
+    replication_replayed_prepares_total: Counter,
     replica_bundle_teardowns_total: Counter,
     replica_preamble_refusals_total: Counter,
     replica_handshake_failures_total: Counter,
@@ -466,6 +469,8 @@ impl ShardMetrics {
             replica_socket_reads_total: Counter::default(),
             replica_inbound_frames_total: Counter::default(),
             replica_outbound_drops_total: Counter::default(),
+            replication_live_refusals_total: Counter::default(),
+            replication_replayed_prepares_total: Counter::default(),
             replica_bundle_teardowns_total: Counter::default(),
             replica_preamble_refusals_total: Counter::default(),
             replica_handshake_failures_total: Counter::default(),
@@ -542,6 +547,31 @@ impl ShardMetrics {
             .inc_by(stats.outbound_drops);
         self.replica_bundles_up
             .set(i64::try_from(stats.bundles_up).unwrap_or(i64::MAX));
+    }
+
+    /// Fold one sweep's replication flow events in, drained by
+    /// `VsrConsensus::take_replication_stats`. Both stay at zero while every
+    /// backup keeps up, so a nonzero value on a run with no fault means that
+    /// flow control held prepares back.
+    pub fn record_replication(&self, stats: ReplicationStats) {
+        self.replication_live_refusals_total
+            .inc_by(stats.live_refusals);
+        self.replication_replayed_prepares_total
+            .inc_by(stats.replayed);
+    }
+
+    /// Snapshot of `replication_live_refusals_total`. Test/simulator accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn replication_live_refusals_value(&self) -> u64 {
+        self.replication_live_refusals_total.get()
+    }
+
+    /// Snapshot of `replication_replayed_prepares_total`. Test/simulator accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn replication_replayed_prepares_value(&self) -> u64 {
+        self.replication_replayed_prepares_total.get()
     }
 
     fn register_persistence(&self, registry: &mut Registry) {
@@ -1208,6 +1238,16 @@ impl ShardMetrics {
             "replica_outbound_drops",
             "replica frames dropped because a peer send queue was full",
             self.replica_outbound_drops_total.clone(),
+        );
+        registry.register(
+            "replication_live_refusals",
+            "live prepares that a backup's replication window, replay cursor or busy state refused",
+            self.replication_live_refusals_total.clone(),
+        );
+        registry.register(
+            "replication_replayed_prepares",
+            "prepares resent to a backup by ordered replay",
+            self.replication_replayed_prepares_total.clone(),
         );
         registry.register(
             "replica_bundle_teardowns",

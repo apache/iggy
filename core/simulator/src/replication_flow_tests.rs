@@ -15,20 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Flow control to a backup must not hold produces for a consensus tick.
+//! Flow control must not hold back the prepares of a backup that keeps up.
 //!
-//! The primary stops sending prepares to a backup while a progress probe is
-//! out, and when the bytes sent since the last probe reply reach
-//! `REPLICATION_BATCH_BYTES_MAX`. A timer also probes each backup about once
-//! per second. A stop that ends one probe round trip later costs little on a
-//! real network. A stop that waits for the next tick, to send the probe or to
-//! resume the prepares, costs up to 10 ms per wait. Steady produce repeats the
-//! stops, so these waits show in the publish tail.
+//! The primary charges each prepare it sends to a backup against a window of
+//! `REPLICATION_BATCH_BYTES_MAX` bytes. A progress probe follows the prepares on
+//! the same ordered link, and its reply returns the credit of the bytes sent
+//! before it. Probes go out at half a window and about once per second, and no
+//! prepare waits for a probe reply. So a backup that keeps up never fills its
+//! window, and no prepare goes out late or by replay.
 //!
 //! The network is ordered, like the TCP link between two replicas, and each hop
 //! takes one tick. A produce takes four hops: the request, the prepare, the
-//! prepare ok and the reply. A probe round trip adds two hops. A produce that
-//! takes longer waited for a tick.
+//! prepare ok and the reply. A produce that takes longer waited for flow
+//! control, and the other backup can hide that wait. So the flow counters must
+//! also stay at zero.
 
 use bytes::Bytes;
 use consensus::REPLICATION_BATCH_BYTES_MAX;
@@ -45,15 +45,13 @@ const PRIMARY: u8 = 0;
 const ONE_WAY_DELAY_TICKS: u64 = 1;
 /// The request, the prepare, the prepare ok and the reply.
 const PRODUCE_HOPS: u64 = 4;
-/// A probe and its reply.
-const PROBE_HOPS: u64 = 2;
-const LATENCY_TICKS_MAX: u64 = (PRODUCE_HOPS + PROBE_HOPS) * ONE_WAY_DELAY_TICKS;
+const LATENCY_TICKS_MAX: u64 = PRODUCE_HOPS * ONE_WAY_DELAY_TICKS;
 /// A client has one produce in flight, so one produce per tick needs more
 /// clients than the slowest produce takes ticks.
 const CLIENTS: u8 = 16;
 
 #[test]
-fn given_steady_produce_when_a_backup_window_fills_should_answer_within_one_probe_round_trip() {
+fn given_steady_produce_when_it_passes_several_windows_should_answer_without_flow_control_waits() {
     const REQUEST_BYTES: u64 = 512 * 1024;
     /// Bytes sent to each backup, counted in windows.
     const WINDOWS: u64 = 3;
@@ -64,12 +62,12 @@ fn given_steady_produce_when_a_backup_window_fills_should_answer_within_one_prob
 }
 
 #[test]
-fn given_steady_produce_when_the_progress_timer_probes_a_backup_should_answer_within_one_probe_round_trip()
+fn given_steady_produce_when_the_progress_timer_probes_a_backup_should_answer_without_flow_control_waits()
  {
     /// Never fills a window, so only the timer sends probes.
     const REQUEST_BYTES: u64 = 1024;
-    /// A backup is probed 1 s (`PROGRESS_INTERVAL_MICROS`) after the first
-    /// prepare that follows the last probe reply: 100 ticks of 10 ms.
+    /// The timer probes a backup 1 s (`PROGRESS_INTERVAL_MICROS`) after its
+    /// last probe reply: 100 ticks of 10 ms.
     const PROBE_INTERVAL_TICKS: u64 = 100;
     /// Four intervals, so the timer probes each backup more than once.
     const TICKS: u64 = 4 * PROBE_INTERVAL_TICKS;
@@ -77,7 +75,8 @@ fn given_steady_produce_when_the_progress_timer_probes_a_backup_should_answer_wi
 }
 
 /// Sends one produce per tick for `ticks` ticks, like a producer at a fixed
-/// rate, and asserts that each one is answered within [`LATENCY_TICKS_MAX`].
+/// rate. Asserts that each one is answered within [`LATENCY_TICKS_MAX`], and
+/// that flow control refused no live prepare and replayed none.
 fn assert_produce_latency(request_bytes: u64, ticks: u64) {
     server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
         enabled: false,
@@ -130,8 +129,24 @@ fn assert_produce_latency(request_bytes: u64, ticks: u64) {
     late.sort_unstable();
     assert!(
         late.is_empty(),
-        "every produce must be answered within {LATENCY_TICKS_MAX} ticks: {PRODUCE_HOPS} hops \
-         and one probe round trip of {PROBE_HOPS}, so a slower one waited for a timer tick. \
-         (tick sent, ticks to the reply or None without one): {late:?}"
+        "every produce must be answered within its {PRODUCE_HOPS} hops, so a slower one waited \
+         for flow control. (tick sent, ticks to the reply or None without one): {late:?}"
+    );
+    let shards = sim
+        .replicas
+        .iter()
+        .flat_map(|replica| replica.shards.iter());
+    let (refusals, replayed) = shards.fold((0, 0), |(refusals, replayed), shard| {
+        let metrics = shard.metrics();
+        (
+            refusals + metrics.replication_live_refusals_value(),
+            replayed + metrics.replication_replayed_prepares_value(),
+        )
+    });
+    assert_eq!(
+        (refusals, replayed),
+        (0, 0),
+        "flow control must not refuse or replay prepares while every backup keeps up: \
+         (live refusals, replayed prepares)"
     );
 }

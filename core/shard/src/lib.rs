@@ -42,10 +42,11 @@ pub use router::CONSENSUS_TICK_INTERVAL;
 #[cfg(feature = "simulator")]
 use consensus::LocalPipeline;
 use consensus::{
-    AdoptedView, ChunkProgress, CommitOutcome, Consensus, ConsensusClock, DVC_HEADERS_MAX,
-    DvcHeaderKind, DvcSuffix, FatalReason, MergedLog, MetadataHandle, MuxPlane, PartitionsHandle,
-    Pipeline, Plane, PlaneKind, RepairEvidence, STATE_TRANSFER_MAX_DECODE_RETRIES,
-    STATE_TRANSFER_MAX_STALL_RETRIES, Sequencer, StartViewRefusal, Status, VsrAction, VsrConsensus,
+    AdoptedView, BackupPrefix, ChunkProgress, CommitOutcome, Consensus, ConsensusClock,
+    DVC_HEADERS_MAX, DvcHeaderKind, DvcSuffix, FatalReason, MergedLog, MetadataHandle, MuxPlane,
+    PartitionsHandle, Pipeline, Plane, PlaneKind, RepairEvidence, ReplicationSend,
+    ReplicationStats, STATE_TRANSFER_MAX_DECODE_RETRIES, STATE_TRANSFER_MAX_STALL_RETRIES,
+    Sequencer, StartViewRefusal, Status, VsrAction, VsrConsensus,
     build_deny_reply_from_request_header, dvc_blank, dvc_header_kind, encode_prepare_headers,
     fatal, repaired_frontier_update, repaired_prepare_evidence, restamp_prepare_view,
     verify_prepare_integrity,
@@ -6087,7 +6088,12 @@ where
                     received = next;
                 }
             }
-            (consensus, ready.then_some(received))
+            // The metadata walk has no durability test, so one value is both prefixes.
+            let prefix = BackupPrefix {
+                held_op: received,
+                received_op: received,
+            };
+            (consensus, ready.then_some(prefix))
         } else {
             let Some(partition) = planes.1.0.get_by_ns(&IggyNamespace::from_raw(header.group))
             else {
@@ -6121,7 +6127,9 @@ where
                 reply.replica = consensus.replica();
                 reply.kind = PrepareProgressHeader::REPLY;
                 reply.ready = u8::from(progress.is_some());
-                reply.received_op = progress.unwrap_or(0);
+                let prefix = progress.unwrap_or_default();
+                reply.held_op = prefix.held_op;
+                reply.received_op = prefix.received_op;
                 reply.seal();
             });
         let _ = self
@@ -6151,36 +6159,22 @@ where
         // Prefer keys after the cursor even when the commit-walk order rotates.
         let rank = |key| (cursor.is_some_and(|last| key <= last), key);
         let mut replay: Option<(u64, u8, u64)> = None;
+        let mut stats = ReplicationStats::default();
         for group in groups {
             let Some(consensus) = self.replication_consensus(group) else {
                 continue;
             };
+            let taken = consensus.take_replication_stats();
+            stats.live_refusals += taken.live_refusals;
+            stats.replayed += taken.replayed;
             for replica in 0..consensus.replica_count() {
                 if replica == consensus.replica() {
                     continue;
                 }
                 match consensus.replication_work(replica) {
                     Some(consensus::ReplicationWork::Probe { nonce, through, .. }) => {
-                        let header_size = size_of::<PrepareProgressHeader>();
-                        let probe = Message::<PrepareProgressHeader>::new(header_size)
-                            .transmute_header(|_, header: &mut PrepareProgressHeader| {
-                                header.command = Command::PrepareProgress;
-                                header.size =
-                                    u32::try_from(header_size).expect("header size fits u32");
-                                header.cluster = consensus.cluster();
-                                header.view = consensus.view();
-                                header.replica = consensus.replica();
-                                header.group = group;
-                                header.partition_incarnation = consensus.partition_incarnation();
-                                header.nonce = nonce;
-                                header.observed_op = through;
-                                header.commit_op = consensus.commit_min();
-                                header.kind = PrepareProgressHeader::PROBE;
-                                header.seal();
-                            });
-                        let _ = self
-                            .bus
-                            .send_to_replica(replica, probe.into_generic().into_frozen())
+                        consensus
+                            .send_replication_probe(replica, nonce, through)
                             .await;
                     }
                     Some(consensus::ReplicationWork::Replay { from_op, .. })
@@ -6194,6 +6188,7 @@ where
                 }
             }
         }
+        self.metrics.record_replication(stats);
         // One bounded range per tick keeps replay I/O independent of group count.
         let Some((group, replica, from_op)) = replay else {
             return;
@@ -6251,7 +6246,7 @@ where
         if !live {
             return self.send_repair_prepare(target, entry).await;
         }
-        send_replayed_prepare(consensus, target, op, entry).await
+        send_replayed_prepare(consensus, target, op, entry, ReplicationSend::Replay).await
     }
 
     #[allow(clippy::future_not_send)]
@@ -14516,9 +14511,14 @@ async fn dispatch_vsr_actions<B, P, J>(
                         continue;
                     };
                     for replica in replicas {
-                        let _ =
-                            send_replayed_prepare(consensus, *replica, header.op, frozen.clone())
-                                .await;
+                        let _ = send_replayed_prepare(
+                            consensus,
+                            *replica,
+                            header.op,
+                            frozen.clone(),
+                            ReplicationSend::Retransmit,
+                        )
+                        .await;
                     }
                 }
             }
@@ -14689,9 +14689,14 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                         continue;
                     };
                     for replica in replicas {
-                        let _ =
-                            send_replayed_prepare(consensus, *replica, header.op, prepare.clone())
-                                .await;
+                        let _ = send_replayed_prepare(
+                            consensus,
+                            *replica,
+                            header.op,
+                            prepare.clone(),
+                            ReplicationSend::Retransmit,
+                        )
+                        .await;
                     }
                 }
             }
@@ -14719,6 +14724,7 @@ async fn send_replayed_prepare<B, P>(
     target: u8,
     op: u64,
     entry: Frozen<MESSAGE_ALIGN>,
+    send: ReplicationSend,
 ) -> bool
 where
     B: MessageBus,
@@ -14730,22 +14736,12 @@ where
     let Some(entry) = restamp_prepare_view(entry, consensus.view()) else {
         return false;
     };
-    let size = entry.len() as u64;
-    if !consensus.admit_replication(target, op, size, true) {
-        return false;
-    }
-    if consensus
-        .message_bus()
-        .send_to_replica(target, entry)
-        .await
-        .is_ok()
-    {
-        consensus.record_replication_send(target, op, size, true);
-        true
-    } else {
-        consensus.record_replication_failure(target, op);
-        false
-    }
+    matches!(
+        consensus
+            .send_replicated_prepare(target, op, entry, send)
+            .await,
+        Ok(true)
+    )
 }
 
 #[cfg(test)]
@@ -18901,6 +18897,7 @@ mod replication_flow_tests {
                 header.ready = 1;
                 header.nonce = nonce;
                 header.observed_op = observed_op;
+                header.held_op = received_op;
                 header.received_op = received_op;
                 header.size = u32::try_from(size_of::<PrepareProgressHeader>()).unwrap();
                 header.seal();
@@ -18967,13 +18964,16 @@ mod replication_flow_tests {
             .unwrap();
         let consensus = partition.consensus();
         consensus.sequencer().set_sequence(1);
-        assert!(consensus.admit_replication(1, 1, REPLICATION_BATCH_BYTES_MAX, false));
-        consensus.record_replication_send(1, 1, REPLICATION_BATCH_BYTES_MAX, false);
-        consensus.record_replication_failure(1, 1);
-        let Some(consensus::ReplicationWork::Probe { nonce, through, .. }) =
-            consensus.replication_work(1)
+        assert!(consensus.admit_replication(
+            1,
+            1,
+            REPLICATION_BATCH_BYTES_MAX,
+            ReplicationSend::Live
+        ));
+        let Some(consensus::ReplicationWork::Probe { nonce, through, .. }) = consensus
+            .record_replication_send(1, 1, REPLICATION_BATCH_BYTES_MAX, ReplicationSend::Live)
         else {
-            panic!("the outstanding batch must own a progress probe");
+            panic!("a full window must send a checkpoint behind its last frame");
         };
         let retry = VsrAction::RetransmitPrepares {
             targets: vec![(header, vec![1, 2])],
@@ -18989,7 +18989,12 @@ mod replication_flow_tests {
             vec![2]
         );
         assert!(
-            !consensus.admit_replication(2, 2, REPLICATION_BATCH_BYTES_MAX, false),
+            !consensus.admit_replication(
+                2,
+                2,
+                REPLICATION_BATCH_BYTES_MAX,
+                ReplicationSend::Retransmit
+            ),
             "a successful timeout retry must consume the same byte credit as replay"
         );
         let reply = ready_reply(consensus, 1, nonce, through, 1);
@@ -19042,13 +19047,16 @@ mod replication_flow_tests {
         let header = *entry.header();
         journal.append(entry).await.unwrap();
         consensus.sequencer().set_sequence(1);
-        assert!(consensus.admit_replication(1, 1, REPLICATION_BATCH_BYTES_MAX, false));
-        consensus.record_replication_send(1, 1, REPLICATION_BATCH_BYTES_MAX, false);
-        consensus.record_replication_failure(1, 1);
-        let Some(consensus::ReplicationWork::Probe { nonce, through, .. }) =
-            consensus.replication_work(1)
+        assert!(consensus.admit_replication(
+            1,
+            1,
+            REPLICATION_BATCH_BYTES_MAX,
+            ReplicationSend::Live
+        ));
+        let Some(consensus::ReplicationWork::Probe { nonce, through, .. }) = consensus
+            .record_replication_send(1, 1, REPLICATION_BATCH_BYTES_MAX, ReplicationSend::Live)
         else {
-            panic!("the metadata batch must own a progress probe");
+            panic!("a full metadata window must send a checkpoint behind its last frame");
         };
         dispatch_vsr_actions(
             &consensus,
@@ -19065,7 +19073,12 @@ mod replication_flow_tests {
                 .collect::<Vec<_>>(),
             vec![2]
         );
-        assert!(!consensus.admit_replication(2, 2, REPLICATION_BATCH_BYTES_MAX, false));
+        assert!(!consensus.admit_replication(
+            2,
+            2,
+            REPLICATION_BATCH_BYTES_MAX,
+            ReplicationSend::Retransmit
+        ));
         let reply = ready_reply(&consensus, 1, nonce, through, 1);
         assert!(consensus.handle_prepare_progress(reply.header()).is_some());
         sent.borrow_mut().clear();
@@ -19112,7 +19125,7 @@ mod replication_flow_tests {
                     replica,
                     1,
                     size_of::<PrepareHeader>() as u64,
-                    false
+                    ReplicationSend::Live
                 ));
                 consensus.record_replication_failure(replica, 1);
                 let Some(consensus::ReplicationWork::Probe { nonce, through, .. }) =

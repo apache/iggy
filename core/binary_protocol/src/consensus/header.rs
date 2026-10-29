@@ -1567,12 +1567,17 @@ impl ConsensusHeader for CommitReplyHeader {
     }
 }
 
-/// Correlates a replication batch with the backup's contiguous acknowledged prefix.
+/// Correlates a replication checkpoint with the backup's contiguous prefixes.
 ///
-/// Progress releases transport credit and never counts toward a commit quorum.
-/// Replies echo the nonce and observed op; `ready` certifies the received prefix.
-/// Probes advertise the primary's applied frontier for retention fallback.
-/// Probes must stay ordered with prepares on the sender's queue.
+/// Probes must stay ordered with prepares on the sender's queue, so a reply
+/// proves that the backup consumed every frame sent before its probe. That FIFO
+/// position, not an op, releases transport credit. Progress never counts toward
+/// a commit quorum.
+/// Replies echo the nonce and observed op. `held_op` is the end of the prefix
+/// that the backup holds with proof in the current view, so the primary finds
+/// replication gaps from it. `received_op <= held_op` is the part of that
+/// prefix that meets the prepare acknowledgment rules, and `ready` certifies it. Probes advertise the primary's applied frontier for retention
+/// fallback.
 /// Nodes using this message require a coordinated cluster upgrade.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
@@ -1591,17 +1596,18 @@ pub struct PrepareProgressHeader {
     pub partition_incarnation: u64,
     pub observed_op: u64,
     pub received_op: u64,
+    pub held_op: u64,
     pub commit_op: u64,
     pub kind: u8,
     pub ready: u8,
-    pub reserved: [u8; 78],
+    pub reserved: [u8; 70],
 }
 
 const _: () = {
     assert!(size_of::<PrepareProgressHeader>() == HEADER_SIZE);
     assert!(offset_of!(PrepareProgressHeader, nonce) == 128);
     assert!(offset_of!(PrepareProgressHeader, partition_incarnation) == 144);
-    assert!(offset_of!(PrepareProgressHeader, reserved) + size_of::<[u8; 78]>() == HEADER_SIZE);
+    assert!(offset_of!(PrepareProgressHeader, reserved) + size_of::<[u8; 70]>() == HEADER_SIZE);
 };
 
 impl ConsensusHeader for PrepareProgressHeader {

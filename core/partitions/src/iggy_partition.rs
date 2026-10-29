@@ -9472,9 +9472,10 @@ where
             .held_through(self.consensus.commit_min())
     }
 
-    /// Progress follows the same per-operation durability contract as prepare acks.
+    /// The held prefix finds replication gaps. The received prefix inside it
+    /// follows the same per-operation durability contract as prepare acks.
     #[must_use]
-    pub fn replication_progress(&self) -> Option<u64> {
+    pub fn replication_progress(&self) -> Option<consensus::BackupPrefix> {
         if !self.consensus.is_normal()
             || self.consensus.is_transferring()
             || self.consensus.has_untrusted_log()
@@ -9483,19 +9484,26 @@ where
         {
             return None;
         }
-        let held = self.held_through();
-        let mut received = self.consensus.commit_min();
-        while received < held {
-            let next = received + 1;
+        let held_through = self.held_through();
+        let mut held = self.consensus.commit_min();
+        let mut received = None;
+        while held < held_through {
+            let next = held + 1;
             let Some(header) = self.log.journal().inner.repair_header(next) else {
                 break;
             };
-            if !self.consensus.view_log_entry_proven(next) || !self.prepare_ack_ready(&header) {
+            if !self.consensus.view_log_entry_proven(next) {
                 break;
             }
-            received = next;
+            if received.is_none() && !self.prepare_ack_ready(&header) {
+                received = Some(held);
+            }
+            held = next;
         }
-        Some(received)
+        Some(consensus::BackupPrefix {
+            held_op: held,
+            received_op: received.unwrap_or(held),
+        })
     }
 
     /// Whether an anchored fence holds every entry of its window, so a proof
@@ -19544,16 +19552,20 @@ mod tests {
             assert!(persistence.is_written(&header));
             assert!(!persistence.is_durable(&header));
 
-            let expected = u64::from(!durability.is_persisted());
+            let expected = Some(consensus::BackupPrefix {
+                held_op: header.op,
+                received_op: u64::from(!durability.is_persisted()),
+            });
             assert_eq!(
                 backup.replication_progress(),
-                Some(expected),
-                "{durability:?}: progress must follow the prepare acknowledgment contract"
+                expected,
+                "{durability:?}: the held prefix finds gaps, and the received prefix follows \
+                 the prepare acknowledgment contract"
             );
             backup.maintenance.flush_through = Some(header.op);
             assert_eq!(
                 backup.replication_progress(),
-                Some(expected),
+                expected,
                 "{durability:?}: ordinary materialization does not replace the held history"
             );
         }
