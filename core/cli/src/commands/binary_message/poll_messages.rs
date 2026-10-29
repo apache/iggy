@@ -48,16 +48,18 @@ impl PollMessagesCmd {
         first: bool,
         last: bool,
         next: bool,
+        timestamp: Option<IggyTimestamp>,
         consumer: Identifier,
         show_headers: bool,
         output_file: Option<String>,
     ) -> Self {
-        let strategy = match (offset, first, last, next) {
-            (Some(offset), false, false, false) => PollingStrategy::offset(offset),
-            (None, true, false, false) => PollingStrategy::first(),
-            (None, false, true, false) => PollingStrategy::last(),
-            (None, false, false, true) => PollingStrategy::next(),
-            _ => unreachable!("Either offset or first, last or next must be specified"),
+        let strategy = match (offset, first, last, next, timestamp) {
+            (Some(offset), false, false, false, None) => PollingStrategy::offset(offset),
+            (None, true, false, false, None) => PollingStrategy::first(),
+            (None, false, true, false, None) => PollingStrategy::last(),
+            (None, false, false, true, None) => PollingStrategy::next(),
+            (None, false, false, false, Some(timestamp)) => PollingStrategy::timestamp(timestamp),
+            _ => unreachable!("Either offset, first, last, next or timestamp must be specified"),
         };
         Self {
             poll_messages: PollMessages {

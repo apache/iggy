@@ -307,6 +307,7 @@ fn get_command(
                 poll_args.first,
                 poll_args.last,
                 poll_args.next,
+                poll_args.timestamp,
                 poll_args.consumer.clone(),
                 poll_args.show_headers,
                 poll_args.output_file.clone(),
