@@ -749,6 +749,10 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         assert_eq!(consumed, TOTAL_MESSAGES);
     }
 
+    // Stop polling before restarts so teardown cannot cancel a group rejoin.
+    fast_consumer.shutdown().await.unwrap();
+    drop(fast_consumer);
+
     let fast_group_details = client
         .get_consumer_group(
             &stream_ident,
@@ -913,8 +917,6 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
     await_segment_layout(&partition_path, &active_only).await;
     assert_no_orphaned_segment_files(&partition_path, 1).await;
 
-    // Cleanup: drop high-level consumer, delete stream resources
-    drop(fast_consumer);
     client
         .delete_topic(&stream_ident, &topic_ident)
         .await
