@@ -17,6 +17,8 @@
 **/node_modules
 **/.gradle
 /foreign/swift/.build
+/bdd/swift/**/.build
+/examples/swift/**/.build
 /foreign/java/**/build
 /bdd/java/build
 /examples/java/**/build

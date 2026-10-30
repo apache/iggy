@@ -10,13 +10,13 @@
 
 Official Swift client SDK for [Apache Iggy](https://iggy.apache.org) message streaming.
 
-The SDK is built up in stages. The client is a TCP connection with optional TLS that
-speaks the consensus protocol, signs in, keeps the session alive with a heartbeat,
-reconnects, and follows the cluster leader. It manages streams, topics, partitions,
-segments, users, personal access tokens, and consumer groups, sends and polls messages,
-stores consumer offsets, produces with a batching producer, and consumes with a
-consumer that tracks and commits its position. Examples and BDD scenarios follow in
-later changes.
+The client is a TCP connection with optional TLS that speaks the consensus protocol,
+signs in, keeps the session alive with a heartbeat, reconnects, and follows the cluster
+leader. It manages streams, topics, partitions, segments, users, personal access tokens,
+and consumer groups, sends and polls messages, stores consumer offsets, produces with a
+batching producer, and consumes with a consumer that tracks and commits its position.
+A runnable producer and consumer live in [`examples/swift`](../../examples/swift), and the
+scenarios every SDK shares run against this one from [`bdd/swift`](../../bdd/swift).
 
 Swift supports the consensus wire protocol and checks commitment proof during
 automatic retries. It does not yet expose retained-operation resolve/abandon APIs,
@@ -95,6 +95,40 @@ let client = IggyClient(configuration: configuration)
 
 The server certificate is verified against the system roots, or against `caFile` when
 set, and against the host of the address unless `TLSOptions.domain` names another one.
+
+### Connection strings
+
+A client can also take the connection string every Iggy SDK reads. The credentials
+become the auto-login, either `username:password` or a personal access token alone:
+
+```swift
+let client = try IggyClient(connectionString: "iggy://iggy:iggy@localhost:8090?tls=true&tls_ca_file=/etc/iggy/ca.pem")
+let configuration = try ClientConfiguration(connectionString: "iggy+tcp://\(token)@[::1]:8090?reconnection_retries=5")
+```
+
+The options are `tls`, `tls_domain`, `tls_ca_file`, `reconnection_retries` (a count or
+`unlimited`), `reconnection_interval`, `reestablish_after`, `heartbeat_interval`, `nodelay`,
+`max_pending_operations`, and `max_pending_operation_bytes`. Durations take the spellings
+of the Rust SDK, such as `500ms`, `5s`, or `1h 30m`. An unknown option or a malformed
+value fails with `invalidConnectionString`, and a bad retry count with
+`invalidNumberValue`, so a string is valid in every SDK or in none. Only the `iggy://`
+and `iggy+tcp://` schemes are accepted.
+
+Some options read differently than in Rust:
+
+- `tls` and `nodelay` take `true` or `false`, and any other value fails, where Rust
+  reads it as false.
+- Without `nodelay` the client keeps Nagle off, its own default.
+- `reconnection_interval` is the full pause between rounds over the endpoints. Rust
+  takes it as the base of a jittered backoff capped at 10 seconds.
+- `reestablish_after` is how long after the last successful connection the client
+  waits before redialing that endpoint. Rust takes it as the uptime that resets the
+  backoff.
+- A request that needs the connection waits for the redial, up to the request timeout
+  (30 seconds by default), and fails when the wait, or the `reconnection_interval`
+  pause, outlasts it. An explicit `connect()` waits it out.
+- The pending operation limits are checked and then ignored, since this client keeps
+  no operations to replay.
 
 ### Resource options
 
@@ -450,6 +484,13 @@ The resource options tests compare against `Tests/IggyTests/Fixtures/resource_op
 
 The metadata changes scenario that churns the change log past its capacity runs only when `IGGY_METADATA_CHANGE_LOG_RESOURCE_CAPACITY` is set for both the server and the test run, for example to 64.
 
+The shared scenarios in `bdd/scenarios` run through `bdd/swift/tests`, a package with a
+small Gherkin runner. CI runs it in Docker with `scripts/run-bdd-tests.sh swift`. Against a
+local server started as above with `IGGY_METADATA_CHANGE_LOG_RESOURCE_CAPACITY=64`, run one
+feature with `IGGY_TCP_ADDRESS=127.0.0.1:8090 IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy
+BDD_FEATURE=stream_options swift run iggy-bdd` from `bdd/swift/tests`. The examples run with
+`scripts/run-examples-from-readme.sh --language swift`.
+
 ## Contributing
 
 Format the sources with the toolchain's formatter before opening a pull request; CI runs it
@@ -459,4 +500,12 @@ in lint mode and builds with warnings as errors:
 swift format format --in-place --recursive Sources Tests Package.swift
 swift format lint --strict --recursive Sources Tests Package.swift
 swift build -Xswiftc -warnings-as-errors
+```
+
+The same configuration covers the examples and the BDD runner, from the repository root:
+
+```bash
+for package in examples/swift/getting-started bdd/swift/tests; do
+  swift format lint --strict --recursive --configuration foreign/swift/.swift-format "$package/Sources" "$package/Package.swift"
+done
 ```
