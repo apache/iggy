@@ -28,7 +28,7 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > they answer `GROUP_AUTHORIZATION_FAILED` (30). Iggy's `metadata.partitions_max` defaults to 0
 > (unlimited), so set it before exposing the gateway. See [docs/SCOPE.md](docs/SCOPE.md).
 >
-> InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
+> InitProducerId does real work too. With the bridge, Iggy builds the producer id, and each partition writes each batch of an idempotent producer once. Without the bridge, the gateway allocates the id, so a stock idempotent producer still starts.
 >
 > Consumer group coordination is not a stub either: `FindCoordinator`, `JoinGroup`, `Heartbeat`,
 > `LeaveGroup`, `SyncGroup`, `DescribeGroups` and `ListGroups` are real, with real membership,
@@ -73,7 +73,7 @@ Default bind: a `PLAINTEXT` listener on `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_READ_TIMEOUT_SECS` | `15` | Seconds allowed to read a frame body once its length prefix arrives |
 | `IGGY_KAFKA_WRITE_TIMEOUT_SECS` | `10` | Seconds allowed to write a response frame |
 | `IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Seconds graceful shutdown waits for in-flight connections before abandoning them. The bridge then signs its Iggy clients out, 5 s at most |
-| `IGGY_KAFKA_INSTANCE_ID` | `IGGY_KAFKA_NODE_ID`, else `0` | This gateway's number among the gateways fronting one Iggy cluster. It is the high half of every producer id `InitProducerId` hands out, and Kafka requires those to be cluster-unique, so give every gateway its own value. Unset, it follows `IGGY_KAFKA_NODE_ID`. A single gateway can leave both unset. |
+| `IGGY_KAFKA_INSTANCE_ID` | `IGGY_KAFKA_NODE_ID`, else `0` | This gateway's number among the gateways fronting one Iggy cluster. Without the bridge, it is the high half of every producer id `InitProducerId` hands out, so give every gateway its own value. With the bridge, Iggy builds the ids, and this value does not change them. Unset, it follows `IGGY_KAFKA_NODE_ID`. A single gateway can leave both unset. |
 | `IGGY_KAFKA_NODE_ID` | `1` | This gateway's broker id in Metadata, 0 to 65535. Beside each Iggy node, use that node's replica id. Required with `IGGY_KAFKA_BROKERS` |
 | `IGGY_KAFKA_BROKERS` | unset | Every gateway in front of the Iggy cluster, this one included, as `id@host:port` entries separated by commas. With several listeners, one `id@PROTOCOL://host:port` entry per gateway and listener. Give every gateway the same list. See [Several gateways](#several-gateways-4515) |
 | `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. If Iggy does not answer, startup tries again 1 s after each failed connect, for up to 60 s, and then the gateway stops. A wrong password or a missing permission stops it at once. It never falls back to stubs. |
@@ -261,15 +261,16 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 
 ### Delivery guarantees
 
-Delivery through this gateway is **at-least-once**, and stays at-least-once across a gateway
-restart. Transactions are not supported, and will not be. An idempotent Kafka producer is given
-a producer id so that it starts, but its retries are not deduplicated: Produce uses the producer
-id only to pick the producer's Iggy session, and ignores the epoch and sequence, so a retry after a
-network timeout writes the record twice, and both copies reach the stream with their own offsets.
+With the bridge, an idempotent Kafka producer writes each batch once. The Java producer is
+idempotent by default. Each batch carries the producer id, the epoch and the sequence of its first
+record. The Iggy partition writes a batch of one producer once. A resend answers the offset of the
+first write. That holds through any gateway, and across a gateway restart.
 
-Iggy deduplicates writes on its own partition plane, and that does not close this gap, because it
-guards the hop from the gateway to Iggy rather than the hop from the producer to the gateway.
-[docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) has the detail and what closing it needs.
+A producer without idempotence gets at-least-once delivery. A retry that follows a network timeout
+writes the record twice. The partition keeps the last 5 batches of each producer, and at most 4096
+producers. It forgets a producer that wrote nothing for a day. Past those limits a resend can
+write a batch twice, as in Kafka.
+[docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) has the detail.
 
 Transactions are **not supported**, and will not be. AddPartitionsToTxn (24), AddOffsetsToTxn
 (25), EndTxn (26) and TxnOffsetCommit (28) are never advertised, so a conforming client never
@@ -325,7 +326,7 @@ cargo run -p iggy-gateway-kafka
   nodes. The bridge itself needs that address at startup. To start while that node is down,
   point it at a load balancer in front of the cluster. A DNS name with one record per node can
   bind a client's first link to the wrong node (not tested).
-- An idempotent producer can still write a batch twice when it moves to another gateway.
+- An idempotent producer that moves to another gateway still writes each batch once.
 - With TLS to Iggy, the SDK dials each node at the address the roster advertises, so each
   node's certificate must name that address, or set `IGGY_KAFKA_IGGY_TLS_DOMAIN`.
 
@@ -505,14 +506,15 @@ One partition, one Iggy send. Each partition answers for itself.
 | ----- | ------- |
 | Partition | Index as sent. Both count from 0. |
 | Base offset | From the send confirmation. `-1` if none. |
-| `log_start_offset` | Always `-1`. |
+| `log_start_offset` | `-1`, but `0` with 59. While it is `-1`, a Java producer retries a 59 unchanged. |
 | `acks` | `0`, `1`, `-1` write the same. Other values: 21, before any per-partition check. |
 | `acks=0` | Writes, answers nothing. Any failed partition closes the connection. |
 | Topics | Creates none. Missing: 3. Bad name: 17. |
 | `timeout_ms` | Honored, max 20 s. The Iggy send stops by then too. Past it: 7. A send that never went out: 6. |
 | Compression | gzip, snappy, lz4. zstd from v7, else 76. |
-| Producer id | Picks the producer's Iggy session. See [Concurrency ceiling](#concurrency-ceiling). |
-| Producer epoch, sequence | Ignored, so a retry writes twice. |
+| Producer id | Goes to Iggy with the batch. It also picks the producer's Iggy session. See [Concurrency ceiling](#concurrency-ceiling). |
+| Producer epoch, sequence | Go to Iggy with the batch. A resend answers the first offset. A gap: 45. An older epoch: 47. A producer that the partition does not hold, above sequence 0: 59. |
+| Producer id with a negative epoch or sequence | 87. |
 | Timestamps over about 71 min apart | Clamped into one send. `kafka.ts` keeps the real one. |
 | Several batches in one partition | 87, as Kafka. |
 | Bytes after the batch | 87. |
@@ -770,9 +772,9 @@ With auto-creation off, the default, nothing changes: a missing topic is answere
 
 - Each producer sends on an `IggyClient` of its own, one request at a time, so its batches land
   in order. Different producers send at once.
-- A producer is its producer id, if this gateway gave that id out since it started, plus its user
-  when SASL is on. Every other producer is its Kafka connection: no id, an id from before a
-  gateway restart, or an id from another gateway.
+- A producer is its producer id, if this gateway gave that id out lately, plus its user when SASL
+  is on. Every other producer is its Kafka connection: no id, an id from before a gateway
+  restart, or an id from another gateway.
 - Up to `IGGY_KAFKA_PRODUCE_SESSIONS` (256) of these clients are open. A full pool closes its
   least recently used free client for a new producer, if that client sat unused for 30 s.
   Otherwise the producer shares 1 more client, one request at a time, and moves to its own at a
@@ -800,8 +802,10 @@ With auto-creation off, the default, nothing changes: a missing topic is answere
   `Admin.createPartitions` report a `TimeoutException`, and the caller must retry.
 - OffsetCommit and OffsetFetch cost one Iggy call per partition, spread over the offset slots. In a
   cluster, an offset commit client can also open one connection per node for stores.
-- Order: set `max.in.flight.requests.per.connection=1`, or `retries=0`. Otherwise a retried batch
-  can land after later ones.
+- Order: an idempotent producer keeps its order. The partition refuses a batch that does not
+  follow with 45, and the producer sends it again. Without idempotence, set
+  `max.in.flight.requests.per.connection=1`, or `retries=0`. Otherwise a retried batch can land
+  after later ones.
 - Order after a 7: the send can still run. A producer with a producer id waits behind it on any
   connection. A producer that is its connection does not once it reconnects, so its retry or its
   next batch can land first. To keep that order use an idempotent producer, the Java default, or

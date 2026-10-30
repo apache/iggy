@@ -32,9 +32,9 @@ pub use config::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, ProduceSes
 pub use error::BridgeError;
 pub use iggy_bridge::{
     CLUSTER_ID_TOPIC, ClusterIdCall, DEFAULT_TOPIC_PARTITIONS, IggyBridge, KafkaTopicMetadata,
-    MAX_TOPIC_PARTITIONS, OFFSET_GROUP_PREFIX, OffsetCalls, OffsetGroups, ProduceTurn, Producer,
-    ScannedGroups, StreamTopicCache, TopicCreationOutcome, TopicLoad, TopicTarget,
-    cluster_id_stream,
+    MAX_TOPIC_PARTITIONS, OFFSET_GROUP_PREFIX, OffsetCalls, OffsetGroups, PartitionBatch,
+    ProduceTurn, Producer, ScannedGroups, StreamTopicCache, TopicCreationOutcome, TopicLoad,
+    TopicTarget, cluster_id_stream,
 };
 pub use nodes::KnownNodes;
 pub use topic_map::{TopicMapping, TopicOverride};

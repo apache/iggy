@@ -41,7 +41,8 @@ use tokio::time::Instant;
 use iggy_gateway_kafka::auth::{IggyAuthenticator, SaslAuthenticator};
 use iggy_gateway_kafka::bridge::{
     BridgeError, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls, KnownNodes,
-    OffsetCalls, ProduceSessionLimits, Producer, TopicCreationOutcome, TopicMapping, TopicOverride,
+    OffsetCalls, PartitionBatch, ProduceSessionLimits, Producer, TopicCreationOutcome,
+    TopicMapping, TopicOverride,
 };
 use iggy_gateway_kafka::protocol::api::ERROR_REQUEST_TIMED_OUT;
 use iggy_gateway_kafka::protocol::sasl::PlainCredentials;
@@ -173,8 +174,11 @@ async fn given_timed_out_writes_when_writing_again_should_resolve_all_client_lan
                     turn,
                     (),
                     &target,
-                    0,
-                    vec![IggyMessage::from_str(payload).expect("message")],
+                    PartitionBatch {
+                        partition: 0,
+                        producer: None,
+                        messages: vec![IggyMessage::from_str(payload).expect("message")],
+                    },
                     deadline,
                 )
                 .await

@@ -1,6 +1,7 @@
 # InitProducerId and idempotent producers
 
-Status: implemented, [#3545](https://github.com/apache/iggy/issues/3545). Gates the Phase 1
+Status: implemented, [#3545](https://github.com/apache/iggy/issues/3545) for InitProducerId and
+[#4513](https://github.com/apache/iggy/issues/4513) for writing each batch once. Gates the Phase 1
 end-to-end test ([#3539](https://github.com/apache/iggy/issues/3539)), which drives
 `kafka-console-producer.sh`.
 
@@ -18,93 +19,24 @@ startup, before it sends a record.
 The gateway's stated purpose is that a Kafka user swaps the broker and changes no application
 code. A broker that the default producer cannot start against does not meet it.
 
-## What Iggy already deduplicates
+## How a resend is written once
 
-Iggy deduplicates on the partition plane, and did so before this gateway existed. The key is
-`(client_id, user_id, request)`. `client_id` is a `u128` the client generates, and `request` is a
-monotonic counter on the client's session. Each partition group holds a per-client watermark with
-a 128-bit `committed_window` under it. A request below the watermark with its bit clear is a
-reordered arrival still to execute. A request below the window is refused with `RequestTooOld`,
-because its outcome is unknown.
-`partition.dedup_clients_max` caps the distinct clients one partition tracks, at 4096 by default
-and 65536 at the ceiling.
+An Iggy partition keeps the state of each idempotent producer that writes to it, as a Kafka log
+does. The core SDK README has the rules, under "Idempotent producers". In short:
 
-The shape is closer to Kafka's than it looks. A producer id with a per-partition sequence maps
-onto a session id with a request id. Under that mapping a request id is `base_sequence + 1` (see
-below), so it advances by each batch's record count and the window is 128 records deep, not 128
-batches. Four batches of 32 records fill it, one fewer than the five a Kafka producer keeps in
-flight.
+- Each batch carries the producer id, the epoch and the sequence of its first record.
+- A partition keeps the last 5 batches of each producer, and at most 4096 producers.
+- A partition drops a producer that wrote nothing for a day.
+- Before the partition primary assigns offsets, it compares each batch with that state and with
+  its uncommitted writes.
 
-What breaks the mapping is the hop each side protects. Iggy's covers gateway to Iggy. Kafka's
-covers producer to gateway. A retrying producer sends a fresh Produce request, and the gateway
-turns it into a fresh Iggy send carrying a fresh request id. Nothing recognises the replay.
+Produce passes the three fields of a Kafka batch to Iggy unchanged. So every resend finds the
+first write: through any gateway, on any Iggy session, and across a gateway restart.
 
-## Closing that gap
-
-Both halves of Iggy's key have to come from the Kafka request rather than from the SDK.
-
-The client id is not a per-request field. `dispatch_partition_request` takes it from the
-transport's bound session, and the header transmute at
-`core/server/src/dispatch/partition.rs:247` overwrites whatever the SDK sent. Deriving it from a
-Kafka producer id therefore needs one bound session per producer.
-
-The request id is different. The transmute copies the header and replaces only `group`, `client`,
-`session` and `user_id`, so a caller-supplied request id survives to the `ClientTable`.
-
-One session per producer is a connection pool keyed by producer id. The gateway has that pool, for
-throughput: see the README's "Concurrency ceiling". Retries are still not deduplicated, because two
-SDK seams are missing:
-
-- a caller-chosen client id at build time. `ConsensusSession::with_client_id` is public, but both
-  construction sites build with `ConsensusSession::new()`
-  (`core/sdk/src/tcp/tcp_client.rs:378` and `:583`)
-- a caller-supplied request id. `send_raw_with_response` already takes
-  `preencoded: Option<RequestHeader>` for transient replay, and it is private
-
-None of this lands in this phase. Produce and Fetch do not need it, delivery is at-least-once
-before and after, and the additions belong to whoever owns that SDK surface.
-
-### Restart
-
-A session registers with a fresh random client id per gateway process. A restarted gateway
-therefore cannot collide with a watermark that outlived it, and a retry that spans a restart is
-not deduplicated. That is still at-least-once, which the README states plainly.
-
-The alternative is a stable client id derived from the producer id. It deduplicates across a
-restart, and it is unsafe without also persisting the last request id per producer. Request ids
-restarting at 1 under a live watermark land below it. Inside the window, an id whose bit is set is
-absorbed as a duplicate and its fresh write is discarded, while an id whose bit is clear executes.
-An id below the window is refused with `RequestTooOld`. Silent loss is worse than duplicate
-delivery, so the fresh random id wins.
-
-### Confirmed and not
-
-The hop mismatch, one session per producer, and the restart choice are agreed in the maintainer
-thread on [#3545](https://github.com/apache/iggy/issues/3545) and in Discord.
-
-Two further readings are ours and are not confirmed yet. One session per producer is enough,
-rather than one per producer and partition, because the `ClientTable` is per partition group. The
-same request number on two partitions is two entries, so `request_id = base_sequence + 1` stays
-monotonic inside each. And the gateway has to preserve per-partition ordering per producer, or
-records land out of order. A lower sequence arriving after a higher one lands below the watermark:
-inside the window, with its bit clear, it executes after its successor, and below the window it is
-refused with `RequestTooOld`.
-
-## Options
-
-| Option | Cost | What a stock producer does |
-| -------- | ------ | ---------------------------- |
-| Stub with `UNSUPPORTED_VERSION` | none | fails at startup unless the user sets `enable.idempotence=false` |
-| Allocate only | about a day | works untouched, at-least-once delivery |
-| Allocate and pool | weeks, blocked on the SDK | works untouched, retries absorbed on both hops |
-
-## Decision
-
-Allocate only, and defer deduplication.
-
-Rejecting the stock producer to avoid that work trades away the one requirement the maintainers
-named. It buys a guarantee nobody is asking for yet. Allocating costs about a day, leaves
-delivery where it already is, and blocks nothing deduplication later needs.
+Iggy's client table does not do this job. It guards the hop from the gateway to Iggy. It keys on a
+request number that the Iggy client picks. A Kafka retry is a new Produce request. The gateway
+sends it as a new Iggy request, with a new number. The producer state keys on the numbers that
+the Kafka producer picks, so every resend carries the same ones.
 
 ## Behavior
 
@@ -113,43 +45,28 @@ ApiVersions. Without both, the producer never sends the request. `kafka-protocol
 the schemas, request v0 to v5 and response v0 to v6, flexible from v2; the gateway serves v0 to
 v5. The handler is `src/protocol/handlers/init_producer_id.rs`.
 
-InitProducerId with no `transactional_id`:
+InitProducerId with no `transactional_id`, with the bridge:
 
-- allocate the next producer id, return it with epoch 0 and error code 0
-- build the id from an instance number in the high 16 bits and a counter in the low 47 bits,
-  leaving bit 63 clear. `producer_id` is an `i64` and `-1` means no producer id, so the value has
-  to stay non-negative. That leaves room for 65536 instances holding 140 trillion ids each
+- ask Iggy for the next producer id, and return it with epoch 0 and error code 0.
+- Iggy builds the id from the session number of the bridge's id client and an index. No other
+  client of the cluster gets that id, on any gateway and across restarts.
+- a request that names its current id and epoch (KIP-360, v3 and later) also gets a new id. Kafka
+  does the same for a producer without a transactional id.
+- if Iggy cannot give an id, answer `COORDINATOR_LOAD_IN_PROGRESS` (14), which the Java producer
+  retries. Not 15 or 16: those send it to look for a transaction coordinator, which this gateway
+  has none of.
+- one Iggy session hands out 2^20 ids. After that, the id client signs in again and gets a new
+  range.
 
-The instance number comes from configuration (`IGGY_KAFKA_INSTANCE_ID`, else
-`IGGY_KAFKA_NODE_ID`, else 0), not from a
-draw at startup. A random 16-bit number collides with even odds at around 300 instances. That is
-a birthday collision, not a remote one.
+For a gap or a lost producer, an idempotent Java producer moves to the next epoch by itself. A new
+epoch starts its sequences at 0. The producer asks for a new id only at epoch 32767.
 
-The id is a pool key, not a dedup identity. Under the design above, the dedup identity is the
-session's own random client id, minted at register. The producer id only decides which connection
-serves a producer. Kafka still requires it to be unique across the cluster, which is what the
-instance number buys. It also has to stay unique across a restart once dedup lands or
-Produce persists, because `producer_epoch` is always 0, so a replayed id is a replayed
-`(producer_id, producer_epoch)` pair a live producer may still hold. The counter therefore starts
-at the wall clock in milliseconds rather than at 0. A restarted gateway starts above every id its
-previous run handed out unless that run averaged more than one allocation per millisecond of its
-uptime, or the clock stepped back across the restart. A clock that reads before the Unix epoch
-seeds 0 and replays from the bottom. 2^47 milliseconds leaves the counter space thousands of years
-from running out.
-
-Nothing is persisted for this, so the clock seed narrows the replay window without closing it.
-Produce reads the id as a pool key, and only an id this run handed out: any other id keys by
-connection. A replayed pair therefore makes two producers of one user share a session and send one
-at a time, and nothing more. It stops being harmless once deduplication reads the id. That work
-must first either persist a high-water mark and seed the counter above it, or bump
-`producer_epoch` on every gateway start. Either one makes a replayed
-`(producer_id, producer_epoch)` pair impossible rather than unlikely.
-
-`IGGY_KAFKA_INSTANCE_ID` follows `IGGY_KAFKA_NODE_ID` when only that one is set, and is 0
-otherwise, so a single gateway needs no configuration. Two gateways
-left on the default draw from the same 47-bit space and can hand out identical ids, on the first
-allocation if they start in the same millisecond. Nothing in the cluster detects that, so a gateway started without the
-variable logs a warning, and the running value is in the startup log line.
+Without the bridge, a local allocator gives the id. It puts an instance number in the high 16 bits
+and a counter in the low 47 bits. Bit 63 stays clear, because `producer_id` is an `i64`, and `-1`
+means no producer. The instance number comes from configuration (`IGGY_KAFKA_INSTANCE_ID`, else
+`IGGY_KAFKA_NODE_ID`, else 0). The counter starts at the wall clock in milliseconds. So a restarted
+gateway starts above the ids of its previous run. Without the bridge nothing is written, so these
+ids only let a stock producer start.
 
 An empty `transactional_id` reads as absent. A wire null decodes to `None`, but
 `kafka-protocol`'s own `Default` is `Some("")`, and a producer that is idempotent-only names no
@@ -180,19 +97,26 @@ for consumer groups and has to refuse a `TXN`-type coordinator lookup explicitly
 
 Produce:
 
-- accept `producer_id`, `producer_epoch` and `base_sequence` on the request. The id picks the
-  producer's session when this run handed it out. The epoch and the sequence are ignored
-- never answer `OUT_OF_ORDER_SEQUENCE_NUMBER` (45) or `DUPLICATE_SEQUENCE_NUMBER` (46)
+- pass `producer_id`, `producer_epoch` and `base_sequence` of an idempotent batch to Iggy. A
+  batch with a producer id but a negative epoch or sequence gets `INVALID_RECORD` (87).
+- a resend of a batch that the partition holds answers the offset of its first write.
+- answer `OUT_OF_ORDER_SEQUENCE_NUMBER` (45) for a gap, as Kafka does. The Java producer retries
+  a 45. For a real gap, it moves to the next epoch.
+- answer 45 also for a resend older than the 5 batches that the partition keeps.
+- answer `INVALID_PRODUCER_EPOCH` (47) for a batch of an older epoch.
+- answer `UNKNOWN_PRODUCER_ID` (59) for a batch above sequence 0 from a producer that the partition
+  does not hold. That partition response carries `log_start_offset` 0. With a log start of `-1`,
+  the Java producer retries a 59 unchanged up to its delivery timeout.
+- a duplicate that is still uncommitted gets Iggy's `TransientNotAccepted`. The SDK retries it up
+  to the deadline. Past it, the client gets a retriable 6 or 7.
+- never answer `DUPLICATE_SEQUENCE_NUMBER` (46). A Kafka broker sends 45 for an old duplicate too.
+- an id that this gateway gave out lately also picks the producer's Iggy session.
 - reject a non-empty `transactional_id` (v3+) with `UNSUPPORTED_VERSION` (35), at the partition
   level, keeping the connection open. Under `acks=0` there is no response to carry 35, so the
   gateway closes the connection instead, as a Kafka broker does on any `acks=0` produce error.
-  The check runs before the `acks=0` branch, so no write path can see a transactional batch
+  The check runs before the `acks=0` branch, so no write path can see a transactional batch.
 
-Those first two codes stay unsent even once dedup lands. The watermark accepts any request
-above it without noticing a gap, so a gap cannot be told apart from ordinary traffic. Sending
-either code claims a detection the gateway does not have.
-
-The third is where `maybeTransitionToErrorState` is exact. `Sender.completeBatch` ->
+The transactional refusal is where `maybeTransitionToErrorState` is exact. `Sender.completeBatch` ->
 `canRetry` false -> `failBatch` -> `handleFailedBatch` -> `maybeTransitionToErrorState`, whose
 explicit fatal set holds ClusterAuthorization, TransactionalIdAuthorization, ProducerFenced,
 UnsupportedVersion and InvalidPidMapping. `INVALID_TXN_STATE` (48) is explicitly rewritten to
@@ -233,29 +157,30 @@ branch load-bearing.
 
 ## What this does not give you
 
-A producer that holds an id believes its retries are deduplicated. They are not. A retry after a
-network timeout writes the record twice, and both copies reach the stream with their own offsets.
-
-Iggy's own deduplication does not help, because it guards the other hop. Delivery through the
-gateway is at-least-once until dedup lands, and at-least-once across a gateway restart after that.
-
-The README states that limitation under "Delivery guarantees", so a user does not have to infer
-it from the presence of key 22.
+- A producer without idempotence still gets at-least-once delivery. A retry that follows a
+  network timeout writes the record twice.
+- A partition forgets a producer that wrote nothing for a day. Past 4096 producers, it also
+  forgets the one idle the longest. A resend of an old batch of a forgotten producer can write it
+  twice, as in Kafka.
+- A resend older than the 5 batches that the partition keeps gets 45, as in Kafka.
+- Released Rust and Swift SDKs refuse a polled batch with a producer section. Before idempotent
+  Kafka producers write to a topic, upgrade every native consumer of it.
+- Transactions are not supported.
 
 ## Resolution
 
-The open question was allocate only, as above, against stub and document
-`enable.idempotence=false`. Allocate only was taken, which this document named as the default
-outcome, and is what shipped.
+InitProducerId first only allocated ids, and delivery stayed at-least-once. The producer state in
+Iggy partitions ([#4513](https://github.com/apache/iggy/issues/4513)) now writes each batch of an
+idempotent producer once.
 
 ## References
 
 - Record mapping: [`BRIDGE_MAPPING.md`](BRIDGE_MAPPING.md), batch-level fields
 - Scope and phases: [`SCOPE.md`](SCOPE.md)
 - Version firewall: `src/protocol/api.rs`, `SUPPORTED_RANGES`
-- Dedup key and window: `core/consensus/src/client_table.rs`
-- Session identity: `core/sdk/src/session.rs`, `core/sdk/src/tcp/tcp_client.rs`
-- Header rewrite: `core/server/src/dispatch/partition.rs`
+- Producer state of a partition: `core/partitions/src/producer_state.rs`
+- Producer ids from the session number: `core/sdk/src/session_owner/producer_ids.rs`
+- The gateway's id client: `src/bridge/iggy_bridge/producer_ids.rs`
 - Produce fatal path: `TransactionManager.maybeTransitionToErrorState`, apache/kafka trunk
 - InitProducerId fatal path: `TransactionManager.InitProducerIdHandler.handleResponse`, same file
 - librdkafka's fatal set: `rd_kafka_idemp_check_error`, `src/rdkafka_idempotence.c`
