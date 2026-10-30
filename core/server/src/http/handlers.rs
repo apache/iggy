@@ -2268,7 +2268,7 @@ async fn try_external_auth_http_login(
     let ext_config = &state.server_config.external_auth;
     let client_address = client_addr.addr.to_string();
     let connection_id = uuid::Uuid::now_v7().to_string();
-    let password_secret = SecretString::from(password.to_owned());
+    let password_secret = SecretString::from(password);
     let ext_request = ExternalAuthRequest {
         transport: "http",
         client_address: &client_address,

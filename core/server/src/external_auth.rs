@@ -377,15 +377,7 @@ pub async fn callout_external_auth(
 pub fn validate_provisioned_account(
     user: Option<&metadata::stm::user::User>,
 ) -> Option<(u32, iggy_common::IggyTimestamp)> {
-    use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
-    use iggy_common::{UserStatus, check_critical_options};
-
-    let user = user?;
-    if user.id == DEFAULT_ROOT_USER_ID {
-        return None;
-    }
-    (user.status == UserStatus::Active && check_critical_options(&user.options).is_ok())
-        .then_some((user.id, user.created_at))
+    check_account_policy(user?).ok()
 }
 
 /// Why a pre-provisioned account was rejected. Logged for debugging but
@@ -417,25 +409,30 @@ pub fn resolve_username(
     users: &metadata::stm::user::UsersInner,
     username: &str,
 ) -> Result<(u32, iggy_common::IggyTimestamp), iggy_common::IggyError> {
-    use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
-    use iggy_common::{UserStatus, check_critical_options};
-
     let Some(user) = users.user_by_name(username) else {
         tracing::warn!(username, reason = %AccountRejection::NotFound, "ext-auth account rejected");
         return Err(iggy_common::IggyError::InvalidCredentials);
     };
-    let rejection = if user.id == DEFAULT_ROOT_USER_ID {
-        Some(AccountRejection::Root)
-    } else if user.status != UserStatus::Active {
-        Some(AccountRejection::Inactive)
-    } else if check_critical_options(&user.options).is_err() {
-        Some(AccountRejection::CriticalOptions)
-    } else {
-        None
-    };
-    if let Some(reason) = rejection {
+    check_account_policy(user).map_err(|reason| {
         tracing::warn!(username, user_id = user.id, reason = %reason, "ext-auth account rejected");
-        return Err(iggy_common::IggyError::InvalidCredentials);
+        iggy_common::IggyError::InvalidCredentials
+    })
+}
+
+fn check_account_policy(
+    user: &metadata::stm::user::User,
+) -> Result<(u32, iggy_common::IggyTimestamp), AccountRejection> {
+    use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+    use iggy_common::{UserStatus, check_critical_options};
+
+    if user.id == DEFAULT_ROOT_USER_ID {
+        return Err(AccountRejection::Root);
+    }
+    if user.status != UserStatus::Active {
+        return Err(AccountRejection::Inactive);
+    }
+    if check_critical_options(&user.options).is_err() {
+        return Err(AccountRejection::CriticalOptions);
     }
     Ok((user.id, user.created_at))
 }
