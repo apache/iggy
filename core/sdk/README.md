@@ -427,6 +427,8 @@ async fn produce(
 }
 ```
 
+`IggyProducer` has an idempotent mode, which `idempotent()` on its builder turns on. The producer then gets its id from `next_producer_id`, picks the partition of each chunk itself and numbers the chunks of each partition. After an unknown outcome, it sends a chunk again with the same producer section. The mode is off by default, because released consumers cannot poll the batches that it writes.
+
 A partition keeps 4096 producers. Past that limit, it drops the producer that was idle the longest. It also drops a producer after 24 hours without a batch. The producer state stays through restarts, checkpoints and state transfer between replicas. HTTP clients get `FeatureUnavailable` from `next_producer_id` and `send_producer_messages`.
 
 Rust and Swift SDKs released before this version refuse a binary poll that returns a batch with a producer. They require zero bytes in that part of the header. Upgrade the SDK of every binary consumer before a producer writes such batches to a topic.

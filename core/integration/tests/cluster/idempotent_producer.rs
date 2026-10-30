@@ -233,6 +233,57 @@ async fn given_two_clients_and_a_new_sign_in_when_taking_producer_ids_should_nev
     assert_eq!(send(&second, producer, &["a"]).await, Some(0));
 }
 
+#[iggy_harness(cluster_nodes = 1, server(sharding.cpu_allocation = "0..1"))]
+async fn given_an_idempotent_producer_when_its_chunk_comes_again_should_answer_the_first_offset(
+    harness: &mut TestHarness,
+) {
+    let client = connect(harness).await;
+    create_topic(&client).await;
+    let producer = client
+        .producer(STREAM_NAME, TOPIC_NAME)
+        .expect("a producer builder")
+        .partitioning(Partitioning::partition_id(PARTITION_ID))
+        .direct(DirectConfig::builder().batch_length(1).build())
+        .idempotent()
+        .build();
+    producer.init().await.expect("init the producer");
+    let messages = ["a", "b"]
+        .iter()
+        .map(|payload| IggyMessage::from_str(payload).expect("message"))
+        .collect();
+
+    let sent = producer.send(messages).await.expect("send two chunks");
+
+    let offsets: Vec<u64> = sent
+        .confirmations
+        .iter()
+        .map(|confirmation| confirmation.base_offset)
+        .collect();
+    assert_eq!(offsets, [0, 1]);
+    // A batch can show in more than one `.log` file under the data path.
+    let mut written: Vec<BatchProducer> = Vec::new();
+    for producer in stored_batches(&harness.node(0).data_path())
+        .iter()
+        .filter_map(|header| header.producer)
+    {
+        if !written.contains(&producer) {
+            written.push(producer);
+        }
+    }
+    let id = written
+        .first()
+        .expect("a batch with a producer")
+        .producer_id;
+    let numbered = |base_sequence| BatchProducer::new(id, 0, base_sequence).unwrap();
+    assert_eq!(written, [numbered(0), numbered(1)]);
+    assert_eq!(
+        send(&client, numbered(0), &["a"]).await,
+        Some(0),
+        "the first chunk, sent again after a lost reply, answers its first offset"
+    );
+    assert_eq!(poll_payloads(&client).await, ["a", "b"]);
+}
+
 pub(crate) async fn connect(harness: &TestHarness) -> IggyClient {
     harness
         .node(0)

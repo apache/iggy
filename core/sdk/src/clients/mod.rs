@@ -50,6 +50,7 @@ pub mod producer_builder;
 pub mod producer_config;
 pub mod producer_dispatcher;
 pub mod producer_error_callback;
+pub(crate) mod producer_idempotence;
 pub mod producer_sharding;
 
 const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
