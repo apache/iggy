@@ -1619,6 +1619,10 @@ where
     /// `limit` bounds what one caller commits in a single pass. The run is
     /// re-derived from the caller's own `commit_min` every time, so a truncated
     /// answer is resumed, not lost.
+    ///
+    /// Costs one index lookup per returned header, however many headers are
+    /// resident: a lagging backup holds hundreds of thousands, and the commit
+    /// walk calls this on every tick.
     pub fn committed_headers_from(
         &self,
         from_op: u64,
@@ -1633,37 +1637,20 @@ where
         if from_op > commit_max {
             return Vec::new();
         }
-        let headers = unsafe { &*self.headers.get() };
-        // Sized off the RUN the caller asked for, capped by the headers that
-        // could possibly cover it. Sizing off `headers.len()` alone would make
-        // a one-op run allocate a slot per resident header, and `commit_max` is
-        // a cluster frontier this replica may be arbitrarily far below, so
-        // neither bound can be dropped. `saturating_add` because `commit_max`
-        // is `u64::MAX` on a saturated frontier, where `+ 1` would panic in
-        // debug and wrap to an empty span (a walk that never resumes) in
-        // release.
-        let span = (commit_max - from_op)
-            .saturating_add(1)
-            .min(limit as u64)
-            .min(headers.len() as u64);
-        // `span` is a `min` of two `usize`-derived values on a 64-bit target,
-        // so the narrowing is lossless; `slot` is then compared against it as
-        // a `u64` BEFORE any cast, so nothing depends on the cast to bound it.
-        #[allow(clippy::cast_possible_truncation)]
-        let span = span as usize;
-        let mut slots: Vec<Option<PrepareHeader>> = vec![None; span];
-        for header in headers {
-            if header.op < from_op || header.op - from_op >= span as u64 {
-                continue;
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            let slot = (header.op - from_op) as usize;
-            // Keep the first resident occurrence, matching `header_by_op`.
-            slots[slot].get_or_insert(*header);
-        }
+        // `saturating_add` because `commit_max` is `u64::MAX` on a saturated
+        // frontier, where `+ 1` would panic in debug and wrap to an empty span
+        // (a walk that never resumes) in release.
+        let span = (commit_max - from_op).saturating_add(1).min(limit as u64);
         // Stops at the first hole: a replication gap must not be skipped, or
-        // `advance_commit_min`'s sequential contract breaks.
-        slots.into_iter().map_while(|header| header).collect()
+        // `advance_commit_min`'s sequential contract breaks. `header_by_op`
+        // returns the first resident occurrence of an op.
+        (0..span)
+            .map_while(|index| {
+                from_op
+                    .checked_add(index)
+                    .and_then(|op| self.header_by_op(op))
+            })
+            .collect()
     }
 
     /// Oldest message offset still resident in the in-memory journal, if
@@ -2845,6 +2832,27 @@ mod tests {
             journal.committed_headers_from(1, 4, 0).is_empty(),
             "a zero limit commits nothing"
         );
+    }
+
+    #[compio::test]
+    async fn given_reordered_duplicates_when_walking_should_follow_op_order_and_first_copy() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for (op, checksum) in [(3, 30), (1, 10), (4, 40), (2, 20), (1, 11), (2, 21)] {
+            let entry = build_prepare(op, HEADER_SIZE).transmute_header(
+                |mut old, header: &mut PrepareHeader| {
+                    old.checksum = checksum;
+                    *header = old;
+                },
+            );
+            journal.append(entry.into_frozen()).await.unwrap();
+        }
+
+        let run: Vec<_> = journal
+            .committed_headers_from(1, u64::MAX, usize::MAX)
+            .iter()
+            .map(|header| (header.op, header.checksum))
+            .collect();
+        assert_eq!(run, vec![(1, 10), (2, 20), (3, 30), (4, 40)]);
     }
 
     /// Three-message batch with the broker append time (`base_timestamp`)
