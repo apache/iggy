@@ -197,13 +197,22 @@ pub struct PollMessages {
     #[schemars(description = "partition identifier (optional, number)")]
     pub partition_id: Option<u32>,
 
-    #[schemars(description = "strategy (optional, string)")]
+    #[schemars(
+        description = "polling strategy (optional, one of 'offset', 'first', 'last', 'next', \
+                       'timestamp'; defaults to 'offset'; 'next' resumes from the stored consumer \
+                       offset and always auto-commits; unknown values fall back to 'offset')"
+    )]
     pub strategy: Option<String>,
 
-    #[schemars(description = "offset to start from (optional)")]
+    #[schemars(
+        description = "offset to start from (optional, used with strategy 'offset', defaults to 0)"
+    )]
     pub offset: Option<u64>,
 
-    #[schemars(description = "timestamp to start from (optional, microseconds from Unix Epoch)")]
+    #[schemars(
+        description = "timestamp to start from (optional, microseconds from Unix Epoch, used with \
+                       strategy 'timestamp', defaults to now)"
+    )]
     pub timestamp: Option<u64>,
 
     #[schemars(description = "count (optional, must be greater than 0)")]
@@ -221,13 +230,20 @@ pub struct SendMessages {
     #[schemars(description = "topic identifier (name or number)")]
     pub topic_id: String,
 
-    #[schemars(description = "partition identifier (optional, number)")]
+    #[schemars(
+        description = "partition identifier (optional, number, used with partitioning 'partition', \
+                       defaults to 0)"
+    )]
     pub partition_id: Option<u32>,
 
-    #[schemars(description = "partitioning (optional, string)")]
+    #[schemars(
+        description = "partitioning (optional, one of 'balanced', 'key', 'partition'; defaults to \
+                       'balanced'; 'key' requires messages_key, 'partition' uses partition_id; \
+                       unknown values fall back to 'balanced')"
+    )]
     pub partitioning: Option<String>,
 
-    #[schemars(description = "messages key (optional, string)")]
+    #[schemars(description = "messages key (optional, string, required with partitioning 'key')")]
     pub messages_key: Option<String>,
 
     #[schemars(description = "messages collection")]
