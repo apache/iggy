@@ -3476,6 +3476,7 @@ dependencies = [
  "server_common",
  "static-toml",
  "tracing",
+ "url",
 ]
 
 [[package]]

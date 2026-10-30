@@ -24,7 +24,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -110,14 +110,15 @@ use iggy_common::{
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
-use secrecy::ExposeSecret;
 use secrecy::zeroize::Zeroizing;
+use secrecy::{ExposeSecret, SecretString};
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use shard::{
     DeferredPollContext, DeferredPollRequest, PartitionRead, PartitionReadReply, PollQuotaIdentity,
 };
 
+use crate::dispatch::login_error::LoginRegisterError;
 use crate::dispatch::metadata_changes::metadata_changes_page;
 use crate::dispatch::partition::{
     ConsumerOffsetTarget, fence_poll_context, resolve_consumer_offset_request,
@@ -187,6 +188,7 @@ pub(in crate::http) async fn ping(State(_state): State<HttpState>) -> &'static s
 
 pub(in crate::http) async fn login_user(
     State(state): State<HttpState>,
+    ConnectInfo(client_addr): ConnectInfo<crate::http::ClientAddr>,
     Json(command): Json<LoginUser>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
     // Credential verification is a consensus-free STM read; hold it while a
@@ -198,13 +200,30 @@ pub(in crate::http) async fn login_user(
     SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard))
         .await
         .map_err(|_| IggyError::TransientNotAccepted)?;
-    let (user_id, created_at) = verify_login_credentials(
+
+    // verify_login_credentials handles not-caught-up (transient), unknown
+    // users (constant-cost dummy hash), and wrong passwords in one call.
+    match verify_login_credentials(
         &state.shard,
         &command.username,
         command.password.expose_secret(),
-    )
-    .map_err(|error| login_error_to_iggy(&error))?;
-    issue_identity(&state, user_id, created_at)
+    ) {
+        Ok((user_id, created_at)) => issue_identity(&state, user_id, created_at),
+        Err(LoginRegisterError::UserNotFound) if state.server_config.external_auth.enabled => {
+            if state.is_normal_primary() {
+                SendWrapper::new(try_external_auth_http_login(
+                    &state,
+                    &command.username,
+                    &command.password,
+                    &client_addr,
+                ))
+                .await
+            } else {
+                Err(IggyError::TransientNotAccepted.into())
+            }
+        }
+        Err(error) => Err(login_error_to_iggy(&error).into()),
+    }
 }
 
 pub(in crate::http) async fn login_with_personal_access_token(
@@ -2271,6 +2290,65 @@ fn issue_identity(
             expiry: generated.access_token_expiry,
         }),
     }))
+}
+
+/// Try external auth callout for an HTTP password login and, on success,
+/// resolve the returned username to a pre-provisioned Iggy user.
+async fn try_external_auth_http_login(
+    state: &HttpInner,
+    username: &str,
+    password: &SecretString,
+    client_addr: &crate::http::ClientAddr,
+) -> Result<Json<IdentityInfo>, CustomError> {
+    use crate::external_auth::{
+        Credentials, ExternalAuthRequest, HTTP_TRANSPORT, ValidatedDecision, callout_external_auth,
+    };
+
+    let ext_config = &state.server_config.external_auth;
+    let client_address = client_addr.addr.to_string();
+    let connection_id = uuid::Uuid::now_v7().to_string();
+    let ext_request = ExternalAuthRequest {
+        transport: HTTP_TRANSPORT,
+        client_address: &client_address,
+        connection_id: &connection_id,
+        credentials: Credentials::UsernamePassword { username, password },
+    };
+
+    let decision = callout_external_auth(ext_config, ext_request)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "external auth callout failed");
+            if error.is_transient() {
+                IggyError::TransientNotAccepted
+            } else {
+                IggyError::InvalidCredentials
+            }
+        })?;
+
+    match decision {
+        ValidatedDecision::Allow {
+            username: ext_username,
+        } => {
+            let (user_id, created_at) = state
+                .shard
+                .plane
+                .metadata()
+                .mux_stm
+                .users()
+                .read(|users| crate::external_auth::resolve_username(users, &ext_username))
+                .inspect_err(|_| {
+                    tracing::warn!(
+                        ext_username = %ext_username,
+                        "ext-auth user resolution failed"
+                    );
+                })?;
+            issue_identity(state, user_id, created_at)
+        }
+        ValidatedDecision::Deny { reason } => {
+            tracing::warn!(reason = %reason, "external auth denied login");
+            Err(IggyError::InvalidCredentials.into())
+        }
+    }
 }
 
 #[cfg(test)]
