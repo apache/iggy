@@ -197,6 +197,10 @@ pub enum IggyError {
     /// No poll progress was applied. Back off without invalidating the partition route.
     #[error("Deferred poll capacity exceeded; retry after backoff on the same replica")]
     DeferredPollCapacityExceeded = 90,
+    /// This client handed out every producer id of its session. Another
+    /// client, or this one after it signs in again, gets new ids.
+    #[error("This client has no producer ids left in its session")]
+    ProducerIdsExhausted = 91,
     /// The batch does not follow the last batch that the partition holds for
     /// its producer. Nothing was written.
     #[error("The producer batch does not follow the last batch of its producer")]

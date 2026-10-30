@@ -97,6 +97,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case lifecycleBusy = 88
     case notPrimary = 89
     case deferredPollCapacityExceeded = 90
+    case producerIdsExhausted = 91
     case producerSequenceOutOfOrder = 92
     case producerEpochFenced = 93
     case producerUnknown = 94
@@ -367,6 +368,7 @@ extension IggyErrorCode {
         case .lifecycleBusy: "lifecycle_busy"
         case .notPrimary: "not_primary"
         case .deferredPollCapacityExceeded: "deferred_poll_capacity_exceeded"
+        case .producerIdsExhausted: "producer_ids_exhausted"
         case .producerSequenceOutOfOrder: "producer_sequence_out_of_order"
         case .producerEpochFenced: "producer_epoch_fenced"
         case .producerUnknown: "producer_unknown"

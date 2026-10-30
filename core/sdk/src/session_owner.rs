@@ -25,6 +25,7 @@ use iggy_common::{
 };
 use lanes::{Lanes, ProvedOutcomes};
 use pending::PendingOperations;
+use producer_ids::ProducerIds;
 use secrecy::{ExposeSecret, SecretString};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -32,16 +33,18 @@ use tokio::sync::watch;
 
 mod lanes;
 mod pending;
+mod producer_ids;
 
 pub(crate) use lanes::{LaneKey, LaneTicket, RetainedOperation};
 
 /// The session state that every link of one client shares: the consensus
-/// session, its epoch, the lanes, the metadata watermark and the sign-in.
+/// session, its epoch, the lanes, the metadata watermark, the sign-in and the
+/// producer ids.
 ///
 /// Lock order is session, lanes, then either the proved outcomes or the
-/// pending-operation usage. The sign-in also comes after the session. The
-/// epoch is read and written under session or lanes, never the other way
-/// round. No lock is held across an await.
+/// pending-operation usage. The sign-in and the producer ids also come after
+/// the session. The epoch is read and written under session or lanes, never
+/// the other way round. No lock is held across an await.
 #[derive(Debug)]
 pub(crate) struct SessionOwner {
     /// The initial client id identifies this owner even after session replacement.
@@ -59,6 +62,7 @@ pub(crate) struct SessionOwner {
     metadata_watermark: AtomicU64,
     sign_in: Mutex<SignIn>,
     auto_login: AutoLogin,
+    producer_ids: Mutex<ProducerIds>,
 }
 
 /// The fence of the current session, whether the session is bound, and the
@@ -123,11 +127,24 @@ impl SessionOwner {
             metadata_watermark: AtomicU64::new(0),
             sign_in: Mutex::default(),
             auto_login,
+            producer_ids: Mutex::default(),
         }
     }
 
     pub(crate) fn consumer_group_state(&self) -> Arc<ConsumerGroupClientState> {
         Arc::clone(&self.consumer_group_state)
+    }
+
+    /// The next producer id of the current session. See [`ProducerIds`].
+    pub(crate) fn next_producer_id(&self) -> Result<u64, IggyError> {
+        let session = self
+            .session()?
+            .session()
+            .ok_or(IggyError::Unauthenticated)?;
+        self.producer_ids
+            .lock()
+            .map_err(|_| IggyError::InvalidConfiguration)?
+            .next(session)
     }
 
     /// The caller must not replace the session through the guard, because

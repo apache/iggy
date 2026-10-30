@@ -603,6 +603,10 @@ impl<B: BinaryClient> MessageClient for B {
         )
         .await
     }
+
+    async fn next_producer_id(&self) -> Result<u64, IggyError> {
+        self.allocate_producer_id()
+    }
 }
 
 fn encode_messages(

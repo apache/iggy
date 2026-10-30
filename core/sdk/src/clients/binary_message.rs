@@ -162,6 +162,10 @@ impl MessageClient for IggyClient {
         )
         .await
     }
+
+    async fn next_producer_id(&self) -> Result<u64, IggyError> {
+        super::with_client!(self, client => client.next_producer_id().await)
+    }
 }
 
 impl IggyClient {

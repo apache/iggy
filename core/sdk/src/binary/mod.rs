@@ -277,6 +277,10 @@ macro_rules! impl_binary_client {
             fn sdk_version(&self) -> &'static str {
                 crate::SDK_VERSION
             }
+
+            fn allocate_producer_id(&self) -> Result<u64, iggy_common::IggyError> {
+                self.driver.session().next_producer_id()
+            }
         }
 
         impl iggy_common::BinaryClient for $client {}

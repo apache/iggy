@@ -255,4 +255,16 @@ pub trait MessageClient {
         let _ = (stream_id, topic_id, partitioning, producer, messages);
         Err(IggyError::FeatureUnavailable)
     }
+
+    /// A producer id that no other client of the cluster gets. It is built
+    /// from this client's session number, the op of its `Register`, so no
+    /// request goes to the server. The ids of a session stay unique after the
+    /// session ends, so a producer can store its id and use it again.
+    ///
+    /// Fails with [`IggyError::ProducerIdsExhausted`] after 2^20 ids from one
+    /// session, and with [`IggyError::Unauthenticated`] before a sign-in.
+    /// HTTP returns [`IggyError::FeatureUnavailable`].
+    async fn next_producer_id(&self) -> Result<u64, IggyError> {
+        Err(IggyError::FeatureUnavailable)
+    }
 }
