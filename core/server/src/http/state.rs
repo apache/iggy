@@ -31,10 +31,9 @@ use std::task::{Poll, Waker};
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::Response;
 use configs::server::ServerConfig;
-use consensus::{MetadataHandle, VsrConsensus};
+use consensus::{Consensus, MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
 use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
-use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{ClusterMetadata, IggyError, IggyTimestamp, UserStatus};
 use message_bus::InstanceToken;
 use metadata::MetadataSubmitError;
@@ -347,6 +346,18 @@ impl HttpInner {
             .consensus
             .as_ref()
             .is_some_and(VsrConsensus::is_primary)
+    }
+
+    /// True when this node is both in normal status and the primary. Used
+    /// by the ext-auth gate to block callouts during view changes, matching
+    /// the binary transport path in `session_ops::is_metadata_primary`.
+    pub(in crate::http) fn is_normal_primary(&self) -> bool {
+        self.shard
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .is_some_and(|c| c.is_normal() && c.is_primary())
     }
 
     /// Grade a linearizable read that reached a follower: redirect (307) to the
@@ -789,11 +800,7 @@ pub(in crate::http) fn insert_view_header(state: &HttpInner, mut response: Respo
 /// not root. A deleted user's id goes to the next user created, so the issuer
 /// is matched by username, and an external issuer never holds root.
 fn trusted_issuer_account(user: Option<&User>) -> Option<(u32, IggyTimestamp)> {
-    let user = user?;
-    if user.id == DEFAULT_ROOT_USER_ID {
-        return None;
-    }
-    (user.status == UserStatus::Active).then_some((user.id, user.created_at))
+    crate::external_auth::validate_provisioned_account(user)
 }
 
 #[cfg(test)]
@@ -801,6 +808,7 @@ mod tests {
     use super::{MetadataWatermarks, register_submit_auth_error, trusted_issuer_account};
     use crate::http::error::AuthError;
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+    use iggy_common::{HeaderKey, HeaderValue, OptionKey, OptionValue};
     use iggy_common::{IggyTimestamp, UserStatus};
     use metadata::MetadataSubmitError;
     use metadata::stm::user::User;
@@ -886,6 +894,26 @@ mod tests {
         assert_eq!(
             trusted_issuer_account(Some(&active)),
             Some((1, active.created_at))
+        );
+    }
+
+    #[test]
+    fn given_user_with_critical_options_when_trusted_issuer_maps_onto_it_should_refuse() {
+        let mut with_critical = user(2, UserStatus::Active);
+        // An unrecognized key listed in the critical-keys marker triggers
+        // check_critical_options to reject the user.
+        with_critical.options.insert(
+            HeaderKey::try_from("future_secret").unwrap(),
+            OptionValue::explicit(HeaderValue::try_from("opaque").unwrap()),
+        );
+        with_critical.options.insert(
+            HeaderKey::from(OptionKey::CriticalKeys),
+            OptionValue::derived(HeaderValue::try_from("future_secret").unwrap()),
+        );
+        assert_eq!(
+            trusted_issuer_account(Some(&with_critical)),
+            None,
+            "a user with unrecognized critical options must be rejected"
         );
     }
 
