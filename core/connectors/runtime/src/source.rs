@@ -21,7 +21,7 @@ use flume::{Receiver, Sender};
 use iggy::prelude::StreamCreateOptions;
 use iggy::prelude::{
     Client, DirectConfig, HeaderKey, HeaderValue, Identifier, IggyClient, IggyDuration, IggyError,
-    IggyMessage, StreamClient, TopicClient, TopicCreateOptions,
+    IggyMessage, Partitioning, StreamClient, TopicClient, TopicCreateOptions,
 };
 use iggy_common::{BINARY_OPERATION_TIMEOUT, Durability, TopicRuntimeOptions};
 use iggy_connector_sdk::encoders::avro::{AvroEncoderConfig, AvroStreamEncoder};
@@ -46,6 +46,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::benchmark;
 use crate::configs::connectors::SourceConfig;
 use crate::context::RuntimeContext;
+use crate::exactly_once::{self, ExactlyOnce, ExactlyOnceTarget};
 use crate::log::LOG_CALLBACK;
 use crate::manager::source::StopReport;
 use crate::metrics::ConnectorType;
@@ -169,6 +170,26 @@ pub async fn init(
             }
             Err(error) => {
                 let message = format!("Failed to load source state: {error}");
+                error!("Source: {name} ({key}) - {message}");
+                failed_plugins.push(FailedPlugin::new(
+                    plugin_id,
+                    &key,
+                    &name,
+                    &config.path,
+                    config.plugin_config_format,
+                    config.enabled,
+                    message,
+                ));
+                continue;
+            }
+        };
+
+        // An exactly-once source keeps its producer around the plugin's bytes. The plugin gets
+        // only its own.
+        let state = match exactly_once::plugin_state(state) {
+            Ok(state) => state,
+            Err(error) => {
+                let message = format!("Failed to read source state: {error}");
                 error!("Source: {name} ({key}) - {message}");
                 failed_plugins.push(FailedPlugin::new(
                     plugin_id,
@@ -459,6 +480,7 @@ pub(crate) async fn setup_source_producer(
 
     let mut last_producer = None;
     let mut last_encoder = None;
+    let mut last_target = None;
     for stream in config.streams.iter() {
         let linger_time = IggyDuration::from_str(stream.linger_time.as_deref().unwrap_or("5ms"))
             .map_err(|error| {
@@ -466,7 +488,7 @@ pub(crate) async fn setup_source_producer(
             })?;
         ensure_durable_source_topic(iggy_client, &stream.stream, &stream.topic).await?;
         let batch_length = stream.batch_length.unwrap_or(1000);
-        let producer = iggy_client
+        let mut builder = iggy_client
             .producer(&stream.stream, &stream.topic)?
             // The topic was validated above. If it disappears before init,
             // recreating it with producer defaults would drop the durability guarantee.
@@ -477,9 +499,21 @@ pub(crate) async fn setup_source_producer(
                     .batch_length(batch_length)
                     .linger_time(linger_time)
                     .build(),
-            )
-            .build();
+            );
+        if let Some(partition_id) = stream.partition_id {
+            builder = builder.partitioning(Partitioning::partition_id(partition_id));
+        }
+        let producer = builder.build();
         producer.init().await?;
+        last_target = if config.exactly_once {
+            Some(ExactlyOnceTarget {
+                stream: Identifier::named(&stream.stream)?,
+                topic: Identifier::named(&stream.topic)?,
+                partition_id: stream.partition_id.unwrap_or(0),
+            })
+        } else {
+            None
+        };
         let encoder: Arc<dyn StreamEncoder> = match stream.schema {
             Schema::Avro => {
                 let config = AvroEncoderConfig {
@@ -507,7 +541,14 @@ pub(crate) async fn setup_source_producer(
         RuntimeError::InvalidConfiguration("No encoder configured for source".to_string())
     })?;
 
-    Ok((SourceConnectorProducer { encoder, producer }, transforms))
+    Ok((
+        SourceConnectorProducer {
+            encoder,
+            producer,
+            exactly_once: last_target,
+        },
+        transforms,
+    ))
 }
 
 async fn ensure_durable_source_topic(
@@ -578,7 +619,12 @@ pub(crate) async fn source_forwarding_loop(
     context: Arc<RuntimeContext>,
     labels: Arc<SourceLabels>,
 ) {
-    let SourceConnectorProducer { encoder, producer } = producer;
+    let SourceConnectorProducer {
+        encoder,
+        producer,
+        exactly_once,
+    } = producer;
+    let mut exactly_once = exactly_once.map(|target| ExactlyOnce::new(&plugin_key, target));
     info!("Source connector with ID: {plugin_id} started.");
     if benchmark {
         info!(
@@ -690,19 +736,33 @@ pub(crate) async fn source_forwarding_loop(
         let send_result = if state_unavailable {
             Err(IggyError::Error)
         } else if processing_errors == 0 {
-            send_with_failed_tail_retries(
-                processed.messages,
-                plugin_id,
-                &context.iggy_clients.producer,
-                |messages| producer.send(messages),
-                |op| {
-                    context
-                        .iggy_clients
-                        .producer
-                        .resolve_operation(op, Instant::now() + BINARY_OPERATION_TIMEOUT)
-                },
-            )
-            .await
+            match exactly_once.as_mut() {
+                Some(exactly_once) => {
+                    let mut messages = processed.messages;
+                    exactly_once
+                        .send(
+                            &context.iggy_clients.producer,
+                            &state_storage,
+                            &mut messages,
+                        )
+                        .await
+                }
+                None => {
+                    send_with_failed_tail_retries(
+                        processed.messages,
+                        plugin_id,
+                        &context.iggy_clients.producer,
+                        |messages| producer.send(messages),
+                        |op| {
+                            context
+                                .iggy_clients
+                                .producer
+                                .resolve_operation(op, Instant::now() + BINARY_OPERATION_TIMEOUT)
+                        },
+                    )
+                    .await
+                }
+            }
         } else {
             Err(IggyError::Error)
         };
@@ -770,9 +830,26 @@ pub(crate) async fn source_forwarding_loop(
             }
 
             let mut state_saved = true;
-            if let Some(state) = produced_messages.state {
-                let state_save_start = Instant::now();
-                match state_storage.save(state).await {
+            let state_save_start = Instant::now();
+            // An exactly-once source saves its producer with the plugin's bytes, also after a
+            // batch whose plugin returned no state.
+            let saved = match exactly_once.as_mut() {
+                Some(exactly_once) => {
+                    exactly_once
+                        .commit(
+                            &context.iggy_clients.producer,
+                            &state_storage,
+                            produced_messages.state,
+                        )
+                        .await
+                }
+                None => match produced_messages.state {
+                    Some(state) => Some(state_storage.save(state).await),
+                    None => None,
+                },
+            };
+            if let Some(saved) = saved {
+                match saved {
                     Ok(()) => {
                         debug!("State saved for source connector with ID: {plugin_id}");
                         let state_save_elapsed = state_save_start.elapsed();
@@ -1325,6 +1402,7 @@ mod tests {
                 .producer("stream", "topic")
                 .expect("producer builder should initialize")
                 .build(),
+            exactly_once: None,
         };
         let context = Arc::new(RuntimeContext {
             sinks: SinkManager::new(vec![]),
