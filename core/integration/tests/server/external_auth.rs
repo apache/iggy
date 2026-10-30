@@ -300,6 +300,56 @@ async fn given_ext_auth_when_server_timeout_should_deny_login() {
     );
 }
 
+// ── multi-shard ext-auth (login may land on a non-metadata shard) ─
+
+#[tokio::test]
+async fn given_ext_auth_multi_shard_when_allow_login_should_authorize_on_any_shard() {
+    let ext_server = ExtAuthServer::start().await;
+    let mut envs = ext_auth_envs(&ext_server.url());
+    // Two shards: login requests round-robin across shard 0 and shard 1.
+    // Shard 1 has no local consensus and must forward the backup check to
+    // shard 0 before proceeding with the ext-auth callout.
+    envs.insert("IGGY_SHARDING_CPU_ALLOCATION".to_owned(), "2".to_owned());
+
+    let mut harness = TestHarness::builder()
+        .server(TestServerConfig::builder().extra_envs(envs).build())
+        .cluster_nodes(1)
+        .build()
+        .expect("build harness");
+    harness.start().await.expect("start server");
+
+    let root_client = harness
+        .client_builder_for(TransportProtocol::Tcp)
+        .expect("tcp builder")
+        .connect()
+        .await
+        .expect("root connect");
+    login_root(&root_client).await.expect("root login");
+
+    create_user(&root_client, EXT_AUTH_IGGY_USERNAME).await;
+
+    // Open several connections so at least one lands on shard 1 (TCP
+    // connections are distributed round-robin across shards).
+    for i in 0..4 {
+        let client = harness
+            .client_builder_for(TransportProtocol::Tcp)
+            .expect("tcp builder")
+            .connect()
+            .await
+            .unwrap_or_else(|e| panic!("connect {i}: {e}"));
+        client
+            .login_user(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
+            .await
+            .unwrap_or_else(|e| panic!("ext-auth login {i} must succeed on any shard: {e}"));
+    }
+
+    assert!(
+        ext_server.request_count() >= 4,
+        "all ext-auth logins must reach the mock (got {} callouts)",
+        ext_server.request_count()
+    );
+}
+
 // ── callout cap saturation (TCP only, transport-independent) ───────
 
 #[tokio::test]

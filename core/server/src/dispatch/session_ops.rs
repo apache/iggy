@@ -1207,9 +1207,10 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
             Err(LoginRegisterError::UserNotFound) if ext_auth.enabled => {
                 // A backup with a partially-replicated user store would leak
                 // the password to the external service and then fail at
-                // resolve_username. Block only confirmed backups; non-metadata
-                // shards and nodes still initializing fall through.
-                if is_metadata_backup(shard) {
+                // resolve_username. Block confirmed backups on every shard:
+                // peer shards forward the check to shard 0 (the only shard
+                // that holds a consensus instance on this node).
+                if is_metadata_backup(shard).await {
                     surface_login_failure(
                         shard,
                         origin,
@@ -1292,10 +1293,14 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     .await;
 }
 
-/// `true` when this shard hosts metadata consensus and that consensus is a
-/// healthy backup in normal status. Non-metadata shards (no local consensus)
-/// and nodes still initializing return `false`, allowing the ext-auth path.
-fn is_metadata_backup<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ, S, SB>>) -> bool
+/// `true` when the node's metadata consensus is a healthy backup in normal
+/// status. On shard 0 the consensus instance is checked directly. On peer
+/// shards (`consensus: None`) the question is forwarded to shard 0 over the
+/// existing `MetadataSubmit` channel, because all shards on the same node
+/// share the same `LeftRight` user store and the only missing piece is the
+/// consensus role. A dropped channel (shard-0 inbox full / shutdown) answers
+/// `true` so the caller blocks the callout rather than leaking credentials.
+async fn is_metadata_backup<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ, S, SB>>) -> bool
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -1303,12 +1308,13 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    shard
-        .plane
-        .metadata()
-        .consensus
-        .as_ref()
-        .is_some_and(|c| c.is_normal() && !c.is_primary())
+    if let Some(consensus) = shard.plane.metadata().consensus.as_ref() {
+        return consensus.is_normal() && !consensus.is_primary();
+    }
+    // Non-metadata shard: ask shard 0 for the consensus role.
+    let (reply, rx) = shard::channel::<bool>(1);
+    shard.forward_metadata_submit(shard::MetadataSubmit::IsMetadataBackup { reply });
+    rx.recv().await.unwrap_or(true)
 }
 
 /// Attempt external auth callout and, on success, resolve the returned
@@ -2236,5 +2242,144 @@ mod tests {
             forward.nonce,
             outcome,
         ))
+    }
+
+    // ── is_metadata_backup ────────────────────────────────────────────
+
+    #[compio::test]
+    async fn given_backup_shard_0_when_checking_backup_should_return_true() {
+        let bus = SpyBus::default();
+        // Replica 1 of 3 at view 0: primary_index(0) == 0, so this is a backup.
+        let shard = Rc::new(test_shard(&bus, 1, 3, FIRST_BOOT));
+        assert!(is_metadata_backup(&shard).await);
+    }
+
+    #[compio::test]
+    async fn given_primary_shard_0_when_checking_backup_should_return_false() {
+        let bus = SpyBus::default();
+        // Replica 0 of 3 at view 0: primary_index(0) == 0, so this IS the primary.
+        let shard = Rc::new(test_shard(&bus, 0, 3, FIRST_BOOT));
+        assert!(!is_metadata_backup(&shard).await);
+    }
+
+    #[compio::test]
+    async fn given_standalone_shard_0_when_checking_backup_should_return_false() {
+        let bus = SpyBus::default();
+        // Solo replica: always primary.
+        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        assert!(!is_metadata_backup(&shard).await);
+    }
+
+    /// A non-metadata shard (id > 0, consensus = None) forwards the check to
+    /// shard 0. When shard 0's consensus says "backup", the peer shard must
+    /// get `true` back.
+    #[compio::test]
+    async fn given_peer_shard_on_backup_node_when_checking_backup_should_return_true() {
+        let bus = SpyBus::default();
+
+        // Build the shard-0 inbox so the peer shard can forward to it.
+        let (senders, mut inboxes, _reply_inboxes) = shard::shard_mesh_channels(2, 16, 16);
+        let shard0_inbox = inboxes[0].take().expect("shard 0 inbox");
+
+        // Peer shard: id=1, no consensus (mirrors a non-metadata shard).
+        let metadata: IggyMetadata<VsrConsensus<SpyBus>, PrepareJournal, IggySnapshot, TestMux> =
+            IggyMetadata::new(None, None, None, None, TestMux::default(), None);
+        let partitions = IggyPartitions::new(
+            ShardId::new(1),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
+                validate_checksum: true,
+                segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                preallocate_segments: false,
+                key_context: Arc::default(),
+                path_layout: PartitionPathLayout::default(),
+            },
+        );
+        let mut peer = TestShard::without_inbox(
+            ShardIdentity::new(1, "peer-shard-test".to_string()),
+            bus.clone(),
+            metadata,
+            partitions,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(1, 3), bus.clone()),
+        );
+        peer.attach_senders(senders);
+        let peer = Rc::new(peer);
+
+        // Spawn the check on the peer shard; it will forward to shard 0's inbox.
+        let peer_clone = Rc::clone(&peer);
+        let check = compio::runtime::spawn(async move { is_metadata_backup(&peer_clone).await });
+
+        // Simulate shard 0 draining its inbox: pull the MetadataSubmit frame
+        // and answer as a backup would (normal + not primary).
+        let frame = shard0_inbox.recv().await.expect("frame from peer");
+        match frame {
+            shard::ShardFrame::Lifecycle(shard::LifecycleFrame::MetadataSubmit(
+                shard::MetadataSubmit::IsMetadataBackup { reply },
+            )) => {
+                // Shard 0 on a backup node: is_normal() && !is_primary() → true.
+                let _ = reply.try_send(true);
+            }
+            _ => panic!("expected IsMetadataBackup"),
+        }
+
+        assert!(
+            check.await.expect("join"),
+            "peer shard on a backup node must report backup"
+        );
+    }
+
+    /// Same as above but shard 0 is the primary: the peer shard must get
+    /// `false` back.
+    #[compio::test]
+    async fn given_peer_shard_on_primary_node_when_checking_backup_should_return_false() {
+        let bus = SpyBus::default();
+
+        let (senders, mut inboxes, _reply_inboxes) = shard::shard_mesh_channels(2, 16, 16);
+        let shard0_inbox = inboxes[0].take().expect("shard 0 inbox");
+
+        let metadata: IggyMetadata<VsrConsensus<SpyBus>, PrepareJournal, IggySnapshot, TestMux> =
+            IggyMetadata::new(None, None, None, None, TestMux::default(), None);
+        let partitions = IggyPartitions::new(
+            ShardId::new(1),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
+                validate_checksum: true,
+                segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                preallocate_segments: false,
+                key_context: Arc::default(),
+                path_layout: PartitionPathLayout::default(),
+            },
+        );
+        let mut peer = TestShard::without_inbox(
+            ShardIdentity::new(1, "peer-shard-test".to_string()),
+            bus.clone(),
+            metadata,
+            partitions,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 3), bus.clone()),
+        );
+        peer.attach_senders(senders);
+        let peer = Rc::new(peer);
+
+        let peer_clone = Rc::clone(&peer);
+        let check = compio::runtime::spawn(async move { is_metadata_backup(&peer_clone).await });
+
+        let frame = shard0_inbox.recv().await.expect("frame from peer");
+        match frame {
+            shard::ShardFrame::Lifecycle(shard::LifecycleFrame::MetadataSubmit(
+                shard::MetadataSubmit::IsMetadataBackup { reply },
+            )) => {
+                let _ = reply.try_send(false);
+            }
+            _ => panic!("expected IsMetadataBackup"),
+        }
+
+        assert!(
+            !check.await.expect("join"),
+            "peer shard on the primary node must not report backup"
+        );
     }
 }
