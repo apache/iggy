@@ -18,7 +18,7 @@
 use chrono::{DateTime, Utc};
 use iggy_connector_sdk::Error;
 
-use crate::OutputFormat;
+use crate::config::OutputFormat;
 
 pub(crate) struct PathContext<'a> {
     pub(crate) stream: &'a str,

@@ -16,216 +16,188 @@
 // under the License.
 
 use std::{
-    collections::BTreeMap,
-    fmt,
-    path::Path,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
 use async_trait::async_trait;
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata,
-    retry::{RetryPolicy, parse_duration, retry_async},
+    ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, retry::retry_async,
     sink_connector,
 };
 use opendal::{Buffer, Operator};
-use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
-use tracing::{debug, error, info};
+use tokio::time::{Instant, timeout, timeout_at};
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
-use crate::path::{PathContext, object_path};
+use crate::{
+    config::{OpenDalSinkConfig, ValidatedConfig, Validation},
+    path::{PathContext, object_path},
+};
 
+mod config;
 mod formatter;
 mod path;
 
 sink_connector!(OpenDalSink);
 
 const CONNECTOR_NAME: &str = "OpenDAL sink";
-const DEFAULT_PATH_TEMPLATE: &str = "{stream}/{topic}/{date}/{hour}";
-const DEFAULT_MAX_ATTEMPTS: u32 = 3;
-const DEFAULT_RETRY_DELAY: &str = "1s";
-const DEFAULT_OUTPUT_FORMAT: &str = "json_lines";
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
-
-#[derive(Clone, Deserialize)]
-pub struct OpenDalSinkConfig {
-    pub service: String,
-    #[serde(default)]
-    pub path_prefix: Option<String>,
-    #[serde(default = "default_path_template")]
-    pub path_template: String,
-    #[serde(default)]
-    pub options: BTreeMap<String, SecretString>,
-    #[serde(default = "default_output_format")]
-    pub output_format: String,
-    #[serde(default = "default_true")]
-    pub include_metadata: bool,
-    #[serde(default)]
-    pub include_headers: bool,
-    #[serde(default, alias = "max_retries")]
-    pub max_attempts: Option<u32>,
-    #[serde(default)]
-    pub retry_delay: Option<String>,
-    #[serde(default)]
-    pub verbose_logging: Option<bool>,
-}
-
-impl fmt::Debug for OpenDalSinkConfig {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("OpenDalSinkConfig")
-            .field("service", &self.service)
-            .field("path_prefix", &self.path_prefix)
-            .field("path_template", &self.path_template)
-            .field("option_keys", &self.options.keys().collect::<Vec<_>>())
-            .field("output_format", &self.output_format)
-            .field("include_metadata", &self.include_metadata)
-            .field("include_headers", &self.include_headers)
-            .field("max_attempts", &self.max_attempts)
-            .field("retry_delay", &self.retry_delay)
-            .field("verbose_logging", &self.verbose_logging)
-            .finish()
-    }
-}
+const ABORT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct OpenDalSink {
     id: u32,
-    config: OpenDalSinkConfig,
-    path_prefix: String,
-    retry_policy: RetryPolicy,
-    verbose: bool,
-    operator: Option<Operator>,
-    formatter: Option<formatter::Formatter>,
+    state: Option<SinkState>,
     messages_processed: AtomicU64,
     write_errors: AtomicU64,
 }
 
+#[derive(Debug)]
+enum SinkState {
+    Config(OpenDalSinkConfig),
+    Running(RunningSink),
+}
+
+#[derive(Debug)]
+struct RunningSink {
+    config: ValidatedConfig,
+    operator: Operator,
+    formatter: formatter::Formatter,
+}
+
 impl OpenDalSink {
     pub fn new(id: u32, config: OpenDalSinkConfig) -> Self {
-        let max_attempts = config.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);
-
-        let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
-
-        let path_prefix = config
-            .path_prefix
-            .as_deref()
-            .unwrap_or_default()
-            .trim_matches('/')
-            .to_string();
-        let verbose = config.verbose_logging.unwrap_or(false);
-
         Self {
             id,
-            config,
-            path_prefix,
-            retry_policy: RetryPolicy {
-                max_attempts,
-                base_delay: retry_delay,
-                max_delay: MAX_BACKOFF,
-            },
-            verbose,
-            formatter: None,
-            operator: None,
+            state: Some(SinkState::Config(config)),
             messages_processed: AtomicU64::new(0),
             write_errors: AtomicU64::new(0),
         }
     }
+}
 
-    async fn write_batch(
-        &self,
-        operator: &Operator,
-        topic_metadata: &TopicMetadata,
-        messages_metadata: &MessagesMetadata,
-        messages: &[ConsumedMessage],
-        formatter: &formatter::Formatter,
-    ) -> Result<(), Error> {
-        let Some(first_message) = messages.first() else {
-            return Ok(());
-        };
-        let last_offset = messages
-            .last()
-            .map_or(first_message.offset, |message| message.offset);
-        let context = PathContext {
-            stream: &topic_metadata.stream,
-            topic: &topic_metadata.topic,
-            partition_id: messages_metadata.partition_id,
-            first_timestamp_micros: first_message.timestamp,
-        };
-        let path = object_path(
-            &self.path_prefix,
-            &self.config.path_template,
-            &context,
-            first_message.offset,
-            last_offset,
-            formatter.output_format(),
-        )?;
-        let data = formatter.format_batch(messages, topic_metadata, messages_metadata)?;
-        let buffer = Buffer::from(data);
-        let retry_context = format!("{CONNECTOR_NAME} connector ID {} batch write", self.id);
-
+impl RunningSink {
+    async fn write_object(&self, id: u32, path: &str, buffer: Buffer) -> Result<(), Error> {
+        let retry_context = format!("{CONNECTOR_NAME} connector ID {id} object write");
         retry_async(
-            self.retry_policy,
+            self.config.retry_policy,
             &retry_context,
             opendal::Error::is_temporary,
-            || operator.write(&path, buffer.clone()),
+            || self.write_attempt(id, path, buffer.clone()),
         )
         .await
         .map_err(|failure| {
             Error::CannotStoreData(format!(
-                "Failed to write OpenDAL batch object '{path}' with offsets {}-{last_offset} \
-                 after {} attempt(s): {}",
-                first_message.offset, failure.attempts, failure.error
+                "Failed to write OpenDAL object '{path}' after {} attempt(s): {}",
+                failure.attempts, failure.error
             ))
-        })?;
+        })
+    }
 
-        Ok(())
+    async fn write_attempt(&self, id: u32, path: &str, buffer: Buffer) -> opendal::Result<()> {
+        let duration = self.write_timeout_for(buffer.len());
+        let deadline = Instant::now() + duration;
+        let mut writer = timeout_at(
+            deadline,
+            self.operator
+                .writer_with(path)
+                .if_not_exists(self.config.if_not_exists),
+        )
+        .await
+        .map_err(|_| write_timeout_error())??;
+        let result = timeout_at(deadline, async {
+            writer.write(buffer).await?;
+            writer.close().await?;
+            Ok(())
+        })
+        .await
+        .unwrap_or_else(|_| Err(write_timeout_error()));
+
+        if result.is_err() {
+            match timeout(ABORT_TIMEOUT, writer.abort()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(abort_error)) => warn!(
+                    "{CONNECTOR_NAME} connector ID: {id} could not abort object '{path}': {abort_error}"
+                ),
+                Err(_) => {
+                    warn!("{CONNECTOR_NAME} connector ID: {id} timed out aborting object '{path}'")
+                }
+            }
+        }
+        result
+    }
+
+    /// Adds one second per MiB to the base timeout, scaled to the buffer size.
+    fn write_timeout_for(&self, buffer_size: usize) -> Duration {
+        self.config
+            .write_timeout
+            .saturating_add(Duration::from_micros(
+                (buffer_size as u64).saturating_mul(1_000_000) / (1024 * 1024),
+            ))
+    }
+
+    async fn check_access(&self, id: u32) -> Result<(), Error> {
+        let probe_name = format!(".iggy-write-probe-{}", Uuid::new_v4());
+        let path_prefix = &self.config.path_prefix;
+        let path = if path_prefix.is_empty() {
+            probe_name
+        } else {
+            format!("{path_prefix}/{probe_name}")
+        };
+        let write_result = self.write_object(id, &path, Buffer::from("iggy")).await;
+        let delete_result = timeout(self.config.write_timeout, self.operator.delete(&path)).await;
+        write_result
+            .map_err(|error| Error::InitError(format!("OpenDAL write probe failed: {error}")))?;
+        match delete_result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(Error::InitError(format!(
+                "OpenDAL write probe could not be deleted: {error}"
+            ))),
+            Err(_) => Err(Error::InitError(
+                "OpenDAL write probe deletion timed out".to_string(),
+            )),
+        }
     }
 }
 
 #[async_trait]
 impl Sink for OpenDalSink {
     async fn open(&mut self) -> Result<(), Error> {
-        let service = self.config.service.trim();
-        if service.is_empty() {
-            return Err(Error::InvalidConfigValue(
-                "OpenDAL service cannot be empty".to_string(),
-            ));
-        }
-        if self.config.path_template.is_empty() {
-            return Err(Error::InvalidConfigValue(
-                "OpenDAL path_template cannot be empty".to_string(),
-            ));
-        }
-
-        let output_format = OutputFormat::try_from(self.config.output_format.as_str())?;
-        let formatter = formatter::Formatter::new(
-            output_format,
-            self.config.include_metadata,
-            self.config.include_headers,
-        );
-        opendal::install_default();
-        let options = operator_options(service, &self.config.options);
-        let operator = Operator::via_iter(service, options).map_err(|error| {
-            Error::InitError(format!(
-                "Failed to create OpenDAL service '{service}': {error}"
-            ))
-        })?;
-
-        if !operator.info().capability().write {
-            return Err(Error::InvalidConfigValue(format!(
-                "OpenDAL service '{service}' does not support writes"
-            )));
-        }
+        let config = match self.state.take() {
+            Some(SinkState::Config(config)) => config,
+            Some(running @ SinkState::Running(_)) => {
+                self.state = Some(running);
+                return Ok(());
+            }
+            None => {
+                return Err(Error::InitError(
+                    "OpenDAL sink was closed or failed to initialize".to_string(),
+                ));
+            }
+        };
+        let config = match config.validate() {
+            Validation::Valid(config) => config,
+            Validation::Invalid { config, error } => {
+                self.state = Some(SinkState::Config(config));
+                return Err(error);
+            }
+        };
+        let formatter = config.build_formatter();
+        let operator = config.build_operator().await?;
+        let sink = RunningSink {
+            config,
+            operator,
+            formatter,
+        };
+        sink.check_access(self.id).await?;
 
         info!(
-            "Opened {CONNECTOR_NAME} connector ID: {}, service: {service}, root: {}",
+            "Opened {CONNECTOR_NAME} connector ID: {}, service: {}, root: {}",
             self.id,
-            operator.info().root()
+            sink.config.service,
+            sink.operator.info().root()
         );
-        self.formatter = Some(formatter);
-        self.operator = Some(operator);
+        self.state = Some(SinkState::Running(sink));
         Ok(())
     }
 
@@ -235,21 +207,17 @@ impl Sink for OpenDalSink {
         messages_metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
-        let Some(operator) = self.operator.as_ref() else {
+        let Some(SinkState::Running(state)) = &self.state else {
             return Err(Error::InitError(
-                "OpenDAL operator is not initialized".to_string(),
+                "OpenDAL sink is not initialized".to_string(),
             ));
         };
-        let Some(formatter) = self.formatter.as_ref() else {
-            return Err(Error::InitError(
-                "OpenDAL formatter is not initialized".to_string(),
-            ));
-        };
+        let formatter = &state.formatter;
         if messages.is_empty() {
             return Ok(());
         }
 
-        if self.verbose {
+        if state.config.verbose_logging {
             info!(
                 "{CONNECTOR_NAME} connector ID: {} consuming {} messages, stream: {}, topic: {}, \
                  partition_id: {}, current_offset: {}",
@@ -262,41 +230,73 @@ impl Sink for OpenDalSink {
             );
         }
 
-        let message_count = messages.len() as u64;
-        match self
-            .write_batch(
-                operator,
+        let mut remaining = messages.as_slice();
+        let mut last_error = None;
+        while !remaining.is_empty() {
+            let (data, count) = match formatter.format_chunk(
+                remaining,
                 topic_metadata,
                 &messages_metadata,
-                &messages,
-                formatter,
-            )
-            .await
-        {
-            Ok(()) => {
-                self.messages_processed
-                    .fetch_add(message_count, Ordering::Relaxed);
-                debug!(
-                    "{CONNECTOR_NAME} connector ID: {} uploaded one object with {} messages",
-                    self.id, message_count
-                );
-                Ok(())
+                state.config.max_file_size,
+            ) {
+                Ok(chunk) => chunk,
+                Err(format_error) => {
+                    self.write_errors.fetch_add(1, Ordering::Relaxed);
+                    error!(
+                        "{CONNECTOR_NAME} connector ID: {} cannot format message at offset {}: {format_error}",
+                        self.id, remaining[0].offset
+                    );
+                    last_error = Some(format_error);
+                    remaining = &remaining[1..];
+                    continue;
+                }
+            };
+            let chunk = &remaining[..count];
+            let context = PathContext {
+                stream: &topic_metadata.stream,
+                topic: &topic_metadata.topic,
+                partition_id: messages_metadata.partition_id,
+                first_timestamp_micros: chunk[0].timestamp,
+            };
+            let result = async {
+                let path = object_path(
+                    &state.config.path_prefix,
+                    &state.config.path_template,
+                    &context,
+                    chunk[0].offset,
+                    chunk[count - 1].offset,
+                    formatter.output_format(),
+                )?;
+                state.write_object(self.id, &path, Buffer::from(data)).await
             }
-            Err(write_error) => {
-                self.write_errors
-                    .fetch_add(message_count, Ordering::Relaxed);
-                error!(
-                    "{CONNECTOR_NAME} connector ID: {} failed to upload {} messages: {write_error}",
-                    self.id, message_count
-                );
-                Err(write_error)
+            .await;
+            let message_count = count as u64;
+            match result {
+                Ok(()) => {
+                    self.messages_processed
+                        .fetch_add(message_count, Ordering::Relaxed);
+                    debug!(
+                        "{CONNECTOR_NAME} connector ID: {} uploaded one object with {} messages",
+                        self.id, message_count
+                    );
+                }
+                Err(write_error) => {
+                    self.write_errors
+                        .fetch_add(message_count, Ordering::Relaxed);
+                    error!(
+                        "{CONNECTOR_NAME} connector ID: {} failed to upload {} messages: {write_error}",
+                        self.id, message_count
+                    );
+                    last_error = Some(write_error);
+                }
             }
+            remaining = &remaining[count..];
         }
+        last_error.map_or(Ok(()), Err)
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        self.operator.take();
-        self.formatter.take();
+        self.state = None;
         info!(
             "Closed {CONNECTOR_NAME} connector ID: {}, processed: {}, failed_messages: {}",
             self.id,
@@ -307,103 +307,37 @@ impl Sink for OpenDalSink {
     }
 }
 
-fn default_path_template() -> String {
-    DEFAULT_PATH_TEMPLATE.to_string()
-}
-
-fn default_output_format() -> String {
-    DEFAULT_OUTPUT_FORMAT.to_string()
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn operator_options(
-    service: &str,
-    options: &BTreeMap<String, SecretString>,
-) -> Vec<(String, String)> {
-    let mut ret = Vec::with_capacity(options.len() + 1);
-    ret.extend(
-        options
-            .iter()
-            .map(|(key, value)| (key.clone(), value.expose_secret().to_owned())),
-    );
-
-    if service.eq_ignore_ascii_case("fs")
-        && !options.contains_key("atomic_write_dir")
-        && let Some(root) = options.get("root")
-    {
-        let atomic_write_dir = Path::new(root.expose_secret())
-            .join(".iggy-opendal-tmp")
-            .to_string_lossy()
-            .into_owned();
-        ret.push(("atomic_write_dir".to_string(), atomic_write_dir));
-    }
-
-    ret
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OutputFormat {
-    JsonLines,
-    JsonArray,
-    Raw,
-}
-
-impl TryFrom<&str> for OutputFormat {
-    type Error = Error;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value.to_lowercase().as_str() {
-            "json_lines" | "jsonl" | "jsonlines" => Ok(Self::JsonLines),
-            "json_array" => Ok(Self::JsonArray),
-            "raw" => Ok(Self::Raw),
-            other => Err(Error::InvalidConfigValue(format!(
-                "Unknown output format: '{other}'. Expected: json_lines, json_array, or raw"
-            ))),
-        }
-    }
-}
-
-impl OutputFormat {
-    fn file_extension(self) -> &'static str {
-        match self {
-            Self::JsonLines => "jsonl",
-            Self::JsonArray => "json",
-            Self::Raw => "bin",
-        }
-    }
+fn write_timeout_error() -> opendal::Error {
+    opendal::Error::new(
+        opendal::ErrorKind::Unexpected,
+        "OpenDAL write attempt timed out",
+    )
+    .set_temporary()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
-    use iggy_connector_sdk::{Payload, Schema, Sink};
-    use tempfile::TempDir;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-        time::timeout,
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::MetadataExt;
+    use std::{
+        fs,
+        future::pending,
+        sync::{Arc, atomic::AtomicBool},
     };
 
-    use super::*;
+    use iggy_connector_sdk::{Payload, Schema, Sink};
+    use opendal::{
+        Capability, ErrorKind, Metadata, OperationContext,
+        raw::{
+            OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite, RpCreateDir,
+            RpPresign, RpRename, RpStat, Service, ServiceInfo, oio,
+        },
+    };
+    use secrecy::SecretString;
+    use tempfile::TempDir;
 
-    fn test_config(root: &str) -> OpenDalSinkConfig {
-        OpenDalSinkConfig {
-            service: "fs".to_string(),
-            path_prefix: Some("iggy/messages".to_string()),
-            path_template: default_path_template(),
-            options: BTreeMap::from([("root".to_string(), SecretString::from(root.to_string()))]),
-            output_format: default_output_format(),
-            include_metadata: false,
-            include_headers: false,
-            max_attempts: Some(1),
-            retry_delay: None,
-            verbose_logging: None,
-        }
-    }
+    use super::*;
+    use crate::config::tests::test_config;
 
     fn test_message(offset: u64, payload: Payload) -> ConsumedMessage {
         ConsumedMessage {
@@ -417,122 +351,82 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn given_config_when_debugged_should_redact_option_values() {
-        let config = test_config("/secret/storage/path");
-
-        let output = format!("{config:?}");
-
-        assert!(output.contains("root"));
-        assert!(!output.contains("/secret/storage/path"));
+    fn given_atomic_directory_on_another_device_when_opening_should_reject_config() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+        runtime.block_on(async {
+            let root = TempDir::new().expect("root should be created");
+            let Ok(atomic_directory) = TempDir::new_in("/dev/shm") else {
+                return;
+            };
+            if fs::metadata(root.path())
+                .expect("root metadata should exist")
+                .dev()
+                == fs::metadata(atomic_directory.path())
+                    .expect("atomic metadata should exist")
+                    .dev()
+            {
+                return;
+            }
+            let mut config = test_config(&root.path().to_string_lossy());
+            config.options.insert(
+                "atomic_write_dir".to_string(),
+                SecretString::from(atomic_directory.path().to_string_lossy().into_owned()),
+            );
+            let error = OpenDalSink::new(1, config)
+                .open()
+                .await
+                .expect_err("different devices cannot provide atomic rename");
+            assert!(matches!(error, Error::InvalidConfigValue(_)));
+            assert_eq!(
+                fs::read_dir(atomic_directory.path())
+                    .expect("atomic directory should exist")
+                    .count(),
+                0,
+            );
+        });
     }
 
     #[test]
-    fn given_temporary_s3_failure_when_consuming_should_retry_write() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+    fn given_pending_abort_when_cleaning_up_should_preserve_write_error_and_drop_writer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("paused runtime should start");
         runtime.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("test server should bind");
-            let endpoint = format!(
-                "http://{}",
-                listener
-                    .local_addr()
-                    .expect("test server address should be available")
-            );
-            let mut config = test_config("/tmp");
-            config.service = "s3".to_string();
-            config.max_attempts = Some(2);
-            config.retry_delay = Some("1ms".to_string());
-            config.options = BTreeMap::from([
-                (
-                    "bucket".to_string(),
-                    SecretString::from("test-bucket".to_string()),
-                ),
-                (
-                    "region".to_string(),
-                    SecretString::from("us-east-1".to_string()),
-                ),
-                ("endpoint".to_string(), SecretString::from(endpoint)),
-                (
-                    "access_key_id".to_string(),
-                    SecretString::from("access-key".to_string()),
-                ),
-                (
-                    "secret_access_key".to_string(),
-                    SecretString::from("secret-key".to_string()),
-                ),
-            ]);
-            let mut sink = OpenDalSink::new(1, config);
-
-            let server = async {
-                for request_index in 0..2 {
-                    let (mut connection, _) = listener
-                        .accept()
-                        .await
-                        .expect("OpenDAL should connect to the test server");
-                    let mut request = [0; 4096];
-                    let bytes_read = connection
-                        .read(&mut request)
-                        .await
-                        .expect("test server should read the request");
-                    let request = String::from_utf8_lossy(&request[..bytes_read]);
-                    assert!(request.starts_with("PUT "));
-
-                    let (status, headers, body) = match request_index {
-                        0 => (
-                            "500 Internal Server Error",
-                            "",
-                            concat!(
-                                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
-                                "<Error><Code>InternalError</Code>",
-                                "<Message>temporary failure</Message></Error>"
-                            ),
-                        ),
-                        1 => ("200 OK", "ETag: \"test-etag\"\r\n", ""),
-                        _ => unreachable!(),
-                    };
-                    let response = format!(
-                        "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\n{headers}\
-                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    connection
-                        .write_all(response.as_bytes())
-                        .await
-                        .expect("test server should write the response");
-                }
+            let Validation::Valid(config) = test_config("/tmp").validate() else {
+                panic!("write test configuration should be valid");
             };
-            let client = async {
-                sink.open().await.expect("S3 service should open");
-                let topic_metadata = TopicMetadata {
-                    stream: "events".to_string(),
-                    topic: "orders".to_string(),
-                };
-                let messages_metadata = MessagesMetadata {
-                    partition_id: 2,
-                    current_offset: 5,
-                    schema: Schema::Raw,
-                };
-                sink.consume(
-                    &topic_metadata,
-                    messages_metadata,
-                    vec![
-                        test_message(4, Payload::Raw(vec![1, 2, 3])),
-                        test_message(5, Payload::Raw(vec![4, 5, 6])),
-                    ],
-                )
-                .await
-                .expect("temporary S3 error should be retried");
-                assert_eq!(sink.messages_processed.load(Ordering::Relaxed), 2);
-            };
-
-            let (server_result, client_result) = tokio::join!(
-                timeout(Duration::from_secs(5), server),
-                timeout(Duration::from_secs(5), client)
+            let dropped = Arc::new(AtomicBool::new(false));
+            let operator = Operator::from_parts(
+                OperationContext::default(),
+                Arc::new(StalledAbortService {
+                    dropped: dropped.clone(),
+                }),
             );
-            server_result.expect("OpenDAL should complete two write requests");
-            client_result.expect("OpenDAL operations should finish");
+            let formatter = config.build_formatter();
+            let sink = RunningSink {
+                config,
+                operator,
+                formatter,
+            };
+            let started = Instant::now();
+
+            let error = timeout(
+                ABORT_TIMEOUT + Duration::from_secs(1),
+                sink.write_attempt(1, "events/orders/object.bin", Buffer::from("payload")),
+            )
+            .await
+            .expect("an abort that never completes should still be bounded")
+            .expect_err("the original write should fail");
+
+            assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+            assert!(!error.is_temporary());
+            assert!(started.elapsed() >= ABORT_TIMEOUT);
+            assert!(started.elapsed() <= ABORT_TIMEOUT + Duration::from_millis(1));
+            assert!(dropped.load(Ordering::Relaxed));
         });
     }
 
@@ -557,6 +451,143 @@ mod tests {
                 .expect_err("unopened sink should reject messages");
 
             assert!(matches!(error, Error::InitError(_)));
+        });
+    }
+
+    #[test]
+    fn given_running_sink_when_closed_should_reject_more_messages() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+        runtime.block_on(async {
+            let root = TempDir::new().expect("root should be created");
+            let mut config = test_config(&root.path().to_string_lossy());
+            config.output_format = "raw".to_string();
+            config.path_prefix = Some("/iggy/messages/".to_string());
+            let mut sink = OpenDalSink::new(1, config);
+            sink.open().await.expect("sink should open");
+            sink.open().await.expect("running sink should stay open");
+            let topic = TopicMetadata {
+                stream: "events".to_string(),
+                topic: "orders".to_string(),
+            };
+            let metadata = || MessagesMetadata {
+                partition_id: 2,
+                current_offset: 4,
+                schema: Schema::Raw,
+            };
+            sink.consume(
+                &topic,
+                metadata(),
+                vec![test_message(4, Payload::Raw(vec![1, 2]))],
+            )
+            .await
+            .expect("running sink should store messages");
+            sink.close().await.expect("sink should close");
+
+            let error = sink
+                .consume(
+                    &topic,
+                    metadata(),
+                    vec![test_message(4, Payload::Raw(vec![3, 4]))],
+                )
+                .await
+                .expect_err("closed sink should reject messages");
+            assert!(matches!(error, Error::InitError(_)));
+            assert_eq!(
+                fs::read(root.path().join(
+                    "iggy/messages/events/orders/1970-01-01/00/00002-00000000000000000004-00000000000000000004.bin",
+                ))
+                .expect("stored data should remain"),
+                [1, 2],
+            );
+        });
+    }
+
+    #[test]
+    fn given_closed_sink_when_opening_should_return_init_error() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+        let mut sink = OpenDalSink::new(1, test_config(""));
+        runtime.block_on(sink.close()).expect("sink should close");
+
+        let error = runtime
+            .block_on(sink.open())
+            .expect_err("closed sink should not open");
+        assert!(matches!(error, Error::InitError(_)));
+    }
+
+    #[test]
+    fn given_invalid_config_when_opening_again_should_return_same_error() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+        runtime.block_on(async {
+            let root = TempDir::new().expect("root should be created");
+            for case in [
+                "service",
+                "path_template",
+                "max_file_size",
+                "write_timeout",
+                "output_format",
+                "duplicate_option",
+                "missing_root",
+                "empty_root",
+            ] {
+                let mut config = test_config(&root.path().to_string_lossy());
+                match case {
+                    "service" => config.service.clear(),
+                    "path_template" => config.path_template = "{stream}".to_string(),
+                    "max_file_size" => config.max_file_size = Some("invalid".to_string()),
+                    "write_timeout" => config.write_timeout = Some("0s".to_string()),
+                    "output_format" => config.output_format = "invalid".to_string(),
+                    "duplicate_option" => {
+                        config
+                            .options
+                            .insert("ROOT".to_string(), SecretString::from("other"));
+                    }
+                    "missing_root" => config.options.clear(),
+                    "empty_root" => {
+                        config
+                            .options
+                            .insert("root".to_string(), SecretString::from(""));
+                    }
+                    _ => unreachable!(),
+                }
+                let mut sink = OpenDalSink::new(1, config);
+                let first = sink.open().await.expect_err(case);
+                assert!(matches!(first, Error::InvalidConfigValue(_)), "{case}");
+                let second = sink.open().await.expect_err(case);
+                assert_eq!(first, second, "{case}");
+            }
+        });
+    }
+
+    #[test]
+    fn given_failed_open_when_consuming_should_return_init_error() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+        runtime.block_on(async {
+            let root = TempDir::new().expect("root should be created");
+            let blocked_root = root.path().join("file");
+            fs::write(&blocked_root, b"not a directory").expect("file should be created");
+            let mut sink = OpenDalSink::new(1, test_config(&blocked_root.to_string_lossy()));
+            assert!(matches!(sink.open().await, Err(Error::InitError(_))));
+
+            let error = sink
+                .consume(
+                    &TopicMetadata {
+                        stream: "events".to_string(),
+                        topic: "orders".to_string(),
+                    },
+                    MessagesMetadata {
+                        partition_id: 2,
+                        current_offset: 4,
+                        schema: Schema::Raw,
+                    },
+                    vec![test_message(4, Payload::Raw(vec![1, 2]))],
+                )
+                .await
+                .expect_err("sink should reject messages after open fails");
+            assert!(matches!(error, Error::InitError(_)));
+            assert_eq!(
+                fs::read(blocked_root).expect("file should remain"),
+                b"not a directory",
+            );
         });
     }
 
@@ -701,52 +732,335 @@ mod tests {
     }
 
     #[test]
-    fn given_whitespace_service_when_opening_should_reject_config() {
+    fn given_empty_atomic_directory_when_consuming_should_write_without_temporary_files() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
         runtime.block_on(async {
-            let mut config = test_config("/tmp");
-            config.service = " \t".to_string();
+            let root = TempDir::new().expect("root should be created");
+            let mut config = test_config(&root.path().to_string_lossy());
+            config.output_format = "raw".to_string();
+            config
+                .options
+                .insert("atomic_write_dir".to_string(), SecretString::from(""));
             let mut sink = OpenDalSink::new(1, config);
-
-            let error = sink
-                .open()
+            sink.open()
                 .await
-                .expect_err("whitespace service should fail");
+                .expect("non-atomic filesystem storage should open");
 
-            assert!(matches!(error, Error::InvalidConfigValue(_)));
+            sink.consume(
+                &TopicMetadata {
+                    stream: "events".to_string(),
+                    topic: "orders".to_string(),
+                },
+                MessagesMetadata {
+                    partition_id: 2,
+                    current_offset: 4,
+                    schema: Schema::Raw,
+                },
+                vec![test_message(4, Payload::Raw(vec![1, 2, 3]))],
+            )
+            .await
+            .expect("message should be stored");
+
+            let object_path = root.path().join(
+                "iggy/messages/events/orders/1970-01-01/00/\
+                 00002-00000000000000000004-00000000000000000004.bin",
+            );
+            assert_eq!(
+                fs::read(object_path).expect("object should be readable"),
+                [1, 2, 3]
+            );
+            assert!(!root.path().join(".iggy-opendal-tmp").exists());
         });
     }
+
     #[test]
-    fn given_empty_path_template_when_opening_should_reject_config() {
+    fn given_small_object_limit_when_consuming_should_split_at_message_offsets() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
         runtime.block_on(async {
-            let mut config = test_config("/tmp");
-            config.path_template.clear();
+            let root = TempDir::new().expect("root should be created");
+            let mut config = test_config(&root.path().to_string_lossy());
+            config.max_file_size = Some("3B".to_string());
+            config.output_format = "raw".to_string();
             let mut sink = OpenDalSink::new(1, config);
-
-            let error = sink
-                .open()
-                .await
-                .expect_err("empty path template should fail");
-
-            assert!(matches!(error, Error::InvalidConfigValue(_)));
+            sink.open().await.expect("sink should open");
+            sink.consume(
+                &TopicMetadata {
+                    stream: "events".to_string(),
+                    topic: "orders".to_string(),
+                },
+                MessagesMetadata {
+                    partition_id: 2,
+                    current_offset: 20,
+                    schema: Schema::Raw,
+                },
+                vec![
+                    test_message(4, Payload::Raw(vec![1, 2])),
+                    test_message(9, Payload::Raw(vec![3])),
+                    test_message(20, Payload::Raw(vec![4, 5])),
+                ],
+            )
+            .await
+            .expect("chunks should be written");
+            let directory = root
+                .path()
+                .join("iggy/messages/events/orders/1970-01-01/00");
+            assert_eq!(
+                fs::read(directory.join("00002-00000000000000000004-00000000000000000009.bin"))
+                    .expect("first chunk should exist"),
+                [1, 2, 3],
+            );
+            assert_eq!(
+                fs::read(directory.join("00002-00000000000000000020-00000000000000000020.bin"))
+                    .expect("second chunk should exist"),
+                [4, 5],
+            );
+            assert_eq!(
+                fs::read_dir(directory)
+                    .expect("object directory should exist")
+                    .count(),
+                2
+            );
+            assert_eq!(sink.messages_processed.load(Ordering::Relaxed), 3);
+            assert_eq!(sink.write_errors.load(Ordering::Relaxed), 0);
         });
     }
 
     #[test]
-    fn given_unknown_output_format_when_opening_should_reject_config() {
+    fn given_oversized_message_when_consuming_should_keep_other_messages() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
         runtime.block_on(async {
-            let mut config = test_config("/tmp");
-            config.output_format = "csv".to_string();
+            let root = TempDir::new().expect("root should be created");
+            let mut config = test_config(&root.path().to_string_lossy());
+            config.max_file_size = Some("2B".to_string());
+            config.output_format = "raw".to_string();
             let mut sink = OpenDalSink::new(1, config);
-
+            sink.open().await.expect("sink should open");
             let error = sink
-                .open()
+                .consume(
+                    &TopicMetadata {
+                        stream: "events".to_string(),
+                        topic: "orders".to_string(),
+                    },
+                    MessagesMetadata {
+                        partition_id: 2,
+                        current_offset: 20,
+                        schema: Schema::Raw,
+                    },
+                    vec![
+                        test_message(4, Payload::Raw(vec![1])),
+                        test_message(9, Payload::Raw(vec![2, 3, 4])),
+                        test_message(20, Payload::Raw(vec![5])),
+                    ],
+                )
                 .await
-                .expect_err("unknown output format should fail");
-
-            assert!(matches!(error, Error::InvalidConfigValue(_)));
+                .expect_err("oversized message should be rejected");
+            assert!(matches!(error, Error::InvalidRecordValue(_)));
+            let directory = root
+                .path()
+                .join("iggy/messages/events/orders/1970-01-01/00");
+            assert_eq!(
+                fs::read(directory.join("00002-00000000000000000004-00000000000000000004.bin"))
+                    .expect("first valid message should exist"),
+                [1],
+            );
+            assert_eq!(
+                fs::read(directory.join("00002-00000000000000000020-00000000000000000020.bin"))
+                    .expect("last valid message should exist"),
+                [5],
+            );
+            assert_eq!(sink.messages_processed.load(Ordering::Relaxed), 2);
+            assert_eq!(sink.write_errors.load(Ordering::Relaxed), 1);
         });
+    }
+
+    #[test]
+    fn given_failed_atomic_rename_when_consuming_should_remove_temporary_file() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+        runtime.block_on(async {
+            let root = TempDir::new().expect("root should be created");
+            let mut sink = OpenDalSink::new(1, test_config(&root.path().to_string_lossy()));
+            sink.open().await.expect("sink should open");
+            let target = root.path().join(
+                "iggy/messages/events/orders/1970-01-01/00/00002-00000000000000000004-00000000000000000004.jsonl",
+            );
+            fs::create_dir_all(&target).expect("target should be blocked by a directory");
+            let error = sink.consume(
+                &TopicMetadata { stream: "events".to_string(), topic: "orders".to_string() },
+                MessagesMetadata { partition_id: 2, current_offset: 4, schema: Schema::Raw },
+                vec![test_message(4, Payload::Raw(vec![1, 2]))],
+            ).await.expect_err("rename onto a directory should fail");
+            assert!(matches!(error, Error::CannotStoreData(_)));
+            assert!(target.is_dir());
+            assert_eq!(
+                fs::read_dir(root.path().join(".iggy-opendal-tmp")).expect("atomic directory should exist").count(),
+                0,
+            );
+        });
+    }
+
+    #[test]
+    fn given_existing_object_when_replacement_is_disabled_should_keep_original_data() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+        runtime.block_on(async {
+            let root = TempDir::new().expect("root should be created");
+            let mut config = test_config(&root.path().to_string_lossy());
+            config.output_format = "raw".to_string();
+            config.if_not_exists = Some(true);
+            let mut sink = OpenDalSink::new(1, config);
+            sink.open().await.expect("conditional write probe should succeed");
+            let topic = TopicMetadata { stream: "events".to_string(), topic: "orders".to_string() };
+            for (payload, should_succeed) in [(vec![1, 2], true), (vec![3, 4], false)] {
+                let result = sink.consume(
+                    &topic,
+                    MessagesMetadata { partition_id: 2, current_offset: 4, schema: Schema::Raw },
+                    vec![test_message(4, Payload::Raw(payload))],
+                ).await;
+                if should_succeed {
+                    result.expect("first write should succeed");
+                } else {
+                    assert!(matches!(result, Err(Error::CannotStoreData(_))));
+                }
+            }
+            assert_eq!(
+                fs::read(root.path().join(
+                    "iggy/messages/events/orders/1970-01-01/00/00002-00000000000000000004-00000000000000000004.bin",
+                )).expect("original object should remain"),
+                [1, 2],
+            );
+        });
+    }
+
+    #[derive(Debug)]
+    struct StalledAbortService {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Service for StalledAbortService {
+        type Reader = ();
+        type Writer = StalledAbortWriter;
+        type Lister = ();
+        type Deleter = ();
+        type Copier = ();
+        type Composer = ();
+
+        fn info(&self) -> ServiceInfo {
+            ServiceInfo::with_scheme("stalled-abort-test")
+        }
+
+        fn capability(&self) -> Capability {
+            Capability {
+                write: true,
+                write_can_multi: true,
+                ..Default::default()
+            }
+        }
+
+        fn write(
+            &self,
+            _: &OperationContext,
+            _: &str,
+            _: OpWrite,
+        ) -> opendal::Result<Self::Writer> {
+            Ok(StalledAbortWriter {
+                dropped: self.dropped.clone(),
+            })
+        }
+
+        async fn create_dir(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpCreateDir,
+        ) -> opendal::Result<RpCreateDir> {
+            ().create_dir(ctx, path, args).await
+        }
+
+        async fn stat(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpStat,
+        ) -> opendal::Result<RpStat> {
+            ().stat(ctx, path, args).await
+        }
+
+        fn read(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpRead,
+        ) -> opendal::Result<Self::Reader> {
+            ().read(ctx, path, args)
+        }
+
+        fn delete(&self, ctx: &OperationContext) -> opendal::Result<Self::Deleter> {
+            ().delete(ctx)
+        }
+
+        fn list(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpList,
+        ) -> opendal::Result<Self::Lister> {
+            ().list(ctx, path, args)
+        }
+
+        fn copy(
+            &self,
+            ctx: &OperationContext,
+            from: &str,
+            to: &str,
+            args: OpCopy,
+        ) -> opendal::Result<Self::Copier> {
+            ().copy(ctx, from, to, args)
+        }
+
+        async fn rename(
+            &self,
+            ctx: &OperationContext,
+            from: &str,
+            to: &str,
+            args: OpRename,
+        ) -> opendal::Result<RpRename> {
+            ().rename(ctx, from, to, args).await
+        }
+
+        async fn presign(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpPresign,
+        ) -> opendal::Result<RpPresign> {
+            ().presign(ctx, path, args).await
+        }
+    }
+
+    #[derive(Debug)]
+    struct StalledAbortWriter {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl oio::Write for StalledAbortWriter {
+        async fn write(&mut self, _: Buffer) -> opendal::Result<()> {
+            Err(opendal::Error::new(
+                ErrorKind::PermissionDenied,
+                "backend write denied",
+            ))
+        }
+
+        async fn close(&mut self) -> opendal::Result<Metadata> {
+            oio::Write::close(&mut ()).await
+        }
+
+        async fn abort(&mut self) -> opendal::Result<()> {
+            pending().await
+        }
+    }
+
+    impl Drop for StalledAbortWriter {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Relaxed);
+        }
     }
 }
