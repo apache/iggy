@@ -193,6 +193,11 @@ pub async fn send_binary_messages<B: BinaryClient>(
     partitioning: &mut BinarySendPartitioning<'_>,
     messages: &mut [IggyMessage],
 ) -> Result<SendMessagesResponse, IggyError> {
+    if partitioning.producer.is_some()
+        && partitioning.original.kind != PartitioningKind::PartitionId
+    {
+        return Err(IggyError::ProducerPartitionRequired);
+    }
     with_binary_lineage(
         client.operation_lineage(),
         with_binary_deadline(binary_operation_deadline(), async {

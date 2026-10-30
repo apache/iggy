@@ -775,6 +775,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_a_producer_batch_without_a_partition_when_sent_should_fail_before_sending() {
+        let transport = Recorder::default();
+        let producer = crate::BatchProducer::new(1, 0, 0).unwrap();
+        for partitioning in [
+            crate::Partitioning::balanced(),
+            crate::Partitioning::messages_key_str("key").unwrap(),
+        ] {
+            let mut messages = [crate::IggyMessage::builder()
+                .payload(Bytes::from_static(b"x"))
+                .build()
+                .unwrap()];
+            let result = transport
+                .send_producer_messages(
+                    &crate::Identifier::numeric(STREAM).unwrap(),
+                    &crate::Identifier::named(TOPIC).unwrap(),
+                    &partitioning,
+                    producer,
+                    &mut messages,
+                )
+                .await;
+
+            assert_eq!(result, Err(IggyError::ProducerPartitionRequired));
+        }
+        assert!(transport.take_calls().is_empty());
+    }
+
+    #[tokio::test]
     async fn given_undecodable_partition_payload_when_sent_should_fail_before_sending() {
         let transport = Recorder::default();
 

@@ -26,6 +26,7 @@
 use crate::shell::{ShellBus, ShellShard};
 use consensus::MetadataHandle;
 use iggy_binary_protocol::PrepareHeader;
+use iggy_binary_protocol::batch::BATCH_PRODUCER_OFFSET;
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
@@ -122,6 +123,15 @@ where
             }
             let header = SendMessagesHeader::decode_from(&body[4..4 + metadata_length])
                 .map_err(|_| IggyError::InvalidCommand)?;
+            // A producer counts its sequence per partition, so its batch must
+            // name one. Refused before `Balanced` moves its cursor.
+            if !matches!(header.partitioning, WirePartitioning::PartitionId(_))
+                && body
+                    .get(4 + metadata_length + BATCH_PRODUCER_OFFSET)
+                    .is_some_and(|&flags| flags != 0)
+            {
+                return Err(IggyError::ProducerPartitionRequired);
+            }
             resolve_send_messages_namespace(shard, &header)?
         }
         Operation::StoreConsumerOffset => {

@@ -100,6 +100,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case producerSequenceOutOfOrder = 92
     case producerEpochFenced = 93
     case producerUnknown = 94
+    case producerPartitionRequired = 95
     case clientNotFound = 100
     case invalidClientId = 101
     case connectionClosed = 206
@@ -369,6 +370,7 @@ extension IggyErrorCode {
         case .producerSequenceOutOfOrder: "producer_sequence_out_of_order"
         case .producerEpochFenced: "producer_epoch_fenced"
         case .producerUnknown: "producer_unknown"
+        case .producerPartitionRequired: "producer_partition_required"
         case .clientNotFound: "client_not_found"
         case .invalidClientId: "invalid_client_id"
         case .connectionClosed: "connection_closed"

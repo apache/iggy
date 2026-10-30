@@ -212,6 +212,10 @@ pub enum IggyError {
         "The partition does not know this producer, and the batch does not start at sequence 0"
     )]
     ProducerUnknown = 94,
+    /// A batch of an idempotent producer names no partition. Its sequence
+    /// counts per partition, so `Balanced` and a messages key cannot pick one.
+    #[error("A producer batch must name its partition")]
+    ProducerPartitionRequired = 95,
     #[error("Client with ID: {0} was not found.")]
     ClientNotFound(u32) = 100,
     #[error("Invalid client ID")]
