@@ -65,12 +65,16 @@ impl ProducerClient for HighLevelProducerClient {
         let user_data_bytes = batch.user_data_bytes;
         let total_bytes = batch.total_bytes;
 
+        // Boxed before the clock starts, so the allocation of the large send future is not
+        // part of the measured latency.
+        let send = Box::pin(
+            self.producer
+                .as_mut()
+                .expect("Producer not initialized")
+                .send(batch.messages),
+        );
         let before_send = Instant::now();
-        self.producer
-            .as_mut()
-            .expect("Producer not initialized")
-            .send(batch.messages)
-            .await?;
+        send.await?;
         let latency = before_send.elapsed();
 
         Ok(Some(BatchMetrics {

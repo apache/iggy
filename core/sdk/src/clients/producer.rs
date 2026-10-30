@@ -21,17 +21,18 @@ use crate::clients::MAX_BATCH_LENGTH;
 use crate::clients::producer_builder::SendMode;
 use crate::clients::producer_config::DirectConfig;
 use crate::clients::producer_dispatcher::ProducerDispatcher;
+use crate::clients::producer_idempotence::{Idempotence, RESENDS};
 use crate::driver::operation_deadline;
 use bytes::Bytes;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
-    BinarySendPartitioning, Client, StreamClient, StreamCreateOptions, TopicClient,
-    TopicCreateOptions,
+    BatchProducer, BinarySendPartitioning, Client, MessageClient, StreamClient,
+    StreamCreateOptions, TopicClient, TopicCreateOptions,
 };
 use iggy_common::{
     Durability, EncryptorKind, IdKind, Identifier, IggyError, IggyExpiry, IggyMessage,
-    IggyTimestamp, MaxTopicSize, Partitioner, Partitioning, SendMessagesConfirmationResponse,
-    SendMessagesResponse, with_binary_lineage,
+    IggyTimestamp, MaxTopicSize, Partitioner, Partitioning, PartitioningKind,
+    SendMessagesConfirmationResponse, SendMessagesResponse, with_binary_lineage,
 };
 use std::collections::HashSet;
 use std::num::NonZeroU32;
@@ -86,6 +87,7 @@ pub struct ProducerCore {
     last_sent_at: Arc<AtomicU64>,
     uncertain_operations: Mutex<HashSet<u64>>,
     direct_config: Option<DirectConfig>,
+    idempotence: Option<Idempotence>,
 }
 
 impl ProducerCore {
@@ -160,6 +162,10 @@ impl ProducerCore {
                     .await?;
             }
 
+            if let Some(idempotence) = &self.idempotence {
+                self.ensure_producer_id(idempotence).await?;
+            }
+
             let _ = self
                 .initialized
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
@@ -169,11 +175,133 @@ impl ProducerCore {
         .await
     }
 
+    /// Sends one chunk, in the idempotent mode when the producer has it.
+    async fn send_chunk(
+        &self,
+        stream: &Identifier,
+        topic: &Identifier,
+        partitioning: &Arc<Partitioning>,
+        messages: &mut [IggyMessage],
+    ) -> Result<SendMessagesResponse, IggyError> {
+        match &self.idempotence {
+            // Boxed, so the idempotent path does not grow the future of every send.
+            Some(idempotence) => {
+                Box::pin(self.try_send_idempotent(
+                    idempotence,
+                    stream,
+                    topic,
+                    partitioning,
+                    messages,
+                ))
+                .await
+            }
+            None => {
+                self.try_send_messages(stream, topic, partitioning, None, messages)
+                    .await
+            }
+        }
+    }
+
+    /// Sends one chunk with the producer section of its partition. See
+    /// [`producer_idempotence`](crate::clients::producer_idempotence).
+    async fn try_send_idempotent(
+        &self,
+        idempotence: &Idempotence,
+        stream: &Identifier,
+        topic: &Identifier,
+        partitioning: &Arc<Partitioning>,
+        messages: &mut [IggyMessage],
+    ) -> Result<SendMessagesResponse, IggyError> {
+        let count = u32::try_from(messages.len()).map_err(|_| IggyError::InvalidMessagesCount)?;
+        let partitions_count = match partitioning.kind {
+            PartitioningKind::PartitionId => 0,
+            _ => self.partitions_count(idempotence, stream, topic).await?,
+        };
+        let partition_id = idempotence.partition(partitioning, partitions_count)?;
+        let explicit = Arc::new(Partitioning::partition_id(partition_id));
+        let lock = idempotence.sequence(stream, topic, partition_id);
+        let mut sequence = lock.lock().await;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            self.ensure_producer_id(idempotence).await?;
+            let producer = idempotence.next_producer(&mut sequence)?;
+            match self
+                .try_send_messages(stream, topic, &explicit, Some(producer), messages)
+                .await
+            {
+                Ok(response) => {
+                    Idempotence::advance(&mut sequence, producer, count);
+                    return Ok(response);
+                }
+                // The partition no longer holds the producer, so the chunk
+                // starts the next epoch at sequence 0.
+                Err(IggyError::ProducerUnknown) if attempts <= RESENDS => {
+                    idempotence.next_epoch(producer);
+                }
+                // The same producer section makes a resend safe, whether or
+                // not the first send landed.
+                Err(IggyError::OperationUncertain(op)) if attempts <= RESENDS => {
+                    self.abandon_operation(op).await;
+                }
+                Err(error) => {
+                    match &error {
+                        IggyError::ProducerEpochFenced => idempotence.fence(),
+                        IggyError::PartitionNotFound(..) => {
+                            idempotence.forget_partitions_count(stream, topic);
+                        }
+                        _ => {}
+                    }
+                    // The chunk may have landed. The next chunk starts a new
+                    // epoch, so it never follows a hole.
+                    idempotence.next_epoch(producer);
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Asks the client for a producer id, once and again after the last epoch.
+    async fn ensure_producer_id(&self, idempotence: &Idempotence) -> Result<(), IggyError> {
+        if idempotence.producer_id().is_none() {
+            let producer_id = super::with_client!(self, client => client.next_producer_id().await)?;
+            idempotence.set_producer_id(producer_id);
+        }
+        Ok(())
+    }
+
+    /// The partition count of a topic, read once and kept until a send finds
+    /// a partition missing.
+    async fn partitions_count(
+        &self,
+        idempotence: &Idempotence,
+        stream: &Identifier,
+        topic: &Identifier,
+    ) -> Result<u32, IggyError> {
+        if let Some(count) = idempotence.partitions_count(stream, topic) {
+            return Ok(count);
+        }
+        let topic_details =
+            super::with_client!(self, client => client.get_topic(stream, topic).await)?
+                .ok_or_else(|| IggyError::TopicIdNotFound(topic.clone(), stream.clone()))?;
+        idempotence.set_partitions_count(stream, topic, topic_details.partitions_count);
+        Ok(topic_details.partitions_count)
+    }
+
+    /// Frees the lane of an uncertain chunk that this producer sends again.
+    async fn abandon_operation(&self, op: u64) {
+        self.uncertain_operations().remove(&op);
+        if let Err(error) = self.client.read().await.abandon_operation(op).await {
+            trace!("Uncertain operation {op} was already released: {error}");
+        }
+    }
+
     async fn try_send_messages(
         &self,
         stream: &Identifier,
         topic: &Identifier,
         partitioning: &Arc<Partitioning>,
+        producer: Option<BatchProducer>,
         messages: &mut [IggyMessage],
     ) -> Result<SendMessagesResponse, IggyError> {
         super::with_client!(self, client => {
@@ -182,6 +310,9 @@ impl ProducerCore {
                 .await
                 .map_err(|_| IggyError::TransientNotAccepted)?;
             let mut partitioning = BinarySendPartitioning::new(partitioning);
+            if let Some(producer) = producer {
+                partitioning = partitioning.with_producer(producer);
+            }
             let mut result = client
                 .send_messages_with_partitioning(stream, topic, &mut partitioning, messages)
                 .await;
@@ -354,7 +485,7 @@ impl ProducerCoreBackend for ProducerCore {
                         let end = (index + max).min(msgs.len());
                         let chunk = &mut msgs[index..end];
 
-                        match self.try_send_messages(stream, topic, &part, chunk).await {
+                        match self.send_chunk(stream, topic, &part, chunk).await {
                             Ok(response) => confirmations.extend(response.confirmations),
                             Err(err) => {
                                 let failed_tail = msgs.split_off(index);
@@ -375,7 +506,7 @@ impl ProducerCoreBackend for ProducerCore {
                 // background send on
                 _ => {
                     let response = self
-                        .try_send_messages(stream, topic, &part, &mut msgs)
+                        .send_chunk(stream, topic, &part, &mut msgs)
                         .await
                         .map_err(|err| {
                             let sent = msgs.len();
@@ -643,6 +774,29 @@ unsafe impl Sync for IggyProducer {}
 ///   automatic retry will be attempted. The default callback logs the failure and drops the context.
 ///   Implement [`ErrorCallback`] when failed sends must be retained.
 ///
+/// # Idempotent sends
+///
+/// [`idempotent()`] turns on the idempotent mode. Each chunk then carries this producer's id, an
+/// epoch and the sequence of its first message, and the partition writes a chunk once. After
+/// [`IggyError::OperationUncertain`], the producer sends the chunk again with the same producer
+/// section, up to three times. So a resend after a lost reply or a lost session writes nothing
+/// new, and the confirmation names the offset of the first write.
+///
+/// The sequence counts per partition, so the producer picks the partition of every chunk itself:
+/// round-robin for [`Partitioning::balanced()`], and by the hash of the key for a messages key. It
+/// reads the partition count of a topic once. It sends the chunks of one partition one at a time,
+/// also from a background producer with [`BalancedSharding`].
+///
+/// When a partition no longer holds the producer, for example after a day without a write, the
+/// producer moves to its next epoch and sends the chunk again from sequence 0. When a chunk fails
+/// for good, the next chunk also starts a new epoch, so it never follows a hole.
+/// [`IggyError::ProducerEpochFenced`] means that another copy of this producer took over, and the
+/// producer refuses every later send.
+///
+/// The id comes from [`next_producer_id`], so the mode needs a binary client. Released Rust and
+/// Swift SDKs refuse a polled batch with a producer section, so upgrade every consumer of the
+/// topic before you turn the mode on.
+///
 /// # Options and defaults
 ///
 /// Everything is configured on the [`IggyProducerBuilder`] before [`build()`] and is fixed
@@ -658,6 +812,7 @@ unsafe impl Sync for IggyProducer {}
 /// | [`create_stream_if_not_exists()`] | on | creating the stream during [`init()`](Self::init) |
 /// | [`create_topic_if_not_exists()`] | on, one partition, server defaults for expiry and max size | creating the topic during [`init()`](Self::init) |
 /// | [`encryptor()`] | inherited from the client | encrypting payloads and user headers |
+/// | [`idempotent()`] | off | writing each chunk once, also when it is sent again |
 ///
 /// There are inverse setters as well, such as [`without_partitioning()`],
 /// [`without_partitioner()`], [`without_encryptor()`], [`do_not_create_stream_if_not_exists()`] and
@@ -712,6 +867,8 @@ unsafe impl Sync for IggyProducer {}
 /// [`do_not_create_stream_if_not_exists()`]: crate::clients::producer_builder::IggyProducerBuilder::do_not_create_stream_if_not_exists
 /// [`do_not_create_topic_if_not_exists()`]: crate::clients::producer_builder::IggyProducerBuilder::do_not_create_topic_if_not_exists
 /// [`encryptor()`]: crate::clients::producer_builder::IggyProducerBuilder::encryptor
+/// [`idempotent()`]: crate::clients::producer_builder::IggyProducerBuilder::idempotent
+/// [`next_producer_id`]: iggy_common::MessageClient::next_producer_id
 /// [`partitioner()`]: crate::clients::producer_builder::IggyProducerBuilder::partitioner
 /// [`partitioning()`]: crate::clients::producer_builder::IggyProducerBuilder::partitioning
 /// [`stream()`]: crate::clients::producer_builder::IggyProducerBuilder::stream
@@ -742,6 +899,7 @@ impl IggyProducer {
         topic_max_size: MaxTopicSize,
         topic_durability: Durability,
         mode: SendMode,
+        idempotent: bool,
     ) -> Self {
         let core = Arc::new(ProducerCore {
             initialized: AtomicBool::new(false),
@@ -766,6 +924,7 @@ impl IggyProducer {
                 SendMode::Direct(ref cfg) => Some(cfg.clone()),
                 _ => None,
             },
+            idempotence: idempotent.then(Idempotence::default),
         });
         let dispatcher = match mode {
             SendMode::Background(cfg) => Some(ProducerDispatcher::new(core.clone(), cfg)),
@@ -975,6 +1134,7 @@ mod tests {
     };
     use crate::tcp::tcp_client::TcpClient;
     use bytes::Bytes;
+    use iggy_binary_protocol::batch::BatchHeader;
     use iggy_binary_protocol::codes::{
         CREATE_STREAM_CODE, GET_STREAM_CODE, GET_TOPIC_CODE, LOGIN_REGISTER_CODE,
         SEND_MESSAGES_CODE,
@@ -988,8 +1148,8 @@ mod tests {
     use iggy_binary_protocol::{WireDecode, WireEncode, WireName, WireOptions, WirePartitioning};
     use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
     use iggy_common::{
-        Client, HttpClientConfig, Identifier, IggyDuration, IggyError, IggyMessage, Partitioning,
-        Sizeable, UserClient,
+        BatchProducer, Client, HttpClientConfig, Identifier, IggyDuration, IggyError, IggyMessage,
+        Partitioning, Sizeable, UserClient,
     };
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
@@ -1420,6 +1580,199 @@ mod tests {
         SendMessagesHeader::decode_from(&body[..u32::from_le_bytes(*metadata_length) as usize])
             .unwrap()
             .partitioning
+    }
+
+    fn sent_producer(body: &[u8]) -> Option<BatchProducer> {
+        let (metadata_length, body) = body.split_first_chunk().unwrap();
+        BatchHeader::decode(&body[u32::from_le_bytes(*metadata_length) as usize..])
+            .unwrap()
+            .producer
+    }
+
+    fn sent_producers(cluster: &FakeCluster) -> Vec<BatchProducer> {
+        cluster
+            .received(SEND_MESSAGES_CODE)
+            .iter()
+            .map(|received| sent_producer(&received.body).expect("a producer section"))
+            .collect()
+    }
+
+    fn idempotent_producer(
+        client: IggyRwLock<ClientWrapper>,
+        partitioning: Partitioning,
+    ) -> IggyProducer {
+        IggyProducerBuilder::new(
+            client,
+            Identifier::numeric(1).unwrap(),
+            "stream".to_owned(),
+            Identifier::numeric(1).unwrap(),
+            "topic".to_owned(),
+            None,
+            None,
+        )
+        .partitioning(partitioning)
+        .direct(DirectConfig::builder().batch_length(1).build())
+        .idempotent()
+        .build()
+    }
+
+    fn producer(producer_id: u64, epoch: u16, base_sequence: u32) -> BatchProducer {
+        BatchProducer::new(producer_id, epoch, base_sequence).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_idempotent_producer_when_sending_chunks_should_number_them_in_order() {
+        let (cluster, plain) = connected_producer().await;
+        let producer_under_test =
+            idempotent_producer(plain.core.client.clone(), Partitioning::partition_id(0));
+        cluster.script(
+            &endpoint(0),
+            SEND_MESSAGES_CODE,
+            [confirmation(0), confirmation(1), confirmation(2)],
+        );
+
+        producer_under_test
+            .send(vec![message(b"1"), message(b"2")])
+            .await
+            .unwrap();
+        producer_under_test.send(vec![message(b"3")]).await.unwrap();
+
+        let sent = sent_producers(&cluster);
+        let id = sent[0].producer_id;
+        assert!(id >> 20 > 0, "the id holds the session number");
+        assert_eq!(
+            sent,
+            [producer(id, 0, 0), producer(id, 0, 1), producer(id, 0, 2)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_partition_that_lost_the_producer_when_sending_should_start_the_next_epoch() {
+        let (cluster, plain) = connected_producer().await;
+        let producer_under_test =
+            idempotent_producer(plain.core.client.clone(), Partitioning::partition_id(0));
+        cluster.script(
+            &endpoint(0),
+            SEND_MESSAGES_CODE,
+            [
+                confirmation(0),
+                Answer::Refuse(IggyError::ProducerUnknown),
+                confirmation(1),
+            ],
+        );
+
+        producer_under_test
+            .send(vec![message(b"1"), message(b"2")])
+            .await
+            .unwrap();
+
+        let sent = sent_producers(&cluster);
+        let id = sent[0].producer_id;
+        assert_eq!(
+            sent,
+            [producer(id, 0, 0), producer(id, 0, 1), producer(id, 1, 0)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_uncertain_chunk_when_sending_idempotently_should_resend_the_same_producer() {
+        let (cluster, plain) = connected_producer().await;
+        let producer_under_test =
+            idempotent_producer(plain.core.client.clone(), Partitioning::partition_id(0));
+        cluster.script(
+            &endpoint(0),
+            SEND_MESSAGES_CODE,
+            [Answer::Silence, confirmation(0), confirmation(1)],
+        );
+
+        let response = producer_under_test
+            .send(vec![message(b"1"), message(b"2")])
+            .await
+            .unwrap();
+
+        assert_eq!(response.confirmations.len(), 2);
+        let sent = sent_producers(&cluster);
+        let id = sent[0].producer_id;
+        let (resends, rest) = sent.split_at(sent.len() - 1);
+        assert!(resends.len() >= 2, "{sent:?}");
+        assert!(
+            resends.iter().all(|sent| *sent == producer(id, 0, 0)),
+            "{sent:?}"
+        );
+        assert_eq!(rest, [producer(id, 0, 1)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_fenced_producer_when_sending_again_should_refuse_without_a_request() {
+        let (cluster, plain) = connected_producer().await;
+        let producer_under_test =
+            idempotent_producer(plain.core.client.clone(), Partitioning::partition_id(0));
+        cluster.script(
+            &endpoint(0),
+            SEND_MESSAGES_CODE,
+            [Answer::Refuse(IggyError::ProducerEpochFenced)],
+        );
+
+        for _ in 0..2 {
+            let Err(IggyError::ProducerSendFailed { cause, .. }) =
+                producer_under_test.send(vec![message(b"1")]).await
+            else {
+                panic!("a fenced producer must fail");
+            };
+            assert_eq!(*cause, IggyError::ProducerEpochFenced);
+        }
+        assert_eq!(cluster.count(SEND_MESSAGES_CODE), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_balanced_partitioning_when_sending_idempotently_should_pick_each_partition_first()
+     {
+        let (cluster, plain) = connected_producer().await;
+        cluster
+            .route
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .partitions_count = 2;
+        cluster.script(&endpoint(0), GET_TOPIC_CODE, [Answer::Body(topic_body(2))]);
+        let producer_under_test =
+            idempotent_producer(plain.core.client.clone(), Partitioning::balanced());
+        cluster.script(
+            &endpoint(0),
+            SEND_MESSAGES_CODE,
+            [
+                confirmation_on(0, 0),
+                confirmation_on(1, 0),
+                confirmation_on(0, 1),
+            ],
+        );
+
+        producer_under_test
+            .send(vec![message(b"1"), message(b"2"), message(b"3")])
+            .await
+            .unwrap();
+
+        let sends = cluster.received(SEND_MESSAGES_CODE);
+        let partitions: Vec<WirePartitioning> = sends
+            .iter()
+            .map(|sent| sent_partition(&sent.body))
+            .collect();
+        assert_eq!(
+            partitions,
+            [
+                WirePartitioning::PartitionId(0),
+                WirePartitioning::PartitionId(1),
+                WirePartitioning::PartitionId(0),
+            ]
+        );
+        let sent = sent_producers(&cluster);
+        let id = sent[0].producer_id;
+        assert_eq!(
+            sent,
+            [producer(id, 0, 0), producer(id, 0, 0), producer(id, 0, 1)]
+        );
+        assert_eq!(cluster.count(GET_TOPIC_CODE), 1, "the count is read once");
     }
 
     #[tokio::test(start_paused = true)]
