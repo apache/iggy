@@ -968,7 +968,14 @@ async fn handle_client_request<B, MJ, S, SB>(
         }
         RequestClass::LoginRegister => {
             let _in_flight = drain.admit(Admission::MetadataLane).await;
-            handle_login_register_request(shard, sessions, origin, request).await;
+            handle_login_register_request(
+                shard,
+                sessions,
+                &server_config.external_auth,
+                origin,
+                request,
+            )
+            .await;
         }
         RequestClass::Logout => {
             let _in_flight = drain.admit(Admission::MetadataLane).await;
@@ -1506,10 +1513,12 @@ mod tests {
                 message_bus::server_internal_client_id(0),
                 message_bus::AUTO_COMMIT_CLIENT_ID,
             ] {
+                let ext_auth = configs::external_auth::ExternalAuthConfig::default();
                 for body in &bodies {
                     handle_login_register_request(
                         &shard,
                         &sessions,
+                        &ext_auth,
                         ClientOrigin::capture(&shard.bus, TRANSPORT),
                         request_message(Operation::Register, client, 0, 0, body),
                     )
