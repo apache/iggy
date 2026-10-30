@@ -54,7 +54,8 @@ describe('mutation admission and retained ownership', () => {
     const first = await enter(lanes, state, 'first');
     first.uncertain = true;
     lanes.retain(first);
-    await assert.rejects(enter(lanes, state, 'first'), (error: unknown) => error instanceof LaneBlockedError && error.operationId === first.id);
+    await assert.rejects(enter(lanes, state, 'first'), (error: unknown) => error instanceof LaneBlockedError &&
+      error.operationId === first.id && !error.requiresExplicitRecovery && error.errorCode === 14007);
     const other = await enter(lanes, state, 'other');
     let admitted = false;
     const next = enter(lanes, state, 'other').then((operation) => { admitted = true; return operation; });

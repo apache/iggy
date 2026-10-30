@@ -23,8 +23,8 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use iggy::prelude::{
-    Client, Consumer, IggyClient, IggyError, MessageClient, Partition, PollOptions, PolledMessages,
-    PollingStrategy, TopicClient,
+    Client, Consumer, IggyClient, IggyError, MIN_DEFERRED_POLL_MAX_BYTES, MessageClient, Partition,
+    PollOptions, PolledMessages, PollingStrategy, TopicClient,
 };
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, timeout_at};
@@ -41,9 +41,10 @@ use crate::bridge::error::BridgeError;
 /// stalls only its own slot, and only until the request deadline.
 const FETCH_SLOTS: usize = 4;
 
-/// The byte cap of a poll of one message: none, since a cap can only refuse that message, never
-/// trim it.
-pub const ONE_MESSAGE_MAX_BYTES: u32 = u32::MAX;
+/// The byte cap of a poll of one message: the smallest Iggy takes. The first message comes
+/// whatever its size, and a larger cap only makes its owner reserve more read budget.
+#[allow(clippy::cast_possible_truncation)]
+pub const ONE_MESSAGE_MAX_BYTES: u32 = MIN_DEFERRED_POLL_MAX_BYTES as u32;
 
 /// The Fetch read slots, with a client for each.
 pub(super) struct FetchPool {

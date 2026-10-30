@@ -25,9 +25,9 @@ pub trait IggyConsumerMessageExt<'a> {
     /// This function starts an event loop that consumes messages from the stream and
     /// applies the provided consumer. The loop will exit when the shutdown receiver is triggered.
     ///
-    /// The event of a `ClientCommitPolicy` counts a message after the consumer returns, also
-    /// after a failure. Its interval can store a message whose consumer still runs, because the
-    /// delivery of a message counts when the stream yields it.
+    /// Under `CommitPolicy::Auto`, a message counts before the consumer runs with
+    /// `CommitAfter::Delivery`, and once it returns with success with `CommitAfter::Processing`.
+    /// With `Processing`, a consumer that fails ends the loop and leaves its message uncounted.
     ///
     /// An error that ends the loop names its partition, if it has one, so the caller can
     /// recover that partition and consume again.

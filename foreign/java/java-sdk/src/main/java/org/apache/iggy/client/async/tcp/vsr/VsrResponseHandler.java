@@ -90,10 +90,6 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 VsrHeaders.readRequestOperation(requestFrame),
                 VsrHeaders.readRequestId(requestFrame),
                 RequestIdentity.from(requestFrame));
-        if (commandCode == CommandCode.Messages.POLL_DEFERRED.getValue()) {
-            pending.maxResponseBody =
-                    requestFrame.getUnsignedIntLE(requestFrame.writerIndex() - Long.BYTES - Integer.BYTES);
-        }
         if (commandCode == CommandCode.Messages.POLL_DEFERRED.getValue()
                 || commandCode == CommandCode.Messages.FETCH_MESSAGES.getValue()) {
             pending.cancellation = new byte[VsrHeaders.HEADER_SIZE];
@@ -433,9 +429,14 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
             maxResponseBody = bytes;
         }
 
-        /** A cancel can discard committed fetch data, so only local abandonment is allowed. */
-        public synchronized void preventCancellation() {
-            cancellation = null;
+        /**
+         * Asks the server to stop a request that stores offsets, and keeps the request registered: the server answers
+         * it once, refused when the cancel won, or with what it read and stored.
+         */
+        public synchronized void cancelOnServer(Channel channel) {
+            if (!future.isDone()) {
+                abandon(channel);
+            }
         }
     }
 

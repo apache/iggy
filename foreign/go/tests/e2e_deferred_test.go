@@ -19,11 +19,11 @@ package tests_test
 
 import (
 	"context"
-	"slices"
+	"errors"
 	"testing"
 	"time"
 
-	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
+	"github.com/apache/iggy/foreign/go/client/reader"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/stretchr/testify/assert"
@@ -41,65 +41,156 @@ const (
 	serverParkedLimit = 64
 )
 
-func longDeferredOptions() iggcon.DeferredPollOptions {
-	options := iggcon.DefaultDeferredPollOptions()
-	options.MaxWait = longWait
-	options.RequestTimeout = longWait + iggcon.MinDeferredPollReplyMargin
+// countOptions read up to count messages at once, and store the offset of the last one with onRead.
+func countOptions(count uint32, onRead bool) iggcon.PollOptions {
+	options := iggcon.DefaultPollOptions()
+	options.Count = count
+	if onRead {
+		options.Commit = iggcon.OnReadCommit()
+	}
+	return options
+}
+
+func longWaitOptions(count uint32) iggcon.PollOptions {
+	options := iggcon.WaitPollOptions(longWait)
+	options.Count = count
 	return options
 }
 
 // A member that owns three partitions reads the one that holds messages
-// without waiting on the idle ones: one fetch names every partition of its
-// readiness group, and each partition continues from its last section.
-func TestE2E_FetchMessagesReadsThePartitionThatHoldsMessages(t *testing.T) {
+// without waiting on the idle ones: the reader reads each readiness group with
+// one request, wherever the primaries of the partitions are.
+func TestE2E_ReaderReadsThePartitionThatHoldsMessages(t *testing.T) {
 	connected := connect(t)
 	ctx := context.Background()
 	streamId, topicId := scratchTopic(t, connected, 3)
-	groupId, partitions := soleMember(t, connected, streamId, topicId)
-	require.Len(t, partitions, 3)
-	busy := partitions[len(partitions)-1]
-	targets := assignmentTargets(t, connected, streamId, topicId, partitions)
+	group := newGroup(t, connected, streamId, topicId)
+	partitionReader, err := reader.NewPartitionReader(ctx, connected, streamId, topicId, iggcon.NewGroupConsumer(group),
+		reader.WithPollOptions(longWaitOptions(10)))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = partitionReader.Close(context.Background()) })
+	require.Eventually(t, func() bool { return len(partitionReader.Partitions()) == 3 }, promptReply, 10*time.Millisecond)
 
 	for round := range 3 {
+		busy := uint32(2 - round)
 		_, err := connected.SendMessages(ctx, streamId, topicId, iggcon.PartitionId(busy), testMessages(t, 1))
 		require.NoError(t, err)
 		started := time.Now()
+		readCtx, cancel := context.WithTimeout(ctx, longWait)
+		polled, err := partitionReader.Next(readCtx)
+		cancel()
 
-		var read map[uint32][]iggcon.IggyMessage
-		read, targets = fetchAssignment(t, connected, streamId, topicId, groupId, targets, 10)
-
+		require.NoError(t, err)
 		assert.Less(t, time.Since(started), promptReply, "round %d waited on an idle partition", round)
-		require.Len(t, read, 1, "round %d read another partition", round)
-		require.Len(t, read[busy], 1, "round %d", round)
-		assert.Equal(t, uint64(round), read[busy][0].Header.Offset)
+		assert.Equal(t, busy, polled.PartitionId, "round %d", round)
+		require.Len(t, polled.Messages, 1, "round %d", round)
 	}
 }
 
-// The server serves the targets of a fetch in request order, and a member
-// moves each partition that it read to the end of its next fetch. So a late
-// message waits behind a backlog for one fetch at most.
-func TestE2E_FetchMessagesFindsAPartitionBehindABacklog(t *testing.T) {
+// A partition with a backlog holds messages at every read, and a late message
+// of another partition is still read: the server allots each read target its
+// share, and the reader reads the backlog one message at a time.
+func TestE2E_ReaderFindsAPartitionBehindABacklog(t *testing.T) {
 	connected := connect(t)
 	ctx := context.Background()
 	streamId, topicId := scratchTopic(t, connected, 3)
-	groupId, partitions := soleMember(t, connected, streamId, topicId)
-	require.Len(t, partitions, 3)
-	targets := assignmentTargets(t, connected, streamId, topicId, partitions)
-	backlog, late := targets[0].PartitionId, targets[1].PartitionId
-	const backlogSize = 10
-	_, err := connected.SendMessages(ctx, streamId, topicId, iggcon.PartitionId(backlog), testMessages(t, backlogSize))
+	const backlogSize = 50
+	_, err := connected.SendMessages(ctx, streamId, topicId, iggcon.PartitionId(0), testMessages(t, backlogSize))
 	require.NoError(t, err)
-	// A member that commits each message fetches one at a time.
-	const batchSize = 1
-	read, targets := fetchAssignment(t, connected, streamId, topicId, groupId, targets, batchSize)
-	require.Len(t, read[backlog], 1, "the first target in request order is read first")
-	_, err = connected.SendMessages(ctx, streamId, topicId, iggcon.PartitionId(late), testMessages(t, 1))
+	partitionReader, err := reader.NewPartitionReader(ctx, connected, streamId, topicId, singleConsumer(t),
+		reader.WithPartitions(0, 2), reader.WithStart(iggcon.FirstPollingStrategy()),
+		reader.WithPollOptions(longWaitOptions(1)), reader.WithPrefetchMessages(1))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = partitionReader.Close(context.Background()) })
+	first, err := partitionReader.Next(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint32(0), first.PartitionId)
+	_, err = connected.SendMessages(ctx, streamId, topicId, iggcon.PartitionId(2), testMessages(t, 1))
 	require.NoError(t, err)
 
-	read, _ = fetchAssignment(t, connected, streamId, topicId, groupId, targets, batchSize)
+	late := false
+	for range backlogSize {
+		readCtx, cancel := context.WithTimeout(ctx, longWait)
+		polled, err := partitionReader.Next(readCtx)
+		cancel()
+		require.NoError(t, err)
+		if polled.PartitionId == 2 {
+			late = true
+			break
+		}
+	}
 
-	assert.Len(t, read[late], 1, "the late message waits behind the backlog")
-	assert.Empty(t, read[backlog])
+	assert.True(t, late, "the late message waits behind the backlog")
+}
+
+// A group consumer that commits after processing resumes after the last
+// message its handler processed, and a message whose handler failed is read again.
+func TestE2E_ConsumerResumesAfterWhatItsHandlerProcessed(t *testing.T) {
+	connected := connect(t)
+	ctx := context.Background()
+	streamId, topicId := scratchTopic(t, connected, 3)
+	for partition := range uint32(3) {
+		_, err := connected.SendMessages(ctx, streamId, topicId, iggcon.PartitionId(partition), testMessages(t, 2))
+		require.NoError(t, err)
+	}
+	group := iggcon.NewGroupConsumer(newGroup(t, connected, streamId, topicId))
+	auto := iggcon.AutoCommit{Every: iggcon.CommitEvery{Kind: iggcon.CommitEveryMessage}, After: iggcon.CommitAfterProcessing}
+	options := iggcon.WaitPollOptions(time.Second)
+	options.Commit = iggcon.AutoCommitPolicy(auto)
+	first, err := reader.NewIggyConsumer(ctx, connected, streamId, topicId, group, reader.WithPollOptions(options))
+	require.NoError(t, err)
+	failure := errors.New("stop after four")
+	var handled []uint64
+	err = first.Consume(ctx, func(_ context.Context, message reader.ReceivedMessage) error {
+		if len(handled) == 3 {
+			return failure
+		}
+		handled = append(handled, uint64(message.PartitionID)<<32|message.Checkpoint.Offset())
+		return nil
+	})
+	require.ErrorIs(t, err, failure)
+	require.NoError(t, first.Shutdown(ctx))
+
+	second, err := reader.NewIggyConsumer(ctx, connected, streamId, topicId, group, reader.WithPollOptions(options))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = second.Shutdown(context.Background()) })
+	rest := make(map[uint64]bool)
+	for len(rest) < 3 {
+		readCtx, cancel := context.WithTimeout(ctx, longWait)
+		message, err := second.Next(readCtx)
+		cancel()
+		require.NoError(t, err)
+		rest[uint64(message.PartitionID)<<32|message.Checkpoint.Offset()] = true
+	}
+	for _, key := range handled {
+		assert.False(t, rest[key], "a processed message is not read again")
+	}
+}
+
+// A poll that stores its offset on read stores the offset of its last message.
+func TestE2E_PollWithOnReadStoresItsLastOffset(t *testing.T) {
+	connected := connect(t)
+	ctx := context.Background()
+	streamId, topicId := scratchTopic(t, connected, 1)
+	_, err := connected.SendMessages(ctx, streamId, topicId, iggcon.PartitionId(0), testMessages(t, 3))
+	require.NoError(t, err)
+	consumer := singleConsumer(t)
+	options := iggcon.DefaultPollOptions()
+	options.Count = 2
+	options.Commit = iggcon.OnReadCommit()
+
+	polled, err := connected.PollMessages(ctx, streamId, topicId, 0, consumer, iggcon.NextPollingStrategy(), options)
+
+	require.NoError(t, err)
+	require.Len(t, polled.Messages, 2)
+	partition := uint32(0)
+	offset, err := connected.GetConsumerOffset(ctx, consumer, streamId, topicId, &partition)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), offset.StoredOffset)
+	continuation, ok := polled.Continuation()
+	require.True(t, ok)
+	_, err = connected.PollMessages(ctx, streamId, topicId, 1, consumer, continuation, iggcon.DefaultPollOptions())
+	require.ErrorIs(t, err, ierror.ErrInvalidCommand)
 }
 
 func TestE2E_DeferredPollReturnsWhenAMessageArrives(t *testing.T) {
@@ -118,8 +209,8 @@ func TestE2E_DeferredPollReturnsWhenAMessageArrives(t *testing.T) {
 
 	// The parked Next poll holds the progress lane of the partition, and the
 	// send of the same client does not wait for that lane.
-	polled, err := connected.PollMessagesDeferred(ctx, streamId, topicId, consumer,
-		iggcon.NextPollingStrategy(), 10, false, &partition, longDeferredOptions())
+	polled, err := connected.PollMessages(ctx, streamId, topicId, partition, consumer,
+		iggcon.NextPollingStrategy(), longWaitOptions(10))
 
 	require.NoError(t, err)
 	elapsed := time.Since(started)
@@ -127,11 +218,11 @@ func TestE2E_DeferredPollReturnsWhenAMessageArrives(t *testing.T) {
 	assert.Less(t, elapsed, promptReply, "the send of the same client wakes its parked poll")
 	require.Len(t, polled.Messages, 1)
 
-	quiet := iggcon.DefaultDeferredPollOptions()
-	quiet.MaxWait = sendDelay
+	quiet := iggcon.WaitPollOptions(sendDelay)
+	quiet.Count = 10
 	started = time.Now()
-	polled, err = connected.PollMessagesDeferred(ctx, streamId, topicId, consumer,
-		iggcon.OffsetPollingStrategy(1), 10, false, &partition, quiet)
+	polled, err = connected.PollMessages(ctx, streamId, topicId, partition, consumer,
+		iggcon.OffsetPollingStrategy(1), quiet)
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, time.Since(started), quiet.MaxWait, "an idle poll waits for MaxWait")
 	assert.Empty(t, polled.Messages)
@@ -146,13 +237,12 @@ func TestE2E_CancelledDeferredPollsFreeTheirServerSlots(t *testing.T) {
 	streamId, topicId := scratchTopic(t, connected, 1)
 	consumer := singleConsumer(t)
 	partition := uint32(0)
-	parkedPoll := iggcon.DefaultDeferredPollOptions()
-	parkedPoll.MaxWait = 30 * time.Second
-	parkedPoll.RequestTimeout = parkedPoll.MaxWait + iggcon.MinDeferredPollReplyMargin
+	parkedPoll := iggcon.WaitPollOptions(30 * time.Second)
+	parkedPoll.Count = 1
 	const parkFor = 50 * time.Millisecond
 	// The route lookup happens before the loop, so each poll reaches the
 	// server well before it is cancelled.
-	_, err := connected.PollMessages(ctx, streamId, topicId, consumer, iggcon.OffsetPollingStrategy(0), 1, false, &partition)
+	_, err := connected.PollMessages(ctx, streamId, topicId, partition, consumer, iggcon.OffsetPollingStrategy(0), iggcon.DefaultPollOptions())
 	require.NoError(t, err)
 
 	for range serverParkedLimit + 8 {
@@ -160,8 +250,8 @@ func TestE2E_CancelledDeferredPollsFreeTheirServerSlots(t *testing.T) {
 		// cancelled instead.
 		cancelled, cancel := context.WithCancel(ctx)
 		stop := time.AfterFunc(parkFor, cancel)
-		_, err := connected.PollMessagesDeferred(cancelled, streamId, topicId, consumer,
-			iggcon.OffsetPollingStrategy(0), 1, false, &partition, parkedPoll)
+		_, err := connected.PollMessages(cancelled, streamId, topicId, partition, consumer,
+			iggcon.OffsetPollingStrategy(0), parkedPoll)
 		stop.Stop()
 		cancel()
 		require.ErrorIs(t, err, ierror.ErrTransientNotCommitted, "the poll ends with its context")
@@ -170,78 +260,22 @@ func TestE2E_CancelledDeferredPollsFreeTheirServerSlots(t *testing.T) {
 	require.NoError(t, err)
 	started := time.Now()
 
-	polled, err := connected.PollMessagesDeferred(ctx, streamId, topicId, consumer,
-		iggcon.OffsetPollingStrategy(0), 1, false, &partition, longDeferredOptions())
+	polled, err := connected.PollMessages(ctx, streamId, topicId, partition, consumer,
+		iggcon.OffsetPollingStrategy(0), longWaitOptions(1))
 
 	require.NoError(t, err)
 	assert.Less(t, time.Since(started), promptReply)
 	require.Len(t, polled.Messages, 1)
 }
 
-// soleMember makes connected the only member of a new consumer group, which
-// then owns every partition of the topic. It returns the group and those
-// partitions.
-func soleMember(t *testing.T, connected iggcon.Client, streamId, topicId iggcon.Identifier) (iggcon.Identifier, []uint32) {
+// newGroup creates a consumer group on the topic, which a reader or a consumer then joins.
+func newGroup(t *testing.T, connected iggcon.Client, streamId, topicId iggcon.Identifier) iggcon.Identifier {
 	t.Helper()
-	ctx := context.Background()
-	group, err := connected.CreateConsumerGroup(ctx, streamId, topicId, "go-e2e-deferred-group")
+	group, err := connected.CreateConsumerGroup(context.Background(), streamId, topicId, "deferred-readers")
 	require.NoError(t, err)
-	groupId, err := iggcon.NewIdentifier(group.Id)
+	id, err := iggcon.NewIdentifier(group.Id)
 	require.NoError(t, err)
-	require.NoError(t, connected.JoinConsumerGroup(ctx, streamId, topicId, groupId))
-	waitForGroupAssignment(t, connected, streamId, topicId, groupId)
-	assignment, err := connected.SyncConsumerGroup(ctx, streamId, topicId, groupId)
-	require.NoError(t, err)
-	return groupId, assignment.Partitions
-}
-
-// assignmentTargets reads every partition of an assignment from Next, in the
-// order of its readiness group.
-func assignmentTargets(t *testing.T, connected iggcon.Client, streamId, topicId iggcon.Identifier, partitions []uint32) []iggcon.FetchMessagesTarget {
-	t.Helper()
-	groups, err := connected.ReadinessGroups(context.Background(), streamId, topicId, partitions)
-	require.NoError(t, err)
-	require.Len(t, groups, 1, "one server is the primary of every partition")
-	targets := make([]iggcon.FetchMessagesTarget, 0, len(groups[0]))
-	for _, partition := range groups[0] {
-		targets = append(targets, iggcon.FetchMessagesTarget{PartitionId: partition, Strategy: iggcon.NextPollingStrategy()})
-	}
-	return targets
-}
-
-// fetchAssignment fetches targets once with auto-commit. It returns the
-// messages of each partition that it read, and the targets of the next fetch:
-// each continues from its section, and the partitions that it read move to
-// the end, because the server serves the targets in request order.
-func fetchAssignment(t *testing.T, connected iggcon.Client, streamId, topicId, groupId iggcon.Identifier,
-	targets []iggcon.FetchMessagesTarget, count uint32) (map[uint32][]iggcon.IggyMessage, []iggcon.FetchMessagesTarget) {
-	t.Helper()
-	sections, err := connected.FetchMessages(context.Background(), streamId, topicId, iggcon.NewGroupConsumer(groupId),
-		targets, count, true, longDeferredOptions())
-	require.NoError(t, err)
-	read := make(map[uint32][]iggcon.IggyMessage)
-	next := slices.Clone(targets)
-	for _, section := range sections {
-		polled, err := binaryserialization.DeserializeSectionMessages(section)
-		require.NoError(t, err, "partition %d", section.PartitionId)
-		index := slices.IndexFunc(next, func(target iggcon.FetchMessagesTarget) bool {
-			return target.PartitionId == section.PartitionId
-		})
-		require.GreaterOrEqual(t, index, 0, "partition %d", section.PartitionId)
-		next[index].Strategy = iggcon.OffsetPollingStrategy(section.NextOffset).WithContext(section.Context)
-		if len(polled.Messages) > 0 {
-			read[section.PartitionId] = polled.Messages
-		}
-	}
-	rotated := make([]iggcon.FetchMessagesTarget, 0, len(next))
-	for _, served := range []bool{false, true} {
-		for _, target := range next {
-			if _, wasRead := read[target.PartitionId]; wasRead == served {
-				rotated = append(rotated, target)
-			}
-		}
-	}
-	return read, rotated
+	return id
 }
 
 func singleConsumer(t *testing.T) iggcon.Consumer {

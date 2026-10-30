@@ -23,6 +23,7 @@ pub mod identifier;
 pub mod message_iterator;
 pub mod metadata_changes;
 pub mod options;
+pub mod pending_poll;
 pub mod poll_options;
 pub mod reader;
 pub mod receive_message;
@@ -35,7 +36,7 @@ pub mod topic;
 use ext_php_rs::prelude::*;
 
 use crate::client::{IggyClient, PendingOperationsConfig};
-use crate::consumer::{ClientCommitPolicy, CommitEvent, IggyConsumer};
+use crate::consumer::{ConsumerOffsetInfo, IggyConsumer};
 use crate::error::{
     AuthenticationException, ConnectionException, IggyException, NotFoundException,
     PendingOperationException, ReadException, TransientException,
@@ -54,7 +55,8 @@ use crate::metadata_changes::{
     MetadataUnknownItem, MetadataUserChange, MetadataUserIdentity, MetadataUserPermissionsUpdated,
 };
 use crate::options::{OptionSpec, OptionsScope, StreamOptionKey, TopicOptionKey};
-use crate::poll_options::{PollOptions, ServerCommitPolicy};
+use crate::pending_poll::PendingPoll;
+use crate::poll_options::{AutoCommit, CommitAfter, CommitEvery, CommitPolicy, PollOptions};
 use crate::reader::PartitionReader;
 use crate::receive_message::{Checkpoint, PolledMessages, PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
@@ -69,7 +71,10 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .enumeration::<StreamOptionKey>()
         .enumeration::<TopicOptionKey>()
         .enumeration::<OptionsScope>()
-        .enumeration::<ServerCommitPolicy>()
+        .enumeration::<CommitAfter>()
+        .class::<CommitPolicy>()
+        .class::<AutoCommit>()
+        .class::<CommitEvery>()
         .enumeration::<MetadataChangeGroup>()
         .enumeration::<MetadataChangeKind>()
         .enumeration::<MetadataChangeStatus>()
@@ -90,15 +95,15 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .class::<PendingOperationsConfig>()
         .class::<IggyClient>()
         .class::<IggyConsumer>()
+        .class::<ConsumerOffsetInfo>()
         .class::<MessageIterator>()
-        .class::<ClientCommitPolicy>()
-        .class::<CommitEvent>()
         .class::<PollOptions>()
         .class::<PollingStrategy>()
         .class::<Checkpoint>()
         .class::<ReceiveMessage>()
         .class::<PolledMessages>()
         .class::<PartitionReader>()
+        .class::<PendingPoll>()
         .class::<SendMessage>()
         .class::<SendMessagesConfirmation>()
         .class::<SendMessagesResponse>()

@@ -23,12 +23,14 @@ use crate::vsr::LIFECYCLE_RETRY_MAX_INTERVAL;
 use async_broadcast::{Receiver, Sender};
 use async_trait::async_trait;
 use bytes::Bytes;
+use iggy_binary_protocol::{MAX_MESSAGE_PAYLOAD_SIZE, MAX_RECORD_SIZE};
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
 use iggy_common::{
-    ConnectionString, ConnectionStringUtils, ConsumerGroupClientState, DeferredPollOptions,
-    DiagnosticEvent, HttpConnectionStringOptions, HttpMethod, IdentityInfo, PollMessages,
-    PolledMessages, PollingKind, TransportProtocol, validate_api_url,
+    ConnectionString, ConnectionStringUtils, ConsumerGroupClientState, DecodeError,
+    DeferredPollOptions, DiagnosticEvent, HttpConnectionStringOptions, HttpMethod, IdentityInfo,
+    PollMessages, PolledMessages, PollingKind, TransportProtocol, UndecodedRecord,
+    validate_api_url,
 };
 use reqwest::{Method, Response, StatusCode, Url};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, RequestBuilder};
@@ -53,6 +55,12 @@ const LIFECYCLE_RETRY_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The query key of [`iggy_common::PollMessages::auto_commit`].
 const AUTO_COMMIT_QUERY_KEY: &str = "auto_commit";
+
+/// Bounds the JSON of a poll reply per byte of records, and of its error body.
+const MAX_JSON_EXPANSION: usize = 16;
+/// The JSON of the largest record: a base64 payload, and its headers at the full expansion.
+const MAX_RECORD_JSON_SIZE: usize = MAX_MESSAGE_PAYLOAD_SIZE.div_ceil(3) * 4
+    + (MAX_RECORD_SIZE - MAX_MESSAGE_PAYLOAD_SIZE) * MAX_JSON_EXPANSION;
 
 /// The first local operation id. Binary request ids also start at 1, because request 0
 /// registers the session, so no transport reports operation 0.
@@ -272,35 +280,48 @@ impl HttpClient {
         path: &str,
         poll: &PollMessages,
         options: DeferredPollOptions,
-    ) -> Result<PolledMessages, IggyError> {
-        // Bound JSON expansion and error bodies under the same request budget.
-        const MAX_JSON_EXPANSION: usize = 16;
-        options.validate(poll.count)?;
+    ) -> Result<PolledMessages, DecodeError> {
+        options
+            .validate(poll.count)
+            .map_err(DecodeError::without_record)?;
         let partition_id = poll.partition_id.unwrap_or(DEFAULT_PARTITION_ID);
         let progress = poll.auto_commit || poll.strategy.kind == PollingKind::Next;
         // Before the lease wait, so a client full of waiting polls cannot hide the block
         // behind `TransientNotAccepted`.
         if progress {
-            self.fail_if_progress_blocked(partition_id)?;
+            self.fail_if_progress_blocked(partition_id)
+                .map_err(DecodeError::without_record)?;
         }
-        let limit = (options.max_bytes as usize).saturating_mul(MAX_JSON_EXPANSION);
+        let limit = deferred_reply_limit(options.max_bytes);
         let started = Instant::now();
         let deadline = started + options.request_timeout.get_duration();
-        let _permit = DeferredLease::acquire(&self.deferred_leases, deadline).await?;
-        let url = self.get_url(path)?;
-        self.fail_if_not_authenticated(path).await?;
+        let _permit = DeferredLease::acquire(&self.deferred_leases, deadline)
+            .await
+            .map_err(DecodeError::without_record)?;
+        let url = self.get_url(path).map_err(DecodeError::without_record)?;
+        self.fail_if_not_authenticated(path)
+            .await
+            .map_err(DecodeError::without_record)?;
         let mut retry_interval = LIFECYCLE_RETRY_INTERVAL;
         loop {
             // Another call can block the partition during the lease wait or a retry pause.
             if progress {
-                self.fail_if_progress_blocked(partition_id)?;
+                self.fail_if_progress_blocked(partition_id)
+                    .map_err(DecodeError::without_record)?;
             }
             let request = {
                 let token = self.access_token.read().await;
-                let remaining = options.remaining(started.elapsed())?;
-                // Deferred auto-commits cannot replay an ambiguous transport failure.
-                self.client
-                    .get(url.clone())
+                let remaining = options
+                    .remaining(started.elapsed())
+                    .map_err(DecodeError::without_record)?;
+                // Deferred auto-commits cannot replay an ambiguous transport failure. A proxy may
+                // send a GET again, so a poll that stores its offset is a POST.
+                let request = if poll.auto_commit {
+                    self.client.post(url.clone())
+                } else {
+                    self.client.get(url.clone())
+                };
+                request
                     .bearer_auth(token.as_str())
                     .query(poll)
                     .query(&[
@@ -322,16 +343,28 @@ impl HttpClient {
                     attempt.settle();
                     error
                 }
-                Err(PollFailure::Unknown(error)) => return Err(attempt.unknown(error)),
+                Err(PollFailure::Unknown(error)) => {
+                    return Err(DecodeError::without_record(attempt.unknown(error)));
+                }
+                // The body is not a batch, so it goes out as it came for a diagnosis.
+                Err(PollFailure::Undecoded(body)) => {
+                    return Err(DecodeError {
+                        error: attempt.unknown(IggyError::InvalidJsonResponse),
+                        record: Some(Box::new(UndecodedRecord {
+                            offset: None,
+                            bytes: body,
+                        })),
+                    });
+                }
             };
             if !matches!(
                 error,
                 IggyError::TransientNotAccepted | IggyError::DeferredPollCapacityExceeded
             ) {
-                return Err(error);
+                return Err(DecodeError::without_record(error));
             }
             if Instant::now() + retry_interval >= deadline {
-                return Err(error);
+                return Err(DecodeError::without_record(error));
             }
             sleep(retry_interval).await;
             retry_interval = (retry_interval * 2).min(LIFECYCLE_RETRY_MAX_INTERVAL);
@@ -395,8 +428,10 @@ impl HttpClient {
                 PollFailure::Unknown(error)
             });
         }
-        let mut messages: PolledMessages = serde_json::from_slice(&body)
-            .map_err(|_| PollFailure::Unknown(IggyError::InvalidJsonResponse))?;
+        let mut messages: PolledMessages = match serde_json::from_slice(&body) {
+            Ok(messages) => messages,
+            Err(_) => return Err(PollFailure::Undecoded(Bytes::from(body))),
+        };
         if messages.count > poll.count || messages.messages.len() != messages.count as usize {
             return Err(PollFailure::Unknown(IggyError::InvalidMessagesCount));
         }
@@ -636,6 +671,8 @@ enum PollFailure {
     Refused(IggyError),
     /// The attempt may have reached the server, and no answer proves what it did.
     Unknown(IggyError),
+    /// The answer is not a batch. Its body goes out with the error.
+    Undecoded(Bytes),
 }
 
 /// One attempt of a deferred poll. An attempt with `auto_commit` that its caller drops before
@@ -702,10 +739,18 @@ fn may_have_committed(result: &Result<Response, reqwest_middleware::Error>) -> b
     }
 }
 
+/// The largest body of a poll reply, which holds up to `max_bytes` of records or one larger
+/// first record.
+fn deferred_reply_limit(max_bytes: u32) -> usize {
+    (max_bytes as usize)
+        .saturating_mul(MAX_JSON_EXPANSION)
+        .max(MAX_RECORD_JSON_SIZE)
+}
+
 /// Decodes the refusals the client acts on: a producer never repeats `RequestTooOld`, a send
 /// refreshes its context once on `HistoryUnavailable`, `LifecycleBusy` is retried,
 /// non-admission and capacity refusals permit a retry without risking duplicate progress, and a
-/// poll reads a first message larger than `max_bytes` alone after `InvalidSizeBytes`.
+/// poll refused for its byte limit returns `InvalidSizeBytes`.
 fn typed_refusal(body: &str) -> Option<IggyError> {
     let id = error_id(body)?;
     [
@@ -945,7 +990,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(result, Err(IggyError::HttpResponseError(503, body))
+            matches!(result, Err(DecodeError { error: IggyError::HttpResponseError(503, body), .. })
             if serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_u64().unwrap() as u32
                 == IggyError::TransientNotCommitted.as_code())
         );
@@ -978,7 +1023,13 @@ mod tests {
                 },
             )
             .await;
-        assert!(matches!(result, Err(IggyError::TransientNotAccepted)));
+        assert!(matches!(
+            result,
+            Err(DecodeError {
+                error: IggyError::TransientNotAccepted,
+                ..
+            })
+        ));
         assert_eq!(
             tokio::time::timeout(std::time::Duration::from_secs(5), requests)
                 .await
@@ -995,9 +1046,12 @@ mod tests {
     async fn deferred_poll_bounds_success_and_error_bodies() {
         const MAX_BYTES: u32 = iggy_common::MIN_DEFERRED_POLL_MAX_BYTES as u32;
         for status in [200, 503] {
-            let (client, requests) =
-                deferred_response_server(vec![(status, " ".repeat(16 * MAX_BYTES as usize + 1))])
-                    .await;
+            let (client, requests) = deferred_server(vec![(
+                status,
+                String::new(),
+                deferred_reply_limit(MAX_BYTES) + 1,
+            )])
+            .await;
             let result = client
                 .get_deferred_poll(
                     "messages/deferred",
@@ -1012,7 +1066,13 @@ mod tests {
                 )
                 .await;
             assert!(
-                matches!(result, Err(IggyError::InvalidSizeBytes)),
+                matches!(
+                    result,
+                    Err(DecodeError {
+                        error: IggyError::InvalidSizeBytes,
+                        ..
+                    })
+                ),
                 "status {status}: {result:?}"
             );
             assert_eq!(requests.await.unwrap().len(), 1);
@@ -1034,6 +1094,22 @@ mod tests {
     async fn deferred_response_server(
         responses: Vec<(u16, String)>,
     ) -> (HttpClient, JoinHandle<Vec<u64>>) {
+        deferred_server(
+            responses
+                .into_iter()
+                .map(|(status, body)| {
+                    let length = body.len();
+                    (status, body, length)
+                })
+                .collect(),
+        )
+        .await
+    }
+
+    /// Answers each request with its status and body under a head that declares its length.
+    async fn deferred_server(
+        responses: Vec<(u16, String, usize)>,
+    ) -> (HttpClient, JoinHandle<Vec<u64>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = HttpClient::create(Arc::new(HttpClientConfig {
             api_url: format!("http://{}", listener.local_addr().unwrap()),
@@ -1043,7 +1119,7 @@ mod tests {
         .unwrap();
         let requests = tokio::spawn(async move {
             let mut waits = Vec::new();
-            for (status, body) in responses {
+            for (status, body, length) in responses {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut stream = BufReader::new(stream);
                 let mut line = String::new();
@@ -1066,8 +1142,7 @@ mod tests {
                     }
                 }
                 let response = format!(
-                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}"
                 );
                 stream
                     .get_mut()

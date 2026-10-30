@@ -618,7 +618,8 @@ impl QuicConfig {
     ///     pending_operations: Client-wide mutation limits; defaults to 256 operations and 64 MiB.
     ///     reconnection: Reconnection policy. Defaults to `QuicReconnectionConfig()`.
     ///     heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
-    ///     response_buffer_size: Size of the response buffer in bytes. Defaults to 10 MB.
+    ///     response_buffer_size: Size of the response buffer in bytes. Defaults to one reply
+    ///         that holds the largest message, about 64 MB.
     ///     max_concurrent_bidi_streams: Maximum number of concurrent bidirectional
     ///         streams. Defaults to 10,000.
     ///     datagram_send_buffer_size: Size of the datagram send buffer in bytes.
@@ -1172,9 +1173,9 @@ impl WebSocketFramingConfig {
     ///         Lifting the limit lets a peer queue an arbitrarily large message
     ///         in memory, so prefer a finite value.
     ///     max_frame_size: Maximum frame size in bytes, or an explicit `None` to
-    ///         lift the limit entirely. Omitting the argument keeps the
-    ///         underlying default of 16 MiB, with the same caveat as
-    ///         `max_message_size`.
+    ///         lift the limit entirely. Omitting the argument keeps the SDK
+    ///         default of 64,156,564 bytes, which holds the largest reply of one
+    ///         record, with the same caveat as `max_message_size`.
     ///     accept_unmasked_frames: Whether to accept unmasked frames. Defaults to
     ///         `False`; clients should typically keep this off for RFC compliance.
     ///
@@ -1193,7 +1194,7 @@ impl WebSocketFramingConfig {
         write_buffer_size=None,
         max_write_buffer_size=None,
         max_message_size=64 << 20,
-        max_frame_size=16 << 20,
+        max_frame_size=64156564,
         accept_unmasked_frames=None,
     ))]
     fn new(
@@ -1606,7 +1607,7 @@ mod tests {
     const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 << 20;
 
     /// Mirrors the literal in `WebSocketFramingConfig::new`'s signature.
-    const DEFAULT_MAX_FRAME_SIZE: usize = 16 << 20;
+    const DEFAULT_MAX_FRAME_SIZE: usize = 64_156_564;
 
     /// The signature defaults have to be literals for the generated stub to stay
     /// valid Python, so nothing but this test stops them drifting from the SDK

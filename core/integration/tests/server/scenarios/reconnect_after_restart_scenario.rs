@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::POLL_REPLY_MAX_BYTES;
 use futures::StreamExt;
 use iggy::prelude::*;
 use iggy_common::TransportProtocol;
@@ -334,7 +335,7 @@ pub async fn run_single_message_offset_zero_restart(harness: &mut TestHarness) {
             &PollingStrategy::next(),
             PollOptions {
                 count: 10,
-                server_commit: ServerCommitPolicy::OnRead,
+                commit: CommitPolicy::OnRead,
                 ..PollOptions::default()
             },
         )
@@ -383,7 +384,7 @@ pub async fn run_single_message_offset_zero_restart(harness: &mut TestHarness) {
             &PollingStrategy::next(),
             PollOptions {
                 count: 10,
-                server_commit: ServerCommitPolicy::OnRead,
+                commit: CommitPolicy::OnRead,
                 ..PollOptions::default()
             },
         )
@@ -463,7 +464,7 @@ pub async fn run_consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
             &PollingStrategy::next(),
             PollOptions {
                 count: 100,
-                server_commit: ServerCommitPolicy::OnRead,
+                commit: CommitPolicy::OnRead,
                 ..PollOptions::default()
             },
         )
@@ -533,7 +534,7 @@ pub async fn run_consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
             &PollingStrategy::next(),
             PollOptions {
                 count: 100,
-                server_commit: ServerCommitPolicy::OnRead,
+                commit: CommitPolicy::OnRead,
                 ..PollOptions::default()
             },
         )
@@ -632,6 +633,9 @@ async fn poll_from_zero_until(
                 &PollingStrategy::offset(0),
                 PollOptions {
                     count: expected * 2,
+                    // Each message is its own batch, so the default byte limit
+                    // holds only a few thousand of them.
+                    max_bytes: POLL_REPLY_MAX_BYTES,
                     ..PollOptions::default()
                 },
             )

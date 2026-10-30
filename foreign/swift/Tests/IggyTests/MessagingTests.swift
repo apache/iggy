@@ -272,7 +272,7 @@ struct MessagingTests {
         let polled = try await client.pollMessages(
             streamID: 1, topicID: 2, partitionID: 1, consumer: .consumer(5), strategy: .next, count: 10, autoCommit: true)
         #expect(polled.context == FakeVSRServer.routeContext)
-        let continued = PollingStrategy.offset(3, context: otherContext)
+        let continued = PollingStrategy(kind: .offset, value: 3, context: otherContext)
         _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 1, consumer: .consumer(5), strategy: continued, count: 10, autoCommit: true)
 
         let lookups = await requests(server, .getPartitionRoute)
@@ -691,7 +691,7 @@ struct MessagingTests {
         // A continuation of the lost partition cannot move to another one.
         syncs.withLock { $0 = 0 }
         client.core.groupState.invalidateAssignment(.init(stream: 1, topic: 2, group: 3))
-        let continued = PollingStrategy.offset(4, context: otherContext)
+        let continued = PollingStrategy(kind: .offset, value: 4, context: otherContext)
         await expectCode(.consumerGroupPartitionNotOwned) {
             _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: nil, consumer: .group(3), strategy: continued, count: 1, autoCommit: true)
         }
@@ -723,8 +723,8 @@ struct MessagingTests {
         defer { Task { await server.stop() } }
         let client = try await connectedClient(server)
         try await client.storeConsumerOffset(consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 3, offset: 40)
-        let position = ConsumerPosition(partitionID: 3, offset: 41, context: otherContext)
-        try await client.storeConsumerPosition(consumer: .consumer(5), streamID: 1, topicID: 2, position: position)
+        let checkpoint = Checkpoint(partitionID: 3, offset: 41, context: otherContext)
+        try await client.storeConsumerPosition(consumer: .consumer(5), streamID: 1, topicID: 2, checkpoint: checkpoint)
         #expect(try await client.getConsumerOffset(consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 3) == nil)
         try await client.deleteConsumerOffset(consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 3)
 

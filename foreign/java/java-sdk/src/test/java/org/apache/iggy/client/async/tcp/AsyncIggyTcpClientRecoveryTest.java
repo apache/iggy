@@ -1007,7 +1007,8 @@ class AsyncIggyTcpClientRecoveryTest {
     }
 
     @Test
-    void shouldEndAnEvictedProgressPollWith57WithoutReplayOrRetention() throws Exception {
+    @SuppressWarnings("checkstyle:NPathComplexity")
+    void shouldEndAnEvictedProgressPollWithoutReplayOrRetention() throws Exception {
         try (ServerSocket socket = new ServerSocket(0, 2, InetAddress.getLoopbackAddress())) {
             List<Request> polls = new CopyOnWriteArrayList<>();
             var server = serve(socket, 2, request -> {
@@ -1051,7 +1052,9 @@ class AsyncIggyTcpClientRecoveryTest {
                             : org.apache.iggy.message.PollingStrategy.next();
                     var polled = client.messages()
                             .pollMessages(stream, topic, Optional.of(0L), consumer, strategy, 1L, autoCommit);
-                    AsyncIggyTcpClientTransientFailoverTest.assertServerError(polled, 57);
+                    // The server can have stored the offset of a committing poll, which only a read shows.
+                    AsyncIggyTcpClientTransientFailoverTest.assertServerError(
+                            polled, autoCommit ? IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode() : 57);
                     assertThat(polls).hasSize(autoCommit ? 2 : 1);
                     long requestId = polls.get(polls.size() - 1).requestId();
                     assertThat(outcome(client.resolveOperation(requestId, Duration.ofSeconds(1))))
@@ -1258,7 +1261,9 @@ class AsyncIggyTcpClientRecoveryTest {
                             : org.apache.iggy.message.PollingStrategy.next();
                     var polled = client.messages()
                             .pollMessages(stream, topic, Optional.of(0L), consumer, strategy, 1L, autoCommit);
-                    AsyncIggyTcpClientTransientFailoverTest.assertServerError(polled, 57);
+                    // The server can have stored the offset of a committing poll, which only a read shows.
+                    AsyncIggyTcpClientTransientFailoverTest.assertServerError(
+                            polled, autoCommit ? IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode() : 57);
                     assertThat(polls).hasSize(index + 1);
                     long requestId = polls.get(index).requestId();
                     assertThatThrownBy(() -> client.resolveOperation(requestId, Duration.ofSeconds(1))

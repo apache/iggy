@@ -404,9 +404,9 @@ pub fn decode_session_binding(
 mod tests {
     use super::*;
     use crate::{
-        Client, Consumer, ConsumerGroupClientState, DeferredPollOptions,
+        AutoCommit, Client, CommitPolicy, Consumer, ConsumerGroupClientState, DeferredPollOptions,
         MIN_DEFERRED_POLL_REPLY_MARGIN_US, MessageClient, PollOptions, PollingKind,
-        PollingStrategy, ServerCommitPolicy, fetch_binary_messages, sync_group_assignment,
+        PollingStrategy, fetch_binary_messages, sync_group_assignment,
     };
     use bytes::BytesMut;
     use iggy_binary_protocol::codes::SYNC_CONSUMER_GROUP_CODE;
@@ -905,6 +905,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_auto_commit_when_polling_once_should_refuse_it_before_sending() {
+        let transport = Recorder::default();
+        let options = PollOptions {
+            commit: CommitPolicy::Auto(AutoCommit::default()),
+            ..PollOptions::default()
+        };
+
+        let polled = transport
+            .poll_messages(
+                &Identifier::numeric(STREAM).unwrap(),
+                &Identifier::named(TOPIC).unwrap(),
+                PARTITION,
+                &Consumer::new(Identifier::numeric(1).unwrap()),
+                &PollingStrategy::next(),
+                options,
+            )
+            .await;
+
+        assert_eq!(polled.map(|_| ()), Err(IggyError::InvalidConfiguration));
+        assert!(transport.take_calls().is_empty(), "nothing is sent");
+    }
+
+    #[tokio::test]
     async fn given_a_poll_when_sent_should_send_one_deferred_poll_of_its_partition() {
         const COUNT: u32 = 5;
         const OFFSET: u64 = 7;
@@ -915,7 +938,7 @@ mod tests {
         };
         let options = PollOptions {
             count: COUNT,
-            server_commit: ServerCommitPolicy::OnRead,
+            commit: CommitPolicy::OnRead,
             ..PollOptions::default()
         };
         let transport = Recorder::default();

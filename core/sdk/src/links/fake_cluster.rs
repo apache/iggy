@@ -24,8 +24,9 @@ use super::{Dialer, ReconnectPolicy, ReplicaLinks};
 use crate::session_owner::SessionOwner;
 use futures::FutureExt;
 use iggy_binary_protocol::codes::{
-    BIND_SESSION_CODE, FETCH_MESSAGES_CODE, GET_CLUSTER_METADATA_CODE, GET_PARTITION_ROUTE_CODE,
-    GET_STATS_CODE, LOGIN_REGISTER_CODE, LOGOUT_USER_CODE,
+    BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, FETCH_MESSAGES_CODE,
+    GET_CLUSTER_METADATA_CODE, GET_PARTITION_ROUTE_CODE, GET_STATS_CODE, LOGIN_REGISTER_CODE,
+    LOGOUT_USER_CODE,
 };
 use iggy_binary_protocol::consensus::{
     EvictionHeader, EvictionReason, HEADER_SIZE, NON_REPLICATED_CODE_RANGE, Operation,
@@ -411,6 +412,8 @@ impl FakeCluster {
                 None => Answer::Refuse(IggyError::TransientNotAccepted),
             },
             UNANSWERED_CODE => Answer::Silence,
+            // The server answers the cancelled request, never the cancel.
+            CANCEL_DEFERRED_REQUEST_CODE => Answer::Silence,
             FETCH_MESSAGES_CODE => Answer::Body(0_u32.to_le_bytes().to_vec()),
             _ if !matches!(
                 request.operation,

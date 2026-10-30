@@ -42,7 +42,7 @@ pub(crate) type PluginClose = Arc<dyn Fn(u32) -> i32 + Send + Sync>;
 /// Teardown runs two ways and they are not interchangeable. [`Self::close`]
 /// awaits, so an error returned after it means the instance is already gone
 /// and an immediate retry has nothing to collide with. `Drop` cannot await, so
-/// it hands the work to the blocking pool; the closure carries the container,
+/// it hands the work to the blocking pool, and the closure carries the container,
 /// which is what keeps the library mapped until the call returns.
 #[must_use = "dropping an armed guard closes the plugin instance"]
 pub(crate) struct PluginInstanceGuard {

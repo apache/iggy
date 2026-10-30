@@ -182,13 +182,14 @@ async fn consume_with_strategy(
         .consumer(consumer_name, STREAM_NAME, TOPIC_NAME)
         .unwrap()
         .partitions([PARTITION_ID])
-        .client_commit(ClientCommitPolicy {
-            interval: Some(NonZeroIggyDuration::from_str("2ms").unwrap()),
-            on: Some(CommitEvent::EachBatch),
-        })
         .polling_strategy(strategy)
         .poll_options(PollOptions {
             count: BATCH_LENGTH,
+            commit: CommitPolicy::Auto(AutoCommit {
+                interval: Some(NonZeroIggyDuration::from_str("2ms").unwrap()),
+                every: Some(CommitEvery::Batch),
+                after: CommitAfter::Delivery,
+            }),
             ..PollOptions::wait(IggyDuration::ONE_SECOND)
         })
         .build();

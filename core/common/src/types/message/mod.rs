@@ -64,8 +64,8 @@ pub use messages_batch::IggyMessagesBatch;
 pub use partitioning::Partitioning;
 pub use partitioning_kind::PartitioningKind;
 pub use poll_metadata::IggyPollMetadata;
-pub use poll_options::{PollOptions, ServerCommitPolicy};
-pub use polled_messages::PolledMessages;
+pub use poll_options::{AutoCommit, CommitAfter, CommitEvery, CommitPolicy, PollOptions};
+pub use polled_messages::{DecodeError, PolledMessages, UndecodedRecord, record_at};
 pub use polling_kind::PollingKind;
 pub use polling_strategy::PollingStrategy;
 pub use user_headers::{

@@ -18,9 +18,11 @@
 
 declare(strict_types=1);
 
+use Iggy\AutoCommit;
 use Iggy\Client as IggyClient;
-use Iggy\ClientCommitPolicy;
-use Iggy\CommitEvent;
+use Iggy\CommitAfter;
+use Iggy\CommitEvery;
+use Iggy\CommitPolicy;
 use Iggy\Exception\NotFoundException;
 use Iggy\PolledMessages;
 use Iggy\PollingStrategy;
@@ -28,7 +30,6 @@ use Iggy\PollOptions;
 use Iggy\ReceiveMessage;
 use Iggy\SendMessage;
 use Iggy\SendMessagesResponse;
-use Iggy\ServerCommitPolicy;
 use PHPUnit\Framework\Attributes\TestDox;
 use PHPUnit\Framework\TestCase;
 
@@ -294,7 +295,7 @@ final class IggySdkTest extends TestCase
                 $partitionId,
                 self::CONSUMER_ID,
                 PollingStrategy::first(),
-                new PollOptions(count: 10, server_commit: ServerCommitPolicy::OnRead),
+                new PollOptions(count: 10, commit: CommitPolicy::onRead()),
             )->messages;
             assert_count(count($messages), $polled);
             assert_same($messages, collect_payloads($polled));
@@ -351,7 +352,7 @@ final class IggySdkTest extends TestCase
                 $partitionId,
                 self::CONSUMER_ID,
                 PollingStrategy::last(),
-                new PollOptions(count: 1, server_commit: ServerCommitPolicy::OnRead),
+                new PollOptions(count: 1, commit: CommitPolicy::onRead()),
             )->messages;
             assert_count(1, $polled);
 
@@ -413,7 +414,7 @@ final class IggySdkTest extends TestCase
             assert_same([$messages[2], $messages[3]], collect_payloads($offsetMessages));
             assert_same([$offset, $offset + 1], collect_offsets($offsetMessages));
 
-            $storing = new PollOptions(count: 2, server_commit: ServerCommitPolicy::OnRead);
+            $storing = new PollOptions(count: 2, commit: CommitPolicy::onRead());
             $nextFirstBatch = $client->pollMessages($streamName, $topicName, $partitionId, self::CONSUMER_ID, PollingStrategy::next(), $storing)->messages;
             assert_count(2, $nextFirstBatch);
             assert_same([$messages[0], $messages[1]], collect_payloads($nextFirstBatch));
@@ -477,6 +478,104 @@ final class IggySdkTest extends TestCase
         }
     }
 
+    #[TestDox('An on read reader close moves the offset back to its last delivered message')]
+    public function testOnReadReaderCloseMovesTheOffsetBackAndASecondSessionResumes(): void
+    {
+        $client = new_client();
+        $streamName = unique_name('on-read-close-stream');
+        $topicName = unique_name('on-read-close-topic');
+        $onRead = new PollOptions(count: 4, commit: CommitPolicy::onRead());
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName, 1);
+            $client->sendMessages(
+                $streamName,
+                $topicName,
+                0,
+                array_map(static fn (int $index): SendMessage => new SendMessage("on-read-{$index}"), range(0, 9)),
+            );
+
+            $reader = $client->reader($streamName, $topicName, self::CONSUMER_ID, [0], PollingStrategy::offset(0), $onRead);
+            $batch = $reader->next(micros(self::DEADLINE_SECONDS));
+            assert_not_null($batch);
+            assert_same([0, 1, 2, 3], collect_offsets($batch->messages));
+            $reader->close();
+            assert_same(3, $client->getConsumerOffset($streamName, $topicName, self::CONSUMER_ID, 0)?->stored_offset);
+
+            $secondSession = new_client();
+            $resumed = $secondSession->reader($streamName, $topicName, self::CONSUMER_ID, [0], null, $onRead);
+            $next = $resumed->next(micros(self::DEADLINE_SECONDS));
+            assert_not_null($next);
+            assert_same([4, 5, 6, 7], collect_offsets($next->messages));
+            $resumed->close();
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    #[TestDox('A poll started in the background returns the message that arrives while it is parked')]
+    public function testPendingPollReturnsTheBatchOfAParkedPollWhenAMessageArrives(): void
+    {
+        $client = new_client();
+        $streamName = unique_name('pending-stream');
+        $topicName = unique_name('pending-topic');
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName, 1);
+            // A parked poll holds its connection, so it runs on a client of its own.
+            $poller = new_client();
+            $poll = $poller->startPollMessages(
+                $streamName,
+                $topicName,
+                0,
+                self::CONSUMER_ID,
+                PollingStrategy::offset(0),
+                new PollOptions(max_wait_micros: micros(self::DEADLINE_SECONDS)),
+            );
+
+            assert_null($poll->wait(self::EMPTY_READ_TIMEOUT_MICROS));
+            $client->sendMessages($streamName, $topicName, 0, [new SendMessage('wake-up')]);
+            $batch = $poll->wait(micros(self::DEADLINE_SECONDS));
+            assert_instance_of(PolledMessages::class, $batch);
+            assert_same(['wake-up'], collect_payloads($batch->messages));
+            assert_throws(static fn () => $poll->wait(self::EMPTY_READ_TIMEOUT_MICROS), 'the poll already ended');
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    #[TestDox('A cancelled parked poll that commits on read stores no offset')]
+    public function testCancelledPendingPollThatCommitsOnReadStoresNoOffset(): void
+    {
+        $client = new_client();
+        $streamName = unique_name('cancel-stream');
+        $topicName = unique_name('cancel-topic');
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName, 1);
+            $client->sendMessages($streamName, $topicName, 0, [new SendMessage('unseen')]);
+            $poll = $client->startPollMessages(
+                $streamName,
+                $topicName,
+                0,
+                self::CONSUMER_ID,
+                PollingStrategy::next(),
+                new PollOptions(max_wait_micros: micros(1), min_count: 2, commit: CommitPolicy::onRead()),
+            );
+
+            assert_null($poll->wait(self::EMPTY_READ_TIMEOUT_MICROS));
+            $poll->cancel();
+            $poll->cancel();
+            assert_throws(static fn () => $poll->wait(self::EMPTY_READ_TIMEOUT_MICROS), 'the poll already ended');
+
+            // Past the max wait, after which an uncancelled poll would have stored its offset.
+            sleep(2);
+            assert_null($client->getConsumerOffset($streamName, $topicName, self::CONSUMER_ID, 0));
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
     #[TestDox('Creating the same stream twice raises an error')]
     public function testDuplicateStreamCreation(): void
     {
@@ -525,7 +624,7 @@ final class IggySdkTest extends TestCase
                 $streamName,
                 $topicName,
                 PollingStrategy::next(),
-                client_commit: new ClientCommitPolicy(micros(5)),
+                poll_options: new PollOptions(max_wait_micros: micros(1), commit: CommitPolicy::auto(new AutoCommit(micros(5), after: CommitAfter::Delivery))),
             );
 
             assert_same($consumerName, $consumer->name());
@@ -551,12 +650,12 @@ final class IggySdkTest extends TestCase
             create_stream_and_topic($client, $streamName, $topicName);
 
             assert_throws(
-                static fn () => new ClientCommitPolicy(0),
+                static fn () => new AutoCommit(0),
                 'interval_micros',
             );
 
             assert_throws(
-                static fn () => new ClientCommitPolicy(0, CommitEvent::eachBatch()),
+                static fn () => new AutoCommit(0, CommitEvery::batch()),
                 'interval_micros',
             );
 
@@ -633,8 +732,11 @@ final class IggySdkTest extends TestCase
                 $streamName,
                 $topicName,
                 PollingStrategy::next(),
-                new PollOptions(count: 10, max_wait_micros: micros(1)),
-                new ClientCommitPolicy(micros(5)),
+                new PollOptions(
+                    count: 10,
+                    max_wait_micros: micros(1),
+                    commit: CommitPolicy::auto(new AutoCommit(micros(5), after: CommitAfter::Delivery)),
+                ),
             );
             $received = [];
             $count = $consumer->consumeMessages(
@@ -678,7 +780,7 @@ final class IggySdkTest extends TestCase
                 $streamName,
                 $topicName,
                 PollingStrategy::next(),
-                client_commit: new ClientCommitPolicy(micros(5)),
+                poll_options: new PollOptions(max_wait_micros: micros(1), commit: CommitPolicy::auto(new AutoCommit(micros(5), after: CommitAfter::Delivery))),
             );
             $iterator = $consumer->iterMessages();
             $received = [];
@@ -697,6 +799,79 @@ final class IggySdkTest extends TestCase
 
             assert_same(range(0, count($messages) - 1), $keys);
             assert_same($messages, $received);
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    #[TestDox('A new foreach over a message iterator reads on after the message it yielded last')]
+    public function testIteratorResumesAfterTheLastYieldedMessage(): void
+    {
+        $client = new_client();
+        $consumerName = unique_name('consumer-group-resume');
+        $streamName = unique_name('consumer-group-stream');
+        $topicName = unique_name('consumer-group-topic');
+        $partitionId = 0;
+        $messages = ['resume-first', 'resume-second'];
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $client->sendMessages(
+                $streamName,
+                $topicName,
+                $partitionId,
+                array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
+            );
+
+            $consumer = $client->consumerGroup($consumerName, $streamName, $topicName, PollingStrategy::next());
+            $iterator = $consumer->iterMessages();
+            $received = [];
+            foreach ($iterator as $key => $message) {
+                $received[$key] = $message->payload();
+                break;
+            }
+            foreach ($iterator as $key => $message) {
+                $received[$key] = $message->payload();
+                break;
+            }
+
+            assert_same($messages, $received);
+            $consumer->shutdown();
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    #[TestDox('A message iterator whose read threw holds no message from before the failure')]
+    public function testIteratorHoldsNoMessageAfterAFailedRead(): void
+    {
+        $client = new_client();
+        $consumerName = unique_name('consumer-group-failed-read');
+        $streamName = unique_name('consumer-group-stream');
+        $topicName = unique_name('consumer-group-topic');
+        $partitionId = 0;
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $client->sendMessages($streamName, $topicName, $partitionId, [new SendMessage('failed-read')]);
+
+            $consumer = $client->consumerGroup($consumerName, $streamName, $topicName, PollingStrategy::first());
+            $iterator = $consumer->iterMessages();
+            $iterator->rewind();
+            assert_same('failed-read', $iterator->current()?->payload());
+            $client->sendMessages($streamName, $topicName, $partitionId, [new SendMessage('callback-trigger')]);
+            $heldAfterFailure = 'not called';
+            // The run holds the consumer, so a read of the iterator in its callback throws.
+            $consumer->consumeMessages(
+                static function (ReceiveMessage $message) use ($iterator, &$heldAfterFailure): void {
+                    assert_throws(static fn () => $iterator->next(), 'iterMessages() ' . self::CONSUMER_BUSY);
+                    $heldAfterFailure = $iterator->valid() ? $iterator->current()?->payload() : null;
+                },
+                1,
+            );
+
+            assert_null($heldAfterFailure);
+            $consumer->shutdown();
         } finally {
             cleanup_stream_with_topics($client, $streamName, [$topicName]);
         }
@@ -829,7 +1004,7 @@ final class IggySdkTest extends TestCase
                 $streamName,
                 $topicName,
                 PollingStrategy::next(),
-                client_commit: new ClientCommitPolicy(on: CommitEvent::eachMessage()),
+                poll_options: new PollOptions(max_wait_micros: micros(1), commit: CommitPolicy::auto(new AutoCommit(every: CommitEvery::message()))),
             );
             $stored = static fn (): ?int => $consumer->getLastStoredOffset($partitionId);
             $received = [];
@@ -856,8 +1031,8 @@ final class IggySdkTest extends TestCase
         }
     }
 
-    #[TestDox('An exception of a consumeMessages() callback ends the run, is thrown, and its message still counts')]
-    public function testConsumeMessagesThrowsTheCallbackExceptionAndCountsItsMessage(): void
+    #[TestDox('An exception of a consumeMessages() callback ends the run, is thrown, and leaves its message uncounted')]
+    public function testConsumeMessagesThrowsTheCallbackExceptionAndLeavesItsMessageUncounted(): void
     {
         $client = new_client();
         $consumerName = unique_name('consumer-group-throw');
@@ -880,7 +1055,7 @@ final class IggySdkTest extends TestCase
                 $streamName,
                 $topicName,
                 PollingStrategy::next(),
-                client_commit: new ClientCommitPolicy(on: CommitEvent::eachMessage()),
+                poll_options: new PollOptions(max_wait_micros: micros(1), commit: CommitPolicy::auto(new AutoCommit(every: CommitEvery::message()))),
             );
             $failure = new RuntimeException('callback failed');
             $thrown = assert_throws(
@@ -894,10 +1069,9 @@ final class IggySdkTest extends TestCase
 
             assert_same($failure, $thrown);
             assert_same(0, $consumer->getLastConsumedOffset($partitionId), 'the exception must end the run at its message');
-            assert_same(
-                0,
-                read_until(static fn (): ?int => $consumer->getLastStoredOffset($partitionId), 0, self::DEADLINE_SECONDS),
-                'the message of the exception must count',
+            assert_null(
+                read_until(static fn (): ?int => $consumer->getLastStoredOffset($partitionId), 0, self::UNCOUNTED_WAIT_SECONDS),
+                'the message of the exception must not count',
             );
 
             $received = [];
@@ -1002,6 +1176,209 @@ final class IggySdkTest extends TestCase
             $reader->close();
             $reader->close();
             assert_throws(static fn () => $reader->next(), 'the reader is closed');
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    #[TestDox('deleteConsumerPosition() deletes the offset that a reader committed for the partition')]
+    public function testDeleteConsumerPositionDeletesTheCommittedOffset(): void
+    {
+        $client = new_client();
+        $readerName = unique_name('reader');
+        $streamName = unique_name('reader-stream');
+        $topicName = unique_name('reader-topic');
+        $partitionId = 0;
+        $messages = ['delete-first', 'delete-second'];
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $client->sendMessages(
+                $streamName,
+                $topicName,
+                $partitionId,
+                array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
+            );
+            $reader = $client->reader($streamName, $topicName, $readerName, [$partitionId], PollingStrategy::first());
+            $checkpoint = $reader->next(micros(self::DEADLINE_SECONDS))->checkpoint();
+            $reader->commit($checkpoint);
+            $reader->close();
+
+            $client->deleteConsumerPosition($streamName, $topicName, $readerName, $checkpoint);
+
+            $afterDelete = $client->pollMessages($streamName, $topicName, $partitionId, $readerName, PollingStrategy::next());
+            assert_same($messages, collect_payloads($afterDelete->messages));
+            $missing = assert_throws(
+                static fn () => $client->deleteConsumerPosition($streamName, $topicName, $readerName, $checkpoint),
+            );
+            assert_instance_of(NotFoundException::class, $missing);
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    #[TestDox('A standalone consumer reads its partitions and stores each counted position on shutdown')]
+    public function testStandaloneConsumerReadsItsPartitionsAndStoresOnShutdown(): void
+    {
+        $client = new_client();
+        $consumerName = unique_name('standalone-consumer');
+        $streamName = unique_name('standalone-stream');
+        $topicName = unique_name('standalone-topic');
+        $partitions = [0, 1];
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName, count($partitions));
+            foreach ($partitions as $partitionId) {
+                $client->sendMessages(
+                    $streamName,
+                    $topicName,
+                    $partitionId,
+                    [new SendMessage("standalone {$partitionId} 0"), new SendMessage("standalone {$partitionId} 1")],
+                );
+            }
+            $consumer = $client->consumer(
+                $consumerName,
+                $streamName,
+                $topicName,
+                $partitions,
+                PollingStrategy::first(),
+                new PollOptions(
+                    max_wait_micros: micros(1),
+                    commit: CommitPolicy::auto(new AutoCommit(every: CommitEvery::message(), after: CommitAfter::Delivery)),
+                ),
+            );
+            $received = [];
+            $count = $consumer->consumeMessages(
+                static function (ReceiveMessage $message) use (&$received): void {
+                    $received[] = $message->payload();
+                },
+                4,
+                micros(self::DEADLINE_SECONDS),
+            );
+            $consumer->shutdown();
+            sort($received);
+
+            assert_same(4, $count);
+            assert_same(['standalone 0 0', 'standalone 0 1', 'standalone 1 0', 'standalone 1 1'], $received);
+            foreach ($partitions as $partitionId) {
+                assert_same(1, $client->getConsumerOffset($streamName, $topicName, $consumerName, $partitionId)?->stored_offset);
+            }
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    #[TestDox('The client stores, reads and deletes consumer offsets by partition and by checkpoint')]
+    public function testClientStoresReadsAndDeletesConsumerOffsets(): void
+    {
+        $client = new_client();
+        $consumerName = unique_name('offset-consumer');
+        $streamName = unique_name('offset-stream');
+        $topicName = unique_name('offset-topic');
+        $partitionId = 0;
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $client->sendMessages(
+                $streamName,
+                $topicName,
+                $partitionId,
+                [new SendMessage('offset 0'), new SendMessage('offset 1'), new SendMessage('offset 2')],
+            );
+            $polled = $client->pollMessages($streamName, $topicName, $partitionId, $consumerName, PollingStrategy::first());
+            $offset = static fn (): ?int => $client->getConsumerOffset($streamName, $topicName, $consumerName, $partitionId)?->stored_offset;
+
+            assert_null($offset());
+            $client->storeConsumerOffset($streamName, $topicName, $consumerName, $partitionId, 1);
+            $info = $client->getConsumerOffset($streamName, $topicName, $consumerName, $partitionId);
+            assert_same([$partitionId, 2, 1], [$info->partition_id, $info->current_offset, $info->stored_offset]);
+            $client->storeConsumerPosition($streamName, $topicName, $consumerName, $polled->checkpoint());
+            assert_same(2, $offset());
+            $client->deleteConsumerOffset($streamName, $topicName, $consumerName, $partitionId);
+            assert_null($offset());
+            assert_instance_of(
+                NotFoundException::class,
+                assert_throws(static fn () => $client->deleteConsumerOffset($streamName, $topicName, $consumerName, $partitionId)),
+            );
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    #[TestDox('pollMessages() reads as a consumer group member and stores the group offset on read')]
+    public function testPollMessagesReadsAsAConsumerGroupMember(): void
+    {
+        $client = new_client();
+        $groupName = unique_name('poll-group');
+        $streamName = unique_name('poll-group-stream');
+        $topicName = unique_name('poll-group-topic');
+        $partitionId = 0;
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $client->sendMessages($streamName, $topicName, $partitionId, [new SendMessage('group 0'), new SendMessage('group 1')]);
+            // The member joins the group, so this client may poll as the group.
+            $member = $client->consumerGroup($groupName, $streamName, $topicName, PollingStrategy::first());
+            // The assignment can reach the member after the join, and a poll before it throws.
+            $poll = static function () use ($client, $streamName, $topicName, $partitionId, $groupName): int {
+                try {
+                    return $client->pollMessages(
+                        $streamName,
+                        $topicName,
+                        $partitionId,
+                        $groupName,
+                        PollingStrategy::first(),
+                        new PollOptions(count: 10, commit: CommitPolicy::onRead()),
+                        true,
+                    )->count;
+                } catch (Throwable) {
+                    return -1;
+                }
+            };
+            $polled = read_until($poll, 2, self::DEADLINE_SECONDS);
+
+            assert_same(2, $polled);
+            assert_same(1, $client->getConsumerOffset($streamName, $topicName, $groupName, $partitionId, true)?->stored_offset);
+            $member->shutdown();
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    #[TestDox('An idle timeout returns control from consumeMessages() and iterMessages() on an idle topic')]
+    public function testIdleTimeoutReturnsControlOnAnIdleTopic(): void
+    {
+        $client = new_client();
+        $consumerName = unique_name('idle-consumer');
+        $streamName = unique_name('idle-stream');
+        $topicName = unique_name('idle-topic');
+        $partitionId = 0;
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $consumer = $client->consumerGroup(
+                $consumerName,
+                $streamName,
+                $topicName,
+                PollingStrategy::first(),
+                new PollOptions(max_wait_micros: micros(1)),
+            );
+            $collect = static function (ReceiveMessage $message): void {
+            };
+
+            assert_same(0, $consumer->consumeMessages($collect, 1, self::EMPTY_READ_TIMEOUT_MICROS));
+            // Long enough for a message sent later to arrive before the second loop gives up.
+            $iterator = $consumer->iterMessages(micros(2));
+            assert_same([], iterator_to_array($iterator, false));
+
+            $client->sendMessages($streamName, $topicName, $partitionId, [new SendMessage('after idle')]);
+            $received = [];
+            foreach ($iterator as $message) {
+                $received[] = $message->payload();
+                break;
+            }
+            assert_same(['after idle'], $received);
+            $consumer->shutdown();
         } finally {
             cleanup_stream_with_topics($client, $streamName, [$topicName]);
         }

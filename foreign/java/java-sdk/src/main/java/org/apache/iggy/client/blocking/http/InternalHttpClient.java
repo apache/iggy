@@ -45,6 +45,7 @@ import org.apache.hc.core5.http.io.support.ClassicRequestBuilder;
 import org.apache.hc.core5.http.protocol.HttpContext;
 import org.apache.hc.core5.io.CloseMode;
 import org.apache.hc.core5.io.ModalCloseable;
+import org.apache.hc.core5.net.URIBuilder;
 import org.apache.hc.core5.ssl.SSLContextBuilder;
 import org.apache.hc.core5.util.TimeValue;
 import org.apache.hc.core5.util.Timeout;
@@ -72,10 +73,13 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
+import java.net.URI;
 import java.net.URISyntaxException;
 import java.security.GeneralSecurityException;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.EnumSet;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
@@ -90,7 +94,8 @@ final class InternalHttpClient implements Closeable {
 
     private static final String AUTHORIZATION = "Authorization";
     private static final String UNCERTAIN_ATTEMPT = "iggy.uncertain-attempt";
-    private static final String DEFERRED_ATTEMPTED = "iggy.deferred-attempted";
+    private static final String ATTEMPTED = "iggy.attempted";
+    private static final String AUTO_COMMIT = "auto_commit";
     private static final Set<IggyErrorCode> SETTLED_REFUSALS = EnumSet.of(
             IggyErrorCode.HISTORY_UNAVAILABLE,
             IggyErrorCode.LIFECYCLE_BUSY,
@@ -108,6 +113,9 @@ final class InternalHttpClient implements Closeable {
     private static final int MAX_PENDING_DEFERRED_REQUESTS = 4096;
 
     private static final int BODY_CHUNK_BYTES = 8 * 1024;
+
+    /** How often a deferred exchange checks whether its caller was interrupted. */
+    private static final long INTERRUPT_CHECK_MILLIS = 50;
 
     private final String url;
     private final ObjectMapper objectMapper = ObjectMapperFactory.getInstance();
@@ -144,6 +152,7 @@ final class InternalHttpClient implements Closeable {
         return HttpClients.custom()
                 .setConnectionManager(connectionManagerBuilder.build())
                 .setDefaultRequestConfig(requestConfigBuilder.build())
+                .setRequestExecutor(new AttemptRecordingExecutor())
                 .setRetryStrategy(new UncertainAttempts())
                 .build();
     }
@@ -151,10 +160,10 @@ final class InternalHttpClient implements Closeable {
     /**
      * A deferred poll declares its own total budget. The library's timeouts
      * restart for every wait, so a read that starts near the deadline would
-     * outlive it. A timer cancels the exchange at the deadline instead, which
-     * ends the connection lease, the connect, the wait for headers and any body
-     * read. Automatic retries are off: the server answers both
-     * {@code TRANSIENT_NOT_ACCEPTED} and the ambiguous
+     * outlive it. A timer cancels the exchange at the deadline instead, or as
+     * soon as the caller is interrupted. The cancel ends the connection lease,
+     * the connect, the wait for headers and any body read. Automatic retries are
+     * off: the server answers both {@code TRANSIENT_NOT_ACCEPTED} and the ambiguous
      * {@code TRANSIENT_NOT_COMMITTED} with HTTP 503, and a proxy can answer it
      * too, so only a parsed server code may authorize a replay.
      *
@@ -171,6 +180,7 @@ final class InternalHttpClient implements Closeable {
             throw deferredFailure(false, new IggyClientException("Too many pending deferred HTTP polls"));
         }
         ScheduledFuture<?> abort = null;
+        ScheduledFuture<?> interruptWatch = null;
         var context = HttpClientContext.create();
         try {
             long remainingNanos = deadlineNanos - System.nanoTime();
@@ -179,6 +189,7 @@ final class InternalHttpClient implements Closeable {
             }
             HttpUriRequestBase exchange = cancellable(request);
             abort = deadlines.schedule(exchange::cancel, remainingNanos, TimeUnit.NANOSECONDS);
+            interruptWatch = cancelOnInterrupt(exchange, Thread.currentThread());
             // Rounded up to whole milliseconds, so neither fires before the deadline and reports it as a
             // connection failure. Their defaults would end a long readiness wait early.
             Timeout budget = Timeout.ofMilliseconds(TimeUnit.NANOSECONDS.toMillis(remainingNanos) + 1);
@@ -202,12 +213,37 @@ final class InternalHttpClient implements Closeable {
                 return objectMapper.readValue(body, clazz);
             });
         } catch (IOException | CancellationException | IggyTimeoutException failure) {
-            throw deferredFailure(Boolean.TRUE.equals(context.getAttribute(DEFERRED_ATTEMPTED)), failure);
-        } finally {
-            if (abort != null) {
-                abort.cancel(false);
+            boolean attempted = Boolean.TRUE.equals(context.getAttribute(ATTEMPTED));
+            if (attempted && Method.POST.isSame(request.getMethod())) {
+                // A poll that stores its offset is a POST, and the server can have stored before the answer was lost.
+                var unknownProgress = new IggyServerException(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode());
+                unknownProgress.initCause(failure);
+                throw unknownProgress;
             }
+            throw deferredFailure(attempted, failure);
+        } finally {
+            cancelTimer(abort);
+            cancelTimer(interruptWatch);
             pendingDeferred.decrementAndGet();
+        }
+    }
+
+    /** A blocking socket read ignores an interrupt, so the timer cancels the exchange for its caller. */
+    private ScheduledFuture<?> cancelOnInterrupt(HttpUriRequestBase exchange, Thread caller) {
+        return deadlines.scheduleWithFixedDelay(
+                () -> {
+                    if (caller.isInterrupted()) {
+                        exchange.cancel();
+                    }
+                },
+                INTERRUPT_CHECK_MILLIS,
+                INTERRUPT_CHECK_MILLIS,
+                TimeUnit.MILLISECONDS);
+    }
+
+    private static void cancelTimer(ScheduledFuture<?> timer) {
+        if (timer != null) {
+            timer.cancel(false);
         }
     }
 
@@ -367,7 +403,7 @@ final class InternalHttpClient implements Closeable {
         applyTlsCertificate(connectionManagerBuilder, tlsCertificate);
         return HttpClients.custom()
                 .setConnectionManager(connectionManagerBuilder.build())
-                .setRequestExecutor(new DeferredRequestExecutor())
+                .setRequestExecutor(new AttemptRecordingExecutor())
                 .disableAutomaticRetries()
                 .evictIdleConnections(TimeValue.ofSeconds(30))
                 .build();
@@ -391,6 +427,9 @@ final class InternalHttpClient implements Closeable {
         } catch (IggyServerException refusal) {
             throw settle(request, context, refusal);
         } catch (IOException e) {
+            if (committingPoll(request) && Boolean.TRUE.equals(context.getAttribute(ATTEMPTED))) {
+                throw deferredFailure(true, e);
+            }
             throw new IggyConnectionException("HTTP request failed", e);
         }
     }
@@ -402,9 +441,9 @@ final class InternalHttpClient implements Closeable {
      */
     private static IggyServerException settle(
             ClassicHttpRequest request, HttpContext context, IggyServerException refusal) {
-        // Reads commit nothing, so only a write can leave an uncertain outcome behind.
-        boolean uncertain =
-                !Method.GET.isSame(request.getMethod()) && Boolean.TRUE.equals(context.getAttribute(UNCERTAIN_ATTEMPT));
+        // Reads commit nothing, so only a write or a committing poll can leave an uncertain outcome behind.
+        boolean uncertain = (!Method.GET.isSame(request.getMethod()) || committingPoll(request))
+                && Boolean.TRUE.equals(context.getAttribute(UNCERTAIN_ATTEMPT));
         if (!uncertain || !SETTLED_REFUSALS.contains(refusal.getErrorCode())) {
             return refusal;
         }
@@ -413,10 +452,41 @@ final class InternalHttpClient implements Closeable {
         return unknownOutcome;
     }
 
+    /** The server stores the offset of a poll with auto-commit when it reads, so such a GET is a write. */
+    private static boolean committingPoll(HttpRequest request) {
+        if (!Method.GET.isSame(request.getMethod())) {
+            return false;
+        }
+        try {
+            return new URIBuilder(request.getUri())
+                    .getQueryParams().stream()
+                            .anyMatch(parameter -> AUTO_COMMIT.equals(parameter.getName())
+                                    && Boolean.parseBoolean(parameter.getValue()));
+        } catch (URISyntaxException unreadable) {
+            return true;
+        }
+    }
+
     ClassicHttpRequest prepareGetRequest(String path, NameValuePair... params) {
         return ClassicRequestBuilder.get(url + path)
                 .setHeader(AUTHORIZATION, getBearerToken())
                 .addParameters(params)
+                .build();
+    }
+
+    /** A POST whose parameters ride in the query, as the GET of the same route has them, with an empty body. */
+    ClassicHttpRequest preparePostQueryRequest(String path, NameValuePair... params) {
+        URI uri;
+        try {
+            uri = new URIBuilder(url + path)
+                    .addParameters(
+                            Arrays.stream(params).filter(Objects::nonNull).toList())
+                    .build();
+        } catch (URISyntaxException invalid) {
+            throw new IggyInvalidArgumentException("Invalid request URI " + url + path, invalid);
+        }
+        return ClassicRequestBuilder.post(uri)
+                .setHeader(AUTHORIZATION, getBearerToken())
                 .build();
     }
 
@@ -468,7 +538,7 @@ final class InternalHttpClient implements Closeable {
         return statusCode >= 200 && statusCode < 300;
     }
 
-    private static final class DeferredRequestExecutor extends HttpRequestExecutor {
+    private static final class AttemptRecordingExecutor extends HttpRequestExecutor {
         @Override
         public ClassicHttpResponse execute(
                 ClassicHttpRequest request,
@@ -477,17 +547,22 @@ final class InternalHttpClient implements Closeable {
                 HttpContext context)
                 throws IOException, HttpException {
             // The lease and connection already exist. A failed header write may still reach the server.
-            context.setAttribute(DEFERRED_ATTEMPTED, Boolean.TRUE);
+            context.setAttribute(ATTEMPTED, Boolean.TRUE);
             return super.execute(request, connection, callback, context);
         }
     }
 
     /**
      * Resends what the default strategy resends: a 429 or a 503 answer to any request, and an I/O
-     * failure of an idempotent one. Each resend marks the request uncertain unless the server
-     * provably never took the attempt before it.
+     * failure of an idempotent one, which a committing poll is not. Each resend marks the request
+     * uncertain unless the server provably never took the attempt before it.
      */
     private static final class UncertainAttempts extends DefaultHttpRequestRetryStrategy {
+
+        @Override
+        protected boolean handleAsIdempotent(HttpRequest request) {
+            return super.handleAsIdempotent(request) && !committingPoll(request);
+        }
 
         @Override
         public boolean retryRequest(HttpResponse response, int execCount, HttpContext context) {

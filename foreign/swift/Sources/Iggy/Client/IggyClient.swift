@@ -48,9 +48,9 @@ import Logging
 /// ``IggyErrorCode/transientNotCommitted``. The other SDKs keep such
 /// a write in a retained-operation registry and fail it with
 /// ``IggyErrorCode/operationUncertain``. This SDK does not retain replicated
-/// writes, so it keeps `transientNotCommitted` for them. An uncertain
-/// committing fetch instead fails with ``IggyErrorCode/fetchProgressUncertain``
-/// and blocks affected partition progress until ``abandonOperation(_:)``.
+/// writes, so it keeps `transientNotCommitted` for them, and so does a read
+/// with ``CommitPolicy/onRead`` that lost its reply. A ``PartitionReader``
+/// repairs such a read by itself.
 ///
 /// A request that was not sent before its deadline fails with
 /// ``IggyErrorCode/transientNotAccepted``, and a retry can succeed. A call
@@ -183,15 +183,6 @@ public final class IggyClient: Sendable {
 
     // MARK: Raw requests
 
-    /// Releases the local partition blocks of an uncertain committing fetch.
-    /// This accepts that its server-side reads can still complete. It sends
-    /// nothing, does not replay the fetch, and proves no committed outcome.
-    /// Use the `operationID` of `fetchProgressUncertain` or `partitionLaneBlocked`.
-    /// An absent or already abandoned handle fails with `operationNotRetained`.
-    public func abandonOperation(_ operationID: UInt128Value) throws {
-        try core.pollRouter.abandonFetch(operationID)
-    }
-
     /// Sends a command code with an already-encoded payload and returns the
     /// raw reply body. For commands without a typed method; the caller owns
     /// the wire format. Session-control codes, `BindSession` among them, are
@@ -204,16 +195,15 @@ public final class IggyClient: Sendable {
     /// `GetConsumerOffset`, `StoreConsumerOffset`, and `DeleteConsumerOffset`
     /// take the route of
     /// ``sendMessages(streamID:topicID:partitioning:messages:)``,
-    /// ``pollMessages(streamID:topicID:partitionID:consumer:strategy:count:autoCommit:options:)``,
+    /// ``pollMessages(streamID:topicID:partitionID:consumer:strategy:options:)``,
     /// and the offset calls. A raw send with balanced or key partitioning
     /// fails with ``IggyErrorCode/featureUnavailable``. A group poll, a store,
     /// or a delete that names no partition fails with
     /// ``IggyErrorCode/invalidIdentifier``, and a partition payload that does
     /// not decode fails with ``IggyErrorCode/invalidCommand``. Each fails
     /// before anything is sent. A deferred poll (106) takes the route of a
-    /// poll with `options`, and a fetch (109) the one of
-    /// ``fetchMessages(streamID:topicID:targets:consumer:count:autoCommit:options:)``,
-    /// with the fences and target limits of its payload.
+    /// poll, and a fetch (109) the route of its first target, with the fences
+    /// and target limits of its payload.
     /// Options or targets the wire refuses fail with
     /// ``IggyErrorCode/invalidCommand``, and so does a cancellation (108):
     /// cancel the task of the deferred request instead.

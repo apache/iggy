@@ -18,7 +18,8 @@
 use std::sync::Arc;
 
 use iggy::prelude::PartitionReader as RustPartitionReader;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
+use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -37,15 +38,18 @@ use crate::receive_message::{Checkpoint, PolledBatch, PollingStrategy};
 /// - `next()` returns the next batch of one partition, in offset order within one generation of
 ///   the partition: from its first read, from each `seek()` and from each new assignment to
 ///   this member.
-/// - Without `ServerCommitPolicy.OnRead`, `commit()` stores the offset of a checkpoint. With it,
-///   the server stores the offset of each reply, and `close()` moves the offset back to the last
-///   delivered message.
+/// - The `commit` of its `PollOptions` says when offsets are stored. With `CommitPolicy.Manual()`
+///   and `CommitPolicy.Auto`, `commit()` stores the offset of a checkpoint. `CommitPolicy.Auto`
+///   also stores the latest counted position by itself, and `mark()` counts one. With
+///   `CommitPolicy.OnRead()`, the server stores the offset of each reply, and `close()` moves the
+///   offset back to the last delivered message.
 /// - The reader stays usable after a `ReadError` and retries by itself. `HistoryUnavailable`
 ///   (87) stops its partition until `seek()`. With `OnRead`, an unknown outcome stops its
 ///   partition until `IggyClient.abandon_operation()` and `seek()`.
 /// - The calls on one reader run one at a time, so a call waits for a pending `next()`.
 ///   `next()` is cancel safe: cancel it before `close()`.
 /// - Dropping the reader stops its tasks without waiting, and it moves no offset back.
+/// - `async for` reads its batches until `close()`, and `async with` closes it on exit.
 #[gen_stub_pyclass]
 #[pyclass]
 pub struct PartitionReader {
@@ -86,7 +90,7 @@ impl PartitionReader {
     /// message of its partition. A checkpoint of an older generation of its partition, or at or
     /// below the last commit of its generation, stores nothing.
     ///
-    /// Raises `IggyError` with `InvalidCommand` (3) under `ServerCommitPolicy.OnRead` and for a
+    /// Raises `IggyError` with `InvalidCommand` (3) under `CommitPolicy.OnRead()` and for a
     /// checkpoint that this reader did not deliver, the errors of the offset store, and
     /// `RuntimeError` after `close()`.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -104,12 +108,33 @@ impl PartitionReader {
         })
     }
 
+    /// Counts a checkpoint that this reader delivered under `CommitPolicy.Auto` and stores
+    /// nothing now: the policy stores the latest counted position of its partition. With
+    /// `CommitAfter.Marked` only marks count, so batches processed concurrently count once they
+    /// are done. Like every call of the reader, it waits for a pending `next()`.
+    ///
+    /// Raises `IggyError` with `InvalidCommand` (3) without `CommitPolicy.Auto` and for a
+    /// checkpoint that this reader did not deliver, and `RuntimeError` after `close()`.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn mark<'a>(&self, py: Python<'a>, checkpoint: &Checkpoint) -> PyResult<Bound<'a, PyAny>> {
+        let checkpoint = checkpoint.inner;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let reader = inner.lock().await;
+            reader
+                .as_ref()
+                .ok_or_else(closed)?
+                .mark(checkpoint)
+                .map_err(to_runtime_error)
+        })
+    }
+
     /// Sets the next read position of a partition and starts a new generation of it. It stores
     /// no offset, drops the queued batches of the partition and ignores its late replies. It
     /// also resumes a stopped partition. `start` is a new strategy or a continuation of the same
     /// partition, such as `ReadError.skip`.
     ///
-    /// With `ServerCommitPolicy.OnRead`, the new position waits for the end of the committing
+    /// With `CommitPolicy.OnRead()`, the new position waits for the end of the committing
     /// read in flight.
     ///
     /// Raises `IggyError` with `InvalidCommand` (3) for a partition that the reader does not read
@@ -149,27 +174,75 @@ impl PartitionReader {
         })
     }
 
-    /// Stops the reader. It waits at most until the deadlines of the reads in flight, and it
-    /// commits nothing. A group reader then leaves its group. Repeated calls are safe.
+    /// Stops the reader. It waits at most until the deadlines of the reads in flight. With
+    /// `CommitPolicy.Manual()` it commits nothing. With `CommitPolicy.Auto`, it counts the last
+    /// batch under `CommitAfter.Processing` and stores the latest counted position of each
+    /// partition. A group reader then leaves its group. Repeated calls are safe.
     ///
-    /// With `ServerCommitPolicy.OnRead`, it moves the offset of each partition with undelivered
+    /// With `CommitPolicy.OnRead()`, it moves the offset of each partition with undelivered
     /// batches back to its last delivered message. A partition that delivered nothing and
     /// started at `Next` gets the offset before its first undelivered message, or no offset at
     /// offset 0.
     ///
-    /// Raises `IggyError` for the first failed store of the `OnRead` close, or else
+    /// Raises `IggyError` for the first failed store of the `OnRead` or the `Auto` close, or else
     /// `PendingOperationError` for a partition with an unknown outcome: abandon its operation
     /// before a new reader reads the partition.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn close<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
-        let inner = self.inner.clone();
-        future_into_py(py, async move {
-            let reader = inner.lock().await.take();
-            match reader {
-                Some(reader) => reader.close().await.map_err(to_runtime_error),
-                None => Ok(()),
-            }
+        future_into_py(py, closing(self.inner.clone()))
+    }
+
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    // pyo3 builds no slot from an `async fn`, so the slot returns the coroutine of `_anext`.
+    #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[PolledMessages]", imports=("collections.abc")))]
+    fn __anext__<'a>(slf: &Bound<'a, Self>) -> PyResult<Bound<'a, PyAny>> {
+        slf.call_method0(intern!(slf.py(), "_anext"))
+    }
+
+    /// `next()` for `async for`, which ends after `close()`.
+    #[gen_stub(override_return_type(type_repr = "PolledMessages"))]
+    #[pyo3(name = "_anext")]
+    async fn next_in_iteration(&self) -> PyResult<PolledBatch> {
+        on_event_loop(async {
+            let mut reader = self.inner.lock().await;
+            let Some(reader) = reader.as_mut() else {
+                return Err(PyStopAsyncIteration::new_err("reader has been closed"));
+            };
+            Ok(PolledBatch(reader.next().await.map_err(to_read_error)?))
         })
+        .await
+    }
+
+    #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[PartitionReader]", imports=("collections.abc")))]
+    fn __aenter__<'py>(this: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        future_into_py(py, async move { Ok(this) })
+    }
+
+    /// Closes the reader as `close()` does, also when the block raised.
+    #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[builtins.bool]", imports=("collections.abc")))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let closing = closing(self.inner.clone());
+        future_into_py(py, async move {
+            closing.await?;
+            Ok(false)
+        })
+    }
+}
+
+async fn closing(inner: Arc<Mutex<Option<RustPartitionReader>>>) -> PyResult<()> {
+    let reader = inner.lock().await.take();
+    match reader {
+        Some(reader) => reader.close().await.map_err(to_runtime_error),
+        None => Ok(()),
     }
 }
 

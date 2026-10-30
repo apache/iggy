@@ -48,6 +48,19 @@ internal static class TcpContracts
     /// <summary>The most partitions one fetch names.</summary>
     internal const int MAX_PARTITIONS_PER_REQUEST = 1000;
 
+    /// <summary>
+    ///     The largest record of one message in a read reply: the batch header, the message header, the largest
+    ///     payload and the largest user headers. A read returns a first record up to this size even above its byte
+    ///     limit, so a reply frame limit below <see cref="MAX_RECORD_REPLY_SIZE" /> cannot read every message.
+    /// </summary>
+    internal const int MAX_RECORD_SIZE = BatchWireFormat.BATCH_HEADER_SIZE + BatchWireFormat.FRAME_HEADER_SIZE
+                                         + 64_000_000 + 100_000;
+
+    /// <summary>The largest reply frame of a read of one such record: the frame header, the largest fetch table and the record.</summary>
+    internal const int MAX_RECORD_REPLY_SIZE = VsrHeader.HEADER_SIZE + FetchedMessages.SECTIONS_COUNT_SIZE
+                                               + MAX_PARTITIONS_PER_REQUEST * FetchedMessages.SECTION_HEADER_SIZE
+                                               + MAX_RECORD_SIZE;
+
     /// <summary>The wait and the request timeout that follow the fetch topic.</summary>
     private const int WaitBudgetSize = sizeof(ulong) + sizeof(ulong);
 
@@ -378,6 +391,19 @@ internal static class TcpContracts
         return body[FetchFieldsOffset(body) + FetchAutoCommitOffset] != 0;
     }
 
+    /// <summary>Whether a PollMessages, PollMessagesDeferred or FetchMessages body commits what it reads.</summary>
+    internal static bool ReadAutoCommits(int code, ReadOnlySpan<byte> body)
+    {
+        return code switch
+        {
+            CommandCodes.FETCH_MESSAGES_CODE => FetchAutoCommits(body),
+            CommandCodes.POLL_MESSAGES_DEFERRED_CODE => body.Length > DEFERRED_POLL_TAIL_SIZE
+                                                        && body[^(DEFERRED_POLL_TAIL_SIZE + 1)] != 0,
+            CommandCodes.POLL_MESSAGES_CODE => body.Length > 0 && body[^1] != 0,
+            _ => false
+        };
+    }
+
     /// <summary>Whether a FetchMessages body moves its consumer: it commits, or a target starts at Next.</summary>
     internal static bool FetchMovesConsumer(ReadOnlySpan<byte> body)
     {
@@ -454,7 +480,7 @@ internal static class TcpContracts
     /// <summary>
     ///     Encodes a SendMessages body: routing metadata followed by one canonical batch record
     ///     (a 256-byte batch header plus per-message frames). The server stamps
-    ///     <c>partition_id</c>, <c>base_offset</c>, and <c>base_timestamp</c>; they stay zero here.
+    ///     <c>partition_id</c>, <c>base_offset</c>, and <c>base_timestamp</c>. They stay zero here.
     /// </summary>
     internal static int CreateMessage(Span<byte> bytes, Identifier streamId, Identifier topicId,
         Partitioning partitioning, ReadOnlySpan<Message> messages, IMessageEncryptor? encryptor = null)
@@ -492,7 +518,7 @@ internal static class TcpContracts
         var blobStart = position;
         var offsetDelta = 0u;
 
-        // One scratch buffer reused across the batch (grown on demand); holds plaintext headers, so it is
+        // One scratch buffer reused across the batch (grown on demand). Holds plaintext headers, so it is
         // returned cleared on every path, including a mid-batch throw from the encryptor or header serialization.
         byte[]? headerScratch = null;
         try
@@ -579,7 +605,7 @@ internal static class TcpContracts
                     (uint)timestampDelta);
                 BinaryPrimitives.WriteInt32LittleEndian(bytes[(frameStart + 32)..(frameStart + 36)], headersLength);
                 BinaryPrimitives.WriteInt32LittleEndian(bytes[(frameStart + 36)..(frameStart + 40)], payloadLength);
-                // Reserved must be zero on the wire; the server rejects non-zero values.
+                // Reserved must be zero on the wire. The server rejects non-zero values.
                 BinaryPrimitives.WriteUInt64LittleEndian(bytes[(frameStart + 40)..(frameStart + 48)], 0);
 
                 position = headersStart + headersLength;

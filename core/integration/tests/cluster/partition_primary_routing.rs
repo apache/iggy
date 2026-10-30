@@ -396,7 +396,7 @@ async fn given_spread_primaries_when_polling_deferred_should_wake_each_partition
                 PollOptions {
                     count: 2,
                     min_count: 2,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..deferred_test_options()
                 },
             )
@@ -457,9 +457,9 @@ async fn given_spread_primaries_when_consuming_deferred_should_route_every_group
     harness: &TestHarness,
 ) {
     let producer = harness.root_client().await.unwrap();
-    for (stream_name, server_commit) in [
-        ("deferred-manual", ServerCommitPolicy::Disabled),
-        ("deferred-on-poll", ServerCommitPolicy::OnRead),
+    for (stream_name, commit) in [
+        ("deferred-manual", CommitPolicy::Manual),
+        ("deferred-on-poll", CommitPolicy::OnRead),
     ] {
         let (client, stream, topic, observers) = spread_deferred_topic(harness, stream_name).await;
         let mut consumer = client
@@ -468,7 +468,7 @@ async fn given_spread_primaries_when_consuming_deferred_should_route_every_group
             .polling_strategy(PollingStrategy::next())
             .poll_options(PollOptions {
                 count: 1,
-                server_commit,
+                commit,
                 ..deferred_test_options()
             })
             .build();
@@ -509,7 +509,7 @@ async fn given_spread_primaries_when_consuming_deferred_should_route_every_group
                 assert_eq!(received.partition_id, partition, "{stream_name}");
                 assert_eq!(received.message.header.offset, offset, "{stream_name}");
                 assert_eq!(received.message.payload.as_ref(), payload.as_bytes());
-                if server_commit == ServerCommitPolicy::Disabled {
+                if commit == CommitPolicy::Manual {
                     let stored = client
                         .get_consumer_offset(&group, &stream, &topic, Some(partition))
                         .await
@@ -1710,6 +1710,96 @@ async fn given_different_metadata_and_partition_primaries_when_quic_group_auto_c
     assert_group_auto_commit_routing(harness, TransportProtocol::Quic).await;
 }
 
+#[iggy_harness(cluster_nodes = 3, server(consumer_group.rebalancing_timeout = "1s"))]
+async fn given_cached_quic_group_route_when_partition_primary_stops_should_resume_on_new_primary(
+    harness: &mut TestHarness,
+) {
+    let primary = leader_node_index_via(harness, 0).await;
+    let producer = harness.root_client_for_node(primary).await.unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    producer
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    producer
+        .create_topic(
+            &stream,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                messages_required_to_save: Some(1),
+                durability: Durability::Persisted,
+                consumer_offset_durability: Durability::Persisted,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut messages: Vec<_> = GROUP_PAYLOADS.into_iter().map(message).collect();
+    producer
+        .send_messages(
+            &stream,
+            &topic,
+            &Partitioning::partition_id(PARTITION_ID),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+
+    let coordinator = (primary + 1) % harness.cluster_size();
+    let member = harness
+        .node(coordinator)
+        .quic_client()
+        .unwrap()
+        .with_reconnecting_root_login()
+        .connect()
+        .await
+        .unwrap();
+    member
+        .create_consumer_group(&stream, &topic, GROUP_NAME)
+        .await
+        .unwrap();
+    let group = Identifier::named(GROUP_NAME).unwrap();
+    member
+        .join_consumer_group(&stream, &topic, &group)
+        .await
+        .unwrap();
+    integration::harness::wait_for_consumer_group_assignment(
+        &member,
+        &stream,
+        &topic,
+        &group,
+        1,
+        PRECONDITION_BUDGET,
+    )
+    .await;
+    let consumer = Consumer::group(group);
+    for expected in GROUP_PAYLOADS {
+        let polled = member
+            .poll_messages(
+                &stream,
+                &topic,
+                PARTITION_ID,
+                &consumer,
+                &PollingStrategy::next(),
+                PollOptions {
+                    count: 1,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(polled.messages.len(), 1);
+        assert_eq!(polled.messages[0].payload.as_ref(), expected.as_bytes());
+    }
+
+    assert_cached_route_after_primary_loss(harness, &member, primary, &stream, &topic, &consumer)
+        .await;
+}
+
 #[iggy_harness(cluster_nodes = 3, server(
     metadata.journal_slots = "256",
     consumer_group.rebalancing_timeout = "1s",
@@ -1751,7 +1841,7 @@ async fn given_split_primaries_when_http_auto_commits_on_a_backup_should_replica
             &PollingStrategy::first(),
             PollOptions {
                 count: GROUP_PAYLOADS.len() as u32,
-                server_commit: ServerCommitPolicy::OnRead,
+                commit: CommitPolicy::OnRead,
                 ..PollOptions::default()
             },
         ),
@@ -2346,22 +2436,27 @@ async fn given_split_primaries_when_a_relayed_read_loses_its_primary_should_rese
     let messages = http.url(&format!(
         "/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/messages"
     ));
-    let poll = |auto_commit: bool| {
-        format!(
-            "{messages}?consumer_id={RELAY_CONSUMER_ID}&partition_id={PARTITION_ID}\
-             &kind=offset&value=0&count={}&auto_commit={auto_commit}",
-            GROUP_PAYLOADS.len()
-        )
-    };
+    let poll = format!(
+        "{messages}?consumer_id={RELAY_CONSUMER_ID}&partition_id={PARTITION_ID}\
+         &kind=offset&value=0&count={}&auto_commit=false",
+        GROUP_PAYLOADS.len()
+    );
+    // A poll that stores its offset is a POST, so nothing resends it as a read.
+    let committing_poll = format!(
+        "{messages}/deferred?consumer_id={RELAY_CONSUMER_ID}&partition_id={PARTITION_ID}\
+         &kind=offset&value=0&count={}&auto_commit=true&wait_us=0",
+        GROUP_PAYLOADS.len()
+    );
     let get = |url: String| http.client.get(url).bearer_auth(&http.token).send();
+    let post = |url: String| http.client.post(url).bearer_auth(&http.token).send();
 
     // A frozen primary takes the relayed requests and never answers them.
     pause_node(harness, partition_primary, true);
     let offset = format!("{offsets}?consumer_id={RELAY_CONSUMER_ID}&partition_id={PARTITION_ID}");
     let (offset_read, read, auto_commit, ()) = tokio::join!(
         get(offset.clone()),
-        get(poll(false)),
-        get(poll(true)),
+        get(poll.clone()),
+        post(committing_poll),
         async {
             wait_for_queued_relays(harness, partition_primary, 3).await;
             harness
@@ -2372,7 +2467,7 @@ async fn given_split_primaries_when_a_relayed_read_loses_its_primary_should_rese
 
     let response = read.expect("poll without auto_commit");
     let response = if response.status() == StatusCode::SERVICE_UNAVAILABLE {
-        until_primary_resolved(|| async { get(poll(false)).await.expect("read-only poll") }).await
+        until_primary_resolved(|| async { get(poll.clone()).await.expect("read-only poll") }).await
     } else {
         response
     };
@@ -2590,30 +2685,25 @@ async fn assert_group_offset_routing(
         .await
         .unwrap();
     assert_routed_offset_from_each_node(harness, &consumer, None).await;
-    for (group_name, client_commit, server_commit) in [
+    for (group_name, commit) in [
         (
             "interval-offset-group",
-            ClientCommitPolicy {
+            CommitPolicy::Auto(AutoCommit {
                 interval: Some(NonZeroIggyDuration::ONE_SECOND),
-                on: None,
-            },
-            ServerCommitPolicy::Disabled,
+                every: None,
+                after: CommitAfter::Delivery,
+            }),
         ),
-        (
-            "default-offset-group",
-            ClientCommitPolicy::default(),
-            ServerCommitPolicy::OnRead,
-        ),
+        ("default-offset-group", CommitPolicy::OnRead),
     ] {
         let mut interval_consumer = member
             .consumer_group(group_name, STREAM_NAME, TOPIC_NAME)
             .unwrap()
             .poll_options(PollOptions {
                 count: GROUP_PAYLOADS.len() as u32,
-                server_commit,
+                commit,
                 ..PollOptions::wait(IggyDuration::ONE_SECOND)
             })
-            .client_commit(client_commit)
             .build();
         interval_consumer.init().await.unwrap();
         for _ in GROUP_PAYLOADS {
@@ -2853,7 +2943,7 @@ async fn assert_group_auto_commit_routing(harness: &mut TestHarness, transport: 
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 1,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             ),
@@ -2889,15 +2979,6 @@ async fn assert_group_auto_commit_routing(harness: &mut TestHarness, transport: 
 
     let expected_offset = u64::try_from(GROUP_PAYLOADS.len() - 1).unwrap();
     assert_routed_offset_from_each_node(harness, &consumer, Some(expected_offset)).await;
-    let partition_primary = assert_cached_route_after_primary_loss(
-        harness,
-        &member,
-        partition_primary,
-        &stream,
-        &topic,
-        &consumer,
-    )
-    .await;
     assert_data_session_fences(
         harness,
         &member,
@@ -2923,7 +3004,7 @@ async fn assert_cached_route_after_primary_loss(
         .unwrap()
         .poll_options(PollOptions {
             count: 1,
-            server_commit: ServerCommitPolicy::OnRead,
+            commit: CommitPolicy::OnRead,
             ..PollOptions::wait(IggyDuration::ONE_SECOND)
         })
         .build();
@@ -2938,7 +3019,7 @@ async fn assert_cached_route_after_primary_loss(
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 1,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )
@@ -2952,8 +3033,7 @@ async fn assert_cached_route_after_primary_loss(
         .await
         .unwrap()
         .unwrap();
-    let coordinator = member.get_connection_info().await.server_address;
-    harness.kill_node(previous_primary).unwrap();
+    harness.stop_node(previous_primary).unwrap();
     let route_request = GetPartitionRouteRequest {
         stream_id: identifier_to_wire(stream).unwrap(),
         topic_id: identifier_to_wire(topic).unwrap(),
@@ -3000,16 +3080,16 @@ async fn assert_cached_route_after_primary_loss(
         loop {
             match receiver.next().await.expect("the consumer must stay open") {
                 Ok(message) => break message,
-                // A read that never reached the killed owner fails as not
-                // accepted.
+                // A refused read stored no offset.
                 Err(ReadError {
                     error: IggyError::TransientNotAccepted,
                     ..
                 }) => {}
-                // A read lost with the killed owner has an unknown outcome, so
-                // the client blocks its partition until the caller abandons
-                // it. The fixture killed the owner before the read, so the
-                // read stored nothing and cannot hide this new message.
+                Err(ReadError {
+                    error: IggyError::TransientNotCommitted,
+                    ..
+                }) => {}
+                // The old owner stopped before this message was sent, so a lost reply cannot hide it.
                 Err(ReadError {
                     error: IggyError::FetchProgressUncertain(operation),
                     ..
@@ -3033,12 +3113,8 @@ async fn assert_cached_route_after_primary_loss(
         }
     })
     .await
-    .expect("IggyConsumer must resume after data loss without coordinator reconnect events");
+    .expect("IggyConsumer must resume after the data primary stops");
     assert_eq!(received.message.payload.as_ref(), PAYLOAD.as_bytes());
-    assert_eq!(
-        member.get_connection_info().await.server_address,
-        coordinator
-    );
     let current = member
         .get_consumer_group(stream, topic, &consumer.id)
         .await

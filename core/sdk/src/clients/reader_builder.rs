@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
-    Client, Consumer, ConsumerKind, EncryptorKind, Identifier, IggyDuration, IggyError,
-    PollOptions, PollingStrategy, ServerCommitPolicy, group_cache_key,
+    Client, CommitPolicy, Consumer, ConsumerKind, EncryptorKind, Identifier, IggyDuration,
+    IggyError, PollOptions, PollingStrategy, group_cache_key,
 };
 use tokio::sync::Notify;
 use tracing::error;
@@ -36,7 +36,7 @@ use crate::driver::MAX_DEFERRED_REQUESTS_PER_CONSUMER;
 
 pub(crate) const DEFAULT_PREFETCH_BYTES: u32 = 16 * 1024 * 1024;
 pub(crate) const DEFAULT_PREFETCH_MESSAGES: u32 = 16_000;
-pub(crate) const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(1);
+pub(crate) const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Builds a [`PartitionReader`]. Get one from [`IggyClient::reader`](crate::prelude::IggyClient::reader).
@@ -113,7 +113,8 @@ impl ReaderBuilder {
         Self { start, ..self }
     }
 
-    /// The options of each request. Default `PollOptions::wait(1 s)`.
+    /// The options of each request and the [`CommitPolicy`] of the reader. Default
+    /// `PollOptions::wait(5 s)`, which commits nothing.
     pub fn options(self, options: PollOptions) -> Self {
         Self { options, ..self }
     }
@@ -180,7 +181,7 @@ impl ReaderBuilder {
     ///   HTTP, which cannot join a group.
     /// - [`IggyError::InvalidCommand`] for partitions of a consumer group, a standalone consumer
     ///   without partitions, or a continuation as the start.
-    /// - [`IggyError::InvalidConfiguration`] for `ServerCommitPolicy::OnRead` with an encryptor:
+    /// - [`IggyError::InvalidConfiguration`] for `CommitPolicy::OnRead` with an encryptor:
     ///   the server would store the offset of a batch before it decrypts.
     /// - The errors of [`PollOptions::validate`], and the error of the first join.
     /// - [`IggyError::OperationUncertain`] for a create or a join of the group with an unknown
@@ -198,7 +199,9 @@ impl ReaderBuilder {
                 let key = group_cache_key(&config.stream, &config.topic, &config.consumer.id);
                 shared.assignment_state = Some((state, key));
             }
-            client.subscribe_events().await
+            // A clone of the client's receiver holds every event published since the client
+            // started, and the worker would act on that history as if it were live.
+            client.subscribe_events().await.new_receiver()
         };
         if let Some(membership) = &shared.membership {
             membership.join().await?;
@@ -259,9 +262,9 @@ impl ReaderBuilder {
             );
             return Err(IggyError::InvalidCommand);
         }
-        if self.options.server_commit == ServerCommitPolicy::OnRead && self.encryptor.is_some() {
+        if self.options.commit == CommitPolicy::OnRead && self.encryptor.is_some() {
             error!(
-                "Reader of consumer: {} has an encryptor and ServerCommitPolicy::OnRead. The server would store the offset of a batch before it decrypts, so a batch that fails to decrypt would be lost.",
+                "Reader of consumer: {} has an encryptor and CommitPolicy::OnRead. The server would store the offset of a batch before it decrypts, so a batch that fails to decrypt would be lost.",
                 self.consumer
             );
             return Err(IggyError::InvalidConfiguration);
@@ -280,6 +283,7 @@ impl ReaderBuilder {
                 Arc::clone(&consumer),
                 Arc::clone(&stream),
                 Arc::clone(&topic),
+                self.options.commit,
             ))
         });
         // Only `IggyConsumer` creates a missing group, through the membership that it passes.

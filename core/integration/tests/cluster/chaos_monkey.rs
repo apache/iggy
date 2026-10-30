@@ -2445,12 +2445,13 @@ async fn start_iggy_consumer(builder: IggyConsumerBuilder) -> IggyConsumer {
         // Commits only what was handed over. `OnRead` commits with the read
         // and can skip a batch whose reply was lost, which would break the
         // no-loss check.
-        .client_commit(ClientCommitPolicy {
-            interval: Some(commit_interval),
-            on: Some(CommitEvent::EachBatch),
-        })
         .poll_options(PollOptions {
             count: POLL_BATCH,
+            commit: CommitPolicy::Auto(AutoCommit {
+                interval: Some(commit_interval),
+                every: Some(CommitEvery::Batch),
+                after: CommitAfter::Delivery,
+            }),
             ..PollOptions::wait(IggyDuration::from(POLL_PAUSE))
         })
         .build();

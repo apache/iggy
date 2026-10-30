@@ -35,8 +35,10 @@ pub struct ConsumerOffsetInfo {
 
 /// The position after one delivered message. A commit stores its offset, so it covers all
 /// earlier messages of the partition. A checkpoint retains the partition incarnation and owner
-/// that delivered the message, so a commit after a change of the partition history fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// that delivered the message, so a commit after a change of the partition history fails. It
+/// serializes for logs but never deserializes: only the reader that delivered the message can
+/// commit it, so a stored checkpoint could never be committed. Store its offset instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Checkpoint {
     partition_id: u32,
     offset: u64,
@@ -87,7 +89,7 @@ impl Checkpoint {
         self.offset
     }
 
-    /// Partition incarnation and owner captured by the read; a delayed commit keeps both.
+    /// Partition incarnation and owner captured by the read. A delayed commit keeps both.
     #[doc(hidden)]
     pub const fn context(&self) -> PartitionContext {
         self.context

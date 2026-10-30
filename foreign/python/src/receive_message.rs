@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use iggy::prelude::{
     Checkpoint as RustCheckpoint, IggyMessage as RustReceiveMessage,
     PartitionContext as RustPartitionContext, PolledMessages as RustPolledMessages, PollingKind,
@@ -114,6 +116,14 @@ impl Checkpoint {
             self.inner.partition_id(),
             self.inner.offset()
         )
+    }
+
+    // Equal checkpoints share their partition and offset, so a hash of the two agrees with
+    // equality.
+    fn __hash__(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        (self.inner.partition_id(), self.inner.offset()).hash(&mut hasher);
+        hasher.finish()
     }
 }
 

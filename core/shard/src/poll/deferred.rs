@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -122,6 +122,12 @@ pub struct DeferredPollRequest {
     pub metadata: PollMetadata,
     pub context: DeferredPollContext,
     pub options: DeferredPollOptions,
+    /// The gate of a committing request that its client can cancel.
+    pub commit_gate: Option<CommitGate>,
+    /// Shared by the reads of one fetch, so at most one of them returns a
+    /// first message larger than its `max_bytes`. A poll alone has none and
+    /// always may.
+    pub oversized_turn: Option<OversizedTurn>,
     pub(crate) deadline: u64,
     pub(crate) request_deadline: u64,
 }
@@ -141,9 +147,70 @@ impl DeferredPollRequest {
             metadata,
             context,
             options,
+            commit_gate: None,
+            oversized_turn: None,
             deadline: 0,
             request_deadline: 0,
         }
+    }
+}
+
+/// The one turn of a fetch to return a first message larger than the byte
+/// limit of its read, which bounds the reply by one such message.
+#[derive(Debug, Clone, Default)]
+pub struct OversizedTurn(Arc<AtomicU8>);
+
+impl OversizedTurn {
+    /// Takes the turn, unless another read took it.
+    #[must_use]
+    pub fn take(&self) -> bool {
+        self.0
+            .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    fn accept_normal(&self) -> bool {
+        matches!(
+            self.0
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst),
+            Ok(_) | Err(1)
+        )
+    }
+}
+
+/// The cancel gate of one committing deferred request.
+///
+/// The origin and the owners of its reads share it. A cancel wins only while
+/// no read passed the gate, and a read commits only while no cancel won, so a
+/// cancelled request stored nothing and a request whose cancel lost answers as
+/// usual.
+#[derive(Debug, Clone, Default)]
+pub struct CommitGate(Arc<AtomicU64>);
+
+const GATE_CANCELLED: u64 = 1 << 63;
+
+impl CommitGate {
+    /// Lets one read commit, unless a cancel won.
+    #[must_use]
+    pub fn enter(&self) -> bool {
+        self.0
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+                (state & GATE_CANCELLED == 0).then_some(state + 1)
+            })
+            .is_ok()
+    }
+
+    /// Cancels the request, unless a read already passed the gate.
+    #[must_use]
+    pub fn cancel(&self) -> bool {
+        self.0
+            .compare_exchange(0, GATE_CANCELLED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst) & GATE_CANCELLED != 0
     }
 }
 
@@ -470,6 +537,16 @@ fn reply_byte_limit(options: &DeferredPollOptions, max_read_bytes: usize) -> usi
         .saturating_sub(POLL_RESPONSE_HEADER_SIZE)
 }
 
+/// The part of a read reservation that its disk selection may hold. Index
+/// loading stays under one part (`SEALED_INDEX_RESIDENT_MAX_BYTES`) and the
+/// snapshot pins journal buffers that exist anyway, so each keeps one minimum
+/// part and the selection gets the rest, at least its third.
+fn walk_bytes(reservation: usize) -> usize {
+    reservation
+        .saturating_sub((READ_BUDGET_PARTS - 1) * READ_PART_MIN_BYTES)
+        .max(reservation / READ_BUDGET_PARTS)
+}
+
 /// Up to `MAINTENANCE_BUDGET` keys of `map` after `cursor`. After the last
 /// key, the sweep starts again at the first.
 fn keys_after<K: Ord + Copy, V>(map: &BTreeMap<K, V>, cursor: Option<K>) -> Vec<K> {
@@ -490,10 +567,18 @@ fn keys_after<K: Ord + Copy, V>(map: &BTreeMap<K, V>, cursor: Option<K>) -> Vec<
 struct Signals {
     queued: HashSet<IggyNamespace>,
     dirty: VecDeque<IggyNamespace>,
+    /// Marked partitions whose status changed, so every parked read of them
+    /// checks it, also a poll that a commit alone would leave parked.
+    changed: HashSet<IggyNamespace>,
     waker: Option<Waker>,
 }
 
 impl Signals {
+    fn mark_changed(&mut self, namespace: IggyNamespace) {
+        self.changed.insert(namespace);
+        self.mark(namespace);
+    }
+
     fn mark(&mut self, namespace: IggyNamespace) {
         if self.queued.insert(namespace) {
             self.dirty.push_back(namespace);
@@ -642,6 +727,9 @@ pub struct DeferredPolls {
     signals: Rc<RefCell<Signals>>,
     mirrors: RefCell<Mirrors>,
     inflight_bytes: Arc<AtomicUsize>,
+    /// The status and view that the last tick saw of each partition with
+    /// parked reads or watchers.
+    statuses: RefCell<BTreeMap<IggyNamespace, (PartitionStatus, u32)>>,
 }
 
 impl DeferredPolls {
@@ -653,6 +741,7 @@ impl DeferredPolls {
             signals: Rc::new(RefCell::new(Signals::default())),
             mirrors: RefCell::new(Mirrors::default()),
             inflight_bytes: Arc::new(AtomicUsize::new(0)),
+            statuses: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -797,7 +886,7 @@ impl DeferredPolls {
     /// The budget that a disk read with `max_bytes` reserves. Its snapshot,
     /// disk selection and index loading can coexist, so it reserves one part
     /// as large as its reply for each, at least [`READ_PART_MIN_BYTES`], up
-    /// to `max_read_bytes` in total.
+    /// to `max_read_bytes` in total. [`walk_bytes`] splits it.
     fn read_bytes(&self, max_bytes: u32) -> usize {
         (max_bytes as usize)
             .max(READ_PART_MIN_BYTES)
@@ -897,9 +986,15 @@ impl DeferredPolls {
         for deadline in deadlines {
             state.deadlines.remove(&(*deadline, id));
         }
-        state.queued.remove(&id);
-        state.ready.retain(|queued| *queued != id);
-        state.read_queue.retain(|(_, queued)| *queued != id);
+        // The pump takes a waiter off `ready` before it finishes it, so only a
+        // waiter that a wake queued again needs the scan.
+        if state.queued.remove(&id) {
+            state.ready.retain(|queued| *queued != id);
+        }
+        debug_assert!(
+            state.read_queue.iter().all(|(_, queued)| *queued != id),
+            "a probe takes the read place of a waiter before it removes the waiter"
+        );
         self.metrics.pending.dec();
         if let Some(count) = state.sessions.get_mut(&quota) {
             *count -= 1;
@@ -964,13 +1059,6 @@ where
 
     pub fn deferred_wait_us(&self, wait_us: u64) -> u64 {
         self.deferred_polls.wait_us(wait_us)
-    }
-
-    /// The read budget that one disk read with `max_bytes` reserves on its
-    /// owner, out of `max_inflight_bytes`.
-    #[must_use]
-    pub fn deferred_read_cost(&self, max_bytes: u32) -> usize {
-        self.deferred_polls.read_bytes(max_bytes)
     }
 
     /// The deferred poll limits, which every shard shares.
@@ -1150,6 +1238,52 @@ where
         }
     }
 
+    /// One consensus tick of the deferred polls. A partition that loses its
+    /// primary, changes view or starts a state transfer marks nothing, so the
+    /// tick compares the status of each partition with parked reads or
+    /// watchers to the last tick and wakes those reads at once, instead of
+    /// when the sweep reaches them.
+    pub(crate) fn tick_deferred_polls(&self) {
+        let namespaces: BTreeSet<IggyNamespace> = {
+            let state = self.deferred_polls.state.borrow();
+            state
+                .partitions
+                .keys()
+                .chain(state.watches.keys())
+                .copied()
+                .collect()
+        };
+        {
+            let mut statuses = self.deferred_polls.statuses.borrow_mut();
+            statuses.retain(|namespace, _| namespaces.contains(namespace));
+            for namespace in namespaces {
+                let incarnation = self.shards_table.epoch_for(namespace);
+                let Some(current) =
+                    self.plane
+                        .partitions()
+                        .with_partition(&namespace, |partition| {
+                            (
+                                PartitionStatus::of(partition, incarnation),
+                                partition.consensus().view(),
+                            )
+                        })
+                else {
+                    continue;
+                };
+                if statuses
+                    .insert(namespace, current)
+                    .is_some_and(|previous| previous != current)
+                {
+                    self.deferred_polls
+                        .signals
+                        .borrow_mut()
+                        .mark_changed(namespace);
+                }
+            }
+        }
+        self.deferred_polls.maintenance();
+    }
+
     #[allow(clippy::future_not_send)]
     pub(crate) async fn service_deferred_polls(&self) {
         for _ in 0..SERVICE_BUDGET {
@@ -1167,13 +1301,14 @@ where
                     // first, ahead of the other wakes.
                     Some(id)
                 } else {
-                    let namespace = {
+                    let (namespace, changed) = {
                         let mut signals = self.deferred_polls.signals.borrow_mut();
                         let namespace = signals.dirty.pop_front();
-                        if let Some(namespace) = namespace {
+                        let changed = namespace.is_some_and(|namespace| {
                             signals.queued.remove(&namespace);
-                        }
-                        namespace
+                            signals.changed.remove(&namespace)
+                        });
+                        (namespace, changed)
                     };
                     if let Some(namespace) = namespace {
                         // A commit queues a poll only if its history or view
@@ -1196,7 +1331,8 @@ where
                             .flat_map(|ids| ids.iter().copied())
                             .collect();
                         for id in ids {
-                            if let Some((history, visibility, view)) = current
+                            if !changed
+                                && let Some((history, visibility, view)) = current
                                 && let Some(waiter) = state.waiters.get_mut(&id)
                                 && waiter.history == history
                                 && waiter.view == view
@@ -1319,8 +1455,7 @@ where
             self.deferred_polls.queue_read(id, waiter, place);
             return;
         };
-        // Snapshot, disk selection and index loading can coexist.
-        let max_bytes = reservation.bytes / READ_BUDGET_PARTS;
+        let max_bytes = walk_bytes(reservation.bytes);
         let max_selected_bytes = reply_byte_limit(
             &waiter.request.options,
             self.deferred_polls.config.borrow().max_read_bytes,
@@ -1385,14 +1520,32 @@ where
             }
         };
         let max_read_bytes = self.deferred_polls.config.borrow().max_read_bytes;
-        let (mut result, byte_limited) =
-            match result.limit_bytes(waiter.request.options.max_bytes as usize, max_read_bytes) {
-                Ok(result) => result,
-                Err(error) => {
-                    self.reject_deferred_poll(id, &waiter, error);
-                    return;
-                }
+        let (mut result, byte_limited) = match result.limit_bytes(
+            waiter.request.options.max_bytes as usize,
+            max_read_bytes,
+            || true,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                self.reject_deferred_poll(id, &waiter, error);
+                return;
+            }
+        };
+        if result.message_count() > 0
+            && let Some(turn) = &waiter.request.oversized_turn
+        {
+            let oversized =
+                result.encoded_bytes() > reply_byte_limit(&waiter.request.options, max_read_bytes);
+            let accepted = if oversized {
+                turn.take()
+            } else {
+                turn.accept_normal()
             };
+            if !accepted {
+                self.reject_deferred_poll(id, &waiter, IggyError::DeferredPollCapacityExceeded);
+                return;
+            }
+        }
         if result.message_count() >= waiter.request.options.min_count
             || byte_limited
             || result.truncated()
@@ -1478,6 +1631,18 @@ where
         self.remove_deferred_poll(id, &waiter);
         if waiter.reply.is_disconnected() {
             self.metrics.deferred_polls.cancelled.inc();
+            return;
+        }
+        // A read that stores nothing needs no gate. One that would commit after
+        // a cancel won stores nothing either.
+        if result.message_count() > 0
+            && let Some(gate) = &waiter.request.commit_gate
+            && !gate.enter()
+        {
+            self.metrics.deferred_polls.cancelled.inc();
+            let _ = waiter.reply.try_send(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ));
             return;
         }
         let before_deadline = self.bus.monotonic_micros() < waiter.request.deadline;

@@ -35,7 +35,7 @@ use base64::{Engine as _, engine::general_purpose};
 use iggy_common::MessageClient;
 use iggy_common::Utc;
 use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
-use iggy_common::{Consumer, Identifier, PollOptions, PollingStrategy, ServerCommitPolicy};
+use iggy_common::{CommitPolicy, Consumer, Identifier, PollOptions, PollingStrategy};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use serde_json::Value;
@@ -85,7 +85,7 @@ async fn influxdb_source_text_payload_column(
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 100,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )
@@ -143,7 +143,7 @@ async fn influxdb_source_text_whitespace_value(
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 10,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )
@@ -210,7 +210,7 @@ async fn influxdb_source_raw_payload_column(
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 10,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )
@@ -273,7 +273,7 @@ async fn influxdb_source_raw_multiple_rows(
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 100,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )
@@ -330,7 +330,7 @@ async fn influxdb_source_scalar_type_integer(
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 10,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )
@@ -389,7 +389,7 @@ async fn influxdb_source_scalar_type_float(harness: &TestHarness, fixture: Influ
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 10,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )
@@ -443,7 +443,7 @@ async fn influxdb_source_scalar_type_bool(harness: &TestHarness, fixture: Influx
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 10,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )
@@ -559,7 +559,7 @@ async fn influxdb_source_cursor_advances_between_batches(
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 100,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )
@@ -616,7 +616,7 @@ async fn influxdb_source_no_metadata_core_fields_present(
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 10,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )

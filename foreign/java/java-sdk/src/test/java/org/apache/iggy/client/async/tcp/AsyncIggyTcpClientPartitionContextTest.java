@@ -652,7 +652,7 @@ class AsyncIggyTcpClientPartitionContextTest {
                                         DeferredPollOptions.defaults()))
                         .isInstanceOfSatisfying(IggyValidationException.class, error -> {
                             assertThat(error.getRawErrorCode()).isEqualTo(IggyErrorCode.INVALID_COMMAND.getCode());
-                            assertThat(error.getMessage()).contains("readinessGroups", "fetchMessages");
+                            assertThat(error.getMessage()).contains("partition reader");
                         });
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
@@ -890,6 +890,29 @@ class AsyncIggyTcpClientPartitionContextTest {
             assertThat(cluster.primaryWrites)
                     .extracting(AsyncIggyTcpClientPartitionContextTest::stampedContext)
                     .containsOnly(routeContext(1));
+        }
+    }
+
+    @Test
+    void shouldDeleteTheReaderOffsetWithItsCapturedContext() throws Exception {
+        try (OffsetCluster cluster = new OffsetCluster(1, STORED)) {
+            AsyncIggyTcpClient client = client(cluster.coordinatorSocket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                ((ConsumerOffsetsTcpClient) client.consumerOffsets())
+                        .deleteConsumerOffset(StreamId.of(1L), TopicId.of(1L), 0L, Consumer.of(7L), CALLER_CONTEXT)
+                        .get(5, TimeUnit.SECONDS);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            cluster.awaitServed();
+            assertThat(cluster.primaryWrites)
+                    .extracting(Request::operation)
+                    .containsExactly(OPERATION_DELETE_CONSUMER_OFFSET);
+            assertThat(cluster.primaryWrites)
+                    .extracting(AsyncIggyTcpClientPartitionContextTest::stampedContext)
+                    .containsExactly(CALLER_CONTEXT);
         }
     }
 

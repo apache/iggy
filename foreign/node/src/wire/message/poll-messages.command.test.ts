@@ -683,12 +683,12 @@ describe('deferred poll encoding', () => {
     );
   });
 
-  it('refuses a deferred consumer-group poll without a partition with 3 before anything is sent, and names the fetch',
+  it('refuses a deferred consumer-group poll without a partition with 3 before anything is sent, and names the reader',
     async () => {
       const { client, commands } = stubClient([]);
       await assert.rejects(pollMessages(async () => client)({ ...golden, partitionId: null, deferred: {} }),
         (error: unknown) => error instanceof ResponseError && error.commandCode === COMMAND_CODE.PollMessagesDeferred &&
-          error.errorCode === 3 && error.message.includes('message.fetch'));
+          error.errorCode === 3 && error.message.includes('message.reader'));
       assert.deepEqual(commands, []);
     });
 });

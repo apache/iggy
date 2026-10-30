@@ -943,6 +943,8 @@ public final class ConsensusSession {
         private boolean restarting;
         private FetchRecovery fetch;
         private boolean fetchSettled;
+        private boolean committingPoll;
+        private CompletableFuture<Void> attemptSettled;
 
         private Ticket(ConsensusSession owner, List<LaneKey> lanes, boolean mutation, long bytes, long generation) {
             this.owner = owner;
@@ -1052,6 +1054,37 @@ public final class ConsensusSession {
                 fetch = new FetchRecovery(lanes, metadataBytes);
                 owner.fetchReservations++;
                 owner.fetchBytes += metadataBytes;
+            }
+        }
+
+        /**
+         * Marks a poll that stores its offset on the server. A lost reply leaves its outcome unknown, which a later
+         * read of the partition shows, so it blocks nothing.
+         */
+        public void markCommittingPoll() {
+            synchronized (owner) {
+                committingPoll = true;
+            }
+        }
+
+        /** Whether this is a poll or fetch that stores the offsets that it reads. */
+        public boolean commitsOnRead() {
+            synchronized (owner) {
+                return committingPoll || fetch != null;
+            }
+        }
+
+        /** Records {@code settled}, which completes once the attempt that a writer started has its outcome. */
+        public void attemptStarted(CompletableFuture<Void> settled) {
+            synchronized (owner) {
+                attemptSettled = settled;
+            }
+        }
+
+        /** Completes once the last started attempt has its outcome, or null before any attempt. */
+        public CompletableFuture<Void> attemptSettled() {
+            synchronized (owner) {
+                return attemptSettled;
             }
         }
 
@@ -1220,11 +1253,13 @@ public final class ConsensusSession {
         public RuntimeException retain() {
             boolean saved;
             boolean fetchUnknown;
+            boolean pollUnknown;
             synchronized (owner) {
                 fetchUnknown = retainUnknownFetch();
                 saved = retainMutation();
+                pollUnknown = committingPoll && sent;
             }
-            if (fetchUnknown) {
+            if (fetchUnknown || pollUnknown) {
                 complete();
                 return new IggyOperationException(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN, operationId);
             }

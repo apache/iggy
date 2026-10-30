@@ -27,7 +27,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use iggy_binary_protocol::codes::{
     DELETE_CONSUMER_OFFSET_CODE, FETCH_MESSAGES_CODE, GET_STREAM_CODE, GET_TOPIC_CODE,
-    STORE_CONSUMER_OFFSET_CODE,
+    POLL_MESSAGES_DEFERRED_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
@@ -35,16 +35,19 @@ use iggy_binary_protocol::requests::consumer_offsets::{
 use iggy_binary_protocol::responses::consumer_groups::{
     ConsumerGroupDetailsResponse, ConsumerGroupResponse, SyncConsumerGroupResponse,
 };
-use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
+use iggy_binary_protocol::responses::messages::{
+    PartitionRouteResponse, PollMessagesResponseHeader,
+};
 use iggy_binary_protocol::responses::streams::{GetStreamResponse, StreamResponse};
 use iggy_binary_protocol::{WireDecode, WireEncode, WireName, WireOptions};
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
-    Consumer, Identifier, NonZeroIggyDuration, PollOptions, PollingStrategy, ServerCommitPolicy,
+    CommitPolicy, Consumer, Identifier, IggyDuration, NonZeroIggyDuration, PollOptions,
+    PollingStrategy,
 };
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::clients::consumer::{ClientCommitPolicy, IggyConsumer, ReceivedMessage};
+use crate::clients::consumer::{IggyConsumer, ReceivedMessage};
 use crate::clients::consumer_builder::IggyConsumerBuilder;
 use crate::clients::reader::fixtures::{Section, fetch_body, served};
 use crate::links::ReconnectPolicy;
@@ -53,7 +56,7 @@ use crate::links::fake_cluster::{
 };
 use crate::tcp::tcp_client::TcpClient;
 use tokio::task::yield_now;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tracing::field::Field;
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Level, Metadata, Subscriber};
@@ -145,6 +148,20 @@ fn fetch_of(served: &[Section]) -> Answer {
 }
 
 /// The reply of a fetch that serves `offsets` of `POLLED_PARTITION`, which continues after them.
+fn poll_reply_of(offsets: &[u64]) -> Answer {
+    let (section, records) = served(POLLED_PARTITION, offsets, offsets.last().unwrap() + 1);
+    let mut body = PollMessagesResponseHeader {
+        partition_id: POLLED_PARTITION,
+        current_offset: section.current_offset,
+        messages_count: section.messages_count,
+        context: section.context,
+    }
+    .to_bytes()
+    .to_vec();
+    body.extend(records);
+    Answer::Body(body)
+}
+
 fn reply_of(offsets: &[u64]) -> Answer {
     let next_offset = offsets.last().unwrap() + 1;
     fetch_of(&[served(POLLED_PARTITION, offsets, next_offset)])
@@ -177,12 +194,12 @@ async fn start_fetch(consumer: &mut IggyConsumer, cluster: &FakeCluster) {
     .unwrap();
 }
 
-/// An initialized consumer of `POLLED_PARTITION` under `policy`, which reads from the first
+/// An initialized consumer of `POLLED_PARTITION` under `commit`, which reads from the first
 /// offset. Its fetches serve `replies`, and the fetch after them stays unanswered, so the reader
 /// reads nothing more. It returns once that fetch is in flight, so every reply waits in the
 /// reader.
 async fn reading_consumer(
-    policy: ClientCommitPolicy,
+    commit: CommitPolicy,
     replies: &[&[u64]],
 ) -> (IggyConsumer, Arc<FakeCluster>) {
     let (client, cluster) = connect_to_three_replicas().await;
@@ -198,7 +215,10 @@ async fn reading_consumer(
     let mut consumer = builder_on(client, standalone())
         .partitions([POLLED_PARTITION])
         .polling_strategy(PollingStrategy::first())
-        .client_commit(policy)
+        .poll_options(PollOptions {
+            commit,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .build();
     consumer.init().await.unwrap();
     eventually("the reader fetched every reply", || {
@@ -210,13 +230,18 @@ async fn reading_consumer(
 
 /// An initialized consumer of `POLLED_PARTITION` whose every fetch commits its batch. It reads
 /// only when it is asked for a message, so a test scripts the fetches after `init`.
-async fn committing_consumer() -> (IggyConsumer, Arc<FakeCluster>) {
+async fn committing_consumer(first_offset: u64) -> (IggyConsumer, Arc<FakeCluster>) {
     let (client, cluster) = connect_to_three_replicas().await;
     answer_lookups(&cluster);
+    script_primary(
+        &cluster,
+        POLL_MESSAGES_DEFERRED_CODE,
+        [poll_reply_of(&[first_offset])],
+    );
     let mut consumer = builder_on(client, standalone())
         .partitions([POLLED_PARTITION])
         .poll_options(PollOptions {
-            server_commit: ServerCommitPolicy::OnRead,
+            commit: CommitPolicy::OnRead,
             ..PollOptions::default()
         })
         .build();
@@ -313,31 +338,10 @@ impl Subscriber for LevelReports {
 }
 
 impl LevelReports {
-    fn errors() -> Self {
-        Self {
-            level: Level::ERROR,
-            events: Arc::default(),
-        }
-    }
-
     fn warnings() -> Self {
         Self {
             level: Level::WARN,
             events: Arc::default(),
         }
-    }
-
-    /// Waits for the first report, or returns none after [`POLL_TIMEOUT`].
-    async fn wait(&self) -> Vec<String> {
-        let first = async {
-            loop {
-                let reports = self.events.lock().unwrap().clone();
-                if !reports.is_empty() {
-                    return reports;
-                }
-                sleep(POLL_RETRY_INTERVAL).await;
-            }
-        };
-        timeout(POLL_TIMEOUT, first).await.unwrap_or_default()
     }
 }

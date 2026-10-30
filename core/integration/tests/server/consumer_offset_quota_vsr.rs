@@ -120,7 +120,7 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
             &PollingStrategy::first(),
             PollOptions {
                 count: 1,
-                server_commit: ServerCommitPolicy::OnRead,
+                commit: CommitPolicy::OnRead,
                 ..PollOptions::default()
             },
         )
@@ -149,7 +149,7 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 1,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 }
             )
@@ -202,14 +202,14 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
             &PollingStrategy::first(),
             PollOptions {
                 count: 1,
-                server_commit: ServerCommitPolicy::OnRead,
+                commit: CommitPolicy::OnRead,
                 ..PollOptions::default()
             },
         )
         .await;
     assert!(
         matches!(poll_rejected, Err(IggyError::TooManyConsumerOffsets)),
-        "auto-commit must not return data when its new key cannot be admitted"
+        "auto-commit must not return data when its new key cannot be admitted: {poll_rejected:?}"
     );
     client
         .poll_messages(

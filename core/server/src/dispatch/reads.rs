@@ -46,7 +46,7 @@ use crate::responses::{
     build_get_me_response, build_get_personal_access_tokens_response,
     build_non_replicated_response, connected_client_to_response,
 };
-use crate::session_manager::{ConnectionContext, SessionManager};
+use crate::session_manager::{ConnectionContext, FetchReadGuard, SessionManager};
 use crate::shell::{ShellBus, ShellShard};
 use crate::snapshot;
 use crate::wire::request_body;
@@ -67,6 +67,7 @@ use iggy_binary_protocol::dispatch::lookup_command;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::messages::{
     DeferredPollMessagesRequest, FetchMessagesRequest, GetPartitionRouteRequest,
+    MIN_DEFERRED_POLL_REPLY_MARGIN_US,
 };
 use iggy_binary_protocol::requests::system::BindSessionRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
@@ -88,7 +89,7 @@ use metadata::AppliedFrontier;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use server_common::Message;
-use shard::{PartitionRead, PartitionReadReply};
+use shard::{CommitGate, PartitionRead, PartitionReadReply};
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::net::IpAddr;
@@ -689,19 +690,45 @@ async fn handle_deferred_request<B, MJ, S, SB>(
         }
         _ => FetchMessagesRequest::decode_from(body).map(DeferredRequest::Fetch),
     };
-    let Ok(wire) = decoded else {
+    let Ok(mut wire) = decoded else {
         send_non_replicated_deny(shard, request, origin, IggyError::InvalidCommand.as_code()).await;
         return;
     };
-    let timeout_us = match &wire {
-        DeferredRequest::Poll(poll) => poll.request_timeout_us,
-        DeferredRequest::Fetch(fetch) => fetch.request_timeout_us,
+    let (wait_us, timeout_us) = match &mut wire {
+        DeferredRequest::Poll(poll) => (&mut poll.wait_us, &mut poll.request_timeout_us),
+        DeferredRequest::Fetch(fetch) => (&mut fetch.wait_us, &mut fetch.request_timeout_us),
     };
+    let elapsed_us = shard
+        .bus
+        .monotonic_micros()
+        .saturating_sub(origin.arrived_us());
+    // A frame that waited in the drain gets only the time its client still waits for it, so a
+    // request that its client gave up on stores nothing.
+    let Some((remaining_wait_us, remaining_timeout_us)) =
+        remaining_timers(*wait_us, *timeout_us, elapsed_us)
+    else {
+        send_non_replicated_deny(
+            shard,
+            request,
+            origin,
+            IggyError::TransientNotAccepted.as_code(),
+        )
+        .await;
+        return;
+    };
+    *wait_us = remaining_wait_us;
+    *timeout_us = remaining_timeout_us;
+    let timeout_us = remaining_timeout_us;
+    let committing = match &wire {
+        DeferredRequest::Poll(poll) => poll.poll.auto_commit,
+        DeferredRequest::Fetch(fetch) => fetch.auto_commit,
+    };
+    let commit_gate = committing.then(CommitGate::default);
     serve_deferred_request(
         shard,
         sessions,
         (origin, request),
-        Duration::from_micros(timeout_us),
+        (Duration::from_micros(timeout_us), commit_gate.clone()),
         async {
             let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
             if !attachment.is_valid() {
@@ -718,20 +745,28 @@ async fn handle_deferred_request<B, MJ, S, SB>(
             }
             match wire {
                 DeferredRequest::Poll(poll) => {
-                    let resolved = resolve_deferred_poll(
+                    let (namespace, partition_id, mut resolved) = resolve_deferred_poll(
                         shard,
                         &poll,
                         request.header(),
                         (consumer_client_id, attachment.clone(), user_id),
                     )?;
-                    read_deferred_poll(shard, request, resolved, attachment).await
+                    resolved.commit_gate = commit_gate;
+                    read_deferred_poll(
+                        shard,
+                        request,
+                        (namespace, partition_id, resolved),
+                        attachment,
+                    )
+                    .await
+                    .map(|reply| (reply, Vec::new()))
                 }
                 DeferredRequest::Fetch(fetch) => {
                     Box::pin(fetch_messages(
                         shard,
                         sessions,
                         request,
-                        &fetch,
+                        (&fetch, commit_gate),
                         (consumer_client_id, attachment, user_id),
                     ))
                     .await
@@ -747,8 +782,8 @@ async fn serve_deferred_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     (origin, request): (ClientOrigin, &Message<RoutedRequestHeader>),
-    watchdog: Duration,
-    reply: impl Future<Output = Result<BusMessage, IggyError>>,
+    (watchdog, commit_gate): (Duration, Option<CommitGate>),
+    reply: impl Future<Output = Result<(BusMessage, Vec<FetchReadGuard>), IggyError>>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -759,7 +794,7 @@ async fn serve_deferred_request<B, MJ, S, SB>(
     let (guard, cancellation) = match SessionManager::begin_deferred_request(
         sessions,
         origin.id,
-        request.header().request,
+        (request.header().request, commit_gate.clone()),
         watchdog,
         shard.bus.monotonic_now(),
     ) {
@@ -773,7 +808,8 @@ async fn serve_deferred_request<B, MJ, S, SB>(
     let outcome = {
         let operation = Abortable::new(
             async {
-                let mut reply = reply.await?;
+                // The session room of the reads stays held until the reply is written.
+                let (mut reply, _held_reads) = reply.await?;
                 let written = reply.track_write();
                 // A watchdog expiry while the send waits for room drops the reply
                 // unsent, so only a returned send counts as queued.
@@ -789,6 +825,13 @@ async fn serve_deferred_request<B, MJ, S, SB>(
         let timeout = pin!(shard.bus.sleep(watchdog));
         match select(operation, timeout).await {
             Either::Left((Ok(result), _)) => Some(result),
+            // A committing request that its client cancelled before any read
+            // committed answers once, so the client knows nothing was stored.
+            Either::Left((Err(_), _))
+                if commit_gate.as_ref().is_some_and(CommitGate::is_cancelled) =>
+            {
+                Some(Err(IggyError::TransientNotAccepted))
+            }
             Either::Left((Err(_), _)) => None,
             Either::Right(_) => Some(Err(IggyError::ShardCommunicationError)),
         }
@@ -802,6 +845,21 @@ async fn serve_deferred_request<B, MJ, S, SB>(
         && !response_queued.get()
     {
         send_non_replicated_deny(shard, request, origin, error.as_code()).await;
+    }
+}
+
+/// The wait and the request timeout of a deferred request whose frame arrived
+/// `elapsed_us` ago, or `None` once its timeout passed. The wait keeps the reply
+/// margin before the shortened timeout.
+const fn remaining_timers(wait_us: u64, timeout_us: u64, elapsed_us: u64) -> Option<(u64, u64)> {
+    match timeout_us.checked_sub(elapsed_us) {
+        Some(remaining) if remaining > 0 => {
+            let wait_us = wait_us.saturating_sub(elapsed_us);
+            let room = remaining.saturating_sub(MIN_DEFERRED_POLL_REPLY_MARGIN_US);
+            let wait = if wait_us < room { wait_us } else { room };
+            Some((wait, remaining))
+        }
+        _ => None,
     }
 }
 
@@ -1210,8 +1268,8 @@ async fn handle_sync_consumer_group<B, MJ, S, SB>(
 #[cfg(test)]
 mod tests {
     use super::{
-        FrontierUnreached, FrontierWait, hold_for_frontier, read_frontier_budget,
-        read_needs_metadata_frontier,
+        FrontierUnreached, FrontierWait, MIN_DEFERRED_POLL_REPLY_MARGIN_US, hold_for_frontier,
+        read_frontier_budget, read_needs_metadata_frontier, remaining_timers,
     };
     use configs::server::ServerConfig;
     use iggy_binary_protocol::codes::{
@@ -1353,6 +1411,45 @@ mod tests {
         assert!(
             !read_needs_metadata_frontier(u32::MAX),
             "an unknown code has no answer to hold, so it must not park"
+        );
+    }
+
+    #[test]
+    fn given_a_queued_deferred_frame_when_timeout_has_room_should_subtract_queue_time_from_wait() {
+        const SECOND: u64 = 1_000_000;
+        assert_eq!(
+            remaining_timers(5 * SECOND, 10 * SECOND, 2 * SECOND),
+            Some((3 * SECOND, 8 * SECOND))
+        );
+        assert_eq!(
+            remaining_timers(5 * SECOND, 10 * SECOND, 6 * SECOND),
+            Some((0, 4 * SECOND))
+        );
+    }
+
+    #[test]
+    fn given_a_queued_deferred_frame_when_timed_should_keep_only_what_its_client_still_waits() {
+        const SECOND: u64 = 1_000_000;
+        let margin = MIN_DEFERRED_POLL_REPLY_MARGIN_US;
+        assert_eq!(
+            remaining_timers(5 * SECOND, 5 * SECOND + margin, 0),
+            Some((5 * SECOND, 5 * SECOND + margin)),
+            "a frame served on arrival keeps its timers"
+        );
+        assert_eq!(
+            remaining_timers(5 * SECOND, 5 * SECOND + margin, 2 * SECOND),
+            Some((3 * SECOND, 3 * SECOND + margin)),
+            "the wait keeps the reply margin before the shortened timeout"
+        );
+        assert_eq!(
+            remaining_timers(0, 10 * SECOND, 4 * SECOND),
+            Some((0, 6 * SECOND)),
+            "a zero wait stays zero"
+        );
+        assert_eq!(
+            remaining_timers(5 * SECOND, 5 * SECOND + margin, 5 * SECOND + margin),
+            None,
+            "a frame that outlived its timeout is not served"
         );
     }
 }

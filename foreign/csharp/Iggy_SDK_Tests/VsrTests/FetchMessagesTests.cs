@@ -353,50 +353,6 @@ public sealed class FetchMessagesTests
     }
 
     /// <summary>
-    ///     A canceled fetch that commits nothing is canceled on the server. A fetch with auto commit is not: the
-    ///     server can commit its messages before a cancel arrives, so the fetch waits for its reply.
-    /// </summary>
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task given_a_parked_fetch_when_the_caller_cancels_should_cancel_it_only_without_auto_commit(
-        bool autoCommit)
-    {
-        using var node = new MockNode();
-        var parked = new TaskCompletionSource<MockRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
-        node.Serve(request =>
-        {
-            if (request.Code == FetchCode)
-            {
-                parked.TrySetResult(request);
-            }
-
-            return request.Code is FetchCode or CancelCode ? null : Standalone(node, request);
-        });
-        using var client = await ConnectAsync(node);
-        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
-        var fetch = client.FetchMessagesAsync(Stream, Topic, Targets(1), Consumer.New(4), 10, autoCommit, LongWait,
-            cancellation.Token);
-        var request = await parked.Task.WaitAsync(PromptLimit, TestContext.Current.CancellationToken);
-
-        await cancellation.CancelAsync();
-
-        if (!autoCommit)
-        {
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => fetch);
-            await UntilAsync(() => node.Requests(CancelCode) == 1);
-            return;
-        }
-
-        await Task.Delay(SettleDelay, TestContext.Current.CancellationToken);
-        Assert.False(fetch.IsCompleted);
-        Assert.Equal(0, node.Requests(CancelCode));
-        await node.AnswerParkedAsync(request, Reply(request.Operation, FetchBody(GoldenSection(1, 0, Served))));
-        using var reply = await fetch.WaitAsync(PromptLimit, TestContext.Current.CancellationToken);
-        Assert.Equal(GOLDEN_BATCH_MESSAGES, Assert.Single(reply.Sections).MessagesCount);
-    }
-
-    /// <summary>
     ///     A fetch that can move an offset takes the progress lanes of all its targets, so a store on one of them
     ///     waits for the fetch. A store on another partition does not, and neither does a store behind a fetch that
     ///     moves nothing.
@@ -503,13 +459,13 @@ public sealed class FetchMessagesTests
         await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => client.FetchMessagesAsync(Stream, Topic,
             [(3, PollingStrategy.Offset(0))], Consumer.New(4), 10, false, LongWait, token));
 
-        var blocked = await Assert.ThrowsAsync<VsrLaneBlockedException>(() => client.StoreOffsetAsync(
+        var blocked = await Assert.ThrowsAsync<VsrPartitionLaneBlockedException>(() => client.StoreOffsetAsync(
             Consumer.New(4), Stream, Topic, 0, 3, token));
         Assert.Equal(3u, blocked.PartitionId);
         Assert.Equal(unknown.OperationId, blocked.OperationId);
         Assert.Empty(stored);
         Assert.Empty(replacementStores);
-        var second = await Assert.ThrowsAsync<VsrLaneBlockedException>(() => client.FetchMessagesAsync(Stream,
+        var second = await Assert.ThrowsAsync<VsrPartitionLaneBlockedException>(() => client.FetchMessagesAsync(Stream,
             Topic, [(1, PollingStrategy.Offset(0)), (5, PollingStrategy.Offset(0))], Consumer.New(4), 10, true,
             LongWait, token));
         Assert.Equal(5u, second.PartitionId);
@@ -523,8 +479,8 @@ public sealed class FetchMessagesTests
             blocked.OperationId, PromptLimit, token));
 
         await node.AnswerParkedAsync(request, Reply(request.Operation, FetchBody()));
-        await Assert.ThrowsAsync<VsrLaneBlockedException>(() => client.StoreOffsetAsync(Consumer.New(4), Stream,
-            Topic, 0, 3, token));
+        await Assert.ThrowsAsync<VsrPartitionLaneBlockedException>(() => client.StoreOffsetAsync(Consumer.New(4),
+            Stream, Topic, 0, 3, token));
         var fetches = node.Requests(FetchCode);
         await client.AbandonOperationAsync(blocked.OperationId);
         await client.StoreOffsetAsync(Consumer.New(4), Stream, Topic, 0, 3, token);
@@ -538,6 +494,7 @@ public sealed class FetchMessagesTests
     [InlineData(VsrError.REQUEST_ALREADY_APPLIED)]
     [InlineData(VsrError.TRANSIENT_NOT_ACCEPTED)]
     [InlineData(VsrError.INVALID_COMMAND)]
+    [InlineData(11001)]
     public async Task given_partial_committing_uncertainty_when_fetching_should_preserve_healthy_sections_and_block_only_uncertain_targets(
         int status)
     {
@@ -555,10 +512,11 @@ public sealed class FetchMessagesTests
         var error = Assert.Throws<VsrFetchProgressUncertainException>(() => uncertain.Decode());
         Assert.NotNull(error.OperationId);
         await client.StoreOffsetAsync(Consumer.New(4), Stream, Topic, 0, 1, token);
-        var blocked = await Assert.ThrowsAsync<VsrLaneBlockedException>(() => client.StoreOffsetAsync(
+        var blocked = await Assert.ThrowsAsync<VsrPartitionLaneBlockedException>(() => client.StoreOffsetAsync(
             Consumer.New(4), Stream, Topic, 0, 3, token));
         Assert.Equal(error.OperationId, blocked.OperationId);
         Assert.Equal(3u, blocked.PartitionId);
+        Assert.Equal(14009, blocked.StatusCode);
         Assert.True(blocked.RequiresExplicitRecovery);
         await client.AbandonOperationAsync(blocked.OperationId);
         await client.StoreOffsetAsync(Consumer.New(4), Stream, Topic, 0, 3, token);
@@ -583,7 +541,7 @@ public sealed class FetchMessagesTests
         var failure = await Assert.ThrowsAsync<VsrFetchProgressUncertainException>(() => client.FetchMessagesAsync(
             Stream, Topic, [(1, PollingStrategy.Offset(0)), (3, PollingStrategy.Offset(0))], Consumer.New(4), 10,
             true, LongWait, token));
-        var blocked = await Assert.ThrowsAsync<VsrLaneBlockedException>(() => client.StoreOffsetAsync(
+        var blocked = await Assert.ThrowsAsync<VsrPartitionLaneBlockedException>(() => client.StoreOffsetAsync(
             Consumer.New(4), Stream, Topic, 0, 3, token));
         Assert.Equal(failure.OperationId, blocked.OperationId);
     }
@@ -606,10 +564,10 @@ public sealed class FetchMessagesTests
         var failure = await Assert.ThrowsAsync<VsrFetchProgressUncertainException>(() => client.FetchMessagesAsync(
             Stream, Topic, [(3, PollingStrategy.Offset(0).WithContext(default))], Consumer.New(4), 10, true, LongWait, token));
         await client.LoginUserAsync("user", "secret", token);
-        var blocked = await Assert.ThrowsAsync<VsrLaneBlockedException>(() => client.StoreOffsetAsync(
+        var blocked = await Assert.ThrowsAsync<VsrPartitionLaneBlockedException>(() => client.StoreOffsetAsync(
             Consumer.New(4), Identifier.String("stream-alias"), Identifier.String("topic-alias"), 0, 3, token));
         Assert.Equal(failure.OperationId, blocked.OperationId);
-        var zeroContext = await Assert.ThrowsAsync<VsrLaneBlockedException>(() => client.StoreOffsetAsync(
+        var zeroContext = await Assert.ThrowsAsync<VsrPartitionLaneBlockedException>(() => client.StoreOffsetAsync(
             Consumer.New(4), Stream, Topic, 0, 3, default(PartitionContext), token));
         Assert.Equal(failure.OperationId, zeroContext.OperationId);
         route = route with { Incarnation = route.Incarnation + 1 };
@@ -729,9 +687,10 @@ public sealed class FetchMessagesTests
         await client.StoreOffsetAsync(Consumer.New(4), Stream, Topic, 0, 1, token);
         if (partial)
         {
-            var blocked = await Assert.ThrowsAsync<VsrLaneBlockedException>(() => client.StoreOffsetAsync(
+            var blocked = await Assert.ThrowsAsync<VsrPartitionLaneBlockedException>(() => client.StoreOffsetAsync(
                 Consumer.New(4), Stream, Topic, 0, 3, token));
             Assert.Equal(3u, blocked.PartitionId);
+            Assert.Equal(14009, blocked.StatusCode);
             Assert.True(blocked.RequiresExplicitRecovery);
             await client.AbandonOperationAsync(blocked.OperationId);
         }

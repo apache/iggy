@@ -191,7 +191,7 @@ func TestPartitionRouteRefreshReplacesTheCachedPartitionCount(t *testing.T) {
 	stream, topic, group := groupConsumer(t)
 	consumer := iggcon.NewSingleConsumer(group.Id)
 	for _, expected := range []uint32{2, 3} {
-		_, err := client.PollMessages(context.Background(), stream, topic, consumer,
+		_, err := client.pollMessages(context.Background(), stream, topic, consumer,
 			iggcon.NextPollingStrategy(), 1, false, nil)
 		require.NoError(t, err)
 		count, exists := client.topics.partitionsCount(newTopicKey(stream, topic))

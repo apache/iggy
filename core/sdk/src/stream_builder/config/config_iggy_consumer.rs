@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::clients::consumer::ClientCommitPolicy;
 use crate::clients::reader_builder::{DEFAULT_MAX_WAIT, DEFAULT_PREFETCH_BYTES};
 use crate::prelude::{
     ConsumerKind, EncryptorKind, Identifier, IggyError, NonZeroIggyDuration, PollOptions,
@@ -27,7 +26,6 @@ use std::sync::Arc;
 use tracing::error;
 
 const DEFAULT_PARTITION_ID: u32 = 0;
-const DEFAULT_POLL_COUNT: u32 = 100;
 
 #[derive(Builder, Debug, Clone)]
 #[builder(on(String, into))]
@@ -36,10 +34,6 @@ pub struct IggyConsumerConfig {
     stream_name: String,
     /// Name of the topic. Must be unique.
     topic_name: String,
-    /// When the consumer stores the position of the last message that it yielded. See
-    /// `ClientCommitPolicy` for details. The default stores nothing.
-    #[builder(default)]
-    client_commit: ClientCommitPolicy,
     /// Maximum encoded bytes reserved for buffered and in-flight batches.
     #[builder(default = DEFAULT_PREFETCH_BYTES)]
     prefetch_bytes: u32,
@@ -61,9 +55,10 @@ pub struct IggyConsumerConfig {
     /// groups.
     #[builder(default = vec![DEFAULT_PARTITION_ID])]
     partitions: Vec<u32>,
-    /// The limits of each request, and whether the server stores the offset of a read. The
-    /// greater the `count`, the higher the throughput for bulk data. Note, there is a tradeoff
-    /// between batch size and latency, so you want to benchmark your setup.
+    /// The limits of each request and the `CommitPolicy` of the consumer, the defaults of
+    /// `IggyConsumerBuilder`. The greater the `count`, the higher the throughput for bulk data.
+    /// Note, there is a tradeoff between batch size and latency, so you want to benchmark your
+    /// setup.
     #[builder(default = default_poll_options())]
     poll_options: PollOptions,
     /// `PollingStrategy` specifies from where to start polling messages. See `PollingStrategy` for details.
@@ -85,7 +80,6 @@ impl Default for IggyConsumerConfig {
         Self {
             stream_name: "test_stream".to_string(),
             topic_name: "test_topic".to_string(),
-            client_commit: ClientCommitPolicy::default(),
             prefetch_bytes: DEFAULT_PREFETCH_BYTES,
             prefetch_messages: None,
             create_stream_if_not_exists: false,
@@ -111,12 +105,11 @@ impl IggyConsumerConfig {
     ///
     /// * `stream_name` - The stream name.
     /// * `topic_name` - The topic name.
-    /// * `client_commit` - The client commit policy.
     /// * `create_stream_if_not_exists` - Whether to create the stream if it does not exists.
     /// * `create_topic_if_not_exists` - Whether to create the topic if it does not exists.
     /// * `consumer_name` - The consumer name.
     /// * `consumer_kind` - The consumer kind.
-    /// * `poll_options` - The limits of each request, and whether the server stores the offset of a read.
+    /// * `poll_options` - The limits of each request and the commit policy.
     /// * `polling_strategy` - The polling strategy.
     /// * `partitions_count` - Topic creation count.
     /// * `encryptor` - The encryptor.
@@ -134,7 +127,6 @@ impl IggyConsumerConfig {
     pub fn new(
         stream_name: String,
         topic_name: String,
-        client_commit: ClientCommitPolicy,
         create_stream_if_not_exists: bool,
         create_topic_if_not_exists: bool,
         consumer_name: String,
@@ -150,7 +142,6 @@ impl IggyConsumerConfig {
         Self {
             stream_name,
             topic_name,
-            client_commit,
             prefetch_bytes: DEFAULT_PREFETCH_BYTES,
             prefetch_messages: None,
             create_stream_if_not_exists,
@@ -174,7 +165,7 @@ impl IggyConsumerConfig {
     ///
     /// * `stream` - The stream name.
     /// * `topic` - The topic name.
-    /// * `poll_options` - The limits of each request, and whether the server stores the offset of a read.
+    /// * `poll_options` - The limits of each request and the commit policy.
     ///
     /// Returns:
     /// A new `IggyConsumerConfig`.
@@ -191,7 +182,6 @@ impl IggyConsumerConfig {
         Ok(Self {
             stream_name: stream.to_string(),
             topic_name: topic.to_string(),
-            client_commit: ClientCommitPolicy::default(),
             prefetch_bytes: DEFAULT_PREFETCH_BYTES,
             prefetch_messages: None,
             create_stream_if_not_exists: false,
@@ -217,13 +207,6 @@ impl IggyConsumerConfig {
         self
     }
 
-    /// Sets the client commit policy, which `default` and `from_stream_topic` leave at the
-    /// default that stores nothing.
-    pub fn with_client_commit(mut self, client_commit: ClientCommitPolicy) -> Self {
-        self.client_commit = client_commit;
-        self
-    }
-
     /// Sets the limits of each request and whether the server stores the offset of a read.
     pub fn with_poll_options(mut self, poll_options: PollOptions) -> Self {
         self.poll_options = poll_options;
@@ -236,10 +219,6 @@ impl IggyConsumerConfig {
 
     pub fn topic_name(&self) -> &str {
         &self.topic_name
-    }
-
-    pub fn client_commit(&self) -> ClientCommitPolicy {
-        self.client_commit
     }
 
     pub fn prefetch_bytes(&self) -> u32 {
@@ -314,12 +293,10 @@ impl Validatable<IggyError> for IggyConsumerConfig {
     }
 }
 
-/// One request asks for at most `DEFAULT_POLL_COUNT` messages and waits up to one second.
+/// The default of `IggyConsumerBuilder`: at most 1000 messages, a wait of up to five seconds, and
+/// no commit.
 fn default_poll_options() -> PollOptions {
-    PollOptions {
-        count: DEFAULT_POLL_COUNT,
-        ..PollOptions::wait(DEFAULT_MAX_WAIT.into())
-    }
+    PollOptions::wait(DEFAULT_MAX_WAIT.into())
 }
 
 #[cfg(test)]
@@ -336,7 +313,8 @@ impl IggyConsumerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prelude::{CommitEvent, IggyDuration, ServerCommitPolicy};
+    use crate::prelude::{CommitPolicy, IggyDuration};
+    use std::time::Duration;
 
     const POLL_COUNT: u32 = 100;
     const PARTITIONS: [u32; 2] = [1, 3];
@@ -375,12 +353,15 @@ mod tests {
 
         assert_eq!(config.stream_name(), "test_stream");
         assert_eq!(config.topic_name(), "test_topic");
-        assert_eq!(config.client_commit(), ClientCommitPolicy::default());
         assert!(config.create_stream_if_not_exists());
         assert!(config.create_topic_if_not_exists());
         assert_eq!(config.consumer_name(), "test_consumer");
         assert_eq!(config.consumer_kind(), ConsumerKind::ConsumerGroup);
-        assert_eq!(config.poll_options(), poll_options());
+        assert_eq!(
+            config.poll_options(),
+            PollOptions::wait(IggyDuration::from(Duration::from_secs(5))),
+            "the defaults of IggyConsumerBuilder"
+        );
         assert_eq!(config.polling_strategy(), PollingStrategy::next());
         assert_eq!(config.partitions_count(), 1);
         assert_eq!(config.partitions(), [DEFAULT_PARTITION_ID]);
@@ -402,12 +383,15 @@ mod tests {
         let config = IggyConsumerConfig::default();
         assert_eq!(config.stream_name(), "test_stream");
         assert_eq!(config.topic_name(), "test_topic");
-        assert_eq!(config.client_commit(), ClientCommitPolicy::default());
         assert!(!config.create_stream_if_not_exists());
         assert!(!config.create_topic_if_not_exists());
         assert_eq!(config.consumer_name(), "test_consumer");
         assert_eq!(config.consumer_kind(), ConsumerKind::ConsumerGroup);
-        assert_eq!(config.poll_options(), poll_options());
+        assert_eq!(
+            config.poll_options(),
+            PollOptions::wait(IggyDuration::from(Duration::from_secs(5))),
+            "the defaults of IggyConsumerBuilder"
+        );
         assert_eq!(config.polling_strategy(), PollingStrategy::next());
         assert_eq!(config.partitions_count(), 1);
         assert_eq!(config.partitions(), [DEFAULT_PARTITION_ID]);
@@ -425,14 +409,9 @@ mod tests {
 
     #[test]
     fn should_be_new() {
-        let client_commit = ClientCommitPolicy {
-            on: Some(CommitEvent::EachBatch),
-            ..ClientCommitPolicy::default()
-        };
         let config = IggyConsumerConfig::new(
             "test_stream".to_string(),
             "test_topic".to_string(),
-            client_commit,
             false,
             false,
             "test_consumer".to_string(),
@@ -447,7 +426,6 @@ mod tests {
         );
         assert_eq!(config.stream_name(), "test_stream");
         assert_eq!(config.topic_name(), "test_topic");
-        assert_eq!(config.client_commit(), client_commit);
         assert!(!config.create_stream_if_not_exists());
         assert!(!config.create_topic_if_not_exists());
         assert_eq!(config.consumer_name(), "test_consumer");
@@ -470,7 +448,7 @@ mod tests {
     #[test]
     fn should_be_from_stream_topic() {
         let options = PollOptions {
-            server_commit: ServerCommitPolicy::OnRead,
+            commit: CommitPolicy::OnRead,
             ..poll_options()
         };
         let res = IggyConsumerConfig::from_stream_topic("test_stream", "test_topic", options);
@@ -489,23 +467,16 @@ mod tests {
     }
 
     #[test]
-    fn given_partitions_and_a_policy_when_set_should_replace_the_defaults() {
-        let client_commit = ClientCommitPolicy {
-            interval: Some(NonZeroIggyDuration::ONE_SECOND),
-            on: Some(CommitEvent::EveryNthMessage(POLL_COUNT)),
-        };
-        let config = IggyConsumerConfig::default()
-            .with_partitions(PARTITIONS)
-            .with_client_commit(client_commit);
+    fn given_partitions_when_set_should_replace_the_default() {
+        let config = IggyConsumerConfig::default().with_partitions(PARTITIONS);
 
         assert_eq!(config.partitions(), PARTITIONS);
-        assert_eq!(config.client_commit(), client_commit);
     }
 
     #[test]
     fn given_poll_options_when_set_should_replace_the_defaults() {
         let options = PollOptions {
-            server_commit: ServerCommitPolicy::OnRead,
+            commit: CommitPolicy::OnRead,
             ..poll_options()
         };
         let config = IggyConsumerConfig::default().with_poll_options(options);

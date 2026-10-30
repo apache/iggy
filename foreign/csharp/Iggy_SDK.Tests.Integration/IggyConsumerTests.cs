@@ -50,8 +50,7 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.New(1))
             .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(10)
-            .WithPartitionId(0)
+            .WithPartitions(0)
             .Build();
 
         await Should.NotThrowAsync(() => consumer.InitAsync());
@@ -73,7 +72,6 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.Group("test-group-init"))
             .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(10)
             .WithConsumerGroup("test-group-init")
             .Build();
 
@@ -98,7 +96,7 @@ public class IggyConsumerTests
                 Consumer.New(2))
             .WithConnection(protocol, clientAddress, "iggy", "iggy")
             .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(10)
+            .WithPartitions(1)
             .WithConsumerGroup("test-group-init")
             .Build();
 
@@ -120,8 +118,7 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.New(2))
             .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(10)
-            .WithPartitionId(1)
+            .WithPartitions(1)
             .Build();
 
         await consumer.InitAsync();
@@ -143,8 +140,7 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.New(3))
             .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(10)
-            .WithPartitionId(1)
+            .WithPartitions(1)
             .Build();
 
         await Should.ThrowAsync<ConsumerNotInitializedException>(async () =>
@@ -172,7 +168,6 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.Group(groupName))
             .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(10)
             .WithConsumerGroup(groupName)
             .Build();
 
@@ -205,7 +200,6 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.Group(groupName))
             .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(10)
             .WithConsumerGroup(groupName, false)
             .Build();
 
@@ -234,7 +228,6 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.Group(groupName))
             .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(10)
             .WithConsumerGroup(groupName, false)
             .Build();
 
@@ -259,7 +252,6 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.Group(groupName))
             .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(10)
             .WithConsumerGroup(groupName)
             .Build();
 
@@ -288,9 +280,7 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.New(10))
             .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(10)
-            .WithPartitionId(1)
-            .WithAutoCommitMode(AutoCommitMode.Disabled)
+            .WithPartitions(1)
             .Build();
 
         await consumer.InitAsync();
@@ -332,9 +322,8 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.New(11))
             .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(batchSize)
-            .WithPartitionId(1)
-            .WithAutoCommitMode(AutoCommitMode.Disabled)
+            .WithPollOptions(new PollOptions { Count = batchSize, MaxWait = TimeSpan.FromSeconds(1) })
+            .WithPartitions(1)
             .Build();
 
         await consumer.InitAsync();
@@ -378,10 +367,8 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.New(12))
             .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(5)
-            .WithPartitionId(0)
-            .WithPollOptions(new DeferredPollOptions { MaxWait = TimeSpan.FromSeconds(10) })
-            .WithAutoCommitMode(AutoCommitMode.Disabled)
+            .WithPartitions(0)
+            .WithPollOptions(new PollOptions { MaxWait = TimeSpan.FromSeconds(10) })
             .Build();
 
         await consumer.InitAsync();
@@ -421,9 +408,12 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.New(consumerId))
             .WithPollingStrategy(PollingStrategy.First())
-            .WithBatchSize(10)
-            .WithPartitionId(1)
-            .WithAutoCommitMode(AutoCommitMode.AfterReceive)
+            .WithPartitions(1)
+            .WithPollOptions(new PollOptions
+            {
+                MaxWait = TimeSpan.FromSeconds(1),
+                Commit = CommitPolicy.Auto(new AutoCommit { Every = CommitEvery.Message })
+            })
             .Build();
 
         await consumer.InitAsync();
@@ -452,8 +442,8 @@ public class IggyConsumerTests
         offset.ShouldNotBeNull();
         receivedCount.ShouldBe(5);
         lastOffset.ShouldBe(4ul);
-        // The loop broke inside the body of offset 4, so that message is delivered again.
-        offset.StoredOffset.ShouldBe(3ul);
+        // Shutdown counts the last message handed over.
+        offset.StoredOffset.ShouldBe(4ul);
     }
 
     [Test]
@@ -471,9 +461,8 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.New(consumerId))
             .WithPollingStrategy(PollingStrategy.First())
-            .WithBatchSize(5)
-            .WithPartitionId(1)
-            .WithAutoCommitMode(AutoCommitMode.Auto)
+            .WithPartitions(1)
+            .WithPollOptions(new PollOptions { MaxWait = TimeSpan.FromSeconds(1), Commit = CommitPolicy.OnRead })
             .Build();
 
         await consumer.InitAsync();
@@ -505,7 +494,7 @@ public class IggyConsumerTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task StoreOffsetAsync_Should_StoreOffset_Successfully(Protocol protocol)
+    public async Task CommitAsync_Should_StoreTheOffsetOfAReceivedMessage(Protocol protocol)
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
@@ -517,16 +506,20 @@ public class IggyConsumerTests
                 Identifier.String(testStream.StreamId),
                 Identifier.String(testStream.TopicId),
                 Consumer.New(consumerId))
-            .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(5)
-            .WithPartitionId(1)
-            .WithAutoCommitMode(AutoCommitMode.Disabled)
+            .WithPollingStrategy(PollingStrategy.First())
+            .WithPartitions(1)
             .Build();
 
         await consumer.InitAsync();
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        ReceivedMessage? received = null;
+        await foreach (var message in consumer.ReceiveAsync(cts.Token))
+        {
+            received = message;
+            break;
+        }
 
-        var testOffset = 42ul;
-        await Should.NotThrowAsync(() => consumer.StoreOffsetAsync(testOffset, 1));
+        await consumer.CommitAsync(received!.Checkpoint!);
 
         var offset = await client.GetOffsetAsync(Consumer.New(consumerId),
             Identifier.String(testStream.StreamId),
@@ -534,51 +527,7 @@ public class IggyConsumerTests
             1u);
 
         offset.ShouldNotBeNull();
-        offset.StoredOffset.ShouldBe(testOffset);
-
-        await consumer.DisposeAsync();
-    }
-
-    [Test]
-    [SkipHttp]
-    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task DeleteOffsetAsync_Should_DeleteOffset_Successfully(Protocol protocol)
-    {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
-
-        var testStream = await CreateTestStreamWithMessages(client, protocol);
-
-        var consumerId = protocol == Protocol.Tcp ? 31 : 131;
-        var consumer = IggyConsumerBuilder
-            .Create(client,
-                Identifier.String(testStream.StreamId),
-                Identifier.String(testStream.TopicId),
-                Consumer.New(consumerId))
-            .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(5)
-            .WithPartitionId(1)
-            .WithAutoCommitMode(AutoCommitMode.Disabled)
-            .Build();
-
-        await consumer.InitAsync();
-
-        var testOffset = 50ul;
-        await consumer.StoreOffsetAsync(testOffset, 1);
-
-        var offset = await client.GetOffsetAsync(Consumer.New(consumerId),
-            Identifier.String(testStream.StreamId),
-            Identifier.String(testStream.TopicId),
-            1u);
-        offset.ShouldNotBeNull();
-
-        await Should.NotThrowAsync(() => consumer.DeleteOffsetAsync(1));
-
-        var deletedOffset = await client.GetOffsetAsync(Consumer.New(consumerId),
-            Identifier.String(testStream.StreamId),
-            Identifier.String(testStream.TopicId),
-            1u);
-
-        deletedOffset.ShouldBeNull();
+        offset.StoredOffset.ShouldBe(received.CurrentOffset);
 
         await consumer.DisposeAsync();
     }
@@ -597,8 +546,7 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.New(40))
             .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(10)
-            .WithPartitionId(1)
+            .WithPartitions(1)
             .Build();
 
         await consumer.InitAsync();
@@ -619,8 +567,7 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.New(41))
             .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(10)
-            .WithPartitionId(1)
+            .WithPartitions(1)
             .Build();
 
         await consumer.InitAsync();
@@ -642,14 +589,18 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.New(42))
             .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(10)
-            .WithPartitionId(1)
+            .WithPartitions(1)
             .Build();
 
         await Should.NotThrowAsync(async () => await consumer.DisposeAsync());
     }
 
+    /// <summary>
+    ///     Over TCP the routing of a missing partition fails at once. Over HTTP the poll of a missing partition is a
+    ///     lasting refusal, which the reader retries with a growing wait and reports only after six in a row.
+    /// </summary>
     [Test]
+    [SkipHttp]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task OnPollingError_Should_Fire_WhenPollingFails(Protocol protocol)
     {
@@ -666,9 +617,7 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.New(50))
             .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(10)
-            .WithPartitionId(999)
-            .WithAutoCommitMode(AutoCommitMode.Disabled)
+            .WithPartitions(999)
             .SubscribeOnPollingError(error =>
             {
                 errorFired = true;
@@ -679,7 +628,7 @@ public class IggyConsumerTests
 
         await consumer.InitAsync();
 
-        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
 
         try
         {
@@ -713,9 +662,7 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.New(60))
             .WithPollingStrategy(PollingStrategy.Offset(startOffset))
-            .WithBatchSize(5)
-            .WithPartitionId(1)
-            .WithAutoCommitMode(AutoCommitMode.Disabled)
+            .WithPartitions(1)
             .Build();
 
         await consumer.InitAsync();
@@ -749,9 +696,7 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.New(61))
             .WithPollingStrategy(PollingStrategy.First())
-            .WithBatchSize(1)
-            .WithPartitionId(1)
-            .WithAutoCommitMode(AutoCommitMode.Disabled)
+            .WithPartitions(1)
             .Build();
 
         await consumer.InitAsync();
@@ -781,9 +726,8 @@ public class IggyConsumerTests
                 Identifier.String(testStream.TopicId),
                 Consumer.New(62))
             .WithPollingStrategy(PollingStrategy.Last())
-            .WithBatchSize(1)
-            .WithPartitionId(1)
-            .WithAutoCommitMode(AutoCommitMode.Disabled)
+            .WithPartitions(1)
+            .WithPollOptions(new PollOptions { Count = 10, MaxWait = TimeSpan.FromSeconds(1) })
             .Build();
 
         await consumer.InitAsync();

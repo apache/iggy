@@ -18,22 +18,23 @@
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
-use std::future::poll_fn;
+use std::future::{pending, poll_fn};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_broadcast::Receiver;
+use bytes::Bytes;
 use iggy_common::locking::IggyRwLock;
 use iggy_common::{
-    AssignmentVersion, Checkpoint, Consumer, ConsumerGroupClientState, ConsumerKind,
-    DiagnosticEvent, EncryptorKind, Identifier, IggyError, PollOptions, PolledMessages,
-    PollingKind, PollingStrategy, ServerCommitPolicy,
+    AssignmentVersion, AutoCommit, Checkpoint, CommitAfter, CommitPolicy, Consumer,
+    ConsumerGroupClientState, ConsumerKind, DiagnosticEvent, EncryptorKind, Identifier, IggyError,
+    NonZeroIggyDuration, PollOptions, PolledMessages, PollingKind, PollingStrategy,
 };
 use tokio::sync::{Notify, OwnedSemaphorePermit, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
+use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at};
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::driver::with_deadline;
@@ -41,6 +42,7 @@ use crate::links::OPERATION_TIMEOUT;
 use membership::Membership;
 use progress::Progress;
 use worker::Worker;
+pub(crate) use worker::lasting_refusal;
 
 #[cfg(test)]
 mod cluster_tests;
@@ -61,20 +63,44 @@ const ORDERING: Ordering = Ordering::SeqCst;
 /// - [`next`](Self::next) returns the next batch of one partition, in offset order within one
 ///   generation of the partition: from its first read, from each [`seek`](Self::seek), and from
 ///   each new assignment to this member.
-/// - Without `ServerCommitPolicy::OnRead`, [`commit`](Self::commit) stores the offset of a
-///   checkpoint. With it, the server stores the offset of each reply, and [`close`](Self::close)
-///   moves the offset back to the last delivered message.
+/// - The [`CommitPolicy`] of the options decides who stores offsets. With `Manual`,
+///   [`commit`](Self::commit) stores the offset of a checkpoint. With `OnRead`, the server stores
+///   the offset of each reply, and [`close`](Self::close) moves the offset back to the last
+///   delivered message. With `Auto`, the reader counts each batch as its
+///   [`CommitAfter`] says, or each [`mark`](Self::mark), and stores the
+///   latest counted position at the interval or the event of the policy, before a rebalance
+///   takes a partition away, and in [`close`](Self::close).
 /// - The reader stays usable after a [`ReadError`] and retries by itself. `HistoryUnavailable`
-///   stops its partition until a `seek`. With `OnRead`, an unknown outcome stops its partition
-///   until the caller abandons the operation and seeks.
+///   stops its partition until a `seek` when the position came from an earlier read of a history
+///   that is gone. A refusal that a quick retry does not change, such as `Unauthorized` or
+///   `PartitionNotFound`, is retried after a wait that doubles each time, and after six in a row
+///   it stops its partition until a `seek` with one error.
+/// - With `OnRead`, the reader reads each partition from its stored offset after a delivery, so
+///   the server refuses the commit of an older read once the offset moved. A read whose reply is
+///   lost can still have stored its offset. The reader then abandons its operation, and when the
+///   next read starts past the last delivered message, it reads the skipped messages again by
+///   offset without a commit and hands them over first. Messages that a lost read committed are
+///   lost only when a rebalance moves their partition to another member before that.
 /// - Dropping the reader stops its tasks without waiting, and it moves no offset back.
 pub struct PartitionReader {
     config: Arc<Config>,
     shared: Arc<Shared>,
-    receiver: mpsc::Receiver<Reply>,
+    receiver: mpsc::UnboundedReceiver<Reply>,
     /// The batches of the received replies, one partition each, in arrival order.
     queue: VecDeque<Entry>,
     task: Option<JoinHandle<()>>,
+    /// With `CommitAfter::Processing`: the last batch that `next()` returned, which counts once
+    /// the application asks for the next one or closes the reader.
+    uncounted: Option<(Checkpoint, u32)>,
+    /// Stores the counted positions under `CommitPolicy::Auto`.
+    committer: Option<Committer>,
+}
+
+/// The store task of a reader under `CommitPolicy::Auto`. It sends one store at a time, so the
+/// stores of one partition go out in order.
+struct Committer {
+    stop: Arc<Notify>,
+    task: JoinHandle<()>,
 }
 
 /// An error of a read. The reader stays usable after it and retries by itself.
@@ -87,6 +113,15 @@ pub struct ReadError {
     /// message again until a [`seek`](PartitionReader::seek) to this continuation skips it. The
     /// messages before it arrive in a batch before this error.
     pub skip: Option<PollingStrategy>,
+    /// For a message that does not decode: its offset, when its frame decoded and a later step
+    /// failed. `None` when the framing is malformed, so no record can be isolated.
+    pub offset: Option<u64>,
+    /// For a message that does not decode: the record as the reply carried it, its frame
+    /// header, payload and user headers before any decryption. For malformed framing, the rest
+    /// of the records from where decoding stopped. For an HTTP reply that is not JSON, the
+    /// response body. `None` for a message that does not decrypt over HTTP, which carries no
+    /// records.
+    pub record: Option<Bytes>,
 }
 
 /// The fixed configuration of a reader.
@@ -137,7 +172,7 @@ struct Reply {
     epoch: u64,
     assignment: Option<AssignmentVersion>,
     result: Result<Vec<PolledMessages>, Refusal>,
-    capacity: FetchCapacity,
+    capacity: Arc<FetchCapacity>,
 }
 
 /// An error with the generation of its partition when the reader reported it. An error of a
@@ -178,12 +213,17 @@ impl PartitionReader {
         events: Option<Receiver<DiagnosticEvent>>,
     ) -> Self {
         let (receiver, task) = spawn_worker(&config, &shared, events);
+        let committer = config
+            .auto()
+            .map(|auto| Committer::spawn(Arc::clone(&shared.progress), auto.interval));
         Self {
             config,
             shared,
             receiver,
             queue: VecDeque::new(),
             task: Some(task),
+            uncounted: None,
+            committer,
         }
     }
 
@@ -193,9 +233,16 @@ impl PartitionReader {
     // size does not matter.
     #[allow(clippy::result_large_err)]
     pub async fn next(&mut self) -> Result<PolledMessages, ReadError> {
+        self.count_uncounted();
         let (batch, hold) = poll_fn(|cx| self.poll_held(cx)).await?;
         if let Some(checkpoint) = batch.checkpoint() {
             self.delivered(&checkpoint);
+            let messages = u32::try_from(batch.messages.len()).unwrap_or(u32::MAX);
+            match self.config.auto().map(|auto| auto.after) {
+                Some(CommitAfter::Delivery) => self.count(checkpoint, messages, true),
+                Some(CommitAfter::Processing) => self.uncounted = Some((checkpoint, messages)),
+                Some(CommitAfter::Marked) | None => {}
+            }
         }
         drop(hold);
         Ok(batch)
@@ -239,6 +286,25 @@ impl PartitionReader {
         self.shared.progress.deliver(checkpoint);
     }
 
+    /// Counts `messages` up to `checkpoint` under `CommitPolicy::Auto`. `ends_batch` marks the
+    /// last message of a batch.
+    pub(crate) fn count(&self, checkpoint: Checkpoint, messages: u32, ends_batch: bool) {
+        self.shared.progress.count(checkpoint, messages, ends_batch);
+    }
+
+    /// Counts a checkpoint that this reader delivered, under `CommitPolicy::Auto`. It stores
+    /// nothing now: the policy stores the latest counted position of the partition. With
+    /// `CommitAfter::Marked` only marks count, so batches processed concurrently count once they
+    /// are done.
+    ///
+    /// # Errors
+    ///
+    /// [`IggyError::InvalidCommand`] without `CommitPolicy::Auto`, and for a checkpoint that
+    /// this reader did not deliver.
+    pub fn mark(&self, checkpoint: Checkpoint) -> Result<(), IggyError> {
+        self.shared.progress.mark(checkpoint)
+    }
+
     /// Stores the offset of a checkpoint that this reader delivered. The commits of one
     /// partition go out in order when the caller awaits each one.
     ///
@@ -247,8 +313,8 @@ impl PartitionReader {
     ///
     /// # Errors
     ///
-    /// [`IggyError::InvalidCommand`] with `ServerCommitPolicy::OnRead`, and for a checkpoint
-    /// that this reader did not deliver. The errors of the offset store.
+    /// [`IggyError::InvalidCommand`] with `CommitPolicy::OnRead`, and for a checkpoint that this
+    /// reader did not deliver. The errors of the offset store.
     pub async fn commit(&self, checkpoint: Checkpoint) -> Result<(), IggyError> {
         if self.config.on_read() {
             return Err(IggyError::InvalidCommand);
@@ -260,15 +326,17 @@ impl PartitionReader {
     /// no offset, drops the queued batches of the partition and ignores its late replies. It
     /// also resumes a stopped partition.
     ///
-    /// With `OnRead`, the new position waits for the end of the committing read in flight.
+    /// With `OnRead`, the new position waits for the end of the committing read in flight, and
+    /// the first read from it commits as usual.
     ///
     /// # Errors
     ///
     /// - [`IggyError::InvalidCommand`] for a partition that the reader does not read, and for a
     ///   continuation of another partition. A group reader reads no partition until the first
     ///   refresh of its assignment after `build()`, so it refuses every partition before it.
-    /// - [`IggyError::PartitionLaneBlocked`] with `OnRead` while a read of the partition has an
-    ///   unknown outcome. Call `abandon_operation` with its operation first.
+    /// - [`IggyError::PartitionLaneBlocked`] with `OnRead` while another call on the client left
+    ///   a committing read of the partition with an unknown outcome. Call `abandon_operation`
+    ///   with its operation first.
     pub async fn seek(&mut self, partition: u32, start: PollingStrategy) -> Result<(), IggyError> {
         start.validate_partition(partition)?;
         if !self.shared.partitions().contains(&partition) {
@@ -298,18 +366,18 @@ impl PartitionReader {
         self.shared.partitions()
     }
 
-    /// Stops the reader. It waits at most until the deadlines of the reads in flight, and it
-    /// commits nothing.
+    /// Stops the reader. It waits at most until the deadlines of the reads in flight. With
+    /// `Manual` it commits nothing. With `Auto`, it counts the last batch under
+    /// `CommitAfter::Processing` and stores the latest counted position of each partition.
     ///
-    /// With `OnRead`, it moves the offset of each partition with undelivered batches back to its
-    /// last delivered message. A partition that delivered nothing and started at `Next` gets the
-    /// offset before its first undelivered message, or no offset at offset 0. It leaves the offset
-    /// of a partition alone while a read of it has an unknown outcome that the caller did not
-    /// abandon. A group reader then leaves its group.
+    /// With `OnRead`, it moves the offset of each partition with undelivered batches, or with a
+    /// read whose reply was lost, back to its last delivered message. A partition that delivered
+    /// nothing and started at `Next` gets the offset before its first undelivered message, or no
+    /// offset at offset 0. A group reader then leaves its group.
     ///
     /// # Errors
     ///
-    /// The first failed store of the `OnRead` close. Otherwise
+    /// The first failed store of the `OnRead` or the `Auto` close. Otherwise
     /// [`IggyError::PartitionLaneBlocked`] for a partition with an unknown outcome: abandon its
     /// operation on the client before a new reader reads the partition.
     pub async fn close(mut self) -> Result<(), IggyError> {
@@ -341,6 +409,15 @@ impl PartitionReader {
             )
             .await;
         }
+        self.count_uncounted();
+        if let Some(committer) = self.committer.take() {
+            committer.stop().await;
+            result = with_deadline(
+                Instant::now() + OPERATION_TIMEOUT,
+                self.shared.progress.flush_counted(),
+            )
+            .await;
+        }
         // The server refuses a store from a member that left, so the rewind goes first.
         if let Some(membership) = &self.shared.membership {
             membership.leave().await;
@@ -351,6 +428,25 @@ impl PartitionReader {
                 Err(IggyError::PartitionLaneBlocked(partition, operation))
             }
             None => Ok(()),
+        }
+    }
+
+    /// Under `CommitPolicy::Auto`, stops the store task once its store in flight ends and
+    /// stores the latest counted position of each partition. The reader stores nothing more
+    /// after it, also not in [`close`](Self::close).
+    pub(crate) async fn flush(&mut self) -> Result<(), IggyError> {
+        let Some(committer) = self.committer.take() else {
+            return Ok(());
+        };
+        committer.stop().await;
+        self.shared.progress.flush_counted().await
+    }
+
+    /// Under `CommitAfter::Processing`, the batch that the application took last counts once
+    /// it asks for the next one.
+    fn count_uncounted(&mut self) {
+        if let Some((checkpoint, messages)) = self.uncounted.take() {
+            self.count(checkpoint, messages, true);
         }
     }
 
@@ -399,7 +495,6 @@ impl PartitionReader {
             result,
             capacity,
         } = reply;
-        let capacity = Arc::new(capacity);
         match result {
             Err(error) => self.queue.push_back(Entry {
                 epoch,
@@ -434,6 +529,41 @@ impl Drop for PartitionReader {
         if let Some(task) = &self.task {
             task.abort();
         }
+        if let Some(committer) = &self.committer {
+            committer.task.abort();
+        }
+    }
+}
+
+impl Committer {
+    fn spawn(progress: Arc<Progress>, interval: Option<NonZeroIggyDuration>) -> Self {
+        let stop = Arc::new(Notify::new());
+        let stopped = Arc::clone(&stop);
+        let task = tokio::spawn(async move {
+            let mut ticks = interval.map(|interval| {
+                let period = interval.get_duration();
+                let mut ticks = interval_at(Instant::now() + period, period);
+                ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                ticks
+            });
+            loop {
+                tokio::select! {
+                    () = stopped.notified() => return,
+                    () = progress.store_due() => {}
+                    () = next_tick(&mut ticks) => {}
+                }
+                // The flush logs each failure, and the next one stores the position again.
+                let _ = progress.flush_counted().await;
+            }
+        });
+        Self { stop, task }
+    }
+
+    /// Lets a flush in flight finish, so its stores never race the final one.
+    async fn stop(self) {
+        self.stop.notify_one();
+        // A task that panicked stored what it could, and the final flush stores the rest.
+        let _ = self.task.await;
     }
 }
 
@@ -443,6 +573,8 @@ impl ReadError {
             partition_id,
             error,
             skip: None,
+            offset: None,
+            record: None,
         }
     }
 }
@@ -474,7 +606,14 @@ impl Config {
     }
 
     pub(crate) fn on_read(&self) -> bool {
-        self.options.server_commit == ServerCommitPolicy::OnRead
+        self.options.commit == CommitPolicy::OnRead
+    }
+
+    pub(crate) fn auto(&self) -> Option<AutoCommit> {
+        match self.options.commit {
+            CommitPolicy::Auto(auto) => Some(auto),
+            CommitPolicy::Manual | CommitPolicy::OnRead => None,
+        }
     }
 }
 
@@ -563,12 +702,21 @@ pub(super) fn first_as_offset(start: PollingStrategy) -> PollingStrategy {
     }
 }
 
+async fn next_tick(ticks: &mut Option<Interval>) {
+    match ticks {
+        Some(ticks) => {
+            ticks.tick().await;
+        }
+        None => pending().await,
+    }
+}
+
 fn spawn_worker(
     config: &Arc<Config>,
     shared: &Arc<Shared>,
     events: Option<Receiver<DiagnosticEvent>>,
-) -> (mpsc::Receiver<Reply>, JoinHandle<()>) {
-    let (sender, receiver) = mpsc::channel(config.slots);
+) -> (mpsc::UnboundedReceiver<Reply>, JoinHandle<()>) {
+    let (sender, receiver) = mpsc::unbounded_channel();
     let worker = Worker::new(Arc::clone(config), Arc::clone(shared), sender, events);
     (receiver, tokio::spawn(worker.run()))
 }
@@ -577,10 +725,12 @@ fn spawn_worker(
 mod tests {
     use std::collections::VecDeque;
     use std::future::poll_fn;
+    use std::num::NonZeroU32;
     use std::ops::RangeInclusive;
     use std::sync::Arc;
     use std::time::Duration;
 
+    use futures::FutureExt;
     use iggy_binary_protocol::WireDecode;
     use iggy_binary_protocol::codes::{
         DELETE_CONSUMER_OFFSET_CODE, POLL_MESSAGES_DEFERRED_CODE, STORE_CONSUMER_OFFSET_CODE,
@@ -589,8 +739,9 @@ mod tests {
     use iggy_binary_protocol::requests::consumer_offsets::DeleteConsumerOffsetRequest;
     use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
     use iggy_common::{
-        Aes256GcmEncryptor, Checkpoint, Client, Consumer, EncryptorKind, IggyError, MessageClient,
-        PollOptions, PolledMessages, PollingKind, PollingStrategy, ReaderStamp, ServerCommitPolicy,
+        Aes256GcmEncryptor, AutoCommit, Checkpoint, Client, CommitAfter, CommitEvery, CommitPolicy,
+        Consumer, EncryptorKind, IggyError, MessageClient, NonZeroIggyDuration, PollOptions,
+        PolledMessages, PollingKind, PollingStrategy, ReaderStamp,
     };
     use tokio::sync::{Semaphore, mpsc};
     use tokio::time::{Instant, timeout};
@@ -601,7 +752,7 @@ mod tests {
         stored_offsets,
     };
     use super::progress::Progress;
-    use super::{FetchCapacity, ORDERING, PartitionReader, ReadError, Refusal, Reply};
+    use super::{Committer, FetchCapacity, ORDERING, PartitionReader, ReadError, Refusal, Reply};
     use crate::client_wrappers::client_wrapper::ClientWrapper;
     use crate::clients::reader_builder::{DEFAULT_PREFETCH_MESSAGES, ReaderBuilder};
     use crate::driver::with_deadline;
@@ -637,6 +788,8 @@ mod tests {
     /// The first offset of a partition. A rewind before it deletes the offset.
     const START_OFFSET: u64 = 0;
     const SEEK_OFFSET: u64 = 50;
+    /// Longer than any test, so only an event or the close stores.
+    const NEVER: Duration = Duration::from_secs(24 * 60 * 60);
 
     #[tokio::test]
     async fn given_a_commit_of_a_later_poll_when_committing_at_or_below_it_should_store_nothing() {
@@ -663,6 +816,73 @@ mod tests {
             Err(IggyError::Disconnected)
         );
         assert_eq!(fed.progress().last_committed(PARTITION), Some(committed));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_auto_commit_when_closing_should_store_only_counted_positions_of_the_current_generation_ahead_of_the_last_store()
+     {
+        let (client, cluster) = connect_to_one_replica().await;
+        let mut fed = FedReader::new(
+            standalone_on(client, [PARTITION, OTHER_PARTITION, THIRD_PARTITION])
+                .options(auto(None, CommitAfter::Delivery)),
+        );
+        fed.reader.count(
+            fed.checkpoint(PARTITION, DELIVERED_OFFSET, CONTEXT),
+            1,
+            true,
+        );
+        fed.progress()
+            .record_commit(fed.checkpoint(OTHER_PARTITION, STORED_OFFSET, CONTEXT));
+        fed.reader.count(
+            fed.checkpoint(OTHER_PARTITION, LOWER_OFFSET, CONTEXT),
+            1,
+            true,
+        );
+        fed.reader.count(
+            fed.checkpoint(THIRD_PARTITION, LOWER_OFFSET, CONTEXT),
+            1,
+            true,
+        );
+        fed.reader
+            .seek(THIRD_PARTITION, PollingStrategy::offset(SEEK_OFFSET))
+            .await
+            .unwrap();
+
+        fed.reader.close().await.unwrap();
+
+        assert_eq!(
+            stored_offsets(&cluster),
+            [DELIVERED_OFFSET],
+            "a store behind the last one and a count of the generation before a seek are dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_auto_commit_every_n_messages_when_counting_should_make_a_store_due_after_n_messages_of_one_partition()
+     {
+        const EVERY: u32 = 3;
+        let every = CommitEvery::Messages(NonZeroU32::new(EVERY).unwrap());
+        let (_, shared) = standalone([PARTITION, OTHER_PARTITION])
+            .options(auto(Some(every), CommitAfter::Processing))
+            .into_parts()
+            .unwrap();
+        let progress = shared.progress;
+        progress.assign(&[PARTITION, OTHER_PARTITION], &[]);
+        let at = |partition, offset| {
+            let generation = progress.generation(partition).unwrap();
+            Checkpoint::stamped(partition, offset, CONTEXT, Some(progress.stamp(generation)))
+        };
+        let due = || progress.store_due().now_or_never().is_some();
+
+        progress.count(at(PARTITION, 10), EVERY - 1, false);
+        progress.count(at(OTHER_PARTITION, 10), EVERY - 1, false);
+        assert!(!due(), "each partition counted fewer than {EVERY} messages");
+
+        progress.count(at(PARTITION, 11), 1, false);
+        assert!(
+            due(),
+            "{EVERY} counted messages of one partition make a store due"
+        );
     }
 
     #[tokio::test]
@@ -1218,6 +1438,76 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn given_on_read_when_a_partition_leaves_with_an_undelivered_batch_should_still_hand_it_over()
+     {
+        let mut fed = FedReader::new(committing(builder_for(group())));
+        fed.assign(&[PARTITION, OTHER_PARTITION]);
+        fed.send(Ok(vec![
+            fed.batch(OTHER_PARTITION, BATCH, CONTEXT),
+            fed.batch(PARTITION, BATCH, CONTEXT),
+        ]));
+        assert_eq!(
+            fed.reader.next().await.unwrap().partition_id,
+            OTHER_PARTITION
+        );
+
+        fed.assign(&[OTHER_PARTITION]);
+
+        let batch = timeout(CANCEL_AFTER, fed.reader.next())
+            .await
+            .expect("the server stored the batch of the partition that left")
+            .unwrap();
+        assert_eq!(partition_and_offsets(&batch), (PARTITION, BATCH.collect()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_on_read_when_a_new_session_keeps_the_partition_should_still_hand_over_its_undelivered_batch()
+     {
+        // A new session starts a new generation of every partition, and the batch
+        // that the server stored under the old one was dropped.
+        let mut fed = FedReader::new(committing(builder_for(group())));
+        fed.assign(&[PARTITION, OTHER_PARTITION]);
+        fed.send(Ok(vec![
+            fed.batch(OTHER_PARTITION, BATCH, CONTEXT),
+            fed.batch(PARTITION, BATCH, CONTEXT),
+        ]));
+        assert_eq!(
+            fed.reader.next().await.unwrap().partition_id,
+            OTHER_PARTITION
+        );
+
+        fed.assign(&[PARTITION, OTHER_PARTITION]);
+
+        let batch = timeout(CANCEL_AFTER, fed.reader.next())
+            .await
+            .expect("the server stored the batch under the old session")
+            .unwrap();
+        assert_eq!(partition_and_offsets(&batch), (PARTITION, BATCH.collect()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_on_read_when_a_seek_follows_an_undelivered_batch_should_drop_it() {
+        let mut fed = FedReader::new(committing(builder_for(group())));
+        fed.assign(&[PARTITION, OTHER_PARTITION]);
+        fed.send(Ok(vec![
+            fed.batch(OTHER_PARTITION, BATCH, CONTEXT),
+            fed.batch(PARTITION, BATCH, CONTEXT),
+        ]));
+        assert_eq!(
+            fed.reader.next().await.unwrap().partition_id,
+            OTHER_PARTITION
+        );
+
+        fed.progress()
+            .seek(PARTITION, PollingStrategy::offset(SEEK_OFFSET));
+
+        assert!(
+            timeout(CANCEL_AFTER, fed.reader.next()).await.is_err(),
+            "a seek reads from its own start, not what came before it"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn given_a_cancelled_read_when_a_reply_arrives_should_hand_over_the_whole_batch() {
         let mut fed = FedReader::new(standalone([PARTITION]));
         assert!(timeout(CANCEL_AFTER, fed.reader.next()).await.is_err());
@@ -1258,7 +1548,7 @@ mod tests {
         fed.reader.shared.epoch.fetch_add(1, ORDERING);
 
         fed.send(Err(old_generation));
-        fed.sender.try_send(old_epoch).unwrap();
+        fed.sender.send(old_epoch).unwrap();
         fed.send(Err(reader_refusal(IggyError::StaleClient)));
 
         assert_eq!(
@@ -1280,6 +1570,8 @@ mod tests {
                 partition_id: Some(PARTITION),
                 error: IggyError::CannotDecryptData,
                 skip: Some(skip),
+                offset: None,
+                record: None,
             },
             generation: fed.progress().generation(PARTITION),
         }));
@@ -1416,7 +1708,7 @@ mod tests {
     /// of `slots`. `sender` stays open, because a closed channel starts a real fetch loop.
     struct FedReader {
         reader: PartitionReader,
-        sender: mpsc::Sender<Reply>,
+        sender: mpsc::UnboundedSender<Reply>,
         slots: Arc<Semaphore>,
     }
 
@@ -1425,14 +1717,21 @@ mod tests {
             let (config, shared) = builder.into_parts().unwrap();
             // The fetch loop of a standalone reader starts its generations at once.
             shared.progress.assign(&config.partitions, &[]);
-            let (sender, receiver) = mpsc::channel(config.slots);
+            let (sender, receiver) = mpsc::unbounded_channel();
             let slots = Arc::new(Semaphore::new(config.slots));
+            let config = Arc::new(config);
+            let shared = Arc::new(shared);
+            let committer = config
+                .auto()
+                .map(|auto| Committer::spawn(Arc::clone(&shared.progress), auto.interval));
             let reader = PartitionReader {
-                config: Arc::new(config),
-                shared: Arc::new(shared),
+                config,
+                shared,
                 receiver,
                 queue: VecDeque::new(),
                 task: None,
+                uncounted: None,
+                committer,
             };
             Self {
                 reader,
@@ -1495,15 +1794,15 @@ mod tests {
                 epoch: self.reader.shared.epoch.load(ORDERING),
                 assignment: None,
                 result,
-                capacity: FetchCapacity {
+                capacity: Arc::new(FetchCapacity {
                     permit: Some(Arc::clone(&self.slots).try_acquire_owned().unwrap()),
                     wake: Arc::clone(&self.reader.shared.wake),
-                },
+                }),
             }
         }
 
         fn send(&self, result: Result<Vec<PolledMessages>, Refusal>) {
-            self.sender.try_send(self.reply(result)).unwrap();
+            self.sender.send(self.reply(result)).unwrap();
         }
     }
 
@@ -1519,6 +1818,19 @@ mod tests {
     }
 
     /// A standalone reader of `partitions` on a client that never connects.
+    /// `CommitPolicy::Auto` that stores on `every` and at the close, never on an interval.
+    fn auto(every: Option<CommitEvery>, after: CommitAfter) -> PollOptions {
+        let interval = (every.is_none()).then_some(NonZeroIggyDuration::new(NEVER).unwrap());
+        PollOptions {
+            commit: CommitPolicy::Auto(AutoCommit {
+                interval,
+                every,
+                after,
+            }),
+            ..PollOptions::default()
+        }
+    }
+
     fn standalone(partitions: impl IntoIterator<Item = u32>) -> ReaderBuilder {
         builder_for(consumer()).partitions(partitions)
     }
@@ -1565,7 +1877,7 @@ mod tests {
                 &config.consumer,
                 &PollingStrategy::next(),
                 PollOptions {
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )

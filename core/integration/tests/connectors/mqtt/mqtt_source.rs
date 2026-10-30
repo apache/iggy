@@ -23,7 +23,7 @@ use crate::connectors::fixtures::{
 use base64::Engine;
 use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
 use iggy_common::{
-    Consumer, Identifier, MessageClient, PollOptions, PollingStrategy, ServerCommitPolicy,
+    CommitPolicy, Consumer, Identifier, MessageClient, PollOptions, PollingStrategy,
 };
 use integration::harness::{TestBinary, TestHarness, seeds};
 use integration::iggy_harness;
@@ -403,7 +403,7 @@ async fn assert_payloads_are_persisted(harness: &TestHarness, expected: HashSet<
                     &PollingStrategy::next(),
                     PollOptions {
                         count: 10,
-                        server_commit: ServerCommitPolicy::OnRead,
+                        commit: CommitPolicy::OnRead,
                         ..PollOptions::default()
                     },
                 )
@@ -608,7 +608,7 @@ where
                     &PollingStrategy::next(),
                     PollOptions {
                         count: 10,
-                        server_commit: ServerCommitPolicy::OnRead,
+                        commit: CommitPolicy::OnRead,
                         ..PollOptions::default()
                     },
                 )
@@ -650,7 +650,7 @@ async fn poll_first_message(
                     &PollingStrategy::next(),
                     PollOptions {
                         count: 10,
-                        server_commit: ServerCommitPolicy::OnRead,
+                        commit: CommitPolicy::OnRead,
                         ..PollOptions::default()
                     },
                 )
@@ -685,7 +685,7 @@ async fn assert_message_is_not_persisted(harness: &TestHarness, payload: &[u8]) 
                     &PollingStrategy::next(),
                     PollOptions {
                         count: 10,
-                        server_commit: ServerCommitPolicy::OnRead,
+                        commit: CommitPolicy::OnRead,
                         ..PollOptions::default()
                     },
                 )

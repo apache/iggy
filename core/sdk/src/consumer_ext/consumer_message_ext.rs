@@ -16,8 +16,9 @@
 // under the License.
 
 use crate::clients::consumer::IggyConsumer;
+use crate::clients::reader::lasting_refusal;
 use crate::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
-use crate::prelude::{IggyError, ReadError};
+use crate::prelude::{CommitAfter, IggyError, ReadError};
 use async_trait::async_trait;
 use std::future::poll_fn;
 use tokio::sync::oneshot;
@@ -27,8 +28,10 @@ use tracing::{error, info, trace, warn};
 impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
     /// Consume messages from the stream and process them with the given message consumer.
     ///
-    /// The event of the client commit policy counts each message after the handler returns,
-    /// also after a failure.
+    /// Under `CommitPolicy::Auto`, a message counts before the handler with
+    /// `CommitAfter::Delivery`, and once the handler succeeds with `CommitAfter::Processing`.
+    /// With `Processing`, a handler that fails ends the consumption with its error, and its
+    /// message stays uncounted, so the next run reads it again.
     ///
     /// # Arguments
     ///
@@ -44,20 +47,26 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
     /// * `IggyError::InvalidServerAddress`: The server address is invalid.
     /// * `IggyError::InvalidClientAddress`: The client address is invalid.
     /// * `IggyError::InvalidConfiguration`: The consumer was not initialized.
+    /// * The error of the handler, with the partition of its message, under
+    ///   `CommitAfter::Processing`.
     /// * `IggyError::ClientShutdown`: The client has been shut down.
     /// * `IggyError::LaneBlocked`: A retained operation that the consumer does not resolve blocks
     ///   its polls and requires caller recovery.
-    /// * `IggyError::PartitionLaneBlocked` or `IggyError::FetchProgressUncertain`: With
-    ///   `ServerCommitPolicy::OnRead`, a read of the partition has an unknown outcome, and the
-    ///   partition stays stopped until the caller abandons the operation and seeks.
+    /// * `IggyError::PartitionLaneBlocked`: With `CommitPolicy::OnRead`, another call on the
+    ///   client left a committing read of the partition with an unknown outcome, and the
+    ///   partition stays stopped until the caller abandons the operation and seeks. A lost reply
+    ///   of the consumer itself ends nothing: the reader reads on and hands over what it stored.
     /// * `IggyError::HistoryUnavailable`: The partition has a new history, and it stays stopped
     ///   until the caller seeks.
+    /// * `IggyError::Unauthorized`, `IggyError::PartitionNotFound` and the other refusals that a
+    ///   retry does not change, with a partition: the reader retried the partition with a longer
+    ///   wait each time, and it stays stopped until the caller seeks.
     /// * Any error with a [`ReadError::skip`]: A message of the partition does not decode, and
     ///   the reader reads it again until the caller seeks to the skip.
     /// * `IggyError::InvalidNumberEncoding`, `IggyError::InvalidMessagePayloadLength` or
     ///   `IggyError::InvalidMessagesCount` without a skip: A reply of the partition does not
     ///   decode, and the reader cannot name the message to skip. With
-    ///   `ServerCommitPolicy::OnRead`, a read from `Next` stops the partition until the caller
+    ///   `CommitPolicy::OnRead`, a read from `Next` stops the partition until the caller
     ///   seeks.
     /// * Any other poll error, once the client cannot come back without the caller: it has no
     ///   link and no replica link that tries to reconnect, and the heartbeat does not restart it,
@@ -80,7 +89,7 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
         // Unlike a caller of `next()`, a message consumer gets no handle to commit with.
         if self.relies_on_manual_commits() {
             warn!(
-                "Consumer: {name} on topic: {topic} and stream: {stream} never stores offsets, because it runs with the default ClientCommitPolicy. With PollingStrategy::next(), each restart reads the same messages again. Set client_commit to store them.",
+                "Consumer: {name} on topic: {topic} and stream: {stream} never stores offsets, because it runs with CommitPolicy::Manual. With PollingStrategy::next(), each restart reads the same messages again. Set CommitPolicy::Auto in the poll options to store them.",
                 name = self.name(),
                 topic = self.topic(),
                 stream = self.stream()
@@ -97,21 +106,33 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
                     break;
                 }
 
-                message = poll_fn(|cx| self.poll_message(cx, false)) => {
+                message = poll_fn(|cx| self.poll_message(cx)) => {
                     match message {
                         Some(Ok((received_message, ends_batch))) => {
                             let checkpoint = received_message.checkpoint();
                             let partition_id = received_message.partition_id;
                             let current_offset = received_message.current_offset;
                             let message_offset = received_message.message.header.offset;
-                            if let Err(err) = message_consumer.consume(received_message).await {
-                                error!("Error while handling message at offset: {message_offset}/{current_offset}, partition: {partition_id} for consumer: {name} on topic: {topic} and stream: {stream} due to error: {err}",
-                                    name = self.name(), topic = self.topic(), stream = self.stream());
-                            } else {
-                                trace!("Message at offset: {message_offset}/{current_offset}, partition: {partition_id} has been handled by consumer: {name} on topic: {topic} and stream: {stream}",
-                                    name = self.name(), topic = self.topic(), stream = self.stream());
+                            let counts_after = self.counts_after();
+                            if counts_after == Some(CommitAfter::Delivery) {
+                                self.count(checkpoint, ends_batch);
                             }
-                            self.on_consumed(checkpoint, ends_batch);
+                            match message_consumer.consume(received_message).await {
+                                Ok(()) => {
+                                    trace!("Message at offset: {message_offset}/{current_offset}, partition: {partition_id} has been handled by consumer: {name} on topic: {topic} and stream: {stream}",
+                                        name = self.name(), topic = self.topic(), stream = self.stream());
+                                    if counts_after == Some(CommitAfter::Processing) {
+                                        self.count(checkpoint, ends_batch);
+                                    }
+                                }
+                                Err(err) => {
+                                    error!("Error while handling message at offset: {message_offset}/{current_offset}, partition: {partition_id} for consumer: {name} on topic: {topic} and stream: {stream} due to error: {err}",
+                                        name = self.name(), topic = self.topic(), stream = self.stream());
+                                    if counts_after == Some(CommitAfter::Processing) {
+                                        return Err(ReadError::new(Some(partition_id), err));
+                                    }
+                                }
+                            }
                         }
                         Some(Err(err)) => {
                             let ends = err.skip.is_some()
@@ -129,6 +150,7 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
                                         | IggyError::InvalidMessagesCount
                                         | IggyError::ClientShutdown
                                 )
+                                || (err.partition_id.is_some() && lasting_refusal(&err.error))
                                 || !self.client_can_recover().await;
                             if ends {
                                 error!("Client error: {err} for consumer: {name} on topic: {topic} and stream: {stream}",

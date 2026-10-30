@@ -82,7 +82,7 @@ func (o DeferredPollOptions) Validate(count uint32) error {
 }
 
 // ValidateFetch checks the initial limits of a fetch. Even a zero-wait fetch
-// needs one second for the server's read and reply; the initial timeout must
+// needs one second for the server's read and reply, so the initial timeout must
 // exceed it so that local setup can consume time without extending the call.
 func (o DeferredPollOptions) ValidateFetch(count uint32) error {
 	if err := o.Validate(count); err != nil {

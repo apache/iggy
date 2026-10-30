@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use iggy_binary_protocol::codes::{
     CREATE_CONSUMER_GROUP_CODE, FETCH_MESSAGES_CODE, GET_CONSUMER_GROUP_CODE,
-    JOIN_CONSUMER_GROUP_CODE, LOGIN_REGISTER_CODE, POLL_MESSAGES_DEFERRED_CODE,
-    STORE_CONSUMER_OFFSET_CODE, SYNC_CONSUMER_GROUP_CODE,
+    GET_PARTITION_ROUTE_CODE, JOIN_CONSUMER_GROUP_CODE, LOGIN_REGISTER_CODE,
+    POLL_MESSAGES_DEFERRED_CODE, STORE_CONSUMER_OFFSET_CODE, SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::consensus::EvictionReason;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
@@ -33,12 +33,15 @@ use iggy_binary_protocol::requests::messages::{DeferredPollMessagesRequest, Fetc
 use iggy_binary_protocol::responses::consumer_groups::{
     ConsumerGroupDetailsResponse, ConsumerGroupResponse, SyncConsumerGroupResponse,
 };
-use iggy_binary_protocol::responses::messages::{FetchMessagesResponse, PartitionRouteResponse};
+use iggy_binary_protocol::responses::messages::{
+    FetchMessagesResponse, PartitionRouteResponse, PollMessagesResponseHeader,
+};
 use iggy_binary_protocol::{WireDecode, WireEncode, WireName};
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
-    BinaryTransport, Client, Consumer, ConsumerOffsetClient, DiagnosticEvent, IggyDuration,
-    IggyError, PollOptions, PolledMessages, PollingStrategy, ServerCommitPolicy, UserClient,
+    BinaryTransport, Client, CommitPolicy, Consumer, ConsumerOffsetClient, DiagnosticEvent,
+    Identifier, IggyDuration, IggyError, PollOptions, PolledMessages, PollingStrategy, TopicClient,
+    UserClient,
 };
 use tokio::task::yield_now;
 use tokio::time::{Instant, sleep, timeout};
@@ -92,7 +95,7 @@ async fn given_reader_options_when_reading_should_send_them_in_each_request() {
         max_wait: IggyDuration::from(MAX_WAIT),
         min_count: MIN_COUNT,
         max_bytes: MAX_BYTES,
-        server_commit: ServerCommitPolicy::Disabled,
+        commit: CommitPolicy::Manual,
     };
     let wait_us = options.max_wait.as_micros();
     let request_timeout_us = options.request_timeout().as_micros();
@@ -167,6 +170,7 @@ async fn given_a_committing_group_member_when_reading_should_fetch_the_partition
     let (client, cluster) = connect_to_three_replicas().await;
     script_group(&cluster, &[OTHER_PARTITION, PARTITION]);
     script_fetches(&cluster, [served_answer(PARTITION, OFFSET)]);
+    script_initial_next(&cluster, &[(OTHER_PARTITION, OFFSET), (PARTITION, OFFSET)]);
     let mut reader = committing(member(client)).build().await.unwrap();
 
     let batch = timeout(POLL_TIMEOUT, reader.next()).await.unwrap().unwrap();
@@ -188,7 +192,7 @@ async fn given_a_committing_group_member_when_reading_should_fetch_the_partition
             .all(|target| target.max_bytes == records_limit),
         "the whole reply fits the reservation of one reply"
     );
-    assert_eq!(cluster.count(POLL_MESSAGES_DEFERRED_CODE), 0);
+    assert_eq!(cluster.count(POLL_MESSAGES_DEFERRED_CODE), 2);
 }
 
 #[tokio::test(start_paused = true)]
@@ -219,10 +223,16 @@ async fn given_an_uncertain_store_of_a_second_target_when_a_committing_member_fe
         .header
         .request;
     assert_eq!(stored, Err(IggyError::OperationUncertain(store)));
+    script_initial_next(
+        &cluster,
+        &[(OTHER_PARTITION, OFFSET), (PARTITION, OFFSET + 1)],
+    );
     let mut reader = committing(member(client)).build().await.unwrap();
 
-    let batch = timeout(POLL_TIMEOUT, reader.next()).await.unwrap().unwrap();
+    // The lane refuses the first fetch of both targets before it leaves, so the refusal of the
+    // blocked partition arrives before the batch of the other one.
     let blocked = timeout(POLL_TIMEOUT, reader.next()).await.unwrap();
+    let batch = timeout(POLL_TIMEOUT, reader.next()).await.unwrap().unwrap();
 
     assert_eq!(
         partition_and_offsets(&batch),
@@ -341,6 +351,41 @@ async fn given_a_lost_membership_when_the_join_fails_should_report_it_for_the_wh
 }
 
 #[tokio::test(start_paused = true)]
+async fn given_a_failed_refresh_when_the_caller_asks_again_at_once_should_wait_its_retry_interval()
+{
+    const CALLS: u32 = 3;
+    let (client, cluster) = connect_to_three_replicas().await;
+    // Only the join of `build()` finds the group.
+    cluster.script(
+        &endpoint(METADATA_PRIMARY),
+        GET_CONSUMER_GROUP_CODE,
+        [existing_group()],
+    );
+    let mut reader = member(client).build().await.unwrap();
+    forget_membership(&reader);
+    timeout(POLL_TIMEOUT, reader.next())
+        .await
+        .unwrap()
+        .unwrap_err();
+    let refreshes = cluster.count(GET_CONSUMER_GROUP_CODE);
+    let started = Instant::now();
+
+    for _ in 0..CALLS {
+        timeout(POLL_TIMEOUT, reader.next())
+            .await
+            .unwrap()
+            .unwrap_err();
+    }
+
+    assert!(started.elapsed() >= RETRY_INTERVAL * CALLS);
+    assert_eq!(
+        cluster.count(GET_CONSUMER_GROUP_CODE),
+        refreshes + usize::try_from(CALLS).unwrap(),
+        "one refresh per failed call"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn given_a_member_unknown_to_the_server_when_refreshing_should_join_again_without_an_error() {
     const OFFSET: u64 = 2;
     let (client, cluster) = connect_to_three_replicas().await;
@@ -405,7 +450,16 @@ async fn given_an_uncertain_group_mutation_when_the_refresh_joins_again_should_r
             repeat_n(assignment(&[PARTITION]), GROUP_REFRESHES),
         );
         script_fetches(&cluster, [served_answer(PARTITION, OFFSET)]);
-        let mut reader = member(client).create_group(true).build().await.unwrap();
+        // Auto-creation creates a group by its name only.
+        let mut reader = builder_on(
+            client,
+            Consumer::group(Identifier::named(GROUP_NAME).unwrap()),
+        )
+        .retry_interval(RETRY_INTERVAL)
+        .create_group(true)
+        .build()
+        .await
+        .unwrap();
         forget_membership(&reader);
 
         let uncertain = timeout(TEST_BUDGET, reader.next()).await.unwrap();
@@ -509,8 +563,9 @@ async fn given_an_evicted_fetch_when_the_client_signs_in_again_should_wait_for_s
 
     let evicted = timeout(POLL_TIMEOUT, reader.next()).await;
     assert!(
-        evicted.is_err(),
-        "reading waits for the new session: {evicted:?}"
+        matches!(&evicted, Ok(Err(error))
+            if *error == ReadError::new(Some(PARTITION), IggyError::TransientNotCommitted)),
+        "a noncommitting fetch that lost its session ends without a stored offset: {evicted:?}"
     );
     eventually("the client signs in again", || {
         cluster.count(LOGIN_REGISTER_CODE) == 2
@@ -536,14 +591,30 @@ async fn given_an_evicted_fetch_when_the_client_signs_in_again_should_wait_for_s
     );
 }
 
+/// A committing fetch whose reply is lost may have stored its offset. The next read from `Next`
+/// starts past the delivered messages, so the reader reads the skipped ones by offset without a
+/// commit and hands them over, without an error and without an abandon by the application.
 #[tokio::test(start_paused = true)]
-async fn given_a_lost_committing_fetch_reply_when_closing_should_skip_the_rewind_of_its_partition()
-{
+async fn given_a_lost_committing_fetch_reply_when_the_next_read_skips_offsets_should_deliver_them_by_offset_without_a_commit()
+ {
     const DELIVERED: u64 = 4;
+    const SKIPPED: [u64; 3] = [5, 6, 7];
     let (client, cluster) = connect_to_three_replicas().await;
     script_fetches(
         &cluster,
-        [served_answer(PARTITION, DELIVERED), Answer::Silence],
+        [
+            served_answer(PARTITION, DELIVERED),
+            Answer::Silence,
+            served_answer(PARTITION, SKIPPED[2]),
+        ],
+    );
+    cluster.script(
+        &endpoint(PRIMARY),
+        POLL_MESSAGES_DEFERRED_CODE,
+        [
+            polled_answer(PARTITION, &[DELIVERED]),
+            polled_answer(PARTITION, &SKIPPED),
+        ],
     );
     let mut reader = committing(standalone(client, [PARTITION]))
         .build()
@@ -555,19 +626,96 @@ async fn given_a_lost_committing_fetch_reply_when_closing_should_skip_the_rewind
         (PARTITION, vec![DELIVERED])
     );
 
-    let lost = reader.next().await;
-    let op = cluster.received(FETCH_MESSAGES_CODE)[1].header.request;
-    let closed = reader.close().await;
+    let caught_up = timeout(request_timeout(&reader) * 3, reader.next())
+        .await
+        .expect("the reader reads on after a lost reply")
+        .expect("a lost reply is no error of the reader");
 
     assert_eq!(
-        lost.unwrap_err(),
-        ReadError::new(Some(PARTITION), IggyError::FetchProgressUncertain(op))
+        partition_and_offsets(&caught_up),
+        (PARTITION, SKIPPED.to_vec())
     );
-    assert_eq!(closed, Err(IggyError::PartitionLaneBlocked(PARTITION, op)));
-    assert!(
-        stored_offsets(&cluster).is_empty(),
-        "the server can store the offset of the lost reply after any store of the close"
+    let fetches = cluster.received(FETCH_MESSAGES_CODE);
+    assert_eq!(
+        targets_of(&fetches[2])
+            .into_iter()
+            .map(|(partition, strategy)| (partition, strategy.kind))
+            .collect::<Vec<_>>(),
+        [(PARTITION, WirePollingStrategy::next().kind)],
+        "an OnRead reader reads from the stored offset, which the server fences"
     );
+    let catch_up = DeferredPollMessagesRequest::decode_from(
+        &cluster.received(POLL_MESSAGES_DEFERRED_CODE)[1].body,
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            catch_up.poll.strategy,
+            catch_up.poll.count,
+            catch_up.poll.auto_commit
+        ),
+        (WirePollingStrategy::offset(SKIPPED[0]), 3, false)
+    );
+    reader.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_the_first_committing_next_reply_is_lost_when_reading_should_recover_its_messages() {
+    const SKIPPED: [u64; 3] = [5, 6, 7];
+    let (client, cluster) = connect_to_three_replicas().await;
+    script_fetches(
+        &cluster,
+        [Answer::Silence, served_answer(PARTITION, SKIPPED[2])],
+    );
+    cluster.script(
+        &endpoint(PRIMARY),
+        POLL_MESSAGES_DEFERRED_CODE,
+        [
+            polled_answer(PARTITION, &SKIPPED[..1]),
+            polled_answer(PARTITION, &SKIPPED),
+        ],
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .prefetch_messages(1)
+        .build()
+        .await
+        .unwrap();
+
+    let caught_up = timeout(request_timeout(&reader) * 3, reader.next())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        partition_and_offsets(&caught_up),
+        (PARTITION, SKIPPED.to_vec())
+    );
+    reader.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_the_first_committing_next_reply_is_lost_when_closing_should_rewind_to_the_resolved_start()
+ {
+    for first in [0, 5] {
+        let (client, cluster) = connect_to_three_replicas().await;
+        script_fetches(&cluster, [Answer::Silence]);
+        script_initial_next(&cluster, &[(PARTITION, first)]);
+        let mut reader = committing(standalone(client, [PARTITION]))
+            .build()
+            .await
+            .unwrap();
+        start_fetch(&mut reader, &cluster, 1).await;
+        reader.close().await.unwrap();
+        if first == 0 {
+            assert_eq!(
+                cluster.count(iggy_binary_protocol::codes::DELETE_CONSUMER_OFFSET_CODE),
+                1
+            );
+            assert!(stored_offsets(&cluster).is_empty());
+        } else {
+            assert_eq!(stored_offsets(&cluster), [first - 1]);
+        }
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -577,6 +725,7 @@ async fn given_a_committing_fetch_in_flight_when_closing_should_rewind_over_its_
     let (client, cluster) = connect_to_three_replicas().await;
     cluster.hold(FETCH_MESSAGES_CODE);
     script_fetches(&cluster, [served_answer(PARTITION, FIRST)]);
+    script_initial_next(&cluster, &[(PARTITION, FIRST)]);
     let mut reader = committing(standalone(client, [PARTITION]))
         .build()
         .await
@@ -606,6 +755,7 @@ async fn given_a_committing_fetch_in_flight_when_closing_should_rewind_over_its_
 async fn given_a_committing_fetch_without_a_reply_when_closing_should_wait_for_its_deadline() {
     let (client, cluster) = connect_to_three_replicas().await;
     script_fetches(&cluster, []);
+    script_initial_next(&cluster, &[(PARTITION, 0)]);
     let mut reader = committing(standalone(client, [PARTITION]))
         .build()
         .await
@@ -613,6 +763,7 @@ async fn given_a_committing_fetch_without_a_reply_when_closing_should_wait_for_i
     start_fetch(&mut reader, &cluster, 1).await;
     let op = cluster.received(FETCH_MESSAGES_CODE)[0].header.request;
     let request_timeout = request_timeout(&reader);
+    let reader_client = reader.config.client.clone();
     let started = Instant::now();
 
     let closed = reader.close().await;
@@ -621,8 +772,12 @@ async fn given_a_committing_fetch_without_a_reply_when_closing_should_wait_for_i
         started.elapsed() >= request_timeout,
         "the server can commit until the deadline of the fetch, so the close waits for it"
     );
-    assert_eq!(closed, Err(IggyError::PartitionLaneBlocked(PARTITION, op)));
-    assert!(stored_offsets(&cluster).is_empty());
+    closed.unwrap();
+    assert!(
+        !reader_client.read().await.retains_operation(op).await,
+        "the close abandons the lost fetch, so the client reads the partition again"
+    );
+    assert!(stored_offsets(&cluster).is_empty(), "nothing was delivered");
 }
 
 #[tokio::test(start_paused = true)]
@@ -630,6 +785,7 @@ async fn given_a_committing_fetch_in_flight_when_the_reader_drops_should_return_
  {
     let (client, cluster) = connect_to_three_replicas().await;
     script_fetches(&cluster, []);
+    script_initial_next(&cluster, &[(PARTITION, 0)]);
     let mut reader = committing(standalone(client, [PARTITION]))
         .build()
         .await
@@ -673,6 +829,7 @@ async fn given_a_committing_fetch_in_flight_when_the_epoch_changes_should_hand_o
     let (client, cluster) = connect_to_three_replicas().await;
     cluster.hold(FETCH_MESSAGES_CODE);
     script_fetches(&cluster, [served_answer(PARTITION, FIRST)]);
+    script_initial_next(&cluster, &[(PARTITION, FIRST)]);
     let mut reader = committing(standalone(client, [PARTITION]))
         .build()
         .await
@@ -704,6 +861,79 @@ async fn given_a_signed_out_client_when_reads_fail_with_unauthenticated_should_b
     assert_eq!(refused.unwrap_err(), unauthenticated);
     assert!(started.elapsed() >= RETRY_INTERVAL);
     assert_eq!(cluster.count(FETCH_MESSAGES_CODE), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_join_in_flight_when_the_reader_drops_should_let_it_finish_and_keep_metadata_calls_usable()
+ {
+    let (client, cluster) = connect_to_three_replicas().await;
+    script_group(&cluster, &[PARTITION]);
+    let reader = member(client).build().await.unwrap();
+    let client = reader.config.client.clone();
+    cluster.hold(JOIN_CONSUMER_GROUP_CODE);
+    forget_membership(&reader);
+    eventually("the refresh joins again", || {
+        cluster.count(JOIN_CONSUMER_GROUP_CODE) == 2
+    })
+    .await;
+
+    drop(reader);
+    cluster.release(JOIN_CONSUMER_GROUP_CODE);
+    let deleted = client
+        .read()
+        .await
+        .delete_topic(&identifier(STREAM_ID), &identifier(TOPIC_ID))
+        .await;
+
+    assert_eq!(
+        deleted,
+        Ok(()),
+        "the join that the server received finished"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_join_in_flight_when_the_session_ends_should_join_again_on_the_next_refresh() {
+    let (client, cluster) = connect_to_three_replicas().await;
+    script_group(&cluster, &[PARTITION]);
+    // A fetch parks as on a server, so the refreshes run on time.
+    script_fetches(&cluster, []);
+    let reader = member(client).build().await.unwrap();
+    cluster.hold(JOIN_CONSUMER_GROUP_CODE);
+    forget_membership(&reader);
+    eventually("the refresh joins again", || {
+        cluster.count(JOIN_CONSUMER_GROUP_CODE) == 2
+    })
+    .await;
+
+    forget_membership(&reader);
+    cluster.release(JOIN_CONSUMER_GROUP_CODE);
+
+    eventually("the next refresh joins for the new session", || {
+        cluster.count(JOIN_CONSUMER_GROUP_CODE) == 3
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_partition_without_a_route_yet_when_refreshing_should_retry_without_an_error() {
+    const OFFSET: u64 = 2;
+    let (client, cluster) = connect_to_three_replicas().await;
+    let route = cluster.route.lock().unwrap().take();
+    script_fetches(&cluster, [served_answer(PARTITION, OFFSET)]);
+    let mut reader = standalone(client, [PARTITION]).build().await.unwrap();
+    eventually("the refresh asks for the route", || {
+        cluster.count(GET_PARTITION_ROUTE_CODE) > 0
+    })
+    .await;
+    *cluster.route.lock().unwrap() = route;
+
+    let read = timeout(POLL_TIMEOUT, reader.next()).await.unwrap();
+
+    assert!(
+        matches!(&read, Ok(batch) if partition_and_offsets(batch) == (PARTITION, vec![OFFSET])),
+        "a partition that is not routable yet is retried, not reported: {read:?}"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -757,46 +987,29 @@ async fn given_a_group_member_when_a_fetch_finds_its_session_ended_should_sign_i
     assert!((2..=3).contains(&cluster.count(JOIN_CONSUMER_GROUP_CODE)));
 }
 
+/// The worker abandons a lost committing read itself, so a seek needs no abandon first.
 #[tokio::test(start_paused = true)]
-async fn given_an_unknown_committing_outcome_when_seeking_should_wait_for_the_abandon_and_read_from_the_new_position()
- {
+async fn given_a_lost_committing_reply_when_seeking_should_read_from_the_new_position() {
     const SEEK_OFFSET: u64 = 9;
     let (client, cluster) = connect_to_three_replicas().await;
     script_fetches(
         &cluster,
         [Answer::Silence, served_answer(PARTITION, SEEK_OFFSET)],
     );
+    script_initial_next(&cluster, &[(PARTITION, 0)]);
     let mut reader = committing(standalone(client, [PARTITION]))
         .build()
         .await
         .unwrap();
-    let lost = reader.next().await;
-    let op = cluster.received(FETCH_MESSAGES_CODE)[0].header.request;
-    assert_eq!(
-        lost.unwrap_err(),
-        ReadError::new(Some(PARTITION), IggyError::FetchProgressUncertain(op))
-    );
-    let stopped = timeout(POLL_TIMEOUT, reader.next()).await;
-    assert!(stopped.is_err(), "the partition stops: {stopped:?}");
+    start_fetch(&mut reader, &cluster, 1).await;
     let seek_start = PollingStrategy::offset(SEEK_OFFSET);
 
-    let blocked = reader.seek(PARTITION, seek_start).await;
-    let abandoned = reader
-        .config
-        .client
-        .read()
-        .await
-        .abandon_operation(op)
-        .await;
     let sought = reader.seek(PARTITION, seek_start).await;
-    let resumed = timeout(TEST_BUDGET, reader.next()).await.unwrap().unwrap();
+    let resumed = timeout(request_timeout(&reader) * 3, reader.next())
+        .await
+        .unwrap()
+        .unwrap();
 
-    assert_eq!(
-        blocked,
-        Err(IggyError::PartitionLaneBlocked(PARTITION, op)),
-        "the server can still commit the lost fetch"
-    );
-    assert_eq!(abandoned, Ok(()));
     assert_eq!(sought, Ok(()));
     assert_eq!(
         partition_and_offsets(&resumed),
@@ -845,9 +1058,11 @@ async fn given_a_partition_without_history_when_read_should_stop_it_until_a_seek
     const OFFSET: u64 = 3;
     const SEEK_OFFSET: u64 = 11;
     let (client, cluster) = connect_to_three_replicas().await;
+    // The first reply gives the partition a position in its history, which the second loses.
     script_fetches(
         &cluster,
         [
+            sections_answer(&[served(PARTITION, &[OFFSET], OFFSET + 1)]),
             sections_answer(&[
                 served(OTHER_PARTITION, &[OFFSET], OFFSET + 1),
                 refused(PARTITION, &IggyError::HistoryUnavailable),
@@ -861,10 +1076,11 @@ async fn given_a_partition_without_history_when_read_should_stop_it_until_a_seek
         .await
         .unwrap();
 
+    timeout(POLL_TIMEOUT, reader.next()).await.unwrap().unwrap();
     let batch = timeout(POLL_TIMEOUT, reader.next()).await.unwrap().unwrap();
     let stopped = timeout(POLL_TIMEOUT, reader.next()).await.unwrap();
     eventually("the next fetch starts", || {
-        cluster.count(FETCH_MESSAGES_CODE) == 2
+        cluster.count(FETCH_MESSAGES_CODE) == 3
     })
     .await;
     reader
@@ -888,12 +1104,12 @@ async fn given_a_partition_without_history_when_read_should_stop_it_until_a_seek
     );
     let fetches = cluster.received(FETCH_MESSAGES_CODE);
     assert_eq!(
-        partitions_of(&fetches[1]),
+        partitions_of(&fetches[2]),
         [OTHER_PARTITION],
         "a stopped partition reads nothing"
     );
     assert_eq!(
-        targets_of(&fetches[2]),
+        targets_of(&fetches[3]),
         [(PARTITION, WirePollingStrategy::offset(SEEK_OFFSET))]
     );
 }
@@ -1042,6 +1258,16 @@ fn script_fetches(cluster: &FakeCluster, answers: impl IntoIterator<Item = Answe
     );
 }
 
+fn script_initial_next(cluster: &FakeCluster, starts: &[(u32, u64)]) {
+    cluster.script(
+        &endpoint(PRIMARY),
+        POLL_MESSAGES_DEFERRED_CODE,
+        starts
+            .iter()
+            .map(|&(partition, offset)| polled_answer(partition, &[offset])),
+    );
+}
+
 fn sections_answer(sections: &[Section]) -> Answer {
     Answer::Body(fetch_body(sections).to_vec())
 }
@@ -1049,6 +1275,22 @@ fn sections_answer(sections: &[Section]) -> Answer {
 /// A fetch reply that serves one message of `partition` at `offset`.
 fn served_answer(partition: u32, offset: u64) -> Answer {
     sections_answer(&[served(partition, &[offset], offset + 1)])
+}
+
+/// A poll reply with one message of `partition` at each of `offsets`.
+fn polled_answer(partition: u32, offsets: &[u64]) -> Answer {
+    let next_offset = offsets.last().map_or(0, |last| last + 1);
+    let (section, records) = served(partition, offsets, next_offset);
+    let mut body = PollMessagesResponseHeader {
+        partition_id: partition,
+        current_offset: section.current_offset,
+        messages_count: section.messages_count,
+        context: section.context,
+    }
+    .to_bytes()
+    .to_vec();
+    body.extend(records);
+    Answer::Body(body)
 }
 
 fn fetch_request(fetch: &Received) -> FetchMessagesRequest {

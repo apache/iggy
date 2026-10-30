@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::polled_messages::messages_from_batches;
+use super::polled_messages::{DecodeError, messages_from_batches, record_at};
 use crate::{EncryptorKind, IggyError, PolledMessages, PollingStrategy};
 use bytes::Bytes;
 use iggy_binary_protocol::STATUS_OK;
@@ -77,19 +77,30 @@ impl FetchedSection {
     /// The refusal of a refused section, a decode error of
     /// [`PolledMessages::from_bytes`], or a decryption error.
     pub fn decode(&self) -> Result<PolledMessages, IggyError> {
-        self.status.clone()?;
+        self.decode_records().map_err(|error| error.error)
+    }
+
+    /// [`Self::decode`], keeping the record of the message that does not decode or decrypt.
+    pub fn decode_records(&self) -> Result<PolledMessages, DecodeError> {
+        self.status.clone().map_err(DecodeError::without_record)?;
         let mut messages = messages_from_batches(self.records.clone(), self.messages_count)?;
         if let Some(encryptor) = &self.encryptor {
-            for message in &mut messages {
-                encryptor.decrypt_message(message)?;
+            for (index, message) in messages.iter_mut().enumerate() {
+                encryptor
+                    .decrypt_message(message)
+                    .map_err(|error| DecodeError {
+                        error,
+                        record: record_at(&self.records, index).map(Box::new),
+                    })?;
             }
         }
-        let mut polled = PolledMessages::new(
+        let mut polled = PolledMessages::with_records(
             self.context,
             self.partition_id,
             self.current_offset,
             self.messages_count,
             messages,
+            self.records.clone(),
         );
         polled.set_request_start(&PollingStrategy::offset(self.next_offset));
         Ok(polled)
@@ -115,9 +126,9 @@ impl FetchedSection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Aes256GcmEncryptor, PollingKind};
+    use crate::{Aes256GcmEncryptor, PollingKind, UndecodedRecord};
     use bytes::BytesMut;
-    use iggy_binary_protocol::batch::BatchHeader;
+    use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, BatchHeader};
     use iggy_binary_protocol::requests::messages::{RawMessage, SendMessagesEncoder};
     use iggy_binary_protocol::responses::messages::{FetchMessagesResponse, FetchMessagesSection};
     use iggy_binary_protocol::{WireIdentifier, WirePartitioning};
@@ -308,6 +319,83 @@ mod tests {
         assert_eq!(
             decrypted.messages[1].header.payload_length as usize,
             PAYLOADS[1].len()
+        );
+    }
+
+    #[test]
+    fn given_a_message_that_does_not_decrypt_when_decoded_should_carry_its_record_as_served() {
+        let encryptor = Arc::new(EncryptorKind::Aes256Gcm(
+            Aes256GcmEncryptor::new(&KEY).unwrap(),
+        ));
+        let other = Arc::new(EncryptorKind::Aes256Gcm(
+            Aes256GcmEncryptor::new(&[8; 32]).unwrap(),
+        ));
+        let encrypted: Vec<_> = PAYLOADS
+            .iter()
+            .map(|payload| encryptor.encrypt(payload).unwrap())
+            .collect();
+        let encrypted: Vec<&[u8]> = encrypted.iter().map(Vec::as_slice).collect();
+        let records = records(&encrypted);
+        let section = FetchedSection::from_reply(&reply(&records, 2))
+            .unwrap()
+            .remove(0)
+            .with_encryptor(Some(other));
+
+        let error = section.decode_records().unwrap_err();
+
+        let first_frame =
+            BATCH_HEADER_SIZE..BATCH_HEADER_SIZE + BATCH_MESSAGE_HEADER_SIZE + encrypted[0].len();
+        assert_eq!(error.error, IggyError::CannotDecryptData);
+        assert_eq!(
+            error.record,
+            Some(Box::new(UndecodedRecord {
+                offset: Some(BASE_OFFSET),
+                bytes: records.slice(first_frame),
+            })),
+            "the record is the ciphertext frame as served"
+        );
+    }
+
+    #[test]
+    fn given_malformed_framing_when_decoded_should_carry_the_rest_without_an_offset() {
+        let mut records = records(&PAYLOADS).to_vec();
+        // The second frame claims a payload past the end of its batch.
+        let second_frame = BATCH_HEADER_SIZE + BATCH_MESSAGE_HEADER_SIZE + PAYLOADS[0].len();
+        let payload_length = second_frame + 36;
+        records[payload_length..payload_length + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let records = Bytes::from(records);
+        let section = FetchedSection::from_reply(&reply(&records, 2))
+            .unwrap()
+            .remove(0);
+
+        let error = section.decode_records().unwrap_err();
+
+        assert_eq!(error.error, IggyError::InvalidMessagePayloadLength);
+        let record = error.record.unwrap();
+        assert_eq!(
+            record.offset,
+            Some(BASE_OFFSET + 1),
+            "the frame decoded, so its offset is known"
+        );
+        assert_eq!(record.bytes, records.slice(second_frame..));
+
+        let mut records = self::records(&PAYLOADS).to_vec();
+        // A reserved byte of the batch header, so the header does not decode.
+        records[BATCH_HEADER_SIZE - 1] = 1;
+        let records = Bytes::from(records);
+        let section = FetchedSection::from_reply(&reply(&records, 2))
+            .unwrap()
+            .remove(0);
+
+        let error = section.decode_records().unwrap_err();
+
+        assert_eq!(
+            error.record,
+            Some(Box::new(UndecodedRecord {
+                offset: None,
+                bytes: records,
+            })),
+            "malformed framing isolates no record"
         );
     }
 }

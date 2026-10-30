@@ -183,7 +183,7 @@ pub async fn run(harness: &mut TestHarness) {
                     &PollingStrategy::next(),
                     PollOptions {
                         count: CONSUMER_BATCH_SIZE,
-                        server_commit: ServerCommitPolicy::OnRead,
+                        commit: CommitPolicy::OnRead,
                         ..PollOptions::default()
                     },
                 )

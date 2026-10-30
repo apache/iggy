@@ -17,7 +17,7 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::clients::reader_builder::{DEFAULT_MAX_WAIT, DEFAULT_PREFETCH_BYTES};
-use crate::prelude::{ClientCommitPolicy, IggyConsumer};
+use crate::prelude::IggyConsumer;
 use iggy_common::locking::IggyRwLock;
 use iggy_common::{
     Consumer, EncryptorKind, Identifier, IggyDuration, NonZeroIggyDuration, PollOptions,
@@ -39,7 +39,6 @@ pub struct IggyConsumerBuilder {
     poll_options: PollOptions,
     prefetch_bytes: u32,
     prefetch_messages: Option<u32>,
-    client_commit: ClientCommitPolicy,
     create_consumer_group_if_not_exists: bool,
     encryptor: Option<Arc<EncryptorKind>>,
     polling_retry_interval: NonZeroIggyDuration,
@@ -69,7 +68,6 @@ impl IggyConsumerBuilder {
             poll_options: PollOptions::wait(DEFAULT_MAX_WAIT.into()),
             prefetch_bytes: DEFAULT_PREFETCH_BYTES,
             prefetch_messages: None,
-            client_commit: ClientCommitPolicy::default(),
             create_consumer_group_if_not_exists: true,
             encryptor,
             polling_retry_interval: NonZeroIggyDuration::ONE_SECOND,
@@ -109,10 +107,10 @@ impl IggyConsumerBuilder {
         }
     }
 
-    /// Sets the limits of each request and who stores the offset of a read. Defaults to
-    /// [`PollOptions::wait`] of one second: at most 1000 messages and a 1 MiB reply, and the
-    /// application or the client commit policy stores offsets. A message larger than the reply
-    /// limit is fetched alone, without that limit.
+    /// Sets the limits of each request and the [`CommitPolicy`](iggy_common::CommitPolicy) of
+    /// the consumer. Defaults to [`PollOptions::wait`] of five seconds: at most 1000 messages and
+    /// a 1 MiB reply, and the application commits. A message larger than the reply limit comes
+    /// alone in its reply.
     pub fn poll_options(self, poll_options: PollOptions) -> Self {
         Self {
             poll_options,
@@ -133,18 +131,6 @@ impl IggyConsumerBuilder {
     pub fn prefetch_messages(self, prefetch_messages: u32) -> Self {
         Self {
             prefetch_messages: Some(prefetch_messages),
-            ..self
-        }
-    }
-
-    /// Sets when the consumer stores the position of the last message that it yielded.
-    /// Defaults to [`ClientCommitPolicy::default()`]: the consumer stores no offset, so a
-    /// restart with `Next` reads every message after the last checkpoint committed with
-    /// `commit` again. `init()` refuses a policy other than the default with
-    /// [`ServerCommitPolicy::OnRead`](iggy_common::ServerCommitPolicy::OnRead).
-    pub fn client_commit(self, client_commit: ClientCommitPolicy) -> Self {
-        Self {
-            client_commit,
             ..self
         }
     }
@@ -210,8 +196,8 @@ impl IggyConsumerBuilder {
         }
     }
 
-    /// Sets how long `shutdown()` waits for each background commit task to drain before the
-    /// reader closes. 5 seconds by default.
+    /// Sets how long `shutdown()` waits for the stores of `CommitPolicy::Auto` before the reader
+    /// closes. 5 seconds by default.
     pub fn offset_drain_timeout(self, timeout: IggyDuration) -> Self {
         Self {
             offset_drain_timeout: timeout,
@@ -234,7 +220,6 @@ impl IggyConsumerBuilder {
             self.poll_options,
             self.prefetch_bytes,
             self.prefetch_messages,
-            self.client_commit,
             self.create_consumer_group_if_not_exists,
             self.encryptor,
             self.polling_retry_interval,

@@ -76,10 +76,12 @@ use compio_quic::{
 use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::stream::{FuturesUnordered, StreamExt};
-use iggy_binary_protocol::codes::{FETCH_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE};
+use iggy_binary_protocol::codes::{
+    CANCEL_DEFERRED_REQUEST_CODE, FETCH_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE,
+};
 use iggy_binary_protocol::requests::messages::{DeferredPollMessagesRequest, FetchMessagesRequest};
 use iggy_binary_protocol::{
-    Command, GenericHeader, HEADER_SIZE, ReplyHeader, RequestHeader, WireDecode,
+    Command, GenericHeader, HEADER_SIZE, Operation, ReplyHeader, RequestHeader, WireDecode,
 };
 use server_common::Message;
 use std::cell::RefCell;
@@ -323,6 +325,13 @@ fn reply_route(frame: &BusMessage) -> ReplyRoute {
     read_u64(bytes, offset_of!(ReplyHeader, request)).map_or(ReplyRoute::Unkeyed, ReplyRoute::Keyed)
 }
 
+/// Whether `header` is a 108, which cancels a deferred request and gets no
+/// reply of its own.
+fn is_cancellation(header: &RequestHeader) -> bool {
+    header.operation == Operation::NonReplicated
+        && u32::from_le_bytes(header.reserved) == CANCEL_DEFERRED_REQUEST_CODE
+}
+
 /// The request id of a client frame, read as raw bytes like [`reply_route`],
 /// so a frame with an undeclared operation still has one.
 fn request_id(request: &Message<GenericHeader>) -> Option<u64> {
@@ -493,6 +502,19 @@ impl StreamContext<'_> {
         let header =
             bytemuck::checked::try_from_bytes::<RequestHeader>(&request.as_slice()[..HEADER_SIZE])
                 .ok();
+        // A cancellation gets no reply. Waiting under the id of the request it
+        // cancels could take that request's reply from the stream that waits
+        // for it, so it only passes through.
+        if header.is_some_and(is_cancellation) {
+            if in_tx.send(request).await.is_err() {
+                debug!(%label, %peer, "quic: inbound queue dropped");
+                return ControlFlow::Break(());
+            }
+            if let Err(e) = send.finish() {
+                debug!(%label, %peer, error = ?e, "quic: send.finish() failed");
+            }
+            return ControlFlow::Continue(());
+        }
         let cancellation = header.and_then(RequestHeader::deferred_cancellation);
         // Only a cancellable request waits, so one predicate decides both.
         let deferred_timeout = header
@@ -1210,6 +1232,52 @@ mod tests {
             .unwrap();
         let answer = read_answer(&mut next).await;
         assert_eq!(reply_header(answer.as_slice()).request, SECOND_REQUEST);
+
+        shutdown.trigger();
+        let _ = server.await;
+    }
+
+    /// A client cancels a committing request with a 108 on a new stream and
+    /// keeps the stream of the request open for the one reply that tells
+    /// whether the request stored anything.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn given_a_cancellation_on_its_own_stream_when_the_request_replies_should_answer_only_the_request_stream()
+     {
+        let (conn, client, _endpoints) = connect(TWO_STREAMS).await;
+        let (outbound, inbound, shutdown, server) = drive(conn);
+        let frame = fetch_request(FIRST_REQUEST, &fetch(NO_WAIT_US, FETCH_REQUEST_TIMEOUT_US));
+        let request_header =
+            *bytemuck::checked::from_bytes::<RequestHeader>(&frame.as_slice()[..HEADER_SIZE]);
+        let cancellation = request_header
+            .deferred_cancellation()
+            .expect("a fetch has a cancellation");
+        let mut cancel_frame = Message::<RequestHeader>::new(HEADER_SIZE);
+        cancel_frame
+            .as_mut_slice()
+            .copy_from_slice(bytemuck::bytes_of(&cancellation));
+        let mut original = send_frame(&client, frame).await;
+        assert_eq!(forwarded(&inbound).await, FIRST_REQUEST);
+        let mut cancel = send_frame(&client, cancel_frame.into_frozen()).await;
+        assert_eq!(
+            forwarded(&inbound).await,
+            FIRST_REQUEST,
+            "the cancellation reaches the server"
+        );
+
+        let ended = compio::time::timeout(
+            TEST_WAIT,
+            framing::read_message(&mut cancel, framing::MAX_MESSAGE_SIZE),
+        )
+        .await
+        .expect("the cancellation stream ends at once");
+        assert!(ended.is_err(), "a cancellation gets no answer");
+        outbound
+            .send(reply(FIRST_REQUEST, ANY_COMMIT))
+            .await
+            .unwrap();
+        let answer = read_answer(&mut original).await;
+        assert_eq!(reply_header(answer.as_slice()).request, FIRST_REQUEST);
 
         shutdown.trigger();
         let _ = server.await;

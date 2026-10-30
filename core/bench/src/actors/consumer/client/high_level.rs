@@ -68,7 +68,7 @@ impl HighLevelConsumerClient {
                 .consumer_group(&format!("cg_{cg_id}"), stream_id_str, TOPIC_ID)?
                 .polling_strategy(PollingStrategy::next())
                 .poll_options(PollOptions {
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..options
                 })
                 .create_consumer_group_if_not_exists()

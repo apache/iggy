@@ -69,29 +69,50 @@ extension IggyClient {
         return (try? Responses.sendConfirmations(body[...])) ?? SendMessagesResponse()
     }
 
-    /// Polls up to `count` messages.
+    /// Polls one partition, as `poll_messages` in the Rust SDK. The request
+    /// is deferred: the server answers once `minCount` messages are
+    /// readable, the next one would pass `maxBytes`, or `maxWait` ran out,
+    /// and then returns what there is, possibly nothing. A first message
+    /// larger than `maxBytes` comes alone in its own reply. The call takes
+    /// at most the request timeout of `options`, `maxWait` plus ten seconds.
     ///
-    /// A consumer-group poll with `partitionID` nil takes the next of the
-    /// member's assigned partitions, round-robin, syncing the assignment from
-    /// the coordinator when needed. A member holding no partitions gets an
-    /// empty result whose partition id is ``PolledMessages/noAssignedPartition``,
-    /// and a client that is not a member gets
-    /// ``IggyErrorCode/consumerGroupMemberNotFound``, so it can join again.
+    /// With ``CommitPolicy/onRead`` the server stores the offset of the last
+    /// message it returns, as part of the read. A cancelled caller of such a
+    /// poll that was sent waits for its one reply: `CancellationError` when
+    /// the server stored nothing, or the messages it stored as consumed.
+    /// ``CommitPolicy/auto(_:)`` is refused with
+    /// ``IggyErrorCode/invalidConfiguration``: a single poll has nothing to
+    /// count. Use a ``PartitionReader`` or an ``IggyConsumer`` for it.
     ///
-    /// With `autoCommit` the server stores the offset of the last polled
-    /// message as consumed. A `strategy` with a ``PollingStrategy/context``
-    /// is refused once its partition was recreated.
-    ///
-    /// With `options` the poll is deferred: the server answers once
-    /// `minCount` messages are readable, the next one would pass `maxBytes`,
-    /// or `maxWait` ran out, and then returns what there is, possibly
-    /// nothing. Invalid options fail before anything is sent. A deferred
-    /// consumer-group poll with `partitionID` nil fails before anything is
-    /// sent too, with ``IggyErrorCode/invalidCommand``. To wait on many
-    /// partitions, fetch each group of
-    /// ``readinessGroups(streamID:topicID:partitions:)`` with
-    /// ``fetchMessages(streamID:topicID:targets:consumer:count:autoCommit:options:)``.
+    /// Continue with ``PolledMessages/continuation``, which this call refuses
+    /// for another partition with ``IggyErrorCode/invalidCommand``, and
+    /// commit with ``storeConsumerPosition(consumer:streamID:topicID:checkpoint:)``.
+    /// Invalid options fail before anything is sent.
     public func pollMessages(
+        streamID: Identifier, topicID: Identifier, partitionID: UInt32, consumer: Consumer = .default, strategy: PollingStrategy,
+        options: PollOptions = PollOptions()
+    ) async throws -> PolledMessages {
+        if case .auto = options.commit {
+            throw IggyError(.invalidConfiguration, context: "a single poll has nothing to count, a PartitionReader commits automatically")
+        }
+        try strategy.validate(partitionID: partitionID)
+        try options.validate()
+        var polled = try await pollMessages(
+            streamID: streamID, topicID: topicID, partitionID: partitionID, consumer: consumer, strategy: strategy, count: options.count,
+            autoCommit: options.commitsOnRead, options: options.deferred)
+        polled.start = strategy
+        return polled
+    }
+
+    /// One poll with the wire limits of the caller: command 100 without
+    /// `options`, else command 106. A consumer-group poll with `partitionID`
+    /// nil takes the next of the member's assigned partitions, round-robin,
+    /// syncing the assignment from the coordinator when needed. A member
+    /// holding no partitions gets an empty result whose partition id is
+    /// ``PolledMessages/noAssignedPartition``, and a client that is not a
+    /// member gets ``IggyErrorCode/consumerGroupMemberNotFound``. A deferred
+    /// consumer-group poll names its partition.
+    func pollMessages(
         streamID: Identifier, topicID: Identifier, partitionID: UInt32?, consumer: Consumer = .default, strategy: PollingStrategy, count: UInt32,
         autoCommit: Bool, options: DeferredPollOptions? = nil
     ) async throws -> PolledMessages {
@@ -103,7 +124,7 @@ extension IggyClient {
     /// ``pollMessages(streamID:topicID:partitionID:consumer:strategy:count:autoCommit:options:)``
     /// with the strategy chosen once the partition is known, so a caller can
     /// continue each partition from its own position.
-    public func pollMessages(
+    func pollMessages(
         streamID: Identifier, topicID: Identifier, partitionID: UInt32?, consumer: Consumer = .default, count: UInt32, autoCommit: Bool,
         options: DeferredPollOptions? = nil, strategyFor: @Sendable (UInt32) -> PollingStrategy
     ) async throws -> PolledMessages {
@@ -126,53 +147,21 @@ extension IggyClient {
 
     /// Fetches up to `count` messages from the partitions of one readiness
     /// group, in one request to the primary of the group, as
-    /// `fetch_messages` in the Rust SDK. Group the partitions with
-    /// ``readinessGroups(streamID:topicID:partitions:)``.
+    /// `fetch_messages` in the Rust SDK. Only a ``PartitionReader`` builds
+    /// its targets: every target must share the primary of the first one.
     ///
-    /// The server holds the fetch until the targets hold `minCount` messages
-    /// together or `maxWait` ran out. Then it reads the targets that hold
-    /// messages, in the order of `targets`, while `count` and `maxBytes`,
-    /// which cap the whole reply, leave room: a target is read up to its
-    /// share or not at all in this fetch. A caller that moves the targets
-    /// that returned messages to the end of its next fetch reads every target
-    /// in turn.
-    ///
-    /// Each start point is ``PollingStrategy/offset(_:context:)`` or
-    /// ``PollingStrategy/next``, and each partition appears once, at most
-    /// 1000 of them. A target without a ``PollingStrategy/context``, or with
-    /// one of incarnation zero, is fenced with the incarnation of its route.
-    /// Invalid options fail before routing. At wire microsecond precision,
-    /// the initial request timeout must exceed one second and be at least
-    /// one second past `maxWait`.
-    ///
-    /// The reply holds a section per target that was read or failed, in
-    /// reply order. The next fetch of a partition that was read starts at
-    /// its ``FetchSection/nextOffset``, under the context of the section. A
-    /// section with an error, and a target the reply has no section for,
-    /// keep the start point of this fetch. A ``IggyErrorCode/notPrimary``
-    /// section or refusal marks the routes of its partitions moved, so the
-    /// next grouping finds their new primaries. A
-    /// ``IggyErrorCode/historyUnavailable`` or
-    /// ``IggyErrorCode/consumerGroupPartitionNotOwned`` one drops their
-    /// routes, so the next fetch fences them with fresh contexts.
-    ///
-    /// With `autoCommit` the server stores the offset of the last message of
-    /// each section as consumed. A fetch with `autoCommit` or a `next` target
-    /// orders progress polls and offset stores/deletes on every target of
-    /// this client, across connections and identifier spellings. Waiting for
-    /// that order is cancellable and consumes the request timeout. Once an
-    /// auto-committing fetch is admitted, a cancelled caller waits for its
-    /// reply, since it can hold messages the server stored as consumed.
-    /// An unknown committing outcome is never replayed. It fails with
-    /// ``IggyErrorCode/fetchProgressUncertain`` and a local recovery handle,
-    /// retaining progress blocks on every uncertain target across reconnects.
-    /// Later progress calls fail with ``IggyErrorCode/partitionLaneBlocked``
-    /// and the target and handle. ``abandonOperation(_:)`` explicitly accepts
-    /// that the old read can still complete and releases those local blocks.
-    /// A partial reply keeps healthy sections and attaches the handle to each
-    /// uncertain section's error. A noncommitting fetch keeps its existing
-    /// ``IggyErrorCode/transientNotCommitted`` behavior without retention.
-    public func fetchMessages(
+    /// Each start point is an offset or `next`, and each partition appears
+    /// once, at most 1000 of them. A target without a context is fenced with
+    /// the incarnation of its route. The reply holds a section per target
+    /// that was read or failed. A `notPrimary` section or refusal marks the
+    /// routes of its partitions moved, a `historyUnavailable` or
+    /// `consumerGroupPartitionNotOwned` one drops them. A fetch with
+    /// `autoCommit` or a `next` target orders progress polls and offset
+    /// stores of its targets. A cancelled caller of a fetch with
+    /// `autoCommit` that was sent waits for its one reply. A lost reply of
+    /// such a fetch fails with ``IggyErrorCode/transientNotCommitted``, and
+    /// it is never sent again.
+    func fetchMessages(
         streamID: Identifier, topicID: Identifier, targets: [(partitionID: UInt32, strategy: PollingStrategy)], consumer: Consumer = .default,
         count: UInt32, autoCommit: Bool, options: DeferredPollOptions = DeferredPollOptions()
     ) async throws -> [FetchSection] {
@@ -196,11 +185,8 @@ extension IggyClient {
     /// `partitions` grouped by the replica that is their primary, as
     /// `readiness_groups` in the Rust SDK: one group per primary, in replica
     /// order, split into groups of at most 1000 partitions, each in the
-    /// order of `partitions`. On a single node they form one group. Fetch
-    /// each group with one
-    /// ``fetchMessages(streamID:topicID:targets:consumer:count:autoCommit:options:)``.
-    /// A route that cannot be looked up fails the call.
-    public func readinessGroups(streamID: Identifier, topicID: Identifier, partitions: [UInt32]) async throws -> [[UInt32]] {
+    /// order of `partitions`.
+    func readinessGroups(streamID: Identifier, topicID: Identifier, partitions: [UInt32]) async throws -> [[UInt32]] {
         let lineage = try await requireAuthenticated()
         return try await core.pollRouter.primaryGroups(
             stream: streamID, topic: topicID, partitions: partitions, lineage: lineage, coordinator: core,
@@ -258,48 +244,20 @@ extension IggyClient {
         let result: (body: [UInt8], sections: [FetchSection])
         do {
             result = try await router.withProgress(progressKeys, deadline: started + options.requestTimeout) {
-                let attempt = autoCommit ? try router.reserveFetch(progressKeys) : nil
-                defer {
-                    if let attempt { router.releaseFetch(attempt) }
-                }
-                let deferred = PollRouter.Deferred(options: options, started: started, fetchAttempt: attempt) { remaining in
+                let deferred = PollRouter.Deferred(options: options, started: started, commits: autoCommit) { remaining in
                     try Requests.fetchMessages(
                         consumer: consumer, streamID: streamID, topicID: topicID, targets: targets, count: count, autoCommit: autoCommit, options: remaining)
                 }
-                @Sendable func send() async throws -> [UInt8] {
-                    try await router.send(
-                        .fetchMessages, body: .deferred(deferred), key: routing, context: .empty, lineage: lineage, coordinator: core,
-                        deadline: deferred.deadline)
+                let body = try await router.send(
+                    .fetchMessages, body: .deferred(deferred), key: routing, context: .empty, lineage: lineage, coordinator: core,
+                    deadline: deferred.deadline)
+                let sections = try Responses.fetchSections(body[...])
+                let requested = Set(targets.map(\.partitionID))
+                let returned = Set(sections.map(\.partitionID))
+                guard returned.count == sections.count, returned.isSubset(of: requested) else {
+                    throw IggyError(.invalidCommand, context: "a fetch reply repeats or adds a partition")
                 }
-                do {
-                    let body = autoCommit ? try await Task { try await send() }.value : try await send()
-                    var sections = try Responses.fetchSections(body[...])
-                    let requested = Set(targets.map(\.partitionID))
-                    let returned = Set(sections.map(\.partitionID))
-                    guard returned.count == sections.count, returned.isSubset(of: requested) else {
-                        throw IggyError(.invalidCommand, context: "a fetch reply repeats or adds a partition")
-                    }
-                    if let attempt {
-                        let uncertain = Set(
-                            sections.compactMap { section in
-                                section.error.flatMap { PollRouter.fetchSectionRefused($0.code) ? nil : section.partitionID }
-                            })
-                        if !uncertain.isEmpty {
-                            _ = router.retainFetch(attempt, keys: progressKeys.filter { uncertain.contains($0.partitionID) })
-                            for index in sections.indices where uncertain.contains(sections[index].partitionID) {
-                                sections[index].uncertainty = IggyError(
-                                    .fetchProgressUncertain, context: sections[index].error?.description, operationID: attempt.id,
-                                    partitionID: sections[index].partitionID)
-                            }
-                        }
-                    }
-                    return (body, sections)
-                } catch {
-                    if let attempt, attempt.mayHaveCommitted {
-                        throw router.retainFetch(attempt, keys: progressKeys, cause: "\(error)")
-                    }
-                    throw error
-                }
+                return (body, sections)
             }
         } catch let error as IggyError where error.code == .notPrimary {
             router.mayHaveMoved(keys)
@@ -325,6 +283,26 @@ extension IggyClient {
         code == .historyUnavailable || code == .consumerGroupPartitionNotOwned
     }
 
+    /// One deferred poll of one partition, its reply body undecoded, so a
+    /// reader can name the bytes of a message that does not decode.
+    func pollBody(
+        streamID: Identifier, topicID: Identifier, partitionID: UInt32, consumer: Consumer, strategy: PollingStrategy, count: UInt32,
+        autoCommit: Bool, options: DeferredPollOptions
+    ) async throws -> [UInt8] {
+        let started = ContinuousClock.now
+        try options.validate(count: count)
+        let lineage = try await requireAuthenticated(within: started + options.requestTimeout)
+        let payload = try Requests.pollMessages(
+            consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID, strategy: strategy, count: count, autoCommit: autoCommit)
+        let deferred = PollRouter.Deferred(options: options, started: started, commits: autoCommit) { remaining in
+            try Requests.pollMessages(
+                consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID, strategy: strategy, count: count,
+                autoCommit: autoCommit, options: remaining)
+        }
+        return try await routedPartitionRequest(
+            .pollMessagesDeferred, payload: payload, deferred: deferred, context: strategy.context, lineage: lineage)
+    }
+
     /// One poll of one partition. With `options` it is deferred: command 106,
     /// the body of a poll followed by the options left for each attempt.
     private func poll(
@@ -337,7 +315,7 @@ extension IggyClient {
             return try Responses.polledMessages(
                 try await routedPartitionRequest(.pollMessages, payload: payload, context: strategy.context, lineage: lineage)[...])
         }
-        let deferred = PollRouter.Deferred(options: options, started: started) { remaining in
+        let deferred = PollRouter.Deferred(options: options, started: started, commits: autoCommit) { remaining in
             try Requests.pollMessages(
                 consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID, strategy: strategy, count: count,
                 autoCommit: autoCommit, options: remaining)
@@ -480,6 +458,9 @@ extension IggyClient {
             return
         }
         let assignment = try Responses.consumerGroupAssignment(body[...])
+        logger.debug(
+            "Synced the consumer group assignment",
+            metadata: ["group": "\(groupID)", "generation": "\(assignment.generation)", "partitions": "\(assignment.partitions)"])
         state.applySync(key, member: (assignment.generation, assignment.partitions), scope: scope)
     }
 
@@ -570,16 +551,28 @@ extension IggyClient {
             context: nil, lineage: lineage)
     }
 
-    /// Stores a checkpoint under the partition context of the poll that
-    /// delivered it. It is refused once the partition was recreated or, for a
-    /// consumer group, reassigned since.
-    public func storeConsumerPosition(consumer: Consumer = .default, streamID: Identifier, topicID: Identifier, position: ConsumerPosition) async throws {
+    /// Stores the offset of a checkpoint under the partition context of the
+    /// read that delivered it, as `store_consumer_position` in the Rust SDK.
+    /// It is refused with ``IggyErrorCode/historyUnavailable`` once the
+    /// partition was recreated and, for a consumer group, with
+    /// ``IggyErrorCode/consumerGroupPartitionNotOwned`` once it was
+    /// reassigned.
+    public func storeConsumerPosition(consumer: Consumer = .default, streamID: Identifier, topicID: Identifier, checkpoint: Checkpoint) async throws {
         let lineage = try await requireAuthenticated()
         _ = try await routedPartitionRequest(
             .storeConsumerOffset,
             payload: Requests.storeConsumerOffset(
-                consumer: consumer, streamID: streamID, topicID: topicID, partitionID: position.partitionID, offset: position.offset, ack: .quorum),
-            context: position.context, lineage: lineage)
+                consumer: consumer, streamID: streamID, topicID: topicID, partitionID: checkpoint.partitionID, offset: checkpoint.offset, ack: .quorum),
+            context: checkpoint.context, lineage: lineage)
+    }
+
+    /// Deletes the stored offset of the partition of a checkpoint under the
+    /// partition context of the read that delivered it, refused as
+    /// ``storeConsumerPosition(consumer:streamID:topicID:checkpoint:)`` is.
+    /// The offset of the checkpoint is not used.
+    public func deleteConsumerPosition(consumer: Consumer = .default, streamID: Identifier, topicID: Identifier, checkpoint: Checkpoint) async throws {
+        try await deleteConsumerOffset(
+            consumer: consumer, streamID: streamID, topicID: topicID, partitionID: checkpoint.partitionID, context: checkpoint.context)
     }
 
     /// The stored offset of a consumer on a partition, or nil when none is
@@ -594,6 +587,17 @@ extension IggyClient {
             .getConsumerOffset, payload: Requests.getConsumerOffset(consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID),
             context: nil, lineage: lineage)
         return body.isEmpty ? nil : try Responses.consumerOffset(body[...])
+    }
+
+    func consumerOffsetNext(
+        consumer: Consumer, streamID: Identifier, topicID: Identifier, partitionID: UInt32, context: PartitionContext
+    ) async throws -> UInt64 {
+        let lineage = try await requireAuthenticated()
+        let body = try await routedPartitionRequest(
+            .getConsumerOffset, payload: Requests.getConsumerOffset(consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID),
+            context: context, lineage: lineage)
+        let offset = body.isEmpty ? nil : try Responses.consumerOffset(body[...])
+        return offset.map { $0.storedOffset == .max ? .max : $0.storedOffset + 1 } ?? 0
     }
 
     /// Deletes the stored offset of a consumer on a partition. A nil
@@ -636,7 +640,7 @@ extension IggyClient {
         case .pollMessagesDeferred:
             let started = ContinuousClock.now
             let request = try RawRequest.deferredPoll(payload)
-            let deferred = PollRouter.Deferred(options: request.options, started: started) { remaining in
+            let deferred = PollRouter.Deferred(options: request.options, started: started, commits: request.autoCommit) { remaining in
                 var writer = ByteWriter(capacity: payload.count)
                 writer.write(request.poll)
                 try remaining.encode(into: &writer)
@@ -668,7 +672,7 @@ extension IggyClient {
 
 /// Reads the partition a raw request names. A payload that does not decode
 /// fails with ``IggyErrorCode/invalidCommand`` before anything is sent.
-private enum RawRequest {
+enum RawRequest {
     /// `[kind:1][value:8]`.
     static let strategySize = 9
 
@@ -690,6 +694,7 @@ private enum RawRequest {
         /// The poll without its options.
         let poll: [UInt8]
         let options: DeferredPollOptions
+        let autoCommit: Bool
     }
 
     struct Fetch {
@@ -747,14 +752,14 @@ private enum RawRequest {
     /// the Rust SDK.
     static func deferredPoll(_ payload: [UInt8]) throws -> DeferredPoll {
         try decode(payload) { reader in
-            let count = try readPollCount(&reader)
+            let (count, autoCommit) = try readPollCount(&reader)
             let poll = Array(payload[..<reader.position])
             let options = DeferredPollOptions(
                 maxWait: .microseconds(try reader.readUInt64()), minCount: try reader.readUInt32(), maxBytes: try reader.readUInt32(),
                 requestTimeout: .microseconds(try reader.readUInt64()))
             try requireEnd(reader)
             try options.validate(count: count)
-            return DeferredPoll(poll: poll, options: options)
+            return DeferredPoll(poll: poll, options: options, autoCommit: autoCommit)
         }
     }
 
@@ -790,13 +795,12 @@ private enum RawRequest {
         }
     }
 
-    /// Reads a poll to its end and returns the count it asks for.
-    private static func readPollCount(_ reader: inout ByteReader) throws -> UInt32 {
+    /// Reads a poll to its end and returns the count it asks for and its
+    /// auto-commit flag.
+    private static func readPollCount(_ reader: inout ByteReader) throws -> (count: UInt32, autoCommit: Bool) {
         _ = try readConsumerTarget(&reader)
         try reader.skip(strategySize)
-        let count = try reader.readUInt32()
-        _ = try reader.readBool()
-        return count
+        return (try reader.readUInt32(), try reader.readBool())
     }
 
     private static func readConsumerTarget(_ reader: inout ByteReader) throws -> ConsumerTarget {

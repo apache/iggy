@@ -87,7 +87,7 @@ func receive[T any](t *testing.T, channel <-chan T, what string) T {
 
 func pollDeferred(ctx context.Context, t *testing.T, client *IggyTcpClient, partition uint32, options iggcon.DeferredPollOptions) (*iggcon.PolledMessage, error) {
 	consumer := iggcon.NewSingleConsumer(numericIdentifier(t, 3))
-	return client.PollMessagesDeferred(ctx, numericIdentifier(t, 1), numericIdentifier(t, 2), consumer,
+	return client.pollMessagesDeferred(ctx, numericIdentifier(t, 1), numericIdentifier(t, 2), consumer,
 		iggcon.OffsetPollingStrategy(0), 1, false, &partition, options)
 }
 
@@ -121,7 +121,7 @@ func TestPollMessagesDeferred_CancelSendsTheCancellationOnTheSameLink(t *testing
 	require.ErrorIs(t, receive(t, polled, "the cancelled poll"), ierror.ErrTransientNotCommitted)
 	requireCancellationOf(t, deferred, receive(t, cancellations, "the cancellation"))
 	partition := uint32(2)
-	after, err := client.PollMessages(context.Background(), numericIdentifier(t, 1), numericIdentifier(t, 2),
+	after, err := client.pollMessages(context.Background(), numericIdentifier(t, 1), numericIdentifier(t, 2),
 		iggcon.NewSingleConsumer(numericIdentifier(t, 3)), iggcon.OffsetPollingStrategy(0), 1, false, &partition)
 	require.NoError(t, err, "the link stays usable after a cancellation")
 	assert.Equal(t, partition, after.PartitionId, "the late reply of the cancelled poll is dropped")
@@ -131,6 +131,97 @@ func TestPollMessagesDeferred_CancelSendsTheCancellationOnTheSameLink(t *testing
 		defer link.mu.Unlock()
 		return len(link.pending) == 0 && len(link.capacity) == 0
 	}, deferredTestTimeout, managedLinkPoll, "the cancelled poll keeps no pending entry or capacity slot")
+}
+
+// The server answers a cancelled poll that stores its offset once: refused when
+// the cancel won, or with what it read and stored. So the call waits for that
+// reply, which tells the caller whether the offset moved.
+func TestPollMessagesDeferred_ACancelledCommittingPollReturnsTheReplyToItsCancellation(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		stored bool
+	}{
+		{"cancel_won", false},
+		{"read_stored_first", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client, serverConn := newPipeClient(t)
+			parked := make(chan request, 1)
+			cancellations := make(chan request, 1)
+			servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+				switch read.code() {
+				case uint32(command.PollMessagesDeferredCode):
+					parked <- read
+					return nil
+				case uint32(command.CancelDeferredRequestCode):
+					cancellations <- read
+					// The cancellation names the request id of the poll, so this answers the poll.
+					if tt.stored {
+						return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(1))
+					}
+					return statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.TransientNotAcceptedCode), nil)
+				default:
+					t.Errorf("unexpected command %d", read.code())
+					return nil
+				}
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			type outcome struct {
+				polled *iggcon.PolledMessage
+				err    error
+			}
+			polled := make(chan outcome, 1)
+			go func() {
+				partition := uint32(1)
+				result, err := client.pollMessagesDeferred(ctx, numericIdentifier(t, 1), numericIdentifier(t, 2),
+					iggcon.NewSingleConsumer(numericIdentifier(t, 3)), iggcon.NextPollingStrategy(), 1, true,
+					&partition, deferredOptions(5*time.Second, 10*time.Second))
+				polled <- outcome{result, err}
+			}()
+			deferred := receive(t, parked, "the committing poll")
+
+			cancel()
+
+			requireCancellationOf(t, deferred, receive(t, cancellations, "the cancellation"))
+			result := receive(t, polled, "the cancelled committing poll")
+			if tt.stored {
+				require.NoError(t, result.err)
+				assert.Equal(t, uint32(1), result.polled.PartitionId)
+				return
+			}
+			require.ErrorIs(t, result.err, ierror.ErrTransientNotAccepted)
+		})
+	}
+}
+
+// The server can have stored the offset of a committing poll whose reply is
+// lost, which only a later read shows.
+func TestPollMessages_ALostReplyOfACommittingPollIsUncertainProgress(t *testing.T) {
+	for _, deferred := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deferred_%t", deferred), func(t *testing.T) {
+			client, serverConn := newPipeClient(t)
+			servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+				if read.code() == uint32(command.PollMessagesCode) || read.code() == uint32(command.PollMessagesDeferredCode) {
+					_ = serverConn.Close()
+					return nil
+				}
+				t.Errorf("unexpected command %d", read.code())
+				return nil
+			})
+			partition := uint32(1)
+			consumer := iggcon.NewSingleConsumer(numericIdentifier(t, 3))
+			var err error
+			if deferred {
+				_, err = client.pollMessagesDeferred(context.Background(), numericIdentifier(t, 1), numericIdentifier(t, 2),
+					consumer, iggcon.NextPollingStrategy(), 1, true, &partition, deferredOptions(time.Second, 3*time.Second))
+			} else {
+				_, err = client.pollMessages(context.Background(), numericIdentifier(t, 1), numericIdentifier(t, 2),
+					consumer, iggcon.NextPollingStrategy(), 1, true, &partition)
+			}
+
+			require.ErrorIs(t, err, ierror.FetchProgressUncertain{})
+		})
+	}
 }
 
 func TestPollMessages_CancelOfAnImmediatePollSendsNoCancellation(t *testing.T) {
@@ -146,7 +237,7 @@ func TestPollMessages_CancelOfAnImmediatePollSendsNoCancellation(t *testing.T) {
 	})
 	partition := uint32(1)
 	poll := func(ctx context.Context) error {
-		_, err := client.PollMessages(ctx, numericIdentifier(t, 1), numericIdentifier(t, 2),
+		_, err := client.pollMessages(ctx, numericIdentifier(t, 1), numericIdentifier(t, 2),
 			iggcon.NewSingleConsumer(numericIdentifier(t, 3)), iggcon.OffsetPollingStrategy(0), 1, false, &partition)
 		return err
 	}
@@ -263,6 +354,43 @@ func TestPollMessagesDeferred_ParksAtMostTheDeferredLimit(t *testing.T) {
 	receive(t, parked, "the deferred poll that waited for a free slot")
 }
 
+// Progress polls of one partition queue behind its parked poll. They take no
+// deferred slot while they wait, so a poll of another partition still parks.
+func TestPollMessagesDeferred_PollsQueuedOnAProgressLaneLeaveTheSlotsFree(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	parked := make(chan request, maxDeferredRequests+1)
+	servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+		if read.code() == uint32(command.PollMessagesDeferredCode) {
+			parked <- read
+		}
+		return nil
+	}, 3)
+	calls := newLaneCalls(t)
+	ctx, cancelAll := context.WithCancel(context.Background())
+	var polls sync.WaitGroup
+	defer func() {
+		cancelAll()
+		polls.Wait()
+	}()
+	options := deferredOptions(10*time.Second, 15*time.Second)
+	for range maxDeferredRequests {
+		polls.Go(func() {
+			_, _ = client.pollMessagesDeferred(ctx, calls.stream, calls.topic, calls.consumer,
+				iggcon.NextPollingStrategy(), 1, false, &calls.partition, options)
+		})
+	}
+	receive(t, parked, "the progress poll that holds the lane")
+	require.Eventually(t, func() bool { return progressLaneWaiters(client) == maxDeferredRequests-1 },
+		deferredTestTimeout, managedLinkPoll, "the other progress polls wait for the lane")
+
+	polls.Go(func() { _, _ = pollDeferred(ctx, t, client, 2, options) })
+
+	read := receive(t, parked, "the poll of another partition")
+	query, err := partitionQuery(command.PollMessagesDeferredCode, read.payload)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(2), binary.LittleEndian.Uint32(query[len(query)-partitionIdSize:]))
+}
+
 // A parked Next or auto-commit poll holds the progress lane of its partition.
 // The offset calls of that partition wait for it, and a send does not.
 func TestPollMessagesDeferred_AParkedProgressPollHoldsOffsetCallsButNotSends(t *testing.T) {
@@ -293,6 +421,10 @@ func TestPollMessagesDeferred_AParkedProgressPollHoldsOffsetCallsButNotSends(t *
 						parked <- struct{}{}
 						return nil
 					case uint32(command.CancelDeferredRequestCode):
+						if progress.autoCommit {
+							// A cancelled poll that stores its offset gets one reply: the cancel won.
+							return statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.TransientNotAcceptedCode), nil)
+						}
 						return nil
 					case uint32(command.SendMessagesCode):
 						return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
@@ -313,7 +445,7 @@ func TestPollMessagesDeferred_AParkedProgressPollHoldsOffsetCallsButNotSends(t *
 				defer cancel()
 				polled := make(chan error, 1)
 				go func() {
-					_, err := client.PollMessagesDeferred(ctx, calls.stream, calls.topic, calls.consumer, progress.strategy, 1,
+					_, err := client.pollMessagesDeferred(ctx, calls.stream, calls.topic, calls.consumer, progress.strategy, 1,
 						progress.autoCommit, &calls.partition, deferredOptions(5*time.Second, 10*time.Second))
 					polled <- err
 				}()
@@ -329,7 +461,11 @@ func TestPollMessagesDeferred_AParkedProgressPollHoldsOffsetCallsButNotSends(t *
 				assert.Zero(t, offsetsSent(), "the offset call is not sent while the poll is parked")
 
 				cancel()
-				require.ErrorIs(t, receive(t, polled, "the cancelled poll"), ierror.ErrTransientNotCommitted)
+				var cancelled error = ierror.ErrTransientNotCommitted
+				if progress.autoCommit {
+					cancelled = ierror.ErrTransientNotAccepted
+				}
+				require.ErrorIs(t, receive(t, polled, "the cancelled poll"), cancelled)
 				require.NoError(t, receive(t, offsetDone, "the offset call"))
 				assert.Equal(t, 1, offsetsSent())
 			})
@@ -373,7 +509,7 @@ func TestPollMessagesDeferred_RefusesAGroupPollWithoutAPartition(t *testing.T) {
 	})
 	streamId, topicId, consumer := groupConsumer(t)
 
-	_, err := client.PollMessagesDeferred(context.Background(), streamId, topicId, consumer,
+	_, err := client.pollMessagesDeferred(context.Background(), streamId, topicId, consumer,
 		iggcon.NextPollingStrategy(), 1, true, nil, deferredOptions(time.Second, 2*time.Second))
 
 	require.ErrorIs(t, err, ierror.ErrInvalidCommand)
@@ -846,7 +982,7 @@ func TestFetchMessages_UnknownCommitBlocksProgressWithAnExplicitZeroContext(t *t
 		}},
 		{"poll", func() error { return calls.poll(t.Context(), client, strategy, false) }},
 		{"deferred", func() error {
-			_, err := client.PollMessagesDeferred(t.Context(), calls.stream, calls.topic, calls.consumer,
+			_, err := client.pollMessagesDeferred(t.Context(), calls.stream, calls.topic, calls.consumer,
 				strategy, 1, false, &calls.partition, deferredOptions(0, 2*time.Second))
 			return err
 		}},
@@ -927,6 +1063,9 @@ func TestFetchMessages_LiveUnknownCommitBlocksAcrossConnectionsAndSessionChanges
 					return statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.TransientNotCommittedCode), nil), true
 				case command.GetOffsetCode:
 					return replyFrame(vsr.OperationNonReplicated, consumerOffsetBody(1)), true
+				case command.CancelDeferredRequestCode:
+					// The cancel reaches the server after the fetch held its reply, so nothing answers it.
+					return nil, true
 				}
 				return nil, false
 			}, func(_ int, read request) ([]byte, bool) {
@@ -1149,7 +1288,7 @@ func TestFetchMessages_CancelBeforeSendReleasesEveryAcquiredLane(t *testing.T) {
 	polled := make(chan error, 1)
 	go func() {
 		partition := uint32(2)
-		_, err := client.PollMessagesDeferred(context.Background(), calls.stream, calls.topic, calls.consumer,
+		_, err := client.pollMessagesDeferred(context.Background(), calls.stream, calls.topic, calls.consumer,
 			iggcon.NextPollingStrategy(), 1, false, &partition, deferredOptions(5*time.Second, 10*time.Second))
 		polled <- err
 	}()
@@ -1316,15 +1455,13 @@ func TestFetchMessages_ClassifiesCorrelatedReplyBeforeSessionReset(t *testing.T)
 						client.invalidateSessionLocked()
 					}
 				}()
+				// The server stored the offsets of the served sections, so the
+				// caller gets them even when its sign-in ended.
 				outcome := receive(t, fetched, "the classified old-session reply")
-				if explicit {
-					require.ErrorIs(t, outcome.err, ierror.ErrUnauthenticated)
-				} else {
-					require.NoError(t, outcome.err)
-					require.Len(t, outcome.sections, len(sections))
-					assert.Equal(t, uint64(7), outcome.sections[0].NextOffset)
-					assert.NoError(t, outcome.sections[0].Err)
-				}
+				require.NoError(t, outcome.err)
+				require.Len(t, outcome.sections, len(sections))
+				assert.Equal(t, uint64(7), outcome.sections[0].NextOffset)
+				assert.NoError(t, outcome.sections[0].Err)
 				client.operations.mu.Lock()
 				_, healthyBlocked := client.operations.fetchBlocked[laneKey{partition: 1, incarnation: 17, progress: true}]
 				unknown := client.operations.fetchBlocked[laneKey{partition: 2, incarnation: 17, progress: true}]
@@ -1466,7 +1603,7 @@ func TestFetchMessages_FencesAgainThePartitionsThatLostTheirRoutes(t *testing.T)
 // A cancel after the read of a fetch with auto-commit drops what it stored,
 // so the client tells the server to drop only a fetch without auto-commit. A
 // fetch with auto-commit returns its reply also after its context ended.
-func TestFetchMessages_CancelSendsTheCancellationOnlyWithoutAutoCommit(t *testing.T) {
+func TestFetchMessages_CancelSendsTheCancellationAndACommittingFetchWaitsForItsReply(t *testing.T) {
 	calls := newLaneCalls(t)
 	for _, tt := range []struct {
 		name       string
@@ -1496,9 +1633,9 @@ func TestFetchMessages_CancelSendsTheCancellationOnlyWithoutAutoCommit(t *testin
 
 			cancel()
 
+			requireCancellationOf(t, fetch, receive(t, cancellations, "the cancellation"))
 			if !tt.autoCommit {
 				require.ErrorIs(t, receive(t, fetched, "the cancelled fetch").err, ierror.ErrTransientNotCommitted)
-				requireCancellationOf(t, fetch, receive(t, cancellations, "the cancellation"))
 				return
 			}
 			select {
@@ -1511,7 +1648,6 @@ func TestFetchMessages_CancelSendsTheCancellationOnlyWithoutAutoCommit(t *testin
 			require.NoError(t, outcome.err)
 			require.Len(t, outcome.sections, 1)
 			assert.Equal(t, uint64(5), outcome.sections[0].NextOffset)
-			assert.Empty(t, cancellations)
 		})
 	}
 }

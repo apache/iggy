@@ -238,7 +238,7 @@ async fn execute_using_none_key(client: &IggyClient) {
 fn single_committed_message() -> PollOptions {
     PollOptions {
         count: 1,
-        server_commit: ServerCommitPolicy::OnRead,
+        commit: CommitPolicy::OnRead,
         ..PollOptions::default()
     }
 }

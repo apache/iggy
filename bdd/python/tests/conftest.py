@@ -81,6 +81,7 @@ def pytest_configure(config: pytest.Config) -> None:
         "stream-options: shared stream option scenarios",
         "resource-options-patch: shared resource patch scenarios",
         "metadata-changes: shared metadata change log scenarios",
+        "deferred-polling: shared deferred polling scenarios",
         "serial: scenarios that must not share the server with other runs",
         "message-headers: scenarios that assert message headers",
         "describe-options: scenarios that assert the option catalog",

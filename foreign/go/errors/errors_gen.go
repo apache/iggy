@@ -2901,7 +2901,7 @@ type FetchProgressUncertain struct {
 }
 
 func (e FetchProgressUncertain) Error() string {
-	return fmt.Sprintf("fetch %d has unknown progress; explicit abandonment is required", e.OperationID)
+	return fmt.Sprintf("read %d has an unknown outcome: the server can have stored its offset", e.OperationID)
 }
 func (e FetchProgressUncertain) Code() Code { return 14010 }
 func (e FetchProgressUncertain) Is(target error) bool {

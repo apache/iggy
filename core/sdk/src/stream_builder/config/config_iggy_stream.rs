@@ -89,6 +89,7 @@ impl IggyStreamConfig {
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use std::time::Duration;
 
     const BATCH_LENGTH: u32 = 100;
 
@@ -128,7 +129,10 @@ mod tests {
         let config = IggyStreamConfig::default();
         assert_eq!(config.consumer_config().stream_name(), "test_stream");
         assert_eq!(config.producer_config().topic_name(), "test_topic");
-        assert_eq!(config.consumer_config().poll_options(), poll_options());
+        assert_eq!(
+            config.consumer_config().poll_options(),
+            PollOptions::wait(IggyDuration::from(Duration::from_secs(5)))
+        );
         assert_eq!(config.producer_config().batch_length(), BATCH_LENGTH);
         assert_eq!(
             config.producer_config().linger_time(),

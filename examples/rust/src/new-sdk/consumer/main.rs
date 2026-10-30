@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     .polling_strategy(PollingStrategy::next())
     .poll_options(PollOptions {
         count: args.messages_per_batch,
-        server_commit: ServerCommitPolicy::OnRead,
+        commit: CommitPolicy::OnRead,
         ..PollOptions::wait(IggyDuration::ONE_SECOND)
     })
     .build();

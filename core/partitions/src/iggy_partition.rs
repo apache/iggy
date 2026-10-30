@@ -1278,6 +1278,7 @@ where
             .remove(&ConsumerGroupId(group_id as usize));
         self.mark_consumer_group_offsets_need_reconcile();
         self.fence_published.set(true);
+        self.publish_poll_visibility();
         Ok(())
     }
 
@@ -1396,6 +1397,7 @@ where
         }
         self.required_metadata_frontier = self.required_metadata_frontier.max(catalog.metadata_op);
         self.owner_retirement = Some(catalog);
+        self.publish_poll_visibility();
         Ok(())
     }
 
@@ -4356,8 +4358,8 @@ where
     }
 
     /// The notifier runs inside partition mutations whenever [`Self::poll_visibility`]
-    /// can change. It must only record the change, and it must not re-enter the
-    /// partition.
+    /// or an installed group owner can change. It must only record the change,
+    /// and it must not re-enter the partition.
     pub fn set_poll_notifier(&mut self, notifier: Option<Rc<dyn Fn()>>) {
         self.poll_notifier = notifier;
     }
@@ -20385,6 +20387,61 @@ mod tests {
                 .collect::<Vec<_>>(),
             [LIVE_GROUP_ID],
             "a retired group stays retired"
+        );
+    }
+
+    #[test]
+    fn given_a_parked_poll_when_a_group_owner_is_installed_or_retired_should_notify_it() {
+        // A parked group read learned that it lost its partition only from a
+        // maintenance sweep, so a fetch over many partitions waited for it.
+        let mut partition = test_partition();
+        let notified = Rc::new(Cell::new(0_u32));
+        let counter = Rc::clone(&notified);
+        partition.set_poll_notifier(Some(Rc::new(move || counter.set(counter.get() + 1))));
+        let install = InstallConsumerGroupOwnerRequest {
+            incarnation: partition.created_revision(),
+            group_id: 7,
+            owner: ConsumerGroupOwner {
+                client_id: 1,
+                session: 1,
+                generation: 1,
+            },
+            metadata_op: 1,
+        };
+        partition
+            .apply_consumer_group_owner(install, 1)
+            .expect("the owner installs");
+        assert_eq!(
+            notified.get(),
+            1,
+            "an installed owner wakes the parked reads"
+        );
+        partition
+            .apply_consumer_group_owner(
+                InstallConsumerGroupOwnerRequest {
+                    owner: ConsumerGroupOwner {
+                        client_id: 0,
+                        session: 0,
+                        generation: 2,
+                    },
+                    metadata_op: install.metadata_op + 1,
+                    ..install
+                },
+                2,
+            )
+            .expect("the unassigned owner installs");
+        partition
+            .apply_consumer_group_owner_retirement(RetireConsumerGroupOwnersRequest {
+                incarnation: install.incarnation,
+                metadata_op: install.metadata_op + 2,
+                next_group_id: install.group_id + 1,
+                live_group_ids: Vec::new(),
+            })
+            .expect("the retirement applies");
+        assert_eq!(
+            notified.get(),
+            3,
+            "each owner change wakes the parked reads"
         );
     }
 

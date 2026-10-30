@@ -992,8 +992,8 @@ async fn attach_partition_request(state: HttpState, request: Request, next: Next
         Ok(bearer) => bearer,
         Err(error) => return CustomError::from(error).into_response(),
     };
-    let deferred =
-        request.method() == Method::GET && request.uri().path().ends_with("/messages/deferred");
+    let deferred = (request.method() == Method::GET || request.method() == Method::POST)
+        && request.uri().path().ends_with("/messages/deferred");
     let request_budget = if deferred {
         let query = match axum::extract::Query::<DeferredPollQuery>::try_from_uri(request.uri()) {
             Ok(query) => query.0,

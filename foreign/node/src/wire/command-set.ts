@@ -48,10 +48,12 @@ import { ensureTopic } from './topic/ensure-topic.virtual.command.js';
 import { getOffset } from './offset/get-offset.command.js';
 import { storeOffset } from './offset/store-offset.command.js';
 import { deleteOffset } from './offset/delete-offset.command.js';
+import { storePosition, deletePosition } from './offset/position.command.js';
+import { openReader } from '../stream/partition-reader.js';
+import { openConsumer, openConsumerGroup } from '../stream/iggy-consumer.js';
 
 import { sendMessages } from './message/send-messages.command.js';
 import { pollMessages } from './message/poll-messages.command.js';
-import { fetchMessages, readinessGroups } from './message/fetch-messages.command.js';
 
 import { createStream } from './stream/create-stream.command.js';
 import { updateStream } from './stream/update-stream.command.js';
@@ -173,15 +175,16 @@ type GroupAPI = ReturnType<typeof groupAPI>;
 const offsetAPI = (c: ClientProvider) => ({
   get: getOffset(c),
   store: storeOffset(c),
-  delete: deleteOffset(c)
+  delete: deleteOffset(c),
+  storePosition: storePosition(c),
+  deletePosition: deletePosition(c)
 });
 
 type OffsetAPI = ReturnType<typeof offsetAPI>;
 
 const messageAPI = (c: ClientProvider) => ({
   poll: pollMessages(c),
-  fetch: fetchMessages(c),
-  readinessGroups: readinessGroups(c),
+  reader: openReader(c),
   send: sendMessages(c)
 });
 
@@ -234,6 +237,10 @@ export abstract class CommandAPI extends AbstractAPI {
   group: GroupAPI = groupAPI(this.clientProvider);
   offset: OffsetAPI = offsetAPI(this.clientProvider);
   message: MessageAPI = messageAPI(this.clientProvider);
+  /** A standalone consumer of some partitions, one message at a time, on this client. */
+  consumer = openConsumer(this.clientProvider);
+  /** A member of a consumer group, created when it is missing, one message at a time, on this client. */
+  consumerGroup = openConsumerGroup(this.clientProvider);
   system: SystemAPI = systemAPI(this.clientProvider);
   cluster: ClusterAPI = clusterAPI(this.clientProvider);
 

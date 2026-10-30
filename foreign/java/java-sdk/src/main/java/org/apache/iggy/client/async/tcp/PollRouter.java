@@ -81,6 +81,7 @@ import java.util.function.Supplier;
  */
 final class PollRouter {
     static final int POLL_PARAMETERS_BYTES = 14;
+    // A deferred poll ends with [wait_us u64][min_count u32][max_bytes u32][request_timeout_us u64].
     static final int DEFERRED_PARAMETERS_BYTES = 2 * Long.BYTES + 2 * Integer.BYTES;
 
     static final Duration POLL_TIMEOUT = Duration.ofSeconds(30);
@@ -88,6 +89,10 @@ final class PollRouter {
     // Deferred polls and fetches together, as MAX_DEFERRED_REQUESTS in core/sdk/src/driver.rs.
     private static final int MAX_DEFERRED_REQUESTS = 64;
     private static final int MAX_ROUTE_LOOKUPS_IN_FLIGHT = 16;
+
+    private static final int DEFERRED_MIN_COUNT_OFFSET = Long.BYTES;
+    private static final int DEFERRED_MAX_BYTES_OFFSET = Long.BYTES + Integer.BYTES;
+    private static final int DEFERRED_TIMEOUT_OFFSET = Long.BYTES + 2 * Integer.BYTES;
 
     private static final int MAX_ROUTES = 4096;
     private static final int MAX_CONNECTIONS = 256;
@@ -743,14 +748,37 @@ final class PollRouter {
         }
     }
 
+    /** Appends the limits that end a deferred poll request. */
+    static void writeDeferredOptions(ByteBuf request, DeferredPollOptions options) {
+        request.writeLongLE(options.maxWaitMicros())
+                .writeIntLE((int) options.minCount())
+                .writeIntLE((int) options.maxBytes())
+                .writeLongLE(options.requestTimeoutMicros());
+    }
+
     /** The limits that end a deferred poll request or frame, checked by the {@link DeferredPollOptions} constructor. */
     static DeferredPollOptions deferredOptions(ByteBuf request) {
-        int parameters = request.writerIndex() - DEFERRED_PARAMETERS_BYTES;
+        int parameters = deferredWait(request);
         return new DeferredPollOptions(
                 Duration.of(request.getLongLE(parameters), ChronoUnit.MICROS),
-                request.getUnsignedIntLE(parameters + Long.BYTES),
-                request.getUnsignedIntLE(parameters + Long.BYTES + Integer.BYTES),
-                Duration.of(request.getLongLE(parameters + Long.BYTES + 2 * Integer.BYTES), ChronoUnit.MICROS));
+                request.getUnsignedIntLE(parameters + DEFERRED_MIN_COUNT_OFFSET),
+                deferredMaxBytes(request),
+                Duration.of(request.getLongLE(deferredTimeout(request)), ChronoUnit.MICROS));
+    }
+
+    /** The index in a deferred poll request or frame of its wait, the first of the limits that end it. */
+    static int deferredWait(ByteBuf request) {
+        return request.writerIndex() - DEFERRED_PARAMETERS_BYTES;
+    }
+
+    /** The index in a deferred poll request or frame of its request timeout. */
+    static int deferredTimeout(ByteBuf request) {
+        return deferredWait(request) + DEFERRED_TIMEOUT_OFFSET;
+    }
+
+    /** The byte limit of a deferred poll request or frame, which also bounds its reply body. */
+    static long deferredMaxBytes(ByteBuf request) {
+        return request.getUnsignedIntLE(deferredWait(request) + DEFERRED_MAX_BYTES_OFFSET);
     }
 
     /** The wait and request timeout of a deferred request, checked by the {@link DeferredPollOptions} constructor. */
@@ -970,8 +998,8 @@ final class PollRouter {
         }
     }
 
-    /** Completes once every committing fetch that is pending now has ended, with any outcome. */
-    CompletableFuture<Void> committingFetchesEnded() {
+    /** Completes once every committing poll and fetch that is pending now has ended, with any outcome. */
+    CompletableFuture<Void> committingReadsEnded() {
         List<CompletableFuture<ByteBuf>> committing;
         synchronized (this) {
             committing = pending.stream()
@@ -1056,7 +1084,7 @@ final class PollRouter {
     @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
     private void failedAttempt(Poll poll, Throwable error) {
         if (poll.retryingRefusal && unwrap(error) instanceof IggyTimeoutException) {
-            poll.fail(notAccepted());
+            poll.fail(poll.deadlineRefusal());
             return;
         }
         IggyServerException refusal = AsyncTcpConnection.findServerError(error);
@@ -1098,7 +1126,7 @@ final class PollRouter {
                         || (refusal != null
                                 && refusal.getRawErrorCode()
                                         == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode()))) {
-            retry(poll, notPrimary);
+            retry(poll, notPrimary, refusal);
         } else {
             poll.fail(error);
         }
@@ -1156,9 +1184,9 @@ final class PollRouter {
         coordinator.get().eventLoop().schedule(() -> attempt(poll), delay, TimeUnit.MILLISECONDS);
     }
 
-    private void retry(Poll poll, boolean notPrimary) {
+    private void retry(Poll poll, boolean notPrimary, IggyServerException refusal) {
         long delay = notPrimary ? poll.notPrimarySeen ? poll.notPrimaryRetryMillis : 0 : RETRY_INTERVAL_MILLIS;
-        if (!poll.retryRefusal(delay)) {
+        if (!poll.retryRefusal(delay, refusal)) {
             return;
         }
         if (notPrimary && poll.notPrimarySeen) {
@@ -1679,10 +1707,13 @@ final class PollRouter {
         // Read once, since the deadline timer can run after the payload was released.
         private final boolean requiresLane;
         private final List<ConsensusSession.LaneKey> fetchLanes;
-        // A fetch that commits on the server, whose cancel can drop the messages that it committed.
+        // A poll or fetch that commits on the server. Its cancel waits for the reply, which tells whether it stored.
         private final boolean commits;
         private boolean historyRefreshed;
         private boolean retryingRefusal;
+        // The last capacity refusal, which the call reports when its deadline ends the retries. A budget too short
+        // for another attempt also ends them with 58, which would hide it.
+        private IggyServerException capacityRefusal;
         private boolean notPrimarySeen;
         private long notPrimaryRetryMillis = RETRY_INTERVAL_MILLIS;
         private boolean terminalRoutingRefusal;
@@ -1713,7 +1744,7 @@ final class PollRouter {
                     - (dataCommand == CommandCode.Messages.POLL_DEFERRED.getValue() ? DEFERRED_PARAMETERS_BYTES : 0);
             boolean fetch = dataCommand == CommandCode.Messages.FETCH_MESSAGES.getValue();
             this.fetchLanes = fetch ? FetchMessages.progressLanes(payload) : List.of();
-            this.commits = fetch && FetchMessages.commits(payload);
+            this.commits = CommittingRead.commits(dataCommand, payload);
             this.requiresLane = isMutation()
                     || dataCommand == CommandCode.ConsumerOffset.GET.getValue()
                     || !fetchLanes.isEmpty()
@@ -1792,10 +1823,14 @@ final class PollRouter {
             lifecycleRefusal = null;
         }
 
-        private synchronized boolean retryRefusal(long delayMillis) {
+        private synchronized boolean retryRefusal(long delayMillis, IggyServerException refusal) {
             retryingRefusal = true;
+            if (refusal != null
+                    && refusal.getRawErrorCode() == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode()) {
+                capacityRefusal = refusal;
+            }
             if (deadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(delayMillis)) {
-                fail(notAccepted());
+                fail(deadlineRefusal());
                 return false;
             }
             return !result.isDone();
@@ -1809,16 +1844,24 @@ final class PollRouter {
             if (payloadLease != null) {
                 payloadLease.finishWrite();
             }
-            if (state.ticket() != null) {
-                if (error != null
-                        && !state.committed()
-                        && (state.wasUncertain()
-                                || unwrap(error) instanceof IggyOperationException operationError
-                                        && operationError.getErrorCode() == IggyErrorCode.OPERATION_UNCERTAIN)) {
-                    state.retainTicket();
-                } else {
-                    state.ticket().complete();
-                }
+            CompletableFuture<Void> settled =
+                    state.ticket() == null ? null : state.ticket().attemptSettled();
+            if (commits && result.isCancelled() && settled != null && !settled.isDone()) {
+                settled.whenComplete((ignored, attemptError) -> settleTicket(error));
+            } else if (state.ticket() != null) {
+                settleTicket(error);
+            }
+        }
+
+        private void settleTicket(Throwable error) {
+            if (error != null
+                    && !state.committed()
+                    && (state.wasUncertain()
+                            || unwrap(error) instanceof IggyOperationException operationError
+                                    && operationError.getErrorCode() == IggyErrorCode.OPERATION_UNCERTAIN)) {
+                state.retainTicket();
+            } else {
+                state.ticket().complete();
             }
         }
 
@@ -1841,7 +1884,13 @@ final class PollRouter {
                                     ? state.lineageEnded(null)
                                     : lifecycleRefusal != null
                                             ? lifecycleRefusal
-                                            : retryingRefusal || !mayBeWritten ? notAccepted() : uncommitted());
+                                            : retryingRefusal
+                                                    ? deadlineRefusal()
+                                                    : !mayBeWritten ? notAccepted() : uncommitted());
+        }
+
+        private synchronized IggyServerException deadlineRefusal() {
+            return capacityRefusal != null ? capacityRefusal : notAccepted();
         }
     }
 

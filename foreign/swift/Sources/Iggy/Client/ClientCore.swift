@@ -782,6 +782,12 @@ actor ClientCore {
                 // of the same request no longer proves it never committed.
                 let error = outcome.observe(answer, committed: VSRFrame.hasCommittedResult(header))
                 refusal = error
+                logger.debug(
+                    "The server refused the request",
+                    metadata: [
+                        "code": "\(code)", "request_id": "\(stamped.requestID)", "error": "\(answer)", "server_address": "\(currentAddress)",
+                        "metadata_watermark": "\(metadataWatermark)",
+                    ])
                 if answer.code == .notPrimary, !VSRFrame.hasCommittedResult(header) {
                     return .failure(answer)
                 }

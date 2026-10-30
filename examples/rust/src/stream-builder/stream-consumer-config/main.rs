@@ -31,13 +31,6 @@ async fn main() -> Result<(), IggyError> {
         .stream_name(stream)
         // Set the topic name. The consumer binds to the topic by this name.
         .topic_name(topic)
-        // When the consumer stores the offset of the last message that it yielded:
-        // * `interval`: at this interval.
-        // * `on`: on each message, on every nth message or on the last message of each batch.
-        // [`consume_messages()` of the `IggyConsumerMessageExt` trait counts a message after its handler returns.]
-        // The default stores nothing, and the application commits checkpoints itself.
-        // It must stay the default with `ServerCommitPolicy::OnRead`, set in `poll_options` below.
-        .client_commit(ClientCommitPolicy::default())
         // Create the stream if it doesn't exist.
         .create_stream_if_not_exists(true)
         // Create the topic if it doesn't exist.
@@ -51,10 +44,14 @@ async fn main() -> Result<(), IggyError> {
         // A poll returns up to `count` messages when `min_count` messages are ready, `max_bytes` is reached or `max_wait` expires.
         // The greater the `count`, the higher the throughput for bulk data.
         // Note, there is a tradeoff between batch size and latency, so you want to benchmark your setup.
-        // With `ServerCommitPolicy::OnRead`, the server stores the offset of each reply.
+        // `commit` decides who stores offsets:
+        // * `CommitPolicy::Manual`, the default: the application commits checkpoints itself.
+        // * `CommitPolicy::OnRead`: the server stores the offset of each reply as part of it.
+        // * `CommitPolicy::Auto`: the consumer stores the latest counted message at an interval or on an event.
+        //   `AutoCommit::default()` stores every 10,000 messages or 5 s, after the application processed them.
         .poll_options(PollOptions {
             count: 100,
-            server_commit: ServerCommitPolicy::OnRead,
+            commit: CommitPolicy::OnRead,
             ..PollOptions::wait(IggyDuration::ONE_SECOND)
         })
         // `PollingStrategy` specifies from where to start polling messages.
@@ -75,7 +72,7 @@ async fn main() -> Result<(), IggyError> {
         .init_retries(5)
         .init_interval(NonZeroIggyDuration::ONE_SECOND)
         // Optionally, configure Aes256Gcm payload and user-header decryption.
-        // Set `server_commit` to `Disabled` first, because the consumer refuses an encryptor with `OnRead`.
+        // Set `commit` to `Manual` or `Auto` first, because the consumer refuses an encryptor with `OnRead`.
         // Key must be identical to the one used by the producer; thus ensure secure key exchange i.e. K8s secret etc.
         // Note, this is independent of server side encryption meaning you can add client encryption, server encryption, or both.
         // .encryptor(std::sync::Arc::new(EncryptorKind::Aes256Gcm(Aes256GcmEncryptor::new(&[1; 32])?)))

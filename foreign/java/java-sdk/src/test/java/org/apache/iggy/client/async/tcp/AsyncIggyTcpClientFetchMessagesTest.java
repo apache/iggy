@@ -34,8 +34,13 @@ import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.CommitPolicy;
 import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.FetchedMessages;
+import org.apache.iggy.message.Message;
+import org.apache.iggy.message.MessageHeader;
+import org.apache.iggy.message.PollOptions;
+import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingKind;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.partition.PartitionContext;
@@ -120,6 +125,12 @@ class AsyncIggyTcpClientFetchMessagesTest {
     private static final PartitionContext GOLDEN_CONTEXT =
             new PartitionContext(BigInteger.valueOf(3), BigInteger.valueOf(9), BigInteger.valueOf(12));
     private static final Duration TIMEOUT = Duration.ofSeconds(5);
+    // Larger than the smallest byte limit, which the server still returns alone.
+    private static final int OVERSIZED_PAYLOAD = 2000;
+    private static final int BATCH_HEADER_SIZE = 256;
+    // A poll whose deadline comes well before the TIMEOUT of a test step.
+    private static final DeferredPollOptions SHORT_POLL =
+            FETCH.withMaxWait(Duration.ofMillis(500)).withRequestTimeout(Duration.ofMillis(1500));
 
     /**
      * The typed call fills each target cap with the byte limit of the request, so the golden request, whose targets
@@ -143,7 +154,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
                 targets.put(1L, PollingStrategy.offset(BigInteger.valueOf(41)).withContext(GOLDEN_CONTEXT));
                 targets.put(2L, PollingStrategy.next().withContext(GOLDEN_CONTEXT));
 
-                assertThat(client.messages()
+                assertThat(messages(client)
                                 .fetchMessages(STREAM, orders(), targets, GROUP, COUNT, true, GOLDEN)
                                 .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
                         .isEmpty();
@@ -202,7 +213,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
                 targets.put(2L, PollingStrategy.next());
                 targets.put(1L, PollingStrategy.offset(BigInteger.valueOf(5)));
 
-                client.messages()
+                messages(client)
                         .fetchMessages(STREAM, TOPIC, targets, GROUP, COUNT, false, FETCH)
                         .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
 
@@ -257,7 +268,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
             });
             AsyncIggyTcpClient client = signedIn(leader);
             try {
-                var messages = client.messages();
+                var messages = messages(client);
                 assertThat(messages.readinessGroups(STREAM, TOPIC, List.of(1L, 2L))
                                 .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
                         .containsExactlyInAnyOrder(List.of(1L), List.of(2L));
@@ -303,17 +314,17 @@ class AsyncIggyTcpClientFetchMessagesTest {
             });
             AsyncIggyTcpClient client = signedIn(socket);
             try {
-                assertThat(client.messages()
+                assertThat(messages(client)
                                 .readinessGroups(STREAM, TOPIC, List.of(1L, 2L))
                                 .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
                         .containsExactly(List.of(1L, 2L));
-                List<FetchedMessages> sections = client.messages()
+                List<FetchedMessages> sections = messages(client)
                         .fetchMessages(STREAM, TOPIC, offsetsOf(1L, 2L), GROUP, COUNT, false, FETCH)
                         .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
                 assertThat(sections).extracting(FetchedMessages::status).containsExactly(0L, (long) NOT_PRIMARY);
                 assertThat(lookups).containsExactlyInAnyOrder(1, 2);
 
-                client.messages()
+                messages(client)
                         .readinessGroups(STREAM, TOPIC, List.of(1L, 2L))
                         .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
 
@@ -366,11 +377,11 @@ class AsyncIggyTcpClientFetchMessagesTest {
             AsyncIggyTcpClient client = signedIn(leader);
             try {
                 assertServerError(
-                        client.messages().fetchMessages(STREAM, TOPIC, offsetsOf(1L, 2L), GROUP, COUNT, true, FETCH),
+                        messages(client).fetchMessages(STREAM, TOPIC, offsetsOf(1L, 2L), GROUP, COUNT, true, FETCH),
                         NOT_PRIMARY);
                 assertThat(refused).hasSize(1);
 
-                assertThat(client.messages()
+                assertThat(messages(client)
                                 .fetchMessages(STREAM, TOPIC, offsetsOf(1L, 2L), GROUP, COUNT, true, FETCH)
                                 .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
                         .isEmpty();
@@ -412,9 +423,9 @@ class AsyncIggyTcpClientFetchMessagesTest {
             AsyncIggyTcpClient client = signedIn(socket);
             try {
                 assertServerError(
-                        client.messages().fetchMessages(STREAM, TOPIC, offsetsOf(1L, 2L), GROUP, COUNT, false, FETCH),
+                        messages(client).fetchMessages(STREAM, TOPIC, offsetsOf(1L, 2L), GROUP, COUNT, false, FETCH),
                         HISTORY_UNAVAILABLE);
-                client.messages()
+                messages(client)
                         .fetchMessages(STREAM, TOPIC, offsetsOf(1L, 2L), GROUP, COUNT, false, FETCH)
                         .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
 
@@ -439,7 +450,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
             CompletableFuture<Void> served = singleNode(socket, AsyncIggyTcpClientFetchMessagesTest::unexpected);
             AsyncIggyTcpClient client = signedIn(socket);
             try {
-                var messages = client.messages();
+                var messages = messages(client);
                 List<Map<Long, PollingStrategy>> refusedTargets = List.of(
                         Map.of(),
                         offsetsOf(LongStream.rangeClosed(0, FetchMessages.MAX_PARTITIONS_PER_REQUEST)
@@ -486,7 +497,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
             });
             AsyncIggyTcpClient client = signedIn(socket);
             try {
-                assertThat(client.messages()
+                assertThat(messages(client)
                                 .fetchMessages(STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, false, IMMEDIATE)
                                 .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
                         .isEmpty();
@@ -537,7 +548,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
                 targets.put(1L, PollingStrategy.next());
                 targets.put(partition, PollingStrategy.next());
 
-                assertThatThrownBy(() -> client.messages()
+                assertThatThrownBy(() -> messages(client)
                                 .fetchMessages(STREAM, TOPIC, targets, GROUP, COUNT, false, FETCH)
                                 .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
                         .hasCauseInstanceOf(IggyOperationException.class)
@@ -556,7 +567,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
 
                 client.resolveOperation(operation, TIMEOUT).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
                 assertThat(stores).hasSize(2).extracting(Request::requestId).containsOnly(operation);
-                assertThat(client.messages()
+                assertThat(messages(client)
                                 .fetchMessages(STREAM, TOPIC, targets, GROUP, COUNT, false, FETCH)
                                 .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
                         .isEmpty();
@@ -589,7 +600,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
             try {
                 PollingStrategy strategy =
                         kind == PollingKind.Next ? PollingStrategy.next() : PollingStrategy.offset(BigInteger.ONE);
-                var fetch = client.messages()
+                var fetch = messages(client)
                         .fetchMessages(STREAM, TOPIC, Map.of(1L, strategy), GROUP, COUNT, autoCommit, IMMEDIATE);
 
                 if (resent) {
@@ -644,7 +655,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
             });
             AsyncIggyTcpClient client = signedIn(socket);
             try {
-                assertThat(client.messages()
+                assertThat(messages(client)
                                 .fetchMessages(STREAM, TOPIC, offsetsOf(1L, 2L), GROUP, COUNT, autoCommit, FETCH)
                                 .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
                         .isEmpty();
@@ -684,7 +695,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
             });
             AsyncIggyTcpClient client = signedIn(socket);
             try {
-                var fetch = client.messages().fetchMessages(STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, false, FETCH);
+                var fetch = messages(client).fetchMessages(STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, false, FETCH);
                 parked.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
 
                 assertThat(fetch.cancel(true)).isTrue();
@@ -736,9 +747,9 @@ class AsyncIggyTcpClientFetchMessagesTest {
                         : unexpected(request);
             });
             AsyncIggyTcpClient client = signedIn(leader);
-            var read = client.messages().fetchMessages(STREAM, TOPIC, offsetsOf(2L), GROUP, COUNT, false, FETCH);
+            var read = messages(client).fetchMessages(STREAM, TOPIC, offsetsOf(2L), GROUP, COUNT, false, FETCH);
             reading.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-            var commit = client.messages().fetchMessages(STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, true, FETCH);
+            var commit = messages(client).fetchMessages(STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, true, FETCH);
             committing.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
 
             CompletableFuture<Void> closed = client.close();
@@ -755,62 +766,14 @@ class AsyncIggyTcpClientFetchMessagesTest {
         }
     }
 
-    /**
-     * The client reads at most the section table and the byte limit of a fetch. A larger reply drops the link, so the
-     * outcome of the fetch is unknown and the client does not send it again.
-     */
-    @Test
-    void shouldReadAReplyUpToTheLimitOfTheFetchAndDropALargerOne() throws Exception {
-        InetAddress loopback = InetAddress.getLoopbackAddress();
-        try (ServerSocket leader = new ServerSocket(0, 4, loopback);
-                ServerSocket primary = new ServerSocket(0, 4, loopback);
-                ServerSocket idle = new ServerSocket(0, 4, loopback)) {
-            Supplier<ByteBuf> metadata = () -> threeNodeMetadata(
-                    leader.getLocalPort(), primary.getLocalPort(), idle.getLocalPort(), leader.getLocalPort());
-            // A dropped reply closes only the link of the primary of partition 1.
-            CompletableFuture<Void> leaderServed = node(leader, metadata, routes(primary, idle));
-            List<Request> fetches = new CopyOnWriteArrayList<>();
-            CompletableFuture<Void> primaryServed = node(primary, metadata, request -> {
-                if (!request.is(FETCH_CODE, OPERATION_NON_REPLICATED)) {
-                    return unexpected(request);
-                }
-                fetches.add(request);
-                // The second reply holds one byte more than the fetch can get.
-                int records = (int) DeferredPollOptions.MIN_MAX_BYTES + fetches.size() - 1;
-                ByteBuf reply = Unpooled.buffer().writeIntLE(1);
-                section(reply, 1, FetchedMessages.STATUS_OK, records);
-                return Response.success(OPERATION_NON_REPLICATED, reply.writeZero(records));
-            });
-            AsyncIggyTcpClient client = signedIn(leader);
-            try {
-                DeferredPollOptions smallest = FETCH.withMaxBytes(DeferredPollOptions.MIN_MAX_BYTES);
-
-                assertThat(client.messages()
-                                .fetchMessages(STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, true, smallest)
-                                .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
-                        .singleElement()
-                        .satisfies(section ->
-                                assertThat(section.records()).hasSize((int) DeferredPollOptions.MIN_MAX_BYTES));
-                var oversized =
-                        client.messages().fetchMessages(STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, true, smallest);
-                assertServerError(oversized, IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode());
-                var unknown = oversized
-                        .handle((sections, error) -> (IggyOperationException) PollRouter.unwrap(error))
-                        .join();
-                assertServerError(client.close(), IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode());
-                client.abandonOperation(unknown.getOperationId()).join();
-                assertThat(fetches).hasSize(2);
-            } finally {
-                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-            }
-            CompletableFuture.allOf(leaderServed, primaryServed).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-        }
-    }
-
     /** A link reads replies up to its frame size, so a fetch asks for no more than the link reads. */
     @Test
     void shouldLowerTheByteLimitOfAFetchToWhatTheLinkReads() throws Exception {
-        long linkRecords = 2 * DeferredPollOptions.MIN_MAX_BYTES;
+        long linkFrame = AsyncIggyTcpClientBuilder.MIN_MAX_VSR_FRAME_SIZE;
+        long linkRecords = linkFrame
+                - VsrHeaders.HEADER_SIZE
+                - BytesDeserializer.FETCH_SECTIONS_COUNT_BYTES
+                - BytesDeserializer.FETCH_SECTION_BYTES;
         try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
             List<Request> fetches = new CopyOnWriteArrayList<>();
             CompletableFuture<Void> served = singleNode(socket, request -> {
@@ -825,16 +788,14 @@ class AsyncIggyTcpClientFetchMessagesTest {
                     .port(socket.getLocalPort())
                     .credentials("configured-user", "configured-password")
                     .heartbeatInterval(Duration.ofMinutes(1))
-                    .maxVsrFrameSize(VsrHeaders.HEADER_SIZE
-                            + BytesDeserializer.FETCH_SECTIONS_COUNT_BYTES
-                            + BytesDeserializer.FETCH_SECTION_BYTES
-                            + linkRecords)
+                    .maxVsrFrameSize(linkFrame)
                     .build();
             client.connect().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
             client.login().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
             try {
-                client.messages()
-                        .fetchMessages(STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, false, FETCH)
+                messages(client)
+                        .fetchMessages(
+                                STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, false, FETCH.withMaxBytes(0xFFFF_0000L))
                         .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
 
                 ByteBuffer body = ByteBuffer.wrap(fetches.get(0).body()).order(ByteOrder.LITTLE_ENDIAN);
@@ -871,8 +832,8 @@ class AsyncIggyTcpClientFetchMessagesTest {
             });
             AsyncIggyTcpClient client = signedIn(socket);
             try {
-                var fetch = client.messages()
-                        .fetchMessages(STREAM, TOPIC, offsetsOf(1L, 2L), GROUP, COUNT, true, IMMEDIATE);
+                var fetch =
+                        messages(client).fetchMessages(STREAM, TOPIC, offsetsOf(1L, 2L), GROUP, COUNT, true, IMMEDIATE);
                 assertServerError(fetch, IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode());
                 var unknown = fetch.handle((sections, error) -> (IggyOperationException) PollRouter.unwrap(error))
                         .join();
@@ -909,7 +870,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
             });
             AsyncIggyTcpClient client = signedIn(socket);
             try {
-                var sections = client.messages()
+                var sections = messages(client)
                         .fetchMessages(STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, true, IMMEDIATE)
                         .join();
                 assertThat(sections.get(0).status()).isEqualTo(status);
@@ -917,6 +878,70 @@ class AsyncIggyTcpClientFetchMessagesTest {
                 client.consumerOffsets()
                         .storeConsumerOffset(STREAM, TOPIC, Optional.of(1L), GROUP, BigInteger.ONE)
                         .join();
+            } finally {
+                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            }
+            served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** A request that the server refuses for capacity until its deadline ends with that refusal, as over HTTP. */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldEndARequestThatTheServerKeepsRefusingForCapacityWithThatRefusal(boolean fetch) throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            List<Request> refused = new CopyOnWriteArrayList<>();
+            CompletableFuture<Void> served = singleNode(socket, request -> {
+                if (!request.is(fetch ? FETCH_CODE : POLL_DEFERRED_CODE, OPERATION_NON_REPLICATED)) {
+                    return unexpected(request);
+                }
+                refused.add(request);
+                return Response.error(
+                        OPERATION_NON_REPLICATED, IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode());
+            });
+            AsyncIggyTcpClient client = signedIn(socket);
+            try {
+                var call = fetch
+                        ? messages(client).fetchMessages(STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, false, IMMEDIATE)
+                        : client.messages()
+                                .pollMessagesDeferred(
+                                        STREAM,
+                                        TOPIC,
+                                        Optional.of(1L),
+                                        GROUP,
+                                        PollingStrategy.offset(BigInteger.ZERO),
+                                        COUNT,
+                                        false,
+                                        IMMEDIATE);
+
+                assertServerError(call, IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode());
+                assertThat(refused).hasSizeGreaterThan(1);
+            } finally {
+                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            }
+            served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** The server refuses a fetch whose first message exceeds its byte limit before it stores an offset. */
+    @Test
+    void shouldKeepTheTargetsOfAFetchRefusedForItsByteLimitFreeForTheNextProgressCall() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Void> served = singleNode(socket, request -> {
+                if (request.is(FETCH_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.error(OPERATION_NON_REPLICATED, IggyErrorCode.INVALID_SIZE_BYTES.getCode());
+                }
+                return Response.committed(
+                        request.operation(), 2, Unpooled.buffer().writeIntLE(0));
+            });
+            AsyncIggyTcpClient client = signedIn(socket);
+            try {
+                assertServerError(
+                        messages(client).fetchMessages(STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, true, IMMEDIATE),
+                        IggyErrorCode.INVALID_SIZE_BYTES.getCode());
+                client.consumerOffsets()
+                        .storeConsumerOffset(STREAM, TOPIC, Optional.of(1L), GROUP, BigInteger.ONE)
+                        .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
             } finally {
                 client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
             }
@@ -934,8 +959,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
             CompletableFuture<Void> served = singleNode(socket, handler);
             AsyncIggyTcpClient client = signedIn(socket);
             try {
-                var first =
-                        client.messages().fetchMessages(STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, true, IMMEDIATE);
+                var first = messages(client).fetchMessages(STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, true, IMMEDIATE);
                 assertServerError(first, IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode());
                 long firstId = first.handle((sections, error) ->
                                 ((IggyOperationException) PollRouter.unwrap(error)).getOperationId())
@@ -951,7 +975,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
                 assertServerError(
                         client.resolveOperation(firstId, TIMEOUT), IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode());
                 client.abandonOperation(firstId).join();
-                var next = client.messages().fetchMessages(STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, true, IMMEDIATE);
+                var next = messages(client).fetchMessages(STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, true, IMMEDIATE);
                 assertServerError(next, IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode());
                 long nextId = next.handle((sections, error) ->
                                 ((IggyOperationException) PollRouter.unwrap(error)).getOperationId())
@@ -992,8 +1016,8 @@ class AsyncIggyTcpClientFetchMessagesTest {
             });
             AsyncIggyTcpClient client = signedIn(leader);
             try {
-                var fetch = client.messages()
-                        .fetchMessages(STREAM, TOPIC, offsetsOf(1L, 2L), GROUP, COUNT, true, IMMEDIATE);
+                var fetch =
+                        messages(client).fetchMessages(STREAM, TOPIC, offsetsOf(1L, 2L), GROUP, COUNT, true, IMMEDIATE);
                 parked.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
                 assertServerError(fetch, IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode());
                 var unknown = fetch.handle((sections, error) -> (IggyOperationException) PollRouter.unwrap(error))
@@ -1031,61 +1055,47 @@ class AsyncIggyTcpClientFetchMessagesTest {
         }
     }
 
-    @Test
-    void shouldNameRecoveryAfterTheCallerCancelsASentCommittingFetch() throws Exception {
+    /**
+     * A cancel stops a committing fetch on the server, which answers it once: refused when the cancel won, with its
+     * sections when the read stored first. Either reply settles the fetch, so its partitions stay free.
+     */
+    @ParameterizedTest(name = "server answers the cancel with status {0}")
+    @ValueSource(ints = {0, 58})
+    void shouldCancelACommittingFetchOnTheServerAndSettleItWithItsReply(int status) throws Exception {
         try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
             CompletableFuture<Request> parked = new CompletableFuture<>();
-            CompletableFuture<Void> releaseReply = new CompletableFuture<>();
-            List<Request> requests = new CopyOnWriteArrayList<>();
+            CompletableFuture<Request> cancelled = new CompletableFuture<>();
+            List<Request> stores = new CopyOnWriteArrayList<>();
             CompletableFuture<Void> served = singleNode(socket, request -> {
-                requests.add(request);
-                if (request.is(FETCH_CODE, OPERATION_NON_REPLICATED)) {
-                    parked.complete(request);
-                    after(releaseReply);
-                    return Response.success(OPERATION_NON_REPLICATED, emptySection(1));
+                if (request.is(FETCH_CODE, OPERATION_NON_REPLICATED) && parked.complete(request)) {
+                    return Response.noReply();
                 }
-                if (request.is(CommandCode.System.GET_STATS.getValue(), OPERATION_NON_REPLICATED)) {
-                    return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+                if (request.is(CANCEL_CODE, OPERATION_NON_REPLICATED) && cancelled.complete(request)) {
+                    // The cancel names the request id of the fetch, so this reply answers the fetch.
+                    return status == 0
+                            ? Response.success(OPERATION_NON_REPLICATED, emptySection(1))
+                            : Response.error(OPERATION_NON_REPLICATED, status);
                 }
-                return Response.committed(
-                        request.operation(), 2, Unpooled.buffer().writeIntLE(0));
+                if (request.operation() == VsrOperation.STORE_CONSUMER_OFFSET) {
+                    stores.add(request);
+                    return Response.committed(
+                            request.operation(), 2, Unpooled.buffer().writeIntLE(0));
+                }
+                return unexpected(request);
             });
             AsyncIggyTcpClient client = signedIn(socket);
             try {
-                var fetch = client.messages().fetchMessages(STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, true, FETCH);
+                var fetch = messages(client).fetchMessages(STREAM, TOPIC, offsetsOf(1L), GROUP, COUNT, true, FETCH);
                 parked.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
                 assertThat(fetch.cancel(true)).isTrue();
-                var store = client.consumerOffsets()
-                        .storeConsumerOffset(STREAM, TOPIC, Optional.of(1L), GROUP, BigInteger.ONE);
-                assertServerError(store, IggyErrorCode.PARTITION_LANE_BLOCKED.getCode());
-                var blocked = store.handle((ignored, error) -> (IggyOperationException) PollRouter.unwrap(error))
-                        .join();
-                assertThat(requests).hasSize(1);
-                assertServerError(
-                        client.resolveOperation(blocked.getOperationId(), TIMEOUT),
-                        IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode());
-                releaseReply.complete(null);
-                client.sendBinaryRequest(CommandCode.System.GET_STATS.getValue(), new byte[0])
-                        .join();
-                assertServerError(
-                        client.consumerOffsets()
-                                .storeConsumerOffset(STREAM, TOPIC, Optional.of(1L), GROUP, BigInteger.ONE),
-                        IggyErrorCode.PARTITION_LANE_BLOCKED.getCode());
-                assertServerError(
-                        client.resolveOperation(blocked.getOperationId(), TIMEOUT),
-                        IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode());
-                client.abandonOperation(blocked.getOperationId()).join();
+
+                assertCancels(cancelled.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS), parked.join());
                 client.consumerOffsets()
                         .storeConsumerOffset(STREAM, TOPIC, Optional.of(1L), GROUP, BigInteger.ONE)
                         .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-                assertThat(requests).hasSize(3);
+                assertThat(stores).hasSize(1);
             } finally {
-                releaseReply.complete(null);
-                if (parked.isDone()) {
-                    client.abandonOperation(parked.join().requestId())
-                            .exceptionally(error -> null)
-                            .join();
-                }
                 client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
             }
             served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
@@ -1093,7 +1103,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
     }
 
     @ParameterizedTest
-    @ValueSource(ints = {3, 57, 58, 59})
+    @ValueSource(ints = {3, 57, 58, 59, 11001})
     void shouldKeepHealthySectionsWhileRetainingOnlyUncertainTargets(int status) throws Exception {
         try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
             List<Request> stores = new CopyOnWriteArrayList<>();
@@ -1111,7 +1121,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
             });
             AsyncIggyTcpClient client = signedIn(socket);
             try {
-                var sections = client.messages()
+                var sections = messages(client)
                         .fetchMessages(STREAM, TOPIC, offsetsOf(1L, 2L), GROUP, COUNT, true, IMMEDIATE)
                         .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
                 assertThat(sections).hasSize(2);
@@ -1205,7 +1215,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
             });
             AsyncIggyTcpClient client = signedIn(socket);
             try {
-                var fetch = client.messages()
+                var fetch = messages(client)
                         .fetchMessages(
                                 STREAM,
                                 TOPIC,
@@ -1242,6 +1252,54 @@ class AsyncIggyTcpClientFetchMessagesTest {
             }
             served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
         }
+    }
+
+    /** A poll reply of {@code partition} with {@code records}. */
+    private static ByteBuf pollReply(int partition, ByteBuf records) {
+        ByteBuf reply = Unpooled.buffer()
+                .writeIntLE(partition)
+                .writeLongLE(0)
+                .writeIntLE(1)
+                .writeZero(PartitionContext.ENCODED_SIZE)
+                .writeBytes(records);
+        records.release();
+        return reply;
+    }
+
+    /** One batch record with one message at {@code offset} whose payload has {@code payloadBytes} bytes. */
+    private static ByteBuf record(long offset, int payloadBytes) {
+        int frame = MessageHeader.SIZE + payloadBytes;
+        return Unpooled.buffer()
+                .writeLongLE(0)
+                .writeLongLE(offset)
+                .writeLongLE(0)
+                .writeLongLE(0)
+                .writeLongLE(BATCH_HEADER_SIZE + frame)
+                .writeZero(BATCH_HEADER_SIZE - 5 * Long.BYTES)
+                .writeLongLE(0)
+                .writeZero(16)
+                .writeIntLE(0)
+                .writeIntLE(0)
+                .writeIntLE(0)
+                .writeIntLE(payloadBytes)
+                .writeLongLE(0)
+                .writeZero(payloadBytes);
+    }
+
+    private static Message messageAt(long offset) {
+        Message plain = Message.of("payload");
+        return new Message(
+                new MessageHeader(
+                        BigInteger.ZERO,
+                        plain.header().id(),
+                        BigInteger.valueOf(offset),
+                        BigInteger.ZERO,
+                        BigInteger.ZERO,
+                        0L,
+                        (long) plain.payload().length,
+                        BigInteger.ZERO),
+                plain.payload(),
+                plain.userHeaders());
     }
 
     /** A reply without sections, as a fetch whose wait found nothing gets. */
@@ -1330,6 +1388,230 @@ class AsyncIggyTcpClientFetchMessagesTest {
         }
     }
 
+    /**
+     * The reply to a cancelled committing poll tells whether it stored its offset, so the next store of its partition
+     * goes out only after that reply, or after the deadline of the poll when none comes.
+     */
+    @Test
+    void shouldHoldTheNextStoreOfAPartitionUntilACancelledCommittingPollEnds() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Request> parked = new CompletableFuture<>();
+            CompletableFuture<Request> cancelled = new CompletableFuture<>();
+            CompletableFuture<Long> storedAt = new CompletableFuture<>();
+            CompletableFuture<Void> served = singleNode(socket, request -> {
+                if (request.is(POLL_DEFERRED_CODE, OPERATION_NON_REPLICATED) && parked.complete(request)) {
+                    return Response.noReply();
+                }
+                if (request.is(CANCEL_CODE, OPERATION_NON_REPLICATED) && cancelled.complete(request)) {
+                    return Response.noReply();
+                }
+                if (request.operation() == VsrOperation.STORE_CONSUMER_OFFSET && storedAt.complete(System.nanoTime())) {
+                    return Response.committed(
+                            request.operation(), 2, Unpooled.buffer().writeIntLE(0));
+                }
+                return unexpected(request);
+            });
+            AsyncIggyTcpClient client = signedIn(socket);
+            try {
+                long deadline = System.nanoTime() + SHORT_POLL.requestTimeout().toNanos();
+                var poll = client.messages()
+                        .pollMessagesDeferred(
+                                STREAM, TOPIC, Optional.of(1L), GROUP, PollingStrategy.next(), COUNT, true, SHORT_POLL);
+                parked.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+                assertThat(poll.cancel(true)).isTrue();
+                assertCancels(cancelled.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS), parked.join());
+                client.consumerOffsets()
+                        .storeConsumerOffset(STREAM, TOPIC, Optional.of(1L), GROUP, BigInteger.ONE)
+                        .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+                assertThat(storedAt.join()).isGreaterThanOrEqualTo(deadline);
+            } finally {
+                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            }
+            served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** The server can have stored the offset of a committing poll whose reply is lost, which only a read shows. */
+    @ParameterizedTest(name = "deferred={0}")
+    @ValueSource(booleans = {false, true})
+    void shouldReportAnUnknownOutcomeOfACommittingPollAsUncertainProgress(boolean deferred) throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Void> served = singleNode(socket, request -> {
+                if (request.is(POLL_DEFERRED_CODE, OPERATION_NON_REPLICATED)
+                        || request.is(CommandCode.Messages.POLL.getValue(), OPERATION_NON_REPLICATED)) {
+                    return Response.disconnect();
+                }
+                return unexpected(request);
+            });
+            AsyncIggyTcpClient client = signedIn(socket);
+            try {
+                var poll = deferred
+                        ? client.messages()
+                                .pollMessagesDeferred(
+                                        STREAM,
+                                        TOPIC,
+                                        Optional.of(1L),
+                                        GROUP,
+                                        PollingStrategy.next(),
+                                        COUNT,
+                                        true,
+                                        SHORT_POLL)
+                        : client.messages()
+                                .pollMessages(
+                                        STREAM, TOPIC, Optional.of(1L), GROUP, PollingStrategy.next(), COUNT, true);
+
+                assertThatThrownBy(() -> poll.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                        .hasCauseInstanceOf(IggyOperationException.class)
+                        .satisfies(error -> assertThat(((IggyOperationException) error.getCause()).getErrorCode())
+                                .isEqualTo(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN));
+            } finally {
+                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            }
+            served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** A poll of one partition is a deferred poll whose limits and commit come from its options. */
+    @Test
+    void shouldSendAPollOfOnePartitionAsADeferredPollWithItsOptions() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            List<Request> sent = new CopyOnWriteArrayList<>();
+            CompletableFuture<Void> served = singleNode(socket, request -> {
+                sent.add(request);
+                return Response.success(OPERATION_NON_REPLICATED, emptyPoll(3));
+            });
+            AsyncIggyTcpClient client = signedIn(socket);
+            try {
+                client.messages()
+                        .pollMessages(
+                                STREAM,
+                                orders(),
+                                3L,
+                                GROUP,
+                                PollingStrategy.next(),
+                                PollOptions.waitFor(Duration.ofSeconds(1))
+                                        .withCount(100)
+                                        .withCommit(CommitPolicy.onRead()))
+                        .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                assertThat(sent).extracting(Request::commandCode).containsExactly(POLL_DEFERRED_CODE);
+                int limits = HEX.parseHex(DEFERRED_POLL_BODY).length - DEFERRED_LIMITS_BYTES;
+                assertGoldenBody(
+                        sent.get(0).body(), DEFERRED_POLL_BODY, limits, limits + DEFERRED_LIMITS_BYTES - Long.BYTES);
+            } finally {
+                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            }
+            served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    @Test
+    void shouldRefuseAnAutomaticCommitAndAContinuationOfAnotherPartitionBeforeSending() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            List<Request> sent = new CopyOnWriteArrayList<>();
+            CompletableFuture<Void> served = singleNode(socket, request -> {
+                sent.add(request);
+                return unexpected(request);
+            });
+            AsyncIggyTcpClient client = signedIn(socket);
+            try {
+                var auto = PollOptions.defaults().withCommit(CommitPolicy.auto());
+                var continuation = new PolledMessages(2L, BigInteger.ONE, 1L, List.of(messageAt(1)), GOLDEN_CONTEXT)
+                        .continuation()
+                        .orElseThrow();
+
+                assertThatThrownBy(() ->
+                                client.messages().pollMessages(STREAM, TOPIC, 1L, GROUP, PollingStrategy.next(), auto))
+                        .isInstanceOfSatisfying(
+                                IggyServerException.class,
+                                error -> assertThat(error.getErrorCode())
+                                        .isEqualTo(IggyErrorCode.INVALID_CONFIGURATION));
+                assertThatThrownBy(() -> client.messages()
+                                .pollMessages(STREAM, TOPIC, 1L, GROUP, continuation, PollOptions.defaults()))
+                        .isInstanceOfSatisfying(
+                                IggyServerException.class,
+                                error -> assertThat(error.getErrorCode()).isEqualTo(IggyErrorCode.INVALID_COMMAND));
+                assertThat(sent).isEmpty();
+            } finally {
+                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            }
+            served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** The server returns a first message larger than the byte limit alone in its reply, so the client reads it. */
+    @Test
+    void shouldReadAFirstMessageLargerThanTheByteLimitOfAPoll() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Void> served = singleNode(
+                    socket,
+                    request -> request.is(POLL_DEFERRED_CODE, OPERATION_NON_REPLICATED)
+                            ? Response.success(OPERATION_NON_REPLICATED, pollReply(3, record(5, OVERSIZED_PAYLOAD)))
+                            : unexpected(request));
+            AsyncIggyTcpClient client = signedIn(socket);
+            try {
+                var polled = client.messages()
+                        .pollMessages(
+                                STREAM,
+                                TOPIC,
+                                3L,
+                                GROUP,
+                                PollingStrategy.offset(BigInteger.valueOf(5)),
+                                PollOptions.defaults().withMaxBytes(DeferredPollOptions.MIN_MAX_BYTES))
+                        .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+                assertThat(polled.messages()).hasSize(1);
+                assertThat(polled.messages().get(0).payload()).hasSize(OVERSIZED_PAYLOAD);
+            } finally {
+                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            }
+            served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    @Test
+    void shouldReadAFirstMessageLargerThanTheByteLimitOfAFetch() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Void> served = singleNode(socket, request -> {
+                if (!request.is(FETCH_CODE, OPERATION_NON_REPLICATED)) {
+                    return unexpected(request);
+                }
+                ByteBuf records = record(5, OVERSIZED_PAYLOAD);
+                ByteBuf reply = Unpooled.buffer().writeIntLE(1);
+                reply.writeIntLE(1)
+                        .writeIntLE((int) FetchedMessages.STATUS_OK)
+                        .writeLongLE(5)
+                        .writeIntLE(1)
+                        .writeZero(PartitionContext.ENCODED_SIZE)
+                        .writeLongLE(6)
+                        .writeIntLE(records.readableBytes())
+                        .writeBytes(records);
+                records.release();
+                return Response.success(OPERATION_NON_REPLICATED, reply);
+            });
+            AsyncIggyTcpClient client = signedIn(socket);
+            try {
+                var sections = messages(client)
+                        .fetchMessages(
+                                STREAM,
+                                TOPIC,
+                                offsetsOf(1L),
+                                GROUP,
+                                COUNT,
+                                false,
+                                FETCH.withMaxBytes(DeferredPollOptions.MIN_MAX_BYTES))
+                        .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+                assertThat(sections).hasSize(1);
+                assertThat(sections.get(0).decode().messages().get(0).payload()).hasSize(OVERSIZED_PAYLOAD);
+            } finally {
+                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            }
+            served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
     @Test
     void shouldGroupThePartitionsOfEachPrimaryInTheOrderOfTheCall() throws Exception {
         InetAddress loopback = InetAddress.getLoopbackAddress();
@@ -1343,14 +1625,14 @@ class AsyncIggyTcpClientFetchMessagesTest {
             AsyncIggyTcpClient client = signedIn(leader);
             try {
                 for (long partition : new long[] {FetchMessages.MAX_PARTITION_ID + 1, -1}) {
-                    assertThatThrownBy(() -> client.messages().readinessGroups(STREAM, TOPIC, List.of(partition)))
+                    assertThatThrownBy(() -> messages(client).readinessGroups(STREAM, TOPIC, List.of(partition)))
                             .isInstanceOf(IggyInvalidArgumentException.class);
                 }
-                assertThat(client.messages()
+                assertThat(messages(client)
                                 .readinessGroups(STREAM, TOPIC, List.of(2L, 1L, 3L))
                                 .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
                         .containsExactly(List.of(2L, 3L), List.of(1L));
-                assertThat(client.messages()
+                assertThat(messages(client)
                                 .readinessGroups(STREAM, TOPIC, List.of())
                                 .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
                         .isEmpty();
@@ -1377,7 +1659,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
             try {
                 int limit = FetchMessages.MAX_PARTITIONS_PER_REQUEST;
                 List<Long> partitions = LongStream.rangeClosed(0, limit).boxed().toList();
-                assertThat(client.messages()
+                assertThat(messages(client)
                                 .readinessGroups(STREAM, TOPIC, partitions)
                                 .get(FETCH.requestTimeout().toMillis(), TimeUnit.MILLISECONDS))
                         .containsExactly(partitions.subList(0, limit), partitions.subList(limit, partitions.size()));
@@ -1467,6 +1749,11 @@ class AsyncIggyTcpClientFetchMessagesTest {
         assertThat(cancel.body()).isEmpty();
         assertThat(List.of(cancel.requestId(), cancel.clientLow(), cancel.clientHigh()))
                 .containsExactly(parked.requestId(), parked.clientLow(), parked.clientHigh());
+    }
+
+    /** The messages client of {@code client}, whose fetch and readiness groups a reader uses. */
+    static MessagesTcpClient messages(AsyncIggyTcpClient client) {
+        return (MessagesTcpClient) client.messages();
     }
 
     static TopicId orders() {

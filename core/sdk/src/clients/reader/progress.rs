@@ -23,9 +23,10 @@ use dashmap::DashMap;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
-    Checkpoint, Client, Consumer, ConsumerOffsetClient, Identifier, IggyError, PolledMessages,
-    PollingStrategy, ReaderStamp,
+    AutoCommit, Checkpoint, Client, CommitEvery, CommitPolicy, Consumer, ConsumerOffsetClient,
+    Identifier, IggyError, PolledMessages, PollingStrategy, ReaderStamp,
 };
+use tokio::sync::Notify;
 use tracing::error;
 
 use super::ORDERING;
@@ -43,16 +44,25 @@ enum OffsetMutation {
     DeletePosition(Checkpoint),
 }
 
-/// What a reader delivered and committed, its blocked partitions and the generations of its
-/// partitions. The fetch loop, the reader handle and `IggyConsumer` share it.
+/// What a reader delivered, counted and committed, its blocked partitions and the generations
+/// of its partitions. The fetch loop, the reader handle and `IggyConsumer` share it.
 pub(crate) struct Progress {
     client: IggyRwLock<ClientWrapper>,
     consumer: Arc<Consumer>,
     stream: Arc<Identifier>,
     topic: Arc<Identifier>,
     reader: u64,
+    /// Set for `CommitPolicy::Auto`.
+    auto: Option<AutoCommit>,
     /// The last message that the application took from each partition.
     delivered: DashMap<u32, Checkpoint>,
+    /// With `CommitPolicy::Auto`: the latest counted message of each partition.
+    counted: DashMap<u32, Counted>,
+    /// Counted positions of partitions that a rebalance takes away, stored before the counted
+    /// ones of the next flush.
+    retiring: Mutex<Vec<Checkpoint>>,
+    /// Wakes the store task of the reader when a count makes a store due.
+    due: Notify,
     /// The offset that this reader believes the server holds for each partition.
     committed: DashMap<u32, Checkpoint>,
     /// The operation of an unknown outcome that blocks the progress of a partition until the
@@ -66,11 +76,20 @@ pub(crate) struct Progress {
     generation_changes: AtomicU64,
 }
 
+#[derive(Clone, Copy)]
+struct Counted {
+    checkpoint: Checkpoint,
+    /// The messages counted since the last store of the partition.
+    since_store: u32,
+}
+
 #[derive(Default)]
 struct Generations {
     last: u64,
     current: BTreeMap<u32, u64>,
     seeks: BTreeMap<u32, PollingStrategy>,
+    /// The generation that the last seek of each partition started.
+    sought: BTreeMap<u32, u64>,
 }
 
 impl Progress {
@@ -79,6 +98,7 @@ impl Progress {
         consumer: Arc<Consumer>,
         stream: Arc<Identifier>,
         topic: Arc<Identifier>,
+        commit: CommitPolicy,
     ) -> Self {
         Self {
             client,
@@ -86,7 +106,14 @@ impl Progress {
             stream,
             topic,
             reader: NEXT_READER.fetch_add(1, Ordering::Relaxed),
+            auto: match commit {
+                CommitPolicy::Auto(auto) => Some(auto),
+                CommitPolicy::Manual | CommitPolicy::OnRead => None,
+            },
             delivered: DashMap::new(),
+            counted: DashMap::new(),
+            retiring: Mutex::new(Vec::new()),
+            due: Notify::new(),
             committed: DashMap::new(),
             blocked: DashMap::new(),
             undecoded: DashMap::new(),
@@ -107,12 +134,18 @@ impl Progress {
     }
 
     /// Whether a read of `generation` still counts. With `OnRead`, the server stored the offset
-    /// of a read, so a read of a revoked partition still counts.
+    /// of a read, so a read of a revoked or reassigned partition still counts. Only a seek drops
+    /// what was read before it.
     pub(crate) fn keeps(&self, partition: u32, generation: u64, on_read: bool) -> bool {
-        match self.generations().current.get(&partition) {
-            Some(current) => *current == generation,
-            None => on_read,
+        let generations = self.generations();
+        if generations.current.get(&partition) == Some(&generation) {
+            return true;
         }
+        on_read
+            && generations
+                .sought
+                .get(&partition)
+                .is_none_or(|sought| generation >= *sought)
     }
 
     /// Rises before any answer of [`Self::keeps`] changes, so a caller that sees the same count
@@ -151,6 +184,7 @@ impl Progress {
         let generation = generations.last;
         generations.current.insert(partition, generation);
         generations.seeks.insert(partition, start);
+        generations.sought.insert(partition, generation);
     }
 
     /// The seeks that the fetch loop did not apply yet, each with its generation.
@@ -173,6 +207,147 @@ impl Progress {
 
     pub(crate) fn last_delivered(&self, partition: u32) -> Option<Checkpoint> {
         self.delivered.get(&partition).map(|entry| *entry.value())
+    }
+
+    /// Counts `messages` up to `checkpoint` under `CommitPolicy::Auto`, and wakes the store task
+    /// when its event makes a store due. A count only moves forward within a generation, and a
+    /// newer generation replaces it. `ends_batch` marks the last message of a batch.
+    pub(crate) fn count(&self, checkpoint: Checkpoint, messages: u32, ends_batch: bool) {
+        let Some(auto) = self.auto else {
+            return;
+        };
+        let generation = |checkpoint: &Checkpoint| checkpoint.stamp().map(|stamp| stamp.generation);
+        let since_store = {
+            let mut counted = self
+                .counted
+                .entry(checkpoint.partition_id())
+                .or_insert(Counted {
+                    checkpoint,
+                    since_store: 0,
+                });
+            let previous = counted.checkpoint;
+            if generation(&checkpoint) > generation(&previous) {
+                counted.checkpoint = checkpoint;
+                counted.since_store = 0;
+            } else if generation(&checkpoint) == generation(&previous)
+                && (!same_incarnation_and_owner(previous.context(), checkpoint.context())
+                    || checkpoint.offset() > previous.offset())
+            {
+                counted.checkpoint = checkpoint;
+            } else if generation(&checkpoint) < generation(&previous) {
+                return;
+            }
+            counted.since_store = counted.since_store.saturating_add(messages);
+            counted.since_store
+        };
+        let due = match auto.every {
+            None => false,
+            Some(CommitEvery::Message) => true,
+            Some(CommitEvery::Messages(every)) => since_store >= every.get(),
+            Some(CommitEvery::Batch) => ends_batch,
+        };
+        if due {
+            self.due.notify_one();
+        }
+    }
+
+    /// Counts a checkpoint that the application processed, under `CommitPolicy::Auto`.
+    pub(crate) fn mark(&self, checkpoint: Checkpoint) -> Result<(), IggyError> {
+        if self.auto.is_none()
+            || checkpoint
+                .stamp()
+                .is_none_or(|stamp| stamp.reader != self.reader)
+        {
+            return Err(IggyError::InvalidCommand);
+        }
+        self.count(checkpoint, 1, false);
+        Ok(())
+    }
+
+    /// The latest counted message of `partition`.
+    #[cfg(test)]
+    pub(crate) fn last_counted(&self, partition: u32) -> Option<Checkpoint> {
+        self.counted
+            .get(&partition)
+            .map(|counted| counted.checkpoint)
+    }
+
+    /// Resolves once a count made a store due since the last call.
+    pub(crate) async fn store_due(&self) {
+        self.due.notified().await;
+    }
+
+    /// Takes the counted positions of `partitions` out of the record, so the next flush stores
+    /// them before a rebalance starts their new generations.
+    pub(crate) fn retire_counted(&self, partitions: &[u32]) {
+        let retired: Vec<Checkpoint> = partitions
+            .iter()
+            .filter_map(|partition| self.counted.remove(partition))
+            .map(|(_, counted)| counted.checkpoint)
+            .filter(|checkpoint| self.is_current(checkpoint))
+            .collect();
+        if retired.is_empty() {
+            return;
+        }
+        self.retiring_guard().extend(retired);
+        self.due.notify_one();
+    }
+
+    /// Stores each counted position that is ahead of the last store of its generation, the
+    /// retired ones first. A position of an older generation is dropped. Every partition is
+    /// tried, and the first failure is the error.
+    pub(crate) async fn flush_counted(&self) -> Result<(), IggyError> {
+        let mut failure = None;
+        let retiring = std::mem::take(&mut *self.retiring_guard());
+        for checkpoint in retiring {
+            if self.commit_covers(&checkpoint) {
+                continue;
+            }
+            if let Err(error) = self.store(checkpoint).await {
+                error!(
+                    "Failed to store the counted offset of a partition that a rebalance took away: {checkpoint:?}. {error}"
+                );
+                failure.get_or_insert(error);
+            }
+        }
+        self.counted
+            .retain(|_, counted| self.is_current(&counted.checkpoint));
+        let counted: Vec<Counted> = self.counted.iter().map(|entry| *entry.value()).collect();
+        for Counted {
+            checkpoint,
+            since_store,
+        } in counted
+        {
+            if self.commit_covers(&checkpoint) {
+                continue;
+            }
+            match self.store(checkpoint).await {
+                Ok(()) => {
+                    if let Some(mut counted) = self.counted.get_mut(&checkpoint.partition_id()) {
+                        counted.since_store = counted.since_store.saturating_sub(since_store);
+                    }
+                }
+                Err(error) => {
+                    error!("Failed to store the counted offset: {checkpoint:?}. {error}");
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// The last delivered message of `partition` that a replay filter skips up to. A seek reads
+    /// again on purpose, so a message delivered before the last seek of its partition is none.
+    pub(crate) fn replay_floor(&self, partition: u32) -> Option<Checkpoint> {
+        let delivered = self.last_delivered(partition)?;
+        let sought = self.generations().sought.get(&partition).copied();
+        sought
+            .is_none_or(|sought| {
+                delivered
+                    .stamp()
+                    .is_some_and(|stamp| stamp.generation >= sought)
+            })
+            .then_some(delivered)
     }
 
     pub(crate) fn last_committed(&self, partition: u32) -> Option<Checkpoint> {
@@ -429,6 +604,16 @@ impl Progress {
         }
         self.mutate_offset(OffsetMutation::Delete { partition_id })
             .await
+    }
+
+    fn is_current(&self, checkpoint: &Checkpoint) -> bool {
+        checkpoint.stamp().is_some_and(|stamp| {
+            self.generation(checkpoint.partition_id()) == Some(stamp.generation)
+        })
+    }
+
+    fn retiring_guard(&self) -> MutexGuard<'_, Vec<Checkpoint>> {
+        self.retiring.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn generations(&self) -> MutexGuard<'_, Generations> {

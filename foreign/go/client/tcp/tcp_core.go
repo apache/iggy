@@ -403,7 +403,7 @@ func (r rawRequest) AppendBinary(b []byte) ([]byte, error) { return append(b, r.
 // across retries. A send must name an explicit partition id: a balanced or
 // key-partitioned send returns ierror.ErrFeatureUnavailable without writing, so use
 // SendMessages for those. Deferred polls and fetches take the paths
-// of PollMessagesDeferred and FetchMessages, and limits that the
+// of a deferred poll and a fetch, and limits that the
 // server refuses fail before anything is sent. A fetch preserves its target caps
 // and nonzero fences, resolving zero incarnations before progress admission.
 func (c *IggyTcpClient) SendBinaryRequest(ctx context.Context, code uint32, payload []byte) ([]byte, error) {
@@ -589,7 +589,7 @@ func (c *IggyTcpClient) GetHeartbeatInterval() time.Duration {
 // ResolveOperation replays the retained bytes under their original identity.
 // A committed business rejection is returned unchanged and releases the lane.
 // For an operation that is no longer retained, it returns what a replay proved.
-// An unknown committing fetch returns FetchProgressUncertain without I/O; its
+// An unknown committing fetch returns FetchProgressUncertain without I/O, and its
 // recovery ID is local ownership, not a replayable server receipt.
 func (c *IggyTcpClient) ResolveOperation(ctx context.Context, operationID uint64) error {
 	if ctx == nil {

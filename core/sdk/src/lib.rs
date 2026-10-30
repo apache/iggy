@@ -114,11 +114,12 @@
 //!   of a [`PartitionReader`] for you.
 //! - A **start** ([`PollingStrategy`]: `next`, `offset`, `first`, `last`, or
 //!   `timestamp`) for each partition without a stored offset.
-//! - **Commits**: [`commit`] stores the checkpoint of a yielded message. A
-//!   [`ClientCommitPolicy`] commits the last yielded position on an interval,
-//!   after each message, every Nth message, or at the end of each batch. With
-//!   [`ServerCommitPolicy::OnRead`], the server stores the offset of each read
-//!   instead. A restart resumes from the last commit.
+//! - **Commits**: the [`CommitPolicy`] of the poll options. With `Manual`,
+//!   [`commit`] stores the checkpoint of a yielded message. With `Auto`, the
+//!   consumer stores the latest message that counted, after it was processed,
+//!   delivered or marked, on an interval or after each message, every n
+//!   messages or each batch. With [`CommitPolicy::OnRead`], the server stores
+//!   the offset of each read instead. A restart resumes from the last commit.
 //! - **Manual offset control** to store, read, or delete the offset of any
 //!   partition yourself.
 //! - A **shared state handle** ([`IggyConsumerState`]) that another task can clone
@@ -205,7 +206,7 @@
 //! Tokio.
 //! The SDK also spawns its own background work with [`tokio::spawn`] (the
 //! [`IggyClient::connect`] heartbeat, and the [`IggyProducer`] and
-//! [`IggyConsumer`] tasks) and drives timeouts, retries, and poll intervals with
+//! [`IggyConsumer`] tasks) and drives timeouts, retries, and commit intervals with
 //! [`tokio::time`].
 //! Note that dropping down to the low-level transport clients does not change this.
 //! **Thus, everything you do with the Rust SDK must happen inside a Tokio runtime.**
@@ -265,8 +266,8 @@
 //! [`PollingStrategy`]: crate::prelude::PollingStrategy
 //! [`PartitionReader`]: crate::prelude::PartitionReader
 //! [`commit`]: crate::prelude::IggyConsumer::commit
-//! [`ClientCommitPolicy`]: crate::prelude::ClientCommitPolicy
-//! [`ServerCommitPolicy::OnRead`]: crate::prelude::ServerCommitPolicy::OnRead
+//! [`CommitPolicy`]: crate::prelude::CommitPolicy
+//! [`CommitPolicy::OnRead`]: crate::prelude::CommitPolicy::OnRead
 //! [`IggyConsumerState`]: crate::prelude::IggyConsumerState
 //! [`futures::Stream`]: https://docs.rs/futures/latest/futures/stream/trait.Stream.html
 //! [`TcpClient`]: crate::prelude::TcpClient

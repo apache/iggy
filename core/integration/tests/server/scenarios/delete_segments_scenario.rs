@@ -578,14 +578,15 @@ pub async fn run_consumer_group_barrier(client: &IggyClient, data_path: &Path) {
     let mut consumer = client
         .consumer_group("test_group", STREAM_NAME, TOPIC_NAME)
         .unwrap()
-        .client_commit(ClientCommitPolicy {
-            on: Some(CommitEvent::EachMessage),
-            ..ClientCommitPolicy::default()
-        })
         .create_consumer_group_if_not_exists()
         .polling_strategy(PollingStrategy::next())
         .poll_options(PollOptions {
             count: 1,
+            commit: CommitPolicy::Auto(AutoCommit {
+                interval: None,
+                every: Some(CommitEvery::Message),
+                after: CommitAfter::Delivery,
+            }),
             ..PollOptions::wait(IggyDuration::ONE_SECOND)
         })
         .build();
@@ -730,7 +731,7 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         .polling_strategy(PollingStrategy::offset(0))
         .poll_options(PollOptions {
             count: TOTAL_MESSAGES,
-            server_commit: ServerCommitPolicy::OnRead,
+            commit: CommitPolicy::OnRead,
             ..PollOptions::wait(IggyDuration::ONE_SECOND)
         })
         .build();

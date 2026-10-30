@@ -27,6 +27,7 @@ use iggy_binary_protocol::batch::{
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::responses::messages::PollMessagesResponseHeader;
 use serde::{Deserialize, Serialize};
+use std::ops::Range;
 use tracing::error;
 
 /// The wrapper on top of the collection of messages that are polled from the partition.
@@ -56,6 +57,10 @@ pub struct PolledMessages {
     /// Set by the SDK reader, and copied into each checkpoint of the batch.
     #[serde(skip)]
     stamp: Option<ReaderStamp>,
+    /// The served records a binary reply carried, kept for the record of a message that does
+    /// not decrypt. A batch decoded from JSON has none.
+    #[serde(skip)]
+    records: Option<Bytes>,
 }
 
 impl PolledMessages {
@@ -80,6 +85,23 @@ impl PolledMessages {
             messages,
             request_start: None,
             stamp: None,
+            records: None,
+        }
+    }
+
+    /// [`Self::new`] with the served records the batch was decoded from.
+    #[doc(hidden)]
+    pub fn with_records(
+        context: PartitionContext,
+        partition_id: u32,
+        current_offset: u64,
+        count: u32,
+        messages: Vec<IggyMessage>,
+        records: Bytes,
+    ) -> Self {
+        Self {
+            records: Some(records),
+            ..Self::new(context, partition_id, current_offset, count, messages)
         }
     }
 
@@ -177,15 +199,22 @@ impl PolledMessages {
     /// [`IggyError::InvalidMessagePayloadLength`] on a malformed record;
     /// [`IggyError::InvalidMessagesCount`] when the records hold another count than the prefix.
     pub fn from_bytes(bytes: Bytes, strategy: &PollingStrategy) -> Result<Self, IggyError> {
+        Self::decode(bytes, strategy).map_err(|error| error.error)
+    }
+
+    /// [`Self::from_bytes`], keeping the records of a reply that does not decode.
+    #[doc(hidden)]
+    pub fn decode(bytes: Bytes, strategy: &PollingStrategy) -> Result<Self, DecodeError> {
         let (header, consumed) = PollMessagesResponseHeader::decode(&bytes)
-            .map_err(|_| IggyError::InvalidNumberEncoding)?;
+            .map_err(|_| DecodeError::without_record(IggyError::InvalidNumberEncoding))?;
         let PollMessagesResponseHeader {
             partition_id,
             current_offset,
             messages_count: count,
             context,
         } = header;
-        let messages = messages_from_batches(bytes.slice(consumed..), count)?;
+        let records = bytes.slice(consumed..);
+        let messages = messages_from_batches(records.clone(), count)?;
 
         Ok(Self {
             context,
@@ -195,8 +224,61 @@ impl PolledMessages {
             messages,
             request_start: Some(*strategy),
             stamp: None,
+            records: Some(records),
         })
     }
+
+    /// The record of the message at `index` as the reply carried it, for a message that does
+    /// not decrypt. `None` for a batch decoded from JSON, which carries no records.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn undecoded_record(&self, index: usize) -> Option<UndecodedRecord> {
+        record_at(self.records.as_ref()?, index)
+    }
+}
+
+/// A record of a reply that does not decode, with what the reply carried for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndecodedRecord {
+    /// The offset of the record, known when its frame decoded and a later step failed, such as
+    /// a payload past the batch, a checksum or a decryption. `None` when the framing itself is
+    /// malformed, so no record can be isolated.
+    pub offset: Option<u64>,
+    /// The record as the reply carried it: its frame header, payload and user headers, before
+    /// any decryption. For malformed framing, the rest of the records from where decoding
+    /// stopped. For an HTTP reply that is not JSON, the response body.
+    pub bytes: Bytes,
+}
+
+/// A reply that does not decode, with its undecoded record when the reply carried one.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodeError {
+    pub error: IggyError,
+    /// Boxed, so a result of the decode stays small.
+    pub record: Option<Box<UndecodedRecord>>,
+}
+
+impl DecodeError {
+    /// A failure before any record was read, or of a reply that carries none.
+    #[must_use]
+    pub const fn without_record(error: IggyError) -> Self {
+        Self {
+            error,
+            record: None,
+        }
+    }
+}
+
+/// The record of the message at `index` of the served `records`, as the reply carried it.
+#[doc(hidden)]
+#[must_use]
+pub fn record_at(records: &Bytes, index: usize) -> Option<UndecodedRecord> {
+    let record = Records::new(records).nth(index)?.ok()?;
+    Some(UndecodedRecord {
+        offset: Some(record.header.offset),
+        bytes: records.slice(record.frame),
+    })
 }
 
 /// Walk the served batch records, resolving each frame's deltas to absolute
@@ -205,39 +287,107 @@ impl PolledMessages {
 pub(super) fn messages_from_batches(
     buffer: Bytes,
     count: u32,
-) -> Result<Vec<IggyMessage>, IggyError> {
+) -> Result<Vec<IggyMessage>, DecodeError> {
+    let whole = |error| DecodeError {
+        error,
+        record: Some(Box::new(UndecodedRecord {
+            offset: None,
+            bytes: buffer.clone(),
+        })),
+    };
     if count as usize > buffer.len() / BATCH_MESSAGE_HEADER_SIZE {
-        return Err(IggyError::InvalidMessagesCount);
+        return Err(whole(IggyError::InvalidMessagesCount));
     }
     let mut messages = Vec::with_capacity(count as usize);
-    let mut position = 0usize;
-    while position < buffer.len() {
-        let batch = BatchHeader::decode(&buffer[position..]).map_err(|decode_error| {
-            error!("Failed to decode polled batch header: {decode_error}");
-            IggyError::InvalidMessagePayloadLength
-        })?;
-        let batch_end = position
-            .checked_add(batch.total_size())
-            .filter(|end| *end <= buffer.len())
-            .ok_or(IggyError::InvalidMessagePayloadLength)?;
-        let mut cursor = position + BATCH_HEADER_SIZE;
-        while cursor < batch_end {
-            let frame =
-                BatchMessageHeader::decode(&buffer[cursor..batch_end]).map_err(|decode_error| {
-                    error!("Failed to decode polled message frame: {decode_error}");
-                    IggyError::InvalidMessagePayloadLength
-                })?;
-            let payload_start = cursor + iggy_binary_protocol::batch::BATCH_MESSAGE_HEADER_SIZE;
-            let payload_end = payload_start + frame.payload_length as usize;
-            let user_headers_end = payload_end + frame.user_headers_length as usize;
-            if user_headers_end > batch_end {
-                return Err(IggyError::InvalidMessagePayloadLength);
-            }
+    for record in Records::new(&buffer) {
+        let record = record?;
+        if messages.len() == count as usize {
+            return Err(DecodeError {
+                error: IggyError::InvalidMessagesCount,
+                record: Some(Box::new(UndecodedRecord {
+                    offset: Some(record.header.offset),
+                    bytes: buffer.slice(record.frame),
+                })),
+            });
+        }
+        let user_headers = record.user_headers.map(|range| buffer.slice(range));
+        messages.push(IggyMessage {
+            header: record.header,
+            payload: buffer.slice(record.payload),
+            user_headers,
+        });
+    }
+    if messages.len() != count as usize {
+        return Err(whole(IggyError::InvalidMessagesCount));
+    }
+    Ok(messages)
+}
 
-            let header = IggyMessageHeader {
+/// One record of a reply: its resolved header and where its parts lie in the buffer.
+struct Record {
+    header: IggyMessageHeader,
+    frame: Range<usize>,
+    payload: Range<usize>,
+    user_headers: Option<Range<usize>>,
+}
+
+/// The records of a reply, batch by batch. Ends at the first record that does not decode,
+/// with the bytes from there on.
+struct Records<'a> {
+    buffer: &'a Bytes,
+    position: usize,
+    /// The batch being walked and where it ends.
+    batch: Option<(BatchHeader, usize)>,
+    cursor: usize,
+}
+
+impl<'a> Records<'a> {
+    const fn new(buffer: &'a Bytes) -> Self {
+        Self {
+            buffer,
+            position: 0,
+            batch: None,
+            cursor: 0,
+        }
+    }
+
+    fn malformed(&mut self, from: usize, offset: Option<u64>) -> DecodeError {
+        self.position = self.buffer.len();
+        self.batch = None;
+        DecodeError {
+            error: IggyError::InvalidMessagePayloadLength,
+            record: Some(Box::new(UndecodedRecord {
+                offset,
+                bytes: self.buffer.slice(from..),
+            })),
+        }
+    }
+
+    fn frame(&mut self, batch: BatchHeader, batch_end: usize) -> Result<Record, DecodeError> {
+        let cursor = self.cursor;
+        let frame = BatchMessageHeader::decode(&self.buffer[cursor..batch_end]).map_err(
+            |decode_error| {
+                error!("Failed to decode polled message frame: {decode_error}");
+                self.malformed(cursor, None)
+            },
+        )?;
+        let offset = batch.base_offset + u64::from(frame.offset_delta);
+        let payload_start = cursor + BATCH_MESSAGE_HEADER_SIZE;
+        let payload_end = payload_start + frame.payload_length as usize;
+        let user_headers_end = payload_end + frame.user_headers_length as usize;
+        if user_headers_end > batch_end {
+            let mut error = self.malformed(cursor, Some(offset));
+            if let Some(record) = &mut error.record {
+                record.bytes = self.buffer.slice(cursor..batch_end);
+            }
+            return Err(error);
+        }
+        self.cursor = user_headers_end;
+        Ok(Record {
+            header: IggyMessageHeader {
                 checksum: frame.checksum,
                 id: frame.id,
-                offset: batch.base_offset + u64::from(frame.offset_delta),
+                offset,
                 // Broker append time is stamped once per batch; the
                 // per-message delta applies to `origin_timestamp` only.
                 timestamp: batch.base_timestamp,
@@ -245,30 +395,47 @@ pub(super) fn messages_from_batches(
                 user_headers_length: frame.user_headers_length,
                 payload_length: frame.payload_length,
                 reserved: 0,
-            };
-            let payload = buffer.slice(payload_start..payload_end);
-            let user_headers = if frame.user_headers_length > 0 {
-                Some(buffer.slice(payload_end..user_headers_end))
-            } else {
-                None
-            };
-            if messages.len() == count as usize {
-                return Err(IggyError::InvalidMessagesCount);
-            }
-            messages.push(IggyMessage {
-                header,
-                payload,
-                user_headers,
-            });
-            cursor = user_headers_end;
-        }
-        position = batch_end;
+            },
+            frame: cursor..user_headers_end,
+            payload: payload_start..payload_end,
+            user_headers: (frame.user_headers_length > 0).then_some(payload_end..user_headers_end),
+        })
     }
+}
 
-    if messages.len() != count as usize {
-        return Err(IggyError::InvalidMessagesCount);
+impl Iterator for Records<'_> {
+    type Item = Result<Record, DecodeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some((batch, batch_end)) = self.batch {
+                if self.cursor < batch_end {
+                    return Some(self.frame(batch, batch_end));
+                }
+                self.batch = None;
+                self.position = batch_end;
+            }
+            if self.position >= self.buffer.len() {
+                return None;
+            }
+            let position = self.position;
+            let batch = match BatchHeader::decode(&self.buffer[position..]) {
+                Ok(batch) => batch,
+                Err(decode_error) => {
+                    error!("Failed to decode polled batch header: {decode_error}");
+                    return Some(Err(self.malformed(position, None)));
+                }
+            };
+            let Some(batch_end) = position
+                .checked_add(batch.total_size())
+                .filter(|end| *end <= self.buffer.len())
+            else {
+                return Some(Err(self.malformed(position, None)));
+            };
+            self.cursor = position + BATCH_HEADER_SIZE;
+            self.batch = Some((batch, batch_end));
+        }
     }
-    Ok(messages)
 }
 
 #[cfg(test)]

@@ -18,8 +18,8 @@
 @deferred-polling
 Feature: Deferred polling
   As a developer using Apache Iggy
-  I want a poll to wait on the server until messages arrive
-  So that a consumer gets a new message at once without a polling loop
+  I want a poll, a partition reader and a consumer to wait on the server until messages arrive
+  So that a new message reaches me at once without a polling loop
 
   Background:
     Given I have a running Iggy server
@@ -36,30 +36,48 @@ Feature: Deferred polling
     When I start a deferred poll of partition 1 from offset 0 with a max wait of 1 second
     Then the deferred poll should return no messages between 1 and 3 seconds after it started
 
-  Scenario: A fetch returns only the partitions that hold messages
-    Given a stream named "deferred-ready" with a topic named "events" with 3 partitions exists
-    When I start a fetch on partitions 0, 1 and 2 from offset 0 with a max wait of 10 seconds
-    And I send a message with payload "ready" to partition 1
-    Then the fetch should return only partition 1 within 2 seconds
-
-  # The partitions get messages in descending order, so a poll that picks partitions in turn
-  # parks on an idle partition in at least one round.
-  Scenario: A group fetch reads the partition that holds messages
-    Given a stream named "deferred-group" with a topic named "events" with 3 partitions exists
-    And I am the only member of consumer group "readers" on the topic
-    When I send a message with payload "first" to partition 2
-    Then a group fetch with a max wait of 10 seconds should return the payload "first" within 2 seconds
-    When I send a message with payload "second" to partition 1
-    Then a group fetch with a max wait of 10 seconds should return the payload "second" within 2 seconds
-    When I send a message with payload "third" to partition 0
-    Then a group fetch with a max wait of 10 seconds should return the payload "third" within 2 seconds
+  Scenario: A poll that commits on read stores the offset of its last message
+    Given a stream named "deferred-on-read" with a topic named "events" with 3 partitions exists
+    When I send a message with payload "one" to partition 0
+    And I send a message with payload "two" to partition 0
+    Then a poll of partition 0 for consumer "on-read" with the next strategy and the on read commit policy should return the payload "one"
+    And a poll of partition 0 for consumer "on-read" with the next strategy should return the payload "two"
 
   # The poll asks for 2 messages and finds 1, so it stays parked until the cancellation.
-  # Without the cancellation it would expire after 1 second and commit the offset of "unseen".
+  # Without the cancellation it would expire after 1 second and store the offset of "unseen".
   Scenario: A cancelled deferred poll does not commit its consumer offset
     Given a stream named "deferred-cancel" with a topic named "events" with 3 partitions exists
     When I send a message with payload "unseen" to partition 2
-    And I start a deferred poll of partition 2 for consumer "cancel-check" with auto commit, a min count of 2 and a max wait of 1 second
+    And I start a deferred poll of partition 2 for consumer "cancel-check" with the on read commit policy, a min count of 2 and a max wait of 1 second
     And I cancel the deferred poll after 200 milliseconds
     And I wait 2 seconds
     Then a poll of partition 2 for consumer "cancel-check" with the next strategy should return the payload "unseen"
+
+  Scenario: A partition reader returns the partition that holds messages
+    Given a stream named "deferred-reader" with a topic named "events" with 3 partitions exists
+    When I open a partition reader on partitions 0, 1 and 2 from offset 0 with a max wait of 10 seconds
+    And I send a message with payload "ready" to partition 1
+    Then the partition reader should return the payload "ready" from partition 1 within 2 seconds
+
+  # The partitions get messages in descending order, so a consumer that reads partitions in
+  # turn waits on an idle partition in at least one round.
+  Scenario: A group consumer reads every partition that holds messages
+    Given a stream named "deferred-group" with a topic named "events" with 3 partitions exists
+    When I open a consumer in group "readers" on the topic with a max wait of 10 seconds
+    And I send a message with payload "first" to partition 2
+    Then the consumer should return the payload "first" within 2 seconds
+    When I send a message with payload "second" to partition 1
+    Then the consumer should return the payload "second" within 2 seconds
+    When I send a message with payload "third" to partition 0
+    Then the consumer should return the payload "third" within 2 seconds
+
+  # Closing the consumer counts the message it handed over last as processed and stores it.
+  Scenario: A group consumer that commits after processing resumes after its last message
+    Given a stream named "deferred-resume" with a topic named "events" with 3 partitions exists
+    When I send a message with payload "processed" to partition 0
+    And I open a consumer in group "resumers" on the topic that commits after processing
+    Then the consumer should return the payload "processed" within 2 seconds
+    When I close the consumer
+    And I send a message with payload "next" to partition 0
+    And I open a consumer in group "resumers" on the topic that commits after processing
+    Then the consumer should return the payload "next" within 2 seconds

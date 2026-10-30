@@ -30,7 +30,7 @@
 //! ascending partition order and no mutation gate, so no two calls wait for
 //! each other in a cycle. Unknown committing fetches and polls retain only
 //! local progress blocks across sessions. Offset inspection bypasses those
-//! blocks; explicit abandon accepts uncertainty.
+//! blocks. Explicit abandon accepts uncertainty.
 
 use super::SessionOwner;
 use super::pending::Reservation;
@@ -45,7 +45,7 @@ use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_common::IggyError;
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::{Instant, timeout_at};
 
@@ -140,6 +140,41 @@ pub(super) struct Lane {
 struct FetchBlock {
     operation_id: u64,
     _reservation: Arc<Reservation>,
+    /// Set once the one reply of a cancelled request proved the outcome: the partitions whose
+    /// outcome it left unknown.
+    settled: OnceLock<Vec<u32>>,
+}
+
+/// Lifts the progress blocks of a committing fetch or poll whose caller left, once the reply
+/// that the server sends for its cancel proves the outcome. It works before and after the call
+/// drops its ticket.
+#[derive(Debug)]
+pub(crate) struct FetchSettlement {
+    owner: Arc<SessionOwner>,
+    block: Arc<FetchBlock>,
+}
+
+impl FetchSettlement {
+    /// Every target keeps its block only when it is in `uncertain`.
+    pub(crate) fn settle(self, uncertain: Vec<u32>) {
+        let mut lanes = self.owner.lanes();
+        if self.block.settled.set(uncertain).is_err() {
+            return;
+        }
+        let uncertain = self.block.settled.get().map_or(&[][..], Vec::as_slice);
+        lanes.retain(|key, lane| {
+            if let LaneKey::Progress { partition_id, .. } = key
+                && !uncertain.contains(partition_id)
+                && lane
+                    .fetch_block
+                    .as_ref()
+                    .is_some_and(|block| Arc::ptr_eq(block, &self.block))
+            {
+                lane.fetch_block = None;
+            }
+            lane.tickets > 0 || lane.retained.is_some() || lane.fetch_block.is_some()
+        });
+    }
 }
 
 impl Lane {
@@ -192,7 +227,7 @@ pub(crate) struct LaneTicket {
     reservation: Option<Arc<Reservation>>,
     fetch_reservation: Option<Arc<Reservation>>,
     fetch_block: Option<Arc<FetchBlock>>,
-    /// None retains all targets; a valid partial reply narrows that set.
+    /// None retains all targets. A valid partial reply narrows that set.
     uncertain_targets: Option<Vec<u32>>,
     fence: u64,
     /// A resume replays an operation that its lane still retains.
@@ -530,6 +565,14 @@ impl LaneTicket {
         Ok(())
     }
 
+    /// The settlement of the frozen committing request, for the reply of its cancel.
+    pub(crate) fn settlement(&self) -> Option<FetchSettlement> {
+        self.fetch_block.as_ref().map(|block| FetchSettlement {
+            owner: Arc::clone(&self.owner),
+            block: Arc::clone(block),
+        })
+    }
+
     pub(crate) fn retain_fetch_targets(&mut self, partitions: Vec<u32>) -> Option<u64> {
         self.uncertain_targets = Some(partitions);
         self.fetch_block.as_ref().map(|block| block.operation_id)
@@ -593,6 +636,7 @@ impl LaneTicket {
             self.fetch_block = Some(Arc::new(FetchBlock {
                 operation_id: frame.header.request,
                 _reservation: Arc::clone(reservation),
+                settled: OnceLock::new(),
             }));
         }
         self.operation = reservation.map(|reservation| RetainedOperation {
@@ -636,8 +680,8 @@ impl LaneTicket {
         self.complete();
     }
 
-    /// Ends the call with an unknown outcome. Mutations retain replay frames;
-    /// committing fetches and polls retain only local progress blocks.
+    /// Ends the call with an unknown outcome. Mutations retain replay frames.
+    /// Committing fetches and polls retain only local progress blocks.
     pub(crate) fn retain(self) -> IggyError {
         if let Some(block) = &self.fetch_block {
             return IggyError::FetchProgressUncertain(block.operation_id);
@@ -665,12 +709,14 @@ impl Drop for LaneTicket {
             && let Some(block) = &self.fetch_block
         {
             let mut lanes = self.owner.lanes();
+            let settled = block.settled.get();
             for progress in &self.progress {
                 if let Some(key @ LaneKey::Progress { partition_id, .. }) = progress.key
                     && self
                         .uncertain_targets
                         .as_ref()
                         .is_none_or(|targets| targets.contains(&partition_id))
+                    && settled.is_none_or(|uncertain| uncertain.contains(&partition_id))
                     && let Some(lane) = lanes.get_mut(&key)
                 {
                     lane.fetch_block = Some(Arc::clone(block));
@@ -1335,6 +1381,69 @@ mod tests {
                     .complete();
                 assert_eq!(lane_count(&owner), 0);
             }
+        }
+    }
+
+    /// The reply to the cancel of a committing fetch proves the outcome of each target but the
+    /// uncertain ones, whether it arrives before or after the call drops its ticket.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_dropped_committing_fetch_when_its_reply_settles_it_should_block_only_its_uncertain_targets()
+     {
+        for settle_before_drop in [false, true] {
+            let owner = bound_owner();
+            let targets = [
+                (PARTITION_ID, INCARNATION),
+                (OTHER_PARTITION_ID, INCARNATION),
+            ];
+            let mut fetch = owner
+                .enter_progress_lanes(&targets, deadline())
+                .await
+                .unwrap();
+            fetch.reserve_fetch(deadline()).await.unwrap();
+            let frame = fetch
+                .freeze(
+                    FETCH_MESSAGES_CODE,
+                    Bytes::new(),
+                    PartitionContext::default(),
+                    None,
+                )
+                .unwrap();
+            *fetch.sent_flag() = true;
+            let settlement = fetch.settlement().unwrap();
+            if settle_before_drop {
+                settlement.settle(vec![OTHER_PARTITION_ID]);
+                drop(fetch);
+            } else {
+                drop(fetch);
+                settlement.settle(vec![OTHER_PARTITION_ID]);
+            }
+
+            let lane = |partition_id| {
+                Some(LaneKey::Progress {
+                    partition_id,
+                    incarnation: INCARNATION,
+                })
+            };
+            owner
+                .enter_lane(lane(PARTITION_ID), deadline())
+                .await
+                .unwrap()
+                .complete();
+            let operation_id = frame.header.request;
+            assert!(
+                matches!(
+                    owner.enter_lane(lane(OTHER_PARTITION_ID), deadline()).await,
+                    Err(IggyError::PartitionLaneBlocked(OTHER_PARTITION_ID, operation))
+                        if operation == operation_id
+                ),
+                "settled before the drop: {settle_before_drop}"
+            );
+            owner.abandon(operation_id).unwrap();
+            owner
+                .enter_lane(lane(OTHER_PARTITION_ID), deadline())
+                .await
+                .unwrap()
+                .complete();
         }
     }
 

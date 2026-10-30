@@ -98,3 +98,9 @@ it('translates the resource option refusals', () => {
   assert.equal(translateErrorCode(4107), 'Unsupported critical option: {0}');
   assert.equal(translateErrorCode(4108), 'Cannot modify root user');
 });
+
+it('translates the local lane and read recovery codes', () => {
+  assert.equal(translateErrorCode(14007), 'Lane blocked by operation {0} with an unknown outcome');
+  assert.equal(translateErrorCode(14009), 'Lane of partition {0} blocked by operation {1} with an unknown outcome');
+  assert.equal(translateErrorCode(14010), 'Read {0} has unknown progress and requires explicit abandonment');
+});

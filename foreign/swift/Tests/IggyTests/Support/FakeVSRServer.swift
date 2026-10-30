@@ -373,6 +373,17 @@ final class FakeVSRServer: @unchecked Sendable {
     /// The partition context the default script routes every partition to.
     static let routeContext = PartitionContext(incarnation: 7, ownerGeneration: 0, metadataOp: 10)
 
+    /// The refusal of a whole fetch that names a partition whose primary is
+    /// not `replica`, as a server answers before it reads any target, or nil.
+    static func notPrimaryRefusal(_ request: Request, replica: UInt8, primary: (UInt32) -> UInt8) -> Reply? {
+        guard request.code == CommandCode.fetchMessages.rawValue, let fetch = try? request.fetch,
+            fetch.targets.contains(where: { primary($0.partitionID) != replica })
+        else {
+            return nil
+        }
+        return .status(IggyErrorCode.notPrimary.rawValue)
+    }
+
     /// The answer to a register and to a resume: the session is bound, as on
     /// a node that holds it. Nil for any other request.
     static func sessionReply(_ request: Request) -> Reply? {

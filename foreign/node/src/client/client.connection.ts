@@ -98,7 +98,7 @@ export const LINK_WRITE_QUEUE = 32;
 export const MAX_PENDING_PER_LINK = 256;
 const STALE_CLIENT = 30;
 
-/** A connected socket was lost; a later bootstrap can bind it again. */
+/** A connected socket was lost. A later bootstrap can bind it again. */
 export class ConnectionClosedError extends Error {
   constructor(cause?: Error) {
     super(cause?.message ?? 'replica connection closed', { cause });
@@ -215,8 +215,16 @@ export class IggyConnection extends EventEmitter {
       try {
         return await waitWithin(response, deadline, signal);
       } catch (error) {
-        if (afterSend && pending.started && signal.aborted)
+        if (afterSend && pending.started && signal.aborted) {
+          // The server answers a cancelled read that commits once: refused when the cancel won, or with what it
+          // stored, so the request keeps its reply slot.
+          const cancellation = pending.done ? undefined : deferredCancellation(pending.frame);
+          if (cancellation && !this.failed) {
+            this.writes.push({ id: pending.id, frame: cancellation, resolve: () => undefined, done: false, started: false });
+            void this.writeFrames();
+          }
           return await waitWithin(response, deadline, afterSend);
+        }
         throw error;
       }
     } catch (error) {

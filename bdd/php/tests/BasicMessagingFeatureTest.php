@@ -22,10 +22,10 @@ require_once __DIR__ . '/SharedFeatureParser.php';
 require_once __DIR__ . '/TestEnvironment.php';
 
 use Iggy\Client as IggyClient;
+use Iggy\CommitPolicy;
 use Iggy\PollingStrategy;
 use Iggy\PollOptions;
 use Iggy\SendMessage;
-use Iggy\ServerCommitPolicy;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\TestDox;
@@ -185,7 +185,7 @@ final class BasicMessagingFeatureTest extends TestCase
                 (int) $matches[3],
                 self::CONSUMER_ID,
                 PollingStrategy::offset((int) $matches[4]),
-                new PollOptions(count: $this->requireSentMessageCount(), server_commit: ServerCommitPolicy::OnRead),
+                new PollOptions(count: $this->requireSentMessageCount(), commit: CommitPolicy::onRead()),
             )->messages;
 
             return;

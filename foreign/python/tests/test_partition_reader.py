@@ -21,6 +21,10 @@ from datetime import timedelta
 import pytest
 
 from apache_iggy import (
+    AutoCommit,
+    CommitAfter,
+    CommitEvery,
+    CommitPolicy,
     Consumer,
     IggyClient,
     IggyError,
@@ -30,7 +34,6 @@ from apache_iggy import (
     PollOptions,
     ReadError,
     ReceiveMessage,
-    ServerCommitPolicy,
     TopicOptions,
 )
 from apache_iggy import SendMessage as Message
@@ -40,6 +43,7 @@ from .utils import read_offsets_with_cancels, wait_for_consumer_group_assignment
 INVALID_COMMAND = 3
 FEATURE_UNAVAILABLE = 5
 HISTORY_UNAVAILABLE = 87
+CONSUMER_OFFSET_NOT_FOUND = 3021
 READ_TIMEOUT_SECONDS = 10
 CONSUMER_ID = 1
 PARTITION_ID = 0
@@ -190,6 +194,115 @@ class TestPartitionReader:
         }
 
     @pytest.mark.asyncio
+    async def test_async_with_and_async_for_read_until_the_reader_closes(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test async for reads batches, and async with closes the reader on exit."""
+        stream_name, topic_name = await _create_topic(iggy_client, unique_name)
+        sent = await _send(iggy_client, stream_name, topic_name, [PARTITION_ID])
+
+        reader = await iggy_client.reader(
+            stream_name,
+            topic_name,
+            consumer=Consumer.Single(CONSUMER_ID),
+            partitions=[PARTITION_ID],
+        )
+        messages: list[ReceiveMessage] = []
+        async with reader as entered:
+            async with asyncio.timeout(READ_TIMEOUT_SECONDS):
+                async for batch in entered:
+                    messages.extend(batch.messages)
+                    if len(messages) == MESSAGES_PER_PARTITION:
+                        break
+
+        assert entered is reader
+        assert _by_partition(messages) == sent
+        assert [batch async for batch in reader] == []
+        with pytest.raises(RuntimeError, match="reader has been closed"):
+            await reader.next()
+
+    @pytest.mark.asyncio
+    async def test_auto_commit_stores_the_marked_checkpoint_when_the_reader_closes(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a reader with CommitAfter.Marked stores what mark() counted on close."""
+        marked_index = 1
+        stream_name, topic_name = await _create_topic(iggy_client, unique_name)
+        sent = await _send(iggy_client, stream_name, topic_name, [PARTITION_ID])
+        consumer = Consumer.Single(CONSUMER_ID)
+
+        reader = await iggy_client.reader(
+            stream_name,
+            topic_name,
+            consumer=consumer,
+            partitions=[PARTITION_ID],
+            start=PollingStrategy.First(),
+            options=PollOptions(
+                max_wait=POLL_WAIT,
+                commit=CommitPolicy.Auto(
+                    AutoCommit(every=CommitEvery.Batch(), after=CommitAfter.Marked)
+                ),
+            ),
+        )
+        async with reader:
+            batch = await _next(reader)
+            checkpoint = batch.checkpoint_at(marked_index)
+            assert checkpoint is not None
+            await reader.mark(checkpoint)
+        resumed = await iggy_client.reader(
+            stream_name,
+            topic_name,
+            consumer=consumer,
+            partitions=[PARTITION_ID],
+            start=PollingStrategy.Next(),
+        )
+        async with resumed:
+            messages = await _read(resumed, MESSAGES_PER_PARTITION - marked_index - 1)
+
+        assert _by_partition(messages) == {
+            PARTITION_ID: sent[PARTITION_ID][marked_index + 1 :]
+        }
+
+    @pytest.mark.asyncio
+    async def test_deleted_position_lets_a_new_reader_start_over(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test delete_consumer_position removes the offset a reader committed."""
+        stream_name, topic_name = await _create_topic(iggy_client, unique_name)
+        sent = await _send(iggy_client, stream_name, topic_name, [PARTITION_ID])
+        consumer = Consumer.Single(CONSUMER_ID)
+
+        reader = await iggy_client.reader(
+            stream_name, topic_name, consumer=consumer, partitions=[PARTITION_ID]
+        )
+        try:
+            checkpoint = (await _read(reader, MESSAGES_PER_PARTITION))[-1].checkpoint()
+            await reader.commit(checkpoint)
+        finally:
+            await reader.close()
+        await iggy_client.delete_consumer_position(
+            stream_name, topic_name, consumer=consumer, checkpoint=checkpoint
+        )
+        with pytest.raises(IggyError) as missing:
+            await iggy_client.delete_consumer_position(
+                stream_name, topic_name, consumer=consumer, checkpoint=checkpoint
+            )
+        resumed = await iggy_client.reader(
+            stream_name,
+            topic_name,
+            consumer=consumer,
+            partitions=[PARTITION_ID],
+            start=PollingStrategy.Next(),
+        )
+        try:
+            messages = await _read(resumed, MESSAGES_PER_PARTITION)
+        finally:
+            await resumed.close()
+
+        assert missing.value.code == CONSUMER_OFFSET_NOT_FOUND
+        assert _by_partition(messages) == sent
+
+    @pytest.mark.asyncio
     async def test_seek_reads_the_partition_again_from_the_new_start(
         self, iggy_client: IggyClient, unique_name
     ):
@@ -325,9 +438,7 @@ class TestPartitionReader:
             topic_name,
             consumer=Consumer.Single(CONSUMER_ID),
             partitions=[PARTITION_ID],
-            options=PollOptions(
-                max_wait=POLL_WAIT, server_commit=ServerCommitPolicy.OnRead
-            ),
+            options=PollOptions(max_wait=POLL_WAIT, commit=CommitPolicy.OnRead()),
         )
         try:
             delivered = (await _read(on_read_reader, 1))[0].checkpoint()
@@ -496,7 +607,7 @@ class TestPartitionReader:
             options=PollOptions(
                 count=ONE_MESSAGE,
                 max_wait=POLL_WAIT,
-                server_commit=ServerCommitPolicy.OnRead,
+                commit=CommitPolicy.OnRead(),
             ),
             prefetch_messages=ONE_MESSAGE,
         )

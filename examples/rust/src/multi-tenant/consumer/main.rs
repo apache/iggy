@@ -298,7 +298,7 @@ async fn create_consumers(
                 .polling_strategy(PollingStrategy::next())
                 .poll_options(PollOptions {
                     count: batch_length,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::wait(IggyDuration::ONE_SECOND)
                 })
                 .build();

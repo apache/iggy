@@ -25,9 +25,10 @@ use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::responses::messages::FetchMessagesResponse;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
-    AssignmentVersion, Checkpoint, Client, DeferredPollOptions, DiagnosticEvent, EncryptorKind,
-    FetchedSection, IggyDuration, IggyError, MIN_DEFERRED_POLL_MAX_BYTES, MessageClient,
-    PollOptions, PolledMessages, PollingKind, PollingStrategy, ServerCommitPolicy,
+    AssignmentVersion, Checkpoint, Client, CommitPolicy, DecodeError, DeferredPollOptions,
+    DiagnosticEvent, EncryptorKind, FetchedSection, IggyDuration, IggyError,
+    MIN_DEFERRED_POLL_MAX_BYTES, MessageClient, PollOptions, PolledMessages, PollingKind,
+    PollingStrategy, UndecodedRecord,
 };
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::{AbortHandle, JoinSet};
@@ -43,6 +44,11 @@ use crate::driver::{
 const ASSIGNMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// The message limit of a probe, and the size of a section whose failure names its message.
 const SINGLE_RECORD: u32 = 1;
+/// A partition refused this many times in a row for a reason that does not pass by itself stops
+/// until a seek.
+pub(super) const MAX_LASTING_REFUSALS: u32 = 6;
+/// The wait after a lasting refusal doubles at most this many times.
+const MAX_REFUSAL_BACKOFF_STEPS: u32 = 5;
 
 enum Completed {
     Poll(CompletedPoll),
@@ -59,8 +65,8 @@ struct CompletedPoll {
     strategy: PollingStrategy,
     /// The generation of the position.
     generation: u64,
-    result: Result<PolledMessages, IggyError>,
-    capacity: FetchCapacity,
+    result: Result<PolledMessages, DecodeError>,
+    capacity: Arc<FetchCapacity>,
     /// Set for a poll that commits its batch.
     commit: Option<PendingCommit>,
 }
@@ -76,7 +82,7 @@ struct CompletedFetch {
     targets: Vec<(u32, PollingStrategy, u64)>,
     /// The sections, whose records the worker decodes once the positions moved.
     result: Result<Vec<FetchedSection>, IggyError>,
-    capacity: FetchCapacity,
+    capacity: Arc<FetchCapacity>,
     /// Set for a fetch that commits its batches.
     commit: Option<PendingCommit>,
 }
@@ -119,12 +125,20 @@ struct Refreshed {
 
 /// The fetch loop of a reader. Its reads run in `tasks`, and one refresh of the assignment and
 /// the readiness groups runs apart from them.
+struct RetainedBatch {
+    batch: PolledMessages,
+    capacity: Arc<FetchCapacity>,
+}
+
 pub(super) struct Worker {
     config: Arc<Config>,
     shared: Arc<Shared>,
-    sender: mpsc::Sender<Reply>,
+    sender: mpsc::UnboundedSender<Reply>,
     events: Option<Receiver<DiagnosticEvent>>,
     capacity: Arc<Semaphore>,
+    recovery_capacity: Arc<Semaphore>,
+    retained_batches: BTreeMap<u32, RetainedBatch>,
+    lost_operations: BTreeMap<u32, u64>,
     request_capacity: Arc<Semaphore>,
     tasks: JoinSet<Completed>,
     /// At most one refresh, apart from the fetches, so a slow one never holds
@@ -134,17 +148,33 @@ pub(super) struct Worker {
     active: BTreeMap<u32, Active>,
     /// Numbers the polls and the fetches.
     fetches: u64,
-    /// Partitions whose next read takes one message without a byte limit: a record above
-    /// `max_bytes`, or the first message of a section that did not decode.
+    /// Partitions whose next read is a poll of one message: a fetch section refused for a first
+    /// record above `max_bytes`, which a poll always returns, or a message of a section that did
+    /// not decode, which the poll names.
     read_alone: BTreeSet<u32>,
+    /// The end of a section that did not decode. Its partition reads alone until its position
+    /// passes it, so each message of the section is read once.
+    read_alone_until: BTreeMap<u32, u64>,
+    /// With `OnRead`: the last offset that a lost read committed past the position of a
+    /// partition. The partition reads up to it again by offset without a commit, then reads
+    /// `Next` again.
+    catch_up: BTreeMap<u32, u64>,
+    /// With `OnRead`: the operations of lost replies, which the worker abandons because the next
+    /// `Next` read finds what they committed.
+    abandoning: Vec<(u64, Vec<u32>)>,
     /// Partitions that probe alone after the server refused a fetch of theirs.
     probing: BTreeSet<u32>,
     /// Partitions that read nothing until a seek.
     stopped: BTreeSet<u32>,
+    /// The lasting refusals in a row of each partition.
+    lasting_refusals: BTreeMap<u32, u32>,
+    /// The lasting refusals in a row of the assignment refresh.
+    refresh_refusals: u32,
     positions: BTreeMap<u32, PollingStrategy>,
     /// The generation of each position.
     generations: BTreeMap<u32, u64>,
-    /// The position that a seek started the generation of a partition at.
+    /// The position that the generation of a partition started at: that of a seek, or the
+    /// first message that a `Last` or `Timestamp` start resolved to.
     seek_starts: BTreeMap<u32, PollingStrategy>,
     retry_at: BTreeMap<u32, Instant>,
     partitions: Vec<u32>,
@@ -153,6 +183,9 @@ pub(super) struct Worker {
     pending_errors: BTreeMap<Option<u32>, Refusal>,
     epoch: u64,
     cursor: Option<u32>,
+    /// The group that the next group fetch starts the walk from, so every group gets a turn
+    /// when there are fewer slots than groups.
+    group_cursor: usize,
     /// The assigned partitions, grouped by primary endpoint and split to fit one
     /// fetch each. Empty while every partition polls alone.
     groups: Vec<Vec<u32>>,
@@ -168,7 +201,7 @@ impl Worker {
     pub(super) fn new(
         config: Arc<Config>,
         shared: Arc<Shared>,
-        sender: mpsc::Sender<Reply>,
+        sender: mpsc::UnboundedSender<Reply>,
         events: Option<Receiver<DiagnosticEvent>>,
     ) -> Self {
         // The fixed partitions of a standalone reader start their generations at once, so a
@@ -180,6 +213,9 @@ impl Worker {
         };
         Self {
             capacity: Arc::new(Semaphore::new(config.slots)),
+            recovery_capacity: Arc::new(Semaphore::new(1)),
+            retained_batches: BTreeMap::new(),
+            lost_operations: BTreeMap::new(),
             request_capacity: Arc::new(Semaphore::new(MAX_DEFERRED_REQUESTS_PER_CONSUMER)),
             epoch: shared.epoch.load(ORDERING),
             config,
@@ -191,8 +227,13 @@ impl Worker {
             active: BTreeMap::new(),
             fetches: 0,
             read_alone: BTreeSet::new(),
+            read_alone_until: BTreeMap::new(),
+            catch_up: BTreeMap::new(),
+            abandoning: Vec::new(),
             probing: BTreeSet::new(),
             stopped: BTreeSet::new(),
+            lasting_refusals: BTreeMap::new(),
+            refresh_refusals: 0,
             positions: BTreeMap::new(),
             generations,
             seek_starts: BTreeMap::new(),
@@ -201,6 +242,7 @@ impl Worker {
             assignment: None,
             pending_errors: BTreeMap::new(),
             cursor: None,
+            group_cursor: 0,
             groups: Vec::new(),
             served: BTreeMap::new(),
             replies: 0,
@@ -210,7 +252,15 @@ impl Worker {
 
     pub(super) async fn run(mut self) {
         if self.events.is_none() {
-            self.events = Some(self.config.client.read().await.subscribe_events().await);
+            self.events = Some(
+                self.config
+                    .client
+                    .read()
+                    .await
+                    .subscribe_events()
+                    .await
+                    .new_receiver(),
+            );
         }
         let mut refresh = tokio::time::interval(ASSIGNMENT_REFRESH_INTERVAL);
         refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -220,6 +270,8 @@ impl Worker {
             }
             if self.shared.closing.load(ORDERING) {
                 self.finish_fetches().await;
+                // The close then stores the last delivered offset over what they committed.
+                self.abandon_lost().await;
                 return;
             }
             if self.epoch != self.shared.epoch.load(ORDERING) {
@@ -231,6 +283,7 @@ impl Worker {
             if std::mem::take(&mut self.refresh_now) {
                 refresh.reset_immediately();
             }
+            self.abandon_lost().await;
             self.shared.progress.unblock_abandoned().await;
             let enabled = self.shared.can_poll.load(ORDERING)
                 || !self.config.client.read().await.can_recover().await;
@@ -259,6 +312,7 @@ impl Worker {
                 Some(refreshed) = self.refreshing.join_next(), if !self.refreshing.is_empty() => {
                     match refreshed {
                         Ok(Ok(refreshed)) => {
+                            self.refresh_refusals = 0;
                             if self.apply(refreshed) {
                                 refresh.reset();
                             } else {
@@ -266,8 +320,14 @@ impl Worker {
                             }
                         }
                         Ok(Err(error)) => {
+                            let delay = if lasting_refusal(&error) {
+                                self.refresh_refusals = self.refresh_refusals.saturating_add(1);
+                                backoff(self.config.retry_interval, self.refresh_refusals)
+                            } else {
+                                self.config.retry_interval
+                            };
                             self.refuse_refresh(error);
-                            refresh.reset_after(self.config.retry_interval);
+                            refresh.reset_after(delay);
                         }
                         // The handle sees the closed channel and starts a new worker.
                         Err(_) => return,
@@ -308,6 +368,10 @@ impl Worker {
                 self.complete(completed);
             }
         }
+        drop(PendingCommit::new(
+            Arc::clone(&self.shared.progress),
+            self.catch_up.keys().copied().collect(),
+        ));
     }
 
     /// Keeps reading in step with the connection, and makes the next refresh join again after
@@ -382,6 +446,8 @@ impl Worker {
         }
         self.groups.clear();
         self.read_alone.clear();
+        self.read_alone_until.clear();
+        self.lasting_refusals.clear();
         self.probing.clear();
         self.retry_at.clear();
         self.partitions.clear();
@@ -404,6 +470,11 @@ impl Worker {
             self.generations.insert(partition, generation);
             self.retry_at.remove(&partition);
             self.read_alone.remove(&partition);
+            self.read_alone_until.remove(&partition);
+            self.catch_up.remove(&partition);
+            self.retained_batches.remove(&partition);
+            self.lost_operations.remove(&partition);
+            self.lasting_refusals.remove(&partition);
             self.probing.remove(&partition);
             self.stopped.remove(&partition);
             self.pending_errors.remove(&Some(partition));
@@ -419,7 +490,12 @@ impl Worker {
         let epoch = self.epoch;
         async move {
             if let Some(membership) = &shared.membership {
-                membership.join().await?;
+                let membership = Arc::clone(membership);
+                // A dropped reader aborts this task. A join that the server received must still
+                // finish, or its retained operation blocks every later metadata call.
+                tokio::spawn(async move { membership.join().await })
+                    .await
+                    .unwrap_or(Err(IggyError::ClientShutdown))?;
             }
             let (assignment, mut partitions) = if config.is_group() {
                 config
@@ -485,6 +561,20 @@ impl Worker {
             } else {
                 Vec::new()
             };
+            if self.config.is_group() {
+                // The counted positions of the partitions that leave go out before their
+                // generations end.
+                let leaving: Vec<u32> = self
+                    .generations
+                    .keys()
+                    .copied()
+                    .filter(|partition| staying.binary_search(partition).is_err())
+                    .collect();
+                self.shared.progress.retire_counted(&leaving);
+                for partition in leaving {
+                    self.interrupt_catch_up(partition);
+                }
+            }
             self.invalidate();
             if self.config.is_group() {
                 self.generations = self.shared.progress.assign(&refreshed.partitions, &staying);
@@ -493,8 +583,10 @@ impl Worker {
             self.positions.retain(|partition, _| stays(partition));
             self.seek_starts.retain(|partition, _| stays(partition));
             self.stopped.retain(stays);
-            self.pending_errors
-                .retain(|partition, _| partition.as_ref().is_none_or(stays));
+            self.pending_errors.retain(|partition, refusal| {
+                partition.as_ref().is_none_or(stays)
+                    || matches!(refusal.error.error, IggyError::FetchProgressUncertain(_))
+            });
             self.assignment = Some(refreshed.assignment);
         }
         self.partitions = refreshed.partitions;
@@ -526,18 +618,37 @@ impl Worker {
                 self.forget_membership();
                 self.report(ReadError::new(None, error));
             }
+            // A partition that is not routable yet, or a primary that is moving, settles by
+            // itself, and the next refresh runs after the retry interval.
+            IggyError::TransientNotAccepted
+            | IggyError::TransientNotCommitted
+            | IggyError::NotPrimary
+            | IggyError::DeferredPollCapacityExceeded => {
+                warn!("Reader assignment refresh will be retried after a transient error: {error}");
+            }
             error => self.report(ReadError::new(None, error)),
         }
     }
 
-    fn reserve(&self) -> Option<FetchCapacity> {
-        Arc::clone(&self.capacity)
-            .try_acquire_owned()
-            .ok()
-            .map(|permit| FetchCapacity {
+    fn reserve(&self) -> Option<Arc<FetchCapacity>> {
+        self.reserve_from(&self.capacity)
+    }
+
+    fn reserve_recovery(&self, partition: u32) -> Option<Arc<FetchCapacity>> {
+        if self.retained_batches.contains_key(&partition) {
+            self.reserve_from(&self.recovery_capacity)
+        } else {
+            self.reserve()
+        }
+    }
+
+    fn reserve_from(&self, capacity: &Arc<Semaphore>) -> Option<Arc<FetchCapacity>> {
+        Arc::clone(capacity).try_acquire_owned().ok().map(|permit| {
+            Arc::new(FetchCapacity {
                 permit: Some(permit),
                 wake: Arc::clone(&self.shared.wake),
             })
+        })
     }
 
     /// The error waits for a slot. It goes out at the next turn, after the batches of the same
@@ -572,7 +683,7 @@ impl Worker {
     /// holds a slot, and the channel has one place per slot, so the send never fails.
     fn deliver(&self, reply: Reply) {
         self.shared.demand.store(false, ORDERING);
-        let _ = self.sender.try_send(reply);
+        let _ = self.sender.send(reply);
     }
 
     fn schedule(&mut self) {
@@ -607,10 +718,15 @@ impl Worker {
             if !self.is_idle(partition) {
                 continue;
             }
-            let Some(capacity) = self.reserve() else {
+            let Some(capacity) = self.reserve_recovery(partition) else {
                 return;
             };
-            self.spawn_poll(partition, FetchKind::Alone, capacity);
+            let kind = if self.needs_start(partition) {
+                FetchKind::Check
+            } else {
+                FetchKind::Alone
+            };
+            self.spawn_poll(partition, kind, capacity);
         }
     }
 
@@ -622,26 +738,36 @@ impl Worker {
         if !self.shared.demand.load(ORDERING) {
             return;
         }
-        for group in 0..self.groups.len() {
+        let count = self.groups.len();
+        let start = self.group_cursor % count;
+        for index in 0..count {
+            let group = (start + index) % count;
             let partitions = &self.groups[group];
             if partitions.iter().any(|partition| {
-                self.active
-                    .get(partition)
-                    .is_some_and(|active| active.kind != FetchKind::Check)
+                self.active.get(partition).is_some_and(|active| {
+                    active.kind != FetchKind::Check
+                        || (self.position(*partition).kind == PollingKind::Next
+                            && self.needs_start(*partition))
+                })
             }) {
                 continue;
             }
-            let alone = partitions
-                .iter()
-                .copied()
-                .find(|partition| self.read_alone.contains(partition) && self.is_idle(*partition));
+            let alone = partitions.iter().copied().find(|partition| {
+                (self.read_alone.contains(partition) || self.catching_up(*partition).is_some())
+                    && self.is_idle(*partition)
+            });
             let targets = self.targets(group);
             if alone.is_none() && targets.is_empty() {
                 continue;
             }
-            let Some(capacity) = self.reserve() else {
+            let capacity = alone.map_or_else(
+                || self.reserve(),
+                |partition| self.reserve_recovery(partition),
+            );
+            let Some(capacity) = capacity else {
                 return;
             };
+            self.group_cursor = (group + 1) % count;
             match alone {
                 Some(partition) => self.spawn_poll(partition, FetchKind::Alone, capacity),
                 None => self.spawn_fetch(targets, FetchKind::Main, capacity),
@@ -654,45 +780,52 @@ impl Worker {
     /// second fetch, and each new one restarts only that fetch. This keeps a busy
     /// partition among quiet ones from waiting up to `max_wait` for the next main
     /// fetch. The next main fetch takes over the partitions of the second one, so
-    /// the second one stays small.
+    /// the second one stays small. Every group without a main fetch gets a slot
+    /// before any second fetch does.
     fn schedule_groups(&mut self) {
-        for group in 0..self.groups.len() {
-            let mut targets = self.targets(group);
-            if targets.is_empty() {
-                continue;
-            }
-            let Some(capacity) = self.reserve() else {
-                return;
-            };
-            let in_flight = |kind| {
-                self.groups[group].iter().find_map(|partition| {
-                    self.active
-                        .get(partition)
-                        .filter(|active| active.kind == kind)
-                        .map(|active| (active.fetch, active.task.clone()))
-                })
-            };
-            let main = in_flight(FetchKind::Main).is_some();
-            if let Some((second, task)) = in_flight(FetchKind::Second) {
-                task.abort();
-                let restarted: Vec<u32> = self
-                    .active
-                    .iter()
-                    .filter(|(_, active)| active.fetch == second)
-                    .map(|(partition, _)| *partition)
-                    .collect();
-                for partition in &restarted {
-                    self.active.remove(partition);
+        let count = self.groups.len();
+        let start = self.group_cursor % count;
+        for kind in [FetchKind::Main, FetchKind::Second] {
+            for index in 0..count {
+                let group = (start + index) % count;
+                let main = self.group_fetch(group, FetchKind::Main).is_some();
+                if main != (kind == FetchKind::Second) {
+                    continue;
                 }
-                targets.extend(restarted);
+                let mut targets = self.targets(group);
+                if targets.is_empty() {
+                    continue;
+                }
+                let Some(capacity) = self.reserve() else {
+                    return;
+                };
+                if let Some((second, task)) = self.group_fetch(group, FetchKind::Second) {
+                    task.abort();
+                    let restarted: Vec<u32> = self
+                        .active
+                        .iter()
+                        .filter(|(_, active)| active.fetch == second)
+                        .map(|(partition, _)| *partition)
+                        .collect();
+                    for partition in &restarted {
+                        self.active.remove(partition);
+                    }
+                    targets.extend(restarted);
+                }
+                self.group_cursor = (group + 1) % count;
+                self.spawn_fetch(targets, kind, capacity);
             }
-            let kind = if main {
-                FetchKind::Second
-            } else {
-                FetchKind::Main
-            };
-            self.spawn_fetch(targets, kind, capacity);
         }
+    }
+
+    /// The fetch of `kind` in flight for `group`.
+    fn group_fetch(&self, group: usize, kind: FetchKind) -> Option<(u64, AbortHandle)> {
+        self.groups[group].iter().find_map(|partition| {
+            self.active
+                .get(partition)
+                .filter(|active| active.kind == kind)
+                .map(|active| (active.fetch, active.task.clone()))
+        })
     }
 
     /// Polls partitions alone, from the one after the last polled one. With
@@ -701,6 +834,19 @@ impl Worker {
     /// wait for a first message never hold every slot.
     fn schedule_alone(&mut self) {
         let by_group = !self.groups.is_empty();
+        // Every partition is in a group fetch, so the walk below would find nothing.
+        if by_group
+            && self.probing.is_empty()
+            && self.read_alone.is_empty()
+            && !(self.config.on_read() && self.config.start.kind == PollingKind::Next)
+            && fetched_by_group_kind(self.config.start.kind)
+            && self
+                .positions
+                .values()
+                .all(|position| fetched_by_group_kind(position.kind))
+        {
+            return;
+        }
         let limit = if by_group {
             self.config.slots.saturating_sub(self.groups.len()).max(1)
         } else {
@@ -723,10 +869,18 @@ impl Worker {
                 continue;
             }
             let on_read = self.config.on_read();
+            if self.needs_start(partition)
+                && self.position(partition).kind == PollingKind::Next
+                && !self.shared.demand.load(ORDERING)
+            {
+                continue;
+            }
             let kind = if !by_group {
                 FetchKind::Alone
             } else if self.fetched_by_group(partition)
-                || (on_read && self.read_alone.contains(&partition))
+                || (on_read
+                    && (self.read_alone.contains(&partition)
+                        || self.catching_up(partition).is_some()))
             {
                 continue;
             } else if on_read || self.probing.contains(&partition) {
@@ -734,7 +888,13 @@ impl Worker {
             } else {
                 FetchKind::Alone
             };
-            let Some(capacity) = self.reserve() else {
+            let capacity = if kind == FetchKind::Check && on_read {
+                self.reserve()
+                    .or_else(|| self.reserve_from(&self.recovery_capacity))
+            } else {
+                self.reserve()
+            };
+            let Some(capacity) = capacity else {
                 break;
             };
             self.spawn_poll(partition, kind, capacity);
@@ -754,11 +914,20 @@ impl Worker {
     /// A fetch of a group reads `Offset` and `Next` positions only.
     fn fetched_by_group(&self, partition: u32) -> bool {
         !self.probing.contains(&partition)
+            && !self.needs_start(partition)
             && !self.read_alone.contains(&partition)
+            && self.catching_up(partition).is_none()
+            && fetched_by_group_kind(self.position(partition).kind)
+    }
+
+    fn needs_start(&self, partition: u32) -> bool {
+        let position = self.position(partition);
+        self.config.on_read()
             && matches!(
-                self.position(partition).kind,
-                PollingKind::Offset | PollingKind::Next
+                position.kind,
+                PollingKind::Next | PollingKind::Last | PollingKind::Timestamp
             )
+            && position.context().is_none()
     }
 
     fn is_idle(&self, partition: u32) -> bool {
@@ -793,7 +962,7 @@ impl Worker {
         self.config.options.request_timeout().get_duration()
     }
 
-    fn spawn_fetch(&mut self, partitions: Vec<u32>, kind: FetchKind, capacity: FetchCapacity) {
+    fn spawn_fetch(&mut self, partitions: Vec<u32>, kind: FetchKind, capacity: Arc<FetchCapacity>) {
         let targets = self.fetch_targets(partitions);
         let wire_targets: Vec<(u32, PollingStrategy)> = targets
             .iter()
@@ -882,10 +1051,11 @@ impl Worker {
             .collect()
     }
 
-    fn spawn_poll(&mut self, partition: u32, kind: FetchKind, capacity: FetchCapacity) {
+    fn spawn_poll(&mut self, partition: u32, kind: FetchKind, capacity: Arc<FetchCapacity>) {
         let config = Arc::clone(&self.config);
         let strategy = self.position(partition);
         let generation = self.generation(partition);
+        let catching_up = self.catching_up(partition);
         let options = if self.probing.contains(&partition) {
             // Only a refusal answers a probe, so it does not wait.
             PollOptions {
@@ -894,19 +1064,34 @@ impl Worker {
                 max_wait: IggyDuration::from(Duration::ZERO),
                 ..config.options
             }
-        } else if self.read_alone.contains(&partition) {
-            config.options.alone()
+        } else if self.read_alone.contains(&partition) || self.needs_start(partition) {
+            PollOptions {
+                count: SINGLE_RECORD,
+                min_count: SINGLE_RECORD,
+                ..config.options
+            }
+        } else if let Some(until) = catching_up {
+            // The server committed these messages already, so the read takes them and no more.
+            let range = until.saturating_sub(strategy.value).saturating_add(1);
+            PollOptions {
+                count: u32::try_from(range)
+                    .unwrap_or(u32::MAX)
+                    .min(config.options.count),
+                min_count: SINGLE_RECORD,
+                max_wait: IggyDuration::from(Duration::ZERO),
+                ..config.options
+            }
         } else {
             config.options
         };
-        // A check delivers nothing, so it does not commit.
-        let on_read = config.on_read() && kind == FetchKind::Alone;
+        // A check delivers nothing, and a catch-up reads what is committed, so neither commits.
+        let on_read = config.on_read() && kind == FetchKind::Alone && catching_up.is_none();
         let commit =
             on_read.then(|| PendingCommit::new(Arc::clone(&self.shared.progress), vec![partition]));
-        let server_commit = if on_read {
-            ServerCommitPolicy::OnRead
+        let policy = if on_read {
+            CommitPolicy::OnRead
         } else {
-            ServerCommitPolicy::Disabled
+            CommitPolicy::Manual
         };
         let epoch = self.epoch;
         self.fetches += 1;
@@ -918,13 +1103,17 @@ impl Worker {
                 let deadline = started + options.request_timeout().get_duration();
                 // As in `spawn_fetch`, only the lock wait has a limit here.
                 let result = async {
-                    let client = timeout_at(deadline, config.client.read())
-                        .await
-                        .map_err(|_| IggyError::TransientNotAccepted)?;
-                    let remaining =
-                        DeferredPollOptions::from(options).remaining(started.elapsed())?;
+                    let client =
+                        timeout_at(deadline, config.client.read())
+                            .await
+                            .map_err(|_| {
+                                DecodeError::without_record(IggyError::TransientNotAccepted)
+                            })?;
+                    let remaining = DeferredPollOptions::from(options)
+                        .remaining(started.elapsed())
+                        .map_err(DecodeError::without_record)?;
                     let polled = client
-                        .poll_messages(
+                        .poll_messages_raw(
                             &config.stream,
                             &config.topic,
                             partition,
@@ -932,7 +1121,7 @@ impl Worker {
                             &strategy,
                             PollOptions {
                                 max_wait: remaining.max_wait,
-                                server_commit,
+                                commit: policy,
                                 ..options
                             },
                         )
@@ -940,7 +1129,7 @@ impl Worker {
                     if polled.count > options.count
                         || polled.messages.len() > options.count as usize
                     {
-                        return Err(IggyError::InvalidMessagesCount);
+                        return Err(DecodeError::without_record(IggyError::InvalidMessagesCount));
                     }
                     Ok(polled)
                 }
@@ -967,7 +1156,25 @@ impl Worker {
             Completed::Poll(completed) if completed.kind == FetchKind::Check => {
                 self.complete_check(completed);
             }
-            Completed::Poll(completed) => self.complete_poll(completed),
+            Completed::Poll(completed) => {
+                let partition = completed.partition;
+                self.complete_poll(completed);
+                self.read_alone_to_section_end(partition);
+            }
+        }
+    }
+
+    /// Keeps a partition reading alone while its position lies inside a section that did not
+    /// decode.
+    fn read_alone_to_section_end(&mut self, partition: u32) {
+        let Some(&until) = self.read_alone_until.get(&partition) else {
+            return;
+        };
+        let position = self.position(partition);
+        if position.kind == PollingKind::Offset && position.value < until {
+            self.read_alone.insert(partition);
+        } else {
+            self.read_alone_until.remove(&partition);
         }
     }
 
@@ -1014,12 +1221,16 @@ impl Worker {
             }
         };
         let mut served = Vec::with_capacity(sections.len());
+        let mut answered = Vec::with_capacity(sections.len());
         for section in sections {
             let partition = section.partition_id;
             let Ok(target) = targets.binary_search_by_key(&partition, |(target, ..)| *target)
             else {
                 continue;
             };
+            if section.status.is_err() || section.messages_count > 0 {
+                answered.push(partition);
+            }
             let (_, sent, generation) = targets[target];
             match &section.status {
                 Err(error) => {
@@ -1035,6 +1246,15 @@ impl Worker {
         }
         let committing = commit.is_some();
         let current = self.is_current(epoch);
+        if current {
+            answered.sort_unstable();
+            let idle: Vec<u32> = held
+                .iter()
+                .copied()
+                .filter(|partition| answered.binary_search(partition).is_err())
+                .collect();
+            self.pause_idle(&idle);
+        }
         // The server committed the batches of a committing fetch, so they reach the
         // application even after the fetch state was cleared, unless a seek replaced the
         // generation of their partition.
@@ -1048,14 +1268,43 @@ impl Worker {
         let mut batches = Vec::with_capacity(served.len());
         let mut lost = Vec::new();
         let mut undecoded = Vec::with_capacity(served.len());
+        let mut kept = Vec::with_capacity(served.len());
         for (sent, generation, section) in served {
+            let partition = section.partition_id;
+            if committing
+                && sent == self.position(partition)
+                && skipped(&sent, section_start(&section), section.context)
+            {
+                let until = section.next_offset.saturating_sub(1);
+                self.start_catch_up(partition, sent.value, until, section.context);
+                if section.messages_count > 0 {
+                    match section.decode_records() {
+                        Ok(mut batch) => {
+                            batch.set_stamp(self.shared.progress.stamp(generation));
+                            self.retained_batches.insert(
+                                partition,
+                                RetainedBatch {
+                                    batch,
+                                    capacity: Arc::clone(&capacity),
+                                },
+                            );
+                        }
+                        Err(error) => self.refuse_section(&section, false, true, &mut lost, error),
+                    }
+                }
+                lost.push(partition);
+                continue;
+            }
+            kept.push((sent, generation, section));
+        }
+        for (sent, generation, section) in kept {
             let Some(encryptor) = self.config.encryptor.clone() else {
                 let moved = self.advance(sent, &section);
                 undecoded.push((moved, generation, section));
                 continue;
             };
             let partition = section.partition_id;
-            let mut polled = match section.decode() {
+            let mut polled = match section.decode_records() {
                 Ok(polled) => polled,
                 Err(error) => {
                     let rewind = sent == self.position(partition);
@@ -1067,9 +1316,17 @@ impl Worker {
                 Ok(()) => {
                     self.advance(sent, &section);
                 }
-                Err((failed, error)) => {
+                Err((index, failed, error)) => {
                     let rewind = sent == self.position(partition);
-                    self.refuse_undecoded(rewind, partition, failed, section.context, error);
+                    let record = polled.undecoded_record(index).map(Box::new);
+                    self.refuse_undecoded(
+                        rewind,
+                        partition,
+                        failed,
+                        section.context,
+                        error,
+                        record,
+                    );
                 }
             }
             if !polled.messages.is_empty() {
@@ -1084,7 +1341,7 @@ impl Worker {
             if section.messages_count == 0 {
                 continue;
             }
-            match section.decode() {
+            match section.decode_records() {
                 Ok(mut polled) => {
                     polled.set_stamp(self.shared.progress.stamp(generation));
                     batches.push(polled);
@@ -1120,7 +1377,7 @@ impl Worker {
         rewind: bool,
         committing: bool,
         lost: &mut Vec<u32>,
-        error: IggyError,
+        error: DecodeError,
     ) {
         let partition = section.partition_id;
         let start = section_start(section);
@@ -1134,7 +1391,8 @@ impl Worker {
         }
         if rewind && section.messages_count != SINGLE_RECORD {
             warn!(
-                "Failed to decode {count} messages from offset: {start}, partition ID: {partition}. They are read again one at a time. {error}",
+                "Failed to decode {count} messages from offset: {start}, partition ID: {partition}. They are read again one at a time. {}",
+                error.error,
                 count = section.messages_count
             );
             self.positions.insert(
@@ -1142,17 +1400,32 @@ impl Worker {
                 continuation_at(partition, start, section.context),
             );
             self.read_alone.insert(partition);
+            self.read_alone_until.insert(partition, section.next_offset);
             return;
         }
-        self.refuse_undecoded(rewind, partition, start, section.context, error);
+        self.refuse_undecoded(
+            rewind,
+            partition,
+            start,
+            section.context,
+            error.error,
+            error.record,
+        );
     }
 
     /// The message at `start` does not decode. Its partition reads it alone again until a seek
     /// to the skip of the error.
-    fn refuse_message(&mut self, partition: u32, start: &PollingStrategy, error: IggyError) {
+    fn refuse_message(&mut self, partition: u32, start: &PollingStrategy, error: DecodeError) {
         self.read_alone.insert(partition);
         let context = start.context().unwrap_or_default();
-        self.refuse_undecoded(false, partition, start.value, context, error);
+        self.refuse_undecoded(
+            false,
+            partition,
+            start.value,
+            context,
+            error.error,
+            error.record,
+        );
     }
 
     /// The reader reads the message at `failed` again until a seek to the continuation after
@@ -1164,6 +1437,7 @@ impl Worker {
         failed: u64,
         context: PartitionContext,
         error: IggyError,
+        record: Option<Box<UndecodedRecord>>,
     ) {
         if rewind {
             self.positions
@@ -1176,6 +1450,8 @@ impl Worker {
             skip: failed
                 .checked_add(1)
                 .map(|next| continuation_at(partition, next, context)),
+            offset: record.as_ref().and_then(|record| record.offset),
+            record: record.map(|record| record.bytes),
         });
     }
 
@@ -1184,16 +1460,15 @@ impl Worker {
     /// `Next` target continues from an offset too, also without a read.
     fn advance(&mut self, sent: PollingStrategy, section: &FetchedSection) -> bool {
         let partition = section.partition_id;
+        self.lasting_refusals.remove(&partition);
         self.shared
             .progress
             .forget_undecoded_history(partition, section.context);
         if sent != self.position(partition) {
             return false;
         }
-        self.positions.insert(
-            partition,
-            continuation_at(partition, section.next_offset, section.context),
-        );
+        let position = self.continue_at(partition, section.next_offset, section.context);
+        self.positions.insert(partition, position);
         if section.messages_count > 0 {
             self.served.insert(partition, self.replies);
         }
@@ -1205,70 +1480,115 @@ impl Worker {
     fn complete_check(&mut self, completed: CompletedPoll) {
         let partition = completed.partition;
         self.active.remove(&partition);
-        self.probing.remove(&partition);
+        let probe = self.probing.remove(&partition);
         if !self.is_current(completed.epoch) || !self.keeps(partition, completed.generation) {
             return;
         }
         match completed.result {
+            // A probe that passes hands its partition back to the group fetch.
+            Ok(polled) if polled.messages.is_empty() && !probe => self.pause_idle(&[partition]),
             Ok(polled) => {
-                if !matches!(
-                    completed.strategy.kind,
-                    PollingKind::Offset | PollingKind::Next
-                ) && completed.strategy == self.position(partition)
+                if (self.needs_start(partition)
+                    || !matches!(
+                        completed.strategy.kind,
+                        PollingKind::Offset | PollingKind::Next
+                    ))
+                    && completed.strategy == self.position(partition)
                     && let Some(first) = polled.messages.first()
                 {
-                    self.positions.insert(
-                        partition,
-                        continuation_at(partition, first.header.offset, polled.context()),
-                    );
+                    let position = if completed.strategy.kind == PollingKind::Next {
+                        self.continue_at(partition, first.header.offset, polled.context())
+                    } else {
+                        continuation_at(partition, first.header.offset, polled.context())
+                    };
+                    self.positions.insert(partition, position);
                 }
             }
-            // The client already read a record above `max_bytes` alone, or skipped that read for
-            // a `Last` start, so the refusal is final.
-            Err(error) => self.refuse(&[partition], error),
+            // A poll returns a record above `max_bytes` alone, so its refusal is final.
+            Err(DecodeError {
+                error: IggyError::LaneBlocked(operation),
+                ..
+            }) if self.config.on_read() => {
+                self.refuse(
+                    &[partition],
+                    IggyError::PartitionLaneBlocked(partition, operation),
+                );
+            }
+            Err(error) => self.refuse(&[partition], error.error),
         }
     }
 
     fn complete_poll(&mut self, mut completed: CompletedPoll) {
         let partition = completed.partition;
-        self.active.remove(&partition);
-        if let Some(commit) = completed.commit.take()
-            && !completed.result.as_ref().is_err_and(may_hide_commit)
+        if self.config.on_read()
+            && completed.commit.is_none()
+            && (!self.is_current(completed.epoch)
+                || !self.keeps(partition, completed.generation)
+                || completed.strategy != self.position(partition))
         {
-            commit.settle(Vec::new());
+            return;
         }
-        // A mark holds for one read, so a record above `max_bytes` then gets a final refusal.
-        // Another failure to decode marks the partition again.
+        self.active.remove(&partition);
+        // Dropped unsettled, it forgets the commit of its partition, so the close rewinds.
+        let commit = completed.commit.take().filter(|_| {
+            !completed
+                .result
+                .as_ref()
+                .is_err_and(|error| may_hide_commit(&error.error))
+        });
+        // A mark holds for one read. Another failure to decode marks the partition again.
         let alone = self.read_alone.remove(&partition);
         if self.config.on_read() {
-            self.complete_on_demand(completed, alone);
+            let lost = self.complete_on_demand(completed, alone);
+            if let Some(commit) = commit {
+                commit.settle(lost);
+            }
             return;
         }
         if !self.is_current(completed.epoch) || !self.keeps(partition, completed.generation) {
             return;
         }
         let mut polled = match completed.result {
-            Ok(polled) => polled,
-            Err(error) if names_message(alone, &completed.strategy, &error) => {
+            Ok(polled) => {
+                self.lasting_refusals.remove(&partition);
+                polled
+            }
+            Err(error) if names_message(alone, &completed.strategy, &error.error) => {
                 self.refuse_message(partition, &completed.strategy, error);
                 return;
             }
             Err(error) => {
-                self.refuse(&[partition], error);
+                self.refuse(&[partition], error.error);
                 return;
             }
         };
         let context = polled.context();
+        let polled_nothing = polled.messages.is_empty();
         let failure = self
             .config
             .encryptor
             .as_deref()
-            .and_then(|encryptor| decrypt_messages(encryptor, &mut polled).err());
+            .and_then(|encryptor| decrypt_messages(encryptor, &mut polled).err())
+            .map(|(index, failed, error)| {
+                (failed, error, polled.undecoded_record(index).map(Box::new))
+            });
         if let Some(last) = polled.messages.last().map(|message| message.header.offset) {
             let Some(next) = last.checked_add(1) else {
                 self.refuse(&[partition], IggyError::InvalidOffset(last));
                 return;
             };
+            // A new read of such a start resolves against a later end, and would skip the
+            // messages in between if the epoch drops this batch.
+            if !matches!(
+                completed.strategy.kind,
+                PollingKind::Offset | PollingKind::Next
+            ) && let Some(first) = polled.messages.first()
+            {
+                self.seek_starts.insert(
+                    partition,
+                    continuation_at(partition, first.header.offset, context),
+                );
+            }
             self.positions
                 .insert(partition, continuation_at(partition, next, context));
             polled.set_stamp(self.shared.progress.stamp(completed.generation));
@@ -1279,53 +1599,116 @@ impl Worker {
                 capacity: completed.capacity,
             });
         }
-        if let Some((failed, error)) = failure {
-            self.refuse_undecoded(true, partition, failed, context, error);
+        match failure {
+            Some((failed, error, record)) => {
+                self.refuse_undecoded(true, partition, failed, context, error, record);
+            }
+            None if polled_nothing => self.pause_idle(&[partition]),
+            None => {}
         }
     }
 
-    /// The server committed a batch that holds messages, so the batch reaches
-    /// the application even after the fetch state was cleared, unless a seek
-    /// replaced the generation of its partition.
-    fn complete_on_demand(&mut self, completed: CompletedPoll, alone: bool) {
+    /// The server committed a batch that holds messages, so the batch reaches the application
+    /// even after the fetch state was cleared, unless a seek replaced the generation of its
+    /// partition. Returns the partition when the server committed messages that the batch does
+    /// not hand over.
+    fn complete_on_demand(&mut self, completed: CompletedPoll, alone: bool) -> Vec<u32> {
         let partition = completed.partition;
         let mut polled = match completed.result {
-            Ok(polled) => polled,
-            Err(error) => {
+            Ok(polled) => {
+                self.lasting_refusals.remove(&partition);
+                polled
+            }
+            Err(DecodeError { error, record }) => {
                 if !self.keeps(partition, completed.generation) {
-                    return;
+                    return Vec::new();
                 }
-                // The server stored the offset of a reply that the worker cannot hand over, so a
-                // read from `Next` would start after it, and its start offset is unknown.
-                if completed.strategy.kind == PollingKind::Next && undeliverable(&error) {
-                    self.stopped.insert(partition);
-                    self.report(ReadError::new(Some(partition), error));
+                let strategy = completed.strategy;
+                if strategy.kind == PollingKind::Next && undeliverable(&error) {
+                    match strategy.context() {
+                        // The server stored the offset of a reply that the worker cannot hand
+                        // over. A continuation knows where that reply started, so the partition
+                        // reads it again one message at a time and the close rewinds before it.
+                        Some(context) if self.is_current(completed.epoch) => {
+                            let start = Checkpoint::new(partition, strategy.value, context);
+                            self.shared.progress.remember_undecoded(start);
+                            self.positions.insert(
+                                partition,
+                                continuation_at(partition, strategy.value, context),
+                            );
+                            self.read_alone.insert(partition);
+                            self.retry(&[partition]);
+                        }
+                        Some(_) => {}
+                        // A read from the stored offset has no known start.
+                        None => {
+                            self.stopped.insert(partition);
+                            self.report(ReadError::new(Some(partition), error));
+                        }
+                    }
                 } else if self.is_current(completed.epoch) {
-                    if names_message(alone, &completed.strategy, &error) {
-                        self.refuse_message(partition, &completed.strategy, error);
+                    if names_message(alone, &strategy, &error) {
+                        // The server stored the offset of the message, so the close rewinds
+                        // before it.
+                        self.shared.progress.remember_undecoded(Checkpoint::new(
+                            partition,
+                            strategy.value,
+                            strategy.context().unwrap_or_default(),
+                        ));
+                        self.refuse_message(partition, &strategy, DecodeError { error, record });
                     } else {
                         self.refuse(&[partition], error);
                     }
                 }
-                return;
+                return Vec::new();
             }
         };
         if !self.keeps(partition, completed.generation) {
-            return;
+            return Vec::new();
         }
         let Some(last) = polled.messages.last().map(|message| message.header.offset) else {
-            return;
+            if completed.strategy == self.position(partition)
+                && skipped(
+                    &completed.strategy,
+                    polled.current_offset.saturating_add(1),
+                    polled.context(),
+                )
+            {
+                self.start_catch_up(
+                    partition,
+                    completed.strategy.value,
+                    polled.current_offset,
+                    polled.context(),
+                );
+                return vec![partition];
+            }
+            self.pause_idle(&[partition]);
+            return Vec::new();
         };
+        let first = polled
+            .messages
+            .first()
+            .map_or(last, |message| message.header.offset);
+        let current = completed.strategy == self.position(partition);
+        if current && skipped(&completed.strategy, first, polled.context()) {
+            self.start_catch_up(partition, completed.strategy.value, last, polled.context());
+            polled.set_stamp(self.shared.progress.stamp(completed.generation));
+            self.retained_batches.insert(
+                partition,
+                RetainedBatch {
+                    batch: polled,
+                    capacity: completed.capacity,
+                },
+            );
+            return vec![partition];
+        }
         let mut overflow = None;
         // A new assignment replaces the position that the poll started from.
-        // `Next` continues from an explicit offset too.
-        if completed.strategy == self.position(partition) {
+        if current {
             match last.checked_add(1) {
                 Some(next) => {
-                    self.positions.insert(
-                        partition,
-                        continuation_at(partition, next, polled.context()),
-                    );
+                    let position = self.after_delivery(partition, next, polled.context());
+                    self.positions.insert(partition, position);
                 }
                 None => overflow = Some(IggyError::InvalidOffset(last)),
             }
@@ -1339,6 +1722,155 @@ impl Worker {
         });
         if let Some(error) = overflow {
             self.refuse(&[partition], error);
+        }
+        Vec::new()
+    }
+
+    /// The position after a delivery that ends before `next`. With `OnRead` it reads `Next`, so
+    /// the server refuses its commit once the stored offset moved, and it keeps `next` for the
+    /// gap check.
+    fn continue_at(&self, partition: u32, next: u64, context: PartitionContext) -> PollingStrategy {
+        if self.config.on_read() {
+            PollingStrategy::continuation(partition, PollingKind::Next, next, context)
+        } else {
+            continuation_at(partition, next, context)
+        }
+    }
+
+    /// [`Self::continue_at`], except that a partition reads by offset until it passes the end of
+    /// its catch-up, or of a section that did not decode.
+    fn after_delivery(
+        &mut self,
+        partition: u32,
+        next: u64,
+        context: PartitionContext,
+    ) -> PollingStrategy {
+        if self
+            .read_alone_until
+            .get(&partition)
+            .is_some_and(|until| next < *until)
+        {
+            return continuation_at(partition, next, context);
+        }
+        match self.catch_up.get(&partition) {
+            Some(&until) if next <= until => continuation_at(partition, next, context),
+            Some(_) => {
+                self.catch_up.remove(&partition);
+                self.retained_batches.remove(&partition);
+                self.lost_operations.remove(&partition);
+                self.continue_at(partition, next, context)
+            }
+            None => self.continue_at(partition, next, context),
+        }
+    }
+
+    /// The end of the catch-up of `partition`, while its position lies inside it.
+    fn catching_up(&self, partition: u32) -> Option<u64> {
+        let until = *self.catch_up.get(&partition)?;
+        let position = self.position(partition);
+        (position.kind == PollingKind::Offset && position.value <= until).then_some(until)
+    }
+
+    /// A lost read committed `from..=until` without handing it over, so the partition reads that
+    /// range again by offset without a commit before it reads `Next` again.
+    fn start_catch_up(&mut self, partition: u32, from: u64, until: u64, context: PartitionContext) {
+        warn!(
+            "Partition: {partition} skipped offsets from: {from} to: {until}, which a lost read committed. They are read again without a commit."
+        );
+        self.positions
+            .insert(partition, continuation_at(partition, from, context));
+        self.catch_up.insert(partition, until);
+        self.shared
+            .progress
+            .remember_undecoded(Checkpoint::new(partition, from, context));
+    }
+
+    fn interrupt_catch_up(&mut self, partition: u32) -> bool {
+        let Some(until) = self.catch_up.remove(&partition) else {
+            return false;
+        };
+        let position = self.position(partition);
+        if let Some(active) = self.active.remove(&partition) {
+            active.task.abort();
+        }
+        let retained = self.retained_batches.remove(&partition);
+        let lost_end = retained
+            .as_ref()
+            .and_then(|retained| retained.batch.messages.first())
+            .map_or(until, |first| first.header.offset.saturating_sub(1));
+        let operation = self.lost_operations.remove(&partition).unwrap_or_default();
+        if position.value <= lost_end {
+            error!(
+                "Partition: {partition} lost offsets from: {} to: {lost_end} during read recovery",
+                position.value
+            );
+            let error = ReadError {
+                partition_id: Some(partition),
+                error: IggyError::FetchProgressUncertain(operation),
+                skip: lost_end.checked_add(1).map(|next| {
+                    continuation_at(partition, next, position.context().unwrap_or_default())
+                }),
+                offset: None,
+                record: None,
+            };
+            if let Some(retained) = &retained {
+                self.deliver(Reply {
+                    epoch: self.epoch,
+                    assignment: self.assignment,
+                    result: Err(Refusal {
+                        error,
+                        generation: retained.batch.stamp().map(|stamp| stamp.generation),
+                    }),
+                    capacity: Arc::clone(&retained.capacity),
+                });
+            } else {
+                self.report(error);
+            }
+        }
+        if let Some(mut retained) = retained {
+            retained
+                .batch
+                .messages
+                .retain(|message| message.header.offset >= position.value);
+            retained.batch.count = u32::try_from(retained.batch.messages.len()).unwrap_or(u32::MAX);
+            if !retained.batch.messages.is_empty() {
+                self.deliver(Reply {
+                    epoch: self.epoch,
+                    assignment: self.assignment,
+                    result: Ok(vec![retained.batch]),
+                    capacity: retained.capacity,
+                });
+            }
+        }
+        true
+    }
+
+    /// Abandons the operations of lost committing reads, so their progress blocks go. The next
+    /// `Next` read of each partition finds what they committed.
+    async fn abandon_lost(&mut self) {
+        if self.abandoning.is_empty() {
+            return;
+        }
+        let mut operations = std::mem::take(&mut self.abandoning);
+        operations.sort_unstable_by_key(|(operation, _)| *operation);
+        let client = self.config.client.clone();
+        let client = client.read().await;
+        if client.operation_lineage().await.is_none() {
+            for (operation, partitions) in operations {
+                for partition in partitions {
+                    self.block(partition, operation);
+                    self.report(ReadError::new(
+                        Some(partition),
+                        IggyError::FetchProgressUncertain(operation),
+                    ));
+                }
+            }
+            return;
+        }
+        operations.dedup_by_key(|(operation, _)| *operation);
+        for (operation, _) in operations {
+            // An operation that the client no longer retains is already free.
+            let _ = client.abandon_operation(operation).await;
         }
     }
 
@@ -1358,8 +1890,9 @@ impl Worker {
         self.refuse(partitions, error);
     }
 
-    /// A record above `max_bytes` would stall the fetches of its partition, so
-    /// the next read takes it alone. Only a failure of that read is reported.
+    /// The reads of one fetch share one turn for a first record above `max_bytes`, so a section
+    /// that lost it is read again by a poll of its partition, which always returns that record.
+    /// Only a failure of that poll is reported.
     fn refuse_partition(&mut self, partition: u32, error: IggyError) {
         if error == IggyError::InvalidSizeBytes {
             self.read_alone.insert(partition);
@@ -1372,6 +1905,26 @@ impl Worker {
     /// partition, so the healthy sections of the same reply survive.
     fn refuse(&mut self, partitions: &[u32], error: IggyError) {
         match error {
+            IggyError::FetchProgressUncertain(operation) if self.config.on_read() => {
+                warn!(
+                    "A read of partitions: {partitions:?} lost its reply. Operation: {operation} needs recovery."
+                );
+                for &partition in partitions {
+                    self.lost_operations.insert(partition, operation);
+                    let position = self.position(partition);
+                    if let Some(context) = position.context() {
+                        self.shared.progress.remember_undecoded(Checkpoint::new(
+                            partition,
+                            position.value,
+                            context,
+                        ));
+                    }
+                }
+                self.abandoning.push((operation, partitions.to_vec()));
+                self.retry(partitions);
+            }
+            // The server refused the commit of a committing read, which stored nothing.
+            IggyError::TransientNotAccepted if self.config.on_read() => self.retry(partitions),
             IggyError::FetchProgressUncertain(operation) => {
                 for &partition in partitions {
                     self.block(partition, operation);
@@ -1388,6 +1941,7 @@ impl Worker {
             }
             IggyError::ConsumerGroupPartitionNotOwned(..) => {
                 for &partition in partitions {
+                    self.interrupt_catch_up(partition);
                     self.positions.remove(&partition);
                     self.shared.progress.forget_undecoded(partition);
                 }
@@ -1406,8 +1960,39 @@ impl Worker {
             }
             IggyError::HistoryUnavailable => {
                 for &partition in partitions {
-                    self.positions.remove(&partition);
+                    let interrupted = self.interrupt_catch_up(partition);
                     self.shared.progress.forget_undecoded(partition);
+                    // A position without a history reads the history of the cached route, which
+                    // the driver drops after this refusal, so only a lost history stops.
+                    if self.position(partition).context().is_none() {
+                        warn!(
+                            "Partition: {partition} has a new history, which the next read takes from a new route."
+                        );
+                        self.retry(&[partition]);
+                        continue;
+                    }
+                    self.positions.remove(&partition);
+                    self.retry_at.remove(&partition);
+                    self.stopped.insert(partition);
+                    if !interrupted {
+                        self.report(ReadError::new(Some(partition), error.clone()));
+                    }
+                }
+            }
+            error if lasting_refusal(&error) => {
+                for &partition in partitions {
+                    let refusals = self.lasting_refusals.entry(partition).or_default();
+                    *refusals += 1;
+                    let refusals = *refusals;
+                    if refusals < MAX_LASTING_REFUSALS {
+                        let delay = backoff(self.config.retry_interval, refusals);
+                        warn!(
+                            "Partition: {partition} was refused: {error}. It is read again in {delay:?}, refusal {refusals} of {MAX_LASTING_REFUSALS}."
+                        );
+                        self.retry_at.insert(partition, Instant::now() + delay);
+                        continue;
+                    }
+                    self.lasting_refusals.remove(&partition);
                     self.retry_at.remove(&partition);
                     self.stopped.insert(partition);
                     self.report(ReadError::new(Some(partition), error.clone()));
@@ -1447,6 +2032,14 @@ impl Worker {
         }
     }
 
+    /// A read that waits for nothing answers an idle partition at once, so the partition reads
+    /// again after the retry interval instead of at the round trip rate.
+    fn pause_idle(&mut self, partitions: &[u32]) {
+        if self.config.options.max_wait.as_micros() == 0 {
+            self.retry(partitions);
+        }
+    }
+
     fn is_current(&self, epoch: u64) -> bool {
         epoch == self.epoch && self.epoch == self.shared.epoch.load(ORDERING)
     }
@@ -1459,16 +2052,21 @@ async fn next_event(events: &mut Option<Receiver<DiagnosticEvent>>) -> Option<Di
     }
 }
 
+/// A fetch of a group reads `Offset` and `Next` positions only.
+fn fetched_by_group_kind(kind: PollingKind) -> bool {
+    matches!(kind, PollingKind::Offset | PollingKind::Next)
+}
+
 fn continuation_at(partition: u32, offset: u64, context: PartitionContext) -> PollingStrategy {
     PollingStrategy::continuation(partition, PollingKind::Offset, offset, context)
 }
 
-/// Keeps the messages before the first one that does not decrypt, and returns the offset of
-/// that message with its error.
+/// Keeps the messages before the first one that does not decrypt, and returns the index and
+/// offset of that message with its error.
 fn decrypt_messages(
     encryptor: &EncryptorKind,
     polled: &mut PolledMessages,
-) -> Result<(), (u64, IggyError)> {
+) -> Result<(), (usize, u64, IggyError)> {
     let partition = polled.partition_id;
     let failed = polled
         .messages
@@ -1489,7 +2087,7 @@ fn decrypt_messages(
     );
     polled.messages.truncate(index);
     polled.count = u32::try_from(index).unwrap_or(polled.count);
-    Err((offset, error))
+    Err((index, offset, error))
 }
 
 /// The records limit of a fetch whose whole reply, with its section table,
@@ -1507,6 +2105,38 @@ fn section_start(section: &FetchedSection) -> u64 {
     section
         .next_offset
         .saturating_sub(u64::from(section.messages_count))
+}
+
+/// A committing read from the `Next` continuation `sent` whose reply starts at `start` in the
+/// history `context` skipped messages: a lost read committed them first.
+fn skipped(sent: &PollingStrategy, start: u64, context: PartitionContext) -> bool {
+    sent.kind == PollingKind::Next
+        && start > sent.value
+        && sent
+            .context()
+            .is_some_and(|sent| same_incarnation_and_owner(sent, context))
+}
+
+/// A refusal that a retry soon after does not change: a missing permission, partition, topic
+/// or stream, or a request the server cannot serve. Its partition reads again later each time,
+/// and stops after [`MAX_LASTING_REFUSALS`] in a row.
+pub(crate) fn lasting_refusal(error: &IggyError) -> bool {
+    matches!(
+        error,
+        IggyError::Unauthorized
+            | IggyError::FeatureUnavailable
+            | IggyError::InvalidCommand
+            | IggyError::PartitionNotFound(..)
+            | IggyError::StreamIdNotFound(..)
+            | IggyError::StreamNameNotFound(..)
+            | IggyError::TopicIdNotFound(..)
+            | IggyError::TopicNameNotFound(..)
+    )
+}
+
+/// The wait after the `refusals`-th lasting refusal in a row.
+fn backoff(retry_interval: Duration, refusals: u32) -> Duration {
+    retry_interval.saturating_mul(1 << refusals.saturating_sub(1).min(MAX_REFUSAL_BACKOFF_STEPS))
 }
 
 /// A reply that never arrived can commit batches that never reach the
@@ -1544,23 +2174,28 @@ fn undeliverable(error: &IggyError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_binary_protocol::batch::BATCH_MESSAGE_HEADER_SIZE;
 
+    use crate::client_wrappers::client_wrapper::ClientWrapper;
+    use crate::http::http_client::HttpClient;
     use bytes::Bytes;
     use iggy_binary_protocol::WireDecode;
+    use iggy_binary_protocol::WirePollingStrategy;
     use iggy_binary_protocol::codes::POLL_MESSAGES_DEFERRED_CODE;
     use iggy_binary_protocol::requests::messages::DeferredPollMessagesRequest;
-    use iggy_common::{Aes256GcmEncryptor, Consumer, Identifier, IggyTimestamp};
+    use iggy_common::locking::IggyRwLock;
+    use iggy_common::{Aes256GcmEncryptor, AutoCommit, Consumer, Identifier, IggyTimestamp};
     use tokio::task::yield_now;
     use tokio::time::{advance, timeout};
 
     use crate::clients::reader::fixtures::{
         Section, batch, builder_for, builder_on, connect_to_one_replica, message_at, refused,
-        sections, served,
+        sections, served, stored_offsets,
     };
-    use crate::clients::reader_builder::ReaderBuilder;
+    use crate::clients::reader_builder::{DEFAULT_MAX_WAIT, ReaderBuilder};
     use crate::links::fake_cluster::{Answer, endpoint};
 
-    type Replies = mpsc::Receiver<Reply>;
+    type Replies = mpsc::UnboundedReceiver<Reply>;
 
     const GROUP_ID: u32 = 1;
     const SESSION: u64 = 1;
@@ -1650,7 +2285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refused_polls_reach_the_application_and_retry_later() {
+    async fn refused_polls_reach_the_application_and_refused_refreshes_retry_quietly() {
         let (mut worker, mut receiver) = worker_of(standalone([0]));
         for error in [
             IggyError::TransientNotAccepted,
@@ -1670,13 +2305,66 @@ mod tests {
                 ReadError::new(Some(0), error.clone()),
                 "a refused poll reaches the application"
             );
-            worker.refuse_refresh(error.clone());
+            worker.refuse_refresh(error);
             worker.flush_errors();
-            assert_eq!(
-                next_error(&mut receiver),
-                ReadError::new(None, error),
-                "a refused refresh reaches the application"
+            assert!(
+                receiver.try_recv().is_err(),
+                "the next refresh retries a transient refusal without an error"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn given_an_empty_next_probe_when_seeking_after_resolution_should_resolve_the_new_start_again()
+     {
+        let (mut worker, receiver) = worker_of(committing(standalone([0])));
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+        worker.complete(polled(
+            &worker,
+            FetchKind::Check,
+            PollingStrategy::next(),
+            0,
+            Ok(batch(0, [], 20)),
+        ));
+        assert!(worker.needs_start(0));
+        assert_eq!(worker.position(0), PollingStrategy::next());
+        worker.complete(polled(
+            &worker,
+            FetchKind::Check,
+            PollingStrategy::next(),
+            0,
+            Ok(batch(0, [5], 20)),
+        ));
+        assert_eq!(worker.position(0), next_at(0, 5));
+        assert!(!worker.needs_start(0));
+        assert!(receiver.is_empty());
+        assert!(worker.shared.progress.last_committed(0).is_none());
+        worker.shared.progress.seek(0, PollingStrategy::next());
+        worker.apply_seeks();
+        assert!(worker.needs_start(0));
+        worker.complete(polled(
+            &worker,
+            FetchKind::Check,
+            PollingStrategy::next(),
+            0,
+            Ok(batch(0, [12], 20)),
+        ));
+        assert_eq!(worker.position(0), next_at(0, 12));
+        assert!(receiver.is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_a_dynamic_on_read_start_when_polling_alone_should_resolve_it_before_committing()
+    {
+        for start in [
+            PollingStrategy::last(),
+            PollingStrategy::timestamp(IggyTimestamp::from(1000)),
+        ] {
+            let (mut worker, _receiver) = worker_of(committing(standalone([0]).start(start)));
+            assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+            worker.shared.demand.store(true, ORDERING);
+            worker.schedule();
+            assert_eq!(worker.active[&0].kind, FetchKind::Check, "{start:?}");
         }
     }
 
@@ -1686,6 +2374,13 @@ mod tests {
         let client = worker.config.client.clone();
         let _blocked_connection = client.write().await;
         assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0, 1])));
+        if worker.config.on_read() {
+            for (partition, offset) in [(0, 3), (1, 0)] {
+                worker
+                    .positions
+                    .insert(partition, next_at(partition, offset));
+            }
+        }
         worker.schedule();
         assert!(
             worker.tasks.is_empty(),
@@ -1716,7 +2411,7 @@ mod tests {
         let mut late = polled(
             &worker,
             FetchKind::Alone,
-            PollingStrategy::next(),
+            next_at(0, 3),
             0,
             Ok(batch(0, [3, 4], 9)),
         );
@@ -1733,16 +2428,273 @@ mod tests {
             !worker.shared.demand.load(ORDERING),
             "the batch answers the demand"
         );
-        assert_eq!(worker.position(0), at(0, 5));
+        assert_eq!(worker.position(0), next_at(0, 5));
+        worker.complete(polled(
+            &worker,
+            FetchKind::Alone,
+            next_at(0, 5),
+            0,
+            Ok(batch(0, [5], 9)),
+        ));
+        assert_eq!(offsets(&next_batches(&mut receiver)[0]), [5]);
+        assert_eq!(worker.position(0), next_at(0, 6));
+    }
+
+    /// A reply from `Next` that starts past the expected offset shows that a lost read committed
+    /// the messages in between. The partition reads them and the batch again by offset without a
+    /// commit, then reads `Next` again.
+    #[tokio::test]
+    async fn given_a_received_batch_behind_a_lost_range_when_ownership_changes_should_report_the_gap_and_keep_the_batch()
+     {
+        for fetch in [false, true] {
+            for reassigned in [false, true] {
+                let (mut worker, mut receiver) = worker_of(committing(builder_for(group())));
+                assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0]])));
+                worker.positions.insert(0, next_at(0, 5));
+                worker.refuse(&[0], IggyError::FetchProgressUncertain(OPERATION));
+                let completed = if fetch {
+                    reply(
+                        &worker,
+                        1,
+                        vec![(0, next_at(0, 5), worker.generation(0))],
+                        Ok(sections(&[served(0, &[7, 8], 9)])),
+                    )
+                } else {
+                    polled(
+                        &worker,
+                        FetchKind::Alone,
+                        next_at(0, 5),
+                        0,
+                        Ok(batch(0, [7, 8], 8)),
+                    )
+                };
+                worker.complete(completed);
+                assert!(receiver.is_empty());
+                if reassigned {
+                    assert!(worker.apply(grouped(&worker, SESSION, VERSION + 1, Vec::new())));
+                } else {
+                    worker.refuse(&[0], IggyError::ConsumerGroupPartitionNotOwned(1, 0));
+                }
+                worker.flush_errors();
+                let error = next_error(&mut receiver);
+                assert_eq!(error.error, IggyError::FetchProgressUncertain(OPERATION));
+                assert_eq!(error.partition_id, Some(0));
+                assert_eq!(error.skip, Some(at(0, 7)));
+                assert_eq!(offsets(&next_batches(&mut receiver)[0]), [7, 8]);
+                assert!(worker.catch_up.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_partial_catch_up_when_closing_should_rewind_over_the_retained_batch() {
+        let (client, cluster) = connect_to_one_replica().await;
+        let (mut worker, mut receiver) = worker_of(
+            committing(builder_on(client, Consumer::default()).partitions([0]))
+                .prefetch_messages(1),
+        );
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+        worker.positions.insert(0, next_at(0, 5));
+        worker.complete(polled(
+            &worker,
+            FetchKind::Alone,
+            next_at(0, 5),
+            0,
+            Ok(batch(0, [7, 8], 8)),
+        ));
         worker.complete(polled(
             &worker,
             FetchKind::Alone,
             at(0, 5),
             0,
-            Ok(batch(0, [5], 9)),
+            Ok(batch(0, [5], 8)),
         ));
-        assert_eq!(offsets(&next_batches(&mut receiver)[0]), [5]);
-        assert_eq!(worker.position(0), at(0, 6));
+        let delivered = next_batches(&mut receiver).remove(0).checkpoint().unwrap();
+        worker.shared.progress.deliver(&delivered);
+        worker.shared.progress.record_commit(delivered);
+        worker.finish_fetches().await;
+        worker
+            .shared
+            .progress
+            .rewind(Vec::new(), None, true)
+            .await
+            .unwrap();
+        assert_eq!(stored_offsets(&cluster), [5]);
+    }
+
+    #[tokio::test]
+    async fn given_a_partly_recovered_batch_when_ownership_changes_should_deliver_only_its_unread_messages()
+     {
+        let (mut worker, mut receiver) =
+            worker_of(committing(standalone([0])).prefetch_messages(1));
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+        worker.positions.insert(0, next_at(0, 5));
+        worker.complete(polled(
+            &worker,
+            FetchKind::Alone,
+            next_at(0, 5),
+            0,
+            Ok(batch(0, [7, 8], 8)),
+        ));
+        assert_eq!(worker.capacity.available_permits(), 0);
+        worker.complete(polled(
+            &worker,
+            FetchKind::Alone,
+            at(0, 5),
+            0,
+            Ok(batch(0, [5, 6, 7], 8)),
+        ));
+        assert_eq!(offsets(&next_batches(&mut receiver)[0]), [5, 6, 7]);
+        worker.refuse(&[0], IggyError::ConsumerGroupPartitionNotOwned(1, 0));
+        assert_eq!(offsets(&next_batches(&mut receiver)[0]), [8]);
+        worker.flush_errors();
+        assert!(receiver.is_empty());
+        assert_eq!(worker.capacity.available_permits(), 1);
+        assert_eq!(worker.recovery_capacity.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn given_a_retained_batch_when_seeking_should_discard_it_and_its_lost_range() {
+        let (mut worker, mut receiver) =
+            worker_of(committing(standalone([0])).prefetch_messages(1));
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+        worker.positions.insert(0, next_at(0, 5));
+        worker.complete(polled(
+            &worker,
+            FetchKind::Alone,
+            next_at(0, 5),
+            0,
+            Ok(batch(0, [7, 8], 8)),
+        ));
+        worker.shared.progress.seek(0, PollingStrategy::offset(20));
+        worker.apply_seeks();
+        worker.refuse(&[0], IggyError::ConsumerGroupPartitionNotOwned(1, 0));
+        worker.flush_errors();
+        assert!(receiver.try_recv().is_err());
+        assert!(worker.retained_batches.is_empty());
+        assert!(worker.catch_up.is_empty());
+        assert_eq!(worker.capacity.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn given_an_interrupted_catch_up_when_its_late_reply_arrives_should_not_deliver_it_after_the_retained_batch()
+     {
+        let (mut worker, mut receiver) =
+            worker_of(committing(standalone([0])).prefetch_messages(1));
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+        worker.positions.insert(0, next_at(0, 5));
+        worker.complete(polled(
+            &worker,
+            FetchKind::Alone,
+            next_at(0, 5),
+            0,
+            Ok(batch(0, [7, 8], 8)),
+        ));
+        let mut late = polled(
+            &worker,
+            FetchKind::Alone,
+            at(0, 5),
+            0,
+            Ok(batch(0, [5, 6], 8)),
+        );
+        if let Completed::Poll(poll) = &mut late {
+            poll.commit = None;
+        }
+        worker.refuse(&[0], IggyError::ConsumerGroupPartitionNotOwned(1, 0));
+        worker.complete(late);
+        assert!(matches!(
+            next_error(&mut receiver).error,
+            IggyError::FetchProgressUncertain(_)
+        ));
+        assert_eq!(offsets(&next_batches(&mut receiver)[0]), [7, 8]);
+        assert!(receiver.is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_a_lost_on_read_tail_when_the_next_poll_is_empty_should_recover_the_skipped_messages()
+     {
+        let (mut worker, receiver) = worker_of(committing(standalone([0])));
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+        worker.positions.insert(0, next_at(0, 5));
+        worker.complete(polled(
+            &worker,
+            FetchKind::Alone,
+            next_at(0, 5),
+            0,
+            Ok(batch(0, [], 7)),
+        ));
+        assert_eq!(worker.position(0), at(0, 5));
+        assert_eq!(worker.catching_up(0), Some(7));
+        assert!(receiver.is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_an_on_read_poll_that_skips_offsets_when_completed_should_read_them_again_without_a_commit()
+     {
+        const EXPECTED: u64 = 6;
+        const COMMITTED: u64 = 9;
+        let (client, cluster) = connect_to_one_replica().await;
+        let (mut worker, mut receiver) = worker_of(committing(
+            builder_on(client, Consumer::default()).partitions([0]),
+        ));
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+        let delivered = Checkpoint::new(0, EXPECTED - 1, PartitionContext::default());
+        worker.shared.progress.deliver(&delivered);
+        worker.shared.progress.record_commit(delivered);
+        worker.positions.insert(0, next_at(0, EXPECTED));
+
+        worker.complete(polled(
+            &worker,
+            FetchKind::Alone,
+            next_at(0, EXPECTED),
+            0,
+            Ok(batch(0, [COMMITTED - 1, COMMITTED], COMMITTED + 1)),
+        ));
+
+        assert!(
+            receiver.is_empty(),
+            "the batch waits for the skipped messages"
+        );
+        assert_eq!(worker.position(0), at(0, EXPECTED));
+        assert_eq!(
+            worker.shared.progress.last_committed(0),
+            None,
+            "the server committed messages that never arrived, so the close rewinds"
+        );
+        worker.shared.demand.store(true, ORDERING);
+        worker.schedule();
+        worker.tasks.join_next().await.unwrap().unwrap();
+        let catch_up = DeferredPollMessagesRequest::decode_from(
+            &cluster.received(POLL_MESSAGES_DEFERRED_CODE)[0].body,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                catch_up.poll.strategy,
+                catch_up.poll.count,
+                catch_up.poll.auto_commit
+            ),
+            (
+                WirePollingStrategy::offset(EXPECTED),
+                u32::try_from(COMMITTED - EXPECTED + 1).unwrap(),
+                false
+            ),
+            "the skipped messages and the batch, by offset, without a commit"
+        );
+        worker.active.clear();
+        worker.complete(polled(
+            &worker,
+            FetchKind::Alone,
+            at(0, EXPECTED),
+            0,
+            Ok(batch(0, EXPECTED..=COMMITTED, COMMITTED + 1)),
+        ));
+        assert_eq!(
+            offsets(&next_batches(&mut receiver)[0]),
+            (EXPECTED..=COMMITTED).collect::<Vec<_>>()
+        );
+        assert_eq!(worker.position(0), next_at(0, COMMITTED + 1));
+        assert!(worker.catch_up.is_empty());
     }
 
     #[tokio::test]
@@ -1787,9 +2739,10 @@ mod tests {
         }
     }
 
-    /// A poll reads a record above `max_bytes` alone itself, so its refusal is final.
+    /// The server returns a record above `max_bytes` alone in the reply of a poll, so a poll
+    /// refused for its byte limit is final.
     #[tokio::test]
-    async fn oversized_record_of_a_poll_is_reported_at_once() {
+    async fn given_a_poll_refused_for_its_byte_limit_when_completed_should_report_it_at_once() {
         for (builder, kind) in [
             (standalone([0]), FetchKind::Alone),
             (committing(standalone([0])), FetchKind::Alone),
@@ -1814,8 +2767,11 @@ mod tests {
         }
     }
 
+    /// The reads of one fetch share one turn for a first record above `max_bytes`, so a section
+    /// that lost the turn is read again by a poll of its partition, which always has one.
     #[tokio::test]
-    async fn oversized_record_of_a_fetch_is_polled_alone() {
+    async fn given_a_fetch_section_refused_for_its_byte_limit_when_scheduled_should_poll_its_partition_alone()
+     {
         for builder in [builder_for(group()), committing(builder_for(group()))] {
             let (mut worker, mut receiver) = worker_of(builder);
             let on_read = worker.config.on_read();
@@ -1823,6 +2779,13 @@ mod tests {
             let _blocked_connection = client.write().await;
             assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0, 1]])));
             worker.shared.demand.store(true, ORDERING);
+            if worker.config.on_read() {
+                for (partition, offset) in [(0, 0), (1, 0)] {
+                    worker
+                        .positions
+                        .insert(partition, next_at(partition, offset));
+                }
+            }
             worker.schedule();
             worker.complete(reply_of(
                 &worker,
@@ -1833,7 +2796,7 @@ mod tests {
             assert!(worker.read_alone.contains(&0));
             assert!(
                 receiver.try_recv().is_err() && worker.retry_at.is_empty(),
-                "only the poll without a byte limit reports the error"
+                "only the poll of the partition reports an error"
             );
 
             worker.shared.demand.store(true, ORDERING);
@@ -1964,27 +2927,17 @@ mod tests {
             1,
             IggyError::FetchProgressUncertain(OPERATION),
         ));
-        assert_eq!(
-            worker.shared.progress.blocked(1),
-            Some(OPERATION),
-            "an unknown outcome blocks its partition"
-        );
         assert!(
-            worker.stopped.contains(&1),
-            "with OnRead the partition stops until a seek"
+            worker.retry_at.contains_key(&1)
+                && !worker.stopped.contains(&1)
+                && worker.shared.progress.blocked(1).is_none(),
+            "the next read of a lost reply finds what it committed"
         );
         worker.flush_errors();
-        assert_eq!(
-            next_error(&mut receiver),
-            ReadError::new(Some(1), IggyError::FetchProgressUncertain(OPERATION))
-        );
+        assert!(receiver.is_empty());
 
         worker.shared.demand.store(true, ORDERING);
         worker.schedule();
-        assert!(
-            !worker.active.contains_key(&1),
-            "a stopped partition is not fetched"
-        );
         worker.complete(failure_of(&worker, 0, IggyError::TransientNotCommitted));
         assert!(
             worker.retry_at.contains_key(&0)
@@ -2051,6 +3004,8 @@ mod tests {
                 partition_id: Some(0),
                 error: IggyError::CannotDecryptData,
                 skip: Some(skip),
+                offset: None,
+                record: None
             }
         );
         assert_eq!(
@@ -2116,6 +3071,13 @@ mod tests {
             VERSION,
             vec![vec![0, 2], vec![1]]
         )));
+        if worker.config.on_read() {
+            for (partition, offset) in [(0, 0), (1, 0), (2, 0)] {
+                worker
+                    .positions
+                    .insert(partition, next_at(partition, offset));
+            }
+        }
         worker.schedule();
         assert!(
             worker.tasks.is_empty(),
@@ -2130,10 +3092,9 @@ mod tests {
         worker.complete(failure_of(&worker, 1, IggyError::TransientNotAccepted));
         assert!(worker.retry_at.contains_key(&1), "the partition retries");
         worker.flush_errors();
-        assert_eq!(
-            next_error(&mut receiver),
-            ReadError::new(Some(1), IggyError::TransientNotAccepted),
-            "the application sees a refused fetch"
+        assert!(
+            receiver.is_empty(),
+            "a refused committing fetch stored nothing, so it retries without an error"
         );
         worker.shared.demand.store(true, ORDERING);
         worker.schedule();
@@ -2273,6 +3234,13 @@ mod tests {
             let _blocked_connection = client.write().await;
             worker.shared.demand.store(true, ORDERING);
             assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0, 1]])));
+            if worker.config.on_read() {
+                for (partition, offset) in [(0, 0), (1, 0)] {
+                    worker
+                        .positions
+                        .insert(partition, next_at(partition, offset));
+                }
+            }
             worker.schedule();
             let fetch = worker.active[&0].task.id();
             assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0, 1]])));
@@ -2309,7 +3277,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn committing_shutdown_waits_for_its_fetch_and_cancels_its_checks() {
-        let (mut worker, mut receiver) = worker_of(committing(builder_for(group())));
+        let (mut worker, receiver) = worker_of(committing(builder_for(group())));
         let client = worker.config.client.clone();
         let _blocked_connection = client.write().await;
         assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0, 1]])));
@@ -2318,6 +3286,7 @@ mod tests {
         worker.shared.progress.deliver(&delivered);
         worker.shared.progress.record_commit(delivered);
         worker.shared.demand.store(true, ORDERING);
+        worker.positions.insert(0, next_at(0, 5));
         worker.schedule();
         assert_eq!(worker.active[&0].kind, FetchKind::Main);
         assert_eq!(
@@ -2340,9 +3309,9 @@ mod tests {
             "a fetch that never left the client hides no commit"
         );
         worker.flush_errors();
-        assert_eq!(
-            next_error(&mut receiver),
-            ReadError::new(Some(0), IggyError::TransientNotAccepted)
+        assert!(
+            receiver.is_empty(),
+            "a committing fetch that stored nothing retries without an error"
         );
         assert!(
             !worker.retry_at.contains_key(&1),
@@ -2400,9 +3369,7 @@ mod tests {
         let client = worker.config.client.clone();
         let _blocked_connection = client.write().await;
         for (partition, offset) in [(1, 11), (2, 21), (3, 31), (4, 41)] {
-            worker
-                .positions
-                .insert(partition, PollingStrategy::offset(offset));
+            worker.positions.insert(partition, at(partition, offset));
         }
         worker.schedule();
         let epoch = worker.epoch;
@@ -2452,7 +3419,7 @@ mod tests {
         assert!(worker.retry_at.contains_key(&2) && worker.retry_at.contains_key(&4));
         assert_eq!(
             worker.position(3),
-            PollingStrategy::offset(31),
+            at(3, 31),
             "a target without a section keeps its position"
         );
         assert!(
@@ -2467,8 +3434,8 @@ mod tests {
         let client = worker.config.client.clone();
         let _blocked_connection = client.write().await;
         let partitions = worker.partitions.clone();
-        worker.positions.insert(4, PollingStrategy::offset(21));
-        worker.positions.insert(6, PollingStrategy::offset(31));
+        worker.positions.insert(4, at(4, 21));
+        worker.positions.insert(6, at(6, 31));
         worker.schedule();
         worker.complete(failure_of(&worker, 0, IggyError::HistoryUnavailable));
         assert_eq!(
@@ -2478,12 +3445,12 @@ mod tests {
         );
         worker.flush_errors();
         assert!(receiver.is_empty(), "only a probe reports the lost history");
-        assert_eq!(worker.positions.get(&4), Some(&PollingStrategy::offset(21)));
+        assert_eq!(worker.positions.get(&4), Some(&at(4, 21)));
 
         worker.complete(polled(
             &worker,
             FetchKind::Check,
-            PollingStrategy::offset(21),
+            at(4, 21),
             4,
             Err(IggyError::HistoryUnavailable),
         ));
@@ -2501,7 +3468,7 @@ mod tests {
         worker.complete(polled(
             &worker,
             FetchKind::Check,
-            PollingStrategy::offset(31),
+            at(6, 31),
             6,
             Err(IggyError::ConsumerGroupPartitionNotOwned(1, 6)),
         ));
@@ -2570,7 +3537,10 @@ mod tests {
                 partition_id: Some(0),
                 error: IggyError::CannotDecryptData,
                 skip: Some(at(0, 4)),
-            }
+                offset: Some(3),
+                record: Some(Bytes::from(vec![0; BATCH_MESSAGE_HEADER_SIZE])),
+            },
+            "the error names the message and carries its record as served"
         );
         assert!(receiver.is_empty());
     }
@@ -2591,6 +3561,13 @@ mod tests {
         worker.shared.progress.deliver(&delivered);
         worker.shared.progress.record_commit(delivered);
         worker.shared.demand.store(true, ORDERING);
+        if worker.config.on_read() {
+            for (partition, offset) in [(0, 7), (1, 0)] {
+                worker
+                    .positions
+                    .insert(partition, next_at(partition, offset));
+            }
+        }
         worker.schedule();
         let fetch = fetch_of(&worker, 0);
         let (mut header, _) = served(0, &[7], 8);
@@ -2609,7 +3586,10 @@ mod tests {
         ));
         let start = worker.shared.progress.undecoded(0).unwrap();
         assert_eq!((start.offset(), start.context()), (7, context));
-        assert_eq!(worker.shared.progress.undecoded(1), None);
+        assert_eq!(
+            worker.shared.progress.undecoded(1),
+            Some(Checkpoint::new(1, 0, PartitionContext::default()))
+        );
         assert_eq!(
             worker.position(0),
             continuation_at(0, 7, context),
@@ -2620,16 +3600,17 @@ mod tests {
             None,
             "the server committed records that never arrived, so the close stores the delivered offset again"
         );
-        assert_eq!(worker.shared.progress.blocked(1), Some(OPERATION));
+        assert_eq!(worker.shared.progress.blocked(1), None);
+        assert_eq!(worker.abandoning, [(OPERATION, vec![1])]);
         worker.flush_errors();
         let undecoded = next_error(&mut receiver);
         assert_eq!(
             (undecoded.partition_id, undecoded.skip),
             (Some(0), Some(continuation_at(0, 8, context)))
         );
-        assert_eq!(
-            next_error(&mut receiver),
-            ReadError::new(Some(1), IggyError::FetchProgressUncertain(OPERATION))
+        assert!(
+            receiver.is_empty(),
+            "a lost section is no error of the reader"
         );
 
         worker.retry_at.clear();
@@ -2643,7 +3624,10 @@ mod tests {
             [7],
             "the retry from the start delivers the records"
         );
-        assert_eq!(worker.position(0), continuation_at(0, 8, context));
+        assert_eq!(
+            worker.position(0),
+            PollingStrategy::continuation(0, PollingKind::Next, 8, context)
+        );
         assert_eq!(
             worker.shared.progress.undecoded(0),
             None,
@@ -2725,9 +3709,122 @@ mod tests {
                     partition_id: Some(0),
                     error: IggyError::InvalidMessagesCount,
                     skip: Some(at(0, 4)),
+                    offset: None,
+                    record: None,
                 }
             );
         }
+    }
+
+    #[tokio::test]
+    async fn given_a_section_that_does_not_decode_when_its_messages_read_alone_should_read_alone_to_its_end()
+     {
+        const START: u64 = 3;
+        const END: u64 = START + 4;
+        let (mut worker, _receiver) = fetching_worker();
+        let client = worker.config.client.clone();
+        let _blocked_connection = client.write().await;
+        worker.positions.insert(0, at(0, START));
+        worker.schedule();
+        let (mut header, records) = served(0, &[START], END);
+        header.messages_count = 4;
+        worker.complete(reply_of(&worker, 0, &[(header, records)]));
+        assert!(worker.read_alone.contains(&0));
+
+        for offset in START..END {
+            assert!(
+                worker.read_alone.contains(&0),
+                "offset {offset}: a message of the section is read alone"
+            );
+            worker.complete(polled(
+                &worker,
+                FetchKind::Alone,
+                at(0, offset),
+                0,
+                Ok(batch(0, [offset], offset + 1)),
+            ));
+        }
+
+        assert_eq!(worker.position(0), at(0, END));
+        assert!(
+            !worker.read_alone.contains(&0),
+            "past the section the group fetch reads the partition again"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_last_start_when_the_epoch_changes_before_a_delivery_should_read_again_from_the_resolved_start()
+     {
+        let (mut worker, _receiver) = worker_of(standalone([0]).start(PollingStrategy::last()));
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+        worker.complete(polled(
+            &worker,
+            FetchKind::Alone,
+            PollingStrategy::last(),
+            0,
+            Ok(batch(0, [7, 8], 9)),
+        ));
+        assert_eq!(worker.position(0), at(0, 9));
+
+        worker.invalidate();
+
+        assert_eq!(
+            worker.position(0),
+            at(0, 7),
+            "a new `Last` read would skip the messages that arrived since the first one"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_auto_commit_when_a_rebalance_takes_a_partition_away_should_store_its_counted_position()
+     {
+        const COUNTED: u64 = 7;
+        let (client, cluster) = connect_to_one_replica().await;
+        let (mut worker, _receiver) = worker_of(builder_on(client, group()).options(PollOptions {
+            commit: CommitPolicy::Auto(AutoCommit::default()),
+            ..PollOptions::default()
+        }));
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0, 1])));
+        let progress = Arc::clone(&worker.shared.progress);
+        let stamp = progress.stamp(worker.generation(1));
+        progress.count(
+            Checkpoint::stamped(1, COUNTED, PartitionContext::default(), Some(stamp)),
+            1,
+            false,
+        );
+
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION + 1, [0])));
+        progress.flush_counted().await.unwrap();
+
+        assert_eq!(
+            stored_offsets(&cluster),
+            [COUNTED],
+            "the count of the partition that left is stored, not dropped with its generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_committing_read_alone_when_its_message_does_not_decode_should_remember_it_for_the_close()
+     {
+        const BAD: u64 = 4;
+        let (mut worker, _receiver) = worker_of(committing(standalone([0])));
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+        worker.positions.insert(0, at(0, BAD));
+        worker.read_alone.insert(0);
+
+        worker.complete(polled(
+            &worker,
+            FetchKind::Alone,
+            at(0, BAD),
+            0,
+            Err(IggyError::InvalidMessagePayloadLength),
+        ));
+
+        assert_eq!(
+            worker.shared.progress.undecoded(0),
+            Some(Checkpoint::new(0, BAD, PartitionContext::default())),
+            "the server stored the offset of the message, so the close moves it back"
+        );
     }
 
     #[tokio::test]
@@ -2739,34 +3836,45 @@ mod tests {
         let client = worker.config.client.clone();
         let _blocked_connection = client.write().await;
         worker.positions.insert(0, at(0, GOOD));
-        for start in [GOOD, BAD] {
-            worker.shared.demand.store(true, ORDERING);
-            worker.schedule();
-            let (mut header, records) = served(0, &[start], start + 2);
-            header.messages_count = 2;
-            worker.complete(reply_of(&worker, 0, &[(header, records)]));
-            assert_eq!(worker.position(0), at(0, start));
-            worker.flush_errors();
-            assert!(
-                receiver.is_empty(),
-                "a failure of two messages names neither of them"
-            );
-
-            worker.shared.demand.store(true, ORDERING);
-            worker.schedule();
-            assert_eq!(worker.active[&0].kind, FetchKind::Alone);
-            if start == GOOD {
-                worker.complete(polled(
-                    &worker,
-                    FetchKind::Alone,
-                    at(0, GOOD),
-                    0,
-                    Ok(batch(0, [GOOD], BAD)),
-                ));
-                assert_eq!(offsets(&next_batches(&mut receiver)[0]), [GOOD]);
-                assert_eq!(worker.position(0), at(0, BAD));
+        worker.shared.demand.store(true, ORDERING);
+        if worker.config.on_read() {
+            for partition in worker.partitions.clone() {
+                worker
+                    .positions
+                    .entry(partition)
+                    .or_insert(next_at(partition, 0));
             }
         }
+        worker.schedule();
+        let (mut header, records) = served(0, &[GOOD], BAD + 1);
+        header.messages_count = 2;
+        worker.complete(reply_of(&worker, 0, &[(header, records)]));
+        assert_eq!(worker.position(0), at(0, GOOD));
+        worker.flush_errors();
+        assert!(
+            receiver.is_empty(),
+            "a failure of two messages names neither of them"
+        );
+
+        worker.shared.demand.store(true, ORDERING);
+        worker.schedule();
+        assert_eq!(worker.active[&0].kind, FetchKind::Alone);
+        worker.complete(polled(
+            &worker,
+            FetchKind::Alone,
+            at(0, GOOD),
+            0,
+            Ok(batch(0, [GOOD], BAD)),
+        ));
+        assert_eq!(offsets(&next_batches(&mut receiver)[0]), [GOOD]);
+        assert_eq!(worker.position(0), at(0, BAD));
+        worker.shared.demand.store(true, ORDERING);
+        worker.schedule();
+        assert_eq!(
+            worker.active[&0].kind,
+            FetchKind::Alone,
+            "the next message of the section reads alone, not in a group fetch"
+        );
 
         worker.complete(polled(
             &worker,
@@ -2787,18 +3895,27 @@ mod tests {
                 partition_id: Some(0),
                 error: IggyError::InvalidMessagePayloadLength,
                 skip: Some(at(0, BAD + 1)),
+                offset: None,
+                record: None,
             }
         );
     }
 
     #[tokio::test]
-    async fn given_partial_unknown_progress_when_fetch_completes_should_deliver_healthy_data_and_stop_only_blocked_targets()
+    async fn given_partial_unknown_progress_when_fetch_completes_should_deliver_healthy_data_and_read_the_lost_target_again()
      {
         let (mut worker, mut receiver) = worker_of(committing(builder_for(group())));
         let client = worker.config.client.clone();
         let _blocked_connection = client.write().await;
         assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0, 1]])));
         worker.shared.demand.store(true, ORDERING);
+        if worker.config.on_read() {
+            for (partition, offset) in [(0, 7), (1, 0)] {
+                worker
+                    .positions
+                    .insert(partition, next_at(partition, offset));
+            }
+        }
         worker.schedule();
         let fetch = fetch_of(&worker, 0);
         let mut response = sections(&[
@@ -2819,23 +3936,19 @@ mod tests {
             (1, 0, vec![7]),
             "the committed data reaches the application"
         );
-        assert_eq!(
-            next_error(&mut receiver),
-            ReadError::new(Some(1), IggyError::FetchProgressUncertain(OPERATION)),
-            "so does the operation of the unknown outcome"
+        assert!(
+            receiver.is_empty(),
+            "a lost section is no error of the reader"
         );
-        assert_eq!(worker.shared.progress.blocked(1), Some(OPERATION));
+        assert_eq!(worker.shared.progress.blocked(1), None);
+        assert_eq!(worker.abandoning, [(OPERATION, vec![1])]);
 
-        worker.shared.demand.store(true, ORDERING);
-        worker.schedule();
-        assert!(worker.active.contains_key(&0));
-        assert!(!worker.active.contains_key(&1));
         worker.retry_at.clear();
         worker.shared.demand.store(true, ORDERING);
         worker.schedule();
         assert!(
-            !worker.active.contains_key(&1),
-            "the blocked target must not retry automatically"
+            worker.active.contains_key(&1),
+            "the lost target reads again, and its read finds what the lost one committed"
         );
     }
 
@@ -2849,6 +3962,13 @@ mod tests {
         worker.shared.progress.deliver(&delivered);
         worker.shared.progress.record_commit(delivered);
         worker.shared.demand.store(true, ORDERING);
+        if worker.config.on_read() {
+            for (partition, offset) in [(0, 0), (1, 8)] {
+                worker
+                    .positions
+                    .insert(partition, next_at(partition, offset));
+            }
+        }
         worker.schedule();
         worker.complete(failure_of(
             &worker,
@@ -2945,18 +4065,18 @@ mod tests {
             let stops = error == IggyError::HistoryUnavailable;
             let (mut worker, mut receiver) = worker_of(builder_for(group()));
             assert!(worker.apply(assigned(&worker, SESSION, VERSION, [3, 4])));
-            worker.positions.insert(3, PollingStrategy::offset(11));
-            worker.positions.insert(4, PollingStrategy::offset(21));
+            worker.positions.insert(3, at(3, 11));
+            worker.positions.insert(4, at(4, 21));
             let epoch = worker.epoch;
             worker.complete(polled(
                 &worker,
                 FetchKind::Alone,
-                PollingStrategy::offset(11),
+                at(3, 11),
                 3,
                 Err(error.clone()),
             ));
             assert!(!worker.positions.contains_key(&3));
-            assert_eq!(worker.positions.get(&4), Some(&PollingStrategy::offset(21)));
+            assert_eq!(worker.positions.get(&4), Some(&at(4, 21)));
             assert_eq!(
                 worker.epoch, epoch,
                 "a refused partition keeps the reads of the others"
@@ -2988,6 +4108,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_a_zero_wait_when_a_poll_returns_nothing_should_poll_again_after_the_retry_interval()
+     {
+        let on_read_without_wait = PollOptions {
+            commit: CommitPolicy::OnRead,
+            ..PollOptions::default()
+        };
+        for (builder, waits) in [
+            (standalone([0]).options(PollOptions::default()), false),
+            (standalone([0]).options(on_read_without_wait), false),
+            (standalone([0]), true),
+            (committing(standalone([0])), true),
+        ] {
+            let (mut worker, _receiver) = worker_of(builder);
+            assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+
+            worker.complete(polled(
+                &worker,
+                FetchKind::Alone,
+                PollingStrategy::next(),
+                0,
+                Ok(batch(0, Vec::new(), 0)),
+            ));
+
+            assert_eq!(
+                worker.retry_at.contains_key(&0),
+                !waits,
+                "on_read: {}, max_wait: {}: a read that waited for nothing pauses an idle partition",
+                worker.config.on_read(),
+                worker.config.options.max_wait
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_zero_wait_when_a_fetch_returns_nothing_should_fetch_again_after_the_retry_interval()
+     {
+        let (mut worker, _receiver) =
+            worker_of(builder_for(group()).options(PollOptions::default()));
+        let client = worker.config.client.clone();
+        let _blocked_connection = client.write().await;
+        assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0, 1, 2]])));
+        worker.schedule();
+
+        worker.complete(reply_of(
+            &worker,
+            0,
+            &[served(1, &[], 0), served(2, &[7], 8)],
+        ));
+
+        assert!(
+            worker.retry_at.contains_key(&0)
+                && worker.retry_at.contains_key(&1)
+                && !worker.retry_at.contains_key(&2),
+            "only the partitions that returned nothing pause"
+        );
+        assert_eq!(
+            worker.active.keys().copied().collect::<Vec<_>>(),
+            [2],
+            "the partition that returned messages reads on"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_position_without_history_when_its_read_finds_no_history_should_retry_instead_of_stopping()
+     {
+        let (mut worker, mut receiver) = worker_of(standalone([3]));
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [3])));
+
+        worker.complete(polled(
+            &worker,
+            FetchKind::Alone,
+            PollingStrategy::next(),
+            3,
+            Err(IggyError::HistoryUnavailable),
+        ));
+
+        worker.flush_errors();
+        assert!(
+            receiver.try_recv().is_err(),
+            "only a stop reports a lost history"
+        );
+        assert!(
+            !worker.stopped.contains(&3) && worker.retry_at.contains_key(&3),
+            "the next read takes the history of a new route"
+        );
+        assert_eq!(worker.position(3), PollingStrategy::next());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_lasting_refusal_when_it_repeats_should_retry_later_each_time_and_then_stop_with_one_error()
+     {
+        let (mut worker, mut receiver) = worker_of(standalone([0]));
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+        let mut delays = Vec::new();
+
+        for _ in 0..MAX_LASTING_REFUSALS {
+            worker.flush_errors();
+            assert!(
+                receiver.try_recv().is_err(),
+                "a refusal before the last one is only logged"
+            );
+            worker.complete(polled(
+                &worker,
+                FetchKind::Alone,
+                PollingStrategy::next(),
+                0,
+                Err(IggyError::Unauthorized),
+            ));
+            if let Some(retry_at) = worker.retry_at.remove(&0) {
+                delays.push(retry_at - Instant::now());
+            }
+        }
+
+        let interval = worker.config.retry_interval;
+        assert_eq!(
+            delays,
+            [1, 2, 4, 8, 16].map(|factor| interval * factor),
+            "the wait doubles with each refusal in a row"
+        );
+        assert!(
+            worker.stopped.contains(&0),
+            "the partition stops until a seek"
+        );
+        worker.flush_errors();
+        assert_eq!(
+            next_error(&mut receiver),
+            ReadError::new(Some(0), IggyError::Unauthorized)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_transient_refusal_when_it_repeats_should_retry_after_the_interval_and_never_stop()
+     {
+        let (mut worker, mut receiver) = worker_of(standalone([0]));
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+
+        for _ in 0..MAX_LASTING_REFUSALS * 2 {
+            worker.complete(polled(
+                &worker,
+                FetchKind::Alone,
+                PollingStrategy::next(),
+                0,
+                Err(IggyError::TransientNotAccepted),
+            ));
+            assert_eq!(
+                worker
+                    .retry_at
+                    .remove(&0)
+                    .map(|retry_at| retry_at - Instant::now()),
+                Some(worker.config.retry_interval)
+            );
+            worker.flush_errors();
+            assert_eq!(
+                next_error(&mut receiver),
+                ReadError::new(Some(0), IggyError::TransientNotAccepted)
+            );
+        }
+
+        assert!(!worker.stopped.contains(&0));
+    }
+
+    #[tokio::test]
     async fn committing_worker_should_drop_only_the_continuation_of_a_partition_without_history() {
         let (mut worker, mut receiver) = worker_of(committing(
             standalone([3, 4]).start(PollingStrategy::first()),
@@ -2995,12 +4277,12 @@ mod tests {
         let client = worker.config.client.clone();
         let _blocked_connection = client.write().await;
         assert!(worker.apply(assigned(&worker, SESSION, VERSION, [3, 4])));
-        worker.positions.insert(3, PollingStrategy::offset(11));
-        worker.positions.insert(4, PollingStrategy::offset(21));
+        worker.positions.insert(3, at(3, 11));
+        worker.positions.insert(4, at(4, 21));
         worker.complete(polled(
             &worker,
             FetchKind::Alone,
-            PollingStrategy::offset(11),
+            at(3, 11),
             3,
             Err(IggyError::HistoryUnavailable),
         ));
@@ -3014,7 +4296,7 @@ mod tests {
             worker.stopped.contains(&3) && !worker.retry_at.contains_key(&3),
             "a lost history stops its partition instead of a retry"
         );
-        assert_eq!(worker.positions.get(&4), Some(&PollingStrategy::offset(21)));
+        assert_eq!(worker.positions.get(&4), Some(&at(4, 21)));
 
         worker.shared.demand.store(true, ORDERING);
         worker.schedule();
@@ -3176,6 +4458,13 @@ mod tests {
             let _blocked_connection = client.write().await;
             assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0, 1]])));
             worker.shared.demand.store(true, ORDERING);
+            if worker.config.on_read() {
+                for (partition, offset) in [(0, 3), (1, 7)] {
+                    worker
+                        .positions
+                        .insert(partition, next_at(partition, offset));
+                }
+            }
             worker.schedule();
             let fetch = reply_of(&worker, 0, &[served(0, &[3, 4], 5), served(1, &[7], 8)]);
             let poll = polled(
@@ -3212,50 +4501,105 @@ mod tests {
         }
     }
 
+    /// The next `Next` read finds what a lost committing read stored, so the worker abandons
+    /// the operation itself and reads again after the retry interval, without an error.
     #[tokio::test]
-    async fn given_an_unknown_committing_outcome_when_the_client_abandons_it_should_stay_stopped_until_a_seek()
+    async fn given_an_empty_or_uncertain_fetch_section_when_closing_should_rewind_only_uncertain_progress()
      {
-        let (mut worker, mut receiver) = worker_of(committing(builder_for(group())));
+        for uncertain in [false, true] {
+            let (client, cluster) = connect_to_one_replica().await;
+            let (mut worker, _receiver) = worker_of(committing(
+                builder_on(client, Consumer::default()).partitions([0]),
+            ));
+            assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0]])));
+            worker.positions.insert(0, next_at(0, 5));
+            let client = worker.config.client.clone();
+            let blocked = client.write().await;
+            worker.shared.demand.store(true, ORDERING);
+            worker.schedule();
+            let fetch = fetch_of(&worker, 0);
+            let mut response = sections(&[served(0, &[], 5)]);
+            if uncertain {
+                response[0].status = Err(IggyError::FetchProgressUncertain(OPERATION));
+            }
+            worker.complete(reply(
+                &worker,
+                fetch,
+                targets_of(&worker, fetch),
+                Ok(response),
+            ));
+            worker.tasks.abort_all();
+            drop(blocked);
+            worker.abandon_lost().await;
+            worker
+                .shared
+                .progress
+                .rewind(Vec::new(), None, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                stored_offsets(&cluster),
+                if uncertain { vec![4] } else { Vec::new() }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn given_http_when_a_committing_reply_is_lost_should_keep_its_partition_blocked() {
+        let builder = ReaderBuilder::new(
+            IggyRwLock::new(ClientWrapper::Http(HttpClient::default())),
+            Identifier::numeric(1).unwrap(),
+            Identifier::numeric(1).unwrap(),
+            Consumer::default(),
+            None,
+        )
+        .partitions([0]);
+        let (mut worker, mut receiver) = worker_of(committing(builder));
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+        worker.positions.insert(0, next_at(0, 5));
+        worker.refuse(&[0], IggyError::FetchProgressUncertain(OPERATION));
+        worker.abandon_lost().await;
+        worker.flush_errors();
+        assert_eq!(worker.shared.progress.blocked(0), Some(OPERATION));
+        assert_eq!(
+            next_error(&mut receiver),
+            ReadError::new(Some(0), IggyError::FetchProgressUncertain(OPERATION))
+        );
+        assert!(worker.abandoning.is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_a_lost_committing_reply_when_completed_should_abandon_it_and_read_on() {
+        let (mut worker, receiver) = worker_of(committing(builder_for(group())));
         let client = worker.config.client.clone();
         let blocked_connection = client.write().await;
         assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0]])));
         worker.shared.demand.store(true, ORDERING);
+        worker.positions.insert(0, next_at(0, 0));
         worker.schedule();
+
         worker.complete(failure_of(
             &worker,
             0,
             IggyError::FetchProgressUncertain(OPERATION),
         ));
-        worker.flush_errors();
-        assert_eq!(
-            next_error(&mut receiver),
-            ReadError::new(Some(0), IggyError::FetchProgressUncertain(OPERATION))
-        );
-        assert_eq!(worker.shared.progress.blocked(0), Some(OPERATION));
 
-        // The lift asks the client, which retains no operation.
-        drop(blocked_connection);
-        worker.shared.progress.unblock_abandoned().await;
-        assert_eq!(
-            worker.shared.progress.blocked(0),
-            None,
-            "the block ends when the client abandons the operation"
+        worker.flush_errors();
+        assert!(
+            receiver.is_empty(),
+            "a lost reply is no error of the reader"
         );
+        assert_eq!(worker.shared.progress.blocked(0), None);
+        assert!(!worker.stopped.contains(&0));
+        assert!(worker.retry_at.contains_key(&0));
+        assert_eq!(worker.abandoning, [(OPERATION, vec![0])]);
+        drop(blocked_connection);
+        worker.abandon_lost().await;
+        assert!(worker.abandoning.is_empty());
+        worker.retry_at.clear();
         worker.shared.demand.store(true, ORDERING);
         worker.schedule();
-        assert!(
-            !worker.active.contains_key(&0),
-            "with OnRead the partition stays stopped until a seek"
-        );
-
-        worker.shared.progress.seek(0, PollingStrategy::next());
-        worker.apply_seeks();
-        worker.schedule();
-        assert_eq!(
-            worker.active[&0].kind,
-            FetchKind::Main,
-            "a seek resumes the partition"
-        );
+        assert_eq!(worker.active[&0].kind, FetchKind::Main);
     }
 
     #[tokio::test]
@@ -3360,8 +4704,114 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn given_more_groups_than_slots_when_each_fetch_ends_should_give_every_group_a_turn() {
+        const GROUPS: u32 = 3;
+        for builder in [builder_for(group()), committing(builder_for(group()))] {
+            let max_bytes = PollOptions::default().max_bytes;
+            let (mut worker, _receiver) = worker_of(builder.prefetch_bytes(max_bytes));
+            assert_eq!(worker.config.slots, 1);
+            let client = worker.config.client.clone();
+            let _blocked_connection = client.write().await;
+            let groups = (0..GROUPS).map(|partition| vec![partition]).collect();
+            assert!(worker.apply(grouped(&worker, SESSION, VERSION, groups)));
+
+            let mut fetched = Vec::new();
+            for _ in 0..GROUPS * 2 {
+                worker.shared.demand.store(true, ORDERING);
+                if worker.config.on_read() {
+                    for (partition, offset) in [(0, 0), (1, 0), (2, 0)] {
+                        worker
+                            .positions
+                            .insert(partition, next_at(partition, offset));
+                    }
+                }
+                worker.schedule();
+                let partitions: Vec<u32> = worker.active.keys().copied().collect();
+                fetched.extend(partitions);
+                let Completed::Fetch(mut completed) =
+                    worker.tasks.join_next().await.unwrap().unwrap()
+                else {
+                    panic!("a group reads with a fetch");
+                };
+                completed.result = Ok(Vec::new());
+                worker.complete(Completed::Fetch(completed));
+            }
+
+            assert_eq!(
+                fetched,
+                [0, 1, 2, 0, 1, 2],
+                "on_read: {}: each group fetches in turn",
+                worker.config.on_read()
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn given_a_record_above_max_bytes_when_polled_alone_should_ask_for_one_message_without_a_byte_limit()
+    async fn given_one_fetch_slot_when_another_partition_needs_a_start_should_check_it() {
+        let options = PollOptions {
+            count: 1,
+            commit: CommitPolicy::OnRead,
+            ..PollOptions::default()
+        };
+        let (mut worker, _receiver) = worker_of(
+            builder_for(group())
+                .options(options)
+                .prefetch_messages(options.count),
+        );
+        assert_eq!(worker.config.slots, 1);
+        let client = worker.config.client.clone();
+        let _blocked_connection = client.write().await;
+        assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0, 1]])));
+        worker.positions.insert(0, next_at(0, 0));
+        worker.shared.demand.store(true, ORDERING);
+
+        worker.schedule();
+
+        assert_eq!(worker.active[&0].kind, FetchKind::Main);
+        assert_eq!(worker.active[&1].kind, FetchKind::Check);
+    }
+
+    #[tokio::test]
+    async fn given_a_group_without_a_fetch_when_a_slot_is_free_should_start_it_before_a_second_fetch()
+     {
+        const SLOTS: u32 = 2;
+        let options = PollOptions::default();
+        let (mut worker, _receiver) = worker_of(
+            builder_for(group())
+                .options(options)
+                .prefetch_bytes(options.max_bytes * SLOTS),
+        );
+        assert_eq!(worker.config.slots, SLOTS as usize);
+        let client = worker.config.client.clone();
+        let _blocked_connection = client.write().await;
+        assert!(worker.apply(grouped(
+            &worker,
+            SESSION,
+            VERSION,
+            vec![vec![0, 1], vec![2]]
+        )));
+        worker.retry(&[1, 2]);
+        worker.schedule();
+        assert_eq!(worker.active[&0].kind, FetchKind::Main);
+
+        worker.retry_at.clear();
+        worker.schedule();
+
+        assert!(
+            worker
+                .active
+                .get(&2)
+                .is_some_and(|active| active.kind == FetchKind::Main)
+                && !worker.active.contains_key(&1),
+            "the idle group takes the last slot before a second fetch of a busy group"
+        );
+    }
+
+    /// A poll alone reads one message within `max_bytes`: the server returns a larger first
+    /// message alone anyway, and a reply of one message that does not decode names it.
+    #[tokio::test]
+    async fn given_a_partition_that_reads_alone_when_polled_should_ask_for_one_message_within_max_bytes()
      {
         let (client, cluster) = connect_to_one_replica().await;
         cluster.script(
@@ -3379,72 +4829,86 @@ mod tests {
             &cluster.received(POLL_MESSAGES_DEFERRED_CODE)[0].body,
         )
         .unwrap();
-        let alone = worker.config.options.alone();
         assert_eq!(
             (request.poll.count, request.min_count, request.max_bytes),
-            (alone.count, alone.min_count, alone.max_bytes),
-            "the record is read alone, without a byte limit"
-        );
-        assert_eq!(
-            cluster.count(POLL_MESSAGES_DEFERRED_CODE),
-            1,
-            "a read without a byte limit is not repeated"
+            (
+                SINGLE_RECORD,
+                SINGLE_RECORD,
+                worker.config.options.max_bytes
+            ),
+            "one message within the byte limit of the reader"
         );
         worker.complete(completed);
         worker.flush_errors();
         assert_eq!(
             next_error(&mut receiver),
-            ReadError::new(Some(0), IggyError::InvalidSizeBytes),
-            "only the read without a byte limit reports the error"
+            ReadError::new(Some(0), IggyError::InvalidSizeBytes)
         );
         assert!(!worker.read_alone.contains(&0));
     }
 
+    /// The client never reads a refused poll again, whatever its start and commit policy.
     #[tokio::test]
-    async fn given_a_last_start_when_its_first_record_is_above_max_bytes_should_report_the_refusal_without_a_read_alone()
-     {
-        // Above 1, because a `Last` read of one message keeps its read alone: both start at the
-        // last message.
+    async fn given_a_poll_refused_for_its_byte_limit_when_read_should_send_it_once_and_report_it() {
         const COUNT: u32 = 2;
-        for server_commit in [ServerCommitPolicy::Disabled, ServerCommitPolicy::OnRead] {
-            let (client, cluster) = connect_to_one_replica().await;
-            cluster.script(
-                &endpoint(0),
-                POLL_MESSAGES_DEFERRED_CODE,
-                [Answer::Refuse(IggyError::InvalidSizeBytes)],
-            );
-            let (mut worker, mut receiver) = worker_of(
-                builder_on(client, Consumer::default())
-                    .partitions([0])
-                    .start(PollingStrategy::last())
-                    .options(PollOptions {
-                        count: COUNT,
-                        server_commit,
-                        ..PollOptions::default()
-                    }),
-            );
-            assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
-            worker.shared.demand.store(true, ORDERING);
-            worker.schedule();
-            let completed = worker.tasks.join_next().await.unwrap().unwrap();
-            let polls = cluster.received(POLL_MESSAGES_DEFERRED_CODE);
-            assert_eq!(
-                polls.len(),
-                1,
-                "{server_commit:?}: a `Last` read of one message would start at the last message and skip the ones before it"
-            );
-            let request = DeferredPollMessagesRequest::decode_from(&polls[0].body).unwrap();
-            assert_eq!(request.poll.count, COUNT);
-            worker.complete(completed);
-            worker.flush_errors();
-            assert_eq!(
-                next_error(&mut receiver),
-                ReadError::new(Some(0), IggyError::InvalidSizeBytes),
-                "{server_commit:?}"
-            );
-            assert_eq!(worker.position(0), PollingStrategy::last());
-            assert!(!worker.read_alone.contains(&0));
+        for commit in [CommitPolicy::Manual, CommitPolicy::OnRead] {
+            for start in [PollingStrategy::offset(0), PollingStrategy::last()] {
+                let case = format!("{commit:?} {start}");
+                let (client, cluster) = connect_to_one_replica().await;
+                cluster.script(
+                    &endpoint(0),
+                    POLL_MESSAGES_DEFERRED_CODE,
+                    [Answer::Refuse(IggyError::InvalidSizeBytes)],
+                );
+                let (mut worker, mut receiver) = worker_of(
+                    builder_on(client, Consumer::default())
+                        .partitions([0])
+                        .start(start)
+                        .options(PollOptions {
+                            count: COUNT,
+                            commit,
+                            ..PollOptions::default()
+                        }),
+                );
+                assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+                worker.shared.demand.store(true, ORDERING);
+                worker.schedule();
+                let completed = worker.tasks.join_next().await.unwrap().unwrap();
+                let polls = cluster.received(POLL_MESSAGES_DEFERRED_CODE);
+                assert_eq!(polls.len(), 1, "{case}");
+                let request = DeferredPollMessagesRequest::decode_from(&polls[0].body).unwrap();
+                assert_eq!(
+                    request.poll.count,
+                    if worker.needs_start(0) {
+                        SINGLE_RECORD
+                    } else {
+                        COUNT
+                    },
+                    "{case}"
+                );
+                worker.complete(completed);
+                worker.flush_errors();
+                assert_eq!(
+                    next_error(&mut receiver),
+                    ReadError::new(Some(0), IggyError::InvalidSizeBytes),
+                    "{case}"
+                );
+                assert_eq!(worker.position(0), start, "{case}");
+                assert!(!worker.read_alone.contains(&0), "{case}");
+            }
         }
+    }
+
+    /// The client sends no heartbeat inside a read, so the default wait stays well below the
+    /// 30 s operation deadline.
+    #[tokio::test]
+    async fn given_no_options_when_building_a_reader_should_wait_up_to_five_seconds() {
+        let (worker, _receiver) = worker_of(standalone([0]));
+
+        assert_eq!(
+            worker.config.options,
+            PollOptions::wait(IggyDuration::from(Duration::from_secs(5)))
+        );
     }
 
     fn group() -> Consumer {
@@ -3455,11 +4919,12 @@ mod tests {
         builder_for(Consumer::default()).partitions(partitions)
     }
 
-    /// The server stores the offset of each read.
+    /// The server stores the offset of each read, which waits as long as a reader does by
+    /// default.
     fn committing(builder: ReaderBuilder) -> ReaderBuilder {
         builder.options(PollOptions {
-            server_commit: ServerCommitPolicy::OnRead,
-            ..PollOptions::default()
+            commit: CommitPolicy::OnRead,
+            ..PollOptions::wait(IggyDuration::from(DEFAULT_MAX_WAIT))
         })
     }
 
@@ -3469,7 +4934,7 @@ mod tests {
     }
 
     fn worker_on(config: Config, shared: Shared) -> (Worker, Replies) {
-        let (sender, receiver) = mpsc::channel(config.slots);
+        let (sender, receiver) = mpsc::unbounded_channel();
         let worker = Worker::new(Arc::new(config), Arc::new(shared), sender, None);
         (worker, receiver)
     }
@@ -3540,15 +5005,17 @@ mod tests {
         partition: u32,
         result: Result<PolledMessages, IggyError>,
     ) -> Completed {
-        let commits = worker.config.on_read() && kind == FetchKind::Alone;
+        let commits = worker.config.on_read()
+            && kind == FetchKind::Alone
+            && worker.catching_up(partition).is_none();
         Completed::Poll(CompletedPoll {
             epoch: worker.epoch,
             kind,
             partition,
             strategy,
             generation: worker.generation(partition),
-            result,
-            capacity: worker.reserve().unwrap(),
+            result: result.map_err(DecodeError::without_record),
+            capacity: worker.reserve_recovery(partition).unwrap(),
             commit: commits
                 .then(|| PendingCommit::new(Arc::clone(&worker.shared.progress), vec![partition])),
         })
@@ -3618,10 +5085,16 @@ mod tests {
                 panic!("a reader without readiness groups polls one partition");
             };
             assert!(
-                matches!(completed.result, Err(IggyError::TransientNotAccepted)),
+                matches!(
+                    completed.result,
+                    Err(DecodeError {
+                        error: IggyError::TransientNotAccepted,
+                        ..
+                    })
+                ),
                 "a read that waits past its deadline for the client was never sent"
             );
-            completed.result = Err(IggyError::CannotReadMessage);
+            completed.result = Err(DecodeError::without_record(IggyError::CannotReadMessage));
             worker.complete(Completed::Poll(completed));
         }
     }
@@ -3651,6 +5124,17 @@ mod tests {
     /// The continuation of `partition` at `offset` in the default history.
     fn at(partition: u32, offset: u64) -> PollingStrategy {
         continuation_at(partition, offset, PartitionContext::default())
+    }
+
+    /// The `Next` continuation of `partition` that expects `offset`, in the default history: the
+    /// position of an `OnRead` partition after a delivery.
+    fn next_at(partition: u32, offset: u64) -> PollingStrategy {
+        PollingStrategy::continuation(
+            partition,
+            PollingKind::Next,
+            offset,
+            PartitionContext::default(),
+        )
     }
 
     /// A batch of partition 0 with a message at each of `offsets`, whose payloads `encryptor`

@@ -17,10 +17,12 @@
 
 using System.Diagnostics;
 using System.Text;
+using Apache.Iggy.Consumers;
 using Apache.Iggy.Contracts;
-using Apache.Iggy.Exceptions;
+using Apache.Iggy.Extensions;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
+using Microsoft.Extensions.Logging.Abstractions;
 using Reqnroll;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
@@ -29,33 +31,29 @@ using TestContext = Apache.Iggy.Tests.BDD.Context.TestContext;
 namespace Apache.Iggy.Tests.BDD.StepDefinitions;
 
 /// <summary>
-///     A start step leaves its deferred poll or fetch parked on the server, and a later step sends the
-///     message that wakes it. All calls share the client of the scenario, which multiplexes them on one link.
+///     A start step leaves its deferred poll, reader or consumer waiting on the server, and a later step sends the
+///     message that wakes it. All of them share the client of the scenario.
 /// </summary>
 [Binding]
-public sealed class DeferredPollingSteps : IDisposable
+public sealed class DeferredPollingSteps : IAsyncDisposable
 {
     private const uint MessagesCount = 10;
 
-    /// <summary>The SDK refuses a request timeout that does not cover the max wait plus this margin.</summary>
-    private static readonly TimeSpan ReplyMargin = TimeSpan.FromSeconds(1);
-
     /// <summary>
-    ///     A message that reaches the server before a call answers it at once, so a start step waits until its call
+    ///     A message that reaches the server before a poll answers it at once, so a start step waits until its poll
     ///     parks.
     /// </summary>
     private static readonly TimeSpan ParkTime = TimeSpan.FromMilliseconds(100);
 
-    private static readonly TimeSpan AssignmentTimeout = TimeSpan.FromSeconds(5);
-    private static readonly TimeSpan AssignmentPollInterval = TimeSpan.FromMilliseconds(100);
     private static readonly Consumer DefaultConsumer = Consumer.New(0);
 
     private readonly CancellationTokenSource _cancellation = new();
     private readonly TestContext _context;
-    private string? _groupName;
+    private IggyConsumer? _consumer;
+    private IAsyncEnumerator<ReceivedMessage>? _messages;
     private Task<PolledMessages>? _poll;
     private Stopwatch? _pollStarted;
-    private Task<FetchedMessages>? _fetch;
+    private PartitionReader? _reader;
     private StreamResponse? _stream;
     private TopicResponse? _topic;
 
@@ -64,8 +62,14 @@ public sealed class DeferredPollingSteps : IDisposable
         _context = context;
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
+        await CloseConsumerAsync();
+        if (_reader is not null)
+        {
+            await _reader.DisposeAsync();
+        }
+
         _cancellation.Dispose();
     }
 
@@ -73,6 +77,13 @@ public sealed class DeferredPollingSteps : IDisposable
     [AfterScenario(Order = 0)]
     public async Task DeleteCreatedStream()
     {
+        await CloseConsumerAsync();
+        if (_reader is not null)
+        {
+            await _reader.DisposeAsync();
+            _reader = null;
+        }
+
         if (_stream is not null)
         {
             await _context.IggyClient.DeleteStreamAsync(StreamId());
@@ -94,21 +105,21 @@ public sealed class DeferredPollingSteps : IDisposable
     [When("I start a deferred poll of partition {int} from offset {int} with a max wait of {int} second(s)")]
     public Task StartDeferredPoll(int partition, int offset, int maxWaitSeconds)
     {
-        return StartDeferredPollAsync(partition, DefaultConsumer, PollingStrategy.Offset((ulong)offset), false,
-            DeferredOptions(maxWaitSeconds));
+        return StartDeferredPollAsync(partition, DefaultConsumer, PollingStrategy.Offset((ulong)offset),
+            Options(maxWaitSeconds));
     }
 
-    [When("I start a deferred poll of partition {int} for consumer {string} with auto commit, a min count of {int} and a max wait of {int} second(s)")]
+    [When("I start a deferred poll of partition {int} for consumer {string} with the on read commit policy, a min count of {int} and a max wait of {int} second(s)")]
     public Task StartCommittingDeferredPoll(int partition, string consumerName, int minCount, int maxWaitSeconds)
     {
-        return StartDeferredPollAsync(partition, Consumer.New(consumerName), PollingStrategy.Next(), true,
-            DeferredOptions(maxWaitSeconds) with { MinCount = (uint)minCount });
+        return StartDeferredPollAsync(partition, Consumer.New(consumerName), PollingStrategy.Next(),
+            Options(maxWaitSeconds) with { MinCount = (uint)minCount, Commit = CommitPolicy.OnRead });
     }
 
     [When("I send a message with payload {string} to partition {int}")]
-    public Task SendToPartition(string payload, int partition)
+    public async Task SendToPartition(string payload, int partition)
     {
-        return _context.IggyClient.SendMessagesAsync(StreamId(), TopicId(), Partitioning.PartitionId(partition),
+        await _context.IggyClient.SendMessagesAsync(StreamId(), TopicId(), Partitioning.PartitionId(partition),
             [new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(payload))]);
     }
 
@@ -130,63 +141,22 @@ public sealed class DeferredPollingSteps : IDisposable
         polled.Messages.ShouldBeEmpty();
     }
 
-    [When("I start a fetch on partitions {int}, {int} and {int} from offset {int} with a max wait of {int} second(s)")]
-    public async Task StartFetch(int first, int second, int third, int offset, int maxWaitSeconds)
+    [Then("a poll of partition {int} for consumer {string} with the next strategy and the on read commit policy should return the payload {string}")]
+    public async Task OnReadPollReturns(int partition, string consumerName, string payload)
     {
-        var partitions = new[] { first, second, third }
-            .Select(partition => (uint)partition).ToArray();
-        var group = (await _context.IggyClient.ReadinessGroupsAsync(StreamId(), TopicId(), partitions))
-            .ShouldHaveSingleItem();
-        _fetch = _context.IggyClient.FetchMessagesAsync(StreamId(), TopicId(),
-            [.. group.Select(partition => (partition, PollingStrategy.Offset((ulong)offset)))], DefaultConsumer,
-            MessagesCount, false, DeferredOptions(maxWaitSeconds), _cancellation.Token);
-
-        await Task.Delay(ParkTime);
-        _fetch.IsCompleted.ShouldBeFalse("the fetch must park");
+        var polled = await _context.IggyClient.PollMessagesAsync(StreamId(), TopicId(), (uint)partition,
+            Consumer.New(consumerName), PollingStrategy.Next(),
+            new PollOptions { Count = 1, Commit = CommitPolicy.OnRead });
+        ShouldHaveSinglePayload(polled, payload);
     }
 
-    [Then("the fetch should return only partition {int} within {int} second(s)")]
-    public async Task FetchReturns(int partition, int withinSeconds)
+    [Then("a poll of partition {int} for consumer {string} with the next strategy should return the payload {string}")]
+    public async Task NextPollReturns(int partition, string consumerName, string payload)
     {
-        using var fetched = await Within(_fetch.ShouldNotBeNull(), TimeSpan.FromSeconds(withinSeconds), "fetch");
-        var served = fetched.Sections.ShouldHaveSingleItem();
-        served.PartitionId.ShouldBe((uint)partition);
-        served.Decode().Messages.ShouldHaveSingleItem();
-    }
-
-    [Given("I am the only member of consumer group {string} on the topic")]
-    public async Task JoinAsOnlyMember(string groupName)
-    {
-        var groupId = Identifier.String(groupName);
-        await _context.IggyClient.CreateConsumerGroupAsync(StreamId(), TopicId(), groupName);
-        await _context.IggyClient.JoinConsumerGroupAsync(StreamId(), TopicId(), groupId);
-
-        // The join can return before the server assigns the partitions.
-        var partitions = _topic.ShouldNotBeNull().PartitionsCount;
-        var waited = Stopwatch.StartNew();
-        while (await _context.IggyClient.GetConsumerGroupByIdAsync(StreamId(), TopicId(), groupId) is not
-            { Members: [var member] } || member.PartitionsCount != partitions)
-        {
-            waited.Elapsed.ShouldBeLessThan(AssignmentTimeout, "the member did not get every partition");
-            await Task.Delay(AssignmentPollInterval);
-        }
-
-        _groupName = groupName;
-    }
-
-    [Then("a group fetch with a max wait of {int} second(s) should return the payload {string} within {int} second(s)")]
-    public async Task GroupFetchReturns(int maxWaitSeconds, string payload, int withinSeconds)
-    {
-        var partitions = Enumerable.Range(0, (int)_topic.ShouldNotBeNull().PartitionsCount)
-            .Select(partition => (uint)partition).ToArray();
-        var group = (await _context.IggyClient.ReadinessGroupsAsync(StreamId(), TopicId(), partitions))
-            .ShouldHaveSingleItem();
-        var fetch = _context.IggyClient.FetchMessagesAsync(StreamId(), TopicId(),
-            [.. group.Select(partition => (partition, PollingStrategy.Next()))],
-            Consumer.Group(_groupName.ShouldNotBeNull()), MessagesCount, true, DeferredOptions(maxWaitSeconds));
-        using var fetched = await Within(fetch, TimeSpan.FromSeconds(withinSeconds), "group fetch");
-        var served = fetched.Sections.Where(section => section.MessagesCount > 0).ShouldHaveSingleItem();
-        ShouldHaveSinglePayload(served.Decode(), payload);
+        var polled = await _context.IggyClient.PollMessagesAsync(StreamId(), TopicId(), (uint)partition,
+            Consumer.New(consumerName), PollingStrategy.Next(), new PollOptions { Count = MessagesCount });
+        polled.Messages.Select(message => Encoding.UTF8.GetString(message.Payload)).FirstOrDefault()
+            .ShouldBe(payload);
     }
 
     [When("I cancel the deferred poll after {int} milliseconds")]
@@ -196,11 +166,10 @@ public sealed class DeferredPollingSteps : IDisposable
         await Task.Delay(milliseconds);
         await _cancellation.CancelAsync();
 
+        // The server answers a cancelled poll that commits once: refused when the cancel won, so the poll ends as
+        // canceled and stores nothing.
         var error = await Record.ExceptionAsync(() => poll);
-        // The server can commit before the cancel arrives, so the SDK reports a canceled poll that can move an offset
-        // as an unknown outcome, with the cancellation inside.
-        var cause = error is VsrRequestOutcomeUnknownException ? error.InnerException : error;
-        cause.ShouldBeAssignableTo<OperationCanceledException>(
+        error.ShouldBeAssignableTo<OperationCanceledException>(
             $"the deferred poll must end as canceled, not with {error?.ToString() ?? "a result"}");
     }
 
@@ -210,37 +179,102 @@ public sealed class DeferredPollingSteps : IDisposable
         return Task.Delay(TimeSpan.FromSeconds(seconds));
     }
 
-    [Then("a poll of partition {int} for consumer {string} with the next strategy should return the payload {string}")]
-    public async Task NextPollReturns(int partition, string consumerName, string payload)
+    [When("I open a partition reader on partitions {int}, {int} and {int} from offset {int} with a max wait of {int} second(s)")]
+    public async Task OpenReader(int first, int second, int third, int offset, int maxWaitSeconds)
     {
-        var polled = await _context.IggyClient.PollMessagesAsync(StreamId(), TopicId(), (uint)partition,
-            Consumer.New(consumerName), PollingStrategy.Next(), MessagesCount, false);
-        polled.Messages.Select(message => Encoding.UTF8.GetString(message.Payload)).FirstOrDefault()
-            .ShouldBe(payload);
+        _reader = await _context.IggyClient.Reader(StreamId(), TopicId(), DefaultConsumer)
+            .WithPartitions((uint)first, (uint)second, (uint)third)
+            .WithStart(PollingStrategy.Offset((ulong)offset))
+            .WithOptions(Options(maxWaitSeconds))
+            .BuildAsync();
     }
 
-    private async Task StartDeferredPollAsync(int partition, Consumer consumer, PollingStrategy pollingStrategy,
-        bool autoCommit, DeferredPollOptions options)
+    [Then("the partition reader should return the payload {string} from partition {int} within {int} second(s)")]
+    public async Task ReaderReturns(string payload, int partition, int withinSeconds)
+    {
+        var batch = await Within(_reader.ShouldNotBeNull().NextAsync().AsTask(),
+            TimeSpan.FromSeconds(withinSeconds), "partition reader");
+
+        batch.PartitionId.ShouldBe((uint)partition);
+        ShouldHaveSinglePayload(batch, payload);
+    }
+
+    [When("I open a consumer in group {string} on the topic with a max wait of {int} second(s)")]
+    public Task OpenGroupConsumer(string group, int maxWaitSeconds)
+    {
+        return OpenConsumerAsync(group, Options(maxWaitSeconds));
+    }
+
+    [When("I open a consumer in group {string} on the topic that commits after processing")]
+    public Task OpenCommittingGroupConsumer(string group)
+    {
+        return OpenConsumerAsync(group, new PollOptions
+        {
+            MaxWait = TimeSpan.FromSeconds(5),
+            Commit = CommitPolicy.Auto(new AutoCommit { Interval = TimeSpan.FromSeconds(5), After = CommitAfter.Processing })
+        });
+    }
+
+    [Then("the consumer should return the payload {string} within {int} second(s)")]
+    public async Task ConsumerReturns(string payload, int withinSeconds)
+    {
+        var messages = _messages.ShouldNotBeNull();
+        (await Within(messages.MoveNextAsync().AsTask(), TimeSpan.FromSeconds(withinSeconds), "consumer"))
+            .ShouldBeTrue();
+        Encoding.UTF8.GetString(messages.Current.Message.Payload).ShouldBe(payload);
+    }
+
+    [When("I close the consumer")]
+    public Task CloseConsumer()
+    {
+        return CloseConsumerAsync();
+    }
+
+    private async Task OpenConsumerAsync(string group, PollOptions options)
+    {
+        _consumer = new IggyConsumer(_context.IggyClient, new IggyConsumerConfig
+        {
+            StreamId = StreamId(),
+            TopicId = TopicId(),
+            Consumer = Consumer.Group(group),
+            PollingStrategy = PollingStrategy.Next(),
+            PollOptions = options
+        }, NullLoggerFactory.Instance);
+        await _consumer.InitAsync();
+        _messages = _consumer.ReceiveAsync().GetAsyncEnumerator();
+    }
+
+    private async Task CloseConsumerAsync()
+    {
+        if (_consumer is null)
+        {
+            return;
+        }
+
+        await _consumer.ShutdownAsync();
+        if (_messages is not null)
+        {
+            await _messages.DisposeAsync();
+        }
+
+        _consumer = null;
+        _messages = null;
+    }
+
+    private async Task StartDeferredPollAsync(int partition, Consumer consumer, PollingStrategy strategy,
+        PollOptions options)
     {
         _pollStarted = Stopwatch.StartNew();
-        _poll = _context.IggyClient.PollMessagesAsync(StreamId(), TopicId(), (uint)partition, consumer,
-            pollingStrategy, MessagesCount, autoCommit, options, _cancellation.Token);
+        _poll = _context.IggyClient.PollMessagesAsync(StreamId(), TopicId(), (uint)partition, consumer, strategy,
+            options, _cancellation.Token);
 
         await Task.Delay(ParkTime);
         _poll.IsCompleted.ShouldBeFalse("the deferred poll must park");
     }
 
-    /// <summary>The SDK defaults with the max wait of the step.</summary>
-    private static DeferredPollOptions DeferredOptions(int maxWaitSeconds)
+    private static PollOptions Options(int maxWaitSeconds)
     {
-        var defaults = new DeferredPollOptions();
-        var maxWait = TimeSpan.FromSeconds(maxWaitSeconds);
-        var shortestTimeout = maxWait + ReplyMargin;
-        return defaults with
-        {
-            MaxWait = maxWait,
-            RequestTimeout = shortestTimeout > defaults.RequestTimeout ? shortestTimeout : defaults.RequestTimeout
-        };
+        return new PollOptions { Count = MessagesCount, MaxWait = TimeSpan.FromSeconds(maxWaitSeconds) };
     }
 
     private static async Task<T> Within<T>(Task<T> call, TimeSpan limit, string name)

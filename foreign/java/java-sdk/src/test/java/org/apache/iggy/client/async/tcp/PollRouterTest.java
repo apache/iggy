@@ -138,6 +138,24 @@ class PollRouterTest {
         ResourceLeakDetector.setLevel(leakDetection);
     }
 
+    @Test
+    void shouldReadBackTheDeferredLimitsThatItWritesAfterAPollBody() {
+        var options = new DeferredPollOptions(Duration.ofMillis(1500), 3, 4096, Duration.ofSeconds(9));
+        ByteBuf request = Unpooled.buffer().writeBytes(new byte[] {1, 2, 3});
+        try {
+            PollRouter.writeDeferredOptions(request, options);
+
+            assertThat(request.readableBytes()).isEqualTo(3 + PollRouter.DEFERRED_PARAMETERS_BYTES);
+            assertThat(PollRouter.deferredOptions(request)).isEqualTo(options);
+            assertThat(PollRouter.deferredMaxBytes(request)).isEqualTo(options.maxBytes());
+            assertThat(request.getLongLE(PollRouter.deferredWait(request))).isEqualTo(options.maxWaitMicros());
+            assertThat(request.getLongLE(PollRouter.deferredTimeout(request)))
+                    .isEqualTo(options.requestTimeoutMicros());
+        } finally {
+            request.release();
+        }
+    }
+
     @ParameterizedTest
     @EnumSource(
             value = IggyErrorCode.class,
@@ -967,7 +985,8 @@ class PollRouterTest {
                     return Response.noReply();
                 }
                 if (request.is(CommandCode.Messages.CANCEL_DEFERRED_REQUEST.getValue(), OPERATION_NON_REPLICATED)) {
-                    return Response.noReply();
+                    // The cancel names the poll, so this answers the poll: the cancel won and nothing was stored.
+                    return Response.error(OPERATION_NON_REPLICATED, IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode());
                 }
                 if (request.operation() == VsrOperation.SEND_MESSAGES) {
                     return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);

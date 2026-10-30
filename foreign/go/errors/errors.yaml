@@ -1400,7 +1400,7 @@
       type: uint64
 - name: FetchProgressUncertain
   code: 14010
-  format: "fetch %d has unknown progress; explicit abandonment is required"
+  format: "read %d has an unknown outcome: the server can have stored its offset"
   fields:
     - name: OperationID
       type: uint64

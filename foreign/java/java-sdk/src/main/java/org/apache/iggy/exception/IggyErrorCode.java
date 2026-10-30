@@ -32,6 +32,7 @@ import java.util.Map;
 public enum IggyErrorCode {
     // General errors
     ERROR(1),
+    INVALID_CONFIGURATION(2),
     INVALID_COMMAND(3),
     INVALID_FORMAT(4),
     FEATURE_UNAVAILABLE(5),

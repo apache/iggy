@@ -257,6 +257,124 @@ async fn deferred_completion_capacity_is_distinct_from_a_closed_lane() {
 }
 
 #[compio::test]
+async fn given_a_normal_fetch_section_when_an_oversized_section_finishes_should_leave_it_uncommitted()
+ {
+    for auto_commit in [false, true] {
+        let normal = owner(&["small"]).await;
+        let oversized_payload = "x".repeat(4096);
+        let oversized = owner(&[&oversized_payload]).await;
+        let turn = OversizedTurn::default();
+        let mut first = request(&normal, 1, false, auto_commit);
+        first.options.max_bytes = 1024;
+        first.oversized_turn = Some(turn.clone());
+        assert_eq!(offsets(&submit(&normal, first).await), [0]);
+
+        let mut second = request(&oversized, 1, false, auto_commit);
+        second.options.max_bytes = 1024;
+        second.oversized_turn = Some(turn);
+        assert!(matches!(
+            submit(&oversized, second).await.try_recv().unwrap(),
+            PartitionReadReply::Rejected(IggyError::DeferredPollCapacityExceeded)
+        ));
+        assert_eq!(
+            stored_offset(&oversized, PollingConsumer::Consumer(0, 0)),
+            None
+        );
+    }
+}
+
+#[compio::test]
+async fn given_an_oversized_fetch_section_when_a_normal_section_finishes_should_leave_it_uncommitted()
+ {
+    for auto_commit in [false, true] {
+        let oversized_payload = "x".repeat(4096);
+        let oversized = owner(&[&oversized_payload]).await;
+        let normal = owner(&["small"]).await;
+        let turn = OversizedTurn::default();
+        let mut first = request(&oversized, 1, false, auto_commit);
+        first.options.max_bytes = 1024;
+        first.oversized_turn = Some(turn.clone());
+        assert_eq!(offsets(&submit(&oversized, first).await), [0]);
+
+        let mut second = request(&normal, 1, false, auto_commit);
+        second.options.max_bytes = 1024;
+        second.oversized_turn = Some(turn);
+        assert!(matches!(
+            submit(&normal, second).await.try_recv().unwrap(),
+            PartitionReadReply::Rejected(IggyError::DeferredPollCapacityExceeded)
+        ));
+        assert_eq!(
+            stored_offset(&normal, PollingConsumer::Consumer(0, 0)),
+            None
+        );
+    }
+}
+
+#[compio::test]
+async fn given_normal_fetch_sections_when_sharing_the_byte_limit_should_serve_each_share() {
+    let owner = owner(&["small"]).await;
+    let turn = OversizedTurn::default();
+    for _ in 0..3 {
+        let mut read = request(&owner, 1, false, false);
+        read.options.max_bytes = 1024;
+        read.oversized_turn = Some(turn.clone());
+        assert_eq!(offsets(&submit(&owner, read).await), [0]);
+    }
+}
+
+#[compio::test]
+async fn given_an_empty_fetch_section_when_an_oversized_section_follows_should_preserve_the_exception()
+ {
+    let payload = "x".repeat(4096);
+    let owner = owner(&[&payload]).await;
+    let turn = OversizedTurn::default();
+    let mut empty = request(&owner, 1, false, false);
+    empty.args = PollingArgs::new(PollingStrategy::offset(1), 1, false);
+    empty.deadline = 0;
+    empty.oversized_turn = Some(turn.clone());
+    assert_eq!(offsets(&submit(&owner, empty).await), Vec::<u64>::new());
+
+    let mut read = request(&owner, 1, false, true);
+    read.options.max_bytes = 1024;
+    read.oversized_turn = Some(turn.clone());
+    assert_eq!(offsets(&submit(&owner, read).await), [0]);
+    assert_eq!(
+        stored_offset(&owner, PollingConsumer::Consumer(0, 0)),
+        Some(0)
+    );
+
+    let mut another = request(&owner, 1, false, false);
+    another.args = PollingArgs::new(PollingStrategy::offset(0), 1, false);
+    another.options.max_bytes = 1024;
+    another.oversized_turn = Some(turn);
+    assert!(matches!(
+        submit(&owner, another).await.try_recv().unwrap(),
+        PartitionReadReply::Rejected(IggyError::DeferredPollCapacityExceeded)
+    ));
+}
+
+#[compio::test]
+async fn given_a_first_record_above_the_server_read_cap_when_polling_should_return_only_that_record()
+ {
+    for fetch in [false, true] {
+        let payload = "x".repeat(4096);
+        let owner = owner(&[&payload, "next"]).await;
+        owner.set_deferred_poll_config(DeferredPollConfig {
+            max_read_bytes: 1024,
+            ..Default::default()
+        });
+        let mut read = request(&owner, 2, false, true);
+        read.options.max_bytes = 8192;
+        read.oversized_turn = fetch.then(OversizedTurn::default);
+        assert_eq!(offsets(&submit(&owner, read).await), [0]);
+        assert_eq!(
+            stored_offset(&owner, PollingConsumer::Consumer(0, 0)),
+            Some(0)
+        );
+    }
+}
+
+#[compio::test]
 async fn resident_poll_completes_while_disk_reads_hold_the_whole_read_budget() {
     let owner = owner(&["first", "second"]).await;
     let held = hold_read_budget(&owner);
@@ -408,6 +526,23 @@ async fn disk_reads_reserve_three_parts_of_their_max_bytes_or_one_chunk() {
             reads * per_read,
             "max_bytes {max_bytes}"
         );
+    }
+}
+
+#[test]
+fn disk_walk_holds_the_reservation_but_one_minimum_part_each_for_index_and_snapshot() {
+    // A walk held a third of the reservation, so a 16 MiB reply could never
+    // carry more than about 5 MiB from disk.
+    let max_read_bytes = DeferredPollConfig::default().max_read_bytes;
+    for (reservation, walk) in [
+        (max_read_bytes, max_read_bytes - 2 * READ_PART_MIN_BYTES),
+        (3 * READ_PART_MIN_BYTES, READ_PART_MIN_BYTES),
+        (
+            2 * READ_PART_MIN_BYTES,
+            2 * READ_PART_MIN_BYTES / READ_BUDGET_PARTS,
+        ),
+    ] {
+        assert_eq!(walk_bytes(reservation), walk, "reservation {reservation}");
     }
 }
 
@@ -755,6 +890,36 @@ async fn partial_result_waits_until_deadline_without_progress() {
         );
         assert!(owner.deferred_polls.state.borrow().deadlines.is_empty());
     }
+}
+
+#[compio::test]
+async fn a_committing_poll_whose_cancel_won_stores_nothing_and_a_commit_makes_the_cancel_lose() {
+    // A cancel proved nothing: a read that the owner served had stored its
+    // offset, the aborted request got no reply, and its batch was lost.
+    let owner = owner(&["first"]).await;
+    let cancelled = CommitGate::default();
+    assert!(cancelled.cancel());
+    let mut poll = request(&owner, 1, false, true);
+    poll.commit_gate = Some(cancelled);
+
+    let replies = submit(&owner, poll).await;
+
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+    assert_eq!(stored_offset(&owner, PollingConsumer::Consumer(0, 0)), None);
+    let open = CommitGate::default();
+    let mut poll = request(&owner, 1, false, true);
+    poll.commit_gate = Some(open.clone());
+    assert_eq!(offsets(&submit(&owner, poll).await), [0]);
+    assert_eq!(
+        stored_offset(&owner, PollingConsumer::Consumer(0, 0)),
+        Some(0)
+    );
+    assert!(!open.cancel(), "a cancel after a commit loses");
 }
 
 #[compio::test]
@@ -1405,6 +1570,56 @@ async fn maintenance_evaluates_a_large_readiness_wait_one_budget_per_tick() {
         ))
     ));
     assert_released(&owner);
+}
+
+#[compio::test]
+async fn status_change_ends_a_parked_readiness_wait_on_the_next_tick() {
+    // A partition that stopped serving reads marks nothing, so a large wait
+    // learned it only when the sweep reached its target.
+    let (owner, replies) = parked_wait_on(MAINTENANCE_BUDGET + 1).await;
+    // Two ticks end the first sweep, so the next one starts at the first target.
+    for _ in 0..2 {
+        owner.tick_deferred_polls();
+        owner.service_deferred_polls().await;
+    }
+    begin_state_transfer(&owner, MAINTENANCE_BUDGET);
+    owner.tick_deferred_polls();
+    owner.service_deferred_polls().await;
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+    assert_released(&owner);
+}
+
+#[compio::test]
+async fn status_change_ends_a_parked_poll_on_the_next_tick() {
+    let owner = owner(&["first"]).await;
+    // The sweep reaches the last poll only on the third tick.
+    let mut parked = Vec::new();
+    for _ in 0..2 * MAINTENANCE_BUDGET {
+        let other = PollingConsumer::Consumer(parked.len() + 2, 0);
+        let mut request = request(&owner, 2, false, false);
+        request.consumer = other;
+        parked.push(submit(&owner, request).await);
+    }
+    let replies = submit(&owner, request(&owner, 2, false, false)).await;
+    owner.tick_deferred_polls();
+    owner.service_deferred_polls().await;
+    begin_state_transfer(&owner, 0);
+    owner.tick_deferred_polls();
+    // The pump turns until the woken polls are served, a budget per turn.
+    for _ in 0..=parked.len().div_ceil(SERVICE_BUDGET) {
+        owner.service_deferred_polls().await;
+    }
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
 }
 
 #[compio::test]

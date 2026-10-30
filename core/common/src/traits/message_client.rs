@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::{
-    Consumer, Identifier, IggyError, IggyMessage, Partitioning, PollOptions, PolledMessages,
-    PollingStrategy, SendMessagesResponse,
+    Consumer, DecodeError, Identifier, IggyError, IggyMessage, Partitioning, PollOptions,
+    PolledMessages, PollingStrategy, SendMessagesResponse,
 };
 use async_trait::async_trait;
 
@@ -29,13 +29,13 @@ pub trait MessageClient {
     /// Authentication is required, and the permission to poll the messages.
     ///
     /// The server waits up to `options.max_wait` until the partition holds `options.min_count`
-    /// messages, and a zero wait answers at once. `options.max_bytes` bounds the reply. A first
-    /// message larger than `max_bytes` comes alone, in a second read with count 1 and no byte
-    /// limit. A `Last` start with a count above 1 gets no second read, because with count 1 it
-    /// would start at the last message and skip the messages before it. The call returns
-    /// [`IggyError::InvalidSizeBytes`] (80) instead, and the server stored nothing, also with
-    /// `OnRead`. The request timeout is `max_wait` plus 10 s. Invalid options fail before
-    /// anything is sent, with the errors of [`PollOptions::validate`].
+    /// messages, and a zero wait answers at once. `options.max_bytes` bounds the reply, and a
+    /// first message larger than it comes alone in the reply. The request timeout is `max_wait`
+    /// plus 10 s. Invalid options fail before anything is sent, with the errors of
+    /// [`PollOptions::validate`], and [`CommitPolicy::Auto`](crate::CommitPolicy::Auto) with
+    /// [`IggyError::InvalidConfiguration`]: one call has nothing to count, so it takes
+    /// [`CommitPolicy::Manual`](crate::CommitPolicy::Manual) or
+    /// [`CommitPolicy::OnRead`](crate::CommitPolicy::OnRead).
     ///
     /// One call has one deadline for admission, route refreshes and retries. If the deadline
     /// passes before the request leaves the client, the call returns
@@ -61,7 +61,7 @@ pub trait MessageClient {
     ///
     /// # Server commits and lost replies
     ///
-    /// Without [`ServerCommitPolicy::OnRead`](crate::ServerCommitPolicy::OnRead), the server
+    /// Without [`CommitPolicy::OnRead`](crate::CommitPolicy::OnRead), the server
     /// stores no offset. If a [`PollingStrategy::next`] request left the client and its reply
     /// does not arrive, the call returns [`IggyError::TransientNotCommitted`]. The server stored
     /// nothing, so a retry is safe.
@@ -73,9 +73,10 @@ pub trait MessageClient {
     /// [`IggyError::FetchProgressUncertain`]. The partition stays blocked until
     /// [`abandon_operation`](crate::Client::abandon_operation), because the server can still
     /// store the offset after the client gives up. A dropped `OnRead` call that already sent
-    /// its request gets the same block. The next call on the partition then returns
-    /// [`IggyError::PartitionLaneBlocked`] with the operation to abandon. An `OnRead` poll is
-    /// never sent again after an unknown outcome.
+    /// its request gets the same block until the server answers its cancel, over TCP and
+    /// WebSocket, which proves the outcome and lifts the block. The next call on the partition
+    /// meanwhile returns [`IggyError::PartitionLaneBlocked`] with the operation to abandon. An
+    /// `OnRead` poll is never sent again after an unknown outcome.
     async fn poll_messages(
         &self,
         stream_id: &Identifier,
@@ -85,6 +86,29 @@ pub trait MessageClient {
         strategy: &PollingStrategy,
         options: PollOptions,
     ) -> Result<PolledMessages, IggyError>;
+
+    /// [`Self::poll_messages`], keeping the record of a reply that does not decode.
+    #[doc(hidden)]
+    async fn poll_messages_raw(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: u32,
+        consumer: &Consumer,
+        strategy: &PollingStrategy,
+        options: PollOptions,
+    ) -> Result<PolledMessages, DecodeError> {
+        self.poll_messages(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            strategy,
+            options,
+        )
+        .await
+        .map_err(DecodeError::without_record)
+    }
 
     /// Send messages using specified partitioning strategy to the given stream and topic by unique IDs or names.
     ///

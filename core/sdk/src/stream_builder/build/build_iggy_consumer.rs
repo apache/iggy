@@ -45,7 +45,6 @@ pub(crate) async fn build_iggy_consumer(
     trace!("Extract config fields.");
     let stream = config.stream_name();
     let topic = config.topic_name();
-    let client_commit = config.client_commit();
     let consumer_kind = config.consumer_kind();
     let consumer_name = config.consumer_name();
     let poll_options = config.poll_options();
@@ -62,7 +61,6 @@ pub(crate) async fn build_iggy_consumer(
         // log, before the entry points make any server call.
         ConsumerKind::ExternalGroup => return Err(IggyError::FeatureUnavailable),
     }
-    .client_commit(client_commit)
     .create_consumer_group_if_not_exists()
     .polling_strategy(polling_strategy)
     .poll_options(poll_options)

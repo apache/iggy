@@ -20,16 +20,13 @@ use crate::clients::reader::membership::Membership;
 use crate::clients::reader::progress::{Progress, same_incarnation_and_owner};
 use crate::clients::reader::{Hold, PartitionReader, ReadError};
 use crate::clients::reader_builder::ReaderBuilder;
-use crate::driver::with_deadline;
-use crate::links::OPERATION_TIMEOUT;
-use dashmap::DashMap;
 use futures::Stream;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
-    Checkpoint, Consumer, ConsumerKind, EncryptorKind, IdKind, Identifier, IggyDuration, IggyError,
-    IggyMessage, NonZeroIggyDuration, PollOptions, PolledMessages, PollingKind, PollingStrategy,
-    ReaderStamp, ServerCommitPolicy,
+    Checkpoint, CommitAfter, CommitPolicy, Consumer, ConsumerKind, EncryptorKind, IdKind,
+    Identifier, IggyDuration, IggyError, IggyMessage, NonZeroIggyDuration, PollOptions,
+    PolledMessages, PollingKind, PollingStrategy, ReaderStamp,
 };
 use iggy_common::{StreamClient, TopicClient};
 use std::fmt::{self, Debug, Formatter};
@@ -38,36 +35,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::task::{Context, Poll};
 use std::vec;
-use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 use tokio::time;
-use tokio::time::Instant;
-use tracing::{error, info, trace, warn};
+use tracing::{error, info, warn};
 
 const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
-
-/// When an [`IggyConsumer`] stores the position of the last message that it yielded. It never
-/// stores the end of a prefetched batch. The default stores nothing, and the application commits
-/// checkpoints with [`IggyConsumer::commit`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ClientCommitPolicy {
-    /// Store the latest position at this interval.
-    pub interval: Option<NonZeroIggyDuration>,
-    /// Also store it on this event.
-    pub on: Option<CommitEvent>,
-}
-
-/// The event of a [`ClientCommitPolicy`]. The stream counts a message at its yield.
-/// [`consume_messages`](crate::prelude::IggyConsumerMessageExt::consume_messages) counts it after
-/// its handler returns, also after a failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommitEvent {
-    EachMessage,
-    /// A message whose offset is a multiple of `n`. `init()` refuses zero.
-    EveryNthMessage(u32),
-    /// The last message of a batch.
-    EachBatch,
-}
 
 /// A cheap, cloneable view of the state shared with an [`IggyConsumer`].
 ///
@@ -85,7 +56,7 @@ pub struct IggyConsumerState {
     stream_id: Arc<Identifier>,
     topic_id: Arc<Identifier>,
     is_consumer_group: bool,
-    on_read: bool,
+    commit: CommitPolicy,
     current_partition_id: Arc<AtomicU32>,
 }
 
@@ -96,7 +67,7 @@ impl Debug for IggyConsumerState {
             .field("stream_id", &self.stream_id)
             .field("topic_id", &self.topic_id)
             .field("is_consumer_group", &self.is_consumer_group)
-            .field("on_read", &self.on_read)
+            .field("commit", &self.commit)
             .field("current_partition_id", &self.partition_id())
             .finish_non_exhaustive()
     }
@@ -108,13 +79,14 @@ impl IggyConsumerState {
         consumer: Arc<Consumer>,
         stream_id: Arc<Identifier>,
         topic_id: Arc<Identifier>,
-        on_read: bool,
+        commit: CommitPolicy,
     ) -> Self {
         let progress = Arc::new(Progress::new(
             client,
             Arc::clone(&consumer),
             Arc::clone(&stream_id),
             Arc::clone(&topic_id),
+            commit,
         ));
         Self {
             progress,
@@ -122,9 +94,14 @@ impl IggyConsumerState {
             consumer,
             stream_id,
             topic_id,
-            on_read,
+            commit,
             current_partition_id: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// The commit policy of the [`PollOptions`] of the consumer.
+    pub fn commit_policy(&self) -> CommitPolicy {
+        self.commit
     }
 
     /// Returns the current partition ID of the consumer.
@@ -182,29 +159,20 @@ impl IggyConsumerState {
 
     /// Stores the offset of a checkpoint that the consumer yielded, see [`IggyConsumer::commit`].
     pub async fn commit(&self, checkpoint: Checkpoint) -> Result<(), IggyError> {
-        if self.on_read {
+        if self.commit == CommitPolicy::OnRead {
             return Err(IggyError::InvalidCommand);
         }
         self.progress.commit(checkpoint).await
     }
 
-    /// The commit tasks have no caller to hand a failure to, so it is logged here.
-    async fn commit_in_background(&self, checkpoint: Checkpoint) {
-        if let Err(error) = self.progress.commit(checkpoint).await {
-            error!(
-                "Failed to store offset: {} for consumer: {}, partition ID: {}, topic: {}, stream: {}. {error}",
-                checkpoint.offset(),
-                self.consumer,
-                checkpoint.partition_id(),
-                self.topic_id,
-                self.stream_id
-            );
-        }
+    /// Counts a checkpoint that the consumer yielded, see [`IggyConsumer::mark`].
+    pub fn mark(&self, checkpoint: Checkpoint) -> Result<(), IggyError> {
+        self.progress.mark(checkpoint)
     }
 }
 
-/// Reads a topic as a stream of messages through one [`PartitionReader`], with commit
-/// policies, group create, init retries and a replay filter.
+/// Reads a topic as a stream of messages through one [`PartitionReader`], with its commit
+/// policy, group create, init retries and a replay filter.
 ///
 /// Call [`Self::init`] before reading and [`Self::shutdown`] before dropping the consumer.
 /// A standalone consumer reads the partitions of
@@ -220,17 +188,25 @@ impl IggyConsumerState {
 /// a partition without a position. `Next` starts after the stored offset, or at zero when no
 /// offset exists. A partition that a rebalance leaves with its group member continues after the
 /// last message that the consumer yielded. Messages already yielded are filtered unless replay is
-/// enabled. Delivery and durable processing progress are separate.
+/// enabled, or a [`seek`](Self::seek) of their partition asked for them again. Delivery and
+/// durable processing progress are separate.
 ///
-/// The default [`ClientCommitPolicy`] stores nothing. Commit [`ReceivedMessage::checkpoint`]
-/// with [`commit`](Self::commit) after processing, in partition order. A policy stores only
-/// positions that the consumer yielded, never the end of a prefetched batch, so it can
-/// acknowledge a message before the application processed it.
+/// The [`CommitPolicy`] of [`poll_options`](crate::prelude::IggyConsumerBuilder::poll_options)
+/// decides who stores offsets:
 ///
-/// Under [`ServerCommitPolicy::OnRead`] the server stores the offset of each batch that it
-/// reads, so the reader reads only when the application asks for a message and nothing is
-/// queued, and `init()` refuses a client policy. [`shutdown`](Self::shutdown) moves the offset
-/// back to the last message that the consumer yielded.
+/// - `Manual`, the default, stores nothing. Commit [`ReceivedMessage::checkpoint`] with
+///   [`commit`](Self::commit) after processing, in partition order.
+/// - `OnRead` has the server store the offset of each batch that it reads, so the reader reads
+///   only when the application asks for a message and nothing is queued.
+///   [`shutdown`](Self::shutdown) moves the offset back to the last message that the consumer
+///   yielded.
+/// - `Auto` stores the latest counted message of each partition at the interval or the event of
+///   the policy, before a rebalance takes a partition away, and at shutdown. It never stores
+///   the end of a prefetched batch. With [`CommitAfter::Processing`], a message that the stream
+///   yields counts when the stream is polled again or shuts down, and one that
+///   [`consume_messages`](crate::prelude::IggyConsumerMessageExt::consume_messages) hands to its
+///   handler counts once the handler succeeds. With [`CommitAfter::Delivery`] it counts when it
+///   is handed over, and with [`CommitAfter::Marked`] only [`mark`](Self::mark) counts.
 ///
 /// ```rust,no_run
 /// use futures_util::StreamExt;
@@ -281,7 +257,6 @@ pub struct IggyConsumer {
     poll_options: PollOptions,
     prefetch_bytes: u32,
     prefetch_messages: Option<u32>,
-    client_commit: ClientCommitPolicy,
     /// The membership of a group consumer. It outlives a failed `init()`, so the next attempt
     /// resolves a create or a join of an unknown outcome instead of finding its lane blocked.
     membership: Option<Arc<Membership>>,
@@ -296,15 +271,10 @@ pub struct IggyConsumer {
     current: Option<CurrentBatch>,
     initialized: bool,
     uninitialized_poll_warned: bool,
-    shutdown: Arc<AtomicBool>,
-    /// The latest checkpoint that a policy asked to commit, per partition. One task sends them
-    /// all, so the commits of one partition go out in order, and a burst of triggers costs one
-    /// round trip per partition instead of one each.
-    pending_commits: Arc<DashMap<u32, Checkpoint>>,
-    store_offset_notify: Arc<Notify>,
-    store_offset_task: Option<JoinHandle<()>>,
-    background_commit_task: Option<JoinHandle<()>>,
-    background_commit_notify: Arc<Notify>,
+    shutdown: AtomicBool,
+    /// Under `CommitAfter::Processing`: the message that the stream yielded last, with whether
+    /// it ends its batch. It counts when the stream is polled again or shuts down.
+    uncounted: Option<(Checkpoint, bool)>,
 }
 
 /// The rest of the batch that the consumer yields one message at a time.
@@ -353,7 +323,6 @@ impl IggyConsumer {
         poll_options: PollOptions,
         prefetch_bytes: u32,
         prefetch_messages: Option<u32>,
-        client_commit: ClientCommitPolicy,
         create_consumer_group_if_not_exists: bool,
         encryptor: Option<Arc<EncryptorKind>>,
         polling_retry_interval: NonZeroIggyDuration,
@@ -370,7 +339,7 @@ impl IggyConsumer {
             Arc::clone(&consumer),
             Arc::clone(&stream_id),
             Arc::clone(&topic_id),
-            poll_options.server_commit == ServerCommitPolicy::OnRead,
+            poll_options.commit,
         );
         let membership = (consumer.kind == ConsumerKind::ConsumerGroup).then(|| {
             Arc::new(Membership::new(
@@ -392,7 +361,6 @@ impl IggyConsumer {
             poll_options,
             prefetch_bytes,
             prefetch_messages,
-            client_commit,
             membership,
             encryptor,
             polling_retry_interval,
@@ -405,20 +373,28 @@ impl IggyConsumer {
             current: None,
             initialized: false,
             uninitialized_poll_warned: false,
-            shutdown: Arc::new(AtomicBool::new(false)),
-            pending_commits: Arc::new(DashMap::new()),
-            store_offset_notify: Arc::new(Notify::new()),
-            store_offset_task: None,
-            background_commit_task: None,
-            background_commit_notify: Arc::new(Notify::new()),
+            shutdown: AtomicBool::new(false),
+            uncounted: None,
         }
     }
 
     /// Whether the consumer resumes after its stored offsets but never stores one itself.
     pub(crate) fn relies_on_manual_commits(&self) -> bool {
-        self.client_commit == ClientCommitPolicy::default()
-            && !self.on_read()
+        self.poll_options.commit == CommitPolicy::Manual
             && self.polling_strategy.kind == PollingKind::Next
+    }
+
+    /// When a message counts under `CommitPolicy::Auto`.
+    pub(crate) fn counts_after(&self) -> Option<CommitAfter> {
+        match self.poll_options.commit {
+            CommitPolicy::Auto(auto) => Some(auto.after),
+            CommitPolicy::Manual | CommitPolicy::OnRead => None,
+        }
+    }
+
+    /// Counts the message at `checkpoint` under `CommitPolicy::Auto`.
+    pub(crate) fn count(&self, checkpoint: Checkpoint, ends_batch: bool) {
+        self.state.progress.count(checkpoint, 1, ends_batch);
     }
 
     /// Whether the client is up or comes back without the caller.
@@ -500,11 +476,24 @@ impl IggyConsumer {
     ///
     /// # Errors
     ///
-    /// [`IggyError::InvalidCommand`] with [`ServerCommitPolicy::OnRead`], and for a checkpoint
-    /// that this consumer did not yield. Otherwise the recovery and error contract of
+    /// [`IggyError::InvalidCommand`] with [`CommitPolicy::OnRead`], and for a checkpoint that
+    /// this consumer did not yield. Otherwise the recovery and error contract of
     /// [`Self::store_offset`].
     pub async fn commit(&self, checkpoint: Checkpoint) -> Result<(), IggyError> {
         self.state.commit(checkpoint).await
+    }
+
+    /// Counts a checkpoint that this consumer yielded, under [`CommitPolicy::Auto`]. It stores
+    /// nothing now: the policy stores the latest counted position of the partition. With
+    /// [`CommitAfter::Marked`] only marks count, so messages processed concurrently count once
+    /// they are done. [`IggyConsumerState::mark`] does the same from another task.
+    ///
+    /// # Errors
+    ///
+    /// [`IggyError::InvalidCommand`] without `CommitPolicy::Auto`, and for a checkpoint that
+    /// this consumer did not yield.
+    pub fn mark(&self, checkpoint: Checkpoint) -> Result<(), IggyError> {
+        self.state.mark(checkpoint)
     }
 
     /// Returns the offset of the last message this consumer handed over for the given partition,
@@ -538,7 +527,7 @@ impl IggyConsumer {
     /// `None` until this consumer observes a successful commit for the partition.
     ///
     /// The value is this consumer's own record of what it committed, kept in memory rather than
-    /// read back from the server. With [`ServerCommitPolicy::OnRead`], it is the end of the last
+    /// read back from the server. With [`CommitPolicy::OnRead`], it is the end of the last
     /// batch that the consumer took from its reader.
     pub fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
         self.state.get_last_stored_offset(partition_id)
@@ -582,28 +571,11 @@ impl IggyConsumer {
     ///   does not exist yet and
     ///   [`create_consumer_group_if_not_exists`](crate::prelude::IggyConsumerBuilder::create_consumer_group_if_not_exists)
     ///   is on, and joins it.
-    /// - the tasks that store the offset on the server are spawned.
-    ///
-    /// # Storing offsets
-    ///
-    /// When the consumer commits is decided by
-    /// [`client_commit()`](crate::prelude::IggyConsumerBuilder::client_commit), see
-    /// [Positions and commits](IggyConsumer#positions-and-commits). `init()` spawns the
-    /// tasks behind it:
-    /// - An interval task, only for a policy with an interval. Every tick it queues the
-    ///   position of the last message that the consumer yielded from each partition.
-    /// - An offset store task, always. It sends the commits that the interval and the
-    ///   [`CommitEvent`] queue, keeping only the latest queued position per partition, so the
-    ///   commits of one partition go out in order. It stays idle under the default policy.
-    ///
-    /// Both skip a position of an older generation of its partition, and a position that is not
-    /// ahead of the last commit of its generation.
+    /// - under [`CommitPolicy::Auto`], the reader runs the task that stores the counted
+    ///   positions, see [Positions and commits](IggyConsumer#positions-and-commits).
     ///
     /// # Errors
     ///
-    /// - [`IggyError::InvalidConfiguration`] for [`ServerCommitPolicy::OnRead`] with a client
-    ///   policy other than the default, because each client commit would move the offset that the
-    ///   server stores back, and for [`CommitEvent::EveryNthMessage`] of zero.
     /// - The errors of [`ReaderBuilder::build`]: the refusals of the configuration, and of a
     ///   consumer group over HTTP. They are checked before anything is sent, except the
     ///   transport check of a group and the join.
@@ -708,10 +680,6 @@ impl IggyConsumer {
         }
 
         self.reader = Some(self.reader_builder().build().await?);
-        if let Some(interval) = self.client_commit.interval {
-            self.background_commit_task = Some(self.store_offsets_in_background(interval));
-        }
-        self.store_offset_task = Some(self.store_pending_commits_in_background());
         self.initialized = true;
         info!(
             "Consumer: {} has been initialized for stream: {}, topic: {}.",
@@ -722,20 +690,6 @@ impl IggyConsumer {
 
     /// The checks that need no I/O, so a configuration that cannot run fails before the lookups.
     fn validate(&self) -> Result<(), IggyError> {
-        if self.on_read() && self.client_commit != ClientCommitPolicy::default() {
-            error!(
-                "Consumer: {} has ServerCommitPolicy::OnRead and a client commit policy: {:?}. Each client commit would move the offset that the server stores on read back.",
-                self.consumer_name, self.client_commit
-            );
-            return Err(IggyError::InvalidConfiguration);
-        }
-        if self.client_commit.on == Some(CommitEvent::EveryNthMessage(0)) {
-            error!(
-                "Consumer: {} has CommitEvent::EveryNthMessage(0), which never commits.",
-                self.consumer_name
-            );
-            return Err(IggyError::InvalidConfiguration);
-        }
         self.reader_builder().into_parts()?;
         Ok(())
     }
@@ -765,102 +719,11 @@ impl IggyConsumer {
         builder
     }
 
-    fn on_read(&self) -> bool {
-        self.state.on_read
-    }
-
-    /// Queues the commit that the event of the client policy asks for at `checkpoint`.
-    /// `ends_batch` marks the last message of its batch.
-    pub(crate) fn on_consumed(&self, checkpoint: Checkpoint, ends_batch: bool) {
-        let commits = match self.client_commit.on {
-            None => false,
-            Some(CommitEvent::EachMessage) => true,
-            Some(CommitEvent::EveryNthMessage(n)) => {
-                checkpoint.offset().checked_rem(u64::from(n)) == Some(0)
-            }
-            Some(CommitEvent::EachBatch) => ends_batch,
-        };
-        if commits {
-            self.send_store_offset(checkpoint);
-        }
-    }
-
-    fn store_offsets_in_background(&self, interval: NonZeroIggyDuration) -> JoinHandle<()> {
-        let progress = Arc::clone(&self.state.progress);
-        let pending_commits = Arc::clone(&self.pending_commits);
-        let shutdown = Arc::clone(&self.shutdown);
-        let notify = Arc::clone(&self.background_commit_notify);
-        let store_offset_notify = Arc::clone(&self.store_offset_notify);
-        tokio::spawn(async move {
-            loop {
-                // Wait for the task until either the interval has passed or
-                // the task is explicitly notified, which happens when shutdown() is called.
-                tokio::select! {
-                    _ = time::sleep(interval.get_duration()) => {}
-                    _ = notify.notified() => {}
-                }
-
-                // `shutdown()` runs its own final commit, so the tick stops here.
-                if shutdown.load(ORDERING) {
-                    trace!("Shutdown signal received, stopping background offset storage");
-                    break;
-                }
-                for checkpoint in progress.unstored_delivered(None) {
-                    pending_commits.insert(checkpoint.partition_id(), checkpoint);
-                }
-                store_offset_notify.notify_one();
-            }
-        })
-    }
-
-    /// Sends the commits that the interval and the events of the client policy queue.
-    fn store_pending_commits_in_background(&self) -> JoinHandle<()> {
-        let state = self.state.clone();
-        let pending_commits = Arc::clone(&self.pending_commits);
-        let shutdown = Arc::clone(&self.shutdown);
-        let notify = Arc::clone(&self.store_offset_notify);
-        tokio::spawn(async move {
-            loop {
-                notify.notified().await;
-                // Keys first, so no map guard is held across a round trip. An offset queued
-                // meanwhile stays in the map and the permit its trigger leaves wakes the next turn.
-                let partitions: Vec<u32> =
-                    pending_commits.iter().map(|entry| *entry.key()).collect();
-                for partition_id in partitions {
-                    let Some((_, checkpoint)) = pending_commits.remove(&partition_id) else {
-                        continue;
-                    };
-                    state.commit_in_background(checkpoint).await;
-                }
-                if shutdown.load(ORDERING) && pending_commits.is_empty() {
-                    break;
-                }
-            }
-        })
-    }
-
-    /// Queues a commit for the store task. A later checkpoint for the same partition replaces a
-    /// queued one that has not been sent yet.
-    fn send_store_offset(&self, checkpoint: Checkpoint) {
-        if !self.initialized || self.shutdown.load(ORDERING) {
-            error!(
-                ?checkpoint,
-                consumer = self.consumer_name,
-                "Offset was not queued because the consumer is not running"
-            );
-            return;
-        }
-        self.pending_commits
-            .insert(checkpoint.partition_id(), checkpoint);
-        self.store_offset_notify.notify_one();
-    }
-
-    /// The next message, with whether it ends its batch. With `trigger`, the event of the client
-    /// policy counts the message at its yield. `consume_messages` counts it after its handler.
+    /// The next message, with whether it ends its batch. It counts nothing: the stream and
+    /// `consume_messages` count each message as their commit policy says.
     pub(crate) fn poll_message(
         &mut self,
         cx: &mut Context<'_>,
-        trigger: bool,
     ) -> Poll<Option<Result<(ReceivedMessage, bool), ReadError>>> {
         if self.shutdown.load(ORDERING) {
             return Poll::Ready(None);
@@ -881,9 +744,6 @@ impl IggyConsumer {
         }
         loop {
             if let Some((received, ends_batch)) = self.yield_current() {
-                if trigger {
-                    self.on_consumed(received.checkpoint, ends_batch);
-                }
                 return Poll::Ready(Some(Ok((received, ends_batch))));
             }
             let Some(reader) = self.reader.as_mut() else {
@@ -899,7 +759,7 @@ impl IggyConsumer {
                     let delivered = if self.allow_replay {
                         None
                     } else {
-                        self.state.progress.last_delivered(batch.partition_id)
+                        self.state.progress.replay_floor(batch.partition_id)
                     };
                     self.current = Some(CurrentBatch::new(batch, hold, delivered));
                 }
@@ -912,7 +772,7 @@ impl IggyConsumer {
     fn yield_current(&mut self) -> Option<(ReceivedMessage, bool)> {
         let current = self.current.as_mut()?;
         // The server stored the offset of an `OnRead` batch, so only a seek drops it.
-        if !self.state.on_read && !current.hold.is_current() {
+        if self.state.commit != CommitPolicy::OnRead && !current.hold.is_current() {
             self.current = None;
             return None;
         }
@@ -1004,81 +864,52 @@ impl Stream for IggyConsumer {
     type Item = Result<ReceivedMessage, ReadError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.get_mut()
-            .poll_message(cx, true)
-            .map_ok(|(received, _)| received)
+        let consumer = self.get_mut();
+        consumer.count_uncounted();
+        let polled = consumer.poll_message(cx);
+        if let Poll::Ready(Some(Ok((received, ends_batch)))) = &polled {
+            match consumer.counts_after() {
+                Some(CommitAfter::Delivery) => consumer.count(received.checkpoint, *ends_batch),
+                Some(CommitAfter::Processing) => {
+                    consumer.uncounted = Some((received.checkpoint, *ends_batch));
+                }
+                Some(CommitAfter::Marked) | None => {}
+            }
+        }
+        polled.map_ok(|(received, _)| received)
     }
 }
 
 impl IggyConsumer {
-    /// Shuts the consumer down.
+    /// Shuts the consumer down. Await it before dropping the consumer: a dropped consumer
+    /// stops its reader without storing or rewinding anything and stays in its group until the
+    /// session ends.
     ///
-    /// Specifically, run shutdown and await before dropping the consumer to
-    /// - finish storing the offsets that are currently in-flight.
-    ///   The interval task and the offset store task (see [`init()`](Self::init)) can both have
-    ///   commits in flight. The consumer waits for `offset_drain_timeout` on each in turn before
-    ///   forcing it to abort.
-    /// - commit the position of the last message that the consumer yielded from each partition,
-    ///   unless [`client_commit()`] is the default. On binary transports, final commits and any
-    ///   blocker recovery share one operation deadline. HTTP retains its configured request
-    ///   timeout.
-    /// - close the reader with [`PartitionReader::close`]: with [`ServerCommitPolicy::OnRead`]
-    ///   it moves the offset back to the last message that the consumer yielded, and a group
-    ///   member leaves its group. This lets the server give its partitions to the remaining
-    ///   members immediately instead of waiting for the connection to time out. The close waits
-    ///   for each `OnRead` read in flight until the deadline of that read, not
-    ///   `offset_drain_timeout`, because a timeout around a committing read would lose its outcome.
-    ///
-    /// [`client_commit()`]: crate::prelude::IggyConsumerBuilder::client_commit
+    /// - Under [`CommitPolicy::Auto`], the message that the stream yielded last counts under
+    ///   [`CommitAfter::Processing`], and the latest counted position of each partition is
+    ///   stored. The stores wait at most
+    ///   [`offset_drain_timeout`](crate::prelude::IggyConsumerBuilder::offset_drain_timeout),
+    ///   and a failure is logged.
+    /// - The reader closes with [`PartitionReader::close`]: with [`CommitPolicy::OnRead`] it
+    ///   moves the offset back to the last message that the consumer yielded, and a group
+    ///   member leaves its group, so the server gives its partitions to the remaining members
+    ///   at once instead of after the connection times out. The close waits for each `OnRead`
+    ///   read in flight until the deadline of that read, because a timeout around a committing
+    ///   read would lose its outcome.
     ///
     /// # Errors
     ///
     /// The errors of [`PartitionReader::close`]: the first failed store of the `OnRead` close,
-    /// or else `PartitionLaneBlocked` for a partition with an unknown outcome. Explicitly abandon
-    /// that operation on the client before starting a replacement consumer. Final commit and
-    /// group-leave failures are logged.
+    /// or else `PartitionLaneBlocked` for a partition that another call on the client left with
+    /// an unknown outcome. Explicitly abandon that operation on the client before starting a
+    /// replacement consumer. Group-leave failures are logged.
     pub async fn shutdown(&mut self) -> Result<(), IggyError> {
-        // Swap so background tasks see that the consumer got shut down.
         if self.shutdown.swap(true, ORDERING) {
             return Ok(());
         }
         self.current = None;
-
         info!("Shutting down consumer: {}...", self.consumer_name);
-
-        // Drain the background commit tasks while still a group member, before
-        // the reader leaves below. Otherwise a store they send afterward hits a group
-        // we've already left.
-        self.background_commit_notify.notify_one();
-
-        // A background_commit_task exists if the client commit policy has an interval.
-        if let Some(mut task) = self.background_commit_task.take()
-            && time::timeout(self.offset_drain_timeout.get_duration(), &mut task)
-                .await
-                .is_err()
-        {
-            // Still running past the bound: abort it rather than leaving it
-            // detached, so it can't send a stale store after we leave below.
-            task.abort();
-            warn!(
-                "Timed out waiting for the background offset-commit task to stop for consumer: {}, aborted",
-                self.consumer_name
-            );
-        }
-
-        // Wakes the store task, which sends what is still queued and exits on the shutdown flag.
-        self.store_offset_notify.notify_one();
-        if let Some(mut task) = self.store_offset_task.take()
-            && time::timeout(self.offset_drain_timeout.get_duration(), &mut task)
-                .await
-                .is_err()
-        {
-            task.abort();
-            warn!(
-                "Timed out draining pending consumer offset stores for consumer: {}, aborted",
-                self.consumer_name
-            );
-        }
+        self.count_uncounted();
 
         let progress = &self.state.progress;
         let unstored = progress.unstored_delivered(None);
@@ -1089,42 +920,38 @@ impl IggyConsumer {
                 .all(|delivered| progress.last_committed(delivered.partition_id()).is_none())
         {
             warn!(
-                "Consumer: {} delivered messages but stored no offset, so the next run reads them again. Commit checkpoints after processing, or set a client commit policy.",
+                "Consumer: {} delivered messages but stored no offset, so the next run reads them again. Commit checkpoints after processing, or set CommitPolicy::Auto in the poll options.",
                 self.consumer_name
             );
         }
 
-        if self.client_commit != ClientCommitPolicy::default() {
-            with_deadline(Instant::now() + OPERATION_TIMEOUT, async {
-                for checkpoint in unstored {
-                    if let Err(error) = progress.commit(checkpoint).await {
-                        warn!(?checkpoint, %error, "Final consumer checkpoint was not acknowledged");
-                    }
-                }
-            })
-            .await;
-        }
-
-        let result = match self.reader.take() {
-            Some(reader) => reader.close().await,
-            None => Ok(()),
+        let Some(mut reader) = self.reader.take() else {
+            return Ok(());
         };
+        // The stores go out while the member still owns its partitions, before the close leaves
+        // the group.
+        match time::timeout(self.offset_drain_timeout.get_duration(), reader.flush()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(
+                "Failed to store the counted offsets of consumer: {}. {error}",
+                self.consumer_name
+            ),
+            Err(_) => warn!(
+                "Timed out storing the counted offsets of consumer: {} after {}.",
+                self.consumer_name, self.offset_drain_timeout
+            ),
+        }
+        let result = reader.close().await;
         info!("Consumer: {} has been shut down.", self.consumer_name);
         result
     }
-}
 
-/// Stops the background tasks and the reader. Commits already queued still go out, nothing else
-/// is flushed and the consumer group is not left. Await [`IggyConsumer::shutdown`] first.
-impl Drop for IggyConsumer {
-    fn drop(&mut self) {
-        self.shutdown.store(true, ORDERING);
-        self.background_commit_notify.notify_one();
-        self.store_offset_notify.notify_one();
-        trace!(
-            "Consumer {} has been dropped, shutdown signal sent",
-            self.consumer_name
-        );
+    /// Under `CommitAfter::Processing`, the message that the stream yielded last counts once the
+    /// stream is polled again or shuts down.
+    fn count_uncounted(&mut self) {
+        if let Some((checkpoint, ends_batch)) = self.uncounted.take() {
+            self.count(checkpoint, ends_batch);
+        }
     }
 }
 

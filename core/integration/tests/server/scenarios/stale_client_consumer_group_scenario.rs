@@ -409,7 +409,7 @@ async fn setup_resources(client: &IggyClient, durability: Durability) {
 fn on_read_options() -> PollOptions {
     PollOptions {
         count: 1,
-        server_commit: ServerCommitPolicy::OnRead,
+        commit: CommitPolicy::OnRead,
         ..PollOptions::default()
     }
 }
@@ -564,7 +564,7 @@ async fn should_handle_stale_client_with_auto_reconnection(
         .unwrap()
         .poll_options(PollOptions {
             count: 1,
-            server_commit: ServerCommitPolicy::OnRead,
+            commit: CommitPolicy::OnRead,
             ..PollOptions::wait(IggyDuration::ONE_SECOND)
         })
         .polling_strategy(PollingStrategy::next())

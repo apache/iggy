@@ -641,14 +641,14 @@ pub enum IggyError {
     OperationNotRetained(u64) = 14008,
     /// Names the blocked partition of a multi-target request, or of any progress
     /// call prevented by the retained unknown outcome of a committing read: a
-    /// fetch or a poll with `ServerCommitPolicy::OnRead`.
+    /// fetch or a poll with `CommitPolicy::OnRead`.
     /// Field order: `(partition_id, operation_id)`.
     #[error("Lane of partition {0} blocked by operation {1} with an unknown outcome")]
     PartitionLaneBlocked(u32, u64) = 14009,
-    /// A committing read, a fetch or a poll with `ServerCommitPolicy::OnRead`,
+    /// A committing read, a fetch or a poll with `CommitPolicy::OnRead`,
     /// has no replayable receipt. Its local recovery ID survives session
-    /// replacement; only explicit abandonment frees progress.
-    #[error("Read {0} has unknown progress; explicit abandonment is required")]
+    /// replacement. Only explicit abandonment frees progress.
+    #[error("Read {0} has unknown progress, explicit abandonment is required")]
     FetchProgressUncertain(u64) = 14010,
 }
 

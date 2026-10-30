@@ -133,10 +133,10 @@ mod tests {
     };
     use iggy_binary_protocol::{WireDecode, WireEncode, WireIdentifier};
     use iggy_common::{
-        BinaryTransport, Client, ClientState, Consumer, Credentials, Identifier, IggyDuration,
-        IggyMessage, MessageClient, Partitioning, PersonalAccessTokenClient, PollOptions,
-        PollingStrategy, ServerCommitPolicy, SystemClient, TcpClientReconnectionConfig,
-        TopicClient, TopicUpdateOptions, UserClient, UserUpdateOptions, with_binary_deadline,
+        BinaryTransport, Client, ClientState, CommitPolicy, Consumer, Credentials, Identifier,
+        IggyDuration, IggyMessage, MessageClient, Partitioning, PersonalAccessTokenClient,
+        PollOptions, PollingStrategy, SystemClient, TcpClientReconnectionConfig, TopicClient,
+        TopicUpdateOptions, UserClient, UserUpdateOptions, with_binary_deadline,
     };
     use secrecy::{ExposeSecret, SecretString};
     use std::time::Duration;
@@ -601,9 +601,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_a_sent_progress_poll_when_signing_in_should_keep_its_lineage_uncertain() {
-        for (server_commit, strategy) in [
-            (ServerCommitPolicy::OnRead, PollingStrategy::offset(0)),
-            (ServerCommitPolicy::Disabled, PollingStrategy::next()),
+        for (commit, strategy) in [
+            (CommitPolicy::OnRead, PollingStrategy::offset(0)),
+            (CommitPolicy::Manual, PollingStrategy::next()),
         ] {
             for answer in [
                 Answer::Body(
@@ -635,7 +635,7 @@ mod tests {
                         let id = Identifier::numeric(1).unwrap();
                         let options = PollOptions {
                             count: 1,
-                            server_commit,
+                            commit,
                             ..PollOptions::default()
                         };
                         client
@@ -658,7 +658,7 @@ mod tests {
                 cluster.release(POLL_MESSAGES_DEFERRED_CODE);
 
                 let error = pending.await.unwrap().unwrap_err();
-                if server_commit == ServerCommitPolicy::OnRead {
+                if commit == CommitPolicy::OnRead {
                     let operation = cluster.received(POLL_MESSAGES_DEFERRED_CODE)[0]
                         .header
                         .request;

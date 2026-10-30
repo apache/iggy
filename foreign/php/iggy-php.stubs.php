@@ -21,6 +21,31 @@
 
 namespace Iggy {
     /**
+     * When CommitPolicy::auto() stores. It also stores on close, on shutdown and before a
+     * rebalance takes a partition away. A store only moves forward.
+     */
+    class AutoCommit {
+        /**
+         * Stores the latest counted position every `interval_micros`, when it moved, and also on
+         * the event `every`. A message counts as `after` says, CommitAfter::Processing when null.
+         * Throws for a zero interval, and without an interval and an event, which would store
+         * only on close.
+         *
+         * @param mixed $interval_micros
+         * @param \Iggy\CommitEvery|null $every
+         * @param \Iggy\CommitAfter|null $after
+         */
+        public function __construct(mixed $interval_micros = null, ?\Iggy\CommitEvery $every = null, ?\Iggy\CommitAfter $after = null) {}
+
+        /**
+         * Every 10,000 messages or every 5 seconds, whichever comes first, after processing.
+         *
+         * @return \Iggy\AutoCommit
+         */
+        public static function default(): \Iggy\AutoCommit {}
+    }
+
+    /**
      * A PHP class representing the position after one delivered message.
      *
      * A commit stores its offset, so it covers every earlier message of the partition.
@@ -66,16 +91,37 @@ namespace Iggy {
         public function connect(): void {}
 
         /**
+         * Creates and initializes a standalone consumer of `partitions`, identified by `name`: it
+         * stores its offsets under that consumer name and joins no group. `partitions` must not be
+         * empty. The other arguments are those of consumerGroup().
+         *
+         * @param string $name
+         * @param string $stream
+         * @param string $topic
+         * @param array $partitions
+         * @param \Iggy\PollingStrategy|null $polling_strategy
+         * @param \Iggy\PollOptions|null $poll_options
+         * @param mixed $prefetch_bytes
+         * @param mixed $prefetch_messages
+         * @param mixed $polling_retry_interval_micros
+         * @param mixed $init_retries
+         * @param mixed $init_retry_interval_micros
+         * @param bool $allow_replay
+         * @return \Iggy\Consumer
+         */
+        public function consumer(string $name, string $stream, string $topic, array $partitions, ?\Iggy\PollingStrategy $polling_strategy = null, ?\Iggy\PollOptions $poll_options = null, mixed $prefetch_bytes = null, mixed $prefetch_messages = null, mixed $polling_retry_interval_micros = null, mixed $init_retries = null, mixed $init_retry_interval_micros = null, bool $allow_replay = false): \Iggy\Consumer {}
+
+        /**
          * Creates and initializes a consumer group consumer.
          *
          * The member reads the partitions that the server assigns to it. `polling_strategy` is
          * the start of a partition without a stored offset, PollingStrategy::next() when null, and
-         * a continuation is refused. `poll_options` defaults to a wait of 1 second for up to 1000
+         * a continuation is refused. `poll_options` defaults to a wait of 5 seconds for up to 1000
          * messages per request: a consumer that waits 0 polls an idle topic in a busy loop.
-         * `client_commit` defaults to storing nothing: commit checkpoints after processing, or
-         * each restart reads the same messages again. With ServerCommitPolicy::OnRead in
-         * `poll_options`, the server stores the offset of each batch that it reads, and a
-         * `client_commit` other than the default is refused with InvalidConfiguration.
+         * The `commit` of `poll_options` says when offsets are stored. CommitPolicy::manual(), the
+         * default, stores nothing: commit checkpoints after processing, or each restart reads the
+         * same messages again. With CommitPolicy::onRead() the server stores the offset of each
+         * batch that it reads, and CommitPolicy::auto() stores counted positions.
          * `prefetch_bytes` and `prefetch_messages` are those of reader().
          *
          * @param string $name
@@ -83,7 +129,6 @@ namespace Iggy {
          * @param string $topic
          * @param \Iggy\PollingStrategy|null $polling_strategy
          * @param \Iggy\PollOptions|null $poll_options
-         * @param \Iggy\ClientCommitPolicy|null $client_commit
          * @param mixed $prefetch_bytes
          * @param mixed $prefetch_messages
          * @param bool $create_consumer_group_if_not_exists
@@ -93,7 +138,7 @@ namespace Iggy {
          * @param bool $allow_replay
          * @return \Iggy\Consumer
          */
-        public function consumerGroup(string $name, string $stream, string $topic, ?\Iggy\PollingStrategy $polling_strategy = null, ?\Iggy\PollOptions $poll_options = null, ?\Iggy\ClientCommitPolicy $client_commit = null, mixed $prefetch_bytes = null, mixed $prefetch_messages = null, bool $create_consumer_group_if_not_exists = true, mixed $polling_retry_interval_micros = null, mixed $init_retries = null, mixed $init_retry_interval_micros = null, bool $allow_replay = false): \Iggy\Consumer {}
+        public function consumerGroup(string $name, string $stream, string $topic, ?\Iggy\PollingStrategy $polling_strategy = null, ?\Iggy\PollOptions $poll_options = null, mixed $prefetch_bytes = null, mixed $prefetch_messages = null, bool $create_consumer_group_if_not_exists = true, mixed $polling_retry_interval_micros = null, mixed $init_retries = null, mixed $init_retry_interval_micros = null, bool $allow_replay = false): \Iggy\Consumer {}
 
         /**
          * Creates a new stream.
@@ -143,6 +188,39 @@ namespace Iggy {
         public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, ?array $raw = null): void {}
 
         /**
+         * Deletes the offset stored on `partition_id` for a standalone consumer, or for a consumer
+         * group when `group` is true. Throws ConsumerOffsetNotFound (3021) when nothing is stored.
+         * Prefer deleteConsumerPosition() with a checkpoint.
+         *
+         * @param mixed $stream
+         * @param mixed $topic
+         * @param mixed $consumer
+         * @param int $partition_id
+         * @param bool|null $group
+         * @return void
+         */
+        public function deleteConsumerOffset(mixed $stream, mixed $topic, mixed $consumer, int $partition_id, ?bool $group = null): void {}
+
+        /**
+         * Deletes the stored offset of the partition of a checkpoint for a standalone consumer, or
+         * for a consumer group when `group` is true, under the partition history that delivered
+         * the checkpoint. The offset of the checkpoint is not used.
+         *
+         * Throws HistoryUnavailable (87) after the partition was deleted and created again,
+         * ConsumerGroupPartitionNotOwned (5009) after its consumer group owner changed, and
+         * ConsumerOffsetNotFound (3021) when no offset is stored. HTTP sends no partition history,
+         * so there the server deletes the offset of the history it holds.
+         *
+         * @param mixed $stream
+         * @param mixed $topic
+         * @param mixed $consumer
+         * @param \Iggy\Checkpoint $checkpoint
+         * @param bool|null $group
+         * @return void
+         */
+        public function deleteConsumerPosition(mixed $stream, mixed $topic, mixed $consumer, \Iggy\Checkpoint $checkpoint, ?bool $group = null): void {}
+
+        /**
          * Deletes a stream by id or name.
          *
          * @param mixed $stream_id
@@ -187,6 +265,20 @@ namespace Iggy {
          * @return \Iggy\Client
          */
         public static function fromConnectionString(string $connection_string): \Iggy\Client {}
+
+        /**
+         * Returns the offset stored on `partition_id` for a standalone consumer, or for a consumer
+         * group when `group` is true, or null when nothing is stored. In a cluster the node of the
+         * connection answers from its own replica, which can lag a store that just returned.
+         *
+         * @param mixed $stream
+         * @param mixed $topic
+         * @param mixed $consumer
+         * @param int $partition_id
+         * @param bool|null $group
+         * @return \Iggy\ConsumerOffsetInfo|null
+         */
+        public function getConsumerOffset(mixed $stream, mixed $topic, mixed $consumer, int $partition_id, ?bool $group = null): ?\Iggy\ConsumerOffsetInfo {}
 
         /**
          * Reads one page of the metadata change log, or of the current state.
@@ -264,7 +356,7 @@ namespace Iggy {
          * Polls messages from one partition of a topic, as the standalone consumer `consumer`.
          *
          * PollingStrategy::next() starts at the stored offset of `consumer`. `options` defaults to
-         * `new PollOptions()`: up to 1000 messages and no wait. With ServerCommitPolicy::OnRead,
+         * `new PollOptions()`: up to 1000 messages and no wait. With CommitPolicy::onRead(),
          * the server stores the offset of the batch for `consumer`.
          *
          * To read on, pass `$polled->continuation()` as the next strategy. It keeps the partition
@@ -276,7 +368,10 @@ namespace Iggy {
          * HistoryUnavailable (87) after another client deleted and recreated the partition. The
          * failed route is dropped, and the next call routes again.
          *
-         * Under ServerCommitPolicy::OnRead, a lost reply throws FetchProgressUncertain (14010),
+         * `consumer` polls as a standalone consumer, or as a member of the consumer group of that
+         * id when `group` is true, which reads only the partitions assigned to it.
+         *
+         * Under CommitPolicy::onRead(), a lost reply throws FetchProgressUncertain (14010),
          * because the server can still store the offset. The partition stays blocked, and the
          * next poll of it throws PartitionLaneBlocked (14009), until abandonOperation().
          *
@@ -286,16 +381,17 @@ namespace Iggy {
          * @param mixed $consumer
          * @param \Iggy\PollingStrategy $polling_strategy
          * @param \Iggy\PollOptions|null $options
+         * @param bool|null $group
          * @return \Iggy\PolledMessages
          */
-        public function pollMessages(mixed $stream, mixed $topic, int $partition_id, mixed $consumer, \Iggy\PollingStrategy $polling_strategy, ?\Iggy\PollOptions $options = null): \Iggy\PolledMessages {}
+        public function pollMessages(mixed $stream, mixed $topic, int $partition_id, mixed $consumer, \Iggy\PollingStrategy $polling_strategy, ?\Iggy\PollOptions $options = null, ?bool $group = null): \Iggy\PolledMessages {}
 
         /**
          * Builds a reader of chosen partitions as a standalone consumer.
          *
          * `partitions` must not be empty. `start` is the start of a partition without a stored
          * offset, PollingStrategy::next() when null, and a continuation is refused. `options`
-         * defaults to a wait of 1 second for up to 1000 messages per request: a reader that waits
+         * defaults to a wait of 5 seconds for up to 1000 messages per request: a reader that waits
          * 0 polls an idle topic in a busy loop. `prefetch_bytes`, 16 MiB when null, and
          * `prefetch_messages`, the larger of 16000 and `count` when null, bound the requests in
          * flight and the queued batches.
@@ -362,6 +458,56 @@ namespace Iggy {
         public function sendMessages(mixed $stream, mixed $topic, int $partition_id, array $messages): \Iggy\SendMessagesResponse {}
 
         /**
+         * Starts the poll of pollMessages() in the background and returns at once, so the caller
+         * can wait for its batch in steps with PendingPoll::wait() or cancel it with
+         * PendingPoll::cancel(). Invalid arguments throw here, a failed poll throws from wait().
+         *
+         * @param mixed $stream
+         * @param mixed $topic
+         * @param int $partition_id
+         * @param mixed $consumer
+         * @param \Iggy\PollingStrategy $polling_strategy
+         * @param \Iggy\PollOptions|null $options
+         * @param bool|null $group
+         * @return \Iggy\PendingPoll
+         */
+        public function startPollMessages(mixed $stream, mixed $topic, int $partition_id, mixed $consumer, \Iggy\PollingStrategy $polling_strategy, ?\Iggy\PollOptions $options = null, ?bool $group = null): \Iggy\PendingPoll {}
+
+        /**
+         * Stores `offset` on `partition_id` for a standalone consumer, or for a consumer group
+         * when `group` is true, under the partition history of its route. After another client
+         * deleted and created the partition again, it can throw HistoryUnavailable (87) once, and
+         * the next call routes again. Prefer storeConsumerPosition() with a checkpoint.
+         *
+         * @param mixed $stream
+         * @param mixed $topic
+         * @param mixed $consumer
+         * @param int $partition_id
+         * @param int $offset
+         * @param bool|null $group
+         * @return void
+         */
+        public function storeConsumerOffset(mixed $stream, mixed $topic, mixed $consumer, int $partition_id, int $offset, ?bool $group = null): void {}
+
+        /**
+         * Stores the offset of a checkpoint for a standalone consumer, or for a consumer group
+         * when `group` is true, under the partition history that delivered the checkpoint, which
+         * covers every earlier message of its partition.
+         *
+         * Throws HistoryUnavailable (87) after the partition was deleted and created again, and
+         * ConsumerGroupPartitionNotOwned (5009) after its consumer group owner changed, instead of
+         * storing the offset on the new partition.
+         *
+         * @param mixed $stream
+         * @param mixed $topic
+         * @param mixed $consumer
+         * @param \Iggy\Checkpoint $checkpoint
+         * @param bool|null $group
+         * @return void
+         */
+        public function storeConsumerPosition(mixed $stream, mixed $topic, mixed $consumer, \Iggy\Checkpoint $checkpoint, ?bool $group = null): void {}
+
+        /**
          * Renames a stream.
          *
          * A null name keeps the current one. No stream option is resettable, so a non-empty
@@ -404,47 +550,89 @@ namespace Iggy {
     }
 
     /**
-     * When the consumer stores the position of the last message that it delivered.
-     *
-     * It never stores the end of a prefetched batch. The default, both arguments null, stores
-     * nothing: commit checkpoints with Consumer::commit() after processing.
+     * When a message counts for CommitPolicy::auto().
      */
-    class ClientCommitPolicy {
-        /**
-         * Stores the latest position every `interval_micros`, and also on the event `on`.
-         *
-         * @param mixed $interval_micros
-         * @param \Iggy\CommitEvent|null $on
-         */
-        public function __construct(mixed $interval_micros = null, ?\Iggy\CommitEvent $on = null) {}
+    enum CommitAfter: string {
+    /**
+     * When the application asks for the next message or batch, returns from its callback, or
+     * closes the reader. A callback that throws leaves its message uncounted.
+     */
+      case Processing = 'processing';
+    /**
+     * When the message or the batch is handed over.
+     */
+      case Delivery = 'delivery';
+    /**
+     * Only when the application calls mark() with its checkpoint.
+     */
+      case Marked = 'marked';
     }
 
     /**
-     * The event of a ClientCommitPolicy. consumeMessages() counts a message after its callback,
-     * and iterMessages() when it yields the message.
+     * The event on which CommitPolicy::auto() also stores.
      */
-    class CommitEvent {
+    class CommitEvery {
         public function __construct() {}
 
         /**
-         * The last message of a batch.
+         * The last message of each batch.
          *
-         * @return \Iggy\CommitEvent
+         * @return \Iggy\CommitEvery
          */
-        public static function eachBatch(): \Iggy\CommitEvent {}
+        public static function batch(): \Iggy\CommitEvery {}
 
         /**
-         * @return \Iggy\CommitEvent
+         * Each counted message, or each counted batch of a reader.
+         *
+         * @return \Iggy\CommitEvery
          */
-        public static function eachMessage(): \Iggy\CommitEvent {}
+        public static function message(): \Iggy\CommitEvery {}
 
         /**
-         * A message whose offset is a multiple of `n`. Creating the consumer refuses zero.
+         * `count` counted messages of a partition since its last store. Throws for zero.
          *
-         * @param int $n
-         * @return \Iggy\CommitEvent
+         * @param int $count
+         * @return \Iggy\CommitEvery
          */
-        public static function everyNthMessage(int $n): \Iggy\CommitEvent {}
+        public static function messages(int $count): \Iggy\CommitEvery {}
+    }
+
+    /**
+     * When the offsets of the messages that a read returns are stored.
+     */
+    class CommitPolicy {
+        /**
+         * `manual`, `on_read` or `auto`.
+         *
+         * @var string
+         */
+        public readonly string $kind;
+
+        public function __construct() {}
+
+        /**
+         * A reader or a consumer stores the latest counted position, at least once with
+         * CommitAfter::Processing. pollMessages() refuses it with InvalidConfiguration (2).
+         *
+         * @param \Iggy\AutoCommit $auto
+         * @return \Iggy\CommitPolicy
+         */
+        public static function auto(\Iggy\AutoCommit $auto): \Iggy\CommitPolicy {}
+
+        /**
+         * Nothing is stored. The application commits checkpoints. The default.
+         *
+         * @return \Iggy\CommitPolicy
+         */
+        public static function manual(): \Iggy\CommitPolicy {}
+
+        /**
+         * The server stores the offset of the last message of each read as part of the read: one
+         * round trip, at most once.
+         *
+         * @return \Iggy\CommitPolicy
+         */
+        public static function onRead(): \Iggy\CommitPolicy {}
     }
 
     /**
@@ -462,7 +650,7 @@ namespace Iggy {
          * at or below the last commit of its generation, stores nothing. One from a deleted or
          * recreated partition fails with HistoryUnavailable (87), and one from a previous owner
          * fails with ConsumerGroupPartitionNotOwned (5009). A checkpoint that this consumer did not
-         * deliver, and every commit under ServerCommitPolicy::OnRead, fail with InvalidCommand (3).
+         * deliver, and every commit under CommitPolicy::onRead(), fail with InvalidCommand (3).
          *
          * @param \Iggy\Checkpoint $checkpoint
          * @return void
@@ -475,27 +663,32 @@ namespace Iggy {
          * The callback is called as callback(ReceiveMessage $message). A finite limit is required.
          * The run ends after `limit` messages, after shutdown(), or with an exception.
          *
-         * The `on` event of a ClientCommitPolicy counts a message after its callback returns, and
-         * also after the callback throws, as for a failed handler in the Rust SDK. The interval of
-         * the policy can store a message whose callback still runs. An exception of the callback
-         * ends the run, and consumeMessages() throws it.
+         * Under CommitPolicy::auto(), a message counts before its callback with
+         * CommitAfter::Delivery, and after its callback returns with CommitAfter::Processing. An
+         * exception of the callback ends the run, and consumeMessages() throws it. Its message
+         * then stays uncounted under CommitAfter::Processing, so the next run reads it again.
          *
          * The consumer retries a failed read by itself and does not throw it. An error that ends
          * the run throws Iggy\Exception\ReadException: HistoryUnavailable (87), which stops its
-         * partition until seek(), and under ServerCommitPolicy::OnRead an unknown outcome, which
+         * partition until seek(), and under CommitPolicy::onRead() an unknown outcome, which
          * stops its partition until its operation is abandoned and the partition is sought. A
          * blocked lane, a shut down client and any error while the client cannot reconnect by
          * itself also end the run.
          *
-         * The callback can call commit(), storeOffset(), deleteOffset() and the getters. seek(),
+         * With `idle_timeout_micros`, a run that gets no message for that long ends and returns
+         * the count of the messages it consumed, so a single-threaded worker regains control on an
+         * idle topic. Null waits without a limit.
+         *
+         * The callback can call commit(), mark(), storeOffset(), deleteOffset() and the getters. seek(),
          * shutdown(), iterMessages() and consumeMessages() throw in the callback, because the run
          * holds the consumer.
          *
          * @param callable $callback
          * @param int $limit
+         * @param mixed $idle_timeout_micros
          * @return int
          */
-        public function consumeMessages(callable $callback, int $limit): int {}
+        public function consumeMessages(callable $callback, int $limit, mixed $idle_timeout_micros = null): int {}
 
         /**
          * Deletes the stored offset for the provided partition id.
@@ -530,13 +723,30 @@ namespace Iggy {
         /**
          * Returns an iterator over messages for use with foreach.
          *
-         * The `on` event of a ClientCommitPolicy counts a message when the iterator yields it. A
+         * With `idle_timeout_micros`, the iteration ends when no message arrives for that long,
+         * and a later foreach over the same iterator reads on. Null waits without a limit.
+         *
+         * Under CommitPolicy::auto(), a message counts when the iterator yields it with
+         * CommitAfter::Delivery, and when the iterator moves past it with CommitAfter::Processing. A
          * failed read throws Iggy\Exception\ReadException. The consumer stays usable and retries by
          * itself. HistoryUnavailable (87) stops its partition until seek().
          *
+         * @param mixed $idle_timeout_micros
          * @return \Iggy\MessageIterator
          */
-        public function iterMessages(): \Iggy\MessageIterator {}
+        public function iterMessages(mixed $idle_timeout_micros = null): \Iggy\MessageIterator {}
+
+        /**
+         * Counts a checkpoint that this consumer delivered under CommitPolicy::auto() and stores
+         * nothing now: the policy stores the latest counted position of its partition. With
+         * CommitAfter::Marked only marks count. It works also in a consumeMessages() callback.
+         * Without CommitPolicy::auto(), and for a checkpoint that this consumer did not deliver,
+         * it throws InvalidCommand (3).
+         *
+         * @param \Iggy\Checkpoint $checkpoint
+         * @return void
+         */
+        public function mark(\Iggy\Checkpoint $checkpoint): void {}
 
         /**
          * Gets the name of the consumer group.
@@ -559,7 +769,7 @@ namespace Iggy {
          * It also resumes a partition that stopped, for example after HistoryUnavailable (87), or
          * after a message that does not decode: seek to the `skip` of its ReadException. A
          * partition that the consumer does not read, and a continuation of another partition, fail
-         * with InvalidCommand (3). Under ServerCommitPolicy::OnRead, a read of the partition with
+         * with InvalidCommand (3). Under CommitPolicy::onRead(), a read of the partition with
          * an unknown outcome fails with PartitionLaneBlocked (14009): abandon its operation first.
          *
          * @param int $partition_id
@@ -571,8 +781,8 @@ namespace Iggy {
         /**
          * Stops the consumer after its queued offset stores.
          *
-         * With a ClientCommitPolicy, it stores the position of the last message that it delivered
-         * from each partition. With ServerCommitPolicy::OnRead, it moves the offset of each
+         * Under CommitPolicy::auto(), it stores the latest counted position of each partition. With
+         * CommitPolicy::onRead(), it moves the offset of each
          * partition back to the last delivered message, so the next run reads the prefetched
          * messages again. A group member then leaves its group. Afterwards consumeMessages()
          * returns at once and iterMessages() ends, and a second call does nothing. Destroying the
@@ -623,6 +833,34 @@ namespace Iggy {
         public function topic(): string {}
     }
 
+    /**
+     * The offset that a consumer stored on a partition.
+     */
+    class ConsumerOffsetInfo {
+        /**
+         * The offset of the last message of the partition when the offset was read.
+         *
+         * @var int
+         */
+        public readonly int $current_offset;
+
+        /**
+         * The partition of the offset.
+         *
+         * @var int
+         */
+        public readonly int $partition_id;
+
+        /**
+         * The stored offset.
+         *
+         * @var int
+         */
+        public readonly int $stored_offset;
+
+        public function __construct() {}
+    }
+
     enum Durability: string {
       case Replicated = 'replicated';
       case Persisted = 'persisted';
@@ -647,6 +885,9 @@ namespace Iggy {
         public function next(): void {}
 
         /**
+         * Reads the first message, and on a started iterator the message after the last one it
+         * yielded, as a stream has no earlier messages to go back to.
+         *
          * @return void
          */
         public function rewind(): void {}
@@ -1851,20 +2092,24 @@ namespace Iggy {
      * partition inside. Build one with Client::reader() or Client::groupReader().
      *
      * Each partition delivers its batches in offset order, from its first read, from each seek()
-     * and from each new assignment to a group member. Without ServerCommitPolicy::OnRead, commit()
-     * stores the offset of a checkpoint. With it, the server stores the offset of each reply, and
-     * close() moves the offset back to the last delivered message. Destroying the reader without
+     * and from each new assignment to a group member. The `commit` of its PollOptions says when
+     * offsets are stored. With CommitPolicy::manual() and CommitPolicy::auto(), commit() stores the
+     * offset of a checkpoint, and CommitPolicy::auto() also stores the latest counted position by
+     * itself, which mark() counts under CommitAfter::Marked. With CommitPolicy::onRead(), the server
+     * stores the offset of each reply, and close() moves the offset back to the last delivered
+     * message. Destroying the reader without
      * close() stops it without waiting, moves no offset back and does not leave the group.
      */
     class PartitionReader {
         public function __construct() {}
 
         /**
-         * Stops the reader. It waits at most until the deadlines of the reads in flight, and it
-         * commits nothing. A group reader then leaves its group. A second call does nothing, and
+         * Stops the reader. It waits at most until the deadlines of the reads in flight. Under
+         * CommitPolicy::manual() it commits nothing, and under CommitPolicy::auto() it stores the
+         * latest counted position of each partition. A group reader then leaves its group. A second call does nothing, and
          * every other method of a closed reader throws.
          *
-         * Under ServerCommitPolicy::OnRead, it moves the offset of each partition with undelivered
+         * Under CommitPolicy::onRead(), it moves the offset of each partition with undelivered
          * batches back to its last delivered message, and the first failed store is thrown.
          * Otherwise a partition with an unknown outcome throws PartitionLaneBlocked (14009):
          * abandon its operation before a new reader reads the partition.
@@ -1879,12 +2124,23 @@ namespace Iggy {
          *
          * A checkpoint of an older generation of its partition, or at or below the last commit of
          * its generation, stores nothing. A checkpoint that this reader did not deliver, and every
-         * commit under ServerCommitPolicy::OnRead, fail with InvalidCommand (3).
+         * commit under CommitPolicy::onRead(), fail with InvalidCommand (3).
          *
          * @param \Iggy\Checkpoint $checkpoint
          * @return void
          */
         public function commit(\Iggy\Checkpoint $checkpoint): void {}
+
+        /**
+         * Counts a checkpoint that this reader delivered under CommitPolicy::auto() and stores
+         * nothing now: the policy stores the latest counted position of its partition. Without
+         * CommitPolicy::auto(), and for a checkpoint that this reader did not deliver, it throws
+         * InvalidCommand (3).
+         *
+         * @param \Iggy\Checkpoint $checkpoint
+         * @return void
+         */
+        public function mark(\Iggy\Checkpoint $checkpoint): void {}
 
         /**
          * The next batch of one partition. It is never empty. Without `timeout_micros`, the call
@@ -1894,7 +2150,7 @@ namespace Iggy {
          *
          * A failed read throws Iggy\Exception\ReadException. The reader stays usable and retries
          * by itself. HistoryUnavailable (87) stops its partition until seek(). Under
-         * ServerCommitPolicy::OnRead, an unknown outcome stops its partition until the operation is
+         * CommitPolicy::onRead(), an unknown outcome stops its partition until the operation is
          * abandoned on the client and the partition is sought.
          *
          * @param mixed $timeout_micros
@@ -1916,7 +2172,7 @@ namespace Iggy {
          * also resumes a stopped partition.
          *
          * A partition that the reader does not read, and a continuation of another partition,
-         * fail with InvalidCommand (3). Under ServerCommitPolicy::OnRead, the new position waits
+         * fail with InvalidCommand (3). Under CommitPolicy::onRead(), the new position waits
          * for the end of the committing read in flight, and a read with an unknown outcome fails
          * with PartitionLaneBlocked (14009): abandon its operation first.
          *
@@ -1945,9 +2201,39 @@ namespace Iggy {
     }
 
     /**
+     * A poll that runs in the background, from Client::startPollMessages(). Wait for its batch in
+     * steps, or cancel it. Destroying it cancels the poll.
+     */
+    class PendingPoll {
+        public function __construct() {}
+
+        /**
+         * Drops the request. A parked deferred poll is then cancelled on the server, and one with
+         * CommitPolicy::onRead() that the server had not answered stores nothing. It returns after
+         * the request was dropped and does nothing after the poll ended.
+         *
+         * @return void
+         */
+        public function cancel(): void {}
+
+        /**
+         * The batch of the poll. Without `timeout_micros`, the call blocks until the poll ends.
+         * With it, the call returns null while the poll still runs. A deferred poll that found no
+         * message in its max wait returns an empty batch. A failed poll throws, and so does a call
+         * after the batch was returned or the poll was cancelled.
+         *
+         * @param mixed $timeout_micros
+         * @return \Iggy\PolledMessages|null
+         */
+        public function wait(mixed $timeout_micros = null): ?\Iggy\PolledMessages {}
+    }
+
+    /**
      * The limits of one poll of one partition.
      */
     class PollOptions {
+        public readonly \Iggy\CommitPolicy $commit;
+
         public readonly int $count;
 
         public readonly int $max_bytes;
@@ -1956,11 +2242,9 @@ namespace Iggy {
 
         public readonly int $min_count;
 
-        public readonly \Iggy\ServerCommitPolicy $server_commit;
-
         /**
          * Every argument left null keeps its default: up to 1000 messages, no wait, at least 1
-         * message, 1 MiB and ServerCommitPolicy::Disabled.
+         * message, 1 MiB and CommitPolicy::manual().
          *
          * `max_wait_micros` is at most 600 seconds, and the server waits that long for
          * `min_count` messages, which must be 1 to `count`. A reader or a consumer that waits 0
@@ -1972,9 +2256,9 @@ namespace Iggy {
          * @param mixed $max_wait_micros
          * @param mixed $min_count
          * @param mixed $max_bytes
-         * @param \Iggy\ServerCommitPolicy|null $server_commit
+         * @param \Iggy\CommitPolicy|null $commit
          */
-        public function __construct(mixed $count = null, mixed $max_wait_micros = null, mixed $min_count = null, mixed $max_bytes = null, ?\Iggy\ServerCommitPolicy $server_commit = null) {}
+        public function __construct(mixed $count = null, mixed $max_wait_micros = null, mixed $min_count = null, mixed $max_bytes = null, ?\Iggy\CommitPolicy $commit = null) {}
     }
 
     /**
@@ -2238,20 +2522,6 @@ namespace Iggy {
         public readonly array $confirmations;
 
         public function __construct() {}
-    }
-
-    /**
-     * Who stores the offset of a poll.
-     */
-    enum ServerCommitPolicy: string {
-    /**
-     * The application or the consumer commits.
-     */
-      case Disabled = 'disabled';
-    /**
-     * The server stores the offset of the last message of a reply as part of the reply.
-     */
-      case OnRead = 'on_read';
     }
 
     class StreamDetails {

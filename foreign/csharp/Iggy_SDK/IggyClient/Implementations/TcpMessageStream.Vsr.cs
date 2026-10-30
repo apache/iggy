@@ -520,8 +520,8 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider, ICons
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<uint>> GetAssignedPartitionsAsync(Identifier streamId, Identifier topicId,
-        Identifier groupId, bool resync, CancellationToken token = default)
+    async Task<IReadOnlyList<uint>> IConsumerGroupAssignmentProvider.GetAssignedPartitionsAsync(Identifier streamId,
+        Identifier topicId, Identifier groupId, bool resync, CancellationToken token)
     {
         var generation = _consensusSession.Generation;
         var key = new GroupKey(streamId, topicId, groupId);
@@ -559,7 +559,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider, ICons
             if (responseBuffer.Memory.Length == 0)
             {
                 // Deregistering is the only thing that observes a server-side removal (group deleted, member
-                // evicted); without it membership latches true and every later poll returns empty.
+                // evicted). Without it membership latches true and every later poll returns empty.
                 _groupState.DeregisterGroup(key);
 
                 return;
@@ -573,7 +573,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider, ICons
 
     /// <summary>
     ///     Re-syncs every joined group so a widened assignment (a partition-count change, say) is picked up
-    ///     without first hitting an ownership fence. Failed syncs are logged; all groups share the refresh
+    ///     without first hitting an ownership fence. Failed syncs are logged. All groups share the refresh
     ///     budget. A sync that outlasts <paramref name="deadline" /> fails as not accepted rather than canceled,
     ///     so it is logged like any other failure, and the groups after it wait for the next refresh. Only
     ///     <paramref name="token" /> cancels the refresh.

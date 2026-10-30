@@ -270,6 +270,7 @@ public sealed partial class TcpMessageStream
         var progress = IsProgressPoll(code, payload.Span);
         var fetchLanes = progress && code == CommandCodes.FETCH_MESSAGES_CODE ? FetchProgressLanes(payload.Span) : null;
         var commits = code == CommandCodes.FETCH_MESSAGES_CODE && TcpContracts.FetchAutoCommits(payload.Span);
+        var committing = TcpContracts.ReadAutoCommits(code, payload.Span);
         var deferred = DeferredBudget.Read(code, payload.Span);
         // A progress poll spends its budget in the frame of its lane. Any other deferred call spends it in a copy,
         // so the caller's buffer keeps what the caller encoded.
@@ -459,9 +460,10 @@ public sealed partial class TcpMessageStream
                             budget, Stopwatch.GetElapsedTime(started));
                     }
                     sending = true;
-                    // A committing fetch can commit before a cancel reaches the server, so the caller cannot end it
-                    // once it goes out: only its reply, its deadline, or the end of the client or the lane does.
-                    using var unattended = commits && operation is not null
+                    // A read that commits can store its offset before a cancel reaches the server, so once it goes
+                    // out the caller's cancel only asks the server to cancel it. Its reply, its deadline, or the end
+                    // of the client or the lane ends the call.
+                    using var unattended = committing && operation is not null
                         ? CancellationTokenSource.CreateLinkedTokenSource(_clientLifetime.Token,
                             operation.Lifetime.Token)
                         : null;
@@ -469,7 +471,16 @@ public sealed partial class TcpMessageStream
                         ? await connection.SendAttemptAsync(code, payload, deadline, deadline, HasSensitiveReply(code),
                             cancellation.Token, retryTransient: false, context: captured.Value, retainedFrame: frame)
                         : await connection.SendFrameAsync(operation, deadline, HasSensitiveReply(code),
-                            unattended?.Token ?? cancellation.Token);
+                            unattended?.Token ?? cancellation.Token, unattended is null ? default : token);
+                    if (unattended is not null && token.IsCancellationRequested
+                        && attempt.Error is IggyInvalidStatusCodeException
+                        {
+                            FromServer: true, StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED
+                        })
+                    {
+                        // The cancel won before the read stored anything.
+                        throw new OperationCanceledException(token);
+                    }
                     if (commits && attempt.RequestStarted)
                     {
                         fetchMayHaveCommitted = attempt.Error is not IggyInvalidStatusCodeException { FromServer: true } refusalStatus

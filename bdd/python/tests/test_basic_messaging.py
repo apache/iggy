@@ -23,12 +23,12 @@ import asyncio
 import socket
 
 from apache_iggy import (
+    CommitPolicy,
     Consumer,
     IggyClient,
     PollingStrategy,
     PollOptions,
     SendMessage,
-    ServerCommitPolicy,
     TopicOptions,
 )
 from pytest_bdd import given, parsers, scenarios, then, when
@@ -234,7 +234,7 @@ def poll_messages(context, stream_id, topic_id, partition_id, start_offset):
             consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Offset(value=start_offset),
-            options=PollOptions(count=100, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=100, commit=CommitPolicy.OnRead()),
         )
         context.last_polled_messages = polled.messages
 

@@ -244,56 +244,6 @@ public sealed class PartitionContextTests
         Assert.Equal(1, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
     }
 
-    /// <summary>
-    ///     A recreation between the poll and the commit replaces the incarnation. The commit carries the
-    ///     incarnation its messages came from, so the server refuses it instead of storing the offset in the
-    ///     replacement.
-    /// </summary>
-    [Fact]
-    public async Task given_an_after_receive_consumer_when_committing_should_store_the_polled_context()
-    {
-        using var node = new MockNode();
-        var stores = new ConcurrentQueue<MockRequest>();
-        node.Serve(request =>
-        {
-            if (request.Code == CommandCodes.POLL_MESSAGES_DEFERRED_CODE)
-            {
-                return Reply(OPERATION_NON_REPLICATED, Convert.FromHexString(MessageBatchGoldenVectorTests.POLL_BODY));
-            }
-
-            if (request.Operation == (byte)VsrOperation.StoreConsumerOffset)
-            {
-                stores.Enqueue(request);
-                return Reply(request.Operation, new byte[4]);
-            }
-
-            return Standalone(node, request);
-        });
-        using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
-        await using var consumer = new IggyConsumer(client, new IggyConsumerConfig
-        {
-            StreamId = Identifier.Numeric(1),
-            TopicId = Identifier.Numeric(2),
-            PartitionId = PartitionId,
-            Consumer = Consumer.New(1),
-            PollingStrategy = PollingStrategy.Next(),
-            AutoCommitMode = AutoCommitMode.AfterReceive,
-            Login = "iggy",
-            Password = "iggy"
-        }, NullLoggerFactory.Instance);
-        await consumer.InitAsync(TestContext.Current.CancellationToken);
-
-        await using (var messages = consumer.ReceiveAsync(TestContext.Current.CancellationToken)
-                         .GetAsyncEnumerator(TestContext.Current.CancellationToken))
-        {
-            Assert.True(await messages.MoveNextAsync());
-            Assert.True(await messages.MoveNextAsync());
-        }
-
-        var store = Assert.Single(stores);
-        Assert.Equal(Polled, store.Context);
-    }
-
     [Fact]
     public async Task given_a_send_refused_for_another_reason_should_keep_the_cached_context()
     {

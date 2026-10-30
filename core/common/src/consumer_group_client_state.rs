@@ -18,7 +18,7 @@
 //! Client-side consumer-group + partitioning state for the VSR transport.
 //!
 //! The SDK resolves partition operations locally before encoding their namespace:
-//! - a consumer-group member reads the assignment synced from the coordinator;
+//! - a consumer-group member reads the assignment synced from the coordinator.
 //! - `Balanced` produce round-robins per topic; `MessagesKey` hashes the key.
 //!
 //! Cursors must persist across calls, so this lives on the long-lived

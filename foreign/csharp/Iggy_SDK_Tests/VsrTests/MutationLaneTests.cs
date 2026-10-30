@@ -299,6 +299,8 @@ public sealed class MutationLaneTests
         var counter = session.RequestCounter;
         var blocked = await Assert.ThrowsAsync<VsrLaneBlockedException>(() => ProgressAsync(lanes, lane));
         Assert.Equal(mutation.Identity.RequestId, blocked.OperationId);
+        Assert.Equal(14007, blocked.StatusCode);
+        Assert.False(blocked.RequiresExplicitRecovery);
         Assert.Equal(counter, session.RequestCounter);
         lanes.Complete(mutation);
     }

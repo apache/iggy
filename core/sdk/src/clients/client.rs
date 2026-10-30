@@ -108,7 +108,7 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// Additionally, you can bypass invoking methods from these traits and directly talk to the server with [`send_binary_request`] and [`send_http_request`] for http.
 /// Both trade typed API's safety for low-level control. You need to know the server codes and the wire format.
 ///
-/// On TCP, QUIC and WebSocket, each read with [`ServerCommitPolicy::OnRead`] holds one slot of a
+/// On TCP, QUIC and WebSocket, each read with [`CommitPolicy::OnRead`] holds one slot of a
 /// pool with the [`PendingOperationsConfig`] limits (256 operations and 64 MiB by default) for the
 /// whole call, also while the server waits for messages, and after an unknown outcome until
 /// [`abandon_operation`]. When the pool is full, the read returns
@@ -187,7 +187,7 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///     .consumer("consumer_name", "stream_name", "topic_name")?
 ///     .partitions([1])
 ///     .poll_options(PollOptions {
-///         server_commit: ServerCommitPolicy::OnRead,
+///         commit: CommitPolicy::OnRead,
 ///         ..PollOptions::wait(IggyDuration::ONE_SECOND)
 ///     })
 ///     .polling_strategy(PollingStrategy::next())
@@ -239,7 +239,7 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// [`ConsumerOffsetClient`]: crate::prelude::ConsumerOffsetClient
 /// [`ConsumerGroupClient`]: crate::prelude::ConsumerGroupClient
 /// [`ClusterClient`]: crate::prelude::ClusterClient
-/// [`ServerCommitPolicy::OnRead`]: crate::prelude::ServerCommitPolicy::OnRead
+/// [`CommitPolicy::OnRead`]: crate::prelude::CommitPolicy::OnRead
 /// [`PendingOperationsConfig`]: crate::prelude::PendingOperationsConfig
 /// [`abandon_operation`]: crate::prelude::Client::abandon_operation
 #[derive(Debug)]
@@ -350,7 +350,7 @@ impl IggyClient {
     /// - `reconnection_reestablish_after`: [`IggyDuration`]. Stable connection duration that resets the retry count and backoff. Default: `5s`.
     /// - `max_pending_operations`: positive usize. Active and retained mutations per session. Default: `256`.
     /// - `max_pending_operation_bytes`: positive usize. Frozen mutation headers and bodies. Default: `67108864` (64 MiB).
-    /// - `response_buffer_size`: u64. Number of bytes in the response receive buffer. Default: `10000000`.
+    /// - `response_buffer_size`: u64. Number of bytes in the response receive buffer, at least the largest read reply of one record. Default: `64156564`.
     /// - `max_concurrent_bidi_streams`: u64. Number of concurrent bidirectional streams. Default: `10000`.
     /// - `datagram_send_buffer_size`: u64. Number of bytes in the datagram send buffer. Default: `100000`.
     /// - `initial_mtu`: u16. Initial MTU estimate (in bytes). Default: `1200`.
@@ -367,7 +367,7 @@ impl IggyClient {
     ///     "iggy+quic://user:secret@localhost:8080\
     ///      ?validate_certificate=true&heartbeat_interval=5s\
     ///      &reconnection_max_retries=unlimited&reconnection_interval=1s&reconnection_reestablish_after=5s\
-    ///      &response_buffer_size=10000000&max_concurrent_bidi_streams=10000\
+    ///      &response_buffer_size=64156564&max_concurrent_bidi_streams=10000\
     ///      &datagram_send_buffer_size=100000&initial_mtu=1200\
     ///      &send_window=100000&receive_window=100000\
     ///      &keep_alive_interval=5000&max_idle_timeout=10000",
@@ -647,7 +647,7 @@ impl IggyClient {
     /// # Examples
     ///
     /// Connect a client, build a consumer of partitions 0 and 1, and configure
-    /// it to store the position of each batch that it yields.
+    /// it to store the processed positions every 10,000 messages or 5 s.
     ///
     /// ```no_run
     /// use iggy::prelude::*;
@@ -661,9 +661,9 @@ impl IggyClient {
     /// let consumer = client
     ///     .consumer("consumer_name", "stream_name", "topic_name")? // returns IggyConsumerBuilder from IggyClient
     ///     .partitions([0, 1])
-    ///     .client_commit(ClientCommitPolicy {
-    ///         on: Some(CommitEvent::EachBatch),
-    ///         ..Default::default()
+    ///     .poll_options(PollOptions {
+    ///         commit: CommitPolicy::Auto(AutoCommit::default()),
+    ///         ..PollOptions::wait(IggyDuration::ONE_SECOND)
     ///     })
     ///     .polling_strategy(PollingStrategy::next())
     ///     .build(); // returns IggyConsumer from IggyConsumerBuilder
@@ -732,7 +732,7 @@ impl IggyClient {
     /// let consumer = client
     ///     .consumer_group("group_name", "stream_name", "topic_name")? // returns IggyConsumerBuilder from IggyClient
     ///     .poll_options(PollOptions {
-    ///         server_commit: ServerCommitPolicy::OnRead,
+    ///         commit: CommitPolicy::OnRead,
     ///         ..PollOptions::wait(IggyDuration::ONE_SECOND)
     ///     })
     ///     .polling_strategy(PollingStrategy::next())
@@ -977,6 +977,21 @@ impl IggyClient {
         })
     }
 
+    /// Sends a raw binary request with a caller-supplied deadline.
+    ///
+    /// The deadline covers client-lock acquisition, routing, admission and retries.
+    /// An earlier enclosing operation deadline still applies. Routing, cancellation
+    /// and error handling follow [`Self::send_binary_request`].
+    pub async fn send_binary_request_with_deadline(
+        &self,
+        code: u32,
+        payload: Bytes,
+        deadline: Instant,
+    ) -> Result<Bytes, IggyError> {
+        iggy_common::with_binary_deadline(deadline.into(), self.send_binary_request(code, payload))
+            .await
+    }
+
     /// Sends a raw request to the replica `replica_id` and returns its raw
     /// reply body.
     ///
@@ -1016,7 +1031,7 @@ impl IggyClient {
     ///
     /// # Errors
     /// [`IggyError::InvalidCommand`] before anything is sent if `code` is a
-    /// session-control code, a replicated command, a poll, a readiness wait, a
+    /// session-control code, a replicated command, a poll, a fetch, a
     /// deferred-request cancel, or a consumer-offset read. Writes and partition reads reach their primary through the typed
     /// API and [`send_binary_request`](IggyClient::send_binary_request).
     /// [`IggyError::InvalidIdentifier`] if the roster does not name
@@ -1043,6 +1058,25 @@ impl IggyClient {
             }
             ClientWrapper::Http(_) | ClientWrapper::Iggy(_) => Err(IggyError::FeatureUnavailable),
         })
+    }
+
+    /// Sends a raw binary request to a named replica with a caller-supplied deadline.
+    ///
+    /// The deadline covers client-lock acquisition, connection setup and the reply.
+    /// An earlier enclosing operation deadline still applies. The command restrictions
+    /// and error handling follow [`Self::send_binary_request_to_replica`].
+    pub async fn send_binary_request_to_replica_with_deadline(
+        &self,
+        code: u32,
+        payload: Bytes,
+        replica_id: u8,
+        deadline: Instant,
+    ) -> Result<Bytes, IggyError> {
+        iggy_common::with_binary_deadline(
+            deadline.into(),
+            self.send_binary_request_to_replica(code, payload, replica_id),
+        )
+        .await
     }
 
     /// Invokes a HTTP endpoint and returns the raw response body.
@@ -1236,7 +1270,7 @@ mod tests {
     use crate::links::test_support::LOCALHOST;
     use crate::links::{OPERATION_TIMEOUT, ReconnectPolicy};
     use iggy_binary_protocol::codes::{
-        CREATE_STREAM_CODE, GET_STATS_CODE, SYNC_CONSUMER_GROUP_CODE,
+        CREATE_STREAM_CODE, GET_STATS_CODE, PING_CODE, SYNC_CONSUMER_GROUP_CODE,
     };
     use iggy_common::{
         StreamClient, StreamCreateOptions, TcpClientConfig, TcpClientReconnectionConfig,
@@ -1245,6 +1279,213 @@ mod tests {
     use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio::time::sleep;
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_raw_request_with_a_long_deadline_when_the_reply_is_late_should_return_it() {
+        const CUSTOM_CODE: u32 = u32::MAX;
+        for replica in [None, Some(1)] {
+            let cluster = FakeCluster::new(2);
+            let client = IggyClient::new(ClientWrapper::Tcp(TcpClient::from_links(
+                connected(&cluster, 1).await,
+            )));
+            let destination = replica.unwrap_or(0);
+            let payload = Bytes::from_static(b"request");
+            let response = Bytes::from_static(b"response");
+            cluster.script(
+                &endpoint(destination),
+                CUSTOM_CODE,
+                [Answer::Body(response.to_vec())],
+            );
+            cluster.hold(CUSTOM_CODE);
+            let started = tokio::time::Instant::now();
+            let deadline = started + Duration::from_secs(60);
+            let request = async {
+                match replica {
+                    None => {
+                        client
+                            .send_binary_request_with_deadline(
+                                CUSTOM_CODE,
+                                payload.clone(),
+                                deadline.into_std(),
+                            )
+                            .await
+                    }
+                    Some(replica) => {
+                        client
+                            .send_binary_request_to_replica_with_deadline(
+                                CUSTOM_CODE,
+                                payload.clone(),
+                                replica,
+                                deadline.into_std(),
+                            )
+                            .await
+                    }
+                }
+            };
+            let (result, ()) = tokio::join!(request, async {
+                eventually("the raw request reaches its destination", || {
+                    cluster.count(CUSTOM_CODE) == 1
+                })
+                .await;
+                sleep(Duration::from_secs(45)).await;
+                cluster.release(CUSTOM_CODE);
+            });
+            assert_eq!(result, Ok(response));
+            assert!(tokio::time::Instant::now() - started > OPERATION_TIMEOUT);
+            let received = cluster.received(CUSTOM_CODE);
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].endpoint, endpoint(destination));
+            assert_eq!(received[0].body, payload);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_raw_request_deadline_when_the_wrapper_is_locked_should_expire_without_sending()
+    {
+        for replica in [None, Some(1)] {
+            let cluster = FakeCluster::new(2);
+            let client = IggyClient::new(ClientWrapper::Tcp(TcpClient::from_links(
+                connected(&cluster, 1).await,
+            )));
+            let guard = client.client.write().await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let result = match replica {
+                None => {
+                    client
+                        .send_binary_request_with_deadline(
+                            GET_STATS_CODE,
+                            Bytes::new(),
+                            deadline.into_std(),
+                        )
+                        .await
+                }
+                Some(replica) => {
+                    client
+                        .send_binary_request_to_replica_with_deadline(
+                            GET_STATS_CODE,
+                            Bytes::new(),
+                            replica,
+                            deadline.into_std(),
+                        )
+                        .await
+                }
+            };
+            assert_eq!(result, Err(IggyError::TransientNotAccepted));
+            assert_eq!(tokio::time::Instant::now(), deadline);
+            assert_eq!(cluster.count(GET_STATS_CODE), 0);
+            drop(guard);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_enclosing_deadline_when_a_raw_request_asks_for_longer_should_keep_the_earlier_budget()
+     {
+        for replica in [None, Some(1)] {
+            let cluster = FakeCluster::new(2);
+            let client = IggyClient::new(ClientWrapper::Tcp(TcpClient::from_links(
+                connected(&cluster, 1).await,
+            )));
+            let started = tokio::time::Instant::now();
+            let outer = started + Duration::from_secs(5);
+            let requested = started + Duration::from_secs(60);
+            let result = iggy_common::with_binary_deadline(outer, async {
+                match replica {
+                    None => {
+                        client
+                            .send_binary_request_with_deadline(
+                                GET_STATS_CODE,
+                                Bytes::new(),
+                                requested.into_std(),
+                            )
+                            .await
+                    }
+                    Some(replica) => {
+                        client
+                            .send_binary_request_to_replica_with_deadline(
+                                GET_STATS_CODE,
+                                Bytes::new(),
+                                replica,
+                                requested.into_std(),
+                            )
+                            .await
+                    }
+                }
+            })
+            .await;
+            assert_eq!(result, Err(IggyError::TransientNotCommitted));
+            assert_eq!(tokio::time::Instant::now(), outer);
+            assert_eq!(cluster.count(GET_STATS_CODE), 1);
+            assert!(iggy_common::binary_operation_deadline() > outer);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_expired_raw_request_deadline_when_called_should_send_nothing() {
+        for replica in [None, Some(1)] {
+            let cluster = FakeCluster::new(2);
+            let client = IggyClient::new(ClientWrapper::Tcp(TcpClient::from_links(
+                connected(&cluster, 1).await,
+            )));
+            let deadline = (tokio::time::Instant::now() - Duration::from_secs(1)).into_std();
+            let result = match replica {
+                None => {
+                    client
+                        .send_binary_request_with_deadline(GET_STATS_CODE, Bytes::new(), deadline)
+                        .await
+                }
+                Some(replica) => {
+                    client
+                        .send_binary_request_to_replica_with_deadline(
+                            GET_STATS_CODE,
+                            Bytes::new(),
+                            replica,
+                            deadline,
+                        )
+                        .await
+                }
+            };
+            assert_eq!(result, Err(IggyError::TransientNotAccepted));
+            assert_eq!(cluster.count(GET_STATS_CODE), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_unsupported_raw_request_when_refused_should_keep_standard_requests_working() {
+        const CUSTOM_CODE: u32 = u32::MAX;
+        for replica in [None, Some(1)] {
+            let cluster = FakeCluster::new(2);
+            let client = IggyClient::new(ClientWrapper::Tcp(TcpClient::from_links(
+                connected(&cluster, 1).await,
+            )));
+            cluster.script(
+                &endpoint(replica.unwrap_or(0)),
+                CUSTOM_CODE,
+                [Answer::Refuse(IggyError::InvalidCommand)],
+            );
+            let deadline = (tokio::time::Instant::now() + Duration::from_secs(60)).into_std();
+            let result = match replica {
+                None => {
+                    client
+                        .send_binary_request_with_deadline(CUSTOM_CODE, Bytes::new(), deadline)
+                        .await
+                }
+                Some(replica) => {
+                    client
+                        .send_binary_request_to_replica_with_deadline(
+                            CUSTOM_CODE,
+                            Bytes::new(),
+                            replica,
+                            deadline,
+                        )
+                        .await
+                }
+            };
+            assert_eq!(result, Err(IggyError::InvalidCommand));
+            assert_eq!(cluster.count(CUSTOM_CODE), 1);
+            assert_eq!(client.ping().await, Ok(()));
+            assert_eq!(cluster.count(PING_CODE), 1);
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn given_nested_client_locks_when_reading_should_share_one_deadline() {

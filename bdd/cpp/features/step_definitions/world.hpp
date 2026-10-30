@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <optional>
@@ -65,6 +66,16 @@ struct GlobalContext {
     std::optional<iggy::MetadataChangeCursor> last_change_cursor;
     std::vector<iggy::MetadataChangeRecord> last_changes;
     std::vector<iggy::MetadataCurrentItem> last_current_items;
+    // Deferred polling steps. A parked poll holds its connection, so it runs on a client of
+    // its own, which outlives the poll so that a cancelled poll still has a link for its
+    // cancellation.
+    std::optional<std::string> last_stream_name;
+    std::optional<std::string> last_topic_name;
+    std::optional<iggy::IggyBlockingClient> background;
+    std::optional<iggy::PendingPoll> deferred_poll;
+    std::chrono::steady_clock::time_point deferred_poll_started;
+    std::optional<iggy::PartitionReader> reader;
+    std::optional<iggy::IggyConsumer> consumer;
 
     GlobalContext()                                 = default;
     GlobalContext(const GlobalContext &)            = delete;
@@ -89,15 +100,20 @@ inline std::string required_env(const char *name) {
     return std::string(value);
 }
 
-// Public client for the option and metadata change steps, connected as root on first use.
+inline iggy::IggyBlockingClient connect_root_client() {
+    auto client = iggy::IggyBlockingClient::Builder()
+                      .WithServerAddress(required_env("IGGY_TCP_ADDRESS"))
+                      .WithAutoLogin(required_env("IGGY_ROOT_USERNAME"), required_env("IGGY_ROOT_PASSWORD"))
+                      .Build();
+    client.Connect();
+    return client;
+}
+
+// Public client for the option, metadata change and deferred polling steps, connected as root
+// on first use.
 inline iggy::IggyBlockingClient &sdk_client(GlobalContext &context) {
     if (!context.sdk) {
-        auto client = iggy::IggyBlockingClient::Builder()
-                          .WithServerAddress(required_env("IGGY_TCP_ADDRESS"))
-                          .WithAutoLogin(required_env("IGGY_ROOT_USERNAME"), required_env("IGGY_ROOT_PASSWORD"))
-                          .Build();
-        client.Connect();
-        context.sdk.emplace(std::move(client));
+        context.sdk.emplace(connect_root_client());
     }
     return *context.sdk;
 }

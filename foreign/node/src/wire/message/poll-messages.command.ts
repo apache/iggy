@@ -44,6 +44,8 @@ import {
 import {
   deferredPollOptions, serializeDeferredPollOptions, type DeferredPollOptions
 } from './deferred-poll.utils.js';
+import { pollOptions, wireOptions, type PollOptions } from './poll-options.js';
+import { polledBatch, validatePartition, type Continuation, type PolledBatch } from './checkpoint.js';
 
 const RESYNC_REQUIRED_PARTITION = 0xFFFF_FFFF;
 /** Internal result used when a group member currently owns no partitions. */
@@ -53,6 +55,7 @@ const GROUP_POLL_MAX_ATTEMPTS = 2;
 export const GROUP_ASSIGNMENT_REFRESH_MS = 5_000;
 const GROUP_MEMBER_NOT_FOUND = 5006;
 const GROUP_PARTITION_NOT_OWNED = 5009;
+const INVALID_CONFIGURATION = 2;
 const INVALID_COMMAND = 3;
 const TRANSIENT_NOT_COMMITTED = 57;
 
@@ -131,12 +134,46 @@ export type PollMessages = {
    * these options over `DEFAULT_DEFERRED_POLL_OPTIONS`. The call gives up at
    * `requestTimeout`. A consumer-group poll without a partition does not
    * wait: with these options it fails with 3 before anything is sent. To wait
-   * on many partitions, fetch each group of `message.readinessGroups` with
-   * `message.fetch`.
+   * on many partitions, read them with `message.reader`.
    */
   deferred?: Partial<DeferredPollOptions>,
   /** Cancels the poll. A poll that waits on the server is cancelled there too. */
   signal?: AbortSignal
+};
+
+/**
+ * Parameters of the poll of one partition: one batch read with
+ * `PollOptions`, as the Rust `poll_messages` reads it.
+ */
+export type PollPartition = {
+  /** Stream identifier */
+  streamId: Id,
+  /** Topic identifier */
+  topicId: Id,
+  /** The partition to read */
+  partitionId: number,
+  /** The consumer whose position Next means */
+  consumer: Consumer,
+  /** Where the read starts, such as the continuation of the previous batch */
+  strategy: PollingStrategy | Continuation,
+  /**
+   * The limits of the read and the commit policy, over `DEFAULT_POLL_OPTIONS`.
+   * A one-shot poll refuses `CommitPolicy.Auto` with 2 (InvalidConfiguration).
+   */
+  options?: Partial<PollOptions>,
+  /**
+   * Cancels the poll. A waiting poll is cancelled on the server too. A poll
+   * that commits keeps its reply then: the server answers it once, refused
+   * when the cancel won and nothing was stored, so the call rejects with the
+   * abort reason, or with the messages it stored, which the call returns.
+   */
+  signal?: AbortSignal
+};
+
+/** `message.poll`: the poll of one partition with `PollOptions`, or the plain poll of `PollMessages`. */
+export type PollMessagesCall = {
+  (request: PollPartition): Promise<PolledBatch>,
+  (request: PollMessages): Promise<PollMessagesResponse>
 };
 
 /**
@@ -350,8 +387,34 @@ export const isGroupFence = (error: unknown): error is ResponseError =>
 /**
  * Executable poll messages command function.
  */
-export const pollMessages = (getClient: ClientProvider) =>
-  async (request: PollMessages): Promise<PollMessagesResponse> => {
+export const pollMessages = (getClient: ClientProvider): PollMessagesCall =>
+  (async (request: PollPartition | PollMessages) => 'strategy' in request
+    ? pollPartition(getClient, request)
+    : pollPlain(getClient, request)) as PollMessagesCall;
+
+const pollPartition = async (getClient: ClientProvider, request: PollPartition): Promise<PolledBatch> => {
+  const command = COMMAND_CODE.PollMessagesDeferred;
+  const options = pollOptions(request.options, command);
+  if (options.commit.kind === 'auto')
+    throw responseError(command, INVALID_CONFIGURATION,
+      'a one-shot poll has nothing to count, so it cannot commit automatically: use a partition reader');
+  validatePartition(request.strategy, request.partitionId, command);
+  const polled = await pollPlain(getClient, {
+    streamId: request.streamId,
+    topicId: request.topicId,
+    consumer: request.consumer,
+    partitionId: request.partitionId,
+    pollingStrategy: request.strategy,
+    count: options.count,
+    autocommit: options.commit.kind === 'onRead',
+    deferred: wireOptions(options, command),
+    context: (request.strategy as Partial<Continuation>).context,
+    signal: request.signal
+  });
+  return polledBatch(polled, request.strategy);
+};
+
+const pollPlain = async (getClient: ClientProvider, request: PollMessages): Promise<PollMessagesResponse> => {
     const client = await getClient();
     const release = client.hold?.();
     try {
@@ -359,7 +422,7 @@ export const pollMessages = (getClient: ClientProvider) =>
           request.partitionId === null) {
         if (request.deferred)
           throw responseError(COMMAND_CODE.PollMessagesDeferred, INVALID_COMMAND,
-            'a deferred group poll needs a partition: fetch the groups of message.readinessGroups with message.fetch');
+            'a deferred group poll needs a partition: read many partitions with message.reader');
         const state = getGroupState(client);
         // As in the Rust SDK, one deadline bounds the whole call, also the
         // attempts after a session end, and no command of the call runs
@@ -394,4 +457,4 @@ export const pollMessages = (getClient: ClientProvider) =>
     } finally {
       release?.();
     }
-  };
+};

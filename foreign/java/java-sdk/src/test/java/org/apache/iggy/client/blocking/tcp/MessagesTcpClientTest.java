@@ -23,13 +23,15 @@ import org.apache.iggy.Iggy;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.MessagesClientBaseTest;
+import org.apache.iggy.client.blocking.reader.PartitionReader;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.DeferredPollOptions;
-import org.apache.iggy.message.FetchedMessages;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.message.PollOptions;
+import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.junit.jupiter.api.Test;
 
@@ -43,6 +45,7 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -126,12 +129,44 @@ class MessagesTcpClientTest extends MessagesClientBaseTest {
     }
 
     @Test
-    void shouldGroupThePartitionsOfOnePrimaryTogether() {
+    void shouldReadEveryPartitionWithABlockingReader() {
         setUpStream();
         client.topics().createTopic(STREAM_NAME, TOPIC_NAME.getName(), 2L, PERSISTED_TOPIC_OPTIONS);
+        List<Long> partitions = List.of(1L, 0L);
+        for (long partition : partitions) {
+            messagesClient.sendMessages(
+                    STREAM_NAME,
+                    TOPIC_NAME,
+                    Partitioning.partitionId(partition),
+                    List.of(Message.of("partition " + partition)));
+        }
+        var asyncClient = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
+        try {
+            asyncClient.connect().join();
+            asyncClient.users().login("iggy", "iggy").join();
+            Map<Long, List<String>> read = new HashMap<>();
+            try (PartitionReader reader = PartitionReader.build(asyncClient
+                    .reader(STREAM_NAME, TOPIC_NAME, Consumer.of(0L))
+                    .partitions(partitions)
+                    .start(PollingStrategy.first())
+                    .options(PollOptions.waitFor(SHORT_WAIT)))) {
+                while (read.size() < partitions.size()) {
+                    PolledMessages batch = reader.next();
+                    read.put(
+                            batch.partitionId(),
+                            batch.messages().stream()
+                                    .map(message -> new String(message.payload(), StandardCharsets.UTF_8))
+                                    .toList());
+                }
+            }
 
-        assertThat(messagesClient.readinessGroups(STREAM_NAME, TOPIC_NAME, List.of(1L, 0L)))
-                .containsExactly(List.of(1L, 0L));
+            assertThat(read).isEqualTo(Map.of(0L, List.of("partition 0"), 1L, List.of("partition 1")));
+        } finally {
+            asyncClient.close().join();
+        }
     }
 
     @Test
@@ -170,7 +205,7 @@ class MessagesTcpClientTest extends MessagesClientBaseTest {
     }
 
     @Test
-    void shouldFreeTheClientAndServerSlotsOfCancelledFetches() throws Exception {
+    void shouldFreeTheClientAndServerSlotsOfCancelledDeferredPolls() throws Exception {
         setUpStreamAndTopic();
         String token = accessToken();
         var asyncClient = AsyncIggyTcpClient.builder()
@@ -181,17 +216,15 @@ class MessagesTcpClientTest extends MessagesClientBaseTest {
             asyncClient.connect().join();
             asyncClient.users().login("iggy", "iggy").join();
             var messages = asyncClient.messages();
-            var target = Map.of(0L, PollingStrategy.offset(BigInteger.ZERO));
-            List<CompletableFuture<List<FetchedMessages>>> parked = new ArrayList<>();
+            List<CompletableFuture<PolledMessages>> parked = new ArrayList<>();
             for (int wait = 0; wait < CLIENT_DEFERRED_SLOTS; wait++) {
-                parked.add(messages.fetchMessages(
+                parked.add(messages.pollMessages(
                         STREAM_NAME,
                         TOPIC_NAME,
-                        target,
+                        0L,
                         Consumer.of(0L),
-                        1L,
-                        false,
-                        DeferredPollOptions.defaults().withMaxWait(LONG_WAIT)));
+                        PollingStrategy.offset(BigInteger.ZERO),
+                        PollOptions.waitFor(LONG_WAIT).withCount(1)));
             }
             assertThat(awaitServerMetric(token, PARKED_DEFERRED_REQUESTS, CLIENT_DEFERRED_SLOTS))
                     .as("deferred requests that the server parked")
@@ -200,25 +233,26 @@ class MessagesTcpClientTest extends MessagesClientBaseTest {
 
             assertThat(parked).allSatisfy(wait -> assertThat(wait.cancel(true)).isTrue());
 
-            // The server sends nothing back for a cancelled fetch. It answers a fetch whose time is up without a slot,
-            // and the client retries a refusal. So only the server metrics show that the cancel frames freed the
-            // server slots.
+            // The server sends nothing back for a cancelled poll that stores nothing. It answers a poll whose time is
+            // up
+            // without a slot, and the client retries a refusal. So only the server metrics show that the cancel frames
+            // freed the server slots.
             long cancelled =
                     awaitServerMetric(token, CANCELLED_DEFERRED_REQUESTS, cancelledBefore + CLIENT_DEFERRED_SLOTS);
             assertThat(cancelled - cancelledBefore)
                     .as("deferred requests that the server cancelled")
                     .isGreaterThanOrEqualTo(CLIENT_DEFERRED_SLOTS);
-            // The client holds at most this many deferred requests, so this fetch starts in time only if every cancel
+            // The client holds at most this many deferred requests, so this poll starts in time only if every cancel
             // freed its client slot.
-            assertThat(messages.fetchMessages(
+            assertThat(messages.pollMessages(
                                     STREAM_NAME,
                                     TOPIC_NAME,
-                                    target,
+                                    0L,
                                     Consumer.of(0L),
-                                    1L,
-                                    false,
-                                    DeferredPollOptions.defaults().withMaxWait(SHORT_WAIT))
-                            .get(WAKE_BOUND.toMillis(), TimeUnit.MILLISECONDS))
+                                    PollingStrategy.offset(BigInteger.ZERO),
+                                    PollOptions.waitFor(SHORT_WAIT).withCount(1))
+                            .get(WAKE_BOUND.toMillis(), TimeUnit.MILLISECONDS)
+                            .messages())
                     .isEmpty();
         } finally {
             asyncClient.close().join();

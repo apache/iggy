@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import type { ConsumerMessage, IggyConsumer } from '../stream/iggy-consumer.js';
+import type { PartitionReader } from '../stream/partition-reader.js';
 import type { Stream } from '../wire/stream/stream.utils.js';
 import type { Topic } from '../wire/topic/topic.utils.js';
 import type {
@@ -56,6 +58,9 @@ export interface TestWorld {
   lastSentPartition?: number,
   /** Deferred poll that a step started in the background */
   deferredPoll?: BackgroundCall<PollMessagesResponse>,
-  /** Fetch that a step started in the background */
-  deferredFetch?: BackgroundCall<PollMessagesResponse[]>
+  /** Partition reader that a step opened */
+  reader?: PartitionReader,
+  /** Consumer that a step opened, with its message iterator */
+  consumer?: IggyConsumer,
+  consumerMessages?: AsyncIterator<ConsumerMessage>
 };

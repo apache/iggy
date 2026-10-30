@@ -216,7 +216,7 @@ impl IggyCmdTestCase for TestMessageSendFromFileCmd<'_> {
                     &PollingStrategy::offset(0),
                     PollOptions {
                         count: self.message_count as u32 * 2,
-                        server_commit: ServerCommitPolicy::OnRead,
+                        commit: CommitPolicy::OnRead,
                         ..PollOptions::default()
                     },
                 )

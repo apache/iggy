@@ -16,38 +16,116 @@
 // under the License.
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
 import type { CommandResponse, RawClient, SendCommandOptions } from '../../client/client.type.js';
+import { DEFAULT_MAX_RESPONSE_FRAME_SIZE } from '../../client/client.config.js';
+import { FETCH_PROGRESS_UNCERTAIN, PARTITION_LANE_BLOCKED } from '../../client/client.operation.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { DeserializeError, ResponseError } from '../error.utils.js';
-import { Consumer } from '../offset/offset.utils.js';
-import { PollingStrategy } from './poll.utils.js';
+import type { Id } from '../identifier.utils.js';
+import { Consumer, type ConsumerKindValue } from '../offset/offset.utils.js';
+import { HEADER_SIZE, deferredCancellation, encodeRequestHeader } from '../vsr/header.js';
+import { Operation } from '../vsr/operation.js';
+import { PollingStrategy, type PollingStrategyKindValue } from './poll.utils.js';
+import { MAX_PARTITIONS_PER_REQUEST, MIN_DEFERRED_POLL_MAX_BYTES } from './deferred-poll.utils.js';
+import { POLL_MESSAGES } from './poll-messages.command.js';
 import {
-  FETCH_MESSAGES, decodeFetchSection, fetchMessages, readinessGroups, type FetchMessages
+  FETCH_MESSAGES, FETCH_SECTION_SIZE, decodeFetchSection, fetchMessages, type FetchMessages
 } from './fetch-messages.command.js';
 
-// The golden vectors of the Rust codec for group 7, stream 1 and topic
-// "orders": a 5 s wait within a 6 s timeout, 100 messages of 1 MiB with
-// auto-commit, partition 1 at offset 41 and partition 2 at Next, both fenced
-// at incarnation 3 and owner generation 9.
-const FETCH_BODY = '0201040700000001040100000002066f7264657273404b4c0000000000808d5b0000000000' +
-  '0100000064000000000010000102000000010000000129000000000000000000080003000000000000000900000000000000' +
-  '020000000500000000000000000000080003000000000000000900000000000000';
-// Partition 1 serves "hello" at offset 41 in context (3, 9, 12) with next
-// offset 42, and partition 2 is refused as not the primary.
-const FETCH_REPLY = '020000000100000000000000290000000000000001000000030000000000000009000000000000000c000000000000002a00' +
-  '0000000000003501000002000000590000000000000000000000000000000000000000000000000000000000000000000000' +
-  '000000000000000000000000000000000100000000000000290000000000000064401e18240a060000401e18240a06003501' +
-  '000000000000bd2d787d3cdb745c010000000000000000000000000000000000000000000000000000000000000000000000' +
-  '0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000' +
-  '0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000' +
-  '0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000' +
-  '000000000000000000000000000000000000000000008e5ca59edbbdbfb90100000000000000000000000000000000000000' +
-  '000000000000000005000000000000000000000068656c6c6f';
-// Each golden target asks for 512 KiB. The client gives every target the
-// limit of the whole reply instead, so the server never splits a batch.
-const GOLDEN_TARGET_CAP = 524_288;
-const TARGET_CAP_AT = [67, 100];
+type WireId = { kind: 'numeric' | 'named', value: number | string };
+type WireStrategy = { kind: number, value: number };
+type WireRequest = {
+  consumer: { kind: number, id: WireId },
+  stream_id: WireId,
+  topic_id: WireId,
+  count: number,
+  auto_commit: boolean,
+  wait_us: number,
+  min_count: number,
+  max_bytes: number,
+  request_timeout_us: number
+};
+type WirePoll = WireRequest & { partition_id: number, strategy: WireStrategy };
+type WireFetch = WireRequest & {
+  targets: { partition_id: number, strategy: WireStrategy, max_bytes: number, incarnation: number, owner_generation: number }[]
+};
+type WireSection = {
+  partition_id: number, status: number, current_offset: number, messages_count: number,
+  context: { incarnation: number, owner_generation: number, metadata_op: number },
+  next_offset: number, records_len: number,
+  messages: { offset: number, id: string, timestamp: number, origin_timestamp: number, payload: string }[]
+};
+type Vector<T = object> = T & { case: string, body_hex: string };
+
+const fixture = JSON.parse(readFileSync(new URL('../fixtures/deferred_polling.json', import.meta.url), 'utf8'));
+
+const idOf = ({ value }: WireId): Id => value;
+const strategyOf = ({ kind, value }: WireStrategy): PollingStrategy =>
+  ({ kind: kind as PollingStrategyKindValue, value: BigInt(value) }) as PollingStrategy;
+const consumerOf = ({ consumer }: WireRequest): Consumer =>
+  ({ kind: consumer.kind as ConsumerKindValue, id: idOf(consumer.id) });
+const optionsOf = (request: WireRequest) => ({
+  maxWait: request.wait_us / 1_000,
+  requestTimeout: request.request_timeout_us / 1_000,
+  minCount: request.min_count,
+  maxBytes: request.max_bytes
+});
+const fetchOf = (request: WireFetch): FetchMessages => ({
+  streamId: idOf(request.stream_id),
+  topicId: idOf(request.topic_id),
+  consumer: consumerOf(request),
+  targets: request.targets.map(target => ({
+    partitionId: target.partition_id,
+    pollingStrategy: strategyOf(target.strategy),
+    context: { incarnation: BigInt(target.incarnation), ownerGeneration: BigInt(target.owner_generation), metadataOp: 0n }
+  })),
+  count: request.count,
+  autocommit: request.auto_commit,
+  options: optionsOf(request)
+});
+
+/** The fields of a fetch body, read back so a refused vector can be offered to the encoder. */
+const decodeFetch = (body: Buffer): { request: FetchMessages, targetBytes: number[] } => {
+  let at = 0;
+  const id = (): Id => {
+    const kind = body.readUInt8(at);
+    const length = body.readUInt8(at + 1);
+    const value = kind === 1 ? body.readUInt32LE(at + 2) : body.toString('utf8', at + 2, at + 2 + length);
+    at += 2 + length;
+    return value;
+  };
+  const consumerKind = body.readUInt8(at++) as ConsumerKindValue;
+  const consumer = { kind: consumerKind, id: id() };
+  const streamId = id();
+  const topicId = id();
+  const maxWait = Number(body.readBigUInt64LE(at)) / 1_000;
+  const requestTimeout = Number(body.readBigUInt64LE(at + 8)) / 1_000;
+  const minCount = body.readUInt32LE(at + 16);
+  const count = body.readUInt32LE(at + 20);
+  const maxBytes = body.readUInt32LE(at + 24);
+  const autocommit = body.readUInt8(at + 28) === 1;
+  const targetsCount = body.readUInt32LE(at + 29);
+  at += 33;
+  const targets = Array.from({ length: targetsCount }, (_, index) => {
+    const position = at + index * 33;
+    return {
+      partitionId: body.readUInt32LE(position),
+      pollingStrategy: { kind: body.readUInt8(position + 4), value: body.readBigUInt64LE(position + 5) } as PollingStrategy,
+      maxBytes: body.readUInt32LE(position + 13),
+      context: { incarnation: body.readBigUInt64LE(position + 17), ownerGeneration: body.readBigUInt64LE(position + 25), metadataOp: 0n }
+    };
+  });
+  return {
+    request: {
+      streamId, topicId, consumer, count, autocommit,
+      targets: targets.map(({ partitionId, pollingStrategy, context }) => ({ partitionId, pollingStrategy, context })),
+      options: { maxWait, requestTimeout, minCount, maxBytes }
+    },
+    targetBytes: targets.map(target => target.maxBytes)
+  };
+};
 
 const fence = { incarnation: 3n, ownerGeneration: 9n, metadataOp: 0n };
 const golden: FetchMessages = {
@@ -74,52 +152,130 @@ const refusedWith = (errorCode: number) => (error: unknown): boolean =>
 const targetsOf = (count: number) =>
   Array.from({ length: count }, (_, partitionId) => ({ partitionId, pollingStrategy: PollingStrategy.Next }));
 
+describe('shared wire vectors', () => {
+  it('hold the codes and limits of the client', () => {
+    const { codes, errors, ...limits } = fixture.constants;
+    assert.deepEqual(codes, {
+      cancel_deferred_request: COMMAND_CODE.CancelDeferredRequest,
+      fetch_messages: COMMAND_CODE.FetchMessages,
+      poll_messages: COMMAND_CODE.PollMessages,
+      poll_messages_deferred: COMMAND_CODE.PollMessagesDeferred
+    });
+    assert.deepEqual([errors.partition_lane_blocked, errors.fetch_progress_uncertain],
+      [PARTITION_LANE_BLOCKED, FETCH_PROGRESS_UNCERTAIN]);
+    assert.deepEqual(
+      [limits.min_deferred_poll_max_bytes, limits.max_partitions_per_request, limits.request_header_size,
+        limits.fetch_section_header_size],
+      [MIN_DEFERRED_POLL_MAX_BYTES, MAX_PARTITIONS_PER_REQUEST, HEADER_SIZE, FETCH_SECTION_SIZE]);
+    assert.ok(DEFAULT_MAX_RESPONSE_FRAME_SIZE >= limits.max_record_reply_size);
+  });
+
+  for (const vector of fixture.deferred_polls as Vector<{ request: WirePoll }>[])
+    it(`encodes the deferred poll ${vector.case}`, () => {
+      const { request } = vector;
+      const body = POLL_MESSAGES.serialize({
+        streamId: idOf(request.stream_id),
+        topicId: idOf(request.topic_id),
+        consumer: consumerOf(request),
+        partitionId: request.partition_id,
+        pollingStrategy: strategyOf(request.strategy),
+        count: request.count,
+        autocommit: request.auto_commit,
+        deferred: optionsOf(request)
+      });
+      assert.equal(body.toString('hex'), vector.body_hex);
+    });
+
+  // The client gives every target the limit of the whole reply, since the
+  // server serves a partition only the bytes it holds, so the vectors are
+  // compared with that limit in each target.
+  for (const vector of fixture.fetches as Vector<{ request: WireFetch }>[])
+    it(`encodes the fetch ${vector.case} with the reply limit as each target limit`, () => {
+      const expected = Buffer.from(vector.body_hex, 'hex');
+      const { targetBytes } = decodeFetch(expected);
+      const targetsAt = expected.length - targetBytes.length * 33;
+      targetBytes.forEach((bytes, index) => {
+        assert.equal(bytes, vector.request.targets[index].max_bytes);
+        expected.writeUInt32LE(vector.request.max_bytes, targetsAt + index * 33 + 13);
+      });
+
+      assert.equal(FETCH_MESSAGES.serialize(fetchOf(vector.request)).toString('hex'), expected.toString('hex'));
+    });
+
+  for (const vector of fixture.cancellations as { case: string, cancels_code: number, client: number,
+    request: number, session: number, header_hex: string }[])
+    it(`encodes the cancellation ${vector.case}`, () => {
+      const parked = encodeRequestHeader({
+        size: HEADER_SIZE + 64,
+        client: BigInt(vector.client),
+        request: BigInt(vector.request),
+        operation: Operation.NonReplicated,
+        session: BigInt(vector.session),
+        nonReplicatedCode: vector.cancels_code,
+        context: fence
+      });
+
+      assert.equal(deferredCancellation(parked)?.toString('hex'), vector.header_hex);
+    });
+
+  for (const vector of fixture.fetch_replies as Vector<{ sections: WireSection[] }>[])
+    it(`decodes the fetch reply ${vector.case}`, () => {
+      const sections = FETCH_MESSAGES.deserialize(reply(vector.body_hex));
+
+      assert.deepEqual(sections.map(section => ({ ...section, records: section.records.length })),
+        vector.sections.map(section => ({
+          partitionId: section.partition_id,
+          status: section.status,
+          currentOffset: BigInt(section.current_offset),
+          messagesCount: section.messages_count,
+          context: {
+            incarnation: BigInt(section.context.incarnation),
+            ownerGeneration: BigInt(section.context.owner_generation),
+            metadataOp: BigInt(section.context.metadata_op)
+          },
+          nextOffset: BigInt(section.next_offset),
+          records: section.records_len
+        })));
+      sections.forEach((section, index) => {
+        const messages = section.status === 0 ? decodeFetchSection(section).messages : [];
+        assert.deepEqual(messages.map(({ headers, payload }) => ({
+          offset: headers.offset,
+          id: BigInt(headers.id),
+          timestamp: headers.timestamp.getTime(),
+          originTimestamp: headers.originTimestamp.getTime(),
+          payload: payload.toString()
+        })), vector.sections[index].messages.map(message => ({
+          offset: BigInt(message.offset),
+          id: BigInt(message.id),
+          // Message headers carry a Date, which holds milliseconds.
+          timestamp: Math.floor(message.timestamp / 1_000),
+          originTimestamp: Math.floor(message.origin_timestamp / 1_000),
+          payload: message.payload
+        })));
+        if (section.status !== 0)
+          assert.throws(() => decodeFetchSection(section), (error: unknown) =>
+            refusedWith(section.status)(error) && error instanceof ResponseError && error.fromServer);
+      });
+    });
+
+  for (const vector of fixture.refused.fetch_replies as Vector[])
+    it(`refuses the fetch reply ${vector.case}`, () => {
+      assert.throws(() => FETCH_MESSAGES.deserialize(reply(vector.body_hex)), DeserializeError);
+    });
+
+  // One byte limit goes to every target, so a target above the request limit
+  // cannot be asked for.
+  for (const vector of fixture.refused.fetches as Vector[])
+    it(`refuses the fetch ${vector.case} before anything is sent`, () => {
+      const { request, targetBytes } = decodeFetch(Buffer.from(vector.body_hex, 'hex'));
+      if (targetBytes.some(bytes => bytes > (request.options?.maxBytes ?? 0)))
+        return;
+
+      assert.throws(() => FETCH_MESSAGES.serialize(request), ResponseError);
+    });
+});
+
 describe('fetch encoding', () => {
-  it('encodes the golden fetch body with the reply limit as each target limit', () => {
-    const expected = Buffer.from(FETCH_BODY, 'hex');
-    for (const at of TARGET_CAP_AT) {
-      assert.equal(expected.readUInt32LE(at), GOLDEN_TARGET_CAP);
-      expected.writeUInt32LE(1_048_576, at);
-    }
-    assert.equal(FETCH_MESSAGES.serialize(golden).toString('hex'), expected.toString('hex'));
-  });
-
-  it('decodes the golden fetch reply into its sections', () => {
-    const [served, refused, ...rest] = FETCH_MESSAGES.deserialize(reply(FETCH_REPLY));
-    assert.deepEqual(rest, []);
-    assert.deepEqual({ ...served, records: served.records.length }, {
-      partitionId: 1,
-      status: 0,
-      currentOffset: 41n,
-      messagesCount: 1,
-      context: { incarnation: 3n, ownerGeneration: 9n, metadataOp: 12n },
-      nextOffset: 42n,
-      records: 309
-    });
-    assert.deepEqual({ ...refused, records: refused.records.length }, {
-      partitionId: 2,
-      status: 89,
-      currentOffset: 0n,
-      messagesCount: 0,
-      context: { incarnation: 0n, ownerGeneration: 0n, metadataOp: 0n },
-      nextOffset: 0n,
-      records: 0
-    });
-
-    const polled = decodeFetchSection(served);
-    assert.equal(polled.partitionId, 1);
-    assert.equal(polled.count, 1);
-    assert.deepEqual(polled.context, served.context);
-    assert.equal(polled.messages[0].headers.offset, 41n);
-    assert.equal(polled.messages[0].payload.toString(), 'hello');
-    assert.throws(() => decodeFetchSection(refused), (error: unknown) =>
-      refusedWith(89)(error) && error instanceof ResponseError && error.fromServer);
-  });
-
-  it('decodes a reply without sections', () => {
-    assert.deepEqual(FETCH_MESSAGES.deserialize(reply('00000000')), []);
-  });
-
   it('writes a target without a context with the route context left to the client', () => {
     const body = FETCH_MESSAGES.serialize({ ...golden, targets: [{ partitionId: 1, pollingStrategy: PollingStrategy.Next }] });
     assert.equal(body.subarray(body.length - 16).toString('hex'), '00'.repeat(16));
@@ -190,21 +346,5 @@ describe('fetch encoding', () => {
     assert.deepEqual(await fetchMessages(async () => client)({ ...golden, signal }), []);
     assert.deepEqual(sent.map(({ command, payload, options }) => [command, payload, options]),
       [[COMMAND_CODE.FetchMessages, FETCH_MESSAGES.serialize(golden), { signal }]]);
-  });
-
-  it('asks the client for the readiness groups, and fails with 5 on a client without them', async () => {
-    const signal = new AbortController().signal;
-    const asked: unknown[] = [];
-    const client = {
-      readinessGroups: async (...args: unknown[]) => {
-        asked.push(args);
-        return [[2], [1, 3]];
-      }
-    } as unknown as RawClient;
-    const request = { streamId: 1, topicId: 'orders', partitions: [1, 2, 3], signal };
-    assert.deepEqual(await readinessGroups(async () => client)(request), [[2], [1, 3]]);
-    assert.deepEqual(asked, [[1, 'orders', [1, 2, 3], { signal }]]);
-    await assert.rejects(readinessGroups(async () => ({}) as RawClient)(request),
-      (error: unknown) => error instanceof ResponseError && error.errorCode === 5);
   });
 });

@@ -86,7 +86,7 @@ and its lane. An `operation_uncertain` result remains retained.
 result. `operation_not_retained` does not prove noncommit, so submitting the old
 payload again can duplicate work. A `lane_blocked` ID belongs to an earlier call;
 resolve it before submitting the new request again. Polls are never replayed.
-A poll with `ServerCommitPolicy::OnRead` whose reply is lost fails with
+A poll with `CommitPolicy::OnRead` whose reply is lost fails with
 `fetch_progress_uncertain` and blocks its partition on the client: later polls
 of that partition fail with `partition_lane_blocked` until `AbandonOperation`
 releases the operation that the error names.
@@ -109,10 +109,11 @@ errors from these methods:
 - `CreateTopic`, `UpdateTopic`, and `DeleteTopic`.
 - `CreatePartitions`, `DeletePartitions`, and `DeleteSegments`.
 - `CreateConsumerGroup`, `DeleteConsumerGroup`, `JoinConsumerGroup`, and `LeaveConsumerGroup`.
-- `StoreConsumerOffset`, `StoreConsumerPosition`, and `DeleteConsumerOffset`.
+- `StoreConsumerOffset`, `StoreConsumerPosition`, `DeleteConsumerOffset`, and `DeleteConsumerPosition`.
+- `PollMessages`, `Reader`, and the calls of `PartitionReader`.
 - `GetMetadataChanges`.
 
-Other methods, including reads and `Connect`, `Disconnect`, and `Shutdown`, report errors through the exception message only. C++ and bridge-local argument errors also leave `Code()` and `OperationId()` empty and `Kind()` empty, including for the methods listed above. `GetMetadataChanges` is the exception: it reports every invalid query as `invalid_command`, including one the bridge refuses.
+Other methods, including `Connect`, `Disconnect`, and `Shutdown`, report errors through the exception message only. C++ and bridge-local argument errors also leave `Code()` and `OperationId()` empty and `Kind()` empty, including for the methods listed above. `GetMetadataChanges` is the exception: it reports every invalid query as `invalid_command`, including one the bridge refuses.
 
 Direct generated-bridge callers pass a local `iggy::ffi::ErrorInfo` as the last argument to login/logout, mutations, polls, raw commands, recovery calls, and the metadata change functions. It is reset at entry and populated only when the Rust SDK returns an `IggyError`. Bridge-local argument errors leave it empty, except in the metadata change functions, which record invalid input as `invalid_command`.
 
@@ -127,23 +128,41 @@ The `IggyException(const std::string &, const ffi::ErrorInfo &)` constructor is 
 Concurrent calls on one client are safe. Moving, assigning, or destroying the
 client while any call is in progress is undefined behavior.
 
-Reads go through the generated bridge. `poll_messages` returns one batch of one
-partition for a `PollingStrategy` and `PollOptions`. `default_poll_options()` returns
-the defaults, which do not wait. To read on after a batch, pass its `continuation()`
-to the `poll_messages` overload that takes a `Continuation`. A continuation belongs to
-the partition of its batch. To store the position after a message, pass the
-`checkpoint()` or `checkpoint_at(index)` of its batch to `store_consumer_position` or
-`IggyBlockingClient::StoreConsumerPosition`. `Checkpoint` and `Continuation` are opaque
-Rust types. Only a polled batch or a read error makes them, so a caller cannot change
-the partition context that they keep.
+`IggyBlockingClient::PollMessages` reads one batch of one partition for a `PollingStrategy` and `PollOptions`, and its overload that takes a `Continuation` reads on after a batch. A default `PollOptions` reads up to 1000 messages and 1 MiB and does not wait. A continuation belongs to the partition of its batch.
 
-`Client::reader` builds a `PartitionReader` with routing and prefetch. `next` waits up to
-its timeout. If the time runs out, it returns an empty batch. `commit` stores a
-checkpoint that the reader delivered. `seek` moves a partition to a `PollingStrategy`,
-or to a `Continuation` of that partition. After a message that does not decode, the
-`skip` of `ReadErrorInfo` holds one continuation past it. `close` stops the reader, and
-a second `close` does nothing. A consumer group reader joins its group in
-`Client::reader` and leaves it in `close`.
+`PolledMessages::Checkpoint()` and `CheckpointAt(index)` name the position after a delivered message. Pass one to `StoreConsumerPosition` to store it, or to `DeleteConsumerPosition` to delete the stored offset of its partition. Only a polled batch or a read error makes a `Checkpoint` or a `Continuation`, so a caller cannot change the partition context that they keep.
+
+`PollOptions::SetCommit` says when offsets are stored: `CommitPolicy::Manual` (the default) stores nothing, `CommitPolicy::OnRead` makes the server store the offset of each read, and `CommitPolicy::Auto` makes a reader store the latest counted position as its `AutoCommit` says. `SetAutoCommit` sets `Auto` with an interval, a `CommitEvery` event and a `CommitAfter` point. A default `AutoCommit` stores every 10,000 messages or every 5 s, after processing. A one-shot poll refuses `Auto`.
+
+```cpp
+auto reader = client.Reader(iggy::Consumer::Single(iggy::Identifier::Numeric(1)), stream, topic,
+                            iggy::ReaderOptions().SetPartitions({0}).SetPollOptions(
+                                iggy::PollOptions().SetAutoCommit(iggy::AutoCommit())));
+while (auto batch = reader.Next(std::chrono::seconds(1))) {
+    for (const auto &message : batch->Messages()) {
+        process(message);
+    }
+}
+reader.Close();
+```
+
+`IggyBlockingClient::Reader` builds a `PartitionReader` with routing and prefetch:
+
+- `Next` waits up to its timeout and returns `std::nullopt` when the time runs out.
+- `Commit` stores a checkpoint that the reader delivered, and under `CommitPolicy::Auto` `Mark` counts one for the policy to store.
+- `Seek` moves a partition to a `PollingStrategy`, or to a `Continuation` of that partition.
+- A failed read throws `ReadException`, which names its partition. After a message that does not decode, its `Skip()` holds the continuation past it.
+- `Close` stops the reader, and a second `Close` does nothing. Destroying a reader without `Close` moves no offset back and does not leave the group.
+
+A consumer group reader joins its group in `Reader` and leaves it in `Close`.
+
+`IggyBlockingClient::StandaloneConsumer` and `GroupConsumer` build an `IggyConsumer`, which hands over one `ReceivedMessage` at a time through a reader, with the commit policy of the `PollOptions` of its `ConsumerOptions`. A standalone consumer reads the partitions of its options. A group consumer creates its group when it is missing, joins it, and leaves it in `Close`.
+
+`IggyConsumer::Next` returns `std::nullopt` when its timeout runs out, and under `CommitAfter::Processing` it counts the message handed over before. `Close` stores as the commit policy says.
+
+`IggyBlockingClient::StartPollMessages` runs the poll of `PollMessages` in the background and returns a `PendingPoll` at once. `Wait` returns its batch, or `std::nullopt` while the poll still runs, and `Cancel` drops the request, which cancels a parked deferred poll on the server. Destroying a `PendingPoll` cancels it. A parked poll holds its connection, so start it on a client that sends nothing else meanwhile.
+
+The generated bridge offers the same reads as `Client::poll_messages` and `Client::reader`, with `default_poll_options()` and a `ReadErrorInfo` for the errors of `next`.
 
 `StoreConsumerOffset` and `DeleteConsumerOffset` require an explicit partition on
 TCP, QUIC, and WebSocket; an absent partition returns `invalid_identifier`.

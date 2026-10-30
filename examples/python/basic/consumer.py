@@ -20,12 +20,12 @@ import asyncio
 from typing import NamedTuple
 
 from apache_iggy import (
+    CommitPolicy,
     Consumer,
     IggyClient,
     PollingStrategy,
     PollOptions,
     ReceiveMessage,
-    ServerCommitPolicy,
 )
 from loguru import logger
 
@@ -86,7 +86,7 @@ async def consume_messages(client: IggyClient):
                 polling_strategy=PollingStrategy.Next(),
                 options=PollOptions(
                     count=messages_per_batch,
-                    server_commit=ServerCommitPolicy.OnRead,
+                    commit=CommitPolicy.OnRead(),
                 ),
             )
             if not polled.messages:

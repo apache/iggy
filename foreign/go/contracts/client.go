@@ -28,7 +28,7 @@ type Client interface {
 
 	// ResolveOperation replays a retained mutation until its final result or ctx deadline.
 	// A retained committing fetch returns FetchProgressUncertain without I/O and
-	// stays blocked until explicit AbandonOperation; its ID is not a replay receipt.
+	// stays blocked until explicit AbandonOperation. Its ID is not a replay receipt.
 	// The client keeps the last outcomes that its replays proved, as many as the operation
 	// limit of tcp.WithPendingOperations, also across a session reset. So a later call for
 	// the same operation returns that outcome without a request. ierror.OperationNotRetained
@@ -143,133 +143,40 @@ type Client interface {
 		messages []IggyMessage,
 	) (*SendMessagesResponse, error)
 
-	// PollMessages poll given amount of messages using the specified consumer and strategy from the specified stream and topic by unique IDs or names.
-	// Authentication is required, and the permission to poll the messages.
+	// PollMessages reads one partition with the limits and the commit policy
+	// of options. The server waits up to options.MaxWait for options.MinCount
+	// messages and returns at most options.Count messages and options.MaxBytes
+	// of records. A first message larger than MaxBytes comes alone in the
+	// reply. A Last poll of more than one message whose first message is
+	// larger than MaxBytes fails with ierror.ErrInvalidSizeBytes. The call
+	// ends after options.RequestTimeout or the deadline of ctx.
 	//
-	// Clustered polls use persistent partition-primary connections while the
-	// coordinator retains group membership. Only explicit refusal before
-	// admission is retried. ErrTransientNotCommitted, or cancellation after
-	// sending an auto-commit poll, can mean the offset advanced without a reply.
-	// These polls are never replayed automatically after an unknown outcome.
-	// Servers must support primary routing and consumer-session attachment.
+	// With CommitOnRead the server stores the offset of the last message it
+	// returns as part of the read. When ctx is cancelled, the SDK cancels the
+	// poll on the server and waits for its one reply: refused with
+	// ierror.ErrTransientNotAccepted when the cancel won and nothing was
+	// stored, or with what it read and stored. A reply that the connection
+	// loses ends the call with ierror.FetchProgressUncertain: the server can
+	// have stored the offset, and the next Next poll starts after it.
+	// CommitAuto is refused with ierror.ErrInvalidConfiguration, because one
+	// poll has nothing to count. A partition reader counts and stores it.
 	//
-	// Without a caller-supplied partition context, a poll stamps the context
-	// of a cached route. After another client deleted and recreated the
-	// partition, one such poll can fail with ErrHistoryUnavailable, or with
-	// ErrConsumerGroupPartitionNotOwned for a consumer group that names the
-	// partition. The SDK drops the failed route and does not retry the poll.
-	// The next call routes again.
-	//
-	// A group poll that names no partition is orchestrated client-side and
-	// has three outcomes:
-	//   - err == nil with PartitionId == NoAssignedPartition and an empty
-	//     batch: nothing to read right now, poll again. This covers a member
-	//     that owns no partition and a rebalance still settling.
-	//   - ErrConsumerGroupMemberNotFound: the client is not a member, for
-	//     example after an explicit LeaveConsumerGroup. JoinConsumerGroup
-	//     restores membership.
-	//   - err == nil with a real partition id: the poll completed; the batch may be empty.
+	// A continuation of another partition, from PolledMessage.Continuation,
+	// is refused with ierror.ErrInvalidCommand. The client holds at most 64
+	// deferred polls at once, and a call waits for a free slot within its
+	// deadline.
 	//
 	// Uncompressed payloads and user headers alias the reply buffer; copy
-	// those bytes to retain only the message you need. S2 decompression
-	// allocates a separate payload buffer.
+	// those bytes to retain only the message you need.
 	PollMessages(
 		ctx context.Context,
 		streamId Identifier,
 		topicId Identifier,
+		partitionId uint32,
 		consumer Consumer,
 		strategy PollingStrategy,
-		count uint32,
-		autoCommit bool,
-		partitionId *uint32,
+		options PollOptions,
 	) (*PolledMessage, error)
-
-	// PollMessagesDeferred is PollMessages, but the server holds the poll
-	// until options.MinCount messages are ready, until options.MaxBytes
-	// stops it from selecting more, or until options.MaxWait passes. Then it
-	// reads what it has, possibly nothing. Options that the server refuses
-	// fail before anything is sent.
-	//
-	// options.RequestTimeout bounds the call with its retries instead of the
-	// default operation timeout, and a call that reaches it fails instead of
-	// returning an empty batch. A ctx deadline that comes first shortens the
-	// wait, so that the server answers before it. When ctx ends while the
-	// server holds the poll, the SDK cancels it on the server. The client
-	// holds at most 64 deferred polls and fetches at once,
-	// and a call waits for a free slot within its deadline.
-	//
-	// A group poll must name its partition, else it fails with
-	// ierror.ErrInvalidCommand before anything is sent. ReadinessGroups
-	// and FetchMessages read the whole assignment.
-	PollMessagesDeferred(
-		ctx context.Context,
-		streamId Identifier,
-		topicId Identifier,
-		consumer Consumer,
-		strategy PollingStrategy,
-		count uint32,
-		autoCommit bool,
-		partitionId *uint32,
-		options DeferredPollOptions,
-	) (*PolledMessage, error)
-
-	// FetchMessages reads targets, the partitions of one group of
-	// ReadinessGroups, in one deferred request to their primary. The server
-	// holds it until the targets hold options.MinCount messages or until
-	// options.MaxWait passes. Then it reads at most count messages and
-	// options.MaxBytes record bytes over all targets, and each target takes
-	// up to options.MaxBytes. With autoCommit, the server stores the offset
-	// of each read. A fetch without autoCommit sets count to the messages
-	// that its caller has room for, and a fetch with it to its batch size,
-	// because count bounds what a crash loses.
-	//
-	// It returns a section for each target that the server read or refused,
-	// in reply order. A target without a section keeps its position. The
-	// next fetch of a partition reads from Offset(NextOffset) of its section
-	// with the section Context. The server can refuse the whole fetch or a
-	// section with ierror.ErrNotPrimary, ierror.ErrHistoryUnavailable,
-	// ierror.ErrConsumerGroupPartitionNotOwned or a missing stream, topic or
-	// partition. Then the next ReadinessGroups and the next fetch look up the
-	// routes of those partitions again. A partition that lost its history
-	// continues without a Context, so that the fetch takes the incarnation of
-	// its new route.
-	//
-	// options.RequestTimeout bounds the call with its retries, and it must
-	// exceed one second at microsecond wire precision, even with a zero wait,
-	// to leave time for local setup. A positive wait also requires at least
-	// MinDeferredPollReplyMargin between MaxWait and RequestTimeout.
-	// A fetch with autoCommit or a Next target holds the progress of
-	// each of its partitions as a progress poll does, and it is never sent
-	// again after a lost reply. A retained operation that blocks a target
-	// returns ierror.PartitionLaneBlocked with its partition and operation ID.
-	// An unknown autoCommit outcome retains affected progress lanes and reports
-	// ierror.FetchProgressUncertain. Partial replies keep healthy sections usable;
-	// only uncertain sections retain blocks. ResolveOperation never replays a
-	// fetch. AbandonOperation explicitly accepts uncertainty and removes its local
-	// blocks, without stopping the original server read.
-	// A fetch with autoCommit is never cancelled:
-	// a cancel after its read drops what it stored. So once it is sent, the
-	// call waits for the reply until its deadline, also after ctx is
-	// cancelled, and Close waits for it. When ctx of any other fetch ends
-	// while the server holds it, the SDK cancels it on the server. A fetch
-	// takes one deferred slot. It takes 1 to MaxPartitionsPerRequest targets
-	// with distinct partition ids.
-	FetchMessages(
-		ctx context.Context,
-		streamId Identifier,
-		topicId Identifier,
-		consumer Consumer,
-		targets []FetchMessagesTarget,
-		count uint32,
-		autoCommit bool,
-		options DeferredPollOptions,
-	) ([]FetchMessagesSection, error)
-
-	// ReadinessGroups groups partitions by their primary, in ascending
-	// primary id order, and keeps the order of partitions within a group. A
-	// group holds at most MaxPartitionsPerRequest partitions, so each group
-	// fits one FetchMessages.
-	ReadinessGroups(ctx context.Context, streamId Identifier, topicId Identifier, partitions []uint32) ([][]uint32, error)
 
 	// StoreConsumerOffset store the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to poll the messages.
@@ -329,6 +236,8 @@ type Client interface {
 		topicId Identifier,
 		partitionId *uint32,
 	) error
+
+	DeleteConsumerPosition(ctx context.Context, consumer Consumer, streamId Identifier, topicId Identifier, position ConsumerPosition) error
 
 	// GetConsumerGroup get the info about a specific consumer group by unique ID or name for the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to read the streams or topics.

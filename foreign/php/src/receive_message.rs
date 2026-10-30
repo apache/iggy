@@ -284,7 +284,7 @@ impl PollingStrategy {
     }
 }
 
-// The SDK message has no Clone; its payload and headers are reference counted.
+// The SDK message has no Clone. Its payload and headers are reference counted.
 fn copy_message(message: &RustReceiveMessage) -> RustReceiveMessage {
     RustReceiveMessage {
         header: IggyMessageHeader {

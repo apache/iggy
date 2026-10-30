@@ -35,7 +35,7 @@ namespace Apache.Iggy.Contracts;
 ///     header and one message header. A record wider than <see cref="MaxBytes" /> fails with status 80
 ///     (InvalidSizeBytes) and is not read.
 /// </remarks>
-public sealed record DeferredPollOptions
+internal sealed record DeferredPollOptions
 {
     internal const ulong REPLY_MARGIN_US = 1_000_000;
 
@@ -48,6 +48,9 @@ public sealed record DeferredPollOptions
     private const ulong MaxWaitLimitUs = 600_000_000;
     private const ulong RequestTimeoutHeadroomUs = 30_000_000;
     private const ulong MaxRequestTimeoutUs = MaxWaitLimitUs + RequestTimeoutHeadroomUs;
+
+    /// <summary>The longest <see cref="RequestTimeout" /> a deferred poll accepts.</summary>
+    internal static readonly TimeSpan MaxRequestTimeout = FromMicros(MaxRequestTimeoutUs);
 
     /// <summary>The header of a poll reply: the partition, its current offset, the count and the context.</summary>
     internal const int POLL_REPLY_HEADER_SIZE =

@@ -41,13 +41,13 @@ from testcontainers.core.container import DockerContainer
 from testcontainers.core.waiting_utils import wait_for_logs
 
 from apache_iggy import (
+    CommitPolicy,
     Consumer,
     IggyClient,
     MetadataChangeGroup,
     MetadataChangeKind,
     PollingStrategy,
     PollOptions,
-    ServerCommitPolicy,
 )
 from apache_iggy import SendMessage as Message
 
@@ -161,7 +161,7 @@ class TestTlsConnectivity:
             consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
-            options=PollOptions(count=10, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
         )
         assert len(polled.messages) >= len(test_messages)
 

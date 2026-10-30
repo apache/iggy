@@ -725,7 +725,7 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
                 &PollingStrategy::next(),
                 PollOptions {
                     count: batch_size,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )

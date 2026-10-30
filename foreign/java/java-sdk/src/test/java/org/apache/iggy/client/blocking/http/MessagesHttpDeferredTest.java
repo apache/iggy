@@ -31,7 +31,9 @@ import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.CommitPolicy;
 import org.apache.iggy.message.DeferredPollOptions;
+import org.apache.iggy.message.PollOptions;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.partition.PartitionContext;
@@ -176,7 +178,8 @@ class MessagesHttpDeferredTest {
     void shouldDiscardARefusedBodyInsteadOfWaitingForTheRest() throws Exception {
         var release = new CountDownLatch(1);
         var peer = new FakePeer(exchange -> {
-            exchange.sendResponseHeaders(200, 1024 * 1024);
+            exchange.sendResponseHeaders(
+                    200, Math.multiplyExact(DeferredPollOptions.MAX_RECORD_POLL_REPLY_SIZE, 16L) + 1);
             OutputStream body = exchange.getResponseBody();
             body.write(new byte[8 * 1024]);
             body.flush();
@@ -232,6 +235,45 @@ class MessagesHttpDeferredTest {
                         .isLessThan(options.requestTimeout().plus(DEADLINE_SLACK));
             } finally {
                 release.countDown();
+            }
+        }
+    }
+
+    @Test
+    void shouldEndAPollWaitingForItsHeadersWhenTheCallerIsInterrupted() throws Exception {
+        var arrived = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var peer = new FakePeer(exchange -> {
+            arrived.countDown();
+            hold(release, STALL);
+        });
+        Thread caller = Thread.currentThread();
+        var interrupter = Executors.newSingleThreadExecutor();
+        try (var server = peer.start();
+                var client = client(peer)) {
+            try {
+                interrupter.execute(() -> {
+                    hold(arrived, STALL);
+                    caller.interrupt();
+                });
+                var options = DeferredPollOptions.defaults()
+                        .withMaxWait(Duration.ofSeconds(10))
+                        .withRequestTimeout(Duration.ofSeconds(11));
+                long startNanos = System.nanoTime();
+
+                assertThatThrownBy(() -> poll(client, Consumer.of(3L), options))
+                        .isInstanceOf(IggyServerException.class)
+                        .extracting(error -> ((IggyServerException) error).getErrorCode())
+                        .isEqualTo(IggyErrorCode.TRANSIENT_NOT_COMMITTED);
+
+                assertThat(Duration.ofNanos(System.nanoTime() - startNanos))
+                        .as("an interrupt ends the wait long before the request timeout")
+                        .isLessThan(Duration.ofSeconds(2));
+                assertThat(caller.isInterrupted()).isTrue();
+            } finally {
+                Thread.interrupted();
+                release.countDown();
+                interrupter.shutdownNow();
             }
         }
     }
@@ -336,7 +378,7 @@ class MessagesHttpDeferredTest {
     }
 
     @Test
-    void shouldReportALostAutoCommitReplyAsNotCommittedWithoutRetrying() throws Exception {
+    void shouldReportALostCommittingReplyAsUncertainProgressWithoutRetrying() throws Exception {
         var peer = new FakePeer(HttpExchange::close);
         try (var server = peer.start();
                 var client = client(peer)) {
@@ -353,9 +395,59 @@ class MessagesHttpDeferredTest {
                     .isInstanceOf(IggyServerException.class)
                     .hasCauseInstanceOf(IOException.class)
                     .extracting(error -> ((IggyServerException) error).getErrorCode())
-                    .isEqualTo(IggyErrorCode.TRANSIENT_NOT_COMMITTED);
-            assertThat(peer.queries).hasSize(1);
+                    .isEqualTo(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN);
+            assertThat(peer.methods).containsExactly("POST");
             assertThat(peer.queries.get(0).get("auto_commit")).isEqualTo("true");
+        }
+    }
+
+    @ParameterizedTest(name = "on read={0}")
+    @ValueSource(booleans = {false, true})
+    void shouldSendAPollOfOnePartitionWithItsOptionsAndPostItWhenItStores(boolean onRead) throws Exception {
+        var peer = new FakePeer(exchange -> respond(exchange, 200, EMPTY_POLL));
+        try (var server = peer.start();
+                var client = client(peer)) {
+            var options = PollOptions.waitFor(Duration.ofSeconds(2))
+                    .withCount(7)
+                    .withMinCount(2)
+                    .withMaxBytes(4096)
+                    .withCommit(onRead ? CommitPolicy.onRead() : CommitPolicy.manual());
+
+            client.messages()
+                    .pollMessages(
+                            StreamId.of(1L), TopicId.of(1L), 0L, Consumer.of(3L), PollingStrategy.next(), options);
+
+            assertThat(peer.methods).containsExactly(onRead ? "POST" : "GET");
+            assertThat(peer.paths).containsExactly("/streams/1/topics/1/messages/deferred");
+            Map<String, String> query = peer.queries.get(0);
+            assertThat(query.get("auto_commit")).isEqualTo(Boolean.toString(onRead));
+            assertThat(query.get("count")).isEqualTo("7");
+            assertThat(query.get("min_count")).isEqualTo("2");
+            assertThat(query.get("max_bytes")).isEqualTo("4096");
+            assertThat(Long.parseLong(query.get("request_timeout_us")))
+                    .isGreaterThan(Long.parseLong(query.get("wait_us")) + 9_000_000L);
+        }
+    }
+
+    @Test
+    void shouldRefuseAnAutomaticCommitOfOnePollWithoutReachingTheServer() throws Exception {
+        var peer = new FakePeer(exchange -> respond(exchange, 200, EMPTY_POLL));
+        try (var server = peer.start();
+                var client = client(peer)) {
+            var options = PollOptions.defaults().withCommit(CommitPolicy.auto());
+
+            assertThatThrownBy(() -> client.messages()
+                            .pollMessages(
+                                    StreamId.of(1L),
+                                    TopicId.of(1L),
+                                    0L,
+                                    Consumer.of(3L),
+                                    PollingStrategy.next(),
+                                    options))
+                    .isInstanceOf(IggyServerException.class)
+                    .extracting(error -> ((IggyServerException) error).getErrorCode())
+                    .isEqualTo(IggyErrorCode.INVALID_CONFIGURATION);
+            assertThat(peer.paths).isEmpty();
         }
     }
 
@@ -437,18 +529,11 @@ class MessagesHttpDeferredTest {
         }
     }
 
+    /** A first message larger than the byte limit comes alone, so the bound holds one of the largest size. */
     @Test
     void shouldRefuseABodyLargerThanTheDeclaredBound() throws Exception {
-        var peer = new FakePeer(exchange -> {
-            // Chunked, so the bound has to hold while the body is read.
-            exchange.sendResponseHeaders(200, 0);
-            try (OutputStream body = exchange.getResponseBody()) {
-                byte[] chunk = new byte[8 * 1024];
-                for (int written = 0; written < 1024 * 1024; written += chunk.length) {
-                    body.write(chunk);
-                }
-            }
-        });
+        long beyondBound = Math.multiplyExact(DeferredPollOptions.MAX_RECORD_POLL_REPLY_SIZE, 16L) + 1;
+        var peer = new FakePeer(exchange -> exchange.sendResponseHeaders(200, beyondBound));
         try (var server = peer.start();
                 var client = client(peer)) {
             var options = DeferredPollOptions.defaults().withMaxBytes(1024);
@@ -496,6 +581,7 @@ class MessagesHttpDeferredTest {
 
     private static final class FakePeer implements HttpHandler {
         private final List<String> paths = new CopyOnWriteArrayList<>();
+        private final List<String> methods = new CopyOnWriteArrayList<>();
         private final List<Map<String, String>> queries = new CopyOnWriteArrayList<>();
         private final HttpHandler handler;
         private int port;
@@ -520,6 +606,7 @@ class MessagesHttpDeferredTest {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             paths.add(exchange.getRequestURI().getPath());
+            methods.add(exchange.getRequestMethod());
             queries.add(parseQuery(exchange.getRequestURI().getRawQuery()));
             try {
                 handler.handle(exchange);

@@ -26,6 +26,7 @@ import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.message.PollOptions;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
@@ -33,7 +34,6 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -66,16 +66,13 @@ class DeferredPollCompatibilityTest {
                         false,
                         DeferredPollOptions.defaults()))
                 .isInstanceOf(IggyOperationNotSupportedException.class);
-        assertThatThrownBy(() -> client.readinessGroups(StreamId.of(1L), TopicId.of(1L), List.of(0L)))
-                .isInstanceOf(IggyOperationNotSupportedException.class);
-        assertThatThrownBy(() -> client.fetchMessages(
+        assertThatThrownBy(() -> client.pollMessages(
                         StreamId.of(1L),
                         TopicId.of(1L),
-                        Map.of(0L, PollingStrategy.next()),
+                        0L,
                         Consumer.of(0L),
-                        10L,
-                        false,
-                        DeferredPollOptions.defaults()))
+                        PollingStrategy.next(),
+                        PollOptions.defaults()))
                 .isInstanceOf(IggyOperationNotSupportedException.class);
         assertThat(client.immediatePolls).isZero();
     }
@@ -96,18 +93,13 @@ class DeferredPollCompatibilityTest {
                         .get())
                 .isInstanceOf(ExecutionException.class)
                 .hasCauseInstanceOf(IggyOperationNotSupportedException.class);
-        assertThatThrownBy(() -> client.readinessGroups(StreamId.of(1L), TopicId.of(1L), List.of(0L))
-                        .get())
-                .isInstanceOf(ExecutionException.class)
-                .hasCauseInstanceOf(IggyOperationNotSupportedException.class);
-        assertThatThrownBy(() -> client.fetchMessages(
+        assertThatThrownBy(() -> client.pollMessages(
                                 StreamId.of(1L),
                                 TopicId.of(1L),
-                                Map.of(0L, PollingStrategy.next()),
+                                0L,
                                 Consumer.of(0L),
-                                10L,
-                                false,
-                                DeferredPollOptions.defaults())
+                                PollingStrategy.next(),
+                                PollOptions.defaults())
                         .get())
                 .isInstanceOf(ExecutionException.class)
                 .hasCauseInstanceOf(IggyOperationNotSupportedException.class);

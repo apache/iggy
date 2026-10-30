@@ -69,25 +69,6 @@ final class PollRouter: Sendable {
         var users = 0
     }
 
-    final class FetchAttempt: Sendable {
-        let id: UInt128Value
-        private let possibleSend = NIOLockedValueBox(false)
-
-        init(id: UInt128Value) {
-            self.id = id
-        }
-
-        var mayHaveCommitted: Bool { possibleSend.withLockedValue { $0 } }
-
-        func sent() { possibleSend.withLockedValue { $0 = true } }
-        func refused() { possibleSend.withLockedValue { $0 = false } }
-    }
-
-    private struct FetchRetention {
-        var keys: [ProgressKey]
-        var blocked = false
-    }
-
     /// What a routed request carries.
     enum Body: Sendable {
         case fixed([UInt8])
@@ -97,8 +78,8 @@ final class PollRouter: Sendable {
             if case .deferred = self { true } else { false }
         }
 
-        var fetchAttempt: FetchAttempt? {
-            if case .deferred(let deferred) = self { deferred.fetchAttempt } else { nil }
+        var commits: Bool {
+            if case .deferred(let deferred) = self { deferred.commits } else { false }
         }
 
         /// The body of one attempt. A deferred request carries what is left
@@ -119,7 +100,9 @@ final class PollRouter: Sendable {
     struct Deferred: Sendable {
         let options: DeferredPollOptions
         let started: ContinuousClock.Instant
-        var fetchAttempt: FetchAttempt? = nil
+        /// The server stores the offsets of what it reads, so a cancellation
+        /// waits for the one reply that says whether it did.
+        var commits = false
         let encode: @Sendable (DeferredPollOptions) throws -> [UInt8]
 
         /// The request timeout bounds the whole call, routing and retries
@@ -173,8 +156,6 @@ final class PollRouter: Sendable {
         var deferredSlots: [String: [Slot]] = [:]
         // A session reset must not release progress still held by an older call.
         var progressLanes: [ProgressKey: ProgressLane] = [:]
-        var fetches: [UInt128Value: FetchRetention] = [:]
-        var blockedProgress: [ProgressKey: UInt128Value] = [:]
         var nextHeartbeat: ContinuousClock.Instant?
     }
 
@@ -233,9 +214,6 @@ final class PollRouter: Sendable {
             throw IggyError(.transientNotAccepted, context: "progress requires a resolved partition incarnation")
         }
         let semaphores = try state.withLockedValue { state in
-            if let blocked = Self.blockedProgress(keys, in: state) {
-                throw blocked
-            }
             let added = keys.reduce(0) { $0 + (state.progressLanes[$1] == nil ? 1 : 0) }
             guard added <= Self.maxProgressLanes - state.progressLanes.count else {
                 throw IggyError(.transientNotAccepted, context: "the concurrent progress partition limit was reached")
@@ -267,91 +245,11 @@ final class PollRouter: Sendable {
             }
             acquired += 1
         }
-        if let blocked = state.withLockedValue({ Self.blockedProgress(keys, in: $0) }) {
-            throw blocked
-        }
         try Task.checkCancellation()
         guard ContinuousClock.now < deadline else {
             throw IggyError(.transientNotAccepted, context: "the request deadline passed before partition progress")
         }
         return try await operation()
-    }
-
-    func reserveFetch(_ keys: [ProgressKey]) throws -> FetchAttempt {
-        try state.withLockedValue { state in
-            guard state.fetches.count < Self.maxDeferredRequests else {
-                throw IggyError(.transientNotAccepted, context: "the retained fetch limit was reached")
-            }
-            var id = UInt128Value.random()
-            while state.fetches[id] != nil {
-                id = .random()
-            }
-            state.fetches[id] = FetchRetention(keys: keys)
-            return FetchAttempt(id: id)
-        }
-    }
-
-    func releaseFetch(_ attempt: FetchAttempt) {
-        state.withLockedValue { state in
-            if state.fetches[attempt.id]?.blocked == false {
-                state.fetches.removeValue(forKey: attempt.id)
-            }
-        }
-    }
-
-    func retainFetch(_ attempt: FetchAttempt, keys: [ProgressKey], cause: String? = nil) -> IggyError {
-        state.withLockedValue { state in
-            state.fetches[attempt.id] = FetchRetention(keys: keys, blocked: true)
-            for key in keys {
-                state.blockedProgress[key] = attempt.id
-            }
-        }
-        return IggyError(.fetchProgressUncertain, context: cause, operationID: attempt.id)
-    }
-
-    func hasUncertainFetch(_ id: UInt128Value) -> Bool {
-        state.withLockedValue { $0.fetches[id]?.blocked == true }
-    }
-
-    func progressRefusal(partitionID: UInt32, incarnation: UInt64) -> IggyError? {
-        state.withLockedValue { Self.blockedProgress([ProgressKey(partitionID: partitionID, incarnation: incarnation)], in: $0) }
-    }
-
-    func abandonFetch(_ id: UInt128Value) throws {
-        try state.withLockedValue { state in
-            guard let retained = state.fetches[id], retained.blocked else {
-                throw IggyError(.operationNotRetained, operationID: id)
-            }
-            for key in retained.keys where state.blockedProgress[key] == id {
-                state.blockedProgress.removeValue(forKey: key)
-            }
-            state.fetches.removeValue(forKey: id)
-        }
-    }
-
-    private static func blockedProgress(_ keys: [ProgressKey], in state: State) -> IggyError? {
-        for key in keys {
-            if let operationID = state.blockedProgress[key] {
-                return IggyError(.partitionLaneBlocked, operationID: operationID, partitionID: key.partitionID)
-            }
-        }
-        return nil
-    }
-
-    static func fetchRefused(_ code: IggyErrorCode) -> Bool {
-        switch code {
-        case .featureUnavailable, .invalidIdentifier, .transientNotAccepted, .historyUnavailable, .notPrimary, .deferredPollCapacityExceeded,
-            .streamIdNotFound, .streamNameNotFound, .topicIdNotFound, .topicNameNotFound, .partitionNotFound, .invalidOffset, .consumerGroupPartitionNotOwned:
-            true
-        default: false
-        }
-    }
-
-    static func fetchSectionRefused(_ code: IggyErrorCode) -> Bool {
-        switch code {
-        case .invalidSizeBytes, .historyUnavailable, .notPrimary, .consumerGroupPartitionNotOwned: true
-        default: false
-        }
     }
 
     func progressContext(
@@ -390,7 +288,9 @@ final class PollRouter: Sendable {
     /// node too, as its wait would hold a lockstep connection. It holds one of
     /// ``maxDeferredRequests`` leases across its attempts, waited for until
     /// `deadline`. A cancelled caller sends command 108 after a request that
-    /// is parked, so the server drops it, and the connection stays usable.
+    /// is parked, so the server drops it, and the connection stays usable. A
+    /// committing request answers the cancellation once, so its caller waits
+    /// for that reply.
     func send(
         _ code: CommandCode, body: Body, key: RouteKey, context: PartitionContext?, lineage: UInt64, coordinator: ClientCore,
         deadline: ContinuousClock.Instant
@@ -428,9 +328,6 @@ final class PollRouter: Sendable {
                 }
                 return try await sendOnCoordinator(request, context: &captured, replay: &replay, coordinator: coordinator)
             } catch let error as IggyError {
-                if body.fetchAttempt?.mayHaveCommitted == true {
-                    throw error
-                }
                 let reconnects =
                     replay.outcome.isUncertain && error.isConnectionLoss && error.code != .staleClient
                     && coordinator.configuration.reconnection.enabled
@@ -823,9 +720,6 @@ final class PollRouter: Sendable {
                 }
                 if replay.outcome.isUncertain { throw error }
             }
-            if body.fetchAttempt?.mayHaveCommitted == true {
-                throw error
-            }
             throw Self.gradedLoss(ClientCore.graded(error), on: endpoint)
         }
     }
@@ -912,12 +806,10 @@ final class PollRouter: Sendable {
         while true {
             let raw: RawFrame
             do {
-                body.fetchAttempt?.sent()
-                raw = try await connection.exchange(request.bytes, timeout: replayDeadline - .now, cancellation: request.deferredCancellation)
+                raw = try await connection.exchange(
+                    request.bytes, timeout: replayDeadline - .now,
+                    cancellation: request.deferredCancellation.map { DeferredCancellation(frame: $0, isAnswered: body.commits) })
             } catch let lost as IggyError {
-                if lost.code == .notConnected || lost.code == .cannotEstablishConnection {
-                    body.fetchAttempt?.refused()
-                }
                 guard replay.outcome.isUncertain else {
                     throw lost
                 }
@@ -938,8 +830,9 @@ final class PollRouter: Sendable {
                 }
                 answer = IggyError(.transientNotCommitted, context: "the reply does not prove the earlier attempt committed")
             } catch let refusal as IggyError {
-                if VSRFrame.peekCommand(header) == .reply, VSRFrame.readReplyStatus(header) == refusal.rawCode, Self.fetchRefused(refusal.code) {
-                    body.fetchAttempt?.refused()
+                if body.commits, refusal.code == .transientNotAccepted, Task.isCancelled {
+                    // The cancellation won, so the server stored nothing.
+                    throw CancellationError()
                 }
                 if VSRFrame.peekCommand(header) == .eviction, refusal.code == .staleClient {
                     // As on the coordinator, a stale client eviction ends only
@@ -955,6 +848,11 @@ final class PollRouter: Sendable {
                 }
                 answer = refusal
             }
+            coordinator.logger.debug(
+                "The data connection refused the request",
+                metadata: [
+                    "code": "\(code)", "request_id": "\(request.requestID)", "error": "\(answer)", "metadata_watermark": "\(identity.metadataWatermark)",
+                ])
             if answer.code == .notPrimary, !VSRFrame.hasCommittedResult(header) {
                 throw answer
             }

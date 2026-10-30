@@ -55,6 +55,9 @@ const (
 // the Rust SDK.
 const readinessLookups = 16
 
+// FetchMessages reads the partitions of one primary in one request, as a
+// reader reads one readiness group. Read partitions with reader.PartitionReader,
+// which groups them, keeps their positions and recovers lost replies.
 func (c *IggyTcpClient) FetchMessages(
 	ctx context.Context,
 	streamId iggcon.Identifier,
@@ -96,6 +99,8 @@ func (c *IggyTcpClient) FetchMessages(
 	return sections, err
 }
 
+// ReadinessGroups groups partitions by their primary for a reader, in
+// ascending primary id order, with at most MaxPartitionsPerRequest in a group.
 func (c *IggyTcpClient) ReadinessGroups(
 	ctx context.Context,
 	streamId iggcon.Identifier,
@@ -427,9 +432,12 @@ type deferredBudget struct {
 	timeoutAt int
 	// minTimeout is the shortest request timeout that the server accepts.
 	minTimeout time.Duration
-	// commits marks a fetch with auto-commit, which the client never
-	// cancels: a cancel after its read drops what it stored.
+	// commits marks a fetch with auto-commit, whose unknown outcome keeps
+	// its partitions blocked until the caller abandons it.
 	commits bool
+	// storesOnRead marks a poll or fetch with auto-commit. A cancel of one
+	// waits for the single reply of the server, which tells whether it stored.
+	storesOnRead bool
 }
 
 // newDeferredBudget reads the budget of a deferred poll or fetch frame that
@@ -463,6 +471,7 @@ func newDeferredBudget(code command.Code, frame []byte) *deferredBudget {
 		budget.minTimeout = iggcon.MinDeferredPollReplyMargin
 		budget.commits = frame[waitAt+fetchAutoCommitAt] != 0
 	}
+	budget.storesOnRead = storesOnRead(code, frame[vsr.HeaderSize:])
 	return budget
 }
 
@@ -486,8 +495,24 @@ func (b *deferredBudget) attempt(ctx context.Context, frame []byte) (*operationF
 	binary.LittleEndian.PutUint64(attempt[b.waitAt:], command.Micros(options.MaxWait))
 	binary.LittleEndian.PutUint64(attempt[b.timeoutAt:], command.Micros(options.RequestTimeout))
 	operation := newOperationFrame(attempt, nil)
-	operation.uncancellable = b.commits
+	operation.uncancellable = b.storesOnRead
 	return operation, nil
+}
+
+// storesOnRead reports whether the body of a poll or fetch asks the server to
+// store the offsets of what it reads.
+func storesOnRead(code command.Code, body []byte) bool {
+	switch code {
+	case command.PollMessagesCode:
+		return len(body) > 0 && body[len(body)-1] != 0
+	case command.PollMessagesDeferredCode:
+		return len(body) > deferredParametersSize && body[len(body)-deferredParametersSize-1] != 0
+	case command.FetchMessagesCode:
+		_, position, err := pollTarget(body)
+		return err == nil && len(body) > position+fetchAutoCommitAt && body[position+fetchAutoCommitAt] != 0
+	default:
+		return false
+	}
 }
 
 // wireDuration reads microseconds as the wire carries them, saturated at the

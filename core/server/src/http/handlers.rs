@@ -1171,8 +1171,35 @@ pub(in crate::http) async fn delete_segments(
 /// `GET /streams/{stream_id}/topics/{topic_id}/messages/deferred`: the poll of
 /// [`poll_messages`] with [`DeferredPollQuery`] limits. The primary holds it until
 /// `min_count` messages are ready, the reply reaches `max_bytes`, or `wait_us`
-/// expires. Invalid limits are refused before the poll is resolved.
+/// expires. Invalid limits are refused before the poll is resolved. A poll that
+/// stores its offset goes through [`poll_messages_committing`].
 pub(in crate::http) async fn poll_messages_deferred(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Query(query): Query<PollMessages>,
+    Query(wait): Query<DeferredPollQuery>,
+    Query(consistency): Query<ConsistencyQuery>,
+    Extension(request): Extension<Arc<PartitionRequest>>,
+) -> Result<Response, ReadError> {
+    refuse_committing_get(&query)?;
+    poll_messages_committing(
+        State(state),
+        identity,
+        Path((stream_id, topic_id)),
+        Query(query),
+        Query(wait),
+        Query(consistency),
+        Extension(request),
+    )
+    .await
+}
+
+/// `POST /streams/{stream_id}/topics/{topic_id}/messages/deferred`: the poll of
+/// [`poll_messages_deferred`], also with `auto_commit`. A poll that stores its
+/// offset changes state, so it must not ride on a GET that clients, proxies and
+/// load balancers may resend (RFC 9110, section 9.2.1).
+pub(in crate::http) async fn poll_messages_committing(
     State(state): State<HttpState>,
     identity: Identity,
     Path((stream_id, topic_id)): Path<(String, String)>,
@@ -1221,6 +1248,7 @@ pub(in crate::http) async fn poll_messages(
     Query(consistency): Query<ConsistencyQuery>,
     Extension(request): Extension<Arc<PartitionRequest>>,
 ) -> Result<Response, ReadError> {
+    refuse_committing_get(&query)?;
     poll_messages_impl(
         state,
         identity,
@@ -1232,6 +1260,15 @@ pub(in crate::http) async fn poll_messages(
         None,
     )
     .await
+}
+
+/// A GET poll that would store its offset is refused: a resent GET would skip
+/// the batch that the first one stored.
+const fn refuse_committing_get(query: &PollMessages) -> Result<(), ReadError> {
+    if query.auto_commit {
+        return Err(ReadError::Rejected(IggyError::InvalidCommand));
+    }
+    Ok(())
 }
 
 #[expect(
@@ -2252,6 +2289,26 @@ mod tests {
     use crate::http::reply::classify_partition_reply;
     use crate::http::wire::build_request_message;
     use crate::reply_frame::build_deny_reply;
+
+    #[test]
+    fn given_a_committing_poll_when_sent_as_get_should_refuse_it() {
+        // A GET poll with `auto_commit` stored its offset, and anything that
+        // resent the GET skipped the batch that the first one stored.
+        let parse = |uri: &str| {
+            Query::<PollMessages>::try_from_uri(&uri.parse().unwrap())
+                .unwrap()
+                .0
+        };
+        let committing =
+            parse("/x?consumer_id=1&partition_id=0&kind=offset&value=0&count=1&auto_commit=true");
+        let reading = parse("/x?consumer_id=1&partition_id=0&kind=offset&value=0&count=1");
+
+        assert!(matches!(
+            refuse_committing_get(&committing),
+            Err(ReadError::Rejected(IggyError::InvalidCommand))
+        ));
+        assert!(refuse_committing_get(&reading).is_ok());
+    }
 
     /// A create body can carry the stream key, so it zeroes itself on drop and
     /// leaves its options block for the handler to erase.

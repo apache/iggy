@@ -32,12 +32,14 @@ import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
+import org.apache.iggy.exception.IggyValidationException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PartitioningKind;
+import org.apache.iggy.message.PollOptions;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
@@ -79,11 +81,52 @@ class MessagesHttpClient implements MessagesClient {
     public PolledMessages pollMessages(
             StreamId streamId,
             TopicId topicId,
+            long partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            PollOptions options) {
+        strategy.requirePartition(partitionId);
+        options.validate();
+        if (options.autoCommit().isPresent()) {
+            throw new IggyValidationException(
+                    IggyErrorCode.INVALID_CONFIGURATION,
+                    IggyErrorCode.INVALID_CONFIGURATION.getCode(),
+                    "A poll of one partition has nothing to count for an automatic commit",
+                    Optional.empty(),
+                    Optional.empty());
+        }
+        return pollMessagesDeferred(
+                streamId,
+                topicId,
+                Optional.of(partitionId),
+                consumer,
+                strategy,
+                options.count(),
+                options.commitsOnRead(),
+                options.deferredOptions());
+    }
+
+    @Override
+    public PolledMessages pollMessages(
+            StreamId streamId,
+            TopicId topicId,
             Optional<Long> partitionId,
             Consumer consumer,
             PollingStrategy strategy,
             Long count,
             boolean autoCommit) {
+        if (autoCommit) {
+            // The server refuses a GET that stores its offset, which a proxy could resend.
+            return pollMessagesDeferred(
+                    streamId,
+                    topicId,
+                    partitionId,
+                    consumer,
+                    strategy,
+                    count,
+                    true,
+                    DeferredPollOptions.defaults().withMaxWait(Duration.ZERO));
+        }
         var request = httpClient.prepareGetRequest(
                 path(streamId, topicId),
                 new BasicNameValuePair("consumer_id", consumer.id().toString()),
@@ -118,7 +161,9 @@ class MessagesHttpClient implements MessagesClient {
         }
         long startNanos = System.nanoTime();
         long requestDeadlineNanos = startNanos + options.requestTimeout().toNanos();
-        long maxBodyBytes = Math.multiplyExact(options.maxBytes(), JSON_BODY_EXPANSION);
+        // A first message larger than maxBytes comes alone in the reply.
+        long maxBodyBytes = Math.multiplyExact(
+                Math.max(options.maxBytes(), DeferredPollOptions.MAX_RECORD_POLL_REPLY_SIZE), JSON_BODY_EXPANSION);
         long retryIntervalMillis = INITIAL_RETRY_INTERVAL_MILLIS;
         while (true) {
             // Both budgets carry across retries rather than restarting.
@@ -152,21 +197,26 @@ class MessagesHttpClient implements MessagesClient {
             Long count,
             boolean autoCommit,
             DeferredPollOptions options) {
-        return httpClient.prepareGetRequest(
-                path(streamId, topicId) + "/deferred",
-                new BasicNameValuePair("consumer_id", consumer.id().toString()),
-                partitionId
-                        .map(id -> new BasicNameValuePair("partition_id", id.toString()))
-                        .orElse(null),
-                new BasicNameValuePair("kind", strategy.kind().name().toLowerCase()),
-                new BasicNameValuePair("value", strategy.value().toString()),
-                contextParameter(strategy),
-                new BasicNameValuePair("count", count.toString()),
-                new BasicNameValuePair("auto_commit", Boolean.toString(autoCommit)),
-                new BasicNameValuePair("wait_us", Long.toString(options.maxWaitMicros())),
-                new BasicNameValuePair("min_count", Long.toString(options.minCount())),
-                new BasicNameValuePair("max_bytes", Long.toString(options.maxBytes())),
-                new BasicNameValuePair("request_timeout_us", Long.toString(options.requestTimeoutMicros())));
+        NameValuePair[] query = {
+            new BasicNameValuePair("consumer_id", consumer.id().toString()),
+            partitionId
+                    .map(id -> new BasicNameValuePair("partition_id", id.toString()))
+                    .orElse(null),
+            new BasicNameValuePair("kind", strategy.kind().name().toLowerCase()),
+            new BasicNameValuePair("value", strategy.value().toString()),
+            contextParameter(strategy),
+            new BasicNameValuePair("count", count.toString()),
+            new BasicNameValuePair("auto_commit", Boolean.toString(autoCommit)),
+            new BasicNameValuePair("wait_us", Long.toString(options.maxWaitMicros())),
+            new BasicNameValuePair("min_count", Long.toString(options.minCount())),
+            new BasicNameValuePair("max_bytes", Long.toString(options.maxBytes())),
+            new BasicNameValuePair("request_timeout_us", Long.toString(options.requestTimeoutMicros()))
+        };
+        String deferredPath = path(streamId, topicId) + "/deferred";
+        // A poll that stores its offset changes state, so it is a POST that no proxy or library resends.
+        return autoCommit
+                ? httpClient.preparePostQueryRequest(deferredPath, query)
+                : httpClient.prepareGetRequest(deferredPath, query);
     }
 
     // Without the context the server would read a recreated partition instead of refusing the poll.

@@ -33,6 +33,6 @@ public class VsrRequestOutcomeUnknownException(Exception innerException, ulong? 
     : Exception("The VSR request outcome is unknown because the server did not confirm whether it committed the request.",
         innerException)
 {
-    /// <summary>The local operation to resolve or abandon; an uncertain committing fetch can only be abandoned.</summary>
+    /// <summary>The local operation to resolve or abandon. An uncertain committing fetch can only be abandoned.</summary>
     public ulong? OperationId { get; } = operationId;
 }

@@ -1852,7 +1852,7 @@ TEST_F(E2E_ConsumerGroup, GetConsumerOffsetReflectsAutoCommittedPoll) {
     ASSERT_NO_THROW(polled = message_client->poll_messages(
                         make_string_identifier(stream_name), make_string_identifier(topic_name), 0, "consumer",
                         make_numeric_identifier(77), make_polling_strategy("next", 0),
-                        make_poll_options(3, iggy::ffi::ServerCommitPolicy::OnRead), error_info));
+                        make_poll_options(3, iggy::ffi::CommitPolicy::OnRead), error_info));
     ASSERT_EQ(polled->count, 3u);
     ASSERT_EQ(polled->messages.size(), 3u);
     EXPECT_EQ(polled->messages.front().offset, 0u);
@@ -1887,20 +1887,65 @@ TEST_F(E2E_ConsumerGroup, StoreConsumerPositionStoresTheOffsetOfTheCheckpoint) {
                                                   make_string_identifier(topic_name), "partition_id",
                                                   partition_id_bytes(0), std::move(messages), error_info));
 
-    std::optional<iggy::ffi::PolledMessages> polled;
-    ASSERT_NO_THROW(
-        polled = message_client->poll_messages(make_string_identifier(stream_name), make_string_identifier(topic_name),
-                                               0, "consumer", make_numeric_identifier(99),
-                                               make_polling_strategy("offset", 0), make_poll_options(5), error_info));
-    ASSERT_EQ(polled->messages.size(), 5u);
+    std::optional<iggy::PolledMessages> polled;
+    ASSERT_NO_THROW(polled = client.PollMessages(consumer, iggy::Identifier::String(stream_name),
+                                                 iggy::Identifier::String(topic_name), 0,
+                                                 iggy::PollingStrategy::Offset(0), iggy::PollOptions().SetCount(5)));
+    ASSERT_EQ(polled->Messages().size(), 5u);
 
     ASSERT_NO_THROW(client.StoreConsumerPosition(consumer, iggy::Identifier::String(stream_name),
-                                                 iggy::Identifier::String(topic_name), *polled->checkpoint_at(2)));
+                                                 iggy::Identifier::String(topic_name), polled->CheckpointAt(2)));
     EXPECT_EQ(
         client
             .GetConsumerOffset(consumer, iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name), 0)
             .StoredOffset(),
         2u);
+}
+
+TEST_F(E2E_ConsumerGroup, DeleteConsumerPositionDeletesTheOffsetOfThePartition) {
+    iggy::ffi::ErrorInfo error_info{};
+    RecordProperty("description",
+                   "Deletes the offset stored for the partition of a checkpoint, and a second delete finds none.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    auto client                   = GetLoggedInHighLevelClient();
+    auto *message_client          = GetLoggedInClient();
+    const auto consumer           = iggy::Consumer::Single(iggy::Identifier::Numeric(98));
+
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    for (std::uint32_t index = 0; index < 3; ++index) {
+        messages.push_back(iggy::ffi::make_message(to_payload("delete-position-" + std::to_string(index)),
+                                                   rust::Vec<iggy::ffi::HeaderEntry>{}));
+    }
+    ASSERT_NO_THROW(message_client->send_messages(make_string_identifier(stream_name),
+                                                  make_string_identifier(topic_name), "partition_id",
+                                                  partition_id_bytes(0), std::move(messages), error_info));
+    std::optional<iggy::PolledMessages> polled;
+    ASSERT_NO_THROW(polled = client.PollMessages(consumer, iggy::Identifier::String(stream_name),
+                                                 iggy::Identifier::String(topic_name), 0,
+                                                 iggy::PollingStrategy::Offset(0), iggy::PollOptions().SetCount(3)));
+    ASSERT_EQ(polled->Messages().size(), 3u);
+    const auto checkpoint = polled->Checkpoint();
+    ASSERT_NO_THROW(client.StoreConsumerPosition(consumer, iggy::Identifier::String(stream_name),
+                                                 iggy::Identifier::String(topic_name), checkpoint));
+
+    ASSERT_NO_THROW(client.DeleteConsumerPosition(consumer, iggy::Identifier::String(stream_name),
+                                                  iggy::Identifier::String(topic_name), checkpoint));
+
+    EXPECT_THROW(client.GetConsumerOffset(consumer, iggy::Identifier::String(stream_name),
+                                          iggy::Identifier::String(topic_name), 0),
+                 iggy::IggyException);
+    try {
+        client.DeleteConsumerPosition(consumer, iggy::Identifier::String(stream_name),
+                                      iggy::Identifier::String(topic_name), checkpoint);
+        FAIL() << "a second delete must find no offset";
+    } catch (const iggy::IggyException &error) {
+        EXPECT_EQ(error.Code(), 3021u);
+    }
 }
 
 TEST_F(E2E_ConsumerGroup, DeleteConsumerOffsetForMissingOffsetThrows) {
@@ -2262,7 +2307,7 @@ TEST_F(E2E_ConsumerGroup, DeleteConsumerOffsetRemovesAutoCommittedOffset) {
     ASSERT_NO_THROW(polled = message_client->poll_messages(
                         make_string_identifier(stream_name), make_string_identifier(topic_name), 0, "consumer",
                         make_numeric_identifier(88), make_polling_strategy("next", 0),
-                        make_poll_options(3, iggy::ffi::ServerCommitPolicy::OnRead), error_info));
+                        make_poll_options(3, iggy::ffi::CommitPolicy::OnRead), error_info));
     ASSERT_EQ(polled->count, 3u);
     EXPECT_EQ(
         client

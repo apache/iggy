@@ -431,7 +431,7 @@ pub async fn run(harness: &TestHarness) {
             &PollingStrategy::next(),
             PollOptions {
                 count: messages_count,
-                server_commit: ServerCommitPolicy::OnRead,
+                commit: CommitPolicy::OnRead,
                 ..PollOptions::default()
             },
         )

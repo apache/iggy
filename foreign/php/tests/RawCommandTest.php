@@ -18,13 +18,14 @@
 
 declare(strict_types=1);
 
+use Iggy\AutoCommit;
 use Iggy\Client;
-use Iggy\ClientCommitPolicy;
+use Iggy\CommitEvery;
+use Iggy\CommitPolicy;
 use Iggy\Exception\IggyException;
 use Iggy\Exception\PendingOperationException;
 use Iggy\PendingOperationsConfig;
 use Iggy\PollOptions;
-use Iggy\ServerCommitPolicy;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\TestDox;
 use PHPUnit\Framework\TestCase;
@@ -225,7 +226,7 @@ final class RawCommandTest extends TestCase
             ],
             'consumerGroup' => [
                 ['name' => 'g', 'stream' => 's', 'topic' => 't', 'polling_strategy' => null,
-                    'poll_options' => null, 'client_commit' => null, 'prefetch_bytes' => null,
+                    'poll_options' => null, 'prefetch_bytes' => null,
                     'prefetch_messages' => null, 'create_consumer_group_if_not_exists' => false,
                     'polling_retry_interval_micros' => null, 'init_retries' => null,
                     'init_retry_interval_micros' => null, 'allow_replay' => false],
@@ -273,14 +274,15 @@ final class RawCommandTest extends TestCase
         assert_same(0, $defaults->max_wait_micros);
         assert_same(1, $defaults->min_count);
         assert_same(1024 * 1024, $defaults->max_bytes);
-        assert_same(ServerCommitPolicy::Disabled, $defaults->server_commit);
+        assert_same('manual', $defaults->commit->kind);
 
-        $options = new PollOptions(10, 5_000, 2, 65_536, ServerCommitPolicy::OnRead);
+        $options = new PollOptions(10, 5_000, 2, 65_536, CommitPolicy::onRead());
         assert_same(10, $options->count);
         assert_same(5_000, $options->max_wait_micros);
         assert_same(2, $options->min_count);
         assert_same(65_536, $options->max_bytes);
-        assert_same(ServerCommitPolicy::OnRead, $options->server_commit);
+        assert_same('on_read', $options->commit->kind);
+        assert_same('auto', (new PollOptions(commit: CommitPolicy::auto(AutoCommit::default())))->commit->kind);
 
         foreach (['count', 'max_wait_micros', 'min_count', 'max_bytes'] as $field) {
             foreach ([-1, 1.5, true, '18446744073709551616'] as $invalid) {
@@ -308,11 +310,13 @@ final class RawCommandTest extends TestCase
         );
     }
 
-    public function testClientCommitPolicyRefusesInvalidIntervals(): void
+    public function testAutoCommitRefusesSettingsThatNeverStore(): void
     {
         foreach ([0, -1, 1.5, true, '18446744073709551616'] as $invalid) {
-            assert_throws(static fn () => new ClientCommitPolicy($invalid), 'interval_micros');
+            assert_throws(static fn () => new AutoCommit($invalid), 'interval_micros');
         }
+        assert_throws(static fn () => new AutoCommit(), "'interval_micros' or an 'every'");
+        assert_throws(static fn () => CommitEvery::messages(0), 'must not be zero');
     }
 
     public function testReaderRefusesAnEmptyPartitionListBeforeConnecting(): void

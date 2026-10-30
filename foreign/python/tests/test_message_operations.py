@@ -16,11 +16,15 @@
 # under the License.
 
 import asyncio
+import contextlib
+import time
 import uuid
 
 import pytest
 
 from apache_iggy import (
+    AutoCommit,
+    CommitPolicy,
     Consumer,
     HeaderKey,
     HeaderValue,
@@ -30,7 +34,6 @@ from apache_iggy import (
     Partitioning,
     PollingStrategy,
     PollOptions,
-    ServerCommitPolicy,
     TopicOptions,
     UserHeaders,
 )
@@ -38,9 +41,13 @@ from apache_iggy import SendMessage as Message
 
 from .utils import wait_for_consumer_group_assignment
 
+INVALID_CONFIGURATION = 2
 INVALID_COMMAND = 3
+CONSUMER_OFFSET_NOT_FOUND = 3021
 HISTORY_UNAVAILABLE = 87
 CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009
+# Far longer than a local reply takes.
+REPLY_WAIT_SECONDS = 1
 
 
 class TestPartitioning:
@@ -107,7 +114,7 @@ class TestPartitionContext:
     async def test_checkpoint_is_a_comparable_value(
         self, iggy_client: IggyClient, unique_name
     ):
-        """Test a checkpoint names the partition and offset of its message."""
+        """Test a checkpoint names its message and hashes as it compares."""
         stream_name = unique_name()
         topic_name = unique_name()
         partition_id = 0
@@ -138,9 +145,80 @@ class TestPartitionContext:
             f"Checkpoint(partition_id={partition_id}, offset={first.offset()})"
         )
         assert checkpoint == polled_messages.checkpoint_at(0)
+        assert hash(checkpoint) == hash(polled_messages.checkpoint_at(0))
         assert checkpoint != second.checkpoint()
+        assert {checkpoint, polled_messages.checkpoint_at(0), second.checkpoint()} == {
+            checkpoint,
+            second.checkpoint(),
+        }
         assert polled_messages.checkpoint() == second.checkpoint()
         assert polled_messages.checkpoint_at(len(polled_messages.messages)) is None
+
+    @pytest.mark.asyncio
+    async def test_client_stores_reads_and_deletes_consumer_offsets(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test the client-level offset calls by partition and by checkpoint."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        consumer = Consumer.Single(7)
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
+        await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=partition_id,
+            messages=[Message(f"offset {i}") for i in range(3)],
+        )
+        polled = await iggy_client.poll_messages(
+            stream=stream_name,
+            topic=topic_name,
+            consumer=consumer,
+            partition_id=partition_id,
+            polling_strategy=PollingStrategy.First(),
+            options=PollOptions(count=10),
+        )
+
+        def offset():
+            return iggy_client.get_consumer_offset(
+                stream_name, topic_name, consumer=consumer, partition_id=partition_id
+            )
+
+        assert await offset() is None
+        await iggy_client.store_consumer_offset(
+            stream_name,
+            topic_name,
+            consumer=consumer,
+            partition_id=partition_id,
+            offset=1,
+        )
+        stored_by_partition = await offset()
+        checkpoint = polled.checkpoint()
+        assert checkpoint is not None
+        await iggy_client.store_consumer_position(
+            stream_name, topic_name, consumer=consumer, checkpoint=checkpoint
+        )
+        stored_by_checkpoint = await offset()
+        await iggy_client.delete_consumer_offset(
+            stream_name, topic_name, consumer=consumer, partition_id=partition_id
+        )
+        deleted = await offset()
+        with pytest.raises(IggyError) as missing:
+            await iggy_client.delete_consumer_offset(
+                stream_name, topic_name, consumer=consumer, partition_id=partition_id
+            )
+
+        assert stored_by_partition is not None
+        assert (
+            stored_by_partition.partition_id,
+            stored_by_partition.current_offset,
+            stored_by_partition.stored_offset,
+        ) == (partition_id, 2, 1)
+        assert stored_by_checkpoint is not None
+        assert stored_by_checkpoint.stored_offset == 2
+        assert deleted is None
+        assert missing.value.code == CONSUMER_OFFSET_NOT_FOUND
 
     @pytest.mark.asyncio
     async def test_continuation_reads_on_after_the_batch(
@@ -350,11 +428,78 @@ class TestMessageOperations:
             consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
-            options=PollOptions(count=10, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
         )
 
         assert [message.payload().decode() for message in polled_messages.messages] == (
             test_messages
+        )
+
+    @pytest.mark.asyncio
+    async def test_poll_refuses_auto_commit(self, iggy_client: IggyClient, unique_name):
+        """Test a one-shot poll refuses CommitPolicy.Auto, which it cannot count."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
+
+        with pytest.raises(IggyError) as refused:
+            await iggy_client.poll_messages(
+                stream=stream_name,
+                topic=topic_name,
+                consumer=Consumer.Single(1),
+                partition_id=0,
+                polling_strategy=PollingStrategy.First(),
+                options=PollOptions(commit=CommitPolicy.Auto(AutoCommit.default())),
+            )
+
+        assert refused.value.code == INVALID_CONFIGURATION
+
+    @pytest.mark.asyncio
+    async def test_cancelled_on_read_poll_settles_through_its_one_reply(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a cancelled OnRead poll settles its partition through its one reply."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        consumer = Consumer.Single(1)
+        on_read = PollOptions(count=1, commit=CommitPolicy.OnRead())
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
+        await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=partition_id,
+            messages=[Message("first"), Message("second")],
+        )
+
+        def poll():
+            return iggy_client.poll_messages(
+                stream=stream_name,
+                topic=topic_name,
+                consumer=consumer,
+                partition_id=partition_id,
+                polling_strategy=PollingStrategy.Next(),
+                options=on_read,
+            )
+
+        cancelled = asyncio.ensure_future(poll())
+        await asyncio.sleep(0)
+        # Blocks the event loop while the reply arrives, so the cancel lands after it.
+        time.sleep(REPLY_WAIT_SECONDS)
+        cancelled.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cancelled
+
+        # The reply of the cancelled poll settles it, so the next poll is not blocked.
+        # The cancel wins and nothing is stored, or the store happened and the batch
+        # went with the cancelled call.
+        polled = await poll()
+        assert [message.payload() for message in polled.messages] in (
+            [b"first"],
+            [b"second"],
         )
 
     @pytest.mark.asyncio
@@ -383,7 +528,7 @@ class TestMessageOperations:
             consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
-            options=PollOptions(count=10, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
         )
 
         assert [
@@ -525,7 +670,7 @@ class TestMessageOperations:
             consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
-            options=PollOptions(count=10, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
         )
 
         assert [message.payload().decode() for message in polled_messages.messages] == (
@@ -557,7 +702,7 @@ class TestMessageOperations:
             consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
-            options=PollOptions(count=1, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=1, commit=CommitPolicy.OnRead()),
         )
 
         assert len(polled_messages.messages) >= 1
@@ -611,7 +756,7 @@ class TestMessageOperations:
             consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
-            options=PollOptions(count=1, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=1, commit=CommitPolicy.OnRead()),
         )
 
         assert len(polled_messages.messages) == 1
@@ -659,7 +804,7 @@ class TestMessageOperations:
             consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
-            options=PollOptions(count=1, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=1, commit=CommitPolicy.OnRead()),
         )
 
         assert len(polled_messages.messages) == 1
@@ -699,7 +844,7 @@ class TestMessageOperations:
             consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
-            options=PollOptions(count=1, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=1, commit=CommitPolicy.OnRead()),
         )
 
         headers = polled_messages.messages[0].user_headers()
@@ -998,7 +1143,7 @@ class TestMessageOperations:
             consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
-            options=PollOptions(count=1, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=1, commit=CommitPolicy.OnRead()),
         )
 
         assert len(polled_messages.messages) == 1
@@ -1037,7 +1182,7 @@ class TestMessageOperations:
             consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
-            options=PollOptions(count=1, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=1, commit=CommitPolicy.OnRead()),
         )
 
         assert len(polled_messages.messages) == 1
@@ -1074,7 +1219,7 @@ class TestMessageOperations:
             consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
-            options=PollOptions(count=1, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=1, commit=CommitPolicy.OnRead()),
         )
 
         assert len(polled_messages.messages) == 1
@@ -1455,10 +1600,10 @@ class TestMessageOperations:
         assert timestamp_messages.messages == ()
 
     @pytest.mark.asyncio
-    async def test_poll_messages_with_server_commit_on_read_advances_next(
+    async def test_poll_messages_committing_on_read_advances_next(
         self, iggy_client: IggyClient, unique_name
     ):
-        """Test ServerCommitPolicy.OnRead stores progress so Next resumes after it."""
+        """Test CommitPolicy.OnRead() stores progress so Next resumes after it."""
         stream_name = unique_name()
         topic_name = unique_name()
         partition_id = 0
@@ -1483,7 +1628,7 @@ class TestMessageOperations:
             consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
-            options=PollOptions(count=10, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
         )
         assert [
             message.payload().decode("utf-8")
@@ -1503,7 +1648,7 @@ class TestMessageOperations:
             consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Next(),
-            options=PollOptions(count=10, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
         )
         assert len(next_messages.messages) == len(new_messages)
         assert [
@@ -1511,7 +1656,7 @@ class TestMessageOperations:
         ] == new_messages
 
     @pytest.mark.asyncio
-    async def test_poll_messages_without_server_commit_does_not_advance_next(
+    async def test_poll_messages_without_a_commit_does_not_advance_next(
         self, iggy_client: IggyClient, unique_name
     ):
         """Test a poll without a server commit stores no offset, so Next starts over."""
@@ -1592,7 +1737,7 @@ class TestMessageOperations:
                 consumer=Consumer.Single(consumer_name),
                 partition_id=partition_id,
                 polling_strategy=PollingStrategy.Next(),
-                options=PollOptions(count=10, server_commit=ServerCommitPolicy.OnRead),
+                options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
             )
             assert [
                 message.payload().decode("utf-8")
@@ -1624,7 +1769,7 @@ class TestMessageOperations:
             consumer=Consumer.Single("shared-consumer"),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Next(),
-            options=PollOptions(count=10, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
         )
         assert [
             message.payload().decode("utf-8") for message in first_poll.messages
@@ -1636,7 +1781,7 @@ class TestMessageOperations:
             consumer=Consumer.Single("shared-consumer"),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Next(),
-            options=PollOptions(count=10, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
         )
         assert second_poll.messages == ()
 
@@ -1654,7 +1799,7 @@ class TestMessageOperations:
                 topic=unique_name(),
                 partition_id=0,
                 polling_strategy=PollingStrategy.Next(),
-                options=PollOptions(count=10, server_commit=ServerCommitPolicy.OnRead),
+                options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
             )
 
     @pytest.mark.asyncio
@@ -1675,7 +1820,7 @@ class TestMessageOperations:
                 consumer=consumer,
                 partition_id=0,
                 polling_strategy=PollingStrategy.Next(),
-                options=PollOptions(count=10, server_commit=ServerCommitPolicy.OnRead),
+                options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
             )
 
     @pytest.mark.parametrize("identifier", [-1, 2**32], ids=["negative", "above-u32"])
@@ -1713,7 +1858,7 @@ class TestMessageOperations:
                 consumer=consumer_kind(identifier),
                 partition_id=0,
                 polling_strategy=PollingStrategy.Next(),
-                options=PollOptions(count=10, server_commit=ServerCommitPolicy.OnRead),
+                options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
             )
 
     @pytest.mark.asyncio
@@ -1745,7 +1890,7 @@ class TestMessageOperations:
             consumer=Consumer.Single("partition-zero-consumer"),
             partition_id=0,
             polling_strategy=PollingStrategy.Next(),
-            options=PollOptions(count=10, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
         )
 
         assert [
@@ -1790,7 +1935,7 @@ class TestMessageOperations:
                 consumer=Consumer.Group(group_name),
                 partition_id=partition_id,
                 polling_strategy=PollingStrategy.Next(),
-                options=PollOptions(count=10, server_commit=ServerCommitPolicy.OnRead),
+                options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
             )
             polled.extend(
                 (message.partition_id(), message.payload().decode("utf-8"))
@@ -1829,7 +1974,7 @@ class TestMessageOperations:
                 consumer=Consumer.Group(group_name),
                 partition_id=0,
                 polling_strategy=PollingStrategy.Next(),
-                options=PollOptions(count=10, server_commit=ServerCommitPolicy.OnRead),
+                options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
             )
         assert refusal.value.code == CONSUMER_GROUP_PARTITION_NOT_OWNED
 
@@ -1863,7 +2008,7 @@ class TestMessageOperations:
             consumer=Consumer.Group(group_name),
             partition_id=0,
             polling_strategy=PollingStrategy.Next(),
-            options=PollOptions(count=10, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=10, commit=CommitPolicy.OnRead()),
         )
         assert [
             message.payload().decode("utf-8") for message in polled_messages.messages

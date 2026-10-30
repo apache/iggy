@@ -23,16 +23,17 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.CommitPolicy;
 import org.apache.iggy.message.DeferredPollOptions;
-import org.apache.iggy.message.FetchedMessages;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.message.PollOptions;
 import org.apache.iggy.message.PolledMessages;
+import org.apache.iggy.message.PollingKind;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
 
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
@@ -74,6 +75,46 @@ import java.util.concurrent.CompletableFuture;
  * @see org.apache.iggy.client.async.tcp.AsyncIggyTcpClient#messages()
  */
 public interface MessagesClient {
+
+    /**
+     * Polls one partition with the limits and the commit policy of {@code options}.
+     *
+     * <p>The server waits up to {@link PollOptions#maxWait()} for {@link PollOptions#minCount()} messages and returns
+     * at most {@link PollOptions#count()} messages and {@link PollOptions#maxBytes()} of records. A first message
+     * larger than {@code maxBytes} comes alone in the reply. A {@link PollingKind#Last} poll of more than one message
+     * whose first message is larger than {@code maxBytes} fails with
+     * {@link org.apache.iggy.exception.IggyErrorCode#INVALID_SIZE_BYTES}. The request ends after
+     * {@link PollOptions#requestTimeout()}.
+     *
+     * <p>With {@link CommitPolicy#onRead()} the server stores the offset of the last message it returns as part of the
+     * read. A cancel of such a poll stops it on the server and waits for its reply, which shows whether it stored. A
+     * reply that the connection loses fails with
+     * {@link org.apache.iggy.exception.IggyErrorCode#FETCH_PROGRESS_UNCERTAIN}: the server can have stored the offset,
+     * so read the stored offset before the next poll. {@link CommitPolicy.Auto} is refused with
+     * {@link org.apache.iggy.exception.IggyErrorCode#INVALID_CONFIGURATION}: a one-shot poll has nothing to count. A
+     * {@link org.apache.iggy.client.async.reader.PartitionReader} counts and stores it.
+     *
+     * <p>Continue a partition with {@link PolledMessages#continuation()}, which a poll of another partition refuses
+     * with {@link org.apache.iggy.exception.IggyErrorCode#INVALID_COMMAND}.
+     *
+     * @param streamId    the stream identifier
+     * @param topicId     the topic identifier
+     * @param partitionId the partition, 0 to 4294967295
+     * @param consumer    the consumer or consumer group whose offset {@code Next} reads and a commit stores
+     * @param strategy    where the poll starts
+     * @param options     the limits and the commit policy
+     * @return a {@link CompletableFuture} that completes with the messages of the partition
+     */
+    default CompletableFuture<PolledMessages> pollMessages(
+            StreamId streamId,
+            TopicId topicId,
+            long partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            PollOptions options) {
+        return CompletableFuture.failedFuture(new IggyOperationNotSupportedException(
+                "pollMessages", getClass().getSimpleName()));
+    }
 
     /**
      * Polls messages from a topic partition asynchronously.
@@ -173,7 +214,7 @@ public interface MessagesClient {
      *
      * <p>A group poll must name its partition. Without one, the TCP client fails with
      * {@link org.apache.iggy.exception.IggyErrorCode#INVALID_COMMAND} before it sends anything.
-     * {@link #readinessGroups} and {@link #fetchMessages} read the whole assignment of a group.
+     * A {@link org.apache.iggy.client.async.reader.PartitionReader} reads the whole assignment of a group.
      *
      * @param streamId    the stream identifier (numeric or string-based)
      * @param topicId     the topic identifier (numeric or string-based)
@@ -234,95 +275,6 @@ public interface MessagesClient {
                 count,
                 autoCommit,
                 options);
-    }
-
-    /**
-     * Groups {@code partitions} by their primary, with at most 1000 partitions in a group, so that a
-     * caller can keep one {@link #fetchMessages} in flight per group.
-     *
-     * <p>A partition without a known route costs a route lookup. The groups show the routes at the
-     * time of the call. If a fetch reports NotPrimary for a partition, its route is marked stale;
-     * call this method again to regroup the partitions before the next fetch.
-     *
-     * @param streamId   the stream identifier (numeric or string-based)
-     * @param topicId    the topic identifier (numeric or string-based)
-     * @param partitions partition IDs from 0 to 4294967295
-     * @return a {@link CompletableFuture} that completes with the groups, each in the order of
-     *         {@code partitions}
-     */
-    default CompletableFuture<List<List<Long>>> readinessGroups(
-            StreamId streamId, TopicId topicId, List<Long> partitions) {
-        return CompletableFuture.failedFuture(new IggyOperationNotSupportedException(
-                "readinessGroups", getClass().getSimpleName()));
-    }
-
-    /**
-     * Fetches messages asynchronously from several partitions of one primary in one request,
-     * letting the server hold the request until the partitions hold data.
-     *
-     * <p>The TCP client sends one fetch to the primary of the first partition of {@code targets},
-     * so take the partitions of one group of {@link #readinessGroups}. The server waits up to
-     * {@link DeferredPollOptions#maxWait()} until the targets hold
-     * {@link DeferredPollOptions#minCount()} messages. Then it reads the targets in the order of
-     * {@code targets}, and each one gets up to {@link DeferredPollOptions#maxBytes()} of records
-     * or no section. All sections together hold at most {@code count} messages and
-     * {@code maxBytes} of records. To give every partition its turn, put the partitions of the
-     * served sections last in the next fetch.
-     *
-     * <p>A section with the status {@link FetchedMessages#STATUS_OK} names the
-     * {@link FetchedMessages#nextOffset()} where the next fetch of its partition starts, also
-     * after a Next start point. Send it as {@link PollingStrategy#offset} with the
-     * {@link FetchedMessages#context()} of the section. A section with another status holds the
-     * error code of its partition and no position, and a partition without a section was not
-     * read, so both keep the start point that they had. A NOT_PRIMARY section or refusal makes
-     * the next {@link #readinessGroups} look up the routes again. The records stay undecoded
-     * until {@link FetchedMessages#decode()}, so the next fetch can go out first.
-     *
-     * <p>A fetch with {@code autoCommit} or a Next start point keeps its place among the offset
-     * stores and the other progress polls of its partitions, and the client does not send it
-     * again after a lost reply. A retained mutation blocking a target fails the fetch with
-     * {@link org.apache.iggy.exception.IggyErrorCode#PARTITION_LANE_BLOCKED}. Its
-     * {@link org.apache.iggy.exception.IggyOperationException} names the blocked partition and
-     * the operation to resolve or abandon. The client never cancels a fetch with {@code autoCommit}: a
-     * close waits for its reply. Cancelling its future can discard committed messages and does
-     * not cancel the server work.
-     *
-     * <p>An unknown committing outcome retains a local recovery id and blocks progress on the
-     * affected partitions across reconnects. A whole unknown outcome fails with
-     * {@link org.apache.iggy.exception.IggyErrorCode#FETCH_PROGRESS_UNCERTAIN}; partial replies
-     * keep healthy sections and expose {@link FetchedMessages#recoveryError()} on uncertain ones.
-     * GetOffset remains available for inspection, but cannot prove that the old fetch ended.
-     * Resolve never replays a fetch. Explicit abandon accepts the uncertainty and releases its
-     * local blocks without cancelling or fencing the old server work.
-     *
-     * <p>Unlike a deferred poll, a fetch needs a {@link DeferredPollOptions#requestTimeout()} of at
-     * least {@code maxWait} plus {@link DeferredPollOptions#REPLY_MARGIN}, also for a zero
-     * {@code maxWait}. A fresh call also needs more than the reply margin to leave time for routing.
-     * The TCP client lowers {@code maxBytes} until the whole reply fits in the
-     * largest frame that its connections read. The server must support command 109. An older one
-     * answers {@link org.apache.iggy.exception.IggyErrorCode#INVALID_COMMAND}.
-     *
-     * @param streamId   the stream identifier (numeric or string-based)
-     * @param topicId    the topic identifier (numeric or string-based)
-     * @param targets    1 to 1000 partition IDs from 0 to 4294967295, each with an Offset or Next
-     *                   strategy, in the order that the server reads them
-     * @param consumer   the consumer identity, either individual or group
-     * @param count      the maximum number of messages of all sections together
-     * @param autoCommit whether the server commits the consumer offset of each read partition
-     * @param options    the wait, message count, byte and request time limits
-     * @return a {@link CompletableFuture} that completes with the sections of the reply, in its
-     *         order
-     */
-    default CompletableFuture<List<FetchedMessages>> fetchMessages(
-            StreamId streamId,
-            TopicId topicId,
-            Map<Long, PollingStrategy> targets,
-            Consumer consumer,
-            Long count,
-            boolean autoCommit,
-            DeferredPollOptions options) {
-        return CompletableFuture.failedFuture(new IggyOperationNotSupportedException(
-                "fetchMessages", getClass().getSimpleName()));
     }
 
     /**

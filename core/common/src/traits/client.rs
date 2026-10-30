@@ -118,7 +118,7 @@ pub trait Client:
     /// retains no operations returns `FeatureUnavailable`.
     /// For `FetchProgressUncertain`, this frees every affected progress lane,
     /// including after reconnect or session replacement. It does not stop an
-    /// old server request; a later offset inspection cannot prove that it stopped.
+    /// old server request. A later offset inspection cannot prove that it stopped.
     async fn abandon_operation(&self, _op: u64) -> Result<(), IggyError> {
         Err(IggyError::FeatureUnavailable)
     }

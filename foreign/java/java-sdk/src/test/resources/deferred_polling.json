@@ -1,0 +1,393 @@
+{
+  "schema_version": 1,
+  "generated_by": "core/common/examples/deferred_polling_fixtures.rs",
+  "conventions": {
+    "body_hex": "Every *_hex field is lowercase hex without separators. body_hex is the command payload without framing.",
+    "header_hex": "header_hex is the whole request header of a cancellation, which has no body, before the transport stamps its checksum and checksum_body.",
+    "oversized": "A reply may carry a first record above max_bytes, up to max_record_size, so a client reply cap is at least max_record_reply_size.",
+    "refused": "Every refused fetch fails to decode or to validate. Every refused fetch reply fails to decode.",
+    "status": "A section status of status_ok was read. Any other status is the error code of that partition alone, and its section holds no records.",
+    "strategy": "strategy.kind is the wire kind: 1 offset, 2 timestamp, 3 first, 4 last, 5 next."
+  },
+  "constants": {
+    "codes": {
+      "cancel_deferred_request": 108,
+      "fetch_messages": 109,
+      "poll_messages": 100,
+      "poll_messages_deferred": 106
+    },
+    "status_ok": 0,
+    "errors": {
+      "deferred_poll_capacity_exceeded": 90,
+      "fetch_progress_uncertain": 14010,
+      "history_unavailable": 87,
+      "invalid_size_bytes": 80,
+      "not_primary": 89,
+      "partition_lane_blocked": 14009,
+      "too_many_consumer_offsets": 3024,
+      "transient_not_accepted": 58,
+      "transient_not_committed": 57
+    },
+    "min_deferred_poll_max_bytes": 344,
+    "max_deferred_poll_wait_us": 600000000,
+    "max_deferred_poll_timeout_us": 630000000,
+    "min_deferred_poll_reply_margin_us": 1000000,
+    "fetch_reply_margin_us": 200000,
+    "max_partitions_per_request": 1000,
+    "max_record_size": 64100304,
+    "max_record_reply_size": 64156564,
+    "request_header_size": 256,
+    "fetch_section_header_size": 56
+  },
+  "deferred_polls": [
+    {
+      "case": "consumer_offset_without_commit",
+      "request": {
+        "consumer": {
+          "kind": 1,
+          "id": {
+            "kind": "numeric",
+            "value": 1
+          }
+        },
+        "stream_id": {
+          "kind": "numeric",
+          "value": 1
+        },
+        "topic_id": {
+          "kind": "named",
+          "value": "orders"
+        },
+        "partition_id": 2,
+        "strategy": {
+          "kind": 1,
+          "value": 41
+        },
+        "count": 100,
+        "auto_commit": false,
+        "wait_us": 5000000,
+        "min_count": 1,
+        "max_bytes": 1048576,
+        "request_timeout_us": 6000000
+      },
+      "body_hex": "0101040100000001040100000002066f726465727301020000000129000000000000006400000000404b4c00000000000100000000001000808d5b0000000000"
+    },
+    {
+      "case": "group_next_with_commit",
+      "request": {
+        "consumer": {
+          "kind": 2,
+          "id": {
+            "kind": "named",
+            "value": "orders-group"
+          }
+        },
+        "stream_id": {
+          "kind": "numeric",
+          "value": 1
+        },
+        "topic_id": {
+          "kind": "named",
+          "value": "orders"
+        },
+        "partition_id": 2,
+        "strategy": {
+          "kind": 5,
+          "value": 0
+        },
+        "count": 100,
+        "auto_commit": true,
+        "wait_us": 5000000,
+        "min_count": 1,
+        "max_bytes": 1048576,
+        "request_timeout_us": 6000000
+      },
+      "body_hex": "02020c6f72646572732d67726f757001040100000002066f726465727301020000000500000000000000006400000001404b4c00000000000100000000001000808d5b0000000000"
+    }
+  ],
+  "fetches": [
+    {
+      "case": "consumer_two_targets_without_commit",
+      "request": {
+        "consumer": {
+          "kind": 1,
+          "id": {
+            "kind": "numeric",
+            "value": 1
+          }
+        },
+        "stream_id": {
+          "kind": "numeric",
+          "value": 1
+        },
+        "topic_id": {
+          "kind": "numeric",
+          "value": 2
+        },
+        "wait_us": 5000000,
+        "request_timeout_us": 6000000,
+        "min_count": 1,
+        "count": 1000,
+        "max_bytes": 1048576,
+        "auto_commit": false,
+        "targets": [
+          {
+            "partition_id": 1,
+            "strategy": {
+              "kind": 1,
+              "value": 41
+            },
+            "max_bytes": 524288,
+            "incarnation": 11,
+            "owner_generation": 0
+          },
+          {
+            "partition_id": 3,
+            "strategy": {
+              "kind": 5,
+              "value": 0
+            },
+            "max_bytes": 524288,
+            "incarnation": 11,
+            "owner_generation": 0
+          }
+        ]
+      },
+      "body_hex": "01010401000000010401000000010402000000404b4c0000000000808d5b000000000001000000e803000000001000000200000001000000012900000000000000000008000b00000000000000000000000000000003000000050000000000000000000008000b000000000000000000000000000000"
+    },
+    {
+      "case": "group_three_targets_with_commit",
+      "request": {
+        "consumer": {
+          "kind": 2,
+          "id": {
+            "kind": "numeric",
+            "value": 9
+          }
+        },
+        "stream_id": {
+          "kind": "numeric",
+          "value": 1
+        },
+        "topic_id": {
+          "kind": "numeric",
+          "value": 2
+        },
+        "wait_us": 5000000,
+        "request_timeout_us": 6000000,
+        "min_count": 1,
+        "count": 1000,
+        "max_bytes": 1048576,
+        "auto_commit": true,
+        "targets": [
+          {
+            "partition_id": 1,
+            "strategy": {
+              "kind": 5,
+              "value": 0
+            },
+            "max_bytes": 524288,
+            "incarnation": 11,
+            "owner_generation": 4
+          },
+          {
+            "partition_id": 2,
+            "strategy": {
+              "kind": 5,
+              "value": 0
+            },
+            "max_bytes": 524288,
+            "incarnation": 11,
+            "owner_generation": 4
+          },
+          {
+            "partition_id": 4,
+            "strategy": {
+              "kind": 1,
+              "value": 7
+            },
+            "max_bytes": 524288,
+            "incarnation": 11,
+            "owner_generation": 4
+          }
+        ]
+      },
+      "body_hex": "02010409000000010401000000010402000000404b4c0000000000808d5b000000000001000000e803000000001000010300000001000000050000000000000000000008000b00000000000000040000000000000002000000050000000000000000000008000b00000000000000040000000000000004000000010700000000000000000008000b000000000000000400000000000000"
+    }
+  ],
+  "cancellations": [
+    {
+      "case": "cancel_deferred_poll",
+      "cancels_code": 106,
+      "client": 7,
+      "request": 21,
+      "session": 3,
+      "header_hex": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000050000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007000000000000000000000000000000000000000000000000000000000000000000000000000000150000000000000002000000000000000300000000000000000000006c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "case": "cancel_fetch",
+      "cancels_code": 109,
+      "client": 7,
+      "request": 22,
+      "session": 3,
+      "header_hex": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000050000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007000000000000000000000000000000000000000000000000000000000000000000000000000000160000000000000002000000000000000300000000000000000000006c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "fetch_replies": [
+    {
+      "case": "ok_section_and_empty_start_section",
+      "sections": [
+        {
+          "partition_id": 1,
+          "status": 0,
+          "current_offset": 44,
+          "messages_count": 3,
+          "context": {
+            "incarnation": 11,
+            "owner_generation": 4,
+            "metadata_op": 42
+          },
+          "next_offset": 44,
+          "records_len": 416,
+          "messages": [
+            {
+              "offset": 41,
+              "id": "258",
+              "timestamp": 1700000000000500,
+              "origin_timestamp": 1700000000000000,
+              "payload": "first"
+            },
+            {
+              "offset": 42,
+              "id": "259",
+              "timestamp": 1700000000000500,
+              "origin_timestamp": 1700000000000000,
+              "payload": "second"
+            },
+            {
+              "offset": 43,
+              "id": "260",
+              "timestamp": 1700000000000500,
+              "origin_timestamp": 1700000000000000,
+              "payload": "third"
+            }
+          ]
+        },
+        {
+          "partition_id": 3,
+          "status": 0,
+          "current_offset": 9,
+          "messages_count": 0,
+          "context": {
+            "incarnation": 11,
+            "owner_generation": 4,
+            "metadata_op": 42
+          },
+          "next_offset": 10,
+          "records_len": 0,
+          "messages": []
+        }
+      ],
+      "body_hex": "0200000001000000000000002c00000000000000030000000b0000000000000004000000000000002a000000000000002c00000000000000a001000003000000000000000900000000000000000000000b0000000000000004000000000000002a000000000000000a000000000000000000000001000000000000002900000000000000f4411e18240a060000401e18240a0600a00100000000000088fc3268f2c0e02103000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000bb5b1cd43b71761a02010000000000000000000000000000000000000000000000000000050000000000000000000000666972737453c25c376f98c265030100000000000000000000000000000100000000000000000000000600000000000000000000007365636f6e64a761c18f632fb022040100000000000000000000000000000200000000000000000000000500000000000000000000007468697264"
+    },
+    {
+      "case": "ok_section_beside_error_sections",
+      "sections": [
+        {
+          "partition_id": 1,
+          "status": 89,
+          "current_offset": 0,
+          "messages_count": 0,
+          "context": {
+            "incarnation": 0,
+            "owner_generation": 0,
+            "metadata_op": 0
+          },
+          "next_offset": 0,
+          "records_len": 0,
+          "messages": []
+        },
+        {
+          "partition_id": 2,
+          "status": 0,
+          "current_offset": 7,
+          "messages_count": 1,
+          "context": {
+            "incarnation": 11,
+            "owner_generation": 4,
+            "metadata_op": 42
+          },
+          "next_offset": 7,
+          "records_len": 308,
+          "messages": [
+            {
+              "offset": 6,
+              "id": "340282366920938463463374607431768211455",
+              "timestamp": 1700000000000500,
+              "origin_timestamp": 1700000000000000,
+              "payload": "only"
+            }
+          ]
+        },
+        {
+          "partition_id": 4,
+          "status": 58,
+          "current_offset": 0,
+          "messages_count": 0,
+          "context": {
+            "incarnation": 0,
+            "owner_generation": 0,
+            "metadata_op": 0
+          },
+          "next_offset": 0,
+          "records_len": 0,
+          "messages": []
+        }
+      ],
+      "body_hex": "03000000010000005900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002000000000000000700000000000000010000000b0000000000000004000000000000002a00000000000000070000000000000034010000040000003a00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002000000000000000600000000000000f4411e18240a060000401e18240a060034010000000000003e89bfefc17b805301000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000fbb4aeb35a85bdaeffffffffffffffffffffffffffffffff0000000000000000000000000400000000000000000000006f6e6c79"
+    },
+    {
+      "case": "no_sections",
+      "sections": [],
+      "body_hex": "00000000"
+    }
+  ],
+  "refused": {
+    "fetches": [
+      {
+        "case": "no_targets",
+        "body_hex": "01010401000000010401000000010402000000404b4c0000000000808d5b000000000001000000e8030000000010000000000000"
+      },
+      {
+        "case": "duplicate_partition",
+        "body_hex": "01010401000000010401000000010402000000404b4c0000000000808d5b000000000001000000e803000000001000000200000001000000010000000000000000000008000b00000000000000000000000000000001000000050000000000000000000008000b000000000000000000000000000000"
+      },
+      {
+        "case": "first_start_point",
+        "body_hex": "01010401000000010401000000010402000000404b4c0000000000808d5b000000000001000000e803000000001000000100000001000000030000000000000000000008000b000000000000000000000000000000"
+      },
+      {
+        "case": "min_count_above_count",
+        "body_hex": "01010401000000010401000000010402000000404b4c0000000000808d5b0000000000e9030000e803000000001000000100000001000000010000000000000000000008000b000000000000000000000000000000"
+      },
+      {
+        "case": "target_bytes_above_request_bytes",
+        "body_hex": "01010401000000010401000000010402000000404b4c0000000000808d5b000000000001000000e803000000001000000100000001000000010000000000000000010010000b000000000000000000000000000000"
+      },
+      {
+        "case": "timeout_without_reply_margin",
+        "body_hex": "01010401000000010401000000010402000000404b4c0000000000404b4c000000000001000000e803000000001000000100000001000000010000000000000000000008000b000000000000000000000000000000"
+      }
+    ],
+    "fetch_replies": [
+      {
+        "case": "error_section_with_records",
+        "body_hex": "01000000010000005900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000400000000000000"
+      },
+      {
+        "case": "truncated_table",
+        "body_hex": "02000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+      }
+    ]
+  }
+}

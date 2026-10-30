@@ -411,7 +411,8 @@ async fn given_deferred_poll_when_messages_arrive_should_fill_count_and_keep_con
         PollOptions {
             count: 2,
             min_count: 2,
-            ..PollOptions::wait(2_000_000.into())
+            // Far above the run time, so a slow runner cannot end the wait before the second send.
+            ..PollOptions::wait(30_000_000.into())
         },
     ));
     tokio::select! {
@@ -520,10 +521,11 @@ async fn given_deferred_poll_when_messages_arrive_should_fill_count_and_keep_con
         http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
     )
 )]
-async fn given_committing_poll_when_dropped_should_block_its_partition_until_abandoned(
+async fn given_committing_poll_when_dropped_should_settle_through_its_one_reply(
     harness: &TestHarness,
 ) {
-    let client = if harness.transport().unwrap() == TransportProtocol::Http {
+    let http = harness.transport().unwrap() == TransportProtocol::Http;
+    let client = if http {
         harness
             .node(1)
             .http_client()
@@ -569,6 +571,12 @@ async fn given_committing_poll_when_dropped_should_block_its_partition_until_aba
         )
         .await
         .unwrap();
+    // Over HTTP the server reads after the wait, so the poll ends before the next steps.
+    let max_wait = if http {
+        Duration::from_millis(200)
+    } else {
+        Duration::from_secs(10)
+    };
     let mut dropped = Box::pin(client.poll_messages(
         &stream,
         &topic,
@@ -578,8 +586,8 @@ async fn given_committing_poll_when_dropped_should_block_its_partition_until_aba
         PollOptions {
             count: 2,
             min_count: 2,
-            server_commit: ServerCommitPolicy::OnRead,
-            ..PollOptions::wait(200_000.into())
+            commit: CommitPolicy::OnRead,
+            ..PollOptions::wait(max_wait.into())
         },
     ));
     tokio::select! {
@@ -587,6 +595,46 @@ async fn given_committing_poll_when_dropped_should_block_its_partition_until_aba
         () = sleep(Duration::from_millis(50)) => {}
     }
     drop(dropped);
+    if !http {
+        // The poll waits for a second message, so the cancel wins before any store. The server
+        // answers it once with nothing stored, and that answer opens the partition.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let polled = loop {
+            let polled = client
+                .poll_messages(
+                    &stream,
+                    &topic,
+                    0,
+                    &consumer,
+                    &strategy,
+                    PollOptions {
+                        count: 1,
+                        ..PollOptions::default()
+                    },
+                )
+                .await;
+            match polled {
+                Err(IggyError::PartitionLaneBlocked(0, _))
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    sleep(Duration::from_millis(50)).await;
+                }
+                polled => break polled,
+            }
+        };
+        let polled = polled.expect("the answer to the cancel opens the partition");
+        assert_eq!(
+            polled
+                .messages
+                .iter()
+                .map(|message| message.header.offset)
+                .collect::<Vec<_>>(),
+            [0],
+            "a cancelled poll stores nothing"
+        );
+        return;
+    }
+    // HTTP has no cancel, so the server can still store the offset after the drop.
     sleep(Duration::from_millis(250)).await;
     let blocked = client
         .poll_messages(
@@ -617,7 +665,7 @@ async fn given_committing_poll_when_dropped_should_block_its_partition_until_aba
             &PollingStrategy::offset(0),
             PollOptions {
                 count: 1,
-                server_commit: ServerCommitPolicy::OnRead,
+                commit: CommitPolicy::OnRead,
                 ..PollOptions::wait(500_000.into())
             },
         )
@@ -633,7 +681,7 @@ async fn given_committing_poll_when_dropped_should_block_its_partition_until_aba
             &strategy,
             PollOptions {
                 count: 1,
-                server_commit: ServerCommitPolicy::OnRead,
+                commit: CommitPolicy::OnRead,
                 ..PollOptions::wait(200_000.into())
             },
         )
@@ -720,7 +768,7 @@ async fn given_group_fetch_when_one_partition_holds_messages_should_not_wait_on_
         .collect();
     let options = PollOptions {
         count: 1,
-        server_commit: ServerCommitPolicy::OnRead,
+        commit: CommitPolicy::OnRead,
         ..PollOptions::wait(MAX_WAIT.into())
     };
     for offset in 0..FETCHES {
@@ -783,7 +831,7 @@ async fn given_group_fetch_when_every_partition_is_idle_should_resolve_next_afte
         &Consumer::group(group),
         PollOptions {
             count: 1,
-            server_commit: ServerCommitPolicy::OnRead,
+            commit: CommitPolicy::OnRead,
             ..PollOptions::wait(MAX_WAIT.into())
         },
     )
@@ -820,7 +868,7 @@ async fn given_group_fetch_when_one_partition_keeps_a_backlog_should_read_anothe
         .polling_strategy(PollingStrategy::next())
         .poll_options(PollOptions {
             count: 1,
-            server_commit: ServerCommitPolicy::OnRead,
+            commit: CommitPolicy::OnRead,
             ..PollOptions::wait(MAX_WAIT.into())
         })
         .build();
@@ -1028,7 +1076,7 @@ async fn given_commit_on_poll_group_when_the_application_pauses_should_commit_on
         .polling_strategy(PollingStrategy::next())
         .poll_options(PollOptions {
             count: 1,
-            server_commit: ServerCommitPolicy::OnRead,
+            commit: CommitPolicy::OnRead,
             ..PollOptions::wait(Duration::from_secs(2).into())
         })
         .build();
@@ -1124,7 +1172,7 @@ async fn given_commit_on_poll_group_when_shut_down_mid_batch_should_store_the_la
         .create_consumer_group_if_not_exists()
         .poll_options(PollOptions {
             count: SENT,
-            server_commit: ServerCommitPolicy::OnRead,
+            commit: CommitPolicy::OnRead,
             ..PollOptions::wait(IggyDuration::ONE_SECOND)
         })
         .build();
@@ -1152,7 +1200,7 @@ async fn given_commit_on_poll_consumer_when_shut_down_mid_batch_should_store_the
         .partitions([0])
         .poll_options(PollOptions {
             count: SENT,
-            server_commit: ServerCommitPolicy::OnRead,
+            commit: CommitPolicy::OnRead,
             ..PollOptions::wait(IggyDuration::ONE_SECOND)
         })
         .build();
@@ -1358,7 +1406,7 @@ async fn given_byte_limit_when_batch_is_larger_should_return_prefix_without_skip
                 &Consumer::default(),
                 &PollingStrategy::next(),
                 PollOptions {
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..options
                 },
             ),
@@ -1369,8 +1417,8 @@ async fn given_byte_limit_when_batch_is_larger_should_return_prefix_without_skip
         assert_eq!(polled.messages.len(), 1);
         assert_eq!(polled.messages[0].header.offset, offset);
     }
-    // The server refuses a first record larger than `max_bytes` with `InvalidSizeBytes`, and the
-    // SDK then reads it alone in a second request.
+    // The server returns a first record larger than `max_bytes` alone, in the one reply of the
+    // request.
     let oversized = client
         .poll_messages(
             &stream,
@@ -1392,6 +1440,31 @@ async fn given_byte_limit_when_batch_is_larger_should_return_prefix_without_skip
             .map(|message| message.header.offset)
             .collect::<Vec<_>>(),
         [0]
+    );
+    // A `Last` start counts back from the end of the partition, and its first record comes alone
+    // in the same way.
+    let last = client
+        .poll_messages(
+            &stream,
+            &topic,
+            0,
+            &Consumer::default(),
+            &PollingStrategy::last(),
+            PollOptions {
+                count: 2,
+                min_count: 1,
+                max_bytes: max_bytes - 1,
+                ..options
+            },
+        )
+        .await
+        .expect("an oversized first record of a `Last` start must come alone");
+    assert_eq!(
+        last.messages
+            .iter()
+            .map(|message| message.header.offset)
+            .collect::<Vec<_>>(),
+        [1]
     );
     let replay = client
         .poll_messages(

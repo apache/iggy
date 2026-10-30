@@ -224,7 +224,7 @@ async fn create_consumer(client: &IggyClient) -> IggyConsumer {
         .unwrap()
         .poll_options(PollOptions {
             count: 10,
-            server_commit: ServerCommitPolicy::OnRead,
+            commit: CommitPolicy::OnRead,
             ..PollOptions::wait(IggyDuration::ONE_SECOND)
         })
         .polling_strategy(PollingStrategy::next())

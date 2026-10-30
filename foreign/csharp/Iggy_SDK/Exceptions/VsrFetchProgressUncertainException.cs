@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Vsr;
+
 namespace Apache.Iggy.Exceptions;
 
 /// <summary>
@@ -23,10 +25,10 @@ namespace Apache.Iggy.Exceptions;
 /// </summary>
 public sealed class VsrFetchProgressUncertainException(ulong operationId, Exception? cause = null)
     : VsrRequestOutcomeUnknownException(cause ?? new InvalidOperationException(
-        $"Committing fetch {operationId} requires explicit abandonment; its outcome remains unknown."), operationId)
+        $"Read {operationId} has unknown progress and requires explicit abandonment."), operationId)
 {
     /// <summary>The SDK-local uncertain-fetch status.</summary>
-    public const int STATUS_CODE = 14010;
+    public const int STATUS_CODE = VsrError.FETCH_PROGRESS_UNCERTAIN;
 
     /// <summary>The SDK-local uncertain-fetch status.</summary>
     public int StatusCode => STATUS_CODE;

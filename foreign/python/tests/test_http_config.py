@@ -33,13 +33,13 @@ from datetime import timedelta
 import pytest
 
 from apache_iggy import (
+    CommitPolicy,
     Consumer,
     HttpConfig,
     IggyClient,
     IggyError,
     PollingStrategy,
     PollOptions,
-    ServerCommitPolicy,
 )
 from apache_iggy import SendMessage as Message
 
@@ -275,7 +275,7 @@ class TestHttpConfigAgainstServer:
             consumer=Consumer.Single("http-round-trip"),
             partition_id=0,
             polling_strategy=PollingStrategy.First(),
-            options=PollOptions(count=1, server_commit=ServerCommitPolicy.OnRead),
+            options=PollOptions(count=1, commit=CommitPolicy.OnRead()),
         )
 
         assert [message.payload().decode() for message in polled.messages] == [payload]

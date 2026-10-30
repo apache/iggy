@@ -114,6 +114,87 @@ public sealed class DeferredPollingTests
     }
 
     /// <summary>
+    ///     A parked request that commits gets the cancel too and keeps its reply slot. The server answers it once:
+    ///     refused when the cancel won and nothing was stored, so the call ends as canceled, or with the messages it
+    ///     stored when the read passed first, so the call delivers them.
+    /// </summary>
+    [Theory]
+    [InlineData(PollCode, true)]
+    [InlineData(PollCode, false)]
+    [InlineData(FetchCode, true)]
+    [InlineData(FetchCode, false)]
+    public async Task given_a_parked_committing_request_when_the_caller_cancels_should_cancel_it_and_wait_for_its_reply(
+        int code, bool cancelWins)
+    {
+        using var node = new MockNode();
+        var parked = new TaskCompletionSource<MockRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
+        node.Serve(request =>
+        {
+            if (request.Code == code)
+            {
+                parked.TrySetResult(request);
+                return null;
+            }
+            return request.Code == CancelCode ? null : Standalone(node, request);
+        });
+        using var client = await ConnectAsync(node);
+        var token = TestContext.Current.CancellationToken;
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var call = ReadCommittingAsync(client, code, cancellation.Token);
+        var request = await parked.Task.WaitAsync(PromptLimit, token);
+
+        await cancellation.CancelAsync();
+
+        await UntilAsync(() => node.Requests(CancelCode) == 1);
+        await Task.Delay(SettleDelay, token);
+        Assert.False(call.IsCompleted);
+        if (cancelWins)
+        {
+            await node.AnswerParkedAsync(request, Reply(request.Operation, [], VsrError.TRANSIENT_NOT_ACCEPTED));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => call.WaitAsync(PromptLimit, token));
+            return;
+        }
+        await node.AnswerParkedAsync(request, code == PollCode
+            ? Batch(request, DrainedOffset)
+            : Reply(request.Operation, FetchBody(GoldenSection(1, 0, default))));
+        Assert.Equal(GOLDEN_BATCH_MESSAGES, await call.WaitAsync(PromptLimit, token));
+    }
+
+    /// <summary>
+    ///     A plain poll that commits is not parked and has no cancel on the server, so once it went out the caller's
+    ///     cancel leaves it running and the call delivers what it stored.
+    /// </summary>
+    [Fact]
+    public async Task given_a_committing_poll_in_flight_when_the_caller_cancels_should_deliver_its_reply()
+    {
+        using var node = new MockNode();
+        var parked = new TaskCompletionSource<MockRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
+        node.Serve(request =>
+        {
+            if (request.Code == CommandCodes.POLL_MESSAGES_CODE)
+            {
+                parked.TrySetResult(request);
+                return null;
+            }
+            return Standalone(node, request);
+        });
+        using var client = await ConnectAsync(node);
+        var token = TestContext.Current.CancellationToken;
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var call = client.PollMessagesAsync(Stream, Topic, 1, Consumer.New(4), PollingStrategy.Offset(0), 10, true,
+            cancellation.Token);
+        var request = await parked.Task.WaitAsync(PromptLimit, token);
+
+        await cancellation.CancelAsync();
+
+        await Task.Delay(SettleDelay, token);
+        Assert.False(call.IsCompleted);
+        Assert.Equal(0, node.Requests(CancelCode));
+        await node.AnswerParkedAsync(request, Batch(request, DrainedOffset));
+        Assert.Equal((int)GOLDEN_BATCH_MESSAGES, (await call.WaitAsync(PromptLimit, token)).Messages.Count);
+    }
+
+    /// <summary>
     ///     A poll that moves a consumer holds the progress lane of its partition while it is parked. A send takes the
     ///     other lane of the partition, and an offset store moves the consumer too, so only the store waits for the poll.
     /// </summary>
@@ -125,11 +206,16 @@ public sealed class DeferredPollingTests
     {
         using var node = new MockNode();
         var stores = 0;
+        var parked = new TaskCompletionSource<MockRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
         node.Serve(request =>
         {
             if (request.Operation == (byte)VsrOperation.StoreConsumerOffset)
             {
                 Interlocked.Increment(ref stores);
+            }
+            if (request.Code == PollCode)
+            {
+                parked.TrySetResult(request);
             }
             return request.Code is PollCode or CancelCode ? null : Standalone(node, request);
         });
@@ -137,7 +223,7 @@ public sealed class DeferredPollingTests
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         var poll = client.PollMessagesAsync(Stream, Topic, 1, Consumer.New(4),
             next ? PollingStrategy.Next() : PollingStrategy.Offset(0), 10, autoCommit, LongWait, cancellation.Token);
-        await UntilAsync(() => node.Requests(PollCode) == 1);
+        var request = await parked.Task.WaitAsync(PromptLimit, TestContext.Current.CancellationToken);
         var store = client.StoreOffsetAsync(Consumer.New(4), Stream, Topic, 0, 1, TestContext.Current.CancellationToken);
 
         await client.SendMessagesAsync(Stream, Topic, Partitioning.PartitionId(1),
@@ -147,60 +233,19 @@ public sealed class DeferredPollingTests
         await Task.Delay(SettleDelay, TestContext.Current.CancellationToken);
         Assert.Equal(0, Volatile.Read(ref stores));
         await cancellation.CancelAsync();
-        await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => poll);
+        if (autoCommit)
+        {
+            // A committing poll keeps its lane until the server answers the cancel.
+            await UntilAsync(() => node.Requests(CancelCode) == 1);
+            await node.AnswerParkedAsync(request, Reply(request.Operation, [], VsrError.TRANSIENT_NOT_ACCEPTED));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => poll);
+        }
+        else
+        {
+            await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => poll);
+        }
         await store.WaitAsync(PromptLimit, TestContext.Current.CancellationToken);
         Assert.Equal(1, Volatile.Read(ref stores));
-    }
-
-    /// <summary>
-    ///     A consumer on a shared client parks a poll that moves its offset. Disposal cancels the poll at once, so the
-    ///     receive loop ends and the progress lane of the partition is free: an offset store of the shared client on
-    ///     that partition does not wait for the wait time.
-    /// </summary>
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task given_a_parked_consumer_poll_when_the_consumer_is_disposed_should_cancel_it_and_free_its_partition(
-        bool rented)
-    {
-        using var node = new MockNode();
-        var stores = 0;
-        node.Serve(request =>
-        {
-            if (request.Operation == (byte)VsrOperation.StoreConsumerOffset)
-            {
-                Interlocked.Increment(ref stores);
-            }
-            return request.Code is PollCode or CancelCode ? null : Standalone(node, request);
-        });
-        using var client = await ConnectAsync(node);
-        var consumer = new IggyConsumer(client, new IggyConsumerConfig
-        {
-            StreamId = Stream,
-            TopicId = Topic,
-            PartitionId = 1,
-            Consumer = Consumer.New(4),
-            PollingStrategy = PollingStrategy.Next(),
-            AutoCommitMode = AutoCommitMode.Disabled,
-            PollOptions = LongWait
-        }, NullLoggerFactory.Instance);
-        var token = TestContext.Current.CancellationToken;
-        await consumer.InitAsync(token);
-        // Disposed only after its receive ends, because an enumerator refuses disposal while it waits for a message.
-        IAsyncEnumerator<object> messages = rented
-            ? consumer.ReceiveRentedAsync(token).GetAsyncEnumerator(token)
-            : consumer.ReceiveAsync(token).GetAsyncEnumerator(token);
-        var received = messages.MoveNextAsync().AsTask();
-        await UntilAsync(() => node.Requests(PollCode) == 1);
-
-        await consumer.DisposeAsync().AsTask().WaitAsync(PromptLimit, token);
-
-        Assert.False(await received.WaitAsync(PromptLimit, token));
-        await messages.DisposeAsync();
-        await UntilAsync(() => node.Requests(CancelCode) == 1);
-        await client.StoreOffsetAsync(Consumer.New(4), Stream, Topic, 0, 1, token).WaitAsync(PromptLimit, token);
-        Assert.Equal(1, Volatile.Read(ref stores));
-        Assert.Equal(1, node.Requests(PollCode));
     }
 
     /// <summary>The server holds a bounded number of parked requests per session and shard, so the client never sends more.</summary>
@@ -366,6 +411,21 @@ public sealed class DeferredPollingTests
     private static Task<PolledMessages> PollPartitionAsync(TcpMessageStream client, CancellationToken token) =>
         client.PollMessagesAsync(Stream, Topic, 1, Consumer.New(4), PollingStrategy.Offset(0), 10, false, LongWait,
             token);
+
+    /// <summary>A deferred poll or a fetch of partition 1 that commits, answered with its message count.</summary>
+    private static async Task<uint> ReadCommittingAsync(TcpMessageStream client, int code, CancellationToken token)
+    {
+        if (code == PollCode)
+        {
+            var polled = await client.PollMessagesAsync(Stream, Topic, 1, Consumer.New(4), PollingStrategy.Offset(0),
+                10, true, LongWait, token);
+            return (uint)polled.Messages.Count;
+        }
+
+        using var fetched = await client.FetchMessagesAsync(Stream, Topic, [(1, PollingStrategy.Offset(0))],
+            Consumer.New(4), 10, true, LongWait, token);
+        return Assert.Single(fetched.Sections).MessagesCount;
+    }
 
     private static async Task<TcpMessageStream> ConnectAsync(MockNode node)
     {

@@ -155,7 +155,7 @@ async fn given_replicated_partition_when_no_ack_offsets_mutate_should_converge_a
             &PollingStrategy::first(),
             PollOptions {
                 count: 1,
-                server_commit: ServerCommitPolicy::OnRead,
+                commit: CommitPolicy::OnRead,
                 ..PollOptions::default()
             },
         )

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use iggy::prelude::{
@@ -31,25 +32,33 @@ const CLOSED: &str = "the reader is closed";
 
 /// The C++ handle of a reader. `close` takes the reader out, so every later call fails, except
 /// a second `close`, which does nothing.
+///
+/// C++ can call it from several threads, so the calls run one at a time: a call waits for a
+/// running `next` to end, at most for its timeout.
 pub struct PartitionReader {
-    inner: Option<RustPartitionReader>,
+    inner: Mutex<Option<RustPartitionReader>>,
 }
 
 impl PartitionReader {
     pub(crate) fn new(reader: RustPartitionReader) -> Self {
         Self {
-            inner: Some(reader),
+            inner: Mutex::new(Some(reader)),
         }
     }
 
+    fn reader(&self) -> MutexGuard<'_, Option<RustPartitionReader>> {
+        // A panic in a call leaves the reader as it was, so the next call can use it.
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn next(
-        &mut self,
+        &self,
         timeout_micros: u64,
         error_info: &mut ffi::ReadErrorInfo,
     ) -> Result<ffi::PolledMessages, String> {
         *error_info = ffi::ReadErrorInfo::default();
-        let reader = self
-            .inner
+        let mut reader = self.reader();
+        let reader = reader
             .as_mut()
             .ok_or_else(|| format!("Could not read messages: {CLOSED}"))?;
         // `timeout` panics when it is built on a thread outside a runtime, such as the C++ caller,
@@ -74,8 +83,8 @@ impl PartitionReader {
         error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
         *error_info = ffi::ErrorInfo::default();
-        let reader = self
-            .inner
+        let reader = self.reader();
+        let reader = reader
             .as_ref()
             .ok_or_else(|| format!("Could not commit checkpoint: {CLOSED}"))?;
         RUNTIME
@@ -84,8 +93,24 @@ impl PartitionReader {
             .map_err(|error| format!("Could not commit checkpoint: {error}"))
     }
 
+    pub fn mark(
+        &self,
+        checkpoint: &Checkpoint,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
+        let reader = self.reader();
+        let reader = reader
+            .as_ref()
+            .ok_or_else(|| format!("Could not mark checkpoint: {CLOSED}"))?;
+        reader
+            .mark(checkpoint.0)
+            .inspect_err(|error| error_info.record(error))
+            .map_err(|error| format!("Could not mark checkpoint: {error}"))
+    }
+
     pub fn seek(
-        &mut self,
+        &self,
         partition_id: u32,
         start: ffi::PollingStrategy,
         error_info: &mut ffi::ErrorInfo,
@@ -97,7 +122,7 @@ impl PartitionReader {
     }
 
     pub fn seek_to(
-        &mut self,
+        &self,
         partition_id: u32,
         continuation: &Continuation,
         error_info: &mut ffi::ErrorInfo,
@@ -107,13 +132,13 @@ impl PartitionReader {
     }
 
     fn set_position(
-        &mut self,
+        &self,
         partition_id: u32,
         start: RustPollingStrategy,
         error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
-        let reader = self
-            .inner
+        let mut reader = self.reader();
+        let reader = reader
             .as_mut()
             .ok_or_else(|| format!("Could not seek partition {partition_id}: {CLOSED}"))?;
         RUNTIME
@@ -123,15 +148,15 @@ impl PartitionReader {
     }
 
     pub fn partitions(&self) -> Result<Vec<u32>, String> {
-        self.inner
+        self.reader()
             .as_ref()
             .map(RustPartitionReader::partitions)
             .ok_or_else(|| format!("Could not get the reader partitions: {CLOSED}"))
     }
 
-    pub fn close(&mut self, error_info: &mut ffi::ErrorInfo) -> Result<(), String> {
+    pub fn close(&self, error_info: &mut ffi::ErrorInfo) -> Result<(), String> {
         *error_info = ffi::ErrorInfo::default();
-        let Some(reader) = self.inner.take() else {
+        let Some(reader) = self.reader().take() else {
             return Ok(());
         };
         RUNTIME
@@ -142,7 +167,7 @@ impl PartitionReader {
 }
 
 impl ffi::ReadErrorInfo {
-    fn record(&mut self, error: &ReadError) {
+    pub(crate) fn record(&mut self, error: &ReadError) {
         self.error.record(&error.error);
         self.has_partition_id = error.partition_id.is_some();
         self.partition_id = error.partition_id.unwrap_or_default();
@@ -158,6 +183,7 @@ impl ffi::ReadErrorInfo {
 mod tests {
     use super::*;
     use iggy::prelude::{Checkpoint as RustCheckpoint, IggyError, PartitionContext, PollingKind};
+    use std::thread;
 
     const PARTITION: u32 = 1;
     const CONTEXT: PartitionContext = PartitionContext {
@@ -172,7 +198,9 @@ mod tests {
 
     #[test]
     fn should_refuse_every_call_on_a_closed_reader_except_a_second_close() {
-        let mut reader = PartitionReader { inner: None };
+        let reader = PartitionReader {
+            inner: Mutex::new(None),
+        };
         let mut error_info = ffi::ErrorInfo::default();
         let mut read_error = ffi::ReadErrorInfo::default();
         let start = ffi::PollingStrategy {
@@ -184,6 +212,14 @@ mod tests {
         assert!(
             reader
                 .commit(
+                    &Checkpoint(RustCheckpoint::new(PARTITION, 0, CONTEXT)),
+                    &mut error_info
+                )
+                .is_err()
+        );
+        assert!(
+            reader
+                .mark(
                     &Checkpoint(RustCheckpoint::new(PARTITION, 0, CONTEXT)),
                     &mut error_info
                 )
@@ -210,6 +246,34 @@ mod tests {
     }
 
     #[test]
+    fn given_reader_shared_by_threads_when_calling_should_serve_every_call() {
+        const THREADS: usize = 4;
+        let reader = PartitionReader {
+            inner: Mutex::new(None),
+        };
+
+        thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    let mut error_info = ffi::ErrorInfo::default();
+                    let mut read_error = ffi::ReadErrorInfo::default();
+                    assert!(reader.next(0, &mut read_error).is_err());
+                    assert!(
+                        reader
+                            .seek_to(
+                                PARTITION,
+                                &Continuation(continuation_at(0)),
+                                &mut error_info
+                            )
+                            .is_err()
+                    );
+                    assert_eq!(reader.close(&mut error_info), Ok(()));
+                });
+            }
+        });
+    }
+
+    #[test]
     fn should_record_the_skip_of_a_read_error_as_one_continuation() {
         let skip = continuation_at(5);
         let mut info = ffi::ReadErrorInfo::default();
@@ -218,6 +282,8 @@ mod tests {
             partition_id: Some(PARTITION),
             error: IggyError::InvalidMessagePayloadLength,
             skip: Some(skip),
+        offset: None,
+        record: None
         });
         assert!(info.has_partition_id);
         assert_eq!(info.partition_id, PARTITION);
@@ -233,6 +299,8 @@ mod tests {
             partition_id: None,
             error: IggyError::ClientShutdown,
             skip: None,
+        offset: None,
+        record: None
         });
         assert!(!info.has_partition_id);
         assert!(

@@ -16,7 +16,7 @@
 // under the License.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{Client, ConsumerGroupClient, Identifier, IggyError};
@@ -38,6 +38,8 @@ pub(crate) struct Membership {
     /// Only `IggyConsumer` creates a missing group.
     create: bool,
     joined: AtomicBool,
+    /// Rises at each `forget`, so a join that a forget overtook does not count as joined.
+    forgets: AtomicU64,
     /// A create or a join whose outcome is unknown, resolved before the next join.
     uncertain: Mutex<Option<u64>>,
 }
@@ -57,6 +59,7 @@ impl Membership {
             group,
             create,
             joined: AtomicBool::new(false),
+            forgets: AtomicU64::new(0),
             uncertain: Mutex::new(None),
         }
     }
@@ -67,6 +70,7 @@ impl Membership {
         if self.joined.load(ORDERING) {
             return Ok(());
         }
+        let forgets = self.forgets.load(ORDERING);
         let (stream_id, topic_id, group_id) = (&self.stream, &self.topic, &self.group);
         let mut uncertain_operation = self.uncertain.lock().await;
         let client = self.client.read().await;
@@ -130,13 +134,17 @@ impl Membership {
             );
             return Err(error);
         }
-        self.joined.store(true, ORDERING);
+        // The session that joined can end while the join is in flight.
+        if self.forgets.load(ORDERING) == forgets {
+            self.joined.store(true, ORDERING);
+        }
         info!("Joined consumer group: {group_id} for topic: {topic_id}, stream: {stream_id}");
         Ok(())
     }
 
     /// The session that joined is gone, so the next refresh joins again.
     pub(crate) fn forget(&self) {
+        self.forgets.fetch_add(1, ORDERING);
         self.joined.store(false, ORDERING);
     }
 

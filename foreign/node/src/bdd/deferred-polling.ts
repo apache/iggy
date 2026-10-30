@@ -17,58 +17,29 @@
 
 import assert from 'node:assert/strict';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { Given, When, Then } from '@cucumber/cucumber';
+import { After, Given, When, Then } from '@cucumber/cucumber';
 import { VsrResponseTimeoutError, waitWithin } from '../client/client.operation.js';
-import { ResponseError } from '../wire/error.utils.js';
 import { ConsumerKind } from '../wire/offset/offset.utils.js';
 import {
-  Consumer, DEFAULT_DEFERRED_POLL_OPTIONS, MIN_DEFERRED_POLL_REPLY_MARGIN_US, Partitioning,
-  PollingStrategy, US_PER_MS, decodeFetchSection, syncGroup,
-  type PollMessages, type PollMessagesResponse
+  CommitAfter, CommitPolicy, Consumer, Partitioning, PollingStrategy,
+  type PollMessagesResponse, type PollOptions, type PollPartition
 } from '../wire/index.js';
 import type { BackgroundCall, Outcome, TestWorld } from './world.js';
 
 const MS_PER_SECOND = 1_000;
 const POLL_COUNT = 10;
-const REPLY_MARGIN_MS = Number(MIN_DEFERRED_POLL_REPLY_MARGIN_US / US_PER_MS);
-const ASSIGNMENT_TIMEOUT_MS = 10_000;
-const ASSIGNMENT_RETRY_MS = 50;
-/** An abort ends the call at once, so this only bounds a broken cancellation. */
-const CANCELLED_END_MS = 1_000;
-const TRANSIENT_NOT_COMMITTED = 57;
+/** A cancelled poll that commits ends once the server answers its cancel. */
+const CANCELLED_END_MS = 2_000;
 const ABORT_ERROR = 'AbortError';
+const COMMIT_INTERVAL_MS = 5_000;
 
-/** The wait, and a request timeout that leaves the SDK reply margin after it. */
-const waitOptions = (maxWaitSeconds: number) => {
-  const maxWait = maxWaitSeconds * MS_PER_SECOND;
-  return { maxWait, requestTimeout: Math.max(DEFAULT_DEFERRED_POLL_OPTIONS.requestTimeout, maxWait + REPLY_MARGIN_MS) };
-};
+const waitOptions = (maxWaitSeconds: number): Partial<PollOptions> =>
+  ({ count: POLL_COUNT, maxWait: maxWaitSeconds * MS_PER_SECOND });
 
 const namedConsumer = (name: string): Consumer => ({ kind: ConsumerKind.Single, id: name });
 
-const poll = (world: TestWorld, request: Omit<PollMessages, 'streamId' | 'topicId' | 'count'>) =>
-  world.client.message.poll({ streamId: world.stream.id, topicId: world.topic.id, count: POLL_COUNT, ...request });
-
-const fetchReady = async (world: TestWorld, consumer: Consumer, partitions: number[], pollingStrategy: PollingStrategy,
-  maxWait: number, signal: AbortSignal): Promise<PollMessagesResponse[]> => {
-  const topic = { streamId: world.stream.id, topicId: world.topic.id };
-  const cancel = new AbortController();
-  const stopped = AbortSignal.any([signal, cancel.signal]);
-  try {
-    const groups = await world.client.message.readinessGroups({ ...topic, partitions, signal: stopped });
-    return await Promise.any(groups.map(async (group) => {
-      const sections = await world.client.message.fetch({
-        ...topic, consumer, count: POLL_COUNT, autocommit: false, options: waitOptions(maxWait), signal: stopped,
-        targets: group.map((partitionId) => ({ partitionId, pollingStrategy }))
-      });
-      const replies = sections.map(decodeFetchSection).filter(({ count }) => count > 0);
-      assert.ok(replies.length > 0, 'the fetch returned no messages');
-      return replies;
-    }));
-  } finally {
-    cancel.abort();
-  }
-};
+const poll = (world: TestWorld, request: Omit<PollPartition, 'streamId' | 'topicId'>) =>
+  world.client.message.poll({ streamId: world.stream.id, topicId: world.topic.id, ...request });
 
 const startInBackground = <T>(call: (signal: AbortSignal) => Promise<T>): BackgroundCall<T> => {
   const cancel = new AbortController();
@@ -96,6 +67,15 @@ const endBy = async <T>(call: BackgroundCall<T>, deadline: number, what: string)
   }
 };
 
+const within = async <T>(promise: Promise<T>, seconds: number, what: string): Promise<T> => {
+  try {
+    return await waitWithin(promise, Date.now() + seconds * MS_PER_SECOND);
+  } catch (error) {
+    if (error instanceof VsrResponseTimeoutError) assert.fail(`${what} did not return in time`);
+    throw error;
+  }
+};
+
 const valueOrThrow = <T>(outcome: Outcome<T>): T => {
   if (!outcome.ok) throw outcome.error;
   return outcome.value;
@@ -104,14 +84,25 @@ const valueOrThrow = <T>(outcome: Outcome<T>): T => {
 const assertOnlyPayload = (response: PollMessagesResponse, payload: string) =>
   assert.deepEqual(response.messages.map((message) => message.payload.toString()), [payload]);
 
-/**
- * An auto-commit poll that reached the server ends with 57 and the abort as
- * its cause, because the client cannot know whether the server committed its offset.
- */
-const isCancellation = (error: unknown): boolean =>
-  error instanceof Error && (error.name === ABORT_ERROR ||
-    (error instanceof ResponseError && error.errorCode === TRANSIENT_NOT_COMMITTED &&
-      error.cause instanceof Error && error.cause.name === ABORT_ERROR));
+const closeConsumer = async (world: TestWorld): Promise<void> => {
+  const consumer = world.consumer;
+  world.consumer = undefined;
+  world.consumerMessages = undefined;
+  await consumer?.shutdown();
+};
+
+const openGroupConsumer = async (world: TestWorld, name: string, options: Partial<PollOptions>): Promise<void> => {
+  world.consumer = await world.client.consumerGroup({
+    name, streamId: world.stream.id, topicId: world.topic.id, start: PollingStrategy.Next, options
+  });
+  world.consumerMessages = world.consumer[Symbol.asyncIterator]();
+};
+
+After(async function (this: TestWorld) {
+  await closeConsumer(this);
+  await this.reader?.close();
+  this.reader = undefined;
+});
 
 Given(
   'a stream named {string} with a topic named {string} with {int} partitions exists',
@@ -127,8 +118,8 @@ When(
   'I start a deferred poll of partition {int} from offset {int} with a max wait of {int} second(s)',
   function (this: TestWorld, partitionId: number, offset: number, maxWait: number) {
     this.deferredPoll = startInBackground((signal) => poll(this, {
-      consumer: Consumer.Single, partitionId, pollingStrategy: PollingStrategy.Offset(BigInt(offset)),
-      autocommit: false, deferred: waitOptions(maxWait), signal
+      consumer: Consumer.Single, partitionId, strategy: PollingStrategy.Offset(BigInt(offset)),
+      options: waitOptions(maxWait), signal
     }));
   }
 );
@@ -164,81 +155,36 @@ Then(
   }
 );
 
-When(
-  'I start a fetch on partitions {int}, {int} and {int} from offset {int} with a max wait of {int} second(s)',
-  function (this: TestWorld, first: number, second: number, third: number, offset: number, maxWait: number) {
-    this.deferredFetch = startInBackground((signal) => fetchReady(this, Consumer.Single, [first, second, third],
-      PollingStrategy.Offset(BigInt(offset)), maxWait, signal));
-  }
-);
-
 Then(
-  'the fetch should return only partition {int} within {int} second(s)',
-  async function (this: TestWorld, partitionId: number, seconds: number) {
-    const call = requireStarted(this.deferredFetch, 'fetch');
-    const outcome = await endBy(call, Date.now() + seconds * MS_PER_SECOND, 'the fetch');
-    const replies = valueOrThrow(outcome);
-    assert.deepEqual(replies.map((reply) => reply.partitionId), [partitionId]);
-    assert.equal(replies[0].messages.length, 1);
-  }
-);
-
-// The assignment can take longer than the default step timeout of cucumber.
-Given(
-  'I am the only member of consumer group {string} on the topic',
-  { timeout: 2 * ASSIGNMENT_TIMEOUT_MS },
-  async function (this: TestWorld, name: string) {
-    const topic = { streamId: this.stream.id, topicId: this.topic.id };
-    await this.client.group.create({ ...topic, name });
-    assert.ok(await this.client.group.join({ ...topic, groupId: name }));
-    // A member gets its partitions one by one after it joins.
-    const deadline = Date.now() + ASSIGNMENT_TIMEOUT_MS;
-    while ((await syncGroup(this.client.clientProvider)({ ...topic, groupId: name }))?.partitions.length !==
-        this.topic.partitionsCount) {
-      assert.ok(Date.now() < deadline, 'the member did not get every partition');
-      await sleep(ASSIGNMENT_RETRY_MS);
-    }
-    this.groupName = name;
-  }
-);
-
-Then(
-  'a group fetch with a max wait of {int} second(s) should return the payload {string} within {int} second(s)',
-  async function (this: TestWorld, maxWait: number, payload: string, seconds: number) {
-    const group = this.groupName;
-    assert.ok(group, 'the client joined no consumer group');
-    const topic = { streamId: this.stream.id, topicId: this.topic.id };
-    const assigned = await syncGroup(this.client.clientProvider)({ ...topic, groupId: group });
-    assert.ok(assigned, 'the client has no group assignment');
-    const consumer = Consumer.Group(group);
-    const call = startInBackground((signal) => fetchReady(this, consumer, assigned.partitions,
-      PollingStrategy.Next, maxWait, signal));
-    const outcome = await endBy(call, call.started + seconds * MS_PER_SECOND, 'the group fetch');
-    const replies = valueOrThrow(outcome);
-    assert.deepEqual(replies.map(({ partitionId }) => partitionId), [this.lastSentPartition]);
-    assertOnlyPayload(replies[0], payload);
-    for (const { partitionId, context, messages } of replies)
-      await this.client.offset.store({ ...topic, consumer, partitionId, context, offset: messages.at(-1)!.headers.offset });
+  'a poll of partition {int} for consumer {string} with the next strategy and the on read commit policy should return the payload {string}',
+  async function (this: TestWorld, partitionId: number, consumer: string, payload: string) {
+    const polled = await poll(this, {
+      consumer: namedConsumer(consumer), partitionId, strategy: PollingStrategy.Next,
+      options: { count: 1, commit: CommitPolicy.OnRead }
+    });
+    assertOnlyPayload(polled, payload);
   }
 );
 
 When(
-  'I start a deferred poll of partition {int} for consumer {string} with auto commit, a min count of {int} and a max wait of {int} second(s)',
+  'I start a deferred poll of partition {int} for consumer {string} with the on read commit policy, a min count of {int} and a max wait of {int} second(s)',
   function (this: TestWorld, partitionId: number, consumer: string, minCount: number, maxWait: number) {
     this.deferredPoll = startInBackground((signal) => poll(this, {
-      consumer: namedConsumer(consumer), partitionId, pollingStrategy: PollingStrategy.Next,
-      autocommit: true, deferred: { ...waitOptions(maxWait), minCount }, signal
+      consumer: namedConsumer(consumer), partitionId, strategy: PollingStrategy.Next,
+      options: { ...waitOptions(maxWait), minCount, commit: CommitPolicy.OnRead }, signal
     }));
   }
 );
 
+// The server answers a cancelled poll that commits once, refused when the cancel won, so the poll ends as aborted.
 When('I cancel the deferred poll after {int} milliseconds', async function (this: TestWorld, delay: number) {
   const call = requireStarted(this.deferredPoll, 'deferred poll');
   await sleep(delay);
   call.cancel.abort();
   const outcome = await endBy(call, Date.now() + CANCELLED_END_MS, 'the cancelled poll');
   assert.ok(!outcome.ok, 'the cancelled poll returned a result');
-  assert.ok(isCancellation(outcome.error), `the cancelled poll failed with ${String(outcome.error)}`);
+  assert.ok(outcome.error instanceof Error && outcome.error.name === ABORT_ERROR,
+    `the cancelled poll failed with ${String(outcome.error)}`);
 });
 
 When('I wait {int} second(s)', (seconds: number) => sleep(seconds * MS_PER_SECOND));
@@ -247,9 +193,60 @@ Then(
   'a poll of partition {int} for consumer {string} with the next strategy should return the payload {string}',
   async function (this: TestWorld, partitionId: number, consumer: string, payload: string) {
     const { messages } = await poll(this, {
-      consumer: namedConsumer(consumer), partitionId, pollingStrategy: PollingStrategy.Next, autocommit: false
+      consumer: namedConsumer(consumer), partitionId, strategy: PollingStrategy.Next
     });
     assert.ok(messages.length > 0, 'the poll returned no message');
     assert.equal(messages[0].payload.toString(), payload);
   }
 );
+
+When(
+  'I open a partition reader on partitions {int}, {int} and {int} from offset {int} with a max wait of {int} second(s)',
+  async function (this: TestWorld, first: number, second: number, third: number, offset: number, maxWait: number) {
+    this.reader = await this.client.message.reader({
+      streamId: this.stream.id, topicId: this.topic.id, consumer: Consumer.Single,
+      partitions: [first, second, third], start: PollingStrategy.Offset(BigInt(offset)), options: waitOptions(maxWait)
+    });
+  }
+);
+
+Then(
+  'the partition reader should return the payload {string} from partition {int} within {int} second(s)',
+  async function (this: TestWorld, payload: string, partitionId: number, seconds: number) {
+    assert.ok(this.reader, 'no partition reader was opened');
+    const batch = await within(this.reader.next(), seconds, 'the partition reader');
+    assert.equal(batch.partitionId, partitionId);
+    assertOnlyPayload(batch, payload);
+  }
+);
+
+When(
+  'I open a consumer in group {string} on the topic with a max wait of {int} second(s)',
+  function (this: TestWorld, name: string, maxWait: number) {
+    return openGroupConsumer(this, name, waitOptions(maxWait));
+  }
+);
+
+When(
+  'I open a consumer in group {string} on the topic that commits after processing',
+  function (this: TestWorld, name: string) {
+    return openGroupConsumer(this, name, {
+      maxWait: 5 * MS_PER_SECOND,
+      commit: CommitPolicy.Auto({ interval: COMMIT_INTERVAL_MS, after: CommitAfter.Processing })
+    });
+  }
+);
+
+Then(
+  'the consumer should return the payload {string} within {int} second(s)',
+  async function (this: TestWorld, payload: string, seconds: number) {
+    assert.ok(this.consumerMessages, 'no consumer was opened');
+    const next = await within(this.consumerMessages.next(), seconds, 'the consumer');
+    assert.ok(!next.done, 'the consumer ended');
+    assert.equal(next.value.message.payload.toString(), payload);
+  }
+);
+
+When('I close the consumer', function (this: TestWorld) {
+  return closeConsumer(this);
+});

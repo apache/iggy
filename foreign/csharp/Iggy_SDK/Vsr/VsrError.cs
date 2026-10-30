@@ -21,11 +21,12 @@ namespace Apache.Iggy.Vsr;
 
 /// <summary>
 ///     Server error codes the VSR paths raise locally or surface from the wire. Values match
-///     <c>core/common/src/error/iggy_error.rs</c>; the server shares this code space across the reply
+///     <c>core/common/src/error/iggy_error.rs</c>. The server shares this code space across the reply
 ///     status word, the committed result section and the eviction mapping.
 /// </summary>
 internal static class VsrError
 {
+    internal const int INVALID_CONFIGURATION = 2;
     internal const int INVALID_COMMAND = 3;
     internal const int INVALID_FORMAT = 4;
     internal const int FEATURE_UNAVAILABLE = 5;
@@ -71,6 +72,9 @@ internal static class VsrError
     internal const int INCOMPATIBLE_PROTOCOL_VERSION = 14003;
     internal const int SESSION_MISMATCH = 14004;
     internal const int REQUEST_ID_EXHAUSTED = 14005;
+    internal const int LANE_BLOCKED = 14007;
+    internal const int PARTITION_LANE_BLOCKED = 14009;
+    internal const int FETCH_PROGRESS_UNCERTAIN = 14010;
 
     /// <summary>A failure the client raised itself, before or instead of a server verdict.</summary>
     internal static IggyInvalidStatusCodeException Exception(int code, string message, Exception? cause = null)

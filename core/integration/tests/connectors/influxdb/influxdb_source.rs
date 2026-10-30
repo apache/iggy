@@ -20,7 +20,7 @@ use crate::connectors::fixtures::InfluxDbSourceFixture;
 use iggy_common::MessageClient;
 use iggy_common::Utc;
 use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
-use iggy_common::{Consumer, Identifier, PollOptions, PollingStrategy, ServerCommitPolicy};
+use iggy_common::{CommitPolicy, Consumer, Identifier, PollOptions, PollingStrategy};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use serde_json::Value;
@@ -67,7 +67,7 @@ async fn influxdb_source_polls_and_produces_messages(
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 100,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )
@@ -117,7 +117,7 @@ async fn influxdb_source_message_payload_structure(
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 10,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )
@@ -221,7 +221,7 @@ async fn influxdb_source_multiple_measurements(
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 100,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )

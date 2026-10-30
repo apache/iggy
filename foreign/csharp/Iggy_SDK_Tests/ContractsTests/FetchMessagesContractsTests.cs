@@ -205,9 +205,9 @@ public sealed class FetchMessagesContractsTests
         options.Validate(1);
     }
 
-    private static RentedConsumerTests.TrackingMemoryOwner Owner(byte[] body)
+    private static RentedBatchTests.TrackingMemoryOwner Owner(byte[] body)
     {
-        var owner = new RentedConsumerTests.TrackingMemoryOwner(body.Length);
+        var owner = new RentedBatchTests.TrackingMemoryOwner(body.Length);
         body.CopyTo(owner.Memory);
         return owner;
     }

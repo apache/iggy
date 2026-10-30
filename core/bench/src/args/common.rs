@@ -137,7 +137,7 @@ pub struct IggyBenchArgs {
 }
 
 impl IggyBenchArgs {
-    /// Each actor sets its own `count` and `server_commit`. The `count` here is the smallest
+    /// Each actor sets its own `count` and `commit`. The `count` here is the smallest
     /// batch, which `--min-count` must fit.
     pub fn poll_options(&self) -> PollOptions {
         PollOptions {

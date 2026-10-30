@@ -158,8 +158,17 @@ func pollPrimaryPartition(ctx context.Context, client *IggyTcpClient, partition 
 	stream, _ := iggcon.NewIdentifier(uint32(1))
 	topic, _ := iggcon.NewIdentifier(uint32(2))
 	consumer, _ := iggcon.NewIdentifier(uint32(3))
-	return client.PollMessages(ctx, stream, topic, iggcon.NewGroupConsumer(consumer),
+	return client.pollMessages(ctx, stream, topic, iggcon.NewGroupConsumer(consumer),
 		iggcon.NextPollingStrategy(), 1, true, &partition)
+}
+
+// readPrimaryPartition polls from Next without storing the offset.
+func readPrimaryPartition(ctx context.Context, client *IggyTcpClient, partition uint32) (*iggcon.PolledMessage, error) {
+	stream, _ := iggcon.NewIdentifier(uint32(1))
+	topic, _ := iggcon.NewIdentifier(uint32(2))
+	consumer, _ := iggcon.NewIdentifier(uint32(3))
+	return client.pollMessages(ctx, stream, topic, iggcon.NewGroupConsumer(consumer),
+		iggcon.NextPollingStrategy(), 1, false, &partition)
 }
 
 func routedPollPartition(t *testing.T, read request) uint32 {
@@ -206,7 +215,7 @@ func TestPrimaryPoll_SplitPrimariesKeepCoordinatorMembershipAndReuseConnections(
 	parent := fixture.client.session.ClientID()
 	session := fixture.client.session.SessionID()
 	for index := range 4 {
-		polled, err := fixture.client.PollMessages(context.Background(), stream, topic, consumer,
+		polled, err := fixture.client.pollMessages(context.Background(), stream, topic, consumer,
 			iggcon.NextPollingStrategy(), 1, true, nil)
 		require.NoError(t, err)
 		require.Equal(t, uint32(index%2), polled.PartitionId)
@@ -273,7 +282,8 @@ func TestPrimaryPoll_UnknownOutcomeDoesNotReplayAndOnlyLostRepliesReplaceDataCon
 				return nil, false
 			}, nil)
 			_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
-			require.ErrorIs(t, err, ierror.ErrTransientNotCommitted)
+			// The poll stores its offset, so its unknown outcome is uncertain progress.
+			require.ErrorIs(t, err, ierror.FetchProgressUncertain{})
 			require.Equal(t, int32(1), polls.Load(), "the admitted poll is never replayed")
 			_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
 			require.NoError(t, err)
@@ -318,7 +328,8 @@ func TestPrimaryPoll_CancellationPreservesTheLinkAndBoundsLaneWaiters(t *testing
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	completed := make(chan error, 1)
-	go func() { _, err := pollPrimaryPartition(ctx, fixture.client, 0); completed <- err }()
+	// A poll that stores nothing, since a cancelled poll that stores its offset waits for its reply.
+	go func() { _, err := readPrimaryPartition(ctx, fixture.client, 0); completed <- err }()
 	select {
 	case <-entered:
 	case <-time.After(time.Second):
@@ -326,7 +337,7 @@ func TestPrimaryPoll_CancellationPreservesTheLinkAndBoundsLaneWaiters(t *testing
 	}
 	waiterCtx, waiterCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer waiterCancel()
-	_, err := pollPrimaryPartition(waiterCtx, fixture.client, 0)
+	_, err := readPrimaryPartition(waiterCtx, fixture.client, 0)
 	require.ErrorIs(t, err, ierror.ErrTransientNotAccepted)
 	cancel()
 	select {
@@ -411,7 +422,7 @@ func TestPrimaryPoll_InvalidReplyFrameDropsTheDataConnectionWithoutReplay(t *tes
 		return nil, false
 	}, nil)
 	_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
-	require.ErrorIs(t, err, ierror.ErrTransientNotCommitted)
+	require.ErrorIs(t, err, ierror.FetchProgressUncertain{})
 	require.Equal(t, int32(1), polls.Load())
 	_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
 	require.NoError(t, err)
@@ -424,7 +435,7 @@ func TestPrimaryPoll_DetachedLinkPreservesTheSessionAndReplaysOnlyARefusedPoll(t
 		reply []byte
 		want  error
 	}{
-		{"evicted", evictionFrame(vsr.EvictionNoSession, 0, 0), ierror.ErrTransientNotCommitted},
+		{"evicted", evictionFrame(vsr.EvictionNoSession, 0, 0), ierror.FetchProgressUncertain{}},
 		{"unauthenticated", statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.ErrUnauthenticated.Code()), nil), nil},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -763,13 +774,13 @@ func TestPrimaryPoll_PlainConsumerAndNonAutoCommitPollsRoute(t *testing.T) {
 	stream, topic, group := groupConsumer(t)
 	consumer := iggcon.NewSingleConsumer(group.Id)
 	partition := uint32(0)
-	_, err := fixture.client.PollMessages(context.Background(), stream, topic, consumer,
+	_, err := fixture.client.pollMessages(context.Background(), stream, topic, consumer,
 		iggcon.NextPollingStrategy(), 1, true, &partition)
 	require.NoError(t, err)
-	_, err = fixture.client.PollMessages(context.Background(), stream, topic, consumer,
+	_, err = fixture.client.pollMessages(context.Background(), stream, topic, consumer,
 		iggcon.NextPollingStrategy(), 1, true, nil)
 	require.NoError(t, err)
-	_, err = fixture.client.PollMessages(context.Background(), stream, topic, consumer,
+	_, err = fixture.client.pollMessages(context.Background(), stream, topic, consumer,
 		iggcon.NextPollingStrategy(), 1, false, &partition)
 	require.NoError(t, err)
 	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.PollMessagesCode))
@@ -829,7 +840,7 @@ func TestCoordinatorRequests_RefetchTheRouteAfterARefusedContext(t *testing.T) {
 		call    func(*IggyTcpClient) error
 	}{
 		{"poll", command.GetPartitionRouteCode, func(client *IggyTcpClient) error {
-			_, err := client.PollMessages(context.Background(), stream, topic, consumer,
+			_, err := client.pollMessages(context.Background(), stream, topic, consumer,
 				iggcon.NextPollingStrategy(), 1, false, &partition)
 			return err
 		}},
@@ -1071,7 +1082,7 @@ func TestPollMessages_StampsTheCallerContext(t *testing.T) {
 			return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(partition))
 		})
 
-		_, err := client.PollMessages(context.Background(), stream, topic, iggcon.NewSingleConsumer(group.Id),
+		_, err := client.pollMessages(context.Background(), stream, topic, iggcon.NewSingleConsumer(group.Id),
 			strategy, 1, false, &partition)
 		require.NoError(t, err)
 
@@ -1088,7 +1099,7 @@ func TestPollMessages_StampsTheCallerContext(t *testing.T) {
 			return nil, false
 		}, nil)
 
-		_, err := fixture.client.PollMessages(context.Background(), stream, topic, group, strategy, 1, true, &partition)
+		_, err := fixture.client.pollMessages(context.Background(), stream, topic, group, strategy, 1, true, &partition)
 		require.NoError(t, err)
 
 		assert.Equal(t, caller, <-stamped)
@@ -1110,7 +1121,7 @@ func TestGroupPoll_ReturnsTheFenceOfACallerContext(t *testing.T) {
 	require.NoError(t, fixture.client.JoinConsumerGroup(context.Background(), stream, topic, consumer.Id))
 	strategy := iggcon.NextPollingStrategy().WithContext(iggcon.PartitionContext{Incarnation: 5, OwnerGeneration: 3})
 
-	_, err := fixture.client.PollMessages(context.Background(), stream, topic, consumer, strategy, 1, true, nil)
+	_, err := fixture.client.pollMessages(context.Background(), stream, topic, consumer, strategy, 1, true, nil)
 
 	require.ErrorIs(t, err, ierror.ErrConsumerGroupPartitionNotOwned)
 	assert.Equal(t, int32(1), polls.Load())
@@ -1841,7 +1852,7 @@ func BenchmarkRoutedOperation(b *testing.B) {
 		call func(client *IggyTcpClient) error
 	}{
 		{"poll", func(client *IggyTcpClient) error {
-			_, err := client.PollMessages(ctx, stream, topic, consumer, iggcon.OffsetPollingStrategy(0), 1, false, &partition)
+			_, err := client.pollMessages(ctx, stream, topic, consumer, iggcon.OffsetPollingStrategy(0), 1, false, &partition)
 			return err
 		}},
 		{"store_offset", func(client *IggyTcpClient) error {
@@ -2480,4 +2491,30 @@ func TestSendHistoryRefreshStartsAtMetadataPrimary(t *testing.T) {
 	for _, replica := range fixture.primaries {
 		require.Zero(t, requestCount(replica.recorded(), command.GetPartitionRouteCode))
 	}
+}
+
+func TestDeleteConsumerPosition_StampsTheCapturedContext(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	server := servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationDeleteConsumerOffset, resultSection())
+	})
+	stream, topic, consumer := groupConsumer(t)
+	polled := iggcon.PartitionContext{
+		Incarnation:     5,
+		OwnerGeneration: 3,
+		MetadataOp:      9,
+	}
+	position := iggcon.ConsumerPosition{PartitionId: 4, Offset: 42, Context: polled}
+
+	require.NoError(t, client.DeleteConsumerPosition(context.Background(), consumer, stream, topic, position))
+
+	recorded := server.recorded()
+	require.Len(t, recorded, 2, "the route chooses the primary but never replaces the captured context")
+	var stamped iggcon.PartitionContext
+	require.NoError(t, stamped.UnmarshalBinary(recorded[1].header[frameOffsetContext:frameOffsetContext+iggcon.PartitionContextSize]))
+	assert.Equal(t, polled, stamped)
+	want, err := (&command.DeleteConsumerOffset{StreamId: stream, TopicId: topic, Consumer: consumer,
+		PartitionId: &position.PartitionId}).MarshalBinary()
+	require.NoError(t, err)
+	assert.Equal(t, want, recorded[1].payload)
 }

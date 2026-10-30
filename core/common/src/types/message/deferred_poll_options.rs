@@ -36,6 +36,7 @@ pub const DEFAULT_POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(11);
 /// timeout for the final read and the reply. Byte limits include the binary
 /// response metadata and batch framing, including for HTTP's equivalent
 /// selection.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeferredPollOptions {
     pub max_wait: IggyDuration,

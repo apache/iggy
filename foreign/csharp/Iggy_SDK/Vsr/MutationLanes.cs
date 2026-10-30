@@ -601,7 +601,7 @@ internal sealed class MutationLanes(ConsensusSession session, IggyClientConfigur
     {
         if (code != CommandCodes.GET_CONSUMER_OFFSET_CODE && _blockedProgress.TryGetValue(lane, out var fetch))
         {
-            throw new VsrLaneBlockedException(fetch.OperationId, lane.PartitionId, requiresExplicitRecovery: true);
+            throw new VsrPartitionLaneBlockedException(fetch.OperationId, lane.PartitionId);
         }
         if (_lanes.TryGetValue(lane, out var active) && active.Retained)
         {

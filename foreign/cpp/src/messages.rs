@@ -29,8 +29,12 @@ pub struct Checkpoint(pub(crate) RustCheckpoint);
 /// The bridge has no constructor for it, so C++ gets one only from a batch or a read error.
 pub struct Continuation(pub(crate) PollingStrategy);
 
-/// The batch fields that Rust keeps private, out of reach of C++.
+/// The batch fields that Rust keeps private, out of reach of C++. The partition and the offsets
+/// are copies of the public fields, so a checkpoint names a message as it was delivered whatever
+/// C++ does to the batch.
 pub struct BatchPositions {
+    partition_id: u32,
+    offsets: Vec<u64>,
     context: PartitionContext,
     stamp: Option<ReaderStamp>,
     // An empty batch continues from the start of its request, which the Rust batch does not
@@ -56,24 +60,25 @@ pub fn default_poll_options() -> ffi::PollOptions {
 
 impl ffi::PolledMessages {
     pub fn checkpoint(&self) -> Result<Box<Checkpoint>, String> {
-        match self.messages.len().checked_sub(1) {
+        match self.positions.offsets.len().checked_sub(1) {
             Some(last) => self.checkpoint_at(last),
             None => Err("Could not take a checkpoint: the batch is empty".to_owned()),
         }
     }
 
     pub fn checkpoint_at(&self, index: usize) -> Result<Box<Checkpoint>, String> {
-        let message = self.messages.get(index).ok_or_else(|| {
+        let positions = &self.positions;
+        let offset = positions.offsets.get(index).ok_or_else(|| {
             format!(
                 "Could not take a checkpoint: index {index} is out of range for {} messages",
-                self.messages.len()
+                positions.offsets.len()
             )
         })?;
         Ok(Box::new(Checkpoint(RustCheckpoint::stamped(
-            self.partition_id,
-            message.offset,
-            self.positions.context,
-            self.positions.stamp,
+            positions.partition_id,
+            *offset,
+            positions.context,
+            positions.stamp,
         ))))
     }
 
@@ -85,6 +90,12 @@ impl ffi::PolledMessages {
 impl From<&RustPolledMessages> for BatchPositions {
     fn from(batch: &RustPolledMessages) -> Self {
         Self {
+            partition_id: batch.partition_id,
+            offsets: batch
+                .messages
+                .iter()
+                .map(|message| message.header.offset)
+                .collect(),
             context: batch.context(),
             stamp: batch.stamp(),
             continuation: batch.continuation(),
@@ -100,6 +111,10 @@ impl Checkpoint {
     pub fn offset(&self) -> u64 {
         self.0.offset()
     }
+
+    pub fn copy(&self) -> Box<Checkpoint> {
+        Box::new(Checkpoint(self.0))
+    }
 }
 
 impl Continuation {
@@ -109,5 +124,9 @@ impl Continuation {
 
     pub fn value(&self) -> u64 {
         self.0.value
+    }
+
+    pub fn copy(&self) -> Box<Continuation> {
+        Box::new(Continuation(self.0))
     }
 }

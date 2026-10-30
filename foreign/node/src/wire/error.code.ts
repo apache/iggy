@@ -286,6 +286,9 @@ export const translateErrorCode = (code: number): string => {
     case '14003': return "Incompatible binary protocol version: client {}, server accepts [{}, {}]";
     case '14004': return "VSR session mismatch: requested {0}, server bound {1}";
     case '14005': return "VSR request id exhausted";
+    case '14007': return "Lane blocked by operation {0} with an unknown outcome";
+    case '14009': return "Lane of partition {0} blocked by operation {1} with an unknown outcome";
+    case '14010': return "Read {0} has unknown progress and requires explicit abandonment";
 
     default: return 'error';
   }

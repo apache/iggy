@@ -17,22 +17,26 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    num::NonZeroU32,
     str::FromStr,
+    time::Duration,
 };
 
 use bytes::Bytes;
 use iggy::prelude::{
-    CompressionAlgorithm as RustCompressionAlgorithm,
+    AutoCommit as RustAutoCommit, CommitAfter as RustCommitAfter, CommitEvery as RustCommitEvery,
+    CommitPolicy as RustCommitPolicy, CompressionAlgorithm as RustCompressionAlgorithm,
     ConsumerGroupDetails as RustConsumerGroupDetails, Durability as RustDurability, IdKind,
     Identifier as RustIdentifier, IggyByteSize as RustIggyByteSize,
     IggyDuration as RustIggyDuration, IggyExpiry as RustIggyExpiry, IggyMessage as RustIggyMessage,
-    MaxTopicSize as RustMaxTopicSize, OptionKey, OptionSpec as RustOptionSpec,
-    Partition as RustPartition, PartitionContext as RustPartitionContext,
-    PartitionResizePolicy as RustPartitionResizePolicy, PollOptions as RustPollOptions,
-    PolledMessages as RustPolledMessages, PollingStrategy as RustPollingStrategy,
+    MaxTopicSize as RustMaxTopicSize, NonZeroIggyDuration as RustNonZeroIggyDuration, OptionKey,
+    OptionSpec as RustOptionSpec, Partition as RustPartition,
+    PartitionContext as RustPartitionContext, PartitionResizePolicy as RustPartitionResizePolicy,
+    PollOptions as RustPollOptions, PolledMessages as RustPolledMessages,
+    PollingStrategy as RustPollingStrategy,
     SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
-    SendMessagesResponse as RustSendMessagesResponse, ServerCommitPolicy as RustServerCommitPolicy,
-    Stream as RustStream, StreamDetails as RustStreamDetails, StreamEncryptionKey,
+    SendMessagesResponse as RustSendMessagesResponse, Stream as RustStream,
+    StreamDetails as RustStreamDetails, StreamEncryptionKey,
     StreamEncryptionSource as RustStreamEncryptionSource,
     StreamUpdateOptions as RustStreamUpdateOptions, Topic as RustTopic,
     TopicCreateOptions as RustTopicCreateOptions, TopicDetails as RustTopicDetails,
@@ -1169,35 +1173,36 @@ impl From<RustPolledMessages> for ffi::PolledMessages {
     }
 }
 
-impl From<RustServerCommitPolicy> for ffi::ServerCommitPolicy {
-    fn from(policy: RustServerCommitPolicy) -> Self {
-        match policy {
-            RustServerCommitPolicy::Disabled => ffi::ServerCommitPolicy::Disabled,
-            RustServerCommitPolicy::OnRead => ffi::ServerCommitPolicy::OnRead,
-        }
-    }
-}
-
-impl TryFrom<ffi::ServerCommitPolicy> for RustServerCommitPolicy {
-    type Error = String;
-
-    fn try_from(policy: ffi::ServerCommitPolicy) -> Result<Self, Self::Error> {
-        match policy {
-            ffi::ServerCommitPolicy::Disabled => Ok(RustServerCommitPolicy::Disabled),
-            ffi::ServerCommitPolicy::OnRead => Ok(RustServerCommitPolicy::OnRead),
-            _ => Err("invalid server commit policy".to_owned()),
-        }
-    }
-}
-
 impl From<RustPollOptions> for ffi::PollOptions {
     fn from(options: RustPollOptions) -> Self {
+        let (commit, auto) = match options.commit {
+            RustCommitPolicy::Manual => (ffi::CommitPolicy::Manual, RustAutoCommit::default()),
+            RustCommitPolicy::OnRead => (ffi::CommitPolicy::OnRead, RustAutoCommit::default()),
+            RustCommitPolicy::Auto(auto) => (ffi::CommitPolicy::Auto, auto),
+        };
+        let (auto_every, auto_every_messages) = match auto.every {
+            Some(RustCommitEvery::Message) | None => (ffi::CommitEvery::Message, 0),
+            Some(RustCommitEvery::Messages(count)) => (ffi::CommitEvery::Messages, count.get()),
+            Some(RustCommitEvery::Batch) => (ffi::CommitEvery::Batch, 0),
+        };
         ffi::PollOptions {
             count: options.count,
             max_wait_micros: options.max_wait.as_micros(),
             min_count: options.min_count,
             max_bytes: options.max_bytes,
-            server_commit: options.server_commit.into(),
+            commit,
+            has_auto_interval: auto.interval.is_some(),
+            auto_interval_micros: auto
+                .interval
+                .map_or(0, |interval| interval.get().as_micros()),
+            has_auto_every: auto.every.is_some(),
+            auto_every,
+            auto_every_messages,
+            auto_after: match auto.after {
+                RustCommitAfter::Processing => ffi::CommitAfter::Processing,
+                RustCommitAfter::Delivery => ffi::CommitAfter::Delivery,
+                RustCommitAfter::Marked => ffi::CommitAfter::Marked,
+            },
         }
     }
 }
@@ -1206,12 +1211,54 @@ impl TryFrom<ffi::PollOptions> for RustPollOptions {
     type Error = String;
 
     fn try_from(options: ffi::PollOptions) -> Result<Self, Self::Error> {
+        let commit = match options.commit {
+            ffi::CommitPolicy::Manual => RustCommitPolicy::Manual,
+            ffi::CommitPolicy::OnRead => RustCommitPolicy::OnRead,
+            ffi::CommitPolicy::Auto => RustCommitPolicy::Auto(RustAutoCommit::try_from(&options)?),
+            _ => return Err("invalid commit policy".to_owned()),
+        };
         Ok(RustPollOptions {
             count: options.count,
             max_wait: RustIggyDuration::from(options.max_wait_micros),
             min_count: options.min_count,
             max_bytes: options.max_bytes,
-            server_commit: options.server_commit.try_into()?,
+            commit,
+        })
+    }
+}
+
+impl TryFrom<&ffi::PollOptions> for RustAutoCommit {
+    type Error = String;
+
+    fn try_from(options: &ffi::PollOptions) -> Result<Self, Self::Error> {
+        let interval = options
+            .has_auto_interval
+            .then(|| {
+                RustNonZeroIggyDuration::new(Duration::from_micros(options.auto_interval_micros))
+                    .map_err(|_| "the auto commit interval must not be zero".to_owned())
+            })
+            .transpose()?;
+        let every = options
+            .has_auto_every
+            .then(|| match options.auto_every {
+                ffi::CommitEvery::Message => Ok(RustCommitEvery::Message),
+                ffi::CommitEvery::Messages => NonZeroU32::new(options.auto_every_messages)
+                    .map(RustCommitEvery::Messages)
+                    .ok_or_else(|| "the auto commit message count must not be zero".to_owned()),
+                ffi::CommitEvery::Batch => Ok(RustCommitEvery::Batch),
+                _ => Err("invalid auto commit event".to_owned()),
+            })
+            .transpose()?;
+        let after = match options.auto_after {
+            ffi::CommitAfter::Processing => RustCommitAfter::Processing,
+            ffi::CommitAfter::Delivery => RustCommitAfter::Delivery,
+            ffi::CommitAfter::Marked => RustCommitAfter::Marked,
+            _ => return Err("invalid auto commit point".to_owned()),
+        };
+        Ok(RustAutoCommit {
+            interval,
+            every,
+            after,
         })
     }
 }
@@ -2127,6 +2174,36 @@ mod tests {
     }
 
     #[test]
+    fn given_bridged_batch_edited_by_the_caller_when_taking_checkpoints_should_keep_delivered_positions()
+     {
+        let mut polled =
+            RustPolledMessages::new(CONTEXT, PARTITION, 9, 2, vec![message_at(7), message_at(8)]);
+        polled.set_stamp(STAMP);
+        let last = polled.checkpoint();
+        let first = polled.checkpoint_at(0);
+        let mut bridged = ffi::PolledMessages::from(polled);
+
+        bridged.partition_id = PARTITION + 1;
+        bridged.messages.reverse();
+        bridged.messages[0].offset = 100;
+        bridged.messages.pop();
+
+        assert_eq!(
+            bridged.checkpoint().map(|checkpoint| checkpoint.0).ok(),
+            last
+        );
+        assert_eq!(
+            bridged.checkpoint_at(0).map(|checkpoint| checkpoint.0).ok(),
+            first
+        );
+        assert_eq!(
+            bridged.checkpoint_at(1).map(|checkpoint| checkpoint.0).ok(),
+            last
+        );
+        assert!(bridged.checkpoint_at(2).is_err());
+    }
+
+    #[test]
     fn given_empty_batch_when_bridged_should_continue_from_the_start_of_its_request() {
         for start in [
             RustPollingStrategy::offset(4),
@@ -2181,29 +2258,105 @@ mod tests {
     }
 
     #[test]
-    fn should_keep_every_poll_option_across_the_bridge() {
-        let options = RustPollOptions {
-            count: 3,
-            max_wait: RustIggyDuration::from(5),
-            min_count: 2,
-            max_bytes: 7,
-            server_commit: RustServerCommitPolicy::OnRead,
+    fn given_each_commit_policy_when_bridged_should_keep_every_poll_option() {
+        let auto = RustAutoCommit {
+            interval: RustNonZeroIggyDuration::new(Duration::from_micros(9)).ok(),
+            every: NonZeroU32::new(11).map(RustCommitEvery::Messages),
+            after: RustCommitAfter::Marked,
         };
+        for commit in [
+            RustCommitPolicy::Manual,
+            RustCommitPolicy::OnRead,
+            RustCommitPolicy::Auto(auto),
+            RustCommitPolicy::Auto(RustAutoCommit {
+                interval: None,
+                every: Some(RustCommitEvery::Batch),
+                after: RustCommitAfter::Delivery,
+            }),
+            RustCommitPolicy::Auto(RustAutoCommit {
+                every: None,
+                ..RustAutoCommit::default()
+            }),
+        ] {
+            let options = RustPollOptions {
+                count: 3,
+                max_wait: RustIggyDuration::from(5),
+                min_count: 2,
+                max_bytes: 7,
+                commit,
+            };
+
+            assert_eq!(
+                RustPollOptions::try_from(ffi::PollOptions::from(options)),
+                Ok(options),
+                "{commit:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_default_options_when_switched_to_auto_should_take_the_auto_commit_defaults() {
+        let mut options = ffi::PollOptions::from(RustPollOptions::default());
+
+        options.commit = ffi::CommitPolicy::Auto;
 
         assert_eq!(
-            RustPollOptions::try_from(ffi::PollOptions::from(options)),
-            Ok(options)
+            RustPollOptions::try_from(options).map(|options| options.commit),
+            Ok(RustCommitPolicy::Auto(RustAutoCommit::default()))
         );
     }
 
     #[test]
-    fn should_reject_an_unknown_server_commit_policy() {
-        assert_eq!(
-            RustServerCommitPolicy::try_from(ffi::ServerCommitPolicy { repr: 2 })
-                .err()
-                .as_deref(),
-            Some("invalid server commit policy")
-        );
+    fn given_invalid_commit_settings_when_bridged_should_refuse_them() {
+        let auto = ffi::PollOptions {
+            commit: ffi::CommitPolicy::Auto,
+            ..ffi::PollOptions::from(RustPollOptions::default())
+        };
+        let cases = [
+            (
+                ffi::PollOptions {
+                    commit: ffi::CommitPolicy { repr: 3 },
+                    ..ffi::PollOptions::from(RustPollOptions::default())
+                },
+                "invalid commit policy",
+            ),
+            (
+                ffi::PollOptions {
+                    auto_interval_micros: 0,
+                    ..auto
+                },
+                "the auto commit interval must not be zero",
+            ),
+            (
+                ffi::PollOptions {
+                    auto_every: ffi::CommitEvery::Messages,
+                    auto_every_messages: 0,
+                    ..auto
+                },
+                "the auto commit message count must not be zero",
+            ),
+            (
+                ffi::PollOptions {
+                    auto_every: ffi::CommitEvery { repr: 3 },
+                    ..auto
+                },
+                "invalid auto commit event",
+            ),
+            (
+                ffi::PollOptions {
+                    auto_after: ffi::CommitAfter { repr: 3 },
+                    ..auto
+                },
+                "invalid auto commit point",
+            ),
+        ];
+
+        for (options, expected) in cases {
+            assert_eq!(
+                RustPollOptions::try_from(options).err().as_deref(),
+                Some(expected)
+            );
+        }
     }
 
     #[test]

@@ -53,7 +53,8 @@ class FetchMessagesTest {
     static final long GOLDEN_MAX_BYTES = 1024 * 1024;
     private static final long GOLDEN_INCARNATION = 3;
     private static final int GOLDEN_TARGETS = 2;
-    private static final int SMALL_MAX_BYTES = 400_000;
+    // More than one record of the largest size and a whole fetch table.
+    private static final long LARGE_MAX_BYTES = 0xFFFF_0000L;
 
     @Test
     void shouldAcceptOneMicrosecondOfStartupBudgetForAZeroWaitFetch() {
@@ -92,12 +93,10 @@ class FetchMessagesTest {
         assertThat(FetchMessages.progressLanes(payload)).isEmpty();
     }
 
+    /** The server returns a first message larger than the byte limit alone, so the reply can hold one such record. */
     @Test
-    void shouldBoundTheReplyByTheSectionTableAndTheByteLimit() {
-        assertThat(FetchMessages.replyLimit(frame()))
-                .isEqualTo(BytesDeserializer.FETCH_SECTIONS_COUNT_BYTES
-                        + GOLDEN_TARGETS * BytesDeserializer.FETCH_SECTION_BYTES
-                        + GOLDEN_MAX_BYTES);
+    void shouldBoundTheReplyByTheSectionTableAndTheLargestRecord() {
+        assertThat(FetchMessages.replyLimit(frame())).isEqualTo(tableBytes() + DeferredPollOptions.MAX_RECORD_SIZE);
     }
 
     @Test
@@ -112,31 +111,42 @@ class FetchMessagesTest {
     @Test
     void shouldLowerTheByteLimitsUntilTheWholeReplyFitsTheLink() {
         ByteBuf frame = frame();
+        setMaxBytes(frame, LARGE_MAX_BYTES);
 
-        FetchMessages.fitReply(frame, VsrHeaders.HEADER_SIZE + GOLDEN_LIMITS, tableBytes() + SMALL_MAX_BYTES);
+        FetchMessages.fitReply(
+                frame, VsrHeaders.HEADER_SIZE + GOLDEN_LIMITS, tableBytes() + DeferredPollOptions.MAX_RECORD_SIZE);
 
         ByteBuf body = Unpooled.wrappedBuffer(body(frame));
         assertThat(body.getUnsignedIntLE(GOLDEN_LIMITS + FetchMessages.MAX_BYTES_OFFSET))
-                .isEqualTo(SMALL_MAX_BYTES);
+                .isEqualTo(DeferredPollOptions.MAX_RECORD_SIZE);
         for (int target = 0; target < GOLDEN_TARGETS; target++) {
             assertThat(body.getUnsignedIntLE(target(target) + FetchMessages.TARGET_MAX_BYTES_OFFSET))
-                    .isEqualTo(SMALL_MAX_BYTES);
+                    .isEqualTo(DeferredPollOptions.MAX_RECORD_SIZE);
         }
-        assertThat(FetchMessages.replyLimit(frame)).isEqualTo(tableBytes() + SMALL_MAX_BYTES);
+        assertThat(FetchMessages.replyLimit(frame)).isEqualTo(tableBytes() + DeferredPollOptions.MAX_RECORD_SIZE);
     }
 
     @Test
-    void shouldRefuseAFetchWhoseSectionTableLeavesTheLinkTooFewBytes() {
+    void shouldRefuseAFetchWhoseLinkCannotHoldTheLargestRecord() {
         ByteBuf frame = frame();
 
         assertThatThrownBy(() -> FetchMessages.fitReply(
                         frame,
                         VsrHeaders.HEADER_SIZE + GOLDEN_LIMITS,
-                        tableBytes() + DeferredPollOptions.MIN_MAX_BYTES - 1))
+                        tableBytes() + DeferredPollOptions.MAX_RECORD_SIZE - 1))
                 .isInstanceOf(IggyInvalidArgumentException.class);
         FetchMessages.fitReply(
-                frame, VsrHeaders.HEADER_SIZE + GOLDEN_LIMITS, tableBytes() + DeferredPollOptions.MIN_MAX_BYTES);
-        assertThat(FetchMessages.replyLimit(frame)).isEqualTo(tableBytes() + DeferredPollOptions.MIN_MAX_BYTES);
+                frame, VsrHeaders.HEADER_SIZE + GOLDEN_LIMITS, tableBytes() + DeferredPollOptions.MAX_RECORD_SIZE);
+        assertThat(HexFormat.of().formatHex(body(frame))).isEqualTo(GOLDEN_REQUEST);
+    }
+
+    /** Sets the byte limit of the request and of each target of the golden fetch in {@code frame}. */
+    private static void setMaxBytes(ByteBuf frame, long maxBytes) {
+        frame.setIntLE(VsrHeaders.HEADER_SIZE + GOLDEN_LIMITS + FetchMessages.MAX_BYTES_OFFSET, (int) maxBytes);
+        for (int target = 0; target < GOLDEN_TARGETS; target++) {
+            frame.setIntLE(
+                    VsrHeaders.HEADER_SIZE + target(target) + FetchMessages.TARGET_MAX_BYTES_OFFSET, (int) maxBytes);
+        }
     }
 
     private static ByteBuf golden() {

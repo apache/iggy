@@ -29,7 +29,7 @@ const PARTITION_ID: u32 = 0;
 const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 const OFFSET_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-// The default `ClientCommitPolicy` leaves every commit to the caller, so the final flush of
+// The default `CommitPolicy::Manual` leaves every commit to the caller, so the final flush of
 // `shutdown()` must not run either: it would commit a message whose handler failed.
 #[iggy_harness]
 async fn given_disabled_auto_commit_when_shutdown_should_not_store_the_reading_position(

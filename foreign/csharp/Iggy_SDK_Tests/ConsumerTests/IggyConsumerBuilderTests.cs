@@ -33,15 +33,11 @@ public class IggyConsumerBuilderTests
     private static readonly Identifier TopicId = Identifier.Numeric(1);
 
     [Fact]
-    public void Build_WithAGroupFetchWithoutClientSetupTime_Throws()
+    public void Build_WithAutoCommitWithoutAnIntervalOrAnEvent_Throws()
     {
         var client = new Mock<IIggyClient>();
-        var builder = IggyConsumerBuilder.Create(client.Object, StreamId, TopicId, Consumer.Group(1))
-            .WithPollOptions(new DeferredPollOptions
-            {
-                MaxWait = TimeSpan.Zero,
-                RequestTimeout = TimeSpan.FromSeconds(1)
-            });
+        var builder = IggyConsumerBuilder.Create(client.Object, StreamId, TopicId, Consumer.Group("group"))
+            .WithPollOptions(new PollOptions { Commit = CommitPolicy.Auto(new AutoCommit()) });
 
         var error = Assert.Throws<InvalidOperationException>(() => builder.Build());
 
@@ -49,10 +45,21 @@ public class IggyConsumerBuilderTests
     }
 
     [Fact]
+    public void Build_WithAStandaloneConsumerWithoutPartitions_Throws()
+    {
+        var builder = IggyConsumerBuilder.Create(new Mock<IIggyClient>().Object, StreamId, TopicId, Consumer.New(1));
+
+        var error = Assert.Throws<InvalidOperationException>(() => builder.Build());
+
+        Assert.Contains("partitions", error.Message);
+    }
+
+    [Fact]
     public void Build_WithDefaultSocketBufferSizes_CreatesTheClient()
     {
         var builder = IggyConsumerBuilder
             .Create(StreamId, TopicId, Consumer.New(1))
+            .WithPartitions(1)
             .WithConnection(Protocol.Tcp, "127.0.0.1:8090", "user", "pass");
 
         Assert.Null(builder.Config.ReceiveBufferSize);
@@ -69,6 +76,7 @@ public class IggyConsumerBuilderTests
     {
         var builder = IggyConsumerBuilder
             .Create(StreamId, TopicId, Consumer.New(1))
+            .WithPartitions(1)
             .WithConnection(Protocol.Tcp, "127.0.0.1:8090", "user", "pass",
                 receiveBufferSize: receiveBufferSize, sendBufferSize: sendBufferSize);
 
@@ -76,20 +84,21 @@ public class IggyConsumerBuilderTests
     }
 
     [Fact]
-    public void Build_WithEncryptorAndAutoCommit_Throws()
+    public void Build_WithEncryptorAndOnReadCommit_Throws()
     {
         var builder = IggyConsumerBuilder
             .Create(StreamId, TopicId, Consumer.New(1))
+            .WithPartitions(1)
             .WithConnection(Protocol.Tcp, "127.0.0.1:8090", "user", "pass")
             .WithEncryptor(new AesMessageEncryptor(AesMessageEncryptor.GenerateKey()))
-            .WithAutoCommitMode(AutoCommitMode.Auto);
+            .WithPollOptions(new PollOptions { Commit = CommitPolicy.OnRead });
 
         var ex = Assert.Throws<InvalidOperationException>(() => builder.Build());
-        Assert.Contains("AutoCommitMode.Auto", ex.Message);
+        Assert.Contains("on read", ex.Message);
     }
 
     [Fact]
-    public void Build_WithExternalClientEncryptorAndAutoCommit_Throws()
+    public void Build_WithExternalClientEncryptorAndOnReadCommit_Throws()
     {
         var client = new Mock<IIggyClient>();
         client.SetupGet(c => c.MessageEncryptor)
@@ -97,20 +106,22 @@ public class IggyConsumerBuilderTests
 
         var builder = IggyConsumerBuilder
             .Create(client.Object, StreamId, TopicId, Consumer.New(1))
-            .WithAutoCommitMode(AutoCommitMode.Auto);
+            .WithPartitions(1)
+            .WithPollOptions(new PollOptions { Commit = CommitPolicy.OnRead });
 
         var ex = Assert.Throws<InvalidOperationException>(() => builder.Build());
-        Assert.Contains("AutoCommitMode.Auto", ex.Message);
+        Assert.Contains("on read", ex.Message);
     }
 
     [Fact]
-    public void Build_WithEncryptorAndAfterReceiveCommit_DoesNotThrow()
+    public void Build_WithEncryptorAndClientCommit_DoesNotThrow()
     {
         var consumer = IggyConsumerBuilder
             .Create(StreamId, TopicId, Consumer.New(1))
+            .WithPartitions(1)
             .WithConnection(Protocol.Tcp, "127.0.0.1:8090", "user", "pass")
             .WithEncryptor(new AesMessageEncryptor(AesMessageEncryptor.GenerateKey()))
-            .WithAutoCommitMode(AutoCommitMode.AfterReceive)
+            .WithPollOptions(new PollOptions { Commit = CommitPolicy.Auto() })
             .Build();
 
         Assert.NotNull(consumer);
@@ -121,6 +132,7 @@ public class IggyConsumerBuilderTests
     {
         var consumer = IggyConsumerBuilder
             .Create(StreamId, TopicId, Consumer.New(1))
+            .WithPartitions(1)
             .WithConnection(Protocol.Tcp, "127.0.0.1:8090", "token")
             .Build();
 
@@ -132,6 +144,7 @@ public class IggyConsumerBuilderTests
     {
         var builder = IggyConsumerBuilder
             .Create(StreamId, TopicId, Consumer.New(1))
+            .WithPartitions(1)
             .WithConnection(Protocol.Tcp, "127.0.0.1:8090", string.Empty);
 
         var ex = Assert.Throws<InvalidOperationException>(() => builder.Build());
@@ -143,6 +156,7 @@ public class IggyConsumerBuilderTests
     {
         IggyConsumerBuilder<string> builder = IggyConsumerBuilder<string>
             .Create(StreamId, TopicId, Consumer.New(1), new StringDeserializer());
+        builder.WithPartitions(1);
         builder.WithConnection(Protocol.Tcp, "127.0.0.1:8090", "user", "pass");
 
         Assert.NotNull(builder.Build());
@@ -158,12 +172,18 @@ public class IggyConsumerBuilderTests
         var client = new Mock<IIggyClient>();
         client.Setup(value => value.LogoutUserAsync(It.IsAny<CancellationToken>()))
             .ThrowsAsync(new IOException("Connection lost during logout."));
+        client.Setup(value => value.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
+                It.IsAny<uint>(), It.IsAny<Consumer>(), It.IsAny<PollingStrategy>(), It.IsAny<PollOptions>(),
+                It.IsAny<CancellationToken>()))
+            .Returns((Identifier _, Identifier _, uint _, Consumer _, PollingStrategy _, PollOptions _,
+                CancellationToken token) => ParkedPollAsync(token));
         var consumer = new IggyConsumer(client.Object, new IggyConsumerConfig
         {
             CreateIggyClient = ownsClient,
             StreamId = StreamId,
             TopicId = TopicId,
-            Consumer = Consumer.New(1)
+            Consumer = Consumer.New(1),
+            Partitions = [1]
         }, NullLoggerFactory.Instance);
 
         if (initialized)
@@ -183,6 +203,13 @@ public class IggyConsumerBuilderTests
         client.Verify(value => value.Dispose(), ownsClient ? Times.Once() : Times.Never());
         client.Verify(value => value.LogoutUserAsync(It.IsAny<CancellationToken>()),
             ownsClient && initialized ? Times.Once() : Times.Never());
+    }
+
+    /// <summary>A poll that the server holds until the caller cancels it.</summary>
+    private static async Task<PolledMessages> ParkedPollAsync(CancellationToken token)
+    {
+        await Task.Delay(Timeout.Infinite, token);
+        return PolledMessages.Empty;
     }
 
     private sealed class StringDeserializer : IDeserializer<string>

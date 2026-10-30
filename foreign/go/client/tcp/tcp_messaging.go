@@ -186,6 +186,34 @@ func (c *IggyTcpClient) PollMessages(
 	ctx context.Context,
 	streamId iggcon.Identifier,
 	topicId iggcon.Identifier,
+	partitionId uint32,
+	consumer iggcon.Consumer,
+	strategy iggcon.PollingStrategy,
+	options iggcon.PollOptions,
+) (*iggcon.PolledMessage, error) {
+	if ctx == nil {
+		return nil, ierror.ErrNilContext
+	}
+	if err := strategy.RequirePartition(partitionId); err != nil {
+		return nil, err
+	}
+	if err := options.Validate(); err != nil {
+		return nil, err
+	}
+	if options.Commit.Kind == iggcon.CommitAuto {
+		return nil, fmt.Errorf("%w: a poll of one partition has nothing to count for an automatic commit; "+
+			"use a partition reader", ierror.ErrInvalidConfiguration)
+	}
+	return c.pollMessagesDeferred(ctx, streamId, topicId, consumer, strategy, options.Count,
+		options.Commit.Kind == iggcon.CommitOnRead, &partitionId, options.Deferred())
+}
+
+// pollMessages is the poll of the earlier API: a plain poll without a wait, and
+// a group poll without a partition that polls the assignment of the member in turn.
+func (c *IggyTcpClient) pollMessages(
+	ctx context.Context,
+	streamId iggcon.Identifier,
+	topicId iggcon.Identifier,
 	consumer iggcon.Consumer,
 	strategy iggcon.PollingStrategy,
 	count uint32,
@@ -205,7 +233,7 @@ func (c *IggyTcpClient) PollMessages(
 	return c.pollPartition(ctx, streamId, topicId, consumer, strategy, count, autoCommit, partitionId, nil)
 }
 
-func (c *IggyTcpClient) PollMessagesDeferred(
+func (c *IggyTcpClient) pollMessagesDeferred(
 	ctx context.Context,
 	streamId iggcon.Identifier,
 	topicId iggcon.Identifier,
@@ -221,7 +249,7 @@ func (c *IggyTcpClient) PollMessagesDeferred(
 	}
 	if consumer.Kind == iggcon.ConsumerKindGroup && partitionId == nil {
 		return nil, fmt.Errorf("%w: a deferred group poll needs a partition id; "+
-			"use ReadinessGroups and FetchMessages to read the whole assignment", ierror.ErrInvalidCommand)
+			"use a partition reader to read the whole assignment", ierror.ErrInvalidCommand)
 	}
 	if err := options.Validate(count); err != nil {
 		return nil, err

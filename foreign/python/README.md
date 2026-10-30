@@ -453,15 +453,11 @@ The client keeps the proved outcomes of its last `max_operations` replays, also
 across a session reset. A later `resolve_operation` of a proved operation
 returns the same outcome without a request.
 
-A committing fetch with an unknown outcome raises code 14010 and kind
-`"fetch_progress_uncertain"`. Its local ID and affected progress blocks survive
-reconnect and session replacement. `resolve_operation` returns the same error
-without sending anything. Explicit `abandon_operation` releases all its local
-blocks and accepts the unknown outcome; it does not stop the old server request.
-GetOffset and stateless reads remain available for inspection. Raw partial replies
-preserve their wire section statuses; a later progress call on an affected target
-raises code 14009 with its partition and recovery ID. Consumers report the block
-and stop affected targets; abandon explicitly before starting a replacement consumer.
+A committing fetch with an unknown outcome raises code 14010 and kind `"fetch_progress_uncertain"`. Its local ID and affected progress blocks survive reconnect and session replacement.
+
+`resolve_operation` returns the same error without sending anything. Explicit `abandon_operation` releases all its local blocks and accepts the unknown outcome. It does not stop the old server request.
+
+GetOffset and stateless reads remain available for inspection. Raw partial replies preserve their wire section statuses. A later progress call on an affected target raises code 14009 with its partition and recovery ID. Consumers report the block and stop affected targets. Abandon explicitly before starting a replacement consumer.
 
 `TcpConfig`, `QuicConfig`, and `WebSocketConfig` accept `pending_operations=
 PendingOperationsConfig(max_operations=256, max_bytes=64 * 1024 * 1024)`. These
@@ -568,9 +564,7 @@ lose buffered messages.
 `poll_messages()` reads one batch of one partition. `PollOptions` sets the
 limits of the read and who stores its offset. The default `PollOptions()`
 returns at most 1,000 messages and 1 MiB, answers at once and stores no offset.
-A message larger than `max_bytes` comes alone in its own batch, except at the
-start of a `Last()` read of more than one message: that read raises error 80
-and stores nothing. To read on, pass `continuation()` of the batch as the next
+A first message larger than `max_bytes` comes alone in its own batch. To read on, pass `continuation()` of the batch as the next
 `polling_strategy`.
 
 ```python
@@ -604,19 +598,23 @@ asyncio.run(main())
 A continuation keeps the partition history of its batch. If the partition was
 deleted and created again, the next poll raises `HistoryUnavailable` (87)
 instead of reading the new partition. With
-`PollOptions(server_commit=ServerCommitPolicy.OnRead)`, the server stores the
-offset of the last message as part of the reply, so `PollingStrategy.Next()`
-reads on after a restart. A lost reply then blocks the partition with a
-`PendingOperationError` until `abandon_operation()`, as described above.
+`PollOptions(commit=CommitPolicy.OnRead())`, the server stores the offset of the
+last message as part of the reply, so `PollingStrategy.Next()` reads on after a
+restart. A lost reply then blocks the partition with a `PendingOperationError`
+until `abandon_operation()`, as described above. `poll_messages()` refuses
+`CommitPolicy.Auto`, which only a reader or a consumer can count.
 
 `reader()` returns a `PartitionReader`, which reads the partitions of a topic
 with prefetch and keeps the position of each one. A `Consumer.Single` reads the
 `partitions` that you pass. A `Consumer.Group` joins its group and reads the
 partitions that the server assigns to it. `next()` returns the next batch of
 one partition and never an empty one, and `commit()` stores the offset of a
-checkpoint. The default options wait up to one second for messages. `next()`
+checkpoint. The default options wait up to five seconds for messages. `next()`
 has no time limit. To bound it, use `asyncio.wait_for()`: a cancelled `next()`
-leaves its batch in the reader. Call `close()` when you are done.
+leaves its batch in the reader. Call `close()` when you are done, or use the
+reader in `async with`, which closes it. `async for` reads batches until
+`close()`. `delete_consumer_position()` deletes the offset stored for the
+partition of a checkpoint.
 
 ```python
 from apache_iggy import Consumer, IggyClient, PollingStrategy
@@ -641,10 +639,22 @@ async def read_batches(client: IggyClient):
 ```
 
 `consumer_group()` returns an `IggyConsumer`, which joins a consumer group and
-yields its messages one at a time. By default it stores no offset. Commit the
-checkpoint of a message after you process it, or pass a `ClientCommitPolicy` to
-store the position of the last yielded message at an interval or on a
-`CommitEvent`. Call `shutdown()` before you drop the consumer.
+yields its messages one at a time. The `commit` of its `poll_options` says when
+offsets are stored. `CommitPolicy.Manual()`, the default, stores none: commit the
+checkpoint of a message after you process it. `CommitPolicy.OnRead()` makes the
+server store the offset of each read. `CommitPolicy.Auto(AutoCommit(...))` makes
+the consumer store the latest counted position at an `interval` or on a
+`CommitEvery` event, and on shutdown. A message counts after its processing with
+`CommitAfter.Processing`, when it is handed over with `CommitAfter.Delivery`, or
+when you call `mark(checkpoint)` with `CommitAfter.Marked`.
+`AutoCommit.default()` stores every 10,000 messages or 5 seconds after
+processing. With `CommitAfter.Processing`, a `consume_messages()` callback that
+raises ends the run with its exception, and its message is read again by the
+next run. A reader takes the same `commit`. Call `shutdown()` before you drop the consumer, or use it in
+`async with`, which shuts it down. `shutdown()` also ends an `async for` that
+waits for a message. In a `consume_messages()` callback, `shutdown()`, iterating
+the consumer and a nested `consume_messages()` raise `RuntimeError`, because the
+run waits for the callback: set the shutdown event instead.
 
 ```python
 from apache_iggy import IggyClient

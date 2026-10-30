@@ -49,7 +49,7 @@ public final class IggyOperationException extends IggyServerException {
         this.partitionId = partitionId;
     }
 
-    /** Returns the unsigned recovery id bits. Negative values are valid ids; fetch ids cannot be replayed. */
+    /** Returns the unsigned recovery id bits. Negative values are valid ids. Fetch ids cannot be replayed. */
     public long getOperationId() {
         return operationId;
     }

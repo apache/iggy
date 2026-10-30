@@ -75,6 +75,7 @@ services:
       - ./scenarios/resource_options_patch.feature:/app/features/resource_options_patch.feature
       - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
       - ./scenarios/session_contract.feature:/app/features/session_contract.feature
+      - ./scenarios/deferred_polling.feature:/app/features/deferred_polling.feature
     working_dir: /app
     command:
       - sh
@@ -87,6 +88,7 @@ services:
           stream_options)         TEST_PATH='tests/test_stream_options.py' ;;
           resource_options_patch) TEST_PATH='tests/test_resource_options_patch.py' ;;
           metadata_changes)       TEST_PATH='tests/test_metadata_changes.py' ;;
+          deferred_polling)       TEST_PATH='tests/test_deferred_polling.py' ;;
           *)                      TEST_PATH='tests/' ;;
         esac
         uv run --project /workspace/bdd/python pytest $$TEST_PATH -v
@@ -107,6 +109,7 @@ services:
       - ./scenarios/stream_options.feature:/app/features/stream_options.feature
       - ./scenarios/session_contract.feature:/app/features/session_contract.feature
       - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
+      - ./scenarios/deferred_polling.feature:/app/features/deferred_polling.feature
     command:
       - sh
       - -c
@@ -117,6 +120,7 @@ services:
           session_contract) GROUP='--group session-contract' ;;
           stream_options)   GROUP='--group stream-options' ;;
           metadata_changes) GROUP='--group metadata-changes' ;;
+          deferred_polling) GROUP='--group deferred-polling' ;;
           *)                GROUP='' ;;
         esac
         ./scripts/test.sh --configuration /workspace/bdd/php/phpunit.xml.dist $$GROUP
@@ -246,6 +250,22 @@ services:
       - ./scenarios/resource_options_patch.feature:/app/features/resource_options_patch.feature
       - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
       - ./scenarios/session_contract.feature:/app/features/session_contract.feature
+      - ./scenarios/deferred_polling.feature:/app/features/deferred_polling.feature
+    networks:
+      - iggy-bdd-network
+
+  # Runs only the deferred polling feature.
+  swift-bdd:
+    image: iggy-bdd-swift
+    build:
+      context: ..
+      dockerfile: bdd/swift/Dockerfile
+    environment:
+      - IGGY_ROOT_USERNAME=iggy
+      - IGGY_ROOT_PASSWORD=iggy
+      - BDD_FEATURE=${BDD_FEATURE:-all}
+    volumes:
+      - ./scenarios/deferred_polling.feature:/app/features/deferred_polling.feature
     networks:
       - iggy-bdd-network
 

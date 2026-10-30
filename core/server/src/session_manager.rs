@@ -32,8 +32,8 @@ use futures::future::{AbortHandle, AbortRegistration};
 use iggy_binary_protocol::ConsumerSession;
 use iggy_common::IggyError;
 use message_bus::installer::conn_info::ClientTransportKind;
-use shard::ConnectedClientInfo;
 use shard::config::DeferredPollConfig;
+use shard::{CommitGate, ConnectedClientInfo};
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -116,7 +116,7 @@ pub struct Connection {
     /// session it binds.
     pub metadata_watermark: u64,
     consumer_session: Option<(u128, SessionAttachment)>,
-    deferred_requests: AHashMap<u64, (u64, Instant, AbortHandle)>,
+    deferred_requests: AHashMap<u64, DeferredRequestEntry>,
 }
 
 /// Bridges transport connections to consensus sessions.
@@ -243,7 +243,7 @@ impl SessionManager {
             .filter(|(_, conn)| {
                 conn.deferred_requests
                     .values()
-                    .all(|(_, deadline, _)| now >= *deadline)
+                    .all(|entry| now >= entry.deadline)
             })
             .filter(|(_, conn)| now.duration_since(conn.last_heartbeat) > max_age)
             .map(|(&id, _)| id)
@@ -273,8 +273,11 @@ impl SessionManager {
     /// Remove a transport connection without ending its durable session.
     pub fn remove_connection(&mut self, connection_id: u128) -> Option<(u128, u64)> {
         if let Some(conn) = self.connections.remove(&connection_id) {
-            for (_, _, abort) in conn.deferred_requests.into_values() {
-                abort.abort();
+            for entry in conn.deferred_requests.into_values() {
+                if let Some(gate) = &entry.commit_gate {
+                    let _ = gate.cancel();
+                }
+                entry.abort.abort();
             }
             if let ConnectionState::Bound {
                 client_id, session, ..
@@ -291,7 +294,7 @@ impl SessionManager {
     pub fn begin_deferred_request(
         sessions: &Rc<RefCell<Self>>,
         connection_id: u128,
-        wire_request_id: u64,
+        (wire_request_id, commit_gate): (u64, Option<CommitGate>),
         watchdog: Duration,
         now: Instant,
     ) -> Result<(DeferredRequestGuard, AbortRegistration), IggyError> {
@@ -307,9 +310,15 @@ impl SessionManager {
             .connections
             .get_mut(&connection_id)
             .ok_or(IggyError::StaleClient)?;
-        connection
-            .deferred_requests
-            .insert(request_id, (wire_request_id, deadline, abort));
+        connection.deferred_requests.insert(
+            request_id,
+            DeferredRequestEntry {
+                wire_request_id,
+                deadline,
+                abort,
+                commit_gate,
+            },
+        );
         Ok((
             DeferredRequestGuard {
                 sessions: Rc::clone(sessions),
@@ -321,6 +330,8 @@ impl SessionManager {
     }
 
     /// Cancels only requests admitted on this connection with the given wire id.
+    /// A committing request stops only while none of its reads committed, and
+    /// otherwise answers as usual.
     pub fn cancel_deferred_request(
         &self,
         connection_id: u128,
@@ -339,20 +350,23 @@ impl SessionManager {
         {
             return false;
         }
-        for (request, _, abort) in connection.deferred_requests.values() {
-            if *request == wire_request_id {
-                abort.abort();
+        for entry in connection.deferred_requests.values() {
+            if entry.wire_request_id == wire_request_id
+                && entry.commit_gate.as_ref().is_none_or(CommitGate::cancel)
+            {
+                entry.abort.abort();
             }
         }
         true
     }
 
     /// Reserves one fetch read of the session `client_id` on the owner shard
-    /// `owner`, which takes `cost` bytes of the owner's read budget. Refused
-    /// when the reads that this shard runs there for the session would pass
-    /// the per-session quota or the read budget of `limits`. The owner also
-    /// counts the parked waits and the reads that other shards send for the
-    /// session, so it can still refuse a reserved read.
+    /// `owner`, which can add `cost` bytes to a reply that this shard holds
+    /// until it is written. Refused when the reads that this shard holds there
+    /// for the session would pass the per-session quota or the byte budget of
+    /// `limits`. The owner keeps its own disk read budget and also counts the
+    /// parked waits and the reads that other shards send for the session, so
+    /// it can still refuse a reserved read.
     #[must_use]
     pub fn reserve_fetch_read(
         sessions: &Rc<RefCell<Self>>,
@@ -584,7 +598,7 @@ impl DeferredRequestGuard {
             && connection
                 .deferred_requests
                 .get(&self.request_id)
-                .is_some_and(|(_, deadline, _)| now < *deadline)
+                .is_some_and(|entry| now < entry.deadline)
         {
             connection.last_heartbeat = now;
         }
@@ -604,6 +618,16 @@ impl Drop for DeferredRequestGuard {
     }
 }
 
+/// One deferred request admitted on a connection.
+#[derive(Debug, Clone)]
+struct DeferredRequestEntry {
+    wire_request_id: u64,
+    deadline: Instant,
+    abort: AbortHandle,
+    /// Set for a request that commits as it reads.
+    commit_gate: Option<CommitGate>,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct FetchReads {
     reads: usize,
@@ -618,6 +642,22 @@ pub struct FetchReadGuard {
     cost: usize,
 }
 
+impl FetchReadGuard {
+    /// Charges the bytes that the read returned instead of what it could
+    /// return, for as long as its reply is held.
+    pub fn settle(&mut self, bytes: usize) {
+        let mut manager = self.sessions.borrow_mut();
+        let Some(running) = manager.fetch_reads.get_mut(&self.key) else {
+            return;
+        };
+        running.bytes = running
+            .bytes
+            .saturating_sub(self.cost)
+            .saturating_add(bytes);
+        self.cost = bytes;
+    }
+}
+
 impl Drop for FetchReadGuard {
     fn drop(&mut self) {
         let mut manager = self.sessions.borrow_mut();
@@ -625,7 +665,7 @@ impl Drop for FetchReadGuard {
             return;
         };
         running.reads -= 1;
-        running.bytes -= self.cost;
+        running.bytes = running.bytes.saturating_sub(self.cost);
         if running.reads == 0 {
             manager.fetch_reads.remove(&self.key);
         }
@@ -1020,7 +1060,7 @@ mod tests {
         let (_first, first) = SessionManager::begin_deferred_request(
             &sessions,
             1,
-            10,
+            (10, None),
             Duration::from_secs(60),
             Instant::now(),
         )
@@ -1028,7 +1068,7 @@ mod tests {
         let (_other, other) = SessionManager::begin_deferred_request(
             &sessions,
             1,
-            11,
+            (11, None),
             Duration::from_secs(60),
             Instant::now(),
         )
@@ -1036,7 +1076,7 @@ mod tests {
         let (_peer, peer) = SessionManager::begin_deferred_request(
             &sessions,
             2,
-            10,
+            (10, None),
             Duration::from_secs(60),
             Instant::now(),
         )
@@ -1075,6 +1115,56 @@ mod tests {
     }
 
     #[test]
+    fn given_committing_requests_when_cancelled_should_stop_only_the_one_whose_reads_did_not_commit()
+     {
+        // Every cancel aborted its request, also one whose read had already
+        // stored its offset, so the client lost that batch without a reply.
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        let mut table = registry(CLIENT, USER, EPOCH);
+        bind(&mut sessions.borrow_mut(), &mut table, 1);
+        let open = CommitGate::default();
+        let committed = CommitGate::default();
+        assert!(committed.enter());
+        let (_open, open_registration) = SessionManager::begin_deferred_request(
+            &sessions,
+            1,
+            (10, Some(open.clone())),
+            Duration::from_secs(60),
+            Instant::now(),
+        )
+        .unwrap();
+        let (_committed, committed_registration) = SessionManager::begin_deferred_request(
+            &sessions,
+            1,
+            (11, Some(committed.clone())),
+            Duration::from_secs(60),
+            Instant::now(),
+        )
+        .unwrap();
+        let mut open_request = Box::pin(futures::future::Abortable::new(
+            std::future::pending::<()>(),
+            open_registration,
+        ));
+        let mut committed_request = Box::pin(futures::future::Abortable::new(
+            std::future::pending::<()>(),
+            committed_registration,
+        ));
+
+        for request in [10, 11] {
+            assert!(
+                sessions
+                    .borrow()
+                    .cancel_deferred_request(1, CLIENT, EPOCH, request)
+            );
+        }
+
+        assert!(open_request.as_mut().now_or_never().unwrap().is_err());
+        assert!(open.is_cancelled());
+        assert!(committed_request.as_mut().now_or_never().is_none());
+        assert!(!committed.is_cancelled());
+    }
+
+    #[test]
     fn deferred_guard_is_connection_local_finite_and_refreshes_only_after_write() {
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
         let old = Instant::now().checked_sub(Duration::from_secs(30)).unwrap();
@@ -1091,7 +1181,7 @@ mod tests {
         let (guard, _) = SessionManager::begin_deferred_request(
             &sessions,
             2,
-            10,
+            (10, None),
             Duration::from_secs(60),
             Instant::now(),
         )
@@ -1114,7 +1204,7 @@ mod tests {
         let (concurrent, _) = SessionManager::begin_deferred_request(
             &sessions,
             2,
-            10,
+            (10, None),
             Duration::from_secs(60),
             Instant::now(),
         )
@@ -1133,7 +1223,7 @@ mod tests {
         let (failed, registration) = SessionManager::begin_deferred_request(
             &sessions,
             1,
-            10,
+            (10, None),
             Duration::from_secs(60),
             Instant::now(),
         )
@@ -1157,7 +1247,7 @@ mod tests {
         let (guard, _) = SessionManager::begin_deferred_request(
             &sessions,
             1,
-            10,
+            (10, None),
             Duration::from_secs(1),
             Instant::now(),
         )

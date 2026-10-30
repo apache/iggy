@@ -20,6 +20,7 @@
 package org.apache.iggy.serde;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.cluster.ClusterNode;
@@ -34,6 +35,7 @@ import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyMalformedResponseException;
 import org.apache.iggy.message.BytesMessageId;
+import org.apache.iggy.message.DecodeFailure;
 import org.apache.iggy.message.FetchedMessages;
 import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderKind;
@@ -282,6 +284,40 @@ public final class BytesDeserializer {
     }
 
     /**
+     * Reads the batch records of a poll reply or of a fetch section into {@code messages} up to the first message that
+     * does not decode, and returns its failure with the bytes received from it on. The messages before it stay in
+     * {@code messages}. Every failure of this decoder is malformed framing, no check runs after a frame header, so the
+     * failure never names an offset.
+     */
+    public static Optional<DecodeFailure> readMessagesUntilMalformed(ByteBuf records, List<Message> messages) {
+        while (records.isReadable()) {
+            int batchStart = records.readerIndex();
+            BatchHeader batch;
+            try {
+                batch = readBatchHeader(records);
+            } catch (RuntimeException malformed) {
+                return Optional.of(framingFailure(malformed, records, batchStart));
+            }
+            int blobStart = records.readerIndex();
+            ByteBuf blob = records.readSlice(batch.blobLength());
+            while (blob.isReadable()) {
+                int frameStart = blobStart + blob.readerIndex();
+                try {
+                    messages.add(readBatchMessage(blob, batch));
+                } catch (RuntimeException malformed) {
+                    return Optional.of(framingFailure(malformed, records, frameStart));
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static DecodeFailure framingFailure(RuntimeException malformed, ByteBuf records, int position) {
+        return new DecodeFailure(
+                malformed, Optional.empty(), ByteBufUtil.getBytes(records, position, records.writerIndex() - position));
+    }
+
+    /**
      * Reads a fetch reply: the section table, then the records of each section in table order. The
      * records of each section stay undecoded until {@link FetchedMessages#decode()}.
      */
@@ -336,6 +372,14 @@ public final class BytesDeserializer {
      * first frame's offset delta is not necessarily zero.
      */
     private static void readBatchRecord(ByteBuf response, List<Message> messages) {
+        BatchHeader batch = readBatchHeader(response);
+        ByteBuf blob = response.readSlice(batch.blobLength());
+        while (blob.isReadable()) {
+            messages.add(readBatchMessage(blob, batch));
+        }
+    }
+
+    private static BatchHeader readBatchHeader(ByteBuf response) {
         if (response.readableBytes() < BytesSerializer.BATCH_HEADER_SIZE) {
             throw new IggyMalformedResponseException(
                     "Truncated batch header: " + response.readableBytes() + " bytes left");
@@ -353,14 +397,10 @@ public final class BytesDeserializer {
             throw new IggyMalformedResponseException("Batch length " + batchLength + " exceeds remaining payload of "
                     + response.readableBytes() + " bytes");
         }
-        ByteBuf blob = response.readSlice(blobLength.intValueExact());
-        while (blob.isReadable()) {
-            messages.add(readBatchMessage(blob, baseOffset, baseTimestamp, batchOriginTimestamp));
-        }
+        return new BatchHeader(baseOffset, baseTimestamp, batchOriginTimestamp, blobLength.intValueExact());
     }
 
-    private static Message readBatchMessage(
-            ByteBuf blob, BigInteger baseOffset, BigInteger baseTimestamp, BigInteger batchOriginTimestamp) {
+    private static Message readBatchMessage(ByteBuf blob, BatchHeader batch) {
         if (blob.readableBytes() < MessageHeader.SIZE) {
             throw new IggyMalformedResponseException(
                     "Truncated message frame header: " + blob.readableBytes() + " bytes left");
@@ -382,9 +422,9 @@ public final class BytesDeserializer {
         var header = new MessageHeader(
                 checksum,
                 id,
-                baseOffset.add(BigInteger.valueOf(offsetDelta)),
-                baseTimestamp,
-                batchOriginTimestamp.add(BigInteger.valueOf(timestampDelta)),
+                batch.baseOffset().add(BigInteger.valueOf(offsetDelta)),
+                batch.baseTimestamp(),
+                batch.originTimestamp().add(BigInteger.valueOf(timestampDelta)),
                 userHeadersLength,
                 payloadLength,
                 BigInteger.ZERO);
@@ -887,6 +927,9 @@ public final class BytesDeserializer {
     private static byte[] newByteArray(Long size) {
         return new byte[size.intValue()];
     }
+
+    private record BatchHeader(
+            BigInteger baseOffset, BigInteger baseTimestamp, BigInteger originTimestamp, int blobLength) {}
 
     private record UserHeaderField(HeaderKind kind, byte[] value) {}
 }

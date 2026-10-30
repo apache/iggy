@@ -21,31 +21,29 @@ use std::convert::identity;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use dashmap::DashMap;
 use futures::StreamExt;
 use iggy_binary_protocol::PartitionContext;
 use iggy_binary_protocol::codes::{
     DELETE_CONSUMER_OFFSET_CODE, FETCH_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
-use iggy_common::{Checkpoint, IggyDuration, IggyError, NonZeroIggyDuration};
+use iggy_common::{
+    AutoCommit, Checkpoint, CommitAfter, CommitEvery, CommitPolicy, IggyDuration, IggyError,
+    NonZeroIggyDuration, PollOptions,
+};
 use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep, timeout};
 
 use super::{
-    LevelReports, PARTITION_PRIMARY, POLL_RETRY_INTERVAL, POLLED_PARTITION, ROUTE_INCARNATION,
-    builder_for, builder_on, committing_consumer, connect_to_three_replicas, deleted_partitions,
-    next_message, reading_consumer, reply_of, script_primary, standalone, start_fetch,
-    stored_offsets,
+    PARTITION_PRIMARY, POLL_RETRY_INTERVAL, POLLED_PARTITION, ROUTE_INCARNATION, builder_on,
+    committing_consumer, connect_to_three_replicas, deleted_partitions, next_message,
+    reading_consumer, reply_of, script_primary, standalone, start_fetch, stored_offsets,
 };
-use crate::clients::consumer::{ClientCommitPolicy, CommitEvent, IggyConsumer, ReceivedMessage};
+use crate::clients::consumer::{IggyConsumer, IggyConsumerState, ReceivedMessage};
 use crate::clients::consumer_builder::IggyConsumerBuilder;
 use crate::clients::reader::ReadError;
 use crate::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
-use crate::links::OPERATION_TIMEOUT;
 use crate::links::fake_cluster::{Answer, FakeCluster, TEST_BUDGET, endpoint, eventually};
 
-/// The other partition of the topic of `connect_to_three_replicas`.
-const OTHER_PARTITION: u32 = 0;
 /// The offset the first store leaves on the server.
 const STORED_OFFSET: u64 = 100;
 /// An offset behind [`STORED_OFFSET`] that a second store asks for.
@@ -64,69 +62,56 @@ const CAPTURED: PartitionContext = PartitionContext {
 /// The commits with which a replica answers the offset writes of one test, in order.
 const FIRST_COMMIT: u64 = 1;
 const SECOND_COMMIT: u64 = 2;
-/// A policy whose final commit `shutdown` sends.
-const EACH_MESSAGE: ClientCommitPolicy = ClientCommitPolicy {
+/// A policy that stores each message that it counts.
+const EACH_MESSAGE: CommitPolicy = CommitPolicy::Auto(AutoCommit {
     interval: None,
-    on: Some(CommitEvent::EachMessage),
-};
-const COMMIT_INTERVAL: Duration = Duration::from_millis(100);
-/// Long enough for the interval to tick more than once.
-const AFTER_TICKS: Duration = COMMIT_INTERVAL.saturating_mul(3);
-const NTH: u32 = 2;
-/// The two replies that the commit events count over.
-const FIRST_REPLY: [u64; 3] = [0, 1, 2];
-const SECOND_REPLY: [u64; 2] = [3, 4];
-/// The message whose handler fails.
-const FAILING_OFFSET: u64 = 2;
-/// The commit that each event queues at each message of [`FIRST_REPLY`] and [`SECOND_REPLY`].
-/// [`SECOND_REPLY`] is already queued in the reader when the first batch ends.
-const QUEUED_BY_EVENT: [(CommitEvent, [Option<u64>; 5]); 3] = [
-    (
-        CommitEvent::EachMessage,
-        [Some(0), Some(1), Some(2), Some(3), Some(4)],
-    ),
-    (
-        CommitEvent::EveryNthMessage(NTH),
-        [Some(0), None, Some(2), None, Some(4)],
-    ),
-    (CommitEvent::EachBatch, [None, None, Some(2), None, Some(4)]),
-];
+    every: Some(CommitEvery::Message),
+    after: CommitAfter::Delivery,
+});
+/// Longer than any test, so only the close or the shutdown stores.
+const NEVER: Duration = Duration::from_secs(24 * 60 * 60);
+/// The batch that the counting tests yield.
+const BATCH: [u64; 3] = [0, 1, 2];
 
 #[tokio::test(start_paused = true)]
 async fn default_consumer_does_not_commit_delivered_messages() {
-    const BATCH: [u64; 2] = [10, 11];
-    let (mut consumer, cluster) = reading_consumer(ClientCommitPolicy::default(), &[&BATCH]).await;
+    let (mut consumer, cluster) = reading_consumer(CommitPolicy::Manual, &[&BATCH]).await;
     for offset in BATCH {
         assert_eq!(
             next_message(&mut consumer).await.message.header.offset,
             offset
         );
     }
-    assert!(consumer.pending_commits.is_empty());
 
     consumer.shutdown().await.unwrap();
 
     assert_eq!(
         consumer.get_last_consumed_offset(POLLED_PARTITION),
-        Some(BATCH[1])
+        Some(BATCH[2])
     );
     assert_eq!(consumer.get_last_stored_offset(POLLED_PARTITION), None);
     assert!(stored_offsets(&cluster).is_empty());
 }
 
 #[tokio::test(start_paused = true)]
-async fn shutdown_should_not_move_a_higher_stored_offset_back_under_replay() {
+async fn flush_should_not_move_a_higher_stored_offset_back_under_replay() {
     const CONSUMED: u64 = 9;
     const STORED: u64 = 19;
-    let (mut consumer, cluster) = consumer_without_reader(&[POLLED_PARTITION], |builder| {
-        builder.allow_replay().client_commit(EACH_MESSAGE)
+    let (consumer, cluster) = consumer_without_reader(&[POLLED_PARTITION], |builder| {
+        builder
+            .allow_replay()
+            .poll_options(auto_options(EACH_MESSAGE))
     })
     .await;
     let progress = &consumer.state.progress;
-    progress.deliver(&captured_checkpoint(&consumer, POLLED_PARTITION, CONSUMED));
+    progress.count(
+        captured_checkpoint(&consumer, POLLED_PARTITION, CONSUMED),
+        1,
+        false,
+    );
     progress.record_commit(captured_checkpoint(&consumer, POLLED_PARTITION, STORED));
 
-    consumer.shutdown().await.unwrap();
+    progress.flush_counted().await.unwrap();
 
     assert!(stored_offsets(&cluster).is_empty());
     assert_eq!(
@@ -299,22 +284,22 @@ async fn store_offset_without_a_consumed_position_should_not_compare_a_captured_
 }
 
 #[tokio::test(start_paused = true)]
-async fn shutdown_should_store_the_captured_position_after_an_uncaptured_scalar_store() {
-    let (mut consumer, cluster) = consumer_without_reader(&[POLLED_PARTITION], |builder| {
-        builder.client_commit(EACH_MESSAGE)
+async fn flush_should_store_the_captured_position_after_an_uncaptured_scalar_store() {
+    let (consumer, cluster) = consumer_without_reader(&[POLLED_PARTITION], |builder| {
+        builder.poll_options(auto_options(EACH_MESSAGE))
     })
     .await;
     consumer
         .store_offset(STORED_OFFSET, Some(POLLED_PARTITION))
         .await
         .unwrap();
-    consumer.state.progress.deliver(&captured_checkpoint(
-        &consumer,
-        POLLED_PARTITION,
-        LOWER_OFFSET,
-    ));
+    consumer.state.progress.count(
+        captured_checkpoint(&consumer, POLLED_PARTITION, LOWER_OFFSET),
+        1,
+        false,
+    );
 
-    consumer.shutdown().await.unwrap();
+    consumer.state.progress.flush_counted().await.unwrap();
 
     assert_eq!(
         stored_offsets(&cluster),
@@ -432,315 +417,157 @@ async fn given_an_uncertain_store_when_deleting_should_resolve_before_sending_th
 }
 
 #[tokio::test(start_paused = true)]
-async fn given_multiple_final_positions_when_shutdown_times_out_should_share_one_deadline() {
-    const PARTITIONS: [u32; 2] = [OTHER_PARTITION, POLLED_PARTITION];
-    let (mut consumer, cluster) =
-        consumer_without_reader(&PARTITIONS, |builder| builder.client_commit(EACH_MESSAGE)).await;
-    for partition in PARTITIONS {
-        consumer
-            .state
-            .progress
-            .deliver(&captured_checkpoint(&consumer, partition, LOWER_OFFSET));
-    }
-    script_primary(
-        &cluster,
-        STORE_CONSUMER_OFFSET_CODE,
-        [Answer::Silence, Answer::Silence],
-    );
-    let started = Instant::now();
-
-    consumer.shutdown().await.unwrap();
-
-    assert!(started.elapsed() <= OPERATION_TIMEOUT);
-    let stored = stored_offsets(&cluster);
-    assert_eq!(
-        stored.len(),
-        1,
-        "the first store spends the deadline: {stored:?}"
-    );
-    assert_eq!(stored[0].1, LOWER_OFFSET);
-    for partition in PARTITIONS {
-        assert_eq!(consumer.get_last_stored_offset(partition), None);
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn given_an_inflight_background_store_when_shutdown_aborts_it_should_resolve_and_flush() {
-    let (mut consumer, cluster) = consumer_without_reader(&[POLLED_PARTITION], |builder| {
-        builder
-            .client_commit(EACH_MESSAGE)
-            .offset_drain_timeout(IggyDuration::new(POLL_RETRY_INTERVAL))
-    })
-    .await;
-    consumer.state.progress.deliver(&captured_checkpoint(
-        &consumer,
-        POLLED_PARTITION,
-        LOWER_OFFSET,
-    ));
-    script_primary(
-        &cluster,
-        STORE_CONSUMER_OFFSET_CODE,
-        [
-            Answer::Silence,
-            Answer::Commit(FIRST_COMMIT),
-            Answer::Commit(SECOND_COMMIT),
-        ],
-    );
-    consumer.store_offset_task = Some(consumer.store_pending_commits_in_background());
-    consumer.background_commit_task = Some(consumer.store_offsets_in_background(commit_interval()));
-    eventually("background store reached the primary", || {
-        cluster.count(STORE_CONSUMER_OFFSET_CODE) == 1
-    })
-    .await;
-
-    consumer.shutdown().await.unwrap();
-
-    let stores = cluster.received(STORE_CONSUMER_OFFSET_CODE);
-    assert_eq!(stores.len(), 3);
-    assert_eq!(stores[0].header.request, stores[1].header.request);
-    assert_ne!(stores[1].header.request, stores[2].header.request);
-    assert_eq!(
-        consumer.get_last_stored_offset(POLLED_PARTITION),
-        Some(LOWER_OFFSET)
-    );
-}
-
-#[tokio::test]
-async fn interval_commit_should_report_a_failed_store() {
-    let recorder = LevelReports::errors();
-    let _subscriber = tracing::subscriber::set_default(recorder.clone());
-    let consumer = builder_for(standalone()).build();
-    start_generations(&consumer, &[POLLED_PARTITION]);
-    consumer
-        .state
-        .progress
-        .deliver(&captured_checkpoint(&consumer, POLLED_PARTITION, DELIVERED));
-
-    // The client is not connected, so every store fails.
-    let store_task = consumer.store_pending_commits_in_background();
-    let interval_task = consumer
-        .store_offsets_in_background(NonZeroIggyDuration::new(POLL_RETRY_INTERVAL).unwrap());
-    let reports = recorder.wait().await;
-    interval_task.abort();
-    store_task.abort();
-
-    assert!(
-        !reports.is_empty(),
-        "a failed interval commit must be reported"
-    );
-    let failure = IggyError::Disconnected.to_string();
-    assert!(
-        reports.iter().all(|report| report.contains(&failure)),
-        "{reports:?}"
-    );
-}
-
-#[tokio::test]
-async fn queued_commit_should_report_a_failed_store() {
-    let recorder = LevelReports::errors();
-    let _subscriber = tracing::subscriber::set_default(recorder.clone());
-    let mut consumer = builder_for(standalone()).build();
-    consumer.initialized = true;
-    start_generations(&consumer, &[POLLED_PARTITION]);
-    let task = consumer.store_pending_commits_in_background();
-
-    // The client is not connected, so the store fails.
-    consumer.send_store_offset(captured_checkpoint(&consumer, POLLED_PARTITION, DELIVERED));
-    let reports = recorder.wait().await;
-    task.abort();
-
-    assert_eq!(
-        reports.len(),
-        1,
-        "a failed queued commit must be reported once"
-    );
-    assert!(
-        reports[0].contains(&IggyError::Disconnected.to_string()),
-        "{reports:?}"
-    );
-}
-
-#[test]
-fn send_store_offset_should_keep_the_latest_offset_per_partition() {
-    const FIRST_QUEUED: u64 = 5;
-    const LATEST_QUEUED: u64 = 7;
-    const OTHER_QUEUED: u64 = 3;
-    let mut consumer = builder_for(standalone()).build();
-    consumer.initialized = true;
-
-    for (partition, offset) in [
-        (POLLED_PARTITION, FIRST_QUEUED),
-        (POLLED_PARTITION, LATEST_QUEUED),
-        (OTHER_PARTITION, OTHER_QUEUED),
+async fn given_auto_commit_when_the_stream_yields_should_count_each_message_as_its_policy_says() {
+    for (after, counted) in [
+        (CommitAfter::Delivery, Some(BATCH[2])),
+        (CommitAfter::Processing, Some(BATCH[1])),
+        (CommitAfter::Marked, None),
     ] {
-        consumer.send_store_offset(Checkpoint::new(
-            partition,
-            offset,
-            PartitionContext::default(),
-        ));
-    }
+        let (mut consumer, _cluster) = reading_consumer(auto(after), &[&BATCH]).await;
 
-    let mut queued: Vec<(u32, u64)> = consumer
-        .pending_commits
-        .iter()
-        .map(|entry| (*entry.key(), entry.value().offset()))
-        .collect();
-    queued.sort_unstable();
-    assert_eq!(
-        queued,
-        [
-            (OTHER_PARTITION, OTHER_QUEUED),
-            (POLLED_PARTITION, LATEST_QUEUED)
-        ]
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn given_a_commit_event_when_the_stream_yields_should_queue_its_commit_at_the_yield() {
-    for (event, expected) in QUEUED_BY_EVENT {
-        let (mut consumer, _cluster) = event_consumer(event).await;
-        let mut queued = Vec::with_capacity(expected.len());
-
-        for offset in FIRST_REPLY.into_iter().chain(SECOND_REPLY) {
+        for offset in BATCH {
             assert_eq!(
                 next_message(&mut consumer).await.message.header.offset,
                 offset
             );
-            queued.push(take_queued(&consumer.pending_commits));
         }
 
-        assert_eq!(queued, expected, "{event:?}");
+        assert_eq!(
+            counted_offset(&consumer.state()),
+            counted,
+            "{after:?}: delivery counts at the yield, processing when the stream is polled again"
+        );
     }
 }
 
 #[tokio::test(start_paused = true)]
-async fn given_a_commit_event_when_consuming_should_queue_its_commit_after_the_handler_also_after_a_failure()
+async fn given_auto_commit_when_consuming_should_count_before_the_handler_on_delivery_and_after_it_on_processing()
  {
-    for (event, expected) in QUEUED_BY_EVENT {
-        let (mut consumer, _cluster) = event_consumer(event).await;
-        let (shutdown, shutdown_rx) = oneshot::channel();
-        let handler = TakeQueuedCommits {
-            pending_commits: Arc::clone(&consumer.pending_commits),
-            last: SECOND_REPLY[1],
-            taken: Mutex::default(),
+    for (after, counted_in_handler) in [
+        (
+            CommitAfter::Delivery,
+            [Some(BATCH[0]), Some(BATCH[1]), Some(BATCH[2])],
+        ),
+        (
+            CommitAfter::Processing,
+            [None, Some(BATCH[0]), Some(BATCH[1])],
+        ),
+    ] {
+        let (mut consumer, _cluster) = reading_consumer(auto(after), &[&BATCH]).await;
+        let (shutdown, receiver) = oneshot::channel();
+        let handler = RecordCounted {
+            state: consumer.state(),
+            last: BATCH[2],
+            counted: Mutex::default(),
             shutdown: Mutex::new(Some(shutdown)),
         };
 
-        let consumed = timeout(
-            TEST_BUDGET,
-            consumer.consume_messages(&handler, shutdown_rx),
-        )
-        .await;
+        timeout(TEST_BUDGET, consumer.consume_messages(&handler, receiver))
+            .await
+            .unwrap()
+            .unwrap();
 
-        assert_eq!(consumed, Ok(Ok(())), "{event:?}");
-        let mut queued = handler.taken.into_inner().unwrap();
-        queued.push(take_queued(&consumer.pending_commits));
-        // Each handler sees the commit of the message before its own.
-        let mut after_each_handler = vec![None];
-        after_each_handler.extend(expected);
-        assert_eq!(queued, after_each_handler, "{event:?}");
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn given_an_interval_when_the_stream_yields_part_of_a_batch_should_store_the_last_yielded_message()
- {
-    const BATCH: [u64; 5] = [0, 1, 2, 3, 4];
-    const LAST_YIELDED: u64 = 2;
-    let (mut consumer, cluster) = reading_consumer(every_interval(), &[&BATCH]).await;
-    for offset in 0..=LAST_YIELDED {
         assert_eq!(
-            next_message(&mut consumer).await.message.header.offset,
-            offset
+            *handler.counted.lock().unwrap(),
+            counted_in_handler,
+            "{after:?}"
+        );
+        assert_eq!(
+            counted_offset(&consumer.state()),
+            Some(BATCH[2]),
+            "{after:?}"
         );
     }
-
-    eventually("the interval stored the last yielded message", || {
-        !stored_offsets(&cluster).is_empty()
-    })
-    .await;
-    sleep(AFTER_TICKS).await;
-
-    assert_eq!(
-        stored_offsets(&cluster),
-        [(POLLED_PARTITION, LAST_YIELDED)],
-        "the end of the batch was never yielded"
-    );
 }
 
-/// The consumer records a message as delivered when it yields it, so the interval can store a
-/// message whose handler still runs.
 #[tokio::test(start_paused = true)]
-async fn given_an_interval_when_consuming_should_store_a_message_while_its_handler_runs() {
-    const BATCH: [u64; 3] = [0, 1, 2];
-    let (mut consumer, cluster) = reading_consumer(every_interval(), &[&BATCH]).await;
-    let (shutdown, shutdown_rx) = oneshot::channel();
-    let handler = AwaitStoreOfLast {
-        cluster: Arc::clone(&cluster),
-        last: BATCH[2],
-        handled: Mutex::default(),
-        shutdown: Mutex::new(Some(shutdown)),
-    };
+async fn given_auto_commit_after_processing_when_a_handler_fails_should_end_the_consumption_without_counting_its_message()
+ {
+    let (mut consumer, _cluster) = reading_consumer(auto(CommitAfter::Processing), &[&BATCH]).await;
+    let (_shutdown, receiver) = oneshot::channel();
 
     let consumed = timeout(
         TEST_BUDGET,
-        consumer.consume_messages(&handler, shutdown_rx),
+        consumer.consume_messages(&FailAt(BATCH[1]), receiver),
     )
-    .await;
+    .await
+    .unwrap();
 
-    assert_eq!(consumed, Ok(Ok(())));
-    assert_eq!(*handler.handled.lock().unwrap(), BATCH);
-    assert_eq!(stored_offsets(&cluster), [(POLLED_PARTITION, BATCH[2])]);
+    assert_eq!(
+        consumed,
+        Err(ReadError::new(Some(POLLED_PARTITION), IggyError::Error))
+    );
+    assert_eq!(
+        counted_offset(&consumer.state()),
+        Some(BATCH[0]),
+        "the failed message stays uncounted, so the next run reads it again"
+    );
 }
 
-/// The store task is the only sender, so a tick and an event queue into one slot per partition.
 #[tokio::test(start_paused = true)]
-async fn given_a_store_in_flight_when_an_interval_tick_and_an_event_queue_commits_should_send_only_the_latest_after_it()
- {
-    const BATCH: [u64; 4] = [0, 1, 2, 3];
-    let policy = ClientCommitPolicy {
-        interval: Some(commit_interval()),
-        on: Some(CommitEvent::EveryNthMessage(NTH)),
-    };
-    let (mut consumer, cluster) = reading_consumer(policy, &[&BATCH]).await;
-    cluster.hold(STORE_CONSUMER_OFFSET_CODE);
+async fn given_marked_auto_commit_when_messages_are_marked_should_count_only_the_marks_forward() {
+    let (mut consumer, _cluster) = reading_consumer(auto(CommitAfter::Marked), &[&BATCH]).await;
+    let mut checkpoints = Vec::new();
+    for _ in BATCH {
+        checkpoints.push(next_message(&mut consumer).await.checkpoint());
+    }
     assert_eq!(
-        next_message(&mut consumer).await.message.header.offset,
-        BATCH[0]
+        counted_offset(&consumer.state()),
+        None,
+        "a yield counts nothing"
     );
-    eventually("the store task sent the commit of the event", || {
-        cluster.count(STORE_CONSUMER_OFFSET_CODE) == 1
-    })
-    .await;
-    for offset in &BATCH[1..] {
+
+    consumer.mark(checkpoints[1]).unwrap();
+    consumer.state().mark(checkpoints[0]).unwrap();
+
+    assert_eq!(counted_offset(&consumer.state()), Some(BATCH[1]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_manual_or_on_read_when_marking_should_refuse_it() {
+    for commit in [CommitPolicy::Manual, CommitPolicy::OnRead] {
+        let (consumer, _cluster) = consumer_without_reader(&[POLLED_PARTITION], |builder| {
+            builder.poll_options(auto_options(commit))
+        })
+        .await;
+        let checkpoint = captured_checkpoint(&consumer, POLLED_PARTITION, DELIVERED);
+
         assert_eq!(
-            next_message(&mut consumer).await.message.header.offset,
-            *offset
+            consumer.mark(checkpoint),
+            Err(IggyError::InvalidCommand),
+            "{commit:?}"
         );
     }
+}
 
-    sleep(AFTER_TICKS).await;
+#[tokio::test(start_paused = true)]
+async fn given_auto_commit_after_processing_when_shutting_down_should_store_the_last_yielded_message()
+ {
+    let (mut consumer, cluster) = reading_consumer(auto(CommitAfter::Processing), &[&BATCH]).await;
+    for _ in BATCH {
+        next_message(&mut consumer).await;
+    }
 
-    let last = BATCH[BATCH.len() - 1];
+    consumer.shutdown().await.unwrap();
+
+    assert_eq!(stored_offsets(&cluster), [(POLLED_PARTITION, BATCH[2])]);
     assert_eq!(
-        consumer
-            .pending_commits
-            .get(&POLLED_PARTITION)
-            .map(|queued| queued.offset()),
-        Some(last),
-        "the event skips the last message, so only the tick queued it"
+        consumer.get_last_stored_offset(POLLED_PARTITION),
+        Some(BATCH[2])
     );
-    assert_eq!(cluster.count(STORE_CONSUMER_OFFSET_CODE), 1);
-    cluster.release(STORE_CONSUMER_OFFSET_CODE);
-    eventually("the store task sent the queued commit", || {
-        cluster.count(STORE_CONSUMER_OFFSET_CODE) == 2
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_auto_commit_on_each_message_when_the_stream_yields_should_store_the_yielded_message()
+{
+    let (mut consumer, cluster) = reading_consumer(EACH_MESSAGE, &[&BATCH]).await;
+
+    let yielded = next_message(&mut consumer).await;
+
+    eventually("the store task stores the counted message", || {
+        stored_offsets(&cluster) == [(POLLED_PARTITION, yielded.message.header.offset)]
     })
     .await;
-    sleep(AFTER_TICKS).await;
-    assert_eq!(
-        stored_offsets(&cluster),
-        [(POLLED_PARTITION, BATCH[0]), (POLLED_PARTITION, last)]
-    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -748,7 +575,7 @@ async fn given_on_read_when_shutting_down_after_a_partial_yield_should_move_the_
  {
     const READ: [u64; 4] = [0, 1, 2, 3];
     const LAST_YIELDED: u64 = 1;
-    let (mut consumer, cluster) = committing_consumer().await;
+    let (mut consumer, cluster) = committing_consumer(READ[0]).await;
     script_primary(&cluster, FETCH_MESSAGES_CODE, [reply_of(&READ)]);
     for offset in 0..=LAST_YIELDED {
         assert_eq!(
@@ -776,7 +603,7 @@ async fn given_on_read_when_shutting_down_before_a_yield_should_rewind_before_th
     const PARTITION_START: u64 = 0;
     const LATER_START: u64 = 5;
     for first in [LATER_START, PARTITION_START] {
-        let (mut consumer, cluster) = committing_consumer().await;
+        let (mut consumer, cluster) = committing_consumer(first).await;
         script_primary(
             &cluster,
             FETCH_MESSAGES_CODE,
@@ -803,10 +630,12 @@ async fn given_on_read_when_shutting_down_before_a_yield_should_rewind_before_th
     }
 }
 
+/// The server can have committed the batch of a lost reply, so the shutdown stores the
+/// delivered offset again, and the lost reply ends nothing.
 #[tokio::test(start_paused = true)]
-async fn given_a_lost_committing_fetch_when_shutting_down_should_skip_its_partition_and_return_the_blocked_lane()
- {
-    let (mut consumer, cluster) = committing_consumer().await;
+async fn given_a_lost_committing_fetch_when_shutting_down_should_store_the_delivered_offset_again()
+{
+    let (mut consumer, cluster) = committing_consumer(DELIVERED).await;
     script_primary(
         &cluster,
         FETCH_MESSAGES_CODE,
@@ -819,32 +648,13 @@ async fn given_a_lost_committing_fetch_when_shutting_down_should_skip_its_partit
         next_message(&mut consumer).await.message.header.offset,
         DELIVERED
     );
+    let read_on = timeout(TEST_BUDGET, consumer.next()).await;
+    assert!(read_on.is_err(), "a lost reply is no error: {read_on:?}");
+    assert!(cluster.count(FETCH_MESSAGES_CODE) >= 2);
 
-    let lost = timeout(TEST_BUDGET, consumer.next())
-        .await
-        .unwrap()
-        .unwrap();
-    let operation = cluster.received(FETCH_MESSAGES_CODE)[1].header.request;
-    assert_eq!(
-        lost.unwrap_err(),
-        ReadError::new(
-            Some(POLLED_PARTITION),
-            IggyError::FetchProgressUncertain(operation)
-        )
-    );
-    assert_eq!(
-        consumer.get_last_stored_offset(POLLED_PARTITION),
-        None,
-        "the server can have committed the batch of the lost reply"
-    );
+    consumer.shutdown().await.unwrap();
 
-    let shut_down = consumer.shutdown().await;
-
-    assert_eq!(
-        shut_down,
-        Err(IggyError::PartitionLaneBlocked(POLLED_PARTITION, operation))
-    );
-    assert!(stored_offsets(&cluster).is_empty());
+    assert_eq!(stored_offsets(&cluster), [(POLLED_PARTITION, DELIVERED)]);
     assert!(deleted_partitions(&cluster).is_empty());
 }
 
@@ -852,7 +662,7 @@ async fn given_a_lost_committing_fetch_when_shutting_down_should_skip_its_partit
 async fn given_a_committing_fetch_that_outlasts_the_drain_timeout_when_shutting_down_should_wait_for_it_and_store_the_delivered_offset_again()
  {
     const REPLY_DELAY: Duration = Duration::from_millis(100);
-    let (mut consumer, cluster) = committing_consumer().await;
+    let (mut consumer, cluster) = committing_consumer(DELIVERED).await;
     consumer.offset_drain_timeout = IggyDuration::new(POLL_RETRY_INTERVAL);
     assert!(REPLY_DELAY > consumer.offset_drain_timeout.get_duration());
     script_primary(
@@ -886,23 +696,22 @@ async fn given_a_committing_fetch_that_outlasts_the_drain_timeout_when_shutting_
     );
 }
 
-/// Takes, in the handler of each message, the commit that the policy queued before it. It fails
-/// at [`FAILING_OFFSET`] and stops the consumption after `last`.
-struct TakeQueuedCommits {
-    pending_commits: Arc<DashMap<u32, Checkpoint>>,
+/// Records the counted offset of its partition when its handler starts, and stops the
+/// consumption after `last`.
+struct RecordCounted {
+    state: IggyConsumerState,
     last: u64,
-    taken: Mutex<Vec<Option<u64>>>,
+    counted: Mutex<Vec<Option<u64>>>,
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
 }
 
-impl MessageConsumer for TakeQueuedCommits {
+impl MessageConsumer for RecordCounted {
     async fn consume(&self, received: ReceivedMessage) -> Result<(), IggyError> {
-        self.taken
+        self.counted
             .lock()
             .unwrap()
-            .push(take_queued(&self.pending_commits));
-        let offset = received.message.header.offset;
-        if offset == self.last {
+            .push(counted_offset(&self.state));
+        if received.message.header.offset == self.last {
             self.shutdown
                 .lock()
                 .unwrap()
@@ -910,41 +719,18 @@ impl MessageConsumer for TakeQueuedCommits {
                 .unwrap()
                 .send(())
                 .unwrap();
-        }
-        if offset == FAILING_OFFSET {
-            return Err(IggyError::Error);
         }
         Ok(())
     }
 }
 
-/// Records each offset. In the handler of `last`, it waits until `cluster` stored that message,
-/// and then stops the consumption.
-struct AwaitStoreOfLast {
-    cluster: Arc<FakeCluster>,
-    last: u64,
-    handled: Mutex<Vec<u64>>,
-    shutdown: Mutex<Option<oneshot::Sender<()>>>,
-}
+/// Fails the handler of the message at its offset.
+struct FailAt(u64);
 
-impl MessageConsumer for AwaitStoreOfLast {
+impl MessageConsumer for FailAt {
     async fn consume(&self, received: ReceivedMessage) -> Result<(), IggyError> {
-        let offset = received.message.header.offset;
-        self.handled.lock().unwrap().push(offset);
-        if offset == self.last {
-            let stored = (received.partition_id, offset);
-            eventually(
-                "the interval stored the message of the running handler",
-                || stored_offsets(&self.cluster).contains(&stored),
-            )
-            .await;
-            self.shutdown
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap()
-                .send(())
-                .unwrap();
+        if received.message.header.offset == self.0 {
+            return Err(IggyError::Error);
         }
         Ok(())
     }
@@ -981,32 +767,27 @@ fn captured_checkpoint(consumer: &IggyConsumer, partition: u32, offset: u64) -> 
     )
 }
 
-/// A consumer that queues on `event`, with [`FIRST_REPLY`] and [`SECOND_REPLY`] in its reader.
-/// Its store task is stopped, so each commit that the policy queues stays in `pending_commits`.
-async fn event_consumer(event: CommitEvent) -> (IggyConsumer, Arc<FakeCluster>) {
-    let policy = ClientCommitPolicy {
-        interval: None,
-        on: Some(event),
-    };
-    let (mut consumer, cluster) = reading_consumer(policy, &[&FIRST_REPLY, &SECOND_REPLY]).await;
-    consumer.store_offset_task.take().unwrap().abort();
-    (consumer, cluster)
+/// `CommitPolicy::Auto` that counts `after`, and stores only at the close or the shutdown.
+fn auto(after: CommitAfter) -> CommitPolicy {
+    CommitPolicy::Auto(AutoCommit {
+        interval: NonZeroIggyDuration::new(NEVER).ok(),
+        every: None,
+        after,
+    })
 }
 
-fn every_interval() -> ClientCommitPolicy {
-    ClientCommitPolicy {
-        interval: Some(commit_interval()),
-        on: None,
+/// The default options of a consumer with `commit`.
+fn auto_options(commit: CommitPolicy) -> PollOptions {
+    PollOptions {
+        commit,
+        ..PollOptions::wait(IggyDuration::ONE_SECOND)
     }
 }
 
-fn commit_interval() -> NonZeroIggyDuration {
-    NonZeroIggyDuration::new(COMMIT_INTERVAL).unwrap()
-}
-
-/// The offset of the commit that the policy queued for `POLLED_PARTITION`.
-fn take_queued(pending_commits: &DashMap<u32, Checkpoint>) -> Option<u64> {
-    pending_commits
-        .remove(&POLLED_PARTITION)
-        .map(|(_, checkpoint)| checkpoint.offset())
+/// The offset of the latest counted message of `POLLED_PARTITION`.
+fn counted_offset(state: &IggyConsumerState) -> Option<u64> {
+    state
+        .progress
+        .last_counted(POLLED_PARTITION)
+        .map(|checkpoint| checkpoint.offset())
 }

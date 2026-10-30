@@ -31,7 +31,7 @@ async fn main() -> Result<(), IggyError> {
     // For customization, use the `new` or `from_stream_topic` constructor
     let consumer_config = IggyConsumerConfig::default();
     let poll_options = PollOptions {
-        server_commit: ServerCommitPolicy::OnRead,
+        commit: CommitPolicy::OnRead,
         ..consumer_config.poll_options()
     };
     let consumer_config = consumer_config.with_poll_options(poll_options);

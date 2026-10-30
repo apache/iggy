@@ -144,7 +144,7 @@ pub async fn consume_messages(
                 &PollingStrategy::next(),
                 PollOptions {
                     count: args.messages_per_batch,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )

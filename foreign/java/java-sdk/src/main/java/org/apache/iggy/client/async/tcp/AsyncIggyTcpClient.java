@@ -34,11 +34,14 @@ import org.apache.iggy.client.async.StreamsClient;
 import org.apache.iggy.client.async.SystemClient;
 import org.apache.iggy.client.async.TopicsClient;
 import org.apache.iggy.client.async.UsersClient;
+import org.apache.iggy.client.async.reader.PartitionReader;
+import org.apache.iggy.client.async.reader.PartitionReaderBuilder;
 import org.apache.iggy.client.async.tcp.AsyncTcpConnection.TcpConnectionPoolConfig;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
 import org.apache.iggy.client.async.tcp.vsr.VsrOperation;
 import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.config.RetryPolicy;
+import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
@@ -46,6 +49,8 @@ import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
+import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
@@ -437,10 +442,10 @@ public class AsyncIggyTcpClient {
      * typed deferred poll, the request timeout in a deferred poll's payload sets
      * its deadline.
      *
-     * <p>FetchMessages goes as it is to the primary of its first target, as a typed
-     * {@link MessagesClient#fetchMessages} goes, with the fences and byte limits of its
+     * <p>FetchMessages goes as it is to the primary of its first target, as the fetch of a
+     * {@link #reader} goes, with the fences and byte limits of its
      * targets. A refusal with NotPrimary (89) and a NotPrimary section make the next
-     * {@link MessagesClient#readinessGroups} look up those routes again. The request timeout
+     * grouping of a reader look up those routes again. The request timeout
      * in its payload sets its deadline. A payload that the server would refuse to decode
      * completes the future with an {@link org.apache.iggy.exception.IggyInvalidArgumentException}
      * and sends nothing.
@@ -478,7 +483,7 @@ public class AsyncIggyTcpClient {
      *
      * <p>The request carries the metadata watermark of the session, so the replica answers after it applied the
      * metadata that this client saw. Replicated commands, PollMessages, deferred polls, FetchMessages,
-     * FetchMessages, CancelDeferredRequest, GetConsumerOffset and session-control codes complete the returned future
+     * CancelDeferredRequest, GetConsumerOffset and session-control codes complete the returned future
      * with an invalid-command error before anything is sent. An id that cluster metadata does not
      * name after one read of it completes the future with an invalid-identifier error. A replica that cannot be
      * reached, or that answers with code 58, is asked again until the request timeout, which ends the call with code
@@ -563,8 +568,8 @@ public class AsyncIggyTcpClient {
      * operation was uncommitted. A replay of the operation that is already running keeps its lane until the replay
      * ends, so a later mutation of that lane waits for it. That replay still keeps the outcome it proves for
      * {@link #resolveOperation}.
-     * A fetch abandon accepts its unknown progress and releases all of its local target blocks;
-     * it does not cancel or fence the original server request.
+     * A fetch abandon accepts its unknown progress and releases all of its local target blocks.
+     * It does not cancel or fence the original server request.
      */
     public CompletableFuture<Void> abandonOperation(long operationId) {
         try {
@@ -606,6 +611,22 @@ public class AsyncIggyTcpClient {
             throw new IggyNotConnectedException();
         }
         return messagesClient;
+    }
+
+    /**
+     * Starts a reader of the partitions of {@code topicId}. A standalone consumer names its partitions on the builder,
+     * a consumer group reads the assignment of its member. The reader groups the partitions by their primary and reads
+     * each group with one request.
+     *
+     * @param streamId the stream identifier
+     * @param topicId  the topic identifier
+     * @param consumer the consumer or consumer group whose offsets the reader reads and stores
+     * @return the builder of the reader
+     * @throws IggyNotConnectedException if the client is not connected
+     */
+    public PartitionReaderBuilder reader(StreamId streamId, TopicId topicId, Consumer consumer) {
+        messages();
+        return PartitionReader.builder(new TcpReaderTransport(this, streamId, topicId, consumer));
     }
 
     /**
@@ -708,15 +729,17 @@ public class AsyncIggyTcpClient {
      * that group down. After you call this method, you cannot reuse the client. If you need
      * a client again, create a new instance.
      *
-     * <p>A close first waits for the reply of every pending fetch with {@code autoCommit}, at
+     * <p>A close first waits for the reply of every pending poll or fetch with {@code autoCommit}, at
      * most until its request timeout, because a cancel can lose the messages that the server
      * committed for it. It cancels every other pending request.
-     * Unresolved fetch recovery is reported after cleanup and is never abandoned automatically.
+     * A fetch whose outcome stays unknown does not fail the close. The close logs it, and its recovery
+     * stays until {@link #abandonOperation(long)} releases it, so the close of a blocking client in
+     * try-with-resources does not throw.
      *
      * @return a {@link CompletableFuture} that completes when all resources are released
      */
     public CompletableFuture<Void> close() {
-        CompletableFuture<Void> committingFetches = pollRouter.committingFetchesEnded();
+        CompletableFuture<Void> committingFetches = pollRouter.committingReadsEnded();
         if (committingFetches.isDone()) {
             return closeNow();
         }
@@ -764,7 +787,9 @@ public class AsyncIggyTcpClient {
                 .thenRun(() -> {
                     var unresolved = session.unresolvedFetch();
                     if (unresolved != null) {
-                        throw unresolved;
+                        log.warn(
+                                "Closed with fetch {} of unknown progress, which stays retained until it is abandoned",
+                                Long.toUnsignedString(unresolved.getOperationId()));
                     }
                 });
     }

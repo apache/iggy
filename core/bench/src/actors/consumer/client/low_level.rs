@@ -37,7 +37,7 @@ pub struct LowLevelConsumerClient {
     topic_id: Identifier,
     /// Where the next poll of a standalone consumer starts.
     polling_strategy: PollingStrategy,
-    server_commit: ServerCommitPolicy,
+    commit: CommitPolicy,
     /// A group member owns no fixed partition, so only a reader follows its assignment.
     reader: Option<PartitionReader>,
 }
@@ -52,7 +52,7 @@ impl LowLevelConsumerClient {
             stream_id: Identifier::default(),
             topic_id: Identifier::default(),
             polling_strategy: PollingStrategy::next(),
-            server_commit: ServerCommitPolicy::OnRead,
+            commit: CommitPolicy::OnRead,
             reader: None,
         }
     }
@@ -74,7 +74,7 @@ impl ConsumerClient for LowLevelConsumerClient {
             let consumer = self.consumer.as_ref().expect("consumer not initialized");
             let options = PollOptions {
                 count: self.config.messages_per_batch.get(),
-                server_commit: self.server_commit,
+                commit: self.commit,
                 ..self.config.poll_options
             };
             client
@@ -152,16 +152,16 @@ impl BenchmarkInit for LowLevelConsumerClient {
             self.config.consumer_id,
         )
         .await;
-        let (polling_strategy, server_commit) = match self.config.polling_kind {
-            PollingKind::Offset => (PollingStrategy::offset(0), ServerCommitPolicy::Disabled),
-            PollingKind::Next => (PollingStrategy::next(), ServerCommitPolicy::OnRead),
+        let (polling_strategy, commit) = match self.config.polling_kind {
+            PollingKind::Offset => (PollingStrategy::offset(0), CommitPolicy::Manual),
+            PollingKind::Next => (PollingStrategy::next(), CommitPolicy::OnRead),
             _ => panic!("Unsupported polling kind: {:?}", self.config.polling_kind),
         };
         if self.config.consumer_group_id.is_some() {
             // A reader asks for one count, so a range of batch sizes reads up to the largest.
             let options = PollOptions {
                 count: self.config.messages_per_batch.max(),
-                server_commit,
+                commit,
                 ..self.config.poll_options
             };
             // Each timed `next()` measures one fetch round trip, so the reader holds one request
@@ -184,7 +184,7 @@ impl BenchmarkInit for LowLevelConsumerClient {
         self.stream_id = stream_id;
         self.topic_id = topic_id;
         self.polling_strategy = polling_strategy;
-        self.server_commit = server_commit;
+        self.commit = commit;
 
         Ok(())
     }
@@ -202,8 +202,8 @@ mod tests {
     use crate::utils::client_factory::TcpClientFactory;
     use bench_report::numeric_parameter::BenchmarkNumericParameter;
     use iggy::prelude::{
-        ClientWrapper, Consumer, Identifier, IggyClient, IggyDuration, PartitionContext,
-        PollOptions, PollingKind, PollingStrategy, ServerCommitPolicy, TcpClient, TcpClientConfig,
+        ClientWrapper, CommitPolicy, Consumer, Identifier, IggyClient, IggyDuration,
+        PartitionContext, PollOptions, PollingKind, PollingStrategy, TcpClient, TcpClientConfig,
     };
     use std::sync::Arc;
 
@@ -218,8 +218,8 @@ mod tests {
     #[tokio::test]
     async fn given_disconnected_standalone_consumer_when_resetting_should_rewind_without_offset_requests()
      {
-        for (polling_strategy, server_commit) in [
-            (PollingStrategy::next(), ServerCommitPolicy::OnRead),
+        for (polling_strategy, commit) in [
+            (PollingStrategy::next(), CommitPolicy::OnRead),
             (
                 PollingStrategy::continuation(
                     PARTITION_ID,
@@ -227,7 +227,7 @@ mod tests {
                     WARMUP_OFFSET,
                     WARMUP_HISTORY,
                 ),
-                ServerCommitPolicy::Disabled,
+                CommitPolicy::Manual,
             ),
         ] {
             let mut consumer = LowLevelConsumerClient::new(
@@ -249,12 +249,12 @@ mod tests {
             )));
             consumer.consumer = Some(Consumer::new(Identifier::numeric(CONSUMER_ID).unwrap()));
             consumer.polling_strategy = polling_strategy;
-            consumer.server_commit = server_commit;
+            consumer.commit = commit;
 
             consumer.reset_offsets().await.unwrap();
 
             assert_eq!(consumer.polling_strategy, PollingStrategy::offset(0));
-            assert_eq!(consumer.server_commit, server_commit);
+            assert_eq!(consumer.commit, commit);
         }
     }
 }

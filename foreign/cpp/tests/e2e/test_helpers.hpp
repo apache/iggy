@@ -73,10 +73,10 @@ inline iggy::ffi::PollingStrategy make_polling_strategy(const std::string &kind,
 
 inline iggy::ffi::PollOptions make_poll_options(
     const std::uint32_t count,
-    const iggy::ffi::ServerCommitPolicy server_commit = iggy::ffi::ServerCommitPolicy::Disabled) {
+    const iggy::ffi::CommitPolicy commit = iggy::ffi::CommitPolicy::Manual) {
     iggy::ffi::PollOptions options = iggy::ffi::default_poll_options();
     options.count                  = count;
-    options.server_commit          = server_commit;
+    options.commit                 = commit;
     return options;
 }
 

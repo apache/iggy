@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{PARTITION_ID, POLL_REPLY_MAX_BYTES, poll_until_expected_count};
+use super::{PARTITION_ID, poll_until_expected_count};
 use bytes::BytesMut;
 use iggy::prelude::*;
 use iggy_binary_protocol::WireUserHeaders;
@@ -436,31 +436,27 @@ async fn verify_sequential_chunk_reads(
     for chunk_start in (0..total_messages).step_by(chunk_size as usize) {
         let read_size = std::cmp::min(chunk_size, total_messages - chunk_start);
 
-        let polled = client
-            .poll_messages(
-                &Identifier::named(stream_name).unwrap(),
-                &Identifier::named(topic_name).unwrap(),
-                PARTITION_ID,
-                &Consumer::default(),
-                &PollingStrategy::offset(chunk_start as u64),
-                PollOptions {
-                    count: read_size,
-                    max_bytes: POLL_REPLY_MAX_BYTES,
-                    ..PollOptions::default()
-                },
-            )
-            .await
-            .unwrap();
+        let messages = poll_until_expected_count(
+            client,
+            stream_name,
+            topic_name,
+            &PollingStrategy::offset(chunk_start as u64),
+            read_size,
+        )
+        .await;
 
         assert_eq!(
-            polled.messages.len() as u32,
+            messages.len() as u32,
             read_size,
             "Failed to read chunk at offset {} with size {}",
             chunk_start,
             read_size
         );
 
-        verified_count += polled.messages.len() as u32;
+        for (index, message) in messages.iter().enumerate() {
+            assert_eq!(message.header.offset, chunk_start as u64 + index as u64);
+        }
+        verified_count += messages.len() as u32;
     }
 
     assert_eq!(

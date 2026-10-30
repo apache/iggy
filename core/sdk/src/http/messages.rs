@@ -23,19 +23,19 @@ use crate::prelude::{
     PollMessages, PolledMessages, PollingStrategy, SendMessages, SendMessagesResponse,
 };
 use async_trait::async_trait;
+use iggy_common::CommitPolicy;
+use iggy_common::DecodeError;
 use iggy_common::IggyMessagesBatch;
 use iggy_common::MessageClient;
 use iggy_common::PartitioningKind;
 use iggy_common::PollOptions;
 use iggy_common::SendMessagesConfirmations;
-use iggy_common::ServerCommitPolicy;
 
 #[async_trait]
 impl MessageClient for HttpClient {
     /// Every poll goes to the deferred endpoint, also with a zero wait, because only that
     /// endpoint honors `min_count`, `max_bytes` and the request timeout. A first message
-    /// larger than `max_bytes` comes alone in its own read, except at a `Last` start with a
-    /// count above 1.
+    /// larger than `max_bytes` comes alone in the reply.
     async fn poll_messages(
         &self,
         stream_id: &Identifier,
@@ -45,31 +45,56 @@ impl MessageClient for HttpClient {
         strategy: &PollingStrategy,
         options: PollOptions,
     ) -> Result<PolledMessages, IggyError> {
-        options.validate()?;
-        strategy.validate_partition(partition_id)?;
+        self.poll_messages_raw(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            strategy,
+            options,
+        )
+        .await
+        .map_err(|error| error.error)
+    }
+
+    async fn poll_messages_raw(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: u32,
+        consumer: &Consumer,
+        strategy: &PollingStrategy,
+        options: PollOptions,
+    ) -> Result<PolledMessages, DecodeError> {
+        options.validate().map_err(DecodeError::without_record)?;
+        strategy
+            .validate_partition(partition_id)
+            .map_err(DecodeError::without_record)?;
         // HTTP cannot join a consumer group, and an external group only holds offsets.
         if consumer.kind != ConsumerKind::Consumer {
-            return Err(IggyError::FeatureUnavailable);
+            return Err(DecodeError::without_record(IggyError::FeatureUnavailable));
         }
+        let auto_commit = match options.commit {
+            CommitPolicy::Manual => false,
+            CommitPolicy::OnRead => true,
+            CommitPolicy::Auto(_) => {
+                return Err(DecodeError::without_record(IggyError::InvalidConfiguration));
+            }
+        };
         let path = format!(
             "{}/deferred",
             get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str())
         );
-        options
-            .poll_oversized_alone(strategy, |count, wire_options| {
-                let poll = PollMessages {
-                    stream_id: stream_id.clone(),
-                    topic_id: topic_id.clone(),
-                    partition_id: Some(partition_id),
-                    consumer: consumer.clone(),
-                    strategy: *strategy,
-                    count,
-                    auto_commit: options.server_commit == ServerCommitPolicy::OnRead,
-                };
-                let path = &path;
-                async move { self.get_deferred_poll(path, &poll, wire_options).await }
-            })
-            .await
+        let poll = PollMessages {
+            stream_id: stream_id.clone(),
+            topic_id: topic_id.clone(),
+            partition_id: Some(partition_id),
+            consumer: consumer.clone(),
+            strategy: *strategy,
+            count: options.count,
+            auto_commit,
+        };
+        self.get_deferred_poll(&path, &poll, options.into()).await
     }
 
     async fn send_messages(
@@ -234,7 +259,6 @@ fn get_path(stream_id: &str, topic_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{PolledMessages, SendMessagesConfirmations, SendMessagesResponse};
-    use crate::clients::reader::fixtures::message_at;
     use crate::http::http_client::HttpClient;
     use crate::http::scripted_server::{Recorded, Reply, ScriptedServer};
     use crate::prelude::{
@@ -245,7 +269,9 @@ mod tests {
     };
     use bytes::Bytes;
     use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
-    use iggy_common::{Checkpoint, DEFAULT_POLL_MAX_BYTES, PollOptions, ServerCommitPolicy};
+    use iggy_common::{
+        AutoCommit, Checkpoint, CommitPolicy, MIN_DEFERRED_POLL_MAX_BYTES, PollOptions,
+    };
     use std::time::Instant;
 
     const PARTITION_ID: u32 = 2;
@@ -266,6 +292,7 @@ mod tests {
     const TOPIC_LINE: &str = "GET /streams/1/topics/1 HTTP/1.1";
     const SEND_LINE: &str = "POST /streams/1/topics/1/messages HTTP/1.1";
     const DEFERRED_POLL_LINE: &str = "GET /streams/1/topics/1/messages/deferred?";
+    const COMMITTING_POLL_LINE: &str = "POST /streams/1/topics/1/messages/deferred?";
 
     fn ids() -> (Identifier, Identifier) {
         (
@@ -301,9 +328,9 @@ mod tests {
     async fn poll(
         client: &HttpClient,
         strategy: &PollingStrategy,
-        server_commit: ServerCommitPolicy,
+        commit: CommitPolicy,
     ) -> Result<PolledMessages, IggyError> {
-        poll_partition(client, &ids(), PARTITION_ID, strategy, server_commit).await
+        poll_partition(client, &ids(), PARTITION_ID, strategy, commit).await
     }
 
     async fn poll_partition(
@@ -311,7 +338,7 @@ mod tests {
         (stream_id, topic_id): &(Identifier, Identifier),
         partition_id: u32,
         strategy: &PollingStrategy,
-        server_commit: ServerCommitPolicy,
+        commit: CommitPolicy,
     ) -> Result<PolledMessages, IggyError> {
         client
             .poll_messages(
@@ -321,7 +348,7 @@ mod tests {
                 &Consumer::default(),
                 strategy,
                 PollOptions {
-                    server_commit,
+                    commit,
                     ..PollOptions::default()
                 },
             )
@@ -344,7 +371,7 @@ mod tests {
         let polled = poll(
             &server.client(),
             &PollingStrategy::offset(START),
-            ServerCommitPolicy::Disabled,
+            CommitPolicy::Manual,
         )
         .await
         .unwrap();
@@ -401,6 +428,49 @@ mod tests {
         assert!(server.requests().is_empty());
     }
 
+    /// A proxy may send a GET again, so a poll that stores its offset goes as a POST with the
+    /// query of the GET and an empty body.
+    #[tokio::test]
+    async fn given_on_read_when_polling_should_post_the_deferred_query() {
+        let server = ScriptedServer::start(vec![Reply::polled()]).await;
+
+        poll(
+            &server.client(),
+            &PollingStrategy::offset(START),
+            CommitPolicy::OnRead,
+        )
+        .await
+        .unwrap();
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].line.starts_with(COMMITTING_POLL_LINE),
+            "{}",
+            requests[0].line
+        );
+        assert_eq!(requests[0].query("auto_commit").as_deref(), Some("true"));
+        assert_eq!(requests[0].query("wait_us").as_deref(), Some("0"));
+        assert!(requests[0].body.is_empty());
+    }
+
+    /// One poll has nothing to count, so it takes no client commit.
+    #[tokio::test]
+    async fn given_auto_commit_when_polling_should_refuse_it_before_sending() {
+        let server = ScriptedServer::start(vec![]).await;
+        let client = server.client();
+
+        let polled = poll(
+            &client,
+            &PollingStrategy::next(),
+            CommitPolicy::Auto(AutoCommit::default()),
+        )
+        .await;
+
+        assert_eq!(polled.map(drop), Err(IggyError::InvalidConfiguration));
+        assert!(server.requests().is_empty());
+    }
+
     /// A continuation of another partition would read this partition at an offset of the
     /// other one. A continuation of this partition fences the poll with its context.
     #[tokio::test]
@@ -411,8 +481,8 @@ mod tests {
             PollingStrategy::continuation(OTHER_PARTITION_ID, PollingKind::Offset, START, CURRENT);
         let own = PollingStrategy::continuation(PARTITION_ID, PollingKind::Offset, START, CURRENT);
 
-        let refused = poll(&client, &other, ServerCommitPolicy::Disabled).await;
-        let polled = poll(&client, &own, ServerCommitPolicy::Disabled).await;
+        let refused = poll(&client, &other, CommitPolicy::Manual).await;
+        let polled = poll(&client, &own, CommitPolicy::Manual).await;
 
         assert_eq!(refused.map(drop), Err(IggyError::InvalidCommand));
         polled.unwrap();
@@ -446,18 +516,8 @@ mod tests {
             let server = ScriptedServer::start(vec![unknown, Reply::polled()]).await;
             let client = server.client();
 
-            let polled = poll(
-                &client,
-                &PollingStrategy::next(),
-                ServerCommitPolicy::OnRead,
-            )
-            .await;
-            let next = poll(
-                &client,
-                &PollingStrategy::next(),
-                ServerCommitPolicy::OnRead,
-            )
-            .await;
+            let polled = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
+            let next = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
 
             let Err(IggyError::FetchProgressUncertain(op)) = polled else {
                 panic!("{case}: {polled:?}");
@@ -497,42 +557,12 @@ mod tests {
         .await;
         let client = server.client();
 
-        let retried = poll(
-            &client,
-            &PollingStrategy::next(),
-            ServerCommitPolicy::OnRead,
-        )
-        .await;
-        let refused = poll(
-            &client,
-            &PollingStrategy::next(),
-            ServerCommitPolicy::OnRead,
-        )
-        .await;
-        let history_gone = poll(
-            &client,
-            &PollingStrategy::next(),
-            ServerCommitPolicy::OnRead,
-        )
-        .await;
-        let invalid_offset = poll(
-            &client,
-            &PollingStrategy::next(),
-            ServerCommitPolicy::OnRead,
-        )
-        .await;
-        let not_found = poll(
-            &client,
-            &PollingStrategy::next(),
-            ServerCommitPolicy::OnRead,
-        )
-        .await;
-        let next = poll(
-            &client,
-            &PollingStrategy::next(),
-            ServerCommitPolicy::OnRead,
-        )
-        .await;
+        let retried = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
+        let refused = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
+        let history_gone = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
+        let invalid_offset = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
+        let not_found = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
+        let next = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
 
         retried.unwrap();
         assert!(
@@ -552,109 +582,87 @@ mod tests {
         assert_eq!(server.requests().len(), 7);
     }
 
-    /// A first message larger than `max_bytes` comes alone in a second read with the consumer,
-    /// the start and the server commit of the first one, so with `OnRead` the server stores the
-    /// offset of that message only. A read without a byte limit is not repeated.
+    /// The server returns a first message above `max_bytes` alone in the reply, so it refuses a
+    /// poll with `InvalidSizeBytes` only for a byte limit it cannot serve, before it stores
+    /// anything. The refusal comes back from one read and the partition polls on.
     #[tokio::test]
-    async fn given_an_oversized_first_message_when_polled_should_read_it_alone_once() {
-        for server_commit in [ServerCommitPolicy::Disabled, ServerCommitPolicy::OnRead] {
-            for max_bytes in [DEFAULT_POLL_MAX_BYTES, u32::MAX] {
-                let case = format!("{server_commit:?} max_bytes={max_bytes}");
-                let alone =
-                    PolledMessages::new(CURRENT, PARTITION_ID, START, 1, vec![message_at(START)]);
+    async fn given_a_byte_limit_refusal_when_polled_should_return_it_from_one_read() {
+        for commit in [CommitPolicy::Manual, CommitPolicy::OnRead] {
+            for strategy in [
+                PollingStrategy::offset(START),
+                PollingStrategy::first(),
+                PollingStrategy::next(),
+                PollingStrategy::last(),
+            ] {
+                let case = format!("{commit:?} {strategy}");
                 let server = ScriptedServer::start(vec![
                     Reply::error(400, &IggyError::InvalidSizeBytes),
-                    Reply::batch(&alone),
+                    Reply::polled(),
                 ])
                 .await;
                 let client = server.client();
-                let (stream_id, topic_id) = ids();
-                let options = PollOptions {
-                    max_bytes,
-                    server_commit,
-                    ..PollOptions::default()
-                };
 
-                let polled = client
-                    .poll_messages(
-                        &stream_id,
-                        &topic_id,
-                        PARTITION_ID,
-                        &Consumer::default(),
-                        &PollingStrategy::offset(START),
-                        options,
-                    )
-                    .await;
+                let refused = poll(&client, &strategy, commit).await;
+                let next = poll(&client, &strategy, commit).await;
 
-                let requests = server.requests();
-                if max_bytes == u32::MAX {
-                    assert_eq!(polled.map(drop), Err(IggyError::InvalidSizeBytes), "{case}");
-                    assert_eq!(requests.len(), 1, "{case}");
-                    continue;
-                }
-                let offsets: Vec<u64> = polled
-                    .unwrap()
-                    .messages
-                    .iter()
-                    .map(|message| message.header.offset)
-                    .collect();
-                assert_eq!(offsets, [START], "{case}");
-                let [first, second] = requests.as_slice() else {
-                    panic!("{case}: one read alone after the refusal, got {requests:?}");
-                };
-                let expected = options.alone();
-                for (key, value) in [
-                    ("count", expected.count),
-                    ("min_count", expected.min_count),
-                    ("max_bytes", expected.max_bytes),
-                ] {
-                    assert_eq!(second.query(key), Some(value.to_string()), "{case}: {key}");
-                }
                 assert_eq!(
-                    second.query("auto_commit"),
-                    Some((server_commit == ServerCommitPolicy::OnRead).to_string()),
+                    refused.map(drop),
+                    Err(IggyError::InvalidSizeBytes),
                     "{case}"
                 );
-                for key in ["consumer_id", "kind", "value"] {
-                    assert_eq!(second.query(key), first.query(key), "{case}: {key}");
+                next.unwrap();
+                let requests = server.requests();
+                assert_eq!(
+                    requests.len(),
+                    2,
+                    "{case}: no second read of the refused poll"
+                );
+                for request in &requests {
+                    for (key, value) in [
+                        ("count", PollOptions::default().count),
+                        ("max_bytes", PollOptions::default().max_bytes),
+                    ] {
+                        assert_eq!(request.query(key), Some(value.to_string()), "{case}: {key}");
+                    }
                 }
             }
         }
     }
 
-    /// With count 1, a `Last` start would begin at the last message and skip the messages
-    /// before it. The refusal proves that the server stored nothing, so the partition polls on.
+    /// A reply holds up to `max_bytes` of records, or one larger first record, so the client
+    /// takes the JSON of one record far above its byte limit.
     #[tokio::test]
-    async fn given_an_oversized_first_message_of_a_last_start_when_polled_should_return_the_refusal()
-     {
-        for server_commit in [ServerCommitPolicy::Disabled, ServerCommitPolicy::OnRead] {
-            let server = ScriptedServer::start(vec![
-                Reply::error(400, &IggyError::InvalidSizeBytes),
-                Reply::polled(),
-            ])
-            .await;
-            let client = server.client();
-            let last = PollingStrategy::last();
+    async fn given_one_record_above_max_bytes_when_polled_should_take_its_reply() {
+        const PAYLOAD_SIZE: usize = 64 * 1024;
+        let max_bytes = u32::try_from(MIN_DEFERRED_POLL_MAX_BYTES).unwrap();
+        let mut message = IggyMessage::builder()
+            .payload(Bytes::from(vec![b'x'; PAYLOAD_SIZE]))
+            .build()
+            .unwrap();
+        message.header.offset = START;
+        let oversized = PolledMessages::new(CURRENT, PARTITION_ID, START, 1, vec![message]);
+        let server = ScriptedServer::start(vec![Reply::batch(&oversized)]).await;
+        let client = server.client();
+        let (stream_id, topic_id) = ids();
 
-            let refused = poll(&client, &last, server_commit).await;
-            let next = poll(&client, &last, server_commit).await;
+        let polled = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                PARTITION_ID,
+                &Consumer::default(),
+                &PollingStrategy::offset(START),
+                PollOptions {
+                    max_bytes,
+                    ..PollOptions::default()
+                },
+            )
+            .await
+            .expect("one record above max_bytes comes in its reply");
 
-            assert_eq!(
-                refused.map(drop),
-                Err(IggyError::InvalidSizeBytes),
-                "{server_commit:?}"
-            );
-            next.unwrap();
-            let requests = server.requests();
-            assert_eq!(requests.len(), 2, "{server_commit:?}: no read alone");
-            for request in &requests {
-                assert_eq!(
-                    request.query("count"),
-                    Some(PollOptions::default().count.to_string()),
-                    "{server_commit:?}"
-                );
-            }
-        }
+        assert_eq!(polled.messages.len(), 1);
+        assert_eq!(polled.messages[0].payload.len(), PAYLOAD_SIZE);
+        assert_eq!(server.requests().len(), 1);
     }
 
     /// The server can still store the offset of a sent `OnRead` poll that its caller dropped.
@@ -665,12 +673,12 @@ mod tests {
         let strategy = PollingStrategy::next();
 
         tokio::select! {
-            polled = poll(&client, &strategy, ServerCommitPolicy::OnRead) => {
+            polled = poll(&client, &strategy, CommitPolicy::OnRead) => {
                 panic!("a poll without an answer ended: {polled:?}");
             }
             () = server.request_arrived() => {}
         }
-        let next = poll(&client, &strategy, ServerCommitPolicy::Disabled).await;
+        let next = poll(&client, &strategy, CommitPolicy::Manual).await;
 
         let Err(IggyError::PartitionLaneBlocked(PARTITION_ID, op)) = next else {
             panic!("{next:?}");
@@ -696,12 +704,7 @@ mod tests {
         let (stream_id, topic_id) = ids();
         let named = named_ids();
         let checkpoint = Checkpoint::new(PARTITION_ID, START, CURRENT);
-        let lost = poll(
-            &client,
-            &PollingStrategy::next(),
-            ServerCommitPolicy::OnRead,
-        )
-        .await;
+        let lost = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
         let Err(IggyError::FetchProgressUncertain(op)) = lost else {
             panic!("{lost:?}");
         };
@@ -712,7 +715,7 @@ mod tests {
             &named,
             PARTITION_ID,
             &PollingStrategy::next(),
-            ServerCommitPolicy::Disabled,
+            CommitPolicy::Manual,
         )
         .await;
         let on_read = poll_partition(
@@ -720,7 +723,7 @@ mod tests {
             &named,
             PARTITION_ID,
             &PollingStrategy::offset(START),
-            ServerCommitPolicy::OnRead,
+            CommitPolicy::OnRead,
         )
         .await;
         let stored_position = client
@@ -743,7 +746,7 @@ mod tests {
             &named,
             PARTITION_ID,
             &PollingStrategy::offset(START),
-            ServerCommitPolicy::Disabled,
+            CommitPolicy::Manual,
         )
         .await;
         let other = poll_partition(
@@ -751,7 +754,7 @@ mod tests {
             &named,
             OTHER_PARTITION_ID,
             &PollingStrategy::next(),
-            ServerCommitPolicy::OnRead,
+            CommitPolicy::OnRead,
         )
         .await;
 
@@ -779,7 +782,7 @@ mod tests {
             &ids(),
             DEFAULT_PARTITION_ID,
             &PollingStrategy::next(),
-            ServerCommitPolicy::OnRead,
+            CommitPolicy::OnRead,
         )
         .await;
         let Err(IggyError::FetchProgressUncertain(op)) = lost else {
@@ -804,12 +807,7 @@ mod tests {
     async fn given_a_blocked_partition_when_abandoned_should_poll_it_again() {
         let server = ScriptedServer::start(vec![Reply::hang_up(), Reply::polled()]).await;
         let client = server.client();
-        let lost = poll(
-            &client,
-            &PollingStrategy::next(),
-            ServerCommitPolicy::OnRead,
-        )
-        .await;
+        let lost = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
         let Err(IggyError::FetchProgressUncertain(op)) = lost else {
             panic!("{lost:?}");
         };
@@ -819,12 +817,7 @@ mod tests {
         let abandoned = client.abandon_operation(op).await;
         let retained_after_abandon = client.retains_operation(op);
         let abandoned_again = client.abandon_operation(op).await;
-        let polled = poll(
-            &client,
-            &PollingStrategy::next(),
-            ServerCommitPolicy::OnRead,
-        )
-        .await;
+        let polled = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
 
         assert_eq!(resolved, Err(IggyError::FeatureUnavailable));
         assert!(retained_after_resolve);
@@ -864,13 +857,8 @@ mod tests {
             let server = ScriptedServer::start(vec![failure, Reply::polled()]).await;
             let client = server.client();
 
-            let polled = poll(&client, &strategy, ServerCommitPolicy::Disabled).await;
-            let next = poll(
-                &client,
-                &PollingStrategy::next(),
-                ServerCommitPolicy::Disabled,
-            )
-            .await;
+            let polled = poll(&client, &strategy, CommitPolicy::Manual).await;
+            let next = poll(&client, &PollingStrategy::next(), CommitPolicy::Manual).await;
 
             assert_eq!(polled.map(drop), Err(expected), "{strategy}");
             next.unwrap();

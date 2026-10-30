@@ -44,8 +44,8 @@ use config::{
     TcpReconnectionConfig, WebSocketConfig, WebSocketFramingConfig, WebSocketReconnectionConfig,
 };
 use consumer::{
-    ClientCommitPolicy, CommitEvent, Consumer, ConsumerGroup, ConsumerGroupDetails,
-    ConsumerGroupMember, IggyConsumer, ReceiveMessageIterator,
+    Consumer, ConsumerGroup, ConsumerGroupDetails, ConsumerGroupMember, ConsumerOffsetInfo,
+    IggyConsumer, ReceiveMessageIterator,
 };
 use metadata_changes::{
     MetadataChangeCursor, MetadataChangeGroup, MetadataChangeKind, MetadataChangePhase,
@@ -62,7 +62,7 @@ use metadata_changes::{
 use options::OptionSpec;
 use partitioning::Partitioning;
 use permissions::{GlobalPermissions, Permissions, StreamPermissions, TopicPermissions};
-use poll_options::{PollOptions, ServerCommitPolicy};
+use poll_options::{AutoCommit, CommitAfter, CommitEvery, CommitPolicy, PollOptions};
 use producer::{
     BackgroundProducerConfig, BackpressureMode, DirectProducerConfig, IggyProducer,
     ProducerSendError, ProducerSharding,
@@ -95,7 +95,10 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Checkpoint>()?;
     m.add_class::<PolledMessages>()?;
     m.add_class::<PollOptions>()?;
-    m.add_class::<ServerCommitPolicy>()?;
+    m.add_class::<CommitPolicy>()?;
+    m.add_class::<AutoCommit>()?;
+    m.add_class::<CommitEvery>()?;
+    m.add_class::<CommitAfter>()?;
     m.add_class::<IggyClient>()?;
     m.add_class::<PyIggyError>()?;
     m.add_class::<PendingOperationError>()?;
@@ -136,14 +139,13 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Partitioning>()?;
     m.add_class::<Partition>()?;
     m.add_class::<Consumer>()?;
+    m.add_class::<ConsumerOffsetInfo>()?;
     m.add_class::<ConsumerGroup>()?;
     m.add_class::<ConsumerGroupDetails>()?;
     m.add_class::<ConsumerGroupMember>()?;
     m.add_class::<PollingStrategy>()?;
     m.add_class::<PartitionReader>()?;
     m.add_class::<IggyConsumer>()?;
-    m.add_class::<ClientCommitPolicy>()?;
-    m.add_class::<CommitEvent>()?;
     m.add_class::<ReceiveMessageIterator>()?;
     m.add_class::<IdentityInfo>()?;
     m.add_class::<TokenInfo>()?;

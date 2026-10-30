@@ -1126,14 +1126,14 @@ TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyAutoCommit) {
 
     auto polled1 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
                                          make_numeric_identifier(1), make_polling_strategy("next", 0),
-                                         make_poll_options(5, iggy::ffi::ServerCommitPolicy::OnRead), error_info);
+                                         make_poll_options(5, iggy::ffi::CommitPolicy::OnRead), error_info);
     ASSERT_EQ(polled1.count, 5u);
     EXPECT_EQ(polled1.messages[0].offset, 0u);
     EXPECT_EQ(polled1.messages[4].offset, 4u);
 
     auto polled2 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
                                          make_numeric_identifier(1), make_polling_strategy("next", 0),
-                                         make_poll_options(5, iggy::ffi::ServerCommitPolicy::OnRead), error_info);
+                                         make_poll_options(5, iggy::ffi::CommitPolicy::OnRead), error_info);
     ASSERT_EQ(polled2.count, 5u);
     EXPECT_EQ(polled2.messages[0].offset, 5u);
     EXPECT_EQ(polled2.messages[4].offset, 9u);
@@ -1150,7 +1150,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyAutoCommit) {
 
     auto polled3 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
                                          make_numeric_identifier(1), make_polling_strategy("next", 0),
-                                         make_poll_options(5, iggy::ffi::ServerCommitPolicy::OnRead), error_info);
+                                         make_poll_options(5, iggy::ffi::CommitPolicy::OnRead), error_info);
     ASSERT_EQ(polled3.count, 0u);
 }
 
@@ -1178,17 +1178,17 @@ TEST_F(LowLevelE2E_Message, PollMessagesConsumerIdIndependence) {
 
     auto polled_c1 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
                                            "consumer", make_numeric_identifier(1), make_polling_strategy("next", 0),
-                                           make_poll_options(3, iggy::ffi::ServerCommitPolicy::OnRead), error_info);
+                                           make_poll_options(3, iggy::ffi::CommitPolicy::OnRead), error_info);
     ASSERT_EQ(polled_c1.count, 3u);
 
     auto polled_c2 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
                                            "consumer", make_numeric_identifier(2), make_polling_strategy("next", 0),
-                                           make_poll_options(5, iggy::ffi::ServerCommitPolicy::OnRead), error_info);
+                                           make_poll_options(5, iggy::ffi::CommitPolicy::OnRead), error_info);
     ASSERT_EQ(polled_c2.count, 5u);
 
     auto polled_c1_again = client->poll_messages(
         make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer", make_numeric_identifier(1),
-        make_polling_strategy("next", 0), make_poll_options(5, iggy::ffi::ServerCommitPolicy::OnRead), error_info);
+        make_polling_strategy("next", 0), make_poll_options(5, iggy::ffi::CommitPolicy::OnRead), error_info);
     ASSERT_EQ(polled_c1_again.count, 2u);
 }
 

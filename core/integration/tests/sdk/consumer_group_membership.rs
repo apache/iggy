@@ -624,11 +624,17 @@ async fn given_stale_assignment_when_fetching_should_refuse_then_resync_owned_pa
         ),
     )
     .await
-    .expect("a revoked target must refuse the whole fetch before waiting");
-    assert!(matches!(
-        refused,
-        Err(IggyError::ConsumerGroupPartitionNotOwned(..))
-    ));
+    .expect("a revoked target must answer before waiting");
+    // A target that the member does not own is refused in its own section.
+    let refused = refused.expect("a revoked target does not fail the whole fetch");
+    assert!(
+        matches!(
+            refused.as_slice(),
+            [section] if section.partition_id == revoked
+                && matches!(section.status, Err(IggyError::ConsumerGroupPartitionNotOwned(..)))
+        ),
+        "{refused:?}"
+    );
     let mut reader = member
         .reader(&stream_id, &topic_id, &consumer)
         .start(PollingStrategy::next())

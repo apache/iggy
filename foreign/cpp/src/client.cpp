@@ -455,10 +455,20 @@ void IggyBlockingClient::StoreConsumerOffset(const Consumer &consumer,
 void IggyBlockingClient::StoreConsumerPosition(const Consumer &consumer,
                                                const Identifier &stream,
                                                const Identifier &topic,
-                                               const ffi::Checkpoint &checkpoint) {
+                                               const Checkpoint &checkpoint) {
     RethrowAsIggyException([this, &consumer, &stream, &topic, &checkpoint](ffi::ErrorInfo &error_info) {
         Handle()->store_consumer_position(stream.ToFfi(), topic.ToFfi(), std::string(consumer.KindName()),
-                                          consumer.Id().ToFfi(), checkpoint, error_info);
+                                          consumer.Id().ToFfi(), *checkpoint.inner_, error_info);
+    });
+}
+
+void IggyBlockingClient::DeleteConsumerPosition(const Consumer &consumer,
+                                                const Identifier &stream,
+                                                const Identifier &topic,
+                                                const Checkpoint &checkpoint) {
+    RethrowAsIggyException([this, &consumer, &stream, &topic, &checkpoint](ffi::ErrorInfo &error_info) {
+        Handle()->delete_consumer_position(stream.ToFfi(), topic.ToFfi(), std::string(consumer.KindName()),
+                                           consumer.Id().ToFfi(), *checkpoint.inner_, error_info);
     });
 }
 

@@ -151,18 +151,6 @@ struct RequestVectorTests {
         #expect(golden.bytes("request.poll_messages_deferred").starts(with: plain))
     }
 
-    @Test func fetchMessages() throws {
-        let fence = PartitionContext(incarnation: 3, ownerGeneration: 9, metadataOp: 0)
-        let targets = [(UInt32(1), PollingStrategy.offset(41)), (2, .next)].map { partitionID, strategy in
-            Requests.FetchTarget(partitionID: partitionID, strategy: strategy, maxBytes: 524_288, fence: fence)
-        }
-        let options = DeferredPollOptions(maxWait: .seconds(5), maxBytes: 1_048_576, requestTimeout: .seconds(6))
-        try options.validateFetch(count: 100)
-        #expect(
-            try Requests.fetchMessages(consumer: .group(7), streamID: 1, topicID: "orders", targets: targets, count: 100, autoCommit: true, options: options)
-                == golden.bytes("request.fetch_messages"))
-    }
-
     @Test func users() throws {
         #expect(
             try Requests.createUser(username: "admin", password: "p@ssw0rd", status: .active, permissions: samplePermissions)

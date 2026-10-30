@@ -150,6 +150,12 @@ public enum Partitioning: Sendable, Hashable {
 }
 
 /// Where a poll starts reading a partition.
+///
+/// A continuation, from ``PolledMessages/continuation``, also carries the
+/// partition and the partition history it was read from: a poll of another
+/// partition refuses it, and a poll after the partition was recreated fails
+/// with ``IggyErrorCode/historyUnavailable`` instead of reading the offset in
+/// another history.
 public struct PollingStrategy: Sendable, Hashable, CustomStringConvertible {
     public enum Kind: UInt8, Sendable, Hashable {
         case offset = 1
@@ -161,28 +167,36 @@ public struct PollingStrategy: Sendable, Hashable, CustomStringConvertible {
 
     public var kind: Kind
     public var value: UInt64
-    /// The partition incarnation and owner a continuation offset was read
-    /// under. A poll that carries one is refused once the partition was
-    /// recreated, instead of reading the offset in another incarnation.
-    public var context: PartitionContext?
+    /// The partition incarnation and owner a continuation was read under.
+    var context: PartitionContext?
+    /// The partition a continuation belongs to.
+    var partitionID: UInt32?
 
-    public init(kind: Kind, value: UInt64, context: PartitionContext? = nil) {
+    public init(kind: Kind, value: UInt64) {
+        self.kind = kind
+        self.value = value
+    }
+
+    init(kind: Kind, value: UInt64, context: PartitionContext?, partitionID: UInt32? = nil) {
         self.kind = kind
         self.value = value
         self.context = context
+        self.partitionID = partitionID
     }
 
-    /// Resume from a specific offset. Pass the ``PolledMessages/context`` of
-    /// the poll the offset came from to have the poll refused once the
-    /// partition was recreated.
-    public static func offset(_ offset: UInt64, context: PartitionContext? = nil) -> PollingStrategy {
-        PollingStrategy(kind: .offset, value: offset, context: context)
+    /// Start at a specific offset.
+    public static func offset(_ offset: UInt64) -> PollingStrategy {
+        PollingStrategy(kind: .offset, value: offset)
     }
 
-    /// Resume from the first message at or after a timestamp, under
-    /// `context` as for ``offset(_:context:)``.
-    public static func timestamp(_ timestamp: IggyTimestamp, context: PartitionContext? = nil) -> PollingStrategy {
-        PollingStrategy(kind: .timestamp, value: timestamp.microseconds, context: context)
+    /// Start at the first message at or after a timestamp.
+    public static func timestamp(_ timestamp: IggyTimestamp) -> PollingStrategy {
+        PollingStrategy(kind: .timestamp, value: timestamp.microseconds)
+    }
+
+    /// A start bound to `partitionID` and the history of `context`.
+    static func continuation(partitionID: UInt32, kind: Kind, value: UInt64, context: PartitionContext) -> PollingStrategy {
+        PollingStrategy(kind: kind, value: value, context: context, partitionID: partitionID)
     }
 
     /// Start from the beginning of the partition.
@@ -191,6 +205,13 @@ public struct PollingStrategy: Sendable, Hashable, CustomStringConvertible {
     public static let last = PollingStrategy(kind: .last, value: 0)
     /// Continue after the consumer's stored offset.
     public static let next = PollingStrategy(kind: .next, value: 0)
+
+    /// Refuses a continuation of another partition.
+    func validate(partitionID: UInt32) throws {
+        if let bound = self.partitionID, bound != partitionID {
+            throw IggyError(.invalidCommand, context: "a continuation of partition \(bound) cannot read partition \(partitionID)")
+        }
+    }
 
     public var description: String {
         switch kind {
@@ -220,9 +241,9 @@ public struct PollingStrategy: Sendable, Hashable, CustomStringConvertible {
 /// and its timeout for the final read and the reply.
 ///
 /// `maxBytes` covers the whole reply body, the poll metadata and the batch
-/// framing included. A first message larger than that fails with
-/// ``IggyErrorCode/invalidSizeBytes``, and the partition stays where it was.
-public struct DeferredPollOptions: Sendable, Hashable {
+/// framing included. A first message larger than that comes alone in its
+/// own reply.
+struct DeferredPollOptions: Sendable, Hashable {
     /// `MAX_DEFERRED_POLL_WAIT_US`, the longest wait the protocol carries.
     static let maxWaitMicroseconds: UInt64 = 600_000_000
     /// `MAX_DEFERRED_POLL_TIMEOUT_US`: the longest wait and 30 seconds more.
@@ -235,14 +256,14 @@ public struct DeferredPollOptions: Sendable, Hashable {
     static let minMaxBytes: UInt32 = 344
     static let maxReplyBytes = UInt32(VSRFrame.maxFrameSize - VSRFrame.headerSize)
 
-    public var maxWait: Duration
-    public var minCount: UInt32
-    public var maxBytes: UInt32
-    public var requestTimeout: Duration
+    var maxWait: Duration
+    var minCount: UInt32
+    var maxBytes: UInt32
+    var requestTimeout: Duration
 
     /// One message, a 1 MiB reply, a one-second wait and an eleven-second
-    /// request timeout by default, as in the Rust SDK.
-    public init(maxWait: Duration = .seconds(1), minCount: UInt32 = 1, maxBytes: UInt32 = 1_048_576, requestTimeout: Duration = .seconds(11)) {
+    /// request timeout by default.
+    init(maxWait: Duration = .seconds(1), minCount: UInt32 = 1, maxBytes: UInt32 = 1_048_576, requestTimeout: Duration = .seconds(11)) {
         self.maxWait = maxWait
         self.minCount = minCount
         self.maxBytes = maxBytes
@@ -333,21 +354,6 @@ public struct DeferredPollOptions: Sendable, Hashable {
         writer.write(minCount)
         writer.write(min(maxBytes, Self.maxReplyBytes))
         writer.write(timeout)
-    }
-}
-
-/// A checkpoint to commit: the inclusive offset of the last consumed
-/// message, with the partition incarnation and owner of the poll that
-/// delivered it, so a delayed commit cannot land on a recreated partition.
-public struct ConsumerPosition: Sendable, Hashable {
-    public var partitionID: UInt32
-    public var offset: UInt64
-    public var context: PartitionContext
-
-    public init(partitionID: UInt32, offset: UInt64, context: PartitionContext) {
-        self.partitionID = partitionID
-        self.offset = offset
-        self.context = context
     }
 }
 

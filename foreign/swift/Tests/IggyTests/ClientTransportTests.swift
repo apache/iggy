@@ -89,7 +89,7 @@ private struct GatedCloseConnector: IggyConnector {
             self.released = released
         }
 
-        func exchange(_ frame: [UInt8], timeout: Duration, cancellation: [UInt8]?) async throws -> RawFrame {
+        func exchange(_ frame: [UInt8], timeout: Duration, cancellation: DeferredCancellation?) async throws -> RawFrame {
             try await underlying.exchange(frame, timeout: timeout, cancellation: cancellation)
         }
 

@@ -29,8 +29,8 @@ use crate::{
 use dlopen2::wrapper::Container;
 use futures::{Stream, StreamExt};
 use iggy::prelude::{
-    Client, IggyClient, IggyConsumer, IggyDuration, IggyError, IggyMessage, NonZeroIggyDuration,
-    PollOptions, PollingStrategy, ReadError, ServerCommitPolicy, UserClient,
+    Client, CommitPolicy, IggyClient, IggyConsumer, IggyDuration, IggyError, IggyMessage,
+    NonZeroIggyDuration, PollOptions, PollingStrategy, ReadError, UserClient,
 };
 use iggy_connector_sdk::decoders::avro::{AvroConfig, AvroStreamDecoder};
 use iggy_connector_sdk::{
@@ -726,7 +726,7 @@ fn poll_options(stream: &StreamConsumerConfig) -> Result<PollOptions, RuntimeErr
     }
     let mut options = PollOptions {
         count: stream.batch_length.unwrap_or(DEFAULT_BATCH_LENGTH),
-        server_commit: ServerCommitPolicy::OnRead,
+        commit: CommitPolicy::OnRead,
         ..PollOptions::wait(IggyDuration::ONE_SECOND)
     };
     if let Some(max_wait) = stream.max_wait.as_deref() {
@@ -1587,6 +1587,8 @@ mod tests {
             partition_id: Some(partition_id),
             error,
             skip,
+            offset: None,
+            record: None,
         };
         let mut messages = FakeMessages::new(futures::stream::iter([
             Err(stopped(
@@ -1643,11 +1645,15 @@ mod tests {
                 partition_id: None,
                 error: IggyError::Disconnected,
                 skip: None,
+                offset: None,
+                record: None,
             }),
             Err(ReadError {
                 partition_id: Some(1),
                 error: IggyError::TransientNotAccepted,
                 skip: None,
+                offset: None,
+                record: None,
             }),
         ]));
 
@@ -1667,6 +1673,8 @@ mod tests {
                 partition_id: Some(1),
                 error: IggyError::FetchProgressUncertain(OPERATION),
                 skip: None,
+                offset: None,
+                record: None,
             })]))
         };
 
@@ -1690,6 +1698,8 @@ mod tests {
             partition_id: Some(partition_id),
             error: IggyError::FetchProgressUncertain(OPERATION),
             skip: None,
+            offset: None,
+            record: None,
         };
         let mut messages = FakeMessages::new(futures::stream::iter([Err(lost(1)), Err(lost(2))]));
         let warnings = Arc::new(AtomicUsize::new(0));
@@ -1914,7 +1924,7 @@ mod tests {
             unset,
             PollOptions {
                 count: DEFAULT_BATCH_LENGTH,
-                server_commit: ServerCommitPolicy::OnRead,
+                commit: CommitPolicy::OnRead,
                 ..PollOptions::wait(IggyDuration::ONE_SECOND)
             }
         );
@@ -1930,7 +1940,7 @@ mod tests {
         assert_eq!(options.count, 2000);
         assert_eq!(options.max_wait.get_duration(), Duration::from_secs(30));
         assert_eq!(options.min_count, 500);
-        assert_eq!(options.server_commit, ServerCommitPolicy::OnRead);
+        assert_eq!(options.commit, CommitPolicy::OnRead);
         assert_eq!(options.validate(), Ok(()));
     }
 

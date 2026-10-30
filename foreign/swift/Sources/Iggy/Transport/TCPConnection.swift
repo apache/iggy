@@ -37,10 +37,21 @@ protocol IggyConnection: AnyObject, Sendable {
     /// leaves the stream at an unknown boundary, so the connection closes
     /// itself and every later call fails. So does a cancelled caller, unless
     /// `cancellation` holds the frame that cancels a deferred request: then
-    /// that frame follows the request, the caller gets `CancellationError`,
-    /// and the connection drops the late reply and stays usable.
-    func exchange(_ frame: [UInt8], timeout: Duration, cancellation: [UInt8]?) async throws -> RawFrame
+    /// that frame follows the request and the connection stays usable. A
+    /// request that ``DeferredCancellation/isAnswered`` waits for its one
+    /// reply, any other gets `CancellationError` and the connection drops
+    /// its late reply.
+    func exchange(_ frame: [UInt8], timeout: Duration, cancellation: DeferredCancellation?) async throws -> RawFrame
     func close() async
+}
+
+/// The command 108 frame that cancels a deferred request.
+struct DeferredCancellation: Sendable {
+    let frame: [UInt8]
+    /// A committing request answers its cancellation once: with
+    /// `transientNotAccepted` when nothing was stored, or with its messages
+    /// when its read committed first. Any other request is not answered.
+    let isAnswered: Bool
 }
 
 extension IggyConnection {
@@ -130,7 +141,7 @@ final class TCPConnection: IggyConnection, @unchecked Sendable {
         return TCPConnection(channel: channel, handler: handler)
     }
 
-    func exchange(_ frame: [UInt8], timeout: Duration, cancellation: [UInt8]?) async throws -> RawFrame {
+    func exchange(_ frame: [UInt8], timeout: Duration, cancellation: DeferredCancellation?) async throws -> RawFrame {
         let channel = self.channel
         let handler = self.handler
         return try await withTaskCancellationHandler {
@@ -235,19 +246,25 @@ final class ExchangeHandler: ChannelInboundHandler, @unchecked Sendable {
     }
 
     /// Ends a deferred request whose caller stopped waiting. One that is
-    /// written is cancelled with `cancellation`, its command 108 frame, and
-    /// one that is not written yet never will be. The server answers neither
-    /// the cancellation nor the request it cancels.
-    func cancel(with cancellation: [UInt8], on channel: Channel) {
-        guard let requestID = VSRFrame.readRequestID(cancellation[...]) else {
+    /// written is cancelled with its command 108 frame, and one that is not
+    /// written yet never will be. The server answers no cancellation. It
+    /// answers a cancelled committing request once, so that request keeps
+    /// waiting for its reply. Any other cancelled request is not answered.
+    func cancel(with cancellation: DeferredCancellation, on channel: Channel) {
+        guard let requestID = VSRFrame.readRequestID(cancellation.frame[...]) else {
+            return
+        }
+        let written = !closed && pendingRequestID == requestID
+        if written, cancellation.isAnswered {
+            write(cancellation.frame, on: channel)
             return
         }
         cancelledThrough = max(cancelledThrough ?? 0, requestID)
-        guard !closed, pendingRequestID == requestID else {
+        guard written else {
             return
         }
         fail(with: CancellationError())
-        write(cancellation, on: channel)
+        write(cancellation.frame, on: channel)
     }
 
     private func write(_ frame: [UInt8], on channel: Channel) {

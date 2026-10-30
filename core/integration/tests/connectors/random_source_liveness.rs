@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
 use iggy_common::{
-    Consumer, Identifier, MessageClient, PollOptions, PollingStrategy, ServerCommitPolicy,
+    CommitPolicy, Consumer, Identifier, MessageClient, PollOptions, PollingStrategy,
 };
 use integration::harness::{TestHarness, seeds};
 use tokio::time::{sleep, timeout};
@@ -46,7 +46,7 @@ pub(crate) async fn assert_produces_messages(harness: &TestHarness) {
                     &PollingStrategy::next(),
                     PollOptions {
                         count: POLL_BATCH,
-                        server_commit: ServerCommitPolicy::OnRead,
+                        commit: CommitPolicy::OnRead,
                         ..PollOptions::default()
                     },
                 )

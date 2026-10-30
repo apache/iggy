@@ -21,9 +21,9 @@ use crate::wire_conversions::{
     consumer_to_wire, identifier_to_wire, partitioning_to_wire, polling_strategy_to_wire,
 };
 use crate::{
-    Consumer, DeferredPollOptions, FetchedSection, Identifier, IggyError, IggyMessage,
-    MessageClient, Partitioning, PollOptions, PolledMessages, PollingStrategy,
-    SendMessagesResponse, ServerCommitPolicy,
+    CommitPolicy, Consumer, DecodeError, DeferredPollOptions, FetchedSection, Identifier,
+    IggyError, IggyMessage, MessageClient, Partitioning, PollOptions, PolledMessages,
+    PollingStrategy, SendMessagesResponse,
 };
 use crate::{
     PartitioningKind, TopicClient, binary_operation_deadline, calculate_32, with_binary_deadline,
@@ -290,7 +290,7 @@ fn select_partition<B: BinaryClient>(
 /// but a cancel cannot undo a fetch that the server already served: serving it committed the
 /// offsets, so the client loses the served messages. Await such a fetch until it ends, also at
 /// shutdown. It ends within `options.request_timeout`.
-/// Dropping it after possible send retains the block; the next progress call names its
+/// Dropping it after possible send retains the block, and the next progress call names its
 /// partition and recovery identity with `PartitionLaneBlocked`.
 ///
 /// # Errors
@@ -415,12 +415,43 @@ impl<B: BinaryClient> MessageClient for B {
         strategy: &PollingStrategy,
         options: PollOptions,
     ) -> Result<PolledMessages, IggyError> {
-        options.validate()?;
-        strategy.validate_partition(partition_id)?;
+        self.poll_messages_raw(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            strategy,
+            options,
+        )
+        .await
+        .map_err(|error| error.error)
+    }
+
+    async fn poll_messages_raw(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: u32,
+        consumer: &Consumer,
+        strategy: &PollingStrategy,
+        options: PollOptions,
+    ) -> Result<PolledMessages, DecodeError> {
+        let auto_commit = match options.commit {
+            CommitPolicy::Manual => false,
+            CommitPolicy::OnRead => true,
+            CommitPolicy::Auto(_) => {
+                return Err(DecodeError::without_record(IggyError::InvalidConfiguration));
+            }
+        };
+        options.validate().map_err(DecodeError::without_record)?;
+        strategy
+            .validate_partition(partition_id)
+            .map_err(DecodeError::without_record)?;
         let deadline = tokio::time::Instant::now()
             .checked_add(options.request_timeout().get_duration())
-            .ok_or(IggyError::InvalidCommand)?;
-        with_binary_lineage(
+            .ok_or(IggyError::InvalidCommand)
+            .map_err(DecodeError::without_record)?;
+        let response = with_binary_lineage(
             self.operation_lineage(),
             with_binary_deadline(deadline, async {
                 fail_if_not_authenticated(self).await?;
@@ -431,29 +462,21 @@ impl<B: BinaryClient> MessageClient for B {
                     partition_id: Some(partition_id),
                     strategy: polling_strategy_to_wire(strategy),
                     count: options.count,
-                    auto_commit: options.server_commit == ServerCommitPolicy::OnRead,
+                    auto_commit,
                 };
-                options
-                    .poll_oversized_alone(strategy, |count, wire_options| {
-                        let request = PollMessagesRequest {
-                            count,
-                            ..request.clone()
-                        };
-                        async move {
-                            let response = self
-                                .send_poll_with_response_and_options(
-                                    &request,
-                                    strategy.context(),
-                                    Some(wire_options),
-                                )
-                                .await?;
-                            PolledMessages::from_bytes(response, strategy)
-                        }
-                    })
-                    .await
+                let response = self
+                    .send_poll_with_response_and_options(
+                        &request,
+                        strategy.context(),
+                        Some(options.into()),
+                    )
+                    .await?;
+                Ok::<Bytes, IggyError>(response)
             }),
         )
         .await
+        .map_err(DecodeError::without_record)?;
+        PolledMessages::decode(response, strategy)
     }
 
     async fn send_messages(

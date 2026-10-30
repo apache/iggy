@@ -48,8 +48,8 @@ record VsrExchange(
         int wait;
         int timeout;
         if (commandCode == CommandCode.Messages.POLL_DEFERRED.getValue()) {
-            wait = retainedFrame.writerIndex() - PollRouter.DEFERRED_PARAMETERS_BYTES;
-            timeout = retainedFrame.writerIndex() - Long.BYTES;
+            wait = PollRouter.deferredWait(retainedFrame);
+            timeout = PollRouter.deferredTimeout(retainedFrame);
         } else if (commandCode == CommandCode.Messages.FETCH_MESSAGES.getValue()) {
             wait = PollRouter.waitParameters(retainedFrame, retainedFrame.readerIndex() + VsrHeaders.HEADER_SIZE);
             timeout = wait + Long.BYTES;

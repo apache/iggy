@@ -19,6 +19,7 @@ using System.Diagnostics;
 using System.Text;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
+using Apache.Iggy.Extensions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
@@ -40,9 +41,9 @@ public class DeferredPollTests
     private const string TopicName = "deferred-topic";
 
     /// <summary>Longer than any test waits, so only an arriving message ends a parked request in time.</summary>
-    private static readonly DeferredPollOptions LongWait = new() { MaxWait = TimeSpan.FromSeconds(10) };
+    private static readonly PollOptions LongWait = new() { Count = 10, MaxWait = TimeSpan.FromSeconds(10) };
 
-    private static readonly DeferredPollOptions ShortWait = new() { MaxWait = TimeSpan.FromMilliseconds(300) };
+    private static readonly PollOptions ShortWait = new() { Count = 10, MaxWait = TimeSpan.FromMilliseconds(300) };
 
     /// <summary>How long a request parks before the test sends the message that wakes it.</summary>
     private static readonly TimeSpan ParkDelay = TimeSpan.FromMilliseconds(500);
@@ -111,6 +112,63 @@ public class DeferredPollTests
         polled.Messages.ShouldBeEmpty();
     }
 
+    /// <summary>
+    ///     On a cluster the three partitions have primaries on different nodes. The reader groups them by primary by
+    ///     itself, and a message of each partition reaches it while its reads wait.
+    /// </summary>
+    [Test]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task PartitionReader_Should_Return_EveryPartition_ThatGetsAMessage(Protocol protocol)
+    {
+        var (client, streamName) = await CreateTopicAsync(protocol);
+        await using var reader = await client.Reader(Identifier.String(streamName), Identifier.String(TopicName),
+                Consumer.New(1))
+            .WithPartitions(0, 1, 2)
+            .WithStart(PollingStrategy.Offset(0))
+            .WithOptions(LongWait)
+            .BuildAsync();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+        HashSet<uint> served = [];
+        for (var partition = 2u; partition < PartitionsCount + 2; partition++)
+        {
+            await SendAsync(client, streamName, partition % PartitionsCount);
+            var batch = await reader.NextAsync(timeout.Token);
+            served.Add(batch.PartitionId);
+        }
+
+        served.ShouldBe([0u, 1u, 2u], ignoreOrder: true);
+    }
+
+    /// <summary>
+    ///     A reader that commits on read stores the offset of each read, and its close moves the offset back to the
+    ///     last batch that the application took, so a new reader resumes after it.
+    /// </summary>
+    [Test]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task OnReadReader_Should_Resume_AfterTheLastBatchTaken(Protocol protocol)
+    {
+        var (client, streamName) = await CreateTopicAsync(protocol);
+        var stream = Identifier.String(streamName);
+        var topic = Identifier.String(TopicName);
+        var options = new PollOptions { Count = 1, MaxWait = TimeSpan.FromSeconds(10), Commit = CommitPolicy.OnRead };
+        for (var message = 0; message < 3; message++)
+        {
+            await SendAsync(client, streamName, 0);
+        }
+
+        var reader = await client.Reader(stream, topic, Consumer.New(7)).WithPartitions(0).WithOptions(options)
+            .BuildAsync();
+        var first = await reader.NextAsync();
+        await reader.CloseAsync();
+        await using var resumed = await client.Reader(stream, topic, Consumer.New(7)).WithPartitions(0)
+            .WithOptions(options).BuildAsync();
+        var second = await resumed.NextAsync();
+
+        first.Messages.Single().Header.Offset.ShouldBe(0ul);
+        second.Messages.Single().Header.Offset.ShouldBe(1ul);
+    }
+
     private async Task<(IIggyClient Client, string StreamName)> CreateTopicAsync(Protocol protocol)
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
@@ -129,12 +187,10 @@ public class DeferredPollTests
             new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes($"deferred-payload-{partitionId}")));
     }
 
-    private static Task<PolledMessages> PollAsync(IIggyClient client, string streamName, DeferredPollOptions options,
+    private static Task<PolledMessages> PollAsync(IIggyClient client, string streamName, PollOptions options,
         CancellationToken token)
     {
         return client.PollMessagesAsync(Identifier.String(streamName), Identifier.String(TopicName), 0,
-            Consumer.New(1), PollingStrategy.Offset(0), 10, false, options, token);
+            Consumer.New(1), PollingStrategy.Offset(0), options, token);
     }
-
-
 }

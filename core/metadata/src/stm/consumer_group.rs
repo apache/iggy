@@ -209,11 +209,17 @@ impl ConsumerGroup {
             let owner_left = assignment
                 .owner
                 .is_none_or(|owner| !members.contains(&(owner.client_id, owner.session)));
+            // An installed owner that left and joined again has no reads left
+            // to commit, so a handoff back to it keeps the skip of its leave. One
+            // that stayed still commits under its generation and drains first.
+            let skip_drain = owner_left
+                || (assignment.owner.is_some_and(same_member)
+                    && assignment.pending.is_some_and(|pending| pending.skip_drain));
             if let Some(pending) = assignment.pending.as_mut() {
                 if same_member(pending.owner) {
                     // Only a member owner can still commit, so the drain
                     // wait follows the current membership.
-                    pending.skip_drain = owner_left;
+                    pending.skip_drain = skip_drain;
                     continue;
                 }
             } else if assignment.owner.is_some_and(same_member)
@@ -228,7 +234,7 @@ impl ConsumerGroup {
                 owner: desired,
                 metadata_op,
                 created_at,
-                skip_drain: owner_left,
+                skip_drain,
             });
         }
         self.rebuild_member_assignments();
@@ -1489,6 +1495,41 @@ mod tests {
     }
 
     #[test]
+    fn given_installed_owner_when_it_rejoins_before_its_revocation_completes_should_skip_the_drain()
+    {
+        // An owner that left and joined again waited a whole rebalancing
+        // timeout for a drain of reads that its leave already gave up.
+        let owner = || {
+            let mut member = ConsumerGroupMember::new(0, 7);
+            member.session = Some(11);
+            member
+        };
+        let mut group = ConsumerGroup::new(0, Arc::from("group"));
+        group.members.insert(owner());
+        let partitions = vec![Partition::new(0, 1, IggyTimestamp::from(1), 1, 0)];
+        group.rebalance_members(&partitions, 12, 100);
+        let assignment = &group.assignments[&0];
+        let pending = assignment.pending.unwrap();
+        let installation = InstallConsumerGroupOwnerRequest {
+            incarnation: assignment.incarnation,
+            group_id: group.id,
+            owner: pending.owner,
+            metadata_op: pending.metadata_op,
+        };
+        assert!(group.complete_revocation(0, &installation, 1));
+        group.members.remove(0);
+        group.rebalance_members(&partitions, 14, 200);
+        assert!(group.assignments[&0].pending.unwrap().owner.is_unassigned());
+        group.members.insert(owner());
+
+        group.rebalance_members(&partitions, 16, 300);
+
+        let pending = group.assignments[&0].pending.unwrap();
+        assert_eq!((pending.owner.client_id, pending.owner.session), (7, 11));
+        assert!(pending.skip_drain);
+    }
+
+    #[test]
     fn given_installed_owner_leaves_when_successor_is_kept_should_skip_its_drain() {
         const OWNER: (u128, u64) = (7, 11);
         const SUCCESSOR: (u128, u64) = (8, 13);
@@ -1545,6 +1586,64 @@ mod tests {
             }),
             "a rejoined owner can commit again, so the handoff waits for its drain"
         );
+    }
+
+    #[test]
+    fn given_pending_handoff_when_its_target_returns_to_an_owner_that_stayed_should_keep_the_drain()
+    {
+        // The handoff back to an installed owner that never left skipped the
+        // drain, so the owner got a new generation at once and its offset
+        // stores under the generation it read with were refused.
+        const OWNER: (u128, u64) = (7, 11);
+        const SECOND: (u128, u64) = (8, 13);
+        let member = |id, (client_id, session)| {
+            let mut member = ConsumerGroupMember::new(id, client_id);
+            member.session = Some(session);
+            member
+        };
+        let partitions: Vec<_> = (0..2)
+            .map(|id| Partition::new(id, id as u64 + 1, IggyTimestamp::from(1), 1, 0))
+            .collect();
+        let mut group = ConsumerGroup::new(0, Arc::from("group"));
+        group.members.insert(member(0, OWNER));
+        group.rebalance_members(&partitions, 12, 100);
+        for partition_id in 0..2 {
+            let assignment = &group.assignments[&partition_id];
+            let pending = assignment.pending.unwrap();
+            let installation = InstallConsumerGroupOwnerRequest {
+                incarnation: assignment.incarnation,
+                group_id: group.id,
+                owner: pending.owner,
+                metadata_op: pending.metadata_op,
+            };
+            assert!(group.complete_revocation(partition_id, &installation, 1));
+        }
+        group.members.insert(member(1, SECOND));
+        group.rebalance_members(&partitions, 14, 200);
+        let (moving, assignment) = group
+            .assignments
+            .iter()
+            .find(|(_, assignment)| assignment.pending.is_some())
+            .expect("the second member takes one partition");
+        let (moving, installed) = (*moving, assignment.owner);
+        assert_eq!(
+            assignment.pending.map(|pending| pending.owner.client_id),
+            Some(SECOND.0)
+        );
+
+        group.members.remove(1);
+        group.rebalance_members(&partitions, 16, 300);
+
+        let assignment = &group.assignments[&moving];
+        assert_eq!(assignment.owner, installed);
+        let pending = assignment
+            .pending
+            .expect("the owner is installed again after its drain");
+        assert_eq!(
+            pending.owner.client_id,
+            installed.expect("an installed owner").client_id
+        );
+        assert!(!pending.skip_drain, "the owner commits what it read first");
     }
 
     #[test]

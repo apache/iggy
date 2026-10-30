@@ -16,7 +16,9 @@
 // under the License.
 
 use bytes::{Bytes, BytesMut};
-use iggy_binary_protocol::codes::{GET_STREAM_CODE, POLL_MESSAGES_CODE};
+use iggy_binary_protocol::codes::{
+    CANCEL_DEFERRED_REQUEST_CODE, GET_STREAM_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE,
+};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_groups::{
@@ -27,7 +29,7 @@ use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::messages::{
-    PollMessagesRequest, RawMessage, SendMessagesEncoder,
+    DeferredPollMessagesRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
@@ -53,6 +55,7 @@ use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, IGGY_PROTOCOL_VERSION, Operation, RoutedRequestHeader, WireEncode,
     WireIdentifier, WireName, WireOptions, WirePartitioning, WirePermissions, WirePollingStrategy,
 };
+use iggy_common::DEFAULT_POLL_MAX_BYTES;
 use iggy_common::wire_conversions::resource_options_to_wire;
 use iggy_common::{
     HeaderKey, HeaderValue, OptionKey, OptionValue, OptionsPatch, OptionsProvenance,
@@ -857,6 +860,79 @@ impl SimClient {
             &body,
             self.request_counter.get(),
         )
+    }
+
+    /// Build a `POLL_MESSAGES_DEFERRED` request for an individual consumer of
+    /// `group`'s partition. Spends a request id, as every bound read does, so
+    /// the reply and a cancellation can name it.
+    ///
+    /// # Panics
+    /// Panics if the session is unbound or the request buffer is invalid.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn deferred_poll_messages(
+        &self,
+        group: IggyNamespace,
+        strategy: WirePollingStrategy,
+        (count, min_count): (u32, u32),
+        auto_commit: bool,
+        (wait_us, request_timeout_us): (u64, u64),
+    ) -> Message<RoutedRequestHeader> {
+        self.deferred_poll_messages_for_consumer(
+            group,
+            strategy,
+            (count, min_count),
+            auto_commit,
+            (wait_us, request_timeout_us),
+            self.client_id as u32,
+        )
+    }
+
+    /// Build a deferred read of another session's standalone consumer.
+    pub fn deferred_poll_messages_for_consumer(
+        &self,
+        group: IggyNamespace,
+        strategy: WirePollingStrategy,
+        (count, min_count): (u32, u32),
+        auto_commit: bool,
+        (wait_us, request_timeout_us): (u64, u64),
+        consumer_id: u32,
+    ) -> Message<RoutedRequestHeader> {
+        let (stream_id, topic_id, partition_id) = namespace_ids(group);
+        let body = DeferredPollMessagesRequest {
+            poll: PollMessagesRequest {
+                consumer: WireConsumer::consumer(WireIdentifier::Numeric(consumer_id)),
+                stream_id,
+                topic_id,
+                partition_id,
+                strategy,
+                count,
+                auto_commit,
+            },
+            wait_us,
+            min_count,
+            max_bytes: DEFAULT_POLL_MAX_BYTES,
+            request_timeout_us,
+        }
+        .to_bytes();
+        self.non_replicated_request(
+            POLL_MESSAGES_DEFERRED_CODE,
+            group.inner(),
+            &body,
+            self.next_request_id(),
+        )
+    }
+
+    /// Build a `CANCEL_DEFERRED_REQUEST` for the deferred request this client
+    /// sent with `request`, as the SDK sends it: same connection, empty body.
+    ///
+    /// # Panics
+    /// Panics if the session is unbound or the request buffer is invalid.
+    pub fn cancel_deferred_request(
+        &self,
+        group: IggyNamespace,
+        request: u64,
+    ) -> Message<RoutedRequestHeader> {
+        self.non_replicated_request(CANCEL_DEFERRED_REQUEST_CODE, group.inner(), &[], request)
     }
 
     /// Build a `POLL_MESSAGES` request reading `count` messages from `offset` of

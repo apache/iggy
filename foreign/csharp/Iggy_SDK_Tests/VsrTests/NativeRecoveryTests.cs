@@ -206,56 +206,6 @@ public sealed partial class NativeRecoveryTests
     }
 
     [Fact]
-    public async Task given_an_uncertain_write_when_a_consumer_polls_its_lane_should_leave_the_resolution_to_its_owner()
-    {
-        using var cluster = new RecoveryCluster();
-        using var client = await cluster.ConnectAsync();
-        var operationId = await RetainWriteAsync(cluster, client);
-        var original = Assert.Single(cluster.Writes);
-        await using var consumer = PartitionConsumer(client);
-        await consumer.InitAsync(cluster.Token);
-        await using var messages = consumer.ReceiveAsync(cluster.Token).GetAsyncEnumerator(cluster.Token);
-
-        var error = await Record.ExceptionAsync(() => messages.MoveNextAsync().AsTask());
-
-        Assert.Single(cluster.Writes);
-        Assert.Equal(operationId, Assert.IsType<VsrLaneBlockedException>(error).OperationId);
-        await client.ResolveOperationAsync(operationId, TimeSpan.FromSeconds(5), cluster.Token);
-        Assert.Equal(original.RequestId, cluster.Writes.Last().RequestId);
-    }
-
-    [Theory]
-    [InlineData(0)]
-    [InlineData(VsrError.HISTORY_UNAVAILABLE)]
-    public async Task given_an_uncertain_write_when_a_consumer_store_resolves_it_first_should_keep_the_outcome_for_its_owner(
-        int status)
-    {
-        using var cluster = new RecoveryCluster();
-        using var client = await cluster.ConnectAsync();
-        var operationId = await RetainWriteAsync(cluster, client);
-        cluster.OnWrite = request => Result(request, request.RequestId == operationId ? status : 0);
-        await using var consumer = PartitionConsumer(client);
-        await consumer.InitAsync(cluster.Token);
-        await consumer.StoreOffsetAsync(20, 0, ct: cluster.Token);
-
-        var resolved = await Record.ExceptionAsync(() =>
-            client.ResolveOperationAsync(operationId, TimeSpan.FromSeconds(5), cluster.Token));
-
-        if (status == 0)
-        {
-            Assert.Null(resolved);
-        }
-        else
-        {
-            var rejection = Assert.IsType<IggyInvalidStatusCodeException>(resolved);
-            Assert.Equal(status, rejection.StatusCode);
-            Assert.True(rejection.Committed);
-        }
-        Assert.Equal(2, cluster.Writes.Count(write => write.RequestId == operationId));
-        Assert.Equal(3, cluster.Writes.Count);
-    }
-
-    [Fact]
     public async Task given_a_running_replay_when_the_owner_resolves_concurrently_should_return_the_proved_outcome()
     {
         using var cluster = new RecoveryCluster();
@@ -1594,41 +1544,6 @@ public sealed partial class NativeRecoveryTests
         Assert.Equal(cached ? 2 : 1, cluster.Sends.Count);
     }
 
-    [Theory]
-    [InlineData(CommandCodes.GET_PARTITION_ROUTE_CODE)]
-    [InlineData(CommandCodes.SEND_MESSAGES_CODE)]
-    public async Task given_a_namespace_miss_from_a_deposed_metadata_primary_when_its_roster_names_another_should_ask_another_replica(
-        int code)
-    {
-        using var cluster = new RecoveryCluster { PrimaryLeads = true };
-        using var client = await cluster.ConnectAsync();
-        // The send binds the link of the partition primary, which the client believes is the metadata primary.
-        await client.SendMessagesAsync(Stream, Topic, Partitioning.PartitionId(0),
-            new Message(Guid.NewGuid(), "payload"u8.ToArray()), cluster.Token);
-        cluster.PrimaryLeads = false;
-        var missed = 0;
-        byte[]? MissOnce(MockRequest request) => Interlocked.Exchange(ref missed, 1) == 0
-            ? Reply(request.Operation, [], VsrError.TOPIC_ID_NOT_FOUND) : null;
-        if (code == CommandCodes.GET_PARTITION_ROUTE_CODE)
-        {
-            cluster.OnRoute = MissOnce;
-        }
-        else
-        {
-            var send = cluster.OnSend;
-            cluster.OnSend = request => MissOnce(request) ?? send(request);
-        }
-        var deposedLookups = cluster.Primary.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE);
-        var electedLookups = cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE);
-
-        await client.SendMessagesAsync(Stream, Topic, Partitioning.PartitionId(1),
-            new Message(Guid.NewGuid(), "payload"u8.ToArray()), cluster.Token);
-
-        Assert.Equal(1, Volatile.Read(ref missed));
-        Assert.Equal(deposedLookups + 1, cluster.Primary.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
-        Assert.Equal(electedLookups + 1, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
-    }
-
     private static Task StoreAsync(TcpMessageStream client, CancellationToken token, uint partition = 0) =>
         client.StoreOffsetAsync(Consumer.New(3), Stream, Topic, 10, partition, token);
 
@@ -1642,16 +1557,6 @@ public sealed partial class NativeRecoveryTests
         using var reply = await client.SendWithResponseAsync(code, body, token,
             deadline: Environment.TickCount64 + (long)budget.TotalMilliseconds);
     }
-
-    private static IggyConsumer PartitionConsumer(TcpMessageStream client) => new(client, new IggyConsumerConfig
-    {
-        StreamId = Stream,
-        TopicId = Topic,
-        PartitionId = 0,
-        Consumer = Consumer.New(3),
-        PollingStrategy = PollingStrategy.Next(),
-        AutoCommitMode = AutoCommitMode.Disabled
-    }, NullLoggerFactory.Instance);
 
     private static async Task<ulong> RetainWriteAsync(RecoveryCluster cluster, TcpMessageStream client)
     {

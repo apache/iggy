@@ -18,8 +18,8 @@
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
 use iggy_common::{
-    Consumer, Identifier, IggyError, IggyMessage, MessageClient, Partitioning, PollOptions,
-    PolledMessages, PollingStrategy, SendMessagesResponse,
+    Consumer, DecodeError, Identifier, IggyError, IggyMessage, MessageClient, Partitioning,
+    PollOptions, PolledMessages, PollingStrategy, SendMessagesResponse,
 };
 
 #[async_trait]
@@ -36,6 +36,29 @@ impl MessageClient for ClientWrapper {
         super::dispatch_client!(
             self,
             MessageClient::poll_messages(
+                stream_id,
+                topic_id,
+                partition_id,
+                consumer,
+                strategy,
+                options
+            )
+        )
+        .await
+    }
+
+    async fn poll_messages_raw(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: u32,
+        consumer: &Consumer,
+        strategy: &PollingStrategy,
+        options: PollOptions,
+    ) -> Result<PolledMessages, DecodeError> {
+        super::dispatch_client!(
+            self,
+            MessageClient::poll_messages_raw(
                 stream_id,
                 topic_id,
                 partition_id,

@@ -22,10 +22,10 @@ use iggy::prelude::{
     Partitioning as RustPartitioning, PollOptions as RustPollOptions,
     PollingStrategy as RustPollingStrategy, ReadError as RustReadError, *,
 };
-use pyo3::PyRef;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDelta, PyList, PyType};
+use pyo3::{PyErrArguments, PyRef};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -37,10 +37,11 @@ use std::time::{Duration, Instant};
 
 use crate::config::PyClientConfig;
 use crate::consumer::{
-    ClientCommitPolicy, Consumer as PyConsumer, ConsumerGroup as PyConsumerGroup,
-    ConsumerGroupDetails as PyConsumerGroupDetails, IggyConsumer,
+    Consumer as PyConsumer, ConsumerGroup as PyConsumerGroup,
+    ConsumerGroupDetails as PyConsumerGroupDetails, ConsumerOffsetInfo, IggyConsumer,
 };
 use crate::duration::{py_delta_to_iggy_duration, reject_zero};
+use crate::event_loop::on_event_loop;
 use crate::identifier::PyIdentifier;
 use crate::metadata_changes::{
     MetadataChangeGroup, MetadataChangeStart, MetadataChanges, validated_query,
@@ -51,7 +52,7 @@ use crate::permissions::Permissions as PyPermissions;
 use crate::poll_options::PollOptions;
 use crate::producer::{IggyProducer, ProducerMode, u32_param as producer_u32_param};
 use crate::reader::PartitionReader;
-use crate::receive_message::{PolledBatch, PollingStrategy};
+use crate::receive_message::{Checkpoint, PolledBatch, PollingStrategy};
 use crate::resource_options::{OptionKey, StreamOptions, TopicOptions, UserOptions};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
 use crate::stats::Stats as PyStats;
@@ -61,7 +62,7 @@ use crate::user::{
     IdentityInfo as PyIdentityInfo, UserInfo as PyUserInfo, UserInfoDetails as PyUserInfoDetails,
     UserStatus as PyUserStatus,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 const DEFAULT_RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -120,6 +121,9 @@ pub struct ReadError {
     partition_id: Option<u32>,
     error: Py<PyAny>,
     skip: Option<RustPollingStrategy>,
+    #[pyo3(get)]
+    offset: Option<u64>,
+    record: Option<Bytes>,
 }
 
 #[gen_stub_pymethods]
@@ -141,6 +145,12 @@ impl ReadError {
     fn skip(&self) -> Option<PollingStrategy> {
         self.skip.map(PollingStrategy::from)
     }
+
+    #[gen_stub(override_return_type(type_repr = "bytes | None"))]
+    #[getter]
+    fn record<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.record.as_ref().map(|record| PyBytes::new(py, record))
+    }
 }
 
 /// The JSON error body the HTTP API returns.
@@ -152,7 +162,58 @@ struct HttpErrorBody {
 
 /// Raises every SDK error with its code, and an operation with its recovery
 /// identity, rather than requiring callers to parse an error message.
+///
+/// The Python exception is built when Python raises it, on a thread that holds the GIL, so the
+/// Tokio worker that fails a call never waits for the GIL.
 pub(crate) fn to_runtime_error(error: IggyError) -> PyErr {
+    PyErr::new::<PyIggyError, _>(RuntimeErrorArguments(error))
+}
+
+/// Raises a read error with its partition and skip, and its cause as `to_runtime_error` raises it.
+pub(crate) fn to_read_error(error: RustReadError) -> PyErr {
+    PyErr::new::<ReadError, _>(ReadErrorArguments(error))
+}
+
+struct RuntimeErrorArguments(IggyError);
+
+impl PyErrArguments for RuntimeErrorArguments {
+    fn arguments(self, py: Python<'_>) -> Py<PyAny> {
+        runtime_error_value(py, self.0)
+    }
+}
+
+struct ReadErrorArguments(RustReadError);
+
+impl PyErrArguments for ReadErrorArguments {
+    fn arguments(self, py: Python<'_>) -> Py<PyAny> {
+        let error = self.0;
+        let message = error.to_string();
+        let coded = PyIggyError::from(&error.error);
+        let read_error = ReadError {
+            partition_id: error.partition_id,
+            error: runtime_error_value(py, error.error),
+            skip: error.skip,
+            offset: error.offset,
+            record: error.record,
+        };
+        exception_value(
+            py,
+            Bound::new(py, PyClassInitializer::from(coded).add_subclass(read_error)),
+            message,
+        )
+    }
+}
+
+/// The exception instance of an SDK error: an `OptionError`, a `PendingOperationError` or an
+/// `IggyError`, with the error message as its only argument.
+fn runtime_error_value(py: Python<'_>, error: IggyError) -> Py<PyAny> {
+    if let Some((code, kind, message)) = option_error(&error) {
+        let instance = Bound::new(
+            py,
+            PyClassInitializer::from(PyIggyError { code }).add_subclass(OptionError { kind }),
+        );
+        return exception_value(py, instance, message);
+    }
     let pending = match error {
         IggyError::OperationUncertain(operation_id) => Some((operation_id, "uncertain", None)),
         IggyError::FetchProgressUncertain(operation_id) => {
@@ -163,64 +224,47 @@ pub(crate) fn to_runtime_error(error: IggyError) -> PyErr {
             Some((operation_id, "lane_blocked", Some(partition_id)))
         }
         IggyError::OperationNotRetained(operation_id) => Some((operation_id, "not_retained", None)),
-        _ => {
-            if let Some(refusal) = to_option_error(&error) {
-                return refusal;
-            }
-            None
-        }
+        _ => None,
     };
-    Python::attach(|py| {
-        let coded = PyIggyError::from(&error);
-        let instance = match pending {
-            Some((operation_id, kind, partition_id)) => Bound::new(
+    let coded = PyIggyError::from(&error);
+    let message = error.to_string();
+    match pending {
+        Some((operation_id, kind, partition_id)) => exception_value(
+            py,
+            Bound::new(
                 py,
                 PyClassInitializer::from(coded).add_subclass(PendingOperationError {
                     operation_id,
                     kind,
                     partition_id,
                 }),
-            )
-            .map(Bound::into_any),
-            None => Bound::new(py, coded).map(Bound::into_any),
-        };
-        let instance = match instance {
-            Ok(instance) => instance,
-            Err(error) => return error,
-        };
-        if let Err(error) = instance.setattr("args", (error.to_string(),)) {
-            return error;
-        }
-        PyErr::from_value(instance)
-    })
+            ),
+            message,
+        ),
+        None => exception_value(py, Bound::new(py, coded), message),
+    }
 }
 
-/// Raises a read error with its partition and skip, and its cause as `to_runtime_error` raises it.
-pub(crate) fn to_read_error(error: RustReadError) -> PyErr {
-    let message = error.to_string();
-    let coded = PyIggyError::from(&error.error);
-    let cause = to_runtime_error(error.error);
-    Python::attach(|py| {
-        let read_error = ReadError {
-            partition_id: error.partition_id,
-            error: cause.into_value(py).into_any(),
-            skip: error.skip,
-        };
-        let instance =
-            match Bound::new(py, PyClassInitializer::from(coded).add_subclass(read_error)) {
-                Ok(instance) => instance,
-                Err(error) => return error,
-            };
-        if let Err(error) = instance.setattr("args", (message,)) {
-            return error;
-        }
-        PyErr::from_value(instance.into_any())
-    })
+/// The instance with `message` as its arguments, or the error that building it raised.
+fn exception_value<T>(
+    py: Python<'_>,
+    instance: PyResult<Bound<'_, T>>,
+    message: String,
+) -> Py<PyAny> {
+    let instance = match instance {
+        Ok(instance) => instance.into_any(),
+        Err(error) => return error.into_value(py).into_any(),
+    };
+    match instance.setattr("args", (message,)) {
+        Ok(()) => instance.unbind(),
+        Err(error) => error.into_value(py).into_any(),
+    }
 }
 
 /// Every transport reports an option refusal with the same code: binary by the error itself,
-/// HTTP by the `id` of its JSON error body.
-fn to_option_error(error: &IggyError) -> Option<PyErr> {
+/// HTTP by the `id` of its JSON error body. The code, its snake_case name and the message, or
+/// `None` for any other error.
+fn option_error(error: &IggyError) -> Option<(u32, &'static str, String)> {
     let (code, message) = match error {
         IggyError::HttpResponseError(_, body) => {
             let body = serde_json::from_str::<HttpErrorBody>(body).ok()?;
@@ -231,20 +275,7 @@ fn to_option_error(error: &IggyError) -> Option<PyErr> {
     if !is_option_error(&IggyError::from_code(code)) {
         return None;
     }
-    let kind = IggyError::from_code_as_string(code);
-    Some(Python::attach(|py| {
-        let instance = match Bound::new(
-            py,
-            PyClassInitializer::from(PyIggyError { code }).add_subclass(OptionError { kind }),
-        ) {
-            Ok(instance) => instance,
-            Err(error) => return error,
-        };
-        if let Err(error) = instance.setattr("args", (message,)) {
-            return error;
-        }
-        PyErr::from_value(instance.into_any())
-    }))
+    Some((code, IggyError::from_code_as_string(code), message))
 }
 
 fn is_option_error(error: &IggyError) -> bool {
@@ -814,7 +845,7 @@ impl IggyClient {
     /// Replays the exact retained operation until its final result or the deadline.
     /// A committed rejection raises its original error and frees the lane.
     /// Uncertainty keeps the operation retained. HTTP does not support this operation.
-    /// A fetch progress block raises code 14010 without replaying; only explicit
+    /// A fetch progress block raises code 14010 without replaying. Only explicit
     /// abandon_operation releases it, accepting the unknown server outcome.
     /// `timeout` must be a positive timedelta; omission or None uses 30 seconds.
     #[pyo3(signature = (operation_id, *, timeout=None))]
@@ -1777,10 +1808,13 @@ impl IggyClient {
     /// Polls one batch of messages of a partition on behalf of the given consumer.
     ///
     /// `options` defaults to `PollOptions()`: at most 1000 messages and 1 MiB, answered at
-    /// once, and no offset stored. With `ServerCommitPolicy.OnRead`, the server stores the
+    /// once, and no offset stored. With `CommitPolicy.OnRead()`, the server stores the
     /// offset of the last message as part of the reply. If that reply is lost, the poll raises
     /// `PendingOperationError` of kind `fetch_progress_uncertain`, and every later poll of the
-    /// partition raises it of kind `lane_blocked` until `abandon_operation()` releases it.
+    /// partition raises it of kind `lane_blocked` until `abandon_operation()` releases it. A
+    /// cancelled `OnRead` poll that already sent its request blocks the partition the same way,
+    /// so a cancel never loses a batch without a trace. `CommitPolicy.Auto` raises `IggyError`
+    /// with `InvalidConfiguration` (2): a one-shot poll has nothing to count.
     ///
     /// To read on, pass `polled.continuation()` as the next `polling_strategy`. The poll is
     /// then refused with `HistoryUnavailable` (87) if the partition was deleted and created
@@ -1792,30 +1826,173 @@ impl IggyClient {
     /// Returns the batch, or raises `IggyError` on failure.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (stream, topic, *, partition_id, consumer, polling_strategy, options=None))]
-    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[PolledMessages]", imports=("collections.abc")))]
-    fn poll_messages<'a>(
+    #[gen_stub(override_return_type(type_repr = "PolledMessages"))]
+    async fn poll_messages(
         &self,
-        py: Python<'a>,
         stream: PyIdentifier,
         topic: PyIdentifier,
         partition_id: u32,
-        consumer: &PyConsumer,
-        polling_strategy: &PollingStrategy,
+        consumer: PyConsumer,
+        polling_strategy: PollingStrategy,
         #[gen_stub(override_type(type_repr = "PollOptions | None"))] options: Option<PollOptions>,
-    ) -> PyResult<Bound<'a, PyAny>> {
-        let consumer = RustConsumer::try_from(consumer)?;
+    ) -> PyResult<PolledBatch> {
+        let consumer = RustConsumer::try_from(&consumer)?;
         let stream = Identifier::try_from(stream)?;
         let topic = Identifier::try_from(topic)?;
         let strategy = polling_strategy.inner;
         let options = options.map_or_else(RustPollOptions::default, |options| options.inner);
-        let inner = self.inner.clone();
-
-        future_into_py(py, async move {
-            let polled = inner
+        // On the event loop a finished poll hands its batch to Python in the same step, so a
+        // cancel never drops a batch whose offset the server stored.
+        on_event_loop(async {
+            let polled = self
+                .inner
                 .poll_messages(&stream, &topic, partition_id, &consumer, &strategy, options)
                 .await
                 .map_err(to_runtime_error)?;
             Ok(PolledBatch(polled))
+        })
+        .await
+    }
+
+    /// Stores the offset of `checkpoint` for `consumer`, under the partition history that
+    /// delivered the checkpoint, which covers every earlier message of its partition.
+    ///
+    /// Raises `IggyError` with `HistoryUnavailable` (87) after the partition was deleted and
+    /// created again, and `ConsumerGroupPartitionNotOwned` (5009) after its consumer group owner
+    /// changed, instead of storing the offset on the new partition.
+    #[pyo3(signature = (stream, topic, *, consumer, checkpoint))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn store_consumer_position<'a>(
+        &self,
+        py: Python<'a>,
+        stream: PyIdentifier,
+        topic: PyIdentifier,
+        consumer: &PyConsumer,
+        checkpoint: &Checkpoint,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let consumer = RustConsumer::try_from(consumer)?;
+        let stream = Identifier::try_from(stream)?;
+        let topic = Identifier::try_from(topic)?;
+        let checkpoint = checkpoint.inner;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .store_consumer_position(&consumer, &stream, &topic, &checkpoint)
+                .await
+                .map_err(to_runtime_error)
+        })
+    }
+
+    /// Stores `offset` for `consumer` on `partition_id`, under the partition history of its
+    /// route. After another client deleted and created the partition again, it can fail once
+    /// with `HistoryUnavailable` (87), and the next call routes again. Prefer
+    /// `store_consumer_position()` with a checkpoint.
+    #[pyo3(signature = (stream, topic, *, consumer, partition_id, offset))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn store_consumer_offset<'a>(
+        &self,
+        py: Python<'a>,
+        stream: PyIdentifier,
+        topic: PyIdentifier,
+        consumer: &PyConsumer,
+        partition_id: u32,
+        offset: u64,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let consumer = RustConsumer::try_from(consumer)?;
+        let stream = Identifier::try_from(stream)?;
+        let topic = Identifier::try_from(topic)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .store_consumer_offset(&consumer, &stream, &topic, Some(partition_id), offset)
+                .await
+                .map_err(to_runtime_error)
+        })
+    }
+
+    /// Returns the offset stored for `consumer` on `partition_id`, or `None` when nothing is
+    /// stored. In a cluster, the node of the connection answers from its own replica, which can
+    /// lag a store that just returned.
+    #[pyo3(signature = (stream, topic, *, consumer, partition_id))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[ConsumerOffsetInfo | None]", imports=("collections.abc")))]
+    fn get_consumer_offset<'a>(
+        &self,
+        py: Python<'a>,
+        stream: PyIdentifier,
+        topic: PyIdentifier,
+        consumer: &PyConsumer,
+        partition_id: u32,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let consumer = RustConsumer::try_from(consumer)?;
+        let stream = Identifier::try_from(stream)?;
+        let topic = Identifier::try_from(topic)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let offset = inner
+                .get_consumer_offset(&consumer, &stream, &topic, Some(partition_id))
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(offset.map(|offset| ConsumerOffsetInfo {
+                partition_id: offset.partition_id,
+                current_offset: offset.current_offset,
+                stored_offset: offset.stored_offset,
+            }))
+        })
+    }
+
+    /// Deletes the offset stored for `consumer` on `partition_id`, under the partition history
+    /// of its route. Raises `IggyError` with `ConsumerOffsetNotFound` (3021) when nothing is
+    /// stored. Prefer `delete_consumer_position()` with a checkpoint.
+    #[pyo3(signature = (stream, topic, *, consumer, partition_id))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn delete_consumer_offset<'a>(
+        &self,
+        py: Python<'a>,
+        stream: PyIdentifier,
+        topic: PyIdentifier,
+        consumer: &PyConsumer,
+        partition_id: u32,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let consumer = RustConsumer::try_from(consumer)?;
+        let stream = Identifier::try_from(stream)?;
+        let topic = Identifier::try_from(topic)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .delete_consumer_offset(&consumer, &stream, &topic, Some(partition_id))
+                .await
+                .map_err(to_runtime_error)
+        })
+    }
+
+    /// Deletes the stored offset of the partition of `checkpoint` for `consumer`, under the
+    /// partition history that delivered the checkpoint. The offset of the checkpoint is not
+    /// used.
+    ///
+    /// Raises `IggyError` with `HistoryUnavailable` (87) after the partition was deleted and
+    /// created again, `ConsumerGroupPartitionNotOwned` (5009) after its consumer group owner
+    /// changed, and `ConsumerOffsetNotFound` (3021) when nothing is stored. HTTP sends no
+    /// partition history, so there the server deletes the offset of the history it holds.
+    #[pyo3(signature = (stream, topic, *, consumer, checkpoint))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn delete_consumer_position<'a>(
+        &self,
+        py: Python<'a>,
+        stream: PyIdentifier,
+        topic: PyIdentifier,
+        consumer: &PyConsumer,
+        checkpoint: &Checkpoint,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let consumer = RustConsumer::try_from(consumer)?;
+        let stream = Identifier::try_from(stream)?;
+        let topic = Identifier::try_from(topic)?;
+        let checkpoint = checkpoint.inner;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .delete_consumer_position(&consumer, &stream, &topic, &checkpoint)
+                .await
+                .map_err(to_runtime_error)
         })
     }
 
@@ -1827,7 +2004,7 @@ impl IggyClient {
     ///
     /// `start` is where a partition without a stored position starts, `PollingStrategy.Next()`
     /// by default. A continuation is refused, because it belongs to one partition. `options`
-    /// sets each request, and defaults to `PollOptions(max_wait=timedelta(seconds=1))`: a
+    /// sets each request, and defaults to `PollOptions(max_wait=timedelta(seconds=5))`: a
     /// reader without a wait polls an idle topic in a busy loop. `prefetch_bytes` (16 MiB by
     /// default) and `prefetch_messages` (the larger of 16,000 and `options.count` by default)
     /// bound the requests in flight and the queued batches.
@@ -1901,12 +2078,11 @@ impl IggyClient {
     ///
     /// `polling_strategy` is where a partition without a stored offset starts,
     /// `PollingStrategy.Next()` by default. `poll_options` sets each request, and defaults to
-    /// `PollOptions(max_wait=timedelta(seconds=1))`: a consumer without a wait polls an idle
-    /// topic in a busy loop. `ServerCommitPolicy.OnRead` makes the server store the offset of
-    /// each reply, and it needs the default `client_commit`.
-    ///
-    /// `client_commit` defaults to `ClientCommitPolicy()`: the consumer stores no offset, so
-    /// commit checkpoints after processing, or each restart reads the same messages again.
+    /// `PollOptions(max_wait=timedelta(seconds=5))`: a consumer without a wait polls an idle
+    /// topic in a busy loop. Its `commit` says when offsets are stored: `CommitPolicy.Manual()`,
+    /// the default, stores none, so commit checkpoints after processing, or each restart reads
+    /// the same messages again. `CommitPolicy.OnRead()` makes the server store the offset of
+    /// each reply, and `CommitPolicy.Auto(...)` makes the consumer store counted positions.
     /// `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (the larger of 16,000 and
     /// the poll count by default) bound the requests in flight and the queued batches.
     /// Call `shutdown()` before dropping the consumer.
@@ -1923,7 +2099,6 @@ impl IggyClient {
         *,
         polling_strategy=None,
         poll_options=None,
-        client_commit=None,
         prefetch_bytes=None,
         prefetch_messages=None,
         create_consumer_group_if_not_exists=true,
@@ -1945,9 +2120,6 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "PollOptions | None"))] poll_options: Option<
             PollOptions,
         >,
-        #[gen_stub(override_type(type_repr = "ClientCommitPolicy | None"))] client_commit: Option<
-            &ClientCommitPolicy,
-        >,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] prefetch_bytes: Option<u32>,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] prefetch_messages: Option<
             u32,
@@ -1965,73 +2137,89 @@ impl IggyClient {
             .consumer_group(name, stream, topic)
             .map_err(to_runtime_error)?
             .without_encryptor();
-
-        if create_consumer_group_if_not_exists {
-            builder = builder.create_consumer_group_if_not_exists()
+        builder = if create_consumer_group_if_not_exists {
+            builder.create_consumer_group_if_not_exists()
         } else {
-            builder = builder.do_not_create_consumer_group_if_not_exists()
+            builder.do_not_create_consumer_group_if_not_exists()
         };
-        if let Some(polling_strategy) = polling_strategy {
-            builder = builder.polling_strategy(polling_strategy.inner)
+        let settings = ConsumerSettings {
+            polling_strategy: polling_strategy.map(|strategy| strategy.inner),
+            poll_options,
+            prefetch_bytes,
+            prefetch_messages,
+            polling_retry_interval,
+            init_retries,
+            init_retry_interval,
+            allow_replay,
         };
-        if let Some(poll_options) = poll_options {
-            builder = builder.poll_options(poll_options.inner)
-        };
-        if let Some(client_commit) = client_commit {
-            builder = builder.client_commit(client_commit.inner)
-        };
-        if let Some(prefetch_bytes) = prefetch_bytes {
-            builder = builder.prefetch_bytes(prefetch_bytes)
-        };
-        if let Some(prefetch_messages) = prefetch_messages {
-            builder = builder.prefetch_messages(prefetch_messages)
-        };
-        if let Some(polling_retry_interval) = polling_retry_interval {
-            builder = builder.polling_retry_interval(reject_zero(
-                py_delta_to_iggy_duration(&polling_retry_interval)?,
-                "polling_retry_interval",
-            )?)
-        }
-        if init_retries.is_some() && init_retry_interval.is_none() {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "'init_retry_interval' is required if 'init_retries' is set",
-            ));
-        }
-        if init_retries.is_none() && init_retry_interval.is_some() {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "'init_retries' is required if 'init_retry_interval' is set",
-            ));
-        }
-        if let (Some(init_retries), Some(init_retry_interval)) = (init_retries, init_retry_interval)
-        {
-            builder = builder.init_retries(
-                init_retries,
-                reject_zero(
-                    py_delta_to_iggy_duration(&init_retry_interval)?,
-                    "init_retry_interval",
-                )?,
-            );
-        }
-        if allow_replay {
-            builder = builder.allow_replay()
-        }
-        let mut consumer = builder.build();
+        initialized_consumer(py, settings.apply(builder)?)
+    }
 
-        future_into_py(py, async move {
-            consumer.init().await.map_err(to_runtime_error)?;
-            let state = consumer.state();
-            let name = consumer.name().to_string();
-            let stream = PyIdentifier::try_from(consumer.stream())?;
-            let topic = PyIdentifier::try_from(consumer.topic())?;
-            Ok(IggyConsumer {
-                inner: Arc::new(Mutex::new(consumer)),
-                state,
-                name,
-                stream,
-                topic,
-                consuming: Arc::default(),
-            })
-        })
+    /// Creates a standalone consumer of `partitions` of `topic`, identified by `name`: it
+    /// stores its offsets as `Consumer.Single(name)` and joins no group. A partition without a
+    /// stored offset starts at `polling_strategy`, `PollingStrategy.Next()` by default.
+    ///
+    /// The other arguments are those of `consumer_group()`. Call `shutdown()` before dropping
+    /// the consumer. Raises `IggyError` with `InvalidCommand` (3) without partitions, and the
+    /// errors of `poll_options`.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        name,
+        stream,
+        topic,
+        *,
+        partitions,
+        polling_strategy=None,
+        poll_options=None,
+        prefetch_bytes=None,
+        prefetch_messages=None,
+        polling_retry_interval=None,
+        init_retries=None,
+        init_retry_interval=None,
+        allow_replay=false,
+    ))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[IggyConsumer]", imports=("collections.abc")))]
+    fn consumer<'a>(
+        &self,
+        py: Python<'a>,
+        name: &str,
+        stream: &str,
+        topic: &str,
+        partitions: Vec<u32>,
+        #[gen_stub(override_type(type_repr = "PollingStrategy | None"))] polling_strategy: Option<
+            &PollingStrategy,
+        >,
+        #[gen_stub(override_type(type_repr = "PollOptions | None"))] poll_options: Option<
+            PollOptions,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] prefetch_bytes: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] prefetch_messages: Option<
+            u32,
+        >,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        polling_retry_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] init_retries: Option<u32>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        init_retry_interval: Option<Py<PyDelta>>,
+        allow_replay: bool,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let builder = self
+            .inner
+            .consumer(name, stream, topic)
+            .map_err(to_runtime_error)?
+            .without_encryptor()
+            .partitions(partitions);
+        let settings = ConsumerSettings {
+            polling_strategy: polling_strategy.map(|strategy| strategy.inner),
+            poll_options,
+            prefetch_bytes,
+            prefetch_messages,
+            polling_retry_interval,
+            init_retries,
+            init_retry_interval,
+            allow_replay,
+        };
+        initialized_consumer(py, settings.apply(builder)?)
     }
 
     /// Send a command code with a payload and return the raw response bytes.
@@ -2106,9 +2294,96 @@ impl IggyClient {
 
 define_stub_info_gatherer!(stub_info);
 
+/// The settings that a standalone consumer and a consumer group member share.
+struct ConsumerSettings {
+    polling_strategy: Option<RustPollingStrategy>,
+    poll_options: Option<PollOptions>,
+    prefetch_bytes: Option<u32>,
+    prefetch_messages: Option<u32>,
+    polling_retry_interval: Option<Py<PyDelta>>,
+    init_retries: Option<u32>,
+    init_retry_interval: Option<Py<PyDelta>>,
+    allow_replay: bool,
+}
+
+impl ConsumerSettings {
+    fn apply(self, mut builder: IggyConsumerBuilder) -> PyResult<IggyConsumerBuilder> {
+        if let Some(polling_strategy) = self.polling_strategy {
+            builder = builder.polling_strategy(polling_strategy);
+        }
+        if let Some(poll_options) = self.poll_options {
+            builder = builder.poll_options(poll_options.inner);
+        }
+        if let Some(prefetch_bytes) = self.prefetch_bytes {
+            builder = builder.prefetch_bytes(prefetch_bytes);
+        }
+        if let Some(prefetch_messages) = self.prefetch_messages {
+            builder = builder.prefetch_messages(prefetch_messages);
+        }
+        if let Some(polling_retry_interval) = self.polling_retry_interval {
+            builder = builder.polling_retry_interval(reject_zero(
+                py_delta_to_iggy_duration(&polling_retry_interval)?,
+                "polling_retry_interval",
+            )?);
+        }
+        match (self.init_retries, self.init_retry_interval) {
+            (Some(init_retries), Some(init_retry_interval)) => {
+                builder = builder.init_retries(
+                    init_retries,
+                    reject_zero(
+                        py_delta_to_iggy_duration(&init_retry_interval)?,
+                        "init_retry_interval",
+                    )?,
+                );
+            }
+            (Some(_), None) => {
+                return Err(PyRuntimeError::new_err(
+                    "'init_retry_interval' is required if 'init_retries' is set",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(PyRuntimeError::new_err(
+                    "'init_retries' is required if 'init_retry_interval' is set",
+                ));
+            }
+            (None, None) => {}
+        }
+        if self.allow_replay {
+            builder = builder.allow_replay();
+        }
+        Ok(builder)
+    }
+}
+
+/// Builds the consumer and initializes it on the Rust runtime, which joins a group member.
+fn initialized_consumer(
+    py: Python<'_>,
+    builder: IggyConsumerBuilder,
+) -> PyResult<Bound<'_, PyAny>> {
+    let mut consumer = builder.build();
+    future_into_py(py, async move {
+        consumer.init().await.map_err(to_runtime_error)?;
+        let state = consumer.state();
+        let name = consumer.name().to_string();
+        let stream = PyIdentifier::try_from(consumer.stream())?;
+        let topic = PyIdentifier::try_from(consumer.topic())?;
+        Ok(IggyConsumer {
+            inner: Arc::new(Mutex::new(consumer)),
+            state,
+            name,
+            stream,
+            topic,
+            consuming: Arc::default(),
+            stopping: Arc::new(watch::Sender::new(false)),
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
 
     #[test]
     fn given_root_policy_refusal_when_mapping_should_preserve_code_and_kind() {
@@ -2194,6 +2469,44 @@ mod tests {
     }
 
     #[test]
+    fn given_decode_diagnostics_when_mapping_read_error_should_preserve_original_bytes_and_offset()
+    {
+        Python::initialize();
+        Python::attach(|py| {
+            for offset in [None, Some(10)] {
+                for record in [None, Some(Bytes::from_static(&[0, 255, 17, 128]))] {
+                    let error = to_read_error(RustReadError {
+                        partition_id: Some(7),
+                        error: IggyError::CannotReadMessage,
+                        skip: Some(RustPollingStrategy::offset(11)),
+                        offset,
+                        record: record.clone(),
+                    });
+                    let value = error.value(py);
+                    assert_eq!(
+                        value
+                            .getattr("offset")
+                            .unwrap()
+                            .extract::<Option<u64>>()
+                            .unwrap(),
+                        offset
+                    );
+                    let bytes = value.getattr("record").unwrap();
+                    match &record {
+                        Some(record) => {
+                            assert!(bytes.is_instance_of::<PyBytes>());
+                            assert_eq!(bytes.extract::<Vec<u8>>().unwrap(), record.to_vec());
+                        }
+                        None => assert!(bytes.is_none()),
+                    }
+                    assert!(value.setattr("offset", 0).is_err());
+                    assert!(value.setattr("record", py.None()).is_err());
+                }
+            }
+        });
+    }
+
+    #[test]
     fn given_read_error_when_mapping_should_keep_partition_skip_and_cause() {
         const PARTITION_ID: u32 = 7;
         const OPERATION_ID: u64 = 42;
@@ -2206,6 +2519,8 @@ mod tests {
                 partition_id: Some(PARTITION_ID),
                 error: cause,
                 skip: Some(RustPollingStrategy::offset(SKIP_OFFSET)),
+                offset: None,
+                record: None,
             };
             let message = read_error.to_string();
 
@@ -2258,6 +2573,8 @@ mod tests {
                 partition_id: None,
                 error: IggyError::Disconnected,
                 skip: None,
+                offset: None,
+                record: None,
             });
 
             let value = error.value(py);
@@ -2266,6 +2583,48 @@ mod tests {
             let cause = value.getattr("error").unwrap();
             assert!(cause.is_instance_of::<PyIggyError>());
             assert!(!cause.is_instance_of::<PendingOperationError>());
+        });
+    }
+
+    #[test]
+    fn given_the_gil_held_by_another_thread_when_mapping_errors_should_not_wait_for_it() {
+        const BUILD_TIME_LIMIT: Duration = Duration::from_secs(5);
+        const OPERATION_ID: u64 = 42;
+        Python::initialize();
+        Python::attach(|py| {
+            let (built, received) = mpsc::channel();
+            // The GIL stays with this thread until the errors arrive, as on a busy event loop.
+            thread::spawn(move || {
+                let errors = (
+                    to_runtime_error(IggyError::FetchProgressUncertain(OPERATION_ID)),
+                    to_runtime_error(IggyError::InvalidOptionValue("count".to_owned())),
+                    to_read_error(RustReadError {
+                        partition_id: None,
+                        error: IggyError::Disconnected,
+                        skip: None,
+                        offset: None,
+                        record: None,
+                    }),
+                );
+                let _ = built.send(errors);
+            });
+
+            let (pending, option, read) = received
+                .recv_timeout(BUILD_TIME_LIMIT)
+                .expect("errors are built without the GIL");
+
+            assert!(pending.is_instance_of::<PendingOperationError>(py));
+            assert_eq!(
+                pending
+                    .value(py)
+                    .getattr("operation_id")
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                OPERATION_ID
+            );
+            assert!(option.is_instance_of::<OptionError>(py));
+            assert!(read.is_instance_of::<ReadError>(py));
         });
     }
 

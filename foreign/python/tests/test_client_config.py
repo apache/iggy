@@ -32,12 +32,15 @@ from datetime import timedelta
 import pytest
 
 from apache_iggy import (
+    AutoCommit,
     AutoLogin,
-    ClientCommitPolicy,
-    CommitEvent,
+    CommitAfter,
+    CommitEvery,
+    CommitPolicy,
     IggyClient,
     IggyExpiry,
     PendingOperationsConfig,
+    PollOptions,
     QuicConfig,
     TcpConfig,
     TcpReconnectionConfig,
@@ -362,22 +365,45 @@ class TestClientConstruction:
 
 
 @pytest.mark.unit
-class TestClientCommitPolicy:
-    """Test when a consumer stores its offsets."""
+class TestCommitPolicy:
+    """Test when reads store their offsets."""
+
+    def test_default_options_store_nothing(self):
+        """Test that the default commit policy leaves every store to the caller."""
+        assert PollOptions().commit == CommitPolicy.Manual()
+
+    def test_auto_commit_default_stores_every_10000_messages_or_5_seconds(self):
+        """Test the default of an automatic commit and that options keep it."""
+        auto = AutoCommit.default()
+        options = PollOptions(commit=CommitPolicy.Auto(auto))
+
+        assert auto == AutoCommit(
+            interval=timedelta(seconds=5),
+            every=CommitEvery.Messages(10_000),
+            after=CommitAfter.Processing,
+        )
+        assert options.commit == CommitPolicy.Auto(auto)
+        assert repr(options.commit) == repr(CommitPolicy.Auto(auto))
+        assert (
+            "CommitPolicy.Auto(AutoCommit(interval=datetime.timedelta(seconds=5)"
+            in (repr(options))
+        )
 
     @pytest.mark.parametrize(
-        "on",
-        [None, CommitEvent.EachMessage()],
-        ids=["interval", "interval_or_event"],
+        ("interval", "every", "message"),
+        [
+            (timedelta(0), None, "zero"),
+            (None, CommitEvery.Messages(0), "above zero"),
+            (None, None, "'interval' or an 'every'"),
+        ],
+        ids=["zero_interval", "zero_messages", "neither"],
     )
-    def test_zero_interval_is_rejected(self, on: CommitEvent | None):
-        """Test that a zero commit interval fails at construction.
-
-        Zero stores the offsets in a busy loop. Committing on each message is
-        spelled with `on` and no interval instead.
-        """
-        with pytest.raises(ValueError, match="zero"):
-            ClientCommitPolicy(interval=timedelta(0), on=on)
+    def test_auto_commit_that_never_stores_is_rejected(
+        self, interval: timedelta | None, every: CommitEvery | None, message: str
+    ):
+        """Test that an automatic commit storing only on close fails at once."""
+        with pytest.raises(ValueError, match=message):
+            AutoCommit(interval=interval, every=every)
 
 
 @pytest.mark.integration

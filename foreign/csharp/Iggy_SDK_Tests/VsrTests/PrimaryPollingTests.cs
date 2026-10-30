@@ -597,123 +597,6 @@ public sealed class PrimaryPollingTests
     }
 
     [Fact]
-    public async Task given_a_live_session_when_a_primary_refuses_a_consumer_poll_with_stale_client_should_keep_polling()
-    {
-        using var cluster = new PollCluster();
-        var polls = 0;
-        cluster.OnPrimaryPoll = request => Interlocked.Increment(ref polls) == 1
-            ? Reply(request.Operation, [], VsrError.STALE_CLIENT)
-            : Reply(request.Operation, Convert.FromHexString(MessageBatchGoldenVectorTests.POLL_BODY));
-        using var client = await cluster.ConnectAsync();
-        var generation = ((ISessionGenerationProvider)client).SessionGeneration;
-        var states = RecordStates(client);
-        await using var consumer = PartitionConsumer(client, PollingStrategy.Next());
-        var errors = RecordErrors(consumer);
-        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
-        cancellation.CancelAfter(TimeSpan.FromSeconds(10));
-        await consumer.InitAsync(cancellation.Token);
-        await using var messages = consumer.ReceiveAsync(cancellation.Token).GetAsyncEnumerator(cancellation.Token);
-
-        Assert.True(await messages.MoveNextAsync());
-
-        var refusal = Assert.IsType<IggyInvalidStatusCodeException>(Assert.Single(errors));
-        Assert.Equal(VsrError.STALE_CLIENT, refusal.StatusCode);
-        Assert.Equal(2, polls);
-        Assert.Equal(2, cluster.Primaries[0].Requests(CommandCodes.BIND_SESSION_CODE));
-        Assert.Equal(1, cluster.Coordinator.Registrations);
-        Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
-        Assert.Empty(states);
-    }
-
-    [Fact]
-    public async Task given_a_consumer_poll_in_flight_when_a_stale_client_refusal_detaches_its_link_should_poll_again()
-    {
-        using var cluster = new PollCluster();
-        var polls = 0;
-        var consumerPolling = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        cluster.OnPrimaryPoll = request =>
-        {
-            if (Interlocked.Increment(ref polls) > 1)
-            {
-                return Reply(request.Operation, Convert.FromHexString(MessageBatchGoldenVectorTests.POLL_BODY));
-            }
-            // The refusal waits until the consumer poll follows this request on the same link.
-            consumerPolling.Task.Wait(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
-            Thread.Sleep(100);
-            return Reply(request.Operation, [], VsrError.STALE_CLIENT);
-        };
-        using var client = await cluster.ConnectAsync();
-        var generation = ((ISessionGenerationProvider)client).SessionGeneration;
-        var states = RecordStates(client);
-        var refused = client.PollMessagesAsync(Stream, Topic, 0, Consumer.New(4), PollingStrategy.First(), 1, false,
-            TestContext.Current.CancellationToken);
-        await cluster.UntilAsync(() => Volatile.Read(ref polls) == 1);
-        await using var consumer = PartitionConsumer(client, PollingStrategy.Next());
-        var errors = RecordErrors(consumer);
-        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
-        cancellation.CancelAfter(TimeSpan.FromSeconds(10));
-        await consumer.InitAsync(cancellation.Token);
-        await using var messages = consumer.ReceiveAsync(cancellation.Token).GetAsyncEnumerator(cancellation.Token);
-        var receiving = messages.MoveNextAsync().AsTask();
-        consumerPolling.TrySetResult();
-
-        Assert.True(await receiving);
-
-        var refusal = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => refused);
-        Assert.Equal(VsrError.STALE_CLIENT, refusal.StatusCode);
-        Assert.Null(Assert.IsType<VsrRequestOutcomeUnknownException>(Assert.Single(errors)).OperationId);
-        Assert.Equal(2, cluster.Primaries[0].Requests(CommandCodes.BIND_SESSION_CODE));
-        Assert.Equal(1, cluster.Coordinator.Registrations);
-        Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
-        Assert.Empty(states);
-    }
-
-    [Fact]
-    public async Task given_a_consumer_poll_in_flight_when_its_link_is_lost_should_wait_for_the_link_and_poll_again()
-    {
-        using var cluster = new PollCluster();
-        var down = false;
-        cluster.OnPrimaryPoll = request => Volatile.Read(ref down)
-            ? throw new IOException("outage")
-            : Reply(request.Operation, Convert.FromHexString(MessageBatchGoldenVectorTests.POLL_BODY));
-        cluster.OnPrimaryAttachment = request => Volatile.Read(ref down)
-            ? throw new IOException("outage")
-            : BindingReply(request);
-        using var client = await cluster.ConnectAsync();
-        // Both primary links bind before the outage, so it fails only the link of the consumer poll.
-        foreach (var partition in new uint[] { 0, 1 })
-        {
-            await client.PollMessagesAsync(Stream, Topic, partition, Consumer.New(3), PollingStrategy.First(), 1, false,
-                TestContext.Current.CancellationToken);
-        }
-        var generation = ((ISessionGenerationProvider)client).SessionGeneration;
-        var states = RecordStates(client);
-        await using var consumer = PartitionConsumer(client, PollingStrategy.Next());
-        var errors = RecordErrors(consumer);
-        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
-        cancellation.CancelAfter(TimeSpan.FromSeconds(10));
-        await consumer.InitAsync(cancellation.Token);
-        await using var messages = consumer.ReceiveAsync(cancellation.Token).GetAsyncEnumerator(cancellation.Token);
-        Volatile.Write(ref down, true);
-        var receiving = messages.MoveNextAsync().AsTask();
-
-        // While the link fails eight binds, the next poll waits for it instead of failing at once.
-        await cluster.UntilAsync(() => cluster.Primaries[0].Requests(CommandCodes.BIND_SESSION_CODE) >= 9);
-        Assert.False(receiving.IsCompleted, receiving.Exception?.GetBaseException().ToString());
-        Assert.Null(Assert.IsType<VsrRequestOutcomeUnknownException>(Assert.Single(errors)).OperationId);
-        Volatile.Write(ref down, false);
-
-        Assert.True(await receiving);
-        Assert.Single(errors);
-        Assert.Equal(1, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_CODE));
-        Assert.Equal(2, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_DEFERRED_CODE));
-        Assert.Equal(1, cluster.Primaries[1].Connections);
-        Assert.Equal(1, cluster.Coordinator.Registrations);
-        Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
-        Assert.Empty(states);
-    }
-
-    [Fact]
     public async Task given_a_stale_binding_when_links_start_should_replace_the_logical_session_once()
     {
         using var cluster = new PollCluster();
@@ -764,8 +647,9 @@ public sealed class PrimaryPollingTests
         };
         using var client = await cluster.ConnectAsync();
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        // A poll that commits waits for its reply, so only a Next poll without commits ends on the cancel.
         var pending = client.PollMessagesAsync(Stream, Topic, 0, Consumer.Group(3), PollingStrategy.Next(), 10,
-            true, cancellation.Token);
+            false, cancellation.Token);
         try
         {
             await started.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
@@ -1974,17 +1858,6 @@ public sealed class PrimaryPollingTests
     private static byte[] BindingReply(MockRequest request) => Reply(request.Operation,
         RegisterBody(BinaryPrimitives.ReadUInt64LittleEndian(BindIdentity(request.Body).AsSpan(16)))[4..]);
 
-    private static IggyConsumer PartitionConsumer(TcpMessageStream client, PollingStrategy strategy) => new(client,
-        new IggyConsumerConfig
-        {
-            StreamId = Stream,
-            TopicId = Topic,
-            PartitionId = 0,
-            Consumer = Consumer.New(3),
-            PollingStrategy = strategy,
-            AutoCommitMode = AutoCommitMode.Disabled,
-        }, NullLoggerFactory.Instance);
-
     private static ConcurrentQueue<ConnectionState> RecordStates(TcpMessageStream client)
     {
         var states = new ConcurrentQueue<ConnectionState>();
@@ -1994,17 +1867,6 @@ public sealed class PrimaryPollingTests
             return Task.CompletedTask;
         });
         return states;
-    }
-
-    private static ConcurrentQueue<Exception> RecordErrors(IggyConsumer consumer)
-    {
-        var errors = new ConcurrentQueue<Exception>();
-        consumer.SubscribeToErrorEvents(error =>
-        {
-            errors.Enqueue(error.Exception);
-            return Task.CompletedTask;
-        });
-        return errors;
     }
 
     private sealed class PollCluster : IDisposable

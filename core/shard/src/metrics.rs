@@ -278,7 +278,7 @@ impl DeferredPollMetrics {
         );
         registry.register(
             "deferred_poll_failed",
-            "admitted deferred polls rejected by a read error, fence, read budget refusal or request deadline",
+            "admitted deferred polls rejected by a read error, fence, full completion lane or request deadline",
             self.failed.clone(),
         );
         registry.register(

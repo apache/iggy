@@ -74,7 +74,7 @@ pub async fn run(client: &IggyClient) {
             &PollingStrategy::offset(0),
             PollOptions {
                 count: 1,
-                server_commit: ServerCommitPolicy::OnRead,
+                commit: CommitPolicy::OnRead,
                 ..PollOptions::default()
             },
         )

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import type { ClientProvider, CommandResponse } from '../../client/client.type.js';
+import type { CommandResponse } from '../../client/client.type.js';
 import { FETCH_PROGRESS_UNCERTAIN, FetchProgressUncertainError } from '../../client/client.operation.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { wrapCommand } from '../command.utils.js';
@@ -36,7 +36,6 @@ import {
 } from './deferred-poll.utils.js';
 
 const INVALID_COMMAND = 3;
-const FEATURE_UNAVAILABLE = 5;
 const STATUS_OK = 0;
 const SECTIONS_COUNT_SIZE = 4;
 /** A split count could loop on or misread the other start points, so the server refuses them. */
@@ -119,7 +118,7 @@ export type FetchMessages = {
   consumer: Consumer,
   /**
    * 1 to 1000 partitions, each once, with one primary: a group of
-   * `message.readinessGroups`. The server reads them in this order, so a
+   * `RawClient.readinessGroups`. The server reads them in this order, so a
    * caller that moves the partitions it read to the end serves them in turn.
    */
   targets: FetchTarget[],
@@ -135,9 +134,10 @@ export type FetchMessages = {
    */
   options?: Partial<DeferredPollOptions>,
   /**
-   * Cancels before send. A sent committing fetch waits for its reply or deadline,
-   * because cancellation cannot undo its progress. Other fetches also send a
-   * server cancellation. Unknown committing outcomes retain local progress blocks.
+   * Cancels the fetch. A sent fetch is cancelled on the server too: one
+   * without `autocommit` ends at once, a committing one answers once, with
+   * its messages or with nothing stored (rejected with the abort reason).
+   * Unknown committing outcomes retain local progress blocks.
    */
   signal?: AbortSignal
 };
@@ -148,7 +148,7 @@ export type FetchMessagesSection = {
   /**
    * 0 when the partition was read. Else the error code of this partition,
    * and the other fields carry no position. Local status 14010 includes `progressError`
-   * and blocks this partition until explicit abandonment; healthy siblings remain usable.
+   * and blocks this partition until explicit abandonment. Healthy siblings remain usable.
    */
   status: number,
   /** Current offset in the partition */
@@ -161,7 +161,7 @@ export type FetchMessagesSection = {
   nextOffset: bigint,
   /** The batch records of the section, as a poll reply carries them, see `decodeFetchSection` */
   records: Buffer,
-  /** Explicit local recovery is required for this section; healthy sibling sections remain usable. */
+  /** Explicit local recovery is required for this section. Healthy sibling sections remain usable. */
   progressError?: FetchProgressUncertainError
 };
 
@@ -260,7 +260,7 @@ export const decodeFetchSection = (section: FetchMessagesSection): PollMessagesR
     throw fetchSectionError(section);
   const messages = deserializeMessages(section.records);
   if (messages.length !== section.messagesCount)
-    throw new DeserializeError('fetch section count does not match its messages');
+    throw new DeserializeError('fetch section count does not match its messages', { record: section.records });
   return {
     partitionId: section.partitionId,
     context: section.context,
@@ -275,33 +275,10 @@ export const decodeFetchSection = (section: FetchMessagesSection): PollMessagesR
  * and takes one of the deferred request slots of the client while it waits.
  * A refusal as not the primary, or for a history or an owner that changed,
  * of the call or of a section, marks the routes of those partitions stale,
- * so the next `readinessGroups` looks them up again. A fetch with
+ * so the next `RawClient.readinessGroups` looks them up again. A fetch with
  * `autocommit` or a Next target is never sent again after it reached the
- * server: a lost reply fails with 57.
+ * server. A lost reply of a fetch with `autocommit` fails with
+ * `FetchProgressUncertainError` (14010) and blocks its partitions until
+ * `abandonOperation`. A lost reply of any other fetch fails with 57.
  */
 export const fetchMessages = wrapCommand(FETCH_MESSAGES, ({ signal }) => ({ signal }));
-
-/** Parameters of `readinessGroups`. */
-export type ReadinessGroups = {
-  /** Stream identifier */
-  streamId: Id,
-  /** Topic identifier */
-  topicId: Id,
-  partitions: number[],
-  /** Cancels the route lookups. */
-  signal?: AbortSignal
-};
-
-/**
- * The partitions grouped by their primary and split to fit one fetch each, so
- * a consumer can keep one fetch in flight per group. Each group keeps the
- * order of `partitions`, and groups of a lower replica id come first. A route
- * lookup that fails fails the call.
- */
-export const readinessGroups = (getClient: ClientProvider) =>
-  async ({ streamId, topicId, partitions, signal }: ReadinessGroups): Promise<number[][]> => {
-    const client = await getClient();
-    if (!client.readinessGroups)
-      throw responseError(0, FEATURE_UNAVAILABLE, 'the supplied raw client does not support readiness groups');
-    return client.readinessGroups(streamId, topicId, partitions, { signal });
-  };

@@ -32,8 +32,8 @@ use iggy_binary_protocol::responses::messages::{
 };
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
-    Consumer, FetchedSection, Identifier, IggyDuration, IggyError, IggyMessage, PollOptions,
-    PolledMessages, ServerCommitPolicy,
+    CommitPolicy, Consumer, FetchedSection, Identifier, IggyDuration, IggyError, IggyMessage,
+    PollOptions, PolledMessages,
 };
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
@@ -99,10 +99,10 @@ pub(super) fn group() -> Consumer {
     Consumer::group(identifier(GROUP_ID))
 }
 
-/// `builder` with `ServerCommitPolicy::OnRead` and the default wait.
+/// `builder` with `CommitPolicy::OnRead` and the default wait.
 pub(super) fn committing(builder: ReaderBuilder) -> ReaderBuilder {
     builder.options(PollOptions {
-        server_commit: ServerCommitPolicy::OnRead,
+        commit: CommitPolicy::OnRead,
         ..PollOptions::wait(IggyDuration::from(DEFAULT_MAX_WAIT))
     })
 }

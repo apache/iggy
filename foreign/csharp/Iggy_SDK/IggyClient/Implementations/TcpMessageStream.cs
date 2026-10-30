@@ -44,7 +44,7 @@ namespace Apache.Iggy.IggyClient.Implementations;
 /// <summary>
 ///     A TCP client with one logical consensus session and independently managed, multiplexed replica links.
 /// </summary>
-public sealed partial class TcpMessageStream : IIggyClient
+public sealed partial class TcpMessageStream : IIggyClient, IPartitionFetchClient
 {
     private static readonly HashSet<uint> SessionControlCodes =
     [
@@ -95,7 +95,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     // The credentials a sign-in succeeded with, so a reconnect - on this node or, after a failover, another one -
     // can re-establish the session instead of leaving every later request unauthenticated. A caller that signs in
     // by hand is otherwise less reconnectable than one that configures auto login, which is a surprising
-    // difference between two ways of doing the same thing. Cleared on sign-out and on Dispose; a server-side
+    // difference between two ways of doing the same thing. Cleared on sign-out and on Dispose. A server-side
     // eviction is not caller intent and leaves them in place.
     private AutoLoginSettings? _rememberedLogin;
     private bool _signInWithdrawn;
@@ -327,6 +327,28 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint partitionId,
+        Consumer consumer, PollingStrategy strategy, PollOptions options, CancellationToken token = default)
+    {
+        using var rental = await PollMessagesRentedAsync(streamId, topicId, partitionId, consumer, strategy, options,
+            token);
+        var polled = BinaryMapper.MaterializeMessages(rental);
+        polled.RequestStart = strategy;
+        return polled;
+    }
+
+    /// <inheritdoc />
+    public Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
+        uint partitionId, Consumer consumer, PollingStrategy strategy, PollOptions options,
+        CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        options.ValidatePoll(partitionId, strategy);
+        return PollRentedAsync(streamId, topicId, partitionId, consumer, _ => strategy, options.Count,
+            options.Commit.Mode == CommitMode.OnRead, options.Wire, token);
+    }
+
+    /// <inheritdoc />
     public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
         Consumer consumer,
         PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
@@ -365,8 +387,7 @@ public sealed partial class TcpMessageStream : IIggyClient
             token);
     }
 
-    /// <inheritdoc />
-    public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+    internal async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
         Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit, DeferredPollOptions options,
         CancellationToken token = default)
     {
@@ -375,8 +396,7 @@ public sealed partial class TcpMessageStream : IIggyClient
         return BinaryMapper.MaterializeMessages(rental);
     }
 
-    /// <inheritdoc />
-    public Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
+    internal Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
         uint? partitionId, Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit,
         DeferredPollOptions options, CancellationToken token = default)
     {
@@ -384,8 +404,7 @@ public sealed partial class TcpMessageStream : IIggyClient
             autoCommit, options, token);
     }
 
-    /// <inheritdoc />
-    public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+    internal async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
         Consumer consumer, Func<uint, PollingStrategy> pollingStrategyFor, uint count, bool autoCommit,
         DeferredPollOptions options, CancellationToken token = default)
     {
@@ -394,8 +413,7 @@ public sealed partial class TcpMessageStream : IIggyClient
         return BinaryMapper.MaterializeMessages(rental);
     }
 
-    /// <inheritdoc />
-    public Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
+    internal Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
         uint? partitionId, Consumer consumer, Func<uint, PollingStrategy> pollingStrategyFor, uint count,
         bool autoCommit, DeferredPollOptions options, CancellationToken token = default)
     {
@@ -405,8 +423,7 @@ public sealed partial class TcpMessageStream : IIggyClient
             options, token);
     }
 
-    /// <inheritdoc />
-    public async Task<FetchedMessages> FetchMessagesAsync(Identifier streamId, Identifier topicId,
+    internal async Task<FetchedMessages> FetchMessagesAsync(Identifier streamId, Identifier topicId,
         IReadOnlyList<(uint PartitionId, PollingStrategy Strategy)> targets, Consumer consumer, uint count,
         bool autoCommit, DeferredPollOptions options, CancellationToken token = default)
     {
@@ -434,13 +451,25 @@ public sealed partial class TcpMessageStream : IIggyClient
             _consensusSession.Generation);
     }
 
-    /// <inheritdoc />
-    public async Task<IReadOnlyList<IReadOnlyList<uint>>> ReadinessGroupsAsync(Identifier streamId,
+    internal async Task<IReadOnlyList<IReadOnlyList<uint>>> ReadinessGroupsAsync(Identifier streamId,
         Identifier topicId, IReadOnlyList<uint> partitions, CancellationToken token = default)
     {
         ArgumentNullException.ThrowIfNull(partitions);
         return await ReadinessGroupsAsync(streamId, topicId, partitions, partition => partition,
             Environment.TickCount64 + VsrRequestTimeoutMs, token);
+    }
+
+    Task<FetchedMessages> IPartitionFetchClient.FetchMessagesAsync(Identifier streamId, Identifier topicId,
+        IReadOnlyList<(uint PartitionId, PollingStrategy Strategy)> targets, Consumer consumer, uint count,
+        bool autoCommit, DeferredPollOptions options, CancellationToken token)
+    {
+        return FetchMessagesAsync(streamId, topicId, targets, consumer, count, autoCommit, options, token);
+    }
+
+    Task<IReadOnlyList<IReadOnlyList<uint>>> IPartitionFetchClient.ReadinessGroupsAsync(Identifier streamId,
+        Identifier topicId, IReadOnlyList<uint> partitions, CancellationToken token)
+    {
+        return ReadinessGroupsAsync(streamId, topicId, partitions, token);
     }
 
     private Task<PolledMessagesRental> PollRentedAsync(Identifier streamId, Identifier topicId, uint? partitionId,
@@ -463,8 +492,14 @@ public sealed partial class TcpMessageStream : IIggyClient
                     "FetchMessagesAsync, one fetch per readiness group."));
         }
 
-        return PollPartitionMessagesRentedAsync(streamId, topicId, partitionId, consumer,
-            pollingStrategyFor(partitionId ?? 0), count, autoCommit, token, generation, options);
+        var strategy = pollingStrategyFor(partitionId ?? 0);
+        if (partitionId is { } partition)
+        {
+            strategy.ValidatePartition(partition);
+        }
+
+        return PollPartitionMessagesRentedAsync(streamId, topicId, partitionId, consumer, strategy, count,
+            autoCommit, token, generation, options);
     }
 
     /// <inheritdoc />
@@ -482,6 +517,15 @@ public sealed partial class TcpMessageStream : IIggyClient
         var message = TcpContracts.UpdateOffset(streamId, topicId, consumer, offset, partitionId);
         using var response = await SendWithResponseAsync(CommandCodes.STORE_CONSUMER_OFFSET_CODE, message,
             token: token, capturedContext: context);
+    }
+
+    /// <inheritdoc />
+    public Task StoreConsumerPositionAsync(Consumer consumer, Identifier streamId, Identifier topicId,
+        Checkpoint checkpoint, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(checkpoint);
+        return StoreOffsetAsync(consumer, streamId, topicId, checkpoint.Offset, checkpoint.PartitionId,
+            checkpoint.Context, token);
     }
 
     /// <inheritdoc />
@@ -515,6 +559,14 @@ public sealed partial class TcpMessageStream : IIggyClient
         var message = TcpContracts.DeleteOffset(streamId, topicId, consumer, partitionId);
         using var response = await SendWithResponseAsync(CommandCodes.DELETE_CONSUMER_OFFSET_CODE, message,
             token: token, capturedContext: context);
+    }
+
+    /// <inheritdoc />
+    public Task DeleteConsumerPositionAsync(Consumer consumer, Identifier streamId, Identifier topicId,
+        Checkpoint checkpoint, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(checkpoint);
+        return DeleteOffsetAsync(consumer, streamId, topicId, checkpoint.PartitionId, checkpoint.Context, token);
     }
 
     /// <inheritdoc />
@@ -1107,7 +1159,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         var encryptor = _configuration.MessageEncryptor;
 
-        // With an encryptor this is an upper bound; the fill reports the size actually written and only that
+        // With an encryptor this is an upper bound. The fill reports the size actually written and only that
         // prefix is sent.
         var metadataLength = 2 + streamId.Length + 2 + topicId.Length
                              + 2 + partitioning.Length + 4 + 4;

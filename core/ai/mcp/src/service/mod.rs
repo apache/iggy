@@ -16,13 +16,13 @@
 // under the License.
 
 use iggy::prelude::{
-    Client, ClusterClient, CompressionAlgorithm, Consumer, ConsumerGroupClient,
+    Client, ClusterClient, CommitPolicy, CompressionAlgorithm, Consumer, ConsumerGroupClient,
     ConsumerOffsetClient, Identifier, IggyClient, IggyError, IggyExpiry, IggyMessage,
     IggyTimestamp, MaxTopicSize, MessageClient, OptionKey, PartitionClient, Partitioning,
     PersonalAccessTokenClient, PollOptions, PollingKind, PollingStrategy, SegmentClient,
-    ServerCommitPolicy, StreamClient, StreamCreateOptions, StreamUpdateOptions, SystemClient,
-    SystemSnapshotType, TopicClient, TopicCreateOptions, TopicUpdateOptions, UserClient,
-    UserCreateOptions, UserStatus, UserUpdateOptions,
+    StreamClient, StreamCreateOptions, StreamUpdateOptions, SystemClient, SystemSnapshotType,
+    TopicClient, TopicCreateOptions, TopicUpdateOptions, UserClient, UserCreateOptions, UserStatus,
+    UserUpdateOptions,
 };
 use requests::*;
 use rmcp::{
@@ -320,11 +320,11 @@ impl IggyService {
             PollingStrategy::offset(offset)
         };
         let auto_commit = auto_commit.unwrap_or(false) || strategy.kind == PollingKind::Next;
-        let server_commit = if auto_commit {
+        let commit = if auto_commit {
             self.permissions.ensure_update()?;
-            ServerCommitPolicy::OnRead
+            CommitPolicy::OnRead
         } else {
-            ServerCommitPolicy::Disabled
+            CommitPolicy::Manual
         };
 
         request(
@@ -337,7 +337,7 @@ impl IggyService {
                     &strategy,
                     PollOptions {
                         count,
-                        server_commit,
+                        commit,
                         ..PollOptions::default()
                     },
                 )

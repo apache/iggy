@@ -21,8 +21,9 @@ from datetime import timedelta
 from typing import NamedTuple
 
 from apache_iggy import (
-    ClientCommitPolicy,
-    CommitEvent,
+    AutoCommit,
+    CommitEvery,
+    CommitPolicy,
     IggyClient,
     PollingStrategy,
     PollOptions,
@@ -68,8 +69,12 @@ async def main() -> None:
         STREAM_NAME,
         TOPIC_NAME,
         polling_strategy=PollingStrategy.First(),
-        poll_options=PollOptions(count=100, max_wait=timedelta(seconds=1)),
-        client_commit=ClientCommitPolicy(on=CommitEvent.EachMessage()),
+        # Stores the offset of each message once its handler returns.
+        poll_options=PollOptions(
+            count=100,
+            max_wait=timedelta(seconds=1),
+            commit=CommitPolicy.Auto(AutoCommit(every=CommitEvery.Message())),
+        ),
     )
 
     shutdown_event = asyncio.Event()

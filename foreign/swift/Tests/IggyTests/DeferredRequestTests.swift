@@ -41,36 +41,44 @@ private func polledPartition(_ request: FakeVSRServer.Request) -> UInt32 {
     UInt32(littleEndianBytes: request.payload[20..<24])
 }
 
-/// A coordinator, replica 0, and primaries where replica `n` is the primary
-/// of partition `n`.
+/// A coordinator, replica 0, and primaries where replica `placement(n)` is
+/// the primary of partition `n`, by default replica `n`.
 private struct Cluster {
     let coordinator: FakeVSRServer
     let primaries: [FakeVSRServer]
+    let placement: @Sendable (UInt32) -> UInt8
 
-    static func started(primaries count: Int) async throws -> Cluster {
+    static func started(primaries count: Int, placement: @escaping @Sendable (UInt32) -> UInt8 = { UInt8($0) }) async throws -> Cluster {
         let coordinator = try await FakeVSRServer.started()
         var primaries: [FakeVSRServer] = []
         for _ in 0..<count {
             primaries.append(try await FakeVSRServer.started())
         }
-        let cluster = Cluster(coordinator: coordinator, primaries: primaries)
+        let cluster = Cluster(coordinator: coordinator, primaries: primaries, placement: placement)
         for server in [coordinator] + primaries {
             await cluster.respond(on: server) { FakeVSRServer.defaultReply($0, address: server.address) }
         }
         return cluster
     }
 
-    /// Answers a roster read and a route lookup as every replica of the
-    /// cluster does, and anything else with `reply`.
+    /// Answers a roster read, a route lookup, and a fetch with a target of
+    /// another primary as every replica of the cluster does, and anything
+    /// else with `reply`.
     func respond(on server: FakeVSRServer, _ reply: @escaping FakeVSRServer.Responder) async {
-        let roster = FakeVSRServer.rosterBody([coordinator.address] + primaries.map(\.address))
+        let replicas = [coordinator] + primaries
+        let roster = FakeVSRServer.rosterBody(replicas.map(\.address))
+        let replica = UInt8(replicas.firstIndex { $0 === server } ?? 0)
+        let placement = placement
         await server.respond { request in
+            if let refusal = FakeVSRServer.notPrimaryRefusal(request, replica: replica, primary: placement) {
+                return refusal
+            }
             switch request.code.flatMap(CommandCode.init(rawValue:)) {
             case .getClusterMetadata:
                 return .ok(roster)
             case .getPartitionRoute:
                 let partition = UInt32(littleEndianBytes: request.payload.suffix(4))
-                return .ok(FakeVSRServer.partitionRouteBody(FakeVSRServer.routeContext, primaryReplica: UInt8(partition)))
+                return .ok(FakeVSRServer.partitionRouteBody(FakeVSRServer.routeContext, primaryReplica: placement(partition)))
             default:
                 return await reply(request)
             }
@@ -289,28 +297,67 @@ struct DeferredRequestTests {
         }
     }
 
-    /// The server stores the messages of a fetch with auto-commit as
-    /// consumed, so its cancelled caller waits for the reply, and the server
-    /// gets no cancellation.
-    @Test func aFetchThatCommitsIsNotCancelledWithItsCaller() async throws {
-        let server = try await FakeVSRServer.started()
-        defer { Task { await server.stop() } }
-        await server.respond { request in
-            guard request.code == CommandCode.fetchMessages.rawValue else {
-                return FakeVSRServer.defaultReply(request, address: server.address)
+    /// A committing request answers its cancellation once: with
+    /// `transientNotAccepted` when the cancellation won and nothing was
+    /// stored, with its messages when its read committed first. So its
+    /// cancelled caller waits for that reply, gets the messages the server
+    /// stored, and the connection stays in step.
+    @Test(arguments: [CommandCode.pollMessagesDeferred, .fetchMessages])
+    func aCancelledCommittingReadWaitsForItsOneReply(code: CommandCode) async throws {
+        for cancellationWins in [true, false] {
+            let server = try await FakeVSRServer.started()
+            let cancelled = Locked(false)
+            let answered = Locked(false)
+            await server.respond { request in
+                switch request.code {
+                case CommandCode.cancelDeferredRequest.rawValue:
+                    cancelled.withLock { $0 = true }
+                    return .stall
+                case code.rawValue where !answered.exchange(true):
+                    _ = await eventually { cancelled.withLock { $0 } }
+                    if cancellationWins {
+                        return .status(IggyErrorCode.transientNotAccepted.rawValue)
+                    }
+                    if code == .fetchMessages {
+                        return .ok(FakeVSRServer.fetchedBody([.init(partitionID: 1, offsets: [3])]))
+                    }
+                    return .ok(FakeVSRServer.polledBody(partitionID: 1, offsets: [3]))
+                default:
+                    return FakeVSRServer.defaultReply(request, address: server.address)
+                }
             }
-            try? await Task.sleep(for: .milliseconds(300))
-            return .ok(FakeVSRServer.fetchedBody([.init(partitionID: 1, offsets: [3])]))
+            let client = try await signedInClient(server)
+            let read = { @Sendable () async throws -> [UInt64] in
+                switch code {
+                case .fetchMessages:
+                    let sections = try await client.fetchMessages(
+                        streamID: 1, topicID: 2, targets: [(1, .next)], count: 10, autoCommit: true, options: Self.parkingOptions)
+                    return try sections.flatMap { try $0.decode().messages.map(\.offset) }
+                default:
+                    let polled = try await client.pollMessages(
+                        streamID: 1, topicID: 2, partitionID: 1, strategy: .next, count: 10, autoCommit: true, options: Self.parkingOptions)
+                    return polled.messages.map(\.offset)
+                }
+            }
+            let cancelledRead = Task { try await read() }
+            #expect(await eventually { await requests(server, code).count == 1 })
+            cancelledRead.cancel()
+            if cancellationWins {
+                await #expect(throws: CancellationError.self, "\(code)") { try await cancelledRead.value }
+            } else {
+                #expect(try await cancelledRead.value == [3], "\(code)")
+            }
+            let request = try #require(await requests(server, code).first)
+            let cancellation = try #require(await requests(server, .cancelDeferredRequest).first)
+            #expect(cancellation.connection == request.connection && cancellation.requestID == request.requestID, "\(code)")
+
+            // The reply was read, so the connection is still in step.
+            _ = try await read()
+            let next = try #require(await requests(server, code).last)
+            #expect(next.connection == request.connection && next.requestID > request.requestID, "\(code)")
+            await client.shutdown()
+            await server.stop()
         }
-        let client = try await signedInClient(server)
-        let fetch = Task {
-            try await client.fetchMessages(streamID: 1, topicID: 2, targets: [(1, .next)], count: 10, autoCommit: true, options: Self.parkingOptions)
-        }
-        #expect(await eventually { await requests(server, .fetchMessages).count == 1 })
-        fetch.cancel()
-        #expect(try await fetch.value.map(\.partitionID) == [1])
-        #expect(await requests(server, .cancelDeferredRequest).isEmpty)
-        await client.shutdown()
     }
 
     /// The server can answer a poll before the cancellation reaches it. That
@@ -362,10 +409,14 @@ struct DeferredRequestTests {
             _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 1, strategy: .next, count: 1, autoCommit: true, options: options)
         }
         #expect(await requests(server, .pollMessagesDeferred).count == 1)
-        await expectCode(.fetchProgressUncertain) {
+        await expectCode(.transientNotCommitted) {
             _ = try await client.fetchMessages(streamID: 1, topicID: 2, targets: [(1, .next)], count: 1, autoCommit: true, options: options)
         }
         #expect(await requests(server, .fetchMessages).count == 1)
+        // The unknown outcome blocks nothing: a reader repairs it by reading
+        // again after the stored offset.
+        try await client.storeConsumerOffset(streamID: 1, topicID: 2, partitionID: 1, offset: 7)
+        _ = try await client.fetchMessages(streamID: 1, topicID: 2, targets: [(1, .next)], count: 1, autoCommit: true, options: options)
         await client.shutdown()
     }
 
@@ -458,232 +509,6 @@ struct DeferredRequestTests {
     }
 
     // MARK: Fetches
-
-    @Test(arguments: [false, true])
-    func anUnknownLiveFetchBlocksEveryTargetUntilExplicitAbandon(cancelled: Bool) async throws {
-        let server = try await FakeVSRServer.started()
-        let finishOldRead = AsyncSemaphore(permits: 0)
-        let oldReadCompleted = Locked(false)
-        defer {
-            finishOldRead.release(1)
-            Task { await server.stop() }
-        }
-        await server.respond { request in
-            if request.code == CommandCode.fetchMessages.rawValue, (try? request.fetch.autoCommit) == true {
-                _ = try? await finishOldRead.acquire(1)
-                _ = oldReadCompleted.exchange(true)
-            }
-            return FakeVSRServer.defaultReply(request, address: server.address)
-        }
-        let client = try await signedInClient(server)
-        let fetch = Task {
-            try await client.fetchMessages(
-                streamID: 1, topicID: 2, targets: [(2, .next), (1, .next)], count: 1, autoCommit: true,
-                options: DeferredPollOptions(maxWait: .zero, requestTimeout: .seconds(2)))
-        }
-        #expect(await eventually { await requests(server, .fetchMessages).count == 1 })
-        let routesBeforeStore = await requests(server, .getPartitionRoute).count
-        let queuedStore = Task { try await client.storeConsumerOffset(streamID: "stream", topicID: "topic", partitionID: 1, offset: 7) }
-        defer { queuedStore.cancel() }
-        #expect(await eventually { await requests(server, .getPartitionRoute).count > routesBeforeStore })
-        if cancelled { fetch.cancel() }
-        let failure = try await reportedError { _ = try await fetch.value }
-        #expect(failure.code == .fetchProgressUncertain)
-        let operationID = try #require(failure.operationID)
-        let queuedFailure = try await reportedError { try await queuedStore.value }
-        #expect(queuedFailure.code == .partitionLaneBlocked && queuedFailure.operationID == operationID && queuedFailure.partitionID == 1)
-        #expect(!oldReadCompleted.withLock { $0 })
-        #expect(await requests(server, .cancelDeferredRequest).isEmpty)
-
-        for partitionID: UInt32 in [1, 2] {
-            let blocked = try await reportedError {
-                try await client.storeConsumerOffset(streamID: "stream", topicID: "topic", partitionID: partitionID, offset: 7)
-            }
-            #expect(blocked.code == .partitionLaneBlocked)
-            #expect(blocked.partitionID == partitionID && blocked.operationID == operationID)
-        }
-        _ = try await client.getConsumerOffset(streamID: 1, topicID: 2, partitionID: 1)
-        _ = try await client.fetchMessages(
-            streamID: 1, topicID: 2, targets: [(1, .offset(0))], count: 1, autoCommit: false, options: Self.parkingOptions)
-        let sentFetches = await requests(server, .fetchMessages)
-        #expect(sentFetches.count == 2 && sentFetches[0].connection != sentFetches[1].connection)
-        let afterReconnect = try await reportedError { try await client.deleteConsumerOffset(streamID: 1, topicID: 2, partitionID: 2) }
-        #expect(afterReconnect.operationID == operationID)
-        try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["independent"])
-        try await client.storeConsumerOffset(streamID: 1, topicID: 2, partitionID: 3, offset: 5)
-        #expect(await requests(server, .storeConsumerOffset).map(polledPartition) == [3])
-        #expect(!oldReadCompleted.withLock { $0 })
-
-        // Replacing the session must not treat the old data connection as fenced.
-        _ = try await client.login(username: "iggy", password: "iggy")
-        let afterLogin = try await reportedError { try await client.deleteConsumerOffset(streamID: 1, topicID: 2, partitionID: 1) }
-        #expect(afterLogin.code == .partitionLaneBlocked && afterLogin.operationID == operationID)
-        let beforeAbandon = await server.requests.count
-        try client.abandonOperation(operationID)
-        #expect(await server.requests.count == beforeAbandon)
-        try await client.storeConsumerOffset(streamID: 1, topicID: 2, partitionID: 1, offset: 9)
-        #expect(await requests(server, .storeConsumerOffset).map(polledPartition) == [3, 1])
-        #expect(await requests(server, .fetchMessages).count == 2)
-        #expect(!oldReadCompleted.withLock { $0 })
-        await expectCode(.operationNotRetained) { try client.abandonOperation(operationID) }
-        finishOldRead.release(1)
-        #expect(await eventually { oldReadCompleted.withLock { $0 } })
-        await client.shutdown()
-    }
-
-    @Test func aPartialUnknownFetchKeepsHealthySectionsAndItsRawBytes() async throws {
-        let server = try await FakeVSRServer.started()
-        defer { Task { await server.stop() } }
-        let body = FakeVSRServer.fetchedBody([
-            .init(partitionID: 1, offsets: [3, 4]), .init(partitionID: 2, status: IggyErrorCode.transientNotCommitted.rawValue),
-            .init(partitionID: 3, status: IggyErrorCode.requestAlreadyApplied.rawValue),
-        ])
-        await server.respond { request in
-            request.code == CommandCode.fetchMessages.rawValue ? .ok(body) : FakeVSRServer.defaultReply(request, address: server.address)
-        }
-        let client = try await signedInClient(server)
-        let targets: [(partitionID: UInt32, strategy: PollingStrategy)] = [(1, .next), (2, .next), (3, .next), (4, .next)]
-        let sections = try await client.fetchMessages(
-            streamID: 1, topicID: 2, targets: targets, count: 10, autoCommit: true, options: Self.parkingOptions)
-        #expect(try sections[0].decode().messages.map(\.offset) == [3, 4])
-        let operationID = try #require(sections[1].error?.operationID)
-        #expect(sections[1].error?.code == .fetchProgressUncertain && sections[1].error?.partitionID == 2)
-        #expect(sections[2].error?.operationID == operationID && sections[2].error?.partitionID == 3)
-        try await client.storeConsumerOffset(streamID: 1, topicID: 2, partitionID: 1, offset: 4)
-        try await client.storeConsumerOffset(streamID: 1, topicID: 2, partitionID: 4, offset: 0)
-        let blocked = try await reportedError { try await client.deleteConsumerOffset(streamID: 1, topicID: 2, partitionID: 3) }
-        #expect(blocked.operationID == operationID)
-        try client.abandonOperation(operationID)
-
-        let raw = try Requests.fetchMessages(
-            consumer: .default, streamID: 1, topicID: 2,
-            targets: targets.map { .init(partitionID: $0.partitionID, strategy: $0.strategy, maxBytes: Self.parkingOptions.maxBytes, fence: .empty) },
-            count: 10, autoCommit: true, options: Self.parkingOptions)
-        #expect(try await client.sendRawRequest(code: CommandCode.fetchMessages.rawValue, payload: raw) == body)
-        let rawBlocked = try await reportedError { try await client.storeConsumerOffset(streamID: 1, topicID: 2, partitionID: 2, offset: 0) }
-        let rawID = try #require(rawBlocked.operationID)
-        #expect(rawID != operationID && rawBlocked.partitionID == 2)
-        try client.abandonOperation(rawID)
-        await client.shutdown()
-    }
-
-    @Test func retainedFetchCapacityIsReservedBeforeSendAndFreedOnlyByRecovery() async throws {
-        let server = try await FakeVSRServer.started()
-        defer { Task { await server.stop() } }
-        await server.respond { request in
-            request.code == CommandCode.fetchMessages.rawValue
-                ? .status(IggyErrorCode.transientNotCommitted.rawValue) : FakeVSRServer.defaultReply(request, address: server.address)
-        }
-        let client = try await signedInClient(server)
-        var operations: [UInt128Value] = []
-        for partition in 0..<PollRouter.maxDeferredRequests {
-            let failure = try await reportedError {
-                _ = try await client.fetchMessages(
-                    streamID: 1, topicID: 2, targets: [(UInt32(partition), .next)], count: 1, autoCommit: true, options: Self.parkingOptions)
-            }
-            #expect(failure.code == .fetchProgressUncertain)
-            operations.append(try #require(failure.operationID))
-        }
-        #expect(Set(operations).count == PollRouter.maxDeferredRequests)
-        let recreated = PartitionContext(incarnation: FakeVSRServer.routeContext.incarnation + 1, ownerGeneration: 0, metadataOp: 0)
-        try await client.storeConsumerPosition(streamID: 1, topicID: 2, position: .init(partitionID: 0, offset: 0, context: recreated))
-        let oldHistory = try await reportedError { try await client.storeConsumerOffset(streamID: 1, topicID: 2, partitionID: 0, offset: 0) }
-        #expect(oldHistory.operationID == operations.first)
-        let extraPartition = UInt32(PollRouter.maxDeferredRequests)
-        await expectCode(.transientNotAccepted) {
-            _ = try await client.fetchMessages(
-                streamID: 1, topicID: 2, targets: [(extraPartition, .next)], count: 1, autoCommit: true, options: Self.parkingOptions)
-        }
-        #expect(await requests(server, .fetchMessages).count == PollRouter.maxDeferredRequests)
-        await expectCode(.transientNotCommitted) {
-            _ = try await client.fetchMessages(
-                streamID: 1, topicID: 2, targets: [(extraPartition, .next)], count: 1, autoCommit: false, options: Self.parkingOptions)
-        }
-        try await client.storeConsumerOffset(streamID: 1, topicID: 2, partitionID: extraPartition, offset: 0)
-        let old = operations.removeFirst()
-        try client.abandonOperation(old)
-        let next = try await reportedError {
-            _ = try await client.fetchMessages(
-                streamID: 1, topicID: 2, targets: [(extraPartition, .next)], count: 1, autoCommit: true, options: Self.parkingOptions)
-        }
-        let nextID = try #require(next.operationID)
-        #expect(next.code == .fetchProgressUncertain && nextID != old && !operations.contains(nextID))
-        operations.append(nextID)
-        for operation in operations { try client.abandonOperation(operation) }
-        try await client.storeConsumerOffset(streamID: 1, topicID: 2, partitionID: extraPartition, offset: 1)
-        await client.shutdown()
-    }
-
-    @Test(arguments: [IggyErrorCode.transientNotCommitted, .requestAlreadyApplied, .invalidCommand, .unauthenticated, .unauthorized, .invalidSizeBytes])
-    func aPossiblyAppliedWholeRefusalIsRetainedWithoutRetry(_ code: IggyErrorCode) async throws {
-        let server = try await FakeVSRServer.started()
-        defer { Task { await server.stop() } }
-        await server.respond { request in
-            request.code == CommandCode.fetchMessages.rawValue ? .status(code.rawValue) : FakeVSRServer.defaultReply(request, address: server.address)
-        }
-        let client = try await signedInClient(server)
-        let failure = try await reportedError {
-            _ = try await client.fetchMessages(
-                streamID: 1, topicID: 2, targets: [(1, .next), (2, .next)], count: 1, autoCommit: true, options: Self.parkingOptions)
-        }
-        #expect(failure.code == .fetchProgressUncertain)
-        #expect(await requests(server, .fetchMessages).count == 1)
-        let operationID = try #require(failure.operationID)
-        let blocked = try await reportedError { try await client.deleteConsumerOffset(streamID: 1, topicID: 2, partitionID: 2) }
-        #expect(blocked.operationID == operationID)
-        try client.abandonOperation(operationID)
-        await client.shutdown()
-    }
-
-    @Test func malformedFetchTablesBlockProgressButBadRecordsAndDefiniteRefusalsDoNot() async throws {
-        let server = try await FakeVSRServer.started()
-        defer { Task { await server.stop() } }
-        let responses: [FakeVSRServer.Reply] = [
-            .ok([1, 0, 0, 0]),
-            .ok(FakeVSRServer.fetchedBody([.init(partitionID: 1), .init(partitionID: 1)])),
-            .ok(FakeVSRServer.fetchedBody([.init(partitionID: 3)])),
-            .ok(FakeVSRServer.fetchedBody([.init(partitionID: 1, offsets: [3, 4], records: [0])])),
-            .status(IggyErrorCode.notPrimary.rawValue),
-            .ok(FakeVSRServer.fetchedBody([.init(partitionID: 2, status: IggyErrorCode.invalidSizeBytes.rawValue)])),
-            .ok(FakeVSRServer.fetchedBody([.init(partitionID: 2, status: IggyErrorCode.transientNotAccepted.rawValue)])),
-        ]
-        let index = Locked(0)
-        await server.respond { request in
-            guard request.code == CommandCode.fetchMessages.rawValue else {
-                return FakeVSRServer.defaultReply(request, address: server.address)
-            }
-            return index.withLock { index in
-                defer { index += 1 }
-                return responses[min(index, responses.count - 1)]
-            }
-        }
-        let client = try await signedInClient(server)
-        let fetch = {
-            try await client.fetchMessages(
-                streamID: 1, topicID: 2, targets: [(1, .next), (2, .next)], count: 2, autoCommit: true, options: Self.parkingOptions)
-        }
-        for _ in 0..<3 {
-            let failure = try await reportedError { _ = try await fetch() }
-            #expect(failure.code == .fetchProgressUncertain)
-            let operationID = try #require(failure.operationID)
-            let blocked = try await reportedError { try await client.storeConsumerOffset(streamID: 1, topicID: 2, partitionID: 2, offset: 0) }
-            #expect(blocked.operationID == operationID)
-            try client.abandonOperation(operationID)
-        }
-        let records = try await fetch()
-        #expect(throws: IggyError.self) { try records[0].decode() }
-        try await client.storeConsumerOffset(streamID: 1, topicID: 2, partitionID: 1, offset: 2)
-        await expectCode(.notPrimary) { _ = try await fetch() }
-        try await client.storeConsumerOffset(streamID: 1, topicID: 2, partitionID: 2, offset: 0)
-        let oversized = try await fetch()
-        #expect(oversized[0].error?.code == .invalidSizeBytes && oversized[0].error?.operationID == nil)
-        try await client.storeConsumerOffset(streamID: 1, topicID: 2, partitionID: 2, offset: 0)
-        let partial = try await fetch()
-        #expect(partial[0].status == IggyErrorCode.transientNotAccepted.rawValue)
-        #expect(partial[0].error?.code == .fetchProgressUncertain)
-        try client.abandonOperation(try #require(partial[0].error?.operationID))
-        await client.shutdown()
-    }
 
     @Test(arguments: [false, true], [false, true])
     func progressFetchesOrderEveryTargetAcrossAliasesAndRequestForms(raw: Bool, autoCommit: Bool) async throws {
@@ -898,7 +723,10 @@ struct DeferredRequestTests {
         let unfenced = PartitionContext(incarnation: 0, ownerGeneration: 6, metadataOp: 0)
         let options = DeferredPollOptions(maxWait: .milliseconds(500), minCount: 2, maxBytes: 4096, requestTimeout: .seconds(3))
         let sections = try await client.fetchMessages(
-            streamID: 1, topicID: 2, targets: [(2, .offset(5, context: carried)), (1, .next), (3, .offset(9, context: unfenced))], consumer: .group(3),
+            streamID: 1, topicID: 2,
+            targets: [
+                (2, PollingStrategy(kind: .offset, value: 5, context: carried)), (1, .next), (3, PollingStrategy(kind: .offset, value: 9, context: unfenced)),
+            ], consumer: .group(3),
             count: 10, autoCommit: true, options: options)
         #expect(sections.map(\.partitionID) == [2, 1])
         #expect(try sections[0].decode().messages.map(\.offset) == [5, 6])
@@ -1037,7 +865,8 @@ struct DeferredRequestTests {
     /// next grouping looks each of them up again, first on the primary of its
     /// route. A section refused so marks the route of its partition alone.
     @Test func aFetchRefusedAsNotPrimaryMarksItsRoutesMoved() async throws {
-        let cluster = try await Cluster.started(primaries: 2)
+        // Partition 3 shares the first primary with partition 1.
+        let cluster = try await Cluster.started(primaries: 2) { partition in partition == 3 ? 1 : UInt8(partition) }
         defer { Task { await cluster.stop() } }
         let (first, second) = (cluster.primaries[0], cluster.primaries[1])
         let refused = Locked(false)
@@ -1049,25 +878,25 @@ struct DeferredRequestTests {
                 return .status(IggyErrorCode.notPrimary.rawValue)
             }
             return .ok(
-                FakeVSRServer.fetchedBody([.init(partitionID: 1, offsets: [4]), .init(partitionID: 2, status: IggyErrorCode.notPrimary.rawValue)]))
+                FakeVSRServer.fetchedBody([.init(partitionID: 1, offsets: [4]), .init(partitionID: 3, status: IggyErrorCode.notPrimary.rawValue)]))
         }
         let client = try await signedInClient(cluster.coordinator)
-        let group = { try await client.readinessGroups(streamID: 1, topicID: 2, partitions: [2, 1]) }
+        let group = { try await client.readinessGroups(streamID: 1, topicID: 2, partitions: [3, 2, 1]) }
         let fetch = { (targets: [UInt32]) in
             try await client.fetchMessages(
                 streamID: 1, topicID: 2, targets: targets.map { ($0, .next) }, count: 10, autoCommit: false, options: Self.parkingOptions)
         }
-        #expect(try await group() == [[1], [2]])
+        #expect(try await group() == [[3, 1], [2]])
         await expectCode(.notPrimary) { _ = try await fetch([1]) }
         #expect(await requests(first, .fetchMessages).count == 1)
-        #expect(try await group() == [[1], [2]])
+        #expect(try await group() == [[3, 1], [2]])
         #expect(await requests(first, .getPartitionRoute).count == 1)
         #expect(await requests(second, .getPartitionRoute).isEmpty)
 
-        #expect(try await fetch([1, 2]).map(\.error) == [nil, IggyError(.notPrimary)])
-        #expect(try await group() == [[1], [2]])
-        #expect(await requests(first, .getPartitionRoute).count == 1)
-        #expect(await requests(second, .getPartitionRoute).count == 1)
+        #expect(try await fetch([1, 3]).map(\.error) == [nil, IggyError(.notPrimary)])
+        #expect(try await group() == [[3, 1], [2]])
+        #expect(await requests(first, .getPartitionRoute).count == 2)
+        #expect(await requests(second, .getPartitionRoute).isEmpty)
         await client.shutdown()
     }
 

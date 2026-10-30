@@ -20,11 +20,10 @@ using Apache.Iggy.IggyClient;
 namespace Apache.Iggy.Vsr;
 
 /// <summary>
-///     Exposes the partitions that the consumer-group member of a transport owns, so a group consumer can fetch them
-///     with <see cref="IIggyConsumer.FetchMessagesAsync" />. A consumer-group <see cref="Consumers.IggyConsumer" />
-///     over a client that does not implement it, such as HTTP, keeps the deferred group poll without a partition.
+///     Exposes the partitions that the consumer-group member of a transport owns, so a group reader can read them. A
+///     transport without it, such as HTTP, cannot serve a group reader.
 /// </summary>
-public interface IConsumerGroupAssignmentProvider
+internal interface IConsumerGroupAssignmentProvider
 {
     /// <summary>
     ///     The partitions the member owns, in assignment order, or an empty list while it owns none. The client asks

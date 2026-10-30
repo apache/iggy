@@ -33,7 +33,7 @@ namespace Apache.Iggy.Contracts;
 ///     <see cref="FetchedSection.DecodeRented" /> are slices of it, so the buffer goes back to the pool once the
 ///     reply and every such rental are disposed.
 /// </remarks>
-public sealed class FetchedMessages : IDisposable
+internal sealed class FetchedMessages : IDisposable
 {
     internal const int SECTIONS_COUNT_SIZE = sizeof(uint);
     internal const int SECTION_HEADER_SIZE = 56;
@@ -105,7 +105,7 @@ public sealed class FetchedMessages : IDisposable
 }
 
 /// <summary>What a fetch read from one target, or the status that refused it.</summary>
-public sealed class FetchedSection
+internal sealed class FetchedSection
 {
     private readonly IMessageEncryptor? _encryptor;
     private readonly FetchedMessages _reply;

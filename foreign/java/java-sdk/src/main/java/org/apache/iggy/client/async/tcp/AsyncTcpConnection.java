@@ -1156,9 +1156,7 @@ public class AsyncTcpConnection {
             long requestDeadlineNanos,
             TransientFailoverState failoverState) {
         try {
-            if (commandCode == CommandCode.Messages.FETCH_MESSAGES.getValue() && FetchMessages.commits(payload)) {
-                failoverState.ticket.reserveFetch();
-            }
+            CommittingRead.admit(failoverState.ticket, commandCode, payload);
             if (failoverState.ticket != null
                     && failoverState.ticket.prepareWrite(channel.isActive(), failoverState.lineage)) {
                 failoverState.renewRequestId();
@@ -1256,7 +1254,9 @@ public class AsyncTcpConnection {
         try {
             pending = handler.registerRequest(
                     channel, frame, attempt, exchange.requestDeadlineNanos(), exchange.commandCode());
-            if (exchange.commandCode() == CommandCode.Messages.FETCH_MESSAGES.getValue()) {
+            if (exchange.commandCode() == CommandCode.Messages.POLL_DEFERRED.getValue()) {
+                pending.limitResponseBody(FetchMessages.pollReplyLimit(frame));
+            } else if (exchange.commandCode() == CommandCode.Messages.FETCH_MESSAGES.getValue()) {
                 FetchMessages.configureResponse(pending, frame);
             }
         } catch (RuntimeException error) {
@@ -1267,13 +1267,12 @@ public class AsyncTcpConnection {
         if (exchange.failoverState().keepsLineage) {
             pending.keepLineage();
         }
-        attempt.whenComplete((response, error) ->
-                completeAttempt(exchange, frame, uncertain, pending, lifecycleRetryIntervalMs, response, error));
-        exchange.callerFuture().whenComplete((response, error) -> {
-            if (exchange.callerFuture().isCancelled()) {
-                attempt.cancel(false);
-            }
-        });
+        attempt.whenComplete(CommittingRead.settling(
+                exchange.failoverState().ticket,
+                (response, error) -> completeAttempt(
+                        exchange, frame, uncertain, pending, lifecycleRetryIntervalMs, response, error)));
+        exchange.callerFuture()
+                .whenComplete((response, error) -> CommittingRead.onCallerCancel(exchange, pending, attempt, channel));
         if (attempt.isDone()) {
             return;
         }
@@ -1351,7 +1350,9 @@ public class AsyncTcpConnection {
                         || PollRouter.isNamespaceMiss(error))) {
             exchange.failoverState().ticket.settleSent(nextUncertain);
         }
-        if (shouldRetryTransient(
+        boolean abandonedRead = CommittingRead.abandoned(exchange, error);
+        if (!abandonedRead
+                && shouldRetryTransient(
                         exchange.commandCode(),
                         error,
                         exchange.deadlineNanos(),
@@ -1377,6 +1378,7 @@ public class AsyncTcpConnection {
             }
         }
         if (!wasUncertain
+                && !abandonedRead
                 && !exchange.failoverState().routed
                 && scheduleLifecycleRetry(exchange, frame, serverError, nextUncertain, lifecycleRetryIntervalMs)) {
             return;

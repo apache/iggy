@@ -19,10 +19,11 @@ use bytes::Bytes;
 use cucumber::World;
 use iggy::clients::client::IggyClient;
 use iggy::prelude::{
-    IggyError, IggyMessage, MetadataChangeCursor, MetadataChangeGroup, MetadataChangeRecord,
-    MetadataCurrentItem, OptionSpec, PartitionReader, PolledMessages, ReadError,
+    IggyConsumer, IggyError, IggyMessage, MetadataChangeCursor, MetadataChangeGroup,
+    MetadataChangeRecord, MetadataCurrentItem, OptionSpec, PartitionReader, PolledMessages,
     StreamEncryptionKey,
 };
+use std::fmt;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -49,10 +50,21 @@ pub struct GlobalContext {
     pub last_change_groups: Vec<MetadataChangeGroup>,
     pub last_changes: Vec<MetadataChangeRecord>,
     pub last_current_items: Vec<MetadataCurrentItem>,
-    pub last_consumer_group_name: Option<String>,
     pub background_client: Option<Arc<IggyClient>>,
     pub deferred_poll_started: Option<Instant>,
     pub deferred_poll: Option<JoinHandle<Result<PolledMessages, IggyError>>>,
-    pub fetch: Option<JoinHandle<Result<PolledMessages, ReadError>>>,
-    pub group_reader: Option<PartitionReader>,
+    pub reader: Option<PartitionReader>,
+    pub consumer: Option<OpenConsumer>,
+}
+
+/// A consumer that a scenario opened, which the world prints by name only.
+pub struct OpenConsumer(pub IggyConsumer);
+
+impl fmt::Debug for OpenConsumer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("OpenConsumer")
+            .field(&self.0.name())
+            .finish()
+    }
 }

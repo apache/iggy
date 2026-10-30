@@ -20,7 +20,6 @@ using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Threading.Channels;
 using Apache.Iggy.Contracts;
-using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Utils;
 using Microsoft.Extensions.Logging;
@@ -28,7 +27,7 @@ using Microsoft.Extensions.Logging;
 namespace Apache.Iggy.Vsr;
 
 /// <summary>
-///     A bounded multiplexed connection. The writer owns frame boundaries; the reader correlates replies
+///     A bounded multiplexed connection. The writer owns frame boundaries. The reader correlates replies
 ///     by request id. Canceling one exchange never interrupts either task or another request. A canceled deferred
 ///     request that already went out is also canceled on the server, with a header-only frame that the server
 ///     never answers.
@@ -52,6 +51,7 @@ internal sealed class VsrConnection : IDisposable
         internal readonly UInt128 RequestChecksum = BinaryPrimitives.ReadUInt128LittleEndian(frame.AsSpan(VsrHeader.REQUEST_CHECKSUM_OFFSET));
         internal readonly ulong Incarnation = BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(VsrHeader.REQUEST_INCARNATION_OFFSET));
         internal bool Started;
+        internal bool CancelSent;
     }
 
     private readonly object _gate = new();
@@ -106,10 +106,15 @@ internal sealed class VsrConnection : IDisposable
         Reason: EvictionReason.NoSession or EvictionReason.StaleClient
     };
 
+    /// <summary>
+    ///     Sends a retained frame. <paramref name="serverCancellation" /> ends the request while it has not gone out.
+    ///     After that it only asks the server to cancel it and the request keeps its reply slot, because a read that
+    ///     commits answers once either way: refused when the cancel won, or with what it stored.
+    /// </summary>
     internal Task<VsrAttempt> SendFrameAsync(ClientOperation operation, long deadline, bool clearSensitiveReply,
-        CancellationToken token) =>
+        CancellationToken token, CancellationToken serverCancellation = default) =>
         ExchangeAsync(operation.Code, operation.Body, operation.Identity, operation.Context, deadline, clearSensitiveReply, token,
-            operation.Frame);
+            operation.Frame, serverCancellation);
 
     internal async ValueTask<VsrAttempt> SendAttemptAsync(int code, ReadOnlyMemory<byte> body,
         long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token,
@@ -167,15 +172,19 @@ internal sealed class VsrConnection : IDisposable
 
     private async Task<VsrAttempt> ExchangeAsync(int code, ReadOnlyMemory<byte> body, SessionFrame frame,
         PartitionContext context, long deadline, bool clearSensitiveReply, CancellationToken token,
-        SharedRequestFrame? owner = null)
+        SharedRequestFrame? owner = null, CancellationToken serverCancellation = default)
     {
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token, _lifetime.Token);
         cancellation.CancelAfter((int)Math.Clamp(deadline - Environment.TickCount64, 0, int.MaxValue));
+        using var unsent = serverCancellation.CanBeCanceled
+            ? CancellationTokenSource.CreateLinkedTokenSource(cancellation.Token, serverCancellation)
+            : null;
+        var sendToken = unsent?.Token ?? cancellation.Token;
         var admitted = false;
         PendingRequest? request = null;
         try
         {
-            await _pendingCapacity.WaitAsync(cancellation.Token);
+            await _pendingCapacity.WaitAsync(sendToken);
             admitted = true;
             var encoded = owner?.Bytes ?? new byte[checked(VsrHeader.HEADER_SIZE + body.Length)];
             if (owner is null)
@@ -203,9 +212,10 @@ internal sealed class VsrConnection : IDisposable
                 }
             }
             using var registration = cancellation.Token.Register(() => Cancel(request, token));
+            using var serverRegistration = serverCancellation.Register(() => CancelOnServer(request, serverCancellation));
             try
             {
-                await _writeSlots.WaitAsync(cancellation.Token);
+                await _writeSlots.WaitAsync(sendToken);
                 lock (_gate)
                 {
                     // Fail completes every pending request under this lock before it completes the channel, so an
@@ -228,7 +238,14 @@ internal sealed class VsrConnection : IDisposable
             }
             catch (OperationCanceledException)
             {
-                Cancel(request, token);
+                if (serverCancellation.IsCancellationRequested)
+                {
+                    CancelOnServer(request, serverCancellation);
+                }
+                else
+                {
+                    Cancel(request, token);
+                }
             }
             return await request.Completion.Task;
         }
@@ -244,7 +261,8 @@ internal sealed class VsrConnection : IDisposable
                     }
                 }
             }
-            if (error is OperationCanceledException && !token.IsCancellationRequested)
+            if (error is OperationCanceledException && !token.IsCancellationRequested
+                && !serverCancellation.IsCancellationRequested)
             {
                 error = _failure ?? new IOException($"Timed out after {_requestTimeoutMs} ms waiting for a consensus reply.");
             }
@@ -270,7 +288,7 @@ internal sealed class VsrConnection : IDisposable
             var error = token.IsCancellationRequested ? new OperationCanceledException(token)
                 : _failure ?? new IOException($"Timed out after {_requestTimeoutMs} ms waiting for a consensus reply.");
             if (request.Completion.TrySetResult(VsrAttempt.Failed(true, error, request.Started)) && request.Started
-                && CancelsOnServer(request))
+                && IsDeferred(request.Code) && !request.CancelSent)
             {
                 // A parked request would hold its server slot until its wait ends. A frame the writer skips gets
                 // the cancel too, and the server ignores a cancel for a request it does not hold.
@@ -286,14 +304,34 @@ internal sealed class VsrConnection : IDisposable
         }
     }
 
-    // A fetch that commits can commit before its cancel arrives, and the cancel would then drop the reply that
-    // carries the committed messages.
-    private static bool CancelsOnServer(PendingRequest request)
+    private void CancelOnServer(PendingRequest request, CancellationToken serverCancellation)
     {
-        return request.Code == CommandCodes.POLL_MESSAGES_DEFERRED_CODE
-               || request.Code == CommandCodes.FETCH_MESSAGES_CODE
-               && !TcpContracts.FetchAutoCommits(request.Frame.AsSpan(VsrHeader.HEADER_SIZE));
+        lock (_gate)
+        {
+            if (request.Completion.Task.IsCompleted || request.CancelSent)
+            {
+                return;
+            }
+            if (!request.Started)
+            {
+                if (_pending.TryGetValue(request.RequestId, out var active) && ReferenceEquals(active, request))
+                {
+                    _pending.Remove(request.RequestId);
+                }
+                request.Completion.TrySetResult(VsrAttempt.Failed(true,
+                    new OperationCanceledException(serverCancellation), false));
+                return;
+            }
+            if (IsDeferred(request.Code))
+            {
+                request.CancelSent = true;
+                _writes.Writer.TryWrite(DeferredCancellation(request));
+            }
+        }
     }
+
+    private static bool IsDeferred(int code) =>
+        code is CommandCodes.POLL_MESSAGES_DEFERRED_CODE or CommandCodes.FETCH_MESSAGES_CODE;
 
     private PendingRequest DeferredCancellation(PendingRequest request)
     {
@@ -553,7 +591,7 @@ internal sealed class VsrConnection : IDisposable
     }
 }
 
-/// <summary>A correlated attempt outcome; Committed is independent of a successful weak acknowledgement.</summary>
+/// <summary>A correlated attempt outcome. Committed is independent of a successful weak acknowledgement.</summary>
 internal readonly record struct VsrAttempt(
     bool Encoded,
     IMemoryOwner<byte>? Response,
@@ -568,7 +606,7 @@ internal readonly record struct VsrAttempt(
         new(encoded, null, error, requestStarted, error is IggyInvalidStatusCodeException { Committed: true });
 }
 
-/// <summary>Shared empty reply payload; disposes to nothing, so it is safe to hand out repeatedly.</summary>
+/// <summary>Shared empty reply payload. Disposes to nothing, so it is safe to hand out repeatedly.</summary>
 internal sealed class EmptyMemoryOwner : IMemoryOwner<byte>
 {
     public static readonly EmptyMemoryOwner Instance = new();

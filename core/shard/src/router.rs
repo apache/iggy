@@ -434,7 +434,7 @@ where
                     // a quiet shard until the next inbound frame's tail
                     // drain; parked partition frames then never re-dispatch.
                     self.apply_reconcile_ops();
-                    self.deferred_polls.maintenance();
+                    self.tick_deferred_polls();
                     self.sweep_readiness_watches();
                     consensus_tick.set(rearm_tick());
                     self.process_loopback(&mut loopback_buf).await;

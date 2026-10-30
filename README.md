@@ -472,17 +472,18 @@ let messages = vec![IggyMessage::from_str("Hello Apache Iggy")?];
 producer.send(messages).await?;
 
 // Create a consumer group member for the given stream and one of its topics.
-// It commits the last message that it handed over every second and after each batch.
+// It stores the last processed message every second and after each batch.
 let mut consumer = client
     .consumer_group("my_app", "dev01", "events")?
-    .client_commit(ClientCommitPolicy {
-        interval: Some(NonZeroIggyDuration::from_str("1s")?),
-        on: Some(CommitEvent::EachBatch),
-    })
     .create_consumer_group_if_not_exists()
     .polling_strategy(PollingStrategy::next())
     .poll_options(PollOptions {
         count: 1000,
+        commit: CommitPolicy::Auto(AutoCommit {
+            interval: Some(NonZeroIggyDuration::from_str("1s")?),
+            every: Some(CommitEvery::Batch),
+            after: CommitAfter::Processing,
+        }),
         ..PollOptions::wait(IggyDuration::from_str("1s")?)
     })
     .build();

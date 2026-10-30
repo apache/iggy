@@ -141,13 +141,14 @@ async fn create_auto_commit_consumer(client: &IggyClient) -> IggyConsumer {
         .unwrap()
         .poll_options(PollOptions {
             count: 10,
+            commit: CommitPolicy::Auto(AutoCommit {
+                interval: Some(NonZeroIggyDuration::from_str("1s").unwrap()),
+                every: Some(CommitEvery::Message),
+                after: CommitAfter::Delivery,
+            }),
             ..PollOptions::wait(IggyDuration::ONE_SECOND)
         })
         .polling_strategy(PollingStrategy::next())
-        .client_commit(ClientCommitPolicy {
-            interval: Some(NonZeroIggyDuration::from_str("1s").unwrap()),
-            on: Some(CommitEvent::EachMessage),
-        })
         .build();
 
     consumer.init().await.unwrap();

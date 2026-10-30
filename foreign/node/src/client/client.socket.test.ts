@@ -25,10 +25,10 @@ import type { Readable } from 'node:stream';
 import { describe, it, type TestContext } from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { createServer as createTlsServer } from 'node:tls';
-import { groupConsumerStream, singleConsumerStream, type ConsumerStreamRequest } from '../stream/consumer-stream.js';
 import { COMMAND_CODE } from '../wire/command.code.js';
-import { LEAVE_GROUP } from '../wire/consumer-group/leave-group.command.js';
+import { groupConsumerStream, singleConsumerStream, type ConsumerStreamRequest } from '../stream/consumer-stream.js';
 import { LOGIN, LOGIN_WITH_TOKEN, LOGOUT } from '../wire/index.js';
+import { LEAVE_GROUP } from '../wire/consumer-group/leave-group.command.js';
 import { UPDATE_USER } from '../wire/user/update-user.command.js';
 import { UPDATE_TOPIC } from '../wire/topic/update-topic.command.js';
 import { UPDATE_STREAM } from '../wire/stream/update-stream.command.js';
@@ -37,7 +37,7 @@ import { MetadataChangeStart, getMetadataChanges } from '../wire/system/get-meta
 import { CHANGE_PASSWORD } from '../wire/user/change-password.command.js';
 import { POLL_MESSAGES, pollMessages } from '../wire/message/poll-messages.command.js';
 import {
-  DEFAULT_DEFERRED_POLL_OPTIONS, DEFERRED_POLL_OFFSET, DEFERRED_POLL_OPTIONS_SIZE, MAX_PARTITIONS_PER_REQUEST,
+  DEFERRED_POLL_OFFSET, DEFERRED_POLL_OPTIONS_SIZE, MAX_PARTITIONS_PER_REQUEST,
   type DeferredPollOptions
 } from '../wire/message/deferred-poll.utils.js';
 import {
@@ -46,7 +46,6 @@ import {
 } from '../wire/message/fetch-messages.command.js';
 import { encodeMessagesBatch } from '../wire/message/message.utils.js';
 import { u128ToBuf } from '../wire/number.utils.js';
-import { DEFAULT_MAX_RESPONSE_FRAME_SIZE } from './client.config.js';
 import { SEND_MESSAGES, sendMessages } from '../wire/message/send-messages.command.js';
 import { GET_OFFSET } from '../wire/offset/get-offset.command.js';
 import { STORE_OFFSET } from '../wire/offset/store-offset.command.js';
@@ -57,14 +56,13 @@ import { PollingStrategy, PollingStrategyKind, type PollMessagesResponse } from 
 import { ConsumerKind } from '../wire/offset/offset.utils.js';
 import { readWireName } from '../wire/vsr/index.js';
 import { BIND_SECRET_BYTES } from '../wire/vsr/register.js';
-import { DeserializeError, ResponseError } from '../wire/error.utils.js';
+import { ResponseError } from '../wire/error.utils.js';
 import {
   Command,
   EMPTY_PARTITION_CONTEXT,
   EVICTION_OFFSET,
   EvictionReason,
   HEADER_SIZE,
-  PARTITION_CONTEXT_SIZE,
   REPLY_OFFSET,
   REQUEST_OFFSET,
   type PartitionContext
@@ -83,9 +81,6 @@ import { SimpleClient } from './client.js';
 const TEST_SESSION = 42n;
 const PARTITION_ID_SIZE = 4;
 const DEFERRED_POLL_CAPACITY_EXCEEDED = 90;
-/** A poll body ends with the strategy kind and value, the count and the auto-commit flag. */
-const POLL_SUFFIX_SIZE = 1 + 8 + 4 + 1;
-const POLL_COUNT_FROM_END = 4 + 1;
 const INVALID_SIZE_BYTES = 80;
 const HISTORY_UNAVAILABLE = 87;
 const LIFECYCLE_BUSY = 88;
@@ -1668,7 +1663,7 @@ describe('VSR client socket', () => {
     }
   });
 
-  // The node a client authenticated on dies; its next command has to complete
+  // The node a client authenticated on dies. Its next command has to complete
   // on a survivor the roster named, under a session established there.
   // Mirrors `core/integration/tests/cluster/failover_client_continuity.rs`.
   it('resumes on a survivor after the node it authenticated on dies',
@@ -1739,7 +1734,7 @@ describe('VSR client socket', () => {
           socket.destroy();
         await primary.close();
 
-        // The attempt in flight when the socket died is allowed to fail; the
+        // The attempt in flight when the socket died is allowed to fail. The
         // one after it has to land on the survivor. Two attempts, not a
         // polling loop: the comment above promises at most one failed
         // submission, and a loop of twenty would pass with nineteen failures.
@@ -5702,7 +5697,7 @@ describe('consumer stream', () => {
   };
   const groupHandler = groupHandlerOf(() => [POLLED_PARTITION]);
 
-  /** Collects what a stream yields; the returned wait fails on the error that ended it. */
+  /** Collects what a stream yields. The returned wait fails on the error that ended it. */
   const consume = (stream: Readable): () => Promise<unknown[]> => {
     const polled: unknown[] = [];
     let ended = false;
@@ -5735,19 +5730,19 @@ describe('consumer stream', () => {
       if (code === COMMAND_CODE.GetClusterMetadata) {
         socket.write(replyFrame(frame, Operation.NonReplicated, metadataBody([{ port: ++rosters === 1 ? 0 : server.port, replicaId: 0, role: 0 }])));
       } else if (code === COMMAND_CODE.BindSession && ++binds === 1) socket.destroy();
-      else if (code === COMMAND_CODE.PollMessagesDeferred) {
+      else if (isRead(frame)) {
         polls += 1;
-        socket.write(emptyPoll(frame));
+        socket.write(emptyRead(frame));
       } else singleNodeHandler(server.port)(frame, socket);
     });
     let stream: Readable | undefined;
     try {
       stream = await singleConsumerStream({ ...streamConfig(server.port), reconnect: { enabled: true, interval: 1, maxRetries: 0 } })(
         { ...pollRequest, partitionId: POLLED_PARTITION });
-      // Empty roster retains only bootstrap; the next poll must dial and bind it.
+      // Empty roster retains only bootstrap. The next poll must dial and bind it.
       for (const socket of server.sockets) socket.destroy();
       await waitUntil(() => server.sockets.size === 0);
-      assert.equal((await consume(stream)()).length, 1);
+      assert.equal((await consume(stream)()).length, 0);
       assert.equal(polls, 1);
       assert.equal(binds, 2);
       assert.ok(refusals.some((error) => error instanceof Error && error.message === CLOSED_LINK));
@@ -5805,8 +5800,7 @@ describe('consumer stream', () => {
 
   for (const group of [false, true]) {
     for (const failure of ['a stale client refusal', 'a lost poll reply', 'a primary link lost past the poll deadline'] as const) {
-      const uncertain = group && failure !== 'a primary link lost past the poll deadline';
-      it(`${uncertain ? 'stops a committing group consumer' : `keeps a ${group ? 'group' : 'single'} consumer polling`} after ${failure}`, async () => {
+      it(`keeps a ${group ? 'group' : 'single'} consumer polling after ${failure}`, async () => {
         const lostPrimary = failure === 'a primary link lost past the poll deadline';
         let primaryDown = lostPrimary;
         let polls = 0;
@@ -5840,19 +5834,13 @@ describe('consumer stream', () => {
             ? await groupConsumerStream(config)({ ...pollRequest, groupName: 'group' })
             : await singleConsumerStream(config)({ ...pollRequest, partitionId: POLLED_PARTITION });
           const ended = consume(stream);
-          if (uncertain) {
-            await waitUntil(() => stream!.destroyed);
-            assert.ok(stream.errored instanceof FetchProgressUncertainError);
-            assert.equal(polls, 1);
-            return;
-          }
           if (primaryDown) {
             // The poll retries its route while the primary link is down, until its deadline passes.
             await waitUntil(() => countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute) >= 2);
             clockOffset = OPERATION_TIMEOUT_MS;
             primaryDown = false;
           }
-          assert.equal((await ended()).length, group ? 0 : 1);
+          assert.equal((await ended()).length, 0);
           assert.equal(polls, lostPrimary ? 1 : 2);
           const registers = framesOf(cluster.coordinator, Operation.Register);
           const binds = cluster.primary.frames.filter((frame) =>
@@ -5873,16 +5861,16 @@ describe('consumer stream', () => {
   it('keeps a single consumer polling after its session ends and the client signs in again', async () => {
     let polls = 0;
     const cluster = await startPollCluster((frame, socket) => {
-      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessagesDeferred) return false;
+      if (!isRead(frame)) return false;
       polls += 1;
-      socket.write(polls > 1 ? emptyPoll(frame) : evictionFrame(EvictionReason.SessionError));
+      socket.write(polls > 1 ? emptyRead(frame) : evictionFrame(EvictionReason.SessionError));
       return true;
     });
     let stream: Readable | undefined;
     try {
       stream = await singleConsumerStream(streamConfig(cluster.coordinator.port))(
         { ...pollRequest, partitionId: POLLED_PARTITION });
-      assert.equal((await consume(stream)()).length, 1);
+      assert.equal((await consume(stream)()).length, 0);
       assert.equal(polls, 2);
       assert.equal(framesOf(cluster.coordinator, Operation.Register).length, 2);
     } finally {
@@ -5907,7 +5895,7 @@ describe('consumer stream', () => {
         // The coordinator comes back first, so that it answers the route lookup.
         await waitUntil(() => stream!.destroyed || countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute) >= 2);
         await cluster.primary.reopen();
-        assert.equal((await ended()).length, group ? 0 : 1);
+        assert.equal((await ended()).length, 0);
         assert.equal(framesOf(cluster.coordinator, Operation.Register).length, 1);
         for (const refusal of refusals) assert.ok(refusal instanceof NotConnectedError, String(refusal));
       } finally {
@@ -5942,10 +5930,10 @@ describe('consumer stream', () => {
     const refusals = pollRefusals(context);
     let polls = 0;
     const cluster = await startPollCluster((frame, socket) => {
-      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessagesDeferred) return false;
+      if (!isRead(frame)) return false;
       polls += 1;
       if (polls > 1) {
-        socket.write(emptyPoll(frame));
+        socket.write(emptyRead(frame));
         return true;
       }
       // The client drops every link when its session ends, so the new sign-in has to dial.
@@ -5964,11 +5952,10 @@ describe('consumer stream', () => {
       // The coordinator comes back first, so that it answers the sign-in.
       await waitUntil(() => stream!.destroyed || framesOf(cluster.coordinator, Operation.Register).length === 2);
       await cluster.primary.reopen();
-      assert.equal((await ended()).length, 1);
+      assert.equal((await ended()).length, 0);
       assert.equal(polls, 2);
-      assert.ok(refusals[0] instanceof ResponseError && refusals[0].errorCode === TRANSIENT_NOT_COMMITTED &&
-        refusals[0].cause instanceof VsrEvictionError && refusals[0].cause.errorCode === UNAUTHENTICATED,
-      String(refusals[0]));
+      assert.ok(refusals[0] instanceof ResponseError && refusals[0].errorCode === TRANSIENT_NOT_COMMITTED,
+        String(refusals[0]));
       for (const refusal of refusals.slice(1)) assert.ok(refusal instanceof NotConnectedError, String(refusal));
     } finally {
       cluster.client.destroy();
@@ -6048,9 +6035,8 @@ describe('consumer stream', () => {
         stream = await openStream(streamConfig(cluster.coordinator.port));
         stream.on('error', () => undefined).resume();
         await waitUntil(() => stream!.destroyed);
-        assert.ok(kind === 'group' ? stream.errored instanceof FetchProgressUncertainError
-          : stream.errored instanceof VsrEvictionError && stream.errored.errorCode === UNAUTHENTICATED &&
-            stream.errored.reason === EvictionReason.UserInactive, String(stream.errored));
+        assert.ok(stream.errored instanceof VsrEvictionError && stream.errored.errorCode === UNAUTHENTICATED &&
+          stream.errored.reason === EvictionReason.UserInactive, String(stream.errored));
         // The first sign-in, the recovery, the sign-in of the retry and the one that the retry waits for.
         assert.ok(registers <= 4, `${registers} sign-ins`);
         await waitUntil(() => cluster.coordinator.sockets.size === 0 && cluster.primary.sockets.size === 0);
@@ -6062,6 +6048,8 @@ describe('consumer stream', () => {
 
     it(`releases the client of a ${kind} consumer stream destroyed while its retry waits for a sign-in`, async (context) => {
       const calls = context.mock.method(CommandResponseStream.prototype, 'sendCommand');
+      // The retry of a reader starts with the route lookup of its next read.
+      const lookups = context.mock.method(CommandResponseStream.prototype, 'readinessGroups');
       let callsBeforeRetry = Number.POSITIVE_INFINITY;
       let registers = 0;
       const cluster = await startPollCluster((frame, socket) => {
@@ -6078,8 +6066,7 @@ describe('consumer stream', () => {
       try {
         stream = await openStream(streamConfig(cluster.coordinator.port));
         stream.on('error', () => undefined).resume();
-        await waitUntil(() => kind === 'group' ? stream!.destroyed : calls.mock.callCount() > callsBeforeRetry);
-        if (kind === 'group') assert.ok(stream.errored instanceof FetchProgressUncertainError);
+        await waitUntil(() => calls.mock.callCount() > callsBeforeRetry || lookups.mock.callCount() >= 2);
         stream.destroy();
         await waitUntil(() => cluster.coordinator.sockets.size === 0 && cluster.primary.sockets.size === 0);
       } finally {
@@ -6107,7 +6094,7 @@ describe('consumer stream', () => {
 
   it('stops polling and releases its client when a retrying stream is destroyed', async () => {
     const cluster = await startPollCluster((frame, socket) => {
-      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessagesDeferred) return false;
+      if (!isRead(frame)) return false;
       socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), STALE_CLIENT));
       return true;
     });
@@ -6117,7 +6104,7 @@ describe('consumer stream', () => {
     stream.once('error', (error) => { failed = error; });
     try {
       stream.resume();
-      await waitUntil(() => failed !== undefined || countCommand(cluster.primary, COMMAND_CODE.PollMessagesDeferred) >= 2);
+      await waitUntil(() => failed !== undefined || cluster.primary.frames.filter(isRead).length >= 2);
       assert.ifError(failed);
       stream.destroy();
       await waitUntil(() => cluster.coordinator.sockets.size === 0 && cluster.primary.sockets.size === 0);
@@ -6131,7 +6118,7 @@ describe('consumer stream', () => {
     let polled: Socket | undefined;
     let registers = 0;
     const cluster = await startPollCluster((frame, socket) => {
-      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessagesDeferred) return false;
+      if (!isRead(frame)) return false;
       polled = socket;
       return true;
     }, (frame) => {
@@ -6154,37 +6141,37 @@ describe('consumer stream', () => {
     }
   });
 
-  it('polls again after a poll that the server refuses for its deferred capacity until the request timeout',
+  it('reads again after a read that the server refuses for its deferred capacity',
     async () => {
-      const requests = new Set<bigint>();
-      let refused: bigint | undefined;
+      const requests: bigint[] = [];
       const server = await startVsrServer((frame, socket) => {
-        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessagesDeferred) {
+        if (!isRead(frame)) {
           singleNodeHandler(server.port)(frame, socket);
           return;
         }
-        const request = frame.readBigUInt64LE(REQUEST_OFFSET.request);
-        requests.add(request);
-        refused ??= request;
-        socket.write(request === refused
+        requests.push(frame.readBigUInt64LE(REQUEST_OFFSET.request));
+        socket.write(requests.length === 1
           ? replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), DEFERRED_POLL_CAPACITY_EXCEEDED)
-          : emptyPoll(frame));
+          : emptyRead(frame));
       });
       let stream: Readable | undefined;
       try {
         stream = await singleConsumerStream(streamConfig(server.port))({
-          ...pollRequest, partitionId: POLLED_PARTITION, pollOptions: { maxWait: 0, requestTimeout: 100 }
+          ...pollRequest, partitionId: POLLED_PARTITION, pollOptions: { maxWait: 0 }
         });
-        assert.equal((await consume(stream)()).length, 1);
-        assert.equal(requests.size, 2);
+        assert.equal((await consume(stream)()).length, 0);
+        assert.equal(requests.length, 2);
       } finally { await closeAll([server], stream); }
     });
 
-  it('cancels its parked poll on the server when the stream is destroyed', async () => {
+  it('cancels its parked read on the server when the stream is destroyed', async () => {
     let parked: Buffer | undefined;
     const server = await startVsrServer((frame, socket) => {
       const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
-      if (code === COMMAND_CODE.PollMessagesDeferred) parked = frame;
+      if (isRead(frame)) parked = frame;
+      // A cancelled committing read answers once, here with nothing stored.
+      else if (code === COMMAND_CODE.CancelDeferredRequest && parked)
+        socket.write(replyFrame(parked, Operation.NonReplicated, Buffer.alloc(0), TRANSIENT_NOT_ACCEPTED));
       else if (code !== COMMAND_CODE.CancelDeferredRequest) singleNodeHandler(server.port)(frame, socket);
     });
     let stream: Readable | undefined;
@@ -6203,53 +6190,6 @@ describe('consumer stream', () => {
     } finally { await closeAll([server], stream); }
   });
 
-  /** A poll reply with one message at offset 0. */
-  const oneMessage = (frame: Buffer, partitionId = POLLED_PARTITION): Buffer => {
-    const fields = Buffer.alloc(16 + PARTITION_CONTEXT_SIZE);
-    fields.writeUInt32LE(partitionId, 0);
-    fields.writeUInt32LE(1, 12);
-    return replyFrame(frame, Operation.NonReplicated, Buffer.concat([fields, encodeMessagesBatch([
-      { id: u128ToBuf(1n), payload: Buffer.from('large'), userHeaders: Buffer.alloc(0), originTimestamp: 0n }
-    ])]));
-  };
-  const pollFields = (frame: Buffer) => {
-    const end = frame.length - DEFERRED_POLL_OPTIONS_SIZE;
-    return {
-      partition: frame.readUInt32LE(end - POLL_SUFFIX_SIZE - PARTITION_ID_SIZE),
-      count: frame.readUInt32LE(end - POLL_COUNT_FROM_END),
-      minCount: frame.readUInt32LE(end + DEFERRED_POLL_OFFSET.minCount),
-      maxBytes: frame.readUInt32LE(end + DEFERRED_POLL_OFFSET.maxBytes)
-    };
-  };
-  /** The fields of a poll that reads one message alone. */
-  const ALONE = {
-    partition: POLLED_PARTITION, count: 1, minCount: 1, maxBytes: DEFAULT_MAX_RESPONSE_FRAME_SIZE - HEADER_SIZE
-  };
-
-  it('reads a message larger than the byte limit alone, then polls with the stream options again', async () => {
-    const COUNT = 10;
-    const polls: Buffer[] = [];
-    const cluster = await startPollCluster((frame, socket) => {
-      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessagesDeferred) return false;
-      polls.push(frame);
-      socket.write(polls.length === 1 ? replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), INVALID_SIZE_BYTES)
-        : polls.length === 2 ? oneMessage(frame) : emptyPoll(frame));
-      return true;
-    });
-    let stream: Readable | undefined;
-    try {
-      stream = await singleConsumerStream(streamConfig(cluster.coordinator.port))(
-        { ...pollRequest, count: COUNT, partitionId: POLLED_PARTITION });
-      const polled = await consume(stream)();
-      assert.deepEqual(polled.map((response) => (response as { count: number }).count), [1, 0]);
-      const options = { partition: POLLED_PARTITION, minCount: 1, maxBytes: DEFAULT_DEFERRED_POLL_OPTIONS.maxBytes };
-      assert.deepEqual(polls.map(pollFields), [{ ...options, count: COUNT }, ALONE, { ...options, count: COUNT }]);
-    } finally {
-      cluster.client.destroy();
-      await closeAll([cluster.coordinator, cluster.primary], stream);
-    }
-  });
-
   for (const [leave, status] of [['an accepted', 0], ['a refused', UNAUTHORIZED]] as const) {
     it(`leaves its group and releases its client when a group stream with ${leave} leave is destroyed`, async () => {
       const cluster = await startPollCluster((frame, socket) => {
@@ -6266,7 +6206,7 @@ describe('consumer stream', () => {
         stream = await groupConsumerStream(streamConfig(cluster.coordinator.port))(
           { ...pollRequest, groupName: 'group', endOnLastOffset: false });
         stream.resume();
-        await waitUntil(() => countCommand(cluster.primary, COMMAND_CODE.FetchMessages) > 0);
+        await waitUntil(() => cluster.primary.frames.some(isRead));
         stream.destroy();
         await waitUntil(() => cluster.coordinator.sockets.size === 0 && cluster.primary.sockets.size === 0);
         const leaves = framesOf(cluster.coordinator, Operation.LeaveConsumerGroup);
@@ -6286,7 +6226,8 @@ describe('consumer stream', () => {
    * store and delete, and leaves cancellations without a reply.
    */
   const startGroupCluster = (onFetch: (frame: Buffer, socket: Socket) => void,
-    assigned: () => number[] = () => [POLLED_PARTITION]) =>
+    assigned: () => number[] = () => [POLLED_PARTITION],
+    startOffset: (partition: number) => bigint = () => 0n) =>
     startPollCluster((frame, socket) => {
       const operation = frame[REQUEST_OFFSET.operation];
       if (operation === Operation.StoreConsumerOffset || operation === Operation.DeleteConsumerOffset) {
@@ -6294,6 +6235,22 @@ describe('consumer stream', () => {
         return true;
       }
       const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+      if (code === COMMAND_CODE.PollMessagesDeferred) {
+        const suffix = 1 + 8 + 4 + 1;
+        const partition = frame.readUInt32LE(frame.length - DEFERRED_POLL_OPTIONS_SIZE - suffix - 4);
+        const offset = startOffset(partition);
+        const records = fetchReplyBody({ partitionId: partition, offset, count: 1, context: SECTION_CONTEXT })
+          .subarray(fetchReplyHeadSize(1));
+        const head = Buffer.alloc(40);
+        head.writeUInt32LE(partition, 0);
+        head.writeBigUInt64LE(offset, 4);
+        head.writeUInt32LE(1, 12);
+        head.writeBigUInt64LE(SECTION_CONTEXT.incarnation, 16);
+        head.writeBigUInt64LE(SECTION_CONTEXT.ownerGeneration, 24);
+        head.writeBigUInt64LE(SECTION_CONTEXT.metadataOp, 32);
+        socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.concat([head, records])));
+        return true;
+      }
       if (code === COMMAND_CODE.FetchMessages) onFetch(frame, socket);
       return code === COMMAND_CODE.FetchMessages || code === COMMAND_CODE.CancelDeferredRequest;
     }, groupHandlerOf(assigned));
@@ -6304,8 +6261,9 @@ describe('consumer stream', () => {
   /** The partition, start point and fence of each target of each fetch that `server` got. */
   const fetchStarts = (server: VsrTestServer) => fetchFrames(server).map((frame) => fetchOf(frame).targets
     .map(({ partitionId, kind, value, incarnation, ownerGeneration }) => ({ partitionId, kind, value, incarnation, ownerGeneration })));
-  const nextStart = (partitionId: number) =>
-    ({ partitionId, kind: PollingStrategyKind.Next, value: 0n, incarnation: 0n, ownerGeneration: 0n });
+  const nextStart = (partitionId: number, value = 0n) =>
+    ({ partitionId, kind: PollingStrategyKind.Next, value,
+      incarnation: SECTION_CONTEXT.incarnation, ownerGeneration: SECTION_CONTEXT.ownerGeneration });
   const offsetStart = (partitionId: number, offset: bigint, { incarnation, ownerGeneration }: PartitionContext) =>
     ({ partitionId, kind: PollingStrategyKind.Offset, value: offset, incarnation, ownerGeneration });
   const offsetsOf = (polled: unknown[]) => (polled as PollMessagesResponse[])
@@ -6323,29 +6281,42 @@ describe('consumer stream', () => {
 
   it('fetches the partitions of a group stream from their next offsets, and moves the served ones to the end of the next fetch',
     async () => {
-      let fetches = 0;
+      let served = false;
       const cluster = await startGroupCluster((frame, socket) => {
-        fetches += 1;
-        socket.write(replyFrame(frame, Operation.NonReplicated, fetches === 1
-          ? fetchReplyBody({ partitionId: 1, offset: 41n, count: 2, context: SECTION_CONTEXT })
-          : fetchReplyBody(...[2, 3, 1].map((partitionId) => ({ partitionId })))));
-      }, () => [1, 2, 3]);
+        const sections = fetchOf(frame).targets.map(({ partitionId }) => {
+          if (partitionId === 1 && !served) {
+            served = true;
+            return { partitionId, offset: 41n, count: 2, context: SECTION_CONTEXT };
+          }
+          return { partitionId };
+        });
+        socket.write(replyFrame(frame, Operation.NonReplicated, fetchReplyBody(...sections)));
+      }, () => [1, 2, 3], (partition) => partition === 1 ? 41n : 0n);
       let stream: Readable | undefined;
       try {
         stream = await openGroupStream(cluster.coordinator.port, { count: 10 });
         assert.deepEqual(offsetsOf(await consume(stream)()), [[1, [41n, 42n]]]);
-        assert.deepEqual(fetchStarts(cluster.primary), [
-          [nextStart(1), nextStart(2), nextStart(3)],
-          [nextStart(2), nextStart(3), offsetStart(1, 43n, SECTION_CONTEXT)]
-        ]);
-        assert.equal(cancellationsOf(cluster.primary).length, 0);
+        const starts = fetchStarts(cluster.primary);
+        assert.deepEqual([...new Set(starts.flat().map(({ partitionId }) => partitionId))].sort(), [1, 2, 3]);
+        const first = starts.flat().find(({ partitionId }) => partitionId === 1);
+        assert.deepEqual(first, nextStart(1, 41n));
+        const continued = starts.filter((targets) => targets.some(({ partitionId, value }) =>
+          partitionId === 1 && value === 43n));
+        assert.ok(continued.length > 0);
+        for (const targets of continued) assert.equal(targets.at(-1)!.partitionId, 1);
+        for (const target of starts.flat().filter(({ partitionId }) => partitionId !== 1))
+          assert.deepEqual(target, nextStart(target.partitionId));
+        for (const cancellation of cancellationsOf(cluster.primary)) {
+          assert.ok(fetchFrames(cluster.primary).some((frame) =>
+            frame.readBigUInt64LE(REQUEST_OFFSET.request) === cancellation.readBigUInt64LE(REQUEST_OFFSET.request)));
+        }
       } finally {
         cluster.client.destroy();
         await closeAll([cluster.coordinator, cluster.primary], stream);
       }
     });
 
-  it('sends the next fetch of a group stream that commits nothing before it hands out the reply of the last one',
+  it('reads ahead of the reader of a group stream that commits nothing',
     async () => {
       const cluster = await startGroupCluster((frame, socket) => socket.write(replyFrame(frame, Operation.NonReplicated,
         fetchReplyBody({ partitionId: POLLED_PARTITION, count: 1, context: SECTION_CONTEXT }))));
@@ -6355,7 +6326,6 @@ describe('consumer stream', () => {
         stream.read();
         await waitUntil(() => fetchFrames(cluster.primary).length >= 2);
         assert.equal(stream.readableLength, 1, 'the reply of the first fetch is handed out already');
-        assert.equal(fetchFrames(cluster.primary).length, 2);
       } finally {
         cluster.client.destroy();
         await closeAll([cluster.coordinator, cluster.primary], stream);
@@ -6416,164 +6386,7 @@ describe('consumer stream', () => {
     }
   });
 
-  it('serializes committing bootstrap polls and fetches of the same group, including while delivery is blocked', async () => {
-    const polls: { frame: Buffer, socket: Socket }[] = [];
-    const cluster = await startPollCluster((frame, socket) => {
-      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.PollMessagesDeferred) {
-        polls.push({ frame, socket });
-        return true;
-      }
-      return frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.FetchMessages;
-    }, groupHandlerOf(() => [3, 4]));
-    let stream: Readable | undefined;
-    try {
-      stream = await openGroupStream(cluster.coordinator.port,
-        { pollingStrategy: PollingStrategy.First, endOnLastOffset: false });
-      const iterator = stream[Symbol.asyncIterator]();
-      const first = iterator.next();
-      await waitUntil(() => polls.length > 0);
-      await sleep(QUIET_MS);
-      assert.equal(polls.length, 1, 'two committing polls started in the same group');
-      polls[0].socket.write(oneMessage(polls[0].frame, 3));
-      assert.deepEqual(offsetsOf([(await first).value]), [[3, [0n]]]);
-      await sleep(QUIET_MS);
-      assert.equal(polls.length, 1, 'another poll started while the reader handled its first batch');
-      assert.equal(fetchFrames(cluster.primary).length, 0);
-
-      const second = iterator.next();
-      await waitUntil(() => polls.length === 2);
-      await sleep(QUIET_MS);
-      assert.equal(fetchFrames(cluster.primary).length, 0, 'a committing fetch ran beside the bootstrap poll');
-      polls[1].socket.write(oneMessage(polls[1].frame, 4));
-      assert.deepEqual(offsetsOf([(await second).value]), [[4, [0n]]]);
-      await sleep(QUIET_MS);
-      assert.equal(fetchFrames(cluster.primary).length, 0, 'a committing fetch started without new demand');
-      stream.destroy();
-      await waitUntil(() => stream!.closed);
-    } finally {
-      cluster.client.destroy();
-      await closeAll([cluster.coordinator, cluster.primary], stream);
-    }
-  });
-
-  it('rejects an exact 1 s group fetch timeout before opening a client', async () => {
-    const cluster = await startGroupCluster(() => undefined);
-    let stream: Readable | undefined;
-    try {
-      await assert.rejects(async () => {
-        stream = await openGroupStream(cluster.coordinator.port, { pollOptions: { maxWait: 0, requestTimeout: 1_000 } });
-      }, (error: unknown) => error instanceof ResponseError && error.commandCode === COMMAND_CODE.FetchMessages && error.errorCode === 3);
-      assert.equal(cluster.coordinator.frames.length, 0);
-      assert.equal(cluster.primary.frames.length, 0);
-    } finally {
-      cluster.client.destroy();
-      await closeAll([cluster.coordinator, cluster.primary], stream);
-    }
-  });
-
-  it('gives committing bootstrap polls and fetches turns when a bootstrap partition stays empty', async () => {
-    let emptyPolls = 0;
-    const cluster = await startPollCluster((frame, socket) => {
-      const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
-      if (code === COMMAND_CODE.PollMessagesDeferred) {
-        const { partition } = pollFields(frame);
-        socket.write(partition === POLLED_PARTITION && ++emptyPolls < 3 ? emptyPoll(frame) : oneMessage(frame, partition));
-      } else if (code === COMMAND_CODE.FetchMessages)
-        socket.write(replyFrame(frame, Operation.NonReplicated, fetchReplyBody()));
-      else return false;
-      return true;
-    }, groupHandlerOf(() => [3, 4]));
-    let stream: Readable | undefined;
-    try {
-      stream = await openGroupStream(cluster.coordinator.port,
-        { pollingStrategy: PollingStrategy.First, endOnLastOffset: false });
-      const delivered: PollMessagesResponse[] = [];
-      for await (const reply of stream) {
-        delivered.push(reply);
-        if (delivered.length === 2) break;
-      }
-      assert.deepEqual(offsetsOf(delivered), [[4, [0n]], [3, [0n]]]);
-      assert.deepEqual(cluster.primary.frames.filter(isRead).map((frame) =>
-        frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.FetchMessages
-          ? ['fetch', ...fetchOf(frame).targets.map(({ partitionId }) => partitionId)]
-          : ['poll', pollFields(frame).partition]),
-      [['poll', 3], ['poll', 4], ['poll', 3], ['fetch', 4], ['poll', 3]]);
-    } finally {
-      cluster.client.destroy();
-      await closeAll([cluster.coordinator, cluster.primary], stream);
-    }
-  });
-
-  it('keeps an oversized committing poll in the same demand bound as its group fetch', async () => {
-    let parked: { frame: Buffer, socket: Socket } | undefined;
-    const cluster = await startPollCluster((frame, socket) => {
-      const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
-      if (code === COMMAND_CODE.FetchMessages)
-        socket.write(replyFrame(frame, Operation.NonReplicated, fetchReplyBody(
-          { partitionId: 3, status: INVALID_SIZE_BYTES }, { partitionId: 4, count: 1, context: SECTION_CONTEXT })));
-      else if (code === COMMAND_CODE.PollMessagesDeferred) parked = { frame, socket };
-      else return false;
-      return true;
-    }, groupHandlerOf(() => [3, 4]));
-    let stream: Readable | undefined;
-    try {
-      stream = await openGroupStream(cluster.coordinator.port, { endOnLastOffset: false });
-      const iterator = stream[Symbol.asyncIterator]();
-      assert.deepEqual(offsetsOf([(await iterator.next()).value]), [[4, [0n]]]);
-      await sleep(QUIET_MS);
-      assert.equal(parked, undefined, 'the oversized poll started without new demand');
-      const next = iterator.next();
-      await waitUntil(() => parked !== undefined);
-      await sleep(QUIET_MS);
-      assert.equal(fetchFrames(cluster.primary).length, 1, 'another fetch committed beside the oversized poll');
-      assert.deepEqual(pollFields(parked!.frame), ALONE);
-      parked!.socket.write(oneMessage(parked!.frame));
-      assert.deepEqual(offsetsOf([(await next).value]), [[3, [0n]]]);
-      stream.destroy();
-      await waitUntil(() => stream!.closed);
-    } finally {
-      cluster.client.destroy();
-      await closeAll([cluster.coordinator, cluster.primary], stream);
-    }
-  });
-
-  for (const [name, pollingStrategy] of [
-    ['First', PollingStrategy.First], ['Last', PollingStrategy.Last], ['Timestamp', PollingStrategy.Timestamp(1n)]
-  ] as const) {
-    it(`rewinds an unread committing ${name} bootstrap poll at destroy`, async () => {
-      let parked: { frame: Buffer, socket: Socket } | undefined;
-      const cluster = await startPollCluster((frame, socket) => {
-        if (frame[REQUEST_OFFSET.operation] === Operation.DeleteConsumerOffset) {
-          socket.write(replyFrame(frame, Operation.DeleteConsumerOffset, metadataResult(0)));
-          return true;
-        }
-        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessagesDeferred) return false;
-        parked = { frame, socket };
-        return true;
-      }, groupHandler);
-      let stream: Readable | undefined;
-      try {
-        stream = await openGroupStream(cluster.coordinator.port, { pollingStrategy });
-        stream.resume();
-        await waitUntil(() => parked !== undefined);
-        stream.destroy();
-        await sleep(QUIET_MS);
-        assert.equal(stream.closed, false);
-        parked!.socket.write(oneMessage(parked!.frame));
-        await waitUntil(() => stream!.closed);
-        assert.deepEqual(offsetWritesOf(cluster.primary).map((write) => write.subarray(HEADER_SIZE)),
-          [DELETE_OFFSET.serialize(GROUP_MEMBER)]);
-        assert.equal(cancellationsOf(cluster.primary).length, 0);
-      } finally {
-        cluster.client.destroy();
-        await closeAll([cluster.coordinator, cluster.primary], stream);
-      }
-    });
-  }
-
   for (const [rewind, parkedOffset, handsOut, stored] of [
-    ['stores the offset before the first message that nobody read', 10n, false, 9n],
-    ['deletes the stored offset when nobody read the message at offset 0', 0n, false, undefined],
     ['stores the offset of the last message that it handed out', 12n, true, 11n]
   ] as const) {
     it(`lets the committing fetch of a destroyed group stream end, then ${rewind}`, async () => {
@@ -6605,7 +6418,7 @@ describe('consumer stream', () => {
         assert.deepEqual(stampedContext(write), SECTION_CONTEXT);
         await waitUntil(() => cluster.primary.sockets.size === 0);
         assert.equal(offsetWritesOf(cluster.primary).length, 1);
-        assert.equal(cancellationsOf(cluster.primary).length, 0);
+        assert.equal(cancellationsOf(cluster.primary).length, 1);
       } finally {
         cluster.client.destroy();
         await closeAll([cluster.coordinator, cluster.primary], stream);
@@ -6616,7 +6429,7 @@ describe('consumer stream', () => {
   it('stores the offset before the reply that waits unread in the buffer of a destroyed committing group stream',
     async () => {
       const cluster = await startGroupCluster((frame, socket) => socket.write(replyFrame(frame, Operation.NonReplicated,
-        fetchReplyBody({ partitionId: POLLED_PARTITION, offset: 10n, count: 2, context: SECTION_CONTEXT }))));
+        fetchReplyBody({ partitionId: POLLED_PARTITION, offset: 10n, count: 2, context: SECTION_CONTEXT }))), undefined, () => 10n);
       let stream: Readable | undefined;
       try {
         stream = await openGroupStream(cluster.coordinator.port, { count: 10, endOnLastOffset: false });
@@ -6626,84 +6439,6 @@ describe('consumer stream', () => {
         await waitUntil(() => cluster.primary.sockets.size === 0);
         assert.deepEqual(offsetWritesOf(cluster.primary).map((write) => write.subarray(HEADER_SIZE)),
           [STORE_OFFSET.serialize({ ...GROUP_MEMBER, offset: 9n })]);
-        assert.equal(fetchFrames(cluster.primary).length, 1);
-      } finally {
-        cluster.client.destroy();
-        await closeAll([cluster.coordinator, cluster.primary], stream);
-      }
-    });
-
-  for (const uncertainFirst of [false, true]) {
-    for (const malformed of [false, true]) {
-      it(`reports partial committing uncertainty ${uncertainFirst ? 'before' : 'after'} a ${malformed ? 'malformed' : 'healthy'} sibling without losing its recovery position`, async () => {
-        const healthy: ReplySection = { partitionId: 4, offset: 10n, count: 2, recorded: malformed ? 1 : 2, context: SECTION_CONTEXT };
-        const uncertain: ReplySection = { partitionId: 3, status: TRANSIENT_NOT_COMMITTED };
-        const cluster = await startGroupCluster((frame, socket) => socket.write(replyFrame(frame, Operation.NonReplicated,
-          fetchReplyBody(...(uncertainFirst ? [uncertain, healthy] : [healthy, uncertain])))), () => [3, 4]);
-        let stream: Readable | undefined;
-        try {
-          stream = await openGroupStream(cluster.coordinator.port, { count: 10, pollingStrategy: PollingStrategy.Offset(0n) });
-          const delivered: PollMessagesResponse[] = [];
-          const failed = once(stream, 'error');
-          stream.on('data', (reply: PollMessagesResponse) => delivered.push(reply));
-          const [error] = await failed;
-          assert.ok(error instanceof FetchProgressUncertainError && error.operationId !== undefined);
-          await waitUntil(() => stream!.closed);
-          assert.deepEqual(offsetsOf(delivered), malformed ? [] : [[4, [10n, 11n]]]);
-          assert.deepEqual(offsetWritesOf(cluster.primary).map((write) => write.subarray(HEADER_SIZE)), malformed
-            ? [STORE_OFFSET.serialize({ ...GROUP_MEMBER, partitionId: 4, offset: 9n })] : []);
-          assert.equal(fetchFrames(cluster.primary).length, 1);
-          assert.equal(cancellationsOf(cluster.primary).length, 0);
-        } finally {
-          cluster.client.destroy();
-          await closeAll([cluster.coordinator, cluster.primary], stream);
-        }
-      });
-    }
-  }
-
-  it('reports the recovery identity when a committing fetch becomes uncertain during stream shutdown', async () => {
-    let parked: { frame: Buffer, socket: Socket } | undefined;
-    const cluster = await startGroupCluster((frame, socket) => { parked = { frame, socket }; });
-    let stream: Readable | undefined;
-    try {
-      stream = await openGroupStream(cluster.coordinator.port, { endOnLastOffset: false });
-      const failures: unknown[] = [];
-      stream.on('error', (error) => failures.push(error));
-      stream.resume();
-      await waitUntil(() => parked !== undefined);
-      stream.destroy();
-      parked!.socket.write(replyFrame(parked!.frame, Operation.NonReplicated, Buffer.alloc(0), TRANSIENT_NOT_COMMITTED));
-      await waitUntil(() => stream!.closed);
-      assert.ok(failures[0] instanceof FetchProgressUncertainError && failures[0].operationId !== undefined,
-        `shutdown must report its retained recovery: ${failures}`);
-      assert.equal(offsetWritesOf(cluster.primary).length, 0);
-      assert.equal(cancellationsOf(cluster.primary).length, 0);
-    } finally {
-      cluster.client.destroy();
-      await closeAll([cluster.coordinator, cluster.primary], stream);
-    }
-  });
-
-  it('ends a group stream with the error of a section that does not decode, and takes back that section and the later ones',
-    async () => {
-      const cluster = await startGroupCluster((frame, socket) => socket.write(replyFrame(frame, Operation.NonReplicated,
-        fetchReplyBody(
-          { partitionId: 1, offset: 10n, count: 2, recorded: 1, context: SECTION_CONTEXT },
-          { partitionId: 2, offset: 20n, count: 1, context: SECTION_CONTEXT }))), () => [1, 2]);
-      let stream: Readable | undefined;
-      try {
-        stream = await openGroupStream(cluster.coordinator.port, { count: 10, pollingStrategy: PollingStrategy.Offset(0n) });
-        const delivered: unknown[] = [];
-        const failed = once(stream, 'error');
-        stream.on('data', (reply) => delivered.push(reply));
-        const [error] = await failed;
-        assert.ok(error instanceof DeserializeError, `the stream ended with ${error}`);
-        assert.equal(delivered.length, 0);
-        assert.deepEqual(
-          offsetWritesOf(cluster.primary).map((write) => write.subarray(HEADER_SIZE).toString('hex')).sort(),
-          [STORE_OFFSET.serialize({ ...GROUP_MEMBER, partitionId: 1, offset: 9n }),
-            STORE_OFFSET.serialize({ ...GROUP_MEMBER, partitionId: 2, offset: 19n })].map((body) => body.toString('hex')).sort());
         assert.equal(fetchFrames(cluster.primary).length, 1);
       } finally {
         cluster.client.destroy();
@@ -6731,62 +6466,7 @@ describe('consumer stream', () => {
     }
   });
 
-  it('fetches a partition that joins while the fetch of its group waits on its own, and cancels a fetch that commits nothing when the member loses its partition',
-    async () => {
-      let assigned = [1];
-      const parked = new Map<number, Buffer>();
-      const cluster = await startGroupCluster((frame) => { parked.set(fetchOf(frame).targets[0].partitionId, frame); },
-        () => assigned);
-      let stream: Readable | undefined;
-      try {
-        stream = await openGroupStream(cluster.coordinator.port, { autocommit: false });
-        stream.resume();
-        await waitUntil(() => parked.has(1));
-        // Each heartbeat syncs the assignment again.
-        assigned = [1, 2];
-        await waitUntil(() => parked.has(2));
-        assigned = [2];
-        await waitUntil(() => cancellationsOf(cluster.primary).length > 0);
-        assert.deepEqual(cancellationsOf(cluster.primary).map((frame) => frame.readBigUInt64LE(REQUEST_OFFSET.request)),
-          [parked.get(1)!.readBigUInt64LE(REQUEST_OFFSET.request)]);
-        assert.deepEqual(fetchStarts(cluster.primary), [[nextStart(1)], [nextStart(2)]]);
-      } finally {
-        cluster.client.destroy();
-        await closeAll([cluster.coordinator, cluster.primary], stream);
-      }
-    });
-
-  it('fetches a partition that joins while the committing fetch of its group waits with the next fetch of the group',
-    async () => {
-      let assigned = [1];
-      const parked: { frame: Buffer, socket: Socket }[] = [];
-      const cluster = await startGroupCluster((frame, socket) => { parked.push({ frame, socket }); }, () => assigned);
-      let stream: Readable | undefined;
-      try {
-        stream = await openGroupStream(cluster.coordinator.port, { endOnLastOffset: false });
-        stream.resume();
-        await waitUntil(() => parked.length === 1);
-        assigned = [1, 2];
-        // Each heartbeat syncs the assignment again, and the second sync started after the change.
-        const syncs = countCommand(cluster.coordinator, COMMAND_CODE.SyncGroup);
-        await waitUntil(() => countCommand(cluster.coordinator, COMMAND_CODE.SyncGroup) > syncs + 1);
-        assert.equal(parked.length, 1, 'the partition that joined got a fetch of its own');
-        parked[0].socket.write(replyFrame(parked[0].frame, Operation.NonReplicated,
-          fetchReplyBody({ partitionId: 1, offset: 4n, context: SECTION_CONTEXT })));
-        await waitUntil(() => parked.length === 2);
-        assert.deepEqual(fetchStarts(cluster.primary), [[nextStart(1)], [offsetStart(1, 4n, SECTION_CONTEXT), nextStart(2)]]);
-        const closed = once(stream, 'close');
-        stream.destroy();
-        parked[1].socket.write(replyFrame(parked[1].frame, Operation.NonReplicated, fetchReplyBody()));
-        await closed;
-      } finally {
-        cluster.client.destroy();
-        await closeAll([cluster.coordinator, cluster.primary], stream);
-      }
-    });
-
   for (const [status, reason, restarts] of [
-    [HISTORY_UNAVAILABLE, 'its history ended', true],
     [NOT_PRIMARY, 'it moved', false]
   ] as const) {
     it(`fetches a partition on a new route after a section refuses it because ${reason}, ${restarts ? 'from the start strategy' : 'at the same offset'}`,
@@ -6797,14 +6477,14 @@ describe('consumer stream', () => {
           fetchReplyBody({ partitionId: POLLED_PARTITION })
         ];
         const cluster = await startGroupCluster((frame, socket) =>
-          socket.write(replyFrame(frame, Operation.NonReplicated, replies.shift())));
+          socket.write(replyFrame(frame, Operation.NonReplicated, replies.shift())), undefined, () => 5n);
         let stream: Readable | undefined;
         try {
           stream = await openGroupStream(cluster.coordinator.port, { count: 10 });
           assert.deepEqual(offsetsOf(await consume(stream)()), [[POLLED_PARTITION, [5n]]]);
-          const fenced = offsetStart(POLLED_PARTITION, 6n, SECTION_CONTEXT);
+          const fenced = { ...offsetStart(POLLED_PARTITION, 6n, SECTION_CONTEXT), kind: PollingStrategyKind.Next };
           assert.deepEqual(fetchStarts(cluster.primary),
-            [[nextStart(POLLED_PARTITION)], [fenced], [restarts ? nextStart(POLLED_PARTITION) : fenced]]);
+            [[nextStart(POLLED_PARTITION, 5n)], [fenced], [restarts ? nextStart(POLLED_PARTITION) : fenced]]);
           assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 2);
         } finally {
           cluster.client.destroy();
@@ -6813,36 +6493,6 @@ describe('consumer stream', () => {
       });
   }
 
-  it('reads a message larger than the byte limit of a group stream alone, then fetches with the stream options again',
-    async () => {
-      const polls: Buffer[] = [];
-      let fetches = 0;
-      const cluster = await startPollCluster((frame, socket) => {
-        const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
-        if (code === COMMAND_CODE.PollMessagesDeferred) {
-          polls.push(frame);
-          socket.write(oneMessage(frame));
-        } else if (code === COMMAND_CODE.FetchMessages) {
-          fetches += 1;
-          socket.write(replyFrame(frame, Operation.NonReplicated, fetchReplyBody(
-            { partitionId: POLLED_PARTITION, status: fetches === 1 ? INVALID_SIZE_BYTES : 0 })));
-        } else return false;
-        return true;
-      }, groupHandler);
-      let stream: Readable | undefined;
-      try {
-        stream = await openGroupStream(cluster.coordinator.port, { count: 10 });
-        assert.deepEqual(offsetsOf(await consume(stream)()), [[POLLED_PARTITION, [0n]]]);
-        assert.deepEqual(polls.map(pollFields), [ALONE]);
-        assert.deepEqual(fetchFrames(cluster.primary).map((frame) => fetchOf(frame).maxBytes),
-          [DEFAULT_DEFERRED_POLL_OPTIONS.maxBytes, DEFAULT_DEFERRED_POLL_OPTIONS.maxBytes]);
-        assert.deepEqual(fetchStarts(cluster.primary),
-          [[nextStart(POLLED_PARTITION)], [offsetStart(POLLED_PARTITION, 1n, EMPTY_PARTITION_CONTEXT)]]);
-      } finally {
-        cluster.client.destroy();
-        await closeAll([cluster.coordinator, cluster.primary], stream);
-      }
-    });
 });
 
 describe('deferred requests', () => {
@@ -6955,6 +6605,55 @@ describe('deferred requests', () => {
       await cluster.close();
     }
   });
+
+  for (const code of [COMMAND_CODE.PollMessagesDeferred, COMMAND_CODE.FetchMessages]) {
+    for (const cancelWins of [true, false]) {
+      it(`cancels a parked committing ${code === COMMAND_CODE.FetchMessages ? 'fetch' : 'poll'} on the server and ${cancelWins ? 'ends as aborted when the cancel won' : 'delivers the reply that stored first'}`, async () => {
+        let parked: { frame: Buffer, socket: Socket } | undefined;
+        const cluster = await startPollCluster((frame, socket) => {
+          if (frame[REQUEST_OFFSET.operation] === Operation.StoreConsumerOffset) {
+            socket.write(replyFrame(frame, Operation.StoreConsumerOffset, metadataResult(0)));
+            return true;
+          }
+          if (codeOf(frame) === COMMAND_CODE.CancelDeferredRequest) return true;
+          if (codeOf(frame) !== code) return false;
+          parked = { frame, socket };
+          return true;
+        });
+        try {
+          const controller = new AbortController();
+          const body = code === COMMAND_CODE.FetchMessages
+            ? fetchBody(offsetTargets(3), { autocommit: true })
+            : POLL_MESSAGES.serialize({
+              streamId: 1, topicId: 2, consumer: { kind: ConsumerKind.Single, id: 1 }, partitionId: 3,
+              pollingStrategy: PollingStrategy.Offset(0n), count: 1, autocommit: true, deferred: {}
+            });
+          let settled = false;
+          const pending = cluster.client.sendCommand(code, body, { signal: controller.signal });
+          void pending.finally(() => { settled = true; }).catch(() => undefined);
+          await waitUntil(() => parked !== undefined);
+
+          controller.abort();
+
+          await waitUntil(() => framesWith(cluster.primary, COMMAND_CODE.CancelDeferredRequest).length === 1);
+          await cluster.client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0));
+          assert.equal(settled, false, 'a committing request keeps its reply slot after the cancel');
+          if (cancelWins) {
+            parked!.socket.write(replyFrame(parked!.frame, Operation.NonReplicated, Buffer.alloc(0),
+              TRANSIENT_NOT_ACCEPTED));
+            await assert.rejects(pending, isAbort);
+          } else {
+            const reply = code === COMMAND_CODE.FetchMessages ? Buffer.alloc(4) : Buffer.from('stored');
+            parked!.socket.write(replyFrame(parked!.frame, Operation.NonReplicated, reply));
+            assert.deepEqual((await pending).data, reply);
+          }
+          await cluster.client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload);
+        } finally {
+          await cluster.close();
+        }
+      });
+    }
+  }
 
   it('sends to the partition of a parked progress poll at once, while an offset store waits for the poll', async () => {
     const SEND_DEADLINE_MS = 2_000;
@@ -7277,7 +6976,7 @@ describe('deferred requests', () => {
     } finally { await cluster.close(); }
   });
 
-  for (const status of [TRANSIENT_NOT_COMMITTED, REQUEST_ALREADY_APPLIED, TRANSIENT_NOT_ACCEPTED, INVALID_COMMAND]) {
+  for (const status of [TRANSIENT_NOT_COMMITTED, REQUEST_ALREADY_APPLIED, TRANSIENT_NOT_ACCEPTED, INVALID_COMMAND, 11001]) {
     it(`preserves healthy committing sections and retains only the section with unknown status ${status}`, async () => {
       const cluster = await startPollCluster((frame, socket) => {
         if (frame[REQUEST_OFFSET.operation] === Operation.StoreConsumerOffset) socket.write(provedReply(frame));
@@ -7321,7 +7020,8 @@ describe('deferred requests', () => {
         await assert.rejects(cluster.client.sendCommand(COMMAND_CODE.FetchMessages,
           fetchBody(offsetTargets(1, 3), { autocommit: true })), FetchProgressUncertainError);
         await assert.rejects(cluster.client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload), (error: unknown) =>
-          error instanceof LaneBlockedError && error.partitionId === 3 && error.requiresExplicitRecovery);
+          error instanceof LaneBlockedError && error.partitionId === 3 && error.requiresExplicitRecovery &&
+          error.errorCode === 14009);
       } finally { await cluster.close(); }
     });
   }
@@ -7397,9 +7097,10 @@ describe('deferred requests', () => {
     } finally { await cluster.close(); }
   });
 
-  it('shields a sent committing fetch from caller cancellation and retains its later unknown reply', async () => {
+  it('cancels a sent committing fetch on the server, keeps its reply slot and retains its later unknown reply', async () => {
     let parked: { frame: Buffer, socket: Socket } | undefined;
     const cluster = await startPollCluster((frame, socket) => {
+      if (codeOf(frame) === COMMAND_CODE.CancelDeferredRequest) return true;
       if (codeOf(frame) !== COMMAND_CODE.FetchMessages) return false;
       parked = { frame, socket };
       return true;
@@ -7413,8 +7114,8 @@ describe('deferred requests', () => {
       await waitUntil(() => parked !== undefined);
       cancel.abort();
       await cluster.client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0));
+      await waitUntil(() => framesWith(cluster.primary, COMMAND_CODE.CancelDeferredRequest).length === 1);
       assert.equal(settled, false);
-      assert.equal(framesWith(cluster.primary, COMMAND_CODE.CancelDeferredRequest).length, 0);
       parked!.socket.write(replyFrame(parked!.frame, Operation.NonReplicated, Buffer.alloc(0), TRANSIENT_NOT_COMMITTED));
       await assert.rejects(pending, FetchProgressUncertainError);
       await assert.rejects(cluster.client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload), LaneBlockedError);

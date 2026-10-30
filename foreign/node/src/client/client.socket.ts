@@ -59,8 +59,8 @@ import { validateReplyForRequest } from '../wire/vsr/reply.js';
 import { debug } from './client.debug.js';
 
 export {
-  FetchProgressUncertainError, LaneBlockedError, NotConnectedError, OperationNotRetainedError, OperationUncertainError,
-  VsrResponseTimeoutError
+  FETCH_PROGRESS_UNCERTAIN, FetchProgressUncertainError, LANE_BLOCKED, LaneBlockedError, NotConnectedError,
+  OperationNotRetainedError, OperationUncertainError, PARTITION_LANE_BLOCKED, VsrResponseTimeoutError
 } from './client.operation.js';
 
 const RETRY_INTERVAL_MS = 50;
@@ -376,6 +376,9 @@ export class CommandResponseStream extends EventEmitter {
     const progress = fetch ? fetch.progress : isPoll(command) &&
       (body[pollEnd - POLL_AUTOCOMMIT_SIZE] !== 0 || body[pollEnd - POLL_OPTIONS_SIZE] === PollingStrategyKind.Next);
     const safeRead = READ_COMMANDS.has(command) || ((isPoll(command) || fetch !== undefined) && !progress);
+    // A read that stores its offset can store it before a cancel arrives, so once it is sent the caller's abort only
+    // cancels it on the server and the call waits for its one reply.
+    const commits = fetch ? fetch.commits : isPoll(command) && body[pollEnd - POLL_AUTOCOMMIT_SIZE] !== 0;
     // A progress fetch holds the progress lane of each target, in ascending
     // partition order, as offset stores take them.
     const fetchPartitions = fetch?.progress
@@ -509,13 +512,18 @@ export class CommandResponseStream extends EventEmitter {
             this.ensureLineage(lineage, command);
             const bytes = operation?.frame.buffer ?? (frame ??= this.vsrSession.encode(command, body, context));
             return options.budget ? deferredFrame(command, bytes, options.budget, deadline) : bytes;
-          }, deadline, attemptSignal, operation, fetch?.commits
-            ? AbortSignal.any([this.lifetime.signal, this.sessionLifetime.signal, operation!.lifetime.signal]) : undefined);
+          }, deadline, attemptSignal, operation, commits
+            ? AbortSignal.any([this.lifetime.signal, this.sessionLifetime.signal,
+              ...(operation ? [operation.lifetime.signal] : [])]) : undefined);
           exchanged = true;
         } catch (error) {
           attempt = { error, committed: false, started: false };
         }
         sent ||= attempt.started;
+        // The server refused the read because the cancel won, so it stored nothing.
+        if (commits && attempt.started && options.signal?.aborted && attempt.error instanceof ResponseError &&
+            attempt.error.fromServer && attempt.error.errorCode === TRANSIENT_NOT_ACCEPTED)
+          throw options.signal.reason;
         if (fetch?.commits && attempt.started)
           fetchMayHaveCommitted = !(attempt.error instanceof ResponseError && attempt.error.fromServer &&
             fetchRefusedBeforeRead(attempt.error.errorCode));
@@ -1469,7 +1477,7 @@ export class CommandResponseStream extends EventEmitter {
     } finally { release(); }
   }
 
-  /** Only SDK recovery shares a sign-in; callers always own a fresh attempt. */
+  /** Only SDK recovery shares a sign-in. Callers always own a fresh attempt. */
   private signIn(): Promise<boolean> {
     if (this.isAuthenticated) return Promise.resolve(true);
     if (!this.authenticationPromise) {

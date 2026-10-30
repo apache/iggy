@@ -1161,7 +1161,11 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     assertThatThrownBy(() -> poll(client, Optional.of(0L), true).get(5, TimeUnit.SECONDS))
                             .hasCauseInstanceOf(IggyServerException.class)
                             .satisfies(error -> assertThat(((IggyServerException) error.getCause()).getRawErrorCode())
-                                    .isEqualTo(failure == -1 ? TRANSIENT_NOT_COMMITTED : failure));
+                                    // The poll stores its offset, so an unknown outcome is uncertain progress.
+                                    .isEqualTo(
+                                            failure == 30
+                                                    ? failure
+                                                    : IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode()));
                     assertThat(polls).hasValue(1);
                     client.users().updateUser(UserId.of(1L), RENAME_USER).get(5, TimeUnit.SECONDS);
                     client.users()

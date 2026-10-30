@@ -18,10 +18,10 @@
 use crate::harness::{TestBinary, TestHarness};
 use iggy::prelude::UserCreateOptions;
 use iggy::prelude::{
-    ClientWrapper, Consumer, ConsumerGroupClient, ConsumerGroupDetails, DEFAULT_ROOT_PASSWORD,
-    DEFAULT_ROOT_USERNAME, GlobalPermissions, Identifier, IdentityInfo, IggyClient, IggyError,
-    MessageClient, Permissions, PollOptions, PolledMessages, PollingStrategy, ServerCommitPolicy,
-    StreamClient, TopicClient, TopicDetails, UserClient, UserStatus,
+    ClientWrapper, CommitPolicy, Consumer, ConsumerGroupClient, ConsumerGroupDetails,
+    DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, GlobalPermissions, Identifier, IdentityInfo,
+    IggyClient, IggyError, MessageClient, Permissions, PollOptions, PolledMessages,
+    PollingStrategy, StreamClient, TopicClient, TopicDetails, UserClient, UserStatus,
 };
 use iggy_binary_protocol::codes::{GET_PARTITION_ROUTE_CODE, SYNC_CONSUMER_GROUP_CODE};
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
@@ -213,7 +213,7 @@ pub async fn fetch_sections(
     consumer: &Consumer,
     options: PollOptions,
 ) -> Result<Vec<FetchedSection>, IggyError> {
-    let auto_commit = options.server_commit == ServerCommitPolicy::OnRead;
+    let auto_commit = options.commit == CommitPolicy::OnRead;
     let transport = client.client();
     let transport = transport.read().await;
     match &*transport {

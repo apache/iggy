@@ -21,78 +21,61 @@ import Testing
 
 @Suite("Deferred polls", requiresServer)
 struct DeferredPollE2ETests {
-    private static let parking = DeferredPollOptions(maxWait: .seconds(10), requestTimeout: .seconds(15))
-    /// Far below the wait of ``parking``, so only a request that the message
-    /// woke returns in time.
+    private static let parking: Duration = .seconds(10)
+    /// Far below ``parking``, so only a read that the message woke returns
+    /// in time.
     private static let prompt: Duration = .seconds(2)
 
-    /// One member owns all three partitions, and one fetch of their readiness
-    /// group waits on all of them. Before each fetch another partition gets a
-    /// message, so a fetch that missed it would wait out its ten seconds.
-    @Test func aFetchReadsThePartitionThatGotAMessage() async throws {
+    /// One member owns all three partitions and its reader waits on all of
+    /// them, one read per primary. Before each read another partition gets
+    /// a message, so a read that missed it would wait out its ten seconds.
+    @Test func aReaderReadsThePartitionThatGotAMessage() async throws {
         try await E2EEnvironment.withSession { session in
             let client = session.client
             let scratch = try await session.scratchTopic(partitions: 3)
-            let name = E2EEnvironment.uniqueName("swift-e2e-ready")
-            let group = try Identifier(named: name)
-            _ = try await client.createConsumerGroup(streamID: scratch.stream, topicID: scratch.topic, name: name)
-            try await client.joinConsumerGroup(streamID: scratch.stream, topicID: scratch.topic, groupID: group)
+            let group = try Identifier(named: E2EEnvironment.uniqueName("swift-e2e-ready"))
+            let reader = try await client.reader(
+                streamID: scratch.stream, topicID: scratch.topic, consumer: .group(group),
+                configuration: ReaderConfiguration(options: PollOptions(count: 10, maxWait: Self.parking, commit: .onRead)))
             #expect(
                 try await E2EEnvironment.eventually {
                     try await client.getConsumerGroup(streamID: scratch.stream, topicID: scratch.topic, groupID: group)?.members.first?.partitions.count == 3
                 })
-            let groups = try await client.readinessGroups(streamID: scratch.stream, topicID: scratch.topic, partitions: [0, 1, 2])
             for (round, partition) in [UInt32(2), 0, 1].enumerated() {
-                let targets = try #require(groups.first { $0.contains(partition) })
                 try await client.sendBatch(
                     streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(partition), messages: [try IggyMessage("round \(round)")])
                 let started = ContinuousClock.now
-                let sections = try await client.fetchMessages(
-                    streamID: scratch.stream, topicID: scratch.topic, targets: targets.map { ($0, .next) }, consumer: .group(group), count: 10,
-                    autoCommit: true, options: Self.parking)
+                let batch = try #require(try await reader.next())
                 let elapsed = ContinuousClock.now - started
                 #expect(elapsed < Self.prompt, "round \(round) took \(elapsed)")
-                let read = try sections.map { try $0.decode() }.filter { !$0.messages.isEmpty }
-                #expect(read.map(\.partitionID) == [partition], "round \(round)")
-                #expect(read.flatMap(\.messages).map(\.payloadString) == ["round \(round)"], "round \(round)")
+                #expect(batch.partitionID == partition, "round \(round)")
+                #expect(batch.messages.map(\.payloadString) == ["round \(round)"], "round \(round)")
             }
-            try await client.leaveConsumerGroup(streamID: scratch.stream, topicID: scratch.topic, groupID: group)
+            try await reader.close()
         }
     }
 
-    /// A fetch reads its targets in order while its count leaves room, so a
-    /// partition with a backlog hides the partitions after it. The consumer
-    /// moves the partitions that a fetch served to the end of the next one,
-    /// so a message on another partition gets through before the backlog
-    /// drains.
+    /// A read of many partitions takes them in order while its count leaves
+    /// room, so a partition with a backlog would hide the partitions after
+    /// it. The reader moves the partitions that a read served to the end of
+    /// the next one, so a message on another partition gets through before
+    /// the backlog drains, whichever primaries hold the partitions.
     @Test func aBacklogDoesNotHideAMessageOnAnotherPartition() async throws {
         try await E2EEnvironment.withSession { session in
             let client = session.client
             let scratch = try await session.scratchTopic(partitions: 2)
-            let name = E2EEnvironment.uniqueName("swift-e2e-backlog")
-            let group = try Identifier(named: name)
-            _ = try await client.createConsumerGroup(streamID: scratch.stream, topicID: scratch.topic, name: name)
-            try await client.joinConsumerGroup(streamID: scratch.stream, topicID: scratch.topic, groupID: group)
-            #expect(
-                try await E2EEnvironment.eventually {
-                    try await client.getConsumerGroup(streamID: scratch.stream, topicID: scratch.topic, groupID: group)?.members.first?.partitions.count == 2
-                })
-            // One server is the primary of every partition.
-            #expect(try await client.readinessGroups(streamID: scratch.stream, topicID: scratch.topic, partitions: [0, 1]) == [[0, 1]])
             let backlog = try (0..<1000).map { try IggyMessage("backlog \($0)") }
             try await client.sendBatch(streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(0), messages: backlog)
             try await client.sendBatch(streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(1), messages: ["late"])
-            let options = DeferredPollOptions(maxWait: .seconds(1), requestTimeout: .seconds(5))
-            let fetch = { @Sendable (order: [UInt32]) -> [String] in
-                let sections = try await client.fetchMessages(
-                    streamID: scratch.stream, topicID: scratch.topic, targets: order.map { ($0, .next) }, consumer: .group(group), count: 1,
-                    autoCommit: true, options: options)
-                return try sections.flatMap { try $0.decode().messages.map(\.payloadString) }
+            let reader = try await client.reader(
+                streamID: scratch.stream, topicID: scratch.topic, consumer: .consumer(try Identifier(named: E2EEnvironment.uniqueName("swift-e2e-backlog"))),
+                configuration: ReaderConfiguration(partitions: [0, 1], start: .first, options: PollOptions(count: 1, maxWait: .seconds(1))))
+            var payloads: [String] = []
+            for _ in 0..<4 {
+                payloads += try #require(try await reader.next()).messages.map(\.payloadString)
             }
-            #expect(try await fetch([0, 1]) == ["backlog 0"])
-            #expect(try await fetch([1, 0]) == ["late"])
-            #expect(try await fetch([0, 1]) == ["backlog 1"])
-            try await client.leaveConsumerGroup(streamID: scratch.stream, topicID: scratch.topic, groupID: group)
+            #expect(payloads.contains("late"), "\(payloads)")
+            try await reader.close()
         }
     }
 
@@ -103,8 +86,8 @@ struct DeferredPollE2ETests {
             let client = session.client
             let scratch = try await session.scratchTopic(partitions: 1)
             let consumer = try client.consumer(
-                name: E2EEnvironment.uniqueName("swift-e2e-idle"), streamID: scratch.stream, topicID: scratch.topic, partitionID: 0,
-                configuration: ConsumerConfiguration(pollOptions: Self.parking))
+                name: E2EEnvironment.uniqueName("swift-e2e-idle"), streamID: scratch.stream, topicID: scratch.topic, partitions: [0],
+                configuration: ConsumerConfiguration(pollOptions: .wait(Self.parking)))
             try await consumer.initialize()
             let reading = Task { try await consumer.next() }
             try await Task.sleep(for: .seconds(3))
@@ -126,7 +109,8 @@ struct DeferredPollE2ETests {
             let scratch = try await session.scratchTopic(partitions: 1)
             let poll = { @Sendable in
                 try await client.pollMessages(
-                    streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, strategy: .next, count: 10, autoCommit: true, options: Self.parking)
+                    streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, strategy: .next,
+                    options: PollOptions(count: 10, maxWait: Self.parking, commit: .onRead))
             }
             let parked = Task { try await poll() }
             try await Task.sleep(for: .milliseconds(500))
@@ -150,17 +134,16 @@ struct DeferredPollE2ETests {
             let client = session.client
             let scratch = try await session.scratchTopic(partitions: 1)
             try await client.sendBatch(streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(0), messages: ["unseen"])
-            let options = DeferredPollOptions(maxWait: .seconds(1), minCount: 2, requestTimeout: .seconds(5))
+            let options = PollOptions(count: 10, maxWait: .seconds(1), minCount: 2, commit: .onRead)
             let parked = Task {
-                try await client.pollMessages(
-                    streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, strategy: .next, count: 10, autoCommit: true, options: options)
+                try await client.pollMessages(streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, strategy: .next, options: options)
             }
             try await Task.sleep(for: .milliseconds(200))
             parked.cancel()
             await #expect(throws: CancellationError.self) { try await parked.value }
             try await Task.sleep(for: options.maxWait + .seconds(1))
             let polled = try await client.pollMessages(
-                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, strategy: .next, count: 10, autoCommit: false)
+                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, strategy: .next, options: PollOptions(count: 10))
             #expect(polled.messages.map(\.payloadString) == ["unseen"])
         }
     }

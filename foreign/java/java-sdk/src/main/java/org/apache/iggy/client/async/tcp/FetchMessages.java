@@ -166,8 +166,8 @@ final class FetchMessages {
     static boolean refusedBeforeAdmission(long status, boolean section) {
         IggyErrorCode code = IggyErrorCode.fromCode((int) status);
         return switch (code) {
-            case INVALID_SIZE_BYTES -> section;
-            case HISTORY_UNAVAILABLE, NOT_PRIMARY, CONSUMER_GROUP_PARTITION_NOT_OWNED -> true;
+            // The server refuses a first message larger than the byte limit before it stores an offset.
+            case INVALID_SIZE_BYTES, HISTORY_UNAVAILABLE, NOT_PRIMARY, CONSUMER_GROUP_PARTITION_NOT_OWNED -> true;
             case FEATURE_UNAVAILABLE,
                     INVALID_IDENTIFIER,
                     TRANSIENT_NOT_ACCEPTED,
@@ -374,16 +374,17 @@ final class FetchMessages {
      * fits in {@code maxReplyBody}, the largest reply body that the link reads. The link drops a larger reply, after
      * the server may have committed what it holds.
      *
-     * @throws IggyInvalidArgumentException if the section table leaves less than the smallest byte limit
+     * @throws IggyInvalidArgumentException if the section table leaves less than one record of the largest size
      */
     static void fitReply(ByteBuf frame, int limits, long maxReplyBody) {
         long targetsCount = frame.getUnsignedIntLE(limits + TARGETS_COUNT_OFFSET);
         long records = maxReplyBody
                 - BytesDeserializer.FETCH_SECTIONS_COUNT_BYTES
                 - targetsCount * BytesDeserializer.FETCH_SECTION_BYTES;
-        if (records < DeferredPollOptions.MIN_MAX_BYTES) {
+        if (records < DeferredPollOptions.MAX_RECORD_SIZE) {
             throw new IggyInvalidArgumentException("A fetch of " + targetsCount
-                    + " partitions needs a reply larger than " + maxReplyBody + " bytes, the most that the link reads");
+                    + " partitions can get a first message that needs a reply larger than " + maxReplyBody
+                    + " bytes, the most that the link reads");
         }
         long maxBytes = Math.min(frame.getUnsignedIntLE(limits + MAX_BYTES_OFFSET), records);
         frame.setIntLE(limits + MAX_BYTES_OFFSET, (int) maxBytes);
@@ -397,24 +398,25 @@ final class FetchMessages {
 
     /**
      * The largest reply body that the fetch in {@code frame} can get: the section count, one table entry per target and
-     * the byte limit of the request.
+     * the byte limit of the request, or one record of the largest size, which the server returns alone above it.
      */
     static long replyLimit(ByteBuf frame) {
         int limits = PollRouter.waitParameters(frame, frame.readerIndex() + VsrHeaders.HEADER_SIZE);
         return BytesDeserializer.FETCH_SECTIONS_COUNT_BYTES
                 + frame.getUnsignedIntLE(limits + TARGETS_COUNT_OFFSET) * BytesDeserializer.FETCH_SECTION_BYTES
-                + frame.getUnsignedIntLE(limits + MAX_BYTES_OFFSET);
+                + Math.max(frame.getUnsignedIntLE(limits + MAX_BYTES_OFFSET), DeferredPollOptions.MAX_RECORD_SIZE);
+    }
+
+    /** The largest reply body of the deferred poll in {@code frame}: its byte limit, or one record of the largest size. */
+    static long pollReplyLimit(ByteBuf frame) {
+        return Math.max(PollRouter.deferredMaxBytes(frame), DeferredPollOptions.MAX_RECORD_POLL_REPLY_SIZE);
     }
 
     static void configureResponse(VsrResponseHandler.PendingRequest pending, ByteBuf frame) {
         pending.limitResponseBody(replyLimit(frame));
-        int limits = PollRouter.waitParameters(frame, frame.readerIndex() + VsrHeaders.HEADER_SIZE);
-        if (frame.getUnsignedByte(limits + AUTO_COMMIT_OFFSET) != 0) {
-            pending.preventCancellation();
-        }
     }
 
-    private static ByteBuf payload(
+    static ByteBuf payload(
             byte[] consumer,
             byte[] topic,
             Map<Long, PollingStrategy> targets,

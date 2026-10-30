@@ -187,7 +187,7 @@ async fn should_not_duplicate_partition_assignments_after_stale_client_cleanup(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
             &PollingStrategy::next(),
-            poll_options(1, ServerCommitPolicy::Disabled), // manual ack - offset NOT stored
+            poll_options(1, CommitPolicy::Manual), // manual ack - offset NOT stored
         )
         .await
         .unwrap();
@@ -238,7 +238,7 @@ async fn should_not_duplicate_partition_assignments_after_stale_client_cleanup(
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::offset(0),
-                poll_options(10, ServerCommitPolicy::Disabled),
+                poll_options(10, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -377,7 +377,7 @@ async fn should_refuse_polls_of_pending_revoked_partitions(harness: &TestHarness
                 partition_id,
                 &consumer,
                 &PollingStrategy::next(),
-                poll_options(1, ServerCommitPolicy::Disabled),
+                poll_options(1, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -405,7 +405,7 @@ async fn should_refuse_polls_of_pending_revoked_partitions(harness: &TestHarness
                     partition_id,
                     &consumer,
                     &PollingStrategy::next(),
-                    poll_options(1, ServerCommitPolicy::Disabled),
+                    poll_options(1, CommitPolicy::Manual),
                 )
                 .await
             {
@@ -517,7 +517,7 @@ async fn should_not_lose_messages_with_concurrent_polls_during_partition_add(
                         &Identifier::named(STREAM_NAME).unwrap(),
                         &Identifier::named(TOPIC_NAME).unwrap(),
                         &PollingStrategy::next(),
-                        poll_options(1, ServerCommitPolicy::OnRead),
+                        poll_options(1, CommitPolicy::OnRead),
                     )
                     .await;
                 if let Ok(polled) = polled {
@@ -541,7 +541,7 @@ async fn should_not_lose_messages_with_concurrent_polls_during_partition_add(
                         &Identifier::named(STREAM_NAME).unwrap(),
                         &Identifier::named(TOPIC_NAME).unwrap(),
                         &PollingStrategy::next(),
-                        poll_options(1, ServerCommitPolicy::OnRead),
+                        poll_options(1, CommitPolicy::OnRead),
                     )
                     .await;
                 if let Ok(polled) = polled {
@@ -645,7 +645,7 @@ async fn should_handle_partition_add_then_consumer_disconnect_then_new_join(harn
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::next(),
-                poll_options(1, ServerCommitPolicy::OnRead),
+                poll_options(1, CommitPolicy::OnRead),
             )
             .await
             .unwrap();
@@ -730,7 +730,7 @@ async fn should_handle_partition_add_then_consumer_disconnect_then_new_join(harn
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::offset(0),
-                poll_options(1, ServerCommitPolicy::Disabled),
+                poll_options(1, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -838,7 +838,7 @@ async fn should_handle_partition_delete_while_multiple_consumers_polling(harness
                         &Identifier::named(STREAM_NAME).unwrap(),
                         &Identifier::named(TOPIC_NAME).unwrap(),
                         &PollingStrategy::next(),
-                        poll_options(1, ServerCommitPolicy::OnRead),
+                        poll_options(1, CommitPolicy::OnRead),
                     )
                     .await;
                 if let Ok(p) = polled {
@@ -1051,7 +1051,7 @@ async fn should_reach_even_distribution_after_multiple_joins(harness: &TestHarne
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::offset(0),
-                poll_options(10, ServerCommitPolicy::Disabled),
+                poll_options(10, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -1168,7 +1168,7 @@ async fn should_split_evenly_when_consumer_joins_after_partitions_added(harness:
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::offset(0),
-                poll_options(10, ServerCommitPolicy::Disabled),
+                poll_options(10, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -1223,7 +1223,7 @@ async fn should_not_duplicate_messages_when_partitions_added_during_polling(harn
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::next(),
-                poll_options(1, ServerCommitPolicy::Disabled),
+                poll_options(1, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -1264,7 +1264,7 @@ async fn should_not_duplicate_messages_when_partitions_added_during_polling(harn
                     &Identifier::named(STREAM_NAME).unwrap(),
                     &Identifier::named(TOPIC_NAME).unwrap(),
                     &PollingStrategy::offset(0),
-                    poll_options(1, ServerCommitPolicy::Disabled),
+                    poll_options(1, CommitPolicy::Manual),
                 )
                 .await
                 .unwrap();
@@ -1358,7 +1358,7 @@ async fn should_handle_delete_partitions_with_uncommitted_work(harness: &TestHar
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::next(),
-                poll_options(1, ServerCommitPolicy::Disabled),
+                poll_options(1, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -1402,7 +1402,7 @@ async fn should_handle_delete_partitions_with_uncommitted_work(harness: &TestHar
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::offset(0),
-                poll_options(1, ServerCommitPolicy::Disabled),
+                poll_options(1, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -1528,7 +1528,7 @@ async fn should_handle_rapid_partition_changes_with_active_consumers(harness: &T
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::offset(0),
-                poll_options(10, ServerCommitPolicy::Disabled),
+                poll_options(10, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -1745,7 +1745,7 @@ async fn should_handle_partition_add_during_pending_revocation(harness: &TestHar
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::next(),
-                poll_options(1, ServerCommitPolicy::Disabled),
+                poll_options(1, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -1829,7 +1829,7 @@ async fn should_timeout_revocation(harness: &TestHarness) {
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::next(),
-                poll_options(1, ServerCommitPolicy::Disabled),
+                poll_options(1, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -1885,7 +1885,7 @@ async fn should_timeout_revocation(harness: &TestHarness) {
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
             &PollingStrategy::offset(0),
-            poll_options(10, ServerCommitPolicy::Disabled),
+            poll_options(10, CommitPolicy::Manual),
         )
         .await
         .unwrap();
@@ -1976,7 +1976,7 @@ async fn should_not_duplicate_after_reconnect_without_heartbeat(harness: &TestHa
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::next(),
-                poll_options(1, ServerCommitPolicy::Disabled),
+                poll_options(1, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -2007,7 +2007,7 @@ async fn should_not_duplicate_after_reconnect_without_heartbeat(harness: &TestHa
     let stream = Identifier::named(STREAM_NAME).unwrap();
     let topic = Identifier::named(TOPIC_NAME).unwrap();
     let strategy = PollingStrategy::offset(0);
-    let options = poll_options(10, ServerCommitPolicy::Disabled);
+    let options = poll_options(10, CommitPolicy::Manual);
     let mut poller1 = GroupPoller::new(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
     let mut poller2 = GroupPoller::new(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
     let mut poller3 = GroupPoller::new(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
@@ -2133,7 +2133,7 @@ async fn should_not_duplicate_partition_assignments_after_client_reconnect(harne
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::next(),
-                poll_options(1, ServerCommitPolicy::Disabled),
+                poll_options(1, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -2180,7 +2180,7 @@ async fn should_not_duplicate_partition_assignments_after_client_reconnect(harne
     let stream = Identifier::named(STREAM_NAME).expect("stream id");
     let topic = Identifier::named(TOPIC_NAME).expect("topic id");
     let strategy = PollingStrategy::offset(0);
-    let options = poll_options(10, ServerCommitPolicy::Disabled);
+    let options = poll_options(10, CommitPolicy::Manual);
     let mut poller1 = GroupPoller::new(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
     let mut poller2 = GroupPoller::new(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
     let mut poller3 = GroupPoller::new(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
@@ -2212,10 +2212,10 @@ async fn should_not_duplicate_partition_assignments_after_client_reconnect(harne
         .unwrap();
 }
 
-fn poll_options(count: u32, server_commit: ServerCommitPolicy) -> PollOptions {
+fn poll_options(count: u32, commit: CommitPolicy) -> PollOptions {
     PollOptions {
         count,
-        server_commit,
+        commit,
         ..PollOptions::default()
     }
 }
@@ -2396,7 +2396,7 @@ async fn should_not_return_same_message_to_two_consumers_during_rebalance(harnes
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
             &PollingStrategy::next(),
-            poll_options(1, ServerCommitPolicy::Disabled), // manual commit - offset NOT stored
+            poll_options(1, CommitPolicy::Manual), // manual commit - offset NOT stored
         )
         .await
         .unwrap();
@@ -2424,7 +2424,7 @@ async fn should_not_return_same_message_to_two_consumers_during_rebalance(harnes
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
             &PollingStrategy::next(),
-            poll_options(1, ServerCommitPolicy::Disabled),
+            poll_options(1, CommitPolicy::Manual),
         )
         .await
         .unwrap();
@@ -2500,7 +2500,7 @@ async fn should_complete_revocation_on_auto_commit(harness: &TestHarness) {
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::next(),
-                poll_options(1, ServerCommitPolicy::OnRead), // auto-commit
+                poll_options(1, CommitPolicy::OnRead), // auto-commit
             )
             .await
             .unwrap();
@@ -2622,7 +2622,7 @@ async fn should_rebalance_when_member_with_pending_revocation_leaves(harness: &T
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
             &PollingStrategy::next(),
-            poll_options(1, ServerCommitPolicy::Disabled),
+            poll_options(1, CommitPolicy::Manual),
         )
         .await
         .unwrap();
@@ -2662,7 +2662,7 @@ async fn should_rebalance_when_member_with_pending_revocation_leaves(harness: &T
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::offset(0),
-                poll_options(1, ServerCommitPolicy::Disabled),
+                poll_options(1, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -2729,7 +2729,7 @@ async fn should_not_produce_duplicate_messages_with_sequential_consumer_joins(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
             &PollingStrategy::next(),
-            poll_options(1, ServerCommitPolicy::Disabled), // manual ack - offset NOT committed
+            poll_options(1, CommitPolicy::Manual), // manual ack - offset NOT committed
         )
         .await
         .unwrap();
@@ -2782,7 +2782,7 @@ async fn should_not_produce_duplicate_messages_with_sequential_consumer_joins(
                     &Identifier::named(STREAM_NAME).unwrap(),
                     &Identifier::named(TOPIC_NAME).unwrap(),
                     &PollingStrategy::next(),
-                    poll_options(1, ServerCommitPolicy::Disabled), // manual ack
+                    poll_options(1, CommitPolicy::Manual), // manual ack
                 )
                 .await
                 .unwrap();
@@ -2865,7 +2865,7 @@ async fn should_wait_for_manual_commit_before_completing_revocation(harness: &Te
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::next(),
-                poll_options(1, ServerCommitPolicy::Disabled), // manual commit
+                poll_options(1, CommitPolicy::Manual), // manual commit
             )
             .await
             .unwrap();
@@ -2891,7 +2891,7 @@ async fn should_wait_for_manual_commit_before_completing_revocation(harness: &Te
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
             &PollingStrategy::next(),
-            poll_options(1, ServerCommitPolicy::Disabled),
+            poll_options(1, CommitPolicy::Manual),
         )
         .await
         .unwrap();
@@ -2966,7 +2966,7 @@ async fn should_redistribute_when_revocation_target_leaves(harness: &TestHarness
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
             &PollingStrategy::next(),
-            poll_options(1, ServerCommitPolicy::Disabled),
+            poll_options(1, CommitPolicy::Manual),
         )
         .await
         .unwrap();
@@ -3008,7 +3008,7 @@ async fn should_redistribute_when_revocation_target_leaves(harness: &TestHarness
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::offset(0),
-                poll_options(1, ServerCommitPolicy::Disabled),
+                poll_options(1, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -3097,7 +3097,7 @@ async fn should_distribute_partitions_evenly_with_concurrent_joins(harness: &Tes
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::offset(0),
-                poll_options(10, ServerCommitPolicy::Disabled),
+                poll_options(10, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -3152,7 +3152,7 @@ async fn should_not_assign_partition_to_wrong_member_after_slab_reuse(harness: &
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::next(),
-                poll_options(1, ServerCommitPolicy::Disabled),
+                poll_options(1, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -3245,7 +3245,7 @@ async fn should_not_complete_other_members_revocations_on_leave(harness: &TestHa
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::next(),
-                poll_options(1, ServerCommitPolicy::Disabled),
+                poll_options(1, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -3338,7 +3338,7 @@ async fn should_not_complete_other_members_revocations_on_leave(harness: &TestHa
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::offset(0),
-                poll_options(1, ServerCommitPolicy::Disabled),
+                poll_options(1, CommitPolicy::Manual),
             )
             .await
             .unwrap();
@@ -3432,7 +3432,7 @@ async fn should_distribute_16_partitions_evenly_across_16_consumers(harness: &Te
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
                 &PollingStrategy::offset(0),
-                poll_options(10, ServerCommitPolicy::Disabled),
+                poll_options(10, CommitPolicy::Manual),
             )
             .await
             .unwrap();

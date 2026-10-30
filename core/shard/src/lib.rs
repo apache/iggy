@@ -32,8 +32,9 @@ mod test_support;
 pub use config::CoordinatorConfig;
 pub use host::{NoopHost, ShardHost};
 pub use poll::deferred::{
-    ANY_MESSAGE, DeferredPollContext, DeferredPollRequest, KNOWN_BYTES_SLACK, PollQuotaIdentity,
-    ReadinessTarget, ReadinessWait, ReadinessWatch, ReadyTarget, ServedState, WatchedState,
+    ANY_MESSAGE, CommitGate, DeferredPollContext, DeferredPollRequest, KNOWN_BYTES_SLACK,
+    OversizedTurn, PollQuotaIdentity, ReadinessTarget, ReadinessWait, ReadinessWatch, ReadyTarget,
+    ServedState, WatchedState,
 };
 pub use poll::{ConsumerAttachment, PollCompleted};
 pub use router::CONSENSUS_TICK_INTERVAL;

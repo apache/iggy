@@ -23,6 +23,7 @@ from datetime import timedelta
 
 from apache_iggy import (
     AutoLogin,
+    CommitPolicy,
     Consumer,
     HttpConfig,
     IggyClient,
@@ -30,7 +31,6 @@ from apache_iggy import (
     PollOptions,
     QuicConfig,
     ReceiveMessage,
-    ServerCommitPolicy,
     TcpConfig,
     TcpReconnectionConfig,
     WebSocketConfig,
@@ -195,7 +195,7 @@ async def consume_messages(client: IggyClient):
                 polling_strategy=PollingStrategy.Next(),
                 options=PollOptions(
                     count=messages_per_batch,
-                    server_commit=ServerCommitPolicy.OnRead,
+                    commit=CommitPolicy.OnRead(),
                 ),
             )
             if not polled.messages:

@@ -38,7 +38,7 @@ See [Maven Central](https://central.sonatype.com/artifact/org.apache.iggy/iggy) 
 
 ### Snapshot Versions
 
-Development builds of the next release carry the version `0.9.5-SNAPSHOT`. Get them from the ASF snapshot repository:
+Development builds of the next release carry the version `0.9.6-SNAPSHOT`. Get them from the ASF snapshot repository:
 
 **Gradle:**
 
@@ -51,7 +51,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'org.apache.iggy:iggy:0.9.5-SNAPSHOT'
+    implementation 'org.apache.iggy:iggy:0.9.6-SNAPSHOT'
 }
 ```
 
@@ -72,7 +72,7 @@ dependencies {
     <dependency>
         <groupId>org.apache.iggy</groupId>
         <artifactId>iggy</artifactId>
-        <version>0.9.5-SNAPSHOT</version>
+        <version>0.9.6-SNAPSHOT</version>
     </dependency>
 </dependencies>
 ```
@@ -416,138 +416,93 @@ A cursor's `toString()` is its `mc1_` text, which `MetadataChangeCursor.parse` r
 
 ## Polling
 
-`pollMessages` returns whatever the server already holds. An empty topic answers
-at once, so the caller has to poll again.
+The SDK reads messages at three levels: a poll of one partition, a partition reader that reads many partitions in batches, and a consumer that hands over one message at a time. All three take `PollOptions`, whose `CommitPolicy` decides who stores the consumer offsets.
 
-`pollMessagesDeferred` lets the server hold the request instead. It waits up to
-`maxWait` for `minCount` messages, caps the encoded response at `maxBytes`, and
-bounds the whole call by `requestTimeout`.
+### Poll one partition
 
-```java
-import org.apache.iggy.message.DeferredPollOptions;
-
-// Defaults: 1 s wait, 1 message, 1 MiB, 11 s budget.
-var options = DeferredPollOptions.defaults()
-    .withMaxWait(Duration.ofSeconds(5))
-    .withMinCount(10);
-
-var polled = client.messages().pollMessagesDeferred(
-    streamId, topicId, Optional.of(0L), Consumer.of(1L),
-    PollingStrategy.next(), 100L, false, options);
-```
-
-If the readiness wait expires, the server still answers, with a partial batch or
-an empty one. If the request timeout expires, the call fails.
-
-A deferred poll of a consumer group must name its partition. Without one, the
-TCP client fails with `INVALID_COMMAND` (3) before it sends anything. To read
-the whole assignment of a group, use `readinessGroups` and `fetchMessages`.
-
-`readinessGroups` groups partitions by their primary, with at most 1000
-partitions in a group. A caller can keep one `fetchMessages` in flight per
-group. Each fetch goes to one primary and completes independently.
+`pollMessages` with a partition and `PollOptions` lets the server hold the request until messages arrive. It waits up to `maxWait` for `minCount` messages and returns at most `count` messages and `maxBytes` of records. The request ends after `maxWait` plus 10 s.
 
 ```java
-List<List<Long>> groups = client.messages()
-    .readinessGroups(streamId, topicId, List.of(0L, 1L, 2L));
+import org.apache.iggy.message.CommitPolicy;
+import org.apache.iggy.message.PollOptions;
+
+// Defaults: 1000 messages, no wait, 1 message, 1 MiB, nothing stored.
+var options = PollOptions.waitFor(Duration.ofSeconds(5))
+    .withCount(100)
+    .withCommit(CommitPolicy.onRead());
+
+PolledMessages polled = client.messages()
+    .pollMessages(streamId, topicId, 0L, Consumer.of(1L), PollingStrategy.next(), options)
+    .get();
 ```
 
-The groups show the routes at the time of the call. If a fetch reports
-`NOT_PRIMARY`, group the partitions again before the next fetch. The HTTP client throws
-`IggyOperationNotSupportedException`.
+`CommitPolicy.manual()` (the default) stores nothing, and the application stores a `Checkpoint` with `storeConsumerPosition`. `CommitPolicy.onRead()` makes the server store the offset of the last message it returns as part of the read: one round trip, at most once. A poll of one partition refuses `CommitPolicy.auto(...)` with `INVALID_CONFIGURATION` (2), because it has nothing to count. A reader and a consumer accept it.
 
-`fetchMessages` reads the partitions of one readiness group in one request to
-their primary. Each target names a partition and its `Next` or `Offset`
-strategy. The call returns one `FetchedMessages` section for each partition
-that the server read, in the order of the reply. A target without a section was
-not read in this request.
+A first message larger than `maxBytes` comes alone in the reply, up to the largest message size. A `Last` poll of more than one message whose first message is larger than `maxBytes` fails with `INVALID_SIZE_BYTES` (80). Every reply limit of the client holds the largest message, and `maxVsrFrameSize` refuses a frame that cannot.
+
+`PolledMessages.checkpoint()` and `checkpointAt(index)` name the position after a message, with the history of its partition. `continuation()` is the strategy after the last message, bound to its partition, and a poll or a seek of another partition refuses it with `INVALID_COMMAND` (3).
+
+A cancel of a poll with `OnRead` stops it on the server and waits for its reply: the server answers `TRANSIENT_NOT_ACCEPTED` (58) when the cancel won and nothing was stored, or with what it read and stored. Until then the offset store and the next progress poll of the partition wait, so they never race the late store.
+
+If the reply of such a poll is lost, the server can have stored its offset, so the call fails with `FETCH_PROGRESS_UNCERTAIN` (14010), and the next `Next` poll starts after what the lost read stored. A close waits for the reply of each pending poll with `OnRead`, and the blocking client does not stop such a poll on an interrupt.
+
+### Partition reader
+
+A `PartitionReader` reads the partitions of a topic in batches. It groups the partitions by their primary and reads each group with one request, puts the partitions that a read served last at the end of the next one so a busy partition does not starve the others, regroups after a primary moves, keeps a prefetch, and stays usable after an error. A standalone consumer names its partitions. A consumer group reader joins its group, follows its assignment, and leaves the group on close.
 
 ```java
-Map<Long, PollingStrategy> targets = new LinkedHashMap<>();
-targets.put(0L, PollingStrategy.next());
-targets.put(1L, PollingStrategy.offset(BigInteger.TEN));
-List<FetchedMessages> sections = client.messages().fetchMessages(
-    streamId, topicId, targets, Consumer.group(groupId), 100L, true, options);
-for (FetchedMessages section : sections) {
-    if (section.status() == FetchedMessages.STATUS_OK) {
-        PolledMessages polled = section.decode();
-    }
-}
+PartitionReader reader = client.reader(streamId, topicId, Consumer.of(1L))
+    .partitions(List.of(0L, 1L, 2L))
+    .start(PollingStrategy.first())
+    .options(PollOptions.waitFor(Duration.ofSeconds(5)))
+    .build()
+    .get();
+PolledMessages batch = reader.next().get();
+reader.commit(batch.checkpoint().orElseThrow()).get();
+reader.closeAsync().get();
 ```
 
-The server waits up to `maxWait` for `minCount` messages over all the targets.
-It reads at most `maxBytes` for each target and for the whole reply. A fetch
-needs a `requestTimeout` of at least `maxWait` plus one second. This margin
-applies to a zero `maxWait` too, but not to a deferred poll. The TCP client
-also requires more than one second for a fresh call to leave time for routing.
-It lowers `maxBytes` until the whole reply fits in the largest frame that its
-connections read (`maxVsrFrameSize`).
+`next()` returns the next batch of one partition, never empty, in offset order within one generation of the partition: from its first read, from each `seek`, and from each new assignment. A cancelled `next()` leaves its batch in the reader. The default wait of a reader is 5 s. The futures of a reader complete on its own thread, so a callback must not block.
 
-A section keeps its records undecoded until `decode()`. For an error section,
-`decode()` throws `IggyServerException` with the status of the section, and the
-partition stays where the request put it. To continue after a served section,
-send its partition as `Offset(nextOffset())` with its `context()`, through
-`withContext`. Put the served partitions at the end of the next request, so
-that the other partitions get a turn.
+- `Manual`: `commit(checkpoint)` stores the offset of a delivered checkpoint, forward only within a generation.
+- `OnRead`: the server stores each read, and the reader reads only for a waiting `next()`. After a read whose reply was lost, the next read starts after what the lost read stored, and the reader reads those messages again without a store and delivers them first. A partition that leaves the assignment still hands over the reads that the server stored for it. `closeAsync()` moves the offset of each partition with undelivered batches back to its last delivered message. `commit` and `mark` are refused.
+- `Auto(AutoCommit)`: the reader counts each batch as `CommitAfter` says (`PROCESSING` at the next `next()` or the close, `DELIVERY` when `next()` returns it, `MARKED` on `mark(checkpoint)`), and stores the latest counted position at its `interval`, on its `every` event, before a rebalance takes a partition away, and on close. `AutoCommit.defaults()` stores every 10,000 messages or 5 s after processing.
 
-The TCP client sends the fetch to the primary of the first target, so the
-targets must come from one group of `readinessGroups`. A `NOT_PRIMARY` (89)
-section, or a `NOT_PRIMARY` refusal of the whole fetch, marks the routes of its
-partitions moved. The next `readinessGroups` call then groups them again. A
-fetch with auto-commit or with a `Next` target takes the progress lanes of all
-its partitions. The client never sends such a fetch again: if its reply is
-lost, the call fails with `TRANSIENT_NOT_COMMITTED` (57). A fetch that only
-reads goes out again within its request timeout.
+A `ReadException` names its partition. `HISTORY_UNAVAILABLE` (87) stops a partition until `seek` when its position came from an earlier read of a history that is gone.
 
-A retained mutation blocking a target fails the fetch with
-`PARTITION_LANE_BLOCKED` (14009). The `IggyOperationException` carries that
-target in `getPartitionId()` and the operation to resolve or abandon in
-`getOperationId()`. Other partition lanes remain usable.
+A message that does not decode arrives as a `ReadException` whose `skip()` is the continuation after it, after a batch with the messages before it, and the partition stops until a `seek`.
 
-`close()` waits for the reply of each pending fetch with auto-commit, and then
-cancels the other requests. A cancel of a fetch with auto-commit can lose the
-messages that the server committed. So the blocking client does not stop such
-a fetch on an interrupt. `sendBinaryRequest` routes a raw `FetchMessages` (code
-109) in the same way and keeps the fences of its targets. A server older than
-0.12.1 refuses the code with `INVALID_COMMAND` (3). The HTTP client throws
-`IggyOperationNotSupportedException`.
+The exception carries the bytes the server served for it: `record()` is the message frame as received (its header, payload and user headers) or, when the framing of the section is malformed, the remaining bytes of the section from where decoding stopped.
 
-The TCP client multiplexes deferred polls with other requests on its shared
-connections and routes them to the partition primary. Up to 64 deferred polls and fetches can be in flight per client. Further requests wait
-for a slot in arrival order, within their original request timeout. A poll that
-expires before getting a slot fails with the retryable `TRANSIENT_NOT_ACCEPTED`.
-Queued and active requests share the client's 4096 pending request limit.
-Each TCP attempt uses the time remaining before the original call deadline,
-including time spent waiting for a slot, routing, or retrying. A server capacity
-refusal (`DEFERRED_POLL_CAPACITY_EXCEEDED`) backs off without discarding the
-cached partition route.
-The HTTP client accepts a plain consumer only,
-because the server refuses a consumer group over HTTP: without a persistent
-connection the client cannot follow the group's partition assignment.
-Deferred HTTP polls use a separate pool of up to 64 connections. A timeout or
-transport failure before the request can be sent reports `IggyServerException`
-with `TRANSIENT_NOT_ACCEPTED` (58). Once sending starts, those failures report
-`TRANSIENT_NOT_COMMITTED` (57), because the server may already have advanced the
-offset. The original failure is available as the cause. The client retries only
-definite non-admission, including `DEFERRED_POLL_CAPACITY_EXCEEDED` (90), within
-the original request timeout.
+`offset()` is the offset of the message when its frame decoded and a later check failed, empty for malformed framing.
 
-A parked `Next` or auto-commit poll does not block sends to its partition.
-Polls that advance progress share a separate partition lane with offset reads,
-stores, and deletes. Stores and deletes also take the mutation lane, after their
-progress turn. A retained uncertain store or delete blocks later progress calls
-until it is resolved or abandoned; an active replay keeps its lanes until it
-finishes. Consumers on the same partition share this ordering, including when
-they name a consumer group by different aliases.
+A refusal that a retry does not change is retried with a doubling wait and stops its partition after six in a row.
 
-Cancelling a TCP deferred poll or noncommitting fetch sends a per-request
-cancellation on the same authenticated connection. A committing fetch sends no
-cancellation and retains uncertain progress for explicit recovery. This stops a poll still
-waiting for readiness; cancellation can race an offset update that the server
-has already accepted.
-With auto-commit, a lost or timed-out reply can leave the stored offset advanced
-without delivering its messages to the caller. Use manual offset commits after
-processing when those messages must remain available for another attempt.
+The blocking client builds a blocking reader with `org.apache.iggy.client.blocking.reader.PartitionReader.build(client.reader(...))`, whose `next(Duration)` returns empty at its timeout and keeps the batch for the next call.
+
+### Consumer
+
+An `IggyConsumer` hands over one message at a time from a reader. Under `Auto` with `PROCESSING`, a message counts when the next one is asked for, or after its handler succeeds in `consume`. A handler that fails leaves its message uncounted and ends `consume` with its error.
+
+```java
+IggyConsumer consumer = IggyConsumer.build(client.reader(streamId, topicId, Consumer.group(groupId))
+        .options(PollOptions.waitFor(Duration.ofSeconds(5)).withCommit(CommitPolicy.auto())))
+    .get();
+consumer.consume(message -> process(message.message())).get();
+consumer.shutdown().get();
+```
+
+`shutdown()` stops a running loop after its current handler, counts the last message under `PROCESSING`, stores, moves offsets back under `OnRead`, and leaves the group.
+
+### Transport notes
+
+The TCP client multiplexes deferred polls with other requests on its shared connections and routes them to the partition primary. Up to 64 deferred requests can be in flight per client, and further ones wait for a slot within their request timeout.
+
+A server capacity refusal (`DEFERRED_POLL_CAPACITY_EXCEEDED`) backs off, and if it lasts until the deadline, the call fails with `DEFERRED_POLL_CAPACITY_EXCEEDED` (90). A deferred poll of a consumer group must name its partition, a reader reads the whole assignment.
+
+The HTTP client sends a poll that stores its offset as a `POST` to `.../messages/deferred`, which no proxy or client library resends, and a poll that stores nothing as a `GET`. If the answer of a storing poll is lost after the request went out, the call fails with `FETCH_PROGRESS_UNCERTAIN` (14010). A timeout or transport failure before the request can be sent reports `TRANSIENT_NOT_ACCEPTED` (58).
+
+The HTTP client accepts a plain consumer only, because the server refuses a consumer group over HTTP. An interrupt of the calling thread ends a poll that stores nothing, also while it waits for the reply headers.
 
 ## Exception Handling
 
@@ -555,7 +510,11 @@ The SDK's custom exception types inherit from `IggyException`. When you join a f
 
 The HTTP client treats 503 `relay_refused` through Apache HttpClient's ordinary
 429/503 retry strategy. That behavior does not provide retained-operation
-recovery over HTTP.
+recovery over HTTP. A `pollMessages` with auto-commit is a write despite its
+GET, because the server stores the offset when it reads. The client never
+sends it again after a transport failure, and once it may have reached the
+server, a transport failure or a refused resend after a 503 fails it with
+`TRANSIENT_NOT_COMMITTED` (57).
 
 On a multi-node cluster, an HTTP call often reaches a node that is not the
 partition primary. For message sends, polls and consumer offset calls, that
@@ -617,11 +576,12 @@ deadline; an oversized frame fails locally. Cancellation removes only the caller
 A mutation already sent may remain retained. The byte limit counts admitted frozen frames and
 writer references; API input snapshots and queued serialization buffers are outside this limit.
 
-Auto-commit and `Next` polls use a temporary partition ordering barrier. Their success
-acknowledges local admission, not replicated offset durability. Code 57, a lost or malformed
-reply, or an eviction ends the call with code 57. Progress is unknown, and the call
-releases the barrier. These polls are never retained or replayed after uncertainty. Explicit non-admission
-(58 or 89) may retry within the same deadline.
+Polls with `OnRead` and `Next` polls use a temporary partition ordering barrier. Their success
+acknowledges local admission, not replicated offset durability. For a `Next` poll that stores nothing, code 57, a lost or
+malformed reply, or an eviction ends the call with code 57. For a poll with `OnRead` they end it with
+`FETCH_PROGRESS_UNCERTAIN` (14010), because the server can have stored its offset. Either way the call releases the
+barrier, and these polls are never retained or replayed after uncertainty. Explicit non-admission (58 or 89) may retry
+within the same deadline.
 
 ## Examples
 

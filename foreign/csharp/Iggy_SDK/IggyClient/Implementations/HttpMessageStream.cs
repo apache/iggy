@@ -54,6 +54,13 @@ public class HttpMessageStream : IIggyClient
     private const int DeferredRetryIntervalMs = 50;
     private const int DeferredRetryMaxIntervalMs = 1_000;
 
+    /// <summary>A plain poll that stores its offset: no wait and no byte limit, as the plain poll has none.</summary>
+    private static readonly DeferredPollOptions CommittingPlainPoll = new()
+    {
+        MaxWait = TimeSpan.Zero,
+        MaxBytes = uint.MaxValue
+    };
+
     private readonly bool _allowAutoCommitWithEncryptor;
     private readonly SemaphoreSlim _deferredRequests =
         new(DeferredPollOptions.MAX_PARKED_REQUESTS, DeferredPollOptions.MAX_PARKED_REQUESTS);
@@ -289,15 +296,37 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
-        Consumer consumer,
-        PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
+    public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint partitionId,
+        Consumer consumer, PollingStrategy strategy, PollOptions options, CancellationToken token = default)
     {
-        return PollAsync(streamId, topicId, partitionId, consumer, pollingStrategy, count, autoCommit, null, token);
+        ArgumentNullException.ThrowIfNull(options);
+        options.ValidatePoll(partitionId, strategy);
+        var polled = await PollAsync(streamId, topicId, partitionId, consumer, strategy, options.Count,
+            options.Commit.Mode == CommitMode.OnRead, options.Wire, token);
+        polled.RequestStart = strategy;
+        return polled;
+    }
+
+    /// <inheritdoc />
+    public async Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
+        uint partitionId, Consumer consumer, PollingStrategy strategy, PollOptions options,
+        CancellationToken token = default)
+    {
+        var messages = await PollMessagesAsync(streamId, topicId, partitionId, consumer, strategy, options, token);
+        return BinaryMapper.ToRentedMessages(messages);
     }
 
     /// <inheritdoc />
     public Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+        Consumer consumer,
+        PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
+    {
+        // The server refuses a GET that stores an offset, so a committing poll is a deferred POST without a wait.
+        return PollAsync(streamId, topicId, partitionId, consumer, pollingStrategy, count, autoCommit,
+            autoCommit ? CommittingPlainPoll : null, token);
+    }
+
+    internal Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
         Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit, DeferredPollOptions options,
         CancellationToken token = default)
     {
@@ -306,8 +335,7 @@ public class HttpMessageStream : IIggyClient
         return PollAsync(streamId, topicId, partitionId, consumer, pollingStrategy, count, autoCommit, options, token);
     }
 
-    /// <inheritdoc />
-    public async Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
+    internal async Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
         uint? partitionId, Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit,
         DeferredPollOptions options, CancellationToken token = default)
     {
@@ -329,18 +357,23 @@ public class HttpMessageStream : IIggyClient
                 "AutoCommit with a message encryptor risks silent message loss: the offset is committed before decryption. Poll with autoCommit false, or set AllowAutoCommitWithEncryptor.");
         }
 
+        if (partitionId is { } partition)
+        {
+            pollingStrategy.ValidatePartition(partition);
+        }
+
         var partitionIdParam = partitionId.HasValue ? $"&partition_id={partitionId.Value}" : string.Empty;
         var contextParam = pollingStrategy.Context is { } context
             ? $"&context={Uri.EscapeDataString(JsonSerializer.Serialize(context, _jsonSerializerOptions))}"
             : string.Empty;
         var deferredPath = deferred is null ? string.Empty : "/deferred";
         var url = CreateUrl($"/streams/{streamId}/topics/{topicId}/messages{deferredPath}?consumer_id={consumer.ConsumerId}" +
-                            $"{partitionIdParam}&kind={pollingStrategy.Kind}&value={pollingStrategy.Value}&count={count}&auto_commit={autoCommit}{contextParam}");
+                            $"{partitionIdParam}&kind={pollingStrategy.Kind}&value={pollingStrategy.Value}&count={count}&auto_commit={(autoCommit ? "true" : "false")}{contextParam}");
 
         var response = deferred is null
             ? await _httpClient.GetAsync(url, token)
-            : await GetDeferredPollAsync(url, deferred, autoCommit || pollingStrategy.Kind == MessagePolling.Next,
-                token);
+            : await SendDeferredPollAsync(url, deferred, autoCommit,
+                autoCommit || pollingStrategy.Kind == MessagePolling.Next, token);
         if (response.IsSuccessStatusCode)
         {
             // SendAsync buffered a deferred reply, so its decode does not wait on the server. If the poll moved an
@@ -377,11 +410,16 @@ public class HttpMessageStream : IIggyClient
     ///     what is left of the wait and the request timeout, so the server always answers before the client gives
     ///     up. Only a refusal that admitted nothing (58 or 90) is sent again.
     /// </summary>
+    /// <remarks>
+    ///     A poll that stores its offset is a POST, which no client or proxy sends again. The server refuses a GET
+    ///     that asks for it.
+    /// </remarks>
     /// <exception cref="VsrRequestOutcomeUnknownException">
-    ///     The caller canceled, or the request timeout passed, while a poll that can move an offset was on the wire.
+    ///     The caller canceled, or the request timeout passed, while a poll that can move an offset was on the wire,
+    ///     or the server answered a committing poll with 504 (Gateway Timeout).
     /// </exception>
-    private async Task<HttpResponseMessage> GetDeferredPollAsync(string url, DeferredPollOptions options,
-        bool progress, CancellationToken token)
+    private async Task<HttpResponseMessage> SendDeferredPollAsync(string url, DeferredPollOptions options,
+        bool commits, bool progress, CancellationToken token)
     {
         var started = Stopwatch.GetTimestamp();
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -396,7 +434,7 @@ public class HttpMessageStream : IIggyClient
                      retryDelayMs = Math.Min(retryDelayMs * 2, DeferredRetryMaxIntervalMs))
                 {
                     var remaining = options.Remaining(Stopwatch.GetElapsedTime(started));
-                    using var request = new HttpRequestMessage(HttpMethod.Get, CreateUrl(
+                    using var request = new HttpRequestMessage(commits ? HttpMethod.Post : HttpMethod.Get, CreateUrl(
                         $"{url}&wait_us={remaining.MaxWaitUs}&min_count={remaining.MinCount}&max_bytes={remaining.MaxBytes}&request_timeout_us={remaining.RequestTimeoutUs}"));
                     request.Options.Set(TransientHttpRetryHandler.SingleAttempt, true);
                     sending = true;
@@ -413,6 +451,14 @@ public class HttpMessageStream : IIggyClient
                         < options.RequestTimeout.TotalMilliseconds)
                     {
                         response.Dispose();
+                    }
+                    catch (IggyInvalidStatusCodeException error) when (commits
+                        && response.StatusCode == HttpStatusCode.GatewayTimeout)
+                    {
+                        // The server stores the offset before it answers, so the poll may have moved past a batch it
+                        // never sent.
+                        response.Dispose();
+                        throw new VsrRequestOutcomeUnknownException(error);
                     }
 
                     await Task.Delay(retryDelayMs, budget.Token);
@@ -447,6 +493,15 @@ public class HttpMessageStream : IIggyClient
     {
         return PutOffsetAsync(streamId, topicId,
             new StoreOffsetRequest(consumer, partitionId, offset) { Context = context }, token);
+    }
+
+    /// <inheritdoc />
+    public Task StoreConsumerPositionAsync(Consumer consumer, Identifier streamId, Identifier topicId,
+        Checkpoint checkpoint, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(checkpoint);
+        return StoreOffsetAsync(consumer, streamId, topicId, checkpoint.Offset, checkpoint.PartitionId,
+            checkpoint.Context, token);
     }
 
     private async Task PutOffsetAsync(Identifier streamId, Identifier topicId, StoreOffsetRequest request,
@@ -488,6 +543,15 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.DeleteAsync(
             $"/streams/{streamId}/topics/{topicId}/consumer-offsets/{consumer}{partitionIdParam}", token);
         await HandleResponseAsync(response);
+    }
+
+    /// <inheritdoc />
+    /// <remarks>HTTP sends no context with a delete, so the server deletes the offset of the history that it holds.</remarks>
+    public Task DeleteConsumerPositionAsync(Consumer consumer, Identifier streamId, Identifier topicId,
+        Checkpoint checkpoint, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(checkpoint);
+        return DeleteOffsetAsync(consumer, streamId, topicId, checkpoint.PartitionId, token);
     }
 
     /// <inheritdoc />
@@ -1258,7 +1322,7 @@ public class HttpMessageStream : IIggyClient
         }
         catch (JsonException)
         {
-            // A gateway or proxy error body is not the server's JSON schema; the raw text still travels in
+            // A gateway or proxy error body is not the server's JSON schema. The raw text still travels in
             // the exception message.
         }
 

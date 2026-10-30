@@ -133,7 +133,7 @@ Per `[[streams]]` entry per sink:
 
 1. Build / ensure consumer group `iggy-connect-sink-{key}` (`connect` matches the docker image name `apache/iggy-connect` - see `runtime/src/sink.rs::default_consumer_group`). Overridable via the stream config's `consumer_group`.
 2. Spawn one task per topic (`spawn_consume_tasks`).
-3. Poll Iggy → batch messages (default `batch_length = 1000`, the poll `count`). Polls use `ServerCommitPolicy::OnRead`: the server stores the offset of each reply, so a reply lost after that store skips its batch. A `consumer.next()` `Err` (a `ReadError`) bumps `errors` and `continue`s.
+3. Poll Iggy → batch messages (default `batch_length = 1000`, the poll `count`). Polls use `CommitPolicy::OnRead`: the server stores the offset of each reply, so a reply lost after that store skips its batch. A `consumer.next()` `Err` (a `ReadError`) bumps `errors` and `continue`s.
    The reader retries most errors by itself. For a partition that it stops, `handle_read_error` seeks: after a read with an unknown outcome (`FetchProgressUncertain`, `PartitionLaneBlocked`) it first calls `abandon_operation` and then seeks `Next` (after the stored offset). It seeks the `skip` of a message that does not decode, and `Next` after `HistoryUnavailable`.
 4. Decode via `Schema::decoder()`. Decode failure logs + bumps `errors`. `messages_filtered` is reserved for the transform filter contract (`Ok(None)`).
 5. Apply transforms (chain). A transform `Err` is logged, bumps `errors`, and drops only that message (drop-and-continue, mirroring the source) - one bad payload never kills the batch. `Ok(None)` filters the message - bumps `messages_filtered{connector_type="sink"}`.

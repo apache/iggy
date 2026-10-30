@@ -16,8 +16,11 @@
 // under the License.
 
 use crate::{
-    RUNTIME, ffi,
+    RUNTIME,
+    consumer::Consumer as ConsumerHandle,
+    ffi,
     messages::{Checkpoint, Continuation},
+    pending_poll::PendingPoll,
     reader::PartitionReader,
     type_conversion::{ffi_options_to_raw, parse_message_expiry},
 };
@@ -65,6 +68,33 @@ fn resolve_consumer(consumer_kind: &str, consumer_id: RustIdentifier) -> Result<
         "consumer" => Ok(Consumer::new(consumer_id)),
         "consumer_group" => Ok(Consumer::group(consumer_id)),
         _ => Err(format!("invalid consumer kind: {consumer_kind}")),
+    }
+}
+
+/// The resolved parts of a poll request.
+struct PollRequest {
+    stream_id: RustIdentifier,
+    topic_id: RustIdentifier,
+    consumer: Consumer,
+    options: PollOptions,
+}
+
+impl PollRequest {
+    fn new(
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        consumer_kind: &str,
+        consumer_id: ffi::Identifier,
+        options: ffi::PollOptions,
+    ) -> Result<Self, String> {
+        let fail = |error: String| format!("Could not poll messages: {error}");
+        let consumer_id = RustIdentifier::try_from(consumer_id).map_err(fail)?;
+        Ok(Self {
+            stream_id: RustIdentifier::try_from(stream_id).map_err(fail)?,
+            topic_id: RustIdentifier::try_from(topic_id).map_err(fail)?,
+            consumer: resolve_consumer(consumer_kind, consumer_id).map_err(fail)?,
+            options: PollOptions::try_from(options).map_err(fail)?,
+        })
     }
 }
 
@@ -526,33 +556,104 @@ impl Client {
         options: ffi::PollOptions,
         error_info: &mut ffi::ErrorInfo,
     ) -> Result<ffi::PolledMessages, String> {
-        let rust_stream_id = RustIdentifier::try_from(stream_id)
-            .map_err(|error| format!("Could not poll messages: {error}"))?;
-        let rust_topic_id = RustIdentifier::try_from(topic_id)
-            .map_err(|error| format!("Could not poll messages: {error}"))?;
-        let rust_consumer_id = RustIdentifier::try_from(consumer_id)
-            .map_err(|error| format!("Could not poll messages: {error}"))?;
-        let consumer = resolve_consumer(&consumer_kind, rust_consumer_id)
-            .map_err(|error| format!("Could not poll messages: {error}"))?;
-        let options = PollOptions::try_from(options)
-            .map_err(|error| format!("Could not poll messages: {error}"))?;
-
+        let request = PollRequest::new(stream_id, topic_id, &consumer_kind, consumer_id, options)?;
         RUNTIME.block_on(async {
             let polled = self
                 .inner
                 .poll_messages(
-                    &rust_stream_id,
-                    &rust_topic_id,
+                    &request.stream_id,
+                    &request.topic_id,
                     partition_id,
-                    &consumer,
+                    &request.consumer,
                     strategy,
-                    options,
+                    request.options,
                 )
                 .await
                 .inspect_err(|error| error_info.record(error))
                 .map_err(|error| format!("Could not poll messages: {error}"))?;
             Ok(ffi::PolledMessages::from(polled))
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_poll_messages(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        partition_id: u32,
+        consumer_kind: String,
+        consumer_id: ffi::Identifier,
+        strategy: ffi::PollingStrategy,
+        options: ffi::PollOptions,
+    ) -> Result<Box<PendingPoll>, String> {
+        let strategy = PollingStrategy::try_from(strategy)
+            .map_err(|error| format!("Could not poll messages: {error}"))?;
+        let request = PollRequest::new(stream_id, topic_id, &consumer_kind, consumer_id, options)?;
+        let client = Arc::clone(&self.inner);
+        let task = RUNTIME.spawn(async move {
+            client
+                .poll_messages(
+                    &request.stream_id,
+                    &request.topic_id,
+                    partition_id,
+                    &request.consumer,
+                    &strategy,
+                    request.options,
+                )
+                .await
+        });
+        Ok(Box::new(PendingPoll::new(task)))
+    }
+
+    pub fn consumer(
+        &self,
+        name: String,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        group: bool,
+        options: ffi::ConsumerOptions,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<Box<ConsumerHandle>, String> {
+        *error_info = ffi::ErrorInfo::default();
+        let fail = |error: String| format!("Could not build consumer '{name}': {error}");
+        let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(fail)?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id).map_err(fail)?;
+        // The builders take names, so the stream and topic identifiers replace them.
+        let builder = if group {
+            self.inner.consumer_group(&name, &name, &name)
+        } else {
+            self.inner.consumer(&name, &name, &name)
+        };
+        let mut builder = builder
+            .map_err(|error| fail(error.to_string()))?
+            .stream(rust_stream_id)
+            .topic(rust_topic_id);
+        if !group {
+            builder = builder.partitions(options.partitions);
+        }
+        if options.has_start {
+            builder =
+                builder.polling_strategy(PollingStrategy::try_from(options.start).map_err(fail)?);
+        }
+        if options.has_poll_options {
+            builder =
+                builder.poll_options(PollOptions::try_from(options.poll_options).map_err(fail)?);
+        }
+        if options.has_prefetch_bytes {
+            builder = builder.prefetch_bytes(options.prefetch_bytes);
+        }
+        if options.has_prefetch_messages {
+            builder = builder.prefetch_messages(options.prefetch_messages);
+        }
+        if options.allow_replay {
+            builder = builder.allow_replay();
+        }
+        let mut consumer = builder.build();
+        RUNTIME
+            .block_on(consumer.init())
+            .inspect_err(|error| error_info.record(error))
+            .map_err(|error| fail(error.to_string()))?;
+        Ok(Box::new(ConsumerHandle::new(consumer)))
     }
 
     pub fn reader(
@@ -1054,6 +1155,38 @@ impl Client {
                 .map_err(|error| {
                     format!(
                         "Could not store consumer position for stream '{rust_stream_id}', topic '{rust_topic_id}': {error}"
+                    )
+                })
+        })
+    }
+
+    pub fn delete_consumer_position(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        consumer_kind: String,
+        consumer_id: ffi::Identifier,
+        checkpoint: &Checkpoint,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
+        let rust_stream_id = RustIdentifier::try_from(stream_id)
+            .map_err(|error| format!("Could not delete consumer position: {error}"))?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id)
+            .map_err(|error| format!("Could not delete consumer position: {error}"))?;
+        let rust_consumer_id = RustIdentifier::try_from(consumer_id)
+            .map_err(|error| format!("Could not delete consumer position: {error}"))?;
+        let consumer = resolve_consumer(&consumer_kind, rust_consumer_id)
+            .map_err(|error| format!("Could not delete consumer position: {error}"))?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .delete_consumer_position(&consumer, &rust_stream_id, &rust_topic_id, &checkpoint.0)
+                .await
+                .inspect_err(|error| error_info.record(error))
+                .map_err(|error| {
+                    format!(
+                        "Could not delete consumer position for stream '{rust_stream_id}', topic '{rust_topic_id}': {error}"
                     )
                 })
         })

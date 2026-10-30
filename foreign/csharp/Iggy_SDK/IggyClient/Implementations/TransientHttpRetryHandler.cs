@@ -16,15 +16,17 @@
 // under the License.
 
 using System.Net;
+using System.Web;
 
 namespace Apache.Iggy.IggyClient.Implementations;
 
 /// <summary>
 ///     Replays requests the server answered with a retryable status: 503 (no caught-up primary, full
 ///     pipeline, view-change cancel, shard write budget) and 429 (session write cap). The server signals
-///     both as transient with a Retry-After; the binary transports absorb the equivalent frames in their
+///     both as transient with a Retry-After. The binary transports absorb the equivalent frames in their
 ///     in-client replay loop, so HTTP replays here for transport parity. A write 504 stays terminal: the
-///     request may still commit, so its outcome is unknown and must surface to the caller.
+///     request may still commit, so its outcome is unknown and must surface to the caller. A poll with auto commit
+///     is a GET that writes, because the server stores its offset before it answers.
 /// </summary>
 internal sealed class TransientHttpRetryHandler : DelegatingHandler
 {
@@ -33,6 +35,8 @@ internal sealed class TransientHttpRetryHandler : DelegatingHandler
     ///     left of its wait, so a copy of an earlier attempt would wait past the request timeout.
     /// </summary>
     internal static readonly HttpRequestOptionsKey<bool> SingleAttempt = new(nameof(SingleAttempt));
+
+    private const string AutoCommitQueryKey = "auto_commit";
 
     private static readonly TimeSpan RetryDeadline = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan RetryInterval = TimeSpan.FromMilliseconds(50);
@@ -60,7 +64,7 @@ internal sealed class TransientHttpRetryHandler : DelegatingHandler
         {
             HttpResponseMessage response = await base.SendAsync(CloneRequest(request, bufferedContent),
                 cancellationToken);
-            if (!IsRetryable(request.Method, response.StatusCode) || Environment.TickCount64 >= deadline)
+            if (!IsRetryable(request, response.StatusCode) || Environment.TickCount64 >= deadline)
             {
                 return response;
             }
@@ -71,7 +75,7 @@ internal sealed class TransientHttpRetryHandler : DelegatingHandler
         }
     }
 
-    private static bool IsRetryable(HttpMethod method, HttpStatusCode statusCode)
+    private static bool IsRetryable(HttpRequestMessage request, HttpStatusCode statusCode)
     {
         if (statusCode is HttpStatusCode.ServiceUnavailable or HttpStatusCode.TooManyRequests)
         {
@@ -81,7 +85,15 @@ internal sealed class TransientHttpRetryHandler : DelegatingHandler
         // A read that timed out in the partition plane (e.g. a poll racing the reconciler that has not yet
         // materialised a fresh topic's partition group) has no side effects, so it replays. A write 504 is an
         // unknown outcome and stays terminal.
-        return statusCode == HttpStatusCode.GatewayTimeout && method == HttpMethod.Get;
+        return statusCode == HttpStatusCode.GatewayTimeout && request.Method == HttpMethod.Get
+                                                           && !AutoCommits(request.RequestUri);
+    }
+
+    private static bool AutoCommits(Uri? uri)
+    {
+        return uri is not null
+               && bool.TryParse(HttpUtility.ParseQueryString(uri.Query)[AutoCommitQueryKey], out var autoCommit)
+               && autoCommit;
     }
 
     /// <summary>

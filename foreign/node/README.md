@@ -70,19 +70,19 @@ captures the route context. Non-admission retries and uncertain-operation replay
 preserve the first captured context, request identity and payload. Route refreshes
 change the destination. Lifecycle error 88 retries with a fresh ID and the same
 context. A send without caller-supplied context can refresh history once after
-error 87; explicit contexts return that error. A new call can capture newer
+error 87. Explicit contexts return that error. A new call can capture newer
 metadata progress.
 
 Route discovery uses command 105. Sends, polls and offset reads/writes use the
-partition primary; other commands use the metadata primary. One logical client
+partition primary. Other commands use the metadata primary. One logical client
 owns a shared session, a monotonic request counter and one multiplexed link per
 replica. Healthy links survive primary changes. Each link dials the address
 that its node advertises in the cluster roster. With a one-node roster, the
 link dials the configured endpoint instead. A single node behind a port
 mapping or a port-forward thus stays reachable. The legacy `poolSize` option
-accepts only one logical client; it does not limit replica links or concurrency.
+accepts only one logical client. It does not limit replica links or concurrency.
 The public `Client._pool` property has been removed. Applications should use the
-client methods directly; the client owns its replica connections.
+client methods directly. The client owns its replica connections.
 
 A backup replica can miss a stream, topic or partition that the metadata primary
 already created. When such a replica replies "not found" (error 1009, 1010,
@@ -97,7 +97,7 @@ metadata primary, the reply is final.
 
 VSR authentication translates password and personal-access-token login into the
 Register handshake. Replacement links bind the existing session. Confirmed
-session expiry requires a new Register; an uncertain mutation is never replayed
+session expiry requires a new Register. An uncertain mutation is never replayed
 under that new session. An eviction that ends the session does not prove the
 outcome of a mutation that the client already wrote. That call ends with
 `OperationUncertainError`. A stale client eviction drops only its link, because
@@ -166,53 +166,155 @@ is sent.
 
 A consumer-group poll with deferred options needs a partition. Without one, it
 fails with error 3 before anything is sent. A member reads all its partitions
-with fetches, as `groupConsumerStream` does.
+with `message.reader`.
 
 An auto-commit or Next deferred poll holds the progress lane of its partition
 while it waits on the server, up to `maxWait`. Offset reads, stores and deletes
 of the same client on that partition wait behind it. Sends do not take the
 progress lane, so a parked poll does not delay them.
 
-### Fetches
+### Polling one partition
 
-`message.fetch` sends command 109. One fetch waits on many partitions of a
-topic and reads them into one reply. It takes 1 to 1000 partitions, each once,
-with an `Offset` or `Next` start point. Another start point fails with error 3
-before anything is sent. The reply holds a section for each partition that the
-server read or refused. `decodeFetchSection` turns a section into the poll
-reply of its partition. For a refused section, it throws the refusal.
+`message.poll` with a `strategy` reads one batch of one partition with
+`PollOptions`. It waits on the server until `minCount` messages are ready, the
+reply reaches `maxBytes`, or `maxWait` ends, and returns what is ready, which
+can be nothing.
 
-The partitions of a fetch must have one primary. `message.readinessGroups`
-groups partitions by their primary, from the cached routes, and splits a group
-into parts of at most 1000 partitions. Each group keeps the order of the
-partitions that you give. The client sends a fetch to the primary of its first
-partition.
+```typescript
+import { CommitPolicy, Consumer, PollingStrategy } from "apache-iggy";
 
-A fetch takes the options of a deferred poll, with two differences. `maxBytes`
-limits the records of the whole reply and of each partition, as `count` limits
-its messages. The request timeout must be at least `maxWait` plus 1 s, and
-greater than 1 s for a `maxWait` of 0. The client lowers `maxBytes` to `maxResponseFrameSize`
-minus the 256-byte header and the section table, which is 4 bytes plus 56
-bytes for each partition. If less than 344 bytes remain, the fetch fails with
-error 80 before anything is sent.
+const consumer = Consumer.Single;
+const options = { count: 100, maxWait: 5_000 };
+const polled = await client.message.poll({
+  streamId, topicId, partitionId: 1, consumer, strategy: PollingStrategy.Next, options
+});
+for (const message of polled.messages) console.log(message.payload.toString());
 
-A partition can carry the context of the section that its offset came from.
-Then the server does not read that offset in a partition that was deleted and
-created again. A partition without a context takes the incarnation of its
-cached route.
+const checkpoint = polled.checkpoint();
+if (checkpoint) await client.offset.storePosition({ streamId, topicId, consumer, checkpoint });
 
-A fetch takes one deferred slot, and `signal` cancels it as it cancels a
-deferred poll. With `autocommit`, the server can read and store the offsets
-before the cancel comes, and the cancel drops that reply, so those messages are
-lost. Let such a fetch end instead.
+const next = await client.message.poll({
+  streamId, topicId, partitionId: 1, consumer, strategy: polled.continuation(), options
+});
+```
 
-An auto-commit fetch, or a fetch with a `Next` partition, holds the progress
-lane of each of its partitions, in ascending partition order. The client never
-sends it again after it reached the server, so a lost reply fails with error
-57. A refusal of the fetch as not the primary (89), or for a history or an
-owner that changed (87 or 5009), makes the routes of all its partitions stale.
-A section with such a refusal makes only the route of its partition stale. The
-next `readinessGroups` looks up the stale routes again.
+| option | default | limits |
+| --- | --- | --- |
+| `count` | `1000` | the most messages of one batch |
+| `maxWait` | `0` | up to 600 s. Zero replies at once. The call gives up 10 s after `maxWait` |
+| `minCount` | `1` | from 1 to `count`, else error 4009 |
+| `maxBytes` | `1048576` | at least 344 bytes, else error 80 |
+| `commit` | `CommitPolicy.Manual` | who stores the offset, see below |
+
+- `CommitPolicy.Manual` stores nothing. Store `checkpoint()`, or
+  `checkpointAt(index)` for a part of the batch, with `offset.storePosition`,
+  and remove it with `offset.deletePosition`. A checkpoint keeps the partition
+  history that delivered it, so a store after the partition was deleted and
+  created again fails with error 87.
+- `CommitPolicy.OnRead` makes the server store the offset of the last message
+  of the read, as part of the read. A one-shot poll refuses
+  `CommitPolicy.Auto()` with error 2 (InvalidConfiguration), since it has
+  nothing to count.
+- `continuation()` continues the partition after the batch, under its context.
+  An empty batch keeps the start of its read, so `Next` stays `Next`. A poll of
+  another partition refuses the continuation with error 3.
+- A first message larger than `maxBytes` comes alone in its read.
+- If you abort a waiting poll, the client cancels it on the server. A poll that
+  stores nothing rejects with the abort reason. A poll that commits keeps its
+  reply: the server answers it once, refused when the cancel won and nothing was
+  stored, so the call rejects with the abort reason, or with the messages that
+  it stored before the cancel came, which the call returns.
+
+### Partition reader
+
+`message.reader` opens a `PartitionReader`, which reads many partitions in
+batches and keeps the position of each. It reads the partitions of one primary
+in one request, finds a moved primary by itself and gives each partition its
+turn.
+
+```typescript
+import { Consumer, ReadError } from "apache-iggy";
+
+const reader = await client.message.reader({
+  streamId, topicId, consumer: Consumer.Single, partitions: [1, 2, 3], options: { maxWait: 5_000 }
+});
+try {
+  while (true) {
+    try {
+      const batch = await reader.next();
+      process(batch);
+      await reader.commit(batch.checkpoint()!);
+    } catch (error) {
+      // A message that does not decode. The reader reads it again until a seek passes it.
+      if (error instanceof ReadError && error.skip) await reader.seek(error.partitionId!, error.skip);
+      else if (!(error instanceof ReadError)) throw error;
+    }
+  }
+} finally {
+  await reader.close();
+}
+```
+
+- A consumer group reads the assignment of its member:
+  `{ consumer: Consumer.Group('g') }` without `partitions` joins the group,
+  follows rebalances and leaves the group in `close()`.
+- `next()` returns one batch of one partition, never empty. A `ReadError`
+  names the partition of an error, or none for an error of the whole reader,
+  and the reader retries by itself. Error 87 stops a partition until `seek`
+  when its position came from an earlier read, and so do error 80 and a refusal
+  that six retries did not change.
+- For a message that does not decode, `ReadError` carries `skip`, `offset` and
+  `record`, the record as the reply carried it: its 48-byte frame header,
+  payload and user headers, so the message can be kept or inspected. When the
+  framing of the reply is malformed, `offset` is undefined and `record` holds
+  the remaining reply bytes from where decoding stopped.
+- With `CommitPolicy.Manual`, `commit` stores a checkpoint. With
+  `CommitPolicy.OnRead` the server stores the offset of each read, the reader
+  reads only while `next()` waits, and `close()` moves the offset back to the
+  last batch that the application took. A read whose reply was lost is
+  repaired: the next read finds what it stored, and the reader reads those
+  messages again by offset without a commit. A batch that the server stored is
+  handed over even when its partition left the assignment of the member.
+- With `CommitPolicy.Auto({ interval, every, after })` the reader counts each
+  batch when `next()` returns it (`CommitAfter.Delivery`), at the next `next()`
+  or `close()` (`CommitAfter.Processing`), or on `mark` (`CommitAfter.Marked`),
+  and stores the latest counted position at the interval, on the event
+  (`CommitEvery.Message`, `CommitEvery.Messages(n)` or `CommitEvery.Batch`),
+  and in `close()`. `DEFAULT_AUTO_COMMIT` stores every 10,000 messages or 5 s
+  after processing.
+- The reader reads ahead up to 16 MiB and 16,000 messages (`prefetchBytes`,
+  `prefetchMessages`). Without options a read waits up to 5 s. After a refused
+  read or a failed refresh it waits `retryInterval`, 1 s by default.
+
+### Consumers
+
+`client.consumer` and `client.consumerGroup` hand over one message at a time on
+a partition reader, as an async iterable, with a handler loop, or as a
+`Readable`.
+
+```typescript
+import { CommitAfter, CommitPolicy } from "apache-iggy";
+
+const consumer = await client.consumerGroup({
+  name: 'orders', streamId, topicId,
+  options: { commit: CommitPolicy.Auto({ after: CommitAfter.Processing }) },
+  onError: (error) => console.warn(error)
+});
+await consumer.consume(async ({ message }) => handle(message));
+await consumer.shutdown();
+```
+
+- `client.consumerGroup` creates the group when it is missing and joins it.
+  `client.consumer` reads the given `partitions` under the consumer `name`.
+- Under `CommitAfter.Processing` a message counts once the iterator is read
+  again or its handler returns. A handler that throws ends `consume` with its
+  error and leaves its message uncounted. `shutdown()` counts the last message,
+  stores or moves back the offsets and leaves the group.
+- A read error that the reader retries by itself goes to `onError` and the
+  consumer goes on. A message that does not decode ends the iteration with its
+  `ReadError`, whose `skip` passes it with `seek`.
+- `toReadable()` takes the next message only when its own reader asks for it,
+  and destroying it shuts the consumer down.
 
 ### Mutation recovery and limits
 
@@ -244,8 +346,9 @@ routing, link waits and retries.
 
 For a blocked fetch target, `LaneBlockedError.partitionId` identifies the partition
 whose retained operation needs repair. A block from an uncertain committing fetch
-also sets `requiresExplicitRecovery`, including on stores and deletes. Other
-single-lane errors leave `partitionId` undefined.
+also sets `requiresExplicitRecovery`, including on stores and deletes, and has
+`errorCode` 14009 (`PARTITION_LANE_BLOCKED`). Other blocks have `errorCode` 14007
+(`LANE_BLOCKED`). Other single-lane errors leave `partitionId` undefined.
 
 Resolution requires correlated committed-result proof. A proved business
 rejection returns the original error and releases the lane. An unproved denial
@@ -270,38 +373,34 @@ Await those calls before destroying the client when their results are needed.
 Auto-commit and Next polls (100/106), and non-committing fetches, hold their progress lane only during the active call.
 Error 57, a lost reply or another unknown outcome ends the call immediately with status 57 and no
 retained operation ID. These polls never replay after uncertainty. Known
-non-admission errors 58/89 remain retryable; pure reads may retry lost replies.
+non-admission errors 58/89 remain retryable. Pure reads may retry lost replies.
 Before uncertainty, lifecycle error 88 retries with a fresh ID within the same
 deadline. After uncertainty, only committed-result proof can release the lane.
 
-A committing fetch (109) with an unknown outcome throws `FetchProgressUncertainError`
-(local code 14010) and retains progress blocks for every affected partition history.
-Its `operationId` is a client-lifetime recovery key, not a server replay receipt.
-Later progress polls, fetches, stores and deletes fail with `LaneBlockedError`
-carrying that ID and the blocked partition. Stateless reads, `GetOffset` inspection
-and sends remain available. Reconnect, sign-in and late replies do not clear these
-blocks. `resolveOperation` returns the same uncertainty without I/O;
-`abandonOperation` explicitly releases the blocks while accepting that the old
-server request may still finish. An inspected offset is not a completion barrier.
+A committing fetch (109) with an unknown outcome throws `FetchProgressUncertainError` (local code 14010) and retains progress blocks for every affected partition history. Its `operationId` is a client-lifetime recovery key, not a server replay receipt.
+
+Later progress polls, fetches, stores and deletes fail with `LaneBlockedError` carrying that ID, the blocked partition and `errorCode` 14009. Stateless reads, `GetOffset` inspection and sends remain available. Reconnect, sign-in and late replies do not clear these blocks.
+
+`resolveOperation` returns the same uncertainty without I/O. `abandonOperation` explicitly releases the blocks while accepting that the old server request may still finish. An inspected offset is not a completion barrier.
 
 Valid partial replies preserve healthy sections. An uncertain section carries
-`status: 14010` and `progressError`; record decode failures keep their existing
+`status: 14010` and `progressError`. Record decode failures keep their existing
 rewind behavior. Raw replies keep their wire bytes, so raw callers inspect section
-statuses and obtain the recovery ID from a later blocked-target call. Group streams
-deliver healthy sections, report the recovery error, and finish cleanup without
-rewinding blocked targets or abandoning them. A terminal stream closes its private
-client; creating a new independent client does not inherit that client's blocks.
+statuses and obtain the recovery ID from a later blocked-target call. A partition
+reader delivers healthy sections and abandons the lost reads of its own committing
+fetches, so the next read finds what they stored and its streams and consumers go
+on. Creating a new independent client does not inherit that client's blocks.
 
 Committing fetches reserve a separate bounded recovery pool using
 `maxPendingOperations` and `maxPendingOperationBytes` before sending. The byte charge
 is the request size, but retained state holds only target identities and the local
 ID. Capacity refusal occurs before send. A proved result or explicit abandonment
-releases the reservation; session reset does not release retained fetch blocks.
+releases the reservation. Session reset does not release retained fetch blocks.
 
 Configure `maxPendingOperations` (default 256) and `maxPendingOperationBytes`
 (default 64 MiB) on the client. Admission waits before allocating an ID or freezing
 a mutation frame. Both limits must be positive. The byte budget includes the
-256-byte header and body; smaller positive budgets reject mutations that cannot
+256-byte header and body. Smaller positive budgets reject mutations that cannot
 fit while reads and login remain available. Oversized frames fail locally.
 Completion, abandonment and reset release the operation slot. Writer aliases keep bytes charged until they release
 the frame. These limits cover admitted active/retained frames, not caller buffers,
@@ -313,7 +412,7 @@ queued sign-ins. A failed explicit attempt, including invalid input, timeout or
 cancellation, withdraws credentials from automatic sign-in until another explicit
 sign-in succeeds. This also discards a session whose Register succeeded when a
 later step of the explicit sign-in fails. Earlier calls keep their original
-lineage; only SDK recovery continues them under a replacement session.
+lineage. Only SDK recovery continues them under a replacement session.
 
 An established session has its own lifetime. Password or PAT changes and PAT
 expiry do not end it. Logout, session lease expiry, or user deactivation end the
@@ -348,72 +447,38 @@ because the heartbeat restarts the links and each sign-in dials again. If
 reconnection or heartbeats are disabled, nothing restarts a link that used its
 budget, so the request fails with a plain `Error` instead.
 
-**Breaking change:** `singleConsumerStream` and `groupConsumerStream` no longer
-take `interval`. Each poll of a single stream is a deferred poll with
-`pollOptions` over `DEFAULT_DEFERRED_POLL_OPTIONS`, so the server waits for
-messages. After an empty reply, the stream polls again at once. Destroying a
-single stream cancels its poll on the server. A message larger than `maxBytes`
-is read alone, without that limit, and only an error of that read is reported.
+**Breaking change:** `singleConsumerStream` and `groupConsumerStream` are
+adapters over a partition reader, each on a client of its own, and hand over
+batches with messages only, never an empty one. `pollOptions` sets `maxWait`,
+`minCount` and `maxBytes` of each read, and a read waits up to 5 s by default.
+`requestTimeout` is not used: a read gives up 10 s after its `maxWait`. With
+`autocommit`, which is the default, the reader commits on read, and the stream
+reads only when its consumer asks for another batch, so the server never stores
+a batch that waits in the stream buffer. Without `autocommit` the stream reads
+ahead. `endOnLastOffset` ends the stream once the last read of every partition
+found no message.
 
-`groupConsumerStream` reads its partitions with fetches, one for each group
-that `message.readinessGroups` returns, with the same options. Its
-`requestTimeout` must be at least `maxWait` plus 1 s, and greater than 1 s for
-a `maxWait` of 0. A group stream hands out only the replies with
-messages. The partitions that a reply served go to the end of the next fetch,
-so each partition gets its turn. A partition with a `First`, `Last` or
-`Timestamp` start point, or with a message larger than `maxBytes`, is polled
-alone first.
-
-Without `autocommit`, a group stream sends the next fetch before it hands out
-the reply. A partition that joins while the fetch of its group waits goes into
-a second fetch. The stream cancels a fetch when it loses one of the partitions
-of that fetch, and when the stream is destroyed.
-
-With `autocommit`, which is the default, the server stores the offsets of what
-a fetch reads. If the process stops before the reader handles a reply, those
-messages are lost. So the stream keeps one committing read for each of these
-groups, including standalone polls, and sends the next one only when the reader
-requests another reply. A partition
-that joins waits for the next fetch of its group. The stream never cancels such
-a fetch, so a destroyed stream closes after the reply, at most `maxWait` later.
-Then it takes back the replies that nobody read. The stored offset of such a
-partition goes back to the last message that the stream handed out. If the
-stream handed out no message of that partition since its last incarnation or
-owner change, the stream stores the offset before the first message that
-nobody read. When that message is at offset 0, the stream deletes the stored
-offset instead.
-
-A section refused for a history, owner or member that changed (87, 5006 or
-5009) makes its partition start again from `pollingStrategy`. After a refused
-section, only that partition waits `pollingRetryInterval` before its next
-fetch. A section whose records do not decode ends the stream with that error.
-With `autocommit`, the stream first takes back that section and the replies
-after it, as at destroy.
-
-When a poll fails with status 30, 40, 57, 58, 89 or 90, `singleConsumerStream` and
-`groupConsumerStream` poll again after `pollingRetryInterval`. Its default is
-1000 ms, the same as `polling_retry_interval` of the Rust consumer. A group stream
-whose member owns no partition also waits that long. They also poll again after a
-poll deadline, after a poll with unknown progress, after `NotConnectedError` and
-after `ConnectionClosedError`. That error reports a lost connected socket. The
-client binds the session again, signs in again,
-reconnects or routes again after these on its own. Any other error ends the
-stream. The server can also refuse a sign-in with status 40, for example for an
-inactive user. So after a 40 the stream waits for the next sign-in, and a
-refused sign-in ends the stream. If the reply of an auto-commit poll or fetch
-is lost, the stream can skip that batch.
+When a read fails with status 30, 40, 57, 58, 89 or 90, after a deadline, after
+unknown progress, after `NotConnectedError` and after `ConnectionClosedError`,
+the stream reads again after `pollingRetryInterval`, 1000 ms by default, the
+same as `polling_retry_interval` of the Rust consumer. A lost reply of a read
+that commits is repaired by the reader. The client binds the session again,
+signs in again, reconnects or routes again after these errors on its own. Any
+other error ends the stream, and so does a message that does not decode. The
+server can also refuse a sign-in with status 40, for example for an inactive
+user. So after a 40 the stream signs in again, and a refused sign-in ends the
+stream.
 
 `singleConsumerStream` and `groupConsumerStream` sign in before they return the
-stream, and `groupConsumerStream` also joins its group. If the sign-in or the
-join fails, the call destroys its client and rejects with that error. If no
-endpoint accepts a dial before the retry budget or the 30 second sign-in
-deadline ends, the error is `NotConnectedError`. When a stream closes, it
-destroys its client. A group stream that is still signed in first leaves its
-group, so that the server gives its partitions to the other members at once. If
-the leave fails or takes more than 5 seconds, the membership ends when the
-session lease expires. If the client of a destroyed stream has no session, or
-loses it, the stream destroys the client at once. It does not wait for a poll
-or a sign-in that still runs.
+stream, and `groupConsumerStream` also creates and joins its group. If the
+sign-in or the join fails, the call destroys its client and rejects with that
+error. If no endpoint accepts a dial before the retry budget or the 30 second
+sign-in deadline ends, the error is `NotConnectedError`. When a stream closes,
+it closes its reader, which waits for a read that commits, moves the offsets of
+the batches that nobody read back and leaves the group, then destroys its
+client. A batch still in the stream buffer counts as unread. If the client of
+a destroyed stream has no session, the stream destroys the client at once, and
+it never keeps the client longer than 5 seconds for the close.
 
 `sendBinaryRequest(code, payload)` sends an arbitrary command code. Known replicated commands use their registered operation, while unknown codes reach the server as non-replicated requests and are rejected by servers that do not register them.
 
@@ -475,13 +540,13 @@ resulting raw client to `SimpleClient` if needed.
 
 | option | limit |
 | --- | --- |
-| `reconnection_retries` | integer up to `4294967295` (u32 max); larger values are rejected like Rust's u32 overflow, and `unlimited` maps to this ceiling. Defaults to unlimited |
-| `heartbeat_interval` | duration up to `2147483647ms` (Node's largest timer delay); `0` disables heartbeats |
-| `reconnection_interval` | positive duration (`ms`, `s`, `m`, `h`) up to `2147483647ms` (Node's largest timer delay); zero spellings are rejected. Defaults to `1s` |
+| `reconnection_retries` | integer up to `4294967295` (u32 max). Larger values are rejected like Rust's u32 overflow, and `unlimited` maps to this ceiling. Defaults to unlimited |
+| `heartbeat_interval` | duration up to `2147483647ms` (Node's largest timer delay). `0` disables heartbeats |
+| `reconnection_interval` | positive duration (`ms`, `s`, `m`, `h`) up to `2147483647ms` (Node's largest timer delay). Zero spellings are rejected. Defaults to `1s` |
 | port in the authority | decimal up to `65535` |
 
 Durations accept the same expressions as the Rust SDK, for example `500ms`,
-`10s`, `1h 30m`, `5d`, `2w`, `1y`; matching is case-insensitive and
+`10s`, `1h 30m`, `5d`, `2w`, `1y`. Matching is case-insensitive and
 `0`, `unlimited`, `disabled` and `none` map to zero. Unit-less numbers such as
 `5` are rejected.
 

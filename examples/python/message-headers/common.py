@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from apache_iggy import (
+    CommitPolicy,
     Consumer,
     HeaderKey,
     HeaderValue,
@@ -32,7 +33,6 @@ from apache_iggy import (
     PollingStrategy,
     PollOptions,
     ReceiveMessage,
-    ServerCommitPolicy,
     StreamDetails,
     TopicDetails,
 )
@@ -198,7 +198,7 @@ async def consume_messages(
                 polling_strategy=PollingStrategy.Next(),
                 options=PollOptions(
                     count=MESSAGES_PER_BATCH,
-                    server_commit=ServerCommitPolicy.OnRead,
+                    commit=CommitPolicy.OnRead(),
                 ),
             )
             if not polled.messages:

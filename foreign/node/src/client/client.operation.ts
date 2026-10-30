@@ -23,6 +23,8 @@ import { COMMAND_CODE } from '../wire/command.code.js';
 const INVALID_MESSAGE_LENGTH = 80;
 const TRANSIENT_NOT_ACCEPTED = 58;
 export const OPERATION_TIMEOUT_MS = 30_000;
+export const LANE_BLOCKED = 14007;
+export const PARTITION_LANE_BLOCKED = 14009;
 export const FETCH_PROGRESS_UNCERTAIN = 14010;
 
 export class OperationUncertainError extends Error {
@@ -38,16 +40,19 @@ export class FetchProgressUncertainError extends OperationUncertainError {
   constructor(operationId: bigint, cause?: unknown) {
     super(operationId, cause);
     this.name = 'FetchProgressUncertainError';
-    this.message = `Committing fetch ${operationId} has an unknown outcome; explicitly abandon it to release its progress blocks.`;
+    this.message = `Read ${operationId} has unknown progress and requires explicit abandonment.`;
   }
 }
 
 export class LaneBlockedError extends Error {
+  /** `PARTITION_LANE_BLOCKED` for a partition that an uncertain committing fetch blocks, else `LANE_BLOCKED`. */
+  readonly errorCode: number;
   constructor(readonly operationId: bigint, readonly partitionId?: number, readonly requiresExplicitRecovery = false) {
     super(requiresExplicitRecovery
-      ? `Committing fetch ${operationId} blocks partition ${partitionId} until explicit abandonment.`
-      : 'A retained operation blocks this mutation lane.');
+      ? `Lane of partition ${partitionId} blocked by operation ${operationId} with an unknown outcome.`
+      : `Lane blocked by operation ${operationId} with an unknown outcome.`);
     this.name = 'LaneBlockedError';
+    this.errorCode = requiresExplicitRecovery ? PARTITION_LANE_BLOCKED : LANE_BLOCKED;
   }
 }
 
@@ -219,7 +224,7 @@ export type ClientOperation = {
   readonly fetchProgress?: FetchProgress
 };
 
-/** Only identities and budget remain after an uncertain fetch; no transport or frame survives with them. */
+/** Only identities and budget remain after an uncertain fetch. No transport or frame survives with them. */
 type FetchProgress = {
   id: bigint,
   readonly targets: ReadonlyMap<string, number>,

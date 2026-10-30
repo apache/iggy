@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::common::global_context::GlobalContext;
+use crate::common::global_context::{GlobalContext, OpenConsumer};
 use crate::steps::auth::given_authenticated_as_root;
 use cucumber::{given, then, when};
+use futures::StreamExt;
 use iggy::prelude::{
-    Consumer, ConsumerGroupClient, Identifier, IggyClient, IggyDuration, IggyMessage,
-    MessageClient, Partitioning, PollOptions, PolledMessages, PollingStrategy, ServerCommitPolicy,
+    AutoCommit, CommitAfter, CommitPolicy, Consumer, Identifier, IggyClient, IggyDuration,
+    IggyMessage, MessageClient, Partitioning, PollOptions, PolledMessages, PollingStrategy,
     StreamClient, StreamCreateOptions, TopicClient, TopicCreateOptions,
 };
 use std::sync::Arc;
@@ -32,8 +33,8 @@ const MESSAGES_COUNT: u32 = 10;
 /// A message that reaches the server before the call answers it at once, so a
 /// start step waits until its call is parked.
 const PARK_TIME: Duration = Duration::from_millis(100);
-const ASSIGNMENT_TIMEOUT: Duration = Duration::from_secs(5);
-const ASSIGNMENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// The wait of a consumer whose step names none.
+const CONSUMER_MAX_WAIT_SECS: u64 = 10;
 
 #[given(
     regex = r#"^a stream named "([^"]+)" with a topic named "([^"]+)" with (\d+) partitions exists$"#
@@ -99,7 +100,7 @@ pub async fn when_start_deferred_poll(
 }
 
 #[when(
-    regex = r#"^I start a deferred poll of partition (\d+) for consumer "([^"]+)" with auto commit, a min count of (\d+) and a max wait of (\d+) seconds?$"#
+    regex = r#"^I start a deferred poll of partition (\d+) for consumer "([^"]+)" with the on read commit policy, a min count of (\d+) and a max wait of (\d+) seconds?$"#
 )]
 pub async fn when_start_committing_deferred_poll(
     world: &mut GlobalContext,
@@ -115,7 +116,7 @@ pub async fn when_start_committing_deferred_poll(
         PollingStrategy::next(),
         PollOptions {
             min_count,
-            server_commit: ServerCommitPolicy::OnRead,
+            commit: CommitPolicy::OnRead,
             ..poll_options(max_wait_secs)
         },
     )
@@ -182,9 +183,9 @@ pub async fn then_deferred_poll_returns_nothing(
 }
 
 #[when(
-    regex = r"^I start a fetch on partitions (\d+), (\d+) and (\d+) from offset (\d+) with a max wait of (\d+) seconds?$"
+    regex = r"^I open a partition reader on partitions (\d+), (\d+) and (\d+) from offset (\d+) with a max wait of (\d+) seconds?$"
 )]
-pub async fn when_start_fetch(
+pub async fn when_open_partition_reader(
     world: &mut GlobalContext,
     first: u32,
     second: u32,
@@ -192,8 +193,8 @@ pub async fn when_start_fetch(
     offset: u64,
     max_wait_secs: u64,
 ) {
-    let client = background_client(world).await;
-    let mut reader = client
+    let client = world.client.as_ref().expect("client");
+    let reader = client
         .reader(
             &stream_identifier(world),
             &topic_identifier(world),
@@ -205,104 +206,77 @@ pub async fn when_start_fetch(
         .build()
         .await
         .expect("build reader");
-    // The reader never yields an empty batch, so its first batch comes from the
-    // first partition that gets a message.
-    let fetch = tokio::spawn(async move { reader.next().await });
-    sleep(PARK_TIME).await;
-    assert!(!fetch.is_finished(), "the fetch must park");
-    world.fetch = Some(fetch);
-}
-
-#[then(regex = r"^the fetch should return only partition (\d+) within (\d+) seconds?$")]
-pub async fn then_fetch_returns(world: &mut GlobalContext, partition: u32, within_secs: u64) {
-    let fetch = world.fetch.take().expect("fetch started");
-    let polled = timeout(Duration::from_secs(within_secs), fetch)
-        .await
-        .unwrap_or_else(|_| panic!("the fetch did not return within {within_secs} s"))
-        .expect("fetch task")
-        .expect("fetch");
-    assert_eq!(
-        polled.partition_id, partition,
-        "the fetch must serve only partition {partition}"
-    );
-    assert_single_payload(&polled, "ready");
-}
-
-#[given(regex = r#"^I am the only member of consumer group "([^"]+)" on the topic$"#)]
-pub async fn given_sole_group_member(world: &mut GlobalContext, group_name: String) {
-    let client = world.client.as_ref().expect("client");
-    let stream_id = stream_identifier(world);
-    let topic_id = topic_identifier(world);
-    client
-        .create_consumer_group(&stream_id, &topic_id, &group_name)
-        .await
-        .expect("create consumer group");
-    let group_id = Identifier::named(&group_name).expect("group name");
-    client
-        .join_consumer_group(&stream_id, &topic_id, &group_id)
-        .await
-        .expect("join consumer group");
-    // The join can return before the coordinator assigns the partitions. The
-    // first group poll then syncs the whole assignment.
-    let partitions = world.last_topic_partitions.expect("topic created");
-    let deadline = Instant::now() + ASSIGNMENT_TIMEOUT;
-    loop {
-        let group = client
-            .get_consumer_group(&stream_id, &topic_id, &group_id)
-            .await
-            .expect("get consumer group")
-            .expect("consumer group exists");
-        if group
-            .members
-            .iter()
-            .any(|member| member.partitions_count == partitions)
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the member did not get every partition within {ASSIGNMENT_TIMEOUT:?}: {group:?}"
-        );
-        sleep(ASSIGNMENT_POLL_INTERVAL).await;
-    }
-    world.last_consumer_group_name = Some(group_name);
+    world.reader = Some(reader);
 }
 
 #[then(
-    regex = r#"^a group fetch with a max wait of (\d+) seconds? should return the payload "([^"]+)" within (\d+) seconds?$"#
+    regex = r#"^the partition reader should return the payload "([^"]+)" from partition (\d+) within (\d+) seconds?$"#
 )]
-pub async fn then_group_fetch_returns(
+pub async fn then_partition_reader_returns(
     world: &mut GlobalContext,
-    max_wait_secs: u64,
     payload: String,
+    partition: u32,
     within_secs: u64,
 ) {
-    // A group reader joins in `build()` and leaves in `close()`, so one reader
-    // serves every step of the scenario, with the max wait of the first step.
-    if world.group_reader.is_none() {
-        let client = world.client.as_ref().expect("client");
-        let group_name = world
-            .last_consumer_group_name
-            .as_ref()
-            .expect("consumer group joined");
-        let group = Consumer::group(Identifier::named(group_name).expect("group name"));
-        let reader = client
-            .reader(&stream_identifier(world), &topic_identifier(world), &group)
-            .start(PollingStrategy::next())
-            .options(PollOptions {
-                server_commit: ServerCommitPolicy::OnRead,
-                ..poll_options(max_wait_secs)
-            })
-            .build()
-            .await
-            .expect("build group reader");
-        world.group_reader = Some(reader);
-    }
-    let reader = world.group_reader.as_mut().expect("group reader");
+    let reader = world.reader.as_mut().expect("partition reader open");
+    // The reader never yields an empty batch, so its first batch comes from the first
+    // partition that gets a message.
     let Ok(read) = timeout(Duration::from_secs(within_secs), reader.next()).await else {
-        panic!("the group fetch did not return within {within_secs} s");
+        panic!("the partition reader did not return within {within_secs} s");
     };
-    assert_single_payload(&read.expect("group fetch"), &payload);
+    let read = read.expect("partition reader batch");
+    assert_eq!(
+        read.partition_id, partition,
+        "the batch must come from partition {partition}"
+    );
+    assert_single_payload(&read, &payload);
+}
+
+#[when(
+    regex = r#"^I open a consumer in group "([^"]+)" on the topic with a max wait of (\d+) seconds?$"#
+)]
+pub async fn when_open_group_consumer(
+    world: &mut GlobalContext,
+    group_name: String,
+    max_wait_secs: u64,
+) {
+    open_group_consumer(world, &group_name, poll_options(max_wait_secs)).await;
+}
+
+#[when(
+    regex = r#"^I open a consumer in group "([^"]+)" on the topic that commits after processing$"#
+)]
+pub async fn when_open_processing_group_consumer(world: &mut GlobalContext, group_name: String) {
+    let options = PollOptions {
+        commit: CommitPolicy::Auto(AutoCommit {
+            after: CommitAfter::Processing,
+            ..AutoCommit::default()
+        }),
+        ..poll_options(CONSUMER_MAX_WAIT_SECS)
+    };
+    open_group_consumer(world, &group_name, options).await;
+}
+
+#[then(regex = r#"^the consumer should return the payload "([^"]+)" within (\d+) seconds?$"#)]
+pub async fn then_consumer_returns(world: &mut GlobalContext, payload: String, within_secs: u64) {
+    let OpenConsumer(consumer) = world.consumer.as_mut().expect("consumer open");
+    let Ok(received) = timeout(Duration::from_secs(within_secs), consumer.next()).await else {
+        panic!("the consumer did not return within {within_secs} s");
+    };
+    let received = received
+        .expect("the consumer stream ended")
+        .expect("consumed message");
+    assert_eq!(
+        String::from_utf8_lossy(&received.message.payload),
+        payload,
+        "the consumer must return the payload {payload:?}"
+    );
+}
+
+#[when(regex = r"^I close the consumer$")]
+pub async fn when_close_consumer(world: &mut GlobalContext) {
+    let OpenConsumer(mut consumer) = world.consumer.take().expect("consumer open");
+    consumer.shutdown().await.expect("shut down the consumer");
 }
 
 #[when(regex = r"^I cancel the deferred poll after (\d+) milliseconds$")]
@@ -332,16 +306,55 @@ pub async fn then_next_poll_returns(
     consumer_name: String,
     payload: String,
 ) {
+    poll_next_and_expect(
+        world,
+        partition,
+        &consumer_name,
+        CommitPolicy::Manual,
+        &payload,
+    )
+    .await;
+}
+
+#[then(
+    regex = r#"^a poll of partition (\d+) for consumer "([^"]+)" with the next strategy and the on read commit policy should return the payload "([^"]+)"$"#
+)]
+pub async fn then_on_read_poll_returns(
+    world: &mut GlobalContext,
+    partition: u32,
+    consumer_name: String,
+    payload: String,
+) {
+    poll_next_and_expect(
+        world,
+        partition,
+        &consumer_name,
+        CommitPolicy::OnRead,
+        &payload,
+    )
+    .await;
+}
+
+/// Polls one message from `Next`, so a poll that commits stores only the offset of the payload
+/// it returns.
+async fn poll_next_and_expect(
+    world: &GlobalContext,
+    partition: u32,
+    consumer_name: &str,
+    commit: CommitPolicy,
+    payload: &str,
+) {
     let client = world.client.as_ref().expect("client");
     let polled = client
         .poll_messages(
             &stream_identifier(world),
             &topic_identifier(world),
             partition,
-            &named_consumer(&consumer_name),
+            &named_consumer(consumer_name),
             &PollingStrategy::next(),
             PollOptions {
-                count: MESSAGES_COUNT,
+                count: 1,
+                commit,
                 ..PollOptions::default()
             },
         )
@@ -353,9 +366,23 @@ pub async fn then_next_poll_returns(
         .map(|message| String::from_utf8_lossy(&message.payload));
     assert_eq!(
         first.as_deref(),
-        Some(payload.as_str()),
+        Some(payload),
         "the first message must have payload {payload:?}: {polled:?}"
     );
+}
+
+async fn open_group_consumer(world: &mut GlobalContext, group_name: &str, options: PollOptions) {
+    let client = world.client.as_ref().expect("client");
+    let stream = world.last_stream_name.as_deref().expect("stream created");
+    let topic = world.last_topic_name.as_deref().expect("topic created");
+    let mut consumer = client
+        .consumer_group(group_name, stream, topic)
+        .expect("consumer group builder")
+        .create_consumer_group_if_not_exists()
+        .poll_options(options)
+        .build();
+    consumer.init().await.expect("init the consumer");
+    world.consumer = Some(OpenConsumer(consumer));
 }
 
 /// The SDK defaults with the count of these steps and the max wait of the step.

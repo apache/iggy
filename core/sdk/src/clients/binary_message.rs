@@ -19,10 +19,10 @@ use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_common::locking::IggyRwLockFn;
-use iggy_common::{BinarySendPartitioning, MessageClient};
+use iggy_common::{BinarySendPartitioning, MessageClient, with_binary_deadline};
 use iggy_common::{
-    Consumer, Identifier, IggyError, IggyMessage, Partitioning, PollOptions, PolledMessages,
-    PollingStrategy, SendMessagesResponse, ServerCommitPolicy,
+    CommitPolicy, Consumer, DecodeError, Identifier, IggyError, IggyMessage, Partitioning,
+    PollOptions, PolledMessages, PollingStrategy, SendMessagesResponse,
 };
 use tokio::time::Instant;
 
@@ -31,7 +31,7 @@ impl MessageClient for IggyClient {
     /// The call ends at its own deadline of `max_wait` plus 10 s, so a wait of up to 600 s
     /// outlives the operation timeout of the other calls.
     ///
-    /// With an encryptor, `ServerCommitPolicy::OnRead` fails with
+    /// With an encryptor, `CommitPolicy::OnRead` fails with
     /// [`IggyError::InvalidConfiguration`] before anything is sent: the server would store the
     /// offset of a batch before the client decrypts it, so a batch that fails to decrypt would
     /// be lost.
@@ -44,24 +44,68 @@ impl MessageClient for IggyClient {
         strategy: &PollingStrategy,
         options: PollOptions,
     ) -> Result<PolledMessages, IggyError> {
-        if options.server_commit == ServerCommitPolicy::OnRead && self.encryptor.is_some() {
-            return Err(IggyError::InvalidConfiguration);
+        self.poll_messages_raw(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            strategy,
+            options,
+        )
+        .await
+        .map_err(|error| error.error)
+    }
+
+    async fn poll_messages_raw(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: u32,
+        consumer: &Consumer,
+        strategy: &PollingStrategy,
+        options: PollOptions,
+    ) -> Result<PolledMessages, DecodeError> {
+        if options.commit == CommitPolicy::OnRead && self.encryptor.is_some() {
+            return Err(DecodeError::without_record(IggyError::InvalidConfiguration));
         }
         let deadline = Instant::now()
             .checked_add(options.request_timeout().get_duration())
-            .ok_or(IggyError::InvalidCommand)?;
-        let mut polled_messages = super::with_client!(self, deadline, client => client.poll_messages(
-                stream_id,
-                topic_id,
-                partition_id,
-                consumer,
-                strategy,
-                options,
-            ).await)?;
+            .ok_or(IggyError::InvalidCommand)
+            .map_err(DecodeError::without_record)?;
+        let mut polled_messages = with_binary_deadline(deadline, async {
+            let client = tokio::time::timeout_at(deadline, self.client.read())
+                .await
+                .map_err(|_| DecodeError::without_record(IggyError::TransientNotAccepted))?;
+            client
+                .poll_messages_raw(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    consumer,
+                    strategy,
+                    options,
+                )
+                .await
+        })
+        .await?;
 
         if let Some(ref encryptor) = self.encryptor {
-            for message in &mut polled_messages.messages {
-                encryptor.decrypt_message(message)?;
+            let failed =
+                polled_messages
+                    .messages
+                    .iter_mut()
+                    .enumerate()
+                    .find_map(|(index, message)| {
+                        encryptor
+                            .decrypt_message(message)
+                            .err()
+                            .map(|error| (index, error))
+                    });
+            if let Some((index, error)) = failed {
+                return Err(DecodeError {
+                    error,
+                    record: polled_messages.undecoded_record(index).map(Box::new),
+                });
             }
         }
 
@@ -228,7 +272,7 @@ mod tests {
         let id = Identifier::numeric(1).unwrap();
         let consumer = Consumer::new(id.clone());
         let next = PollingStrategy::next();
-        let poll = |server_commit| {
+        let poll = |commit| {
             client.poll_messages(
                 &id,
                 &id,
@@ -236,15 +280,15 @@ mod tests {
                 &consumer,
                 &next,
                 PollOptions {
-                    server_commit,
+                    commit,
                     ..PollOptions::default()
                 },
             )
         };
 
-        let refused = poll(ServerCommitPolicy::OnRead).await;
+        let refused = poll(CommitPolicy::OnRead).await;
         let sent_after_refusal = cluster.count(POLL_MESSAGES_DEFERRED_CODE);
-        let polled = poll(ServerCommitPolicy::Disabled).await;
+        let polled = poll(CommitPolicy::Manual).await;
 
         assert_eq!(refused.map(drop), Err(IggyError::InvalidConfiguration));
         assert_eq!(sent_after_refusal, 0);

@@ -19,7 +19,7 @@ use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::connectors::fixtures::ElasticsearchSourcePreCreatedFixture;
 use iggy_common::MessageClient;
 use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
-use iggy_common::{Consumer, Identifier, PollOptions, PollingStrategy, ServerCommitPolicy};
+use iggy_common::{CommitPolicy, Consumer, Identifier, PollOptions, PollingStrategy};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use std::time::Duration;
@@ -64,7 +64,7 @@ async fn elasticsearch_source_produces_messages_to_iggy(
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 10,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )
@@ -178,7 +178,7 @@ async fn elasticsearch_source_produces_bulk_messages(
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 100,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )
@@ -233,7 +233,7 @@ async fn state_persists_across_connector_restart(
                     &PollingStrategy::next(),
                     PollOptions {
                         count: 10,
-                        server_commit: ServerCommitPolicy::OnRead,
+                        commit: CommitPolicy::OnRead,
                         ..PollOptions::default()
                     },
                 )
@@ -293,7 +293,7 @@ async fn state_persists_across_connector_restart(
                 &PollingStrategy::next(),
                 PollOptions {
                     count: 10,
-                    server_commit: ServerCommitPolicy::OnRead,
+                    commit: CommitPolicy::OnRead,
                     ..PollOptions::default()
                 },
             )

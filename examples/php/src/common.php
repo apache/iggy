@@ -19,10 +19,10 @@
 declare(strict_types=1);
 
 use Iggy\Client;
+use Iggy\CommitPolicy;
 use Iggy\PollingStrategy;
 use Iggy\PollOptions;
 use Iggy\SendMessage;
-use Iggy\ServerCommitPolicy;
 
 const CONSUMER_ID = 1;
 
@@ -74,7 +74,7 @@ function print_polled_messages(Client $client, string $stream, string $topic, in
         0,
         CONSUMER_ID,
         PollingStrategy::first(),
-        new PollOptions(count: $count, server_commit: ServerCommitPolicy::OnRead),
+        new PollOptions(count: $count, commit: CommitPolicy::onRead()),
     )->messages;
 
     if (count($messages) < $count) {

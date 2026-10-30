@@ -16,6 +16,7 @@
 // under the License.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use ext_php_rs::{
     exception::PhpResult,
@@ -24,12 +25,12 @@ use ext_php_rs::{
 };
 use iggy::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
 use iggy::prelude::{
-    ClientCommitPolicy as RustClientCommitPolicy, CommitEvent as RustCommitEvent,
     IggyConsumer as RustIggyConsumer, IggyConsumerState, IggyError, ReadError, ReceivedMessage,
 };
 use tokio::sync::{Mutex, MutexGuard, mpsc, oneshot};
+use tokio::time::timeout;
 
-use crate::client::{non_zero_duration_micros, optional_unsigned};
+use crate::client::optional_unsigned;
 use crate::error::to_php_exception;
 use crate::message_iterator::MessageIterator;
 use crate::receive_message::{Checkpoint, PollingStrategy, ReceiveMessage};
@@ -113,11 +114,20 @@ impl IggyConsumer {
     /// at or below the last commit of its generation, stores nothing. One from a deleted or
     /// recreated partition fails with HistoryUnavailable (87), and one from a previous owner
     /// fails with ConsumerGroupPartitionNotOwned (5009). A checkpoint that this consumer did not
-    /// deliver, and every commit under ServerCommitPolicy::OnRead, fail with InvalidCommand (3).
+    /// deliver, and every commit under CommitPolicy::onRead(), fail with InvalidCommand (3).
     pub fn commit(&self, checkpoint: &Checkpoint) -> PhpResult {
         runtime()
             .block_on(self.state.commit(checkpoint.inner))
             .map_err(to_php_exception)
+    }
+
+    /// Counts a checkpoint that this consumer delivered under CommitPolicy::auto() and stores
+    /// nothing now: the policy stores the latest counted position of its partition. With
+    /// CommitAfter::Marked only marks count. It works also in a consumeMessages() callback.
+    /// Without CommitPolicy::auto(), and for a checkpoint that this consumer did not deliver,
+    /// it throws InvalidCommand (3).
+    pub fn mark(&self, checkpoint: &Checkpoint) -> PhpResult {
+        self.state.mark(checkpoint.inner).map_err(to_php_exception)
     }
 
     /// Sets the next read position of a partition and drops the rest of its current batch. It
@@ -126,7 +136,7 @@ impl IggyConsumer {
     /// It also resumes a partition that stopped, for example after HistoryUnavailable (87), or
     /// after a message that does not decode: seek to the `skip` of its ReadException. A
     /// partition that the consumer does not read, and a continuation of another partition, fail
-    /// with InvalidCommand (3). Under ServerCommitPolicy::OnRead, a read of the partition with
+    /// with InvalidCommand (3). Under CommitPolicy::onRead(), a read of the partition with
     /// an unknown outcome fails with PartitionLaneBlocked (14009): abandon its operation first.
     pub fn seek(&self, partition_id: u32, start: &PollingStrategy) -> PhpResult {
         let mut consumer = lock_consumer(&self.inner, "seek()")?;
@@ -154,22 +164,33 @@ impl IggyConsumer {
     /// The callback is called as callback(ReceiveMessage $message). A finite limit is required.
     /// The run ends after `limit` messages, after shutdown(), or with an exception.
     ///
-    /// The `on` event of a ClientCommitPolicy counts a message after its callback returns, and
-    /// also after the callback throws, as for a failed handler in the Rust SDK. The interval of
-    /// the policy can store a message whose callback still runs. An exception of the callback
-    /// ends the run, and consumeMessages() throws it.
+    /// Under CommitPolicy::auto(), a message counts before its callback with
+    /// CommitAfter::Delivery, and after its callback returns with CommitAfter::Processing. An
+    /// exception of the callback ends the run, and consumeMessages() throws it. Its message
+    /// then stays uncounted under CommitAfter::Processing, so the next run reads it again.
     ///
     /// The consumer retries a failed read by itself and does not throw it. An error that ends
     /// the run throws Iggy\Exception\ReadException: HistoryUnavailable (87), which stops its
-    /// partition until seek(), and under ServerCommitPolicy::OnRead an unknown outcome, which
+    /// partition until seek(), and under CommitPolicy::onRead() an unknown outcome, which
     /// stops its partition until its operation is abandoned and the partition is sought. A
     /// blocked lane, a shut down client and any error while the client cannot reconnect by
     /// itself also end the run.
     ///
-    /// The callback can call commit(), storeOffset(), deleteOffset() and the getters. seek(),
+    /// With `idle_timeout_micros`, a run that gets no message for that long ends and returns
+    /// the count of the messages it consumed, so a single-threaded worker regains control on an
+    /// idle topic. Null waits without a limit.
+    ///
+    /// The callback can call commit(), mark(), storeOffset(), deleteOffset() and the getters. seek(),
     /// shutdown(), iterMessages() and consumeMessages() throw in the callback, because the run
     /// holds the consumer.
-    pub fn consume_messages(&self, callback: ZendCallable, limit: u32) -> PhpResult<u32> {
+    pub fn consume_messages(
+        &self,
+        callback: ZendCallable,
+        limit: u32,
+        idle_timeout_micros: Option<&Zval>,
+    ) -> PhpResult<u32> {
+        let idle_timeout = optional_unsigned::<u64>(idle_timeout_micros, "idle_timeout_micros")?
+            .map(Duration::from_micros);
         let mut consumer = lock_consumer(&self.inner, "consumeMessages()")?;
         if limit == 0 {
             return Ok(0);
@@ -177,12 +198,29 @@ impl IggyConsumer {
         let (deliveries, mut delivered) = mpsc::channel(DELIVERIES_IN_FLIGHT);
         let handoff = Handoff { deliveries };
         let (stop, stopped) = oneshot::channel();
+        let mut stop = Some(stop);
         let mut run = consumer.consume_messages(&handoff, stopped);
         let mut consumed = 0;
 
         loop {
-            let delivery = runtime().block_on(next_delivery(&mut delivered, &mut run))?;
-            let Some(Delivery { message, answer }) = delivery else {
+            let waited = runtime().block_on(async {
+                match idle_timeout.filter(|_| stop.is_some()) {
+                    Some(idle_timeout) => {
+                        timeout(idle_timeout, next_delivery(&mut delivered, &mut run))
+                            .await
+                            .ok()
+                    }
+                    None => Some(next_delivery(&mut delivered, &mut run).await),
+                }
+            });
+            let Some(delivery) = waited else {
+                // A message that the run took before the stop still reaches the callback.
+                if let Some(stop) = stop.take() {
+                    let _ = stop.send(());
+                }
+                continue;
+            };
+            let Some(Delivery { message, answer }) = delivery? else {
                 return Ok(consumed);
             };
             let message = ReceiveMessage::from(message);
@@ -196,7 +234,9 @@ impl IggyConsumer {
             }
             // The biased select of the run sees this signal before it takes another message, so
             // the run ends right after it counts this one.
-            let _ = stop.send(());
+            if let Some(stop) = stop.take() {
+                let _ = stop.send(());
+            }
             let _ = answer.send(called.as_ref().map(|_| ()).map_err(|_| IggyError::Error));
             runtime().block_on(run).map_err(to_php_exception)?;
             return called.map(|_| consumed).map_err(to_php_exception);
@@ -205,17 +245,23 @@ impl IggyConsumer {
 
     /// Returns an iterator over messages for use with foreach.
     ///
-    /// The `on` event of a ClientCommitPolicy counts a message when the iterator yields it. A
+    /// With `idle_timeout_micros`, the iteration ends when no message arrives for that long,
+    /// and a later foreach over the same iterator reads on. Null waits without a limit.
+    ///
+    /// Under CommitPolicy::auto(), a message counts when the iterator yields it with
+    /// CommitAfter::Delivery, and when the iterator moves past it with CommitAfter::Processing. A
     /// failed read throws Iggy\Exception\ReadException. The consumer stays usable and retries by
     /// itself. HistoryUnavailable (87) stops its partition until seek().
-    pub fn iter_messages(&self) -> MessageIterator {
-        MessageIterator::new(self.inner.clone())
+    pub fn iter_messages(&self, idle_timeout_micros: Option<&Zval>) -> PhpResult<MessageIterator> {
+        let idle_timeout = optional_unsigned::<u64>(idle_timeout_micros, "idle_timeout_micros")?
+            .map(Duration::from_micros);
+        Ok(MessageIterator::new(self.inner.clone(), idle_timeout))
     }
 
     /// Stops the consumer after its queued offset stores.
     ///
-    /// With a ClientCommitPolicy, it stores the position of the last message that it delivered
-    /// from each partition. With ServerCommitPolicy::OnRead, it moves the offset of each
+    /// Under CommitPolicy::auto(), it stores the latest counted position of each partition. With
+    /// CommitPolicy::onRead(), it moves the offset of each
     /// partition back to the last delivered message, so the next run reads the prefetched
     /// messages again. A group member then leaves its group. Afterwards consumeMessages()
     /// returns at once and iterMessages() ends, and a second call does nothing. Destroying the
@@ -253,6 +299,36 @@ impl IggyConsumer {
         }
 
         Ok(Some(current_partition_id))
+    }
+}
+
+/// The offset that a consumer stored on a partition.
+#[php_class]
+#[php(name = "Iggy\\ConsumerOffsetInfo")]
+pub struct ConsumerOffsetInfo {
+    pub(crate) partition_id: u32,
+    pub(crate) current_offset: u64,
+    pub(crate) stored_offset: u64,
+}
+
+#[php_impl]
+impl ConsumerOffsetInfo {
+    /// The partition of the offset.
+    #[php(getter, change_case = "snake_case")]
+    pub fn partition_id(&self) -> u32 {
+        self.partition_id
+    }
+
+    /// The offset of the last message of the partition when the offset was read.
+    #[php(getter, change_case = "snake_case")]
+    pub fn current_offset(&self) -> u64 {
+        self.current_offset
+    }
+
+    /// The stored offset.
+    #[php(getter, change_case = "snake_case")]
+    pub fn stored_offset(&self) -> u64 {
+        self.stored_offset
     }
 }
 
@@ -301,68 +377,5 @@ async fn next_delivery(
     tokio::select! {
         Some(delivery) = delivered.recv() => Ok(Some(delivery)),
         result = run => result.map(|()| None).map_err(to_php_exception),
-    }
-}
-
-/// When the consumer stores the position of the last message that it delivered.
-///
-/// It never stores the end of a prefetched batch. The default, both arguments null, stores
-/// nothing: commit checkpoints with Consumer::commit() after processing.
-#[php_class]
-#[php(name = "Iggy\\ClientCommitPolicy")]
-#[derive(Clone, Copy)]
-pub struct ClientCommitPolicy {
-    pub(crate) inner: RustClientCommitPolicy,
-}
-
-#[php_impl]
-impl ClientCommitPolicy {
-    /// Stores the latest position every `interval_micros`, and also on the event `on`.
-    #[php(constructor)]
-    pub fn __construct(
-        interval_micros: Option<&Zval>,
-        on: Option<&CommitEvent>,
-    ) -> PhpResult<Self> {
-        let interval = optional_unsigned::<u64>(interval_micros, "interval_micros")?
-            .map(|micros| non_zero_duration_micros("interval_micros", micros))
-            .transpose()?;
-        Ok(Self {
-            inner: RustClientCommitPolicy {
-                interval,
-                on: on.map(|event| event.inner),
-            },
-        })
-    }
-}
-
-/// The event of a ClientCommitPolicy. consumeMessages() counts a message after its callback,
-/// and iterMessages() when it yields the message.
-#[php_class]
-#[php(name = "Iggy\\CommitEvent")]
-#[derive(Clone, Copy)]
-pub struct CommitEvent {
-    pub(crate) inner: RustCommitEvent,
-}
-
-#[php_impl]
-impl CommitEvent {
-    pub fn each_message() -> Self {
-        Self {
-            inner: RustCommitEvent::EachMessage,
-        }
-    }
-
-    /// A message whose offset is a multiple of `n`. Creating the consumer refuses zero.
-    pub fn every_nth_message(n: u32) -> Self {
-        Self {
-            inner: RustCommitEvent::EveryNthMessage(n),
-        }
-    }
-
-    /// The last message of a batch.
-    pub fn each_batch() -> Self {
-        Self {
-            inner: RustCommitEvent::EachBatch,
-        }
     }
 }

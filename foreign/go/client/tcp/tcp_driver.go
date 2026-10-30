@@ -49,16 +49,12 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 		return nil, err
 	}
 	budget := newDeferredBudget(code, frame)
-	if budget != nil {
-		select {
-		case c.deferred <- struct{}{}:
-			defer func() { <-c.deferred }()
-		case <-ctx.Done():
-			return nil, ierror.ErrTransientNotAccepted
-		case <-c.closed:
-			return nil, ierror.ErrClientShutdown
+	slotTaken := false
+	defer func() {
+		if slotTaken {
+			<-c.deferred
 		}
-	}
+	}()
 	historyRefreshed := false
 	keptContext := exact
 	lifecycleDelay := replayInterval
@@ -135,6 +131,18 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 				return nil, err
 			}
 		}
+		// After the lanes, so that a poll queued behind a parked poll of its
+		// partition leaves the slot to deferred calls of other partitions.
+		if budget != nil && !slotTaken {
+			select {
+			case c.deferred <- struct{}{}:
+				slotTaken = true
+			case <-ctx.Done():
+				return nil, ierror.ErrTransientNotAccepted
+			case <-c.closed:
+				return nil, ierror.ErrClientShutdown
+			}
+		}
 		if mutation {
 			if err := ticket.reserve(ctx, len(frame)); err != nil {
 				if c.sessionRecovers(ctx, err) {
@@ -182,6 +190,7 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 			operation = &pendingOperation{id: vsr.StampedRequestID(frozen), code: code, query: append([]byte(nil), query...), fence: fence, frame: newOperationFrame(frozen, nil), replica: replica}
 		}
 		operation.budget = budget
+		operation.frame.uncancellable = storesOnRead(code, frozen[vsr.HeaderSize:])
 		committing := budget != nil && budget.commits
 		if committing && !c.startCommit() {
 			return nil, ierror.ErrClientShutdown
@@ -230,6 +239,12 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 	lookupDelay := replayInterval
 	progress := isProgressPoll(operation.code, operation.frame.data[vsr.HeaderSize:])
 	committing := operation.budget != nil && operation.budget.commits
+	// The server can have stored the offset of a poll whose reply is lost, which
+	// the next read shows, so it blocks nothing.
+	var lost error = ierror.ErrTransientNotCommitted
+	if !committing && storesOnRead(operation.code, operation.frame.data[vsr.HeaderSize:]) {
+		lost = ierror.FetchProgressUncertain{OperationID: operation.id}
+	}
 	possiblySent := false
 	defer func() {
 		if committing && possiblySent && err != nil {
@@ -413,7 +428,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				c.recoverSession(operation.fence)
 			}
 			if progress && sent {
-				return nil, ierror.ErrTransientNotCommitted
+				return nil, lost
 			}
 			if !retryBeforeAdmission(reply.err) {
 				if uncertain && mutation {
@@ -458,7 +473,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				continue
 			}
 			if progress {
-				return nil, ierror.ErrTransientNotCommitted
+				return nil, lost
 			}
 			return nil, decodeErr
 		}
@@ -475,7 +490,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 		}
 		publishCredentials := outcome.Err == nil && (!uncertain || !mutation || outcome.Committed)
 		// A correlated fetch table settles progress even if recovery replaced
-		// its session. Explicit caller isolation applies after that evidence.
+		// its session or the caller's sign-in ended.
 		accepted := c.acceptOperationReply(c.callEpoch(ctx), operation, &reply.header, publishCredentials)
 		if !accepted && !committing {
 			return nil, sessionChanged(sent)
@@ -492,9 +507,6 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 					return nil, err
 				}
 				possiblySent = false
-				if ended := c.callEpoch(ctx).err(); ended != nil {
-					return nil, ended
-				}
 			}
 			c.refreshMembership(operation.code, operation.frame.data[vsr.HeaderSize:])
 			return outcome.Body, nil
@@ -518,6 +530,9 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 		switch {
 		case errors.Is(err, ierror.ErrTransientNotCommitted):
 			if progress {
+				if lost != ierror.ErrTransientNotCommitted {
+					return nil, lost
+				}
 				return nil, err
 			}
 			uncertain = true

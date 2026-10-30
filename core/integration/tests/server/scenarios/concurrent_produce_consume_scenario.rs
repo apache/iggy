@@ -114,7 +114,7 @@ async fn concurrent_produce_consume_no_offset_skip(harness: &TestHarness) {
                     PollOptions {
                         count: CONSUMER_BATCH_SIZE,
                         // The server commit is what makes the skip permanent.
-                        server_commit: ServerCommitPolicy::OnRead,
+                        commit: CommitPolicy::OnRead,
                         ..PollOptions::default()
                     },
                 )

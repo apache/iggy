@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A poll with `ServerCommitPolicy::OnRead` must replicate the consumer offset through
+//! A poll with `CommitPolicy::OnRead` must replicate the consumer offset through
 //! the partition consensus, not merely persist it on the serving node -- else a
 //! failover to a backup silently loses the committed offset.
 //!
@@ -104,7 +104,7 @@ async fn run(harness: &TestHarness) {
             &PollingStrategy::offset(0),
             PollOptions {
                 count: MESSAGE_COUNT,
-                server_commit: ServerCommitPolicy::OnRead,
+                commit: CommitPolicy::OnRead,
                 ..PollOptions::default()
             },
         )

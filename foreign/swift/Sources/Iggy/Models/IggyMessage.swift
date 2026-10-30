@@ -182,6 +182,11 @@ public struct PolledMessages: Sendable, Hashable {
     /// Number of messages the server reported.
     public var count: UInt32
     public var messages: [IggyMessage]
+    /// The start of the request, which the continuation of an empty batch
+    /// keeps.
+    var start: PollingStrategy?
+    /// The reader and generation that delivered the batch.
+    var stamp: ReaderStamp?
 
     public init(partitionID: UInt32, currentOffset: UInt64, count: UInt32, messages: [IggyMessage], context: PartitionContext = .empty) {
         self.context = context
@@ -207,31 +212,30 @@ public struct PolledMessages: Sendable, Hashable {
 /// One partition of a fetch reply, as `FetchMessagesSection` in the Rust
 /// SDK. A section with a nonzero ``status`` holds no position: its offsets
 /// and context are zero, and the partition stays where the fetch started it.
-public struct FetchSection: Sendable, Hashable {
-    public var partitionID: UInt32
+struct FetchSection: Sendable, Hashable {
+    var partitionID: UInt32
     /// Zero for a partition that was read, else the code of the error the
     /// server answered for this partition alone.
-    public var status: UInt32
+    var status: UInt32
     /// The newest offset the partition had when it was read.
-    public var currentOffset: UInt64
-    public var messagesCount: UInt32
-    public var context: PartitionContext
+    var currentOffset: UInt64
+    var messagesCount: UInt32
+    var context: PartitionContext
     /// Where the next fetch of the partition starts: after the last message
     /// read, or, with nothing read, where this fetch started, past messages
     /// that retention removed.
-    public var nextOffset: UInt64
+    var nextOffset: UInt64
     /// The undecoded batch records, as a poll reply carries them after its
     /// header. They share the buffer of the whole reply.
-    public var records: ArraySlice<UInt8>
-    var uncertainty: IggyError? = nil
+    var records: ArraySlice<UInt8>
 
     /// The error of the partition, nil for one that was read.
-    public var error: IggyError? {
-        status == 0 ? nil : uncertainty ?? IggyError(wireCode: status)
+    var error: IggyError? {
+        status == 0 ? nil : IggyError(wireCode: status)
     }
 
     /// The messages of the section. A section with an error throws it.
-    public func decode() throws -> PolledMessages {
+    func decode() throws -> PolledMessages {
         if let error {
             throw error
         }

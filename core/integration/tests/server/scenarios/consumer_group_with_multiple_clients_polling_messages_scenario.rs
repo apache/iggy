@@ -327,7 +327,7 @@ async fn validate_message_polling(client: &IggyClient) {
 fn single_committed_message() -> PollOptions {
     PollOptions {
         count: 1,
-        server_commit: ServerCommitPolicy::OnRead,
+        commit: CommitPolicy::OnRead,
         ..PollOptions::default()
     }
 }

@@ -352,7 +352,7 @@ func TestDriverLinkAdmissionDeadlineReportsNotAccepted(t *testing.T) {
 			stream, topic, group := groupConsumer(t)
 			partition := uint32(0)
 			consumer := iggcon.NewSingleConsumer(group.Id)
-			_, err := client.PollMessages(context.Background(), stream, topic, consumer, iggcon.FirstPollingStrategy(), 1, false, &partition)
+			_, err := client.pollMessages(context.Background(), stream, topic, consumer, iggcon.FirstPollingStrategy(), 1, false, &partition)
 			require.NoError(t, err)
 			before := len(server.recorded())
 			link := client.links.metadata()
@@ -372,7 +372,7 @@ func TestDriverLinkAdmissionDeadlineReportsNotAccepted(t *testing.T) {
 			case "read":
 				err = client.Ping(ctx)
 			case "progress":
-				_, err = client.PollMessages(ctx, stream, topic, consumer, iggcon.NextPollingStrategy(), 1, true, &partition)
+				_, err = client.pollMessages(ctx, stream, topic, consumer, iggcon.NextPollingStrategy(), 1, true, &partition)
 			}
 			require.ErrorIs(t, err, ierror.ErrTransientNotAccepted)
 			require.Len(t, server.recorded(), before)
@@ -390,8 +390,8 @@ func TestDriverMalformedProgressReplyReportsUnknownWithoutReplay(t *testing.T) {
 	})
 	stream, topic, group := groupConsumer(t)
 	partition := uint32(0)
-	_, err := client.PollMessages(context.Background(), stream, topic, iggcon.NewSingleConsumer(group.Id), iggcon.NextPollingStrategy(), 1, true, &partition)
-	require.ErrorIs(t, err, ierror.ErrTransientNotCommitted)
+	_, err := client.pollMessages(context.Background(), stream, topic, iggcon.NewSingleConsumer(group.Id), iggcon.NextPollingStrategy(), 1, true, &partition)
+	require.ErrorIs(t, err, ierror.FetchProgressUncertain{})
 	require.Equal(t, uint32(1), polls.Load())
 	require.Empty(t, client.operations.retained)
 	require.Empty(t, client.operations.lanes)
@@ -554,7 +554,7 @@ func TestDriverSessionRecoveryHoldsUnsentCallsUntilItFails(t *testing.T) {
 		return err
 	}
 	poll := func() error {
-		_, err := client.PollMessages(context.Background(), stream, topic, iggcon.NewSingleConsumer(group.Id), iggcon.FirstPollingStrategy(), 1, false, &partition)
+		_, err := client.pollMessages(context.Background(), stream, topic, iggcon.NewSingleConsumer(group.Id), iggcon.FirstPollingStrategy(), 1, false, &partition)
 		return err
 	}
 	created, polled := make(chan error, 1), make(chan error, 1)
@@ -671,17 +671,26 @@ func TestDriverProgressUncertaintyEndsCallAndReleasesLane(t *testing.T) {
 					strategy = iggcon.OffsetPollingStrategy(0)
 				}
 				ctx, cancel := context.WithCancel(context.Background())
+				if lostReply && autoCommit {
+					// A poll that stores its offset waits for its reply after a cancel, so its reply is lost at the deadline.
+					ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
+				}
 				defer cancel()
 				done := make(chan error, 1)
 				go func() {
-					_, err := client.PollMessages(ctx, stream, topic, iggcon.NewSingleConsumer(consumer), strategy, 1, autoCommit, &partition)
+					_, err := client.pollMessages(ctx, stream, topic, iggcon.NewSingleConsumer(consumer), strategy, 1, autoCommit, &partition)
 					done <- err
 				}()
 				<-received
-				if lostReply {
+				if lostReply && !autoCommit {
 					cancel()
 				}
-				require.ErrorIs(t, <-done, ierror.ErrTransientNotCommitted)
+				var want error = ierror.ErrTransientNotCommitted
+				if autoCommit {
+					// The server can have stored the offset, which only a read shows.
+					want = ierror.FetchProgressUncertain{}
+				}
+				require.ErrorIs(t, <-done, want)
 				require.Equal(t, uint32(1), polls.Load())
 				require.Equal(t, 1, requestCount(server.recorded(), command.PollMessagesCode))
 				client.operations.mu.Lock()
@@ -722,7 +731,7 @@ func (c laneCalls) send(ctx context.Context, client *IggyTcpClient) error {
 }
 
 func (c laneCalls) poll(ctx context.Context, client *IggyTcpClient, strategy iggcon.PollingStrategy, autoCommit bool) error {
-	_, err := client.PollMessages(ctx, c.stream, c.topic, c.consumer, strategy, 1, autoCommit, &c.partition)
+	_, err := client.pollMessages(ctx, c.stream, c.topic, c.consumer, strategy, 1, autoCommit, &c.partition)
 	return err
 }
 

@@ -20,6 +20,7 @@ package tcp
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -117,8 +118,22 @@ func (l *tcpLink) exchange(ctx context.Context, frame *operationFrame) (linkRepl
 	if !sent {
 		return linkReply{err: ierror.ErrTransientNotAccepted}, false
 	}
+	caller := ctx
 	ctx, stopWaiting := replyContext(ctx, frame)
 	defer stopWaiting()
+	if frame.uncancellable {
+		select {
+		case reply := <-pending.reply:
+			return reply, true
+		case <-caller.Done():
+			// The server answers the cancelled request once, refused or with what it stored.
+			if errors.Is(caller.Err(), context.Canceled) {
+				l.queueCancellation(frame.data)
+			}
+		case <-ctx.Done():
+		case <-l.closed:
+		}
+	}
 	select {
 	case reply := <-pending.reply:
 		return reply, true
@@ -178,6 +193,23 @@ func (l *tcpLink) cancelDeferred(id uint64, pending *linkPending, frame []byte) 
 		}
 	}()
 	return true
+}
+
+// queueCancellation queues the cancellation of a deferred request whose caller
+// stopped waiting and keeps its pending entry, so its reply still arrives.
+func (l *tcpLink) queueCancellation(frame []byte) {
+	cancellation, deferred := vsr.DeferredCancellation(frame)
+	if !deferred {
+		return
+	}
+	l.senders.Add(1)
+	go func() {
+		defer l.senders.Done()
+		select {
+		case l.writes <- newOperationFrame(cancellation, nil):
+		case <-l.closed:
+		}
+	}()
 }
 
 func (l *tcpLink) close(err error) {

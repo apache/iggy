@@ -22,8 +22,8 @@ use comfy_table::{Cell, CellAlignment, Row, Table};
 use iggy_binary_protocol::WireUserHeaders;
 use iggy_common::Client;
 use iggy_common::{
-    Consumer, HeaderKey, HeaderKind, Identifier, IggyByteSize, IggyDuration, IggyMessage,
-    IggyTimestamp, PollOptions, PollingStrategy, ServerCommitPolicy, Sizeable,
+    CommitPolicy, Consumer, HeaderKey, HeaderKind, Identifier, IggyByteSize, IggyDuration,
+    IggyMessage, IggyTimestamp, PollOptions, PollingStrategy, Sizeable,
     wire_conversions::user_headers_from_wire,
 };
 use std::collections::HashSet;
@@ -65,10 +65,10 @@ impl PollMessagesCmd {
             (None, false, false, true) => PollingStrategy::next(),
             _ => unreachable!("Either offset or first, last or next must be specified"),
         };
-        let server_commit = if auto_commit {
-            ServerCommitPolicy::OnRead
+        let commit = if auto_commit {
+            CommitPolicy::OnRead
         } else {
-            ServerCommitPolicy::Disabled
+            CommitPolicy::Manual
         };
         Self {
             stream_id,
@@ -78,7 +78,7 @@ impl PollMessagesCmd {
             strategy,
             options: PollOptions {
                 count: message_count,
-                server_commit,
+                commit,
                 ..PollOptions::default()
             },
             show_headers,

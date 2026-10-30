@@ -28,7 +28,7 @@ async fn main() -> Result<(), IggyError> {
     // Stores the offset of each polled batch, so a restart continues after it.
     let config = IggyConsumerConfig::default();
     let poll_options = PollOptions {
-        server_commit: ServerCommitPolicy::OnRead,
+        commit: CommitPolicy::OnRead,
         ..config.poll_options()
     };
     let config = config.with_poll_options(poll_options);

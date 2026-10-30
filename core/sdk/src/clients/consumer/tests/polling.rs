@@ -19,10 +19,12 @@
 
 use std::convert::identity;
 use std::iter::repeat_n;
+use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
+use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use iggy_binary_protocol::codes::{
     FETCH_MESSAGES_CODE, GET_CONSUMER_GROUP_CODE, GET_STREAM_CODE, JOIN_CONSUMER_GROUP_CODE,
@@ -33,10 +35,10 @@ use iggy_binary_protocol::requests::messages::{DeferredPollMessagesRequest, Fetc
 use iggy_binary_protocol::{PartitionContext, WireDecode};
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
-    Aes256GcmEncryptor, BinaryTransport, Checkpoint, Client, Consumer, ConsumerGroupClient,
-    ConsumerOffsetClient, DiagnosticEvent, EncryptorKind, Identifier, IggyError,
-    NonZeroIggyDuration, PollOptions, PollingKind, PollingStrategy, ServerCommitPolicy,
-    TcpClientReconnectionConfig, group_cache_key,
+    Aes256GcmEncryptor, AutoCommit, BinaryTransport, Checkpoint, Client, CommitAfter, CommitEvery,
+    CommitPolicy, Consumer, ConsumerGroupClient, ConsumerOffsetClient, DiagnosticEvent,
+    EncryptorKind, Identifier, IggyError, NonZeroIggyDuration, PollOptions, PollingKind,
+    PollingStrategy, TcpClientReconnectionConfig, group_cache_key,
 };
 use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep, timeout};
@@ -45,10 +47,10 @@ use super::{
     LevelReports, POLL_RETRY_INTERVAL, POLL_TIMEOUT, POLLED_PARTITION, answer_lookups, assignment,
     builder_for, builder_on, committing_consumer, connect_to_three_replicas,
     connect_to_three_replicas_with, existing_consumer_group, fetch_of, group, next_message,
-    reading_consumer, reply_of, script_primary, standalone,
+    poll_reply_of, reading_consumer, reply_of, script_primary, standalone,
 };
 use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::clients::consumer::{ClientCommitPolicy, CommitEvent, IggyConsumer, ReceivedMessage};
+use crate::clients::consumer::{IggyConsumer, ReceivedMessage};
 use crate::clients::consumer_builder::IggyConsumerBuilder;
 use crate::clients::reader::ReadError;
 use crate::clients::reader::fixtures::{refused, served};
@@ -129,7 +131,7 @@ impl MessageConsumer for RecordMessages {
 
 #[tokio::test(start_paused = true)]
 async fn given_a_blocked_poll_when_consuming_callbacks_should_return_the_retained_operation() {
-    let (mut consumer, cluster) = committing_consumer().await;
+    let (mut consumer, cluster) = committing_consumer(DELIVERED).await;
     script_primary(
         &cluster,
         STORE_CONSUMER_OFFSET_CODE,
@@ -171,7 +173,7 @@ async fn given_a_blocked_poll_when_consuming_callbacks_should_return_the_retaine
         ))
     );
 
-    let (mut consumer, cluster) = committing_consumer().await;
+    let (mut consumer, cluster) = committing_consumer(DELIVERED).await;
     script_primary(
         &cluster,
         FETCH_MESSAGES_CODE,
@@ -183,18 +185,13 @@ async fn given_a_blocked_poll_when_consuming_callbacks_should_return_the_retaine
     let handler = RecordMessages::default();
     let (_shutdown, receiver) = oneshot::channel();
 
-    let lost = timeout(TEST_BUDGET, consumer.consume_messages(&handler, receiver))
-        .await
-        .unwrap();
+    let lost = timeout(TEST_BUDGET, consumer.consume_messages(&handler, receiver)).await;
 
-    let operation = cluster.received(FETCH_MESSAGES_CODE)[1].header.request;
-    assert_eq!(
-        lost,
-        Err(ReadError::new(
-            Some(POLLED_PARTITION),
-            IggyError::FetchProgressUncertain(operation)
-        ))
+    assert!(
+        lost.is_err(),
+        "the reader reads on after a lost reply, so the loop goes on: {lost:?}"
     );
+    assert!(cluster.count(FETCH_MESSAGES_CODE) >= 2);
     assert_eq!(handler.offsets(), [DELIVERED]);
 }
 
@@ -267,6 +264,8 @@ async fn given_a_message_that_does_not_decode_when_consuming_callbacks_should_en
             partition_id: Some(POLLED_PARTITION),
             error: IggyError::InvalidMessagesCount,
             skip: Some(skip),
+            offset: None,
+            record: Some(Bytes::from_static(b"\0"))
         }))
     );
     assert_eq!(handler.offsets(), BATCH);
@@ -276,9 +275,9 @@ async fn given_a_message_that_does_not_decode_when_consuming_callbacks_should_en
 /// `Next` then has no known start, so its partition stays stopped until a `seek`, which the loop
 /// cannot make.
 #[tokio::test(start_paused = true)]
-async fn given_an_on_read_poll_from_next_that_does_not_decode_when_consuming_callbacks_should_end_with_its_partition()
+async fn given_a_committing_next_continuation_that_does_not_decode_when_consuming_callbacks_should_end_with_a_skip()
  {
-    let (mut consumer, cluster) = committing_consumer().await;
+    let (mut consumer, cluster) = committing_consumer(DELIVERED).await;
     // A record above `max_bytes` makes the reader poll it alone.
     let oversized = refused(POLLED_PARTITION, &IggyError::InvalidSizeBytes);
     script_primary(&cluster, FETCH_MESSAGES_CODE, [fetch_of(&[oversized])]);
@@ -297,20 +296,34 @@ async fn given_an_on_read_poll_from_next_that_does_not_decode_when_consuming_cal
     .await;
 
     let poll = DeferredPollMessagesRequest::decode_from(
-        &cluster.received(POLL_MESSAGES_DEFERRED_CODE)[0].body,
+        &cluster.received(POLL_MESSAGES_DEFERRED_CODE)[1].body,
     )
     .unwrap()
     .poll;
     assert_eq!(
         (poll.strategy, poll.auto_commit),
-        (WirePollingStrategy::next(), true)
+        (
+            WirePollingStrategy {
+                value: DELIVERED,
+                ..WirePollingStrategy::next()
+            },
+            true
+        )
     );
     assert_eq!(
         consumed,
-        Ok(Err(ReadError::new(
-            Some(POLLED_PARTITION),
-            IggyError::InvalidNumberEncoding
-        )))
+        Ok(Err(ReadError {
+            partition_id: Some(POLLED_PARTITION),
+            error: IggyError::InvalidNumberEncoding,
+            skip: Some(PollingStrategy::continuation(
+                POLLED_PARTITION,
+                PollingKind::Offset,
+                DELIVERED + 1,
+                PartitionContext::default()
+            )),
+            offset: None,
+            record: None,
+        }))
     );
 }
 
@@ -322,7 +335,7 @@ async fn given_a_shutdown_signal_inside_a_batch_when_consuming_callbacks_should_
     const RUNS: u64 = 16;
     let offsets: Vec<u64> = (0..RUNS).collect();
     let (mut consumer, _cluster) =
-        reading_consumer(ClientCommitPolicy::default(), &[offsets.as_slice()]).await;
+        reading_consumer(CommitPolicy::Manual, &[offsets.as_slice()]).await;
     for offset in offsets {
         let (handler, receiver) = RecordMessages::until(offset);
 
@@ -335,7 +348,7 @@ async fn given_a_shutdown_signal_inside_a_batch_when_consuming_callbacks_should_
 
 #[tokio::test(start_paused = true)]
 async fn standalone_consumer_should_stop_yielding_messages_after_shutdown() {
-    let (consumer, _cluster) = reading_consumer(ClientCommitPolicy::default(), &[&BATCH]).await;
+    let (consumer, _cluster) = reading_consumer(CommitPolicy::Manual, &[&BATCH]).await;
 
     assert_stream_ends_after_shutdown(consumer).await;
 }
@@ -392,7 +405,7 @@ async fn given_a_standalone_consumer_without_partitions_or_with_a_continuation_s
 
 #[tokio::test(start_paused = true)]
 async fn standalone_consumer_should_keep_the_partition_set_on_the_builder() {
-    let (consumer, cluster) = reading_consumer(ClientCommitPolicy::default(), &[]).await;
+    let (consumer, cluster) = reading_consumer(CommitPolicy::Manual, &[]).await;
 
     assert_eq!(
         consumer.reader.as_ref().unwrap().partitions(),
@@ -436,6 +449,11 @@ async fn given_a_committed_batch_when_the_generation_or_assignment_changes_shoul
     script_group(&cluster, &[POLLED_PARTITION]);
     let mut consumer = builder_on(client, group()).poll_options(on_read()).build();
     consumer.init().await.unwrap();
+    script_primary(
+        &cluster,
+        POLL_MESSAGES_DEFERRED_CODE,
+        [poll_reply_of(&BATCH[..1])],
+    );
     script_primary(&cluster, FETCH_MESSAGES_CODE, [reply_of(&BATCH)]);
     assert_eq!(
         next_message(&mut consumer).await.message.header.offset,
@@ -600,44 +618,38 @@ async fn init_should_refuse_an_encryptor_with_on_read() {
 #[tokio::test(start_paused = true)]
 async fn given_each_commit_policy_when_initializing_should_refuse_only_the_policies_that_cannot_run()
  {
-    for policy in client_commit_policies() {
-        let without_on_read = init_without_stream(standalone(), |builder| {
-            builder.partitions([POLLED_PARTITION]).client_commit(policy)
-        })
-        .await;
-        let with_on_read = init_without_stream(standalone(), |builder| {
+    for commit in commit_policies() {
+        let initialized = init_without_stream(standalone(), |builder| {
             builder
                 .partitions([POLLED_PARTITION])
-                .client_commit(policy)
-                .poll_options(on_read())
+                .poll_options(PollOptions {
+                    commit,
+                    ..PollOptions::default()
+                })
         })
         .await;
 
-        assert_reaches_the_server(without_on_read, &format!("{policy:?}"));
-        if policy == ClientCommitPolicy::default() {
-            assert_reaches_the_server(with_on_read, "OnRead with the default policy");
-        } else {
-            assert_eq!(
-                with_on_read,
-                (Err(IggyError::InvalidConfiguration), NO_LOOKUP),
-                "OnRead with {policy:?}"
-            );
-        }
+        assert_reaches_the_server(initialized, &format!("{commit:?}"));
     }
 
     let never_commits = init_without_stream(standalone(), |builder| {
         builder
             .partitions([POLLED_PARTITION])
-            .client_commit(ClientCommitPolicy {
-                interval: None,
-                on: Some(CommitEvent::EveryNthMessage(0)),
+            .poll_options(PollOptions {
+                commit: CommitPolicy::Auto(AutoCommit {
+                    interval: None,
+                    every: None,
+                    after: CommitAfter::Processing,
+                }),
+                ..PollOptions::default()
             })
     })
     .await;
 
     assert_eq!(
         never_commits,
-        (Err(IggyError::InvalidConfiguration), NO_LOOKUP)
+        (Err(IggyError::InvalidConfiguration), NO_LOOKUP),
+        "auto commit without an interval or an event would store only at shutdown"
     );
 }
 
@@ -832,7 +844,7 @@ async fn given_reconnection_disabled_when_every_replica_link_is_lost_should_end_
 
 #[tokio::test(start_paused = true)]
 async fn given_a_shut_down_client_when_consuming_callbacks_should_end_with_client_shutdown() {
-    let (mut consumer, _cluster) = reading_consumer(ClientCommitPolicy::default(), &[]).await;
+    let (mut consumer, _cluster) = reading_consumer(CommitPolicy::Manual, &[]).await;
     consumer.client.read().await.shutdown().await.unwrap();
     let (_shutdown, receiver) = oneshot::channel();
 
@@ -885,18 +897,20 @@ async fn given_the_default_client_commit_and_next_when_consuming_callbacks_shoul
 
 #[tokio::test(start_paused = true)]
 async fn given_a_commit_policy_or_a_fixed_start_when_consuming_callbacks_should_not_warn() {
-    let each_message = ClientCommitPolicy {
-        interval: None,
-        on: Some(CommitEvent::EachMessage),
-    };
-    let client_commit = consume_three_messages(|builder| builder.client_commit(each_message)).await;
-    let server_commit = consume_three_messages(|builder| builder.poll_options(on_read())).await;
+    let auto_commit = consume_three_messages(|builder| {
+        builder.poll_options(PollOptions {
+            commit: CommitPolicy::Auto(AutoCommit::default()),
+            ..PollOptions::default()
+        })
+    })
+    .await;
+    let on_read = consume_three_messages(|builder| builder.poll_options(on_read())).await;
     let fixed_start =
         consume_three_messages(|builder| builder.polling_strategy(PollingStrategy::first())).await;
 
     for (case, warnings) in [
-        ("a client commit policy", client_commit),
-        ("OnRead", server_commit),
+        ("auto commit", auto_commit),
+        ("OnRead", on_read),
         ("a fixed start", fixed_start),
     ] {
         assert!(warnings.is_empty(), "{case}: {warnings:?}");
@@ -989,6 +1003,40 @@ async fn given_a_seek_when_polled_should_drop_the_rest_of_the_batch_and_read_fro
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn given_a_backward_seek_when_polled_should_hand_over_the_earlier_messages_again() {
+    let (client, cluster) = connect_to_three_replicas().await;
+    answer_lookups(&cluster);
+    script_primary(
+        &cluster,
+        FETCH_MESSAGES_CODE,
+        [reply_of(&BATCH), reply_of(&BATCH), Answer::Silence],
+    );
+    let mut consumer = standalone_reader(client)
+        .prefetch_messages(ONE_SLOT)
+        .build();
+    consumer.init().await.unwrap();
+    for offset in BATCH {
+        assert_eq!(
+            next_message(&mut consumer).await.message.header.offset,
+            offset
+        );
+    }
+
+    consumer
+        .seek(POLLED_PARTITION, PollingStrategy::offset(BATCH[0]))
+        .await
+        .unwrap();
+
+    for offset in BATCH {
+        assert_eq!(
+            next_message(&mut consumer).await.message.header.offset,
+            offset,
+            "a seek back reads the messages that the consumer already yielded again"
+        );
+    }
+}
+
 async fn assert_stream_ends_after_shutdown(mut consumer: IggyConsumer) {
     next_message(&mut consumer).await;
     assert!(consumer.current.is_some(), "the rest of the batch waits");
@@ -1028,34 +1076,30 @@ fn assert_reaches_the_server(initialized: (Result<(), IggyError>, usize), case: 
     );
 }
 
-/// Every shape of a client policy.
-fn client_commit_policies() -> [ClientCommitPolicy; 6] {
-    let interval = Some(NonZeroIggyDuration::ONE_SECOND);
-    [
-        ClientCommitPolicy::default(),
-        ClientCommitPolicy { interval, on: None },
-        ClientCommitPolicy {
-            interval: None,
-            on: Some(CommitEvent::EachMessage),
-        },
-        ClientCommitPolicy {
-            interval: None,
-            on: Some(CommitEvent::EveryNthMessage(NTH)),
-        },
-        ClientCommitPolicy {
-            interval: None,
-            on: Some(CommitEvent::EachBatch),
-        },
-        ClientCommitPolicy {
+/// Every commit policy that a consumer runs, with each event and each counting point.
+fn commit_policies() -> [CommitPolicy; 6] {
+    let auto = |interval, every, after| {
+        CommitPolicy::Auto(AutoCommit {
             interval,
-            on: Some(CommitEvent::EachBatch),
-        },
+            every,
+            after,
+        })
+    };
+    let interval = Some(NonZeroIggyDuration::ONE_SECOND);
+    let every_nth = CommitEvery::Messages(NonZeroU32::new(NTH).unwrap());
+    [
+        CommitPolicy::Manual,
+        CommitPolicy::OnRead,
+        CommitPolicy::Auto(AutoCommit::default()),
+        auto(interval, None, CommitAfter::Delivery),
+        auto(None, Some(every_nth), CommitAfter::Processing),
+        auto(interval, Some(CommitEvery::Batch), CommitAfter::Marked),
     ]
 }
 
 fn on_read() -> PollOptions {
     PollOptions {
-        server_commit: ServerCommitPolicy::OnRead,
+        commit: CommitPolicy::OnRead,
         ..PollOptions::default()
     }
 }
@@ -1121,7 +1165,7 @@ async fn reassign(consumer: &IggyConsumer, generation: u64) {
 /// in the partition history in which the application took [`DELIVERED`].
 async fn rereading_consumer() -> (IggyConsumer, Arc<FakeCluster>) {
     let (consumer, cluster) = reading_consumer(
-        ClientCommitPolicy::default(),
+        CommitPolicy::Manual,
         &[&[DELIVERED - 1, DELIVERED, DELIVERED + 1]],
     )
     .await;
@@ -1190,6 +1234,11 @@ async fn consume_three_messages(
     const OFFSETS: [u64; 3] = [1, 2, 3];
     let (client, cluster) = connect_to_three_replicas().await;
     answer_lookups(&cluster);
+    script_primary(
+        &cluster,
+        POLL_MESSAGES_DEFERRED_CODE,
+        [poll_reply_of(&OFFSETS[..1])],
+    );
     script_primary(
         &cluster,
         FETCH_MESSAGES_CODE,

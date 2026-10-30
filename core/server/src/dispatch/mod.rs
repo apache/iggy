@@ -67,13 +67,16 @@ use consensus::MetadataHandle;
 use futures::future::{Either, select};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
-    BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, LOGIN_REGISTER_CODE, LOGIN_USER_CODE,
-    LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, LOGOUT_USER_CODE, PING_CODE,
+    BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, FETCH_MESSAGES_CODE, LOGIN_REGISTER_CODE,
+    LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, LOGOUT_USER_CODE, PING_CODE,
+    POLL_MESSAGES_DEFERRED_CODE,
 };
+use iggy_binary_protocol::requests::messages::{FetchMessagesRequest, PollMessagesRequest};
 use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::{
     EvictionReason, GenericHeader, HEADER_SIZE, Operation, RequestHeader, RoutedRequestHeader,
+    WireDecode,
 };
 use iggy_common::{IggyError, UserStatus};
 use journal::superblock::SuperblockStore;
@@ -243,6 +246,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
     {
         // Cancellation bypasses admission limits. A poll still queued behind
         // another operation must be removed before it can be admitted.
+        let mut cancelled = Vec::new();
         let mut queues = queues.borrow_mut();
         if let Some(queue) = queues.get_mut(&client_id) {
             for index in (0..queue.requests.len()).rev() {
@@ -256,13 +260,21 @@ fn enqueue_client_request<B, MJ, S, SB>(
                             && header.session == cancel.header().session
                             && header.request == cancel.header().request
                     });
-                if matches {
-                    queue.remove(index);
+                if matches
+                    && let Some(removed) = queue.remove(index)
+                    && commits_on_read(&removed.message)
+                {
+                    cancelled.push(removed);
                 }
             }
             if queue.requests.is_empty() {
                 queues.remove(&client_id);
             }
+        }
+        drop(queues);
+        // A committing request answers its cancel once, so the client knows it stored nothing.
+        for removed in cancelled {
+            deny_cancelled_client_request(shard_handle, removed.origin, removed.message);
         }
         if let Some(drain) = active.borrow().get(&client_id) {
             drain.wake();
@@ -378,6 +390,54 @@ fn deny_overflowing_client_request<B, MJ, S, SB>(
             operation = ?request.header().operation,
             "denying client request retryable: this connection's request queue is full"
         );
+        send_deny_reply(
+            &shard,
+            origin,
+            request.header(),
+            IggyError::TransientNotAccepted.as_code(),
+        )
+        .await;
+    });
+}
+
+/// Whether a deferred request stores the offset of what it reads.
+fn commits_on_read(message: &Message<GenericHeader>) -> bool {
+    let Ok(request) = message.try_as_typed::<RequestHeader>() else {
+        return false;
+    };
+    match u32::from_le_bytes(request.header().reserved) {
+        POLL_MESSAGES_DEFERRED_CODE => {
+            PollMessagesRequest::peek_progress(request.body()).is_ok_and(|(_, commits)| commits)
+        }
+        FETCH_MESSAGES_CODE => {
+            FetchMessagesRequest::decode_from(request.body()).is_ok_and(|fetch| fetch.auto_commit)
+        }
+        _ => false,
+    }
+}
+
+/// Answers a committing request that a cancel removed from the queue before
+/// it ran with `TransientNotAccepted`: it stored nothing.
+fn deny_cancelled_client_request<B, MJ, S, SB>(
+    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
+    origin: ClientOrigin,
+    message: Message<GenericHeader>,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let Some(shard) = upgrade_shard_handle(shard_handle) else {
+        return;
+    };
+    let bus = shard.bus.clone();
+    bus.spawn(async move {
+        let Some(request) = decode_or_deny_client_request(&shard, origin, message).await else {
+            return;
+        };
+        let request = request.into_routed();
         send_deny_reply(
             &shard,
             origin,
@@ -2143,7 +2203,7 @@ mod tests {
 
         let queues = ClientRequestQueues::default();
         let drain = Rc::new(ClientDrain::new(&server_config));
-        let dispatched = handle_client_request(
+        let mut dispatched = Box::pin(handle_client_request(
             &shard,
             &sessions,
             &server_config,
@@ -2152,8 +2212,7 @@ mod tests {
             ClientOrigin::capture(&shard.bus, READER_TRANSPORT),
             read.into_generic(),
             None,
-        );
-        futures::pin_mut!(dispatched);
+        ));
         assert!(futures::poll!(dispatched.as_mut()).is_pending());
         let Ok(ShardFrame::Lifecycle(frame)) = shard_inbox.try_recv() else {
             panic!("code {code} must wait on a shard");
@@ -3687,6 +3746,7 @@ mod tests {
     /// does. A poll admitted after its own cancellation would park and commit
     /// with nothing left to abort it, so only that cancellation may keep it
     /// from its owner.
+    #[allow(clippy::too_many_lines)]
     async fn assert_cancel_of_queued_deferred_poll(cancel_names_the_poll: bool) {
         const POLL_REQUEST: u64 = 3;
         let cancelled = if cancel_names_the_poll {
@@ -3788,7 +3848,15 @@ mod tests {
             .map(|(_, frame)| reply_request(frame))
             .collect();
         replies.sort_unstable();
-        assert_eq!(replies, [1, 2], "a cancellation gets no reply of its own");
+        let expected: &[u64] = if cancel_names_the_poll {
+            &[1, 2, POLL_REQUEST]
+        } else {
+            &[1, 2]
+        };
+        assert_eq!(
+            replies, expected,
+            "a cancelled committing poll answers once, and the cancellation gets no reply of its own"
+        );
     }
 
     /// A deferred poll of partition 0 by the root session, sent as `request`.

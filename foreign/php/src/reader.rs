@@ -31,9 +31,12 @@ const CLOSED: &str = "the reader is closed";
 /// partition inside. Build one with Client::reader() or Client::groupReader().
 ///
 /// Each partition delivers its batches in offset order, from its first read, from each seek()
-/// and from each new assignment to a group member. Without ServerCommitPolicy::OnRead, commit()
-/// stores the offset of a checkpoint. With it, the server stores the offset of each reply, and
-/// close() moves the offset back to the last delivered message. Destroying the reader without
+/// and from each new assignment to a group member. The `commit` of its PollOptions says when
+/// offsets are stored. With CommitPolicy::manual() and CommitPolicy::auto(), commit() stores the
+/// offset of a checkpoint, and CommitPolicy::auto() also stores the latest counted position by
+/// itself, which mark() counts under CommitAfter::Marked. With CommitPolicy::onRead(), the server
+/// stores the offset of each reply, and close() moves the offset back to the last delivered
+/// message. Destroying the reader without
 /// close() stops it without waiting, moves no offset back and does not leave the group.
 #[php_class]
 #[php(name = "Iggy\\PartitionReader")]
@@ -56,7 +59,7 @@ impl PartitionReader {
     ///
     /// A failed read throws Iggy\Exception\ReadException. The reader stays usable and retries
     /// by itself. HistoryUnavailable (87) stops its partition until seek(). Under
-    /// ServerCommitPolicy::OnRead, an unknown outcome stops its partition until the operation is
+    /// CommitPolicy::onRead(), an unknown outcome stops its partition until the operation is
     /// abandoned on the client and the partition is sought.
     pub fn next(&mut self, timeout_micros: Option<&Zval>) -> PhpResult<Option<PolledMessages>> {
         let timeout = optional_unsigned::<u64>(timeout_micros, "timeout_micros")?;
@@ -81,11 +84,21 @@ impl PartitionReader {
     ///
     /// A checkpoint of an older generation of its partition, or at or below the last commit of
     /// its generation, stores nothing. A checkpoint that this reader did not deliver, and every
-    /// commit under ServerCommitPolicy::OnRead, fail with InvalidCommand (3).
+    /// commit under CommitPolicy::onRead(), fail with InvalidCommand (3).
     pub fn commit(&self, checkpoint: &Checkpoint) -> PhpResult {
         let reader = self.open()?;
         runtime()
             .block_on(reader.commit(checkpoint.inner))
+            .map_err(to_php_exception)
+    }
+
+    /// Counts a checkpoint that this reader delivered under CommitPolicy::auto() and stores
+    /// nothing now: the policy stores the latest counted position of its partition. Without
+    /// CommitPolicy::auto(), and for a checkpoint that this reader did not deliver, it throws
+    /// InvalidCommand (3).
+    pub fn mark(&self, checkpoint: &Checkpoint) -> PhpResult {
+        self.open()?
+            .mark(checkpoint.inner)
             .map_err(to_php_exception)
     }
 
@@ -94,7 +107,7 @@ impl PartitionReader {
     /// also resumes a stopped partition.
     ///
     /// A partition that the reader does not read, and a continuation of another partition,
-    /// fail with InvalidCommand (3). Under ServerCommitPolicy::OnRead, the new position waits
+    /// fail with InvalidCommand (3). Under CommitPolicy::onRead(), the new position waits
     /// for the end of the committing read in flight, and a read with an unknown outcome fails
     /// with PartitionLaneBlocked (14009): abandon its operation first.
     pub fn seek(&mut self, partition_id: u32, start: &PollingStrategy) -> PhpResult {
@@ -110,11 +123,12 @@ impl PartitionReader {
         Ok(self.open()?.partitions())
     }
 
-    /// Stops the reader. It waits at most until the deadlines of the reads in flight, and it
-    /// commits nothing. A group reader then leaves its group. A second call does nothing, and
+    /// Stops the reader. It waits at most until the deadlines of the reads in flight. Under
+    /// CommitPolicy::manual() it commits nothing, and under CommitPolicy::auto() it stores the
+    /// latest counted position of each partition. A group reader then leaves its group. A second call does nothing, and
     /// every other method of a closed reader throws.
     ///
-    /// Under ServerCommitPolicy::OnRead, it moves the offset of each partition with undelivered
+    /// Under CommitPolicy::onRead(), it moves the offset of each partition with undelivered
     /// batches back to its last delivered message, and the first failed store is thrown.
     /// Otherwise a partition with an unknown outcome throws PartitionLaneBlocked (14009):
     /// abandon its operation before a new reader reads the partition.

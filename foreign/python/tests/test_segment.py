@@ -20,6 +20,7 @@ import asyncio
 import pytest
 
 from apache_iggy import (
+    CommitPolicy,
     Consumer,
     Durability,
     IggyClient,
@@ -27,7 +28,6 @@ from apache_iggy import (
     PollingStrategy,
     PollOptions,
     SendMessage,
-    ServerCommitPolicy,
     StreamPermissions,
     TopicOptions,
     TopicPermissions,
@@ -175,7 +175,7 @@ class TestSegmentManagement:
             options=PollOptions(
                 count=MESSAGES_PER_SEALED_SEGMENT + 1,
                 max_bytes=POLL_MAX_BYTES,
-                server_commit=ServerCommitPolicy.OnRead,
+                commit=CommitPolicy.OnRead(),
             ),
         )
         assert [message.offset() for message in polled.messages] == list(range(6))
