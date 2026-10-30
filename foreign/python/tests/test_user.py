@@ -63,14 +63,7 @@ def _create_personal_access_token(
     name: str,
     expiry: int,
 ) -> tuple[str, str]:
-    login_req = urllib.request.Request(  # noqa: S310
-        f"{api}/users/login",
-        data=json.dumps({"username": username, "password": password}).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(login_req, timeout=10) as response:  # noqa: S310
-        jwt = json.loads(response.read())["access_token"]["token"]
+    jwt = _login_jwt(api, username, password)
     create_req = urllib.request.Request(  # noqa: S310
         f"{api}/personal-access-tokens",
         data=json.dumps({"name": name, "expiry": expiry}).encode(),
@@ -446,19 +439,25 @@ class TestLoginIdentity:
 
     @pytest.mark.asyncio
     async def test_create_personal_access_token_refuses_empty_name_on_every_transport(
-        self, transport_client: IggyClient
+        self, transport_client: IggyClient, request: pytest.FixtureRequest
     ):
-        """Test that every transport refuses an empty token name with an error."""
-        with pytest.raises(IggyError):
+        """Test that every transport refuses an empty token name with its code."""
+        transport = request.node.callspec.params["transport_client"]
+        with pytest.raises(IggyError) as refusal:
             await transport_client.create_personal_access_token(
                 "", IggyExpiry.NeverExpire()
             )
+        assert refusal.value.code == (300 if transport == "http" else 4)
 
     @pytest.mark.asyncio
     async def test_create_personal_access_token_refuses_duplicate_on_every_transport(
-        self, transport_client: IggyClient, unique_name
+        self,
+        transport_client: IggyClient,
+        unique_name,
+        request: pytest.FixtureRequest,
     ):
         """Test that every transport refuses a second token with the same name."""
+        transport = request.node.callspec.params["transport_client"]
         name = unique_name(min_bytes=16, max_bytes=30)
         http_host, http_port = get_http_server_config()
         api = f"http://{http_host}:{http_port}"
@@ -468,10 +467,11 @@ class TestLoginIdentity:
             await transport_client.create_personal_access_token(
                 name, IggyExpiry.NeverExpire()
             )
-            with pytest.raises(IggyError):
+            with pytest.raises(IggyError) as clash:
                 await transport_client.create_personal_access_token(
                     name, IggyExpiry.NeverExpire()
                 )
+            assert clash.value.code == (300 if transport == "http" else 51)
         finally:
             _delete_if_present(api, jwt, name)
 

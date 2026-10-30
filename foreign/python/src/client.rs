@@ -459,6 +459,10 @@ impl IggyClient {
     /// Raises:
     ///     ValueError: If the expiry is invalid.
     ///     PendingOperationError: If the reply is lost on TCP, QUIC, or WebSocket.
+    ///         The token may exist with its value lost, and a retry with the same
+    ///         name fails with code 51. Delete the token by name and create it
+    ///         again. Until `delete_personal_access_token` is added, delete it
+    ///         through the HTTP API or another SDK.
     ///     RuntimeError: If the server refuses the request. On TCP, QUIC, and
     ///         WebSocket, an empty name or a name over 255 bytes raises code 4
     ///         before anything is sent. On HTTP, a name outside 3 to 30 bytes is
