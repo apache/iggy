@@ -7239,10 +7239,8 @@ mod tests {
                     .restore_commit_state(commit, commit);
             }
             let journal = &backup.partition(namespace).log.journal().inner;
-            assert_eq!(
-                journal.evict_prefix(adopted).len(),
-                prepares.len() - adopted
-            );
+            journal.evict_prefix(adopted);
+            assert_eq!(journal.resident_entries().len(), prepares.len() - adopted);
             assert!(journal.header_by_op(ADOPTED_HEAD).is_none());
             assert!(journal.repair_header(ADOPTED_HEAD).is_some());
         }

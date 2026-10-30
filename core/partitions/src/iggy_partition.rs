@@ -6222,8 +6222,8 @@ where
                 .journal()
                 .inner
                 .with_entries(|entries| entries.len().saturating_sub(prefix));
-            // Eviction rebuilds the retained tail. Amortize partial flushes so
-            // a slow writer cannot make us rebuild a large tail after each write.
+            // A partial flush waits until it frees at least as many entries as
+            // it keeps, so a slow writer gets fewer and larger flushes.
             if (ready_through == through || prefix >= retained)
                 && self.begin_materialization(
                     ready_through,
@@ -10326,8 +10326,8 @@ where
                     .map(|pending| pending.index_span_limit)
             });
         self.log.journal().inner.with_entries(|entries| {
-            let entries = entries
-                .get(first_entry..prefix_len)
+            let entries = (first_entry <= prefix_len && prefix_len <= entries.len())
+                .then(|| entries.range(first_entry..prefix_len))
                 .ok_or(IggyError::CannotWriteToFile)?;
             let mut backing = 0_usize;
             let mut file_position = position;
@@ -10409,9 +10409,10 @@ where
                     .ok_or(IggyError::CannotWriteToFile)?;
                 let completes = chunk.end_entry == save.chunk.end_entry;
                 let batches = self.log.journal().inner.with_entries(|entries| {
-                    let entries = entries
-                        .get(chunk.first_entry..chunk.end_entry)
-                        .ok_or(IggyError::CannotWriteToFile)?;
+                    let entries = (chunk.first_entry <= chunk.end_entry
+                        && chunk.end_entry <= entries.len())
+                    .then(|| entries.range(chunk.first_entry..chunk.end_entry))
+                    .ok_or(IggyError::CannotWriteToFile)?;
                     let mut batches = Vec::with_capacity(chunk.buffers);
                     for entry in entries {
                         if materialization_batch_meta(entry, chunk.persisted_end)?.is_some() {
@@ -10572,12 +10573,10 @@ where
     }
 
     /// Evict the committed prefix (the `count` front entries read by
-    /// `committed_prefix_len`) and reset `journal.info` to reflect only the
-    /// uncommitted tail left resident, so the next persist threshold counts that
-    /// tail alone. Call once the prefix is durable, or when there is nothing to
-    /// persist. The retained tail's accounting is folded from the meta
-    /// `evict_prefix` surfaced during its re-append, so the tail is not decoded
-    /// a second time.
+    /// `committed_prefix_len`) and set the message count and size in
+    /// `journal.info` to the batches left resident, so the next persist
+    /// threshold counts that tail alone. Call once the prefix is durable, or
+    /// when there is nothing to persist.
     fn evict_committed_prefix(&mut self, count: usize) {
         if count == 0 {
             return;
@@ -10587,26 +10586,20 @@ where
             return;
         }
         let persistence = self.persistence.as_deref();
-        let retained = self.log.journal().inner.evict_prefix_located(count, |op| {
+        let journal = &self.log.journal().inner;
+        journal.evict_prefix_located(count, |op| {
             persistence?.segment_reference(op).map(BodyPosition::from)
         });
-        // Eviction drains the ring and re-appends the retained tail, so the slots
-        // a suffix snapshot describes move under it without the head or the
-        // commit point changing.
+        // Every retained entry moves `count` slots towards the front, so the
+        // slots a suffix snapshot describes move under it without the head or
+        // the commit point changing.
         self.consensus.note_journal_mutation();
-        let mut retained_info = JournalInfo::default();
-        for (_, meta) in &retained {
-            if let Some(meta) = meta {
-                accumulate_committed_info(
-                    &mut retained_info,
-                    meta.base_offset,
-                    meta.base_timestamp,
-                    meta.total_size,
-                    meta.message_count,
-                );
-            }
-        }
-        self.log.journal_mut().info = retained_info;
+        // Appends reject a batch that overflows the count, so it fits.
+        let messages_count = u32::try_from(journal.resident_messages()).unwrap_or(u32::MAX);
+        let size = IggyByteSize::from(journal.resident_message_size());
+        let info = &mut self.log.journal_mut().info;
+        info.messages_count = messages_count;
+        info.size = size;
     }
 
     async fn handle_committed_entries(
@@ -14428,7 +14421,7 @@ mod tests {
             .inner
             .with_entries(|entries| {
                 crate::io::materialization_allocation_charge(
-                    &entries[..1],
+                    std::slice::from_ref(&entries[0]),
                     1,
                     crate::iggy_index::IGGY_INDEX_SIZE,
                 )
@@ -35349,7 +35342,7 @@ mod tests {
         partition.consensus().advance_commit_max(3);
         partition.repair = Some(armed_fetch_session(2, 3, 0));
         partition.commit_journal(&repair_config()).await;
-        let _ = partition.log.journal().inner.evict_prefix(3);
+        partition.log.journal().inner.evict_prefix(3);
 
         let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -36963,7 +36956,7 @@ mod tests {
                                     .log
                                     .journal()
                                     .inner
-                                    .with_entries(<[_]>::len),
+                                    .with_entries(VecDeque::len),
                                 usize::try_from(RECORDS).unwrap()
                             );
                         }

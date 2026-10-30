@@ -30,7 +30,7 @@ use server_common::{
 use std::io;
 use std::{
     cell::{Cell, RefCell, UnsafeCell},
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     fmt::Debug,
     ops::RangeInclusive,
     rc::{Rc, Weak},
@@ -45,17 +45,40 @@ const ZERO_LEN: usize = 0;
 const PREPARE_HEADER_SIZE: usize = std::mem::size_of::<PrepareHeader>();
 type JournalBuffer = Frozen<4096>;
 
-/// Decoded `SendMessages` header fields surfaced from a journal (re-)append so a
-/// caller can fold segment accounting without a second decode of the same bytes.
-/// Raw header values only: the journal stays agnostic of partition-layer
-/// accounting types (`JournalInfo` lives in the log layer). `None` is surfaced
-/// for non-`SendMessages` ops, which carry no segment bytes.
+/// Decoded `SendMessages` header fields: what a resident batch adds to the
+/// journal's offset and timestamp indexes and message totals, and what a flush
+/// folds into segment accounting. Raw header values only: the journal stays
+/// agnostic of partition-layer accounting types (`JournalInfo` lives in the
+/// log layer).
 #[derive(Clone, Copy)]
 pub struct RetainedBatchMeta {
     pub base_offset: u64,
     pub base_timestamp: u64,
     pub total_size: u64,
     pub message_count: u32,
+}
+
+impl RetainedBatchMeta {
+    /// `None` for an op that is not `SendMessages` or that carries no
+    /// messages: such an entry has no offset to index and no segment bytes.
+    ///
+    /// Trusted (no batch-hash): every entry here was just stamped by
+    /// `stamp_prepare_for_persistence` (its checksum recomputed over this exact
+    /// blob) or was validated by such an append before, so re-hashing the
+    /// ~1 MiB blob only to read the header is waste.
+    fn of(header: &PrepareHeader, entry: &JournalBuffer) -> Option<Self> {
+        if header.operation != Operation::SendMessages {
+            return None;
+        }
+        let batch = decode_prepare_slice_trusted(entry.as_slice()).ok()?;
+        let message_count = batch.message_count();
+        (message_count != 0).then(|| Self {
+            base_offset: batch.header.base_offset,
+            base_timestamp: batch.header.base_timestamp,
+            total_size: batch.header.total_size() as u64,
+            message_count,
+        })
+    }
 }
 
 /// What one pass over the journal headers found for a repair window.
@@ -449,7 +472,7 @@ pub struct SelectedBatchSlice {
 ///
 /// # Warning — development storage only
 ///
-/// This storage backs the `Journal` trait with a plain `Vec<JournalBuffer>`
+/// This storage backs the `Journal` trait with a plain `VecDeque<JournalBuffer>`
 /// inside an `UnsafeCell`. Writes never hit disk, nothing is `fsync`ed, and
 /// every entry is lost on process exit.
 ///
@@ -470,11 +493,10 @@ pub struct SelectedBatchSlice {
 /// production cluster traffic.
 #[derive(Debug, Default)]
 pub struct PartitionJournalMemStorage {
-    entries: UnsafeCell<Vec<JournalBuffer>>,
-    /// Maps byte offset (as if disk-backed) to index in entries Vec
-    offset_to_index: UnsafeCell<HashMap<usize, usize>>,
-    /// Current write position (cumulative byte offset)
-    current_offset: UnsafeCell<usize>,
+    entries: UnsafeCell<VecDeque<JournalBuffer>>,
+    /// Offset of `entries[0]`. An offset counts the entries written since the
+    /// last drain, so popping the front leaves every other offset valid.
+    front_offset: Cell<usize>,
 }
 
 impl Storage for PartitionJournalMemStorage {
@@ -485,15 +507,8 @@ impl Storage for PartitionJournalMemStorage {
     }
 
     async fn read_at(&self, offset: usize, _buffer: Self::Buffer) -> io::Result<Self::Buffer> {
-        let offset_to_index = unsafe { &*self.offset_to_index.get() };
-        let Some(&index) = offset_to_index.get(&offset) else {
-            return Ok(Owned::<4096>::zeroed(0).into());
-        };
-
-        let entries = unsafe { &*self.entries.get() };
-        Ok(entries
-            .get(index)
-            .cloned()
+        Ok(self
+            .read_at_sync(offset)
             .unwrap_or_else(|| Owned::<4096>::zeroed(0).into()))
     }
 }
@@ -511,9 +526,16 @@ where
     /// Keeping `op` in the key preserves duplicate timestamps while still
     /// letting us seek to the closest batch for timestamp-based polling.
     timestamp_to_op: UnsafeCell<BTreeMap<(u64, u64), u64>>,
-    headers: UnsafeCell<Vec<PrepareHeader>>,
+    headers: UnsafeCell<VecDeque<PrepareHeader>>,
+    /// Position of `headers[0]`, counted from the last clear, so the positions
+    /// in `first_header_by_op` stay valid when the front leaves.
+    front_position: Cell<usize>,
     /// Commit validation uses the first resident occurrence, including duplicates.
     first_header_by_op: RefCell<AHashMap<u64, usize>>,
+    /// Messages in the resident `SendMessages` batches.
+    resident_messages: Cell<u64>,
+    /// Segment bytes of the resident `SendMessages` batches.
+    resident_message_size: Cell<u64>,
     inner: UnsafeCell<JournalInner<S>>,
     /// Ring of recently evicted committed entries, keyed by op, retained so
     /// this replica can serve journal repair for rejoin windows after the
@@ -615,30 +637,33 @@ where
 
 impl PartitionJournalMemStorage {
     /// Synchronous mirror of [`Storage::read_at`] for the poll path. Mem
-    /// storage never hits the reactor (it copies from an in-memory `Vec`), so
-    /// the read can run under a partition borrow without crossing an `.await`
-    /// - the property that keeps poll-read sound.
+    /// storage never hits the reactor (it copies from an in-memory `VecDeque`),
+    /// so the read can run under a partition borrow without crossing an
+    /// `.await` - the property that keeps poll-read sound.
     fn read_at_sync(&self, offset: usize) -> Option<JournalBuffer> {
-        let offset_to_index = unsafe { &*self.offset_to_index.get() };
-        let index = *offset_to_index.get(&offset)?;
         let entries = unsafe { &*self.entries.get() };
-        entries.get(index).cloned()
+        entries
+            .get(offset.checked_sub(self.front_offset.get())?)
+            .cloned()
     }
 
     fn entries(&self) -> Vec<JournalBuffer> {
         let entries = unsafe { &*self.entries.get() };
-        entries.clone()
+        entries.iter().cloned().collect()
     }
 
     fn drain(&self) -> Vec<JournalBuffer> {
         let entries = unsafe { &mut *self.entries.get() };
-        let offset_to_index = unsafe { &mut *self.offset_to_index.get() };
-        let current_offset = unsafe { &mut *self.current_offset.get() };
+        self.front_offset.set(0);
+        std::mem::take(entries).into()
+    }
 
-        offset_to_index.clear();
-        *current_offset = 0;
-
-        std::mem::take(entries)
+    /// Removes the front entry and keeps the offsets of the others.
+    fn pop_front(&self) -> Option<JournalBuffer> {
+        let entries = unsafe { &mut *self.entries.get() };
+        let entry = entries.pop_front()?;
+        self.front_offset.set(self.front_offset.get() + 1);
+        Some(entry)
     }
 
     fn is_empty(&self) -> bool {
@@ -647,21 +672,14 @@ impl PartitionJournalMemStorage {
     }
 
     fn current_offset(&self) -> usize {
-        let current_offset = unsafe { &*self.current_offset.get() };
-        *current_offset
+        let entries = unsafe { &*self.entries.get() };
+        self.front_offset.get() + entries.len()
     }
 
     fn write_at_sync(&self, buf: JournalBuffer) -> usize {
         let len = buf.len();
         let entries = unsafe { &mut *self.entries.get() };
-        let offset_to_index = unsafe { &mut *self.offset_to_index.get() };
-        let current_offset = unsafe { &mut *self.current_offset.get() };
-
-        let index = entries.len();
-        offset_to_index.insert(*current_offset, index);
-        entries.push(buf);
-        *current_offset += len;
-
+        entries.push_back(buf);
         len
     }
 }
@@ -772,6 +790,18 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     /// gate bounds this the way the message thresholds bound batches.
     pub const fn resident_control_ops(&self) -> usize {
         self.resident_control_ops.get()
+    }
+
+    /// Messages in the resident `SendMessages` batches, which the partition's
+    /// message-count flush threshold reads.
+    pub const fn resident_messages(&self) -> u64 {
+        self.resident_messages.get()
+    }
+
+    /// Segment bytes of the resident `SendMessages` batches, which the
+    /// partition's size flush threshold reads.
+    pub const fn resident_message_size(&self) -> u64 {
+        self.resident_message_size.get()
     }
 
     /// Restore the materialized commit point for elections and body repair.
@@ -1115,8 +1145,8 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     }
 
     /// Inspect resident allocations without pinning extra payload references.
-    /// The closure cannot retain the borrowed entry vector across owner mutations.
-    pub(crate) fn with_entries<R>(&self, inspect: impl FnOnce(&[JournalBuffer]) -> R) -> R {
+    /// The closure cannot retain the borrowed entry deque across owner mutations.
+    pub(crate) fn with_entries<R>(&self, inspect: impl FnOnce(&VecDeque<JournalBuffer>) -> R) -> R {
         let inner = unsafe { &*self.inner.get() };
         let entries = unsafe { &*inner.storage.entries.get() };
         inspect(entries)
@@ -1173,77 +1203,139 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         ordered.sort_by_key(|(op, _)| *op);
         self.clear_resident_indexes();
         for (_, entry) in ordered {
-            self.append_with_meta_sync(entry);
+            self.append_sync(entry);
         }
         true
     }
 
-    /// Remove the persisted prefix and return the retained entries with their batch metadata.
-    pub fn evict_prefix(&self, count: usize) -> Vec<(JournalBuffer, Option<RetainedBatchMeta>)> {
-        self.evict_prefix_located(count, |_| None)
+    /// Remove the persisted prefix: the `count` front entries.
+    pub fn evict_prefix(&self, count: usize) {
+        self.evict_prefix_located(count, |_| None);
     }
 
     /// [`Self::evict_prefix`] for a journal whose bodies also sit in segments.
     /// `locate` names where the body of an evicted op lies, so the evicted
     /// ring can release that body from memory and still serve the op.
-    pub fn evict_prefix_located(
-        &self,
-        count: usize,
-        locate: impl Fn(u64) -> Option<BodyPosition>,
-    ) -> Vec<(JournalBuffer, Option<RetainedBatchMeta>)> {
-        let all_entries = {
-            let inner = unsafe { &*self.inner.get() };
-            inner.storage.drain()
+    ///
+    /// Costs O(`count`), however many entries stay resident: a lagging backup
+    /// holds hundreds of thousands and evicts after every flush. Two rare
+    /// shapes rebuild the retained tail instead, because a popped entry would
+    /// leave a stale index behind: a journal out of op order, and a prefix op
+    /// that has another copy in the retained tail.
+    pub fn evict_prefix_located(&self, count: usize, locate: impl Fn(u64) -> Option<BodyPosition>) {
+        let evicted = if self.out_of_order.get() || self.retains_copy_of_prefix(count) {
+            self.rebuild_without_prefix(count)
+        } else {
+            self.pop_prefix(count)
         };
-        // Ops are positional against `headers` until the clear below; capture
-        // the evicted prefix's ops first so the ring stays op-addressable.
-        let evicted_ops: Vec<u64> = {
-            let headers = unsafe { &*self.headers.get() };
-            headers.iter().take(count).map(|header| header.op).collect()
-        };
-        if let Some(&highest) = evicted_ops.iter().max() {
+        if let Some(highest) = evicted.iter().map(|(op, _)| *op).max() {
             self.evicted_through
                 .set(self.evicted_through.get().max(highest));
         }
+        if !self.repair_retention.get() {
+            return;
+        }
+        let ring = unsafe { &mut *self.evicted_ring.get() };
+        let mut ring_bytes = self.evicted_ring_bytes.get();
+        for (op, prepare) in evicted {
+            ring_bytes += prepare.len() as u64;
+            let entry = RingEntry {
+                prepare,
+                body: locate(op),
+            };
+            if let Some(previous) = ring.insert(op, entry) {
+                ring_bytes -= previous.prepare.len() as u64;
+            }
+        }
+        self.evicted_ring_bytes.set(ring_bytes);
+        self.trim_evicted_ring();
+    }
+
+    /// Whether an op in the `count` front entries has a copy behind them. The
+    /// op index names the last copy, so one lookup per op answers it.
+    fn retains_copy_of_prefix(&self, count: usize) -> bool {
+        let headers = unsafe { &*self.headers.get() };
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        let inner = unsafe { &*self.inner.get() };
+        let retained_from = inner.storage.current_offset() - headers.len().saturating_sub(count);
+        headers.iter().take(count).any(|header| {
+            op_to_storage_offset
+                .get(&header.op)
+                .is_some_and(|&storage_offset| storage_offset >= retained_from)
+        })
+    }
+
+    /// Pops the `count` front entries and removes them from every index. The
+    /// caller makes sure that no evicted op has a retained copy, so each index
+    /// ends as a rebuild of the retained tail would leave it.
+    fn pop_prefix(&self, count: usize) -> Vec<(u64, JournalBuffer)> {
+        let headers = unsafe { &mut *self.headers.get() };
+        let inner = unsafe { &*self.inner.get() };
+        let op_to_storage_offset = unsafe { &mut *self.op_to_storage_offset.get() };
+        let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
+        let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
+        let mut first_header_by_op = self.first_header_by_op.borrow_mut();
+        let mut evicted = Vec::with_capacity(count.min(headers.len()));
+        while evicted.len() < count {
+            // The length-lock pairs every header with one stored entry.
+            let (Some(header), Some(entry)) = (headers.pop_front(), inner.storage.pop_front())
+            else {
+                break;
+            };
+            self.front_position.set(self.front_position.get() + 1);
+            let op = header.op;
+            op_to_storage_offset.remove(&op);
+            first_header_by_op.remove(&op);
+            if header.operation != Operation::SendMessages {
+                self.resident_control_ops
+                    .set(self.resident_control_ops.get() - 1);
+            }
+            if let Some(meta) = RetainedBatchMeta::of(&header, &entry) {
+                // A later batch at the same offset keeps the key.
+                if offset_to_op.get(&meta.base_offset) == Some(&op) {
+                    offset_to_op.remove(&meta.base_offset);
+                }
+                timestamp_to_op.remove(&(meta.base_timestamp, op));
+                self.resident_messages
+                    .set(self.resident_messages.get() - u64::from(meta.message_count));
+                self.resident_message_size
+                    .set(self.resident_message_size.get() - meta.total_size);
+            }
+            evicted.push((op, entry));
+        }
+        // Every op above the highest evicted one is still resident, so the
+        // cached run keeps that part instead of a full walk on the next probe.
+        if let Some(highest) = evicted.iter().map(|(op, _)| *op).max() {
+            let (run_floor, run_through) = self.held_run.get();
+            let floor = run_floor.max(highest);
+            self.held_run.set(if floor < run_through {
+                (floor, run_through)
+            } else {
+                (0, 0)
+            });
+        }
+        evicted
+    }
+
+    /// Evicts the `count` front entries by draining the journal and appending
+    /// the retained tail again.
+    fn rebuild_without_prefix(&self, count: usize) -> Vec<(u64, JournalBuffer)> {
+        let entries = {
+            let inner = unsafe { &*self.inner.get() };
+            inner.storage.drain()
+        };
+        // Positional against `headers` until the clear below.
+        let ops: Vec<u64> = {
+            let headers = unsafe { &*self.headers.get() };
+            headers.iter().map(|header| header.op).collect()
+        };
         self.clear_resident_indexes();
-
-        let mut all_entries = all_entries.into_iter();
-        if self.repair_retention.get() {
-            let ring = unsafe { &mut *self.evicted_ring.get() };
-            let mut ring_bytes = self.evicted_ring_bytes.get();
-            for op in evicted_ops {
-                let Some(prepare) = all_entries.next() else {
-                    break;
-                };
-                ring_bytes += prepare.len() as u64;
-                let entry = RingEntry {
-                    prepare,
-                    body: locate(op),
-                };
-                if let Some(previous) = ring.insert(op, entry) {
-                    ring_bytes -= previous.prepare.len() as u64;
-                }
-            }
-            self.evicted_ring_bytes.set(ring_bytes);
-            self.trim_evicted_ring();
-        } else {
-            // Consume without retaining: the iterator itself must still
-            // advance past the evicted prefix so the retained tail below is
-            // aligned.
-            for _ in &evicted_ops {
-                if all_entries.next().is_none() {
-                    break;
-                }
-            }
+        let mut entries = ops.into_iter().zip(entries);
+        let evicted = entries.by_ref().take(count).collect();
+        for (_, entry) in entries {
+            self.append_sync(entry);
         }
-        let retained: Vec<JournalBuffer> = all_entries.collect();
-        let mut result = Vec::with_capacity(retained.len());
-        for entry in retained {
-            let meta = self.append_with_meta_sync(entry.clone());
-            result.push((entry, meta));
-        }
-
-        result
+        evicted
     }
 
     /// Keeps the evicted ring within its caps. Past the byte cap the oldest
@@ -1285,63 +1377,32 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         self.evicted_ring_bytes.set(bytes);
     }
 
-    /// `append`, additionally returning the decoded `RetainedBatchMeta` for a
-    /// `SendMessages` entry so the eviction path folds its accounting without a
-    /// second decode of the same bytes.
-    ///
     /// INVARIANT (length-lock): the header is pushed before `storage.write_at`,
     /// so `headers[i]` and the entry at storage index `i` stay positionally
     /// paired - materialization reads entries by that position. `MemStorage::write_at`
     /// is infallible, so the push never runs ahead of a failed write. A future
     /// fallible `Storage` MUST roll the header push back on a write error (or
     /// write before pushing the header) or the zip desyncs.
-    fn append_with_meta_sync(&self, entry: JournalBuffer) -> Option<RetainedBatchMeta> {
+    fn append_sync(&self, entry: JournalBuffer) {
         let header_bytes = &entry[..PREPARE_HEADER_SIZE];
         let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
             .expect("partition journal append expects a valid prepare header");
         let op = header.op;
-        // One decode feeds both the offset/timestamp index and the surfaced
-        // accounting meta. Both are keyed on `base_timestamp`, the broker
-        // append time stamped into replies: the seek hint must live on the
-        // same clock as `select_batch_slice`'s filter or timestamp polls seek
-        // to the wrong resident entry.
-        // Trusted (no batch-hash): every entry reaching append was just stamped
-        // by `stamp_prepare_for_persistence` (its checksum recomputed over this
-        // exact blob) or re-appended from an already-validated resident entry,
-        // so re-hashing the ~1 MiB blob here only to read the header is waste.
-        let (index_offset_timestamp, meta) = if header.operation == Operation::SendMessages {
-            match decode_prepare_slice_trusted(entry.as_slice()) {
-                Ok(batch) if batch.message_count() != 0 => {
-                    let message_count = batch.message_count();
-                    let meta = RetainedBatchMeta {
-                        base_offset: batch.header.base_offset,
-                        base_timestamp: batch.header.base_timestamp,
-                        total_size: batch.header.total_size() as u64,
-                        message_count,
-                    };
-                    (
-                        Some((batch.header.base_offset, batch.header.base_timestamp)),
-                        Some(meta),
-                    )
-                }
-                _ => (None, None),
-            }
-        } else {
-            (None, None)
-        };
+        let meta = RetainedBatchMeta::of(&header, &entry);
 
         {
             let headers = unsafe { &mut *self.headers.get() };
-            if headers.last().is_some_and(|last| last.op > op) {
+            if headers.back().is_some_and(|last| last.op > op) {
                 self.out_of_order.set(true);
             }
             if !headers.is_empty() {
+                let position = self.front_position.get() + headers.len();
                 self.first_header_by_op
                     .borrow_mut()
                     .entry(op)
-                    .or_insert(headers.len());
+                    .or_insert(position);
             }
-            headers.push(header);
+            headers.push_back(header);
         };
 
         let storage_offset = {
@@ -1360,15 +1421,22 @@ impl PartitionJournal<PartitionJournalMemStorage> {
                 .set(self.resident_control_ops.get() + 1);
         }
 
-        if let Some((offset, timestamp)) = index_offset_timestamp {
+        if let Some(meta) = meta {
             let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
-            offset_to_op.insert(offset, op);
+            offset_to_op.insert(meta.base_offset, op);
 
+            // Keyed on `base_timestamp`, the broker append time stamped into
+            // replies: the seek hint must live on the same clock as
+            // `select_batch_slice`'s filter or timestamp polls seek to the
+            // wrong resident entry.
             let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
-            timestamp_to_op.insert((timestamp, op), op);
-        }
+            timestamp_to_op.insert((meta.base_timestamp, op), op);
 
-        meta
+            self.resident_messages
+                .set(self.resident_messages.get() + u64::from(meta.message_count));
+            self.resident_message_size
+                .set(self.resident_message_size.get() + meta.total_size);
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1421,9 +1489,12 @@ where
             op_to_storage_offset: UnsafeCell::new(BTreeMap::new()),
             offset_to_op: UnsafeCell::new(BTreeMap::new()),
             timestamp_to_op: UnsafeCell::new(BTreeMap::new()),
-            headers: UnsafeCell::new(Vec::new()),
+            headers: UnsafeCell::new(VecDeque::new()),
+            front_position: Cell::new(0),
             inner: UnsafeCell::new(JournalInner { storage }),
             first_header_by_op: RefCell::new(AHashMap::new()),
+            resident_messages: Cell::new(0),
+            resident_message_size: Cell::new(0),
             evicted_ring: UnsafeCell::new(BTreeMap::new()),
             evicted_ring_bytes: Cell::new(0),
             evicted_headers: UnsafeCell::new(VecDeque::new()),
@@ -1442,22 +1513,27 @@ where
     /// Forget every resident header and index. The caller drained the entries.
     fn clear_resident_indexes(&self) {
         unsafe { &mut *self.headers.get() }.clear();
+        self.front_position.set(0);
         self.first_header_by_op.borrow_mut().clear();
         unsafe { &mut *self.op_to_storage_offset.get() }.clear();
         unsafe { &mut *self.offset_to_op.get() }.clear();
         self.held_run.set((0, 0));
         unsafe { &mut *self.timestamp_to_op.get() }.clear();
         self.resident_control_ops.set(0);
+        self.resident_messages.set(0);
+        self.resident_message_size.set(0);
         self.out_of_order.set(false);
     }
 
     pub fn header_by_op(&self, op: u64) -> Option<PrepareHeader> {
         let headers = unsafe { &*self.headers.get() };
-        if headers.first().is_some_and(|header| header.op == op) {
-            return headers.first().copied();
+        if headers.front().is_some_and(|header| header.op == op) {
+            return headers.front().copied();
         }
-        let index = *self.first_header_by_op.borrow().get(&op)?;
-        let header = headers.get(index);
+        let position = *self.first_header_by_op.borrow().get(&op)?;
+        let header = position
+            .checked_sub(self.front_position.get())
+            .and_then(|index| headers.get(index));
         debug_assert!(header.is_some_and(|header| header.op == op));
         header.copied()
     }
@@ -1747,7 +1823,7 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
     }
 
     async fn append(&self, entry: Self::Entry) -> io::Result<()> {
-        self.append_with_meta_sync(entry);
+        self.append_sync(entry);
         Ok(())
     }
 
@@ -1775,7 +1851,7 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
             inner.storage.drain()
         };
         // Positional against `headers` until the clear below (see the length-lock
-        // invariant on `append_with_meta_sync`), so the ops are captured first.
+        // invariant on `append_sync`), so the ops are captured first.
         let entry_ops: Vec<u64> = {
             let headers = unsafe { &*self.headers.get() };
             headers.iter().map(|header| header.op).collect()
@@ -1789,7 +1865,7 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
                 continue;
             }
             // Replays bytes this journal already accepted once, so it cannot fail.
-            self.append_with_meta_sync(entry);
+            self.append_sync(entry);
         }
         Ok(removed)
     }
@@ -2675,9 +2751,9 @@ mod tests {
             "read must not evict op 1"
         );
 
-        let retained = journal.evict_prefix(committed.len());
+        journal.evict_prefix(committed.len());
         assert_eq!(
-            retained.len(),
+            journal.resident_entries().len(),
             2,
             "ops 3 and 4 stay resident after eviction"
         );
@@ -2688,7 +2764,7 @@ mod tests {
         let header3 = journal.header_by_op(3).expect("op 3 must be retained");
         let header4 = journal.header_by_op(4).expect("op 4 must be retained");
 
-        // Retained entries are still byte-readable after the storage rebuild.
+        // Retained entries are still byte-readable after the eviction.
         for header in [header3, header4] {
             let entry = journal
                 .entry(&header)
@@ -2703,8 +2779,7 @@ mod tests {
 
         // Advancing the frontier flushes the rest with no gap.
         let committed = journal.committed_prefix(4);
-        let rest = journal.evict_prefix(committed.len());
-        assert!(rest.is_empty(), "ops 3 and 4 flush on the next evict");
+        journal.evict_prefix(committed.len());
         assert!(journal.is_empty(), "journal is empty once all ops flushed");
     }
 
@@ -2735,8 +2810,12 @@ mod tests {
             .collect();
         assert_eq!(ops, vec![1, 2], "prefix stops before the op 3 gap");
 
-        let retained = journal.evict_prefix(committed.len());
-        assert_eq!(retained.len(), 1, "op 4 stays retained past the gap");
+        journal.evict_prefix(committed.len());
+        assert_eq!(
+            journal.resident_entries().len(),
+            1,
+            "op 4 stays retained past the gap"
+        );
         assert!(journal.header_by_op(4).is_some(), "op 4 still resident");
     }
 
@@ -2973,7 +3052,7 @@ mod tests {
         );
         assert_eq!(journal.resident_control_ops(), 3);
 
-        // Eviction rebuilds the poll view from the retained tail.
+        // Eviction drops the evicted batches from the poll view.
         journal.evict_prefix(2);
         assert_eq!(entry_ops(&journal.resident_message_entries()), vec![3, 5]);
         assert_eq!(journal.resident_control_ops(), 2);
@@ -3009,6 +3088,196 @@ mod tests {
             .expect("append");
         journal.clear_all();
         assert_eq!(journal.resident_control_ops(), 0);
+    }
+
+    /// What readers see of the resident journal. The storage offsets of an
+    /// eviction and of a rebuild differ, so entries are read back through them
+    /// instead of compared. Probing `held_through` also seeds its cached run.
+    #[derive(Debug, PartialEq)]
+    struct ResidentView {
+        entry_ops: Vec<u64>,
+        headers: Vec<Option<PrepareHeader>>,
+        reads: Vec<(u64, Option<u64>)>,
+        offsets: BTreeMap<u64, u64>,
+        timestamps: BTreeMap<(u64, u64), u64>,
+        held_through: Vec<u64>,
+        control_ops: usize,
+        totals: (u64, u64),
+        out_of_order: bool,
+    }
+
+    fn resident_view(
+        journal: &PartitionJournal<PartitionJournalMemStorage>,
+        top_op: u64,
+    ) -> ResidentView {
+        let inner = unsafe { &*journal.inner.get() };
+        let entries = journal.resident_entries();
+        let folded = entries.iter().fold((0, 0), |(messages, size), entry| {
+            let header =
+                bytemuck::checked::try_from_bytes::<PrepareHeader>(&entry[..PREPARE_HEADER_SIZE])
+                    .expect("entry holds a valid prepare header");
+            RetainedBatchMeta::of(header, entry).map_or((messages, size), |meta| {
+                (
+                    messages + u64::from(meta.message_count),
+                    size + meta.total_size,
+                )
+            })
+        });
+        let totals = (journal.resident_messages(), journal.resident_message_size());
+        assert_eq!(totals, folded, "the totals must count the resident batches");
+        ResidentView {
+            entry_ops: entry_ops(&entries),
+            headers: (0..=top_op).map(|op| journal.header_by_op(op)).collect(),
+            reads: unsafe { &*journal.op_to_storage_offset.get() }
+                .iter()
+                .map(|(&op, &storage_offset)| {
+                    let entry = inner.storage.read_at_sync(storage_offset);
+                    (op, entry.map(|entry| entry_ops(&[entry])[0]))
+                })
+                .collect(),
+            offsets: unsafe { &*journal.offset_to_op.get() }.clone(),
+            timestamps: unsafe { &*journal.timestamp_to_op.get() }.clone(),
+            held_through: (0..=top_op)
+                .map(|floor| journal.held_through(floor))
+                .collect(),
+            control_ops: journal.resident_control_ops(),
+            totals,
+            out_of_order: journal.out_of_order.get(),
+        }
+    }
+
+    async fn journal_with(
+        entries: &[Frozen<4096>],
+    ) -> PartitionJournal<PartitionJournalMemStorage> {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for entry in entries {
+            journal.append(entry.clone()).await.expect("append");
+        }
+        journal
+    }
+
+    #[compio::test]
+    async fn given_journal_shapes_when_evicting_a_prefix_should_leave_what_a_rebuild_leaves() {
+        // `(op, base offset)` per entry, `None` for an offset op. The shapes:
+        // batches between offset ops, two batches at one base offset, and a
+        // duplicated op that a prefix either takes whole or splits.
+        let shapes: [&[(u64, Option<u64>)]; 3] = [
+            &[
+                (1, Some(0)),
+                (2, None),
+                (3, Some(3)),
+                (4, None),
+                (5, Some(6)),
+                (6, Some(9)),
+                (7, None),
+            ],
+            &[(1, Some(0)), (2, Some(3)), (3, Some(3)), (4, Some(6))],
+            &[(1, Some(0)), (2, None), (2, None), (3, Some(3)), (4, None)],
+        ];
+        for shape in shapes {
+            let entries: Vec<_> = shape
+                .iter()
+                .zip(0u128..)
+                .map(|(&(op, base_offset), checksum)| {
+                    base_offset.map_or_else(
+                        || {
+                            build_prepare(op, HEADER_SIZE + 16)
+                                .transmute_header(|mut old, header: &mut PrepareHeader| {
+                                    old.checksum = checksum;
+                                    *header = old;
+                                })
+                                .into_frozen()
+                        },
+                        |base_offset| build_message_prepare(op, base_offset, 3, 8),
+                    )
+                })
+                .collect();
+            let next_op = shape.iter().map(|(op, _)| op).max().unwrap() + 1;
+            let next = build_message_prepare(next_op, 100, 3, 8);
+            for count in 0..=entries.len() + 1 {
+                let popped = journal_with(&entries).await;
+                let rebuilt = journal_with(&entries).await;
+                resident_view(&popped, next_op);
+                resident_view(&rebuilt, next_op);
+
+                popped.evict_prefix(count);
+                rebuilt.rebuild_without_prefix(count);
+                assert_eq!(
+                    resident_view(&popped, next_op),
+                    resident_view(&rebuilt, next_op),
+                    "shape {shape:?}, evicting {count}"
+                );
+
+                // Positions taken after the eviction must stay right too.
+                for journal in [&popped, &rebuilt] {
+                    journal.append(next.clone()).await.expect("append");
+                }
+                popped.evict_prefix(1);
+                rebuilt.rebuild_without_prefix(1);
+                assert_eq!(
+                    resident_view(&popped, next_op),
+                    resident_view(&rebuilt, next_op),
+                    "shape {shape:?}, evicting {count} and then 1"
+                );
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_backfill_inside_the_prefix_when_evicting_should_flush_the_tail_in_order() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in [1u64, 2, 5, 3, 4] {
+            journal
+                .append(build_control_prepare(op))
+                .await
+                .expect("append");
+        }
+        assert_eq!(journal.committed_prefix_len(0, u64::MAX), 0);
+
+        journal.evict_prefix(3);
+
+        assert_eq!(entry_ops(&journal.resident_entries()), vec![3, 4]);
+        assert_eq!(
+            journal.committed_prefix_len(0, u64::MAX),
+            2,
+            "the out-of-order pair left with the prefix"
+        );
+    }
+
+    #[compio::test]
+    async fn given_every_rebuild_when_counting_resident_messages_should_count_the_batches() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for (op, base_offset) in [(1u64, 0u64), (3, 6), (4, 9), (2, 3)] {
+            journal
+                .append(build_message_prepare(op, base_offset, 3, 8))
+                .await
+                .expect("append");
+        }
+        let batch_size = journal.resident_message_size() / 4;
+        assert_eq!(journal.resident_messages(), 12);
+
+        assert!(journal.sort_by_op());
+        assert_eq!(journal.resident_messages(), 12, "sorting keeps every batch");
+
+        journal.evict_prefix(1);
+        assert_eq!(journal.resident_messages(), 9);
+        assert_eq!(journal.resident_message_size(), 3 * batch_size);
+
+        journal.truncate_from(4).await.expect("truncate");
+        assert_eq!(journal.resident_messages(), 6, "ops 2 and 3 stay");
+
+        journal.commit();
+        assert_eq!(journal.resident_messages(), 0);
+
+        journal
+            .append(build_message_prepare(5, 12, 3, 8))
+            .await
+            .expect("append");
+        journal.clear_all();
+        assert_eq!(
+            (journal.resident_messages(), journal.resident_message_size()),
+            (0, 0)
+        );
     }
 
     fn offset_lookup(offset: u64, count: u32) -> MessageLookup {
