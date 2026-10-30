@@ -12697,7 +12697,7 @@ checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
 [[package]]
 name = "scopedb-client"
 version = "0.4.2"
-source = "git+https://github.com/scopedb/scopedb-client?rev=8b757f71e09b21470a030f2d625398785e3eab09#8b757f71e09b21470a030f2d625398785e3eab09"
+source = "git+https://github.com/scopedb/scopedb-client?rev=c970cd918496e0de3e6fee077fc000f2e7a5e09c#c970cd918496e0de3e6fee077fc000f2e7a5e09c"
 dependencies = [
  "anyhow",
  "fastrace",
