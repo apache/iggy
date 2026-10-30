@@ -7199,6 +7199,7 @@ dependencies = [
  "comfy-table",
  "dirs 7.0.0",
  "figlet-rs",
+ "futures-util",
  "iggy",
  "iggy_binary_protocol",
  "iggy_common",

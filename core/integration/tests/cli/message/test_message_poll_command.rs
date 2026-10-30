@@ -322,7 +322,7 @@ Examples:
  iggy message poll --offset 0 1 topic 1
  iggy message poll --offset 0 stream topic 1
 
-{USAGE_PREFIX} message poll [OPTIONS] <--offset <OFFSET>|--first|--last|--next> <STREAM_ID> <TOPIC_ID> <PARTITION_ID>
+{USAGE_PREFIX} message poll [OPTIONS] <--offset <OFFSET>|--first|--last|--next> <STREAM_ID> <TOPIC_ID> [PARTITION_ID]
 
 Arguments:
   <STREAM_ID>
@@ -335,8 +335,11 @@ Arguments:
 {CLAP_INDENT}
           Topic ID can be specified as a topic name or ID
 
-  <PARTITION_ID>
+  [PARTITION_ID]
           Partition ID from which message will be polled
+{CLAP_INDENT}
+          Required unless a consumer group is set with --consumer-group,
+          in which case the server assigns the partitions to the group member.
 
 Options:
   -m, --message-count <MESSAGE_COUNT>
@@ -374,6 +377,24 @@ Options:
 {CLAP_INDENT}
           [default: 0]
 
+  -g, --consumer-group <CONSUMER_GROUP>
+          Consumer group which will poll messages
+{CLAP_INDENT}
+          The CLI joins the group, polls the partitions that the server assigns
+          to it and leaves the group on exit, also after Ctrl-C or an error.
+          The group must already exist. Cannot be combined with --consumer,
+          --offset or PARTITION_ID.
+{CLAP_INDENT}
+          With --auto-commit, the group offset moves past the messages that
+          are printed, so the other group members never receive them.
+
+      --follow
+          Keep polling until interrupted with Ctrl-C
+{CLAP_INDENT}
+          Requires --consumer-group. Each message is printed as it arrives.
+          Without this flag, the command stops after --message-count messages
+          or once no message arrives for five seconds.
+
   -s, --show-headers
           Include the message headers in the output
 {CLAP_INDENT}
@@ -409,24 +430,26 @@ pub async fn should_short_help_match() {
             format!(
                 r#"Poll messages from given topic ID and given stream ID
 
-{USAGE_PREFIX} message poll [OPTIONS] <--offset <OFFSET>|--first|--last|--next> <STREAM_ID> <TOPIC_ID> <PARTITION_ID>
+{USAGE_PREFIX} message poll [OPTIONS] <--offset <OFFSET>|--first|--last|--next> <STREAM_ID> <TOPIC_ID> [PARTITION_ID]
 
 Arguments:
   <STREAM_ID>     ID of the stream from which message will be polled
   <TOPIC_ID>      ID of the topic from which message will be polled
-  <PARTITION_ID>  Partition ID from which message will be polled
+  [PARTITION_ID]  Partition ID from which message will be polled
 
 Options:
-  -m, --message-count <MESSAGE_COUNT>  Number of messages to poll [default: 1]
-  -a, --auto-commit                    Auto commit offset
-  -o, --offset <OFFSET>                Polling strategy - offset to start polling messages from
-  -f, --first                          Polling strategy - start polling from the first message in the partition
-  -l, --last                           Polling strategy - start polling from the last message in the partition
-  -n, --next                           Polling strategy - start polling from the next message
-  -c, --consumer <CONSUMER>            Regular consumer which will poll messages [default: 0]
-  -s, --show-headers                   Include the message headers in the output
-      --output-file <OUTPUT_FILE>      Store polled message into file in binary format
-  -h, --help                           Print help (see more with '--help')
+  -m, --message-count <MESSAGE_COUNT>    Number of messages to poll [default: 1]
+  -a, --auto-commit                      Auto commit offset
+  -o, --offset <OFFSET>                  Polling strategy - offset to start polling messages from
+  -f, --first                            Polling strategy - start polling from the first message in the partition
+  -l, --last                             Polling strategy - start polling from the last message in the partition
+  -n, --next                             Polling strategy - start polling from the next message
+  -c, --consumer <CONSUMER>              Regular consumer which will poll messages [default: 0]
+  -g, --consumer-group <CONSUMER_GROUP>  Consumer group which will poll messages
+      --follow                           Keep polling until interrupted with Ctrl-C
+  -s, --show-headers                     Include the message headers in the output
+      --output-file <OUTPUT_FILE>        Store polled message into file in binary format
+  -h, --help                             Print help (see more with '--help')
 "#,
             ),
         ))

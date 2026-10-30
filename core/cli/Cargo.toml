@@ -62,6 +62,7 @@ clap_complete = { workspace = true }
 comfy-table = { workspace = true }
 dirs = { workspace = true }
 figlet-rs = { workspace = true }
+futures-util = { workspace = true }
 iggy = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
