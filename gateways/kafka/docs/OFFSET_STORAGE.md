@@ -106,7 +106,10 @@ consumer still uses a group, and Iggy keeps no commit time.
 ## More than one gateway
 
 Offsets are shared, since the key depends only on the Kafka group id. Membership is not
-([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)).
+([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)). With `IGGY_KAFKA_BROKERS`, `FindCoordinator` names
+one gateway for every group, so consumers and admin tools commit through that gateway. The cases
+below remain for gateways without that list, and for a client that sends group requests to
+another gateway.
 
 - A gateway with no members in a group accepts a commit with no generation, as admin tools and
   `assign()` consumers send, even when another gateway has live members in it. That commit
