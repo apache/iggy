@@ -44,8 +44,9 @@ struct ConnectionStringTests {
         #expect(configuration.address == "[::1]:8090")
     }
 
-    @Test func withoutOptionsTheDefaultsMatchRust() throws {
-        let configuration = try ClientConfiguration(connectionString: "iggy://user:secret@127.0.0.1:1234")
+    @Test(arguments: ["", "?nodelay=true"])
+    func unsetOptionsTakeTheRustDefaults(_ options: String) throws {
+        let configuration = try ClientConfiguration(connectionString: "iggy://user:secret@127.0.0.1:1234\(options)")
         #expect(configuration.reconnection == ReconnectionOptions(enabled: true, maxRetries: nil, interval: .seconds(1), reestablishAfter: .seconds(5)))
         #expect(configuration.heartbeatInterval == .seconds(5))
         #expect(configuration.noDelay)
@@ -63,12 +64,19 @@ struct ConnectionStringTests {
         #expect(!configuration.noDelay)
     }
 
-    @Test func spellsTheFlagsAsRustDoes() throws {
-        // Anything but `true` turns a flag off, and TLS options alone do not
-        // turn TLS on.
-        let off = try ClientConfiguration(connectionString: "iggy://user:secret@localhost:8090?tls=yes&tls_domain=localhost&nodelay=1")
+    @Test func flagsAreTrueOrFalse() throws {
+        for flag in ["tls", "nodelay"] {
+            for value in ["1", "yes", "TRUE", "True", "0", ""] {
+                #expect(throws: IggyError(.invalidConnectionString), "\(flag)=\(value)") {
+                    try ClientConfiguration(connectionString: "iggy://user:secret@localhost:8090?\(flag)=\(value)")
+                }
+            }
+        }
+        // TLS options alone do not turn TLS on, as in every SDK.
+        let off = try ClientConfiguration(connectionString: "iggy://user:secret@localhost:8090?tls=false&tls_domain=localhost&nodelay=false")
         #expect(off.tls == nil)
         #expect(!off.noDelay)
+        #expect(try ClientConfiguration(connectionString: "iggy://user:secret@localhost:8090?tls_ca_file=/etc/iggy/ca.pem").tls == nil)
         let on = try ClientConfiguration(connectionString: "iggy://user:secret@localhost:8090?nodelay=true&tls=true")
         #expect(on.tls == TLSOptions())
         #expect(on.noDelay)

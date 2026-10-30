@@ -111,10 +111,22 @@ The options are `tls`, `tls_domain`, `tls_ca_file`, `reconnection_retries` (a co
 `max_pending_operations`, and `max_pending_operation_bytes`. Durations take the spellings
 of the Rust SDK, such as `500ms`, `5s`, or `1h 30m`. An unknown option or a malformed
 value fails with `invalidConnectionString`, and a bad retry count with
-`invalidNumberValue`, so a string is valid in every SDK or in none. Two options differ
-from Rust: without `nodelay` the client keeps Nagle off, its own default, and the pending
-operation limits are checked and then ignored, since this client keeps no operations to
-replay. Only the `iggy://` and `iggy+tcp://` schemes are accepted.
+`invalidNumberValue`, so a string is valid in every SDK or in none. Only the `iggy://`
+and `iggy+tcp://` schemes are accepted.
+
+Some options read differently than in Rust:
+
+- `tls` and `nodelay` take `true` or `false`, and any other value fails, where Rust
+  reads it as false.
+- Without `nodelay` the client keeps Nagle off, its own default.
+- `reconnection_interval` is the full pause between rounds over the endpoints. Rust
+  takes it as the base of a jittered backoff capped at 10 seconds.
+- `reestablish_after` is how long after the last successful connection the client
+  waits before redialing that endpoint. Rust takes it as the uptime that resets the
+  backoff. With one endpoint, a long value holds the redial back, and requests made
+  while it waits fail.
+- The pending operation limits are checked and then ignored, since this client keeps
+  no operations to replay.
 
 ### Resource options
 

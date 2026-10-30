@@ -35,10 +35,21 @@ extension ClientConfiguration {
     /// An unknown option fails the parse, so one string is valid in every
     /// SDK or in none.
     ///
-    /// Two options read differently than in Rust. Without `nodelay` the
-    /// client keeps its own default, Nagle off. The pending operation limits
-    /// are checked and then ignored, because the client keeps no operations
-    /// to replay after a session reset.
+    /// Some options read differently than in Rust:
+    ///
+    /// - `tls` and `nodelay` take `true` or `false`, and any other value
+    ///   fails, where Rust reads it as false.
+    /// - Without `nodelay` the client keeps its own default, Nagle off.
+    /// - `reconnection_interval` is the full pause between rounds over the
+    ///   endpoints. Rust takes it as the base of a jittered backoff capped at
+    ///   10 seconds.
+    /// - `reestablish_after` is how long after the last successful
+    ///   connection the client waits before redialing that endpoint. Rust
+    ///   takes it as the uptime that resets the backoff. With one endpoint, a
+    ///   long value holds the redial back, and requests made while it waits
+    ///   fail.
+    /// - The pending operation limits are checked and then ignored, because
+    ///   the client keeps no operations to replay after a session reset.
     public init(connectionString: String) throws {
         self = try ConnectionString.parse(connectionString)
     }
@@ -158,14 +169,14 @@ enum ConnectionString {
                 guard value.allSatisfy({ $0.isASCII && $0.isNumber }), let limit = UInt64(value), limit > 0 else {
                     throw IggyError(.invalidConnectionString, context: "\(pair[0]) must be a positive integer")
                 }
-            case "tls": tlsEnabled = value == "true"
+            case "tls": tlsEnabled = try flag(value, option: pair[0])
             case "tls_domain": tls.domain = value
             case "tls_ca_file": tls.caFile = value
             case "reconnection_retries": retries = value
             case "reconnection_interval": interval = value
             case "reestablish_after": reestablishAfter = value
             case "heartbeat_interval": heartbeatInterval = value
-            case "nodelay": configuration.noDelay = value == "true"
+            case "nodelay": configuration.noDelay = try flag(value, option: pair[0])
             default: throw IggyError(.invalidConnectionString, context: "unknown option \(pair[0])")
             }
         }
@@ -183,6 +194,16 @@ enum ConnectionString {
         configuration.heartbeatInterval = try duration(heartbeatInterval, option: "heartbeat_interval", nonZero: true)
         if tlsEnabled {
             configuration.tls = tls
+        }
+    }
+
+    /// Rust reads any value but `true` as false, so `tls=1` would sign in
+    /// over plaintext. The Go, Node, Java and C# parsers refuse it instead.
+    private static func flag(_ value: String, option: Substring) throws -> Bool {
+        switch value {
+        case "true": return true
+        case "false": return false
+        default: throw IggyError(.invalidConnectionString, context: "\(option) must be true or false")
         }
     }
 
