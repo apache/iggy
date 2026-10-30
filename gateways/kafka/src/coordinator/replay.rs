@@ -23,7 +23,8 @@
 //! already lost the partition when the record landed. So a stale coordinator can append, but
 //! nothing it appends after a newer claim counts, and it learns so when it reads its own record.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Bound;
 use std::time::Duration;
 
 use crate::coordinator::record::{Body, CommittedOffset, NO_CHECKPOINT, Record};
@@ -31,6 +32,13 @@ use crate::group::GroupSnapshot;
 
 /// A Kafka topic partition, by name and index.
 pub type TopicPartition = (String, i32);
+
+/// What a checkpoint rewrites of one group: its state, or its offsets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointUnit {
+    Group(String),
+    Offsets(String),
+}
 
 /// The offsets of one group that the log holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -119,7 +127,7 @@ impl PartitionState {
         self.highest = record.claim;
         self.since_checkpoint += 1;
         match record.body {
-            Body::Claim { .. } | Body::Unknown { .. } => {}
+            Body::Claim { .. } => {}
             // A load that starts at a checkpoint learns the owner here. The writer checked its
             // claim when it appended this record, so no higher claim comes before it.
             Body::CheckpointBegin { node_id } => {
@@ -164,14 +172,19 @@ impl PartitionState {
                     },
                 );
             }
-            // Removed, not marked deleted: Iggy deleted its copies with the topic, and holds the
-            // copy of a commit to a new topic of that name that lands before this record.
-            Body::TopicOffsetsDeleted { topic } => {
+            // Removed, not marked deleted: Iggy deleted its copies with the topic. An offset that
+            // names a later incarnation of that name stays, as Kafka keeps one by topic id.
+            Body::TopicOffsetsDeleted { topic, incarnation } => {
                 for offsets in self.offsets.values_mut() {
-                    offsets.entries.retain(|(name, _), _| *name != topic);
+                    offsets.entries.retain(|(name, _), committed| {
+                        *name != topic || !deleted_with(committed.as_ref(), incarnation)
+                    });
                 }
                 self.offsets
                     .retain(|_, offsets| offsets.complete || !offsets.entries.is_empty());
+            }
+            Body::GroupOffsetsExpired { group_id } => {
+                self.offsets.remove(&group_id);
             }
         }
         Applied::Valid
@@ -184,10 +197,83 @@ impl PartitionState {
     #[must_use]
     pub fn checkpoint_due(&self, records: u64, age: Duration, now: u64) -> bool {
         let age = u64::try_from(age.as_micros()).unwrap_or(u64::MAX);
-        self.since_checkpoint >= records.max(self.live_entries())
-            || self
-                .checkpointed_at
-                .is_some_and(|at| now.saturating_sub(at) >= age)
+        let aged = self
+            .checkpointed_at
+            .is_some_and(|at| now.saturating_sub(at) >= age);
+        // Counting the entries walks every offset, so only once enough records came.
+        aged || (self.since_checkpoint >= records && self.since_checkpoint >= self.live_entries())
+    }
+
+    /// Whether a deletion of incarnation `incarnation` of `topic` removes an entry.
+    #[must_use]
+    pub fn holds_topic(&self, topic: &str, incarnation: u64) -> bool {
+        self.offsets.values().any(|offsets| {
+            offsets.entries.iter().any(|((name, _), committed)| {
+                name == topic && deleted_with(committed.as_ref(), incarnation)
+            })
+        })
+    }
+
+    /// The deletions that match the log to the topics Iggy holds, for deletions a gateway missed.
+    /// `incarnation_of` names the incarnation of each topic Iggy holds. One deletion per older
+    /// incarnation the log holds offsets of, and one for a topic Iggy no longer holds.
+    #[must_use]
+    pub fn deletions_against(&self, incarnation_of: impl Fn(&str) -> Option<u64>) -> Vec<Body> {
+        let mut logged: BTreeMap<&str, BTreeSet<u64>> = BTreeMap::new();
+        for offsets in self.offsets.values() {
+            for ((topic, _), committed) in &offsets.entries {
+                let known = logged.entry(topic.as_str()).or_default();
+                let incarnation = committed
+                    .as_ref()
+                    .and_then(|committed| committed.topic_incarnation);
+                if let Some(incarnation) = incarnation {
+                    known.insert(incarnation);
+                }
+            }
+        }
+        let mut deletions = Vec::new();
+        for (topic, known) in logged {
+            let current = incarnation_of(topic);
+            let mut stale: Vec<u64> = known
+                .into_iter()
+                .filter(|incarnation| current.is_none_or(|current| *incarnation < current))
+                .collect();
+            // Op 0 creates no topic, so its deletion takes only the entries of no known
+            // incarnation.
+            if stale.is_empty() && current.is_none() {
+                stale.push(0);
+            }
+            deletions.extend(
+                stale
+                    .into_iter()
+                    .map(|incarnation| Body::TopicOffsetsDeleted {
+                        topic: topic.to_owned(),
+                        incarnation,
+                    }),
+            );
+        }
+        deletions
+    }
+
+    /// The groups whose offsets the log drops at `now_ms`: no stored state, so no members here,
+    /// and no commit in the last `retention_ms`. A group with no commit, which holds only
+    /// deletions, goes at once: Iggy deleted those offsets too.
+    #[must_use]
+    pub fn expired_groups(&self, retention_ms: i64, now_ms: i64) -> Vec<String> {
+        self.offsets
+            .iter()
+            .filter(|(group_id, offsets)| {
+                !self.groups.contains_key(*group_id)
+                    && offsets
+                        .entries
+                        .values()
+                        .flatten()
+                        .map(|committed| committed.commit_timestamp_ms)
+                        .max()
+                        .is_none_or(|last| now_ms.saturating_sub(last) >= retention_ms)
+            })
+            .map(|(group_id, _)| group_id.clone())
+            .collect()
     }
 
     /// The records a checkpoint writes, without building them.
@@ -211,37 +297,97 @@ impl PartitionState {
         u64::try_from(self.groups.len() + offsets).unwrap_or(u64::MAX)
     }
 
-    /// The records that rewrite every live group and offset, for a checkpoint. A deletion that
-    /// the log alone knows stays, since without it a load would find the offset in Iggy again.
+    /// Every unit a checkpoint rewrites now.
+    #[must_use]
+    pub fn checkpoint_units(&self) -> Vec<CheckpointUnit> {
+        self.groups
+            .keys()
+            .cloned()
+            .map(CheckpointUnit::Group)
+            .chain(self.offsets.keys().cloned().map(CheckpointUnit::Offsets))
+            .collect()
+    }
+
+    /// Hands `write` each record that rewrites `unit` as the state holds it now, with the offset
+    /// it rewrites, until `write` returns false. Offsets go in key order, from the one after
+    /// `after`. A group whose offsets the log alone holds starts with its deletion when `after` is
+    /// `None`, so its offsets must follow that record. Nothing when the state no longer holds the
+    /// unit.
+    ///
+    /// A deletion of one offset stays, since without it a load would find the offset in Iggy
+    /// again.
+    pub fn rewrite_unit(
+        &self,
+        unit: &CheckpointUnit,
+        after: Option<&TopicPartition>,
+        mut write: impl FnMut(Body, Option<&TopicPartition>) -> bool,
+    ) {
+        let group_id = match unit {
+            CheckpointUnit::Group(group_id) => {
+                if let Some(snapshot) = self.groups.get(group_id) {
+                    let body = Body::Group {
+                        group_id: group_id.clone(),
+                        snapshot: Some(snapshot.clone()),
+                    };
+                    write(body, None);
+                }
+                return;
+            }
+            CheckpointUnit::Offsets(group_id) => group_id,
+        };
+        let Some(offsets) = self.offsets.get(group_id) else {
+            return;
+        };
+        let deletion = Body::GroupOffsetsDeleted {
+            group_id: group_id.clone(),
+        };
+        if offsets.complete && after.is_none() && !write(deletion, None) {
+            return;
+        }
+        let start = after.map_or(Bound::Unbounded, Bound::Excluded);
+        let entries = offsets
+            .entries
+            .range::<TopicPartition, _>((start, Bound::Unbounded));
+        for (key, committed) in entries {
+            if offsets.complete && committed.is_none() {
+                continue;
+            }
+            let body = Body::Offset {
+                group_id: group_id.clone(),
+                topic: key.0.clone(),
+                partition: key.1,
+                committed: committed.clone(),
+            };
+            if !write(body, Some(key)) {
+                return;
+            }
+        }
+    }
+
+    /// Every record a checkpoint writes now, in one go.
+    #[cfg(test)]
     #[must_use]
     pub fn checkpoint_bodies(&self) -> Vec<Body> {
-        let mut bodies = Vec::with_capacity(self.groups.len() + self.offsets.len());
-        for (group_id, snapshot) in &self.groups {
-            bodies.push(Body::Group {
-                group_id: group_id.clone(),
-                snapshot: Some(snapshot.clone()),
+        let mut bodies = Vec::new();
+        for unit in self.checkpoint_units() {
+            self.rewrite_unit(&unit, None, |body, _| {
+                bodies.push(body);
+                true
             });
-        }
-        for (group_id, offsets) in &self.offsets {
-            if offsets.complete {
-                bodies.push(Body::GroupOffsetsDeleted {
-                    group_id: group_id.clone(),
-                });
-            }
-            for ((topic, partition), committed) in &offsets.entries {
-                if offsets.complete && committed.is_none() {
-                    continue;
-                }
-                bodies.push(Body::Offset {
-                    group_id: group_id.clone(),
-                    topic: topic.clone(),
-                    partition: *partition,
-                    committed: committed.clone(),
-                });
-            }
         }
         bodies
     }
+}
+
+/// Whether a deletion of incarnation `incarnation` of a topic removes `committed`, an entry of
+/// that topic: a deletion, an offset of that incarnation, or one whose incarnation the gateway
+/// did not know.
+fn deleted_with(committed: Option<&CommittedOffset>, incarnation: u64) -> bool {
+    committed.is_none_or(|committed| {
+        committed
+            .topic_incarnation
+            .is_none_or(|other| other == incarnation)
+    })
 }
 
 #[cfg(test)]
@@ -279,15 +425,26 @@ mod tests {
     }
 
     fn offset(group_id: &str, value: i64) -> Body {
+        commit(group_id, "orders", 0, value, None)
+    }
+
+    fn commit(
+        group_id: &str,
+        topic: &str,
+        partition: i32,
+        value: i64,
+        topic_incarnation: Option<u64>,
+    ) -> Body {
         Body::Offset {
             group_id: group_id.to_string(),
-            topic: "orders".to_string(),
-            partition: 0,
+            topic: topic.to_string(),
+            partition,
             committed: Some(CommittedOffset {
                 offset: value,
                 leader_epoch: -1,
                 metadata: None,
-                commit_timestamp_ms: 0,
+                commit_timestamp_ms: value,
+                topic_incarnation,
             }),
         }
     }
@@ -472,18 +629,6 @@ mod tests {
     }
 
     #[test]
-    fn given_an_unknown_record_should_count_its_claim_only() {
-        let mut state = PartitionState::default();
-        state.apply(0, 0, record(1, Body::Claim { node_id: 1 }));
-        assert_eq!(
-            state.apply(1, 0, record(2, Body::Unknown { kind: 99 })),
-            Applied::Valid
-        );
-        assert_eq!(state.claim(), 2);
-        assert_eq!(state.apply(2, 0, record(1, offset("a", 1))), Applied::Void);
-    }
-
-    #[test]
     fn given_a_deleted_topic_should_remove_its_offsets_from_every_group() {
         let mut state = PartitionState::default();
         let topic_offset = |group_id: &str, topic: &str| Body::Offset {
@@ -494,7 +639,7 @@ mod tests {
         };
         state.apply(0, 0, record(1, offset("a", 1)));
         state.apply(1, 0, record(1, topic_offset("a", "payments")));
-        state.apply(2, 0, record(1, offset("b", 2)));
+        state.apply(2, 0, record(1, commit("b", "orders", 0, 2, Some(7))));
         state.apply(
             3,
             0,
@@ -509,17 +654,163 @@ mod tests {
 
         let deleted = Body::TopicOffsetsDeleted {
             topic: "orders".to_string(),
+            incarnation: 7,
         };
         assert_eq!(state.apply(5, 0, record(1, deleted)), Applied::Valid);
         assert_eq!(
             state.offsets["a"].entries.keys().collect::<Vec<_>>(),
-            [&("payments".to_string(), 0)]
+            [&("payments".to_string(), 0)],
+            "an offset of unknown incarnation goes with any"
         );
         assert!(!state.offsets.contains_key("b"), "an emptied group goes");
         assert!(
             state.offsets["c"].complete && state.offsets["c"].entries.is_empty(),
             "a deleted group stays complete"
         );
+    }
+
+    /// The deletion can reach the log after a commit to the topic created again under the name,
+    /// for example when a gateway loads the partition within a minute of the deletion.
+    #[test]
+    fn given_a_deletion_of_an_older_incarnation_should_keep_the_offsets_of_the_newer() {
+        let mut state = PartitionState::default();
+        state.apply(0, 0, record(1, commit("a", "orders", 0, 5, Some(3))));
+        state.apply(1, 0, record(1, commit("a", "orders", 1, 6, Some(9))));
+        let deleted = Body::TopicOffsetsDeleted {
+            topic: "orders".to_string(),
+            incarnation: 3,
+        };
+        state.apply(2, 0, record(1, deleted));
+        assert_eq!(
+            state.offsets["a"].entries.keys().collect::<Vec<_>>(),
+            [&("orders".to_string(), 1)]
+        );
+    }
+
+    /// A receiver that lagged lost the deletions it missed. The topics Iggy holds still name them.
+    #[test]
+    fn given_the_topics_iggy_holds_should_delete_the_offsets_of_the_others() {
+        let mut state = PartitionState::default();
+        state.apply(0, 0, record(1, commit("a", "orders", 0, 5, Some(3))));
+        state.apply(1, 0, record(1, commit("a", "orders", 1, 6, Some(9))));
+        state.apply(2, 0, record(1, commit("a", "payments", 0, 7, Some(5))));
+        state.apply(3, 0, record(1, commit("b", "refunds", 0, 8, None)));
+        state.apply(4, 0, record(1, commit("b", "shipped", 0, 9, None)));
+        let held = |topic: &str| match topic {
+            "orders" => Some(9),
+            "shipped" => Some(2),
+            _ => None,
+        };
+
+        let deletions = state.deletions_against(held);
+
+        let deleted = |topic: &str, incarnation| Body::TopicOffsetsDeleted {
+            topic: topic.to_string(),
+            incarnation,
+        };
+        assert_eq!(
+            deletions,
+            [
+                deleted("orders", 3),
+                deleted("payments", 5),
+                deleted("refunds", 0),
+            ]
+        );
+        for (offset, deletion) in (5..).zip(deletions) {
+            state.apply(offset, 0, record(1, deletion));
+        }
+        assert_eq!(
+            state.offsets["a"].entries.keys().collect::<Vec<_>>(),
+            [&("orders".to_string(), 1)]
+        );
+        assert_eq!(
+            state.offsets["b"].entries.keys().collect::<Vec<_>>(),
+            [&("shipped".to_string(), 0)],
+            "an offset of no known incarnation stays while Iggy holds the topic"
+        );
+    }
+
+    #[test]
+    fn given_groups_without_members_or_recent_commits_should_expire_their_offsets() {
+        let mut state = PartitionState::default();
+        state.apply(0, 0, record(1, commit("old", "orders", 0, 100, None)));
+        state.apply(1, 0, record(1, commit("recent", "orders", 0, 900, None)));
+        state.apply(2, 0, record(1, commit("live", "orders", 0, 100, None)));
+        state.apply(
+            3,
+            0,
+            record(
+                1,
+                Body::Group {
+                    group_id: "live".to_string(),
+                    snapshot: Some(group(1)),
+                },
+            ),
+        );
+        state.apply(
+            4,
+            0,
+            record(
+                1,
+                Body::GroupOffsetsDeleted {
+                    group_id: "deleted".to_string(),
+                },
+            ),
+        );
+
+        let mut expired = state.expired_groups(500, 1_000);
+        expired.sort();
+        assert_eq!(expired, ["deleted", "old"]);
+
+        let expiry = Body::GroupOffsetsExpired {
+            group_id: "deleted".to_string(),
+        };
+        assert_eq!(state.apply(5, 0, record(1, expiry)), Applied::Valid);
+        assert!(
+            !state.offsets.contains_key("deleted"),
+            "Iggy answers for the group again"
+        );
+    }
+
+    /// A checkpoint goes on with a group's offsets where its last chunk ended.
+    #[test]
+    fn given_a_resumed_unit_should_rewrite_the_offsets_after_the_last_one_written() {
+        let mut state = PartitionState::default();
+        state.apply(
+            0,
+            0,
+            record(
+                1,
+                Body::GroupOffsetsDeleted {
+                    group_id: "a".to_string(),
+                },
+            ),
+        );
+        for (offset, partition) in (1..).zip(0..3) {
+            state.apply(
+                offset,
+                0,
+                record(1, commit("a", "orders", partition, 1, None)),
+            );
+        }
+        let unit = CheckpointUnit::Offsets("a".to_string());
+        let partitions = |after: Option<&TopicPartition>| {
+            let mut written = Vec::new();
+            state.rewrite_unit(&unit, after, |body, _| {
+                written.push(match body {
+                    Body::Offset { partition, .. } => partition,
+                    _ => -1,
+                });
+                true
+            });
+            written
+        };
+        assert_eq!(
+            partitions(None),
+            [-1, 0, 1, 2],
+            "the deletion first, from the start"
+        );
+        assert_eq!(partitions(Some(&("orders".to_string(), 0))), [1, 2]);
     }
 
     #[test]

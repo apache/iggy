@@ -24,6 +24,8 @@
 //! partition it holds an offset or a deletion for, with the commit metadata. Iggy answers the
 //! others, which hold offsets from before the log.
 
+use std::collections::{HashMap, HashSet};
+
 use bytes::Bytes;
 use futures::future::join_all;
 use kafka_protocol::messages::offset_fetch_response::{
@@ -36,7 +38,7 @@ use tokio::time::Instant;
 
 use crate::bridge::{BridgeError, IggyBridge, KafkaTopicMetadata, OffsetCalls, TopicTarget};
 use crate::coordinator::record::CommittedOffset;
-use crate::coordinator::replay::{GroupOffsets, TopicPartition};
+use crate::coordinator::replay::GroupOffsets;
 use crate::error::Result;
 use crate::group::is_valid_group_id;
 use crate::protocol::api::{
@@ -225,7 +227,12 @@ async fn answer(state: &GatewayState, query: &GroupQuery, calls: &OffsetCalls) -
     };
     let logged = match &state.coordination {
         Some(coordination) => {
-            let requested = query.topics.as_deref().map(requested_partitions);
+            let requested: Option<Vec<(&str, &[i32])>> = query.topics.as_deref().map(|topics| {
+                topics
+                    .iter()
+                    .map(|(name, indexes)| (name.0.as_str(), indexes.as_slice()))
+                    .collect()
+            });
             match coordination
                 .offsets(&query.group_id, requested.as_deref())
                 .await
@@ -278,28 +285,20 @@ async fn answer(state: &GatewayState, query: &GroupQuery, calls: &OffsetCalls) -
     }
 }
 
-/// Each partition `topics` asks for, as the log keys it.
-fn requested_partitions(topics: &[(TopicName, Vec<i32>)]) -> Vec<TopicPartition> {
-    topics
-        .iter()
-        .flat_map(|(name, indexes)| {
-            indexes
-                .iter()
-                .map(move |index| (name.0.to_string(), *index))
-        })
-        .collect()
-}
-
 /// `topics` without the partitions the log holds an entry for. Each topic stays, so the read
 /// answers in the same order.
 fn unlogged(topics: &[(TopicName, Vec<i32>)], logged: &GroupOffsets) -> Vec<(TopicName, Vec<i32>)> {
     topics
         .iter()
         .map(|(name, indexes)| {
+            let mut key = (name.0.to_string(), 0);
             let indexes = indexes
                 .iter()
                 .copied()
-                .filter(|index| !logged.entries.contains_key(&(name.0.to_string(), *index)))
+                .filter(|index| {
+                    key.1 = *index;
+                    !logged.entries.contains_key(&key)
+                })
                 .collect();
             (name.clone(), indexes)
         })
@@ -318,20 +317,19 @@ fn merged(
         .zip(read)
         .map(|((name, indexes), read)| {
             let mut from_iggy = read.partitions.into_iter();
+            let mut key = (name.0.to_string(), 0);
             let partitions = indexes
                 .iter()
                 .map(|&index| {
-                    logged
-                        .entries
-                        .get(&(name.0.to_string(), index))
-                        .map_or_else(
-                            || {
-                                from_iggy.next().unwrap_or_else(|| {
-                                    PartitionAnswer::new(index, UNKNOWN_OFFSET, ERROR_NONE)
-                                })
-                            },
-                            |committed| PartitionAnswer::logged(index, committed.as_ref()),
-                        )
+                    key.1 = index;
+                    logged.entries.get(&key).map_or_else(
+                        || {
+                            from_iggy.next().unwrap_or_else(|| {
+                                PartitionAnswer::new(index, UNKNOWN_OFFSET, ERROR_NONE)
+                            })
+                        },
+                        |committed| PartitionAnswer::logged(index, committed.as_ref()),
+                    )
                 })
                 .collect();
             TopicAnswer {
@@ -347,9 +345,11 @@ fn merged(
 fn answers_all(logged: &GroupOffsets, topics: Option<&[(TopicName, Vec<i32>)]>) -> bool {
     topics.is_some_and(|topics| {
         topics.iter().all(|(name, indexes)| {
-            indexes
-                .iter()
-                .all(|index| logged.entries.contains_key(&(name.0.to_string(), *index)))
+            let mut key = (name.0.to_string(), 0);
+            indexes.iter().all(|index| {
+                key.1 = *index;
+                logged.entries.contains_key(&key)
+            })
         })
     })
 }
@@ -376,18 +376,21 @@ fn from_log(logged: &GroupOffsets, topics: Option<&[(TopicName, Vec<i32>)]>) -> 
     };
     topics
         .iter()
-        .map(|(name, indexes)| TopicAnswer {
-            name: name.clone(),
-            partitions: indexes
-                .iter()
-                .map(|&index| {
-                    let key = (name.0.to_string(), index);
-                    PartitionAnswer::logged(
-                        index,
-                        logged.entries.get(&key).and_then(Option::as_ref),
-                    )
-                })
-                .collect(),
+        .map(|(name, indexes)| {
+            let mut key = (name.0.to_string(), 0);
+            TopicAnswer {
+                name: name.clone(),
+                partitions: indexes
+                    .iter()
+                    .map(|&index| {
+                        key.1 = index;
+                        PartitionAnswer::logged(
+                            index,
+                            logged.entries.get(&key).and_then(Option::as_ref),
+                        )
+                    })
+                    .collect(),
+            }
         })
         .collect()
 }
@@ -396,35 +399,52 @@ fn from_log(logged: &GroupOffsets, topics: Option<&[(TopicName, Vec<i32>)]>) -> 
 /// The log's offsets that Iggy does not hold join the answer, and its deletions leave it.
 fn overlay(topics: &mut Vec<TopicAnswer>, logged: &GroupOffsets) {
     for topic in topics.iter_mut() {
+        let mut key = (topic.name.0.to_string(), 0);
         for partition in &mut topic.partitions {
-            let key = (topic.name.0.to_string(), partition.index);
+            key.1 = partition.index;
             if let Some(committed) = logged.entries.get(&key) {
                 *partition = PartitionAnswer::logged(partition.index, committed.as_ref());
             }
         }
-    }
-    for topic in topics.iter_mut() {
         topic
             .partitions
             .retain(|partition| partition.offset != UNKNOWN_OFFSET);
     }
+    // Where each topic of the answer is, and the partitions it holds.
+    let mut positions: HashMap<String, usize> = topics
+        .iter()
+        .enumerate()
+        .map(|(at, topic)| (topic.name.0.to_string(), at))
+        .collect();
+    let mut held: Vec<HashSet<i32>> = topics
+        .iter()
+        .map(|topic| {
+            topic
+                .partitions
+                .iter()
+                .map(|partition| partition.index)
+                .collect()
+        })
+        .collect();
     for ((name, index), committed) in &logged.entries {
         let Some(committed) = committed else {
             continue;
         };
-        let found = topics
-            .iter()
-            .position(|topic| topic.name.0.as_str() == name);
-        let at = found.unwrap_or_else(|| {
+        let at = if let Some(&at) = positions.get(name.as_str()) {
+            at
+        } else {
             topics.push(TopicAnswer {
                 name: TopicName(StrBytes::from_string(name.clone())),
                 partitions: Vec::new(),
             });
+            held.push(HashSet::new());
+            positions.insert(name.clone(), topics.len() - 1);
             topics.len() - 1
-        });
-        let partitions = &mut topics[at].partitions;
-        if !partitions.iter().any(|partition| partition.index == *index) {
-            partitions.push(PartitionAnswer::logged(*index, Some(committed)));
+        };
+        if held[at].insert(*index) {
+            topics[at]
+                .partitions
+                .push(PartitionAnswer::logged(*index, Some(committed)));
         }
     }
     topics.retain(|topic| !topic.partitions.is_empty());
@@ -771,6 +791,7 @@ mod tests {
             leader_epoch: 3,
             metadata: Some("logged".to_string()),
             commit_timestamp_ms: 0,
+            topic_incarnation: None,
         };
         let logged = GroupOffsets {
             complete: false,

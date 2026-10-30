@@ -21,9 +21,11 @@
 //! (`docs/OFFSET_STORAGE.md`). The response has no top-level error, so a group answer goes on
 //! every partition.
 //!
-//! With the coordinator log, each offset that Iggy stored is also appended to the log with its
-//! metadata, and the commit counts only once the log holds it. The Iggy copy goes first, because
-//! that write checks the topic and the partition. The log answers `OffsetFetch`.
+//! With the coordinator log, each offset is also appended to the log with its metadata, and the
+//! commit counts only once the log holds it. The log answers `OffsetFetch`. A partition that
+//! Iggy's change log shows appends at once with the Iggy store, as Kafka checks a commit against
+//! its metadata and writes once. Any other appends once Iggy stored it, since that store checks
+//! the topic and the partition.
 
 use bytes::Bytes;
 use kafka_protocol::messages::offset_commit_response::{
@@ -31,9 +33,9 @@ use kafka_protocol::messages::offset_commit_response::{
 };
 use kafka_protocol::messages::{OffsetCommitRequest, OffsetCommitResponse};
 
-use crate::bridge::{IggyBridge, OffsetCalls};
-use crate::coordinator::Coordination;
+use crate::bridge::{BridgeError, IggyBridge, OffsetCalls, TopicShape, TopicTarget};
 use crate::coordinator::record::CommittedOffset;
+use crate::coordinator::{Coordination, unix_millis};
 use crate::error::Result;
 use crate::group::CommitRequest;
 use crate::protocol::api::{
@@ -55,8 +57,10 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 /// Partition index, error code and tagged fields of one echoed partition.
 const PER_PARTITION_BYTES: usize = 7;
 
-/// Kafka's default `offset.metadata.max.bytes`. Only the coordinator log keeps metadata.
-pub const MAX_OFFSET_METADATA_BYTES: usize = 4096;
+/// Kafka's default `offset.metadata.max.bytes`. Kafka compares it with the metadata's Java
+/// `String.length()`, which counts UTF-16 units, not bytes. Only the coordinator log keeps
+/// metadata.
+const MAX_OFFSET_METADATA_BYTES: usize = 4096;
 
 pub async fn handle(
     state: &GatewayState,
@@ -89,12 +93,10 @@ pub async fn handle(
             // The commit stays counted until none of its Iggy calls can land, also past the
             // deadline, so a deletion of the group's offsets waits for them.
             let calls = OffsetCalls::new(offset_deadline(state, connection).await).keeping(commit);
-            let logged = state.coordination.as_deref();
-            let mut topics = commit_all(bridge, &request, &calls, logged.is_some()).await;
-            if let Some(coordination) = logged {
-                log_commits(coordination, &request, &mut topics, &calls).await;
+            match state.coordination.as_deref() {
+                Some(coordination) => commit_logged(bridge, coordination, &request, &calls).await,
+                None => commit_all(bridge, &request, &calls).await,
             }
-            topics
         }
         (None, Ok(_)) => same_code(&request, ERROR_COORDINATOR_LOAD_IN_PROGRESS),
         (_, Err(error)) => same_code(&request, error),
@@ -102,52 +104,165 @@ pub async fn handle(
     respond_or_close(encode_response(api_version, topics), "OffsetCommit")
 }
 
-/// Stores every requested offset. The slots run at once, each one partition at a time, and a
-/// partition that the deadline leaves out answers 14 and makes no call.
+/// One requested partition that passed the gateway's own checks.
+struct Planned<'a> {
+    /// Where its code goes: (topic, partition) in the answer.
+    at: (usize, usize),
+    target: &'a TopicTarget,
+    index: u32,
+}
+
+/// Stores every requested offset in Iggy.
 async fn commit_all(
     bridge: &IggyBridge,
     request: &OffsetCommitRequest,
     calls: &OffsetCalls,
-    keeps_metadata: bool,
 ) -> Vec<OffsetCommitResponseTopic> {
+    let targets = targets(bridge, request);
+    let (mut topics, planned) = plan(request, &targets, false);
+    store_in_iggy(bridge, request, &planned, calls, &mut topics).await;
+    topics
+}
+
+/// Stores every requested offset in Iggy and appends it to the coordinator log, with its metadata.
+/// A partition gets the log's code when the append fails, since the commit counts only in the log.
+async fn commit_logged(
+    bridge: &IggyBridge,
+    coordination: &Coordination,
+    request: &OffsetCommitRequest,
+    calls: &OffsetCalls,
+) -> Vec<OffsetCommitResponseTopic> {
+    let targets = targets(bridge, request);
+    let (mut topics, planned) = plan(request, &targets, true);
     let group = request.group_id.0.as_str();
-    let targets: Vec<_> = request
+    let shapes: Vec<Option<TopicShape>> = request
+        .topics
+        .iter()
+        .map(|topic| bridge.topic_shape(topic.name.0.as_str()))
+        .collect();
+    let (checked, unchecked): (Vec<&Planned<'_>>, Vec<&Planned<'_>>) =
+        planned.iter().partition(|planned| {
+            shapes[planned.at.0].is_some_and(|shape| planned.index < shape.partitions)
+        });
+    let commit_timestamp_ms = unix_millis();
+    let offsets = |entries: &[&Planned<'_>]| {
+        entries
+            .iter()
+            .map(|planned| {
+                let (topic_at, partition_at) = planned.at;
+                let topic = &request.topics[topic_at];
+                let partition = &topic.partitions[partition_at];
+                let committed = CommittedOffset {
+                    offset: partition.committed_offset,
+                    leader_epoch: partition.committed_leader_epoch,
+                    metadata: partition
+                        .committed_metadata
+                        .as_ref()
+                        .map(ToString::to_string),
+                    commit_timestamp_ms,
+                    topic_incarnation: shapes[topic_at].map(|shape| shape.incarnation),
+                };
+                (
+                    topic.name.0.to_string(),
+                    partition.partition_index,
+                    committed,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let ((), logged) = tokio::join!(
+        store_in_iggy(bridge, request, &planned, calls, &mut topics),
+        log_offsets(coordination, group, offsets(&checked), calls),
+    );
+    if let Err(code) = logged {
+        set_code(&mut topics, &checked, code);
+    }
+    let stored: Vec<&Planned<'_>> = unchecked
+        .into_iter()
+        .filter(|planned| code_of(&topics, planned) == ERROR_NONE)
+        .collect();
+    if let Err(code) = log_offsets(coordination, group, offsets(&stored), calls).await {
+        set_code(&mut topics, &stored, code);
+    }
+    topics
+}
+
+/// The Iggy topic of each requested topic, in request order.
+fn targets(
+    bridge: &IggyBridge,
+    request: &OffsetCommitRequest,
+) -> Vec<core::result::Result<TopicTarget, BridgeError>> {
+    request
         .topics
         .iter()
         .map(|topic| bridge.topic_target(topic.name.0.as_str()))
-        .collect();
+        .collect()
+}
+
+/// The answer with the code of each partition that fails the gateway's own checks, and the
+/// partitions that pass them. With `keeps_metadata`, metadata over Kafka's limit fails.
+fn plan<'a>(
+    request: &OffsetCommitRequest,
+    targets: &'a [core::result::Result<TopicTarget, BridgeError>],
+    keeps_metadata: bool,
+) -> (Vec<OffsetCommitResponseTopic>, Vec<Planned<'a>>) {
     let mut topics = same_code(request, ERROR_NONE);
-    let mut commits = Vec::new();
-    // Where each commit's code goes: (topic, partition) in `topics`.
-    let mut positions = Vec::new();
-    for (topic_at, (topic, target)) in request.topics.iter().zip(&targets).enumerate() {
+    let mut planned = Vec::new();
+    for (topic_at, (topic, target)) in request.topics.iter().zip(targets).enumerate() {
         for (partition_at, partition) in topic.partitions.iter().enumerate() {
             let oversized = keeps_metadata
                 && partition
                     .committed_metadata
                     .as_ref()
-                    .is_some_and(|metadata| metadata.len() > MAX_OFFSET_METADATA_BYTES);
+                    .is_some_and(|metadata| {
+                        metadata.encode_utf16().count() > MAX_OFFSET_METADATA_BYTES
+                    });
             let code = match (target, u32::try_from(partition.partition_index)) {
                 _ if oversized => ERROR_OFFSET_METADATA_TOO_LARGE,
                 (Err(error), _) => error.to_offset_error_code(),
                 (Ok(_), Err(_)) => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
                 (Ok(target), Ok(index)) => {
-                    commits.push((target, index, partition.committed_offset));
-                    positions.push((topic_at, partition_at));
+                    planned.push(Planned {
+                        at: (topic_at, partition_at),
+                        target,
+                        index,
+                    });
                     continue;
                 }
             };
             topics[topic_at].partitions[partition_at].error_code = code;
         }
     }
+    (topics, planned)
+}
 
+/// Stores the offset of each partition of `planned` in Iggy, and puts each failure's code in
+/// `topics`. The slots run at once, each one partition at a time, and a partition that the
+/// deadline leaves out answers 14 and makes no call.
+async fn store_in_iggy(
+    bridge: &IggyBridge,
+    request: &OffsetCommitRequest,
+    planned: &[Planned<'_>],
+    calls: &OffsetCalls,
+    topics: &mut [OffsetCommitResponseTopic],
+) {
+    let group = request.group_id.0.as_str();
+    let commits: Vec<_> = planned
+        .iter()
+        .map(|planned| {
+            let (topic_at, partition_at) = planned.at;
+            let offset = request.topics[topic_at].partitions[partition_at].committed_offset;
+            (planned.target, planned.index, offset)
+        })
+        .collect();
     let results = bridge.commit_group_offsets(group, &commits, calls).await;
     let mut refused = 0_usize;
     let mut first_refusal = None;
-    for ((topic_at, partition_at), result) in positions.into_iter().zip(results) {
+    for (planned, result) in planned.iter().zip(results) {
         let Err(error) = result else {
             continue;
         };
+        let (topic_at, partition_at) = planned.at;
         let code = error.to_offset_error_code();
         topics[topic_at].partitions[partition_at].error_code = code;
         if code == ERROR_UNKNOWN_SERVER_ERROR {
@@ -171,56 +286,33 @@ async fn commit_all(
             "Iggy refused Kafka offset commits"
         );
     }
-    topics
 }
 
-/// Appends each offset that Iggy stored to the coordinator log, with its metadata. A partition
-/// gets the log's code when the append fails, since the commit counts only in the log. Stops at
-/// the deadline of `calls`, as the Iggy commits do.
-async fn log_commits(
+/// Appends `offsets` to the coordinator log, until the deadline of `calls`, as the Iggy stores
+/// stop there.
+async fn log_offsets(
     coordination: &Coordination,
-    request: &OffsetCommitRequest,
-    topics: &mut [OffsetCommitResponseTopic],
+    group: &str,
+    offsets: Vec<(String, i32, CommittedOffset)>,
     calls: &OffsetCalls,
-) {
-    let commit_timestamp_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
-        });
-    let mut offsets = Vec::new();
-    let mut positions = Vec::new();
-    for (topic_at, topic) in request.topics.iter().enumerate() {
-        for (partition_at, partition) in topic.partitions.iter().enumerate() {
-            if topics[topic_at].partitions[partition_at].error_code != ERROR_NONE {
-                continue;
-            }
-            offsets.push((
-                topic.name.0.to_string(),
-                partition.partition_index,
-                CommittedOffset {
-                    offset: partition.committed_offset,
-                    leader_epoch: partition.committed_leader_epoch,
-                    metadata: partition
-                        .committed_metadata
-                        .as_ref()
-                        .map(ToString::to_string),
-                    commit_timestamp_ms,
-                },
-            ));
-            positions.push((topic_at, partition_at));
-        }
-    }
+) -> core::result::Result<(), i16> {
     if offsets.is_empty() {
-        return;
+        return Ok(());
     }
-    if let Err(code) = coordination
-        .commit_offsets(request.group_id.0.as_str(), offsets, calls.deadline())
+    coordination
+        .commit_offsets(group, offsets, calls.deadline())
         .await
-    {
-        for (topic_at, partition_at) in positions {
-            topics[topic_at].partitions[partition_at].error_code = code;
-        }
+}
+
+fn code_of(topics: &[OffsetCommitResponseTopic], planned: &Planned<'_>) -> i16 {
+    let (topic_at, partition_at) = planned.at;
+    topics[topic_at].partitions[partition_at].error_code
+}
+
+fn set_code(topics: &mut [OffsetCommitResponseTopic], planned: &[&Planned<'_>], code: i16) {
+    for planned in planned {
+        let (topic_at, partition_at) = planned.at;
+        topics[topic_at].partitions[partition_at].error_code = code;
     }
 }
 

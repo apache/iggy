@@ -76,7 +76,7 @@ Default bind: a `PLAINTEXT` listener on `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_INSTANCE_ID` | `IGGY_KAFKA_NODE_ID`, else `0` | This gateway's number among the gateways fronting one Iggy cluster. It is the high half of every producer id `InitProducerId` hands out, and Kafka requires those to be cluster-unique, so give every gateway its own value. Unset, it follows `IGGY_KAFKA_NODE_ID`. A single gateway can leave both unset. |
 | `IGGY_KAFKA_NODE_ID` | `1` | This gateway's broker id in Metadata, 0 to 65535. Beside each Iggy node, use that node's replica id. Required with `IGGY_KAFKA_BROKERS` |
 | `IGGY_KAFKA_BROKERS` | unset | Every gateway in front of the Iggy cluster, this one included, as `id@host:port` entries separated by commas. With several listeners, one `id@PROTOCOL://host:port` entry per gateway and listener. Give every gateway the same list. See [Several gateways](#several-gateways-4515) |
-| `IGGY_KAFKA_COORDINATOR_LOG` | `true` with `IGGY_KAFKA_BROKERS` and the bridge, else `false` | Share the consumer groups through the coordinator log in Iggy (`true` or `false`). Needs the bridge. See [Several gateways](#several-gateways-4515) |
+| `IGGY_KAFKA_COORDINATOR_LOG` | `true` with `IGGY_KAFKA_BROKERS` and the bridge, else `false` | Share the consumer groups through the coordinator log in Iggy (`true` or `false`). Needs the bridge, and `manage_servers` on the bridge's Iggy user. Setup tries again for up to 60 s while Iggy does not answer. See [Several gateways](#several-gateways-4515) |
 | `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. If Iggy does not answer, startup tries again 1 s after each failed connect, for up to 60 s, and then the gateway stops. A wrong password or a missing permission stops it at once. It never falls back to stubs. |
 | `IGGY_KAFKA_SASL_ENABLED` | `false` | Single-listener form: require SASL/PLAIN before serving any other API (`true` or `false`, nothing else). With `IGGY_KAFKA_LISTENERS`, a `SASL_PLAINTEXT` or `SASL_SSL` listener says the same |
 | `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` | `15` | Seconds an unauthenticated connection may sit between frames. Waiting for an authentication slot and the verification itself each get this budget, the verification's starting once it holds a slot. Separate from the 10-minute idle timeout that applies once authenticated |
@@ -292,8 +292,10 @@ Limits:
   completed generation in Iggy, so another gateway or a restarted one takes the group over with
   its members ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md#more-than-one-gateway)).
 - Classic protocol only. A consumer with `group.protocol=consumer` (KIP-848) fails.
-- Offsets never expire. `kafka-consumer-groups.sh --delete` and `--delete-offsets` delete them
-  ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md#deleting-groups-and-offsets)).
+- Offsets never expire in Iggy. `kafka-consumer-groups.sh --delete` and `--delete-offsets` delete
+  them ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md#deleting-groups-and-offsets)). The
+  coordinator log drops its copy, with the commit metadata, 7 days after the last commit of a
+  group without members. Iggy answers from then on.
 - If `--delete` fails with `GroupAuthorizationException` although the principal holds a global
   `manage_topics` or `manage_streams`, look in the gateway log for `the bridge user may not list
   the Iggy groups of these Kafka topics, so DeleteGroups deletes nothing`. The bridge's Iggy user,
@@ -342,10 +344,10 @@ cargo run -p iggy-gateway-kafka
   with their members and offsets. A member that keeps its heartbeat goes on without a rebalance.
   A stop on SIGTERM hands the partitions over at once. After a crash, the takeover waits for the
   Iggy session timeout, 1.2 times `heartbeat.interval`, 36 s by default (not tested).
-- Metadata lists each gateway that owns a log partition, and this gateway. It names a leader for
-  each partition by a hash of the topic and the partition index, so the clients spread over the
-  gateways. Any gateway can serve any partition, because the Iggy SDK sends each partition
-  request to its primary. A client of a stopped gateway goes on through the others.
+- Metadata lists each gateway that owns a log partition, and this gateway. It names this gateway
+  as the leader of every partition. Any gateway can serve any partition, because the Iggy SDK
+  sends each partition request to its primary. A client of a stopped or crashed gateway goes on
+  through another at its next Metadata.
 - The owner of log partition 0 is the controller. Only the controller creates and deletes topics
   and adds partitions. The others answer `NOT_CONTROLLER` (41), and Kafka admin clients retry at
   the controller.
@@ -353,12 +355,19 @@ cargo run -p iggy-gateway-kafka
   consumer group `kafka-gateways` in the stream `<default stream>.meta`, where the cluster id
   lives. It needs `manage_topics` there, or an operator creates the topics first and grants it
   `read_topics`, `poll_messages` and `send_messages`. `read_topics` also covers the group.
+- An operator's `coordinators` topic needs 16 partitions, durability `persisted`, and an expiry
+  of 25 hours or more, or none. The gateway does not start with any other.
+- The log needs `manage_servers` on the bridge's Iggy user, to learn from Iggy's change log which
+  topics Iggy deletes. Without it the gateway does not start: a topic created again would start
+  at the deleted topic's offsets.
 - With `IGGY_KAFKA_COORDINATOR_LOG=false`, the gateway with the lowest node id coordinates every
   group, and while it is down the groups wait for it.
 - Gateways with and without the log name different coordinators for a group. To upgrade from a
   build without the log, set `IGGY_KAFKA_COORDINATOR_LOG=false` until every gateway runs this
   build, then turn it on with every gateway stopped. Turned on one gateway at a time, a group
   can have two coordinators until the last restart, and its records can be read twice.
+- An older build does not serve a log partition that a newer build wrote. Its groups wait for a
+  gateway of the newer build.
 - To add a gateway, restart the others with an `IGGY_KAFKA_BROKERS` that lists it, then start
   it. A gateway that owns log partitions but is missing from a list leaves their groups without
   a coordinator there: `FindCoordinator` answers `COORDINATOR_NOT_AVAILABLE` (15), and the

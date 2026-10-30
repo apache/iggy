@@ -211,6 +211,43 @@ impl GroupIndex {
         self.feed.published.borrow().source
     }
 
+    /// See [`super::IggyBridge::follows_change_log`].
+    pub(super) async fn followed_once(&self, deadline: Instant) -> Option<bool> {
+        let outcome = |current: &Published| match current.source {
+            OffsetGroupSource::Scans => Some(false),
+            OffsetGroupSource::ChangeLog => current.groups.is_some().then_some(true),
+        };
+        let mut published = self.feed.published.subscribe();
+        let first = outcome(&published.borrow_and_update());
+        if let Some(followed) = first {
+            return Some(followed);
+        }
+        self.feed.wake.notify_one();
+        let current = timeout_at(
+            deadline,
+            published.wait_for(|current| outcome(current).is_some()),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        outcome(&current)
+    }
+
+    /// See [`super::IggyBridge::change_log_lost`].
+    pub(super) fn fallen_back(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut published = self.feed.published.subscribe();
+        async move {
+            let lost = published
+                .wait_for(|current| current.source == OffsetGroupSource::Scans)
+                .await
+                .is_ok();
+            // A bridge that is dropped has not lost the log.
+            if !lost {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
     /// The groups of the change log, at once. Before its first view, the caller wakes the
     /// follower and waits for its next read, until `deadline`. A read that failed then answers
     /// [`ScannedGroups::Failed`], and none that ended [`ScannedGroups::Pending`], as a scan does.

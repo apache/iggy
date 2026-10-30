@@ -48,6 +48,7 @@
 use std::collections::HashSet;
 
 use bytes::Bytes;
+use futures::future::join_all;
 use kafka_protocol::messages::delete_groups_response::DeletableGroupResult;
 use kafka_protocol::messages::{DeleteGroupsRequest, DeleteGroupsResponse, GroupId};
 use kafka_protocol::protocol::StrBytes;
@@ -230,7 +231,8 @@ async fn delete(
 }
 
 /// Deletes from the coordinator log each group of `names` that Iggy deleted or this coordinator
-/// holds, so the next coordinator does not restore it. A group the log refuses gets its code.
+/// holds, so the next coordinator does not restore it. A group the log refuses gets its code. The
+/// deletions run at once, so the log writes those of one partition in one send.
 async fn forget_logged(
     state: &GatewayState,
     names: &[&str],
@@ -241,15 +243,18 @@ async fn forget_logged(
     let Some(coordination) = &state.coordination else {
         return found;
     };
-    let mut forgotten = Vec::with_capacity(found.len());
-    for ((name, &at), found) in names.iter().zip(deletable).zip(found) {
-        let held = matches!(plans[at], Plan::Delete { held: true });
-        forgotten.push(match found {
-            Ok(found) if found || held => coordination.delete_group(name).await.map(|()| found),
-            other => other,
+    let deletions = names
+        .iter()
+        .zip(deletable)
+        .zip(found)
+        .map(|((name, &at), found)| async move {
+            let held = matches!(plans[at], Plan::Delete { held: true });
+            match found {
+                Ok(found) if found || held => coordination.delete_group(name).await.map(|()| found),
+                other => other,
+            }
         });
-    }
-    forgotten
+    join_all(deletions).await
 }
 
 /// Removes from the coordinator each group of `deletable` that it holds and whose offsets went,

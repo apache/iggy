@@ -28,7 +28,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, SemaphorePermit, broadcast};
 use tokio::task::JoinSet;
-use tokio::time::{timeout, timeout_at};
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
@@ -65,6 +65,11 @@ use crate::tls::{IdentityError, TlsConfig, TlsState};
 
 const READ_CHUNK: usize = 65536;
 const GATEWAY_LOG_TARGET: &str = env!("CARGO_CRATE_NAME");
+
+/// How long a start tries again to set up the coordinator log while Iggy is not ready, and the
+/// pause between tries. The same as for the bridge's connect in `main.rs`.
+const COORDINATION_STARTUP_LIMIT: Duration = Duration::from_secs(60);
+const COORDINATION_STARTUP_RETRY: Duration = Duration::from_secs(1);
 
 /// Builds the log filter, forcing the Iggy SDK quiet unless the operator asked otherwise.
 ///
@@ -175,8 +180,10 @@ pub struct GatewayConfig {
     /// Empty for a gateway alone.
     pub brokers: Vec<BrokerEntry>,
     /// Whether the gateways share the consumer groups through the coordinator log in Iggy
-    /// (`IGGY_KAFKA_COORDINATOR_LOG`). Needs the bridge. On by default when `brokers` lists the
-    /// gateways. Off, this gateway keeps its groups in memory alone.
+    /// (`IGGY_KAFKA_COORDINATOR_LOG`). Needs the bridge, and a bridge user that may read Iggy's
+    /// metadata change log. Off here by default. `load_config` in `main.rs` turns it on when the
+    /// bridge is on, `IGGY_KAFKA_BROKERS` lists the gateways and the variable is unset. Off, this
+    /// gateway keeps its groups in memory alone.
     pub coordinator_log: bool,
     /// How the coordinator log behaves. No environment variable maps onto it yet.
     pub coordination: CoordinationConfig,
@@ -613,7 +620,9 @@ impl KafkaGateway {
         Ok(state)
     }
 
-    /// Starts coordinating `groups` with the other gateways, when the coordinator log is on.
+    /// Starts coordinating `groups` with the other gateways, when the coordinator log is on. A
+    /// failure that a retry can fix is retried for up to [`COORDINATION_STARTUP_LIMIT`], as
+    /// `main.rs` retries the bridge's connect.
     async fn start_coordination(
         &self,
         groups: &GroupCoordinator,
@@ -628,16 +637,32 @@ impl KafkaGateway {
                     .into(),
             ));
         };
-        // Its own token, not the drain's: the shutdown hands the groups over before the drain.
-        let coordination = Coordination::start(
-            bridge,
-            groups.clone(),
-            self.config.node_id,
-            self.config.coordination,
-            CancellationToken::new(),
-        )
-        .await?;
-        Ok(Some(coordination))
+        let give_up = Instant::now() + COORDINATION_STARTUP_LIMIT;
+        loop {
+            // Its own token, not the drain's: the shutdown hands the groups over before the drain.
+            let started = Coordination::start(
+                bridge,
+                groups.clone(),
+                self.config.node_id,
+                self.config.coordination,
+                CancellationToken::new(),
+            )
+            .await;
+            match started {
+                Ok(coordination) => return Ok(Some(coordination)),
+                Err(error)
+                    if error.is_retriable()
+                        && Instant::now() + COORDINATION_STARTUP_RETRY < give_up =>
+                {
+                    warn!(
+                        "cannot set up the coordinator log yet, retrying in \
+                         {COORDINATION_STARTUP_RETRY:?}: {error}"
+                    );
+                    tokio::time::sleep(COORDINATION_STARTUP_RETRY).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     /// The id set by [`Self::with_cluster_id`], else the one stored in Iggy, else a random one.

@@ -49,7 +49,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::group::offset_work::OffsetWork;
-use crate::group::state::{GroupState, Step, SyncStep};
+use crate::group::state::{GroupState, JoinStep, Replacement, Step, SyncStep};
 use crate::protocol::api::{
     ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_NONE, ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_MEMBER_ID,
 };
@@ -190,11 +190,12 @@ pub trait GroupHome: Send + Sync {
     /// The Kafka code above.
     fn serves(&self, group_id: &str) -> Result<(), i16>;
 
-    /// Keeps the state of a completed generation, before any member learns its assignment.
+    /// Keeps the state of a completed generation, before any member learns its assignment, and
+    /// that of a static member's takeover, before the member learns its new id.
     ///
     /// # Errors
     ///
-    /// The Kafka code that refuses the store, which the leader gets.
+    /// The Kafka code that refuses the store, which the leader or the member gets.
     async fn store(&self, group_id: &str, snapshot: GroupSnapshot) -> Result<(), i16>;
 }
 
@@ -694,7 +695,24 @@ impl GroupCoordinator {
                             request.member_id.clone(),
                         ))
                     }
-                    None => state::join_step(&mut groups, &self.config, request, now),
+                    None => {
+                        let store_first = self.home.get().is_some();
+                        match state::join_or_store_step(
+                            &mut groups,
+                            &self.config,
+                            request,
+                            now,
+                            store_first,
+                        ) {
+                            JoinStep::Step(step) => step,
+                            JoinStep::Store(snapshot, replacement) => {
+                                drop(groups);
+                                return self
+                                    .store_then_replace(&request.group_id, snapshot, replacement)
+                                    .await;
+                            }
+                        }
+                    }
                     Some(member_id) => state::join_resume_step(
                         &mut groups,
                         &request.group_id,
@@ -793,6 +811,33 @@ impl GroupCoordinator {
             &request.group_id,
             &request.member_id,
             request.generation_id,
+            stored,
+            gone,
+            Instant::now(),
+        )
+    }
+
+    /// Stores the group that a static member's takeover left, then answers the member.
+    async fn store_then_replace(
+        &self,
+        group_id: &StrBytes,
+        snapshot: GroupSnapshot,
+        replacement: Replacement,
+    ) -> JoinResult {
+        let stored = match self.home.get() {
+            Some(home) => home.store(group_id, snapshot).await,
+            None => Ok(()),
+        };
+        let mut groups = self.groups.lock().await;
+        // As in `store_then_sync`: the member then looks for the new coordinator.
+        let gone = self
+            .serves(group_id)
+            .err()
+            .unwrap_or(ERROR_UNKNOWN_MEMBER_ID);
+        state::finish_replacement(
+            &mut groups,
+            group_id,
+            replacement,
             stored,
             gone,
             Instant::now(),
@@ -1255,6 +1300,93 @@ mod tests {
             })
             .await;
         assert_eq!(synced.error, ERROR_NOT_COORDINATOR);
+    }
+
+    /// A home that keeps each stored snapshot, and refuses stores once told to.
+    #[derive(Default)]
+    struct KeepingHome {
+        stored: std::sync::Mutex<Vec<GroupSnapshot>>,
+        refusal: std::sync::Mutex<Option<i16>>,
+    }
+
+    #[async_trait]
+    impl GroupHome for KeepingHome {
+        fn serves(&self, _group_id: &str) -> Result<(), i16> {
+            Ok(())
+        }
+
+        async fn store(&self, _group_id: &str, snapshot: GroupSnapshot) -> Result<(), i16> {
+            let refusal = *self.refusal.lock().unwrap();
+            if let Some(refusal) = refusal {
+                return Err(refusal);
+            }
+            self.stored.lock().unwrap().push(snapshot);
+            Ok(())
+        }
+    }
+
+    /// One static member, `Stable` with its assignment stored.
+    async fn stable_static_member(coordinator: &GroupCoordinator) -> (JoinRequest, JoinResult) {
+        let join = JoinRequest {
+            group_instance_id: Some(id("i-1")),
+            ..join_request("orders")
+        };
+        let joined = coordinator.join(&join).await;
+        assert_eq!(joined.error, ERROR_NONE);
+        let synced = coordinator
+            .sync(SyncRequest {
+                group_id: id("orders"),
+                generation_id: joined.generation_id,
+                member_id: joined.member_id.clone(),
+                group_instance_id: Some(id("i-1")),
+                protocol_type: None,
+                protocol_name: None,
+                assignments: vec![(joined.member_id.clone(), Bytes::from_static(b"blob"))],
+            })
+            .await;
+        assert_eq!(synced.error, ERROR_NONE);
+        (join, joined)
+    }
+
+    #[tokio::test]
+    async fn given_a_static_member_returning_to_a_stable_group_should_answer_after_the_store() {
+        let coordinator = coordinator();
+        let home = Arc::new(KeepingHome::default());
+        coordinator.set_home(Arc::clone(&home) as Arc<dyn GroupHome>);
+        let (join, joined) = stable_static_member(&coordinator).await;
+
+        let returned = coordinator.join(&join).await;
+
+        assert_eq!(returned.error, ERROR_NONE);
+        assert_ne!(returned.member_id, joined.member_id);
+        let stored = home.stored.lock().unwrap().last().cloned();
+        let last = &stored.expect("the takeover is stored").members[0];
+        assert_eq!(last.member_id, returned.member_id.as_str());
+        assert_eq!(last.assignment, Bytes::from_static(b"blob"));
+    }
+
+    #[tokio::test]
+    async fn given_a_static_takeover_whose_store_fails_should_keep_the_old_member() {
+        let coordinator = coordinator();
+        let home = Arc::new(KeepingHome::default());
+        coordinator.set_home(Arc::clone(&home) as Arc<dyn GroupHome>);
+        let (join, joined) = stable_static_member(&coordinator).await;
+        *home.refusal.lock().unwrap() = Some(ERROR_NOT_COORDINATOR);
+
+        let refused = coordinator.join(&join).await;
+
+        assert_eq!(refused.error, ERROR_NOT_COORDINATOR);
+        assert_eq!(
+            coordinator
+                .heartbeat(
+                    &id("orders"),
+                    joined.generation_id,
+                    &joined.member_id,
+                    Some(&id("i-1")),
+                )
+                .await,
+            ERROR_NONE
+        );
     }
 
     #[tokio::test]

@@ -32,7 +32,8 @@ mod wire;
 use std::collections::BTreeSet;
 
 use iggy::prelude::{
-    Consumer, Identifier, IggyMessage, MessageClient, Partitioning, PollingStrategy,
+    Consumer, Identifier, IggyMessage, MessageClient, Partitioning, PollingStrategy, StreamClient,
+    StreamCreateOptions, TopicClient, TopicCreateOptions,
 };
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
@@ -46,7 +47,7 @@ use serial_test::serial;
 use iggy_gateway_kafka::GatewayConfig;
 use iggy_gateway_kafka::bridge::{COORDINATOR_LOG_TOPIC, cluster_id_stream};
 use iggy_gateway_kafka::coordinator::record::{Body, Record};
-use iggy_gateway_kafka::coordinator::{CoordinationConfig, partition_of_group};
+use iggy_gateway_kafka::coordinator::{CoordinationConfig, PARTITIONS, partition_of_group};
 use iggy_gateway_kafka::listener::parse_brokers;
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_CREATE_TOPICS, API_KEY_DESCRIBE_GROUPS, API_KEY_METADATA, ERROR_NONE,
@@ -55,7 +56,7 @@ use iggy_gateway_kafka::protocol::api::{
 use iggy_gateway_kafka::server::bind_listener;
 
 use gateways::{
-    Gateway, SETTLE, TOPIC, agreed_coordinator, call, commit, coordinators, create_topic,
+    Gateway, SETTLE, TOPIC, agreed_coordinator, call, commit, connect, coordinators, create_topic,
     eventually, fetch, gateway_config, gateway_of, heartbeat, join_and_sync, start_gateway,
     start_gateways,
 };
@@ -282,9 +283,11 @@ async fn given_two_gateways_when_creating_a_topic_should_refuse_it_off_the_contr
     }
 }
 
+/// Each gateway leads every partition, so a client of a gateway that crashed goes on through
+/// another at its next Metadata.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn given_two_gateways_when_asked_for_metadata_should_name_the_same_spread_leaders() {
+async fn given_two_gateways_when_asked_for_metadata_should_list_both_and_lead_from_each() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     create_topic(server.test_config()).await;
@@ -294,8 +297,8 @@ async fn given_two_gateways_when_asked_for_metadata_should_name_the_same_spread_
             .with_name(Some(TopicName(StrBytes::from_static_str(TOPIC)))),
     ]));
 
-    let leaders = eventually(SETTLE, "agreement on the leaders", || async {
-        let mut answers = Vec::new();
+    let leaders = eventually(SETTLE, "both gateways listed", || async {
+        let mut leaders = Vec::new();
         for gateway in &gateways {
             let response: MetadataResponse =
                 call(gateway.addr, API_KEY_METADATA, 9, &request).await;
@@ -307,17 +310,19 @@ async fn given_two_gateways_when_asked_for_metadata_should_name_the_same_spread_
             if brokers != BTreeSet::from([1, 2]) {
                 return None;
             }
-            let leaders: Vec<i32> = response.topics[0]
+            let named: BTreeSet<i32> = response.topics[0]
                 .partitions
                 .iter()
                 .map(|partition| partition.leader_id.0)
                 .collect();
-            answers.push(leaders);
+            leaders.push((i32::from(gateway.node_id), named));
         }
-        (answers[0] == answers[1]).then(|| answers[0].clone())
+        Some(leaders)
     })
     .await;
-    assert_eq!(leaders.len(), 2);
+    for (node_id, named) in leaders {
+        assert_eq!(named, BTreeSet::from([node_id]), "gateway {node_id}");
+    }
 
     for gateway in gateways {
         gateway.stop().await;
@@ -446,4 +451,41 @@ async fn given_checkpoints_in_the_log_when_the_gateway_restarts_should_load_the_
     );
 
     gateway.stop().await;
+}
+
+/// A log topic that a crash of a quorum can lose a claim from would let two gateways own one
+/// partition. Only an operator makes one.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn given_a_log_topic_that_is_not_persisted_when_linking_should_refuse_it() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let client = raw_client(&server).await;
+    let stream = cluster_id_stream("kafka");
+    client
+        .create_stream(&stream, &StreamCreateOptions::default())
+        .await
+        .expect("create the stream");
+    client
+        .create_topic(
+            &Identifier::named(&stream).expect("stream name"),
+            COORDINATOR_LOG_TOPIC,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .expect("create the log topic");
+
+    let bridge = connect(server.test_config()).await;
+    let error = bridge
+        .coordinator_link(PARTITIONS, 1)
+        .await
+        .expect_err("a replicated log topic is refused");
+    assert!(
+        error.to_string().contains("needs durability persisted"),
+        "{error}"
+    );
+    bridge.close().await.expect("close the bridge");
 }

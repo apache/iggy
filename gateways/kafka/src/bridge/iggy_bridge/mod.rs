@@ -46,8 +46,8 @@ mod offsets;
 mod produce;
 mod topics;
 
+pub use change_log::{DeletedTopic, PermissionBoard, TopicShape, TopicShapes, UserAccess};
 use change_log::{Follower, TOPIC_DELETIONS_CAPACITY};
-pub use change_log::{PermissionBoard, UserAccess};
 pub use cluster_id::{CLUSTER_ID_TOPIC, ClusterIdCall, cluster_id_stream};
 pub use coordinator_log::{
     COORDINATOR_LEASE_GROUP, COORDINATOR_LOG_TOPIC, COORDINATOR_OWNER_TOPIC, CoordinatorLink,
@@ -190,9 +190,11 @@ pub struct IggyBridge {
     follower: FollowerTask,
     /// Moves after each stream, topic or partition change the change log shows.
     topic_changes: Arc<watch::Sender<u64>>,
+    /// The Kafka topics the change log shows. See [`IggyBridge::topic_shape`].
+    topic_shapes: Arc<watch::Sender<Arc<TopicShapes>>>,
     permissions: Arc<PermissionBoard>,
-    /// Gets the Kafka name of each topic that the change log shows deleted.
-    topic_deletions: broadcast::Sender<String>,
+    /// Gets each topic that the change log shows deleted.
+    topic_deletions: broadcast::Sender<DeletedTopic>,
 }
 
 /// The task that follows the change log. Dropping it stops the task.
@@ -275,6 +277,7 @@ impl IggyBridge {
             change_client: LazyClient::default(),
             follower: FollowerTask::default(),
             topic_changes: Arc::new(watch::Sender::new(0)),
+            topic_shapes: Arc::new(watch::Sender::new(Arc::default())),
             permissions: Arc::default(),
             topic_deletions: broadcast::Sender::new(TOPIC_DELETIONS_CAPACITY),
         };
@@ -303,11 +306,40 @@ impl IggyBridge {
         &self.permissions
     }
 
-    /// The Kafka name of each topic that Iggy's change log shows deleted, as it reads them.
-    /// Nothing arrives while the bridge user cannot read the change log.
+    /// Each topic that Iggy's change log shows deleted, as it reads them. Nothing arrives while
+    /// the bridge user cannot read the change log.
     #[must_use]
-    pub fn topic_deletions(&self) -> broadcast::Receiver<String> {
+    pub fn topic_deletions(&self) -> broadcast::Receiver<DeletedTopic> {
         self.topic_deletions.subscribe()
+    }
+
+    /// The Kafka topic `kafka_topic` as Iggy's change log last showed it, or `None` when it shows
+    /// none of that name. The log lags Iggy by about a second, and shows nothing while the bridge
+    /// user cannot read it.
+    #[must_use]
+    pub fn topic_shape(&self, kafka_topic: &str) -> Option<TopicShape> {
+        self.topic_shapes.borrow().get(kafka_topic).copied()
+    }
+
+    /// Every Kafka topic as Iggy's change log last showed it. A read replaces them before it
+    /// reports the topics it deleted, so they show each deletion that [`Self::topic_deletions`]
+    /// has sent.
+    #[must_use]
+    pub fn topic_shapes(&self) -> watch::Receiver<Arc<TopicShapes>> {
+        self.topic_shapes.subscribe()
+    }
+
+    /// Waits until the change log follower has read Iggy's change log once, or turned out not to
+    /// be able to, at most until `deadline`. `Some(true)` once it read it, `Some(false)` when the
+    /// bridge user may not read it or Iggy does not serve it, `None` at the deadline.
+    pub async fn follows_change_log(&self, deadline: Instant) -> Option<bool> {
+        self.group_index.followed_once(deadline).await
+    }
+
+    /// Ends once the change log follower stops for good, because the bridge user may no longer
+    /// read Iggy's change log. Holds no borrow of the bridge.
+    pub fn change_log_lost(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.group_index.fallen_back()
     }
 
     /// Starts the task that follows Iggy's metadata change log (`change_log.rs`).
@@ -322,6 +354,7 @@ impl IggyBridge {
             mapping: self.config.topic_mapping.clone(),
             groups: self.group_index.feed(),
             topics: Arc::clone(&self.topic_changes),
+            shapes: Arc::clone(&self.topic_shapes),
             permissions: Arc::clone(&self.permissions),
             deletions: self.topic_deletions.clone(),
         };
@@ -542,6 +575,7 @@ impl IggyBridge {
             change_client: LazyClient::default(),
             follower: FollowerTask::default(),
             topic_changes: Arc::new(watch::Sender::new(0)),
+            topic_shapes: Arc::new(watch::Sender::new(Arc::default())),
             permissions: Arc::default(),
             topic_deletions: broadcast::Sender::new(TOPIC_DELETIONS_CAPACITY),
         }

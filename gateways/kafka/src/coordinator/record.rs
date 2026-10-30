@@ -18,9 +18,11 @@
 //! The records of the coordinator log and of the owner topic.
 //!
 //! Each record starts with a format version, a kind, its claim and its checkpoint. Every version
-//! keeps that header, and a claim's body starts with its node id in every version. A gateway reads
-//! the header of every record and the body of the kinds it knows, so during a rolling upgrade an
-//! older gateway still sees a newer gateway's claim. Every number is little endian.
+//! keeps that header, and a claim's body starts with its node id in every version. So during a
+//! rolling upgrade an older gateway still sees a newer gateway's claim. Any other record of a newer
+//! format fails to decode with [`RecordError::Unreadable`], and the gateway does not serve its
+//! partition: a checkpoint of what it read would drop what that record holds, as Kafka fails such
+//! a load. Every number is little endian.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
@@ -40,6 +42,7 @@ const KIND_GROUP: u8 = 4;
 const KIND_OFFSET: u8 = 5;
 const KIND_GROUP_OFFSETS_DELETED: u8 = 6;
 const KIND_TOPIC_OFFSETS_DELETED: u8 = 7;
+const KIND_GROUP_OFFSETS_EXPIRED: u8 = 8;
 
 const KIND_ANNOUNCEMENT: u8 = 1;
 
@@ -82,10 +85,13 @@ pub enum Body {
     },
     /// Every offset of the group is deleted.
     GroupOffsetsDeleted { group_id: String },
-    /// Iggy deleted the topic, so every offset of it, in every group, is gone.
-    TopicOffsetsDeleted { topic: String },
-    /// A kind or a version this gateway does not know. Only its header counts.
-    Unknown { kind: u8 },
+    /// Iggy deleted the topic incarnation `incarnation`, so every offset committed to it, in every
+    /// group, is gone. An offset of a later topic of that name stays, as Kafka keeps one by topic
+    /// id.
+    TopicOffsetsDeleted { topic: String, incarnation: u64 },
+    /// The group had no members and no commit for the retention period, so the log drops its
+    /// offsets. Iggy still holds them.
+    GroupOffsetsExpired { group_id: String },
 }
 
 /// One committed offset, with what Kafka keeps beside it.
@@ -95,6 +101,10 @@ pub struct CommittedOffset {
     pub leader_epoch: i32,
     pub metadata: Option<String>,
     pub commit_timestamp_ms: i64,
+    /// The op of Iggy's metadata log that created the topic the offset was committed to, as the
+    /// change log names it. `None` when the gateway did not know it, and any deletion of the topic
+    /// then removes the offset.
+    pub topic_incarnation: Option<u64>,
 }
 
 /// A gateway owns one coordinator log partition. Written to the owner topic, which every gateway
@@ -114,6 +124,8 @@ pub enum RecordError {
     NotUtf8(&'static str),
     #[error("the record's {0} does not fit its length prefix")]
     TooLong(&'static str),
+    #[error("the record has format {version} and kind {kind}, which only a newer gateway reads")]
+    Unreadable { version: u8, kind: u8 },
 }
 
 impl Record {
@@ -158,22 +170,29 @@ impl Record {
                         buf.put_i32_le(committed.leader_epoch);
                         put_optional_str(&mut buf, committed.metadata.as_deref(), "metadata")?;
                         buf.put_i64_le(committed.commit_timestamp_ms);
+                        put_optional_u64(&mut buf, committed.topic_incarnation);
                     }
                 }
             }
-            Body::GroupOffsetsDeleted { group_id } => put_str(&mut buf, group_id, "group id")?,
-            Body::TopicOffsetsDeleted { topic } => put_str(&mut buf, topic, "topic")?,
-            Body::Unknown { .. } => {}
+            Body::GroupOffsetsDeleted { group_id } | Body::GroupOffsetsExpired { group_id } => {
+                put_str(&mut buf, group_id, "group id")?;
+            }
+            Body::TopicOffsetsDeleted { topic, incarnation } => {
+                put_str(&mut buf, topic, "topic")?;
+                buf.put_u64_le(*incarnation);
+            }
         }
         Ok(buf.freeze())
     }
 
-    /// The record in `bytes`. A kind or a version this gateway does not know gives
-    /// [`Body::Unknown`], except a claim, whose body every version starts the same way.
+    /// The record in `bytes`. A claim decodes in every version, since every version starts its
+    /// body the same way.
     ///
     /// # Errors
     ///
-    /// [`RecordError`] when the header or a known body is cut short, or a string is not UTF-8.
+    /// [`RecordError::Unreadable`] for any other record of another format, or of a kind this
+    /// gateway does not know. Another [`RecordError`] when the header or the body is cut short, or
+    /// a string is not UTF-8.
     pub fn decode(mut bytes: &[u8]) -> Result<Self, RecordError> {
         let version = get_u8(&mut bytes, "version")?;
         let kind = get_u8(&mut bytes, "kind")?;
@@ -183,7 +202,9 @@ impl Record {
             KIND_CLAIM => Body::Claim {
                 node_id: get_u16(&mut bytes, "node id")?,
             },
-            _ if version != FORMAT_VERSION => Body::Unknown { kind },
+            _ if version != FORMAT_VERSION => {
+                return Err(RecordError::Unreadable { version, kind });
+            }
             KIND_CHECKPOINT_BEGIN => Body::CheckpointBegin {
                 node_id: get_u16(&mut bytes, "node id")?,
             },
@@ -209,6 +230,7 @@ impl Record {
                         leader_epoch: get_i32(&mut bytes, "leader epoch")?,
                         metadata: get_optional_str(&mut bytes, "metadata")?,
                         commit_timestamp_ms: get_i64(&mut bytes, "commit timestamp")?,
+                        topic_incarnation: get_optional_u64(&mut bytes, "topic incarnation")?,
                     }),
                 };
                 Body::Offset {
@@ -223,8 +245,12 @@ impl Record {
             },
             KIND_TOPIC_OFFSETS_DELETED => Body::TopicOffsetsDeleted {
                 topic: get_str(&mut bytes, "topic")?,
+                incarnation: get_u64(&mut bytes, "topic incarnation")?,
             },
-            _ => Body::Unknown { kind },
+            KIND_GROUP_OFFSETS_EXPIRED => Body::GroupOffsetsExpired {
+                group_id: get_str(&mut bytes, "group id")?,
+            },
+            _ => return Err(RecordError::Unreadable { version, kind }),
         };
         Ok(Self {
             claim,
@@ -244,7 +270,7 @@ impl Body {
             Self::Offset { .. } => KIND_OFFSET,
             Self::GroupOffsetsDeleted { .. } => KIND_GROUP_OFFSETS_DELETED,
             Self::TopicOffsetsDeleted { .. } => KIND_TOPIC_OFFSETS_DELETED,
-            Self::Unknown { kind } => *kind,
+            Self::GroupOffsetsExpired { .. } => KIND_GROUP_OFFSETS_EXPIRED,
         }
     }
 
@@ -254,12 +280,12 @@ impl Body {
         match self {
             Self::Group { group_id, .. }
             | Self::Offset { group_id, .. }
-            | Self::GroupOffsetsDeleted { group_id } => Some(group_id),
+            | Self::GroupOffsetsDeleted { group_id }
+            | Self::GroupOffsetsExpired { group_id } => Some(group_id),
             Self::Claim { .. }
             | Self::CheckpointBegin { .. }
             | Self::CheckpointEnd { .. }
-            | Self::TopicOffsetsDeleted { .. }
-            | Self::Unknown { .. } => None,
+            | Self::TopicOffsetsDeleted { .. } => None,
         }
     }
 }
@@ -276,15 +302,16 @@ impl Announcement {
         buf.freeze()
     }
 
-    /// The announcement in `bytes`, or `None` for a version or a kind this gateway does not know.
+    /// The announcement in `bytes`, of any version: every version starts it with the partition,
+    /// the claim and the node id, so an older gateway still routes to a newer owner. `None` for
+    /// another kind.
     ///
     /// # Errors
     ///
-    /// [`RecordError::Truncated`] when a known announcement is cut short.
+    /// [`RecordError::Truncated`] when an announcement is cut short.
     pub fn decode(mut bytes: &[u8]) -> Result<Option<Self>, RecordError> {
-        let version = get_u8(&mut bytes, "version")?;
-        let kind = get_u8(&mut bytes, "kind")?;
-        if version != FORMAT_VERSION || kind != KIND_ANNOUNCEMENT {
+        get_u8(&mut bytes, "version")?;
+        if get_u8(&mut bytes, "kind")? != KIND_ANNOUNCEMENT {
             return Ok(None);
         }
         Ok(Some(Self {
@@ -368,6 +395,16 @@ fn put_optional_str(
     }
 }
 
+fn put_optional_u64(buf: &mut BytesMut, value: Option<u64>) {
+    match value {
+        None => buf.put_u8(0),
+        Some(value) => {
+            buf.put_u8(1);
+            buf.put_u64_le(value);
+        }
+    }
+}
+
 fn put_blob(buf: &mut BytesMut, value: &[u8], field: &'static str) -> Result<(), RecordError> {
     let len = u32::try_from(value.len()).map_err(|_| RecordError::TooLong(field))?;
     buf.put_u32_le(len);
@@ -394,6 +431,13 @@ fn take_str(bytes: &mut &[u8], len: usize, field: &'static str) -> Result<String
     let (value, rest) = bytes.split_at(len);
     *bytes = rest;
     String::from_utf8(value.to_vec()).map_err(|_| RecordError::NotUtf8(field))
+}
+
+fn get_optional_u64(bytes: &mut &[u8], field: &'static str) -> Result<Option<u64>, RecordError> {
+    match get_u8(bytes, field)? {
+        0 => Ok(None),
+        _ => get_u64(bytes, field).map(Some),
+    }
 }
 
 fn get_blob(bytes: &mut &[u8], field: &'static str) -> Result<Bytes, RecordError> {
@@ -506,6 +550,19 @@ mod tests {
                     leader_epoch: -1,
                     metadata: Some("partition time 17".to_string()),
                     commit_timestamp_ms: 1_700_000_000_000,
+                    topic_incarnation: Some(41),
+                }),
+            },
+            Body::Offset {
+                group_id: "orders".to_string(),
+                topic: "payments".to_string(),
+                partition: 4,
+                committed: Some(CommittedOffset {
+                    offset: 5,
+                    leader_epoch: 2,
+                    metadata: None,
+                    commit_timestamp_ms: 0,
+                    topic_incarnation: None,
                 }),
             },
             Body::Offset {
@@ -519,6 +576,10 @@ mod tests {
             },
             Body::TopicOffsetsDeleted {
                 topic: "payments".to_string(),
+                incarnation: 41,
+            },
+            Body::GroupOffsetsExpired {
+                group_id: "orders".to_string(),
             },
         ];
         for body in bodies {
@@ -532,8 +593,10 @@ mod tests {
         }
     }
 
+    /// A gateway that served the partition without such a record would drop what it holds at
+    /// its next checkpoint, for every gateway.
     #[test]
-    fn given_a_newer_version_when_decoded_should_keep_its_header_and_read_a_claim() {
+    fn given_a_newer_version_when_decoded_should_read_a_claim_and_refuse_the_rest() {
         let newer = |body: Body| {
             let mut bytes = Record {
                 claim: 4,
@@ -558,18 +621,15 @@ mod tests {
         );
         assert_eq!(
             newer(Body::CheckpointEnd { begin: 1 }),
-            Ok(Record {
-                claim: 4,
-                checkpoint: 9,
-                body: Body::Unknown {
-                    kind: KIND_CHECKPOINT_END
-                },
+            Err(RecordError::Unreadable {
+                version: FORMAT_VERSION + 1,
+                kind: KIND_CHECKPOINT_END
             })
         );
     }
 
     #[test]
-    fn given_an_unknown_kind_when_decoded_should_keep_its_header() {
+    fn given_an_unknown_kind_when_decoded_should_refuse_it() {
         let mut bytes = Record {
             claim: 1,
             checkpoint: 0,
@@ -581,10 +641,9 @@ mod tests {
         bytes[1] = 200;
         assert_eq!(
             Record::decode(&bytes),
-            Ok(Record {
-                claim: 1,
-                checkpoint: 0,
-                body: Body::Unknown { kind: 200 },
+            Err(RecordError::Unreadable {
+                version: FORMAT_VERSION,
+                kind: 200
             })
         );
     }
@@ -619,5 +678,21 @@ mod tests {
             Announcement::decode(&announcement.encode()),
             Ok(Some(announcement))
         );
+    }
+
+    /// An older gateway must still route the groups of a newer owner.
+    #[test]
+    fn given_an_announcement_of_a_newer_version_should_read_its_owner() {
+        let announcement = Announcement {
+            partition: 3,
+            claim: 7,
+            node_id: 4,
+        };
+        let mut bytes = announcement.encode().to_vec();
+        bytes[0] = FORMAT_VERSION + 1;
+        bytes.extend_from_slice(b"newer");
+        assert_eq!(Announcement::decode(&bytes), Ok(Some(announcement)));
+        bytes[1] = KIND_ANNOUNCEMENT + 1;
+        assert_eq!(Announcement::decode(&bytes), Ok(None), "another kind");
     }
 }

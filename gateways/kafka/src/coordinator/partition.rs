@@ -24,22 +24,23 @@
 //! lost the partition learns it from its next write, or sooner from the reader.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
 use iggy::prelude::{IGGY_MESSAGE_HEADER_SIZE, IggyTimestamp, MAX_PAYLOAD_SIZE};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::{Instant, MissedTickBehavior, interval, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::bridge::{BridgeError, CoordinatorLink, LoggedRecord};
-use crate::coordinator::record::{Body, NO_CHECKPOINT, Record, RecordError};
-use crate::coordinator::replay::{Applied, PartitionState};
+use crate::coordinator::record::{Body, CommittedOffset, NO_CHECKPOINT, Record, RecordError};
+use crate::coordinator::replay::{Applied, CheckpointUnit, PartitionState, TopicPartition};
 use crate::protocol::api::{
     ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_SERVER_ERROR,
 };
@@ -57,8 +58,8 @@ const CLAIM_TIMEOUT: Duration = Duration::from_secs(15);
 /// confirmed meanwhile.
 const READ_FAILURE_LIMIT: Duration = Duration::from_secs(10);
 
-/// What one send carries at most, so a burst of small appends shares one send. Iggy's message
-/// size caps it too.
+/// What one send of appends carries at most, so a burst of small appends shares one send. Iggy's
+/// message size caps it too. A checkpoint chunk fills up to the bytes alone.
 const MAX_BATCH_RECORDS: usize = 1_000;
 const MAX_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -72,6 +73,11 @@ const CHECKPOINT_AGE: Duration = Duration::from_hours(24);
 /// How often an idle writer checks whether a checkpoint is due, so a partition without traffic
 /// still writes one inside the log's retention.
 const CHECKPOINT_CHECK: Duration = Duration::from_hours(1);
+
+/// How old a logged commit gets before an equal one is logged again. A consumer commits every
+/// assigned partition every 5 s, also when its position did not move, so most commits change
+/// nothing. Logging one an hour keeps the commit time that expiry reads close.
+const UNCHANGED_REFRESH: Duration = Duration::from_hours(1);
 
 /// Why a served partition stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +99,16 @@ pub struct Stopped {
     pub stop: Stop,
 }
 
+/// Why a load gave up.
+#[derive(Debug, Error)]
+pub enum LoadError {
+    #[error(transparent)]
+    Bridge(#[from] BridgeError),
+    /// A newer gateway wrote the partition. Serving it would drop what that record holds.
+    #[error("the record at offset {offset} does not decode: {source}")]
+    Unreadable { offset: u64, source: RecordError },
+}
+
 /// Why the writer gives the partition up.
 #[derive(Debug, Error)]
 enum WriteError {
@@ -112,6 +128,45 @@ struct Append {
     /// What the records take of a send, message headers included.
     bytes: u64,
     done: oneshot::Sender<Result<u64, i16>>,
+    flight: Option<Flight>,
+}
+
+/// An append that was sent, waiting for the reader to reach its last record.
+struct Waiter {
+    done: oneshot::Sender<Result<u64, i16>>,
+    /// Dropped with the waiter, once the reader applied the append.
+    _flight: Option<Flight>,
+}
+
+/// A group's offset, by topic and partition.
+type OffsetKey = (String, TopicPartition);
+
+/// The offsets one append commits, counted as in flight from before it queues until the reader
+/// applies it, or it is dropped unsent.
+struct Flight {
+    counts: Arc<Mutex<HashMap<OffsetKey, usize>>>,
+    keys: Vec<OffsetKey>,
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        let mut counts = lock(&self.counts);
+        for key in self.keys.drain(..) {
+            if let Entry::Occupied(mut count) = counts.entry(key) {
+                *count.get_mut() -= 1;
+                if *count.get() == 0 {
+                    count.remove();
+                }
+            }
+        }
+    }
+}
+
+/// Where a checkpoint goes on: the unit, and the last offset of it written, `None` before any.
+#[derive(Debug, Default)]
+struct CheckpointCursor {
+    unit: usize,
+    after: Option<TopicPartition>,
 }
 
 /// One coordinator log partition this gateway serves.
@@ -129,7 +184,12 @@ pub struct PartitionLog {
     checkpoint: AtomicU64,
     appends: mpsc::Sender<Append>,
     /// The appends sent and not yet read, by the id of their last record.
-    pending: Mutex<HashMap<u128, oneshot::Sender<Result<u64, i16>>>>,
+    pending: Mutex<HashMap<u128, Waiter>>,
+    /// The commits in flight, per offset. A commit equal to the logged one writes nothing only
+    /// while none is.
+    flying: Arc<Mutex<HashMap<OffsetKey, usize>>>,
+    /// Woken after each read, and when the partition stops.
+    read: Notify,
     stop: CancellationToken,
 }
 
@@ -145,13 +205,14 @@ pub struct Claimed {
 ///
 /// # Errors
 ///
-/// `Ok(None)` when another gateway's claim came first. [`BridgeError`] when a call to Iggy fails
-/// or the claim does not come back in time.
+/// `Ok(None)` when another gateway's claim came first. [`LoadError::Bridge`] when a call to Iggy
+/// fails or the claim does not come back in time. [`LoadError::Unreadable`] when a newer gateway
+/// wrote the partition.
 pub async fn claim(
     link: &CoordinatorLink,
     partition: u32,
     node_id: u16,
-) -> Result<Option<Claimed>, BridgeError> {
+) -> Result<Option<Claimed>, LoadError> {
     let mut state = PartitionState::default();
     let mut next = 0;
     if let Some(last) = link.last(partition).await? {
@@ -166,7 +227,7 @@ pub async fn claim(
             }
             for logged in records {
                 next = logged.offset + 1;
-                apply_logged(&mut state, partition, &logged);
+                apply_logged(&mut state, partition, &logged)?;
             }
         }
     }
@@ -186,11 +247,11 @@ pub async fn claim(
     let deadline = Instant::now() + CLAIM_TIMEOUT;
     loop {
         if Instant::now() >= deadline {
-            return Err(BridgeError::Timeout);
+            return Err(BridgeError::Timeout.into());
         }
         for logged in link.read(partition, next, TAIL_WAIT).await? {
             next = logged.offset + 1;
-            let applied = apply_logged(&mut state, partition, &logged);
+            let applied = apply_logged(&mut state, partition, &logged)?;
             if logged.id != id {
                 continue;
             }
@@ -207,13 +268,21 @@ pub async fn claim(
 
 /// Decodes and applies one record. A record that does not decode is skipped: a load that stopped
 /// on it would leave the partition unserved for good.
+///
+/// # Errors
+///
+/// [`LoadError::Unreadable`] for a record that only a newer gateway reads.
 fn apply_logged(
     state: &mut PartitionState,
     partition: u32,
     logged: &LoggedRecord,
-) -> Option<Applied> {
+) -> Result<Option<Applied>, LoadError> {
     match Record::decode(&logged.payload) {
-        Ok(record) => Some(state.apply(logged.offset, logged.timestamp, record)),
+        Ok(record) => Ok(Some(state.apply(logged.offset, logged.timestamp, record))),
+        Err(source @ RecordError::Unreadable { .. }) => Err(LoadError::Unreadable {
+            offset: logged.offset,
+            source,
+        }),
         Err(error) => {
             warn!(
                 partition,
@@ -221,7 +290,7 @@ fn apply_logged(
                 %error,
                 "skipping a coordinator log record that does not decode"
             );
-            None
+            Ok(None)
         }
     }
 }
@@ -250,6 +319,8 @@ impl PartitionLog {
             checkpoint: AtomicU64::new(checkpoint),
             appends,
             pending: Mutex::new(HashMap::new()),
+            flying: Arc::new(Mutex::new(HashMap::new())),
+            read: Notify::new(),
             stop: parent.child_token(),
         });
         tokio::spawn(Arc::clone(&log).read_on(Arc::clone(&link), claimed.next, stopped.clone()));
@@ -270,10 +341,11 @@ impl PartitionLog {
     /// Stops serving. Every append still waiting gets `NOT_COORDINATOR`.
     pub fn stop(&self) {
         self.stop.cancel();
-        let pending: Vec<_> = self.pending().drain().map(|(_, done)| done).collect();
-        for done in pending {
-            let _ = done.send(Err(ERROR_NOT_COORDINATOR));
+        let pending: Vec<Waiter> = self.pending().drain().map(|(_, waiter)| waiter).collect();
+        for waiter in pending {
+            let _ = waiter.done.send(Err(ERROR_NOT_COORDINATOR));
         }
+        self.read.notify_waiters();
     }
 
     /// [`Self::append_by`] within [`APPEND_TIMEOUT`], answering `COORDINATOR_NOT_AVAILABLE` when
@@ -303,6 +375,83 @@ impl PartitionLog {
     pub async fn append_by(
         &self,
         bodies: Vec<Body>,
+        deadline: Instant,
+        late: i16,
+    ) -> Result<u64, i16> {
+        self.append_flying(bodies, None, deadline, late).await
+    }
+
+    /// Appends the commits of `group_id` that change what the log holds, as [`Self::append_by`].
+    /// A commit equal to the logged one, of an offset with no commit in flight, writes nothing
+    /// until the logged one is [`UNCHANGED_REFRESH`] old: a load restores the same offset.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::append_by`].
+    pub async fn commit(
+        &self,
+        group_id: &str,
+        offsets: Vec<(String, i32, CommittedOffset)>,
+        deadline: Instant,
+        late: i16,
+    ) -> Result<(), i16> {
+        if !self.is_serving() {
+            return Err(ERROR_NOT_COORDINATOR);
+        }
+        let (bodies, flight) = self.changed_commits(group_id, offsets).await;
+        if bodies.is_empty() {
+            return Ok(());
+        }
+        self.append_flying(bodies, Some(flight), deadline, late)
+            .await
+            .map(drop)
+    }
+
+    /// The records of the commits that change what the log holds, and their offsets counted in
+    /// flight. One step under the state's lock, so a commit that lands in between is either read
+    /// or counted.
+    async fn changed_commits(
+        &self,
+        group_id: &str,
+        offsets: Vec<(String, i32, CommittedOffset)>,
+    ) -> (Vec<Body>, Flight) {
+        let state = self.state.lock().await;
+        let logged = state.offsets.get(group_id);
+        let mut flying = lock(&self.flying);
+        let mut bodies = Vec::with_capacity(offsets.len());
+        let mut keys = Vec::with_capacity(offsets.len());
+        for (topic, partition, committed) in offsets {
+            let key = (group_id.to_owned(), (topic, partition));
+            let unchanged = !flying.contains_key(&key)
+                && logged
+                    .and_then(|logged| logged.entries.get(&key.1))
+                    .and_then(Option::as_ref)
+                    .is_some_and(|logged| repeats(logged, &committed));
+            if unchanged {
+                continue;
+            }
+            *flying.entry(key.clone()).or_default() += 1;
+            bodies.push(Body::Offset {
+                group_id: group_id.to_owned(),
+                topic: key.1.0.clone(),
+                partition,
+                committed: Some(committed),
+            });
+            keys.push(key);
+        }
+        drop(flying);
+        drop(state);
+        let flight = Flight {
+            counts: Arc::clone(&self.flying),
+            keys,
+        };
+        (bodies, flight)
+    }
+
+    async fn append_flying(
+        &self,
+        bodies: Vec<Body>,
+        flight: Option<Flight>,
         deadline: Instant,
         late: i16,
     ) -> Result<u64, i16> {
@@ -355,6 +504,7 @@ impl PartitionLog {
             records,
             bytes,
             done,
+            flight,
         };
         match timeout_at(deadline, self.appends.send(append)).await {
             Ok(Ok(())) => {}
@@ -428,41 +578,50 @@ impl PartitionLog {
         let mut state = self.state.lock().await;
         let mut stop = None;
         for logged in records {
-            let applied = apply_logged(&mut state, self.partition, logged);
+            let applied = match apply_logged(&mut state, self.partition, logged) {
+                Ok(applied) => applied,
+                // Only after a newer claim, which stops the partition first.
+                Err(error) => {
+                    error!(partition = self.partition, %error, "a newer gateway wrote the coordinator log partition; giving it up");
+                    stop = Some(Stop::InDoubt);
+                    break;
+                }
+            };
             if state.checkpoint != NO_CHECKPOINT {
                 self.checkpoint.store(state.checkpoint, Ordering::Release);
             }
-            let done = self.pending().remove(&logged.id);
+            let waiter = self.pending().remove(&logged.id);
             match applied {
                 Some(Applied::Claimed { claim, node_id }) if claim > self.claim => {
                     info!(
                         partition = self.partition,
                         claim, node_id, "another gateway claimed the coordinator log partition"
                     );
-                    if let Some(done) = done {
-                        let _ = done.send(Err(ERROR_NOT_COORDINATOR));
+                    if let Some(waiter) = waiter {
+                        let _ = waiter.done.send(Err(ERROR_NOT_COORDINATOR));
                     }
                     stop = Some(Stop::Claimed { node_id });
                     break;
                 }
                 // Unreachable in order, since the newer claim is read first. Kept so a record of
                 // this gateway is never answered as written when it does not count.
-                Some(Applied::Void) if done.is_some() => {
-                    if let Some(done) = done {
-                        let _ = done.send(Err(ERROR_NOT_COORDINATOR));
+                Some(Applied::Void) if waiter.is_some() => {
+                    if let Some(waiter) = waiter {
+                        let _ = waiter.done.send(Err(ERROR_NOT_COORDINATOR));
                     }
                     let node_id = state.owner.map_or(0, |(_, node_id)| node_id);
                     stop = Some(Stop::Claimed { node_id });
                     break;
                 }
                 _ => {
-                    if let Some(done) = done {
-                        let _ = done.send(Ok(logged.offset));
+                    if let Some(waiter) = waiter {
+                        let _ = waiter.done.send(Ok(logged.offset));
                     }
                 }
             }
         }
         drop(state);
+        self.read.notify_waiters();
         stop
     }
 
@@ -507,7 +666,7 @@ impl PartitionLog {
                     state.checkpoint_due(self.checkpoint_records, CHECKPOINT_AGE, now)
                 })
                 .await;
-            if due && let Err(error) = self.write_checkpoint(&link).await {
+            if due && let Err(error) = self.write_checkpoint(&link, &mut queue, &mut held).await {
                 warn!(partition = self.partition, %error, "a coordinator log checkpoint failed; giving the partition up");
                 break Some(Stop::InDoubt);
             }
@@ -560,24 +719,84 @@ impl PartitionLog {
         (batch, None)
     }
 
-    /// Sends one batch. Each append is answered when the reader reaches its last record.
-    async fn send(&self, link: &CoordinatorLink, batch: Vec<Append>) -> Result<(), BridgeError> {
+    /// Sends one batch. Each append is answered when the reader reaches its last record. Returns
+    /// the ids of those records.
+    async fn send(
+        &self,
+        link: &CoordinatorLink,
+        batch: Vec<Append>,
+    ) -> Result<Vec<u128>, BridgeError> {
         let mut records = Vec::with_capacity(batch.iter().map(|append| append.records.len()).sum());
-        let mut answers = Vec::with_capacity(batch.len());
+        let mut waiters = Vec::with_capacity(batch.len());
         for append in batch {
             if let Some((last, _)) = append.records.last() {
-                answers.push((*last, append.done));
+                let waiter = Waiter {
+                    done: append.done,
+                    _flight: append.flight,
+                };
+                waiters.push((*last, waiter));
             }
             records.extend(append.records);
         }
-        self.pending().extend(answers);
-        link.append(self.partition, records).await
+        let ids = waiters.iter().map(|(id, _)| *id).collect();
+        self.pending().extend(waiters);
+        link.append(self.partition, records).await?;
+        Ok(ids)
+    }
+
+    /// Sends one batch of the queued appends, if any. Returns the ids that [`Self::send`] does.
+    async fn send_queued(
+        &self,
+        link: &CoordinatorLink,
+        queue: &mut mpsc::Receiver<Append>,
+        held: &mut Option<Append>,
+    ) -> Result<Vec<u128>, BridgeError> {
+        let Some(first) = held.take().or_else(|| queue.try_recv().ok()) else {
+            return Ok(Vec::new());
+        };
+        let (batch, rest) = self.batch(first, queue);
+        *held = rest;
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.send(link, batch).await
+    }
+
+    /// Waits until the reader has read the records `ids` name, at most [`APPEND_TIMEOUT`].
+    async fn await_read(&self, ids: &[u128]) -> Result<(), WriteError> {
+        let deadline = Instant::now() + APPEND_TIMEOUT;
+        loop {
+            let read = self.read.notified();
+            tokio::pin!(read);
+            read.as_mut().enable();
+            if !self.is_serving() {
+                return Err(WriteError::Lost);
+            }
+            let unread = {
+                let pending = self.pending();
+                ids.iter().any(|id| pending.contains_key(id))
+            };
+            if !unread {
+                return Ok(());
+            }
+            if timeout_at(deadline, read).await.is_err() {
+                return Err(WriteError::NotReadBack);
+            }
+        }
     }
 
     /// Rewrites every live group and offset between a begin and an end record, so a later load
-    /// starts at the begin. The records go back to back, and only the end is waited for: the
-    /// reader reaches it after all of them.
-    async fn write_checkpoint(&self, link: &CoordinatorLink) -> Result<(), WriteError> {
+    /// starts at the begin.
+    ///
+    /// Appends that queue meanwhile go between the chunks, so a caller waits for one chunk at
+    /// most. Each chunk is built from the state once the reader has read every append sent before
+    /// it: a chunk built earlier could land an older value after a newer one.
+    async fn write_checkpoint(
+        &self,
+        link: &CoordinatorLink,
+        queue: &mut mpsc::Receiver<Append>,
+        held: &mut Option<Append>,
+    ) -> Result<(), WriteError> {
         let checkpoint = self.checkpoint.load(Ordering::Acquire);
         let opening = Body::CheckpointBegin {
             node_id: self.node_id,
@@ -585,42 +804,23 @@ impl PartitionLog {
         let begin = self
             .append_now(link, vec![self.record(opening, checkpoint)?])
             .await?;
-        let bodies = self.with_state(PartitionState::checkpoint_bodies).await;
-        let max_record = self.max_record_bytes();
-        let max_bytes = MAX_BATCH_BYTES.min(self.max_send_bytes);
-        let mut chunk = Vec::new();
-        let mut bytes = 0;
-        for body in bodies {
-            let record = Record {
-                claim: self.claim,
-                checkpoint,
-                body,
+        // The reader read the begin, so the state holds every record before it.
+        let units = self.with_state(PartitionState::checkpoint_units).await;
+        let mut cursor = CheckpointCursor::default();
+        loop {
+            if !self.is_serving() {
+                return Err(WriteError::Lost);
+            }
+            let chunk = {
+                let state = self.state.lock().await;
+                self.checkpoint_chunk(&state, &units, &mut cursor, checkpoint)?
             };
-            let payload = record.encode()?;
-            if payload.len() > max_record {
-                // Only after Iggy's message size went down. Leaving it out keeps the partition
-                // served, and the group's members rejoin after a takeover.
-                warn!(
-                    partition = self.partition,
-                    bytes = payload.len(),
-                    group = record.body.group_id().unwrap_or_default(),
-                    "a coordinator log record is over Iggy's message size; the checkpoint leaves it out"
-                );
-                continue;
+            if chunk.is_empty() {
+                break;
             }
-            let record_bytes = send_bytes(&payload);
-            if !chunk.is_empty()
-                && (chunk.len() >= MAX_BATCH_RECORDS || bytes + record_bytes > max_bytes)
-            {
-                link.append(self.partition, std::mem::take(&mut chunk))
-                    .await?;
-                bytes = 0;
-            }
-            chunk.push((Uuid::new_v4().as_u128(), payload));
-            bytes += record_bytes;
-        }
-        if !chunk.is_empty() {
             link.append(self.partition, chunk).await?;
+            let sent = self.send_queued(link, queue, held).await?;
+            self.await_read(&sent).await?;
         }
         let end = Body::CheckpointEnd { begin };
         self.append_now(link, vec![self.record(end, checkpoint)?])
@@ -630,6 +830,79 @@ impl PartitionLog {
             begin, "coordinator log checkpoint written"
         );
         Ok(())
+    }
+
+    /// The next records of a checkpoint over `units` from `cursor`, built from `state`, up to what
+    /// one send carries. Moves `cursor` past them. Empty once every unit is written.
+    fn checkpoint_chunk(
+        &self,
+        state: &PartitionState,
+        units: &[CheckpointUnit],
+        cursor: &mut CheckpointCursor,
+        checkpoint: u64,
+    ) -> Result<Vec<(u128, Bytes)>, RecordError> {
+        let max_bytes = MAX_BATCH_BYTES.min(self.max_send_bytes);
+        let max_record = self.max_record_bytes();
+        let mut chunk = Vec::new();
+        let mut bytes = 0;
+        let mut failed = None;
+        while let Some(unit) = units.get(cursor.unit) {
+            let after = cursor.after.take();
+            let mut last = after.clone();
+            let mut full = false;
+            // A group's deletion alone in the chunk still takes the next offset, so a chunk
+            // always gets past it.
+            let mut alone = false;
+            state.rewrite_unit(unit, after.as_ref(), |body, key| {
+                let record = Record {
+                    claim: self.claim,
+                    checkpoint,
+                    body,
+                };
+                let payload = match record.encode() {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        failed = Some(error);
+                        return false;
+                    }
+                };
+                if payload.len() > max_record {
+                    // Only after Iggy's message size went down. Leaving it out keeps the
+                    // partition served, and the group's members rejoin after a takeover.
+                    warn!(
+                        partition = self.partition,
+                        bytes = payload.len(),
+                        group = record.body.group_id().unwrap_or_default(),
+                        "a coordinator log record is over Iggy's message size; the checkpoint leaves it out"
+                    );
+                    if let Some(key) = key {
+                        last = Some(key.clone());
+                    }
+                    return true;
+                }
+                let record_bytes = send_bytes(&payload);
+                if !chunk.is_empty() && !alone && bytes + record_bytes > max_bytes {
+                    full = true;
+                    return false;
+                }
+                alone = chunk.is_empty() && key.is_none();
+                chunk.push((Uuid::new_v4().as_u128(), payload));
+                bytes += record_bytes;
+                if let Some(key) = key {
+                    last = Some(key.clone());
+                }
+                true
+            });
+            if let Some(error) = failed {
+                return Err(error);
+            }
+            if full {
+                cursor.after = last;
+                return Ok(chunk);
+            }
+            cursor.unit += 1;
+        }
+        Ok(chunk)
     }
 
     /// `body` as a record of this claim, with a new id.
@@ -651,7 +924,11 @@ impl PartitionLog {
     ) -> Result<u64, WriteError> {
         let (done, answer) = oneshot::channel();
         if let Some((last, _)) = records.last() {
-            self.pending().insert(*last, done);
+            let waiter = Waiter {
+                done,
+                _flight: None,
+            };
+            self.pending().insert(*last, waiter);
         }
         link.append(self.partition, records).await?;
         match timeout(APPEND_TIMEOUT, answer).await {
@@ -669,16 +946,33 @@ impl PartitionLog {
             .min(MAX_PAYLOAD_SIZE as usize)
     }
 
-    fn pending(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<u128, oneshot::Sender<Result<u64, i16>>>> {
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    fn pending(&self) -> MutexGuard<'_, HashMap<u128, Waiter>> {
+        lock(&self.pending)
     }
+}
+
+/// Whether `committed` repeats `logged`: the same offset, epoch, metadata and topic, committed
+/// within [`UNCHANGED_REFRESH`] of it.
+fn repeats(logged: &CommittedOffset, committed: &CommittedOffset) -> bool {
+    let refresh = i64::try_from(UNCHANGED_REFRESH.as_millis()).unwrap_or(i64::MAX);
+    logged.offset == committed.offset
+        && logged.leader_epoch == committed.leader_epoch
+        && logged.metadata == committed.metadata
+        && logged.topic_incarnation == committed.topic_incarnation
+        && committed
+            .commit_timestamp_ms
+            .saturating_sub(logged.commit_timestamp_ms)
+            < refresh
 }
 
 /// What `payload` takes of a send, with its message header.
 const fn send_bytes(payload: &Bytes) -> u64 {
     (payload.len() + IGGY_MESSAGE_HEADER_SIZE) as u64
+}
+
+/// Each update is whole, so the state stays sound after a panic elsewhere.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]
@@ -698,6 +992,8 @@ mod tests {
             checkpoint: AtomicU64::new(NO_CHECKPOINT),
             appends,
             pending: Mutex::new(HashMap::new()),
+            flying: Arc::new(Mutex::new(HashMap::new())),
+            read: Notify::new(),
             stop: CancellationToken::new(),
         };
         (log, queue)
@@ -709,8 +1005,33 @@ mod tests {
             records: vec![(id, Bytes::new())],
             bytes,
             done,
+            flight: None,
         };
         (append, answer)
+    }
+
+    fn committed(offset: i64, commit_timestamp_ms: i64) -> CommittedOffset {
+        CommittedOffset {
+            offset,
+            leader_epoch: -1,
+            metadata: None,
+            commit_timestamp_ms,
+            topic_incarnation: Some(4),
+        }
+    }
+
+    /// The state after `bodies`, read one record after another.
+    fn applied(bodies: Vec<Body>) -> PartitionState {
+        let mut state = PartitionState::default();
+        for (offset, body) in bodies.into_iter().enumerate() {
+            let record = Record {
+                claim: 1,
+                checkpoint: NO_CHECKPOINT,
+                body,
+            };
+            state.apply(offset as u64, 0, record);
+        }
+        state
     }
 
     #[test]
@@ -733,5 +1054,96 @@ mod tests {
             Some(4),
             "the next send starts with what did not fit"
         );
+    }
+
+    /// The Java consumer commits every assigned partition every 5 s, also when its position did
+    /// not move.
+    #[tokio::test]
+    async fn given_a_commit_equal_to_the_logged_one_should_write_nothing_until_it_is_old() {
+        let (log, _queue) = unserved(MAX_BATCH_BYTES);
+        let logged = Body::Offset {
+            group_id: "g".to_string(),
+            topic: "orders".to_string(),
+            partition: 0,
+            committed: Some(committed(5, 1_000)),
+        };
+        *log.state.lock().await = applied(vec![logged]);
+        let refresh = i64::try_from(UNCHANGED_REFRESH.as_millis()).unwrap();
+        let commits = |entries: &[(i32, i64, i64)]| {
+            entries
+                .iter()
+                .map(|&(partition, offset, at)| {
+                    ("orders".to_string(), partition, committed(offset, at))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let (bodies, flight) = log
+            .changed_commits("g", commits(&[(0, 5, 2_000), (0, 6, 2_000), (1, 5, 2_000)]))
+            .await;
+        assert_eq!(bodies.len(), 2, "the moved offset and the new partition");
+        let (repeat, _) = log.changed_commits("g", commits(&[(0, 5, 2_000)])).await;
+        assert_eq!(
+            repeat.len(),
+            1,
+            "an offset in flight is written, though it equals the logged one"
+        );
+        drop(flight);
+
+        let (unchanged, _) = log
+            .changed_commits("g", commits(&[(0, 5, 1_000 + refresh - 1)]))
+            .await;
+        assert_eq!(unchanged, Vec::<Body>::new());
+        let (refreshed, _) = log
+            .changed_commits("g", commits(&[(0, 5, 1_000 + refresh)]))
+            .await;
+        assert_eq!(refreshed.len(), 1, "an hour later it is logged again");
+    }
+
+    /// A load from the checkpoint's begin must rebuild what the owner holds, also when the chunks
+    /// split a group's offsets.
+    #[test]
+    fn given_small_sends_should_split_a_checkpoint_into_chunks_that_rebuild_the_state() {
+        let mut bodies = vec![Body::GroupOffsetsDeleted {
+            group_id: "deleted".to_string(),
+        }];
+        for partition in 0..20 {
+            bodies.push(Body::Offset {
+                group_id: if partition % 2 == 0 {
+                    "deleted"
+                } else {
+                    "kept"
+                }
+                .to_string(),
+                topic: "orders".to_string(),
+                partition,
+                committed: Some(committed(i64::from(partition), 0)),
+            });
+        }
+        let state = applied(bodies);
+        let (log, _queue) = unserved(600);
+        let units = state.checkpoint_units();
+        let mut cursor = CheckpointCursor::default();
+        let mut chunks = Vec::new();
+        loop {
+            let chunk = log
+                .checkpoint_chunk(&state, &units, &mut cursor, NO_CHECKPOINT)
+                .expect("the records encode");
+            if chunk.is_empty() {
+                break;
+            }
+            assert!(chunks.len() < 100, "every chunk makes progress");
+            chunks.push(chunk);
+        }
+        assert!(chunks.len() > 2, "{} chunks", chunks.len());
+
+        let rebuilt = applied(
+            chunks
+                .into_iter()
+                .flatten()
+                .map(|(_, payload)| Record::decode(&payload).expect("a record").body)
+                .collect(),
+        );
+        assert_eq!(rebuilt.offsets, state.offsets);
     }
 }

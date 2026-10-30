@@ -521,10 +521,11 @@ pub fn encode_response(
 }
 
 /// Real (bridge-backed) response: unlike [`encode_response`], each topic carries its own
-/// resolved error code and, on success, one [`MetadataResponsePartition`] per partition, with the
-/// gateway `placement` names as leader, replica and ISR. Every gateway can serve every partition,
-/// because the SDK sends each partition request to its Iggy primary. The leader spreads the
-/// clients over the gateways, and only live gateways are listed.
+/// resolved error code and, on success, one [`MetadataResponsePartition`] per partition with
+/// this gateway as leader, replica and ISR. Every gateway can serve every partition, because the
+/// SDK sends each partition request to its Iggy primary. So a client of a gateway that stops, or
+/// crashes, goes on through another at its next Metadata, and a producer holds one Iggy session.
+/// `placement` names the controller and the live gateways.
 fn encode_real_response(
     response_version: i16,
     results: &[TopicResult],
@@ -533,21 +534,18 @@ fn encode_real_response(
     cluster_id: &ClusterId,
     placement: &Placement,
 ) -> Result<Bytes> {
+    let own = BrokerId(brokers.node_id);
     let response_topics = results
         .iter()
         .map(|result| {
             let partitions = if result.error_code == ERROR_NONE {
                 (0..result.partitions_count)
                     .map(|index| {
-                        let index = i32::try_from(index).unwrap_or(i32::MAX);
-                        let leader = BrokerId(
-                            brokers.listed_or_own(placement.leader_of(result.name.as_str(), index)),
-                        );
                         MetadataResponsePartition::default()
-                            .with_partition_index(index)
-                            .with_leader_id(leader)
-                            .with_replica_nodes(vec![leader])
-                            .with_isr_nodes(vec![leader])
+                            .with_partition_index(i32::try_from(index).unwrap_or(i32::MAX))
+                            .with_leader_id(own)
+                            .with_replica_nodes(vec![own])
+                            .with_isr_nodes(vec![own])
                     })
                     .collect()
             } else {
@@ -941,9 +939,10 @@ mod tests {
         }
     }
 
+    /// A gateway that crashed stays an owner until another claims its partitions. Leading every
+    /// partition here keeps its clients going through the others meanwhile.
     #[test]
-    fn given_owned_coordinator_partitions_when_answering_should_list_live_gateways_and_spread_leaders()
-     {
+    fn given_owned_coordinator_partitions_when_answering_should_list_live_gateways_and_lead_here() {
         let own = BrokerAdvertise {
             host: "gateway-2.example".to_string(),
             port: 9092,
@@ -983,18 +982,9 @@ mod tests {
             .collect();
         assert_eq!(listed, [1, 2]);
         assert_eq!(response.controller_id, BrokerId(1));
-        let leaders: std::collections::BTreeSet<i32> = response.topics[0]
-            .partitions
-            .iter()
-            .map(|partition| {
-                assert_eq!(partition.replica_nodes, vec![partition.leader_id]);
-                partition.leader_id.0
-            })
-            .collect();
-        assert_eq!(leaders, [1, 2].into());
         for partition in &response.topics[0].partitions {
-            let expected = placement.leader_of("orders", partition.partition_index);
-            assert_eq!(partition.leader_id, BrokerId(i32::from(expected)));
+            assert_eq!(partition.leader_id, BrokerId(2));
+            assert_eq!(partition.replica_nodes, vec![BrokerId(2)]);
         }
     }
 }

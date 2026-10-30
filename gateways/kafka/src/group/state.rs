@@ -132,6 +132,36 @@ pub enum Step<T> {
     },
 }
 
+/// Outcome of one `JoinGroup` step when the coordinator log keeps the groups.
+pub enum JoinStep {
+    Step(Step<JoinResult>),
+    /// A static member took its instance id over in `Stable`, under a new member id, and keeps
+    /// the assignment in effect. Store this state, then call [`finish_replacement`]: a takeover
+    /// of the group before the store would restore the old member id and fence the member. Kafka
+    /// stores this case too (`updateStaticMemberThenRebalanceOrCompleteJoin`).
+    Store(GroupSnapshot, Replacement),
+}
+
+/// What [`finish_replacement`] needs to answer a replaced static member, or to put the member it
+/// replaced back.
+pub struct Replacement {
+    instance_id: StrBytes,
+    old_member_id: StrBytes,
+    new_member_id: StrBytes,
+    previous_leader: StrBytes,
+    supports_skip_assignment: bool,
+    previous: PreviousJoin,
+}
+
+/// What a join changes on a member, as it was before.
+struct PreviousJoin {
+    client_id: StrBytes,
+    client_host: StrBytes,
+    session_timeout: Duration,
+    rebalance_timeout: Duration,
+    protocols: Vec<(StrBytes, Bytes)>,
+}
+
 /// Outcome of one `SyncGroup` step when the coordinator log keeps the groups.
 pub enum SyncStep {
     Step(Step<SyncResult>),
@@ -216,6 +246,27 @@ impl Member {
     fn note_client(&mut self, request: &JoinRequest) {
         self.client_id.clone_from(&request.client_id);
         self.client_host.clone_from(&request.client_host);
+    }
+
+    fn previous_join(&self) -> PreviousJoin {
+        PreviousJoin {
+            client_id: self.client_id.clone(),
+            client_host: self.client_host.clone(),
+            session_timeout: self.session_timeout,
+            rebalance_timeout: self.rebalance_timeout,
+            protocols: self.protocols.clone(),
+        }
+    }
+
+    /// Undoes a join, and starts the session again at `now`, as Kafka does for the member it puts
+    /// back.
+    fn undo_join(&mut self, previous: PreviousJoin, now: Instant) {
+        self.client_id = previous.client_id;
+        self.client_host = previous.client_host;
+        self.session_timeout = previous.session_timeout;
+        self.rebalance_timeout = previous.rebalance_timeout;
+        self.protocols = previous.protocols;
+        self.session_deadline = now + self.session_timeout;
     }
 
     fn roster_bytes(&self, member_id: &StrBytes) -> usize {
@@ -338,8 +389,8 @@ impl GroupState {
     }
 
     /// The group a coordinator log kept, `Stable` in the generation it stored. Each member's
-    /// session starts again at `now`, as Kafka's coordinator does when it loads a group. `None`
-    /// for a snapshot with no members.
+    /// session starts again at `now`, and it keeps only the selected protocol, as Kafka's
+    /// coordinator does when it loads a group. `None` for a snapshot with no members.
     pub(super) fn restore(
         snapshot: &GroupSnapshot,
         now: Instant,
@@ -388,7 +439,22 @@ impl GroupState {
 
     /// This group as the coordinator log keeps it, with `assignments` as the leader's sync gave
     /// them. A member the leader left out keeps empty bytes, as [`Self::apply_assignments`] does.
+    /// The blobs are shared, not copied: the snapshot lives only until its record is encoded.
     fn snapshot_with(&self, assignments: &[(StrBytes, Bytes)]) -> GroupSnapshot {
+        let by_member = assignments_by_member(assignments);
+        self.snapshot_by(|member_id, _| {
+            by_member
+                .get(member_id)
+                .map_or_else(Bytes::new, |blob| Bytes::clone(blob))
+        })
+    }
+
+    /// This group as the coordinator log keeps it, with the assignments in effect.
+    fn snapshot(&self) -> GroupSnapshot {
+        self.snapshot_by(|_, member| member.assignment.clone())
+    }
+
+    fn snapshot_by(&self, assignment_of: impl Fn(&StrBytes, &Member) -> Bytes) -> GroupSnapshot {
         let selected = self.protocol_name.clone().unwrap_or_default();
         GroupSnapshot {
             generation_id: self.generation_id,
@@ -406,10 +472,7 @@ impl GroupState {
                     session_timeout_ms: duration_millis(member.session_timeout),
                     rebalance_timeout_ms: duration_millis(member.rebalance_timeout),
                     metadata: member.metadata_for(&selected),
-                    assignment: assignments
-                        .iter()
-                        .find(|(target, _)| target == member_id)
-                        .map_or_else(Bytes::new, |(_, blob)| Bytes::copy_from_slice(blob)),
+                    assignment: assignment_of(member_id, member),
                 })
                 .collect(),
         }
@@ -871,18 +934,14 @@ impl GroupState {
     /// `updateStaticMemberThenRebalanceOrCompleteJoin`). From v9 a replaced leader gets the roster
     /// and `skip_assignment`. Below v9 the response names the previous leader, so a replaced
     /// leader acts as a follower and does not reassign.
-    fn replaced_static_result(
-        &self,
-        member_id: &StrBytes,
-        previous_leader: &StrBytes,
-        supports_skip_assignment: bool,
-    ) -> JoinResult {
+    fn replaced_result(&self, replacement: &Replacement) -> JoinResult {
+        let member_id = &replacement.new_member_id;
         let is_leader = self.leader.as_ref() == Some(member_id);
-        let (leader, members, skip_assignment) = if supports_skip_assignment {
+        let (leader, members, skip_assignment) = if replacement.supports_skip_assignment {
             let members = if is_leader { self.roster() } else { Vec::new() };
             (self.leader.clone().unwrap_or_default(), members, is_leader)
         } else {
-            (previous_leader.clone(), Vec::new(), false)
+            (replacement.previous_leader.clone(), Vec::new(), false)
         };
         JoinResult {
             error: ERROR_NONE,
@@ -894,6 +953,20 @@ impl GroupState {
             members,
             skip_assignment,
         }
+    }
+
+    /// Puts the member that `replacement` replaced back under its old id, with what its join
+    /// changed undone.
+    fn undo_replacement(&mut self, replacement: Replacement, now: Instant) {
+        let Some(mut member) = self.members.remove(&replacement.new_member_id) else {
+            return;
+        };
+        member.undo_join(replacement.previous, now);
+        self.insert_member(replacement.old_member_id.clone(), member);
+        if self.leader.as_ref() == Some(&replacement.new_member_id) {
+            self.leader = Some(replacement.old_member_id);
+        }
+        self.bump();
     }
 
     /// The member list an assignor needs, in the group's selected protocol.
@@ -924,11 +997,11 @@ impl GroupState {
     /// Fan the leader's blobs out to every member. A member the leader left out gets empty bytes,
     /// which is what a broker stores for it too.
     fn apply_assignments(&mut self, assignments: &[(StrBytes, Bytes)], now: Instant) {
+        let by_member = assignments_by_member(assignments);
         for (member_id, member) in &mut self.members {
-            member.assignment = assignments
-                .iter()
-                .find(|(target, _)| target == member_id)
-                .map_or_else(Bytes::new, |(_, blob)| Bytes::copy_from_slice(blob));
+            member.assignment = by_member
+                .get(member_id)
+                .map_or_else(Bytes::new, |blob| Bytes::copy_from_slice(blob));
         }
         if let Some(leader) = self.leader.clone() {
             self.mark_synced(&leader);
@@ -1039,6 +1112,15 @@ impl GroupState {
         }
         Subscribed::Topics(topics)
     }
+}
+
+/// The leader's blob for each member id, the first where a sync names a member twice.
+fn assignments_by_member(assignments: &[(StrBytes, Bytes)]) -> HashMap<&StrBytes, &Bytes> {
+    let mut by_member = HashMap::with_capacity(assignments.len());
+    for (member_id, blob) in assignments {
+        by_member.entry(member_id).or_insert(blob);
+    }
+    by_member
 }
 
 /// A `StrBytes` that owns a copy of `value`.
@@ -1241,13 +1323,38 @@ fn ensure_group(
     Ok(true)
 }
 
+#[cfg(test)]
 pub fn join_step(
     groups: &mut Groups,
     config: &GroupCoordinatorConfig,
     request: &JoinRequest,
     now: Instant,
 ) -> Step<JoinResult> {
-    let reject = |error: i16| Step::Respond(JoinResult::error(error, request.member_id.clone()));
+    match join_or_store_step(groups, config, request, now, false) {
+        JoinStep::Step(step) => step,
+        // Asked for no store, so never reached.
+        JoinStep::Store(..) => Step::Respond(JoinResult::error(
+            ERROR_UNKNOWN_SERVER_ERROR,
+            request.member_id.clone(),
+        )),
+    }
+}
+
+/// `join_step`, except that with `store_first` a static member that takes its instance id over
+/// in `Stable` asks for the group to be stored before it is answered.
+pub fn join_or_store_step(
+    groups: &mut Groups,
+    config: &GroupCoordinatorConfig,
+    request: &JoinRequest,
+    now: Instant,
+    store_first: bool,
+) -> JoinStep {
+    let reject = |error: i16| {
+        JoinStep::Step(Step::Respond(JoinResult::error(
+            error,
+            request.member_id.clone(),
+        )))
+    };
     // A group this call created must not outlive a rejection further down: the checks below run
     // after the insert, and a group left behind holds its `max_groups` slot with no member to
     // ever expire and release it.
@@ -1255,7 +1362,7 @@ pub fn join_step(
         if created {
             groups.remove(&request.group_id);
         }
-        Step::Respond(JoinResult::error(error, request.member_id.clone()))
+        reject(error)
     };
 
     if let Some(error) = join_request_error(config, request) {
@@ -1284,11 +1391,11 @@ pub fn join_step(
             .and_then(|instance_id| group.static_holder(instance_id))
             .cloned()
     {
-        return replace_static(group, config, &holder, request, now);
+        return replace_static(group, config, &holder, request, now, store_first);
     }
 
     if request.member_id.is_empty() {
-        return join_new_member(groups, config, request, created, now);
+        return JoinStep::Step(join_new_member(groups, config, request, created, now));
     }
 
     if group.pending.contains_key(&request.member_id) {
@@ -1309,7 +1416,7 @@ pub fn join_step(
         if group.roster_overflows(config, &request.member_id, request) {
             return reject(ERROR_GROUP_MAX_SIZE_REACHED);
         }
-        return admit(group, config, &request.member_id, request, now);
+        return JoinStep::Step(admit(group, config, &request.member_id, request, now));
     }
     if let Err(error) =
         group.validate_member(&request.member_id, request.group_instance_id.as_ref())
@@ -1325,7 +1432,14 @@ pub fn join_step(
     let protocols_changed = member.protocols != request.protocols;
     let is_leader = group.leader.as_ref() == Some(&request.member_id);
 
-    rejoin_step(group, config, request, is_leader, protocols_changed, now)
+    JoinStep::Step(rejoin_step(
+        group,
+        config,
+        request,
+        is_leader,
+        protocols_changed,
+        now,
+    ))
 }
 
 /// A join with no member id and no instance held: capacity checks, then `MEMBER_ID_REQUIRED` or
@@ -2183,35 +2297,36 @@ fn admit(
 /// under a new id (Kafka's `updateStaticMemberThenRebalanceOrCompleteJoin`).
 ///
 /// The assignment and generation carry over, so a `Stable` group does not rebalance unless the
-/// returning member's protocols change the selected protocol. In `CompletingRebalance` the leader
-/// may already be assigning to the old id, so a rebalance opens. Capacity caps do not apply: the
-/// group does not grow.
+/// returning member's protocols change the selected protocol. With `store_first` that case asks
+/// for the group to be stored before the member learns its new id. In `CompletingRebalance` the
+/// leader may already be assigning to the old id, so a rebalance opens. Capacity caps do not
+/// apply: the group does not grow.
 fn replace_static(
     group: &mut GroupState,
     config: &GroupCoordinatorConfig,
     old_member_id: &StrBytes,
     request: &JoinRequest,
     now: Instant,
-) -> Step<JoinResult> {
+    store_first: bool,
+) -> JoinStep {
     let new_member_id = generate_member_id(request);
     if group.roster_overflows_replacing(config, old_member_id, &new_member_id, request) {
-        return Step::Respond(JoinResult::error(
+        return JoinStep::Step(Step::Respond(JoinResult::error(
             ERROR_GROUP_MAX_SIZE_REACHED,
             request.member_id.clone(),
-        ));
+        )));
     }
     let previous_leader = group.leader.clone().unwrap_or_default();
-    let holder = request
-        .group_instance_id
-        .as_ref()
-        .and_then(|instance_id| group.static_members.get_mut(instance_id));
+    let instance_id = request.group_instance_id.clone().unwrap_or_default();
+    let holder = group.static_members.get_mut(&instance_id);
     let (Some(holder), Some(mut member)) = (holder, group.members.remove(old_member_id)) else {
-        return Step::Respond(JoinResult::error(
+        return JoinStep::Step(Step::Respond(JoinResult::error(
             ERROR_UNKNOWN_MEMBER_ID,
             request.member_id.clone(),
-        ));
+        )));
     };
     *holder = new_member_id.clone();
+    let previous = member.previous_join();
     member.rejoin(request, now, config.max_rebalance_timeout);
     group.members.insert(new_member_id.clone(), member);
     if group.leader.as_ref() == Some(old_member_id) {
@@ -2228,11 +2343,18 @@ fn replace_static(
                 // The replacement keeps the assignment in effect, so it owes no sync.
                 group.mark_synced(&new_member_id);
                 group.bump();
-                return Step::Respond(group.replaced_static_result(
-                    &new_member_id,
-                    &previous_leader,
-                    request.supports_skip_assignment,
-                ));
+                let replacement = Replacement {
+                    instance_id,
+                    old_member_id: old_member_id.clone(),
+                    new_member_id,
+                    previous_leader,
+                    supports_skip_assignment: request.supports_skip_assignment,
+                    previous,
+                };
+                if store_first {
+                    return JoinStep::Store(group.snapshot(), replacement);
+                }
+                return JoinStep::Step(Step::Respond(group.replaced_result(&replacement)));
             }
             group.prepare_rebalance(now, Some(&new_member_id));
         }
@@ -2240,7 +2362,37 @@ fn replace_static(
         Phase::PreparingRebalance => group.bump(),
     }
     group.maybe_complete_join(now);
-    park_or_respond(group, &new_member_id, now)
+    JoinStep::Step(park_or_respond(group, &new_member_id, now))
+}
+
+/// Ends the store that [`join_or_store_step`] asked for, and answers the static member. Once
+/// stored, it gets the generation in effect. A refused store puts the member it replaced back,
+/// as Kafka does, and it gets the refusal with no member id. A member that another join of its
+/// instance replaced meanwhile gets `FENCED_INSTANCE_ID`, and one whose instance left gets
+/// `UNKNOWN_MEMBER_ID`. A group that is gone answers the refusal of the store, else `gone`.
+pub fn finish_replacement(
+    groups: &mut Groups,
+    group_id: &StrBytes,
+    replacement: Replacement,
+    stored: Result<(), i16>,
+    gone: i16,
+    now: Instant,
+) -> JoinResult {
+    let Some(group) = groups.get_mut(group_id) else {
+        return JoinResult::error(stored.err().unwrap_or(gone), StrBytes::new());
+    };
+    match group.static_holder(&replacement.instance_id) {
+        Some(holder) if *holder == replacement.new_member_id => {}
+        Some(_) => return JoinResult::error(ERROR_FENCED_INSTANCE_ID, StrBytes::new()),
+        None => return JoinResult::error(ERROR_UNKNOWN_MEMBER_ID, StrBytes::new()),
+    }
+    match stored {
+        Ok(()) => group.replaced_result(&replacement),
+        Err(refusal) => {
+            group.undo_replacement(replacement, now);
+            JoinResult::error(refusal, StrBytes::new())
+        }
+    }
 }
 
 fn park_or_respond(group: &mut GroupState, member_id: &StrBytes, now: Instant) -> Step<JoinResult> {
@@ -5036,6 +5188,135 @@ mod tests {
         };
         assert_eq!(synced.error, ERROR_NONE);
         assert_eq!(synced.assignment, Bytes::from_static(b"b-blob"));
+    }
+
+    /// A takeover of the group restores what the log holds. Unstored, the replacement would come
+    /// back under the old member id, and the member's next heartbeat would be fenced.
+    #[test]
+    fn given_a_stable_static_group_with_the_log_when_a_member_returns_should_store_it_first() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (leader, follower) = stable_static_pair(&mut groups, &config, &["x"], now);
+        let generation = groups[&group_id()].generation_id;
+
+        let JoinStep::Store(snapshot, replacement) = join_or_store_step(
+            &mut groups,
+            &config,
+            &static_join("", "i-b", &["x"]),
+            now,
+            true,
+        ) else {
+            panic!("a replacement in Stable is stored before it is answered");
+        };
+        let stored: Vec<(&str, Option<&str>, &[u8])> = snapshot
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    member.member_id.as_str(),
+                    member.group_instance_id.as_deref(),
+                    member.assignment.as_ref(),
+                )
+            })
+            .collect();
+        assert!(stored.contains(&(leader.as_str(), Some("i-a"), b"a-blob".as_slice())));
+        let returned = stored
+            .iter()
+            .find(|(_, instance_id, _)| *instance_id == Some("i-b"))
+            .expect("the returning member");
+        assert_ne!(returned.0, follower.as_str());
+        assert_eq!(returned.2, b"b-blob", "the assignment carries over");
+
+        let answered = finish_replacement(
+            &mut groups,
+            &group_id(),
+            replacement,
+            Ok(()),
+            ERROR_UNKNOWN_MEMBER_ID,
+            now,
+        );
+        assert_eq!(answered.error, ERROR_NONE);
+        assert_eq!(answered.member_id.as_str(), returned.0);
+        assert_eq!(answered.generation_id, generation);
+        assert_eq!(groups[&group_id()].phase, Phase::Stable);
+    }
+
+    /// Kafka reverts the takeover when its record does not land.
+    #[test]
+    fn given_a_static_replacement_whose_store_fails_should_put_the_old_member_back() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (_, follower) = stable_static_pair(&mut groups, &config, &["x"], now);
+        let generation = groups[&group_id()].generation_id;
+        let JoinStep::Store(_, replacement) = join_or_store_step(
+            &mut groups,
+            &config,
+            &static_join("", "i-b", &["x"]),
+            now,
+            true,
+        ) else {
+            panic!("a replacement in Stable is stored first");
+        };
+
+        let later = now + Duration::from_secs(1);
+        let answered = finish_replacement(
+            &mut groups,
+            &group_id(),
+            replacement,
+            Err(ERROR_COORDINATOR_NOT_AVAILABLE),
+            ERROR_UNKNOWN_MEMBER_ID,
+            later,
+        );
+
+        assert_eq!(answered.error, ERROR_COORDINATOR_NOT_AVAILABLE);
+        assert!(answered.member_id.is_empty());
+        let group = &groups[&group_id()];
+        assert_eq!(group.static_holder(&instance("i-b")), Some(&follower));
+        assert_eq!(group.members.len(), 2);
+        assert_eq!(
+            heartbeat_step(
+                &mut groups,
+                &group_id(),
+                generation,
+                &follower,
+                Some(&instance("i-b")),
+                later,
+            ),
+            ERROR_NONE,
+            "the old member goes on"
+        );
+    }
+
+    #[test]
+    fn given_a_static_replacement_taken_over_again_during_its_store_should_be_fenced() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let _ = stable_static_pair(&mut groups, &config, &["x"], now);
+        let returning = static_join("", "i-b", &["x"]);
+        let JoinStep::Store(_, first) =
+            join_or_store_step(&mut groups, &config, &returning, now, true)
+        else {
+            panic!("a replacement in Stable is stored first");
+        };
+        let JoinStep::Store(_, _second) =
+            join_or_store_step(&mut groups, &config, &returning, now, true)
+        else {
+            panic!("so is the next one");
+        };
+
+        let answered = finish_replacement(
+            &mut groups,
+            &group_id(),
+            first,
+            Ok(()),
+            ERROR_UNKNOWN_MEMBER_ID,
+            now,
+        );
+
+        assert_eq!(answered.error, ERROR_FENCED_INSTANCE_ID);
     }
 
     #[test]

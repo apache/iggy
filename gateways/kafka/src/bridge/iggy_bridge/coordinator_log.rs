@@ -56,9 +56,14 @@ pub const COORDINATOR_OWNER_TOPIC: &str = "coordinator_owners";
 /// gateways.
 pub const COORDINATOR_LEASE_GROUP: &str = "kafka-gateways";
 
-/// How long Iggy keeps a log record. A coordinator writes a checkpoint well inside it, so a load
-/// never starts at an expired record.
-const LOG_EXPIRY: Duration = Duration::from_hours(24 * 7);
+/// How long Iggy keeps a log record. The log has no compaction, so a group that commits often
+/// fills it for this long. A coordinator writes a checkpoint at least once a day, so a load never
+/// starts at an expired record unless no gateway served the partition for about a day.
+const LOG_EXPIRY: Duration = Duration::from_hours(24 * 2);
+
+/// The shortest expiry an existing log topic may have. A coordinator writes a checkpoint at least
+/// once a day and checks each hour, so a shorter one can drop the last checkpoint.
+const MIN_LOG_EXPIRY: Duration = Duration::from_hours(25);
 
 /// How long Iggy keeps an announcement. Owners announce again well inside it.
 const OWNER_EXPIRY: Duration = Duration::from_hours(24);
@@ -158,7 +163,8 @@ impl IggyBridge {
     /// # Errors
     ///
     /// [`BridgeError::InvalidConfig`] when the log topic exists with another partition count than
-    /// `partitions`, since every gateway must map each group to the same partition.
+    /// `partitions`, since every gateway must map each group to the same partition, or with
+    /// settings that can lose its records.
     /// [`BridgeError::CoordinatorLogCall`] when a call to Iggy fails, with the permission it
     /// takes. [`BridgeError::Iggy`] or [`BridgeError::Timeout`] when a client does not connect.
     pub async fn coordinator_link(
@@ -195,6 +201,7 @@ impl IggyBridge {
                 found.partitions_count
             )));
         }
+        check_log_topic(&stream_name, &found)?;
         self.coordinator_topic(
             &stream_name,
             &stream_id,
@@ -210,12 +217,14 @@ impl IggyBridge {
         self.lease_group(&stream_name, &stream_id, &log_topic, &group_id)
             .await?;
 
-        let lease = connect_client(&self.config).await?;
-        let reader = connect_client(&self.config).await?;
-        let mut clients = Vec::with_capacity(writers.max(1));
-        for _ in 0..writers.max(1) {
-            clients.push(connect_client(&self.config).await?);
-        }
+        // The lease client, the reader, then the writers.
+        let mut clients = self.connect_clients(2 + writers.max(1)).await?.into_iter();
+        let (Some(lease), Some(reader)) = (clients.next(), clients.next()) else {
+            return Err(BridgeError::InvalidConfig(
+                "the coordinator log opened too few clients".to_string(),
+            ));
+        };
+        let clients: Vec<IggyClient> = clients.collect();
         info!(
             "Coordinator log ready on Iggy topic '{stream_name}/{COORDINATOR_LOG_TOPIC}' with \
              {partitions} partitions"
@@ -230,6 +239,22 @@ impl IggyBridge {
             writers: clients,
             max_send_bytes: self.max_send_bytes(),
         })
+    }
+
+    /// `count` clients, connected and signed in. When one does not connect, the ones before it
+    /// sign out, so a startup that tries again leaves no session behind.
+    async fn connect_clients(&self, count: usize) -> Result<Vec<IggyClient>, BridgeError> {
+        let mut clients = Vec::with_capacity(count);
+        for _ in 0..count {
+            match connect_client(&self.config).await {
+                Ok(client) => clients.push(client),
+                Err(error) => {
+                    join_all(clients.iter().map(sign_out_and_shut_down)).await;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(clients)
     }
 
     /// The topic `topic`, created when the read finds none: Iggy checks the permission to create
@@ -325,6 +350,34 @@ fn coordinator_call_failed(
         topic,
         source: Box::new(source),
     }
+}
+
+/// Refuses a log topic that can lose records the log needs. Only an operator makes one.
+fn check_log_topic(stream: &str, topic: &TopicDetails) -> Result<(), BridgeError> {
+    let durability = TopicCreateOptions::from_resource_options(&topic.options).durability;
+    let expiry = topic.resolved_options().message_expiry;
+    if keeps_log_records(durability, expiry) {
+        return Ok(());
+    }
+    Err(BridgeError::InvalidConfig(format!(
+        "Iggy topic '{stream}/{COORDINATOR_LOG_TOPIC}' has durability {durability} and expiry \
+         {expiry}. The coordinator log needs durability persisted, or a crash of a quorum can \
+         give one partition two owners, and an expiry of at least {} hours or none, or a load \
+         can miss the last checkpoint. Update the expiry, or recreate the topic with durability \
+         persisted",
+        MIN_LOG_EXPIRY.as_secs() / 3600
+    )))
+}
+
+/// Whether a log topic keeps each claim through a crash of a quorum, and each record until a
+/// newer checkpoint replaces it.
+fn keeps_log_records(durability: Durability, expiry: IggyExpiry) -> bool {
+    let expires_early = match expiry {
+        IggyExpiry::ExpireDuration(duration) => duration.get_duration() < MIN_LOG_EXPIRY,
+        // Iggy expires nothing under its server default.
+        IggyExpiry::NeverExpire | IggyExpiry::ServerDefault => false,
+    };
+    durability == Durability::Persisted && !expires_early
 }
 
 impl CoordinatorLink {
@@ -598,5 +651,43 @@ impl From<IggyMessage> for LoggedRecord {
 impl std::fmt::Debug for CoordinatorLink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CoordinatorLink").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expiry(duration: Duration) -> IggyExpiry {
+        IggyExpiry::ExpireDuration(IggyDuration::from(duration))
+    }
+
+    #[test]
+    fn given_the_settings_a_gateway_creates_should_keep_the_log_records() {
+        assert!(keeps_log_records(Durability::Persisted, expiry(LOG_EXPIRY)));
+    }
+
+    #[test]
+    fn given_log_topic_settings_should_refuse_only_those_that_lose_records() {
+        assert!(
+            !keeps_log_records(Durability::Replicated, IggyExpiry::NeverExpire),
+            "a crash of a quorum can lose a claim"
+        );
+        assert!(
+            !keeps_log_records(Durability::Persisted, expiry(Duration::from_hours(24))),
+            "the last checkpoint can expire"
+        );
+        assert!(keeps_log_records(
+            Durability::Persisted,
+            IggyExpiry::NeverExpire
+        ));
+        assert!(keeps_log_records(
+            Durability::Persisted,
+            IggyExpiry::ServerDefault
+        ));
+        assert!(keeps_log_records(
+            Durability::Persisted,
+            expiry(MIN_LOG_EXPIRY)
+        ));
     }
 }

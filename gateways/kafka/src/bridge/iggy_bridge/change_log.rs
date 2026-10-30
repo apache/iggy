@@ -68,15 +68,38 @@ const RETRY_PAUSE_MAX: Duration = Duration::from_secs(10);
 /// The deleted topics a receiver can fall behind by before it lags.
 pub(super) const TOPIC_DELETIONS_CAPACITY: usize = 1024;
 
+/// A Kafka topic as the change log last showed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopicShape {
+    /// The op of Iggy's metadata log that created the Iggy topic. A topic created again under the
+    /// name gets another.
+    pub incarnation: u64,
+    pub partitions: u32,
+}
+
+/// A Kafka topic that the change log shows deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedTopic {
+    pub name: String,
+    /// See [`TopicShape::incarnation`].
+    pub incarnation: u64,
+}
+
+/// The Kafka topics the change log shows, by name.
+pub type TopicShapes = HashMap<String, TopicShape>;
+
 /// What the follower keeps up to date from the change log.
 pub(super) struct Follower {
     pub(super) mapping: TopicMapping,
     pub(super) groups: GroupFeed,
     /// Moves after each read that showed a stream, topic or partition change.
     pub(super) topics: Arc<watch::Sender<u64>>,
+    /// Replaced after each read that showed a stream, topic or partition change, before the groups
+    /// and `topics` move.
+    pub(super) shapes: Arc<watch::Sender<Arc<TopicShapes>>>,
     pub(super) permissions: Arc<PermissionBoard>,
-    /// Gets the Kafka name of each topic that the change log shows deleted.
-    pub(super) deletions: broadcast::Sender<String>,
+    /// Gets each topic that the change log shows deleted.
+    pub(super) deletions: broadcast::Sender<DeletedTopic>,
 }
 
 /// What the change log last said of each Iggy user, for the connections that authenticated as
@@ -484,7 +507,12 @@ impl Follower {
         }
     }
 
+    /// The topics go first, so a caller that saw the groups move sees the topics of that read.
     fn publish(&self, mirror: &Mirror, changed: Changed) {
+        if changed.topics {
+            self.shapes
+                .send_replace(Arc::new(mirror.kafka_topic_shapes(&self.mapping)));
+        }
         if changed.groups {
             self.groups.publish(mirror.kafka_groups(&self.mapping));
         }
@@ -493,11 +521,11 @@ impl Follower {
         }
     }
 
-    /// Sends the Kafka name of each deleted topic.
-    fn report(&self, deleted: Vec<String>) {
-        for kafka_topic in deleted {
+    /// Sends each deleted topic.
+    fn report(&self, deleted: Vec<DeletedTopic>) {
+        for topic in deleted {
             // Fails only without a receiver, and then no one keeps offsets to drop.
-            let _ = self.deletions.send(kafka_topic);
+            let _ = self.deletions.send(topic);
         }
     }
 }
@@ -568,6 +596,7 @@ struct StreamEntry {
 struct TopicEntry {
     key: TopicKey,
     name: String,
+    partitions: u32,
 }
 
 /// One incarnation of a topic, in one incarnation of its stream.
@@ -625,14 +654,14 @@ macro_rules! group_key {
 }
 
 impl Mirror {
-    /// Applies one change. User changes go to `permissions`, and the Kafka name by `mapping` of
-    /// each topic it deletes to `deleted`.
+    /// Applies one change. User changes go to `permissions`, and each topic it deletes that
+    /// `mapping` names to `deleted`.
     fn apply(
         &mut self,
         change: &MetadataChange,
         permissions: &PermissionBoard,
         mapping: &TopicMapping,
-        deleted: &mut Vec<String>,
+        deleted: &mut Vec<DeletedTopic>,
     ) -> Changed {
         match change {
             MetadataChange::StreamCreated(stream) | MetadataChange::StreamUpdated(stream) => {
@@ -644,22 +673,28 @@ impl Mirror {
                 deleted.extend(
                     self.kafka_topics(mapping)
                         .filter(|(key, _)| key.in_stream(stream_id, created_op))
-                        .map(|(_, kafka_topic)| kafka_topic.to_owned()),
+                        .map(|(key, kafka_topic)| deleted_topic(key, kafka_topic)),
                 );
                 self.drop_stream(stream_id, created_op);
                 Changed::ALL
             }
             MetadataChange::TopicCreated(topic) | MetadataChange::TopicUpdated(topic) => {
-                self.put_topic(topic_key!(topic), &topic.name);
+                self.put_topic(topic_key!(topic), &topic.name, Some(topic.partitions_count));
                 Changed::ALL
             }
             MetadataChange::TopicDeleted(topic) => {
                 let key = topic_key!(topic);
-                deleted.extend(self.kafka_topic_of(key, mapping).map(str::to_owned));
+                deleted.extend(
+                    self.kafka_topic_of(key, mapping)
+                        .map(|kafka_topic| deleted_topic(key, kafka_topic)),
+                );
                 self.drop_topic(key);
                 Changed::ALL
             }
-            MetadataChange::PartitionsChanged(_) => Changed::TOPICS,
+            MetadataChange::PartitionsChanged(partitions) => {
+                self.set_partitions(topic_key!(partitions), partitions.partitions_count);
+                Changed::TOPICS
+            }
             MetadataChange::ConsumerGroupCreated(group) => {
                 Changed::groups(self.put_group(group_key!(group), &group.name))
             }
@@ -693,7 +728,12 @@ impl Mirror {
             MetadataCurrentItem::Stream(stream) => {
                 self.put_stream(stream.stream_id, stream.stream_created_op, &stream.name);
             }
-            MetadataCurrentItem::Topic(topic) => self.put_topic(topic_key!(topic), &topic.name),
+            MetadataCurrentItem::Topic(topic) => {
+                self.put_topic(topic_key!(topic), &topic.name, None);
+            }
+            MetadataCurrentItem::Partitions(partitions) => {
+                self.set_partitions(topic_key!(partitions), partitions.partitions_count);
+            }
             MetadataCurrentItem::ConsumerGroup(group) => {
                 self.put_group(group_key!(group), &group.name);
             }
@@ -726,16 +766,31 @@ impl Mirror {
             .filter_map(move |topic| Some((topic.key, self.kafka_topic_of(topic.key, mapping)?)))
     }
 
-    /// The Kafka names that this mirror lists under `mapping` and `newer` does not.
-    fn kafka_topics_left_out(&self, newer: &Self, mapping: &TopicMapping) -> Vec<String> {
-        let kept: HashSet<&str> = newer
+    /// Each Kafka topic that `mapping` names, by name.
+    fn kafka_topic_shapes(&self, mapping: &TopicMapping) -> TopicShapes {
+        self.topics
+            .values()
+            .filter_map(|topic| {
+                let kafka_topic = self.kafka_topic_of(topic.key, mapping)?;
+                let shape = TopicShape {
+                    incarnation: topic.key.topic_created_op,
+                    partitions: topic.partitions,
+                };
+                Some((kafka_topic.to_owned(), shape))
+            })
+            .collect()
+    }
+
+    /// The topics that this mirror lists under `mapping` and `newer` does not, also those that
+    /// `newer` lists under the same name in another incarnation.
+    fn kafka_topics_left_out(&self, newer: &Self, mapping: &TopicMapping) -> Vec<DeletedTopic> {
+        let kept: HashSet<(&str, u64)> = newer
             .kafka_topics(mapping)
-            .map(|(_, kafka_topic)| kafka_topic)
+            .map(|(key, kafka_topic)| (kafka_topic, key.topic_created_op))
             .collect();
         self.kafka_topics(mapping)
-            .map(|(_, kafka_topic)| kafka_topic)
-            .filter(|kafka_topic| !kept.contains(kafka_topic))
-            .map(str::to_owned)
+            .filter(|(key, kafka_topic)| !kept.contains(&(*kafka_topic, key.topic_created_op)))
+            .map(|(key, kafka_topic)| deleted_topic(key, kafka_topic))
             .collect()
     }
 
@@ -786,21 +841,40 @@ impl Mirror {
             .retain(|key, _| !key.topic.in_stream(stream_id, created_op));
     }
 
-    /// As [`Self::put_stream`], by the op that created the topic.
-    fn put_topic(&mut self, key: TopicKey, name: &str) {
+    /// As [`Self::put_stream`], by the op that created the topic. Without `partitions`, the topic
+    /// keeps the count it had.
+    fn put_topic(&mut self, key: TopicKey, name: &str, partitions: Option<u32>) {
         let slot = (key.stream_id, key.topic_id);
-        match self.topics.get(&slot).map(|topic| topic.key) {
-            Some(known) if known.topic_created_op > key.topic_created_op => return,
-            Some(older) if older != key => self.drop_topic(older),
-            _ => {}
+        let mut known_partitions = 0;
+        match self
+            .topics
+            .get(&slot)
+            .map(|topic| (topic.key, topic.partitions))
+        {
+            Some((known, _)) if known.topic_created_op > key.topic_created_op => return,
+            Some((older, _)) if older != key => self.drop_topic(older),
+            Some((_, partitions)) => known_partitions = partitions,
+            None => {}
         }
         self.topics.insert(
             slot,
             TopicEntry {
                 key,
                 name: name.to_owned(),
+                partitions: partitions.unwrap_or(known_partitions),
             },
         );
+    }
+
+    /// Sets the partition count of that incarnation of the topic, when the mirror holds it.
+    fn set_partitions(&mut self, key: TopicKey, partitions: u32) {
+        if let Some(topic) = self
+            .topics
+            .get_mut(&(key.stream_id, key.topic_id))
+            .filter(|topic| topic.key == key)
+        {
+            topic.partitions = partitions;
+        }
     }
 
     /// Drops that incarnation of the topic, with its groups.
@@ -819,6 +893,13 @@ impl Mirror {
         };
         self.groups.insert(key, group);
         true
+    }
+}
+
+fn deleted_topic(key: TopicKey, kafka_topic: &str) -> DeletedTopic {
+    DeletedTopic {
+        name: kafka_topic.to_owned(),
+        incarnation: key.topic_created_op,
     }
 }
 
@@ -1039,15 +1120,16 @@ mod tests {
     fn deleted_by(mirror: &mut Mirror, records: &[MetadataChange]) -> Vec<String> {
         let mut deleted = Vec::new();
         apply_to(mirror, records, &PermissionBoard::default(), &mut deleted);
-        deleted.sort();
-        deleted
+        let mut names: Vec<String> = deleted.into_iter().map(|topic| topic.name).collect();
+        names.sort();
+        names
     }
 
     fn apply_to(
         mirror: &mut Mirror,
         records: &[MetadataChange],
         board: &PermissionBoard,
-        deleted: &mut Vec<String>,
+        deleted: &mut Vec<DeletedTopic>,
     ) -> Changed {
         let mapping = mapping();
         let mut changed = Changed::default();
@@ -1231,12 +1313,78 @@ mod tests {
     }
 
     #[test]
-    fn given_a_deleted_topic_when_applied_should_report_its_kafka_name() {
+    fn given_a_deleted_topic_when_applied_should_report_its_kafka_name_and_incarnation() {
         let (mut mirror, _) = seeded();
+        let mut deleted = Vec::new();
 
-        let deleted = deleted_by(&mut mirror, &[topic_deleted(KAFKA, 1, 10)]);
+        apply_to(
+            &mut mirror,
+            &[topic_deleted(KAFKA, 1, 10)],
+            &PermissionBoard::default(),
+            &mut deleted,
+        );
 
-        assert_eq!(deleted, ["orders"]);
+        assert_eq!(
+            deleted,
+            [DeletedTopic {
+                name: "orders".to_string(),
+                incarnation: 10,
+            }]
+        );
+    }
+
+    /// The coordinator log checks commits against the partition count, and tags each with the
+    /// incarnation.
+    #[test]
+    fn given_topic_and_partition_changes_should_keep_each_kafka_topic_shape() {
+        let (mut mirror, _) = seeded();
+        let mut grown = topic(KAFKA, 1, 10, "orders");
+        grown.partitions_count = 3;
+        apply_all(&mut mirror, &[MetadataChange::TopicUpdated(grown)]);
+        apply_all(
+            &mut mirror,
+            &[MetadataChange::PartitionsChanged(
+                MetadataPartitionsChanged {
+                    stream_id: KAFKA,
+                    stream_created_op: u64::from(KAFKA),
+                    topic_id: 1,
+                    topic_created_op: 10,
+                    partitions_count: 5,
+                    removed_partition_ids: Vec::new(),
+                    requested_op: None,
+                },
+            )],
+        );
+
+        assert_eq!(
+            mirror.kafka_topic_shapes(&mapping()).get("orders"),
+            Some(&TopicShape {
+                incarnation: 10,
+                partitions: 5,
+            })
+        );
+    }
+
+    /// A gap in the log can hide a delete and the create of a topic of the same name.
+    #[test]
+    fn given_a_topic_created_again_in_a_newer_state_should_report_the_older_deleted() {
+        let (mirror, _) = seeded();
+        let mut newer = Mirror::default();
+        apply_all(
+            &mut newer,
+            &[
+                MetadataChange::StreamCreated(stream(KAFKA, u64::from(KAFKA), "kafka")),
+                MetadataChange::TopicCreated(topic(KAFKA, 1, 40, "orders")),
+            ],
+        );
+
+        assert_eq!(
+            mirror.kafka_topics_left_out(&newer, &mapping()),
+            [DeletedTopic {
+                name: "orders".to_string(),
+                incarnation: 10,
+            }]
+        );
     }
 
     /// Iggy records no delete of their own for the topics of a deleted stream.
@@ -1693,7 +1841,7 @@ mod tests {
         index: GroupIndex,
         topics: watch::Receiver<u64>,
         permissions: Arc<PermissionBoard>,
-        deleted: broadcast::Receiver<String>,
+        deleted: broadcast::Receiver<DeletedTopic>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -1707,6 +1855,7 @@ mod tests {
             mapping: mapping(),
             groups: index.feed(),
             topics: Arc::clone(&topics),
+            shapes: Arc::new(watch::Sender::new(Arc::default())),
             permissions: Arc::clone(&permissions),
             deletions,
         };
@@ -1876,8 +2025,8 @@ mod tests {
 
         assert_eq!(&log.starts()[..4], ["current", "after", "after", "current"]);
         assert_eq!(
-            followed.deleted.try_recv().ok().as_deref(),
-            Some("payments")
+            followed.deleted.try_recv().ok().map(|topic| topic.name),
+            Some("payments".to_string())
         );
         assert!(
             followed.deleted.try_recv().is_err(),

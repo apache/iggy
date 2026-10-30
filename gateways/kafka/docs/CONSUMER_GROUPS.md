@@ -247,8 +247,9 @@ can pin it.
 ## More than one gateway
 
 The gateways share their groups through the coordinator log, the Iggy topic `coordinators` in the
-stream `<default stream>.meta`. The log is on by default with `IGGY_KAFKA_BROKERS`
-(`IGGY_KAFKA_COORDINATOR_LOG`). The code is in `src/coordinator/`.
+stream `<default stream>.meta`. The log is on by default with `IGGY_KAFKA_BROKERS` and the bridge
+(`IGGY_KAFKA_COORDINATOR_LOG`). It needs `manage_servers` on the bridge's Iggy user, to follow
+Iggy's change log. Without it the gateway does not start. The code is in `src/coordinator/`.
 
 - Each group belongs to one of 16 log partitions, by an FNV-1a hash of its id. The count never
   changes, since a new count would move nearly every group.
@@ -266,8 +267,10 @@ stream `<default stream>.meta`. The log is on by default with `IGGY_KAFKA_BROKER
 - The owner stores the state of each completed generation when the leader's `SyncGroup` arrives:
   members, subscriptions in the selected protocol, assignments and static instance ids. The group
   stays `CompletingRebalance` until the record is read back, so no member learns its assignment
-  before it is stored. Kafka does the same. Joins and leaves between generations are not stored,
-  as in Kafka. A group whose members are all gone leaves the log within 5 s.
+  before it is stored. Kafka does the same. A static member that takes its instance id over in
+  `Stable` is stored too, before it learns its new member id, as in Kafka. A failed store puts the
+  old member back. Other joins and leaves between generations are not stored, as in Kafka. A
+  group whose members are all gone leaves the log within 5 s.
 - Every write is checked. The owner reads each record it appends. When a newer claim comes before
   the record, the record does not count, and the owner answers `NOT_COORDINATOR` (16) and stops
   serving the partition. A load skips each record of an older claim that comes after a newer
@@ -283,13 +286,19 @@ stream `<default stream>.meta`. The log is on by default with `IGGY_KAFKA_BROKER
   record. It writes one after 10,000 records, or after as many records as there are live
   entries when that is more, and when the last one is a day old, also across a change of owner.
   Each record names where the last complete checkpoint begins, so a load reads only from there.
-  Iggy keeps the log for 7 days.
+  Appends go between the checkpoint's chunks, so a commit waits for one chunk at most. Iggy keeps
+  the log for 2 days.
+- A commit equal to the logged one writes nothing, until the logged one is an hour old.
+- The log drops the offsets of a group without members 7 days after its last commit, Kafka's
+  `offsets.retention.minutes` default. Iggy still holds them, and answers from then on.
 - Every record starts with a format version, a kind, its claim and the last checkpoint, and a
-  claim's body starts with its node id, in every version. A gateway reads these of any record, so
-  an older gateway still sees a newer gateway's claim during a rolling upgrade.
+  claim's body starts with its node id, in every version. So an older gateway still sees a newer
+  gateway's claim during a rolling upgrade. Any other record of a newer format stops the load, as
+  in Kafka: the older gateway does not serve that partition. An announcement reads in any version.
 - The log topic is `persisted`: a claim that a crash of a quorum loses would let two gateways
   own one partition. So each commit and each stored generation also waits for a stable-storage
-  write on a quorum. The owner topic is `replicated`.
+  write on a quorum. The owner topic is `replicated`. A gateway refuses a log topic that is not
+  `persisted`, or that expires records within 25 hours, which could drop the last checkpoint.
 - On SIGTERM, the gateway leaves the Iggy group before its drain, so the others take its
   partitions over at once. Its group requests in flight answer `NOT_COORDINATOR`, and their
   clients go to the new coordinator.
@@ -400,7 +409,7 @@ assignment and the generation:
 
 | Group state when it returns | What happens |
 | --- | --- |
-| `Stable` | No rebalance. The member gets the current generation and syncs to its previous assignment. From JoinGroup v9 a returning leader is sent the roster with `skip_assignment` set. Below v9 the response names the previous leader, so the client acts as a follower and does not reassign. A rebalance opens only if the member's protocols change the group's selected protocol |
+| `Stable` | No rebalance. The member gets the current generation and syncs to its previous assignment. From JoinGroup v9 a returning leader is sent the roster with `skip_assignment` set. Below v9 the response names the previous leader, so the client acts as a follower and does not reassign. A rebalance opens only if the member's protocols change the group's selected protocol. With the coordinator log, the takeover is stored before the answer |
 | `CompletingRebalance` | A rebalance opens, since the leader may already be assigning to the old member id |
 | `PreparingRebalance` | The member counts as rejoined for the open barrier |
 
