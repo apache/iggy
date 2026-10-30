@@ -19,11 +19,11 @@ use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_common::locking::IggyRwLockFn;
-use iggy_common::{BinarySendPartitioning, MessageClient};
 use iggy_common::{
-    Consumer, DeferredPollOptions, Identifier, IggyError, IggyMessage, Partitioning,
+    BatchProducer, Consumer, DeferredPollOptions, Identifier, IggyError, IggyMessage, Partitioning,
     PolledMessages, PollingStrategy, SendMessagesResponse,
 };
+use iggy_common::{BinarySendPartitioning, MessageClient};
 
 #[async_trait]
 impl MessageClient for IggyClient {
@@ -141,6 +141,23 @@ impl MessageClient for IggyClient {
             stream_id,
             topic_id,
             &mut BinarySendPartitioning::new(partitioning),
+            messages,
+        )
+        .await
+    }
+
+    async fn send_producer_messages(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitioning: &Partitioning,
+        producer: BatchProducer,
+        messages: &mut [IggyMessage],
+    ) -> Result<SendMessagesResponse, IggyError> {
+        self.send_messages_with_partitioning(
+            stream_id,
+            topic_id,
+            &mut BinarySendPartitioning::new(partitioning).with_producer(producer),
             messages,
         )
         .await

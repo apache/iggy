@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::{
-    Consumer, ConsumerKind, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages,
-    PollingStrategy, SendMessagesResponse,
+    BatchProducer, Consumer, ConsumerKind, Identifier, IggyError, IggyMessage, Partitioning,
+    PolledMessages, PollingStrategy, SendMessagesResponse,
 };
 use async_trait::async_trait;
 
@@ -237,4 +237,22 @@ pub trait MessageClient {
         partitioning: &Partitioning,
         messages: &mut [IggyMessage],
     ) -> Result<SendMessagesResponse, IggyError>;
+
+    /// [`Self::send_messages`] for one batch of an idempotent producer.
+    ///
+    /// The partition keeps the last batches of each producer. A batch it
+    /// already holds is not written again: the reply names the offset of its
+    /// first write. Only binary clients send a producer, and HTTP returns
+    /// [`IggyError::FeatureUnavailable`].
+    async fn send_producer_messages(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitioning: &Partitioning,
+        producer: BatchProducer,
+        messages: &mut [IggyMessage],
+    ) -> Result<SendMessagesResponse, IggyError> {
+        let _ = (stream_id, topic_id, partitioning, producer, messages);
+        Err(IggyError::FeatureUnavailable)
+    }
 }

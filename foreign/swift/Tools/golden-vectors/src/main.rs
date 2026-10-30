@@ -28,7 +28,8 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::batch::{
-    BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, BatchHeader, calculate_batch_checksum,
+    BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, BatchHeader, BatchProducer,
+    calculate_batch_checksum,
 };
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::*;
@@ -1632,6 +1633,23 @@ fn main() {
         }
         .encode(&mut empty);
         vectors.insert("response.poll_messages.empty".to_owned(), hex(&empty));
+
+        // A batch of an idempotent producer.
+        let mut record = batch_record(7, 200, 7_000, 3_000, &[frame(21, 0, 0, b"k", &[])]);
+        let mut header = BatchHeader::decode(&record).expect("a batch header");
+        header.producer = Some(BatchProducer::new(4_000, 3, 17).expect("a producer"));
+        header.batch_checksum = calculate_batch_checksum(&header, &record[BATCH_HEADER_SIZE..]);
+        header.encode_into(&mut record[..BATCH_HEADER_SIZE]);
+        let mut produced = BytesMut::new();
+        PollMessagesResponseHeader {
+            context: Default::default(),
+            partition_id: 7,
+            current_offset: 200,
+            messages_count: 1,
+        }
+        .encode(&mut produced);
+        produced.put_slice(&record);
+        vectors.insert("response.poll_messages.producer".to_owned(), hex(&produced));
     }
     add(
         &mut vectors,

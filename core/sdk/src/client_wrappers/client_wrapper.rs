@@ -67,11 +67,24 @@ impl ClientWrapper {
                 ))
                 .await
             }
-            Self::Http(client) => {
-                client
-                    .send_messages(stream, topic, partitioning.original(), messages)
-                    .await
-            }
+            Self::Http(client) => match partitioning.producer() {
+                Some(producer) => {
+                    client
+                        .send_producer_messages(
+                            stream,
+                            topic,
+                            partitioning.original(),
+                            producer,
+                            messages,
+                        )
+                        .await
+                }
+                None => {
+                    client
+                        .send_messages(stream, topic, partitioning.original(), messages)
+                        .await
+                }
+            },
             Self::Tcp(client) => {
                 send_binary_messages(client, stream, topic, partitioning, messages).await
             }

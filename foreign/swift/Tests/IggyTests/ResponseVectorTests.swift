@@ -309,6 +309,13 @@ struct ResponseVectorTests {
         let empty = try Responses.polledMessages(body("response.poll_messages.empty"))
         #expect(empty.messages.isEmpty)
 
+        // A batch of an idempotent producer carries it in the header, under the checksum.
+        let produced = try Responses.polledMessages(body("response.poll_messages.producer"), verifyChecksums: true)
+        #expect(produced.messages.map(\.id) == [21])
+        #expect(produced.messages.map(\.payloadString) == ["k"])
+        let producedHeader = try Batch.Header.decode(golden.bytes("response.poll_messages.producer")[40...])
+        #expect(producedHeader.producer == Batch.Producer(producerID: 4_000, epoch: 3, baseSequence: 17))
+
         var corrupted = golden.bytes("response.poll_messages")
         corrupted[corrupted.count - 1] ^= 0xFF
         #expect(throws: IggyError.self) {

@@ -46,13 +46,76 @@ pub const BATCH_CHECKSUM_OFFSET: usize = 40;
 /// Byte offset of `message_count` inside the batch header.
 pub const BATCH_MESSAGE_COUNT_OFFSET: usize = 48;
 
+/// Byte offset of the producer section of the batch header: a flags byte,
+/// then the [`BatchProducer`] fields.
+///
+/// ```text
+/// [52] flags: bit 0 = producer present  [53..56] zero
+/// [56..64] producer_id  [64..66] epoch  [66..68] zero  [68..72] base_sequence
+/// ```
+pub const BATCH_PRODUCER_OFFSET: usize = 52;
+
 /// Byte offset where the reserved region of the batch header starts.
-pub const BATCH_RESERVED_OFFSET: usize = 52;
+pub const BATCH_RESERVED_OFFSET: usize = 72;
+
+const PRODUCER_PRESENT: u8 = 1;
+const PRODUCER_ID_OFFSET: usize = 56;
+const PRODUCER_EPOCH_OFFSET: usize = 64;
+const PRODUCER_SEQUENCE_OFFSET: usize = 68;
 
 /// Upper bound on a message's `timestamp_delta`: the field is a `u32`
 /// microsecond delta against the batch `origin_timestamp`, so a single batch
 /// spans at most ~71.6 minutes of producer clock.
 pub const MAX_TIMESTAMP_DELTA_MICROS: u64 = u32::MAX as u64;
+
+/// The idempotent producer that wrote a batch: its id, its epoch, and the
+/// sequence number of the batch's first message.
+///
+/// Each field stays in the non-negative range of a signed integer of its
+/// width, so SDKs in languages without unsigned integers read it as is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BatchProducer {
+    pub producer_id: u64,
+    pub epoch: u16,
+    pub base_sequence: u32,
+}
+
+impl BatchProducer {
+    pub const PRODUCER_ID_MAX: u64 = i64::MAX as u64;
+    pub const EPOCH_MAX: u16 = i16::MAX as u16;
+    /// Sequences wrap to 0 after this value.
+    pub const SEQUENCE_MAX: u32 = i32::MAX as u32;
+
+    /// `None` when a field is above its maximum.
+    #[must_use]
+    pub const fn new(producer_id: u64, epoch: u16, base_sequence: u32) -> Option<Self> {
+        if producer_id > Self::PRODUCER_ID_MAX
+            || epoch > Self::EPOCH_MAX
+            || base_sequence > Self::SEQUENCE_MAX
+        {
+            return None;
+        }
+        Some(Self {
+            producer_id,
+            epoch,
+            base_sequence,
+        })
+    }
+
+    /// The sequence number of the last message of a batch of `count`
+    /// messages, with the wrap after [`Self::SEQUENCE_MAX`].
+    #[must_use]
+    pub const fn last_sequence(&self, count: u32) -> u32 {
+        Self::advance(self.base_sequence, count.saturating_sub(1))
+    }
+
+    /// `sequence` moved forward by `by`, with the wrap.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn advance(sequence: u32, by: u32) -> u32 {
+        ((sequence as u64 + by as u64) % (Self::SEQUENCE_MAX as u64 + 1)) as u32
+    }
+}
 
 /// The batch header.
 ///
@@ -70,6 +133,9 @@ pub struct BatchHeader {
     pub batch_length: u64,
     pub batch_checksum: u64,
     pub message_count: u32,
+    /// Set only for a batch of an idempotent producer. The partition writes
+    /// a batch of one producer once, also when it is sent again.
+    pub producer: Option<BatchProducer>,
 }
 
 impl BatchHeader {
@@ -88,6 +154,7 @@ impl BatchHeader {
             batch_length,
             batch_checksum: 0,
             message_count,
+            producer: None,
         }
     }
 
@@ -130,6 +197,7 @@ impl BatchHeader {
             batch_length,
             batch_checksum: read_u64(bytes, BATCH_CHECKSUM_OFFSET),
             message_count: read_u32(bytes, BATCH_MESSAGE_COUNT_OFFSET),
+            producer: decode_producer(bytes)?,
         })
     }
 
@@ -147,6 +215,15 @@ impl BatchHeader {
             .copy_from_slice(&self.batch_checksum.to_le_bytes());
         bytes[BATCH_MESSAGE_COUNT_OFFSET..BATCH_MESSAGE_COUNT_OFFSET + 4]
             .copy_from_slice(&self.message_count.to_le_bytes());
+        if let Some(producer) = self.producer {
+            bytes[BATCH_PRODUCER_OFFSET] = PRODUCER_PRESENT;
+            bytes[PRODUCER_ID_OFFSET..PRODUCER_ID_OFFSET + 8]
+                .copy_from_slice(&producer.producer_id.to_le_bytes());
+            bytes[PRODUCER_EPOCH_OFFSET..PRODUCER_EPOCH_OFFSET + 2]
+                .copy_from_slice(&producer.epoch.to_le_bytes());
+            bytes[PRODUCER_SEQUENCE_OFFSET..PRODUCER_SEQUENCE_OFFSET + 4]
+                .copy_from_slice(&producer.base_sequence.to_le_bytes());
+        }
     }
 
     /// Total batch size in bytes (header + blob).
@@ -456,6 +533,47 @@ fn write_batch_header_fields(hasher: &mut XxHash3_64, header: &BatchHeader) {
     hasher.write(&header.origin_timestamp.to_le_bytes());
     hasher.write(&header.batch_length.to_le_bytes());
     hasher.write(&header.message_count.to_le_bytes());
+    // Hashed only when present, so a batch without a producer keeps the
+    // checksum every earlier build computed for it.
+    if let Some(producer) = header.producer {
+        hasher.write(&[PRODUCER_PRESENT]);
+        hasher.write(&producer.producer_id.to_le_bytes());
+        hasher.write(&producer.epoch.to_le_bytes());
+        hasher.write(&producer.base_sequence.to_le_bytes());
+    }
+}
+
+/// The producer section of a header whose length `decode` already checked.
+fn decode_producer(bytes: &[u8]) -> Result<Option<BatchProducer>, WireError> {
+    let invalid = || {
+        WireError::Validation(std::borrow::Cow::Borrowed(
+            "batch header producer section is malformed",
+        ))
+    };
+    let section = &bytes[BATCH_PRODUCER_OFFSET..BATCH_RESERVED_OFFSET];
+    match bytes[BATCH_PRODUCER_OFFSET] {
+        0 if section.iter().all(|&byte| byte == 0) => Ok(None),
+        PRODUCER_PRESENT
+            if bytes[BATCH_PRODUCER_OFFSET + 1..PRODUCER_ID_OFFSET]
+                .iter()
+                .chain(&bytes[PRODUCER_EPOCH_OFFSET + 2..PRODUCER_SEQUENCE_OFFSET])
+                .all(|&byte| byte == 0) =>
+        {
+            let epoch = u16::from_le_bytes(
+                bytes[PRODUCER_EPOCH_OFFSET..PRODUCER_EPOCH_OFFSET + 2]
+                    .try_into()
+                    .expect("2-byte slice"),
+            );
+            BatchProducer::new(
+                read_u64(bytes, PRODUCER_ID_OFFSET),
+                epoch,
+                read_u32(bytes, PRODUCER_SEQUENCE_OFFSET),
+            )
+            .map(Some)
+            .ok_or_else(invalid)
+        }
+        _ => Err(invalid()),
+    }
 }
 
 /// Verify every per-message checksum in `batch` and return the recomputed
@@ -659,5 +777,112 @@ mod tests {
         bytes[BATCH_RESERVED_OFFSET] = 0;
         bytes[BATCH_HEADER_SIZE - 1] = 1;
         assert!(BatchHeader::decode(&bytes).is_err());
+    }
+
+    fn producer() -> BatchProducer {
+        BatchProducer::new(4_000, 3, 17).unwrap()
+    }
+
+    fn producer_batch_bytes(frames: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = batch_bytes(frames);
+        let mut header = BatchHeader::decode(&bytes).unwrap();
+        header.producer = Some(producer());
+        header.batch_checksum = calculate_batch_checksum(&header, &bytes[BATCH_HEADER_SIZE..]);
+        header.encode_into(&mut bytes[..BATCH_HEADER_SIZE]);
+        bytes
+    }
+
+    #[test]
+    fn given_a_producer_when_round_tripping_should_keep_it_and_verify() {
+        let bytes = producer_batch_bytes(&[frame(1, 0, 0, b"payload")]);
+
+        let batch = decode_batch_slice(&bytes).unwrap();
+
+        assert_eq!(batch.header.producer, Some(producer()));
+        assert_eq!(bytes[BATCH_PRODUCER_OFFSET], PRODUCER_PRESENT);
+    }
+
+    #[test]
+    fn given_no_producer_when_checksumming_should_match_the_earlier_format() {
+        let bytes = batch_bytes(&[frame(1, 0, 0, b"payload")]);
+        let header = BatchHeader::decode(&bytes).unwrap();
+        let mut hasher = XxHash3_64::new();
+        for field in [
+            header.partition_id,
+            header.base_offset,
+            header.base_timestamp,
+            header.origin_timestamp,
+            header.batch_length,
+        ] {
+            hasher.write(&field.to_le_bytes());
+        }
+        hasher.write(&header.message_count.to_le_bytes());
+        hasher.write(&bytes[BATCH_HEADER_SIZE..BATCH_HEADER_SIZE + 8]);
+
+        assert_eq!(header.batch_checksum, hasher.finish());
+    }
+
+    #[test]
+    fn given_a_changed_producer_field_when_verifying_should_refuse_the_batch() {
+        let mut bytes = producer_batch_bytes(&[frame(1, 0, 0, b"payload")]);
+        bytes[PRODUCER_SEQUENCE_OFFSET] ^= 1;
+        assert!(matches!(
+            decode_batch_slice(&bytes),
+            Err(WireError::InvalidBatchChecksum { .. })
+        ));
+
+        let mut bytes = producer_batch_bytes(&[frame(1, 0, 0, b"payload")]);
+        bytes[BATCH_PRODUCER_OFFSET..BATCH_RESERVED_OFFSET].fill(0);
+        assert!(matches!(
+            decode_batch_slice(&bytes),
+            Err(WireError::InvalidBatchChecksum { .. })
+        ));
+    }
+
+    #[test]
+    fn given_a_malformed_producer_section_when_decoding_should_refuse_it() {
+        let valid = producer_batch_bytes(&[frame(1, 0, 0, b"payload")]);
+        let mutations: [(usize, u8); 5] = [
+            (BATCH_PRODUCER_OFFSET, 2),
+            (BATCH_PRODUCER_OFFSET + 1, 1),
+            (PRODUCER_EPOCH_OFFSET + 2, 1),
+            (PRODUCER_ID_OFFSET + 7, 0x80),
+            (PRODUCER_SEQUENCE_OFFSET + 3, 0x80),
+        ];
+        for (offset, value) in mutations {
+            let mut bytes = valid.clone();
+            bytes[offset] = value;
+            assert!(
+                matches!(BatchHeader::decode(&bytes), Err(WireError::Validation(_))),
+                "byte {offset} = {value:#x} must be refused"
+            );
+        }
+
+        let mut absent = batch_bytes(&[frame(1, 0, 0, b"payload")]);
+        absent[PRODUCER_ID_OFFSET] = 1;
+        assert!(BatchHeader::decode(&absent).is_err());
+    }
+
+    #[test]
+    fn given_fields_above_their_maximum_when_building_a_producer_should_refuse() {
+        assert!(BatchProducer::new(BatchProducer::PRODUCER_ID_MAX + 1, 0, 0).is_none());
+        assert!(BatchProducer::new(0, BatchProducer::EPOCH_MAX + 1, 0).is_none());
+        assert!(BatchProducer::new(0, 0, BatchProducer::SEQUENCE_MAX + 1).is_none());
+        assert!(
+            BatchProducer::new(
+                BatchProducer::PRODUCER_ID_MAX,
+                BatchProducer::EPOCH_MAX,
+                BatchProducer::SEQUENCE_MAX,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn given_a_batch_across_the_sequence_limit_when_computing_its_last_sequence_should_wrap() {
+        let producer = BatchProducer::new(1, 0, BatchProducer::SEQUENCE_MAX - 1).unwrap();
+        assert_eq!(producer.last_sequence(2), BatchProducer::SEQUENCE_MAX);
+        assert_eq!(producer.last_sequence(4), 1);
+        assert_eq!(producer.last_sequence(1), BatchProducer::SEQUENCE_MAX - 1);
     }
 }

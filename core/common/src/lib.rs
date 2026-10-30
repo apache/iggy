@@ -77,6 +77,7 @@ pub use http::streams::*;
 pub use http::system::*;
 pub use http::topics::*;
 pub use http::users::*;
+pub use iggy_binary_protocol::batch::BatchProducer;
 pub use iggy_binary_protocol::requests::messages::{
     MAX_DEFERRED_POLL_TIMEOUT_US, MAX_DEFERRED_POLL_WAIT_US, MIN_DEFERRED_POLL_MAX_BYTES,
     MIN_DEFERRED_POLL_REPLY_MARGIN_US,
