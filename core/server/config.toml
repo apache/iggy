@@ -1311,9 +1311,11 @@ handshake_grace = "10 s"
 # credential (password) is forwarded so the external service can verify
 # the requester; use TLS ('url' starting with https://) to protect it.
 #
-# The SDK replays logins after transient failures, so the external
-# service must be idempotent. One-time passwords will not survive a
-# replay.
+# Callouts fire only on the normal-status primary. Backup nodes and
+# nodes in a view change return a retryable error so the SDK reconnects
+# to the primary. The SDK replays logins after transient failures, so
+# the external service must be idempotent. One-time passwords will not
+# survive a replay.
 #[external_auth]
 #enabled = false
 #url = "https://auth.example.com/iggy/verify"

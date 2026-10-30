@@ -796,6 +796,7 @@ mod tests {
     use super::{MetadataWatermarks, register_submit_auth_error, trusted_issuer_account};
     use crate::http::error::AuthError;
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+    use iggy_common::{HeaderKey, HeaderValue, OptionKey, OptionValue};
     use iggy_common::{IggyTimestamp, UserStatus};
     use metadata::MetadataSubmitError;
     use metadata::stm::user::User;
@@ -881,6 +882,26 @@ mod tests {
         assert_eq!(
             trusted_issuer_account(Some(&active)),
             Some((1, active.created_at))
+        );
+    }
+
+    #[test]
+    fn given_user_with_critical_options_when_trusted_issuer_maps_onto_it_should_refuse() {
+        let mut with_critical = user(2, UserStatus::Active);
+        // An unrecognized key listed in the critical-keys marker triggers
+        // check_critical_options to reject the user.
+        with_critical.options.insert(
+            HeaderKey::try_from("future_secret").unwrap(),
+            OptionValue::explicit(HeaderValue::try_from("opaque").unwrap()),
+        );
+        with_critical.options.insert(
+            HeaderKey::from(OptionKey::CriticalKeys),
+            OptionValue::derived(HeaderValue::try_from("future_secret").unwrap()),
+        );
+        assert_eq!(
+            trusted_issuer_account(Some(&with_critical)),
+            None,
+            "a user with unrecognized critical options must be rejected"
         );
     }
 

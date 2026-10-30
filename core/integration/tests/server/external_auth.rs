@@ -308,7 +308,7 @@ async fn given_ext_auth_multi_shard_when_logins_spread_should_callout_on_every_s
     let mut envs = ext_auth_envs(&ext_server.url());
     // Two shards: TCP connections round-robin, so successive logins
     // alternate between shard 0 (has consensus) and shard 1 (forwards
-    // the IsMetadataBackup check to shard 0 before calling out).
+    // the IsMetadataPrimary check to shard 0 before calling out).
     envs.insert("IGGY_SHARDING_CPU_ALLOCATION".to_owned(), "2".to_owned());
 
     let mut harness = TestHarness::builder()

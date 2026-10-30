@@ -300,14 +300,14 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
             shard::MetadataSubmit::ForwardedCompletion(message) => {
                 propose_relayed_completion(&shard, &message).await;
             }
-            shard::MetadataSubmit::IsMetadataBackup { reply } => {
-                let backup = shard
+            shard::MetadataSubmit::IsMetadataPrimary { reply } => {
+                let primary = shard
                     .plane
                     .metadata()
                     .consensus
                     .as_ref()
-                    .is_some_and(|c| c.is_normal() && !c.is_primary());
-                let _ = reply.try_send(backup);
+                    .is_some_and(|c| c.is_normal() && c.is_primary());
+                let _ = reply.try_send(primary);
             }
         }
     });
