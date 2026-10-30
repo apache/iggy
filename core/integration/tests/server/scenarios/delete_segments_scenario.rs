@@ -775,8 +775,6 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         (TOTAL_MESSAGES - 1) as u64,
     )
     .await;
-    // Stop background polling before the deliberate server restarts.
-    fast_consumer.shutdown().await.unwrap();
 
     // --- Set up slow standalone consumer: store offset at 0 ---
     let slow_consumer = Consumer {
