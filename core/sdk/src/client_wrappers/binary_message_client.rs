@@ -88,7 +88,7 @@ impl MessageClient for ClientWrapper {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partitioning: &Partitioning,
+        partition_id: u32,
         producer: BatchProducer,
         messages: &mut [IggyMessage],
     ) -> Result<SendMessagesResponse, IggyError> {
@@ -97,7 +97,7 @@ impl MessageClient for ClientWrapper {
             MessageClient::send_producer_messages(
                 stream_id,
                 topic_id,
-                partitioning,
+                partition_id,
                 producer,
                 messages
             )

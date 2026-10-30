@@ -121,7 +121,7 @@ fn given_a_producer_batch_in_flight_when_another_client_resends_it_to_the_same_p
     let reply = submit_and_wait(&mut sim, &second, OLD_PRIMARY, resend);
     assert_eq!(
         reply.header().status,
-        IggyError::TransientNotAccepted.as_code(),
+        IggyError::TransientNotCommitted.as_code(),
         "a resend of an uncommitted batch must wait for it"
     );
 
@@ -147,8 +147,9 @@ fn set_acks(sim: &mut Simulator, delivered: bool) {
     }
 }
 
-/// Send the batch again until the new primary answers it. It refuses with
-/// `TransientNotAccepted` while the batch is still in flight there.
+/// Send the batch again until the new primary answers it. It answers
+/// `TransientNotCommitted` while the batch is still in flight there, and
+/// `TransientNotAccepted` while it cannot take the request yet.
 fn resend_until_answered(
     sim: &mut Simulator,
     client: &SimClient,
@@ -166,7 +167,10 @@ fn resend_until_answered(
                     .expect("a send reply names its offset");
                 return response.confirmations[0].base_offset;
             }
-            status if status == IggyError::TransientNotAccepted.as_code() => {
+            status
+                if status == IggyError::TransientNotCommitted.as_code()
+                    || status == IggyError::TransientNotAccepted.as_code() =>
+            {
                 for _ in 0..STEPS_PER_SEND {
                     sim.step();
                 }

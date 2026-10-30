@@ -403,6 +403,7 @@ impl TestServer {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             tls: IggyTls::default(),
             produce_sessions: ProduceSessionLimits::default(),
+            idempotent_producers: true,
             nodes: KnownNodes::default(),
         }
     }

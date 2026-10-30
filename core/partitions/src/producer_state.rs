@@ -24,7 +24,7 @@
 //! Every replica records a committed batch in op order, so the tables agree.
 
 use iggy_binary_protocol::batch::BatchProducer;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Batches each producer keeps.
 ///
@@ -44,7 +44,7 @@ pub const PRODUCERS_MAX: usize = 4096;
 pub const PRODUCER_IDLE_EXPIRY_MICROS: u64 = 24 * 60 * 60 * 1_000_000;
 
 /// One batch of a producer, as the partition wrote it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProducerBatch {
     pub first_sequence: u32,
     pub last_sequence: u32,
@@ -52,11 +52,12 @@ pub struct ProducerBatch {
 }
 
 /// The state of one producer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProducerEntry {
     pub epoch: u16,
-    /// Oldest first, at most [`PRODUCER_BATCHES_RETAINED`].
-    pub batches: VecDeque<ProducerBatch>,
+    /// Oldest first. Slots from `len` on stay default, so equality holds.
+    batches: [ProducerBatch; PRODUCER_BATCHES_RETAINED],
+    len: usize,
     /// Prepare timestamp of the newest batch.
     pub last_timestamp: u64,
 }
@@ -90,41 +91,65 @@ pub struct StampedBatch {
 }
 
 impl ProducerEntry {
+    /// An entry that a checkpoint or a transfer carried, oldest batch first.
+    /// `None` for more than [`PRODUCER_BATCHES_RETAINED`] batches.
+    #[must_use]
+    pub fn restored(epoch: u16, last_timestamp: u64, batches: &[ProducerBatch]) -> Option<Self> {
+        let mut entry = Self {
+            epoch,
+            batches: [ProducerBatch::default(); PRODUCER_BATCHES_RETAINED],
+            len: batches.len(),
+            last_timestamp,
+        };
+        entry
+            .batches
+            .get_mut(..batches.len())?
+            .copy_from_slice(batches);
+        Some(entry)
+    }
+
     fn new(batch: &StampedBatch) -> Self {
         let mut entry = Self {
-            epoch: batch.producer.epoch,
-            batches: VecDeque::with_capacity(PRODUCER_BATCHES_RETAINED),
+            epoch: batch.producer.epoch(),
+            batches: [ProducerBatch::default(); PRODUCER_BATCHES_RETAINED],
+            len: 0,
             last_timestamp: batch.timestamp,
         };
         entry.push(batch);
         entry
     }
 
+    /// Oldest first, at most [`PRODUCER_BATCHES_RETAINED`].
+    #[must_use]
+    pub fn batches(&self) -> &[ProducerBatch] {
+        &self.batches[..self.len]
+    }
+
     /// The rules in order: the epoch, a duplicate of a retained batch, then
     /// the sequence.
     #[must_use]
     pub fn check(&self, producer: BatchProducer, message_count: u32) -> ProducerAdmission {
-        if producer.epoch < self.epoch {
+        if producer.epoch() < self.epoch {
             return ProducerAdmission::StaleEpoch;
         }
-        if producer.epoch > self.epoch {
+        if producer.epoch() > self.epoch {
             // A new epoch starts its sequence again.
-            return if producer.base_sequence == 0 {
+            return if producer.base_sequence() == 0 {
                 ProducerAdmission::Append
             } else {
                 ProducerAdmission::OutOfOrder
             };
         }
         let last_sequence = producer.last_sequence(message_count);
-        if let Some(batch) = self.batches.iter().find(|batch| {
-            batch.first_sequence == producer.base_sequence && batch.last_sequence == last_sequence
+        if let Some(batch) = self.batches().iter().find(|batch| {
+            batch.first_sequence == producer.base_sequence() && batch.last_sequence == last_sequence
         }) {
             return ProducerAdmission::Duplicate {
                 base_offset: batch.base_offset,
             };
         }
-        let follows = self.batches.back().is_none_or(|newest| {
-            BatchProducer::advance(newest.last_sequence, 1) == producer.base_sequence
+        let follows = self.batches().last().is_none_or(|newest| {
+            BatchProducer::advance(newest.last_sequence, 1) == producer.base_sequence()
         });
         if follows {
             ProducerAdmission::Append
@@ -134,26 +159,31 @@ impl ProducerEntry {
     }
 
     fn record(&mut self, batch: &StampedBatch) {
-        if batch.producer.epoch < self.epoch {
+        if batch.producer.epoch() < self.epoch {
             return;
         }
-        if batch.producer.epoch > self.epoch {
-            self.epoch = batch.producer.epoch;
-            self.batches.clear();
+        if batch.producer.epoch() > self.epoch {
+            self.epoch = batch.producer.epoch();
+            self.batches = [ProducerBatch::default(); PRODUCER_BATCHES_RETAINED];
+            self.len = 0;
         }
         self.push(batch);
         self.last_timestamp = self.last_timestamp.max(batch.timestamp);
     }
 
     fn push(&mut self, batch: &StampedBatch) {
-        if self.batches.len() == PRODUCER_BATCHES_RETAINED {
-            self.batches.pop_front();
-        }
-        self.batches.push_back(ProducerBatch {
-            first_sequence: batch.producer.base_sequence,
+        let written = ProducerBatch {
+            first_sequence: batch.producer.base_sequence(),
             last_sequence: batch.producer.last_sequence(batch.message_count),
             base_offset: batch.base_offset,
-        });
+        };
+        if self.len == PRODUCER_BATCHES_RETAINED {
+            self.batches.copy_within(1.., 0);
+            self.batches[PRODUCER_BATCHES_RETAINED - 1] = written;
+        } else {
+            self.batches[self.len] = written;
+            self.len += 1;
+        }
     }
 }
 
@@ -187,7 +217,7 @@ impl ProducerTable {
     /// Record a committed batch. Every replica calls this in op order, so
     /// every replica also drops the same idle producers.
     pub fn record(&mut self, batch: &StampedBatch) {
-        let producer_id = batch.producer.producer_id;
+        let producer_id = batch.producer.producer_id();
         if let Some(entry) = self.entries.get_mut(&producer_id) {
             self.by_idle.remove(&(entry.last_timestamp, producer_id));
             entry.record(batch);
@@ -220,7 +250,7 @@ impl ProducerTable {
         message_count: u32,
         in_flight: &[StampedBatch],
     ) -> ProducerAdmission {
-        let mut entry = self.entries.get(&producer.producer_id).cloned();
+        let mut entry = self.entries.get(&producer.producer_id()).copied();
         for batch in in_flight {
             match &mut entry {
                 Some(entry) => entry.record(batch),
@@ -230,7 +260,7 @@ impl ProducerTable {
         // A producer starts at sequence 0. A later batch that overtook the
         // first one through another session would otherwise land ahead of it.
         let Some(entry) = entry else {
-            return if producer.base_sequence == 0 {
+            return if producer.base_sequence() == 0 {
                 ProducerAdmission::Append
             } else {
                 ProducerAdmission::Unknown
@@ -248,19 +278,14 @@ impl ProducerTable {
         }
     }
 
-    #[must_use]
-    pub fn get(&self, producer_id: u64) -> Option<&ProducerEntry> {
+    #[cfg(test)]
+    fn get(&self, producer_id: u64) -> Option<&ProducerEntry> {
         self.entries.get(&producer_id)
     }
 
-    #[must_use]
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    fn len(&self) -> usize {
         self.entries.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 }
 
@@ -379,7 +404,7 @@ mod tests {
 
         let entry = table.get(PRODUCER_ID).unwrap();
         assert_eq!(entry.epoch, 1);
-        assert_eq!(entry.batches.len(), 1);
+        assert_eq!(entry.batches().len(), 1);
         assert_eq!(
             table.admit(producer(1, 2), 1, &[]),
             ProducerAdmission::Append
@@ -417,7 +442,7 @@ mod tests {
         let table = table(&batches);
 
         assert_eq!(
-            table.get(PRODUCER_ID).unwrap().batches.len(),
+            table.get(PRODUCER_ID).unwrap().batches().len(),
             PRODUCER_BATCHES_RETAINED
         );
         assert_eq!(
@@ -483,7 +508,7 @@ mod tests {
         let rebuilt = ProducerTable::from_entries(
             original
                 .entries()
-                .map(|(producer_id, entry)| (producer_id, entry.clone())),
+                .map(|(producer_id, entry)| (producer_id, *entry)),
         );
 
         assert_eq!(rebuilt, original);

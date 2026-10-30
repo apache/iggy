@@ -527,7 +527,7 @@ InitProducerId and idempotent producers
 
 - [x] InitProducerId (22) allocates a producer id so a stock idempotent producer starts; a
       transactional request is refused
-- [x] Write each batch of an idempotent producer once
+- [x] Write each batch of an idempotent producer once, with `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`
       ([#4513](https://github.com/apache/iggy/issues/4513)). Iggy partitions keep the producer state
 
 Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):

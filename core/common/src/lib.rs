@@ -109,7 +109,9 @@ pub use traits::topic_client::TopicClient;
 pub use traits::user_client::UserClient;
 pub use traits::validatable::Validatable;
 #[doc(hidden)]
-pub use traits::{BinarySendPartitioning, fetch_binary_messages, send_binary_messages};
+pub use traits::{
+    BinarySendPartitioning, fetch_binary_messages, select_send_partition, send_binary_messages,
+};
 pub use traits::{binary_sign_in, rust_sdk_version_info, sign_in_request};
 pub use traits::{decode_send_confirmations, group_cache_key, sync_group_assignment};
 pub use types::args::*;

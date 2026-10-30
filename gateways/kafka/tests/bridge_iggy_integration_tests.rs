@@ -622,6 +622,7 @@ async fn connect_to_unreachable_iggy_returns_err_not_panic() {
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
+        idempotent_producers: false,
         nodes: KnownNodes::default(),
     };
 
@@ -648,6 +649,7 @@ async fn connect_to_a_black_hole_address_times_out_instead_of_hanging() {
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
+        idempotent_producers: false,
         nodes: KnownNodes::default(),
     };
 

@@ -414,6 +414,7 @@ impl IggyBridge {
             max_message_size: crate::bridge::DEFAULT_MAX_MESSAGE_SIZE,
             produce_sessions: crate::bridge::ProduceSessionLimits::default(),
             tls: crate::bridge::IggyTls::default(),
+            idempotent_producers: false,
             nodes: KnownNodes::default(),
         };
         let client = Arc::new(client);

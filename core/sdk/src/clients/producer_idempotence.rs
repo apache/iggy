@@ -24,24 +24,20 @@
 //! partition of a chunk itself and sends the chunks of one partition one at a
 //! time.
 
-use iggy_common::{BatchProducer, Identifier, IggyError, Partitioning, PartitioningKind};
+use iggy_common::{BatchProducer, Identifier, IggyError};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// Sends of one chunk with the same producer after an unknown outcome,
 /// before the send fails.
 pub(crate) const RESENDS: usize = 3;
 
-type TopicKey = (Identifier, Identifier);
-type PartitionKey = (Identifier, Identifier, u32);
+type PartitionSequences = HashMap<u32, Arc<tokio::sync::Mutex<Sequence>>>;
 
 #[derive(Debug, Default)]
 pub(crate) struct Idempotence {
     identity: Mutex<Identity>,
-    sequences: Mutex<HashMap<PartitionKey, Arc<tokio::sync::Mutex<Sequence>>>>,
-    partition_counts: Mutex<HashMap<TopicKey, u32>>,
-    next_balanced: AtomicU32,
+    sequences: Mutex<HashMap<Identifier, HashMap<Identifier, PartitionSequences>>>,
 }
 
 /// The producer id, its current epoch, and whether a newer copy fenced it.
@@ -84,12 +80,24 @@ impl Idempotence {
         topic: &Identifier,
         partition_id: u32,
     ) -> Arc<tokio::sync::Mutex<Sequence>> {
-        let key = (stream.clone(), topic.clone(), partition_id);
+        let mut sequences = self
+            .sequences
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(sequence) = sequences
+            .get(stream)
+            .and_then(|topics| topics.get(topic))
+            .and_then(|partitions| partitions.get(&partition_id))
+        {
+            return Arc::clone(sequence);
+        }
         Arc::clone(
-            self.sequences
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .entry(key)
+            sequences
+                .entry(stream.clone())
+                .or_default()
+                .entry(topic.clone())
+                .or_default()
+                .entry(partition_id)
                 .or_default(),
         )
     }
@@ -120,7 +128,7 @@ impl Idempotence {
 
     /// Records the written chunk of `count` messages that `producer` started.
     pub(crate) fn advance(sequence: &mut Sequence, producer: BatchProducer, count: u32) {
-        sequence.next = BatchProducer::advance(producer.base_sequence, count);
+        sequence.next = producer.next(count).base_sequence();
     }
 
     /// Moves past `producer` to the next epoch, unless a chunk of another
@@ -128,10 +136,12 @@ impl Idempotence {
     /// the caller asks for a new one.
     pub(crate) fn next_epoch(&self, producer: BatchProducer) {
         let mut identity = self.identity();
-        if identity.producer_id != Some(producer.producer_id) || identity.epoch != producer.epoch {
+        if identity.producer_id != Some(producer.producer_id())
+            || identity.epoch != producer.epoch()
+        {
             return;
         }
-        if producer.epoch == BatchProducer::EPOCH_MAX {
+        if producer.epoch() == BatchProducer::EPOCH_MAX {
             identity.producer_id = None;
             identity.epoch = 0;
         } else {
@@ -142,55 +152,6 @@ impl Idempotence {
     /// A newer copy of this producer wrote to a partition, so this one stops.
     pub(crate) fn fence(&self) {
         self.identity().fenced = true;
-    }
-
-    /// The partition that `partitioning` picks for a chunk, in a topic of
-    /// `partitions_count` partitions. `Balanced` goes round-robin and a
-    /// messages key hashes as the binary clients hash it.
-    pub(crate) fn partition(
-        &self,
-        partitioning: &Partitioning,
-        partitions_count: u32,
-    ) -> Result<u32, IggyError> {
-        match partitioning.kind {
-            PartitioningKind::PartitionId => partitioning
-                .value
-                .get(..4)
-                .and_then(|bytes| bytes.try_into().ok())
-                .map(u32::from_le_bytes)
-                .ok_or(IggyError::InvalidCommand),
-            _ if partitions_count == 0 => Err(IggyError::InvalidCommand),
-            PartitioningKind::Balanced => {
-                Ok(self.next_balanced.fetch_add(1, Ordering::Relaxed) % partitions_count)
-            }
-            PartitioningKind::MessagesKey => {
-                Ok(iggy_common::calculate_32(&partitioning.value) % partitions_count)
-            }
-        }
-    }
-
-    /// The partition count of a topic, as a lookup found it.
-    pub(crate) fn partitions_count(&self, stream: &Identifier, topic: &Identifier) -> Option<u32> {
-        self.partition_counts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&(stream.clone(), topic.clone()))
-            .copied()
-    }
-
-    pub(crate) fn set_partitions_count(&self, stream: &Identifier, topic: &Identifier, count: u32) {
-        self.partition_counts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert((stream.clone(), topic.clone()), count);
-    }
-
-    /// Drops a count that a missing partition proved stale.
-    pub(crate) fn forget_partitions_count(&self, stream: &Identifier, topic: &Identifier) {
-        self.partition_counts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&(stream.clone(), topic.clone()));
     }
 
     fn identity(&self) -> MutexGuard<'_, Identity> {
@@ -268,7 +229,7 @@ mod tests {
             idempotence.next_epoch(sent);
         }
         let last = idempotence.next_producer(&mut sequence).unwrap();
-        assert_eq!(last.epoch, BatchProducer::EPOCH_MAX);
+        assert_eq!(last.epoch(), BatchProducer::EPOCH_MAX);
 
         idempotence.next_epoch(last);
 
@@ -290,28 +251,6 @@ mod tests {
         assert_eq!(
             idempotence.next_producer(&mut *lock.lock().await),
             Err(IggyError::ProducerEpochFenced)
-        );
-    }
-
-    #[test]
-    fn given_each_partitioning_when_picking_should_name_one_partition() {
-        let idempotence = Idempotence::default();
-
-        assert_eq!(
-            idempotence.partition(&Partitioning::partition_id(5), 0),
-            Ok(5)
-        );
-        let picks: Vec<u32> = (0..4)
-            .map(|_| idempotence.partition(&Partitioning::balanced(), 3).unwrap())
-            .collect();
-        assert_eq!(picks, [0, 1, 2, 0]);
-        let key = Partitioning::messages_key_str("orders").unwrap();
-        let keyed = idempotence.partition(&key, 8).unwrap();
-        assert_eq!(idempotence.partition(&key, 8), Ok(keyed));
-        assert_eq!(keyed, iggy_common::calculate_32(b"orders") % 8);
-        assert_eq!(
-            idempotence.partition(&Partitioning::balanced(), 0),
-            Err(IggyError::InvalidCommand)
         );
     }
 }

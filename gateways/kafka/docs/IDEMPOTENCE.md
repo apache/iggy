@@ -30,8 +30,14 @@ does. The core SDK README has the rules, under "Idempotent producers". In short:
 - Before the partition primary assigns offsets, it compares each batch with that state and with
   its uncommitted writes.
 
-Produce passes the three fields of a Kafka batch to Iggy unchanged. So every resend finds the
-first write: through any gateway, on any Iggy session, and across a gateway restart.
+With `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, Produce passes the three fields of a Kafka batch to
+Iggy unchanged. So every resend finds the first write: through any gateway, on any Iggy session,
+and across a gateway restart.
+
+The switch is off by default. Released gateways, and released consumers built on the Rust SDK,
+refuse to read a batch that carries a producer. Upgrade every gateway and every consumer of the
+topics, then turn the switch on for every gateway. While it is off, Produce drops the three
+fields, and an idempotent producer gets at-least-once delivery.
 
 Iggy's client table does not do this job. It guards the hop from the gateway to Iggy. It keys on a
 request number that the Iggy client picks. A Kafka retry is a new Produce request. The gateway
@@ -97,8 +103,9 @@ for consumer groups and has to refuse a `TXN`-type coordinator lookup explicitly
 
 Produce:
 
-- pass `producer_id`, `producer_epoch` and `base_sequence` of an idempotent batch to Iggy. A
-  batch with a producer id but a negative epoch or sequence gets `INVALID_RECORD` (87).
+- pass `producer_id`, `producer_epoch` and `base_sequence` of an idempotent batch to Iggy, when
+  `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` is `true`. A batch with a producer id but a negative epoch or
+  sequence gets `INVALID_RECORD` (87).
 - a resend of a batch that the partition holds answers the offset of its first write.
 - answer `OUT_OF_ORDER_SEQUENCE_NUMBER` (45) for a gap, as Kafka does. The Java producer retries
   a 45. For a real gap, it moves to the next epoch.
@@ -107,8 +114,9 @@ Produce:
 - answer `UNKNOWN_PRODUCER_ID` (59) for a batch above sequence 0 from a producer that the partition
   does not hold. That partition response carries `log_start_offset` 0. With a log start of `-1`,
   the Java producer retries a 59 unchanged up to its delivery timeout.
-- a duplicate that is still uncommitted gets Iggy's `TransientNotAccepted`. The SDK retries it up
-  to the deadline. Past it, the client gets a retriable 6 or 7.
+- a duplicate that is still uncommitted gets Iggy's `TransientNotCommitted`, because the first
+  copy can still commit. The SDK retries it up to the deadline. Past it, the client gets a
+  retriable 7.
 - never answer `DUPLICATE_SEQUENCE_NUMBER` (46). A Kafka broker sends 45 for an old duplicate too.
 - an id that this gateway gave out lately also picks the producer's Iggy session.
 - reject a non-empty `transactional_id` (v3+) with `UNSUPPORTED_VERSION` (35), at the partition
@@ -163,8 +171,10 @@ branch load-bearing.
   forgets the one idle the longest. A resend of an old batch of a forgotten producer can write it
   twice, as in Kafka.
 - A resend older than the 5 batches that the partition keeps gets 45, as in Kafka.
-- Released Rust and Swift SDKs refuse a polled batch with a producer section. Before idempotent
-  Kafka producers write to a topic, upgrade every native consumer of it.
+- Released builds refuse a polled batch with a producer section: the gateway, the Rust SDK and
+  every client that embeds it (the Python, C++ and PHP SDKs, the CLI and the connectors runtime),
+  and the Swift SDK. Before you set `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, upgrade every gateway
+  and every consumer of the topics.
 - Transactions are not supported.
 
 ## Resolution

@@ -418,6 +418,7 @@ async fn root_bridge(server: &TestServer) -> IggyBridge {
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
+        idempotent_producers: true,
         nodes: KnownNodes::default(),
     };
     IggyBridge::connect(config)
@@ -2311,6 +2312,7 @@ async fn tls_stack() -> Option<TlsStack> {
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         produce_sessions: ProduceSessionLimits::default(),
         tls: IggyTls::default(),
+        idempotent_producers: true,
         nodes: KnownNodes::default(),
     })
     .await
