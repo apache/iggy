@@ -340,6 +340,9 @@ pub mod topic_option_keys {
     /// [`SEGMENT_SIZE`] -- preallocation reserves exactly that much, so
     /// the two only make sense decided together.
     pub const PREALLOCATE_SEGMENTS: &str = "preallocate_segments";
+    /// Nodes that store each partition: `Uint32`, create-only. Bounded by
+    /// [`super::MAX_REPLICATION_FACTOR`] and the cluster's node count.
+    pub const REPLICATION_FACTOR: &str = "replication_factor";
 }
 
 /// Values an absent topic option resolves to at admission.
@@ -365,6 +368,11 @@ pub const DEFAULT_MESSAGES_REQUIRED_TO_SAVE: u32 = 1024;
 pub const DEFAULT_PREALLOCATE_SEGMENTS: bool = false;
 /// 1 MiB (was `[partition] size_of_messages_required_to_save`).
 pub const DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE: u64 = 1024 * 1024;
+/// Lowered to the cluster's node count at admission when that is smaller.
+pub const DEFAULT_REPLICATION_FACTOR: u32 = 3;
+
+/// Largest partition group consensus supports.
+pub const MAX_REPLICATION_FACTOR: u32 = 32;
 
 /// Ceiling for `size_of_messages_required_to_save`.
 ///
@@ -1194,6 +1202,9 @@ pub struct TopicCreateOptions {
     /// Whether this topic's segments reserve their bytes on open; `None`
     /// resolves against [`DEFAULT_PREALLOCATE_SEGMENTS`].
     pub preallocate_segments: Option<bool>,
+    /// Nodes that store each partition; `None` resolves at admission to
+    /// [`DEFAULT_REPLICATION_FACTOR`], lowered to the cluster's node count.
+    pub replication_factor: Option<u32>,
     /// String-valued keys with no typed field above, parsed server-side
     /// through each key's `FromStr`. Lets a client reach a key added to the
     /// server catalog after this build shipped. Outbound only: a typed field
@@ -1311,6 +1322,9 @@ impl TopicCreateOptions {
             OptionKey::PreallocateSegments => {
                 self.preallocate_segments = Some(bool::decode(option, entry)?);
             }
+            OptionKey::ReplicationFactor => {
+                self.replication_factor = Some(u32::decode(option, entry)?);
+            }
             OptionKey::Name
             | OptionKey::Username
             | OptionKey::Status
@@ -1354,6 +1368,7 @@ impl TopicCreateOptions {
                 .size_of_messages_required_to_save
                 .or(defaults.size_of_messages_required_to_save),
             preallocate_segments: self.preallocate_segments.or(defaults.preallocate_segments),
+            replication_factor: self.replication_factor.or(defaults.replication_factor),
             raw: BTreeMap::new(),
         }
     }
@@ -1459,6 +1474,13 @@ impl TopicCreateOptions {
                 HeaderKey::from_str(topic_option_keys::PREALLOCATE_SEGMENTS)
                     .expect("catalog key is a valid header key"),
                 OptionValue::explicit(HeaderValue::from(preallocate_segments)),
+            );
+        }
+        if let Some(replication_factor) = self.replication_factor {
+            options.insert(
+                HeaderKey::from_str(topic_option_keys::REPLICATION_FACTOR)
+                    .expect("catalog key is a valid header key"),
+                OptionValue::explicit(HeaderValue::from(replication_factor)),
             );
         }
         Ok(options)
@@ -1732,6 +1754,7 @@ mod tests {
             messages_required_to_save: Some(500),
             size_of_messages_required_to_save: Some(IggyByteSize::from(2_097_152u64)),
             preallocate_segments: Some(false),
+            replication_factor: Some(2),
             partitions_count: None,
             consumer_offset_durability: Durability::Replicated,
             partition_resize_policy: Some(PartitionResizePolicy::Fixed),

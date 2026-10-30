@@ -93,6 +93,8 @@ pub enum OptionKey {
     SizeOfMessagesRequiredToSave,
     /// Topic segment preallocation, fixed at creation.
     PreallocateSegments,
+    /// Topic replication factor, fixed at creation.
+    ReplicationFactor,
     /// Stream encryption key, write-only and fixed at creation.
     EncryptionKey,
     /// Who chose the stream's key, computed by the server.
@@ -223,6 +225,13 @@ impl TopicOptions {
     ///     size_of_messages_required_to_save: Byte flush threshold as
     ///         `int | None`.
     ///     preallocate_segments: Reserve segment bytes on open as `bool | None`.
+    ///     replication_factor: Nodes that store each partition as
+    ///         `int | None`, 1 to 32 and at most the cluster's node count.
+    ///         `None` resolves to 3, lowered to the node count when smaller.
+    ///         A write commits on a quorum of these nodes, so 2 keeps two
+    ///         copies but stops accepting writes while either node is down.
+    ///         The server rejects an out-of-range value with
+    ///         `InvalidReplicationFactor`.
     ///     raw: Additional option keys as `dict[str, str]`, sent as string
     ///         values so a key newer than this build can be set. A typed field
     ///         wins on collision.
@@ -233,7 +242,7 @@ impl TopicOptions {
     ///     TypeError: If a durability is not a `Durability`.
     #[new]
     #[pyo3(
-        signature = (*, partitions_count = 1, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, durability = None, consumer_offset_durability = None, partition_resize_policy = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, raw = None)
+        signature = (*, partitions_count = 1, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, durability = None, consumer_offset_durability = None, partition_resize_policy = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, replication_factor = None, raw = None)
     )]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -261,6 +270,9 @@ impl TopicOptions {
         size_of_messages_required_to_save: Option<u64>,
         #[gen_stub(override_type(type_repr = "builtins.bool | None"))] preallocate_segments: Option<
             bool,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] replication_factor: Option<
+            u32,
         >,
         #[gen_stub(override_type(type_repr = "builtins.dict[builtins.str, builtins.str] | None"))]
         raw: Option<BTreeMap<String, String>>,
@@ -293,6 +305,7 @@ impl TopicOptions {
                 size_of_messages_required_to_save: size_of_messages_required_to_save
                     .map(IggyByteSize::from),
                 preallocate_segments,
+                replication_factor,
                 raw: raw.unwrap_or_default(),
             },
         })
@@ -367,6 +380,7 @@ impl From<OptionKey> for RustOptionKey {
             OptionKey::MessagesRequiredToSave => Self::MessagesRequiredToSave,
             OptionKey::SizeOfMessagesRequiredToSave => Self::SizeOfMessagesRequiredToSave,
             OptionKey::PreallocateSegments => Self::PreallocateSegments,
+            OptionKey::ReplicationFactor => Self::ReplicationFactor,
             OptionKey::EncryptionKey => Self::EncryptionKey,
             OptionKey::EncryptionKeySource => Self::EncryptionKeySource,
             OptionKey::EncryptionKeyFingerprint => Self::EncryptionKeyFingerprint,

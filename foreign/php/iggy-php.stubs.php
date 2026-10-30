@@ -154,6 +154,12 @@ namespace Iggy {
          * know, and the server decides whether to accept them. It is marked
          * `#[\SensitiveParameter]`, because an unknown key may hold a secret.
          *
+         * `replication_factor` is how many nodes store each partition, 1 to 32 and at most the
+         * cluster's node count. Null resolves to 3, lowered to the node count when smaller. A write
+         * commits on a quorum of these nodes, so 2 keeps two copies but stops accepting writes while
+         * either node is down. The server rejects an out-of-range value with
+         * `InvalidReplicationFactor`.
+         *
          * @param mixed $stream
          * @param string $name
          * @param int $partitions_count
@@ -167,10 +173,11 @@ namespace Iggy {
          * @param mixed $size_of_messages_required_to_save
          * @param bool|null $preallocate_segments
          * @param string|null $partition_resize_policy
+         * @param mixed $replication_factor
          * @param array|null $raw
          * @return void
          */
-        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, ?array $raw = null): void {}
+        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, mixed $replication_factor = null, ?array $raw = null): void {}
 
         /**
          * Deletes a stream by id or name.
@@ -2158,6 +2165,7 @@ namespace Iggy {
       case MessagesRequiredToSave = 'messages_required_to_save';
       case SizeOfMessagesRequiredToSave = 'size_of_messages_required_to_save';
       case PreallocateSegments = 'preallocate_segments';
+      case ReplicationFactor = 'replication_factor';
     }
 }
 

@@ -543,6 +543,7 @@ pub fn create_one_partition_in(mux_stm: &TestMux) -> IggyNamespace {
                     initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 1,
+                    members: Vec::new(),
                 }],
             }
             .to_bytes(),
@@ -603,6 +604,7 @@ pub fn recreate_topic_in(mux_stm: &TestMux, namespace: IggyNamespace) {
                 partition_id: namespace.partition_id().try_into().unwrap(),
                 consensus_group_id: 2,
                 initial_view: 0,
+                members: Vec::new(),
             }],
         }
         .to_bytes(),

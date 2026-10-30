@@ -24,8 +24,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
-use iggy_binary_protocol::requests::system::SessionIdentity;
-use iggy_binary_protocol::{Command, ConsumerSession, ConsumerSessionHeartbeatHeader, WireDecode};
+use bytes::{BufMut, BytesMut};
+use iggy_binary_protocol::requests::system::{RetirementDebt, SessionIdentity};
+use iggy_binary_protocol::{
+    Command, ConsumerSession, ConsumerSessionHeartbeatHeader, MAX_CONSUMER_SESSIONS_PER_HEARTBEAT,
+    WireDecode, WireEncode,
+};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use tracing::{debug, warn};
@@ -54,14 +58,29 @@ impl SessionActivity {
     }
 }
 
+/// What a reporter could not prove retired among the partitions it stores.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct Withheld {
+    /// Member sets none of whose partitions it could prove.
+    pub(super) masks: Vec<u32>,
+    pub(super) partitions: Vec<RetirementDebt>,
+}
+
+/// A reporter's withheld vouches. `None` vouches for none of its partitions.
+pub(super) type Unprovable = Option<Rc<Withheld>>;
+
 pub(super) struct RetirementProgress {
     pub(super) identity: SessionIdentity,
     pub(super) revision: u64,
     pub(super) cursor: usize,
-    pub(super) complete: bool,
+    /// Swept namespaces not yet proven: created revision, first attempt, and
+    /// whether a retry followed it.
+    pub(super) pending: BTreeMap<IggyNamespace, (u64, Instant, bool)>,
+    pub(super) unprovable: BTreeSet<RetirementDebt>,
     pub(super) reported: bool,
     last_report: Option<Instant>,
-    pub(super) reporters: BTreeSet<u8>,
+    pub(super) reporters: BTreeMap<u8, Unprovable>,
+    pub(super) debt_settleable_since: Option<Instant>,
 }
 
 impl RetirementProgress {
@@ -79,6 +98,32 @@ impl RetirementProgress {
 
 type RetirementNamespaces = Rc<[(IggyNamespace, u64)]>;
 
+/// Committed partitions grouped by member set, for counting vouching reporters
+/// once per set instead of once per partition.
+#[derive(Default)]
+pub(super) struct RetirementGroups {
+    pub(super) sets: Vec<MemberSet>,
+    pub(super) by_partition: BTreeMap<RetirementDebt, usize>,
+}
+
+pub(super) struct MemberSet {
+    pub(super) mask: u32,
+    pub(super) quorum: u32,
+    pub(super) partitions: Vec<RetirementDebt>,
+}
+
+/// Unpaid retirement debts of partitions this node stores, and the newest
+/// debt op absorbed into them.
+#[derive(Default)]
+pub(super) struct RetirementDebts {
+    pub(super) seen_through: Option<u64>,
+    /// `(created_revision, debt_op)` by namespace.
+    pub(super) unpaid: BTreeMap<IggyNamespace, (u64, u64)>,
+    /// Debts confirmed paid, so a rescan does not visit them again.
+    pub(super) paid: BTreeMap<IggyNamespace, (u64, u64)>,
+    pub(super) cursor: Option<IggyNamespace>,
+}
+
 /// Bounded by the session registry, independent of heartbeat volume.
 #[derive(Default)]
 pub struct ConsumerGroupLiveness {
@@ -92,6 +137,14 @@ pub struct ConsumerGroupLiveness {
     pub(super) retirement: Option<RetirementProgress>,
     pub(super) retirement_namespaces: Option<(u64, RetirementNamespaces)>,
     pub(super) retirement_fences: BTreeMap<IggyNamespace, u64>,
+    /// Namespaces the last completed sweep could not prove: the next sweep
+    /// gives each of them one attempt instead of the full wait.
+    pub(super) retirement_suspects: BTreeSet<IggyNamespace>,
+    pub(super) retirement_groups: Option<(u64, Rc<RetirementGroups>)>,
+    /// Nodes missing from the reports of the last finalization, which the
+    /// next one does not wait for before recording debt.
+    pub(super) retirement_absent: u32,
+    pub(super) retirement_debts: RetirementDebts,
 }
 
 impl ConsumerGroupLiveness {
@@ -171,20 +224,24 @@ impl ConsumerGroupLiveness {
                 identity,
                 revision,
                 cursor: 0,
-                complete: true,
+                pending: BTreeMap::new(),
+                unprovable: BTreeSet::new(),
                 reported: false,
                 last_report: None,
-                reporters: BTreeSet::new(),
+                reporters: BTreeMap::new(),
+                debt_settleable_since: None,
             });
         } else if let Some(progress) = &mut self.retirement
             && progress.revision != revision
         {
             progress.revision = revision;
             progress.cursor = 0;
-            progress.complete = true;
+            progress.pending.clear();
+            progress.unprovable.clear();
             progress.reported = false;
             progress.last_report = None;
             progress.reporters.clear();
+            progress.debt_settleable_since = None;
         }
     }
 
@@ -218,6 +275,26 @@ impl ConsumerGroupLiveness {
         if primary_view != Some(header.view) || header.cluster != cluster {
             return;
         }
+        if header.command == Command::SessionRetirementProgress {
+            if header.incomplete != 0 {
+                return;
+            }
+            let Some((session, unprovable)) = decode_retirement_progress(message.body()) else {
+                debug!(
+                    replica = header.replica,
+                    "invalid session retirement progress body"
+                );
+                return;
+            };
+            if let Some(progress) = &mut self.retirement
+                && header.namespace_revision == progress.revision
+                && session.client_id == progress.identity.client_id
+                && session.session == progress.identity.session
+            {
+                progress.reporters.insert(header.replica, unprovable);
+            }
+            return;
+        }
         // Validate the whole batch before refreshing anything.
         let (sessions, remainder) = message
             .body()
@@ -237,24 +314,6 @@ impl ConsumerGroupLiveness {
                 replica = header.replica,
                 "invalid consumer session heartbeat body"
             );
-            return;
-        }
-        if header.command == Command::SessionRetirementProgress {
-            if header.incomplete != 0 {
-                return;
-            }
-            if let Some(progress) = &mut self.retirement
-                && header.namespace_revision == progress.revision
-            {
-                for bytes in sessions {
-                    if let Ok((session, _)) = ConsumerSession::decode(bytes)
-                        && session.client_id == progress.identity.client_id
-                        && session.session == progress.identity.session
-                    {
-                        progress.reporters.insert(header.replica);
-                    }
-                }
-            }
             return;
         }
         if header.incomplete != 0 {
@@ -284,6 +343,76 @@ impl ConsumerGroupLiveness {
                     && now.saturating_duration_since(lease.last_seen) >= timeout
             })
     }
+}
+
+const WITHHELD_PARTITION: u64 = 1;
+const WITHHELD_MEMBER_SET: u64 = 2;
+const WITHHELD_ALL: u64 = 3;
+
+/// A retirement progress body: the session, then one 24-byte record per
+/// withheld vouch, `namespace u64 | created_revision u64 | tag u64`, or
+/// `mask u64 | 0 | tag` for a member set. The records keep the body whole
+/// heartbeat sessions; a list that does not fit is sent as one record
+/// withholding every vouch.
+pub(super) fn encode_retirement_progress(
+    session: ConsumerSession,
+    withheld: Option<&Withheld>,
+    body_max: usize,
+) -> BytesMut {
+    let records = withheld.map_or(1, |withheld| {
+        withheld.masks.len() + withheld.partitions.len()
+    });
+    let fits = withheld.is_some()
+        && records < MAX_CONSUMER_SESSIONS_PER_HEARTBEAT
+        && (records + 1) * ConsumerSession::ENCODED_SIZE <= body_max;
+    let mut body = BytesMut::with_capacity((records + 1) * ConsumerSession::ENCODED_SIZE);
+    session.encode(&mut body);
+    let mut record = |first: u64, second: u64, tag: u64| {
+        body.put_u64_le(first);
+        body.put_u64_le(second);
+        body.put_u64_le(tag);
+    };
+    match withheld {
+        Some(withheld) if fits => {
+            for &mask in &withheld.masks {
+                record(u64::from(mask), 0, WITHHELD_MEMBER_SET);
+            }
+            for debt in &withheld.partitions {
+                record(debt.namespace, debt.created_revision, WITHHELD_PARTITION);
+            }
+        }
+        _ => record(0, 0, WITHHELD_ALL),
+    }
+    body
+}
+
+fn decode_retirement_progress(body: &[u8]) -> Option<(ConsumerSession, Unprovable)> {
+    let (records, remainder) = body.as_chunks::<{ ConsumerSession::ENCODED_SIZE }>();
+    let (session, records) = records.split_first()?;
+    if !remainder.is_empty() {
+        return None;
+    }
+    let (session, _) = ConsumerSession::decode(session).ok()?;
+    let mut withheld = Withheld::default();
+    for record in records {
+        let (first, rest) = record.split_first_chunk::<8>()?;
+        let (second, tag) = rest.split_first_chunk::<8>()?;
+        let (first, second) = (u64::from_le_bytes(*first), u64::from_le_bytes(*second));
+        match u64::from_le_bytes(tag.try_into().ok()?) {
+            WITHHELD_PARTITION => withheld.partitions.push(RetirementDebt {
+                namespace: first,
+                created_revision: second,
+            }),
+            WITHHELD_MEMBER_SET if second == 0 => {
+                withheld.masks.push(u32::try_from(first).ok()?);
+            }
+            WITHHELD_ALL if records.len() == 1 && first == 0 && second == 0 => {
+                return Some((session, None));
+            }
+            _ => return None,
+        }
+    }
+    Some((session, Some(Rc::new(withheld))))
 }
 
 #[cfg(test)]

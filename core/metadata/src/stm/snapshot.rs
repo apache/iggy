@@ -371,6 +371,7 @@ impl MetadataSnapshot {
     pub(crate) fn validate(&self) -> Result<(), SnapshotError> {
         if let Some(streams) = &self.streams {
             streams.validate_ownership_history(self.sequence_number)?;
+            streams.validate_partition_members()?;
         }
         self.change_log.validate(self.sequence_number)
     }
@@ -668,6 +669,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn nested_snapshot_shapes_are_pinned_too() {
         // The top-level count above is blind to everything under it, which is how
         // `TopicSnapshot` once swapped a removed field for an added one and kept
@@ -684,7 +686,8 @@ mod tests {
         const CLIENT_TABLE_FIELD_COUNT: u32 = 2;
         // Version 5 appended `created_view` the same way. Version 10 dropped
         // `purge_generation` from the middle, which no default can cover.
-        const PARTITION_FIELD_COUNT: u32 = 6;
+        // `members` and `retirement_debt_op` are appended with defaults.
+        const PARTITION_FIELD_COUNT: u32 = 8;
 
         let client_table = consensus::ClientTableSnapshot {
             slots: Vec::new(),
@@ -728,6 +731,8 @@ mod tests {
             created_revision: 0,
             deleted_up_to_offset: 0,
             created_view: 0,
+            members: Vec::new(),
+            retirement_debt_op: 0,
         };
         let encoded = rmp_serde::to_vec(&partition).unwrap();
         assert_eq!(
@@ -1006,6 +1011,8 @@ mod tests {
                                 created_revision: 0,
                                 deleted_up_to_offset: 0,
                                 created_view: 0,
+                                members: vec![2, 0, 1],
+                                retirement_debt_op: 9,
                             }],
                             consumer_groups: Vec::new(),
                             // Nonzero and distinct from every id above so the
@@ -1043,6 +1050,7 @@ mod tests {
         let (_, topic) = &stream.topics[0];
         assert_eq!(topic.partitions.len(), 1);
         assert_eq!(topic.partitions[0].consensus_group_id, 33);
+        assert_eq!(topic.partitions[0].retirement_debt_op, 9);
         // Never-reuse counter: `#[serde(default)]` would silently restore 0 if
         // the field were dropped from the wire format, so pin its survival.
         assert_eq!(topic.next_consumer_group_id, 5);

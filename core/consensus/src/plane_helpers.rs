@@ -203,11 +203,7 @@ where
     P: Pipeline<Entry = PipelineEntry>,
 {
     loop {
-        match consensus
-            .message_bus()
-            .send_to_replica(next, message.clone())
-            .await
-        {
+        match consensus.send_to_member(next, message.clone()).await {
             Ok(()) => return Ok(()),
             Err(error @ (SendError::ReplicaNotConnected(_) | SendError::ConnectionClosed)) => {
                 next = (next + 1) % consensus.replica_count();
@@ -1134,7 +1130,7 @@ pub fn repaired_prepare_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Consensus, LocalPipeline, VsrAction};
+    use crate::{Consensus, ConsensusClock, LocalPipeline, ReplicaSet, VsrAction};
     use aligned_vec::{AVec, ConstAlign};
     use iggy_binary_protocol::{ConsensusHeader, Operation, StartViewChangeHeader};
     use iggy_common::calculate_checksum;
@@ -2722,6 +2718,104 @@ mod tests {
         let sent = consensus.message_bus().sent.borrow();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, 1);
+    }
+
+    const SUBSET_MEMBERS: [u8; 3] = [4, 1, 3];
+
+    fn subset_consensus(self_node: u8) -> VsrConsensus<SpyBus> {
+        let consensus = VsrConsensus::with_members(
+            1,
+            self_node,
+            ReplicaSet::new(&SUBSET_MEMBERS).expect("valid members"),
+            0,
+            SpyBus::new(),
+            LocalPipeline::new(),
+            ConsensusClock::system(),
+        );
+        consensus.init();
+        consensus
+    }
+
+    #[test]
+    fn given_subset_group_when_sending_to_members_should_address_their_nodes() {
+        let consensus = subset_consensus(1);
+        let message = || {
+            Message::<PrepareOkHeader>::new(std::mem::size_of::<PrepareOkHeader>()).into_generic()
+        };
+
+        assert!(futures::executor::block_on(
+            consensus.send_or_loopback(0, message())
+        ));
+        assert!(futures::executor::block_on(
+            consensus.send_or_loopback(2, message())
+        ));
+        assert!(futures::executor::block_on(
+            consensus.send_or_loopback(1, message())
+        ));
+        assert!(matches!(
+            futures::executor::block_on(consensus.send_to_member(3, message().into_frozen())),
+            Err(SendError::ReplicaNotConnected(3))
+        ));
+
+        let mut looped = Vec::new();
+        consensus.drain_loopback_into(&mut looped);
+        assert_eq!(looped.len(), 1, "member 1 is this node");
+        assert_eq!(*consensus.message_bus().attempts.borrow(), [4, 3]);
+    }
+
+    #[test]
+    fn given_no_link_to_a_member_when_sending_should_count_it_out_of_sync() {
+        let consensus = subset_consensus(4);
+        let send = |consensus: &VsrConsensus<SpyBus>| {
+            futures::executor::block_on(
+                consensus.send_to_member(
+                    1,
+                    Message::<PrepareOkHeader>::new(std::mem::size_of::<PrepareOkHeader>())
+                        .into_generic()
+                        .into_frozen(),
+                ),
+            )
+        };
+        assert_eq!(consensus.in_sync_members(crate::MEMBER_LAG_MAX), Some(3));
+
+        consensus.message_bus().reject_sends.set(true);
+        assert!(send(&consensus).is_err());
+        assert_eq!(consensus.in_sync_members(crate::MEMBER_LAG_MAX), Some(2));
+
+        consensus.message_bus().reject_sends.set(false);
+        send(&consensus).expect("the link is back");
+        assert_eq!(consensus.in_sync_members(crate::MEMBER_LAG_MAX), Some(3));
+    }
+
+    #[test]
+    fn given_subset_group_when_forwarding_prepare_should_reach_next_member_node() {
+        let consensus = subset_consensus(1);
+
+        futures::executor::block_on(replicate_frozen_to_next_in_chain(
+            &consensus,
+            prepare_message(1, 0, 42).into_frozen(),
+        ))
+        .expect("node 3 is connected");
+
+        assert_eq!(*consensus.message_bus().attempts.borrow(), [3]);
+    }
+
+    #[test]
+    fn given_subset_group_when_next_member_is_down_should_stop_before_the_primary_node() {
+        let consensus = subset_consensus(1);
+        consensus
+            .message_bus()
+            .failures
+            .borrow_mut()
+            .insert(3, SendError::ReplicaNotConnected(3));
+
+        let result = futures::executor::block_on(replicate_frozen_to_next_in_chain(
+            &consensus,
+            prepare_message(1, 0, 42).into_frozen(),
+        ));
+
+        assert!(result.is_err(), "the chain ends at member 0, node 4");
+        assert_eq!(*consensus.message_bus().attempts.borrow(), [3]);
     }
 
     /// `advance_commit_min` is strictly sequential, so draining op 7 with 6 never

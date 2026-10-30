@@ -1303,6 +1303,7 @@ async fn assert_topic_recovered(
         preallocate_segments: seed
             .preallocate_segments
             .and(recovered.preallocate_segments),
+        replication_factor: seed.replication_factor.and(recovered.replication_factor),
         raw: BTreeMap::new(),
     };
     assert_eq!(

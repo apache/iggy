@@ -1071,9 +1071,12 @@ where
                     );
                 }
             }
-            LifecycleFrame::PartitionPlacementViews(reports) => {
+            LifecycleFrame::PartitionPlacementViews(reports, statuses) => {
                 if self.id == 0 {
                     self.plane.metadata().observe_partition_views(&reports);
+                    self.partition_status_outbox
+                        .record(&statuses, self.bus.monotonic_now());
+                    self.record_partition_statuses(&statuses);
                 } else {
                     self.metrics.record_frame_drop(
                         frame_drop_variant::PARTITION_PLACEMENT_VIEWS,

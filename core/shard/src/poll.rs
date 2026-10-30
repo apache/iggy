@@ -329,6 +329,19 @@ where
                     )
                 })
                 .unwrap_or(PartitionReadReply::NotFound),
+            PartitionRead::RetirementDebt {
+                created_revision,
+                debt_op,
+            } => partitions
+                .with_partition(&namespace, |partition| {
+                    (partition.created_revision() == created_revision).then(|| {
+                        PartitionReadReply::RetirementDebt(
+                            partition.observe_retirement_debt(debt_op),
+                        )
+                    })
+                })
+                .flatten()
+                .unwrap_or(PartitionReadReply::NotFound),
             PartitionRead::DeferredPoll(_) => unreachable!("deferred admission handled above"),
             PartitionRead::Primary => partitions
                 .with_partition(&namespace, |partition| {
@@ -341,7 +354,7 @@ where
                     {
                         PartitionReadReply::Primary {
                             view,
-                            primary: consensus.primary_index(view),
+                            primary: consensus.primary_node(view),
                         }
                     } else {
                         PartitionReadReply::Rejected(IggyError::TransientNotAccepted)

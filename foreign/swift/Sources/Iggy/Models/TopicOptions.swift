@@ -32,6 +32,7 @@ public enum TopicOptionKey: String, Sendable, Hashable, CaseIterable {
     case messagesRequiredToSave = "messages_required_to_save"
     case sizeOfMessagesRequiredToSave = "size_of_messages_required_to_save"
     case preallocateSegments = "preallocate_segments"
+    case replicationFactor = "replication_factor"
 }
 
 /// How far a write has to get before the server completes it.
@@ -80,13 +81,23 @@ public struct TopicCreateOptions: Sendable, Hashable {
     public var messagesRequiredToSave: UInt32?
     public var sizeOfMessagesRequiredToSaveBytes: UInt64?
     public var preallocateSegments: Bool?
+    /// Number of nodes that store each partition, 1 to 32 and at most the
+    /// cluster's node count. Nil lets the server use 3, lowered to the node
+    /// count when the cluster is smaller. Create-only.
+    ///
+    /// Two replicas keep two copies but stop accepting writes while either
+    /// node is down, like Kafka with `min.insync.replicas=2`. The server
+    /// refuses an out-of-range value with
+    /// ``IggyErrorCode/invalidReplicationFactor``.
+    public var replicationFactor: UInt32?
     public var raw: [String: String]
 
     public init(
         partitionsCount: UInt32? = nil, compressionAlgorithm: CompressionAlgorithm? = nil, messageExpiry: IggyExpiry? = nil,
         maxTopicSize: MaxTopicSize? = nil, segmentSizeBytes: UInt64? = nil, durability: Durability = .replicated,
         consumerOffsetDurability: Durability = .replicated, partitionResizePolicy: PartitionResizePolicy? = nil, messagesRequiredToSave: UInt32? = nil,
-        sizeOfMessagesRequiredToSaveBytes: UInt64? = nil, preallocateSegments: Bool? = nil, raw: [String: String] = [:]
+        sizeOfMessagesRequiredToSaveBytes: UInt64? = nil, preallocateSegments: Bool? = nil, replicationFactor: UInt32? = nil,
+        raw: [String: String] = [:]
     ) {
         self.partitionsCount = partitionsCount
         self.compressionAlgorithm = compressionAlgorithm
@@ -99,6 +110,7 @@ public struct TopicCreateOptions: Sendable, Hashable {
         self.messagesRequiredToSave = messagesRequiredToSave
         self.sizeOfMessagesRequiredToSaveBytes = sizeOfMessagesRequiredToSaveBytes
         self.preallocateSegments = preallocateSegments
+        self.replicationFactor = replicationFactor
         self.raw = raw
     }
 
@@ -146,6 +158,9 @@ public struct TopicCreateOptions: Sendable, Hashable {
         }
         if let preallocateSegments {
             options[TopicOptionKey.preallocateSegments.rawValue] = .explicit(.bool(preallocateSegments))
+        }
+        if let replicationFactor {
+            options[TopicOptionKey.replicationFactor.rawValue] = .explicit(.uint32(replicationFactor))
         }
         return options
     }

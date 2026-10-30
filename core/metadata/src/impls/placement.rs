@@ -16,8 +16,9 @@
 // under the License.
 
 use crate::impls::metadata::{PartitionPlacementView, PartitionPrimaryTransfer};
-use crate::stm::stream::{Partition, Streams, StreamsInner, find_partition};
+use crate::stm::stream::{Partition, Streams, StreamsInner, find_partition, primary_of};
 use ahash::AHashMap;
+use consensus::{ReplicaSet, quorum_view_change};
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest;
@@ -25,6 +26,7 @@ use iggy_binary_protocol::{Operation, PrepareHeader, WireDecode};
 use iggy_common::IggyError;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
+use std::cmp::Reverse;
 
 /// Summaries are only a cache. The live canonical pipeline decides which
 /// reservations count, so commit, rejection and log replacement need no undo.
@@ -38,14 +40,73 @@ pub(super) struct PlacementState {
     /// Changes with every observation, so a scan can tell its input moved.
     observed_generation: u64,
     last_scan: Option<(ScanInputs, Option<PartitionPrimaryTransfer>)>,
-    reservations: AHashMap<(u64, u128), Vec<u64>>,
+    reservations: AHashMap<(u64, u128), PlacementCounts>,
     eligible: Option<(u32, Vec<bool>)>,
 }
+
+/// Per node: partitions it is primary of, and partitions it stores.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PlacementCounts {
+    pub(super) primaries: Vec<u64>,
+    pub(super) replicas: Vec<u64>,
+}
+
+impl PlacementCounts {
+    fn new(nodes: u8) -> Self {
+        Self {
+            primaries: vec![0; usize::from(nodes)],
+            replicas: vec![0; usize::from(nodes)],
+        }
+    }
+
+    fn nodes(&self) -> u8 {
+        u8::try_from(self.primaries.len()).unwrap_or(u8::MAX)
+    }
+
+    /// Count one partition whose `created_view` names its primary among
+    /// `members`, or among every node when it has no member list.
+    fn record(&mut self, members: Option<ReplicaSet>, created_view: u32) {
+        let nodes = self.nodes();
+        if let Some(primary) = primary_of(members, created_view, nodes)
+            && let Some(count) = self.primaries.get_mut(usize::from(primary))
+        {
+            *count += 1;
+        }
+        match members {
+            Some(members) => {
+                for node in members.nodes() {
+                    if let Some(count) = self.replicas.get_mut(usize::from(*node)) {
+                        *count += 1;
+                    }
+                }
+            }
+            None => {
+                for count in &mut self.replicas {
+                    *count += 1;
+                }
+            }
+        }
+    }
+
+    fn add(&mut self, other: &Self) {
+        for (count, added) in self.primaries.iter_mut().zip(&other.primaries) {
+            *count += added;
+        }
+        for (count, added) in self.replicas.iter_mut().zip(&other.replicas) {
+            *count += added;
+        }
+    }
+}
+
+/// A candidate move's order: widest gap, lowest source node, after the cursor,
+/// lowest namespace.
+type MoveRank = (u64, Reverse<u8>, bool, Reverse<IggyNamespace>);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ObservedView {
     report: PartitionPlacementView,
     created_view: u32,
+    members: Option<ReplicaSet>,
 }
 
 /// Everything a rebalance scan reads. `revision` moves with the partition set
@@ -80,6 +141,7 @@ impl PlacementState {
                 let mut observed = ObservedView {
                     report: *report,
                     created_view: partition.created_view,
+                    members: partition.members,
                 };
                 if let Some(previous) = self.observations.get(&namespace).copied() {
                     if previous.report.created_revision == report.created_revision {
@@ -97,14 +159,24 @@ impl PlacementState {
         });
     }
 
-    pub(super) fn committed_counts(&mut self, streams: &Streams, replicas: u8) -> Vec<u64> {
+    pub(super) fn committed_counts(&mut self, streams: &Streams, nodes: u8) -> PlacementCounts {
         streams.read(|inner| {
             self.retire_removed(inner);
-            let mut counts = vec![0_u64; usize::from(replicas)];
-            for (&view, &partitions) in &inner.created_views {
-                counts[(view % u32::from(replicas)) as usize] += partitions;
+            let index = &inner.placement_index;
+            let mut counts = PlacementCounts::new(nodes);
+            let without_members: u64 = index.created_views.values().sum();
+            for (&view, &partitions) in &index.created_views {
+                counts.primaries[(view % u32::from(nodes)) as usize] += partitions;
             }
-            for (count, &moved) in counts.iter_mut().zip(self.moved(replicas)) {
+            for (&node, &partitions) in &index.created_primaries {
+                if let Some(count) = counts.primaries.get_mut(usize::from(node)) {
+                    *count += partitions;
+                }
+            }
+            for (node, count) in (0..nodes).zip(counts.replicas.iter_mut()) {
+                *count = without_members + index.stored_replicas.get(&node).copied().unwrap_or(0);
+            }
+            for (count, &moved) in counts.primaries.iter_mut().zip(self.moved(nodes)) {
                 *count = count.saturating_add_signed(moved);
             }
             counts
@@ -137,7 +209,7 @@ impl PlacementState {
             {
                 return *plan;
             }
-            let plan = self.scan(inner, replica_count, eligible, after);
+            let plan = self.scan(inner, replicas, eligible, after);
             self.last_scan = Some((inputs, plan));
             plan
         })
@@ -166,18 +238,61 @@ impl PlacementState {
         })
     }
 
-    pub(super) fn select(&self, counts: &mut [u64], view: u32) -> Result<u32, IggyError> {
+    /// Members and created view for one new partition, counted into `counts`.
+    ///
+    /// The primary is the ready node leading the fewest partitions. The other
+    /// members are the nodes storing the fewest, ready nodes first, so a node
+    /// that is down is chosen only when too few are up. `None` keeps the
+    /// layout from before replication factors: no member list, every node
+    /// stores it.
+    ///
+    /// # Errors
+    /// `InvalidReplicationFactor` for a factor of zero or above the node count,
+    /// `TransientNotAccepted` when no node is ready to lead.
+    pub(super) fn select(
+        &self,
+        counts: &mut PlacementCounts,
+        view: u32,
+        replication_factor: Option<u8>,
+    ) -> Result<(Vec<u8>, u32), IggyError> {
+        let nodes = counts.nodes();
+        if replication_factor.is_some_and(|factor| factor == 0 || factor > nodes) {
+            return Err(IggyError::InvalidReplicationFactor);
+        }
         let eligible = self.eligible.as_ref().filter(|(observed_view, eligible)| {
-            *observed_view == view && eligible.len() == counts.len()
+            *observed_view == view && eligible.len() == usize::from(nodes)
         });
-        let (replica, count) = counts
-            .iter_mut()
-            .enumerate()
-            .filter(|(replica, _)| eligible.is_none_or(|(_, eligible)| eligible[*replica]))
-            .min_by_key(|(replica, count)| (**count, *replica))
+        let ready = |node: u8| eligible.is_none_or(|(_, eligible)| eligible[usize::from(node)]);
+        let load = |node: u8| {
+            (
+                counts.primaries[usize::from(node)],
+                counts.replicas[usize::from(node)],
+            )
+        };
+        let primary = (0..nodes)
+            .filter(|node| ready(*node))
+            .min_by_key(|node| (load(*node), *node))
             .ok_or(IggyError::TransientNotAccepted)?;
-        *count += 1;
-        u32::try_from(replica).map_err(|_| IggyError::TransientNotAccepted)
+        let Some(factor) = replication_factor else {
+            counts.record(None, u32::from(primary));
+            return Ok((Vec::new(), u32::from(primary)));
+        };
+        let mut followers: Vec<u8> = (0..nodes).filter(|node| *node != primary).collect();
+        followers.sort_by_key(|&node| {
+            let (primaries, replicas) = load(node);
+            (!ready(node), replicas, primaries, node)
+        });
+        let mut members = followers[..usize::from(factor) - 1].to_vec();
+        members.push(primary);
+        members.sort_unstable();
+        let created_view = members
+            .iter()
+            .position(|node| *node == primary)
+            .and_then(|index| u32::try_from(index).ok())
+            .ok_or(IggyError::InvalidReplicationFactor)?;
+        let set = ReplicaSet::new(&members).map_err(|_| IggyError::InvalidReplicationFactor)?;
+        counts.record(Some(set), created_view);
+        Ok((members, created_view))
     }
 
     pub(super) fn prune(&mut self, retained: impl Fn(u64, u128) -> bool) {
@@ -194,22 +309,20 @@ impl PlacementState {
     pub(super) fn reserved_partitions(&self, header: &PrepareHeader) -> Result<u64, IggyError> {
         self.reservations
             .get(&(header.op, header.checksum))
-            .map(|reserved| reserved.iter().sum())
+            .map(|reserved| reserved.primaries.iter().sum())
             .ok_or(IggyError::TransientNotAccepted)
     }
 
     pub(super) fn add_reservation(
         &self,
         header: &PrepareHeader,
-        counts: &mut [u64],
+        counts: &mut PlacementCounts,
     ) -> Result<(), IggyError> {
         let reserved = self
             .reservations
             .get(&(header.op, header.checksum))
             .ok_or(IggyError::TransientNotAccepted)?;
-        for (count, reserved) in counts.iter_mut().zip(reserved) {
-            *count += reserved;
-        }
+        counts.add(reserved);
         Ok(())
     }
 
@@ -231,15 +344,20 @@ impl PlacementState {
             }
             _ => return Ok(None),
         };
-        let mut counts = vec![0; usize::from(replicas)];
+        let mut counts = PlacementCounts::new(replicas);
         let mut highest_group_id = 0;
         for CreatedPartitionAssignment {
             consensus_group_id,
             initial_view,
+            members,
             ..
         } in partitions
         {
-            counts[(initial_view % u32::from(replicas)) as usize] += 1;
+            let members = (!members.is_empty())
+                .then(|| ReplicaSet::new(&members))
+                .transpose()
+                .map_err(|_| IggyError::InvalidCommand)?;
+            counts.record(members, initial_view);
             highest_group_id = highest_group_id.max(consensus_group_id);
         }
         self.reservations
@@ -247,16 +365,84 @@ impl PlacementState {
         Ok(Some(highest_group_id))
     }
 
+    /// One primary move to a ready member of the same partition leading at
+    /// least two fewer partitions, the widest such gap first. A partition
+    /// qualifies only while enough of its members are ready to elect. Equal
+    /// gaps go to the lowest source node, then rotate with `after`.
     fn scan(
         &self,
         inner: &StreamsInner,
-        replicas: usize,
+        nodes: u8,
         eligible: &[bool],
         after: Option<IggyNamespace>,
     ) -> Option<PartitionPrimaryTransfer> {
-        let mut counts = vec![0_u64; replicas];
-        let mut first: Vec<Option<PartitionPlacementView>> = vec![None; replicas];
-        let mut next: Vec<Option<PartitionPlacementView>> = vec![None; replicas];
+        let ready = |node: u8| eligible.get(usize::from(node)).copied().unwrap_or(false);
+        let mut counts = vec![0_u64; usize::from(nodes)];
+        self.for_each_partition(inner, |_, partition, report| {
+            let view = report.map_or(partition.created_view, |report| report.view);
+            if let Some(count) = partition
+                .primary_node(view, nodes)
+                .and_then(|primary| counts.get_mut(usize::from(primary)))
+            {
+                *count += 1;
+            }
+        });
+        let count = |node: u8| counts.get(usize::from(node)).copied().unwrap_or(u64::MAX);
+        let mut best: Option<(MoveRank, PartitionPrimaryTransfer)> = None;
+        self.for_each_partition(inner, |namespace, partition, report| {
+            let Some(report) = report else {
+                return;
+            };
+            let Some(source) = partition
+                .primary_node(report.view, nodes)
+                .filter(|source| ready(*source))
+            else {
+                return;
+            };
+            let members = partition.replica_set(nodes);
+            let ready_members = members.nodes().iter().filter(|node| ready(**node)).count();
+            if ready_members < quorum_view_change(members.len()) {
+                return;
+            }
+            let Some(target) = members
+                .nodes()
+                .iter()
+                .copied()
+                .filter(|node| *node != source && ready(*node))
+                .min_by_key(|node| (count(*node), *node))
+            else {
+                return;
+            };
+            let gap = count(source).saturating_sub(count(target));
+            if gap <= 1 {
+                return;
+            }
+            let key = (
+                gap,
+                Reverse(source),
+                after.is_none_or(|cursor| namespace > cursor),
+                Reverse(namespace),
+            );
+            if best.as_ref().is_none_or(|(best_key, _)| key > *best_key) {
+                best = Some((
+                    key,
+                    PartitionPrimaryTransfer {
+                        namespace,
+                        created_revision: report.created_revision,
+                        view: report.view,
+                        target,
+                    },
+                ));
+            }
+        });
+        best.map(|(_, plan)| plan)
+    }
+
+    fn for_each_partition(
+        &self,
+        inner: &StreamsInner,
+        mut visit: impl FnMut(IggyNamespace, &Partition, Option<PartitionPlacementView>),
+    ) {
         for (stream_id, stream) in &inner.items {
             for (topic_id, topic) in &stream.topics {
                 if inner.lifecycle_blocks(stream_id, Some(topic_id)) {
@@ -264,49 +450,14 @@ impl PlacementState {
                 }
                 for partition in &topic.partitions {
                     let namespace = IggyNamespace::new(stream_id, topic_id, partition.id);
-                    let report = self.matching_view(namespace, partition);
-                    let primary = report.map_or(partition.created_view, |report| report.view)
-                        as usize
-                        % replicas;
-                    counts[primary] += 1;
-                    let Some(report) = report.filter(|_| eligible[primary]) else {
-                        continue;
-                    };
-                    if first[primary].is_none_or(|first| namespace < first.namespace) {
-                        first[primary] = Some(report);
-                    }
-                    if after.is_none_or(|cursor| namespace > cursor)
-                        && next[primary].is_none_or(|next| namespace < next.namespace)
-                    {
-                        next[primary] = Some(report);
-                    }
+                    visit(
+                        namespace,
+                        partition,
+                        self.matching_view(namespace, partition),
+                    );
                 }
             }
         }
-        let mut available = eligible
-            .iter()
-            .enumerate()
-            .filter_map(|(replica, &eligible)| eligible.then_some(replica));
-        let mut source = available.next()?;
-        let mut target = source;
-        for replica in available {
-            if counts[replica] > counts[source] {
-                source = replica;
-            }
-            if counts[replica] < counts[target] {
-                target = replica;
-            }
-        }
-        if counts[source].saturating_sub(counts[target]) <= 1 {
-            return None;
-        }
-        let report = next[source].or(first[source])?;
-        Some(PartitionPrimaryTransfer {
-            namespace: report.namespace,
-            created_revision: report.created_revision,
-            view: report.view,
-            target: u8::try_from(target).ok()?,
-        })
     }
 
     fn matching_view(
@@ -382,11 +533,18 @@ impl PlacementState {
 impl ObservedView {
     /// Counts this partition at its observed primary instead of its created
     /// one, or back for a negative `by`.
-    fn shift(self, replicas: u8, moved: &mut [i64], by: i64) {
-        let replicas = u32::from(replicas);
+    fn shift(self, nodes: u8, moved: &mut [i64], by: i64) {
         let observed = self.report.view.max(self.created_view);
-        moved[(observed % replicas) as usize] += by;
-        moved[(self.created_view % replicas) as usize] -= by;
+        if let Some(count) = primary_of(self.members, observed, nodes)
+            .and_then(|node| moved.get_mut(usize::from(node)))
+        {
+            *count += by;
+        }
+        if let Some(count) = primary_of(self.members, self.created_view, nodes)
+            .and_then(|node| moved.get_mut(usize::from(node)))
+        {
+            *count -= by;
+        }
     }
 }
 
@@ -624,7 +782,10 @@ mod tests {
                 }],
             );
         }
-        assert_eq!(placement.committed_counts(&streams, 5), [0, 40, 20, 20, 20]);
+        assert_eq!(
+            placement.committed_counts(&streams, 5).primaries,
+            [0, 40, 20, 20, 20]
+        );
         for (eligible, expected_counts, expected_moves) in [
             ([false, true, true, true, true], [0, 25, 25, 25, 25], 15),
             ([true; 5], [20; 5], 20),
@@ -651,10 +812,15 @@ mod tests {
                 moves += 1;
             }
             assert_eq!(moves, expected_moves);
-            assert_eq!(placement.committed_counts(&streams, 5), expected_counts);
+            assert_eq!(
+                placement.committed_counts(&streams, 5).primaries,
+                expected_counts
+            );
         }
         assert_eq!(
-            PlacementState::default().committed_counts(&streams, 5),
+            PlacementState::default()
+                .committed_counts(&streams, 5)
+                .primaries,
             [20; 5],
             "transfers must not rewrite committed initial views"
         );
@@ -875,18 +1041,184 @@ mod tests {
     }
 
     #[test]
+    fn given_replication_factor_when_placing_many_partitions_should_spread_primaries_and_copies() {
+        const NODES: u8 = 5;
+        let placement = PlacementState::default();
+        let mut counts = PlacementCounts::new(NODES);
+        for _ in 0..10 {
+            let (members, created_view) = placement.select(&mut counts, 0, Some(3)).unwrap();
+            assert_eq!(members.len(), 3);
+            assert!(members.is_sorted());
+            assert!(usize::try_from(created_view).unwrap() < members.len());
+        }
+        assert_eq!(counts.primaries, [2; 5]);
+        assert_eq!(counts.replicas.iter().sum::<u64>(), 30);
+        assert!(
+            counts.replicas.iter().all(|copies| copies.abs_diff(6) <= 1),
+            "copies stay within one of the mean: {:?}",
+            counts.replicas
+        );
+    }
+
+    #[test]
+    fn given_factor_outside_the_cluster_when_placing_should_refuse() {
+        let placement = PlacementState::default();
+        for factor in [0, 4] {
+            assert_eq!(
+                placement.select(&mut PlacementCounts::new(3), 0, Some(factor)),
+                Err(IggyError::InvalidReplicationFactor)
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_down_node_when_placing_should_use_it_only_when_too_few_are_up() {
+        let mut placement = PlacementState::default();
+        placement.observe_replicas(0, &[true, false, true]);
+        for _ in 0..4 {
+            let mut counts = PlacementCounts::new(3);
+            assert_eq!(
+                placement.select(&mut counts, 0, Some(2)).unwrap().0,
+                [0, 2],
+                "two nodes are up"
+            );
+            let (members, created_view) = placement.select(&mut counts, 0, Some(3)).unwrap();
+            assert_eq!(members, [0, 1, 2]);
+            assert_ne!(
+                members[usize::try_from(created_view).unwrap()],
+                1,
+                "a down node never leads"
+            );
+        }
+    }
+
+    #[test]
+    fn given_imbalance_outside_a_group_when_rebalancing_should_move_only_to_a_member() {
+        const NODES: u8 = 5;
+        let streams = Streams::default();
+        let mut placement = PlacementState::default();
+        for topic in 0..4 {
+            let namespace = IggyNamespace::new(0, topic, 0);
+            streams.seed_namespace_on(
+                namespace,
+                u64::try_from(topic).unwrap() + 1,
+                0,
+                iggy_common::Durability::Persisted,
+                &[0, 1, 2],
+            );
+            placement.observe(
+                &streams,
+                &[PartitionPlacementView {
+                    namespace,
+                    created_revision: streams.created_revision_for_namespace(namespace).unwrap(),
+                    view: 0,
+                }],
+            );
+        }
+        assert_eq!(
+            placement.committed_counts(&streams, NODES),
+            PlacementCounts {
+                primaries: vec![4, 0, 0, 0, 0],
+                replicas: vec![4, 4, 4, 0, 0],
+            }
+        );
+
+        let transfer = placement
+            .primary_rebalance_candidate(&streams, NODES, &[true; 5], None)
+            .unwrap();
+        assert_eq!(
+            transfer.target, 1,
+            "nodes 3 and 4 lead fewer but store nothing"
+        );
+
+        let mut group_down = [true; 5];
+        group_down[1] = false;
+        group_down[2] = false;
+        assert_eq!(
+            placement.primary_rebalance_candidate(&streams, NODES, &group_down, None),
+            None,
+            "one of three members cannot elect"
+        );
+    }
+
+    #[test]
+    fn given_the_busiest_node_has_no_lighter_member_when_rebalancing_should_move_another_group() {
+        const NODES: u8 = 5;
+        let streams = Streams::default();
+        let mut placement = PlacementState::default();
+        let layout: [(&[u8], u32); 8] = [
+            (&[0, 1, 2], 0),
+            (&[0, 1, 2], 0),
+            (&[0, 1, 2], 0),
+            (&[1, 3, 4], 0),
+            (&[1, 3, 4], 0),
+            (&[1, 3, 4], 0),
+            (&[0, 1, 2], 2),
+            (&[0, 1, 2], 2),
+        ];
+        for (topic, (members, view)) in layout.into_iter().enumerate() {
+            let namespace = IggyNamespace::new(0, topic, 0);
+            streams.seed_namespace_on(
+                namespace,
+                u64::try_from(topic).unwrap() + 1,
+                view,
+                iggy_common::Durability::Persisted,
+                members,
+            );
+            placement.observe(
+                &streams,
+                &[PartitionPlacementView {
+                    namespace,
+                    created_revision: streams.created_revision_for_namespace(namespace).unwrap(),
+                    view,
+                }],
+            );
+        }
+        assert_eq!(
+            placement.committed_counts(&streams, NODES).primaries,
+            [3, 3, 2, 0, 0]
+        );
+
+        let transfer = placement
+            .primary_rebalance_candidate(&streams, NODES, &[true; 5], None)
+            .expect("node 1 can hand a partition to node 3");
+        assert_eq!(transfer.target, 3);
+        assert_eq!(
+            streams
+                .members_for_namespace(transfer.namespace)
+                .flatten()
+                .unwrap()
+                .nodes(),
+            &[1, 3, 4]
+        );
+    }
+
+    #[test]
     fn given_readiness_from_another_view_when_placing_should_ignore_stale_evidence() {
         let mut placement = PlacementState::default();
         placement.observe_replicas(1, &[false, true, true]);
-        assert_eq!(placement.select(&mut [0, 5, 5], 1), Ok(1));
-        assert_eq!(placement.select(&mut [0, 5, 5], 2), Ok(0));
+        let counts = || PlacementCounts {
+            primaries: vec![0, 5, 5],
+            replicas: vec![0; 3],
+        };
+        assert_eq!(
+            placement.select(&mut counts(), 1, None),
+            Ok((Vec::new(), 1))
+        );
+        assert_eq!(
+            placement.select(&mut counts(), 2, None),
+            Ok((Vec::new(), 0))
+        );
         placement.observe_replicas(2, &[false; 3]);
         assert_eq!(
-            placement.select(&mut [0, 5, 5], 2),
+            placement.select(&mut counts(), 2, None),
             Err(IggyError::TransientNotAccepted)
         );
         placement.observe_replicas(2, &[]);
-        assert_eq!(placement.select(&mut [0, 5, 5], 2), Ok(0));
+        assert_eq!(
+            placement.select(&mut counts(), 2, None),
+            Ok((Vec::new(), 0))
+        );
     }
 
     fn observe_views(
@@ -923,9 +1255,13 @@ mod tests {
 
     /// Every committed partition at its observed view, or its created view
     /// before an observation of its incarnation.
-    fn walked_counts(placement: &PlacementState, streams: &Streams, replicas: u8) -> Vec<u64> {
+    fn walked_counts(
+        placement: &PlacementState,
+        streams: &Streams,
+        replicas: u8,
+    ) -> PlacementCounts {
         streams.read(|inner| {
-            let mut counts = vec![0; usize::from(replicas)];
+            let mut counts = PlacementCounts::new(replicas);
             for (stream_id, stream) in &inner.items {
                 for (topic_id, topic) in &stream.topics {
                     for partition in &topic.partitions {
@@ -939,7 +1275,11 @@ mod tests {
                             .map_or(partition.created_view, |observed| {
                                 observed.report.view.max(partition.created_view)
                             });
-                        counts[(view % u32::from(replicas)) as usize] += 1;
+                        counts.primaries
+                            [usize::from(partition.primary_node(view, replicas).unwrap())] += 1;
+                        for node in partition.replica_set(replicas).nodes() {
+                            counts.replicas[usize::from(*node)] += 1;
+                        }
                     }
                 }
             }

@@ -322,11 +322,69 @@ partitions. Neither policy prevents retention or deletion of the topic.
 Set the option through `TopicCreateOptions::partition_resize_policy`, HTTP's
 `options` map, or the CLI's `--set partition_resize_policy=fixed`.
 
+### Replication factor
+
+A topic's create-only `replication_factor` is the number of nodes that store
+each of its partitions. It applies to every partition of the topic, including
+ones added later, and takes 1 to 32 but no more than the cluster's node count.
+Any other number is refused with `InvalidReplicationFactor` (2018), and a value
+that is not a number with `InvalidOptionValue` (4042). Omitted, it is 3, or the
+node count when the cluster is smaller, so clusters of up to three nodes store
+every partition on every node. `DescribeOptions` lists the default as 3; a
+topic created without the key stores the lowered value as derived. Metadata is
+always on every node.
+
+At create the metadata primary picks each partition's nodes: the primary is the
+ready node leading the fewest partitions, and the other members are the nodes
+storing the fewest. A node that is down is picked only when too few are up. The
+assignment never moves. While a member is down its partitions run with fewer
+copies, and the member catches up from the others when it comes back.
+
+Each partition's primary reports in `/metrics`, per shard, how many of the
+partitions it leads have a member out of sync: `partitions_under_replicated`
+counts a member it cannot reach or one that has trailed the commit point for
+30 seconds, Kafka's `replica.lag.time.max.ms` default, and
+`partitions_below_write_quorum` counts partitions with too few members in sync
+to commit. Like Kafka's `UnderReplicatedPartitions`, sum the series over every
+node for the cluster's total.
+
+A write commits on a quorum of a partition's members: 2 of 3, 3 of 5, and at
+most 3 for wider groups. A factor of 2 keeps two copies but stops accepting
+writes while either member is down, like Kafka with `min.insync.replicas=2`,
+because the two members have no third party to decide between them. A factor
+of 1 keeps one copy, and the default `replicated` durability acknowledges a
+write before that copy reaches disk; set `durability=persisted` on such a topic
+to acknowledge only written data.
+
+Deleting a topic or stream waits while one of its partitions lacks a quorum of
+its members, and completes once they return, like Kafka's pending deletes.
+
+Logins keep working while a partition lacks a quorum of its members. A session
+that ends then cannot be retired on that partition, so the partition owes the
+retirement instead of holding the session's slot in the client table. The
+partition's next primary pays it before serving sessions again, and refuses
+their requests with `TransientNotAccepted` (58) until it has. `/metrics`
+reports `partitions_owing_retirement`, the partitions still refusing sessions
+for that reason, and `retirement_debts_paid`, the payments a node made.
+
+A node that comes back with empty storage refuses to serve a factor-1
+partition created before it, because that data was only on this node and
+serving it again would reuse its offsets. Delete and recreate the topic to
+accept the loss.
+
+A node that does not store a partition answers its route lookups from what the
+partition's primary last reported, or from the partition's initial primary
+before any report, and it refuses sends and polls for it with `NotPrimary`, so
+clients go to the primary. Its topic and stream counters
+follow those reports too, so they trail the members.
+
+Topics created before replication factors keep every partition on every node.
+
 ## Resource options
 
 Streams, topics and users take their settings from one option catalog. The binary `DescribeOptions` command (13), `GET /options/{scope}` over HTTP (`stream`, `topic` or `user`) and `iggy options <scope>` list every key a client can see with its kind, default, description and five flags: updatable, resettable, secret, read-only and critical.
 
-Most keys are fixed at create. A topic's `compression_algorithm`, `segment_size`, `durability`, `consumer_offset_durability`, `partition_resize_policy` and save thresholds, and a stream's `encryption_key`, are refused by an update with `OptionNotUpdatable` (4103). `compression_algorithm` is create-only because the server never applies it and stored batches carry no codec marker.
+Most keys are fixed at create. A topic's `compression_algorithm`, `segment_size`, `durability`, `consumer_offset_durability`, `partition_resize_policy`, `replication_factor` and save thresholds, and a stream's `encryption_key`, are refused by an update with `OptionNotUpdatable` (4103). `compression_algorithm` is create-only because the server never applies it and stored batches carry no codec marker.
 
 The updatable keys are `name` for streams and topics, `username` and `status` for users, and a topic's `message_expiry` and `max_topic_size`. Only those two topic keys can be reset to their default, any other reset is refused with `OptionNotResettable` (4104). Read-only keys, such as the stream key projections below, are refused with `ReadOnlyOption` (4105).
 

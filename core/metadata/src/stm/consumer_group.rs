@@ -2095,6 +2095,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
@@ -2168,6 +2169,7 @@ mod tests {
                         initial_view: 0,
                         partition_id,
                         consensus_group_id: u64::from(partition_id) + 2,
+                        members: Vec::new(),
                     })
                     .collect(),
             },

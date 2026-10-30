@@ -41,7 +41,8 @@ public enum TopicOptionKey implements OptionKey {
     PARTITION_RESIZE_POLICY("partition_resize_policy", 0),
     MESSAGES_REQUIRED_TO_SAVE("messages_required_to_save", 0),
     SIZE_OF_MESSAGES_REQUIRED_TO_SAVE("size_of_messages_required_to_save", 0),
-    PREALLOCATE_SEGMENTS("preallocate_segments", 0);
+    PREALLOCATE_SEGMENTS("preallocate_segments", 0),
+    REPLICATION_FACTOR("replication_factor", 0);
 
     private final String value;
     private final int flags;

@@ -17,7 +17,9 @@
 
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_u32_le};
-use crate::primitives::partition_assignment::CreatedPartitionAssignment;
+use crate::primitives::partition_assignment::{
+    CreatedPartitionAssignment, decode_members, encode_members, members_encoded_size,
+};
 use crate::requests::partitions::CreatePartitionsRequest;
 use bytes::{BufMut, BytesMut};
 
@@ -40,6 +42,7 @@ impl WireEncode for CreatePartitionsWithAssignmentsRequest {
                 .iter()
                 .map(WireEncode::encoded_size)
                 .sum::<usize>()
+            + members_encoded_size(&self.partitions)
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -55,6 +58,7 @@ impl WireEncode for CreatePartitionsWithAssignmentsRequest {
         for partition in &self.partitions {
             partition.encode(buf);
         }
+        encode_members(&self.partitions, buf);
     }
 }
 
@@ -112,6 +116,7 @@ impl WireDecode for CreatePartitionsWithAssignmentsRequest {
             offset += consumed;
             partitions.push(partition);
         }
+        offset += decode_members(buf, offset, &mut partitions)?;
 
         Ok((
             Self {
@@ -144,11 +149,13 @@ mod tests {
                     initial_view: 9,
                     partition_id: 3,
                     consensus_group_id: 11,
+                    members: Vec::new(),
                 },
                 CreatedPartitionAssignment {
                     initial_view: 10,
                     partition_id: 4,
                     consensus_group_id: 12,
+                    members: Vec::new(),
                 },
             ],
         };
@@ -171,6 +178,7 @@ mod tests {
                 initial_view: 9,
                 partition_id: 3,
                 consensus_group_id: 11,
+                members: Vec::new(),
             }],
         };
         let bytes = request.to_bytes();

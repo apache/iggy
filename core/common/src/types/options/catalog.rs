@@ -19,10 +19,11 @@ use super::codec::{OptionValueCodec, invalid};
 use super::key::OptionKey;
 use super::{
     DEFAULT_MAX_TOPIC_SIZE, DEFAULT_MESSAGE_EXPIRY, DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
-    DEFAULT_PREALLOCATE_SEGMENTS, DEFAULT_SEGMENT_SIZE, DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
-    Durability, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_PREALLOCATED_TOPIC_BYTES,
-    MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, MAX_TOPIC_SEGMENT_SIZE, MIN_TOPIC_SEGMENT_SIZE,
-    OptionValue, OptionsScope, PartitionResizePolicy, ResourceOptions, erase_options,
+    DEFAULT_PREALLOCATE_SEGMENTS, DEFAULT_REPLICATION_FACTOR, DEFAULT_SEGMENT_SIZE,
+    DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, Durability, MAX_MESSAGES_REQUIRED_TO_SAVE,
+    MAX_PREALLOCATED_TOPIC_BYTES, MAX_REPLICATION_FACTOR, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+    MAX_TOPIC_SEGMENT_SIZE, MIN_TOPIC_SEGMENT_SIZE, OptionValue, OptionsScope,
+    PartitionResizePolicy, ResourceOptions, erase_options,
 };
 use crate::http::users::defaults::{MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
@@ -67,7 +68,7 @@ const TOPIC_ONLY: &[OptionsScope] = &[OptionsScope::Topic];
 const USER_ONLY: &[OptionsScope] = &[OptionsScope::User];
 
 /// Every option key, indexed by its `OptionKey` discriminant.
-pub static CATALOG: [OptionDescriptor; 19] = [
+pub static CATALOG: [OptionDescriptor; 20] = [
     OptionDescriptor {
         key: OptionKey::Name,
         scopes: STREAM_AND_TOPIC,
@@ -275,6 +276,25 @@ pub static CATALOG: [OptionDescriptor; 19] = [
                  Unsupported or failed reservations fall back to ordinary allocation with a \
                  warning. Reservation runs inline on the owning shard. segment_size * \
                  partitions_count is capped at {MAX_PREALLOCATED_TOPIC_BYTES} bytes per create"
+            )
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::ReplicationFactor,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint32,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::CreateOnly,
+        default: OptionDefault::Const(|| Ok(HeaderValue::from(DEFAULT_REPLICATION_FACTOR))),
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            format!(
+                "Nodes that store each partition, 1..={MAX_REPLICATION_FACTOR} and at most the \
+                 cluster's node count. Omitted, it is {DEFAULT_REPLICATION_FACTOR} or the node \
+                 count when smaller. A write commits on a quorum of these nodes, so 2 keeps two \
+                 copies but stops writing while either is down, and 1 keeps one copy that \
+                 replicated durability acknowledges before it reaches disk"
             )
         },
     },
@@ -626,7 +646,9 @@ pub fn derived_defaults(
 /// 4. `OptionNotUpdatable`: a create-only key in an update's set or reset.
 /// 5. `OptionNotResettable`: a reset of a column or of a key without default.
 /// 6. Value errors: a column inside a create block is `InvalidOptionValue`,
-///    column values keep their own errors, other keys `InvalidOptionValue`.
+///    column values keep their own errors, other keys `InvalidOptionValue`,
+///    except a well-formed `replication_factor` out of range, which is
+///    `InvalidReplicationFactor`.
 /// 7. `InvalidCommand`: an update that changes nothing once its zero
 ///    sentinels are dropped.
 /// 8. `OptionsBlockTooLarge`: the resulting map exceeds the block limits.
@@ -780,7 +802,9 @@ pub fn canonical_value(
             Durability::decode(key, entry)?.encode()?
         }
         OptionKey::PartitionResizePolicy => PartitionResizePolicy::decode(key, entry)?.encode()?,
-        OptionKey::MessagesRequiredToSave => u32::decode(key, entry)?.encode()?,
+        OptionKey::MessagesRequiredToSave | OptionKey::ReplicationFactor => {
+            u32::decode(key, entry)?.encode()?
+        }
         OptionKey::PreallocateSegments => bool::decode(key, entry)?.encode()?,
         OptionKey::EncryptionKey => {
             HeaderValue::try_from(stream_key_from_entry(entry)?.as_bytes().as_slice())?
@@ -1143,6 +1167,10 @@ mod tests {
                 topic_option_keys::PREALLOCATE_SEGMENTS,
                 OptionKey::PreallocateSegments,
             ),
+            (
+                topic_option_keys::REPLICATION_FACTOR,
+                OptionKey::ReplicationFactor,
+            ),
         ] {
             assert_eq!(constant, key.to_string());
         }
@@ -1265,6 +1293,40 @@ mod tests {
                 "{key} {input:?}"
             );
         }
+    }
+
+    #[test]
+    fn given_replication_factor_when_decoding_should_accept_only_supported_group_sizes() {
+        let key = OptionKey::ReplicationFactor;
+        for (input, expected) in [
+            (HeaderValue::from(1u32), 1u32),
+            (HeaderValue::try_from("3").unwrap(), 3),
+            (
+                HeaderValue::from(MAX_REPLICATION_FACTOR),
+                MAX_REPLICATION_FACTOR,
+            ),
+        ] {
+            assert_eq!(
+                canonical_value(key, &entry(key, &input)),
+                Ok(Some(HeaderValue::from(expected))),
+                "{input:?}"
+            );
+        }
+        for input in [
+            HeaderValue::from(0u32),
+            HeaderValue::from(MAX_REPLICATION_FACTOR + 1),
+            HeaderValue::try_from("0").unwrap(),
+        ] {
+            assert_eq!(
+                canonical_value(key, &entry(key, &input)),
+                Err(IggyError::InvalidReplicationFactor),
+                "{input:?}"
+            );
+        }
+        assert_eq!(
+            canonical_value(key, &entry(key, &HeaderValue::try_from("three").unwrap())),
+            Err(IggyError::InvalidOptionValue(key.to_string()))
+        );
     }
 
     #[test]

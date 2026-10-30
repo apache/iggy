@@ -85,6 +85,7 @@ pub fn sample(
         // stream, and the primary mints dense 0-based partition ids, so neither
         // partition guard is reachable from the wire.
         Outcome::InvalidOptionValue
+        | Outcome::InvalidReplicationFactor
         | Outcome::TooManyTopics
         | Outcome::InvalidPartitionsCount
         | Outcome::PartitionIdSpaceExhausted => None,

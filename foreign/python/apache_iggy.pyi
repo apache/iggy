@@ -3516,6 +3516,10 @@ class OptionKey:
     r"""
     Topic segment preallocation, fixed at creation.
     """
+    ReplicationFactor: typing.ClassVar[OptionKey]
+    r"""
+    Topic replication factor, fixed at creation.
+    """
     EncryptionKey: typing.ClassVar[OptionKey]
     r"""
     Stream encryption key, write-only and fixed at creation.
@@ -4899,6 +4903,7 @@ class TopicOptions:
         messages_required_to_save: builtins.int | None = None,
         size_of_messages_required_to_save: builtins.int | None = None,
         preallocate_segments: builtins.bool | None = None,
+        replication_factor: builtins.int | None = None,
         raw: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> TopicOptions:
         r"""
@@ -4928,6 +4933,13 @@ class TopicOptions:
             size_of_messages_required_to_save: Byte flush threshold as
                 `int | None`.
             preallocate_segments: Reserve segment bytes on open as `bool | None`.
+            replication_factor: Nodes that store each partition as
+                `int | None`, 1 to 32 and at most the cluster's node count.
+                `None` resolves to 3, lowered to the node count when smaller.
+                A write commits on a quorum of these nodes, so 2 keeps two
+                copies but stops accepting writes while either node is down.
+                The server rejects an out-of-range value with
+                `InvalidReplicationFactor`.
             raw: Additional option keys as `dict[str, str]`, sent as string
                 values so a key newer than this build can be set. A typed field
                 wins on collision.

@@ -210,6 +210,8 @@ pub use view_change_quorum::*;
 
 mod dvc_merge;
 pub use dvc_merge::*;
+mod replica_set;
+pub use replica_set::{ReplicaSet, ReplicaSetError};
 mod vsr_state;
 pub use vsr_state::{AdoptedView, HistoryCertificate, HistoryRecovery, VsrState, VsrStateError};
 mod vsr_timeout;

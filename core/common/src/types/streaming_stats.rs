@@ -415,6 +415,36 @@ impl PartitionStats {
         self.segments_count.load(Ordering::Relaxed)
     }
 
+    /// Move every counter to the values another node reported, carrying the
+    /// difference into the parents.
+    pub fn store_reported(
+        &self,
+        size_bytes: u64,
+        messages_count: u64,
+        segments_count: u32,
+        current_offset: u64,
+    ) {
+        let size = self.size_bytes.load(Ordering::Relaxed);
+        if size_bytes >= size {
+            self.increment_size_bytes(size_bytes - size);
+        } else {
+            self.decrement_size_bytes(size - size_bytes);
+        }
+        let messages = self.messages_count.load(Ordering::Relaxed);
+        if messages_count >= messages {
+            self.increment_messages_count(messages_count - messages);
+        } else {
+            self.decrement_messages_count(messages - messages_count);
+        }
+        let segments = self.segments_count.load(Ordering::Relaxed);
+        if segments_count >= segments {
+            self.increment_segments_count(segments_count - segments);
+        } else {
+            self.decrement_segments_count(segments - segments_count);
+        }
+        self.set_current_offset(current_offset);
+    }
+
     pub fn current_offset(&self) -> u64 {
         self.current_offset.load(Ordering::Relaxed)
     }

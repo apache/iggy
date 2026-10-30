@@ -51,6 +51,7 @@ use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsWithAssignmentsRequest, DeletePartitionsRequest,
 };
 use iggy_binary_protocol::requests::streams::{DeleteStreamRequest, UpdateStreamResolvedRequest};
+use iggy_binary_protocol::requests::system::RetirementDebt;
 use iggy_binary_protocol::requests::topics::{
     CreateTopicWithAssignmentsRequest, DeleteTopicRequest, UpdateTopicResolvedRequest,
 };
@@ -148,6 +149,9 @@ pub trait GatedApply:
     /// Partition-set revision used to validate retirement coverage during WAL replay.
     fn namespace_revision(&self) -> u64;
 
+    /// Records the retirement debt a replayed `FinalizeSession` carried.
+    fn record_retirement_debt(&self, debts: &[RetirementDebt], metadata_op: u64);
+
     fn is_active_account(&self, user_id: u32, created_at: u64) -> bool;
 
     /// Rebinds the consumer group memberships of the client a replayed
@@ -217,6 +221,10 @@ impl GatedApply for MuxStateMachine<variadic!(Users, Streams)> {
 
     fn namespace_revision(&self) -> u64 {
         self.streams().read(|inner| inner.namespace_revision)
+    }
+
+    fn record_retirement_debt(&self, debts: &[RetirementDebt], metadata_op: u64) {
+        self.streams().record_retirement_debt(debts, metadata_op);
     }
 }
 
@@ -631,6 +639,8 @@ impl GatedApply for MuxStateMachine<()> {
     fn namespace_revision(&self) -> u64 {
         0
     }
+
+    fn record_retirement_debt(&self, _debts: &[RetirementDebt], _metadata_op: u64) {}
 }
 
 #[cfg(test)]
@@ -736,6 +746,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         }
         .to_bytes()

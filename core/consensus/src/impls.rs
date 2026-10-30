@@ -20,10 +20,10 @@ use crate::vsr_timeout::{TimeoutKind, TimeoutManager};
 use crate::{
     AckLogEvent, Consensus, ControlActionLogEvent, DvcHeaderKind, DvcQuorumArray, DvcSuffix,
     HistoryCertificate, HistoryRecovery, IgnoreReason, MergeOutcome, MergeQuorums, MergedLog,
-    Pipeline, PlaneKind, PrepareLogEvent, Project, RepairEvidence, ReplicaLogContext, SimEventKind,
-    StoredDvc, ViewChangeLogEvent, ViewChangeReason, VsrState, dvc_count, dvc_header_kind,
-    dvc_iter, dvc_quorum_array_empty, dvc_record, dvc_reset, dvc_suffix_decode, emit_replica_event,
-    emit_sim_event, merge_view_change, seal_prepare_checksum,
+    Pipeline, PlaneKind, PrepareLogEvent, Project, RepairEvidence, ReplicaLogContext, ReplicaSet,
+    SimEventKind, StoredDvc, ViewChangeLogEvent, ViewChangeReason, VsrState, dvc_count,
+    dvc_header_kind, dvc_iter, dvc_quorum_array_empty, dvc_record, dvc_reset, dvc_suffix_decode,
+    emit_replica_event, emit_sim_event, merge_view_change, seal_prepare_checksum,
 };
 use bit_set::BitSet;
 use clock::{Clock, IggySystemClock};
@@ -36,7 +36,10 @@ use iggy_common::IggyTimestamp;
 use iggy_common::calculate_checksum;
 use message_bus::IggyMessageBus;
 use message_bus::MessageBus;
+use message_bus::SendError;
+use server_common::MESSAGE_ALIGN;
 use server_common::Message;
+use server_common::iobuf::Frozen;
 use server_common::poll::AutoCommitReservation;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use std::cell::{Cell, RefCell};
@@ -185,6 +188,41 @@ pub const REPLICAS_MAX: usize = 32;
 /// Past three acks marginal durability is small and every extra ack sits on the
 /// commit path, so wide clusters spend the difference on the view-change quorum.
 pub const QUORUM_REPLICATION_MAX: usize = 3;
+
+/// How long a member may trail its primary's commit point before the partition
+/// counts as under-replicated: Kafka's `replica.lag.time.max.ms` default.
+pub const MEMBER_LAG_MAX: Duration = Duration::from_secs(30);
+
+/// Replicas of a `replica_count` group that must ack before an op is committed.
+///
+/// Capped at [`QUORUM_REPLICATION_MAX`] to keep a wide group's commit path
+/// cheap; the view-change quorum grows so the two still sum above the count.
+#[must_use]
+pub const fn quorum_replication(replica_count: u8) -> usize {
+    if replica_count == 2 {
+        // =1 would intersect, but =2 keeps a two-replica group durable.
+        return 2;
+    }
+    let half_rounded_up = (replica_count as usize).div_ceil(2);
+    if half_rounded_up < QUORUM_REPLICATION_MAX {
+        half_rounded_up
+    } else {
+        QUORUM_REPLICATION_MAX
+    }
+}
+
+/// Replicas of a `replica_count` group that must send a `DoViewChange` before a
+/// view can start.
+///
+/// Pays for the cheaper replication quorum, which is the far hotter path.
+#[must_use]
+pub const fn quorum_view_change(replica_count: u8) -> usize {
+    if replica_count == 2 {
+        // Avoids a single-replica view change special case.
+        return 2;
+    }
+    replica_count as usize - quorum_replication(replica_count) + 1
+}
 
 /// Headers a `DoViewChange` may carry, and so the widest uncommitted suffix a
 /// view change can reason about.
@@ -1221,6 +1259,10 @@ struct ReplicaCommitProgress {
     acked: u64,
     /// Highest commit point sent to the replica in this view.
     sent: u64,
+    /// The commit point the replica has not acknowledged, and the monotonic
+    /// microseconds it has trailed since. Each ack reaching it restarts the
+    /// clock, so only a replica that stops keeping up ages.
+    behind: Option<(u64, u64)>,
 }
 
 impl ReplicaCommitProgress {
@@ -1244,10 +1286,38 @@ impl CommitAnnouncements {
         self.replicas.fill(ReplicaCommitProgress::default());
     }
 
-    fn record_ack(&mut self, replica: u8, op: u64) {
+    fn record_ack(&mut self, replica: u8, op: u64, commit: u64, now: impl FnOnce() -> u64) {
         if let Some(progress) = self.replicas.get_mut(usize::from(replica)) {
             progress.acked = progress.acked.max(op);
+            if progress
+                .behind
+                .is_some_and(|(marker, _)| progress.acked >= marker)
+            {
+                progress.behind = (progress.acked < commit).then(|| (commit, now()));
+            }
         }
+    }
+
+    fn record_commit(&mut self, op: u64, now: impl FnOnce() -> u64) {
+        let mut now = Some(now);
+        let mut since = 0;
+        for progress in &mut self.replicas {
+            if progress.acked < op && progress.behind.is_none() {
+                if let Some(now) = now.take() {
+                    since = now();
+                }
+                progress.behind = Some((op, since));
+            }
+        }
+    }
+
+    /// Whether `replica` has trailed the commit point for at least `lag_max`
+    /// microseconds at `now`.
+    fn lagging(&self, replica: u8, now: u64, lag_max: u64) -> bool {
+        self.replicas
+            .get(usize::from(replica))
+            .and_then(|progress| progress.behind)
+            .is_some_and(|(_, since)| now.saturating_sub(since) >= lag_max)
     }
 
     fn record_broadcast(&mut self, commit: u64) {
@@ -1284,8 +1354,11 @@ where
     P: Pipeline,
 {
     cluster: u128,
+    /// This replica's member index, not its node id.
     replica: u8,
     replica_count: u8,
+    /// `members.len() == replica_count`.
+    members: ReplicaSet,
     group: u64,
     /// Metadata creation revision for a partition group; zero for metadata.
     partition_incarnation: Cell<u64>,
@@ -1523,6 +1596,8 @@ where
     /// [`Self::request_eager_commit`].
     eager_commit: Cell<bool>,
     commit_announcements: RefCell<CommitAnnouncements>,
+    /// Bit per member index: the last frame sent to it found no link.
+    member_unreachable: Cell<u32>,
     /// Views whose logs were refused for naming a different prepare at an op
     /// this replica applied; see [`Self::contradicts_applied_log`].
     applied_log_contradictions: Cell<u64>,
@@ -1713,24 +1788,24 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// advertise a view older than the recorded one.
     ///
     /// # Panics
-    /// - If `replica >= replica_count`.
-    /// - If `replica_count < 1`.
+    /// If `self_node` is not in `members`.
     pub fn restored(
         cluster: u128,
-        replica: u8,
-        replica_count: u8,
+        self_node: u8,
+        members: ReplicaSet,
         group: u64,
         message_bus: B,
         pipeline: P,
         restore: VsrRestore<'_>,
     ) -> Self {
-        let mut consensus = Self::new(
+        let mut consensus = Self::with_members(
             cluster,
-            replica,
-            replica_count,
+            self_node,
+            members,
             group,
             message_bus,
             pipeline,
+            ConsensusClock::system(),
         );
         let timers = restore.timers;
         consensus.set_normal_heartbeat_ticks(timers.normal_heartbeat_ticks);
@@ -1844,6 +1919,35 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             "replica index must be < replica_count"
         );
         assert!(replica_count >= 1, "need at least 1 replica");
+        Self::with_members(
+            cluster,
+            replica,
+            ReplicaSet::all(replica_count),
+            group,
+            message_bus,
+            pipeline,
+            clock,
+        )
+    }
+
+    /// A group whose members are the cluster nodes `members` lists, in member
+    /// order. [`Self::with_clock`] is the case where they are every node.
+    ///
+    /// # Panics
+    /// If `self_node` is not in `members`.
+    pub fn with_members(
+        cluster: u128,
+        self_node: u8,
+        members: ReplicaSet,
+        group: u64,
+        message_bus: B,
+        pipeline: P,
+        clock: ConsensusClock,
+    ) -> Self {
+        let replica = members
+            .member(self_node)
+            .unwrap_or_else(|| panic!("node {self_node} is not a member of group {group:#x}"));
+        let replica_count = members.len();
         // Consensus-control routing distinguishes metadata frames from
         // partition frames by the group id: metadata uses the sentinel,
         // partitions use `IggyNamespace::inner()` which lives strictly
@@ -1866,6 +1970,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             cluster,
             replica,
             replica_count,
+            members,
             group,
             view: Cell::new(0),
             log_view: Cell::new(0),
@@ -1920,6 +2025,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             heartbeat_watermark: Cell::new((0, 0)),
             eager_commit: Cell::new(false),
             commit_announcements: RefCell::new(CommitAnnouncements::new(replica_count)),
+            member_unreachable: Cell::new(0),
             applied_log_contradictions: Cell::new(0),
             applied_log_contradictions_taken: Cell::new(0),
             contradiction_reported_view: Cell::new(None),
@@ -2097,6 +2203,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         (view % self.replica_count as u32) as u8
     }
 
+    /// Node id of `view`'s primary, for anything addressed outside the group.
+    #[must_use]
+    pub fn primary_node(&self, view: u32) -> u8 {
+        self.member_node(self.primary_index(view))
+    }
+
     #[must_use]
     pub const fn is_primary(&self) -> bool {
         self.primary_index(self.view.get()) == self.replica
@@ -2109,14 +2221,17 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.is_primary() && self.status.get() == Status::Normal && !self.ceded_primaryship.get()
     }
 
-    /// Ask the partition quorum to elect `target` in the next view assigned to it.
-    /// A ready backup may initiate this too. Refusal leaves consensus unchanged.
-    /// The caller fences the incarnation, drains history work, refreshes the DVC
-    /// suffix and persists the new view before dispatching the returned actions.
-    pub fn request_primary_transfer(&self, expected_view: u32, target: u8) -> Vec<VsrAction> {
+    /// Ask the partition quorum to elect node `target_node` in the next view
+    /// assigned to it. A ready backup may initiate this too. Refusal leaves
+    /// consensus unchanged. The caller fences the incarnation, drains history
+    /// work, refreshes the DVC suffix and persists the new view before
+    /// dispatching the returned actions.
+    pub fn request_primary_transfer(&self, expected_view: u32, target_node: u8) -> Vec<VsrAction> {
         let view = self.view();
+        let Some(target) = self.members.member(target_node) else {
+            return Vec::new();
+        };
         if self.group == METADATA_GROUP
-            || target >= self.replica_count
             || view != expected_view
             || !self.is_normal()
             || self.has_ceded_primaryship()
@@ -2191,6 +2306,35 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         );
         self.commit_min.set(op);
         assert!(self.commit_max.get() >= self.commit_min.get());
+        // Members acked ops up to the view start in an earlier view, and the
+        // acks this view counts were reset with it.
+        if self.is_primary() && op > self.view_start_head.get() {
+            self.commit_announcements
+                .borrow_mut()
+                .record_commit(op, || self.message_bus.monotonic_micros());
+        }
+    }
+
+    /// Members, this replica included, that keep up with this primary: a link
+    /// reaches them and they trail its commit point for less than `lag_max`.
+    /// `None` unless this replica is the acting primary.
+    #[must_use]
+    pub fn in_sync_members(&self, lag_max: Duration) -> Option<u8> {
+        if !self.is_acting_primary() {
+            return None;
+        }
+        let now = self.message_bus.monotonic_micros();
+        let lag_max = u64::try_from(lag_max.as_micros()).unwrap_or(u64::MAX);
+        let unreachable = self.member_unreachable.get();
+        let announcements = self.commit_announcements.borrow();
+        let in_sync = (0..self.replica_count)
+            .filter(|member| {
+                *member == self.replica
+                    || !(unreachable & (1 << member) != 0
+                        || announcements.lagging(*member, now, lag_max))
+            })
+            .count();
+        u8::try_from(in_sync).ok()
     }
 
     /// Restore local commit progress from already-applied state during bootstrap.
@@ -2227,34 +2371,17 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         (self.replica_count as usize - 1) / 2
     }
 
-    /// Replicas that must ack before an op is committed.
-    ///
-    /// Capped at [`QUORUM_REPLICATION_MAX`] to keep a wide cluster's commit path
-    /// cheap; the view-change quorum grows so the two still sum above the count.
+    /// Replicas that must ack before an op is committed; see [`quorum_replication`].
     #[must_use]
     pub const fn quorum_replication(&self) -> usize {
-        if self.replica_count == 2 {
-            // =1 would intersect, but =2 keeps a two-replica cluster durable.
-            return 2;
-        }
-        let half_rounded_up = (self.replica_count as usize).div_ceil(2);
-        if half_rounded_up < QUORUM_REPLICATION_MAX {
-            half_rounded_up
-        } else {
-            QUORUM_REPLICATION_MAX
-        }
+        quorum_replication(self.replica_count)
     }
 
-    /// Replicas that must send a `DoViewChange` before a view can start.
-    ///
-    /// Pays for the cheaper replication quorum, which is the far hotter path.
+    /// Replicas that must send a `DoViewChange` before a view can start; see
+    /// [`quorum_view_change`].
     #[must_use]
     pub const fn quorum_view_change(&self) -> usize {
-        if self.replica_count == 2 {
-            // Avoids a single-replica view change special case.
-            return 2;
-        }
-        self.replica_count as usize - self.quorum_replication() + 1
+        quorum_view_change(self.replica_count)
     }
 
     /// Nacks required to prove an op was never committed, so the new primary may
@@ -2283,6 +2410,31 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[must_use]
     pub const fn replica(&self) -> u8 {
         self.replica
+    }
+
+    /// This replica's cluster node id.
+    #[must_use]
+    pub fn node_id(&self) -> u8 {
+        self.member_node(self.replica)
+    }
+
+    #[must_use]
+    pub const fn members(&self) -> &ReplicaSet {
+        &self.members
+    }
+
+    /// Node id of `member`, which every caller derives from this group's size.
+    ///
+    /// # Panics
+    /// If `member` is not below [`Self::replica_count`].
+    #[must_use]
+    pub fn member_node(&self, member: u8) -> u8 {
+        self.members.node(member).unwrap_or_else(|| {
+            panic!(
+                "member {member} outside group {:#x} of {}",
+                self.group, self.replica_count
+            )
+        })
     }
 
     #[must_use]
@@ -2815,7 +2967,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     pub fn vsr_state(&self, checkpoint_op: u64, checkpoint_checksum: u128) -> VsrState {
         VsrState {
             cluster: self.cluster,
-            replica_id: self.replica,
+            replica_id: self.node_id(),
             replica_count: self.replica_count,
             view: self.view.get(),
             log_view: self.persisted_log_view(),
@@ -5477,7 +5629,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return;
         }
         let mut announcements = self.commit_announcements.borrow_mut();
-        announcements.record_ack(replica, op);
+        announcements.record_ack(replica, op, self.commit_min.get(), || {
+            self.message_bus.monotonic_micros()
+        });
         if announcements.owes(replica) {
             self.eager_commit.set(true);
         }
@@ -5548,11 +5702,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             self.push_loopback(message);
             return true;
         }
-        match self
-            .message_bus
-            .send_to_replica(target, message.into_frozen())
-            .await
-        {
+        match self.send_to_member(target, message.into_frozen()).await {
             Ok(()) => true,
             Err(error) => {
                 tracing::warn!(
@@ -5563,6 +5713,37 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 false
             }
         }
+    }
+
+    /// Send to the node behind `member`. Every frame a group addresses to one
+    /// of its own replicas goes through here, never straight to the bus.
+    ///
+    /// # Errors
+    /// The bus error, or `ReplicaNotConnected` when `member` is outside the group.
+    // VsrConsensus uses Cell/RefCell for single-threaded compio shards; futures are intentionally !Send.
+    #[allow(clippy::future_not_send)]
+    pub async fn send_to_member(
+        &self,
+        member: u8,
+        message: Frozen<MESSAGE_ALIGN>,
+    ) -> Result<(), SendError> {
+        let Some(node) = self.members.node(member) else {
+            return Err(SendError::ReplicaNotConnected(member));
+        };
+        let sent = self.message_bus.send_to_replica(node, message).await;
+        let unreachable = match &sent {
+            Ok(()) => Some(false),
+            Err(SendError::ReplicaNotConnected(_) | SendError::ConnectionClosed) => Some(true),
+            Err(_) => None,
+        };
+        if let Some(unreachable) = unreachable
+            && let Some(bit) = 1_u32.checked_shl(u32::from(member))
+        {
+            let mask = self.member_unreachable.get();
+            self.member_unreachable
+                .set(if unreachable { mask | bit } else { mask & !bit });
+        }
+        sent
     }
 
     #[must_use]
@@ -7060,6 +7241,138 @@ mod vsr_consensus_tests {
             assert_eq!(consensus.svc_count_excluding_self(), 0);
             assert!(consensus.sent_own_start_view_change.get());
         }
+    }
+
+    #[test]
+    fn given_subset_group_when_requesting_primary_transfer_should_address_target_by_node() {
+        const MEMBERS: [u8; 3] = [4, 1, 3];
+        let members = ReplicaSet::new(&MEMBERS).expect("valid members");
+        for (target_node, next_view) in [(3, 2), (1, 1)] {
+            let consensus = VsrConsensus::with_members(
+                1,
+                1,
+                members,
+                0,
+                StageNoopBus,
+                LocalPipeline::new(),
+                ConsensusClock::system(),
+            );
+            consensus.mark_superblock_durable(0, 0);
+            consensus.init();
+            assert_eq!(consensus.primary_node(0), 4);
+
+            let actions = consensus.request_primary_transfer(0, target_node);
+
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [VsrAction::SendStartViewChange { view, group: 0 }] if *view == next_view
+                ),
+                "target node {target_node}"
+            );
+            assert_eq!(consensus.primary_node(next_view), target_node);
+        }
+        let consensus = VsrConsensus::with_members(
+            1,
+            4,
+            members,
+            0,
+            StageNoopBus,
+            LocalPipeline::new(),
+            ConsensusClock::system(),
+        );
+        consensus.mark_superblock_durable(0, 0);
+        consensus.init();
+        assert!(
+            consensus.request_primary_transfer(0, 2).is_empty(),
+            "node 2 is not a member, whatever its id falls inside the group size"
+        );
+    }
+
+    #[test]
+    fn given_a_member_that_stops_acking_when_ops_commit_should_drop_out_of_sync() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        assert_eq!(consensus.in_sync_members(Duration::ZERO), Some(3));
+
+        consensus.note_backup_ack(1, 1);
+        consensus.advance_commit_max(1);
+        consensus.advance_commit_min(1);
+        assert_eq!(
+            consensus.in_sync_members(Duration::ZERO),
+            Some(2),
+            "member 2 trails op 1"
+        );
+        assert_eq!(
+            consensus.in_sync_members(MEMBER_LAG_MAX),
+            Some(3),
+            "within the lag window"
+        );
+
+        consensus.note_backup_ack(2, 1);
+        assert_eq!(consensus.in_sync_members(Duration::ZERO), Some(3));
+
+        let backup = VsrConsensus::new(1, 1, 3, 0, StageNoopBus, LocalPipeline::new());
+        backup.init();
+        assert_eq!(
+            backup.in_sync_members(MEMBER_LAG_MAX),
+            None,
+            "only a primary counts"
+        );
+    }
+
+    #[test]
+    fn given_ops_up_to_the_view_start_when_a_new_primary_commits_them_should_not_mark_members_behind()
+     {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.view_start_head.set(2);
+        consensus.advance_commit_max(3);
+        consensus.advance_commit_min(1);
+        consensus.advance_commit_min(2);
+        assert_eq!(
+            consensus.in_sync_members(Duration::ZERO),
+            Some(3),
+            "ops the members acked in an earlier view"
+        );
+        consensus.advance_commit_min(3);
+        assert_eq!(consensus.in_sync_members(Duration::ZERO), Some(1));
+    }
+
+    #[test]
+    fn given_subset_group_when_snapshotting_state_should_record_node_and_group_size() {
+        let members = ReplicaSet::new(&[4, 1, 3]).expect("valid members");
+        let consensus = VsrConsensus::with_members(
+            1,
+            3,
+            members,
+            0,
+            StageNoopBus,
+            LocalPipeline::new(),
+            ConsensusClock::system(),
+        );
+
+        let state = consensus.vsr_state(0, 0);
+
+        assert_eq!(consensus.replica(), 2);
+        assert_eq!(consensus.node_id(), 3);
+        assert_eq!(state.replica_id, 3);
+        assert_eq!(state.replica_count, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "node 0 is not a member")]
+    fn given_node_outside_members_when_building_group_should_panic() {
+        let members = ReplicaSet::new(&[4, 1, 3]).expect("valid members");
+        let _ = VsrConsensus::with_members(
+            1,
+            0,
+            members,
+            0,
+            StageNoopBus,
+            LocalPipeline::new(),
+            ConsensusClock::system(),
+        );
     }
 
     #[test]

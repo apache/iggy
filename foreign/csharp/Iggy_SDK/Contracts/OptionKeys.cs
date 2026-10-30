@@ -67,7 +67,8 @@ internal static class OptionKeys
         new("partition_resize_policy", HeaderKind.String, OptionFlags.None),
         new("messages_required_to_save", HeaderKind.Uint32, OptionFlags.None),
         new("size_of_messages_required_to_save", HeaderKind.Uint64, OptionFlags.None),
-        new("preallocate_segments", HeaderKind.Bool, OptionFlags.None)
+        new("preallocate_segments", HeaderKind.Bool, OptionFlags.None),
+        new("replication_factor", HeaderKind.Uint32, OptionFlags.None)
     ];
 
     private static readonly OptionDescriptor[] UserKeys =
@@ -115,6 +116,7 @@ internal static class OptionKeys
             TopicOptionKey.MessagesRequiredToSave => "messages_required_to_save",
             TopicOptionKey.SizeOfMessagesRequiredToSave => "size_of_messages_required_to_save",
             TopicOptionKey.PreallocateSegments => "preallocate_segments",
+            TopicOptionKey.ReplicationFactor => "replication_factor",
             _ => throw new ArgumentOutOfRangeException(nameof(key), key, "Unknown topic option key")
         });
     }

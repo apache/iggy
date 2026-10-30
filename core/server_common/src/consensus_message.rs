@@ -828,6 +828,39 @@ impl MessageBag {
         }
     }
 
+    /// The replica a partition-group frame names as its sender: a member index
+    /// of that group. `None` for client requests and metadata-only frames.
+    #[must_use]
+    pub fn partition_source_replica(&self) -> Option<u8> {
+        let generic = match self {
+            Self::Prepare(message) => message.as_generic(),
+            Self::PrepareOk(message) => message.as_generic(),
+            Self::StartViewChange(message) => message.as_generic(),
+            Self::DoViewChange(message) => message.as_generic(),
+            Self::StartView(message) => message.as_generic(),
+            Self::Commit(message) => message.as_generic(),
+            Self::RequestStartView(message) => message.as_generic(),
+            Self::RequestPrepares(message) => message.as_generic(),
+            Self::RepairRangeReply(message) => message.as_generic(),
+            Self::RequestStateTransfer(message) => message.as_generic(),
+            Self::StateTransferTarget(message) => message.as_generic(),
+            Self::RequestStateChunk(message) => message.as_generic(),
+            Self::StateChunk(message) => message.as_generic(),
+            Self::Request(_)
+            | Self::RepairPrepare(_)
+            | Self::ForwardRegister(_)
+            | Self::ForwardRegisterResult(_)
+            | Self::ForwardLogout(_)
+            | Self::ConsumerSessionHeartbeat(_)
+            | Self::ForwardLogoutResult(_)
+            | Self::ForwardCompletion(_)
+            | Self::PrimaryRebalance(_)
+            | Self::SegmentDelete(_) => return None,
+        };
+        let (_, group) = self.routing();
+        (group != METADATA_GROUP).then(|| generic.header().replica)
+    }
+
     /// Discard the classification and hand back the underlying frame.
     ///
     /// Type-erasure only: the backing bytes are untouched, so a later

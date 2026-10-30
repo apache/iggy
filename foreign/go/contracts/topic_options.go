@@ -39,6 +39,7 @@ const (
 	TopicOptionMessagesRequiredToSave       TopicOptionKey = "messages_required_to_save"
 	TopicOptionSizeOfMessagesRequiredToSave TopicOptionKey = "size_of_messages_required_to_save"
 	TopicOptionPreallocateSegments          TopicOptionKey = "preallocate_segments"
+	TopicOptionReplicationFactor            TopicOptionKey = "replication_factor"
 )
 
 // TopicOptions are the options CreateTopic may carry. A nil *TopicOptions
@@ -72,6 +73,8 @@ type TopicOptions struct {
 	SizeOfMessagesRequiredToSave *uint64
 	// PreallocateSegments, see PreallocateSegmentsOption.
 	PreallocateSegments *bool
+	// ReplicationFactor, see ReplicationFactorOption.
+	ReplicationFactor *uint32
 	// Raw carries keys newer than this build.
 	Raw []HeaderEntry
 }
@@ -154,6 +157,16 @@ func SizeOfMessagesRequiredToSaveOption(bytes uint64) HeaderEntry {
 // a create whose product crosses its preallocation cap.
 func PreallocateSegmentsOption(enabled bool) HeaderEntry {
 	return boolOption(TopicOptionPreallocateSegments, enabled)
+}
+
+// ReplicationFactorOption sets how many nodes store each partition of the
+// topic: 1 to 32 and at most the cluster's node count. Omitted, the server uses
+// 3, lowered to the node count when that is smaller. A write commits on a quorum
+// of those nodes, so 2 keeps two copies but stops taking writes while either
+// node is down, like Kafka with min.insync.replicas=2. A value out of range is
+// refused with InvalidReplicationFactor.
+func ReplicationFactorOption(nodes uint32) HeaderEntry {
+	return uint32Option(TopicOptionReplicationFactor, nodes)
 }
 
 func stringOption(key TopicOptionKey, value string) HeaderEntry {

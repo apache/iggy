@@ -212,9 +212,10 @@ final class RawCommandTest extends TestCase
                     'compression_algorithm' => null, 'message_expiry_micros' => null,
                     'max_topic_size' => null, 'segment_size' => null, 'durability' => null,
                     'consumer_offset_durability' => null, 'messages_required_to_save' => null,
-                    'size_of_messages_required_to_save' => null, 'preallocate_segments' => null],
+                    'size_of_messages_required_to_save' => null, 'preallocate_segments' => null,
+                    'replication_factor' => null],
                 ['message_expiry_micros', 'max_topic_size', 'segment_size',
-                    'messages_required_to_save', 'size_of_messages_required_to_save'],
+                    'messages_required_to_save', 'size_of_messages_required_to_save', 'replication_factor'],
             ],
             'consumerGroup' => [
                 ['name' => 'g', 'stream' => 's', 'topic' => 't', 'partition_id' => null,
@@ -240,8 +241,10 @@ final class RawCommandTest extends TestCase
         }
         $arguments = array_replace($methods['consumerGroup'][0], ['poll_interval_micros' => 1_000]);
         assert_throws(static fn () => $client->consumerGroup(...$arguments), 'poll_interval_micros');
-        $arguments = array_replace($methods['createTopic'][0], ['messages_required_to_save' => 4294967296]);
-        assert_throws(static fn () => $client->createTopic(...$arguments), 'messages_required_to_save');
+        foreach (['messages_required_to_save', 'replication_factor'] as $field) {
+            $arguments = array_replace($methods['createTopic'][0], [$field => 4294967296]);
+            assert_throws(static fn () => $client->createTopic(...$arguments), $field);
+        }
     }
 
     public function testConnectionStringBudgetsReachEveryBinaryTransport(): void

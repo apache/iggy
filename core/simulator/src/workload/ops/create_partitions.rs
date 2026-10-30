@@ -87,7 +87,9 @@ pub fn sample(
         Outcome::PartitionIdSpaceExhausted => {
             unreachable!("create_partitions does not target PartitionIdSpaceExhausted")
         }
-        Outcome::PartitionResizeDisabled => None,
+        // The sim client never sets a replication factor, so admission and
+        // apply agree on the member count.
+        Outcome::PartitionResizeDisabled | Outcome::InvalidReplicationFactor => None,
     }
 }
 

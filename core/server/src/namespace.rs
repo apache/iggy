@@ -43,6 +43,7 @@ use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::Streams;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
+use shard::{PartitionRead, PartitionReadReply};
 use std::rc::Rc;
 
 pub fn resolve_offset_group_id(
@@ -161,6 +162,66 @@ where
         _ => return Err(IggyError::FeatureUnavailable),
     };
     Ok(namespace.inner())
+}
+
+/// Whether this node stores `namespace`: true for one every node stores, and
+/// for one this node has not seen committed yet.
+pub fn stores_partition<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+) -> bool
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let node = shard.replica_topology().self_replica_id;
+    shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .members_for_namespace(namespace)
+        .is_none_or(|members| members.is_none_or(|members| members.member(node).is_some()))
+}
+
+/// The primary of `namespace`'s group. A node storing the partition answers
+/// from its own replica; any other node answers with the view the group's
+/// primary last reported, or the committed initial view before any report.
+#[allow(clippy::future_not_send)]
+pub async fn partition_primary<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+) -> Option<PartitionReadReply>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let topology = shard.replica_topology();
+    let route = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .partition_route_inputs(namespace);
+    let stored = route.as_ref().is_none_or(|(members, _, _)| {
+        members.is_none_or(|members| members.member(topology.self_replica_id).is_some())
+    });
+    if stored {
+        return shard
+            .partition_read(namespace, PartitionRead::Primary)
+            .await;
+    }
+    let (members, created_view, reported) = route?;
+    // A stale view costs one NotPrimary hop; no view leaves the route empty.
+    let view = reported.unwrap_or(created_view);
+    let primary = metadata::stm::stream::primary_of(members, view, topology.replica_count)?;
+    Some(PartitionReadReply::Primary { view, primary })
 }
 
 pub fn resolve_partition_namespace<B, MJ, S, SB>(
@@ -387,6 +448,35 @@ mod tests {
                 ))
             ),
             "{refusal:?}"
+        );
+    }
+
+    #[compio::test]
+    async fn given_no_report_from_a_partition_this_node_does_not_store_when_routing_should_name_its_initial_primary()
+     {
+        const CREATED_VIEW: u32 = 1;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 3, 1));
+        let namespace = IggyNamespace::new(0, 0, 0);
+        shard.plane.metadata().mux_stm.streams().seed_namespace_on(
+            namespace,
+            1,
+            CREATED_VIEW,
+            iggy_common::Durability::Persisted,
+            &[1, 2],
+        );
+
+        let route = partition_primary(&shard, namespace).await;
+
+        assert!(
+            matches!(
+                route,
+                Some(PartitionReadReply::Primary {
+                    view: CREATED_VIEW,
+                    primary: 2,
+                })
+            ),
+            "{route:?}"
         );
     }
 

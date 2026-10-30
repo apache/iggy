@@ -63,6 +63,15 @@ export type TopicOptions = {
   /** Preallocate segment files when the topic is created */
   preallocateSegments?: boolean,
   /**
+   * Number of nodes that store each partition of the topic: 1 to 32 and at most
+   * the cluster's node count. Omitted, the server uses 3, lowered to the node
+   * count when that is smaller. A write commits on a quorum of those nodes, so
+   * 2 keeps two copies but stops taking writes while either node is down, like
+   * Kafka with `min.insync.replicas=2`. A value out of range is refused with
+   * error 2018, invalid replication factor.
+   */
+  replicationFactor?: number,
+  /**
    * Option keys with no field of their own, for a key the server catalog gained
    * after this build shipped. A field above wins on collision, since the block
    * must not carry a key twice. Call `describeOptions` for the keys a server
@@ -106,6 +115,7 @@ export const CREATE_TOPIC = {
     messagesRequiredToSave,
     sizeOfMessagesRequiredToSave,
     preallocateSegments,
+    replicationFactor,
     options: extraOptions = []
   }: CreateTopic
   ) => {
@@ -176,6 +186,11 @@ export const CREATE_TOPIC = {
       options.push({
         key: 'preallocate_segments',
         value: HeaderValue.Bool(preallocateSegments)
+      });
+    if (replicationFactor !== undefined)
+      options.push({
+        key: 'replication_factor',
+        value: HeaderValue.Uint32(replicationFactor)
       });
     const b = Buffer.allocUnsafe(4 + 1);
     b.writeUInt32LE(partitionCount, 0);

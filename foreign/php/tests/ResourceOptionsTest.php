@@ -52,6 +52,8 @@ final class ResourceOptionsTest extends TestCase
     private const NEVER = '18446744073709551615';
     // Both durabilities are always sent, so a topic created without options stores them as explicit.
     private const DURABILITY_DEFAULTS = ['consumer_offset_durability' => 'replicated', 'durability' => 'replicated'];
+    // The e2e lanes run a single-node server.
+    private const SERVER_NODES = 1;
     private const STREAM_DERIVED_KEYS = ['encryption_kek_fingerprint', 'encryption_key_fingerprint', 'encryption_key_source'];
     // Create and update arguments named after the unit they take rather than the option key.
     private const PARAMETER_NAMES = ['message_expiry' => 'message_expiry_micros'];
@@ -405,6 +407,10 @@ final class ResourceOptionsTest extends TestCase
             if ($row['storage'] === 'map' && !array_key_exists($key, $explicit)) {
                 $expected[$key] = self::phpScalar($row['default'], $row['kind']);
             }
+        }
+        // The server lowers an omitted replication factor to its node count.
+        if (array_key_exists('replication_factor', $expected)) {
+            $expected['replication_factor'] = min($expected['replication_factor'], self::SERVER_NODES);
         }
         ksort($expected);
         $derived = $defaults->derived_options;

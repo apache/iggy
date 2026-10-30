@@ -88,6 +88,17 @@ public sealed class TopicOptions
     public bool? PreallocateSegments { get; init; }
 
     /// <summary>
+    ///     Number of nodes that store each partition, 1 to 32 and at most the cluster's node count. Null lets the
+    ///     server use 3, lowered to the node count when the cluster is smaller. Fixed at creation.
+    /// </summary>
+    /// <remarks>
+    ///     Two replicas keep two copies but stop accepting writes while either node is down, like Kafka with
+    ///     <c>min.insync.replicas=2</c>. The server refuses an out-of-range value with error code 2018,
+    ///     <c>invalid_replication_factor</c>.
+    /// </remarks>
+    public uint? ReplicationFactor { get; init; }
+
+    /// <summary>
     ///     Option keys with no property of their own, keyed by option name, for keys newer than this build. A
     ///     property above wins on collision, and the server refuses a key outside its catalog by name. A raw
     ///     durability is kept unless the matching property asks for persisted durability.
@@ -159,6 +170,11 @@ public sealed class TopicOptions
         if (PreallocateSegments is { } preallocateSegments)
         {
             options[Name(TopicOptionKey.PreallocateSegments)] = HeaderValue.FromBool(preallocateSegments);
+        }
+
+        if (ReplicationFactor is { } replicationFactor)
+        {
+            options[Name(TopicOptionKey.ReplicationFactor)] = HeaderValue.FromUInt32(replicationFactor);
         }
 
         return options;

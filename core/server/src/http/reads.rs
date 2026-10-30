@@ -1408,6 +1408,7 @@ pub(in crate::http) mod tests {
                     initial_view: 0,
                     partition_id: 0,
                     consensus_group_id,
+                    members: Vec::new(),
                 }],
             },
         );

@@ -334,6 +334,15 @@ pub enum ServerError {
     #[error("cluster mode requires --replica-id to identify the current node")]
     MissingReplicaId,
     #[error(
+        "committed metadata places partition {namespace_raw} on node {node}, but the cluster \
+         has {nodes} nodes; adding or removing nodes is not supported"
+    )]
+    PartitionMemberOutsideCluster {
+        namespace_raw: u64,
+        node: u8,
+        nodes: u8,
+    },
+    #[error(
         "--replica-id {supplied} was passed with cluster.enabled=false; the WAL would commit \
          under replica {default} which permanently fixes this node's identity. Either set \
          cluster.enabled=true with a matching nodes[] entry, or drop --replica-id"
