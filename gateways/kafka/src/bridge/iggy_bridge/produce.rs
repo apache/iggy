@@ -26,7 +26,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures::future::join_all;
-use iggy::prelude::{IggyClient, IggyError, IggyMessage, MessageClient, Partitioning};
+use iggy::prelude::{
+    BatchProducer, IggyClient, IggyError, IggyMessage, MessageClient, Partitioning,
+};
 use iggy_common::{binary_operation_deadline, with_binary_deadline};
 use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
@@ -68,6 +70,16 @@ pub enum Producer {
     Id { id: i64, user: Option<String> },
     /// The Kafka connection, for a producer without such an id.
     Connection(u64),
+}
+
+/// The messages of one partition, sent to Iggy in one request.
+#[derive(Debug)]
+pub struct PartitionBatch {
+    /// Passes through unchanged: Kafka and Iggy both count partitions from 0.
+    pub partition: u32,
+    /// The id, epoch and first sequence of an idempotent Kafka producer.
+    pub producer: Option<BatchProducer>,
+    pub messages: Vec<IggyMessage>,
 }
 
 /// One Iggy client. One request holds its turn at a time, so the sends on it reach Iggy in order.
@@ -370,11 +382,13 @@ impl IggyBridge {
         self.produce_pool.forget(&Producer::Connection(connection));
     }
 
-    /// Appends `messages` to `partition` of `target` on the session of `turn`, and returns the
+    /// Appends `batch` to its partition of `target` on the session of `turn`, and returns the
     /// base offset. Hands `turn` and `kept` back with it.
     ///
-    /// `partition` passes through unchanged: both systems count from 0. The server rejects a
-    /// partition the topic lacks, so no round trip checks first.
+    /// With a producer, the batch carries the Kafka producer's id, epoch and first sequence, and
+    /// the partition writes it once. A resend of a batch it holds answers the first offset.
+    ///
+    /// The server rejects a partition the topic lacks, so no round trip checks first.
     ///
     /// `Ok(None)`: committed, but the server named no offset (a duplicate request, or a journal
     /// entry that is gone). Do not retry it.
@@ -384,9 +398,9 @@ impl IggyBridge {
     ///
     /// A send still running at `deadline` keeps `turn` and `kept`, and hands back `None` for
     /// them. So the producer's later requests answer 7 meanwhile and cannot overtake it, and what
-    /// `kept` reserves for `messages` stays reserved. Other producers send on.
+    /// `kept` reserves for the messages stays reserved. Other producers send on.
     ///
-    /// Such a send drops `messages` and `kept` when it ends, at `SLOT_LIMIT` at the latest. Cut
+    /// Such a send drops the messages and `kept` when it ends, at `SLOT_LIMIT` at the latest. Cut
     /// off there, it keeps `turn` until its connection is closed.
     ///
     /// # Errors
@@ -401,10 +415,14 @@ impl IggyBridge {
         turn: ProduceTurn,
         kept: K,
         target: &TopicTarget,
-        partition: u32,
-        mut messages: Vec<IggyMessage>,
+        batch: PartitionBatch,
         deadline: Instant,
     ) -> (Result<Option<u64>, BridgeError>, Option<(ProduceTurn, K)>) {
+        let PartitionBatch {
+            partition,
+            producer,
+            mut messages,
+        } = batch;
         let session = Arc::clone(&turn.seat.session);
         let connect = self.produce_pool.client_of(&session, &self.config);
         let client = match timeout_at(deadline, connect).await {
@@ -431,10 +449,30 @@ impl IggyBridge {
                 async move {
                     let partitioning = Partitioning::partition_id(partition);
                     loop {
-                        match client
-                            .send_messages(&stream_id, &topic_id, &partitioning, &mut messages)
-                            .await
-                        {
+                        let sent = match producer {
+                            Some(producer) => {
+                                client
+                                    .send_producer_messages(
+                                        &stream_id,
+                                        &topic_id,
+                                        &partitioning,
+                                        producer,
+                                        &mut messages,
+                                    )
+                                    .await
+                            }
+                            None => {
+                                client
+                                    .send_messages(
+                                        &stream_id,
+                                        &topic_id,
+                                        &partitioning,
+                                        &mut messages,
+                                    )
+                                    .await
+                            }
+                        };
+                        match sent {
                             Err(IggyError::LaneBlocked(operation)) => {
                                 resolve_blocker(&client, operation, sdk_deadline.into_std())
                                     .await?;
@@ -595,8 +633,11 @@ mod tests {
                     .expect("a free turn"),
                 7,
                 &target,
-                0,
-                Vec::new(),
+                PartitionBatch {
+                    partition: 0,
+                    producer: None,
+                    messages: Vec::new(),
+                },
                 Instant::now(),
             )
             .await;

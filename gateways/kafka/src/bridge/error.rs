@@ -21,9 +21,10 @@ use thiserror::Error;
 use crate::bridge::iggy_bridge::ClusterIdCall;
 use crate::cluster_id::InvalidClusterId;
 use crate::protocol::api::{
-    ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_INVALID_PARTITIONS, ERROR_INVALID_REQUEST,
-    ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_POLICY_VIOLATION,
-    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED,
+    ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_INVALID_PARTITIONS, ERROR_INVALID_PRODUCER_EPOCH,
+    ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NOT_LEADER_OR_FOLLOWER,
+    ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
+    ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_PRODUCER_ID,
     ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 
@@ -306,6 +307,10 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         // The outcome was forgotten; a retry after client eviction could duplicate the write.
         // UNKNOWN_SERVER_ERROR is non-retryable in the Kafka protocol.
         IggyError::RequestTooOld => ERROR_UNKNOWN_SERVER_ERROR,
+        // The partition refused an idempotent batch and wrote nothing, as Kafka's log does.
+        IggyError::ProducerSequenceOutOfOrder => ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
+        IggyError::ProducerEpochFenced => ERROR_INVALID_PRODUCER_EPOCH,
+        IggyError::ProducerUnknown => ERROR_UNKNOWN_PRODUCER_ID,
         // Not `ERROR_INVALID_PARTITIONS` (37): that code's own text, per `kafka-protocol`'s
         // table, is "Number of partitions is below 1" - the opposite condition from "too many"
         // (Iggy's server-side cap, above 1000). Reusing 37 for both directions would return a
@@ -704,6 +709,15 @@ mod tests {
             ),
             (ERROR_INVALID_PARTITIONS, ResponseError::InvalidPartitions),
             (ERROR_INVALID_REQUEST, ResponseError::InvalidRequest),
+            (
+                ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
+                ResponseError::OutOfOrderSequenceNumber,
+            ),
+            (
+                ERROR_INVALID_PRODUCER_EPOCH,
+                ResponseError::InvalidProducerEpoch,
+            ),
+            (ERROR_UNKNOWN_PRODUCER_ID, ResponseError::UnknownProducerId),
         ] {
             assert_eq!(ours, theirs.code());
         }

@@ -40,10 +40,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use iggy_gateway_kafka::bridge::{IggyBridge, IggyBridgeConfig, Producer};
+use iggy_gateway_kafka::bridge::{IggyBridge, IggyBridgeConfig, PartitionBatch, Producer};
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_INIT_PRODUCER_ID, API_KEY_PRODUCE, ERROR_NONE, ERROR_NOT_LEADER_OR_FOLLOWER,
+    API_KEY_INIT_PRODUCER_ID, API_KEY_PRODUCE, ERROR_INVALID_PRODUCER_EPOCH, ERROR_NONE,
+    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_UNKNOWN_PRODUCER_ID,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, handle_request_bounded,
 };
 use iggy_gateway_kafka::records::{KEY_HEADER, MAPPING_VERSION, VERSION_HEADER, from_iggy};
@@ -187,6 +188,14 @@ fn encode_timed_request(
 
 /// Every partition entry of a response, flattened, in the order the response lists them.
 fn partition_results(version: i16, body: Bytes) -> Vec<(i32, i16, i64)> {
+    partition_entries(version, body)
+        .into_iter()
+        .map(|(index, error_code, base_offset, _)| (index, error_code, base_offset))
+        .collect()
+}
+
+/// [`partition_results`], with the log start offset of each entry from v5 on.
+fn partition_entries(version: i16, body: Bytes) -> Vec<(i32, i16, i64, Option<i64>)> {
     let flexible = version >= 9;
     let mut d = Decoder::new(body);
     let topics = read_count(&mut d, flexible);
@@ -201,9 +210,7 @@ fn partition_results(version: i16, body: Bytes) -> Vec<(i32, i16, i64)> {
             let base_offset = d.read_i64().expect("base offset");
             let append_time = d.read_i64().expect("log append time");
             assert_eq!(append_time, -1, "CreateTime topics report no append time");
-            if version >= 5 {
-                d.read_i64().expect("log start offset");
-            }
+            let log_start_offset = (version >= 5).then(|| d.read_i64().expect("log start offset"));
             if version >= 8 {
                 assert_eq!(read_count(&mut d, flexible), 0, "no per-record errors");
                 read_name(&mut d, flexible); // error_message
@@ -211,7 +218,7 @@ fn partition_results(version: i16, body: Bytes) -> Vec<(i32, i16, i64)> {
             if flexible {
                 d.read_tagged_fields().expect("partition tagged fields");
             }
-            results.push((index, error_code, base_offset));
+            results.push((index, error_code, base_offset, log_start_offset));
         }
         if flexible {
             d.read_tagged_fields().expect("topic tagged fields");
@@ -687,7 +694,7 @@ async fn given_iggy_out_of_reach_past_the_deadline_when_the_client_retries_shoul
     let state = gateway_on(config, 1).await;
     // Each request here comes on a new connection, so only a producer id keeps one Iggy session.
     let id = issued_producer_id(&state).await;
-    let first = [(0, idempotent_batch(id, b"first"))];
+    let first = [(0, producer_batch(id, 0, 0, &[b"first"]))];
     assert_eq!(
         produce(&state, 3, 1, TOPIC, &first).await,
         vec![(0, ERROR_NONE, 0)],
@@ -695,7 +702,7 @@ async fn given_iggy_out_of_reach_past_the_deadline_when_the_client_retries_shoul
     );
 
     relay.go_down().await;
-    let retried = [(0, idempotent_batch(id, b"retried"))];
+    let retried = [(0, producer_batch(id, 0, 1, &[b"retried"]))];
     let body = encode_timed_request(3, 1, 1_000, TOPIC, &retried);
     let response = handle_request_bounded(&state, API_KEY_PRODUCE, 3, body)
         .await
@@ -829,12 +836,18 @@ async fn issued_producer_id(state: &GatewayState) -> i64 {
     d.read_i64().expect("producer id")
 }
 
-/// A one-record batch that carries `producer_id`, as an idempotent producer sends it.
-fn idempotent_batch(producer_id: i64, value: &[u8]) -> Bytes {
-    let mut records = [record(0, None, value, &[])];
-    records[0].producer_id = producer_id;
-    records[0].producer_epoch = 0;
-    records[0].sequence = 0;
+/// A batch of `values` from `producer_id` at `epoch`, the first record at `base_sequence`, as an
+/// idempotent producer sends it.
+fn producer_batch(producer_id: i64, epoch: i16, base_sequence: i32, values: &[&[u8]]) -> Bytes {
+    let mut records: Vec<Record> = (0..)
+        .zip(values)
+        .map(|(offset, value)| record(offset, None, value, &[]))
+        .collect();
+    for (sequence, record) in (base_sequence..).zip(records.iter_mut()) {
+        record.producer_id = producer_id;
+        record.producer_epoch = epoch;
+        record.sequence = sequence;
+    }
     batch(&records, Compression::None)
 }
 
@@ -862,7 +875,7 @@ async fn given_a_producers_request_still_running_when_handled_should_hold_back_o
         "another producer sends on a session of its own"
     );
 
-    let own = [(0, idempotent_batch(id, b"own"))];
+    let own = [(0, producer_batch(id, 0, 0, &[b"own"]))];
     let answer = |acks| {
         let body = encode_timed_request(3, acks, 100, TOPIC, &own);
         handle_request_bounded(&state, API_KEY_PRODUCE, 3, body)
@@ -905,8 +918,11 @@ async fn send_each(bridge: &IggyBridge, producer: Producer, name: &str, count: u
                     .expect("the producer's own turn"),
                 (),
                 &target,
-                0,
-                vec![message],
+                PartitionBatch {
+                    partition: 0,
+                    producer: None,
+                    messages: vec![message],
+                },
                 soon_enough(),
             )
             .await;
@@ -1031,16 +1047,11 @@ async fn given_a_transactional_batch_when_handled_should_answer_unsupported_vers
 
 #[tokio::test]
 #[serial]
-async fn given_an_idempotent_batch_sent_twice_when_handled_should_store_both_copies() {
+async fn given_an_idempotent_batch_sent_twice_when_handled_should_store_it_once() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let state = gateway_with_topic(&server, 1).await;
-
-    let mut records = [record(0, None, b"v", &[])];
-    records[0].producer_id = 7;
-    records[0].producer_epoch = 0;
-    records[0].sequence = 0;
-    let entries = [(0, batch(&records, Compression::None))];
+    let entries = [(0, producer_batch(7, 0, 0, &[b"v"]))];
 
     assert_eq!(
         produce(&state, 3, -1, TOPIC, &entries).await,
@@ -1049,14 +1060,82 @@ async fn given_an_idempotent_batch_sent_twice_when_handled_should_store_both_cop
     );
     assert_eq!(
         produce(&state, 3, -1, TOPIC, &entries).await,
-        vec![(0, ERROR_NONE, 1)],
-        "the sequence is ignored, so a resend never answers DUPLICATE_SEQUENCE_NUMBER (46)"
+        vec![(0, ERROR_NONE, 0)],
+        "a resend answers the offset of its first write"
+    );
+    assert_eq!(
+        stored(&server, 0, 10).await.len(),
+        1,
+        "the partition writes the batch once"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn given_idempotent_batches_out_of_line_when_handled_should_refuse_them_as_kafka_does() {
+    const VERSION: i16 = 5;
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = gateway_with_topic(&server, 1).await;
+    let send = |entries: Vec<(i32, Bytes)>| {
+        let body = encode_request(VERSION, -1, TOPIC, &entries);
+        let state = &state;
+        async move {
+            let response = handle_request_bounded(state, API_KEY_PRODUCE, VERSION, body)
+                .await
+                .expect_response("acks=-1 is answered");
+            partition_entries(VERSION, response)
+        }
+    };
+
+    assert_eq!(
+        send(vec![(0, producer_batch(7, 1, 0, &[b"a", b"b"]))]).await,
+        vec![(0, ERROR_NONE, 0, Some(-1))]
+    );
+    assert_eq!(
+        send(vec![(0, producer_batch(7, 1, 5, &[b"gap"]))]).await,
+        vec![(0, ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, -1, Some(-1))],
+        "a batch after a gap"
+    );
+    assert_eq!(
+        send(vec![(0, producer_batch(7, 0, 2, &[b"old"]))]).await,
+        vec![(0, ERROR_INVALID_PRODUCER_EPOCH, -1, Some(-1))],
+        "a batch of an older epoch"
+    );
+    assert_eq!(
+        send(vec![(0, producer_batch(8, 0, 3, &[b"late"]))]).await,
+        vec![(0, ERROR_UNKNOWN_PRODUCER_ID, -1, Some(0))],
+        "a producer the partition does not hold, with a log start so the client starts over"
     );
     assert_eq!(
         stored(&server, 0, 10).await.len(),
         2,
-        "a retry writes twice until the producer pool in IDEMPOTENCE.md lands"
+        "nothing refused was written"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn given_a_producer_that_moves_to_another_gateway_when_it_resends_should_store_once() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let first = gateway_with_topic(&server, 1).await;
+    let second = gateway_on(server.test_config(), 1).await;
+
+    let id = issued_producer_id(&first).await;
+    let other = issued_producer_id(&second).await;
+    assert_ne!(id, other, "two gateways never give out the same id");
+    let entries = [(0, producer_batch(id, 0, 0, &[b"once"]))];
+    assert_eq!(
+        produce(&first, 3, -1, TOPIC, &entries).await,
+        vec![(0, ERROR_NONE, 0)]
+    );
+    assert_eq!(
+        produce(&second, 3, -1, TOPIC, &entries).await,
+        vec![(0, ERROR_NONE, 0)],
+        "the reply was lost, and the producer sends the batch again through another gateway"
+    );
+    assert_eq!(stored(&server, 0, 10).await.len(), 1);
 }
 
 #[tokio::test]

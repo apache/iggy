@@ -276,6 +276,16 @@ const PRODUCE_LARGE: usize = 4;
 const PRODUCE_CAPS: usize = PRODUCE_LARGE + 1;
 
 impl GatewayState {
+    /// Whether this gateway gave out `producer_id` lately, so Produce may key an Iggy session on
+    /// it. With a bridge the ids come from Iggy. Without one, from the local allocator.
+    #[must_use]
+    pub(crate) fn issued_producer_id(&self, producer_id: i64) -> bool {
+        self.bridge.as_ref().map_or_else(
+            || self.producer_ids.issued(producer_id),
+            |bridge| bridge.issued_producer_id(producer_id),
+        )
+    }
+
     #[must_use]
     pub fn new(
         bridge: Option<Arc<IggyBridge>>,
