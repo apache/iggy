@@ -2262,14 +2262,14 @@ async fn try_external_auth_http_login(
     client_addr: &crate::http::ClientAddr,
 ) -> Result<Json<IdentityInfo>, CustomError> {
     use crate::external_auth::{
-        Credentials, ExternalAuthRequest, ValidatedDecision, callout_external_auth,
+        Credentials, ExternalAuthRequest, HTTP_TRANSPORT, ValidatedDecision, callout_external_auth,
     };
 
     let ext_config = &state.server_config.external_auth;
     let client_address = client_addr.addr.to_string();
     let connection_id = uuid::Uuid::now_v7().to_string();
     let ext_request = ExternalAuthRequest {
-        transport: "http",
+        transport: HTTP_TRANSPORT,
         client_address: &client_address,
         connection_id: &connection_id,
         credentials: Credentials::UsernamePassword { username, password },

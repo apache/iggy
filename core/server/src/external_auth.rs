@@ -66,7 +66,7 @@ impl CalloutGuard {
 
 impl Drop for CalloutGuard {
     fn drop(&mut self) {
-        IN_FLIGHT_CALLOUTS.with(|c| c.set(c.get().saturating_sub(1)));
+        IN_FLIGHT_CALLOUTS.with(|c| c.set(c.get() - 1));
     }
 }
 
@@ -96,6 +96,11 @@ fn serialize_secret<S: serde::Serializer>(
 ) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(value.expose_secret())
 }
+
+/// Transport label for HTTP REST logins, which do not go through the
+/// binary `ClientTransportKind` enum. Matches the value documented in
+/// config.toml.
+pub const HTTP_TRANSPORT: &str = "http";
 
 /// Connection and credential metadata sent to the external auth service.
 ///
@@ -134,10 +139,7 @@ fn default_deny_reason() -> String {
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum ExternalAuthDecision {
     /// Map the caller to a pre-provisioned Iggy user by username.
-    Allow {
-        #[serde(default)]
-        username: Option<String>,
-    },
+    Allow { username: String },
     /// Reject the login.
     Deny {
         #[serde(default = "default_deny_reason")]
@@ -278,9 +280,6 @@ fn validate_decision(
 ) -> Result<ValidatedDecision, ExternalAuthError> {
     match decision {
         ExternalAuthDecision::Allow { username } => {
-            let username = username.ok_or_else(|| {
-                ExternalAuthError::BadResponse("allow decision missing username".to_owned())
-            })?;
             if username.is_empty() {
                 return Err(ExternalAuthError::BadResponse(
                     "allow decision has empty username".to_owned(),
@@ -491,7 +490,10 @@ mod tests {
     fn response_allow_missing_username_should_error() {
         let json = r#"{"decision": "allow"}"#;
         let err = parse_response(json).unwrap_err();
-        assert!(err.to_string().contains("missing username"));
+        assert!(
+            err.to_string().contains("username"),
+            "serde must report the missing field: {err}"
+        );
     }
 
     #[test]
