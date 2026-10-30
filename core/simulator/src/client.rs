@@ -16,6 +16,7 @@
 // under the License.
 
 use bytes::{Bytes, BytesMut};
+use iggy_binary_protocol::batch::BatchProducer;
 use iggy_binary_protocol::codes::{GET_STREAM_CODE, POLL_MESSAGES_CODE};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
@@ -763,6 +764,28 @@ impl SimClient {
         group: IggyNamespace,
         messages: &[Bytes],
     ) -> Message<RoutedRequestHeader> {
+        self.send_batch(group, None, messages)
+    }
+
+    /// [`Self::send_messages`] as one batch of an idempotent producer.
+    ///
+    /// # Panics
+    /// Panics if a group id exceeds `u32` or the request buffer is invalid.
+    pub fn send_producer_messages(
+        &self,
+        group: IggyNamespace,
+        producer: BatchProducer,
+        messages: &[Bytes],
+    ) -> Message<RoutedRequestHeader> {
+        self.send_batch(group, Some(producer), messages)
+    }
+
+    fn send_batch(
+        &self,
+        group: IggyNamespace,
+        producer: Option<BatchProducer>,
+        messages: &[Bytes],
+    ) -> Message<RoutedRequestHeader> {
         let to_u32 = |v: usize| u32::try_from(v).expect("group id fits u32");
         let stream_id = WireIdentifier::Numeric(to_u32(group.stream_id()));
         let topic_id = WireIdentifier::Numeric(to_u32(group.topic_id()));
@@ -785,8 +808,15 @@ impl SimClient {
 
         let size = SendMessagesEncoder::encoded_size(&stream_id, &topic_id, &partitioning, &raw);
         let mut buf = BytesMut::with_capacity(size);
-        SendMessagesEncoder::encode(&mut buf, &stream_id, &topic_id, &partitioning, &raw)
-            .expect("simulator send batch encodes");
+        SendMessagesEncoder::encode_with_producer(
+            &mut buf,
+            &stream_id,
+            &topic_id,
+            &partitioning,
+            producer,
+            &raw,
+        )
+        .expect("simulator send batch encodes");
 
         self.build_request_with_namespace(Operation::SendMessages, &buf, group)
     }

@@ -53,7 +53,7 @@ fn send(sim: &mut Simulator, client: &SimClient, namespace: IggyNamespace, to: u
     }
 }
 
-fn isolate(sim: &mut Simulator, replica: u8, isolated: bool) {
+pub fn isolate(sim: &mut Simulator, replica: u8, isolated: bool) {
     for peer in (0..REPLICAS).filter(|peer| *peer != replica) {
         sim.network.set_link_filter(
             ProcessId::Replica(replica),
@@ -70,7 +70,7 @@ fn isolate(sim: &mut Simulator, replica: u8, isolated: bool) {
 
 /// `(offset, payload)` for every message a consumer can poll from `replica`,
 /// read through the ordinary client poll path.
-fn polled(sim: &mut Simulator, replica: u8, namespace: IggyNamespace) -> Vec<(u64, String)> {
+pub fn polled(sim: &mut Simulator, replica: u8, namespace: IggyNamespace) -> Vec<(u64, String)> {
     let mut out = Vec::new();
     loop {
         let next = out.last().map_or(0, |(offset, _)| offset + 1);
@@ -486,7 +486,7 @@ fn repair_session(
         .repair
 }
 
-fn primary_of(sim: &Simulator, replica: u8, namespace: IggyNamespace, view: u32) -> u8 {
+pub fn primary_of(sim: &Simulator, replica: u8, namespace: IggyNamespace, view: u32) -> u8 {
     sim.replicas[usize::from(replica)]
         .partition_shard(namespace)
         .plane
