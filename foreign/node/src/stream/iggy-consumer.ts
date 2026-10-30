@@ -67,6 +67,8 @@ export type ConsumerGroupRequest = Omit<ConsumerRequest, 'partitions'>;
 export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
   private uncounted?: { checkpoint: Checkpoint, endsBatch: boolean };
   private stopped = false;
+  /** The batch whose messages the consumer hands over, until a seek of its partition drops the rest. */
+  private current?: PolledBatch;
 
   /** @internal */
   constructor(
@@ -86,7 +88,8 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
     while (!this.stopped) {
       const batch = await this.nextBatch();
       if (!batch) return;
-      for (let index = 0; index < batch.messages.length; index += 1) {
+      this.current = batch;
+      for (let index = 0; index < batch.messages.length && this.current === batch; index += 1) {
         if (this.stopped) return;
         const message = this.hand(batch, index);
         yield message;
@@ -98,21 +101,22 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
   /**
    * Hands each message to `handler` until the consumer shuts down or a handler
    * fails, which ends the loop with its error and leaves its message uncounted.
+   * A message counts only once its handler returns, so a shutdown while the
+   * handler runs leaves it uncounted too.
    */
   async consume(handler: (message: ConsumerMessage) => Promise<void> | void): Promise<void> {
     while (!this.stopped) {
       const batch = await this.nextBatch();
       if (!batch) return;
-      for (let index = 0; index < batch.messages.length; index += 1) {
+      this.current = batch;
+      for (let index = 0; index < batch.messages.length && this.current === batch; index += 1) {
         if (this.stopped) return;
         const message = this.hand(batch, index);
-        try {
-          await handler(message);
-        } catch (error) {
-          this.uncounted = undefined;
-          throw error;
-        }
-        this.countProcessed();
+        // A shutdown while the handler runs must not count its message.
+        const handled = this.uncounted;
+        this.uncounted = undefined;
+        await handler(message);
+        if (handled) this.reader.countDelivered(handled.checkpoint, 1, handled.endsBatch);
       }
     }
   }
@@ -127,19 +131,26 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
     this.reader.mark(checkpoint);
   }
 
-  /** Sets the next read position of a partition, as `PartitionReader.seek` does. */
-  seek(partitionId: number, start: PollingStrategy): Promise<void> {
-    return this.reader.seek(partitionId, start);
+  /**
+   * Sets the next read position of a partition, as `PartitionReader.seek`
+   * does, and drops the rest of the batch of that partition that the consumer
+   * hands over.
+   */
+  async seek(partitionId: number, start: PollingStrategy): Promise<void> {
+    await this.reader.seek(partitionId, start);
+    if (this.current?.partitionId === partitionId) this.current = undefined;
   }
 
   /**
    * Stops the consumer: counts the last message under `after: processing`,
    * closes the reader, which stores or rewinds the offsets, and leaves the group.
+   * A later call waits for the first one and ends as it does.
    */
   async shutdown(): Promise<void> {
-    if (this.stopped) return;
-    this.stopped = true;
-    this.countProcessed();
+    if (!this.stopped) {
+      this.stopped = true;
+      this.countProcessed();
+    }
     await this.reader.close();
   }
 

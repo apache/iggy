@@ -1165,6 +1165,36 @@ mod tests {
     }
 
     #[test]
+    fn given_a_parked_committing_request_when_its_connection_is_removed_should_cancel_its_gate_before_any_store()
+     {
+        // The aborted request drops its reply only once its task runs again,
+        // and an owner that finishes the read before that must find the gate
+        // closed, or it stores an offset for a client that is gone.
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        let mut table = registry(CLIENT, USER, EPOCH);
+        bind(&mut sessions.borrow_mut(), &mut table, 1);
+        let gate = CommitGate::default();
+        let (_request, registration) = SessionManager::begin_deferred_request(
+            &sessions,
+            1,
+            (10, Some(gate.clone())),
+            Duration::from_secs(60),
+            Instant::now(),
+        )
+        .unwrap();
+        let mut request = Box::pin(futures::future::Abortable::new(
+            std::future::pending::<()>(),
+            registration,
+        ));
+
+        sessions.borrow_mut().remove_connection(1);
+
+        assert!(gate.is_cancelled());
+        assert!(!gate.enter(), "a read that finishes later stores nothing");
+        assert!(request.as_mut().now_or_never().unwrap().is_err());
+    }
+
+    #[test]
     fn deferred_guard_is_connection_local_finite_and_refreshes_only_after_write() {
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
         let old = Instant::now().checked_sub(Duration::from_secs(30)).unwrap();

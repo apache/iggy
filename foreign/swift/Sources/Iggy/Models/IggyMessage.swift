@@ -228,10 +228,13 @@ struct FetchSection: Sendable, Hashable {
     /// The undecoded batch records, as a poll reply carries them after its
     /// header. They share the buffer of the whole reply.
     var records: ArraySlice<UInt8>
+    /// ``IggyErrorCode/fetchProgressUncertain`` naming the fetch, for a
+    /// committing section whose error leaves the outcome unknown.
+    var uncertainty: IggyError? = nil
 
     /// The error of the partition, nil for one that was read.
     var error: IggyError? {
-        status == 0 ? nil : IggyError(wireCode: status)
+        uncertainty ?? (status == 0 ? nil : IggyError(wireCode: status))
     }
 
     /// The messages of the section. A section with an error throws it.

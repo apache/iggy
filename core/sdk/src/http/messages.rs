@@ -272,9 +272,11 @@ mod tests {
     use iggy_common::{
         AutoCommit, Checkpoint, CommitPolicy, MIN_DEFERRED_POLL_MAX_BYTES, PollOptions,
     };
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
+    use tokio::time::timeout;
 
     const PARTITION_ID: u32 = 2;
+    const TEST_BUDGET: Duration = Duration::from_secs(5);
     const OTHER_PARTITION_ID: u32 = 3;
     const CURRENT: PartitionContext = PartitionContext {
         incarnation: 7,
@@ -687,7 +689,8 @@ mod tests {
         assert_eq!(server.requests().len(), 1);
     }
 
-    /// A name and a numeric id spell the same partition, so the block refuses both. Offset
+    /// A call that carries the context of the partition meets its block in any spelling of the
+    /// stream and the topic, and a call without one in the spelling of the lost poll. Offset
     /// reads and polls that neither store the offset nor start at it go on, and so do other
     /// partitions.
     #[tokio::test]
@@ -704,7 +707,11 @@ mod tests {
         let (stream_id, topic_id) = ids();
         let named = named_ids();
         let checkpoint = Checkpoint::new(PARTITION_ID, START, CURRENT);
-        let lost = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
+        let next_start =
+            PollingStrategy::continuation(PARTITION_ID, PollingKind::Next, START, CURRENT);
+        let offset_start =
+            PollingStrategy::continuation(PARTITION_ID, PollingKind::Offset, START, CURRENT);
+        let lost = poll(&client, &next_start, CommitPolicy::OnRead).await;
         let Err(IggyError::FetchProgressUncertain(op)) = lost else {
             panic!("{lost:?}");
         };
@@ -714,7 +721,7 @@ mod tests {
             &client,
             &named,
             PARTITION_ID,
-            &PollingStrategy::next(),
+            &next_start,
             CommitPolicy::Manual,
         )
         .await;
@@ -722,7 +729,7 @@ mod tests {
             &client,
             &named,
             PARTITION_ID,
-            &PollingStrategy::offset(START),
+            &offset_start,
             CommitPolicy::OnRead,
         )
         .await;
@@ -803,6 +810,75 @@ mod tests {
     }
 
     /// HTTP cannot learn the outcome of a lost poll, so only an abandon frees its partition.
+    /// The block covers the stream and the topic of the lost poll, so another topic reads the
+    /// same partition id and stores its offsets.
+    #[tokio::test]
+    async fn given_a_lost_on_read_poll_when_another_topic_reads_the_same_partition_id_should_go_on()
+    {
+        let server =
+            ScriptedServer::start(vec![Reply::hang_up(), Reply::polled(), Reply::empty(200)]).await;
+        let client = server.client();
+        let other_topic = (
+            Identifier::numeric(1).unwrap(),
+            Identifier::numeric(2).unwrap(),
+        );
+        let lost = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
+        assert!(
+            matches!(lost, Err(IggyError::FetchProgressUncertain(_))),
+            "{lost:?}"
+        );
+
+        let polled = poll_partition(
+            &client,
+            &other_topic,
+            PARTITION_ID,
+            &PollingStrategy::next(),
+            CommitPolicy::OnRead,
+        )
+        .await;
+        let stored = client
+            .store_consumer_offset(
+                &Consumer::default(),
+                &other_topic.0,
+                &other_topic.1,
+                Some(PARTITION_ID),
+                START,
+            )
+            .await;
+
+        polled.unwrap();
+        stored.unwrap();
+        assert_eq!(server.requests().len(), 3);
+    }
+
+    /// One progress poll of a partition runs at a time, so the next one sees the block that the
+    /// first one leaves.
+    #[tokio::test]
+    async fn given_an_on_read_poll_in_flight_when_another_progress_poll_of_its_partition_starts_should_wait_for_it()
+     {
+        const LANE_WAIT: Duration = Duration::from_millis(200);
+        let server = ScriptedServer::start(vec![Reply::stall(), Reply::polled()]).await;
+        let client = server.client();
+        let next = PollingStrategy::next();
+        let mut first = Box::pin(poll(&client, &next, CommitPolicy::OnRead));
+        tokio::select! {
+            polled = &mut first => panic!("the stalled poll returned: {polled:?}"),
+            () = server.request_arrived() => {}
+        }
+        let mut second = Box::pin(poll(&client, &next, CommitPolicy::OnRead));
+
+        let waited = timeout(LANE_WAIT, &mut second).await;
+        assert!(waited.is_err(), "the second poll went out: {waited:?}");
+        drop(first);
+        let second = timeout(TEST_BUDGET, second).await.unwrap();
+
+        let Err(IggyError::PartitionLaneBlocked(PARTITION_ID, op)) = second else {
+            panic!("{second:?}");
+        };
+        assert!(client.retains_operation(op));
+        assert_eq!(server.requests().len(), 1);
+    }
+
     #[tokio::test]
     async fn given_a_blocked_partition_when_abandoned_should_poll_it_again() {
         let server = ScriptedServer::start(vec![Reply::hang_up(), Reply::polled()]).await;

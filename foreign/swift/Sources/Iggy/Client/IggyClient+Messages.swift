@@ -79,7 +79,12 @@ extension IggyClient {
     /// With ``CommitPolicy/onRead`` the server stores the offset of the last
     /// message it returns, as part of the read. A cancelled caller of such a
     /// poll that was sent waits for its one reply: `CancellationError` when
-    /// the server stored nothing, or the messages it stored as consumed.
+    /// the server stored nothing, or the messages it stored as consumed. Such
+    /// a poll whose outcome is unknown, after a lost reply, a
+    /// ``disconnect()`` or a sign-in or sign-out while it waits, fails with
+    /// ``IggyErrorCode/fetchProgressUncertain`` and is never sent again. Every later poll with `onRead` or `next` and
+    /// every offset store or delete of its partition then fails with
+    /// ``IggyErrorCode/partitionLaneBlocked`` until ``abandonOperation(_:)``.
     /// ``CommitPolicy/auto(_:)`` is refused with
     /// ``IggyErrorCode/invalidConfiguration``: a single poll has nothing to
     /// count. Use a ``PartitionReader`` or an ``IggyConsumer`` for it.
@@ -159,8 +164,10 @@ extension IggyClient {
     /// `autoCommit` or a `next` target orders progress polls and offset
     /// stores of its targets. A cancelled caller of a fetch with
     /// `autoCommit` that was sent waits for its one reply. A lost reply of
-    /// such a fetch fails with ``IggyErrorCode/transientNotCommitted``, and
-    /// it is never sent again.
+    /// such a fetch fails with ``IggyErrorCode/fetchProgressUncertain`` and
+    /// blocks its targets, a section whose error leaves the outcome unknown
+    /// carries that error and blocks its partition, and the fetch is never
+    /// sent again.
     func fetchMessages(
         streamID: Identifier, topicID: Identifier, targets: [(partitionID: UInt32, strategy: PollingStrategy)], consumer: Consumer = .default,
         count: UInt32, autoCommit: Bool, options: DeferredPollOptions = DeferredPollOptions()
@@ -239,25 +246,54 @@ extension IggyClient {
         let targets = zip(targets, fences).map { target, fence in
             Requests.FetchTarget(partitionID: target.partitionID, strategy: target.strategy, maxBytes: target.maxBytes, fence: fence)
         }
-        let progress = autoCommit || targets.contains { $0.strategy.kind == .next }
-        let progressKeys = progress ? targets.map { PollRouter.ProgressKey(partitionID: $0.partitionID, incarnation: $0.fence.incarnation) } : []
+        // A fetch that commits nothing guards only the stored offsets that its
+        // `next` targets read.
+        let progressKeys = targets.filter { autoCommit || $0.strategy.kind == .next }.map {
+            PollRouter.ProgressKey(partitionID: $0.partitionID, incarnation: $0.fence.incarnation)
+        }
         let result: (body: [UInt8], sections: [FetchSection])
         do {
             result = try await router.withProgress(progressKeys, deadline: started + options.requestTimeout) {
-                let deferred = PollRouter.Deferred(options: options, started: started, commits: autoCommit) { remaining in
+                let attempt = autoCommit ? try router.reserveFetch(progressKeys) : nil
+                defer {
+                    if let attempt { router.releaseFetch(attempt) }
+                }
+                var deferred = PollRouter.Deferred(options: options, started: started, commits: autoCommit) { remaining in
                     try Requests.fetchMessages(
                         consumer: consumer, streamID: streamID, topicID: topicID, targets: targets, count: count, autoCommit: autoCommit, options: remaining)
                 }
-                let body = try await router.send(
-                    .fetchMessages, body: .deferred(deferred), key: routing, context: .empty, lineage: lineage, coordinator: core,
-                    deadline: deferred.deadline)
-                let sections = try Responses.fetchSections(body[...])
-                let requested = Set(targets.map(\.partitionID))
-                let returned = Set(sections.map(\.partitionID))
-                guard returned.count == sections.count, returned.isSubset(of: requested) else {
-                    throw IggyError(.invalidCommand, context: "a fetch reply repeats or adds a partition")
+                deferred.fetchAttempt = attempt
+                do {
+                    let body = try await router.send(
+                        .fetchMessages, body: .deferred(deferred), key: routing, context: .empty, lineage: lineage, coordinator: core,
+                        deadline: deferred.deadline)
+                    var sections = try Responses.fetchSections(body[...])
+                    let requested = Set(targets.map(\.partitionID))
+                    let returned = Set(sections.map(\.partitionID))
+                    guard returned.count == sections.count, returned.isSubset(of: requested) else {
+                        throw IggyError(.invalidCommand, context: "a fetch reply repeats or adds a partition")
+                    }
+                    if let attempt {
+                        let uncertain = Set(
+                            sections.compactMap { section in
+                                section.error.flatMap { CommitErrorScope.section.provesNothingStored($0.code) ? nil : section.partitionID }
+                            })
+                        if !uncertain.isEmpty {
+                            _ = router.retainFetch(attempt, keys: progressKeys.filter { uncertain.contains($0.partitionID) })
+                            for index in sections.indices where uncertain.contains(sections[index].partitionID) {
+                                sections[index].uncertainty = IggyError(
+                                    .fetchProgressUncertain, context: sections[index].error?.description, operationID: attempt.id,
+                                    partitionID: sections[index].partitionID)
+                            }
+                        }
+                    }
+                    return (body, sections)
+                } catch {
+                    if let attempt, attempt.mayHaveCommitted, !Self.provesNothingStored(error) {
+                        throw router.retainFetch(attempt, keys: progressKeys, cause: "\(error)")
+                    }
+                    throw error
                 }
-                return (body, sections)
             }
         } catch let error as IggyError where error.code == .notPrimary {
             router.mayHaveMoved(keys)
@@ -281,6 +317,16 @@ extension IggyClient {
     /// or its owner changed, so the route is looked up again.
     private static func staleRoute(_ code: IggyErrorCode) -> Bool {
         code == .historyUnavailable || code == .consumerGroupPartitionNotOwned
+    }
+
+    /// Whether a committing poll or fetch that failed with `error` after it
+    /// may have been sent stored nothing. A cancellation is answered only
+    /// once the server stored nothing.
+    private static func provesNothingStored(_ error: any Error) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+        return (error as? IggyError).map { CommitErrorScope.request.provesNothingStored($0.code) } ?? false
     }
 
     /// One deferred poll of one partition, its reply body undecoded, so a
@@ -400,9 +446,29 @@ extension IggyClient {
             keys = []
         }
         return try await router.withProgress(keys, deadline: deadline) {
-            try await router.send(
-                code, body: deferred.map { .deferred($0) } ?? .fixed(payload), key: key, context: captured, lineage: lineage, coordinator: core,
-                deadline: deadline)
+            let attempt = deferred?.commits == true ? try router.reserveFetch(keys) : nil
+            defer {
+                if let attempt { router.releaseFetch(attempt) }
+            }
+            var deferred = deferred
+            deferred?.fetchAttempt = attempt
+            do {
+                let body = try await router.send(
+                    code, body: deferred.map { .deferred($0) } ?? .fixed(payload), key: key, context: captured, lineage: lineage, coordinator: core,
+                    deadline: deadline)
+                if let attempt, let ended = await core.lineageRefusal(lineage) {
+                    // The caller signed in or out meanwhile, so it never gets the batch the server stored.
+                    throw router.retainFetch(attempt, keys: keys, cause: "\(ended)")
+                }
+                return body
+            } catch let uncertain as IggyError where uncertain.code == .fetchProgressUncertain && uncertain.operationID == attempt?.id {
+                throw uncertain
+            } catch {
+                if let attempt, attempt.mayHaveCommitted, !Self.provesNothingStored(error) {
+                    throw router.retainFetch(attempt, keys: keys, cause: "\(error)")
+                }
+                throw error
+            }
         }
     }
 

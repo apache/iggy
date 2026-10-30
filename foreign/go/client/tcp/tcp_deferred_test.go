@@ -22,7 +22,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -916,6 +915,92 @@ func TestFetchMessages_UnknownCommitBlocksEveryTargetUntilExplicitRecovery(t *te
 	assert.ErrorIs(t, client.AbandonOperation(ctx, recoveryID), ierror.ErrOperationNotRetained)
 }
 
+// A committing poll whose outcome is unknown blocks the progress of its
+// partition as a committing fetch does, until the caller abandons it. A
+// refusal before the store blocks nothing.
+func TestPollMessages_UnknownCommitBlocksItsPartitionUntilAbandoned(t *testing.T) {
+	for _, deferred := range []bool{false, true} {
+		for _, refusal := range []ierror.Code{ierror.TransientNotCommittedCode, ierror.ConsumerGroupPartitionNotOwnedCode} {
+			t.Run(fmt.Sprintf("deferred_%t/status_%d", deferred, refusal), func(t *testing.T) {
+				calls := newLaneCalls(t)
+				client, serverConn := newPipeClient(t)
+				var polls atomic.Int32
+				servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+					switch command.Code(read.code()) {
+					case command.PollMessagesCode, command.PollMessagesDeferredCode:
+						if polls.Add(1) == 1 {
+							return statusReplyFrame(vsr.OperationNonReplicated, uint32(refusal), nil)
+						}
+						return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(calls.partition))
+					default:
+						return replyFrame(read.operation(), resultSection())
+					}
+				})
+				ctx, cancel := context.WithTimeout(context.Background(), deferredTestTimeout)
+				defer cancel()
+				poll := func() error {
+					if !deferred {
+						return calls.poll(ctx, client, iggcon.NextPollingStrategy(), true)
+					}
+					_, err := client.pollMessagesDeferred(ctx, calls.stream, calls.topic, calls.consumer,
+						iggcon.NextPollingStrategy(), 1, true, &calls.partition, deferredOptions(0, 2*time.Second))
+					return err
+				}
+
+				err := poll()
+
+				if refusal != ierror.TransientNotCommittedCode {
+					require.ErrorIs(t, err, ierror.FromCode(refusal))
+					require.NoError(t, poll(), "a refusal before the store leaves the partition open")
+					return
+				}
+				var unknown ierror.FetchProgressUncertain
+				require.ErrorAs(t, err, &unknown)
+				var blocked ierror.PartitionLaneBlocked
+				require.ErrorAs(t, poll(), &blocked)
+				assert.Equal(t, calls.partition, blocked.PartitionID)
+				assert.Equal(t, unknown.OperationID, blocked.OperationID)
+				require.ErrorAs(t, calls.storeOffset(ctx, client), &blocked)
+				assert.Equal(t, unknown.OperationID, blocked.OperationID)
+				assert.Equal(t, int32(1), polls.Load(), "a blocked poll is never sent")
+				require.NoError(t, client.AbandonOperation(ctx, unknown.OperationID))
+				require.NoError(t, poll())
+				assert.Equal(t, int32(2), polls.Load())
+			})
+		}
+	}
+}
+
+// A disconnect of the caller while a committing poll waits on the server
+// leaves the outcome of the poll unknown, and its partition blocked.
+func TestPollMessages_ADisconnectDuringACommittingPollLeavesItUncertain(t *testing.T) {
+	calls := newLaneCalls(t)
+	client, serverConn := newPipeClient(t)
+	parked := make(chan request, 1)
+	servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+		if read.code() == uint32(command.PollMessagesDeferredCode) {
+			parked <- read
+			return nil
+		}
+		return replyFrame(read.operation(), resultSection())
+	})
+	polled := make(chan error, 1)
+	go func() {
+		_, err := client.pollMessagesDeferred(context.Background(), calls.stream, calls.topic, calls.consumer,
+			iggcon.NextPollingStrategy(), 1, true, &calls.partition, deferredOptions(10*time.Second, 20*time.Second))
+		polled <- err
+	}()
+	receive(t, parked, "the parked poll")
+
+	require.NoError(t, client.Disconnect())
+
+	var unknown ierror.FetchProgressUncertain
+	require.ErrorAs(t, receive(t, polled, "the poll"), &unknown)
+	var retained ierror.FetchProgressUncertain
+	require.ErrorAs(t, client.operations.unresolvedFetch(), &retained, "the block outlives the session")
+	assert.Equal(t, unknown.OperationID, retained.OperationID)
+}
+
 func TestFetchMessages_UnknownCommitResolvesZeroIncarnationsBeforeAdmission(t *testing.T) {
 	for _, raw := range []bool{false, true} {
 		t.Run(fmt.Sprintf("raw_%t", raw), func(t *testing.T) {
@@ -1166,7 +1251,7 @@ func TestFetchMessages_PartialUnknownKeepsHealthyRecordsAndRawBytes(t *testing.T
 			body := fetchBody(fetchSection{partition: 3, status: ierror.TransientNotCommittedCode},
 				fetchSection{partition: 1, next: 1, count: 1, records: records, context: iggcon.PartitionContext{Incarnation: 17}},
 				fetchSection{partition: 2, status: ierror.RequestAlreadyAppliedCode},
-				fetchSection{partition: 4, status: ierror.TransientNotAcceptedCode})
+				fetchSection{partition: 4, status: ierror.DeferredPollCapacityExceededCode})
 			server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 				if read.code() == uint32(command.FetchMessagesCode) {
 					return replyFrame(vsr.OperationNonReplicated, body)
@@ -1310,25 +1395,16 @@ func TestFetchMessages_CancelBeforeSendReleasesEveryAcquiredLane(t *testing.T) {
 }
 
 func TestFetchMessages_WholeAndSectionRefusalsRetainOnlyUncertainProgress(t *testing.T) {
-	wholeSafe := []ierror.Code{ierror.FeatureUnavailableCode, ierror.InvalidIdentifierCode, ierror.TransientNotAcceptedCode,
-		ierror.HistoryUnavailableCode, ierror.NotPrimaryCode, ierror.DeferredPollCapacityExceededCode,
-		ierror.StreamIdNotFoundCode, ierror.StreamNameNotFoundCode, ierror.TopicIdNotFoundCode, ierror.TopicNameNotFoundCode,
-		ierror.PartitionNotFoundCode, ierror.InvalidOffsetCode, ierror.ConsumerGroupPartitionNotOwnedCode}
-	sectionSafe := []ierror.Code{ierror.InvalidSizeBytesCode, ierror.HistoryUnavailableCode, ierror.NotPrimaryCode, ierror.ConsumerGroupPartitionNotOwnedCode}
-	unknown := []ierror.Code{ierror.TransientNotCommittedCode, ierror.RequestAlreadyAppliedCode, ierror.InvalidCommandCode,
-		ierror.StaleClientCode, ierror.UnauthenticatedCode, ierror.UnauthorizedCode, ierror.ShardCommunicationErrorCode}
-	for _, section := range []bool{false, true} {
-		safe := wholeSafe
-		if section {
-			safe = sectionSafe
-		}
-		cases := append(append([]ierror.Code(nil), safe...), unknown...)
-		if section {
-			cases = append(cases, ierror.TransientNotAcceptedCode, ierror.DeferredPollCapacityExceededCode)
-		} else {
-			cases = append(cases, ierror.InvalidSizeBytesCode)
-		}
-		for _, status := range cases {
+	requests, sections := commitOutcomes(t)
+	// A status that the shared vectors do not list leaves the outcome unknown.
+	unlisted := []commitOutcome{{Status: ierror.RequestAlreadyAppliedCode}, {Status: ierror.InvalidCommandCode}}
+	for _, scope := range []struct {
+		section  bool
+		outcomes []commitOutcome
+	}{{false, requests}, {true, sections}} {
+		section := scope.section
+		for _, vector := range append(append([]commitOutcome(nil), scope.outcomes...), unlisted...) {
+			status := vector.Status
 			t.Run(fmt.Sprintf("section_%t/status_%d", section, status), func(t *testing.T) {
 				var attempts atomic.Int32
 				fixture := newPrimaryPollFixture(t, func(_, _ int, read request) ([]byte, bool) {
@@ -1348,8 +1424,7 @@ func TestFetchMessages_WholeAndSectionRefusalsRetainOnlyUncertainProgress(t *tes
 				}, nil)
 				calls := newLaneCalls(t)
 				outcome := receive(t, startFetch(context.Background(), fixture.client, calls, iggcon.NextPollingStrategy(), true, 1), "the classified reply")
-				isSafe := slices.Contains(safe, status)
-				if isSafe {
+				if vector.Certain {
 					if outcome.err != nil {
 						require.ErrorIs(t, outcome.err, ierror.FromCode(status))
 					}

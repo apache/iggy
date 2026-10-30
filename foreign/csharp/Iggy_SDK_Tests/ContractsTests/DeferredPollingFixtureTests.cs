@@ -61,6 +61,8 @@ public sealed class DeferredPollingFixtureTests
 
     public static TheoryData<string> RefusedFetches => Cases("refused", "fetches");
 
+    public static TheoryData<string, int, bool> CommitOutcomes => Outcomes("request", "section");
+
     [Fact]
     public void given_the_fixture_constants_when_compared_should_match_the_client()
     {
@@ -237,10 +239,38 @@ public sealed class DeferredPollingFixtureTests
         Assert.Equal(0, node.Requests(CommandCodes.FETCH_MESSAGES_CODE));
     }
 
+    /// <summary>
+    ///     A committing poll or fetch that fails with a certain status stored nothing. Every listed uncertain status,
+    ///     like every status the fixture does not list, leaves the outcome unknown.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(CommitOutcomes))]
+    public void given_a_commit_outcome_vector_when_classified_should_match_its_certainty(string scope, int status,
+        bool certain)
+    {
+        var errorScope = scope == "request" ? CommitErrorScope.Request : CommitErrorScope.Section;
+
+        Assert.Equal(certain, errorScope.ProvesNothingStored(status));
+    }
+
     private static TheoryData<string> Cases(params string[] path)
     {
         var element = path.Aggregate(Fixture, (current, key) => current.GetProperty(key));
         return [.. element.EnumerateArray().Select(vector => vector.GetProperty("case").GetString()!)];
+    }
+
+    private static TheoryData<string, int, bool> Outcomes(params string[] scopes)
+    {
+        var outcomes = new TheoryData<string, int, bool>();
+        foreach (var scope in scopes)
+        {
+            foreach (var outcome in Fixture.GetProperty("commit_outcomes").GetProperty(scope).EnumerateArray())
+            {
+                outcomes.Add(scope, outcome.GetProperty("status").GetInt32(), outcome.GetProperty("certain").GetBoolean());
+            }
+        }
+
+        return outcomes;
     }
 
     private static JsonElement Case(string section, string name)

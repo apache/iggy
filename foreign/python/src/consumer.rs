@@ -168,15 +168,18 @@ impl IggyConsumer {
     }
 
     /// Sets the next read position of a partition and drops the rest of its batch that the
-    /// consumer yields from. It stores no offset, and it resumes a stopped partition.
+    /// consumer yields from. With `CommitPolicy.OnRead()`, a seek to an offset above 0 first
+    /// stores the offset before it, so a restart resumes at the new position. Every other seek
+    /// stores nothing. It resumes a stopped partition.
     /// `start` is a new strategy or a continuation of the same partition, such as
     /// `ReadError.skip`. After `HistoryUnavailable` (87), the partition reads nothing until
     /// this call picks a start in its new history.
     /// Raises `IggyError` with `InvalidCommand` (3) for a partition that the consumer does not
     /// read and for a continuation of another partition, `PendingOperationError` under
     /// `CommitPolicy.OnRead()` while a read of the partition has an unknown outcome
-    /// (abandon its operation first), and `RuntimeError` while `consume_messages()` runs, also
-    /// from its callback: seek after the run ends.
+    /// (abandon its operation first), the errors of the offset store with `OnRead`, and
+    /// `RuntimeError` while `consume_messages()` runs, also from its callback: seek after the
+    /// run ends.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn seek<'a>(
         &self,

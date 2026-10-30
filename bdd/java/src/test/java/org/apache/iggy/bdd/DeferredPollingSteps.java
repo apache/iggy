@@ -28,6 +28,8 @@ import org.apache.iggy.client.async.reader.PartitionReader;
 import org.apache.iggy.client.async.reader.ReceivedMessage;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.consumergroup.Consumer;
+import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -42,6 +44,7 @@ import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -56,6 +59,8 @@ public final class DeferredPollingSteps {
     // The Java SDK has no default consumer, so this is the default consumer id of the Rust SDK.
     private static final Consumer DEFAULT_CONSUMER = Consumer.of(1L);
     private static final Duration CLOSE_TIMEOUT = Duration.ofSeconds(30);
+    // Lets a committing poll that starts on a routed partition leave the client and park on the server.
+    private static final Duration PARK_TIME = Duration.ofMillis(100);
 
     private AsyncIggyTcpClient client;
     private Long streamId;
@@ -64,6 +69,7 @@ public final class DeferredPollingSteps {
     private long pollStartedAtNanos;
     private PartitionReader reader;
     private IggyConsumer consumer;
+    private long lostOperation;
 
     @After
     public void close() throws InterruptedException, ExecutionException, TimeoutException {
@@ -112,6 +118,74 @@ public final class DeferredPollingSteps {
                 Consumer.of(ConsumerId.of(consumerName)),
                 PollingStrategy.next(),
                 waitFor(maxWaitSeconds).withMinCount(minCount).withCommit(CommitPolicy.onRead()));
+    }
+
+    @When(
+            "I start a deferred poll of partition {int} for consumer {string} with the on read commit policy and a max wait of {int} second(s)")
+    public void startOnReadPoll(int partition, String consumerName, int maxWaitSeconds) throws InterruptedException {
+        Consumer pollConsumer = Consumer.of(ConsumerId.of(consumerName));
+        // A read that stores nothing routes the partition first, so the committing poll leaves the client at once. A
+        // disconnect before it left would end it as never sent.
+        client().messages()
+                .pollMessages(
+                        stream(),
+                        topic(),
+                        partition,
+                        pollConsumer,
+                        offset(0),
+                        PollOptions.defaults().withCount(1))
+                .join();
+        startPoll(
+                partition,
+                pollConsumer,
+                PollingStrategy.next(),
+                waitFor(maxWaitSeconds).withCommit(CommitPolicy.onRead()));
+        Thread.sleep(PARK_TIME.toMillis());
+        assertFalse(poll.isDone(), "The deferred poll must park");
+    }
+
+    @When("the client disconnects before the deferred poll answers")
+    public void disconnectBeforeThePollAnswers() {
+        assertFalse(poll.isDone(), "The deferred poll answered before the disconnect");
+        client.disconnect().join();
+    }
+
+    @Then("the deferred poll should fail as uncertain")
+    public void pollFailsAsUncertain() throws InterruptedException {
+        IggyOperationException uncertain = operationError(poll, IggyErrorCode.FETCH_PROGRESS_UNCERTAIN);
+        poll = null;
+        lostOperation = uncertain.getOperationId();
+    }
+
+    @When("the client connects again")
+    public void connectAgain() {
+        client.connect().join();
+        client.users()
+                .login(TestEnvironment.rootUsername(), TestEnvironment.rootPassword())
+                .join();
+    }
+
+    @Then(
+            "a poll of partition {int} for consumer {string} with the next strategy and the on read commit policy should fail as blocked by the deferred poll")
+    public void committingPollIsBlocked(int partition, String consumerName) throws InterruptedException {
+        IggyOperationException blocked = operationError(
+                client().messages()
+                        .pollMessages(
+                                stream(),
+                                topic(),
+                                partition,
+                                Consumer.of(ConsumerId.of(consumerName)),
+                                PollingStrategy.next(),
+                                PollOptions.defaults().withCount(1).withCommit(CommitPolicy.onRead())),
+                IggyErrorCode.PARTITION_LANE_BLOCKED);
+
+        assertEquals(lostOperation, blocked.getOperationId());
+        assertEquals(OptionalLong.of(partition), blocked.getPartitionId());
+    }
+
+    @When("I abandon the operation of the deferred poll")
+    public void abandonTheLostPoll() {
+        client().abandonOperation(lostOperation).join();
     }
 
     @When("I send a message with payload {string} to partition {int}")
@@ -288,6 +362,21 @@ public final class DeferredPollingSteps {
         } catch (TimeoutException timeout) {
             throw new AssertionError("The call did not end within " + bound, timeout);
         }
+    }
+
+    private static IggyOperationException operationError(CompletableFuture<?> call, IggyErrorCode expected)
+            throws InterruptedException {
+        try {
+            call.get(CLOSE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (ExecutionException failed) {
+            if (failed.getCause() instanceof IggyOperationException operation && operation.getErrorCode() == expected) {
+                return operation;
+            }
+            throw new AssertionError("The call failed with another error than " + expected, failed.getCause());
+        } catch (TimeoutException timeout) {
+            throw new AssertionError("The call did not end within " + CLOSE_TIMEOUT, timeout);
+        }
+        throw new AssertionError("The call did not fail with " + expected);
     }
 
     private static List<String> payloads(PolledMessages polled) {

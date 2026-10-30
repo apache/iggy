@@ -38,6 +38,7 @@ import { deserializeOptions } from '../wire/options.utils.js';
 import { OptionsScope } from '../wire/system/describe-options.command.js';
 import { PartitionKind } from '../wire/message/partitioning.utils.js';
 import { PollingStrategyKind } from '../wire/message/poll.utils.js';
+import { CommitErrorScope, provesNothingStored } from '../wire/message/commit-outcome.js';
 import {
   DEFERRED_POLL_OFFSET, DEFERRED_POLL_OPTIONS_SIZE, MAX_PARTITIONS_PER_REQUEST, MIN_DEFERRED_POLL_MAX_BYTES,
   MIN_DEFERRED_POLL_REPLY_MARGIN_US, US_PER_MS, isDeferredBudget, isFetchBudget
@@ -407,7 +408,7 @@ export class CommandResponseStream extends EventEmitter {
     let lastRefusal: ResponseError | undefined;
     let previousLink: IggyConnection | undefined;
     let sent = false;
-    let fetchMayHaveCommitted = false;
+    let mayHaveCommitted = false;
     try {
       for (;;) {
         this.ensureLineage(lineage, command);
@@ -476,9 +477,12 @@ export class CommandResponseStream extends EventEmitter {
           }
         } else if (!operation && lane) {
           try {
+            // A committing poll keeps a recovery record for its partition, as a committing fetch does for each target.
+            const recovered = fetchPartitions ?? (commits && target
+              ? new Map([[lane, target.query.readUInt32LE(target.query.length - PARTITION_ID_SIZE)]]) : undefined);
             operation = await this.lanes.enter(lane, command, body, context, replicated,
-              this.vsrSession, deadline, signal, replicated ? progressLanes : progressLanes.slice(0, -1), fetchPartitions,
-              fetch?.commits);
+              this.vsrSession, deadline, signal, replicated ? progressLanes : progressLanes.slice(0, -1), recovered,
+              commits);
             staleFrame = false;
           } catch (error) {
             // A lane can free while no session is bound to encode the frame.
@@ -524,9 +528,9 @@ export class CommandResponseStream extends EventEmitter {
         if (commits && attempt.started && options.signal?.aborted && attempt.error instanceof ResponseError &&
             attempt.error.fromServer && attempt.error.errorCode === TRANSIENT_NOT_ACCEPTED)
           throw options.signal.reason;
-        if (fetch?.commits && attempt.started)
-          fetchMayHaveCommitted = !(attempt.error instanceof ResponseError && attempt.error.fromServer &&
-            fetchRefusedBeforeRead(attempt.error.errorCode));
+        if (commits && attempt.started)
+          mayHaveCommitted = !(attempt.error instanceof ResponseError && attempt.error.fromServer &&
+            provesNothingStored(CommitErrorScope.Request, attempt.error.errorCode));
         if (fetch?.commits && operation && !attempt.error) {
           const sections = FETCH_MESSAGES.deserialize(attempt.response!);
           const requested = new Set(fetch.targets.map((target) => target.readUInt32LE(FETCH_TARGET_FIELD.partitionId)));
@@ -536,17 +540,20 @@ export class CommandResponseStream extends EventEmitter {
               throw new DeserializeError('fetch reply names a duplicate or unrequested partition');
             seen.add(section.partitionId);
           }
-          const uncertain = new Set(sections.filter(({ status }) => status !== 0 && !fetchSectionRefusedBeforeRead(status))
+          const uncertain = new Set(sections.filter(({ status }) =>
+            status !== 0 && !provesNothingStored(CommitErrorScope.Section, status))
             .map(({ partitionId }) => partitionId));
           if (uncertain.size > 0) {
             this.lanes.retainFetch(operation, uncertain);
             attempt.response!.fetchProgress = { operationId: operation.id, partitions: uncertain };
           }
-          fetchMayHaveCommitted = false;
+          mayHaveCommitted = false;
           this.ensureLineage(lineage, command);
+        } else if (commits && !attempt.error) {
+          mayHaveCommitted = false;
         }
-        const hasCommittingFetchReply = fetch?.commits && !attempt.error;
-        if (!hasCommittingFetchReply && generation !== this.routingGeneration && attempt.started && (replicated || progress))
+        const hasCommittingReply = commits && !attempt.error;
+        if (!hasCommittingReply && generation !== this.routingGeneration && attempt.started && (replicated || progress))
           throw uncertainOutcome(command, operation, attempt.error ?? responseError(command, TRANSIENT_NOT_ACCEPTED));
         // A committed rejection proves the outcome even when it also ends the session.
         if (operation?.uncertain && attempt.committed && attempt.error) {
@@ -567,11 +574,11 @@ export class CommandResponseStream extends EventEmitter {
           if (restartable && exchanged && !attempt.started && generation !== this.routingGeneration) continue;
           throw attempt.error;
         }
-        if (!hasCommittingFetchReply && generation !== this.routingGeneration) {
+        if (!hasCommittingReply && generation !== this.routingGeneration) {
           if (restartable && (!attempt.started || safeRead)) continue;
           throw responseError(command, TRANSIENT_NOT_ACCEPTED);
         }
-        if (fetchMayHaveCommitted && attempt.error)
+        if (mayHaveCommitted && attempt.error)
           throw new FetchProgressUncertainError(operation!.id, attempt.error);
         if (!attempt.error) {
           if (operation?.uncertain && !attempt.committed)
@@ -683,7 +690,7 @@ export class CommandResponseStream extends EventEmitter {
         retryDelay = Math.min(retryDelay * 2, MAX_RETRY_INTERVAL_MS);
       }
     } catch (error) {
-      if (operation?.fetchProgress && fetchMayHaveCommitted) {
+      if (operation?.fetchProgress && mayHaveCommitted) {
         this.lanes.retainFetch(operation);
         throw error instanceof FetchProgressUncertainError ? error : new FetchProgressUncertainError(operation.id, error);
       }
@@ -1581,10 +1588,6 @@ const uncertainOutcome = (command: number, operation: ClientOperation | undefine
   error.cause = cause;
   return error;
 };
-const FETCH_REFUSALS_BEFORE_READ = new Set([5, 6, 58, 87, 89, 90, 1009, 1010, 2010, 2011, 3007, 4100, 5009]);
-const FETCH_SECTION_REFUSALS_BEFORE_READ = new Set([80, 87, 89, 5009]);
-const fetchRefusedBeforeRead = (status: number): boolean => FETCH_REFUSALS_BEFORE_READ.has(status);
-const fetchSectionRefusedBeforeRead = (status: number): boolean => FETCH_SECTION_REFUSALS_BEFORE_READ.has(status);
 const isDetachedFailure = (error: unknown): boolean =>
   error instanceof VsrEvictionError
     ? error.reason === EvictionReason.NoSession || error.reason === EvictionReason.StaleClient

@@ -85,7 +85,8 @@ import java.util.function.Supplier;
  *   <li>The reader stays usable after a {@link ReadException} and retries by itself. {@code HistoryUnavailable} stops
  *       its partition until a {@link #seek} when the position came from an earlier read of a history that is gone. A
  *       refusal that a quick retry does not change, such as {@code Unauthorized}, is retried after a wait that doubles
- *       each time, and after six in a row it stops its partition until a {@link #seek} with one error.
+ *       each time, and after six in a row it stops its partition until a {@link #seek} with one error. A partition
+ *       that another member owns resolves its start again, and six such refusals in a row are reported once.
  * </ul>
  *
  * <p>The futures of a reader complete on its own thread, so a callback must not block.
@@ -107,13 +108,15 @@ public final class PartitionReader implements AutoCloseable {
     private final Optional<AutoCommit> autoCommit;
     private final ScheduledThreadPoolExecutor loop;
 
-    // Everything below is read and written on the loop only, except the volatile list.
+    // Everything below is read and written on the loop only, except the volatile fields.
     private final Map<Long, Partition> partitions = new TreeMap<>();
     private final Map<Long, Long> seekGenerations = new HashMap<>();
     private volatile List<Long> partitionIds = List.of();
     private final Deque<Entry> queue = new ArrayDeque<>();
     private final Deque<Waiter> waiters = new ArrayDeque<>();
     private final Set<CompletableFuture<List<FetchedMessages>>> reads = new HashSet<>();
+    // The committing requests of the reads in flight, which the close cancels with them.
+    private final Set<CompletableFuture<List<FetchedMessages>>> sends = new HashSet<>();
     private final List<Retired> retiring = new ArrayList<>();
     private List<List<Long>> groups = List.of();
     private boolean regroup = true;
@@ -129,7 +132,7 @@ public final class PartitionReader implements AutoCloseable {
     private boolean flushAgain;
     private ScheduledFuture<?> wake;
     private ScheduledFuture<?> interval;
-    private CompletableFuture<Void> closed;
+    private volatile CompletableFuture<Void> closed;
 
     PartitionReader(
             ReaderTransport transport,
@@ -250,8 +253,10 @@ public final class PartitionReader implements AutoCloseable {
                                     && checkpoint.offset().compareTo(partition.committed) <= 0)) {
                         return CompletableFuture.completedFuture(null);
                     }
-                    partition.committed = checkpoint.offset();
-                    return transport.store(checkpoint.partitionId(), checkpoint.offset(), checkpoint.context());
+                    long generation = partition.generation;
+                    return transport
+                            .store(checkpoint.partitionId(), checkpoint.offset(), checkpoint.context())
+                            .thenRun(() -> run(() -> recordCommit(checkpoint, generation)));
                 })
                 .thenCompose(store -> store);
     }
@@ -266,23 +271,32 @@ public final class PartitionReader implements AutoCloseable {
      *         not read and for a continuation of another partition
      */
     public CompletableFuture<Void> seek(long partitionId, PollingStrategy start) {
+        return seek(partitionId, start, () -> {});
+    }
+
+    /** {@link #seek}, which runs {@code applied} on the reader thread once the seek drops the queued batches. */
+    CompletableFuture<Void> seek(long partitionId, PollingStrategy start, Runnable applied) {
         start.requirePartition(partitionId);
         return this.<CompletableFuture<Void>>call(() -> {
-                    Partition partition = partitions.get(partitionId);
-                    if (partition == null) {
-                        throw invalid("This reader does not read partition " + partitionId);
+                    try {
+                        Partition partition = partitions.get(partitionId);
+                        if (partition == null) {
+                            throw invalid("This reader does not read partition " + partitionId);
+                        }
+                        seekGenerations.put(partitionId, ++lastGeneration);
+                        queue.removeIf(entry -> entry.partition == partitionId);
+                        PollingStrategy position = start.kind() == PollingKind.First
+                                ? new PollingStrategy(PollingKind.Offset, BigInteger.ZERO, start.context())
+                                : start;
+                        if (onRead && partition.inFlight) {
+                            partition.pendingSeek = position;
+                            partition.sought = new CompletableFuture<>();
+                            return partition.sought;
+                        }
+                        return applySeek(partition, position);
+                    } finally {
+                        applied.run();
                     }
-                    seekGenerations.put(partitionId, ++lastGeneration);
-                    queue.removeIf(entry -> entry.partition == partitionId);
-                    PollingStrategy position = start.kind() == PollingKind.First
-                            ? new PollingStrategy(PollingKind.Offset, BigInteger.ZERO, start.context())
-                            : start;
-                    if (onRead && partition.inFlight) {
-                        partition.pendingSeek = position;
-                        partition.sought = new CompletableFuture<>();
-                        return partition.sought;
-                    }
-                    return applySeek(partition, position);
                 })
                 .thenCompose(sought -> sought);
     }
@@ -308,7 +322,12 @@ public final class PartitionReader implements AutoCloseable {
         try {
             loop.execute(() -> shutDown(result));
         } catch (RejectedExecutionException alreadyClosed) {
-            result.complete(null);
+            CompletableFuture<Void> first = closed;
+            if (first == null) {
+                result.complete(null);
+            } else {
+                first.whenComplete((ignored, error) -> complete(result, error));
+            }
         }
         return result;
     }
@@ -388,19 +407,38 @@ public final class PartitionReader implements AutoCloseable {
         partitions.values().stream().filter(partition -> partition.inFlight).forEach(partition -> {
             reading.add(partition.id);
         });
-        // A cancelled read that stores keeps its partition held until the server answers, so the rewind goes after it.
         List.copyOf(reads).forEach(read -> read.cancel(false));
+        List.copyOf(sends).forEach(send -> send.cancel(false));
         countUncounted();
-        CompletableFuture<Void> stores = onRead ? rewind(reading) : flushThen();
+        // The server can store until it answers the cancel of a committing read, so the stores wait for that reply. A
+        // read whose outcome stays unknown would block its partition with no reader left to recover it.
+        CompletableFuture<Void> stores = onRead
+                ? transport
+                        .cancelledReadsSettled()
+                        .thenComposeAsync(ignored -> transport.abandonLost(), loop)
+                        .thenComposeAsync(ignored -> seekThenRewind(reading), loop)
+                : flushThen();
         stores.handle((ignored, error) -> error)
-                .thenCompose(storeError -> (transport.group()
-                                ? transport.leave()
-                                : CompletableFuture.<Void>completedFuture(null))
-                        .handle((ignored, leaveError) -> storeError == null ? leaveError : storeError))
+                .thenCompose(storeError ->
+                        leaveGroup().thenApply(leaveError -> storeError == null ? leaveError : storeError))
                 .whenComplete((error, ignored) -> {
                     loop.shutdown();
                     complete(result, error);
                 });
+    }
+
+    /** Leaves the group of a member. A membership that the server already ended has nothing to leave. */
+    private CompletableFuture<Throwable> leaveGroup() {
+        if (!transport.group()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        return transport.leave().handle((ignored, error) -> {
+            Throwable cause = error == null ? null : unwrap(error);
+            return cause instanceof IggyServerException server
+                            && server.getRawErrorCode() == IggyErrorCode.CONSUMER_GROUP_MEMBER_NOT_FOUND.getCode()
+                    ? null
+                    : cause;
+        });
     }
 
     /** With {@code Auto}, the final store of each partition. */
@@ -410,6 +448,25 @@ public final class PartitionReader implements AutoCloseable {
         }
         CompletableFuture<Void> pending = flushing == null ? CompletableFuture.completedFuture(null) : flushing;
         return pending.handle((ignored, error) -> null).thenComposeAsync(ignored -> storeCounted(), loop);
+    }
+
+    /** Applies the seeks that waited for a read in flight, store included, then moves the other partitions back. */
+    private CompletableFuture<Void> seekThenRewind(Set<Long> reading) {
+        List<CompletableFuture<Void>> seeks = new ArrayList<>();
+        for (Partition partition : partitions.values()) {
+            if (partition.pendingSeek != null) {
+                reading.remove(partition.id);
+                seeks.add(applyPendingSeek(partition));
+            }
+        }
+        CompletableFuture<Void> rewound = rewind(reading);
+        return CompletableFuture.allOf(seeks.toArray(CompletableFuture[]::new))
+                .handle((ignored, seekError) -> seekError)
+                .thenCompose(seekError ->
+                        rewound.handle((ignored, rewindError) -> seekError != null ? seekError : rewindError))
+                .thenCompose(error -> error == null
+                        ? CompletableFuture.completedFuture(null)
+                        : CompletableFuture.failedFuture(unwrap(error)));
     }
 
     /** Moves the offset of each partition with undelivered messages back to its last delivered message. */
@@ -430,27 +487,32 @@ public final class PartitionReader implements AutoCloseable {
                     || reading.contains(partition.id)
                     || (partition.received != null
                             && (partition.delivered == null
-                                    || partition.received.compareTo(partition.delivered.offset()) > 0));
+                                    || partition.received.compareTo(partition.delivered.offset()) > 0))
+                    || (partition.lost != null
+                            && (partition.delivered == null
+                                    || partition.lost.from().compareTo(partition.delivered.offset()) > 0));
             if (!undelivered) {
                 continue;
             }
             BigInteger offset;
             PartitionContext context;
+            BigInteger before = partition.baseline != null
+                    ? partition.baseline
+                    : partition.lost != null ? partition.lost.from() : null;
             if (partition.delivered != null) {
                 offset = partition.delivered.offset();
                 context = partition.delivered.context();
-            } else if (partition.baseline != null) {
-                context = partition.context;
-                if (partition.baseline.signum() == 0) {
-                    chain = chain.thenCompose(ignored -> transport
-                            .delete(partition.id, partition.context)
-                            .exceptionally(error -> {
+            } else if (before != null) {
+                context = partition.baseline != null ? partition.context : partition.lost.context();
+                if (before.signum() == 0) {
+                    chain = chain.thenCompose(
+                            ignored -> transport.delete(partition.id, context).exceptionally(error -> {
                                 failures.add(unwrap(error));
                                 return null;
                             }));
                     continue;
                 }
-                offset = partition.baseline.subtract(BigInteger.ONE);
+                offset = before.subtract(BigInteger.ONE);
             } else if (start.kind() == PollingKind.Next
                     && firstQueued.containsKey(partition.id)
                     && firstQueued.get(partition.id).signum() > 0) {
@@ -485,14 +547,16 @@ public final class PartitionReader implements AutoCloseable {
         partition.sinceStore = 0;
         partition.gapFrom = null;
         partition.held = null;
+        partition.lost = null;
+        partition.backlogged = false;
         partition.fromRead = position.context().isPresent();
         CompletableFuture<Void> stored = CompletableFuture.completedFuture(null);
         if (onRead && position.kind() == PollingKind.Offset && position.value().signum() > 0) {
             // The server stores forward only on a read, so a store moves the offset that the next read starts after.
-            BigInteger before = position.value().subtract(BigInteger.ONE);
-            partition.received = before;
+            position.context().ifPresent(context -> partition.context = context);
+            partition.baseline = position.value();
             partition.position = PollingStrategy.next();
-            stored = transport.store(partition.id, before, position.context().orElse(partition.context));
+            stored = transport.store(partition.id, position.value().subtract(BigInteger.ONE), partition.context);
         } else {
             partition.position = position;
         }
@@ -525,20 +589,73 @@ public final class PartitionReader implements AutoCloseable {
         if (regroup && !grouping && !partitions.isEmpty() && due(now, regroupAt)) {
             regroup();
         }
-        if (!grouping && !groups.isEmpty() && demanded()) {
-            int budget = onRead ? groups.size() : slots - queue.size() - reads.size();
-            int first = groupCursor;
-            for (int turn = 0; turn < groups.size() && budget > 0; turn++) {
-                int index = (first + turn) % groups.size();
-                Map<Long, PollingStrategy> targets = readyTargets(groups.get(index), now);
-                if (!targets.isEmpty()) {
-                    read(targets, options.count(), onRead);
-                    budget--;
-                    groupCursor = index + 1;
+        if (!grouping) {
+            for (Partition partition : partitions.values()) {
+                if (partition.gapFrom != null
+                        && !partition.inFlight
+                        && partition.stopped == null
+                        && due(now, partition.retryAt)) {
+                    readGap(partition);
                 }
             }
         }
+        if (!grouping && !groups.isEmpty() && demanded()) {
+            readGroups(slots - queue.size() - reads.size(), now);
+        }
         scheduleWake(now);
+    }
+
+    /**
+     * Every group with ready partitions gets a read, those without a read that may wait in flight first. The slots left
+     * spread the backlogged partitions of each group over reads of their own, each with the whole limits. Such a read
+     * returns at once, so each slot keeps a full read in flight, and the quiet partitions share the one read that may
+     * wait. Under {@code OnRead} that read stores, so a group holds one at a time, and a waiting call fills the slots.
+     */
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
+    private void readGroups(int budget, long now) {
+        int first = groupCursor;
+        List<GroupPlan> plans = new ArrayList<>();
+        for (boolean waiting : new boolean[] {false, true}) {
+            for (int turn = 0; turn < groups.size(); turn++) {
+                int index = (first + turn) % groups.size();
+                List<Long> group = groups.get(index);
+                boolean parked = group.stream()
+                        .map(partitions::get)
+                        .anyMatch(partition -> partition != null && partition.inFlight && partition.parked);
+                List<Partition> ready = parked == waiting ? ready(group, now, parked) : List.of();
+                if (!ready.isEmpty() && plans.size() < budget) {
+                    plans.add(new GroupPlan(index, ready));
+                }
+            }
+        }
+        int extra = budget - plans.size();
+        boolean dealt = true;
+        while (extra > 0 && dealt) {
+            dealt = false;
+            for (GroupPlan plan : plans) {
+                if (extra > 0 && plan.extra < plan.room()) {
+                    plan.extra++;
+                    extra--;
+                    dealt = true;
+                }
+            }
+        }
+        for (GroupPlan plan : plans) {
+            int chunks = plan.extra + (plan.quiet.isEmpty() ? 1 : 0);
+            List<Partition> waiting = new ArrayList<>(plan.quiet);
+            List<List<Partition>> spread = new ArrayList<>();
+            for (int chunk = 0; chunk < chunks; chunk++) {
+                spread.add(new ArrayList<>());
+            }
+            for (int at = 0; at < plan.backlogged.size(); at++) {
+                (chunks == 0 ? waiting : spread.get(at % chunks)).add(plan.backlogged.get(at));
+            }
+            if (!waiting.isEmpty()) {
+                read(targetsOf(waiting), options.count(), onRead, true);
+            }
+            spread.forEach(targets -> read(targetsOf(targets), options.count(), onRead, false));
+            groupCursor = plan.index + 1;
+        }
     }
 
     /** Under {@code OnRead} the reader reads only for a waiting {@link #next()}, so it stores only what it hands over. */
@@ -547,8 +664,11 @@ public final class PartitionReader implements AutoCloseable {
         return !onRead || (!waiters.isEmpty() && queue.isEmpty());
     }
 
-    /** The partitions served last go last, since a read that reaches its count serves its first targets. */
-    private Map<Long, PollingStrategy> readyTargets(List<Long> group, long now) {
+    /**
+     * The partitions served last go last, since a read that reaches its count serves its first targets. Under
+     * {@code OnRead} a quiet partition waits for the read of the group that may wait, since a second one would store.
+     */
+    private List<Partition> ready(List<Long> group, long now, boolean parked) {
         List<Partition> ready = new ArrayList<>();
         for (Long id : group) {
             Partition partition = partitions.get(id);
@@ -556,22 +676,31 @@ public final class PartitionReader implements AutoCloseable {
                     && !partition.inFlight
                     && partition.stopped == null
                     && partition.gapFrom == null
-                    && due(now, partition.retryAt)) {
+                    && due(now, partition.retryAt)
+                    && (partition.backlogged || !onRead || !parked)) {
                 ready.add(partition);
             }
         }
         ready.sort(Comparator.comparingLong(partition -> partition.servedAt));
+        return ready;
+    }
+
+    private static Map<Long, PollingStrategy> targetsOf(List<Partition> ready) {
         Map<Long, PollingStrategy> targets = new LinkedHashMap<>();
         ready.forEach(partition -> targets.put(partition.id, partition.position));
         return targets;
     }
 
-    private void read(Map<Long, PollingStrategy> targets, long count, boolean commit) {
+    private void read(Map<Long, PollingStrategy> targets, long count, boolean commit, boolean parked) {
         Map<Long, Long> generations = new HashMap<>();
+        // A partition that leaves and comes back gets a new state, which another read may hold.
+        List<Partition> held = new ArrayList<>();
         targets.keySet().forEach(id -> {
             Partition partition = partitions.get(id);
             partition.inFlight = true;
+            partition.parked = parked;
             generations.put(id, partition.generation);
+            held.add(partition);
         });
         CompletableFuture<List<FetchedMessages>> read;
         try {
@@ -594,18 +723,13 @@ public final class PartitionReader implements AutoCloseable {
                     if (closed != null) {
                         return;
                     }
-                    generations.keySet().forEach(id -> {
-                        Partition partition = partitions.get(id);
-                        if (partition != null) {
-                            partition.inFlight = false;
-                        }
-                    });
+                    held.forEach(partition -> partition.inFlight = false);
                     if (error == null) {
                         accept(targets, generations, commit, sections);
                     } else {
                         refuse(targets.keySet(), error);
                     }
-                    applyPendingSeeks(generations.keySet());
+                    applyPendingSeeks(held);
                     handOver();
                     pump();
                 },
@@ -667,8 +791,8 @@ public final class PartitionReader implements AutoCloseable {
         }
         CompletableFuture<List<FetchedMessages>> sent =
                 transport.read(prepared, count, true, options.deferredOptions());
-        reads.add(sent);
-        sent.whenCompleteAsync((sections, error) -> reads.remove(sent), loop);
+        sends.add(sent);
+        sent.whenCompleteAsync((sections, error) -> sends.remove(sent), loop);
         return sent;
     }
 
@@ -680,18 +804,23 @@ public final class PartitionReader implements AutoCloseable {
                 && (strategy.kind() != PollingKind.Next || partition.received != null || partition.baseline != null);
     }
 
-    private void applyPendingSeeks(Set<Long> ids) {
-        for (Long id : ids) {
-            Partition partition = partitions.get(id);
-            if (partition != null && partition.pendingSeek != null) {
-                PollingStrategy position = partition.pendingSeek;
-                CompletableFuture<Void> sought = partition.sought;
-                partition.pendingSeek = null;
-                partition.sought = null;
-                queue.removeIf(entry -> entry.partition == id);
-                applySeek(partition, position).whenComplete((ignored, error) -> complete(sought, error));
+    private void applyPendingSeeks(List<Partition> held) {
+        for (Partition partition : held) {
+            if (partitions.get(partition.id) == partition && partition.pendingSeek != null) {
+                applyPendingSeek(partition);
             }
         }
+    }
+
+    private CompletableFuture<Void> applyPendingSeek(Partition partition) {
+        PollingStrategy position = partition.pendingSeek;
+        CompletableFuture<Void> sought = partition.sought;
+        partition.pendingSeek = null;
+        partition.sought = null;
+        queue.removeIf(entry -> entry.partition == partition.id);
+        CompletableFuture<Void> applied = applySeek(partition, position);
+        applied.whenComplete((ignored, error) -> complete(sought, error));
+        return applied;
     }
 
     @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
@@ -706,6 +835,9 @@ public final class PartitionReader implements AutoCloseable {
             Partition partition = partitions.get(section.partitionId());
             answered.add(section.partitionId());
             Long generation = generations.get(section.partitionId());
+            Optional<IggyOperationException> unknown = section.recoveryError();
+            // The lost read blocks its partition until abandoned, also after a seek or a revoke.
+            unknown.ifPresent(lost -> transport.abandon(lost.getOperationId()));
             if (generation == null || !keeps(section.partitionId(), generation)) {
                 continue;
             }
@@ -719,10 +851,9 @@ public final class PartitionReader implements AutoCloseable {
                     || partition.pendingSeek != null) {
                 continue;
             }
-            Optional<IggyOperationException> unknown = section.recoveryError();
             if (unknown.isPresent()) {
                 // A later read of the server shows what the lost read stored, and the gap check reads it again.
-                transport.abandon(unknown.get().getOperationId());
+                lose(partition, now);
                 continue;
             }
             if (section.status() != FetchedMessages.STATUS_OK) {
@@ -746,7 +877,11 @@ public final class PartitionReader implements AutoCloseable {
         Optional<DecodeFailure> malformed =
                 BytesDeserializer.readMessagesUntilMalformed(Unpooled.wrappedBuffer(section.records()), messages);
         if (malformed.isPresent()) {
-            partition.stopped = new ReadException(OptionalLong.of(partition.id), malformed.get(), Optional.empty());
+            BigInteger bad = undecoded(section, malformed.get(), messages);
+            partition.stopped = new ReadException(
+                    OptionalLong.of(partition.id),
+                    malformed.get(),
+                    Optional.of(skipPast(partition.id, bad, section.context())));
             queue.addLast(new Entry(partition.id, partition.generation, null, partition.stopped));
         } else if (messages.isEmpty()) {
             partition.retryAt = now + retryIntervalNanos;
@@ -763,18 +898,24 @@ public final class PartitionReader implements AutoCloseable {
         List<Message> messages = new ArrayList<>();
         Optional<DecodeFailure> malformed =
                 BytesDeserializer.readMessagesUntilMalformed(Unpooled.wrappedBuffer(section.records()), messages);
-        BigInteger expected = partition.received == null ? partition.baseline : partition.received.add(BigInteger.ONE);
+        // A read that ends before the head returns at once. An empty partition reports the head 0.
+        partition.backlogged = section.nextOffset().compareTo(section.currentOffset()) <= 0
+                && (section.count() > 0 || section.currentOffset().signum() > 0);
+        BigInteger expected = expected(partition);
+        // Only a lost read explains a later start. Without one, the application or another session stored it.
+        boolean catchesUp = commit && partition.gapFrom == null && partition.lost != null && expected != null;
         if (messages.isEmpty() && malformed.isEmpty()) {
-            if (commit
-                    && partition.gapFrom == null
-                    && expected != null
-                    && section.nextOffset().compareTo(expected) > 0) {
+            if (catchesUp && section.nextOffset().compareTo(expected) > 0) {
                 partition.gapFrom = expected;
                 partition.gapEnd = section.nextOffset();
                 partition.held =
                         new PolledMessages(partition.id, section.currentOffset(), 0L, List.of(), section.context());
                 partition.received = section.nextOffset().subtract(BigInteger.ONE);
                 readGap(partition);
+                return;
+            }
+            if (!commit && partition.gapFrom != null) {
+                skipGap(partition, section.nextOffset(), now);
                 return;
             }
             if (options.maxWait().isZero()) {
@@ -788,7 +929,7 @@ public final class PartitionReader implements AutoCloseable {
                     partition.id, section.currentOffset(), (long) messages.size(), messages, section.context());
             BigInteger first = messages.get(0).header().offset();
             BigInteger last = messages.get(messages.size() - 1).header().offset();
-            if (commit && partition.gapFrom == null && expected != null && first.compareTo(expected) > 0) {
+            if (catchesUp && first.compareTo(expected) > 0) {
                 // A read whose reply was lost stored up to here, so the messages in between are read again first.
                 partition.gapFrom = expected;
                 partition.gapEnd = first;
@@ -798,6 +939,10 @@ public final class PartitionReader implements AutoCloseable {
             } else if (partition.gapFrom != null && !commit) {
                 acceptGap(partition, batch);
             } else {
+                if (commit) {
+                    // This store fences out the lost read, so a later start no longer comes from it.
+                    partition.lost = null;
+                }
                 partition.received = last;
                 queue.addLast(new Entry(partition.id, partition.generation, batch, null));
             }
@@ -806,22 +951,35 @@ public final class PartitionReader implements AutoCloseable {
             partition.fromRead = !onRead;
         }
         malformed.ifPresent(failure -> {
-            // Malformed framing isolates no message, so the bad one is the first after the healthy prefix.
-            BigInteger bad = failure.offset()
-                    .orElseGet(() -> messages.isEmpty()
-                            ? section.nextOffset().subtract(BigInteger.valueOf(section.count()))
-                            : messages.get(messages.size() - 1)
-                                    .header()
-                                    .offset()
-                                    .add(BigInteger.ONE));
-            PollingStrategy skip = new PollingStrategy(
-                    PollingKind.Offset,
-                    bad.add(BigInteger.ONE),
-                    Optional.of(section.context()),
-                    Optional.of(partition.id));
-            partition.stopped = new ReadException(OptionalLong.of(partition.id), failure, Optional.of(skip));
+            BigInteger bad = undecoded(section, failure, messages);
+            if (commit) {
+                // The server stored the whole read, so the close moves the offset back before the bad message.
+                remember(partition, bad, section.context());
+            }
+            partition.stopped = new ReadException(
+                    OptionalLong.of(partition.id),
+                    failure,
+                    Optional.of(skipPast(partition.id, bad, section.context())));
             queue.addLast(new Entry(partition.id, partition.generation, null, partition.stopped));
         });
+    }
+
+    /**
+     * A committing read whose outcome is unknown can have stored from the expected offset on. The close moves the
+     * offset back over it, a later read catches up a forward gap, and the partition waits the retry interval.
+     */
+    private void lose(Partition partition, long now) {
+        BigInteger expected = expected(partition);
+        if (expected == null && partition.position.kind() == PollingKind.Offset) {
+            // The first read from an offset start can have stored from there.
+            remember(
+                    partition,
+                    partition.position.value(),
+                    partition.position.context().orElse(partition.context));
+        } else {
+            remember(partition, expected, partition.context);
+        }
+        partition.retryAt = now + retryIntervalNanos;
     }
 
     /** Queues the messages of a stored read of a partition that left the assignment. */
@@ -853,7 +1011,7 @@ public final class PartitionReader implements AutoCloseable {
         targets.put(
                 partition.id,
                 new PollingStrategy(PollingKind.Offset, partition.gapFrom, Optional.of(partition.context)));
-        read(targets, count, false);
+        read(targets, count, false, false);
     }
 
     private void acceptGap(Partition partition, PolledMessages read) {
@@ -872,21 +1030,34 @@ public final class PartitionReader implements AutoCloseable {
                     missing.get(missing.size() - 1).header().offset().add(BigInteger.ONE);
         }
         if (missing.isEmpty() || partition.gapFrom.compareTo(heldFirst) >= 0) {
-            if (!partition.held.messages().isEmpty()) {
-                queue.addLast(new Entry(partition.id, partition.generation, partition.held, null));
-            }
-            partition.gapFrom = null;
-            partition.held = null;
+            closeGap(partition);
         } else {
             readGap(partition);
         }
     }
 
+    /** An empty gap read: the messages before its next offset are gone. */
+    private void skipGap(Partition partition, BigInteger next, long now) {
+        if (next.compareTo(partition.gapFrom) > 0) {
+            partition.gapFrom = next;
+        }
+        if (partition.gapFrom.compareTo(partition.gapEnd) >= 0) {
+            closeGap(partition);
+        } else if (options.maxWait().isZero()) {
+            partition.retryAt = now + retryIntervalNanos;
+        }
+    }
+
+    private void closeGap(Partition partition) {
+        if (!partition.held.messages().isEmpty()) {
+            queue.addLast(new Entry(partition.id, partition.generation, partition.held, null));
+        }
+        partition.gapFrom = null;
+        partition.held = null;
+    }
+
     private void refuseSection(Partition partition, long status, long now) {
         int code = (int) status;
-        if (partition.gapFrom != null && code == IggyErrorCode.CONSUMER_GROUP_PARTITION_NOT_OWNED.getCode()) {
-            giveUpGap(partition);
-        }
         handleRefusal(partition, code, IggyServerException.fromTcpResponse(code, new byte[0]), now);
     }
 
@@ -922,6 +1093,12 @@ public final class PartitionReader implements AutoCloseable {
                 && operation.getErrorCode() == IggyErrorCode.FETCH_PROGRESS_UNCERTAIN) {
             // The next read of the server starts after what the lost read stored, and the gap check reads it again.
             transport.abandon(operation.getOperationId());
+            for (Long id : targets) {
+                Partition partition = partitions.get(id);
+                if (partition != null) {
+                    lose(partition, now);
+                }
+            }
             return;
         }
         if (cause instanceof IggyServerException server) {
@@ -958,8 +1135,27 @@ public final class PartitionReader implements AutoCloseable {
             return;
         }
         if (code == IggyErrorCode.CONSUMER_GROUP_PARTITION_NOT_OWNED.getCode()) {
+            if (partition.gapFrom != null) {
+                giveUpGap(partition);
+            }
+            // A rejoin gives the partition a new owner generation, which only a new start resolves.
+            partition.position = start;
+            partition.fromRead = start.context().isPresent();
+            partition.context = PartitionContext.EMPTY;
+            partition.received = null;
+            partition.baseline = null;
+            partition.lost = null;
+            partition.backlogged = false;
             refreshAt = now;
             partition.retryAt = now + retryIntervalNanos;
+            if (++partition.lastingRefusals >= LASTING_REFUSALS_BEFORE_STOP) {
+                partition.lastingRefusals = 0;
+                queue.addLast(new Entry(
+                        partition.id,
+                        partition.generation,
+                        null,
+                        new ReadException(OptionalLong.of(partition.id), error, Optional.empty())));
+            }
             return;
         }
         if (code == IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode()
@@ -1048,6 +1244,7 @@ public final class PartitionReader implements AutoCloseable {
         for (Long id : List.copyOf(partitions.keySet())) {
             if (!next.contains(id)) {
                 Partition revoked = partitions.remove(id);
+                failSeek(revoked, invalid("Partition " + id + " left the assignment of this reader"));
                 if (!onRead) {
                     queue.removeIf(entry -> entry.partition == id);
                 } else if (revoked.gapFrom != null) {
@@ -1234,6 +1431,15 @@ public final class PartitionReader implements AutoCloseable {
                 : CompletableFuture.failedFuture(failures.get(0)));
     }
 
+    private void recordCommit(Checkpoint checkpoint, long generation) {
+        Partition partition = partitions.get(checkpoint.partitionId());
+        if (partition != null
+                && partition.generation == generation
+                && (partition.committed == null || checkpoint.offset().compareTo(partition.committed) > 0)) {
+            partition.committed = checkpoint.offset();
+        }
+    }
+
     private Partition delivering(Checkpoint checkpoint) {
         Partition partition = partitions.get(checkpoint.partitionId());
         if (partition == null || !partition.delivered(checkpoint)) {
@@ -1295,9 +1501,49 @@ public final class PartitionReader implements AutoCloseable {
         return result;
     }
 
+    /** The first message that does not decode. Malformed framing isolates none, so it follows the healthy prefix. */
+    private static BigInteger undecoded(FetchedMessages section, DecodeFailure failure, List<Message> messages) {
+        return failure.offset()
+                .orElseGet(() -> messages.isEmpty()
+                        ? section.nextOffset().subtract(BigInteger.valueOf(section.count()))
+                        : messages.get(messages.size() - 1).header().offset().add(BigInteger.ONE));
+    }
+
+    private static PollingStrategy skipPast(long partitionId, BigInteger bad, PartitionContext context) {
+        return new PollingStrategy(
+                PollingKind.Offset, bad.add(BigInteger.ONE), Optional.of(context), Optional.of(partitionId));
+    }
+
+    /** The offset that the next read of the partition starts at, or null before its first read. */
+    private static BigInteger expected(Partition partition) {
+        return partition.received == null ? partition.baseline : partition.received.add(BigInteger.ONE);
+    }
+
+    /** Keeps the lowest start of what the server stored without handing it over. */
+    private static void remember(Partition partition, BigInteger from, PartitionContext context) {
+        if (from != null && (partition.lost == null || from.compareTo(partition.lost.from()) < 0)) {
+            partition.lost = new Lost(from, context);
+        }
+    }
+
+    /** Offsets compare within one incarnation and owner. The server raises the metadata op of a history meanwhile. */
+    private static boolean sameIncarnationAndOwner(PartitionContext left, PartitionContext right) {
+        return left.incarnation().equals(right.incarnation())
+                && left.ownerGeneration().equals(right.ownerGeneration());
+    }
+
     /** Whether the time {@code at} passed, where zero is no time. */
     private static boolean due(long now, long at) {
         return at == 0 || now - at >= 0;
+    }
+
+    private static void failSeek(Partition partition, RuntimeException error) {
+        if (partition.sought != null) {
+            CompletableFuture<Void> sought = partition.sought;
+            partition.pendingSeek = null;
+            partition.sought = null;
+            sought.completeExceptionally(error);
+        }
     }
 
     private static void cancel(ScheduledFuture<?> timer) {
@@ -1342,9 +1588,13 @@ public final class PartitionReader implements AutoCloseable {
         // The position came from a read, so it carries the history of the partition.
         private boolean fromRead;
         private boolean inFlight;
+        // The read in flight holds quiet partitions, so it may wait.
+        private boolean parked;
         private long retryAt;
         // The read turn that last returned messages of the partition.
         private long servedAt;
+        // The last read ended before the head of the partition.
+        private boolean backlogged;
         private int lastingRefusals;
         private ReadException stopped;
         private PartitionContext context = PartitionContext.EMPTY;
@@ -1358,6 +1608,8 @@ public final class PartitionReader implements AutoCloseable {
         private BigInteger gapFrom;
         private BigInteger gapEnd;
         private PolledMessages held;
+        // Under OnRead, the start of what the server stored without handing it over, see lose().
+        private Lost lost;
         private PollingStrategy pendingSeek;
         private CompletableFuture<Void> sought;
         private Checkpoint counted;
@@ -1372,7 +1624,7 @@ public final class PartitionReader implements AutoCloseable {
         private boolean delivered(Checkpoint checkpoint) {
             return delivered != null
                     && firstDelivered != null
-                    && checkpoint.context().equals(delivered.context())
+                    && sameIncarnationAndOwner(checkpoint.context(), delivered.context())
                     && checkpoint.offset().compareTo(firstDelivered) >= 0
                     && checkpoint.offset().compareTo(delivered.offset()) <= 0;
         }
@@ -1386,4 +1638,25 @@ public final class PartitionReader implements AutoCloseable {
     private record Uncounted(long partition, long generation, Checkpoint checkpoint, long messages) {}
 
     private record Retired(long partition, Checkpoint checkpoint) {}
+
+    private record Lost(BigInteger from, PartitionContext context) {}
+
+    /** The reads of one group in one turn: its quiet partitions share one, its backlogged ones take the extra slots. */
+    private static final class GroupPlan {
+        private final int index;
+        private final List<Partition> quiet = new ArrayList<>();
+        // The least recently served first.
+        private final List<Partition> backlogged = new ArrayList<>();
+        private int extra;
+
+        private GroupPlan(int index, List<Partition> ready) {
+            this.index = index;
+            ready.forEach(partition -> (partition.backlogged ? backlogged : quiet).add(partition));
+        }
+
+        /** The extra slots that the group can use, so that every read holds a backlogged partition. */
+        private int room() {
+            return backlogged.size() - (quiet.isEmpty() ? 1 : 0);
+        }
+    }
 }

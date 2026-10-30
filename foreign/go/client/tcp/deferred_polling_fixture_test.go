@@ -20,9 +20,12 @@ package tcp
 import (
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"testing"
 
+	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -51,4 +54,44 @@ func TestFixture_RefusesEachRefusedFetchOfTheSharedVectors(t *testing.T) {
 			require.Error(t, err)
 		})
 	}
+}
+
+// A committing poll or fetch that fails with a status stored nothing exactly
+// when the shared vectors call that status certain, for a whole reply and for
+// a fetch section.
+func TestFixture_ClassifiesEachCommitOutcomeOfTheSharedVectors(t *testing.T) {
+	requests, sections := commitOutcomes(t)
+	for _, scope := range []struct {
+		section  bool
+		outcomes []commitOutcome
+	}{{false, requests}, {true, sections}} {
+		require.NotEmpty(t, scope.outcomes)
+		for _, vector := range scope.outcomes {
+			t.Run(fmt.Sprintf("section_%t/%s", scope.section, vector.Error), func(t *testing.T) {
+				assert.Equal(t, vector.Certain, fetchRefusedBeforeAdmission(ierror.FromCode(vector.Status), scope.section))
+			})
+		}
+	}
+}
+
+// commitOutcome is one status of the shared commit outcome vectors.
+type commitOutcome struct {
+	Status  ierror.Code `json:"status"`
+	Error   string      `json:"error"`
+	Certain bool        `json:"certain"`
+}
+
+// commitOutcomes reads the whole reply and the section lists of the shared commit outcome vectors.
+func commitOutcomes(t *testing.T) (requests, sections []commitOutcome) {
+	t.Helper()
+	data, err := os.ReadFile("../../contracts/testdata/deferred_polling.json")
+	require.NoError(t, err)
+	var fixture struct {
+		CommitOutcomes struct {
+			Request []commitOutcome `json:"request"`
+			Section []commitOutcome `json:"section"`
+		} `json:"commit_outcomes"`
+	}
+	require.NoError(t, json.Unmarshal(data, &fixture))
+	return fixture.CommitOutcomes.Request, fixture.CommitOutcomes.Section
 }

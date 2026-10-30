@@ -117,6 +117,78 @@ public sealed class ConsumerOnReaderTests
     }
 
     /// <summary>
+    ///     A shutdown that starts while a handler runs waits for it, because the message counts only once its handler
+    ///     returns with success. This handler fails, so only the message before it is stored.
+    /// </summary>
+    [Fact]
+    public async Task given_auto_commit_after_processing_when_shutting_down_during_a_handler_should_not_count_its_message()
+    {
+        using var cluster = new ReaderCluster(1);
+        using var client = await cluster.ConnectAsync();
+        var consumer = await StartAsync(client,
+            CommitPolicy.Auto(new AutoCommit { Interval = TimeSpan.FromHours(1), After = CommitAfter.Processing }), 1);
+        var failure = new InvalidOperationException("The handler failed.");
+        var handling = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var consuming = consumer.ConsumeAsync(async (message, _) =>
+        {
+            if (message.CurrentOffset == 1)
+            {
+                handling.SetResult();
+                await release.Task;
+                throw failure;
+            }
+        }, Token);
+        await handling.Task.WaitAsync(PromptLimit, Token);
+
+        var shutdown = consumer.ShutdownAsync();
+        await Task.WhenAny(shutdown, Task.Delay(TimeSpan.FromMilliseconds(200), Token));
+        var waited = !shutdown.IsCompleted;
+        release.SetResult();
+        await shutdown;
+
+        Assert.Same(failure, await Assert.ThrowsAsync<InvalidOperationException>(() => consuming));
+        Assert.True(waited);
+        Assert.Equal(0ul, cluster.Stored[1]);
+    }
+
+    /// <summary>
+    ///     The first shutdown waits for the handler that runs. A second shutdown waits for the first instead of
+    ///     returning while it still runs.
+    /// </summary>
+    [Fact]
+    public async Task given_a_shutdown_in_progress_when_shutting_down_again_should_wait_for_the_first()
+    {
+        using var cluster = new ReaderCluster(1);
+        using var client = await cluster.ConnectAsync();
+        var consumer = await StartAsync(client,
+            CommitPolicy.Auto(new AutoCommit { Interval = TimeSpan.FromHours(1), After = CommitAfter.Processing }), 1);
+        var handling = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var consuming = consumer.ConsumeAsync(async (message, _) =>
+        {
+            if (message.CurrentOffset == 1)
+            {
+                handling.SetResult();
+                await release.Task;
+            }
+        }, Token);
+        await handling.Task.WaitAsync(PromptLimit, Token);
+        var first = consumer.ShutdownAsync();
+
+        var second = consumer.ShutdownAsync();
+        await Task.WhenAny(second, Task.Delay(TimeSpan.FromMilliseconds(200), Token));
+        var waited = !second.IsCompleted;
+        release.SetResult();
+        await first.WaitAsync(PromptLimit, Token);
+        await second.WaitAsync(PromptLimit, Token);
+        await consuming.WaitAsync(PromptLimit, Token);
+
+        Assert.True(waited);
+        Assert.Equal(1ul, cluster.Stored[1]);
+    }
+
+    /// <summary>
     ///     With on read commits the server stored both messages of the read, but the application took only the
     ///     first, so shutdown moves the offset back to it.
     /// </summary>

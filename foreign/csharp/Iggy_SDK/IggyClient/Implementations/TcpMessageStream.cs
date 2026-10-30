@@ -812,6 +812,17 @@ public sealed partial class TcpMessageStream : IIggyClient, IPartitionFetchClien
         return ConnectAsync(true, token);
     }
 
+    /// <summary>
+    ///     Closes the links of the client without a sign-out, as a lost network does, so the server keeps the session
+    ///     until it expires. <see cref="ConnectAsync(CancellationToken)" /> and a sign-in open the client again. A
+    ///     committing read in flight ends with an unknown outcome and keeps its partition blocked.
+    /// </summary>
+    internal Task DisconnectAsync()
+    {
+        CancelSessionRecovery();
+        return ResetConsensusSessionAsync(stops: true, interrupt: true).AsTask();
+    }
+
     /// <inheritdoc />
     public async Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default)
     {

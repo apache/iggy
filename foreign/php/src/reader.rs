@@ -35,8 +35,10 @@ const CLOSED: &str = "the reader is closed";
 /// offsets are stored. With CommitPolicy::manual() and CommitPolicy::auto(), commit() stores the
 /// offset of a checkpoint, and CommitPolicy::auto() also stores the latest counted position by
 /// itself, which mark() counts under CommitAfter::Marked. With CommitPolicy::onRead(), the server
-/// stores the offset of each reply, and close() moves the offset back to the last delivered
-/// message. Destroying the reader without
+/// stores the offset of each reply, the reader reads only while next() waits and then fills its
+/// budget (one fetch per primary that may wait for messages, the partitions with messages left
+/// behind spread over the other slots), a seek() to an offset stores the offset before it, and
+/// close() moves the offset back to the last delivered message. Destroying the reader without
 /// close() stops it without waiting, moves no offset back and does not leave the group.
 #[php_class]
 #[php(name = "Iggy\\PartitionReader")]
@@ -102,14 +104,19 @@ impl PartitionReader {
             .map_err(to_php_exception)
     }
 
-    /// Sets the next read position of a partition and starts a new generation of it. It stores
-    /// no offset, drops the queued batches of the partition and ignores its late replies. It
-    /// also resumes a stopped partition.
+    /// Sets the next read position of a partition and starts a new generation of it. It drops
+    /// the queued batches of the partition, ignores its late replies and resumes a stopped
+    /// partition.
+    ///
+    /// Under CommitPolicy::onRead(), a seek to an offset above 0 first stores the offset before
+    /// it, under the history of a continuation or else of the last delivered message, so a
+    /// restart resumes at the new position. A failed store fails the seek with its exception and
+    /// nothing moves. Every other seek stores nothing. The new position waits for the end of the
+    /// committing read in flight, whose reply the new generation drops.
     ///
     /// A partition that the reader does not read, and a continuation of another partition,
-    /// fail with InvalidCommand (3). Under CommitPolicy::onRead(), the new position waits
-    /// for the end of the committing read in flight, and a read with an unknown outcome fails
-    /// with PartitionLaneBlocked (14009): abandon its operation first.
+    /// fail with InvalidCommand (3). Under CommitPolicy::onRead(), a read with an unknown
+    /// outcome fails with PartitionLaneBlocked (14009): abandon its operation first.
     pub fn seek(&mut self, partition_id: u32, start: &PollingStrategy) -> PhpResult {
         let reader = self.open_mut()?;
         runtime()

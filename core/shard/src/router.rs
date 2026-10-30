@@ -1051,6 +1051,13 @@ where
             LifecycleFrame::ReadinessUnwatch { from, watches } => {
                 self.unwatch_readiness(from, watches);
             }
+            LifecycleFrame::ReadinessInterest {
+                from,
+                watches,
+                parked,
+            } => {
+                self.set_readiness_interest(from, watches, parked);
+            }
             LifecycleFrame::PartitionSubmit {
                 request,
                 reply,

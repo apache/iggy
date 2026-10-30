@@ -1205,6 +1205,9 @@ actor ClientCore {
         lineage += 1
         rememberedSignIn = nil
         stopHeartbeat()
+        // A committing read parked on its own connection ends now, with an
+        // unknown outcome, before the server can answer it for the session.
+        await pollRouter.closeDeferredConnections()
         await disconnectTransport()
         resetSession()
     }

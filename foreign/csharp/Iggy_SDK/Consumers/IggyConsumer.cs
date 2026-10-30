@@ -57,10 +57,13 @@ public partial class IggyConsumer : IAsyncDisposable
     private readonly IIggyClient _client;
     private readonly IggyConsumerConfig _config;
     private readonly EventAggregator<ConsumerErrorEventArgs> _consumerErrorEvents;
+    private readonly AsyncLocal<bool> _handlerRunning = new();
     private readonly SemaphoreSlim _initialization = new(1, 1);
     private readonly ILogger<IggyConsumer> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly CancellationTokenSource _lifetime = new();
+    private TaskCompletionSource? _handling;
+    private TaskCompletionSource? _shutdown;
     private PartitionReader? _reader;
     private int _state;
     private (Checkpoint Checkpoint, bool EndsBatch)? _uncounted;
@@ -191,7 +194,8 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <summary>
     ///     Hands each message to <paramref name="handler" /> until the consumer shuts down or a handler fails. With
     ///     <see cref="CommitAfter.Delivery" /> a message counts before its handler runs, with
-    ///     <see cref="CommitAfter.Processing" /> only after its handler returned with success.
+    ///     <see cref="CommitAfter.Processing" /> only after its handler returned with success. A
+    ///     <see cref="ShutdownAsync" /> from outside the handler waits for the handler that runs.
     /// </summary>
     /// <exception cref="Exception">The error of the first handler that failed. Its message is not counted.</exception>
     public async Task ConsumeAsync(Func<ReceivedMessage, CancellationToken, Task> handler,
@@ -211,7 +215,10 @@ public partial class IggyConsumer : IAsyncDisposable
                 var message = batch.Messages[index];
                 var checkpoint = batch.CheckpointAt(index)!;
                 var endsBatch = index == batch.Messages.Count - 1;
-                Hand(checkpoint, endsBatch);
+                Hand(checkpoint, endsBatch, false);
+                var handling = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Volatile.Write(ref _handling, handling);
+                _handlerRunning.Value = true;
                 try
                 {
                     await handler(new ReceivedMessage
@@ -222,15 +229,16 @@ public partial class IggyConsumer : IAsyncDisposable
                         Context = batch.Context,
                         Checkpoint = checkpoint
                     }, ct);
+                    if (_config.PollOptions.Commit.Settings?.After == CommitAfter.Processing)
+                    {
+                        Reader.CountDelivered(checkpoint, 1, endsBatch);
+                    }
                 }
-                catch
+                finally
                 {
-                    // A message whose handler failed does not count.
-                    _uncounted = null;
-                    throw;
+                    _handlerRunning.Value = false;
+                    handling.SetResult();
                 }
-
-                CountProcessed();
             }
         }
     }
@@ -261,19 +269,49 @@ public partial class IggyConsumer : IAsyncDisposable
     }
 
     /// <summary>
-    ///     Stops reading. It counts the last message under <see cref="CommitAfter.Processing" />, closes the reader,
-    ///     which stores the counted positions or moves an on read offset back and leaves the group, and disposes a
-    ///     client that the consumer created.
+    ///     Stops reading. It waits for a handler of <see cref="ConsumeAsync" /> that runs, unless that handler calls
+    ///     it, counts the last message of <see cref="ReceiveAsync" /> under <see cref="CommitAfter.Processing" />,
+    ///     closes the reader, which stores the counted positions or moves an on read offset back and leaves the
+    ///     group, and disposes a client that the consumer created. A later call waits for the first shutdown and
+    ///     ends as it does, unless the handler that the first one waits for makes it.
     /// </summary>
     /// <exception cref="Exception">The first failed store of the close.</exception>
     public async Task ShutdownAsync()
     {
-        if (Interlocked.Exchange(ref _state, StateShutDown) == StateShutDown)
+        var shutdown = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (Interlocked.CompareExchange(ref _shutdown, shutdown, null) is { } running)
         {
+            if (!_handlerRunning.Value)
+            {
+                await running.Task;
+            }
+
             return;
         }
 
+        Volatile.Write(ref _state, StateShutDown);
+        try
+        {
+            await ShutdownOnceAsync();
+            shutdown.SetResult();
+        }
+        catch (Exception error)
+        {
+            shutdown.SetException(error);
+        }
+
+        await shutdown.Task;
+    }
+
+    private async Task ShutdownOnceAsync()
+    {
         await _lifetime.CancelAsync();
+        // The message of a running handler counts only once the handler returns with success.
+        if (!_handlerRunning.Value && Volatile.Read(ref _handling) is { } handling)
+        {
+            await handling.Task;
+        }
+
         Exception? failure = null;
         if (_reader is { } reader)
         {
@@ -365,8 +403,11 @@ public partial class IggyConsumer : IAsyncDisposable
         return null;
     }
 
-    /// <summary>Records a message as handed over, and counts it there under <see cref="CommitAfter.Delivery" />.</summary>
-    private protected void Hand(Checkpoint checkpoint, bool endsBatch)
+    /// <summary>
+    ///     Records a message as handed over, and counts it there under <see cref="CommitAfter.Delivery" />. Under
+    ///     <see cref="CommitAfter.Processing" /> a message of a stream counts once the stream is read again.
+    /// </summary>
+    private protected void Hand(Checkpoint checkpoint, bool endsBatch, bool streamed = true)
     {
         Reader.Delivered(checkpoint);
         switch (_config.PollOptions.Commit.Settings?.After)
@@ -374,7 +415,7 @@ public partial class IggyConsumer : IAsyncDisposable
             case CommitAfter.Delivery:
                 Reader.CountDelivered(checkpoint, 1, endsBatch);
                 break;
-            case CommitAfter.Processing:
+            case CommitAfter.Processing when streamed:
                 _uncounted = (checkpoint, endsBatch);
                 break;
         }

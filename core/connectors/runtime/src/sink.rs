@@ -718,8 +718,10 @@ pub(crate) async fn setup_sink_consumers(
     Ok(consumers)
 }
 
-/// The server stores the offset of each reply, so the plugin gets each message
-/// at most once. A stream without `max_wait` waits one second.
+/// The server stores the offset of each reply as part of the read. While the
+/// primary stays up the plugin gets each message at most once, and a failover
+/// before the store replicates can deliver the last batch again. A stream
+/// without `max_wait` waits one second.
 fn poll_options(stream: &StreamConsumerConfig) -> Result<PollOptions, RuntimeError> {
     if stream.poll_interval.is_some() {
         return Err(RuntimeError::UnsupportedPollInterval(stream.stream.clone()));

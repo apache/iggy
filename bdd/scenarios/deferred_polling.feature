@@ -81,3 +81,16 @@ Feature: Deferred polling
     And I send a message with payload "next" to partition 0
     And I open a consumer in group "resumers" on the topic that commits after processing
     Then the consumer should return the payload "next" within 2 seconds
+
+  # The connection drops while a committing poll waits, so its outcome stays unknown, and the
+  # partition takes no committing poll until the caller abandons that poll.
+  Scenario: A committing poll whose reply is lost blocks its partition until abandoned
+    Given a stream named "deferred-lost" with a topic named "events" with 3 partitions exists
+    When I start a deferred poll of partition 0 for consumer "lost-check" with the on read commit policy and a max wait of 10 seconds
+    And the client disconnects before the deferred poll answers
+    Then the deferred poll should fail as uncertain
+    When the client connects again
+    Then a poll of partition 0 for consumer "lost-check" with the next strategy and the on read commit policy should fail as blocked by the deferred poll
+    When I abandon the operation of the deferred poll
+    And I send a message with payload "after" to partition 0
+    Then a poll of partition 0 for consumer "lost-check" with the next strategy and the on read commit policy should return the payload "after"

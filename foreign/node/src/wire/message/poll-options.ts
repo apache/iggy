@@ -88,7 +88,9 @@ export const CommitPolicy = {
   Manual: Object.freeze({ kind: 'manual' }) as CommitPolicy,
   /**
    * The server stores the offset of the last message of each read as part of
-   * the read: one round trip, at most once.
+   * the read, in one round trip. While the primary stays up a message is
+   * delivered at most once. A failover before the store replicates can
+   * deliver the last batch again.
    */
   OnRead: Object.freeze({ kind: 'onRead' }) as CommitPolicy,
   /**
@@ -106,8 +108,9 @@ export const CommitPolicy = {
 };
 
 /**
- * The limits of one read of one partition and who stores its offsets.
- * Durations are in milliseconds.
+ * The limits of one read and who stores its offsets: a poll of one
+ * partition, or a fetch of several partitions of one primary that a reader
+ * sends, whose sections share them. Durations are in milliseconds.
  */
 export type PollOptions = {
   /** Most messages of one batch, 1000 by default. */

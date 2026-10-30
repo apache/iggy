@@ -455,9 +455,10 @@ public sealed class PrimaryPollingTests
         using var client = await cluster.ConnectAsync();
         var generation = ((ISessionGenerationProvider)client).SessionGeneration;
 
-        await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => PollAsync(client));
+        var uncertain = await Assert.ThrowsAsync<VsrFetchProgressUncertainException>(() => PollAsync(client));
         Assert.Equal(1, polls);
         Assert.Equal(1, cluster.Coordinator.Connections);
+        await client.AbandonOperationAsync(uncertain.OperationId!.Value);
         await PollAsync(client);
 
         Assert.Equal(2, polls);
@@ -511,10 +512,19 @@ public sealed class PrimaryPollingTests
 
         try
         {
-            var error = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => client.PollMessagesAsync(
+            var error = await Assert.ThrowsAnyAsync<VsrRequestOutcomeUnknownException>(() => client.PollMessagesAsync(
                 Stream, Topic, 0, Consumer.New(3), next ? PollingStrategy.Next() : PollingStrategy.Offset(0), 1,
                 !next, TestContext.Current.CancellationToken));
-            Assert.Null(error.OperationId);
+            if (next)
+            {
+                Assert.Null(error.OperationId);
+            }
+            else
+            {
+                // A committing poll may have stored its offset, so its partition waits for the caller to abandon it.
+                await client.AbandonOperationAsync(Assert.IsType<VsrFetchProgressUncertainException>(error).OperationId!.Value);
+            }
+
             var invalid = Assert.IsType<IggyInvalidStatusCodeException>(error.InnerException);
             Assert.False(invalid.FromServer);
             Assert.False(invalid.Committed);

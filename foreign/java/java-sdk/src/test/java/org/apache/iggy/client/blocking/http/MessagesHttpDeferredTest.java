@@ -26,6 +26,7 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyException;
 import org.apache.iggy.exception.IggyMalformedResponseException;
+import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
@@ -66,6 +67,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 /**
  * The HTTP deferred poll against a peer that can misbehave: the route and its
@@ -401,6 +403,119 @@ class MessagesHttpDeferredTest {
         }
     }
 
+    /**
+     * The server can have stored the offset of a committing poll whose answer is lost, so its partition takes no
+     * committing poll and no offset store on this client until the caller abandons that poll.
+     */
+    @Test
+    void shouldBlockThePartitionOfALostCommittingPollUntilItIsAbandoned() throws Exception {
+        var answers = new AtomicInteger();
+        var peer = new FakePeer(exchange -> {
+            if (answers.getAndIncrement() > 0) {
+                respond(exchange, 200, EMPTY_POLL);
+            }
+        });
+        try (var server = peer.start();
+                var client = client(peer)) {
+            var lost = (IggyOperationException) catchThrowable(() -> committingPoll(client));
+            assertThat(lost.getErrorCode()).isEqualTo(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN);
+
+            assertBlockedBy(catchThrowable(() -> committingPoll(client)), lost.getOperationId());
+            assertBlockedBy(
+                    catchThrowable(() -> client.consumerOffsets()
+                            .storeConsumerOffset(
+                                    StreamId.of(1L), TopicId.of(1L), Optional.of(0L), Consumer.of(3L), BigInteger.ONE)),
+                    lost.getOperationId());
+            assertThat(peer.methods).containsExactly("POST");
+            client.abandonOperation(lost.getOperationId());
+
+            assertThat(committingPoll(client).messages()).isEmpty();
+            assertThat(peer.methods).containsExactly("POST", "POST");
+        }
+    }
+
+    /**
+     * Progress polls of one partition take turns, so a committing poll that starts while another one of its partition
+     * waits for its answer goes out only after it, and then meets the block that the lost answer left.
+     */
+    @Test
+    void shouldLetASecondCommittingPollWaitForTheFirstAndMeetItsBlock() throws Exception {
+        var firstArrived = new CountDownLatch(1);
+        var secondArrived = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var requests = new AtomicInteger();
+        var peer = new FakePeer(exchange -> {
+            if (requests.getAndIncrement() == 0) {
+                firstArrived.countDown();
+                hold(release, STALL);
+                return;
+            }
+            secondArrived.countDown();
+            respond(exchange, 200, EMPTY_POLL);
+        });
+        var callers = Executors.newFixedThreadPool(2);
+        try (var server = peer.start(Executors.newCachedThreadPool());
+                var client = client(peer)) {
+            Future<Throwable> first = callers.submit(() -> catchThrowable(() -> committingPoll(client)));
+            assertThat(firstArrived.await(STALL.toMillis(), TimeUnit.MILLISECONDS))
+                    .isTrue();
+            Future<Throwable> second = callers.submit(() -> catchThrowable(() -> committingPoll(client)));
+            // The second poll gets the time to go out, which only a missing lane lets it do.
+            assertThat(secondArrived.await(DEADLINE_SLACK.toMillis(), TimeUnit.MILLISECONDS))
+                    .isFalse();
+            release.countDown();
+
+            var lost = (IggyOperationException) first.get(STALL.toMillis(), TimeUnit.MILLISECONDS);
+            assertThat(lost.getErrorCode()).isEqualTo(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN);
+            assertBlockedBy(second.get(STALL.toMillis(), TimeUnit.MILLISECONDS), lost.getOperationId());
+            assertThat(requests).hasValue(1);
+        } finally {
+            release.countDown();
+            callers.shutdownNow();
+        }
+    }
+
+    /**
+     * A block covers its partition for every consumer of the client, and in any spelling of the stream and topic for
+     * a call that carries the context of the same incarnation.
+     */
+    @Test
+    void shouldBlockAnotherConsumerAndAnotherSpellingOfTheSameIncarnation() throws Exception {
+        var peer = new FakePeer(exchange -> {});
+        var context = new PartitionContext(BigInteger.valueOf(7), BigInteger.ONE, BigInteger.ONE);
+        try (var server = peer.start();
+                var client = client(peer)) {
+            var lost = (IggyOperationException) catchThrowable(() -> client.messages()
+                    .pollMessagesDeferred(
+                            StreamId.of(1L),
+                            TopicId.of(1L),
+                            Optional.of(0L),
+                            Consumer.of(3L),
+                            PollingStrategy.next().withContext(context),
+                            10L,
+                            true,
+                            DeferredPollOptions.defaults()));
+            assertThat(lost.getErrorCode()).isEqualTo(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN);
+
+            assertBlockedBy(
+                    catchThrowable(() -> client.consumerOffsets()
+                            .storeConsumerOffset(
+                                    StreamId.of(1L), TopicId.of(1L), Optional.of(0L), Consumer.of(4L), BigInteger.ONE)),
+                    lost.getOperationId());
+            assertBlockedBy(
+                    catchThrowable(() -> client.consumerOffsets()
+                            .storeConsumerOffset(
+                                    StreamId.of("orders"),
+                                    TopicId.of("events"),
+                                    0L,
+                                    Consumer.of(4L),
+                                    BigInteger.ONE,
+                                    context)),
+                    lost.getOperationId());
+            assertThat(peer.methods).containsExactly("POST");
+        }
+    }
+
     @ParameterizedTest(name = "on read={0}")
     @ValueSource(booleans = {false, true})
     void shouldSendAPollOfOnePartitionWithItsOptionsAndPostItWhenItStores(boolean onRead) throws Exception {
@@ -542,6 +657,27 @@ class MessagesHttpDeferredTest {
                     .isInstanceOf(IggyException.class)
                     .hasMessageContaining("bytes");
         }
+    }
+
+    private static PolledMessages committingPoll(IggyHttpClient client) {
+        return client.messages()
+                .pollMessagesDeferred(
+                        StreamId.of(1L),
+                        TopicId.of(1L),
+                        Optional.of(0L),
+                        Consumer.of(3L),
+                        PollingStrategy.next(),
+                        10L,
+                        true,
+                        DeferredPollOptions.defaults());
+    }
+
+    private static void assertBlockedBy(Throwable failure, long operation) {
+        assertThat(failure).isInstanceOf(IggyOperationException.class);
+        var blocked = (IggyOperationException) failure;
+        assertThat(blocked.getErrorCode()).isEqualTo(IggyErrorCode.PARTITION_LANE_BLOCKED);
+        assertThat(blocked.getOperationId()).isEqualTo(operation);
+        assertThat(blocked.getPartitionId()).hasValue(0);
     }
 
     private static IggyHttpClient client(FakePeer peer) {

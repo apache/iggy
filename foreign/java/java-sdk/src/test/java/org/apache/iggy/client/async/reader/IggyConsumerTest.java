@@ -26,8 +26,10 @@ import org.apache.iggy.message.CommitAfter;
 import org.apache.iggy.message.CommitEvery;
 import org.apache.iggy.message.CommitPolicy;
 import org.apache.iggy.message.PollOptions;
+import org.apache.iggy.message.PollingStrategy;
 import org.junit.jupiter.api.Test;
 
+import java.math.BigInteger;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
@@ -148,14 +150,39 @@ class IggyConsumerTest {
         }
     }
 
+    /** A seek drops only the batches of its own partition, so a batch of another one that the reader handed over stays. */
+    @Test
+    void shouldKeepABatchOfAnotherPartitionThatArrivesWhileASeekRuns() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        IggyConsumer consumer = consumer(transport, WAIT, 1L, 2L);
+        try {
+            CompletableFuture<ReceivedMessage> pending = consumer.next();
+            FakeTransport.Read read = transport.nextRead();
+            consumer.seek(1L, PollingStrategy.offset(BigInteger.TEN)).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+            read.answer(section(2, 5));
+
+            ReceivedMessage message = pending.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            assertThat(message.partitionId()).isEqualTo(2L);
+            assertThat(message.checkpoint().offset()).isEqualTo(BigInteger.valueOf(5));
+        } finally {
+            consumer.shutdown().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
     private static PollOptions auto(CommitAfter after) {
         return WAIT.withCommit(
                 CommitPolicy.auto(new AutoCommit(Optional.empty(), Optional.of(CommitEvery.message()), after)));
     }
 
     private static IggyConsumer consumer(FakeTransport transport, PollOptions options) throws Exception {
+        return consumer(transport, options, 1L);
+    }
+
+    private static IggyConsumer consumer(FakeTransport transport, PollOptions options, Long... partitions)
+            throws Exception {
         return IggyConsumer.build(PartitionReader.builder(transport)
-                        .partitions(List.of(1L))
+                        .partitions(List.of(partitions))
                         .options(options)
                         .retryInterval(Duration.ofMillis(100)))
                 .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);

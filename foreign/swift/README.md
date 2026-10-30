@@ -254,7 +254,9 @@ Every poll is deferred (binary command 106). The server answers once `minCount` 
 
 The call takes at most its request timeout, `maxWait` plus ten seconds: the route lookup, a reconnect, the wait, the reply and every retry. A first message larger than `maxBytes` comes alone in its own reply. The client refuses options out of range before it sends anything: a `minCount` outside `1...count` with `invalidMessagesCount`, a wait above 600 seconds with `invalidCommand`, a `maxBytes` below 344 with `invalidSizeBytes`.
 
-`commit` is a `CommitPolicy`. `.manual`, the default, stores nothing. `.onRead` makes the server store the offset of the last message it returns as part of the read, at most once. `.auto(_)` stores counted positions on the client and needs a `PartitionReader` or an `IggyConsumer`: a single poll refuses it with `invalidConfiguration`, as it has nothing to count.
+`commit` is a `CommitPolicy`. `.manual`, the default, stores nothing. `.onRead` makes the server store the offset of the last message of each read as part of the read, in one round trip. While the primary stays up a message is delivered at most once. A failover before the store replicates can deliver the last batch again.
+
+`.auto(_)` stores counted positions on the client and needs a `PartitionReader` or an `IggyConsumer`: a single poll refuses it with `invalidConfiguration`, as it has nothing to count.
 
 Positions are opaque. `polled.continuation` is where the next poll of the same partition starts, and a poll of another partition refuses it with `invalidCommand`. `polled.checkpoint` and `polled.checkpoint(at:)` are the positions after a message, which `storeConsumerPosition(consumer:streamID:topicID:checkpoint:)` stores.
 
@@ -262,7 +264,11 @@ Both carry the partition context the read was served under: the partition's inca
 
 To cancel a poll, cancel its task. The client then sends command 108 on the connection of the request. A poll that commits nothing gets no reply, and a reply that still arrives is dropped.
 
-A poll with `.onRead` gets exactly one reply, which the cancelled caller waits for: `CancellationError` when the cancellation won and the server stored nothing, or the messages the server stored before the cancellation arrived. A poll that lost its reply to a broken connection fails with `transientNotCommitted` and is not sent again: with `.onRead` the server may have stored its offset.
+A poll with `.onRead` gets exactly one reply, which the cancelled caller waits for: `CancellationError` when the cancellation won and the server stored nothing, or the messages the server stored before the cancellation arrived. A poll with `.onRead` that lost its reply, to a broken connection or to `disconnect()`, or whose reply arrived after the caller signed in or out, may have stored its offset.
+
+It fails with `fetchProgressUncertain` (14010), whose `operationID` names it, and is not sent again. Every later poll with `.onRead` or `.next` and every offset store or delete of that partition on the same client then fails with `partitionLaneBlocked` (14009) naming the same operation, also after a reconnect and a new session, until `abandonOperation(_:)` takes that operation.
+
+Offset reads still work, so the caller can look at what the server stored before it abandons.
 
 A client keeps at most 64 deferred requests in flight. A request waits for a free slot within its request timeout, and fails with `transientNotAccepted` when none frees up in time. If the server refuses to admit a request with `deferredPollCapacityExceeded`, the client pauses and sends it again within the same timeout.
 
@@ -281,12 +287,20 @@ for try await batch in reader {
 
 The reader groups its partitions by their primary and reads each group with one request, which the server holds until a message arrives or the wait runs out. A moved primary, a rebalance and a lost connection are repaired inside, so a caller never groups partitions or handles `notPrimary`.
 
-The partitions that a read served go last in the next read of their group, so a backlog does not starve the other partitions. `next()` returns a batch of one partition, never empty, in offset order within one generation of the partition: from its first read, from each `seek(partitionID:to:)`, and from each new assignment. The default wait of a reader is five seconds. With a zero `maxWait`, a partition that a read found empty waits `retryInterval` before it is read again.
+The partitions that a read served go last in the next read of their group, so a backlog does not starve the other partitions. The partitions whose last read ended before their head are spread over the free requests of the reader, each share in a fetch of its own with the full `count` and `maxBytes`, while the quiet partitions of a group share one fetch that may wait.
+
+`next()` returns a batch of one partition, never empty, in offset order within one generation of the partition: from its first read, from each `seek(partitionID:to:)`, and from each new assignment. The default wait of a reader is five seconds. With a zero `maxWait`, a partition that a read found empty waits `retryInterval` before it is read again.
 
 - `.manual`: `commit(_:)` stores a checkpoint that the reader delivered.
-- `.onRead`: the server stores each read, and the reader reads a group only when `next()` waits with nothing queued, so at most one batch per group is stored before it was asked for. A partition that leaves the assignment still hands over the reads that the server stored for it. `close()` moves the offset of each partition back to the last batch delivered.
+- `.onRead`: the server stores each read, and the reader reads only when `next()` waits with nothing queued, so no batch is stored before it was asked for. It then fills its free requests: the quiet partitions of a group share one fetch that may wait, and the backlogged ones take a committing fetch each beside it, with the full `count` and `maxBytes`. A partition that leaves the assignment still hands over the reads that the server stored for it.
 
-  A read that lost its reply to a broken connection may have stored messages that never arrived: the next reply then starts past them, and the reader reads that gap again without a commit and delivers it first. When the partition moved to another member before that, the reader reports `fetchProgressUncertain` with the lost range. A seek to an offset stores the offset before it first.
+  `close()` moves the offset of each partition back to the last batch delivered. It cancels the committing reads in flight first, and each waits for its one reply, so a parked read ends the close in about a round trip.
+
+  A read that lost its reply, or a section whose error leaves the outcome unknown, may have stored messages that never arrived. The reader abandons that read and reads its partitions again after `retryInterval`: the next reply then starts past those messages, and the reader reads that gap again without a commit and delivers it first.
+
+  A forward jump without such a lost read is a store of the application or of another session, and the reader delivers from there. When the partition moved to another member before the gap was read, the reader reports `fetchProgressUncertain` with the lost range.
+
+  A seek to an offset above zero stores the offset before it first, once the committing read of the partition in flight ended, so a restart resumes at the sought offset. A refused store fails the seek and moves nothing. A seek to offset zero or to another strategy stores nothing. A partition that a lost read of another caller on the same client blocks reports `partitionLaneBlocked` once and reads again after that operation was abandoned.
 
 - `.auto(AutoCommit(interval:every:after:))`: the reader counts a batch when `next()` returns it (`.delivery`), when the next one is asked for or the reader closes (`.processing`), or when the application calls `mark(_:)` (`.marked`), and stores the latest counted position of each partition at the interval, on the event of `every` (`.message`, `.messages(n)` counted per partition, `.batch`), before a rebalance takes a partition away, and in `close()`.
 
@@ -404,6 +418,9 @@ Three codes tell what happened to a request that did not complete:
   safe.
 - `transientNotCommitted` (57): the outcome is unknown, and the server possibly applied
   the write. Read the state before you write it again.
+- `fetchProgressUncertain` (14010): a poll or fetch with `.onRead` lost its reply, so the
+  server may have stored its offset. Its partition is blocked with
+  `partitionLaneBlocked` (14009) until `abandonOperation(_:)` takes the operation.
 - `unauthenticated` (40): the request needs a session. Sign in, then retry.
 
 The Rust SDK and the other native SDKs keep a write with an unknown outcome in a

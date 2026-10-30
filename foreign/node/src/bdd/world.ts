@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import type { Socket } from 'node:net';
 import type { ConsumerMessage, IggyConsumer } from '../stream/iggy-consumer.js';
 import type { PartitionReader } from '../stream/partition-reader.js';
 import type { Stream } from '../wire/stream/stream.utils.js';
@@ -58,6 +59,10 @@ export interface TestWorld {
   lastSentPartition?: number,
   /** Deferred poll that a step started in the background */
   deferredPoll?: BackgroundCall<PollMessagesResponse>,
+  /** The link that the deferred poll goes out on, its bytes written before the poll and the size of the poll frame */
+  deferredPollLink?: { socket: Socket, written: number, frameBytes: number },
+  /** Operation of a deferred poll whose outcome stayed unknown */
+  uncertainOperation?: bigint,
   /** Partition reader that a step opened */
   reader?: PartitionReader,
   /** Consumer that a step opened, with its message iterator */

@@ -21,7 +21,7 @@
 //! each reply goes to the request with its id. So a caller that goes away
 //! never leaves a frame half written or half read on the connection.
 
-use crate::links::{Frame, LateReply, Reply};
+use crate::links::{Frame, LateReply, Reply, committing_cancelled};
 use crate::vsr::{decode_eviction, eviction_reason, peek_command, reply_request_id, response_size};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -248,10 +248,29 @@ impl MuxLink {
         entry.close_if_abandoned = unbound;
         entry.late = late.filter(|_| cancellation.is_some());
         entry.cancellation = cancellation;
+        let committing = entry.late.is_some();
         let Some(reply) = entry.reply.as_mut() else {
             return Err(IggyError::Disconnected);
         };
-        let replied = timeout_at(deadline, reply).await;
+        let cancellation = &mut entry.cancellation;
+        let replied = timeout_at(deadline, async {
+            if committing {
+                tokio::select! {
+                    biased;
+                    replied = &mut *reply => return replied,
+                    () = committing_cancelled() => {}
+                }
+                // The server answers the request once more, which settles it.
+                if let Some((permit, frame)) = cancellation.take() {
+                    permit.send(QueuedFrame {
+                        frame,
+                        uses_write_permit: false,
+                    });
+                }
+            }
+            reply.await
+        })
+        .await;
         // The caller takes the reply, or ends at its deadline without one.
         entry.late = None;
         match replied {

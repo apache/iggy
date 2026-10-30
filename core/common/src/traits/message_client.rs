@@ -66,17 +66,30 @@ pub trait MessageClient {
     /// does not arrive, the call returns [`IggyError::TransientNotCommitted`]. The server stored
     /// nothing, so a retry is safe.
     ///
-    /// With `OnRead`, the server stores the offset of the last message of a reply as part of the
-    /// reply. A new offset key can be refused with `TooManyConsumerOffsets` at the configured
-    /// limit of the partition, and that poll returns no messages. If an `OnRead` request left the
-    /// client and its reply does not arrive or reports an unknown outcome, the call returns
-    /// [`IggyError::FetchProgressUncertain`]. The partition stays blocked until
-    /// [`abandon_operation`](crate::Client::abandon_operation), because the server can still
-    /// store the offset after the client gives up. A dropped `OnRead` call that already sent
-    /// its request gets the same block until the server answers its cancel, over TCP and
-    /// WebSocket, which proves the outcome and lifts the block. The next call on the partition
-    /// meanwhile returns [`IggyError::PartitionLaneBlocked`] with the operation to abandon. An
+    /// With `OnRead`, the server stores the offset of the last message of a read as part of the
+    /// read, in one round trip. While the primary stays up a message is delivered at most once.
+    /// A failover before the store replicates can deliver the last batch again. A new offset key
+    /// can be refused with `TooManyConsumerOffsets` at the configured limit of the partition,
+    /// and that poll returns no messages.
+    ///
+    /// An `OnRead` call whose outcome is unknown fails with
+    /// [`IggyError::FetchProgressUncertain`] naming its operation, never with
+    /// `TransientNotCommitted`: its request left the client and no reply proves what the server
+    /// stored, also when the client disconnects while the call waits. Every later poll of that
+    /// partition with `OnRead` or from `Next`, and every offset store or delete of it, on the
+    /// same client then fails with [`IggyError::PartitionLaneBlocked`] naming that operation,
+    /// until [`abandon_operation`](crate::Client::abandon_operation) or a reply proves the
+    /// outcome, because the server can still store the offset after the client gives up. The
+    /// block survives a reconnect and a new session of the same client, and it names the
+    /// partition by its incarnation, so another spelling of its stream or topic meets it too. An
+    /// `OnRead` call dropped after its request left keeps its reply slot and sends a cancel over
+    /// TCP, QUIC and WebSocket, and its block lasts until that one reply proves the outcome. An
     /// `OnRead` poll is never sent again after an unknown outcome.
+    ///
+    /// HTTP has no cancel and no connection to close, so a dropped call keeps its block until
+    /// `abandon_operation`, and `disconnect` leaves a call in flight to its reply. An HTTP block
+    /// covers the stream and the topic as the lost call spelled them, and any spelling for a
+    /// call that carries a context of the same partition incarnation.
     async fn poll_messages(
         &self,
         stream_id: &Identifier,

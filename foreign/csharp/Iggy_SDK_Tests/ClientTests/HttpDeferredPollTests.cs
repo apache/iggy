@@ -80,8 +80,10 @@ public sealed class HttpDeferredPollTests
 
         await cancellation.CancelAsync();
 
-        var error = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => poll);
+        var error = await Assert.ThrowsAnyAsync<VsrRequestOutcomeUnknownException>(() => poll);
         Assert.IsAssignableFrom<OperationCanceledException>(error.InnerException);
+        // A poll that commits may have stored its offset, so it names the operation that blocks its partition.
+        Assert.Equal(autoCommit, error is VsrFetchProgressUncertainException { OperationId: not null });
     }
 
     [Fact]

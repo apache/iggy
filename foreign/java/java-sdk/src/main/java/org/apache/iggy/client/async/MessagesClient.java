@@ -87,10 +87,14 @@ public interface MessagesClient {
      * {@link PollOptions#requestTimeout()}.
      *
      * <p>With {@link CommitPolicy#onRead()} the server stores the offset of the last message it returns as part of the
-     * read. A cancel of such a poll stops it on the server and waits for its reply, which shows whether it stored. A
-     * reply that the connection loses fails with
-     * {@link org.apache.iggy.exception.IggyErrorCode#FETCH_PROGRESS_UNCERTAIN}: the server can have stored the offset,
-     * so read the stored offset before the next poll. {@link CommitPolicy.Auto} is refused with
+     * read. A cancel of such a poll stops it on the server and waits for its reply, which shows whether it stored.
+     * Until then the poll blocks its partition, so an offset store or another progress poll of it fails at once with
+     * {@link org.apache.iggy.exception.IggyErrorCode#PARTITION_LANE_BLOCKED}. A
+     * reply that the connection loses, or a refusal that does not prove that nothing was stored, fails with
+     * {@link org.apache.iggy.exception.IggyErrorCode#FETCH_PROGRESS_UNCERTAIN} naming the operation: the server can
+     * have stored the offset. Every later committing poll and offset store or delete of the partition on this client
+     * then fails with {@link org.apache.iggy.exception.IggyErrorCode#PARTITION_LANE_BLOCKED} naming that operation,
+     * also after a reconnect, until {@code abandonOperation} releases it. {@link CommitPolicy.Auto} is refused with
      * {@link org.apache.iggy.exception.IggyErrorCode#INVALID_CONFIGURATION}: a one-shot poll has nothing to count. A
      * {@link org.apache.iggy.client.async.reader.PartitionReader} counts and stores it.
      *

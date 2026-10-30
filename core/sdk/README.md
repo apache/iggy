@@ -350,9 +350,10 @@ async fn read_many(
 
 ### Poll options
 
-`PollOptions` sets the limits of one request:
+`PollOptions` sets the limits of one request, a poll of one partition or a fetch of several. A fetch
+applies `count`, `min_count` and `max_bytes` to all of its partitions together:
 
-- `count`: the most messages in one batch. Default 1000.
+- `count`: the most messages in one request. Default 1000.
 - `max_wait`: how long the server waits for `min_count` messages, at most 600 s. Default zero,
   which answers at once.
 - `min_count`: from 1 to `count`. Default 1.
@@ -407,10 +408,13 @@ picks one of three policies:
   older generation, and also happen on close, on shutdown and before a rebalance takes a partition
   away. `AutoCommit::default()` stores every 10,000 messages or 5 s after processing. A one-shot
   `poll_messages` refuses `Auto` with `InvalidConfiguration`, because it has nothing to count.
-- `OnRead`: the server stores the offset of the last message of each reply, as part of the reply.
-  This gives at-most-once delivery. The reader does not prefetch. When the application asks for a
-  batch and none is queued, the reader sends new reads. `commit` and `mark` return
-  `InvalidCommand`. An encryptor is refused, because the server stores the offset before the
+- `OnRead`: the server stores the offset of the last message of each read as part of the read, in
+  one round trip. While the primary stays up a message is delivered at most once. A failover before
+  the store replicates can deliver the last batch again. The reader reads only when the application
+  asks for a batch and none is queued, and then fills its prefetch budget: one fetch per primary that
+  may wait for messages, and the partitions with messages left behind spread over the other slots. A
+  `seek` to an offset above 0 first stores the offset before it, so a restart resumes at the new
+  position. `commit` and `mark` return `InvalidCommand`. An encryptor is refused, because the server stores the offset before the
   client decrypts the batch. `close()` and `shutdown()` move the offset back to the last delivered
   message.
 
@@ -445,13 +449,14 @@ from `next` returns `TransientNotCommitted` (57) instead.
 
 With `OnRead`, the server can still store the offset after the client gives up. So a read with
 `OnRead` whose reply is lost, or reports an unknown outcome, returns `FetchProgressUncertain(op)`
-(14010). A dropped call that already sent its request leaves the same state. The SDK never sends an
+(14010), never `TransientNotCommitted` (57). A `disconnect()` while such a read waits leaves it the
+same way. A dropped call that already sent its request leaves the same state. The SDK never sends an
 `OnRead` read again. The partition stays blocked on this client, also after a reconnect or a new
 sign-in: later progress calls on it return `PartitionLaneBlocked(partition_id, op)` (14009). Offset
-reads still work during this block, but they do not prove the outcome. A dropped call over TCP or
-WebSocket sends a cancel, and the server answers it once: `TransientNotAccepted` (58) when nothing
-was stored, or the normal reply when the store won. That answer proves the outcome and lifts the
-block. QUIC cancels by closing the stream of the read, which loses that answer.
+reads still work during this block, but they do not prove the outcome. A dropped call over TCP, QUIC
+or WebSocket sends a cancel (on QUIC on a stream of its own) and keeps the stream or slot of its
+reply, and the server answers it once: `TransientNotAccepted` (58) when nothing was stored, or the
+normal reply when the store won. That answer proves the outcome and lifts the block.
 
 `client.abandon_operation(op)` frees the partition and accepts the unknown outcome. It does not stop
 the old server request or prove what it stored. `resolve_operation(op)` cannot prove the outcome of
@@ -459,14 +464,20 @@ a read, and it returns `FetchProgressUncertain` without I/O. `PartitionLaneBlock
 offset store or delete with an unknown outcome, and `resolve_operation` can prove that one (see
 [mutation recovery](#mutation-recovery)).
 
-`PartitionReader` and `IggyConsumer` recover by themselves. After a delivery they read each partition
-from its stored offset, so the server refuses the commit of an older read once the offset moved. For
-a lost reply they abandon the operation, and when the next read starts past the last delivered
-message, they read the skipped messages again by offset without a commit and hand them over first.
-Only a rebalance that moves the partition to another member before that loses those messages.
-`close()` and `shutdown()` wait for each `OnRead` read in flight until its deadline, then move the
-offset of a partition with a lost reply back to its last delivered message. A partition that another
-call on the client blocked stops until `abandon_operation(op)` and a `seek`.
+`PartitionReader` and `IggyConsumer` recover by themselves. After a delivery they read each
+partition from its stored offset, so the server refuses the commit of an older read once the offset
+moved. For a lost reply they abandon the operation, and while they hold it, a next read that starts
+past the last delivered message makes them read the skipped messages again by offset without a
+commit and hand them over first. A later read that stores from the expected offset ends that,
+because its store fences out the lost read. A read that starts past the last delivered message
+without a lost read goes on from there: the application or another session stored that offset. Under
+`OnRead`, `IggyConsumer::store_offset` also moves the reader to the message after the stored offset.
+Only a rebalance that moves the partition to another member before the catch-up loses messages that
+a lost read stored. `close()` and `shutdown()` cancel each `OnRead` read in flight on TCP, QUIC and
+WebSocket and take its one reply, which tells what the server stored, so a read that waits on the
+server ends at once. Over HTTP, which has no cancel, they wait until the deadline of the read. Then
+they move the offset of a partition with a lost reply back to its last delivered message. A
+partition that another call on the client blocked stops until `abandon_operation(op)` and a `seek`.
 
 ### Timeouts, admission and prefetch
 
@@ -494,11 +505,15 @@ stalls.
 ### Routing and lanes
 
 On TCP, QUIC and WebSocket, the reader groups its partitions by primary and sends one fetch (command
-109) for each group. After a rebalance, a partition that stays with the member continues after its
-last delivered message. A newly assigned partition starts at the start of the builder: `.start(...)`
-on the reader, `.polling_strategy(...)` on the consumer. In a new session, a group member starts
-every partition there again. `last` and `timestamp` starts read with single polls until the first
-message.
+109) for each group. The partitions whose last read ended before their newest message are spread
+over more fetches of the group, one per free slot of the budget, so each slot reads a full
+`max_bytes`. The quiet partitions of a group share one waiting fetch. With `OnRead` the reader
+starts them only when the application waits for a batch, and the waiting fetch of a group runs to
+its end before the next one starts. After a
+rebalance, a partition that stays with the member continues after its last delivered message. A
+newly assigned partition starts at the start of the builder: `.start(...)` on the reader,
+`.polling_strategy(...)` on the consumer. In a new session, a group member starts every partition
+there again. `last` and `timestamp` starts read with single polls until the first message.
 
 On these transports, progress calls of one partition share a progress lane: polls and fetches from
 `next` or with `OnRead`, and offset reads, stores and deletes. Sends use a separate mutation lane,
@@ -515,10 +530,13 @@ safe.
 
 HTTP has no fetch. A standalone reader on HTTP keeps one waiting poll for each partition, within its
 budget. HTTP cannot join a consumer group, so a group reader or consumer, and a poll as a group,
-return `FeatureUnavailable`. `resolve_operation` is unavailable too. HTTP keys the block of a lost
-`OnRead` read by the partition id alone. So the block stops progress calls on that partition id in
-every stream and topic of the client. HTTP does not order the progress calls of one partition, so a
-call that started before a block can overlap the lost read.
+return `FeatureUnavailable`. `resolve_operation` is unavailable too. HTTP has no partition id
+independent of the spelling of the stream and the topic, so it keys the block of a lost `OnRead`
+read by the stream and the topic as the read spelled them and the partition id, and by the partition
+incarnation when the read carried its context. A later call meets the block in the same spelling, or
+in any spelling when it carries a context of the same incarnation. A call that names the partition
+by another spelling and carries no context does not see the block. The progress polls of one
+partition in one spelling run one at a time, so a poll sees the block that the poll before it left.
 
 HTTP polls use `GET /streams/{stream}/topics/{topic}/messages/deferred` with the poll fields plus
 `wait_us`, `min_count`, `max_bytes` and `request_timeout_us`. A poll that commits (`OnRead`) is a

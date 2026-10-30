@@ -20,8 +20,8 @@ using Apache.Iggy.Vsr;
 namespace Apache.Iggy.Exceptions;
 
 /// <summary>
-///     An uncertain committing fetch blocks the partition until the application abandons its operation. Polls,
-///     committing fetches, offset stores and deletes of the partition fail with this until then.
+///     A committing poll or fetch with an unknown outcome blocks the partition until the application abandons its
+///     operation. Polls, committing fetches, offset stores and deletes of the partition fail with this until then.
 /// </summary>
 public sealed class VsrPartitionLaneBlockedException(ulong operationId, uint partitionId)
     : VsrLaneBlockedException(operationId, partitionId,

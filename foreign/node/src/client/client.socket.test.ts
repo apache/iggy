@@ -70,7 +70,7 @@ import {
 import { Operation, operationForCode } from '../wire/vsr/operation.js';
 import { VsrEvictionError } from '../wire/vsr/reply.js';
 import { IggyConnection, type LinkAttempt } from './client.connection.js';
-import { OPERATION_TIMEOUT_MS } from './client.operation.js';
+import { FETCH_PROGRESS_UNCERTAIN, OPERATION_TIMEOUT_MS, PARTITION_LANE_BLOCKED } from './client.operation.js';
 import {
   CommandResponseStream, FetchProgressUncertainError, LaneBlockedError, NotConnectedError, OperationNotRetainedError,
   OperationUncertainError
@@ -1142,16 +1142,22 @@ describe('primary auto-commit polling', () => {
           assert.equal(countCommand(cluster.primary, COMMAND_CODE.BindSession), 2);
           return;
         }
-        await assert.rejects(first, (error: unknown) =>
-          failure === 'stale session'
-            ? error instanceof ResponseError && error.errorCode === STALE_CLIENT
-            : error instanceof ResponseError && error.errorCode === TRANSIENT_NOT_COMMITTED);
+        let operationId!: bigint;
+        await assert.rejects(first, (error: unknown) => {
+          assert.ok(error instanceof FetchProgressUncertainError, String(error));
+          operationId = error.operationId!;
+          return true;
+        });
         assert.equal(polls, 1);
         assert.equal(resets, 0);
         if (failure === 'partial reply') {
           await cluster.client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0));
           assert.equal(polls, 1);
         } else {
+          await assert.rejects(cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload()), (error: unknown) =>
+            error instanceof LaneBlockedError && error.errorCode === PARTITION_LANE_BLOCKED &&
+            error.operationId === operationId);
+          cluster.client.abandonOperation(operationId);
           await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
           assert.equal(polls, 2);
           assert.equal(countCommand(cluster.primary, COMMAND_CODE.BindSession),
@@ -1417,8 +1423,7 @@ describe('primary auto-commit polling', () => {
     });
     try {
       const polling = cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
-      const failed = assert.rejects(polling, (error: unknown) =>
-        error instanceof ResponseError && error.errorCode === TRANSIENT_NOT_COMMITTED);
+      const failed = assert.rejects(polling, FetchProgressUncertainError);
       await pendingAdmission;
       await cluster.client.sendCommand(LOGOUT.code, LOGOUT.serialize());
       await failed;
@@ -3792,7 +3797,8 @@ describe('native mutation recovery', () => {
 
   for (const strategy of ['auto-commit', 'Next'] as const) {
     for (const failure of ['not committed', 'cancel'] as const) {
-      it(`ends uncertain ${strategy} polls with 57 after ${failure} and releases the transient lane`, async () => {
+      const code = strategy === 'auto-commit' ? FETCH_PROGRESS_UNCERTAIN : TRANSIENT_NOT_COMMITTED;
+      it(`ends uncertain ${strategy} polls with ${code} after ${failure} and releases the transient lane`, async () => {
         const cancel = new AbortController();
         let polls = 0;
         const cluster = await startPollCluster((frame, socket) => {
@@ -3808,8 +3814,7 @@ describe('native mutation recovery', () => {
           autocommit: strategy === 'auto-commit' });
         try {
           await assert.rejects(cluster.client.sendCommand(COMMAND_CODE.PollMessages, body,
-            { signal: cancel.signal }), (error: unknown) => error instanceof ResponseError &&
-            error.errorCode === TRANSIENT_NOT_COMMITTED);
+            { signal: cancel.signal }), (error: unknown) => (error as { errorCode?: number }).errorCode === code);
           assert.equal(polls, 1);
           await cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
         } finally { await cluster.close(); }
@@ -6638,6 +6643,11 @@ describe('deferred requests', () => {
           await waitUntil(() => framesWith(cluster.primary, COMMAND_CODE.CancelDeferredRequest).length === 1);
           await cluster.client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0));
           assert.equal(settled, false, 'a committing request keeps its reply slot after the cancel');
+          const storing = cluster.client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload);
+          void storing.catch(() => undefined);
+          await cluster.client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0));
+          assert.equal(framesOf(cluster.primary, Operation.StoreConsumerOffset).length, 0,
+            'the partition takes no store until the cancelled request has its reply');
           if (cancelWins) {
             parked!.socket.write(replyFrame(parked!.frame, Operation.NonReplicated, Buffer.alloc(0),
               TRANSIENT_NOT_ACCEPTED));
@@ -6647,6 +6657,7 @@ describe('deferred requests', () => {
             parked!.socket.write(replyFrame(parked!.frame, Operation.NonReplicated, reply));
             assert.deepEqual((await pending).data, reply);
           }
+          await storing;
           await cluster.client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload);
         } finally {
           await cluster.close();
@@ -6976,7 +6987,7 @@ describe('deferred requests', () => {
     } finally { await cluster.close(); }
   });
 
-  for (const status of [TRANSIENT_NOT_COMMITTED, REQUEST_ALREADY_APPLIED, TRANSIENT_NOT_ACCEPTED, INVALID_COMMAND, 11001]) {
+  for (const status of [TRANSIENT_NOT_COMMITTED, REQUEST_ALREADY_APPLIED, INVALID_COMMAND, 11001]) {
     it(`preserves healthy committing sections and retains only the section with unknown status ${status}`, async () => {
       const cluster = await startPollCluster((frame, socket) => {
         if (frame[REQUEST_OFFSET.operation] === Operation.StoreConsumerOffset) socket.write(provedReply(frame));
@@ -7006,6 +7017,24 @@ describe('deferred requests', () => {
     });
   }
 
+  for (const status of [TRANSIENT_NOT_ACCEPTED, 3024]) {
+    it(`keeps a committing section refused with status ${status} a plain refusal that blocks nothing`, async () => {
+      const cluster = await startPollCluster((frame, socket) => {
+        if (frame[REQUEST_OFFSET.operation] === Operation.StoreConsumerOffset) socket.write(provedReply(frame));
+        else if (codeOf(frame) === COMMAND_CODE.FetchMessages)
+          socket.write(replyFrame(frame, Operation.NonReplicated, fetchReplyBody({ partitionId: 3, status })));
+        else return false;
+        return true;
+      });
+      try {
+        const [refused] = FETCH_MESSAGES.deserialize(await cluster.client.sendCommand(COMMAND_CODE.FetchMessages,
+          fetchBody(offsetTargets(3), { autocommit: true })));
+        assert.deepEqual([refused.status, refused.progressError], [status, undefined]);
+        await cluster.client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload);
+      } finally { await cluster.close(); }
+    });
+  }
+
   for (const malformed of ['missing table', 'duplicate target', 'foreign target'] as const) {
     it(`retains every committing target for a malformed reply with ${malformed}`, async () => {
       const cluster = await startPollCluster((frame, socket) => {
@@ -7024,6 +7053,45 @@ describe('deferred requests', () => {
           error.errorCode === 14009);
       } finally { await cluster.close(); }
     });
+  }
+
+  for (const loss of ['link loss', 'not committed'] as const) {
+    it(`ends a committing poll with unknown outcome after ${loss} with 14010 and blocks its partition until abandoned`,
+      async () => {
+        let polls = 0;
+        const cluster = await startPollCluster((frame, socket) => {
+          if (frame[REQUEST_OFFSET.operation] === Operation.StoreConsumerOffset) socket.write(provedReply(frame));
+          else if (codeOf(frame) !== COMMAND_CODE.PollMessagesDeferred) return false;
+          else if (++polls > 1) socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.from('polled')));
+          else if (loss === 'link loss') socket.destroy();
+          else socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), TRANSIENT_NOT_COMMITTED));
+          return true;
+        }, undefined, 'TCP', { reconnect: { enabled: true, interval: 10, maxRetries: 5 } });
+        const committing = POLL_MESSAGES.serialize({
+          streamId: 1, topicId: 2, consumer: { kind: ConsumerKind.Single, id: 1 }, partitionId: 3,
+          pollingStrategy: PollingStrategy.Next, count: 1, autocommit: true, deferred: {}
+        });
+        try {
+          let operationId!: bigint;
+          await assert.rejects(cluster.client.sendCommand(COMMAND_CODE.PollMessagesDeferred, committing),
+            (error: unknown) => {
+              assert.ok(error instanceof FetchProgressUncertainError, String(error));
+              operationId = error.operationId!;
+              return true;
+            });
+          await cluster.client.authenticate({ username: 'iggy', password: 'iggy' });
+          for (const [code, body] of [[COMMAND_CODE.PollMessagesDeferred, committing],
+            [COMMAND_CODE.StoreOffset, storeOffsetPayload], [COMMAND_CODE.DeleteConsumerOffset, deleteOffsetPayload]] as const)
+            await assert.rejects(cluster.client.sendCommand(code, body), (error: unknown) =>
+              error instanceof LaneBlockedError && error.errorCode === PARTITION_LANE_BLOCKED &&
+              error.operationId === operationId && error.partitionId === 3);
+          assert.equal(polls, 1);
+          cluster.client.abandonOperation(operationId);
+          await cluster.client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload);
+          await cluster.client.sendCommand(COMMAND_CODE.PollMessagesDeferred, committing);
+          assert.equal(polls, 2);
+        } finally { await cluster.close(); }
+      });
   }
 
   it('preserves committing recovery across sign-in, resolves aliases, and separates new incarnations', async () => {

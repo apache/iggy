@@ -478,8 +478,9 @@ class CommitPolicy:
     @typing.final
     class OnRead(CommitPolicy):
         r"""
-        The server stores the offset of the last message of each read as part of the read: one
-        round trip, at most once.
+        The server stores the offset of the last message of each read as part of the read, in one
+        round trip. While the primary stays up a message is delivered at most once. A failover
+        before the store replicates can deliver the last batch again.
         """
 
         __match_args__ = ()
@@ -2370,15 +2371,18 @@ class IggyConsumer:
     ) -> collections.abc.Awaitable[None]:
         r"""
         Sets the next read position of a partition and drops the rest of its batch that the
-        consumer yields from. It stores no offset, and it resumes a stopped partition.
+        consumer yields from. With `CommitPolicy.OnRead()`, a seek to an offset above 0 first
+        stores the offset before it, so a restart resumes at the new position. Every other seek
+        stores nothing. It resumes a stopped partition.
         `start` is a new strategy or a continuation of the same partition, such as
         `ReadError.skip`. After `HistoryUnavailable` (87), the partition reads nothing until
         this call picks a start in its new history.
         Raises `IggyError` with `InvalidCommand` (3) for a partition that the consumer does not
         read and for a continuation of another partition, `PendingOperationError` under
         `CommitPolicy.OnRead()` while a read of the partition has an unknown outcome
-        (abandon its operation first), and `RuntimeError` while `consume_messages()` runs, also
-        from its callback: seek after the run ends.
+        (abandon its operation first), the errors of the offset store with `OnRead`, and
+        `RuntimeError` while `consume_messages()` runs, also from its callback: seek after the
+        run ends.
         """
     def delete_offset(
         self, partition_id: builtins.int | None
@@ -3858,8 +3862,11 @@ class PartitionReader:
     - The `commit` of its `PollOptions` says when offsets are stored. With `CommitPolicy.Manual()`
       and `CommitPolicy.Auto`, `commit()` stores the offset of a checkpoint. `CommitPolicy.Auto`
       also stores the latest counted position by itself, and `mark()` counts one. With
-      `CommitPolicy.OnRead()`, the server stores the offset of each reply, and `close()` moves the
-      offset back to the last delivered message.
+      `CommitPolicy.OnRead()`, the server stores the offset of each reply, the reader reads only
+      while `next()` waits and then fills its budget (one fetch per primary that may wait for
+      messages, the partitions with messages left behind spread over the other slots), a `seek()`
+      to an offset stores the offset before it, and `close()` moves the offset back to the last
+      delivered message.
     - The reader stays usable after a `ReadError` and retries by itself. `HistoryUnavailable`
       (87) stops its partition until `seek()`. With `OnRead`, an unknown outcome stops its
       partition until `IggyClient.abandon_operation()` and `seek()`.
@@ -3899,18 +3906,21 @@ class PartitionReader:
         self, partition_id: builtins.int, start: PollingStrategy
     ) -> collections.abc.Awaitable[None]:
         r"""
-        Sets the next read position of a partition and starts a new generation of it. It stores
-        no offset, drops the queued batches of the partition and ignores its late replies. It
-        also resumes a stopped partition. `start` is a new strategy or a continuation of the same
-        partition, such as `ReadError.skip`.
+        Sets the next read position of a partition and starts a new generation of it. It drops
+        the queued batches of the partition, ignores its late replies and resumes a stopped
+        partition. `start` is a new strategy or a continuation of the same partition, such as
+        `ReadError.skip`.
 
-        With `CommitPolicy.OnRead()`, the new position waits for the end of the committing
-        read in flight.
+        With `CommitPolicy.OnRead()`, a seek to an offset above 0 first stores the offset before
+        it, under the history of a continuation or else of the last delivered message, so a
+        restart resumes at the new position. A failed store fails the seek and nothing moves.
+        Every other seek stores nothing. The new position waits for the end of the committing
+        read in flight, whose reply the new generation drops.
 
         Raises `IggyError` with `InvalidCommand` (3) for a partition that the reader does not read
         and for a continuation of another partition, `PendingOperationError` with `OnRead` while
-        a read of the partition has an unknown outcome (abandon its operation first), and
-        `RuntimeError` after `close()`.
+        a read of the partition has an unknown outcome (abandon its operation first), the errors
+        of the offset store with `OnRead`, and `RuntimeError` after `close()`.
         """
     def partitions(self) -> collections.abc.Awaitable[list[builtins.int]]:
         r"""
@@ -4063,12 +4073,16 @@ class Permissions:
 @typing.final
 class PollOptions:
     r"""
-    The limits of each read and when its offsets are stored.
+    The limits of each read and when its offsets are stored. A read is a poll of one partition,
+    or a fetch that a partition reader sends for several partitions of one primary. A fetch
+    applies `count`, `min_count` and `max_bytes` to all of its partitions together. A reader that
+    commits nothing runs several fetches at once, each within these limits, for partitions with
+    more messages waiting.
     """
     @property
     def count(self) -> builtins.int:
         r"""
-        The most messages in one batch.
+        The most messages in one read, over all partitions of a fetch.
         """
     @property
     def max_wait(self) -> datetime.timedelta:
@@ -4083,7 +4097,7 @@ class PollOptions:
     @property
     def max_bytes(self) -> builtins.int:
         r"""
-        The most bytes in one batch.
+        The most bytes in one read, over all partitions of a fetch.
         """
     @property
     def commit(self) -> CommitPolicy:
@@ -4103,12 +4117,14 @@ class PollOptions:
         Constructs the options of a read.
 
         Args:
-            count: The most messages in one batch.
+            count: The most messages in one read, over all partitions of a fetch.
             max_wait: How long the server waits for `min_count` messages, at most 600 seconds.
                 `None` answers at once. A reader or a consumer with no wait on an idle topic
                 polls in a busy loop.
-            min_count: The messages to wait for, from 1 to `count`.
-            max_bytes: The most bytes in one batch. A message larger than that comes alone.
+            min_count: The messages to wait for, from 1 to `count`, over all partitions of a
+                fetch.
+            max_bytes: The most bytes in one read, over all partitions of a fetch. A message
+                larger than that comes alone.
             commit: When offsets are stored. `None` stores none, as `CommitPolicy.Manual()`.
 
         The limits are checked when the options are used, and a fault raises `IggyError`.

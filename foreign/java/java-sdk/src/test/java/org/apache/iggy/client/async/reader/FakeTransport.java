@@ -37,6 +37,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -54,13 +55,23 @@ final class FakeTransport implements ReaderTransport {
     private static final int MESSAGE_HEADER_SIZE = 48;
 
     final Map<Long, Long> starts = new ConcurrentHashMap<>();
+    // The answer to the probe of a partition, instead of one message at its start.
+    final Map<Long, FetchedMessages> probes = new ConcurrentHashMap<>();
     final List<Long> deleted = new CopyOnWriteArrayList<>();
     final BlockingQueue<Read> reads = new LinkedBlockingQueue<>();
     final List<Store> stores = new CopyOnWriteArrayList<>();
+    final BlockingQueue<RuntimeException> storeFailures = new LinkedBlockingQueue<>();
     final List<Long> abandoned = new CopyOnWriteArrayList<>();
     final List<List<Long>> groupings = new CopyOnWriteArrayList<>();
     final BlockingQueue<CompletableFuture<Optional<ConsumerGroupAssignment>>> assignments = new LinkedBlockingQueue<>();
     final List<String> membership = new CopyOnWriteArrayList<>();
+    volatile RuntimeException leaveFailure;
+    // The reply to the cancel of the committing reads, which the test holds back.
+    volatile CompletableFuture<Void> settled = CompletableFuture.completedFuture(null);
+    // The operations of the committing reads whose outcome stayed unknown after the cancel.
+    final List<Long> lost = new CopyOnWriteArrayList<>();
+    // Every abandon and store in order.
+    final List<String> events = new CopyOnWriteArrayList<>();
     private final boolean group;
     private volatile Function<List<Long>, List<List<Long>>> grouper = partitions -> List.of(partitions);
 
@@ -114,7 +125,9 @@ final class FakeTransport implements ReaderTransport {
                 && targets.size() == 1
                 && targets.values().iterator().next().kind() == org.apache.iggy.message.PollingKind.Next) {
             long partition = targets.keySet().iterator().next();
-            return CompletableFuture.completedFuture(List.of(section(partition, starts.getOrDefault(partition, 0L))));
+            FetchedMessages probe = probes.get(partition);
+            return CompletableFuture.completedFuture(
+                    List.of(probe != null ? probe : section(partition, starts.getOrDefault(partition, 0L))));
         }
         Read read = new Read(
                 Collections.unmodifiableMap(new LinkedHashMap<>(targets)), count, commit, new CompletableFuture<>());
@@ -124,7 +137,12 @@ final class FakeTransport implements ReaderTransport {
 
     @Override
     public CompletableFuture<Void> store(long partition, BigInteger offset, PartitionContext context) {
+        RuntimeException failure = storeFailures.poll();
+        if (failure != null) {
+            return CompletableFuture.failedFuture(failure);
+        }
         stores.add(new Store(partition, offset.longValue()));
+        events.add("store " + partition + " " + offset);
         return CompletableFuture.completedFuture(null);
     }
 
@@ -155,7 +173,8 @@ final class FakeTransport implements ReaderTransport {
     @Override
     public CompletableFuture<Void> leave() {
         membership.add("leave");
-        return CompletableFuture.completedFuture(null);
+        RuntimeException failure = leaveFailure;
+        return failure == null ? CompletableFuture.completedFuture(null) : CompletableFuture.failedFuture(failure);
     }
 
     @Override
@@ -164,21 +183,79 @@ final class FakeTransport implements ReaderTransport {
         return CompletableFuture.completedFuture(null);
     }
 
+    @Override
+    public CompletableFuture<Void> cancelledReadsSettled() {
+        return settled;
+    }
+
+    @Override
+    public CompletableFuture<Void> abandonLost() {
+        lost.forEach(operation -> {
+            abandoned.add(operation);
+            events.add("abandon " + operation);
+        });
+        return CompletableFuture.completedFuture(null);
+    }
+
     /** An OK section of {@code partition} with one message at each of {@code offsets}. */
     static FetchedMessages section(long partition, long... offsets) {
+        return section(partition, CONTEXT, offsets);
+    }
+
+    /** An OK section of {@code partition} in the history of {@code context}. */
+    static FetchedMessages section(long partition, PartitionContext context, long... offsets) {
         ByteBuf records = Unpooled.buffer();
         for (long offset : offsets) {
             records.writeBytes(record(offset));
         }
         long next = offsets[offsets.length - 1] + 1;
+        // The read ends at the head of the partition, its last offset.
         return new FetchedMessages(
                 partition,
                 FetchedMessages.STATUS_OK,
-                BigInteger.valueOf(next),
+                BigInteger.valueOf(next - 1),
                 offsets.length,
-                CONTEXT,
+                context,
                 BigInteger.valueOf(next),
                 ByteBufUtil.getBytes(records));
+    }
+
+    /** An OK section of {@code partition} that ends before the head {@code head} of the partition. */
+    static FetchedMessages backlogged(long partition, long head, long... offsets) {
+        FetchedMessages section = section(partition, offsets);
+        return new FetchedMessages(
+                partition,
+                section.status(),
+                BigInteger.valueOf(head),
+                section.count(),
+                section.context(),
+                section.nextOffset(),
+                section.records());
+    }
+
+    /** An OK section of {@code partition} without messages, whose next offset is {@code next}. */
+    static FetchedMessages empty(long partition, long next) {
+        return new FetchedMessages(
+                partition,
+                FetchedMessages.STATUS_OK,
+                BigInteger.valueOf(Math.max(0, next - 1)),
+                0,
+                CONTEXT,
+                BigInteger.valueOf(next),
+                new byte[0]);
+    }
+
+    /** A section of a committing read of {@code partition} whose outcome {@code operation} left unknown. */
+    static FetchedMessages lost(long partition, long operation) {
+        return new FetchedMessages(
+                partition,
+                11001,
+                BigInteger.ZERO,
+                0,
+                CONTEXT,
+                BigInteger.ZERO,
+                new byte[0],
+                OptionalLong.of(operation));
     }
 
     /** A section of {@code partition} that refuses its read with {@code status}. */

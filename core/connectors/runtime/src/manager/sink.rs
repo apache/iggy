@@ -25,9 +25,12 @@ use crate::plugin_instance::PluginInstanceGuard;
 use crate::sink;
 use dashmap::DashMap;
 use dlopen2::wrapper::Container;
+use futures::future::join_all;
+use iggy_common::{BINARY_OPERATION_TIMEOUT, IggyDuration, PollOptions};
 use iggy_connector_sdk::api::{ConnectorError, ConnectorStatus};
 use std::collections::HashMap;
 use std::fmt;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -142,13 +145,14 @@ impl SinkManager {
             .map(|e| e.value().clone())
             .ok_or_else(|| RuntimeError::SinkNotFound(key.to_string()))?;
 
-        let (shutdown_tx, task_handles, plugin_id, container) = {
+        let (shutdown_tx, task_handles, plugin_id, container, budget) = {
             let mut details = details.lock().await;
             (
                 details.shutdown_tx.take(),
                 std::mem::take(&mut details.task_handles),
                 details.info.id,
                 details.container.clone(),
+                close_budget(&details.config),
             )
         };
 
@@ -156,9 +160,8 @@ impl SinkManager {
             let _ = tx.send(());
         }
 
-        for handle in task_handles {
-            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-        }
+        // The consumers close at the same time, so one budget covers them all.
+        let _ = tokio::time::timeout(budget, join_all(task_handles)).await;
 
         if let Some(container) = &container {
             info!("Closing sink connector with ID: {plugin_id} for plugin: {key}");
@@ -325,10 +328,32 @@ impl fmt::Debug for SinkDetails {
     }
 }
 
+/// The longest that the consumers of `config` take to close: a committing read, which the close
+/// cancels but a server that stopped answering ends only at its deadline, then the rewind of the
+/// offsets and the leave of the group, each within one operation timeout. A stream without
+/// `max_wait` waits one second.
+fn close_budget(config: &SinkConfig) -> Duration {
+    let read = config
+        .streams
+        .iter()
+        .map(|stream| {
+            stream
+                .max_wait
+                .as_deref()
+                .and_then(|max_wait| IggyDuration::from_str(max_wait).ok())
+                .unwrap_or(IggyDuration::ONE_SECOND)
+        })
+        .map(|max_wait| PollOptions::wait(max_wait).request_timeout().get_duration())
+        .max()
+        .unwrap_or_default();
+    read.saturating_add(BINARY_OPERATION_TIMEOUT.saturating_mul(2))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::configs::connectors::SinkConfig;
+    use crate::configs::connectors::{SinkConfig, StreamConsumerConfig};
+    use std::sync::atomic::AtomicBool;
 
     fn create_test_sink_info(key: &str, id: u32) -> SinkInfo {
         SinkInfo {
@@ -522,6 +547,39 @@ mod tests {
         assert_eq!(details.info.status, ConnectorStatus::Stopped);
         assert!(details.shutdown_tx.is_none());
         assert!(details.task_handles.is_empty());
+    }
+
+    /// A consumer close can wait for a committing read and then store its offset and leave its
+    /// group, which takes longer than a fixed few seconds.
+    #[tokio::test]
+    async fn given_a_consumer_close_longer_than_a_few_seconds_when_stopping_should_wait_for_it() {
+        const CLOSE: Duration = Duration::from_secs(6);
+        let metrics = Arc::new(Metrics::init());
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(());
+        let closed = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn({
+            let closed = Arc::clone(&closed);
+            async move {
+                let _ = shutdown_rx.changed().await;
+                tokio::time::sleep(CLOSE).await;
+                closed.store(true, Ordering::SeqCst);
+            }
+        });
+        let mut details = create_test_sink_details("es", 1);
+        details.config.streams = vec![StreamConsumerConfig {
+            max_wait: Some("10s".to_owned()),
+            ..Default::default()
+        }];
+        details.shutdown_tx = Some(shutdown_tx);
+        details.task_handles = vec![handle];
+        let manager = SinkManager::new(vec![details]);
+
+        manager.stop_connector("es", &metrics).await.unwrap();
+
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "the stop waits for the close of its consumer"
+        );
     }
 
     #[tokio::test]

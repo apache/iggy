@@ -127,6 +127,12 @@ impl ffi::ErrorInfo {
         let operation = error.operation_id();
         self.has_operation_id = operation.is_some();
         self.operation_id = operation.unwrap_or_default();
+        let blocked_partition = match error {
+            IggyError::PartitionLaneBlocked(partition_id, _) => Some(*partition_id),
+            _ => None,
+        };
+        self.has_blocked_partition_id = blocked_partition.is_some();
+        self.blocked_partition_id = blocked_partition.unwrap_or_default();
     }
 }
 
@@ -1882,6 +1888,27 @@ mod tests {
         info.record(&IggyError::InvalidCommand);
         assert!(!info.has_operation_id);
         assert_eq!(info.operation_id, 0);
+    }
+
+    #[test]
+    fn given_a_lost_committing_poll_when_recording_should_keep_its_operation_and_blocked_partition()
+    {
+        let mut info = ffi::ErrorInfo::default();
+        info.record(&IggyError::PartitionLaneBlocked(u32::MAX, u64::MAX));
+        assert_eq!(info.code, IggyError::PartitionLaneBlocked(0, 0).as_code());
+        assert_eq!(info.kind, "partition_lane_blocked");
+        assert!(info.has_operation_id);
+        assert_eq!(info.operation_id, u64::MAX);
+        assert!(info.has_blocked_partition_id);
+        assert_eq!(info.blocked_partition_id, u32::MAX);
+
+        info.record(&IggyError::FetchProgressUncertain(u64::MAX));
+        assert_eq!(info.code, IggyError::FetchProgressUncertain(0).as_code());
+        assert_eq!(info.kind, "fetch_progress_uncertain");
+        assert!(info.has_operation_id);
+        assert_eq!(info.operation_id, u64::MAX);
+        assert!(!info.has_blocked_partition_id);
+        assert_eq!(info.blocked_partition_id, 0);
     }
 
     #[test]

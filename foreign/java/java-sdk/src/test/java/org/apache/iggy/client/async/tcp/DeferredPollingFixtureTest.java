@@ -25,6 +25,7 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.CommitErrorScope;
 import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.FetchedMessages;
 import org.apache.iggy.message.Message;
@@ -49,6 +50,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 
@@ -184,6 +186,22 @@ class DeferredPollingFixtureTest {
                             .forEach(FetchedMessages::decode))
                     .as(vector.get("case").asString())
                     .isInstanceOf(RuntimeException.class);
+        }
+    }
+
+    /** A committing poll or fetch that fails with a certain status stored nothing, any other leaves it unknown. */
+    @Test
+    void shouldClassifyEachCommitOutcomeOfTheFixture() {
+        JsonNode outcomes = ROOT.get("commit_outcomes");
+
+        for (CommitErrorScope scope : CommitErrorScope.values()) {
+            JsonNode listed = outcomes.get(scope.name().toLowerCase(Locale.ROOT));
+            assertThat(listed).as(scope.name()).isNotEmpty();
+            for (JsonNode outcome : listed) {
+                assertThat(scope.provesNothingStored(outcome.get("status").asLong()))
+                        .as("%s %s %s", scope, outcome.get("status"), outcome.get("error"))
+                        .isEqualTo(outcome.get("certain").asBoolean());
+            }
         }
     }
 

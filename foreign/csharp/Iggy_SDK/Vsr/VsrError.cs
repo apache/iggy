@@ -60,6 +60,7 @@ internal static class VsrError
     internal const int INVALID_TOPIC_NAME = 2014;
     internal const int CONSUMER_GROUP_MEMBER_NOT_FOUND = 5006;
     internal const int PARTITION_NOT_FOUND = 3007;
+    internal const int TOO_MANY_CONSUMER_OFFSETS = 3024;
     internal const int CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009;
     internal const int TOO_MANY_CONSUMER_GROUPS = 5010;
     internal const int INVALID_MESSAGES_COUNT = 4009;

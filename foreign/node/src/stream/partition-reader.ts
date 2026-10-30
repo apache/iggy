@@ -28,7 +28,9 @@ import { storePosition } from '../wire/offset/position.command.js';
 import { joinGroup } from '../wire/consumer-group/join-group.command.js';
 import { leaveGroup } from '../wire/consumer-group/leave-group.command.js';
 import { syncGroup } from '../wire/consumer-group/sync-group.command.js';
-import { decodeFetchSection, fetchMessages, fetchSectionError } from '../wire/message/fetch-messages.command.js';
+import {
+  decodeFetchSection, fetchMessages, fetchSectionError, type FetchMessagesSection
+} from '../wire/message/fetch-messages.command.js';
 import { pollMessages } from '../wire/message/poll-messages.command.js';
 import { PollingStrategy, PollingStrategyKind, type PollMessagesResponse } from '../wire/message/poll.utils.js';
 import { CommitPolicy, pollOptions, wireOptions, type PollOptions } from '../wire/message/poll-options.js';
@@ -51,10 +53,13 @@ const CONSUMER_OFFSET_NOT_FOUND = 3021;
 const CONSUMER_GROUP_MEMBER_NOT_FOUND = 5006;
 const CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009;
 const FETCH_PROGRESS_UNCERTAIN = 14010;
-const LASTING_REFUSALS = new Set([UNAUTHORIZED, 5, INVALID_COMMAND, PARTITION_NOT_FOUND, 1009, 1010, 2010, 2011]);
+const LASTING_REFUSALS = new Set([UNAUTHORIZED, 5, INVALID_COMMAND, PARTITION_NOT_FOUND, 1009, 1010, 2010, 2011,
+  CONSUMER_GROUP_PARTITION_NOT_OWNED]);
 const TRANSIENT_REFUSALS = new Set([TRANSIENT_NOT_COMMITTED, TRANSIENT_NOT_ACCEPTED, NOT_PRIMARY,
   DEFERRED_POLL_CAPACITY_EXCEEDED, LIFECYCLE_BUSY]);
 const MAX_LASTING_REFUSALS = 6;
+/** The most reads in flight that a reader adds to spread a backlog, the deferred request limit of a Rust SDK consumer. */
+const MAX_READS_IN_FLIGHT = 16;
 const GROUP_REFRESH_MS = 1_000;
 /** The wait of a reader read when the caller sets none. */
 export const DEFAULT_READER_MAX_WAIT_MS = 5_000;
@@ -123,7 +128,7 @@ export class ReadError extends Error {
   readonly record?: Buffer;
 }
 
-type Target = { partition: number, sent: PollingStrategy, generation: number };
+type Target = { partition: number, sent: PollingStrategy, generation: number, state?: PartitionState };
 
 type Entry = {
   partitionId?: number,
@@ -145,16 +150,21 @@ type PartitionState = {
   lasting: number,
   catchUpUntil?: bigint,
   catchUpBatch?: PollMessagesResponse,
-  pendingStart?: Continuation,
+  /** A committing read of the partition lost its reply, so a later read that skips offsets skipped what it stored. */
+  lost?: boolean,
+  /** The start of a committing read whose store nobody took yet, so the close moves the offset back before it. */
+  pendingStart?: PollingStrategy & { context?: PartitionContext },
   aloneUntil?: bigint,
-  delivered?: { offset: bigint, context: PartitionContext },
-  handed?: { offset: bigint, context: PartitionContext },
+  delivered?: { offset: bigint, context?: PartitionContext },
+  handed?: { offset: bigint, context?: PartitionContext },
   firstHanded?: bigint,
   counted?: Checkpoint,
   countedSinceStore: number,
   stored?: Checkpoint,
   /** The last read of the partition found no message. */
   atEnd?: boolean,
+  /** Its last fetch section ended before the head of the partition, so its next read returns at once. */
+  backlogged?: boolean,
   /** When a read last served messages of the partition, so served partitions go last in the next fetch. */
   servedAt: number
 };
@@ -163,6 +173,10 @@ let readers = 0;
 
 const sameHistory = (sent: PartitionContext, served: PartitionContext): boolean =>
   sent.incarnation === served.incarnation && sent.ownerGeneration === served.ownerGeneration;
+
+/** An empty partition reports current offset 0, so only a section with messages or a later head shows a backlog. */
+const endsBeforeHead = ({ nextOffset, currentOffset, messagesCount }: FetchMessagesSection): boolean =>
+  nextOffset <= currentOffset && (messagesCount > 0 || currentOffset > 0n);
 
 const errorCode = (error: unknown): number | undefined =>
   error instanceof FetchProgressUncertainError ? FETCH_PROGRESS_UNCERTAIN
@@ -197,6 +211,7 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
   private readonly sought = new Map<number, number>();
   private readonly queue: Entry[] = [];
   private readonly reads = new Set<Promise<void>>();
+  private readonly seeks = new Set<Promise<void>>();
   private readonly lifetime = new AbortController();
   private readonly closing = new Promise<void>((resolve) =>
     this.lifetime.signal.addEventListener('abort', () => resolve(), { once: true }));
@@ -211,6 +226,7 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
   private storeDue = resolvers();
   private demand = false;
   private closed = false;
+  private closure?: Promise<void>;
   private resync = false;
   private queuedMessages = 0;
   private queuedBytes = 0;
@@ -346,28 +362,49 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
 
   /**
    * Sets the next read position of a partition and starts a new generation of
-   * it. It stores no offset, drops the queued batches of the partition, ignores
-   * its late replies and resumes a stopped partition. With
-   * `CommitPolicy.OnRead` it waits for the read of the partition in flight.
-   * Fails with 3 for a partition the reader does not read and for a
-   * continuation of another partition.
+   * it: it drops the queued batches of the partition, ignores its late replies
+   * and resumes a stopped partition. With `CommitPolicy.OnRead` a seek to an
+   * offset above 0 first stores the offset before it on the server, so a
+   * restart resumes at the sought offset, a refused store fails the seek and
+   * moves nothing, and the seek then waits for the read of the partition in
+   * flight, whose batch it drops. Every other seek stores nothing. Fails with 3
+   * for a partition the reader does not read and for a continuation of another
+   * partition.
    */
-  async seek(partitionId: number, start: PollingStrategy): Promise<void> {
+  seek(partitionId: number, start: PollingStrategy): Promise<void> {
+    const seek = this.seekOnce(partitionId, start);
+    this.seeks.add(seek);
+    return seek.finally(() => this.seeks.delete(seek));
+  }
+
+  private async seekOnce(partitionId: number, start: PollingStrategy): Promise<void> {
     validatePartition(start, partitionId, 0);
     const state = this.stateOf(partitionId);
-    if (this.options.commit.kind === 'onRead' && state.inFlight) await state.idle;
+    const onRead = this.options.commit.kind === 'onRead';
     const position = start.kind === PollingStrategyKind.First ? PollingStrategy.Offset(0n) : start;
+    let stored: { offset: bigint, context?: PartitionContext } | undefined;
+    if (onRead && position.kind === PollingStrategyKind.Offset && position.value > 0n) {
+      stored = { offset: position.value - 1n,
+        context: (start as Partial<Continuation>).context ?? state.handed?.context };
+      await storeOffset(this.getClient)({ ...this.target(), partitionId, ...stored });
+    }
+    const raced = state.inFlight ||
+      this.queue.some((entry) => entry.partitionId === partitionId && entry.batch !== undefined);
+    if (onRead && state.inFlight) await state.idle;
     Object.assign(state, {
       position: continuation(partitionId, position.kind, position.value,
         (start as Partial<Continuation>).context ?? (state.position as Partial<Continuation>).context!),
       generation: ++this.generations,
-      stopped: undefined, lasting: 0, retryAt: 0, catchUpUntil: undefined, catchUpBatch: undefined, pendingStart: undefined, aloneUntil: undefined,
+      stopped: undefined, lasting: 0, retryAt: 0, catchUpUntil: undefined, catchUpBatch: undefined, lost: undefined,
+      pendingStart: undefined, aloneUntil: undefined, backlogged: undefined,
       counted: undefined, countedSinceStore: 0, stored: undefined,
-      delivered: undefined, handed: undefined, firstHanded: undefined
+      delivered: stored, handed: stored, firstHanded: undefined
     });
     this.sought.set(partitionId, state.generation);
     if ((start as Partial<Continuation>).context === undefined && (state.position as Partial<Continuation>).context === undefined)
       state.position = position;
+    // A committing read that the server admitted after the store moved the offset on, so the close puts it back.
+    if (raced && stored) state.pendingStart = state.position;
     for (let index = this.queue.length - 1; index >= 0; index -= 1) {
       if (this.queue[index].partitionId === partitionId) {
         this.release(this.queue[index]);
@@ -385,9 +422,14 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
    * undelivered messages back to its last delivered message, or before the
    * first undelivered one when it delivered nothing and started at Next. A
    * group reader then leaves its group. Rejects with the first failed store.
+   * A later call waits for the first one and ends as it does.
    */
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    this.closure ??= this.closeOnce();
+    return this.closure;
+  }
+
+  private async closeOnce(): Promise<void> {
     this.countUncounted();
     this.closed = true;
     this.lifetime.abort();
@@ -395,6 +437,8 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
     this.storeDue.resolve();
     await this.worker;
     await Promise.allSettled([...this.reads]);
+    // A seek whose store waited for a read still applies, so the rewind sees its position and not the dropped batch.
+    await Promise.allSettled([...this.seeks]);
     await this.committer;
     let failure: unknown;
     if (this.options.commit.kind === 'onRead') failure = await this.rewind();
@@ -678,11 +722,52 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
         ? await client.readinessGroups(this.request.streamId, this.request.topicId, grouped,
           { signal: this.lifetime.signal })
         : grouped.map((partition) => [partition]);
-      for (const group of groups) this.startFetch(group);
+      for (const targets of this.spread(groups)) this.startFetch(targets);
     }
     let wait = Number.isFinite(nextRetry) ? Math.max(1, nextRetry - Date.now()) : undefined;
     if (this.group && (wait === undefined || wait > GROUP_REFRESH_MS)) wait = GROUP_REFRESH_MS;
     return wait;
+  }
+
+  /**
+   * The fetches of a turn. Each group reads its idle partitions in one fetch.
+   * The free read slots left then spread the backlogged partitions of the
+   * groups over more fetches, each with the full limits. Their reads return at
+   * once, so each slot keeps a full read in flight, as a poll of each partition
+   * would, and no more reads park. Under `CommitPolicy.OnRead` a turn starts
+   * only while `next()` waits, and a partition is in one committing read at a
+   * time, so the fetches of a turn commit disjoint partitions.
+   */
+  private spread(groups: number[][]): number[][] {
+    const plans = groups.map((group) => {
+      const backlogged = group.filter((partition) => this.states.get(partition)?.backlogged);
+      const quiet = group.filter((partition) => !this.states.get(partition)?.backlogged);
+      return { quiet, backlogged, extra: 0, room: backlogged.length - (quiet.length === 0 ? 1 : 0) };
+    });
+    let extra = this.freeSlots() - plans.length;
+    while (extra > 0 && plans.some(({ extra: taken, room }) => taken < room)) {
+      for (const plan of plans) {
+        if (extra === 0) break;
+        if (plan.extra < plan.room) {
+          plan.extra += 1;
+          extra -= 1;
+        }
+      }
+    }
+    return plans.flatMap(({ quiet, backlogged, extra: taken }) => {
+      const chunks = taken + (quiet.length === 0 ? 1 : 0);
+      const spread: number[][] = Array.from({ length: chunks }, () => []);
+      const waiting = [...quiet];
+      backlogged.forEach((partition, index) => (chunks > 0 ? spread[index % chunks] : waiting).push(partition));
+      return waiting.length > 0 ? [waiting, ...spread] : spread;
+    });
+  }
+
+  /** The full reads that the read ahead budget has room for besides those in flight. */
+  private freeSlots(): number {
+    const room = Math.min(Math.floor((this.prefetchMessages - this.queuedMessages) / this.options.count),
+      Math.floor((this.prefetchBytes - this.queuedBytes) / this.options.maxBytes), MAX_READS_IN_FLIGHT);
+    return room - this.reads.size;
   }
 
   private claim(partition: number): Target | undefined {
@@ -692,7 +777,7 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
     const idle = resolvers();
     state.idle = idle.promise;
     state.settleIdle = idle.resolve;
-    return { partition, sent: state.position, generation: state.generation };
+    return { partition, sent: state.position, generation: state.generation, state };
   }
 
   private track(read: Promise<void>): void {
@@ -765,7 +850,7 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
           section.context, error);
         continue;
       }
-      this.complete(target, polled, section.nextOffset);
+      this.complete(target, polled, section.nextOffset, endsBeforeHead(section));
     }
   }
 
@@ -775,8 +860,14 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
   }
 
   private async poll(target: Target, commits: boolean, single: boolean, check = false): Promise<void> {
+    const until = this.states.get(target.partition)?.catchUpUntil;
+    const catchUp = !commits && !single && !check && until !== undefined &&
+      target.sent.kind === PollingStrategyKind.Offset && target.sent.value <= until;
     const options = { ...this.options, commit: commits ? CommitPolicy.OnRead : CommitPolicy.Manual,
-      ...(single || check ? { count: 1, minCount: 1 } : {}) };
+      ...(single || check ? { count: 1, minCount: 1 } : {}),
+      // The server stored these messages already, so the read takes them and no more.
+      ...(catchUp ? { count: Math.min(Number(until - target.sent.value + 1n), this.options.count), minCount: 1,
+        maxWait: 0 } : {}) };
     let polled: PolledBatch;
     try {
       polled = await pollMessages(this.getClient)({
@@ -793,6 +884,7 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
           (target.sent as Partial<Continuation>).context, error);
         return;
       }
+      await this.abandonLost(error);
       this.refuse(target, error);
       return;
     }
@@ -825,13 +917,14 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
   /** Ends the read of a target. Undefined when the generation of its partition moved on. */
   private settle(target: Target): PartitionState | undefined {
     const state = this.states.get(target.partition);
-    if (!state) return undefined;
+    // A partition assigned again has a new state, whose read this is not.
+    if (!state || state !== target.state) return undefined;
     state.inFlight = false;
     state.settleIdle?.();
     return state.generation === target.generation ? state : undefined;
   }
 
-  private complete(target: Target, polled: PollMessagesResponse, nextOffset?: bigint): void {
+  private complete(target: Target, polled: PollMessagesResponse, nextOffset?: bigint, backlogged?: boolean): void {
     const state = this.settle(target);
     const onRead = this.options.commit.kind === 'onRead';
     if (!state) {
@@ -840,17 +933,23 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
         this.enqueueBatch(target, polledBatch(polled, target.sent, { reader: this.id, generation: target.generation }));
       return;
     }
+    if (backlogged !== undefined) state.backlogged = backlogged;
     if (polled.messages.length > 0) state.pendingStart = undefined;
     state.lasting = 0;
     state.atEnd = polled.messages.length === 0;
     if (polled.messages.length === 0) {
       const context = (target.sent as Partial<Continuation>).context;
       const next = nextOffset ?? polled.currentOffset + 1n;
-      if (onRead && target.sent.kind === PollingStrategyKind.Next && context &&
+      if (onRead && state.lost && target.sent.kind === PollingStrategyKind.Next && context &&
           sameHistory(context, polled.context) && next > target.sent.value) {
         state.position = continuation(target.partition, PollingStrategyKind.Offset, target.sent.value, polled.context);
         state.catchUpUntil = next - 1n;
         state.atEnd = false;
+        return;
+      }
+      // A catch-up that finds nothing by offset cannot read the lost range again.
+      if (state.catchUpUntil !== undefined && target.sent.kind === PollingStrategyKind.Offset) {
+        this.giveUpGap(target.partition, state);
         return;
       }
       this.notify();
@@ -862,7 +961,7 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
     const first = polled.messages[0].headers.offset;
     const last = polled.messages.at(-1)!.headers.offset;
     const sentContext = (target.sent as Partial<Continuation>).context;
-    if (onRead && target.sent.kind === PollingStrategyKind.Next && sentContext &&
+    if (onRead && state.lost && target.sent.kind === PollingStrategyKind.Next && sentContext &&
         first > target.sent.value && sameHistory(sentContext, polled.context)) {
       // A lost read stored these offsets without handing them over.
       state.position = continuation(target.partition, PollingStrategyKind.Offset, target.sent.value, polled.context);
@@ -870,6 +969,8 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
       state.catchUpBatch = polled;
       return;
     }
+    // This store fences out any older lost read, so a later jump is a store of the application or another session.
+    if (onRead && target.sent.kind === PollingStrategyKind.Next) state.lost = undefined;
     const next = last + 1n;
     const byOffset = (state.aloneUntil !== undefined && next < state.aloneUntil) ||
       (state.catchUpUntil !== undefined && next <= state.catchUpUntil);
@@ -923,6 +1024,7 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
   private refuse(target: Target, error: unknown): void {
     const state = this.settle(target);
     if (!state || this.closed) return;
+    state.backlogged = undefined;
     const now = Date.now();
     const code = errorCode(error);
     const report = (stop: boolean) => {
@@ -931,13 +1033,16 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
       this.enqueue({ partitionId: target.partition, generation: target.generation, error: readError,
         messages: 0, bytes: 0 });
     };
-    if (isAbort(error)) return;
-    if (code === FETCH_PROGRESS_UNCERTAIN || error instanceof OperationUncertainError || code === NOT_PRIMARY) return;
-    if (code === CONSUMER_GROUP_PARTITION_NOT_OWNED) {
-      this.resync = true;
+    if (isAbort(error) || code === NOT_PRIMARY) return;
+    if (code === FETCH_PROGRESS_UNCERTAIN || error instanceof OperationUncertainError) {
+      state.lost = true;
       state.retryAt = now + this.retryInterval;
-      this.giveUpGap(target.partition, state);
       return;
+    }
+    if (code === CONSUMER_GROUP_PARTITION_NOT_OWNED) {
+      // The owner generation of the position is gone, so the next read starts again under a new route.
+      this.giveUpGap(target.partition, state);
+      Object.assign(state, { position: this.start, lost: undefined, pendingStart: undefined, aloneUntil: undefined });
     }
     if (code === HISTORY_UNAVAILABLE && (target.sent as Partial<Continuation>).context === undefined) {
       state.retryAt = now + this.retryInterval;
@@ -973,7 +1078,7 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
     if (state.position.value < first) {
       const lost = responseError(COMMAND_CODE.PollMessagesDeferred, FETCH_PROGRESS_UNCERTAIN,
         `a lost read stored offsets ${state.position.value} to ${first - 1n} of partition ${partitionId}, ` +
-        'and the partition moved before they were read again');
+        'which the reader could not read again');
       this.enqueue({ partitionId, generation: state.generation,
         error: new ReadError(partitionId, lost), messages: 0, bytes: 0 });
     }

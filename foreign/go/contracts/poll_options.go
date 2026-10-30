@@ -44,7 +44,9 @@ const (
 	// CommitManual stores nothing. The application commits checkpoints.
 	CommitManual CommitPolicyKind = iota
 	// CommitOnRead makes the server store the offset of the last message of
-	// each read as part of the read: one round trip, at most once.
+	// each read as part of the read, in one round trip. While the primary
+	// stays up a message is delivered at most once. A failover before the
+	// store replicates can deliver the last batch again.
 	CommitOnRead
 	// CommitAuto makes the client store the latest counted position, at
 	// least once with CommitAfterProcessing. A poll of one partition refuses
@@ -126,8 +128,9 @@ func AutoCommitPolicy(auto AutoCommit) CommitPolicy {
 	return CommitPolicy{Kind: CommitAuto, Auto: auto}
 }
 
-// PollOptions are the limits of one poll of one partition and who stores its
-// offsets. MaxWait zero answers at once. A first message larger than MaxBytes
+// PollOptions are the limits of one read and who stores its offsets: a poll
+// of one partition, or a fetch of partitions of one primary that a reader
+// sends, whose sections share the limits. MaxWait zero answers at once. A first message larger than MaxBytes
 // comes alone in the reply, up to MaxRecordSize.
 type PollOptions struct {
 	// Count is the most messages of one batch, at least 1.

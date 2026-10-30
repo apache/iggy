@@ -74,6 +74,7 @@ under the License.
     <ItemGroup>
         <InternalsVisibleTo Include="Apache.Iggy.Tests" />
         <InternalsVisibleTo Include="Apache.Iggy.Tests.Integrations" />
+        <InternalsVisibleTo Include="Apache.Iggy.Tests.BDD" />
     </ItemGroup>
 
 </Project>

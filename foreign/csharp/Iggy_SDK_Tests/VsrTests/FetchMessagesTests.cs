@@ -492,7 +492,6 @@ public sealed class FetchMessagesTests
     [Theory]
     [InlineData(VsrError.TRANSIENT_NOT_COMMITTED)]
     [InlineData(VsrError.REQUEST_ALREADY_APPLIED)]
-    [InlineData(VsrError.TRANSIENT_NOT_ACCEPTED)]
     [InlineData(VsrError.INVALID_COMMAND)]
     [InlineData(11001)]
     public async Task given_partial_committing_uncertainty_when_fetching_should_preserve_healthy_sections_and_block_only_uncertain_targets(

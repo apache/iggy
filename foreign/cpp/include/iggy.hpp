@@ -117,8 +117,10 @@ decltype(auto) RethrowAsIggyException(Operation &&operation);
  * C++ or bridge-local argument errors leave Code() empty and Kind() empty,
  * except the metadata change calls, which report invalid input with the kind
  * each one documents.
- * OperationId() is present only for operation_uncertain, lane_blocked, and
- * operation_not_retained errors and preserves the full unsigned 64-bit ID.
+ * OperationId() is present only for operation_uncertain, lane_blocked,
+ * operation_not_retained, partition_lane_blocked and fetch_progress_uncertain
+ * errors and preserves the full unsigned 64-bit ID. BlockedPartitionId() is
+ * present only for partition_lane_blocked.
  */
 class IggyException : public std::runtime_error {
   public:
@@ -131,6 +133,7 @@ class IggyException : public std::runtime_error {
         return kind_ ? *kind_ : kNoKind;
     }
     [[nodiscard]] std::optional<std::uint64_t> OperationId() const noexcept { return operation_id_; }
+    [[nodiscard]] std::optional<std::uint32_t> BlockedPartitionId() const noexcept { return blocked_partition_id_; }
 
   private:
     IggyException(const std::string &message, const ffi::ErrorInfo &error) : std::runtime_error(message) {
@@ -140,6 +143,9 @@ class IggyException : public std::runtime_error {
         }
         if (error.has_operation_id) {
             operation_id_ = error.operation_id;
+        }
+        if (error.has_blocked_partition_id) {
+            blocked_partition_id_ = error.blocked_partition_id;
         }
     }
 
@@ -151,6 +157,7 @@ class IggyException : public std::runtime_error {
     // Shared, so that copying the exception cannot throw.
     std::shared_ptr<const std::string> kind_;
     std::optional<std::uint64_t> operation_id_;
+    std::optional<std::uint32_t> blocked_partition_id_;
 };
 
 namespace detail {
@@ -5683,7 +5690,11 @@ class PollingStrategy final {
 enum class CommitPolicy : std::uint8_t {
     /** Nothing is stored. The caller commits checkpoints. The default. */
     Manual = 0,
-    /** The server stores the offset of the last message of each read as part of the read. */
+    /**
+     * The server stores the offset of the last message of each read as part of the read, in one round trip. While the
+     * primary stays up a message is delivered at most once. A failover before the store replicates can deliver the
+     * last batch again.
+     */
     OnRead = 1,
     /** A reader stores the latest counted position, as its AutoCommit says. A one-shot poll refuses it. */
     Auto = 2,
@@ -5778,7 +5789,13 @@ class AutoCommit final {
 };
 
 /**
- * @brief The limits of one read of one partition and when its offsets are stored.
+ * @brief The limits of one read and when its offsets are stored.
+ *
+ * A read is a poll of one partition, or a fetch that a PartitionReader sends for
+ * several partitions of one primary. A fetch applies Count(), MinCount() and
+ * MaxBytes() to all of its partitions together. A reader that commits nothing
+ * runs several fetches at once, each within these limits, for partitions with
+ * more messages waiting.
  *
  * A default PollOptions reads up to 1000 messages and 1 MiB, answers at once,
  * waits for at least one message and stores nothing. A reader or a poll checks
@@ -5790,7 +5807,7 @@ class PollOptions final {
 
     [[nodiscard]] std::uint32_t Count() const noexcept { return options_.count; }
 
-    /** @param count Most messages in one batch. */
+    /** @param count Most messages in one read, over all partitions of a fetch. */
     PollOptions &SetCount(std::uint32_t count) noexcept {
         options_.count = count;
         return *this;
@@ -5809,7 +5826,7 @@ class PollOptions final {
 
     [[nodiscard]] std::uint32_t MinCount() const noexcept { return options_.min_count; }
 
-    /** @param min_count Messages to wait for, from 1 to Count(). */
+    /** @param min_count Messages to wait for, from 1 to Count(), over all partitions of a fetch. */
     PollOptions &SetMinCount(std::uint32_t min_count) noexcept {
         options_.min_count = min_count;
         return *this;
@@ -5817,7 +5834,8 @@ class PollOptions final {
 
     [[nodiscard]] std::uint32_t MaxBytes() const noexcept { return options_.max_bytes; }
 
-    /** @param max_bytes Most bytes in one batch. A first message larger than that comes alone. */
+    /** @param max_bytes Most bytes in one read, over all partitions of a fetch. A first message larger than that comes
+     * alone. */
     PollOptions &SetMaxBytes(std::uint32_t max_bytes) noexcept {
         options_.max_bytes = max_bytes;
         return *this;
@@ -6112,7 +6130,15 @@ class PartitionReader final {
      */
     void Mark(const Checkpoint &checkpoint);
 
-    /** @brief Sets the next read position of a partition and drops its queued batches. It stores no offset. */
+    /**
+     * @brief Sets the next read position of a partition and drops its queued batches.
+     *
+     * With CommitPolicy::OnRead, a seek to an offset above 0 first stores the
+     * offset before it, so a restart resumes at the new position. Every other
+     * seek stores nothing.
+     * @throws IggyException for a partition this reader does not read, and for
+     *         a failed store, after which nothing moved.
+     */
     void Seek(std::uint32_t partition_id, const PollingStrategy &start);
 
     /** @brief Moves a partition to a continuation of one of its batches, or past a message with ReadException::Skip().
@@ -6259,7 +6285,15 @@ class IggyConsumer final {
      */
     void Mark(const Checkpoint &checkpoint);
 
-    /** @brief Sets the next read position of a partition. It stores no offset. */
+    /**
+     * @brief Sets the next read position of a partition.
+     *
+     * With CommitPolicy::OnRead, a seek to an offset above 0 first stores the
+     * offset before it, so a restart resumes at the new position. Every other
+     * seek stores nothing.
+     * @throws IggyException for a partition this consumer does not read, and
+     *         for a failed store, after which nothing moved.
+     */
     void Seek(std::uint32_t partition_id, const PollingStrategy &start);
     void Seek(std::uint32_t partition_id, const Continuation &continuation);
 
@@ -6479,8 +6513,11 @@ class IggyBlockingClient final {
      * changes the client state to disconnected, but keeps the client reusable.
      * Call Connect() to establish a new connection. Configured automatic login
      * is applied when reconnecting.
-     * For binary transports, disconnect also drops all retained operations
+     * For binary transports, disconnect also drops all retained mutations
      * without settling their outcomes. They cannot be resolved after reconnecting.
+     * A poll with CommitPolicy::OnRead that waits fails with
+     * fetch_progress_uncertain, and its partition stays blocked across the
+     * reconnect until AbandonOperation().
      *
      * @note The disconnect holds until the next Connect(): requests fail and
      *       nothing reconnects the client in the background, even with
@@ -7345,7 +7382,7 @@ class IggyBlockingClient final {
      * An operation_uncertain result keeps the original frame and lane for a later
      * resolve. operation_not_retained does not prove that the original command
      * failed or make resending it safe. Disconnect() and session reset drop
-     * retained operations without settling them or allowing later recovery.
+     * retained mutations without settling them or allowing later recovery.
      * The client keeps the proved outcomes of its last max_operations replays,
      * also across a session reset. A later resolve of a proved operation returns
      * the same outcome without a request.

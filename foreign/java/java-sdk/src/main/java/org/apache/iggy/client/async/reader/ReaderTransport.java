@@ -74,4 +74,10 @@ public interface ReaderTransport {
 
     /** Lets the client forget a read whose outcome the reader repairs by itself. */
     CompletableFuture<Void> abandon(long operationId);
+
+    /** Completes once no committing read of the client that was cancelled after its send still waits for its reply. */
+    CompletableFuture<Void> cancelledReadsSettled();
+
+    /** Abandons the committing reads of this transport whose outcome stayed unknown, so their partitions take stores. */
+    CompletableFuture<Void> abandonLost();
 }

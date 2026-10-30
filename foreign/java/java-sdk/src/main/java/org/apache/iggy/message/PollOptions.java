@@ -27,7 +27,8 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * The limits of one poll of one partition, and who stores its offsets.
+ * The limits of one read, and who stores its offsets. A read is a poll of one partition, or a fetch of several
+ * partitions of one primary that a reader sends, whose sections share the limits.
  *
  * @param count    most messages in one batch, 1 to 4294967295, default 1000
  * @param maxWait  zero answers at once, at most {@link DeferredPollOptions#MAX_WAIT}, default zero

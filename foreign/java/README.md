@@ -436,19 +436,29 @@ PolledMessages polled = client.messages()
     .get();
 ```
 
-`CommitPolicy.manual()` (the default) stores nothing, and the application stores a `Checkpoint` with `storeConsumerPosition`. `CommitPolicy.onRead()` makes the server store the offset of the last message it returns as part of the read: one round trip, at most once. A poll of one partition refuses `CommitPolicy.auto(...)` with `INVALID_CONFIGURATION` (2), because it has nothing to count. A reader and a consumer accept it.
+`CommitPolicy.manual()` (the default) stores nothing, and the application stores a `Checkpoint` with `storeConsumerPosition`. `CommitPolicy.onRead()` makes the server store the offset of the last message it returns as part of the read, in one round trip. While the primary stays up a message is delivered at most once. A failover before the store replicates can deliver the last batch again.
+
+A poll of one partition refuses `CommitPolicy.auto(...)` with `INVALID_CONFIGURATION` (2), because it has nothing to count. A reader and a consumer accept it.
 
 A first message larger than `maxBytes` comes alone in the reply, up to the largest message size. A `Last` poll of more than one message whose first message is larger than `maxBytes` fails with `INVALID_SIZE_BYTES` (80). Every reply limit of the client holds the largest message, and `maxVsrFrameSize` refuses a frame that cannot.
 
 `PolledMessages.checkpoint()` and `checkpointAt(index)` name the position after a message, with the history of its partition. `continuation()` is the strategy after the last message, bound to its partition, and a poll or a seek of another partition refuses it with `INVALID_COMMAND` (3).
 
-A cancel of a poll with `OnRead` stops it on the server and waits for its reply: the server answers `TRANSIENT_NOT_ACCEPTED` (58) when the cancel won and nothing was stored, or with what it read and stored. Until then the offset store and the next progress poll of the partition wait, so they never race the late store.
+A cancel of a poll with `OnRead` stops it on the server and waits for its reply: the server answers `TRANSIENT_NOT_ACCEPTED` (58) when the cancel won and nothing was stored, or with what it read and stored. Until then the poll blocks its partition: an offset store or another progress poll of the partition fails at once with `PARTITION_LANE_BLOCKED` (14009) naming the poll, and the reply lifts the block. Without a reply by the deadline of the poll, its outcome is unknown, as below.
 
-If the reply of such a poll is lost, the server can have stored its offset, so the call fails with `FETCH_PROGRESS_UNCERTAIN` (14010), and the next `Next` poll starts after what the lost read stored. A close waits for the reply of each pending poll with `OnRead`, and the blocking client does not stop such a poll on an interrupt.
+If the reply of such a poll is lost, or the server refuses it with a status that does not prove that nothing was stored, the server can have stored its offset. The call fails with `FETCH_PROGRESS_UNCERTAIN` (14010), whose `getOperationId()` names the poll.
+
+Every later poll with `OnRead` and every offset store or delete of that partition on this client then fails with `PARTITION_LANE_BLOCKED` (14009) naming the same operation, also after a reconnect and a new sign-in, until `abandonOperation(id)` releases it. The next `Next` poll then starts after what the lost poll stored. A close waits for the reply of each pending poll with `OnRead`, and the blocking client does not stop such a poll on an interrupt.
+
+`disconnect()` drops the connections without waiting, so a poll with `OnRead` that still waits fails with 14010, and `connect()` with a sign-in continues the client.
 
 ### Partition reader
 
-A `PartitionReader` reads the partitions of a topic in batches. It groups the partitions by their primary and reads each group with one request, puts the partitions that a read served last at the end of the next one so a busy partition does not starve the others, regroups after a primary moves, keeps a prefetch, and stays usable after an error. A standalone consumer names its partitions. A consumer group reader joins its group, follows its assignment, and leaves the group on close.
+A `PartitionReader` reads the partitions of a topic in batches. It groups the partitions by their primary and reads each group with one request, puts the partitions that a read served last at the end of the next one so a busy partition does not starve the others, regroups after a primary moves, keeps a prefetch, and stays usable after an error.
+
+The prefetch slots that the groups leave free spread the partitions whose last read ended before their head over reads of their own, each with the whole `count` and `maxBytes`, while the quiet partitions of a group share the one read that may wait. Under `OnRead` every read stores, so a group holds one read that may wait at a time, and a waiting `next()` fills the free slots with the backlogged partitions, one committing read per partition.
+
+A standalone consumer names its partitions. A consumer group reader joins its group, follows its assignment, and leaves the group on close.
 
 ```java
 PartitionReader reader = client.reader(streamId, topicId, Consumer.of(1L))
@@ -465,7 +475,11 @@ reader.closeAsync().get();
 `next()` returns the next batch of one partition, never empty, in offset order within one generation of the partition: from its first read, from each `seek`, and from each new assignment. A cancelled `next()` leaves its batch in the reader. The default wait of a reader is 5 s. The futures of a reader complete on its own thread, so a callback must not block.
 
 - `Manual`: `commit(checkpoint)` stores the offset of a delivered checkpoint, forward only within a generation.
-- `OnRead`: the server stores each read, and the reader reads only for a waiting `next()`. After a read whose reply was lost, the next read starts after what the lost read stored, and the reader reads those messages again without a store and delivers them first. A partition that leaves the assignment still hands over the reads that the server stored for it. `closeAsync()` moves the offset of each partition with undelivered batches back to its last delivered message. `commit` and `mark` are refused.
+- `OnRead`: the server stores each read, and the reader reads only for a waiting `next()`. After a read whose reply was lost, the reader abandons it and reads that partition again after its retry interval. That read starts after what the lost read stored, so the reader reads those messages again without a store and delivers them first.
+
+  Only a lost read explains a read that starts past the expected offset: without one, the application or another session stored that offset, and the reader delivers from there. A partition that leaves the assignment still hands over the reads that the server stored for it. `closeAsync()` moves the offset of each partition with undelivered batches, or with a lost or undecoded read, back to its last delivered message.
+
+  `seek` to an offset above 0 stores the offset before it, which moves the server position, and the other strategies store nothing. A seek that waits for a read in flight applies after that read ends, also when `closeAsync()` starts first: its store then runs before the rewind, and a refused store fails the seek, or the close. `commit` and `mark` are refused.
 - `Auto(AutoCommit)`: the reader counts each batch as `CommitAfter` says (`PROCESSING` at the next `next()` or the close, `DELIVERY` when `next()` returns it, `MARKED` on `mark(checkpoint)`), and stores the latest counted position at its `interval`, on its `every` event, before a rebalance takes a partition away, and on close. `AutoCommit.defaults()` stores every 10,000 messages or 5 s after processing.
 
 A `ReadException` names its partition. `HISTORY_UNAVAILABLE` (87) stops a partition until `seek` when its position came from an earlier read of a history that is gone.
@@ -476,7 +490,7 @@ The exception carries the bytes the server served for it: `record()` is the mess
 
 `offset()` is the offset of the message when its frame decoded and a later check failed, empty for malformed framing.
 
-A refusal that a retry does not change is retried with a doubling wait and stops its partition after six in a row.
+A refusal that a retry does not change is retried with a doubling wait and stops its partition after six in a row. A partition that another member owns (`CONSUMER_GROUP_PARTITION_NOT_OWNED`, 5009) drops its position and resolves its start again after the next assignment, and six such refusals in a row are reported once without a stop.
 
 The blocking client builds a blocking reader with `org.apache.iggy.client.blocking.reader.PartitionReader.build(client.reader(...))`, whose `next(Duration)` returns empty at its timeout and keeps the batch for the next call.
 
@@ -500,7 +514,11 @@ The TCP client multiplexes deferred polls with other requests on its shared conn
 
 A server capacity refusal (`DEFERRED_POLL_CAPACITY_EXCEEDED`) backs off, and if it lasts until the deadline, the call fails with `DEFERRED_POLL_CAPACITY_EXCEEDED` (90). A deferred poll of a consumer group must name its partition, a reader reads the whole assignment.
 
-The HTTP client sends a poll that stores its offset as a `POST` to `.../messages/deferred`, which no proxy or client library resends, and a poll that stores nothing as a `GET`. If the answer of a storing poll is lost after the request went out, the call fails with `FETCH_PROGRESS_UNCERTAIN` (14010). A timeout or transport failure before the request can be sent reports `TRANSIENT_NOT_ACCEPTED` (58).
+The HTTP client sends a poll that stores its offset as a `POST` to `.../messages/deferred`, which no proxy or client library resends, and a poll that stores nothing as a `GET`. If the answer of a storing poll is lost after the request went out, or the server refuses it with a status that does not prove that nothing was stored, the call fails with `FETCH_PROGRESS_UNCERTAIN` (14010), whose `getOperationId()` names the poll on this client.
+
+Every later poll that stores its offset or starts at it (`Next`), and every offset store, of that partition on the client then fails with `PARTITION_LANE_BLOCKED` (14009) naming the same operation, until `abandonOperation(id)` releases it. The block covers the stream and topic as the call spells them, and any spelling of a call that carries the context of the same partition incarnation, for every consumer.
+
+A call that spells the stream or topic differently and carries no context does not see it. Such polls of one partition take turns, so a second one waits for the first and then meets its block. A timeout or transport failure before the request can be sent reports `TRANSIENT_NOT_ACCEPTED` (58).
 
 The HTTP client accepts a plain consumer only, because the server refuses a consumer group over HTTP. An interrupt of the calling thread ends a poll that stores nothing, also while it waits for the reply headers.
 
@@ -508,13 +526,7 @@ The HTTP client accepts a plain consumer only, because the server refuses a cons
 
 The SDK's custom exception types inherit from `IggyException`. When you join a failed future, the cause can come back inside a `CompletionException`. The HTTP client's `close()` method declares `IOException`. Handle these two boundaries as well as the specific SDK errors.
 
-The HTTP client treats 503 `relay_refused` through Apache HttpClient's ordinary
-429/503 retry strategy. That behavior does not provide retained-operation
-recovery over HTTP. A `pollMessages` with auto-commit is a write despite its
-GET, because the server stores the offset when it reads. The client never
-sends it again after a transport failure, and once it may have reached the
-server, a transport failure or a refused resend after a 503 fails it with
-`TRANSIENT_NOT_COMMITTED` (57).
+The HTTP client treats 503 `relay_refused` through Apache HttpClient's ordinary 429/503 retry strategy. That behavior does not provide retained-operation recovery over HTTP. A `pollMessages` with auto-commit is the `POST` above, which the client never sends again after the request may have reached the server, and whose unknown outcome fails with `FETCH_PROGRESS_UNCERTAIN` (14010).
 
 On a multi-node cluster, an HTTP call often reaches a node that is not the
 partition primary. For message sends, polls and consumer offset calls, that

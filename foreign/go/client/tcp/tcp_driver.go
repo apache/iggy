@@ -49,6 +49,9 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 		return nil, err
 	}
 	budget := newDeferredBudget(code, frame)
+	// A poll or fetch that stores its offset blocks the progress of its
+	// partitions until the caller abandons it when its outcome is unknown.
+	committing := storesOnRead(code, frame[vsr.HeaderSize:])
 	slotTaken := false
 	defer func() {
 		if slotTaken {
@@ -151,7 +154,7 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 				return nil, err
 			}
 		}
-		if budget != nil && budget.commits {
+		if committing {
 			if err := ticket.reserveFetch(); err != nil {
 				return nil, err
 			}
@@ -190,8 +193,7 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 			operation = &pendingOperation{id: vsr.StampedRequestID(frozen), code: code, query: append([]byte(nil), query...), fence: fence, frame: newOperationFrame(frozen, nil), replica: replica}
 		}
 		operation.budget = budget
-		operation.frame.uncancellable = storesOnRead(code, frozen[vsr.HeaderSize:])
-		committing := budget != nil && budget.commits
+		operation.frame.uncancellable = committing
 		if committing && !c.startCommit() {
 			return nil, ierror.ErrClientShutdown
 		}
@@ -238,13 +240,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 	notPrimarySeen := false
 	lookupDelay := replayInterval
 	progress := isProgressPoll(operation.code, operation.frame.data[vsr.HeaderSize:])
-	committing := operation.budget != nil && operation.budget.commits
-	// The server can have stored the offset of a poll whose reply is lost, which
-	// the next read shows, so it blocks nothing.
-	var lost error = ierror.ErrTransientNotCommitted
-	if !committing && storesOnRead(operation.code, operation.frame.data[vsr.HeaderSize:]) {
-		lost = ierror.FetchProgressUncertain{OperationID: operation.id}
-	}
+	committing := storesOnRead(operation.code, operation.frame.data[vsr.HeaderSize:])
 	possiblySent := false
 	defer func() {
 		if committing && possiblySent && err != nil {
@@ -428,7 +424,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				c.recoverSession(operation.fence)
 			}
 			if progress && sent {
-				return nil, lost
+				return nil, ierror.ErrTransientNotCommitted
 			}
 			if !retryBeforeAdmission(reply.err) {
 				if uncertain && mutation {
@@ -473,7 +469,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				continue
 			}
 			if progress {
-				return nil, lost
+				return nil, ierror.ErrTransientNotCommitted
 			}
 			return nil, decodeErr
 		}
@@ -503,8 +499,10 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				continue
 			}
 			if committing {
-				if err = classifyFetchReply(ctx, operation, ticket, outcome.Body); err != nil {
-					return nil, err
+				if operation.code == command.FetchMessagesCode {
+					if err = classifyFetchReply(ctx, operation, ticket, outcome.Body); err != nil {
+						return nil, err
+					}
 				}
 				possiblySent = false
 			}
@@ -513,6 +511,9 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 		}
 		if committing {
 			if !fetchRefusedBeforeAdmission(outcome.Err, false) {
+				if !closeIfDetached(link, outcome, bound) && isSessionError(outcome.Err) {
+					c.recoverSession(operation.fence)
+				}
 				return nil, outcome.Err
 			}
 			possiblySent = false
@@ -530,9 +531,6 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 		switch {
 		case errors.Is(err, ierror.ErrTransientNotCommitted):
 			if progress {
-				if lost != ierror.ErrTransientNotCommitted {
-					return nil, lost
-				}
 				return nil, err
 			}
 			uncertain = true

@@ -16,14 +16,22 @@
 // under the License.
 
 import assert from 'node:assert/strict';
+import type { Socket } from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { After, Given, When, Then } from '@cucumber/cucumber';
-import { VsrResponseTimeoutError, waitWithin } from '../client/client.operation.js';
+import {
+  FETCH_PROGRESS_UNCERTAIN, FetchProgressUncertainError, LaneBlockedError, OPERATION_TIMEOUT_MS,
+  PARTITION_LANE_BLOCKED, VsrResponseTimeoutError, waitWithin
+} from '../client/client.operation.js';
 import { ConsumerKind } from '../wire/offset/offset.utils.js';
+import { DEFERRED_POLL_OPTIONS_SIZE } from '../wire/message/deferred-poll.utils.js';
+import { serializePollMessages } from '../wire/message/poll.utils.js';
+import { HEADER_SIZE } from '../wire/vsr/header.js';
 import {
   CommitAfter, CommitPolicy, Consumer, Partitioning, PollingStrategy,
   type PollMessagesResponse, type PollOptions, type PollPartition
 } from '../wire/index.js';
+import { getRootCredentials } from './env.js';
 import type { BackgroundCall, Outcome, TestWorld } from './world.js';
 
 const MS_PER_SECOND = 1_000;
@@ -32,6 +40,11 @@ const POLL_COUNT = 10;
 const CANCELLED_END_MS = 2_000;
 const ABORT_ERROR = 'AbortError';
 const COMMIT_INTERVAL_MS = 5_000;
+/** How long a started poll may take to reach its link, and how often the step looks. */
+const SENT_WITHIN_MS = 5_000;
+const SENT_CHECK_MS = 5;
+/** A poll whose link drops ends at once. */
+const UNCERTAIN_WITHIN_MS = 5_000;
 
 const waitOptions = (maxWaitSeconds: number): Partial<PollOptions> =>
   ({ count: POLL_COUNT, maxWait: maxWaitSeconds * MS_PER_SECOND });
@@ -249,4 +262,68 @@ Then(
 
 When('I close the consumer', function (this: TestWorld) {
   return closeConsumer(this);
+});
+
+When(
+  'I start a deferred poll of partition {int} for consumer {string} with the on read commit policy and a max wait of {int} second(s)',
+  async function (this: TestWorld, partitionId: number, consumer: string, maxWait: number) {
+    // A poll that stores nothing caches the route, so the deferred poll is the next frame on its link.
+    await poll(this, {
+      consumer: namedConsumer(consumer), partitionId, strategy: PollingStrategy.Offset(0n), options: { count: 1 }
+    });
+    const socket = (await this.client.clientProvider()).getReadStream() as Socket;
+    this.deferredPollLink = {
+      socket, written: socket.bytesWritten,
+      frameBytes: HEADER_SIZE + DEFERRED_POLL_OPTIONS_SIZE + serializePollMessages(this.stream.id, this.topic.id,
+        namedConsumer(consumer), partitionId, PollingStrategy.Next, POLL_COUNT, true).length
+    };
+    this.deferredPoll = startInBackground((signal) => poll(this, {
+      consumer: namedConsumer(consumer), partitionId, strategy: PollingStrategy.Next,
+      options: { ...waitOptions(maxWait), commit: CommitPolicy.OnRead }, signal
+    }));
+  }
+);
+
+// The client has no disconnect that keeps it usable, so the step drops the link once the poll is on it.
+When('the client disconnects before the deferred poll answers', async function (this: TestWorld) {
+  const link = this.deferredPollLink;
+  assert.ok(link, 'no deferred poll was started');
+  const deadline = Date.now() + SENT_WITHIN_MS;
+  while (link.socket.bytesWritten < link.written + link.frameBytes) {
+    assert.ok(Date.now() < deadline, 'the deferred poll did not reach its link');
+    await sleep(SENT_CHECK_MS);
+  }
+  link.socket.destroy();
+});
+
+Then('the deferred poll should fail as uncertain', async function (this: TestWorld) {
+  const call = requireStarted(this.deferredPoll, 'deferred poll');
+  const outcome = await endBy(call, Date.now() + UNCERTAIN_WITHIN_MS, 'the deferred poll');
+  assert.ok(!outcome.ok, 'the deferred poll returned a result');
+  assert.ok(outcome.error instanceof FetchProgressUncertainError,
+    `the deferred poll failed with ${String(outcome.error)}`);
+  assert.equal(outcome.error.errorCode, FETCH_PROGRESS_UNCERTAIN);
+  this.uncertainOperation = outcome.error.operationId;
+});
+
+// The client dials its link again by itself, which can take its reconnect interval.
+When('the client connects again', { timeout: 2 * OPERATION_TIMEOUT_MS }, async function (this: TestWorld) {
+  assert.deepEqual(await this.client.session.login(getRootCredentials()), { userId: 0 });
+});
+
+Then(
+  'a poll of partition {int} for consumer {string} with the next strategy and the on read commit policy should fail as blocked by the deferred poll',
+  async function (this: TestWorld, partitionId: number, consumer: string) {
+    assert.ok(this.uncertainOperation !== undefined, 'no deferred poll ended uncertain');
+    await assert.rejects(poll(this, {
+      consumer: namedConsumer(consumer), partitionId, strategy: PollingStrategy.Next,
+      options: { count: 1, commit: CommitPolicy.OnRead }
+    }), (error: unknown) => error instanceof LaneBlockedError && error.errorCode === PARTITION_LANE_BLOCKED &&
+      error.operationId === this.uncertainOperation);
+  }
+);
+
+When('I abandon the operation of the deferred poll', async function (this: TestWorld) {
+  assert.ok(this.uncertainOperation !== undefined, 'no deferred poll ended uncertain');
+  await this.client.abandonOperation(this.uncertainOperation);
 });

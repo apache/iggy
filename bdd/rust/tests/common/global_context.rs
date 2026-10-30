@@ -51,6 +51,10 @@ pub struct GlobalContext {
     pub last_changes: Vec<MetadataChangeRecord>,
     pub last_current_items: Vec<MetadataCurrentItem>,
     pub background_client: Option<Arc<IggyClient>>,
+    /// The client of the scenario while a deferred poll runs on it.
+    pub polling_client: Option<Arc<IggyClient>>,
+    /// The operation of a deferred poll whose outcome is unknown.
+    pub lost_operation: Option<u64>,
     pub deferred_poll_started: Option<Instant>,
     pub deferred_poll: Option<JoinHandle<Result<PolledMessages, IggyError>>>,
     pub reader: Option<PartitionReader>,

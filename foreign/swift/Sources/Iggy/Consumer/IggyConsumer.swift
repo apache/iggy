@@ -65,7 +65,7 @@ public actor IggyConsumer: AsyncSequence {
     private let configuration: ConsumerConfiguration
     private let logger: Logger
     private let reading = AsyncMutex()
-    private var reader: PartitionReader?
+    private(set) var reader: PartitionReader?
     private var initialization: Task<Void, any Error>?
     private var isShutDown = false
     private var shutdownTask: Task<Void, Never>?
@@ -316,6 +316,12 @@ public actor IggyConsumer: AsyncSequence {
         defer { reading.unlock() }
         while !isShutDown {
             if let buffered = buffer, bufferIndex < buffered.messages.count {
+                // A seek of its partition can have replaced its generation since
+                // the batch was taken, as `yield_current` checks in the Rust SDK.
+                if let reader, await !reader.holds(buffered) {
+                    buffer = nil
+                    continue
+                }
                 return await handOver(buffered)
             }
             buffer = nil

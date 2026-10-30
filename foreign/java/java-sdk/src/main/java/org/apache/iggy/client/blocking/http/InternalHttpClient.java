@@ -55,9 +55,13 @@ import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyException;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyMalformedResponseException;
+import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.apache.iggy.exception.IggyTlsException;
+import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.partition.PartitionContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import tools.jackson.core.JacksonException;
@@ -73,20 +77,26 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
+import java.math.BigInteger;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.security.GeneralSecurityException;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 final class InternalHttpClient implements Closeable {
 
@@ -123,6 +133,11 @@ final class InternalHttpClient implements Closeable {
     private final CloseableHttpClient deferredHttpClient;
     private final ScheduledThreadPoolExecutor deadlines = createDeadlineTimer();
     private final AtomicInteger pendingDeferred = new AtomicInteger();
+    // The committing polls whose outcome is unknown, each with the partition that it blocks.
+    private final Map<Long, ProgressKey> progressBlocks = new ConcurrentHashMap<>();
+    private final AtomicLong lostPolls = new AtomicLong();
+    // One lane per partition as calls spell it, which a progress poll holds from before its send to its end.
+    private final Map<ProgressKey, ProgressLane> progressLanes = new HashMap<>();
     private Optional<String> token = Optional.empty();
 
     InternalHttpClient(
@@ -244,6 +259,71 @@ final class InternalHttpClient implements Closeable {
     private static void cancelTimer(ScheduledFuture<?> timer) {
         if (timer != null) {
             timer.cancel(false);
+        }
+    }
+
+    /**
+     * Refuses a progress poll or an offset store of a partition that a committing poll with an unknown outcome
+     * blocks.
+     */
+    void checkProgress(ProgressKey key) {
+        progressBlocks.entrySet().stream()
+                .filter(block -> block.getValue().covers(key))
+                .findFirst()
+                .ifPresent(block -> {
+                    throw new IggyOperationException(
+                            IggyErrorCode.PARTITION_LANE_BLOCKED, block.getKey(), key.partition());
+                });
+    }
+
+    /** Blocks {@code key} after a committing poll whose outcome is unknown, until the caller abandons it. */
+    IggyOperationException loseProgress(ProgressKey key, Throwable cause) {
+        long operation = lostPolls.incrementAndGet();
+        progressBlocks.put(operation, key);
+        var lost = new IggyOperationException(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN, operation);
+        lost.initCause(cause);
+        return lost;
+    }
+
+    void abandon(long operation) {
+        if (progressBlocks.remove(operation) == null) {
+            throw new IggyOperationException(IggyErrorCode.OPERATION_NOT_RETAINED, operation);
+        }
+    }
+
+    /**
+     * Waits until {@code deadlineNanos} for the lane of the partition of {@code key}, so the block check and the arm
+     * of one progress poll have no other progress poll of the partition in between.
+     */
+    ProgressLane enterProgressLane(ProgressKey key, long deadlineNanos) {
+        ProgressLane lane;
+        synchronized (progressLanes) {
+            lane = progressLanes.computeIfAbsent(key.lane(), ProgressLane::new);
+            lane.holders++;
+        }
+        boolean entered = false;
+        try {
+            entered = lane.gate.tryLock(Math.max(0, deadlineNanos - System.nanoTime()), TimeUnit.NANOSECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
+        if (!entered) {
+            release(lane);
+            throw deferredFailure(false, new IggyTimeoutException("Another poll of the partition held its lane"));
+        }
+        return lane;
+    }
+
+    void leaveProgressLane(ProgressLane lane) {
+        lane.gate.unlock();
+        release(lane);
+    }
+
+    private void release(ProgressLane lane) {
+        synchronized (progressLanes) {
+            if (--lane.holders == 0) {
+                progressLanes.remove(lane.key, lane);
+            }
         }
     }
 
@@ -583,6 +663,48 @@ final class InternalHttpClient implements Closeable {
                 context.setAttribute(UNCERTAIN_ATTEMPT, Boolean.TRUE);
             }
             return retry;
+        }
+    }
+
+    /**
+     * The partition of a progress call. HTTP has no partition id independent of the spelling of the stream and the
+     * topic, so a key names them as the call spells them, with the incarnation of the partition when the call carries
+     * its context, which names one partition in every spelling.
+     */
+    record ProgressKey(String stream, String topic, long partition, Optional<BigInteger> incarnation) {
+        // The partition that the server reads for a call that names none.
+        private static final long DEFAULT_PARTITION = 0;
+
+        static ProgressKey of(
+                StreamId stream, TopicId topic, Optional<Long> partition, Optional<PartitionContext> context) {
+            return new ProgressKey(
+                    stream.toString(),
+                    topic.toString(),
+                    partition.orElse(DEFAULT_PARTITION),
+                    // Incarnation 0 is a context that was never read.
+                    context.map(PartitionContext::incarnation).filter(incarnation -> incarnation.signum() != 0));
+        }
+
+        /** Whether a block of this key covers a call of {@code other}. */
+        boolean covers(ProgressKey other) {
+            return partition == other.partition
+                    && ((stream.equals(other.stream) && topic.equals(other.topic))
+                            || (incarnation.isPresent() && incarnation.equals(other.incarnation)));
+        }
+
+        ProgressKey lane() {
+            return new ProgressKey(stream, topic, partition, Optional.empty());
+        }
+    }
+
+    /** The lane of one partition, which one progress poll at a time holds. */
+    static final class ProgressLane {
+        private final ProgressKey key;
+        private final ReentrantLock gate = new ReentrantLock(true);
+        private int holders;
+
+        private ProgressLane(ProgressKey key) {
+            this.key = key;
         }
     }
 }

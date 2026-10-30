@@ -135,15 +135,23 @@ impl IggyConsumerState {
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
         let partition_id = partition_id.unwrap_or_else(|| self.partition_id());
-        match self.progress.last_delivered(partition_id) {
+        let stored = match self.progress.last_delivered(partition_id) {
             Some(last) => {
-                self.progress
-                    .store(Checkpoint::new(partition_id, offset, last.context()))
-                    .await
+                let stored = Checkpoint::new(partition_id, offset, last.context());
+                self.progress.store(stored).await?;
+                stored
             }
             // Nothing was consumed from this partition, so there is no captured context to keep.
-            None => self.progress.store_offset(partition_id, offset).await,
+            None => {
+                self.progress.store_offset(partition_id, offset).await?;
+                Checkpoint::new(partition_id, offset, PartitionContext::default())
+            }
+        };
+        // The batches that the reader holds and its close would undo the store.
+        if self.commit == CommitPolicy::OnRead {
+            self.progress.read_after(stored);
         }
+        Ok(())
     }
 
     /// Deletes the stored offset either for the current partition or the provided partition ID,
@@ -197,7 +205,9 @@ impl IggyConsumerState {
 /// - `Manual`, the default, stores nothing. Commit [`ReceivedMessage::checkpoint`] with
 ///   [`commit`](Self::commit) after processing, in partition order.
 /// - `OnRead` has the server store the offset of each batch that it reads, so the reader reads
-///   only when the application asks for a message and nothing is queued.
+///   only when the application asks for a message and nothing is queued, and then fills its
+///   prefetch budget: one fetch per primary that may wait for messages, and the partitions with
+///   messages left behind spread over the other slots.
 ///   [`shutdown`](Self::shutdown) moves the offset back to the last message that the consumer
 ///   yielded.
 /// - `Auto` stores the latest counted message of each partition at the interval or the event of
@@ -447,6 +457,12 @@ impl IggyConsumer {
     /// refusal of the captured context, such as [`IggyError::HistoryUnavailable`] after the
     /// partition was recreated, repeats until a message is consumed under the new context.
     ///
+    /// With [`CommitPolicy::OnRead`], a stored offset also moves the reading position: the
+    /// consumer drops the messages of the partition that it holds and reads on from the message
+    /// after `offset`, as a [`seek`](Self::seek) there does, and the offset counts as the last
+    /// consumed message, so [`shutdown()`](Self::shutdown) keeps it. A skip past a message is
+    /// therefore never delivered again.
+    ///
     /// On binary transports, a retained operation blocking this partition is resolved before
     /// the requested store. Recovery and the new store share one operation deadline. The store
     /// goes on after a proved commit or committed rejection of that operation, and the client keeps
@@ -534,7 +550,9 @@ impl IggyConsumer {
     }
 
     /// Sets the next read position of `partition`, as [`PartitionReader::seek`] does, and drops
-    /// the rest of the batch of `partition` that the consumer yields from. It stores no offset.
+    /// the rest of the batch of `partition` that the consumer yields from. With
+    /// [`CommitPolicy::OnRead`], a seek to an offset above 0 first stores the offset before it,
+    /// so a restart resumes at the new position. Every other seek stores nothing.
     ///
     /// # Errors
     ///
@@ -771,8 +789,9 @@ impl IggyConsumer {
     /// batch leaves the budget with its last message.
     fn yield_current(&mut self) -> Option<(ReceivedMessage, bool)> {
         let current = self.current.as_mut()?;
-        // The server stored the offset of an `OnRead` batch, so only a seek drops it.
-        if self.state.commit != CommitPolicy::OnRead && !current.hold.is_current() {
+        // The server stored the offset of an `OnRead` batch, so only a seek drops it, which
+        // the hold also tells.
+        if !current.hold.is_current() {
             self.current = None;
             return None;
         }
@@ -893,9 +912,10 @@ impl IggyConsumer {
     /// - The reader closes with [`PartitionReader::close`]: with [`CommitPolicy::OnRead`] it
     ///   moves the offset back to the last message that the consumer yielded, and a group
     ///   member leaves its group, so the server gives its partitions to the remaining members
-    ///   at once instead of after the connection times out. The close waits for each `OnRead`
-    ///   read in flight until the deadline of that read, because a timeout around a committing
-    ///   read would lose its outcome.
+    ///   at once instead of after the connection times out. The close cancels each `OnRead`
+    ///   read in flight and takes its one reply, which tells whether the server stored, so a
+    ///   read that waits on the server ends at once. Over HTTP, which has no cancel, it waits
+    ///   until the deadline of that read.
     ///
     /// # Errors
     ///

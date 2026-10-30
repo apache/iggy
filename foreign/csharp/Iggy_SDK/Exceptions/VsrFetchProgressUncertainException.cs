@@ -20,8 +20,8 @@ using Apache.Iggy.Vsr;
 namespace Apache.Iggy.Exceptions;
 
 /// <summary>
-///     An uncertain committing fetch retains local progress blocks. Its operation id is a recovery key, not a
-///     replayable server receipt. Explicit abandonment accepts that the old read may still commit.
+///     A committing poll or fetch with an unknown outcome retains local progress blocks. Its operation id is a
+///     recovery key, not a replayable server receipt. Explicit abandonment accepts that the old read may still commit.
 /// </summary>
 public sealed class VsrFetchProgressUncertainException(ulong operationId, Exception? cause = null)
     : VsrRequestOutcomeUnknownException(cause ?? new InvalidOperationException(

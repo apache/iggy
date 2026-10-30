@@ -310,9 +310,13 @@ Use SDKs and servers from the same protocol generation and fresh storage for
 this wire-contract cutover. The server refuses the previous storage format;
 there is no implicit migration or fallback to retired routing commands.
 
-`Next` polls and polls with `iggcon.OnReadCommit()` can advance progress before replying. A 57 reply, a lost reply or an eviction after sending ends a `Next` poll that stores nothing with 57, and a poll that stores its offset with `errors.FetchProgressUncertain` (14010), because the server can have stored it.
+`Next` polls and polls with `iggcon.OnReadCommit()` can advance progress before replying. A 57 reply, a lost reply or an eviction after sending ends a `Next` poll that stores nothing with 57, and a poll that stores its offset with `errors.FetchProgressUncertain` (14010) naming the operation, because the server can have stored it.
 
-Either way the call releases its transient lane barrier and creates no retained operation. A later poll from `Next` starts after what the server stored. Pure reads retry within their deadline. Known non-admission replies 58
+An error reply of a poll or fetch that stores its offset is uncertain too, unless its status proves that nothing was stored (the `commit_outcomes` table of the shared deferred polling vectors).
+
+A `Next` poll that stores nothing releases its lane barrier and creates no retained operation. A poll or fetch that stores its offset and ends uncertain keeps the progress of its partitions blocked: the next poll or fetch of the partition that stores its offset and every offset store or delete of it fail with `errors.PartitionLaneBlocked` (14009) naming the operation, also after a reconnect and a new session of the same client, until `AbandonOperation(operation)`.
+
+A later poll from `Next` starts after what the server stored. Pure reads retry within their deadline. Known non-admission replies 58
 and 89 can retry without changing the frozen request. Manual offset writes are
 replicated mutations and use the exact-ID recovery API above.
 
@@ -339,19 +343,31 @@ polled, err := client.PollMessages(ctx, stream, topic, 0, iggcon.DefaultConsumer
     iggcon.NextPollingStrategy(), options)
 ```
 
-`iggcon.ManualCommit()` (the default) stores nothing, and the application stores a checkpoint with `StoreConsumerPosition`. `iggcon.OnReadCommit()` makes the server store the offset of the last message it returns as part of the read: one round trip, at most once. A poll of one partition refuses `iggcon.AutoCommitPolicy(...)` with `errors.ErrInvalidConfiguration`, because it has nothing to count. A reader and a consumer accept it.
+`iggcon.ManualCommit()` (the default) stores nothing, and the application stores a checkpoint with `StoreConsumerPosition`. `iggcon.OnReadCommit()` makes the server store the offset of the last message it returns as part of the read, in one round trip. While the primary stays up a message is delivered at most once. A failover before the store replicates can deliver the last batch again.
 
-A first message larger than `MaxBytes` comes alone in the reply, up to `iggcon.MaxRecordSize`. A `Last` poll of more than one message whose first message is larger than `MaxBytes` fails with `errors.ErrInvalidSizeBytes`. `PolledMessage.Checkpoint` and `CheckpointAt` name the position after a message with the history of its partition. `PolledMessage.Continuation` is the strategy after the last message, bound to its partition, and a poll or a seek of another partition refuses it with `errors.ErrInvalidCommand`.
+A poll of one partition refuses `iggcon.AutoCommitPolicy(...)` with `errors.ErrInvalidConfiguration`, because it has nothing to count. A reader and a consumer accept it.
+
+A first message larger than `MaxBytes` comes alone in the reply, up to `iggcon.MaxRecordSize`. A `Last` poll of more than one message whose first message is larger than `MaxBytes` fails with `errors.ErrInvalidSizeBytes`. `PolledMessage.Checkpoint` and `CheckpointAt` name the position after a message with the history of its partition.
+
+`PolledMessage.Continuation` is the strategy after the last message, bound to its partition, and a poll or a seek of another partition refuses it with `errors.ErrInvalidCommand`.
 
 When the context of a poll with `OnReadCommit` is cancelled, the SDK cancels the poll on the server and waits for its one reply: refused with `errors.ErrTransientNotAccepted` (58) when the cancel won and nothing was stored, or with what the server read and stored, which the call returns. Until then the offset calls of the partition wait, so they never race a late store.
 
-A reply that the connection loses ends the call with `errors.FetchProgressUncertain` (14010), and the next `Next` poll starts after what the lost read stored. The client holds at most 64 deferred polls at once, a call waits for a free slot within its deadline, and `Close` waits for the reply of each poll that stores its offset.
+A reply that the connection loses ends the call with `errors.FetchProgressUncertain` (14010) and blocks the progress of the partition until `AbandonOperation`, as above. After the abandon the next `Next` poll starts after what the lost read stored. The client holds at most 64 deferred polls at once, a call waits for a free slot within its deadline, and `Close` waits for the reply of each poll that stores its offset.
 
 ### Partition reader
 
-`reader.NewPartitionReader` reads the partitions of a topic in batches. It groups the partitions by their primary and reads each group with one request, puts the partitions that a read served last at the end of the next one so a busy partition does not starve the others, regroups after a primary moves, keeps a prefetch, and stays usable after an error.
+`reader.NewPartitionReader` reads the partitions of a topic in batches.
 
-A standalone consumer names its partitions with `reader.WithPartitions`. A consumer group reader joins its group, follows its assignment and leaves the group in `Close`.
+It groups the partitions by their primary and reads the partitions of a group together.
+
+It puts the partitions that a read served last at the end of the next one so a busy partition does not starve the others, and spreads the partitions that hold more messages than their last read returned over the free prefetch slots, one read each with the whole `Count` and `MaxBytes`, while the quiet partitions of a group share one read that waits on the server.
+
+Under `OnReadCommit` every read stores, so a group holds one read that waits at a time, and a waiting `Next` fills the free slots with the backlogged partitions, one committing read per partition.
+
+It regroups after a primary moves, keeps a prefetch, and stays usable after an error.
+
+A standalone consumer names its partitions with `reader.WithPartitions`. A consumer group reader joins its group, follows its assignment and leaves the group in `Close`. A later or concurrent `Close` waits for the first one and returns its result.
 
 ```go
 partitionReader, err := reader.NewPartitionReader(ctx, client, stream, topic, iggcon.DefaultConsumer(),
@@ -365,14 +381,20 @@ err = partitionReader.Close(ctx)
 `Next` returns the next batch of one partition, never empty, in offset order within one generation of the partition: from its first read, from each `Seek`, and from each new assignment. A cancelled `Next` leaves its batch in the reader. The default wait of a reader is 5 s (`reader.DefaultMaxWait`).
 
 - `ManualCommit`: `Commit` stores the offset of a delivered checkpoint, forward only within a generation.
-- `OnReadCommit`: the server stores each read, and the reader reads only for a waiting `Next`. After a read whose reply was lost, the next read starts after what the lost read stored, and the reader reads those messages again without a store and delivers them first. A partition that leaves the assignment still hands over the reads that the server stored for it. `Close` moves the offset of each partition with undelivered batches back to its last delivered message. `Commit` and `Mark` are refused.
+- `OnReadCommit`: the server stores each read, and the reader reads only for a waiting `Next`. After a read whose reply was lost, the reader abandons it, waits its retry interval, and its next read starts after what the lost read stored. The reader reads those messages again without a store and delivers them first. A forward jump without such a lost read is a store of the application or of another session, and the reader goes on from there.
+
+  A partition that leaves the assignment still hands over the reads that the server stored for it. A `Seek` to an offset above 0 stores the offset before it once the read in flight ends, also when `Close` starts first, and a seek to offset 0 or to another strategy stores nothing. A refused store fails the seek, or the close when it ran there. `Close` moves the offset of each partition with undelivered batches back to its last delivered message. `Commit` and `Mark` are refused.
 - `AutoCommitPolicy(auto)`: the reader counts each batch as `auto.After` says (`CommitAfterProcessing` at the next `Next` or `Close`, `CommitAfterDelivery` when `Next` returns it, `CommitAfterMarked` on `Mark`), and stores the latest counted position at `auto.Interval`, on `auto.Every`, before a rebalance takes a partition away, and in `Close`. `iggcon.DefaultAutoCommit()` stores every 10,000 messages or 5 s after processing.
 
-A `*reader.ReadError` names its partition. `errors.ErrHistoryUnavailable` stops a partition until `Seek` when its position came from an earlier read of a history that is gone. A section that does not decode stops its partition with `Skip`, the continuation after it. A refusal that a retry does not change is retried with a doubling wait and stops its partition after six in a row.
+A `*reader.ReadError` names its partition. `errors.ErrHistoryUnavailable` stops a partition until `Seek` when its position came from an earlier read of a history that is gone. A section that does not decode is read again one message at a time: every good message is delivered, and a message that does not decode stops its partition with `Skip`, the continuation after it.
+
+`errors.ErrConsumerGroupPartitionNotOwned` reads the partition again from its stored offset, and six in a row are reported. A refusal that a retry does not change is retried with a doubling wait and stops its partition after six in a row.
 
 ### Consumer
 
-`reader.NewIggyConsumer` hands over one message at a time from a reader, as `Next`, as an iterator from `Messages`, or to a handler in `Consume`. Under `CommitAfterProcessing` a message counts when the next one is asked for, or after its handler succeeds in `Consume`. A handler that fails leaves its message uncounted and ends `Consume` with its error. `Shutdown` stops `Consume`, counts the last message, stores, moves `OnRead` offsets back and leaves the group.
+`reader.NewIggyConsumer` hands over one message at a time from a reader, as `Next`, as an iterator from `Messages`, or to a handler in `Consume`. Under `CommitAfterProcessing` a message counts when the next one is asked for, or after its handler succeeds in `Consume`. A handler that fails leaves its message uncounted and ends `Consume` with its error. `Consume` also ends when its context ends, between the messages of a batch too.
+
+`Shutdown` stops `Consume`, counts the last message, stores, moves `OnRead` offsets back and leaves the group.
 
 ```go
 options := iggcon.WaitPollOptions(5 * time.Second)

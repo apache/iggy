@@ -60,10 +60,13 @@ namespace Apache.Iggy.Consumers;
 ///             The reader stays usable after a <see cref="ReadException" /> and retries by itself. Status 87
 ///             (HistoryUnavailable) stops its partition until a <see cref="SeekAsync" /> when the position came from an
 ///             earlier read of a history that is gone. A refusal that a quick retry does not change, such as status 41
-///             (Unauthorized) or 3007 (PartitionNotFound), is retried after a wait that doubles each time, and after six
-///             in a row it stops its partition until a <see cref="SeekAsync" /> with one error. With
-///             <see cref="CommitMode.OnRead" />, a read whose reply was lost is repaired: the next read finds the
-///             messages that the lost read stored and reads them again without a commit before it goes on.
+///             (Unauthorized), 3007 (PartitionNotFound) or 5009 (ConsumerGroupPartitionNotOwned), is retried after a
+///             wait that doubles each time, and after six in a row it stops its partition until a
+///             <see cref="SeekAsync" /> with one error. Status 5009 also drops the position of its partition, which
+///             reads again from the start of the reader. After a read whose outcome is unknown the partition waits the
+///             retry interval. With <see cref="CommitMode.OnRead" />, a read whose reply was lost is repaired: the next
+///             read finds the messages that the lost read stored and reads them again without a commit before it goes
+///             on. A read that starts past its position while no read was lost delivers from there.
 ///         </item>
 ///         <item>One caller at a time calls <see cref="NextAsync" />. The other members are safe to call concurrently.</item>
 ///     </list>
@@ -71,6 +74,7 @@ namespace Apache.Iggy.Consumers;
 public sealed class PartitionReader : IAsyncDisposable
 {
     private const int MaxLastingRefusals = 6;
+    private const int MaxFetchSlots = 16;
     private const int ConsumerOffsetNotFound = 3021;
     private static readonly TimeSpan GroupRefreshInterval = TimeSpan.FromSeconds(1);
     private static long _readers;
@@ -93,13 +97,18 @@ public sealed class PartitionReader : IAsyncDisposable
     private readonly Task _worker;
     private TaskCompletionSource _arrival = NewArrival();
     private bool _closed;
+    private Task? _closing;
     private bool _demand;
+    private int _fetching;
+    private readonly List<Task> _seeks = [];
+    private ulong _claims;
     private ulong _generations;
     private ulong _serves;
     private ulong _joinedSession;
     private long _queuedBytes;
     private long _queuedMessages;
     private bool _resync;
+    private long? _syncedAt;
     private (Checkpoint Checkpoint, uint Messages)? _uncounted;
 
     internal PartitionReader(IIggyClient client, IConsumerGroupAssignmentProvider? assignment,
@@ -259,14 +268,38 @@ public sealed class PartitionReader : IAsyncDisposable
 
     /// <summary>
     ///     Sets the next read position of <paramref name="partitionId" /> and starts a new generation of it. It stores
-    ///     no offset, drops the queued batches of the partition, ignores its late replies, and resumes a stopped
-    ///     partition. With <see cref="CommitMode.OnRead" />, it waits for the read of the partition in flight, and the
-    ///     first read from the new position stores its offset as every read does.
+    ///     the queued batches of the partition, ignores its late replies, and resumes a stopped partition. With
+    ///     <see cref="CommitMode.OnRead" />, a seek to an offset above 0 first stores the offset before it on the
+    ///     server, so a restart resumes at the sought offset, a refused store fails the seek and moves nothing, and the
+    ///     seek then waits for the read of the partition in flight, whose batch it drops. Every other seek stores
+    ///     nothing.
     /// </summary>
     /// <exception cref="IggyInvalidStatusCodeException">
     ///     Status 3 for a partition that the reader does not read, and for a continuation of another partition.
     /// </exception>
+    /// <exception cref="ObjectDisposedException">The reader is closed.</exception>
     public async Task SeekAsync(uint partitionId, PollingStrategy start, CancellationToken token = default)
+    {
+        var seek = SeekOnceAsync(partitionId, start, token);
+        lock (_gate)
+        {
+            _seeks.Add(seek);
+        }
+
+        try
+        {
+            await seek;
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                _seeks.Remove(seek);
+            }
+        }
+    }
+
+    private async Task SeekOnceAsync(uint partitionId, PollingStrategy start, CancellationToken token)
     {
         start.ValidatePartition(partitionId);
         if (start.Kind == MessagePolling.First)
@@ -274,12 +307,30 @@ public sealed class PartitionReader : IAsyncDisposable
             start = start with { Kind = MessagePolling.Offset, Value = 0 };
         }
 
-        Task idle;
+        (ulong Offset, PartitionContext Context)? stored = null;
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_closed, this);
             var state = State(partitionId);
+            if (OnRead && start.Kind == MessagePolling.Offset && start.Value > 0)
+            {
+                stored = (start.Value - 1, start.Context ?? state.Handed?.Context ?? default);
+            }
+        }
+
+        if (stored is { } store)
+        {
+            await _client.StoreOffsetAsync(_settings.Consumer, _settings.StreamId, _settings.TopicId, store.Offset,
+                partitionId, store.Context, token);
+        }
+
+        Task idle;
+        bool raced;
+        lock (_gate)
+        {
+            var state = State(partitionId);
             idle = state.InFlight && OnRead ? state.Idle.Task : Task.CompletedTask;
+            raced = state.InFlight || _queue.Any(entry => entry.PartitionId == partitionId && entry.Batch is not null);
         }
 
         await idle.WaitAsync(token);
@@ -295,13 +346,15 @@ public sealed class PartitionReader : IAsyncDisposable
             state.RetryAt = 0;
             state.CatchUpUntil = null;
             state.CatchUpBatch = null;
-            state.PendingStart = null;
+            // A committing read that the server admitted after the store moved the offset on, so the close puts it back.
+            state.PendingStart = raced && stored is not null ? state.Position : null;
+            state.Lost = false;
             state.AloneUntil = null;
             state.Counted = null;
             state.CountedSinceStore = 0;
             state.Stored = null;
-            state.Delivered = null;
-            state.Handed = null;
+            state.Delivered = stored;
+            state.Handed = stored;
             state.FirstHanded = null;
             for (var node = _queue.First; node is not null;)
             {
@@ -327,19 +380,42 @@ public sealed class PartitionReader : IAsyncDisposable
     ///     its last delivered message. A partition that delivered nothing and started at Next gets the offset before
     ///     its first undelivered message, or no offset at offset 0. A group reader then leaves its group.
     /// </summary>
+    /// <remarks>A later call waits for the first close and ends as it does.</remarks>
     /// <exception cref="Exception">The first failed store of the close.</exception>
     public async ValueTask CloseAsync()
     {
+        TaskCompletionSource? closing = null;
+        Task closed;
         lock (_gate)
         {
-            if (_closed)
+            if (_closing is null)
             {
-                return;
+                closing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _closing = closing.Task;
+                _closed = true;
             }
 
-            _closed = true;
+            closed = _closing;
         }
 
+        if (closing is not null)
+        {
+            try
+            {
+                await CloseOnceAsync();
+                closing.SetResult();
+            }
+            catch (Exception error)
+            {
+                closing.SetException(error);
+            }
+        }
+
+        await closed;
+    }
+
+    private async Task CloseOnceAsync()
+    {
         CountUncounted();
         await _lifetime.CancelAsync();
         await _worker;
@@ -350,6 +426,25 @@ public sealed class PartitionReader : IAsyncDisposable
         }
 
         await Task.WhenAll(reads);
+        Task[] seeks;
+        lock (_gate)
+        {
+            seeks = [.. _seeks];
+        }
+
+        // A seek whose store waited for a read still applies, so the rewind sees its position and not the dropped batch.
+        foreach (var seek in seeks)
+        {
+            try
+            {
+                await seek;
+            }
+            catch (Exception)
+            {
+                // The seek reports its own failure.
+            }
+        }
+
         await _committer;
         Exception? failure = null;
         if (OnRead)
@@ -605,7 +700,9 @@ public sealed class PartitionReader : IAsyncDisposable
                 }
                 else if (_settings.Start.Kind == MessagePolling.Next)
                 {
-                    var first = state.FirstHanded ?? queued?.Messages[0].Header.Offset ?? state.PendingStart!.Value.Value;
+                    // A lost read stored from its start, which lies before the batch that the next read held back.
+                    var first = Math.Min(state.FirstHanded ?? queued?.Messages[0].Header.Offset ?? ulong.MaxValue,
+                        state.PendingStart?.Value ?? ulong.MaxValue);
                     rewinds.Add((partition, first == 0 ? null : first - 1,
                         state.Handed?.Context ?? queued?.Context ?? state.PendingStart!.Value.Context!.Value));
                 }
@@ -722,14 +819,21 @@ public sealed class PartitionReader : IAsyncDisposable
         }
 
         bool resync;
+        var now = Environment.TickCount64;
         lock (_gate)
         {
-            resync = _resync;
+            // A joining member gets its partitions one at a time, so the reader asks the coordinator each interval.
+            resync = _resync || _syncedAt is not { } synced
+                             || now - synced >= (long)GroupRefreshInterval.TotalMilliseconds;
             _resync = false;
         }
 
         var assigned = await _assignment!.GetAssignedPartitionsAsync(_settings.StreamId, _settings.TopicId,
             _settings.Consumer.ConsumerId, resync, token);
+        if (resync)
+        {
+            _syncedAt = now;
+        }
         List<Checkpoint> leaving = [];
         lock (_gate)
         {
@@ -828,9 +932,9 @@ public sealed class PartitionReader : IAsyncDisposable
             }
 
             var groups = await _fetcher!.ReadinessGroupsAsync(_settings.StreamId, _settings.TopicId, grouped, token);
-            foreach (var group in groups)
+            foreach (var fetch in Spread(groups, alone.Count))
             {
-                StartFetch(group);
+                StartFetch(fetch);
             }
         }
 
@@ -845,12 +949,78 @@ public sealed class PartitionReader : IAsyncDisposable
         return wait;
     }
 
+    /// <summary>
+    ///     Deals the backlogged partitions of each group over the fetch slots that are free, one fetch with the full
+    ///     limits each, so a backlog keeps as many reads in flight as the prefetch holds. Every group gets one fetch
+    ///     first, and its quiet partitions share one fetch, which may wait on the server. With
+    ///     <see cref="CommitMode.OnRead" /> a turn starts only while <see cref="NextAsync" /> waits, and a partition
+    ///     is in one committing read at a time, so the fetches of a turn commit disjoint partitions.
+    /// </summary>
+    private List<IReadOnlyList<uint>> Spread(IReadOnlyList<IReadOnlyList<uint>> groups, int alone)
+    {
+        List<(List<uint> Backlogged, List<uint> Quiet)> split;
+        int free;
+        lock (_gate)
+        {
+            split =
+            [
+                .. groups.Select(group => (
+                    group.Where(partition => _states.TryGetValue(partition, out var state) && state.Backlogged).ToList(),
+                    group.Where(partition => !_states.TryGetValue(partition, out var state) || !state.Backlogged).ToList()))
+            ];
+            var slots = Math.Min(_settings.PrefetchMessages / Math.Max(_settings.Options.Count, 1),
+                _settings.PrefetchBytes / Math.Max(_settings.Options.MaxBytes, 1));
+            free = (int)Math.Clamp(slots, 1, MaxFetchSlots) - _fetching - groups.Count - alone;
+        }
+
+        // Every fetch holds at least one partition, so a group without quiet partitions keeps one backlogged.
+        var extras = new int[split.Count];
+        for (var dealt = true; dealt && free > 0;)
+        {
+            dealt = false;
+            for (var index = 0; index < split.Count && free > 0; index++)
+            {
+                var (backlogged, quiet) = split[index];
+                if (extras[index] < backlogged.Count - (quiet.Count > 0 ? 0 : 1))
+                {
+                    extras[index]++;
+                    free--;
+                    dealt = true;
+                }
+            }
+        }
+
+        List<IReadOnlyList<uint>> fetches = [];
+        for (var index = 0; index < split.Count; index++)
+        {
+            var (backlogged, quiet) = split[index];
+            if (extras[index] == 0)
+            {
+                fetches.Add(groups[index]);
+                continue;
+            }
+
+            if (quiet.Count > 0)
+            {
+                fetches.Add(quiet);
+            }
+
+            var shares = quiet.Count > 0 ? extras[index] : extras[index] + 1;
+            fetches.AddRange(backlogged.Select((partition, position) => (partition, position))
+                .GroupBy(entry => entry.position % shares, entry => entry.partition)
+                .Select(share => (IReadOnlyList<uint>)[.. share]));
+        }
+
+        return fetches;
+    }
+
     private void StartPoll(uint partition)
     {
         Target target;
         bool commits;
         bool single;
         bool check;
+        ulong? catchUpUntil;
         lock (_gate)
         {
             if (Claim(partition) is not { } claimed)
@@ -862,6 +1032,10 @@ public sealed class PartitionReader : IAsyncDisposable
             var state = _states[partition];
             single = state.AloneUntil is not null;
             check = NeedsStart(target.Sent);
+            catchUpUntil = target.Sent.Kind == MessagePolling.Offset && state.CatchUpUntil is { } until
+                                                                     && target.Sent.Value <= until
+                ? until
+                : null;
             commits = OnRead && state.CatchUpUntil is null && !single && !check;
             if (commits && target.Sent.Context is not null)
             {
@@ -869,7 +1043,7 @@ public sealed class PartitionReader : IAsyncDisposable
             }
         }
 
-        Track(PollAsync(target, commits, single, check));
+        Track(PollAsync(target, commits, single, check, catchUpUntil));
     }
 
     private void StartFetch(IReadOnlyList<uint> group)
@@ -892,6 +1066,11 @@ public sealed class PartitionReader : IAsyncDisposable
 
         if (targets.Count > 0)
         {
+            lock (_gate)
+            {
+                _fetching++;
+            }
+
             Track(FetchAsync(targets));
         }
     }
@@ -905,8 +1084,9 @@ public sealed class PartitionReader : IAsyncDisposable
         }
 
         state.InFlight = true;
+        state.Claim = ++_claims;
         state.Idle = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        return new Target(partition, state.Position, state.Generation);
+        return new Target(partition, state.Position, state.Generation, state.Claim);
     }
 
     private void Track(Task read)
@@ -929,6 +1109,21 @@ public sealed class PartitionReader : IAsyncDisposable
 
     private async Task FetchAsync(List<Target> targets)
     {
+        try
+        {
+            await FetchOnceAsync(targets);
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                _fetching--;
+            }
+        }
+    }
+
+    private async Task FetchOnceAsync(List<Target> targets)
+    {
         FetchedMessages reply;
         try
         {
@@ -949,38 +1144,57 @@ public sealed class PartitionReader : IAsyncDisposable
 
         using (reply)
         {
+            List<(Target Target, FetchedSection? Section, PolledMessages? Polled, Exception? Error)> outcomes =
+                new(targets.Count);
             foreach (var target in targets)
             {
                 var section = reply.Sections.FirstOrDefault(section => section.PartitionId == target.Partition);
-                if (section is null)
+                if (section is null || section.Status != 0)
                 {
-                    // A read that does not wait would ask the server again at once.
-                    Retry(target,
-                        _settings.Options.MaxWait == TimeSpan.Zero ? (long)_settings.RetryInterval.TotalMilliseconds : 0);
+                    outcomes.Add((target, section, null, section?.Refusal()));
                     continue;
                 }
 
-                if (section.Status != 0)
-                {
-                    var refusal = section.Refusal();
-                    await AbandonLostAsync(refusal);
-                    Refuse(target, refusal);
-                    continue;
-                }
-
-                PolledMessages polled;
                 try
                 {
                     using var rental = section.DecodeRented();
-                    polled = BinaryMapper.MaterializeMessages(rental);
+                    outcomes.Add((target, section, BinaryMapper.MaterializeMessages(rental), null));
                 }
                 catch (Exception error) when (error is MessageDecryptionException or MalformedResponseException)
                 {
-                    ReadAlone(target, section, error);
-                    continue;
+                    outcomes.Add((target, section, null, error));
                 }
+            }
 
-                Complete(target, polled, section.NextOffset);
+            foreach (var outcome in outcomes.Where(outcome => outcome.Section is { Status: not 0 }))
+            {
+                await AbandonLostAsync(outcome.Error!);
+            }
+
+            // Every target of the reply settles before a new read starts, so the next fetch keeps the turn order.
+            lock (_gate)
+            {
+                foreach (var (target, section, polled, error) in outcomes)
+                {
+                    if (section is null)
+                    {
+                        // A read that does not wait would ask the server again at once.
+                        Retry(target,
+                            _settings.Options.MaxWait == TimeSpan.Zero ? (long)_settings.RetryInterval.TotalMilliseconds : 0);
+                    }
+                    else if (section.Status != 0)
+                    {
+                        Refuse(target, error!);
+                    }
+                    else if (polled is null)
+                    {
+                        ReadAlone(target, section, error!);
+                    }
+                    else
+                    {
+                        Complete(target, polled, section.NextOffset);
+                    }
+                }
             }
         }
     }
@@ -990,7 +1204,7 @@ public sealed class PartitionReader : IAsyncDisposable
         return OnRead && position.Kind == MessagePolling.Next && position.Context is null;
     }
 
-    private async Task PollAsync(Target target, bool commits, bool single, bool check = false)
+    private async Task PollAsync(Target target, bool commits, bool single, bool check, ulong? catchUpUntil)
     {
         var options = _settings.Options with
         {
@@ -998,6 +1212,16 @@ public sealed class PartitionReader : IAsyncDisposable
             Count = single || check ? 1 : _settings.Options.Count,
             MinCount = single || check ? 1 : _settings.Options.MinCount
         };
+        if (!single && !check && catchUpUntil is { } until)
+        {
+            // The server stored these messages already, so the read takes them and no more.
+            options = options with
+            {
+                Count = (uint)Math.Min(until - target.Sent.Value + 1, options.Count),
+                MinCount = 1,
+                MaxWait = TimeSpan.Zero
+            };
+        }
         PolledMessages polled;
         try
         {
@@ -1018,8 +1242,25 @@ public sealed class PartitionReader : IAsyncDisposable
 
             return;
         }
+        catch (Exception error) when (commits && error is MalformedResponseException)
+        {
+            // The server stored this read, so the next read finds the range it skipped and reads it again by offset.
+            lock (_gate)
+            {
+                if (Settle(target) is { } state)
+                {
+                    state.Lost = true;
+                    state.RetryAt = Environment.TickCount64 + (long)_settings.RetryInterval.TotalMilliseconds;
+                }
+            }
+
+            _logger.LogWarning(error, "A committing read of partition {Partition} from offset {Offset} does not decode.",
+                target.Partition, target.Sent.Value);
+            return;
+        }
         catch (Exception error)
         {
+            await AbandonLostAsync(error);
             Refuse(target, error);
             return;
         }
@@ -1085,16 +1326,14 @@ public sealed class PartitionReader : IAsyncDisposable
                 return;
             }
 
-            if (polled.Messages.Count > 0)
-            {
-                state.PendingStart = null;
-            }
-
             state.Lasting = 0;
+            // A fetch section that ended before the head of its partition reads again at once.
+            state.Backlogged = nextOffset is { } sectionEnd && sectionEnd <= polled.CurrentOffset
+                                                            && (polled.Messages.Count > 0 || polled.CurrentOffset > 0);
             if (polled.Messages.Count == 0)
             {
                 var emptyNext = nextOffset ?? polled.CurrentOffset + 1;
-                if (OnRead && target.Sent is { Kind: MessagePolling.Next, Context: { } context }
+                if (OnRead && state.Lost && target.Sent is { Kind: MessagePolling.Next, Context: { } context }
                            && SameHistory(context, polled.Context) && emptyNext > target.Sent.Value)
                 {
                     state.Position = PollingStrategy.Continuation(target.Partition, MessagePolling.Offset,
@@ -1109,7 +1348,8 @@ public sealed class PartitionReader : IAsyncDisposable
                     state.Position = polled.Context == default ? target.Sent : polled.Continuation;
                 }
 
-                if (_settings.Options.MaxWait == TimeSpan.Zero)
+                // A read again of a lost range does not wait either.
+                if (_settings.Options.MaxWait == TimeSpan.Zero || state.CatchUpUntil is not null)
                 {
                     state.RetryAt = Environment.TickCount64 + (long)_settings.RetryInterval.TotalMilliseconds;
                 }
@@ -1119,7 +1359,7 @@ public sealed class PartitionReader : IAsyncDisposable
 
             var first = polled.Messages[0].Header.Offset;
             var last = polled.Messages[^1].Header.Offset;
-            if (OnRead && target.Sent is { Kind: MessagePolling.Next, Context: { } sentContext }
+            if (OnRead && state.Lost && target.Sent is { Kind: MessagePolling.Next, Context: { } sentContext }
                        && first > target.Sent.Value && SameHistory(sentContext, polled.Context))
             {
                 _logger.LogWarning(
@@ -1132,6 +1372,9 @@ public sealed class PartitionReader : IAsyncDisposable
                 return;
             }
 
+            state.PendingStart = null;
+            // This read stored its offset, which fences out the lost read.
+            state.Lost &= target.Sent.Kind != MessagePolling.Next;
             var next = last + 1;
             var byOffset = state.AloneUntil is { } aloneUntil && next < aloneUntil
                            || state.CatchUpUntil is { } catchUpUntil && next <= catchUpUntil;
@@ -1238,13 +1481,27 @@ public sealed class PartitionReader : IAsyncDisposable
             {
                 case VsrRequestOutcomeUnknownException:
                     // A lost reply. With an on read policy the next read finds what it stored.
+                    state.Lost |= OnRead && error is VsrFetchProgressUncertainException;
+                    state.RetryAt = now + interval;
                     return;
                 case IggyInvalidStatusCodeException { StatusCode: VsrError.NOT_PRIMARY }:
                     return;
                 case IggyInvalidStatusCodeException { StatusCode: VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED }:
                     GiveUpGap(target.Partition, state);
+                    // A rejoin gives the partition a new owner generation, which the old position still names.
+                    state.Position = _settings.Start;
+                    state.PendingStart = null;
+                    state.Lost = false;
                     _resync = true;
-                    state.RetryAt = now + interval;
+                    state.Lasting++;
+                    if (state.Lasting >= MaxLastingRefusals)
+                    {
+                        report = new ReadException(target.Partition, error);
+                        state.Stopped = report;
+                        break;
+                    }
+
+                    state.RetryAt = now + interval * (1L << (state.Lasting - 1));
                     return;
                 case IggyInvalidStatusCodeException { StatusCode: VsrError.HISTORY_UNAVAILABLE }
                     when target.Sent.Context is null:
@@ -1338,15 +1595,19 @@ public sealed class PartitionReader : IAsyncDisposable
         }
     }
 
-    /// <summary>Ends the read of a target, under the lock. Null when the generation of its partition moved on.</summary>
+    /// <summary>
+    ///     Ends the read of a target, under the lock. Null when the generation of its partition moved on. The state of
+    ///     a partition assigned again has a read of its own, which the old read leaves in flight.
+    /// </summary>
     private PartitionState? Settle(Target target)
     {
-        if (!_states.TryGetValue(target.Partition, out var state))
+        if (!_states.TryGetValue(target.Partition, out var state) || state.Claim != target.Claim)
         {
             return null;
         }
 
         state.InFlight = false;
+        state.Backlogged = false;
         state.Idle.TrySetResult();
         return state.Generation == target.Generation ? state : null;
     }
@@ -1463,7 +1724,8 @@ public sealed class PartitionReader : IAsyncDisposable
             };
     }
 
-    private readonly record struct Target(uint Partition, PollingStrategy Sent, ulong Generation);
+    /// <summary>A read of one partition. Its claim tells it from a later read of the partition, and zero reads nothing.</summary>
+    private readonly record struct Target(uint Partition, PollingStrategy Sent, ulong Generation, ulong Claim = 0);
 
     /// <summary>A batch or an error, with the generation of its partition when the reader read it.</summary>
     private sealed record Entry(
@@ -1477,8 +1739,12 @@ public sealed class PartitionReader : IAsyncDisposable
     private sealed class PartitionState(PollingStrategy start, ulong generation)
     {
         internal ulong? AloneUntil;
+
+        /// <summary>The last fetch section of the position ended before the head of the partition.</summary>
+        internal bool Backlogged;
         internal ulong? CatchUpUntil;
         internal PolledMessages? CatchUpBatch;
+        internal ulong Claim;
         internal PollingStrategy? PendingStart;
         internal Checkpoint? Counted;
         internal uint CountedSinceStore;
@@ -1489,6 +1755,9 @@ public sealed class PartitionReader : IAsyncDisposable
         internal TaskCompletionSource Idle = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal bool InFlight;
         internal int Lasting;
+
+        /// <summary>With an on read policy: a committing read of the partition lost its reply and may have stored.</summary>
+        internal bool Lost;
         internal PollingStrategy Position = start;
         internal long RetryAt;
 

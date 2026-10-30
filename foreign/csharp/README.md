@@ -321,17 +321,23 @@ Auto-commit and `Next` polls, offset stores and offset deletes also share a prog
 and deletes hold both lanes of their partition, and sends hold only the partition lane, so a poll that waits on the
 server never delays a send.
 
-Auto-commit and `Next` polls (100/106) hold the progress lane only while they run, and are not retained or
+`Next` polls (100/106) that store nothing hold the progress lane only while they run, and are not retained or
 replayed after uncertainty. Their unknown-outcome error has no operation id. Behind a retained offset store or
-delete these polls throw `VsrLaneBlockedException`, and a retained send does not block them.
+delete these polls throw `VsrLaneBlockedException`, and a retained send does not block them. A poll that commits
+(`CommitPolicy.OnRead` or auto commit) and whose outcome is unknown throws `VsrFetchProgressUncertainException`
+(local status 14010) with its operation id, also when its link drops while it waits. Its partition then refuses
+every poll that moves the consumer and every offset store or delete of this client with
+`VsrPartitionLaneBlockedException` (local status 14009), also after a reconnect or a new sign-in, until
+`AbandonOperationAsync` with that operation id. The server may still store the offset of the abandoned poll.
 
 The `PartitionReader` and `IggyConsumer` read several partitions of one primary in one internal request. When the
 reply of such a read that commits is lost, the client throws `VsrFetchProgressUncertainException` (local status
 14010) inside the reader and blocks those partitions (`VsrPartitionLaneBlockedException`, local status 14009).
-The reader abandons its own lost read at once and reads `Next` again: the server refuses a late commit of the
-old read once the stored offset moved, and a read that finds messages stored by the lost read reads them again by
-offset without a commit. A lost range is reported only when the partition moved to another member before it
-could be read again.
+The reader abandons its own lost read, waits its retry interval and reads `Next` again: the server refuses a late
+commit of the old read once the stored offset moved, and a read that finds messages stored by the lost read reads
+them again by offset without a commit, up to the end that the server stored. A read that starts past its position
+while no read was lost, because the application or another session stored that offset, delivers from there. A lost
+range is reported only when the partition moved to another member before it could be read again.
 
 Background `IggyPublisher` sends report unknown outcomes through the message-batch-failed event. Direct sends throw
 them to the caller.
@@ -731,8 +737,10 @@ var next = await client.PollMessagesAsync(streamId, topicId, 0, Consumer.New(1),
 - `CommitPolicy.Manual` stores nothing. Commit `PolledMessages.Checkpoint`, or `CheckpointAt(index)` for a part
   of the batch, with `StoreConsumerPositionAsync`. A checkpoint keeps the partition history that delivered it,
   so a commit after the partition was deleted and recreated fails with status 87.
-- `CommitPolicy.OnRead` makes the server store the offset of the last message of the read, as part of the read.
-  A one-shot poll refuses `CommitPolicy.Auto` with status 2 (`InvalidConfiguration`): it has nothing to count.
+- `CommitPolicy.OnRead` makes the server store the offset of the last message of the read, as part of the read,
+  in one round trip. While the primary stays up a message is delivered at most once. A failover before the store
+  replicates can deliver the last batch again. A one-shot poll refuses `CommitPolicy.Auto` with status 2
+  (`InvalidConfiguration`): it has nothing to count.
 - `PolledMessages.Continuation` continues the partition after the batch, under its context. An empty batch keeps
   the start of its read, so `Next` stays `Next`. A poll of another partition refuses the continuation with
   status 3.
@@ -749,8 +757,12 @@ var next = await client.PollMessagesAsync(streamId, topicId, 0, Consumer.New(1),
   stores and deletes of the same client on that partition wait for it, and its sends do not.
 - Over HTTP, a poll uses `.../messages/deferred`, and a poll that commits is a `POST`, which no client or proxy
   sends again. The server refuses a `GET` that asks for auto commit. The SDK `HttpClient` times out after 640
-  seconds, above the longest request timeout. A committing poll answered with 504 throws
-  `VsrRequestOutcomeUnknownException`.
+  seconds, above the longest request timeout. A committing poll whose outcome is unknown (a 5xx other than 503,
+  a 4xx whose error does not prove that nothing was stored, a transport failure after the connect, or a cancel
+  while it is on the wire) throws `VsrFetchProgressUncertainException`, and its partition refuses progress polls
+  and offset stores or deletes with `VsrPartitionLaneBlockedException` until `AbandonOperationAsync`. The block
+  covers calls that spell the stream and the topic the same way, and calls whose context names the same
+  incarnation.
 
 ### Partition Reader
 
@@ -786,7 +798,8 @@ while (true)
 - `NextAsync` returns one batch of one partition, never empty. A canceled call leaves the batches in the
   reader. `ReadException` names the partition of an error, and the reader retries by itself. Status 87 stops a
   partition until `SeekAsync` when its position came from an earlier read, and so do status 80 and a refusal
-  that six retries did not change.
+  that six retries did not change. Status 5009 (`ConsumerGroupPartitionNotOwned`) also drops the position of its
+  partition, which reads again from the start of the reader with the owner generation of a new route.
 - For a message that does not decode, `ReadException` carries `Skip`, `Offset` and `Record`. `Record` is the
   record as the reply carried it, its 48-byte frame header, payload and user headers before decryption, so a
   message that does not decrypt can be kept or inspected. When the framing of the reply is malformed, `Offset`
@@ -795,8 +808,11 @@ while (true)
 - With `CommitPolicy.Manual`, `CommitAsync` stores a checkpoint. With `CommitPolicy.OnRead` the server stores the
   offset of each read, the reader reads only while `NextAsync` waits, and `CloseAsync` moves the offset back to
   the last batch the application took. A read whose reply was lost is repaired: the next read finds the messages
-  that it stored, and the reader reads them again by offset without a commit. A batch that the server stored is
-  handed over even when its partition left the assignment of the member.
+  that it stored, and the reader reads them again by offset without a commit, up to the end that the server
+  stored. `CloseAsync` also moves the offset back before a lost read that nobody took. A batch that the server
+  stored is handed over even when its partition left the assignment of the member. A `SeekAsync` to an offset
+  above 0 first stores the offset before it, so a restart resumes at the sought offset, and a refused store fails
+  the seek and moves nothing. Every other `SeekAsync` stores nothing.
 - With `CommitPolicy.Auto(new AutoCommit { Interval, Every, After })` the reader counts each batch, when
   `NextAsync` returns it (`CommitAfter.Delivery`), at the next `NextAsync` or `CloseAsync`
   (`CommitAfter.Processing`), or on `Mark` (`CommitAfter.Marked`), and stores the latest counted position at the
@@ -805,6 +821,10 @@ while (true)
 - The reader reads ahead up to 16 MiB and 16,000 messages, set with `WithPrefetch`. Without options a read waits
   up to 5 seconds. A fetch puts the partitions that it served last at its end, so each partition gets its turn.
   After a refused read or a failed refresh the reader waits its retry interval.
+- A partition whose last read ended before its head reads in a fetch of its own, with the full `Count` and
+  `MaxBytes`, while the prefetch holds that many reads (up to 16 at once). The quiet partitions of a primary share
+  one fetch, which waits on the server. With `CommitPolicy.OnRead` the reader starts those fetches only while
+  `NextAsync` waits, and each partition is in one committing read at a time.
 
 ## Offset Management
 
@@ -1159,8 +1179,9 @@ await consumer.ConsumeAsync(async (message, token) =>
   `CommitAfter.Marked` only `Mark(checkpoint)` counts.
 
 A read error does not end the loop: the reader retries by itself and the error reaches `SubscribeToErrorEvents`.
-`DisposeAsync` calls `ShutdownAsync`, which counts the last message under `CommitAfter.Processing`, stores or
-rewinds the offsets, and leaves the group.
+`DisposeAsync` calls `ShutdownAsync`. It waits for a handler of `ConsumeAsync` that runs, unless that handler calls
+it, counts the last message of `ReceiveAsync` under `CommitAfter.Processing`, stores or rewinds the offsets, and
+leaves the group.
 
 For automatic deserialization:
 

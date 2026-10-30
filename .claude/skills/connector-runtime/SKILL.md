@@ -148,7 +148,7 @@ Stages (both labels snake_case): `decode` (schema decode loop), `prepare` (trans
 Gotchas:
 
 - Batch flushes when a message is the last one in its partition (`message_offset == current_offset`), when the batch is full, OR before a message of another partition, because the plugin gets one partition id per batch. `max_wait` and `min_count` on the stream make the server collect larger replies.
-- The server stores the offset on read (`OnRead`), so sink delivery is at-most-once: a crash after the poll and before the plugin write loses that batch.
+- The server stores the offset on read (`OnRead`), so sink delivery is at-most-once while the primary stays up: a crash after the poll and before the plugin write loses that batch. A failover before the store replicates can deliver the last batch again.
 - A stop still flushes the batch the loop holds, and the task then awaits `IggyConsumer::shutdown`, which rewinds over the batches the consumer holds. Without either step, the next run skips messages that the polls committed.
 
 ## Logging format

@@ -30,8 +30,9 @@ public sealed interface CommitPolicy permits CommitPolicy.Manual, CommitPolicy.O
     }
 
     /**
-     * The server stores the offset of the last message of each read as part of the read: one round trip, at most
-     * once.
+     * The server stores the offset of the last message of each read as part of the read, in one round trip. While the
+     * primary stays up a message is delivered at most once. A failover before the store replicates can deliver the
+     * last batch again.
      */
     static CommitPolicy onRead() {
         return OnRead.INSTANCE;

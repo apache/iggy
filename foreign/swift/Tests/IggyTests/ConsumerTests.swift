@@ -80,6 +80,7 @@ private final class FakeTopic: Sendable {
         var undecodable: Set<UInt64> = []
         var oversized: Set<UInt64> = []
         var losesReply = 0
+        var reportsHead = false
 
         func start(_ partition: UInt32, kind: PollingStrategy.Kind, value: UInt64, count: UInt32) -> UInt64 {
             let end = ends[partition, default: 0]
@@ -115,9 +116,17 @@ private final class FakeTopic: Sendable {
     private static let waitStep: Duration = .milliseconds(10)
     private let state: Locked<State>
 
-    init(ends: [UInt32: UInt64], assignment: [UInt32] = [1], undecodable: Set<UInt64> = [], oversized: Set<UInt64> = [], losesReply: Int = 0) {
+    /// With `reportsHead` a fetch section carries the newest offset of its
+    /// partition, as the server sends it, else the last offset it read.
+    init(
+        ends: [UInt32: UInt64], assignment: [UInt32] = [1], undecodable: Set<UInt64> = [], oversized: Set<UInt64> = [], losesReply: Int = 0,
+        reportsHead: Bool = false
+    ) {
         state = Locked(State(ends: ends, assignment: assignment, undecodable: undecodable, oversized: oversized))
-        state.withLock { $0.losesReply = losesReply }
+        state.withLock { state in
+            state.losesReply = losesReply
+            state.reportsHead = reportsHead
+        }
     }
 
     var stored: [UInt32: UInt64] {
@@ -219,7 +228,8 @@ private final class FakeTopic: Sendable {
                 let offsets = state.read(target.partitionID, from: start, count: room, commits: fetch.autoCommit)
                 room -= UInt64(offsets.count)
                 var section = FakeVSRServer.FetchedSection(
-                    partitionID: target.partitionID, offsets: offsets, nextOffset: offsets.last.map { $0 + 1 } ?? start)
+                    partitionID: target.partitionID, offsets: offsets, nextOffset: offsets.last.map { $0 + 1 } ?? start,
+                    currentOffset: state.reportsHead ? state.ends[target.partitionID].map { $0 > 0 ? $0 - 1 : 0 } : nil)
                 if !state.undecodable.isDisjoint(with: offsets) {
                     section.records = [1, 2, 3]
                 }
@@ -283,6 +293,17 @@ private func batches(_ reader: PartitionReader, _ count: Int) async throws -> [[
         batches.append(batch.messages.map(\.offset))
     }
     return batches
+}
+
+/// The error `reader` throws next, or nil when it returns a batch or nothing
+/// within two seconds.
+private func readError(_ reader: PartitionReader) async -> ReadError? {
+    do {
+        _ = try await withDeadline(.now + .seconds(2)) { try await reader.next() }
+    } catch let error as ReadError {
+        return error
+    } catch {}
+    return nil
 }
 
 private func standalone(
@@ -359,6 +380,50 @@ struct ConsumerTests {
         await server.stop()
     }
 
+    /// Partitions whose last section ended before their head read at once,
+    /// so each one takes a fetch of its own while requests are free, with
+    /// the full limits, as the base consumer kept a poll per partition.
+    @Test func backloggedPartitionsOfOneGroupReadInFetchesOfTheirOwn() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 20, 2: 20, 3: 20, 4: 20], reportsHead: true)
+        await serve(server, topic: topic)
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, partitions: [1, 2, 3, 4], start: .first)
+        _ = try #require(try await reader.next())
+
+        let read = { @Sendable in Set(((try? await fetches(server)) ?? []).dropFirst().flatMap { $0.targets.map(\.partitionID) }) }
+        #expect(await eventually { await read() == [1, 2, 3, 4] })
+
+        let spread = try await fetches(server).dropFirst()
+        #expect(spread.allSatisfy { $0.targets.count == 1 && $0.count == 2 }, "\(spread.map { $0.targets.map(\.partitionID) })")
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// Once `next()` waits, an `onRead` reader deals its backlogged partitions
+    /// over the free requests too, one committing fetch each with the full
+    /// limits, beside the one fetch of the quiet partitions that may wait.
+    @Test func backloggedPartitionsOfAnOnReadGroupReadInCommittingFetchesOfTheirOwn() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 20, 2: 20, 3: 20, 4: 20, 5: 0], reportsHead: true)
+        await serve(server, topic: topic)
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, partitions: [1, 2, 3, 4, 5], start: .first, commit: .onRead)
+        #expect(try await batches(reader, 1) == [[0, 1]])
+
+        _ = try #require(try await reader.next())
+
+        let committing = { @Sendable in (try? await fetches(server).filter(\.autoCommit)) ?? [] }
+        #expect(await eventually { await committing().count == 6 })
+        let spread = await committing().dropFirst()
+        #expect(Set(spread.map { $0.targets.map(\.partitionID) }) == [[5], [1], [2], [3], [4]], "\(spread.map { $0.targets.map(\.partitionID) })")
+        #expect(spread.allSatisfy { $0.count == 2 })
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
     /// A section refused as not primary groups the partitions again, and
     /// the partition is read on without an error for the caller.
     @Test func aReaderGroupsAgainAfterNotPrimary() async throws {
@@ -396,6 +461,27 @@ struct ConsumerTests {
         let gapReads = await requests(server, .pollMessagesDeferred).map(polledStrategy)
         #expect(gapReads.map(\.kind) == [PollingStrategy.Kind.offset.rawValue] && gapReads.map(\.value) == [2] && gapReads.allSatisfy { !$0.autoCommit })
         try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// A read that starts past the expected offset while no read of its
+    /// partition was lost follows a store of the application or another
+    /// session, so the reader delivers from there and reads nothing again.
+    @Test func anOnReadReaderTakesAForwardJumpWithoutALostReadAsIs() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 6])
+        await serve(server, topic: topic)
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, commit: .onRead)
+        #expect(try await batches(reader, 1) == [[0, 1]])
+        topic.store(3, for: 1)
+
+        #expect(try await batches(reader, 1) == [[4, 5]])
+
+        #expect(await requests(server, .pollMessagesDeferred).isEmpty)
+        try await reader.close()
+        #expect(topic.stored[1] == 5)
         await client.shutdown()
         await server.stop()
     }
@@ -460,8 +546,11 @@ struct ConsumerTests {
         await server.stop()
     }
 
-    @Test(arguments: [false, true])
-    func anUncertainCommittedSectionKeepsItsSiblingAndRecoversOrRewinds(closing: Bool) async throws {
+    /// A committing section whose error leaves the outcome unknown may have
+    /// stored its read, so the reader reads that range again, or the close
+    /// moves the offset back over it.
+    @Test(arguments: [false, true], [IggyErrorCode.shardCommunicationError, .cannotDecryptData, .staleClient, .unauthorized])
+    func anUncertainCommittedSectionKeepsItsSiblingAndRecoversOrRewinds(closing: Bool, status: IggyErrorCode) async throws {
         let server = try await FakeVSRServer.started()
         let topic = FakeTopic(ends: [1: 7, 2: 1])
         topic.store(4, for: 1)
@@ -476,7 +565,7 @@ struct ConsumerTests {
             _ = await topic.reply(to: request)
             return .ok(
                 FakeVSRServer.fetchedBody([
-                    FakeVSRServer.FetchedSection(partitionID: 1, status: IggyErrorCode.shardCommunicationError.rawValue),
+                    FakeVSRServer.FetchedSection(partitionID: 1, status: status.rawValue),
                     FakeVSRServer.FetchedSection(partitionID: 2, offsets: [0], nextOffset: 1),
                 ]))
         }
@@ -492,6 +581,245 @@ struct ConsumerTests {
         try await reader.close()
         #expect(topic.stored[1] == (closing ? 4 : 6))
         #expect(topic.stored[2] == 0)
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// The close of an `onRead` reader cancels a committing fetch that waits
+    /// on the server, and that fetch waits for its one reply: nothing stored
+    /// when the cancel won, or the messages when the store won, which the
+    /// close moves back as undelivered. So the close takes a round trip, not
+    /// the wait of the fetch.
+    @Test(arguments: [true, false])
+    func anOnReadCloseCancelsAParkedCommittingFetch(cancelWins: Bool) async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 0])
+        let cancelled = Locked(false)
+        await serve(server, topic: topic) { request in
+            switch request.code {
+            case CommandCode.cancelDeferredRequest.rawValue:
+                cancelled.withLock { $0 = true }
+                return .stall
+            case CommandCode.fetchMessages.rawValue where (try? request.fetch.autoCommit) == true:
+                let parked = ContinuousClock.now + .seconds(10)
+                while !cancelled.withLock({ $0 }), ContinuousClock.now < parked {
+                    try? await Task.sleep(for: .milliseconds(10))
+                }
+                if cancelWins {
+                    return .status(IggyErrorCode.transientNotAccepted.rawValue)
+                }
+                topic.append(2, to: 1)
+                return await topic.reply(to: request)
+            default:
+                return nil
+            }
+        }
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, commit: .onRead)
+        let pending = Task { try? await reader.next() }
+        #expect(await eventually { (try? await fetches(server).filter(\.autoCommit).count) == 1 })
+
+        let started = ContinuousClock.now
+        try await reader.close()
+        let closing = ContinuousClock.now - started
+
+        #expect(closing < .seconds(2), "the close took \(closing)")
+        #expect(cancelled.withLock { $0 })
+        #expect(topic.stored[1] == nil)
+        _ = await pending.value
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// The offset a seek under `onRead` stored is the last delivered message
+    /// of the new generation, so the close moves the offset back to it over a
+    /// read that the server stored and nobody received, whatever the start.
+    @Test func anOnReadCloseMovesTheOffsetBackToTheSoughtPosition() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 4])
+        let held = Locked(false)
+        let released = Locked(false)
+        await serve(server, topic: topic) { request in
+            guard request.code == CommandCode.fetchMessages.rawValue, (try? request.fetch.autoCommit) == true, topic.stored[1] == 0 else {
+                return nil
+            }
+            let reply = await topic.reply(to: request)
+            held.withLock { $0 = true }
+            while !released.withLock({ $0 }) {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            return reply
+        }
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, start: .first, commit: .onRead)
+        #expect(try await batches(reader, 1) == [[0, 1]])
+        try await reader.seek(partitionID: 1, to: .offset(1))
+        #expect(topic.stored[1] == 0)
+        let pending = Task { try? await reader.next() }
+        #expect(await eventually { held.withLock { $0 } && topic.stored[1] == 2 })
+        pending.cancel()
+        _ = await pending.value
+        released.withLock { $0 = true }
+
+        try await reader.close()
+
+        #expect(topic.stored[1] == 0)
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// While the store of a seek under `onRead` waits, no committing read of
+    /// the partition starts, and the new generation then reads from the
+    /// sought offset without a round trip for its stored offset.
+    @Test func anOnReadSeekBeforeTheFirstReadReadsFromItsOffsetAfterTheStore() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 5])
+        let held = Locked(false)
+        let released = Locked(false)
+        await serve(server, topic: topic) { request in
+            guard request.code == CommandCode.storeConsumerOffset.rawValue else {
+                return nil
+            }
+            let reply = await topic.reply(to: request)
+            held.withLock { $0 = true }
+            while !released.withLock({ $0 }) {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            return reply
+        }
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, start: .first, commit: .onRead)
+        let seeking = Task { try await reader.seek(partitionID: 1, to: .offset(3)) }
+        #expect(await eventually { held.withLock { $0 } })
+        let pending = Task { try? await reader.next() }
+        released.withLock { $0 = true }
+        try await seeking.value
+
+        let batch = (await pending.value) ?? nil
+        #expect(batch?.messages.map(\.offset) == [3, 4])
+        let first = try #require(try await fetches(server).first)
+        #expect(first.autoCommit && first.targets.map(\.kind) == [.offset] && first.targets.map(\.value) == [3])
+        #expect(topic.stored[1] == 4)
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// There is no offset before zero, so a seek under `onRead` to offset
+    /// zero stores and deletes nothing: the first read from zero stores.
+    @Test func anOnReadSeekToOffsetZeroStoresNothing() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 2])
+        await serve(server, topic: topic)
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, commit: .onRead)
+        #expect(try await batches(reader, 1) == [[0, 1]])
+
+        try await reader.seek(partitionID: 1, to: .offset(0))
+
+        #expect(topic.stored[1] == 1)
+        #expect(await requests(server, .storeConsumerOffset).isEmpty)
+        #expect(await requests(server, .deleteConsumerOffset).isEmpty)
+        #expect(try await batches(reader, 1) == [[0, 1]])
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// A seek under `onRead` whose store the server refuses fails with that
+    /// error and moves nothing: the partition reads on in its generation.
+    @Test func anOnReadSeekWhoseStoreIsRefusedMovesNothing() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 4])
+        await serve(server, topic: topic) { request in
+            request.code == CommandCode.storeConsumerOffset.rawValue ? .status(IggyErrorCode.unauthorized.rawValue) : nil
+        }
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, commit: .onRead)
+        let before = try #require(try await reader.next())
+
+        let refused = await #expect(throws: IggyError.self) { try await reader.seek(partitionID: 1, to: .offset(4)) }
+
+        #expect(refused?.code == .unauthorized)
+        let after = try #require(try await reader.next())
+        #expect(after.messages.map(\.offset) == [2, 3] && after.stamp?.generation == before.stamp?.generation)
+        #expect(topic.stored[1] == 3)
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// A seek under `onRead` that stores while the close starts keeps its
+    /// store: the read in flight ends in the old generation, and the close
+    /// moves the offset back to the sought position.
+    @Test func anOnReadSeekThatWaitsWhenTheCloseStartsKeepsItsStore() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 4])
+        let held = Locked(false)
+        let released = Locked(false)
+        await serve(server, topic: topic) { request in
+            guard request.code == CommandCode.fetchMessages.rawValue, (try? request.fetch.autoCommit) == true, topic.stored[1] == 1 else {
+                return nil
+            }
+            let reply = await topic.reply(to: request)
+            held.withLock { $0 = true }
+            while !released.withLock({ $0 }) {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            return reply
+        }
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, commit: .onRead)
+        #expect(try await batches(reader, 1) == [[0, 1]])
+        let pending = Task { try? await reader.next() }
+        #expect(await eventually { held.withLock { $0 } && topic.stored[1] == 3 })
+        let seeking = Task { try await reader.seek(partitionID: 1, to: .offset(1)) }
+        let closing = Task { try await reader.close() }
+        released.withLock { $0 = true }
+        try await seeking.value
+        try await closing.value
+        _ = await pending.value
+
+        #expect(topic.stored[1] == 0)
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// A section that the member no longer owns says nothing about its other
+    /// partitions, so the close still moves back what the same reply stored
+    /// for them.
+    @Test func anOnReadCloseRewindsTheSiblingOfASectionThatLostItsOwner() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 0, 2: 2], assignment: [1, 2])
+        let ready = Locked(false)
+        let released = Locked(false)
+        await serve(server, topic: topic) { request in
+            guard request.code == CommandCode.fetchMessages.rawValue, (try? request.fetch.autoCommit) == true, !ready.withLock({ $0 }) else {
+                return nil
+            }
+            _ = await topic.reply(to: request)
+            ready.withLock { $0 = true }
+            while !released.withLock({ $0 }) {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            return .ok(
+                FakeVSRServer.fetchedBody([
+                    FakeVSRServer.FetchedSection(partitionID: 1, status: IggyErrorCode.consumerGroupPartitionNotOwned.rawValue),
+                    FakeVSRServer.FetchedSection(partitionID: 2, offsets: [0, 1]),
+                ]))
+        }
+        let client = try await signedInClient(server)
+        let reader = try await member(client, commit: .onRead)
+        let pending = Task { try? await reader.next() }
+        #expect(await eventually { ready.withLock { $0 } && topic.stored[2] == 1 })
+        pending.cancel()
+        _ = await pending.value
+
+        let closing = Task { try await reader.close() }
+        released.withLock { $0 = true }
+        try await closing.value
+
+        #expect(topic.stored[2] == nil)
         await client.shutdown()
         await server.stop()
     }
@@ -519,6 +847,115 @@ struct ConsumerTests {
         #expect(skip.kind == .offset && skip.value == 2)
         try await reader.seek(partitionID: 1, to: skip)
         #expect(try await batches(reader, 1) == [[2]])
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// A poll of one partition whose reply does not decode is read again one
+    /// message at a time, so the error names the bad message and the
+    /// continuation after it.
+    @Test func anUndecodablePollIsReadAgainOneMessageAtATime() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 3], undecodable: [0], oversized: [0])
+        await serve(server, topic: topic)
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, start: .first)
+
+        let error = try #require(await readError(reader))
+
+        #expect(error.partitionID == 1 && error.offset == 0 && error.skip?.value == 1)
+        try await reader.seek(partitionID: 1, to: try #require(error.skip))
+        #expect(try await batches(reader, 1) == [[1, 2]])
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// A gap that a lost read stored is read again one message at a time
+    /// once its reply does not decode, so the messages before the bad one
+    /// arrive and the error names the bad one.
+    @Test func anUndecodableGapReadNamesTheBadMessage() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 6], undecodable: [3])
+        await serve(server, topic: topic)
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, commit: .onRead)
+        #expect(try await batches(reader, 1) == [[0, 1]])
+        topic.loseReplies(1)
+
+        #expect(try await batches(reader, 1) == [[2]])
+        let error = try #require(await readError(reader))
+
+        #expect(error.partitionID == 1 && error.offset == 3 && error.skip?.value == 4)
+        try await reader.seek(partitionID: 1, to: try #require(error.skip))
+        #expect(try await batches(reader, 1) == [[4, 5]])
+        #expect(topic.stored[1] == 5)
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// An empty committing poll says nothing about where the next read
+    /// starts, so the next reply opens no gap.
+    @Test func anEmptyCommittingPollKeepsTheExpectedStart() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 2])
+        let committingFetches = Locked(0)
+        await serve(server, topic: topic) { request in
+            if request.code == CommandCode.pollMessagesDeferred.rawValue, polledStrategy(request).autoCommit {
+                return .ok(FakeVSRServer.polledBody(partitionID: 1, offsets: []))
+            }
+            guard request.code == CommandCode.fetchMessages.rawValue, (try? request.fetch.autoCommit) == true else {
+                return nil
+            }
+            let fetch = committingFetches.withLock { count in
+                count += 1
+                return count
+            }
+            return fetch == 2 ? .ok(FakeVSRServer.fetchedBody([.init(partitionID: 1, status: IggyErrorCode.invalidSizeBytes.rawValue)])) : nil
+        }
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, commit: .onRead)
+        #expect(try await batches(reader, 1) == [[0, 1]])
+        let pending = Task { try await batches(reader, 1) }
+        #expect(await eventually { await requests(server, .pollMessagesDeferred).count == 1 })
+        topic.append(1, to: 1)
+
+        #expect(try await pending.value == [[2]])
+        #expect(await requests(server, .pollMessagesDeferred).count == 1)
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// Two partitions whose history is gone stop in one reply, and each one
+    /// reports its own error.
+    @Test func everyPartitionThatStopsInOneReplyReportsItsError() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 1, 2: 1])
+        await serve(server, topic: topic) { request in
+            guard request.code == CommandCode.fetchMessages.rawValue, let fetch = try? request.fetch, fetch.targets.allSatisfy({ $0.value == 1 })
+            else {
+                return nil
+            }
+            return .ok(
+                FakeVSRServer.fetchedBody(
+                    fetch.targets.map { FakeVSRServer.FetchedSection(partitionID: $0.partitionID, status: IggyErrorCode.historyUnavailable.rawValue) }))
+        }
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, partitions: [1, 2], start: .first)
+        #expect(try await batches(reader, 2) == [[0], [0]])
+
+        var reported: [UInt32] = []
+        for _ in 0..<2 {
+            if let error = await readError(reader) {
+                #expect(error.error.code == .historyUnavailable)
+                reported += error.partitionID.map { [$0] } ?? []
+            }
+        }
+
+        #expect(reported.sorted() == [1, 2])
         try await reader.close()
         await client.shutdown()
         await server.stop()
@@ -705,7 +1142,7 @@ struct ConsumerTests {
         let client = try await signedInClient(server)
         let reader = try await member(client, commit: .onRead)
         #expect(try await batches(reader, 1) == [[0, 1]])
-        topic.store(3, for: 1)
+        topic.loseReplies(1)
         let pending = Task { try await reader.next() }
         #expect(await eventually { gapReads.withLock { $0 } == 1 })
         topic.assign([2])
@@ -810,6 +1247,30 @@ struct ConsumerTests {
         await server.stop()
     }
 
+    /// A read refused for the session leaves the member joined on the server
+    /// when the client keeps that session, so the close leaves the group
+    /// whatever the reader saw.
+    @Test func aMemberLeavesItsGroupOnCloseAfterALostSessionError() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 2], assignment: [1])
+        let refused = Locked(false)
+        await serve(server, topic: topic) { request in
+            guard request.code == CommandCode.fetchMessages.rawValue, !refused.exchange(true) else {
+                return nil
+            }
+            return .ok(FakeVSRServer.fetchedBody([.init(partitionID: 1, status: IggyErrorCode.staleClient.rawValue)]))
+        }
+        let client = try await signedInClient(server)
+        let reader = try await member(client, commit: .manual)
+        #expect(await readError(reader)?.error.code == .staleClient)
+
+        try await reader.close()
+
+        #expect(await requests(server, .leaveConsumerGroup).count == 1)
+        await client.shutdown()
+        await server.stop()
+    }
+
     /// The server hands a member its partitions as its shards learn of the
     /// join, so a sync right after it can hold part of the assignment. The
     /// reader syncs again at its check interval, without a fence or a
@@ -905,6 +1366,36 @@ struct ConsumerTests {
         }
         await consumer.shutdown()
         #expect(topic.stored[1] == 0)
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// A seek can replace the generation of a partition while the consumer
+    /// waits for the batch it then buffers. That batch is dropped, and the
+    /// batches of the other partitions still arrive.
+    @Test func aConsumerDropsABufferedBatchOfAGenerationASeekReplaced() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 3, 2: 3])
+        await serve(server, topic: topic)
+        let client = try await signedInClient(server)
+        let consumer = try client.consumer(
+            name: "reader", streamID: 1, topicID: 2, partitions: [1, 2],
+            configuration: ConsumerConfiguration(pollingStrategy: .first, pollOptions: PollOptions(count: 6, maxWait: .milliseconds(200))))
+        try await consumer.initialize()
+        let first = try #require(try await consumer.next())
+        let stale = first.checkpoint.stamp?.generation
+        let other: UInt32 = first.partitionID == 1 ? 2 : 1
+
+        try await #require(await consumer.reader).seek(partitionID: first.partitionID, to: .offset(0))
+        var received: [ReceivedMessage] = []
+        while received.count < 5, let message = try await withDeadline(.now + .seconds(2), { try await consumer.next() }) ?? nil {
+            received.append(message)
+        }
+
+        let replaced = received.filter { $0.partitionID == first.partitionID && $0.checkpoint.stamp?.generation == stale }
+        #expect(replaced.isEmpty, "\(replaced.map(\.message.offset))")
+        #expect(received.filter { $0.partitionID == other }.map(\.message.offset) == [0, 1, 2])
+        await consumer.shutdown()
         await client.shutdown()
         await server.stop()
     }

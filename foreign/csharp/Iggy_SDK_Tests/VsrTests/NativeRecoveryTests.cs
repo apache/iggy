@@ -175,17 +175,31 @@ public sealed partial class NativeRecoveryTests
     [Theory]
     [InlineData(true, false)]
     [InlineData(false, true)]
-    public async Task given_a_progress_poll_when_its_outcome_is_uncertain_should_not_replay_or_retain_it(
+    public async Task given_a_progress_poll_when_its_outcome_is_uncertain_should_not_replay_it_and_block_only_a_commit(
         bool autoCommit, bool next)
     {
         using var cluster = new RecoveryCluster();
         using var client = await cluster.ConnectAsync();
         cluster.OnPoll = request => Reply(request.Operation, [], VsrError.TRANSIENT_NOT_COMMITTED);
-        var error = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => client.PollMessagesAsync(
+        var error = await Assert.ThrowsAnyAsync<VsrRequestOutcomeUnknownException>(() => client.PollMessagesAsync(
             Stream, Topic, 0, Consumer.New(3), next ? PollingStrategy.Next() : PollingStrategy.Offset(0), 1,
             autoCommit, cluster.Token));
-        Assert.Null(error.OperationId);
         Assert.Single(cluster.Polls);
+        if (autoCommit)
+        {
+            // The poll may have stored its offset, so its partition waits for the caller to abandon it.
+            var uncertain = Assert.IsType<VsrFetchProgressUncertainException>(error);
+            var blocked = await Assert.ThrowsAsync<VsrPartitionLaneBlockedException>(() =>
+                StoreAsync(client, cluster.Token));
+            Assert.Equal(uncertain.OperationId, blocked.OperationId);
+            Assert.Empty(cluster.Writes);
+            await client.AbandonOperationAsync(blocked.OperationId);
+        }
+        else
+        {
+            Assert.Null(error.OperationId);
+        }
+
         await StoreAsync(client, cluster.Token);
         Assert.Single(cluster.Writes);
     }

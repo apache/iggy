@@ -124,3 +124,85 @@ func TestIggyConsumer_ShutdownWaitsForAnAutomaticStoreWithoutCancellingIt(t *tes
 		t.Fatal("shutdown did not finish after the store settled")
 	}
 }
+
+// A seek of another partition leaves the batch that the consumer took from the reader meanwhile.
+func TestIggyConsumer_HandsOverABatchTakenWhileAnotherPartitionIsSought(t *testing.T) {
+	client := newFakeClient()
+	consumer := manualConsumer(t, client, 1, 2)
+	read := client.nextRead(t)
+	received := receiveInBackground(consumer)
+	require.Eventually(t, func() bool { return waiting(consumer.reader) == 1 }, testTimeout, time.Millisecond)
+
+	require.NoError(t, consumer.Seek(context.Background(), 2, iggcon.OffsetPollingStrategy(0)))
+	read.answer(section(1, 0))
+
+	result := <-received
+	require.NoError(t, result.err)
+	assert.Equal(t, uint32(1), result.message.PartitionID)
+	assert.Equal(t, uint64(0), result.message.Checkpoint.Offset())
+}
+
+// The first batch that the reader reads after a seek reaches the consumer that waited during the seek.
+func TestIggyConsumer_HandsOverTheBatchReadAfterASeekOfItsPartition(t *testing.T) {
+	client := newFakeClient()
+	consumer := manualConsumer(t, client, 1)
+	stale := client.nextRead(t)
+	received := receiveInBackground(consumer)
+	require.Eventually(t, func() bool { return waiting(consumer.reader) == 1 }, testTimeout, time.Millisecond)
+
+	require.NoError(t, consumer.Seek(context.Background(), 1, iggcon.OffsetPollingStrategy(5)))
+	sought := client.nextRead(t)
+	require.Equal(t, uint64(5), sought.targets[0].Strategy.Value)
+	sought.answer(section(1, 5))
+	stale.answer(section(1, 0))
+
+	result := <-received
+	require.NoError(t, result.err)
+	assert.Equal(t, uint64(5), result.message.Checkpoint.Offset())
+}
+
+// A handler that ends the context of Consume gets no further message of the batch.
+func TestIggyConsumer_ConsumeEndsWhenItsContextEndsBetweenMessages(t *testing.T) {
+	client := newFakeClient()
+	consumer := manualConsumer(t, client, 1)
+	client.nextRead(t).answer(section(1, 0, 1, 2))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var handled []uint64
+
+	err := consumer.Consume(ctx, func(_ context.Context, message ReceivedMessage) error {
+		handled = append(handled, message.Checkpoint.Offset())
+		cancel()
+		return nil
+	})
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, []uint64{0}, handled)
+}
+
+func manualConsumer(t *testing.T, client *fakeClient, partitions ...uint32) *IggyConsumer {
+	t.Helper()
+	consumer, err := NewIggyConsumer(context.Background(), client, identifier(t, 1), identifier(t, 2),
+		iggcon.NewSingleConsumer(identifier(t, 3)), WithPartitions(partitions...), WithPollOptions(waitOneSecond),
+		WithRetryInterval(testRetryInterval))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = consumer.Shutdown(context.Background()) })
+	return consumer
+}
+
+type receivedOutcome struct {
+	message ReceivedMessage
+	err     error
+}
+
+// receiveInBackground starts a Next of consumer whose outcome arrives on the returned channel.
+func receiveInBackground(consumer *IggyConsumer) <-chan receivedOutcome {
+	received := make(chan receivedOutcome, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+		defer cancel()
+		message, err := consumer.Next(ctx)
+		received <- receivedOutcome{message, err}
+	}()
+	return received
+}

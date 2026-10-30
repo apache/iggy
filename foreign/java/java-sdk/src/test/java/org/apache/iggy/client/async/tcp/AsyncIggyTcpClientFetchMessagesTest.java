@@ -65,6 +65,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.stream.LongStream;
@@ -131,6 +132,9 @@ class AsyncIggyTcpClientFetchMessagesTest {
     // A poll whose deadline comes well before the TIMEOUT of a test step.
     private static final DeferredPollOptions SHORT_POLL =
             FETCH.withMaxWait(Duration.ofMillis(500)).withRequestTimeout(Duration.ofMillis(1500));
+    // A poll whose deadline comes after every step of a test.
+    private static final DeferredPollOptions LONG_POLL =
+            FETCH.withMaxWait(Duration.ofSeconds(10)).withRequestTimeout(Duration.ofSeconds(20));
 
     /**
      * The typed call fills each target cap with the byte limit of the request, so the golden request, whose targets
@@ -856,7 +860,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
     }
 
     @ParameterizedTest
-    @ValueSource(ints = {80, 87, 89, 5009})
+    @ValueSource(ints = {58, 80, 87, 89, 3007, 3024, 5009})
     void shouldKeepDefinitelyRefusedSectionsFreeForTheNextProgressCall(int status) throws Exception {
         try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
             CompletableFuture<Void> served = singleNode(socket, request -> {
@@ -1091,9 +1095,8 @@ class AsyncIggyTcpClientFetchMessagesTest {
                 assertThat(fetch.cancel(true)).isTrue();
 
                 assertCancels(cancelled.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS), parked.join());
-                client.consumerOffsets()
-                        .storeConsumerOffset(STREAM, TOPIC, Optional.of(1L), GROUP, BigInteger.ONE)
-                        .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                // The reply to the cancel lifts the block of the fetch.
+                awaitStored(client);
                 assertThat(stores).hasSize(1);
             } finally {
                 client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
@@ -1103,7 +1106,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
     }
 
     @ParameterizedTest
-    @ValueSource(ints = {3, 57, 58, 59, 11001})
+    @ValueSource(ints = {3, 57, 59, 11001})
     void shouldKeepHealthySectionsWhileRetainingOnlyUncertainTargets(int status) throws Exception {
         try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
             List<Request> stores = new CopyOnWriteArrayList<>();
@@ -1308,7 +1311,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
     }
 
     /** A reply with one section of {@code partition}, which holds no records. */
-    private static ByteBuf emptySection(int partition) {
+    static ByteBuf emptySection(int partition) {
         ByteBuf reply = Unpooled.buffer().writeIntLE(1);
         section(reply, partition, FetchedMessages.STATUS_OK, 0);
         return reply;
@@ -1389,15 +1392,64 @@ class AsyncIggyTcpClientFetchMessagesTest {
     }
 
     /**
-     * The reply to a cancelled committing poll tells whether it stored its offset, so the next store of its partition
-     * goes out only after that reply, or after the deadline of the poll when none comes.
+     * The reply to the cancel of a committing poll tells whether it stored its offset. Until it arrives the poll blocks
+     * its partition, so the next store fails at once naming it, and the reply lifts the block.
      */
     @Test
-    void shouldHoldTheNextStoreOfAPartitionUntilACancelledCommittingPollEnds() throws Exception {
+    void shouldFailTheNextStoreAtOnceUntilTheReplyToTheCancelOfACommittingPoll() throws Exception {
         try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
             CompletableFuture<Request> parked = new CompletableFuture<>();
             CompletableFuture<Request> cancelled = new CompletableFuture<>();
-            CompletableFuture<Long> storedAt = new CompletableFuture<>();
+            CompletableFuture<Void> release = new CompletableFuture<>();
+            List<Request> stores = new CopyOnWriteArrayList<>();
+            CompletableFuture<Void> served = singleNode(socket, request -> {
+                if (request.is(POLL_DEFERRED_CODE, OPERATION_NON_REPLICATED) && parked.complete(request)) {
+                    return Response.noReply();
+                }
+                if (request.is(CANCEL_CODE, OPERATION_NON_REPLICATED) && cancelled.complete(request)) {
+                    after(release);
+                    // The cancel won, so the poll stored nothing.
+                    return Response.error(OPERATION_NON_REPLICATED, TRANSIENT_NOT_ACCEPTED);
+                }
+                if (request.operation() == VsrOperation.STORE_CONSUMER_OFFSET) {
+                    stores.add(request);
+                    return Response.committed(
+                            request.operation(), 2, Unpooled.buffer().writeIntLE(0));
+                }
+                return unexpected(request);
+            });
+            AsyncIggyTcpClient client = signedIn(socket);
+            try {
+                var poll = client.messages()
+                        .pollMessagesDeferred(
+                                STREAM, TOPIC, Optional.of(1L), GROUP, PollingStrategy.next(), COUNT, true, LONG_POLL);
+                parked.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+                assertThat(poll.cancel(true)).isTrue();
+                assertCancels(cancelled.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS), parked.join());
+                assertBlockedBy(store(client), parked.join().requestId());
+                release.complete(null);
+
+                awaitStored(client);
+                assertThat(stores).hasSize(1);
+            } finally {
+                release.complete(null);
+                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            }
+            served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * Without a reply to its cancel by the deadline of the poll, the outcome of the poll stays unknown, so its block
+     * holds until the caller abandons it.
+     */
+    @Test
+    void shouldKeepTheBlockOfACancelledCommittingPollWithoutAReplyUntilItIsAbandoned() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Request> parked = new CompletableFuture<>();
+            CompletableFuture<Request> cancelled = new CompletableFuture<>();
+            List<Request> stores = new CopyOnWriteArrayList<>();
             CompletableFuture<Void> served = singleNode(socket, request -> {
                 if (request.is(POLL_DEFERRED_CODE, OPERATION_NON_REPLICATED) && parked.complete(request)) {
                     return Response.noReply();
@@ -1405,7 +1457,8 @@ class AsyncIggyTcpClientFetchMessagesTest {
                 if (request.is(CANCEL_CODE, OPERATION_NON_REPLICATED) && cancelled.complete(request)) {
                     return Response.noReply();
                 }
-                if (request.operation() == VsrOperation.STORE_CONSUMER_OFFSET && storedAt.complete(System.nanoTime())) {
+                if (request.operation() == VsrOperation.STORE_CONSUMER_OFFSET) {
+                    stores.add(request);
                     return Response.committed(
                             request.operation(), 2, Unpooled.buffer().writeIntLE(0));
                 }
@@ -1414,18 +1467,18 @@ class AsyncIggyTcpClientFetchMessagesTest {
             AsyncIggyTcpClient client = signedIn(socket);
             try {
                 long deadline = System.nanoTime() + SHORT_POLL.requestTimeout().toNanos();
-                var poll = client.messages()
-                        .pollMessagesDeferred(
-                                STREAM, TOPIC, Optional.of(1L), GROUP, PollingStrategy.next(), COUNT, true, SHORT_POLL);
+                var poll = committingPoll(client);
                 parked.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
 
                 assertThat(poll.cancel(true)).isTrue();
                 assertCancels(cancelled.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS), parked.join());
-                client.consumerOffsets()
-                        .storeConsumerOffset(STREAM, TOPIC, Optional.of(1L), GROUP, BigInteger.ONE)
-                        .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                assertBlockedBy(store(client), parked.join().requestId());
+                TimeUnit.NANOSECONDS.sleep(Math.max(0, deadline - System.nanoTime()));
+                assertBlockedBy(store(client), parked.join().requestId());
+                client.abandonOperation(parked.join().requestId()).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                store(client).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
 
-                assertThat(storedAt.join()).isGreaterThanOrEqualTo(deadline);
+                assertThat(stores).hasSize(1);
             } finally {
                 client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
             }
@@ -1470,6 +1523,110 @@ class AsyncIggyTcpClientFetchMessagesTest {
                 client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
             }
             served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * A committing poll refused with a certain status stored nothing and frees its partition. Any other refusal leaves
+     * its outcome unknown and blocks the partition until the caller abandons the poll.
+     */
+    @ParameterizedTest
+    @CsvSource({"3024, false", "72, true", "11001, true"})
+    void shouldEndACommittingPollWithItsCertainRefusalOrAsUnknownProgress(int status, boolean uncertain)
+            throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Void> served = singleNode(
+                    socket,
+                    request -> request.is(POLL_DEFERRED_CODE, OPERATION_NON_REPLICATED)
+                            ? Response.error(OPERATION_NON_REPLICATED, status)
+                            : Response.committed(
+                                    request.operation(), 2, Unpooled.buffer().writeIntLE(0)));
+            AsyncIggyTcpClient client = signedIn(socket);
+            try {
+                var poll = committingPoll(client);
+                if (!uncertain) {
+                    assertServerError(poll, status);
+                } else {
+                    long operation = assertUncertainProgress(poll);
+                    assertBlockedBy(store(client), operation);
+                    client.abandonOperation(operation).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                }
+                store(client).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            } finally {
+                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            }
+            served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * The block of a lost committing poll stays across a reconnect and a new session of the client, so neither a
+     * committing poll nor a store of its partition goes out until the caller abandons the poll.
+     */
+    @Test
+    void shouldBlockThePartitionOfALostCommittingPollAcrossAReconnectUntilItIsAbandoned() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            RequestHandler handler = request -> request.is(POLL_DEFERRED_CODE, OPERATION_NON_REPLICATED)
+                    ? Response.disconnect()
+                    : Response.committed(
+                            request.operation(), 2, Unpooled.buffer().writeIntLE(0));
+            CompletableFuture<Void> served = singleNode(socket, handler);
+            AsyncIggyTcpClient client = signedIn(socket);
+            try {
+                long operation = assertUncertainProgress(committingPoll(client));
+                CompletableFuture<Void> reconnected = singleNode(socket, handler);
+                client.connect().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                client.login().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+                assertBlockedBy(committingPoll(client), operation);
+                assertBlockedBy(store(client), operation);
+                assertServerError(
+                        client.resolveOperation(operation, TIMEOUT), IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode());
+                client.abandonOperation(operation).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                store(client).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                reconnected.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            } finally {
+                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            }
+        }
+    }
+
+    /** A disconnect leaves the outcome of a committing poll that waits unknown, so the poll blocks its partition. */
+    @Test
+    void shouldLeaveACommittingPollThatWaitsUncertainWhenTheClientDisconnects() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Request> parked = new CompletableFuture<>();
+            RequestHandler handler = request -> {
+                if (request.is(POLL_DEFERRED_CODE, OPERATION_NON_REPLICATED)) {
+                    parked.complete(request);
+                    return Response.noReply();
+                }
+                return Response.committed(
+                        request.operation(), 2, Unpooled.buffer().writeIntLE(0));
+            };
+            CompletableFuture<Void> served = singleNode(socket, handler);
+            AsyncIggyTcpClient client = signedIn(socket);
+            try {
+                var poll = committingPoll(client);
+                parked.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                CompletableFuture<Void> reconnected = singleNode(socket, handler);
+
+                client.disconnect().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+                long operation = assertUncertainProgress(poll);
+                client.connect().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                client.login().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                served.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                assertBlockedBy(store(client), operation);
+                client.abandonOperation(operation).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                store(client).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                reconnected.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            } finally {
+                client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            }
         }
     }
 
@@ -1762,5 +1919,48 @@ class AsyncIggyTcpClientFetchMessagesTest {
 
     static int lastInt(byte[] body) {
         return ByteBuffer.wrap(body).order(ByteOrder.LITTLE_ENDIAN).getInt(body.length - Integer.BYTES);
+    }
+
+    private static CompletableFuture<PolledMessages> committingPoll(AsyncIggyTcpClient client) {
+        return client.messages()
+                .pollMessagesDeferred(
+                        STREAM, TOPIC, Optional.of(1L), GROUP, PollingStrategy.next(), COUNT, true, SHORT_POLL);
+    }
+
+    private static CompletableFuture<Void> store(AsyncIggyTcpClient client) {
+        return client.consumerOffsets().storeConsumerOffset(STREAM, TOPIC, Optional.of(1L), GROUP, BigInteger.ONE);
+    }
+
+    /** Stores an offset of partition 1 once the block that a reply lifts is gone. */
+    private static void awaitStored(AsyncIggyTcpClient client) throws Exception {
+        long deadline = System.nanoTime() + TIMEOUT.toNanos();
+        while (true) {
+            try {
+                store(client).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                return;
+            } catch (ExecutionException blocked) {
+                if (System.nanoTime() - deadline > 0) {
+                    throw blocked;
+                }
+                TimeUnit.MILLISECONDS.sleep(10);
+            }
+        }
+    }
+
+    /** Asserts that {@code call} failed with an unknown progress and returns its operation. */
+    private static long assertUncertainProgress(CompletableFuture<?> call) {
+        assertServerError(call, IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode());
+        return call.handle((ignored, error) -> ((IggyOperationException) PollRouter.unwrap(error)).getOperationId())
+                .join();
+    }
+
+    /** Asserts that {@code call} failed because the lost {@code operation} blocks partition 1. */
+    private static void assertBlockedBy(CompletableFuture<?> call, long operation) {
+        assertServerError(call, IggyErrorCode.PARTITION_LANE_BLOCKED.getCode());
+        IggyOperationException blocked = call.handle(
+                        (ignored, error) -> (IggyOperationException) PollRouter.unwrap(error))
+                .join();
+        assertThat(blocked.getOperationId()).isEqualTo(operation);
+        assertThat(blocked.getPartitionId()).hasValue(1);
     }
 }

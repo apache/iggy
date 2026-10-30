@@ -149,12 +149,10 @@ impl Membership {
     }
 
     /// Lets the server give the partitions to the other members at once, instead of after the
-    /// connection times out.
+    /// connection times out. It leaves also when a reconnect forgot the join, because the
+    /// session that joined can still hold the member.
     pub(crate) async fn leave(&self) {
-        // Cleared either way: the reader is torn down whether or not the server confirms.
-        if !self.joined.swap(false, ORDERING) {
-            return;
-        }
+        self.joined.store(false, ORDERING);
         let (stream_id, topic_id, group_id) = (&self.stream, &self.topic, &self.group);
         trace!("Leaving consumer group: {group_id} for stream: {stream_id}, topic: {topic_id}");
         if let Err(error) = self
@@ -164,10 +162,55 @@ impl Membership {
             .leave_consumer_group(stream_id, topic_id, group_id)
             .await
         {
-            // Expected after an explicit leave or a deleted group.
+            // Expected for a member that the server already dropped, and for a deleted group.
             debug!(
                 "Failed to leave consumer group: {group_id} for stream: {stream_id}, topic: {topic_id}. {error}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_binary_protocol::codes::LEAVE_CONSUMER_GROUP_CODE;
+
+    use crate::clients::reader::fixtures::{
+        GROUP_ID, PRIMARY, STREAM_ID, TOPIC_ID, connect_to_one_replica, identifier,
+    };
+    use crate::links::fake_cluster::{Answer, endpoint};
+
+    /// A reconnect clears the joined flag, while the session that joined can still hold the
+    /// member on the server.
+    #[tokio::test]
+    async fn given_a_reconnect_after_the_join_when_leaving_should_send_the_leave_and_ignore_a_missing_member()
+     {
+        let (client, cluster) = connect_to_one_replica().await;
+        cluster.script(
+            &endpoint(PRIMARY),
+            LEAVE_CONSUMER_GROUP_CODE,
+            [Answer::Refuse(IggyError::ConsumerGroupMemberNotFound(
+                1,
+                identifier(TOPIC_ID),
+                identifier(STREAM_ID),
+            ))],
+        );
+        let membership = Membership::new(
+            IggyRwLock::new(ClientWrapper::Tcp(client)),
+            Arc::new(identifier(STREAM_ID)),
+            Arc::new(identifier(TOPIC_ID)),
+            identifier(GROUP_ID),
+            false,
+        );
+        membership.joined.store(true, ORDERING);
+        membership.forget();
+
+        membership.leave().await;
+
+        assert_eq!(
+            cluster.count(LEAVE_CONSUMER_GROUP_CODE),
+            1,
+            "the close leaves whatever the client knows of its session"
+        );
     }
 }

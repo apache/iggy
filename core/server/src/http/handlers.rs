@@ -1285,7 +1285,7 @@ pub(in crate::http) async fn poll_messages(
 /// the batch that the first one stored.
 const fn refuse_committing_get(query: &PollMessages) -> Result<(), ReadError> {
     if query.auto_commit {
-        return Err(ReadError::Rejected(IggyError::InvalidCommand));
+        return Err(ReadError::CommittingGet);
     }
     Ok(())
 }
@@ -2368,10 +2368,11 @@ mod tests {
     use crate::http::wire::build_request_message;
     use crate::reply_frame::build_deny_reply;
 
-    #[test]
-    fn given_a_committing_poll_when_sent_as_get_should_refuse_it() {
+    #[tokio::test]
+    async fn given_a_committing_poll_when_sent_as_get_should_refuse_it_and_name_the_post_route() {
         // A GET poll with `auto_commit` stored its offset, and anything that
-        // resent the GET skipped the batch that the first one stored.
+        // resent the GET skipped the batch that the first one stored. The bare
+        // refusal then left an older client without a hint where to send it.
         let parse = |uri: &str| {
             Query::<PollMessages>::try_from_uri(&uri.parse().unwrap())
                 .unwrap()
@@ -2381,10 +2382,24 @@ mod tests {
             parse("/x?consumer_id=1&partition_id=0&kind=offset&value=0&count=1&auto_commit=true");
         let reading = parse("/x?consumer_id=1&partition_id=0&kind=offset&value=0&count=1");
 
-        assert!(matches!(
-            refuse_committing_get(&committing),
-            Err(ReadError::Rejected(IggyError::InvalidCommand))
-        ));
+        let response = refuse_committing_get(&committing)
+            .expect_err("a committing GET is refused")
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the error body reads");
+        let error: Value = serde_json::from_slice(&body).expect("the error body is JSON");
+        assert_eq!(
+            error,
+            serde_json::json!({
+                "id": IggyError::InvalidCommand.as_code(),
+                "code": "invalid_command",
+                "reason": "A poll with auto_commit stores its offset, so send it as POST /streams/{stream_id}/topics/{topic_id}/messages/deferred",
+                "field": "auto_commit",
+            })
+        );
         assert!(refuse_committing_get(&reading).is_ok());
     }
 

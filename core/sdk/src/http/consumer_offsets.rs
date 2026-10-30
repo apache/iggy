@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::http::http_client::HttpClient;
+use crate::http::http_client::{HttpClient, ProgressKey};
 use crate::http::http_transport::HttpTransport;
 use crate::http::path::encode_segment;
 use crate::prelude::Identifier;
@@ -37,7 +37,12 @@ impl ConsumerOffsetClient for HttpClient {
         topic_id: &Identifier,
         checkpoint: &Checkpoint,
     ) -> Result<(), IggyError> {
-        self.fail_if_progress_blocked(checkpoint.partition_id())?;
+        self.fail_if_progress_blocked(&ProgressKey::new(
+            stream_id,
+            topic_id,
+            checkpoint.partition_id(),
+            Some(checkpoint.context()),
+        ))?;
         self.put(
             &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
             &StoreConsumerOffset {
@@ -59,7 +64,12 @@ impl ConsumerOffsetClient for HttpClient {
         partition_id: Option<u32>,
         offset: u64,
     ) -> Result<(), IggyError> {
-        self.fail_if_progress_blocked(partition_id.unwrap_or(DEFAULT_PARTITION_ID))?;
+        self.fail_if_progress_blocked(&ProgressKey::new(
+            stream_id,
+            topic_id,
+            partition_id.unwrap_or(DEFAULT_PARTITION_ID),
+            None,
+        ))?;
         self.put(
             &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
             &StoreConsumerOffset {
@@ -111,7 +121,12 @@ impl ConsumerOffsetClient for HttpClient {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
-        self.fail_if_progress_blocked(partition_id.unwrap_or(DEFAULT_PARTITION_ID))?;
+        self.fail_if_progress_blocked(&ProgressKey::new(
+            stream_id,
+            topic_id,
+            partition_id.unwrap_or(DEFAULT_PARTITION_ID),
+            None,
+        ))?;
         let path = format!(
             "{}/{}",
             get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
@@ -136,6 +151,12 @@ impl ConsumerOffsetClient for HttpClient {
         topic_id: &Identifier,
         checkpoint: &Checkpoint,
     ) -> Result<(), IggyError> {
+        self.fail_if_progress_blocked(&ProgressKey::new(
+            stream_id,
+            topic_id,
+            checkpoint.partition_id(),
+            Some(checkpoint.context()),
+        ))?;
         self.delete_consumer_offset(
             consumer,
             stream_id,

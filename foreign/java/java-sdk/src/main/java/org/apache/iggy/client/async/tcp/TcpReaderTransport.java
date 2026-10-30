@@ -34,7 +34,9 @@ import java.math.BigInteger;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 
 /** The reads of a reader over TCP: one fetch per primary, sent to the primary of its partitions. */
 final class TcpReaderTransport implements ReaderTransport {
@@ -42,6 +44,8 @@ final class TcpReaderTransport implements ReaderTransport {
     private final StreamId stream;
     private final TopicId topic;
     private final Consumer consumer;
+    // The committing reads whose outcome is not known yet, cancelled ones included.
+    private final Set<AsyncTcpConnection.TransientFailoverState> committing = ConcurrentHashMap.newKeySet();
 
     TcpReaderTransport(AsyncIggyTcpClient client, StreamId stream, TopicId topic, Consumer consumer) {
         this.client = client;
@@ -68,7 +72,19 @@ final class TcpReaderTransport implements ReaderTransport {
                 options.requestTimeout().compareTo(options.maxWait().plus(DeferredPollOptions.REPLY_MARGIN)) < 0
                         ? options.withRequestTimeout(options.maxWait().plus(DeferredPollOptions.REPLY_MARGIN))
                         : options;
-        return messages().fetchMessages(stream, topic, targets, consumer, count, commit, fetch);
+        if (!commit) {
+            return messages().fetchMessages(stream, topic, targets, consumer, count, commit, fetch);
+        }
+        AsyncTcpConnection.TransientFailoverState state = messages().startCall();
+        committing.add(state);
+        CompletableFuture<List<FetchedMessages>> read =
+                messages().fetchMessages(stream, topic, targets, consumer, count, commit, fetch, state);
+        read.whenComplete((sections, error) -> {
+            if (!read.isCancelled()) {
+                committing.remove(state);
+            }
+        });
+        return read;
     }
 
     @Override
@@ -105,6 +121,21 @@ final class TcpReaderTransport implements ReaderTransport {
     @Override
     public CompletableFuture<Void> abandon(long operationId) {
         return client.abandonOperation(operationId);
+    }
+
+    @Override
+    public CompletableFuture<Void> cancelledReadsSettled() {
+        return messages().cancelledReadsSettled();
+    }
+
+    @Override
+    public CompletableFuture<Void> abandonLost() {
+        List<CompletableFuture<Void>> abandons = committing.stream()
+                .filter(state -> state.ticket() != null && state.ticket().fetchRetained())
+                .map(state -> client.abandonOperation(state.ticket().operationId()))
+                .toList();
+        committing.clear();
+        return CompletableFuture.allOf(abandons.toArray(CompletableFuture[]::new));
     }
 
     private MessagesTcpClient messages() {

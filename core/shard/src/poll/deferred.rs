@@ -23,10 +23,12 @@
 //!
 //! A readiness wait runs on the shard of its connection. That shard keeps a
 //! mirror of each partition of another shard that its waits name, and the
-//! owner pushes the partition state after every change. So a wait in steady
-//! state sends no frame to the owners, and its cancel stays local. The first
-//! wait on a partition goes to the owner, which answers it and starts the
-//! pushes.
+//! owner pushes the partition state after every change while that shard
+//! holds a parked wait on it. A wait that parks on a mirror tells the owner,
+//! and the first push that finds no parked wait ends the pushes. So a wait in
+//! steady state sends no frame to the owners, and its cancel stays local. The
+//! first wait on a partition goes to the owner, which answers it and starts
+//! the watch.
 
 use std::cell::RefCell;
 use std::collections::btree_map::Entry;
@@ -128,6 +130,11 @@ pub struct DeferredPollRequest {
     /// first message larger than its `max_bytes`. A poll alone has none and
     /// always may.
     pub oversized_turn: Option<OversizedTurn>,
+    /// From when, on the bus clock, a client store of the consumer offset
+    /// fences out a committing `Next` read, also a store of the value it
+    /// started from. `None` means from its admission. A fetch that resolved
+    /// its starts before it waited sets that time.
+    pub stores_fenced_from: Option<u64>,
     pub(crate) deadline: u64,
     pub(crate) request_deadline: u64,
 }
@@ -149,6 +156,7 @@ impl DeferredPollRequest {
             options,
             commit_gate: None,
             oversized_turn: None,
+            stores_fenced_from: None,
             deadline: 0,
             request_deadline: 0,
         }
@@ -158,20 +166,37 @@ impl DeferredPollRequest {
 /// The one turn of a fetch to return a first message larger than the byte
 /// limit of its read, which bounds the reply by one such message.
 #[derive(Debug, Clone, Default)]
-pub struct OversizedTurn(Arc<AtomicU8>);
+pub struct OversizedTurn {
+    state: Arc<AtomicU8>,
+    /// A follower shares the turn of the first read and never takes it.
+    follower: bool,
+}
 
 impl OversizedTurn {
-    /// Takes the turn, unless another read took it.
+    /// The same turn for a read after the first, which serves only a first
+    /// message within its byte limit, so all reads of a fetch can start at
+    /// once while only the first may return a larger one.
+    #[must_use]
+    pub fn follower(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            follower: true,
+        }
+    }
+
+    /// Takes the turn, unless another read took it or this read follows.
     #[must_use]
     pub fn take(&self) -> bool {
-        self.0
-            .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+        !self.follower
+            && self
+                .state
+                .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
     }
 
     fn accept_normal(&self) -> bool {
         matches!(
-            self.0
+            self.state
                 .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst),
             Ok(_) | Err(1)
         )
@@ -453,6 +478,9 @@ struct Waiter {
     /// Admission turned this `Next` poll into an `Offset` poll that starts
     /// after the stored offset.
     next: bool,
+    /// A client store of the consumer offset at or after this time fences
+    /// the poll if it commits.
+    fenced_from: u64,
     reply: Sender<PartitionReadReply>,
     history: PollHistoryId,
     view: u32,
@@ -592,6 +620,9 @@ impl Signals {
 /// A partition of this shard that other shards watch.
 struct Watch {
     watchers: Vec<ReadinessWatch>,
+    /// The watching shards that hold a parked wait on the partition. Only
+    /// they get the pushes of its commits.
+    parked: BTreeSet<u16>,
     /// The groups whose installed owner each push carries.
     groups: BTreeSet<u64>,
     notifier: Rc<dyn Fn()>,
@@ -609,6 +640,9 @@ struct Mirror {
     used: u64,
     /// When this shard applied the last push.
     pushed: u64,
+    /// The owner took the news that this shard holds a parked wait on the
+    /// partition, so its commits come as pushes.
+    interest: bool,
 }
 
 impl Mirror {
@@ -644,6 +678,7 @@ struct State {
     /// A flush reads the current state, so the latest state wins.
     pushes: BTreeMap<u16, BTreeSet<IggyNamespace>>,
     watch_cursor: Option<IggyNamespace>,
+    status_cursor: Option<IggyNamespace>,
     closed: bool,
 }
 
@@ -693,6 +728,10 @@ impl State {
             return false;
         };
         watch.watchers.retain(|watcher| !stop(watcher));
+        let watchers = &watch.watchers;
+        watch
+            .parked
+            .retain(|shard| watchers.iter().any(|watcher| watcher.shard == *shard));
         if !watch.watchers.is_empty() {
             return false;
         }
@@ -727,8 +766,8 @@ pub struct DeferredPolls {
     signals: Rc<RefCell<Signals>>,
     mirrors: RefCell<Mirrors>,
     inflight_bytes: Arc<AtomicUsize>,
-    /// The status and view that the last tick saw of each partition with
-    /// parked reads or watchers.
+    /// The status and view of each partition with parked reads, from when
+    /// they parked or from the last tick that checked it.
     statuses: RefCell<BTreeMap<IggyNamespace, (PartitionStatus, u32)>>,
 }
 
@@ -881,6 +920,7 @@ impl DeferredPolls {
         state.read_queue.clear();
         self.metrics.pending.set(0);
         *self.signals.borrow_mut() = Signals::default();
+        self.statuses.borrow_mut().clear();
     }
 
     /// The budget that a disk read with `max_bytes` reserves. Its snapshot,
@@ -1010,6 +1050,7 @@ impl DeferredPolls {
             });
             if empty {
                 state.partitions.remove(&namespace);
+                self.statuses.borrow_mut().remove(&namespace);
                 if !state.watches.contains_key(&namespace) {
                     unwatched.push(namespace);
                 }
@@ -1151,7 +1192,9 @@ where
     /// The visibility of the partition, while its history and view are those
     /// of the admission. A `Next` poll also needs the stored offset of its
     /// admission: another session can store an offset while it waits, and a
-    /// commit of this poll would then pass over a rewind.
+    /// commit of this poll would then pass over a rewind. A committing one
+    /// also needs no client store since then, as a rewind can store the
+    /// value it started from.
     fn validate_waiter(&self, waiter: &Waiter) -> Result<PollVisibility, IggyError> {
         let (history, visibility, view) =
             self.validate_deferred_context(waiter.namespace, &waiter.request)?;
@@ -1160,10 +1203,31 @@ where
             || (waiter.next
                 && self.next_offset(waiter.namespace, waiter.request.consumer)?
                     != waiter.request.args.value)
+            || (waiter.next
+                && waiter.request.args.auto_commit
+                && self.offset_stored_since(
+                    waiter.namespace,
+                    waiter.request.consumer,
+                    waiter.fenced_from,
+                )?)
         {
             return Err(IggyError::TransientNotAccepted);
         }
         Ok(visibility)
+    }
+
+    fn offset_stored_since(
+        &self,
+        namespace: IggyNamespace,
+        consumer: PollingConsumer,
+        since: u64,
+    ) -> Result<bool, IggyError> {
+        self.plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                partition.consumer_offset_stored_since(consumer, since)
+            })
+            .ok_or(IggyError::TransientNotAccepted)
     }
 
     /// Where a `Next` poll of `consumer` starts: after its stored offset.
@@ -1203,6 +1267,9 @@ where
             let mut state = self.deferred_polls.state.borrow_mut();
             let id = state.admit(request.context.quota, &config)?;
             let next = request.args.kind == PollingKind::Next;
+            let fenced_from = request
+                .stores_fenced_from
+                .unwrap_or_else(|| self.bus.monotonic_micros());
             if next {
                 request.args.kind = PollingKind::Offset;
                 request.args.value = self.next_offset(namespace, request.consumer)?;
@@ -1219,6 +1286,7 @@ where
                     namespace,
                     request,
                     next,
+                    fenced_from,
                     reply: reply.clone(),
                     history,
                     view,
@@ -1240,48 +1308,52 @@ where
 
     /// One consensus tick of the deferred polls. A partition that loses its
     /// primary, changes view or starts a state transfer marks nothing, so the
-    /// tick compares the status of each partition with parked reads or
-    /// watchers to the last tick and wakes those reads at once, instead of
-    /// when the sweep reaches them.
+    /// tick compares the status of `MAINTENANCE_BUDGET` partitions with parked
+    /// reads, from a cursor, to what it saw when they parked or at their last
+    /// check, and wakes the reads of a changed one at once. Each such change
+    /// is found within one pass over them. The watch sweep pushes the changes
+    /// of a watched partition.
     pub(crate) fn tick_deferred_polls(&self) {
-        let namespaces: BTreeSet<IggyNamespace> = {
-            let state = self.deferred_polls.state.borrow();
-            state
-                .partitions
-                .keys()
-                .chain(state.watches.keys())
-                .copied()
-                .collect()
+        let namespaces = {
+            let mut state = self.deferred_polls.state.borrow_mut();
+            let namespaces = keys_after(&state.partitions, state.status_cursor);
+            if let Some(last) = namespaces.last() {
+                state.status_cursor = Some(*last);
+            }
+            namespaces
         };
-        {
-            let mut statuses = self.deferred_polls.statuses.borrow_mut();
-            statuses.retain(|namespace, _| namespaces.contains(namespace));
-            for namespace in namespaces {
-                let incarnation = self.shards_table.epoch_for(namespace);
-                let Some(current) =
-                    self.plane
-                        .partitions()
-                        .with_partition(&namespace, |partition| {
-                            (
-                                PartitionStatus::of(partition, incarnation),
-                                partition.consensus().view(),
-                            )
-                        })
-                else {
-                    continue;
-                };
-                if statuses
-                    .insert(namespace, current)
-                    .is_some_and(|previous| previous != current)
-                {
-                    self.deferred_polls
-                        .signals
-                        .borrow_mut()
-                        .mark_changed(namespace);
-                }
+        for namespace in namespaces {
+            let Some(current) = self.partition_status(namespace) else {
+                continue;
+            };
+            if self
+                .deferred_polls
+                .statuses
+                .borrow_mut()
+                .insert(namespace, current)
+                .is_some_and(|previous| previous != current)
+            {
+                self.deferred_polls
+                    .signals
+                    .borrow_mut()
+                    .mark_changed(namespace);
             }
         }
         self.deferred_polls.maintenance();
+    }
+
+    /// The status and view of the partition at `namespace`, `None` if this
+    /// shard has no such partition.
+    fn partition_status(&self, namespace: IggyNamespace) -> Option<(PartitionStatus, u32)> {
+        let incarnation = self.shards_table.epoch_for(namespace);
+        self.plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                (
+                    PartitionStatus::of(partition, incarnation),
+                    partition.consensus().view(),
+                )
+            })
     }
 
     #[allow(clippy::future_not_send)]
@@ -1349,12 +1421,8 @@ where
                         }
                         let state = &mut *state;
                         if let Some(watch) = state.watches.get(&namespace) {
-                            for watcher in &watch.watchers {
-                                state
-                                    .pushes
-                                    .entry(watcher.shard)
-                                    .or_default()
-                                    .insert(namespace);
+                            for shard in &watch.parked {
+                                state.pushes.entry(*shard).or_default().insert(namespace);
                             }
                         }
                     }
@@ -1496,11 +1564,7 @@ where
 
     #[allow(clippy::future_not_send)]
     async fn accept_deferred_result(&self, id: u64, mut waiter: Waiter, result: PollReadResult) {
-        if waiter.reply.is_disconnected() {
-            self.metrics.deferred_polls.cancelled.inc();
-            self.remove_deferred_poll(id, &waiter);
-            return;
-        }
+        // The disconnect check sits right before the store, in `finish_deferred_poll`.
         if self.bus.monotonic_micros() >= waiter.request.request_deadline {
             self.reject_deferred_poll(id, &waiter, IggyError::TransientNotCommitted);
             return;
@@ -1597,7 +1661,17 @@ where
         *state.sessions.entry(quota).or_default() += 1;
         state.deadlines.insert((deadline, id));
         for namespace in namespaces {
-            state.partitions.entry(namespace).or_default().insert(id);
+            let ids = state.partitions.entry(namespace).or_default();
+            // A change before the tick reaches the partition still counts.
+            if ids.is_empty()
+                && let Some(current) = self.partition_status(namespace)
+            {
+                self.deferred_polls
+                    .statuses
+                    .borrow_mut()
+                    .insert(namespace, current);
+            }
+            ids.insert(id);
             if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
                 partition.set_poll_notifier(Some(self.deferred_polls.notifier(namespace)));
             }
@@ -1781,7 +1855,15 @@ where
             (quota, waiter.wait.deadline),
             waiter.wait.targets.iter().map(|target| target.namespace),
         );
+        let namespaces = waiter
+            .wait
+            .targets
+            .iter()
+            .map(|target| target.namespace)
+            .collect();
         state.readiness.insert(id, waiter);
+        drop(state);
+        self.tell_mirror_owners(namespaces, true);
         Ok(PartitionReadReply::Ready {
             shard: self.id,
             parked: Some(id),
@@ -2032,6 +2114,7 @@ where
                     self.metrics.deferred_polls.readiness_watches.inc();
                     entry.insert(Watch {
                         watchers: Vec::new(),
+                        parked: BTreeSet::new(),
                         groups: BTreeSet::new(),
                         notifier,
                         last: None,
@@ -2083,8 +2166,10 @@ where
     }
 
     /// Sends the queued pushes, one frame per watching shard. They ride the
-    /// reply lane, so that consensus traffic cannot hold them back. A full
-    /// lane keeps them for the next flush, which reads the state again.
+    /// reply lane, so that consensus traffic cannot hold them back. A lane
+    /// that holds half its capacity keeps them for the next flush, which reads
+    /// the state again, so pushes never fill the lane that client replies
+    /// and transient denies need.
     pub(crate) fn flush_readiness_pushes(&self) {
         let mut idle = Vec::new();
         {
@@ -2096,7 +2181,10 @@ where
                     return false;
                 };
                 let lane = sender.reply_sender();
-                if lane.is_full() {
+                let room = lane
+                    .capacity()
+                    .map_or(usize::MAX, |capacity| (capacity / 2).max(1));
+                if lane.len() >= room {
                     return true;
                 }
                 let states: Vec<_> = namespaces
@@ -2154,13 +2242,15 @@ where
 
     /// A tick sweeps `MAINTENANCE_BUDGET` watched partitions and as many
     /// mirrors. It installs the notifier of a watched partition again,
-    /// because a rebuilt partition starts without one, and it queues the
-    /// changes that no notifier reports, such as a view change or a group
-    /// owner install. It ends the watch of a mirror that no wait needs, also
-    /// for a partition without commits, which pushes nothing.
+    /// because a rebuilt partition starts without one, and it queues for the
+    /// shards with a parked wait the changes that no notifier reports, such
+    /// as a view change or a group owner install. It ends the watch of a
+    /// mirror that no wait needs, also for a partition without commits, which
+    /// pushes nothing.
     pub(crate) fn sweep_readiness_watches(&self) {
         let now = self.bus.monotonic_micros();
         let mut unused: BTreeMap<u16, Vec<(IggyNamespace, u64)>> = BTreeMap::new();
+        let mut interested = Vec::new();
         {
             let mut state = self.deferred_polls.state.borrow_mut();
             let state = &mut *state;
@@ -2172,33 +2262,36 @@ where
                 if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
                     partition.set_poll_notifier(Some(Rc::clone(&watch.notifier)));
                 }
-                if self.served_state(namespace, &watch.groups) != watch.last {
-                    for watcher in &watch.watchers {
-                        state
-                            .pushes
-                            .entry(watcher.shard)
-                            .or_default()
-                            .insert(namespace);
+                if !watch.parked.is_empty()
+                    && self.served_state(namespace, &watch.groups) != watch.last
+                {
+                    for shard in &watch.parked {
+                        state.pushes.entry(*shard).or_default().insert(namespace);
                     }
                 }
             }
             let mut mirrors = self.deferred_polls.mirrors.borrow_mut();
             for namespace in keys_after(&mirrors.entries, mirrors.cursor) {
                 mirrors.cursor = Some(namespace);
-                if let Some(mirror) = mirrors.entries.get(&namespace)
-                    && mirror.unused(now)
-                    && !state.partitions.contains_key(&namespace)
-                {
+                let Some(mirror) = mirrors.entries.get(&namespace) else {
+                    continue;
+                };
+                let parked = state.partitions.contains_key(&namespace);
+                if mirror.unused(now) && !parked {
                     unused
                         .entry(mirror.owner)
                         .or_default()
                         .push((namespace, mirror.seq));
+                } else if parked && !mirror.interest {
+                    // An owner whose inbox refused the news hears it again.
+                    interested.push(namespace);
                 }
             }
         }
         for (owner, watches) in unused {
             self.unwatch_mirrors(owner, watches);
         }
+        self.tell_mirror_owners(interested, true);
     }
 
     /// Ends the watches of `from` whose sequence matches.
@@ -2220,13 +2313,46 @@ where
         self.unwatch_partitions(idle);
     }
 
+    /// Starts or ends the pushes of commits to `from` for those of `watches`
+    /// whose sequence matches. A start pushes the state at once, because the
+    /// mirror that the parked wait read can be behind.
+    pub(crate) fn set_readiness_interest(
+        &self,
+        from: u16,
+        watches: Vec<(IggyNamespace, u64)>,
+        parked: bool,
+    ) {
+        let mut state = self.deferred_polls.state.borrow_mut();
+        let state = &mut *state;
+        for (namespace, seq) in watches {
+            let Some(watch) = state.watches.get_mut(&namespace) else {
+                continue;
+            };
+            if !watch
+                .watchers
+                .iter()
+                .any(|watcher| watcher.shard == from && watcher.seq == seq)
+            {
+                continue;
+            }
+            if parked {
+                watch.parked.insert(from);
+                state.pushes.entry(from).or_default().insert(namespace);
+            } else {
+                watch.parked.remove(&from);
+            }
+        }
+    }
+
     /// Stores pushed states in their mirrors and marks their partitions, so
     /// that the service loop probes the local waiters on them. A push for a
     /// mirror that no wait needs ends its watch, and so does a push for a
-    /// partition without a mirror.
+    /// partition without a mirror. A push that finds no parked wait ends the
+    /// pushes of commits.
     pub(crate) fn apply_readiness_update(&self, from: u16, states: Vec<WatchedState>) {
         let now = self.bus.monotonic_micros();
         let mut unused = Vec::new();
+        let mut idle = Vec::new();
         {
             let state = self.deferred_polls.state.borrow();
             let mut mirrors = self.deferred_polls.mirrors.borrow_mut();
@@ -2244,14 +2370,60 @@ where
                 // the next wait can still read the mirror.
                 mirror.state = update.state;
                 mirror.pushed = now;
-                if mirror.unused(now) && !state.partitions.contains_key(&update.namespace) {
+                let parked = state.partitions.contains_key(&update.namespace);
+                if mirror.unused(now) && !parked {
                     unused.push((update.namespace, update.seq));
-                } else {
-                    signals.mark(update.namespace);
+                    continue;
                 }
+                if !parked && mirror.interest {
+                    idle.push(update.namespace);
+                }
+                signals.mark(update.namespace);
             }
         }
         self.unwatch_mirrors(from, unused);
+        self.tell_mirror_owners(idle, false);
+    }
+
+    /// Tells the owners of the mirrors of `namespaces` whose interest is not
+    /// `parked` yet that this shard now holds a parked wait on them, or no
+    /// longer does. A mirror changes its interest only if the inbox of its
+    /// owner takes the frame, so that the next sweep or push repeats a
+    /// refused one.
+    fn tell_mirror_owners(&self, namespaces: Vec<IggyNamespace>, parked: bool) {
+        if namespaces.is_empty() {
+            return;
+        }
+        let mut mirrors = self.deferred_polls.mirrors.borrow_mut();
+        let mut owners: BTreeMap<u16, Vec<(IggyNamespace, u64)>> = BTreeMap::new();
+        for namespace in namespaces {
+            if let Some(mirror) = mirrors.entries.get(&namespace)
+                && mirror.interest != parked
+            {
+                owners
+                    .entry(mirror.owner)
+                    .or_default()
+                    .push((namespace, mirror.seq));
+            }
+        }
+        for (owner, watches) in owners {
+            let Some(sender) = self.senders.get(usize::from(owner)) else {
+                continue;
+            };
+            let namespaces: Vec<_> = watches.iter().map(|(namespace, _)| *namespace).collect();
+            let interest = LifecycleFrame::ReadinessInterest {
+                from: self.id,
+                watches,
+                parked,
+            };
+            if sender.try_send(ShardFrame::lifecycle(interest)).is_ok() {
+                for namespace in namespaces {
+                    if let Some(mirror) = mirrors.entries.get_mut(&namespace) {
+                        mirror.interest = parked;
+                    }
+                }
+            }
+        }
     }
 
     /// Ends the watches of this shard on `watches` of `owner`. Their mirrors
@@ -2336,7 +2508,12 @@ where
                 state: None,
                 used: now,
                 pushed: now,
+                interest: false,
             });
+            // A new owner holds no news of this shard's parked waits.
+            if mirror.owner != owner {
+                mirror.interest = false;
+            }
             mirror.owner = owner;
             mirror.seq = seq;
             mirror.used = now;

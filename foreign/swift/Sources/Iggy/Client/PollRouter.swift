@@ -69,6 +69,28 @@ final class PollRouter: Sendable {
         var users = 0
     }
 
+    /// A committing poll or fetch, as a fetch block in the Rust SDK. Once its
+    /// frame may have reached the server, an unknown outcome blocks the
+    /// progress of its partitions under `id` until the caller abandons it.
+    final class FetchAttempt: Sendable {
+        let id: UInt128Value
+        private let possibleSend = NIOLockedValueBox(false)
+
+        init(id: UInt128Value) {
+            self.id = id
+        }
+
+        var mayHaveCommitted: Bool { possibleSend.withLockedValue { $0 } }
+
+        func sent() { possibleSend.withLockedValue { $0 = true } }
+        func refused() { possibleSend.withLockedValue { $0 = false } }
+    }
+
+    private struct FetchRetention {
+        var keys: [ProgressKey]
+        var blocked = false
+    }
+
     /// What a routed request carries.
     enum Body: Sendable {
         case fixed([UInt8])
@@ -80,6 +102,10 @@ final class PollRouter: Sendable {
 
         var commits: Bool {
             if case .deferred(let deferred) = self { deferred.commits } else { false }
+        }
+
+        var fetchAttempt: FetchAttempt? {
+            if case .deferred(let deferred) = self { deferred.fetchAttempt } else { nil }
         }
 
         /// The body of one attempt. A deferred request carries what is left
@@ -103,6 +129,7 @@ final class PollRouter: Sendable {
         /// The server stores the offsets of what it reads, so a cancellation
         /// waits for the one reply that says whether it did.
         var commits = false
+        var fetchAttempt: FetchAttempt? = nil
         let encode: @Sendable (DeferredPollOptions) throws -> [UInt8]
 
         /// The request timeout bounds the whole call, routing and retries
@@ -156,6 +183,11 @@ final class PollRouter: Sendable {
         var deferredSlots: [String: [Slot]] = [:]
         // A session reset must not release progress still held by an older call.
         var progressLanes: [ProgressKey: ProgressLane] = [:]
+        /// The committing polls and fetches in flight, and those whose
+        /// outcome is unknown. A session reset keeps both, so a block
+        /// survives a reconnect and a new session.
+        var fetches: [UInt128Value: FetchRetention] = [:]
+        var blockedProgress: [ProgressKey: UInt128Value] = [:]
         var nextHeartbeat: ContinuousClock.Instant?
     }
 
@@ -200,7 +232,9 @@ final class PollRouter: Sendable {
 
     /// Orders progress across connections and aliases of the same partition
     /// history. Sorted acquisition prevents overlapping fetches from deadlocking.
-    /// Entries exist only while a holder or waiter references them.
+    /// Entries exist only while a holder or waiter references them. A
+    /// partition whose committing read has an unknown outcome fails with
+    /// ``IggyErrorCode/partitionLaneBlocked`` until that read is abandoned.
     func withProgress<Value: Sendable>(
         _ keys: [ProgressKey], deadline: ContinuousClock.Instant, _ operation: () async throws -> Value
     ) async throws -> Value {
@@ -214,6 +248,9 @@ final class PollRouter: Sendable {
             throw IggyError(.transientNotAccepted, context: "progress requires a resolved partition incarnation")
         }
         let semaphores = try state.withLockedValue { state in
+            if let blocked = Self.blockedProgress(keys, in: state) {
+                throw blocked
+            }
             let added = keys.reduce(0) { $0 + (state.progressLanes[$1] == nil ? 1 : 0) }
             guard added <= Self.maxProgressLanes - state.progressLanes.count else {
                 throw IggyError(.transientNotAccepted, context: "the concurrent progress partition limit was reached")
@@ -245,11 +282,93 @@ final class PollRouter: Sendable {
             }
             acquired += 1
         }
+        // The call that held the lane can have left its outcome unknown.
+        if let blocked = state.withLockedValue({ Self.blockedProgress(keys, in: $0) }) {
+            throw blocked
+        }
         try Task.checkCancellation()
         guard ContinuousClock.now < deadline else {
             throw IggyError(.transientNotAccepted, context: "the request deadline passed before partition progress")
         }
         return try await operation()
+    }
+
+    /// Registers a committing poll or fetch before it is sent. At most
+    /// ``maxDeferredRequests`` are in flight or blocked at once.
+    func reserveFetch(_ keys: [ProgressKey]) throws -> FetchAttempt {
+        try state.withLockedValue { state in
+            guard state.fetches.count < Self.maxDeferredRequests else {
+                throw IggyError(.transientNotAccepted, context: "\(Self.maxDeferredRequests) committing reads are in flight or blocked")
+            }
+            var id = UInt128Value.random()
+            while state.fetches[id] != nil {
+                id = .random()
+            }
+            state.fetches[id] = FetchRetention(keys: keys)
+            return FetchAttempt(id: id)
+        }
+    }
+
+    /// Forgets an attempt that ended with a known outcome.
+    func releaseFetch(_ attempt: FetchAttempt) {
+        state.withLockedValue { state in
+            if state.fetches[attempt.id]?.blocked == false {
+                state.fetches.removeValue(forKey: attempt.id)
+            }
+        }
+    }
+
+    /// Blocks the progress of `keys` under the attempt and returns
+    /// ``IggyErrorCode/fetchProgressUncertain`` naming it.
+    func retainFetch(_ attempt: FetchAttempt, keys: [ProgressKey], cause: String? = nil) -> IggyError {
+        state.withLockedValue { state in
+            state.fetches[attempt.id] = FetchRetention(keys: keys, blocked: true)
+            for key in keys {
+                state.blockedProgress[key] = attempt.id
+            }
+        }
+        return IggyError(.fetchProgressUncertain, context: cause, operationID: attempt.id)
+    }
+
+    /// Whether the client still blocks progress under `id`.
+    func retainsFetch(_ id: UInt128Value) -> Bool {
+        state.withLockedValue { $0.fetches[id]?.blocked == true }
+    }
+
+    /// Lifts the blocks of an attempt whose outcome stays unknown, or throws
+    /// ``IggyErrorCode/operationNotRetained``.
+    func abandonFetch(_ id: UInt128Value) throws {
+        try state.withLockedValue { state in
+            guard let retained = state.fetches[id], retained.blocked else {
+                throw IggyError(.operationNotRetained, operationID: id)
+            }
+            for key in retained.keys where state.blockedProgress[key] == id {
+                state.blockedProgress.removeValue(forKey: key)
+            }
+            state.fetches.removeValue(forKey: id)
+        }
+    }
+
+    private static func blockedProgress(_ keys: [ProgressKey], in state: State) -> IggyError? {
+        for key in keys {
+            if let operationID = state.blockedProgress[key] {
+                return IggyError(
+                    .partitionLaneBlocked, context: "a committing read of partition \(key.partitionID) has an unknown outcome",
+                    operationID: operationID, partitionID: key.partitionID)
+            }
+        }
+        return nil
+    }
+
+    /// Closes the connections of the deferred requests in flight, so each
+    /// one ends at once instead of waiting on a session the caller ended.
+    func closeDeferredConnections() async {
+        let connections = state.withLockedValue { state in
+            state.deferredSlots.values.joined().compactMap { slot in slot.connection.withLockedValue { $0?.connection } }
+        }
+        for connection in connections {
+            await connection.close()
+        }
     }
 
     func progressContext(
@@ -328,6 +447,10 @@ final class PollRouter: Sendable {
                 }
                 return try await sendOnCoordinator(request, context: &captured, replay: &replay, coordinator: coordinator)
             } catch let error as IggyError {
+                if body.fetchAttempt?.mayHaveCommitted == true {
+                    // A committing read that may have stored is never sent again.
+                    throw error
+                }
                 let reconnects =
                     replay.outcome.isUncertain && error.isConnectionLoss && error.code != .staleClient
                     && coordinator.configuration.reconnection.enabled
@@ -806,10 +929,14 @@ final class PollRouter: Sendable {
         while true {
             let raw: RawFrame
             do {
+                body.fetchAttempt?.sent()
                 raw = try await connection.exchange(
                     request.bytes, timeout: replayDeadline - .now,
                     cancellation: request.deferredCancellation.map { DeferredCancellation(frame: $0, isAnswered: body.commits) })
             } catch let lost as IggyError {
+                if lost.code == .notConnected || lost.code == .cannotEstablishConnection {
+                    body.fetchAttempt?.refused()
+                }
                 guard replay.outcome.isUncertain else {
                     throw lost
                 }
@@ -830,6 +957,11 @@ final class PollRouter: Sendable {
                 }
                 answer = IggyError(.transientNotCommitted, context: "the reply does not prove the earlier attempt committed")
             } catch let refusal as IggyError {
+                if VSRFrame.peekCommand(header) == .reply, VSRFrame.readReplyStatus(header) == refusal.rawCode,
+                    CommitErrorScope.request.provesNothingStored(refusal.code)
+                {
+                    body.fetchAttempt?.refused()
+                }
                 if body.commits, refusal.code == .transientNotAccepted, Task.isCancelled {
                     // The cancellation won, so the server stored nothing.
                     throw CancellationError()

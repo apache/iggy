@@ -144,6 +144,19 @@ private struct DeferredPollingFixture: Decodable {
         let fetchReplies: [Refused]
     }
 
+    /// Whether a committing poll or fetch that failed with `status` stored
+    /// nothing, as the Rust classifier says.
+    struct CommitOutcome: Decodable {
+        let status: UInt32
+        let error: String
+        let certain: Bool
+    }
+
+    struct CommitOutcomes: Decodable {
+        let request: [CommitOutcome]
+        let section: [CommitOutcome]
+    }
+
     struct Constants: Decodable {
         let codes: [String: UInt32]
         let statusOk: UInt32
@@ -165,6 +178,7 @@ private struct DeferredPollingFixture: Decodable {
     let cancellations: [Cancellation]
     let fetchReplies: [Reply]
     let refused: RefusedSet
+    let commitOutcomes: CommitOutcomes
 
     static func load() throws -> DeferredPollingFixture {
         let url = try #require(Bundle.module.url(forResource: "deferred_polling", withExtension: "json", subdirectory: "Fixtures"))
@@ -340,6 +354,23 @@ struct DeferredPollingVectorTests {
                 #expect(messages.map(\.originTimestamp.microseconds) == expected.messages.map(\.originTimestamp), "\(label)")
                 #expect(messages.map(\.id) == (try expected.messages.map { try messageID($0.id) }), "\(label)")
             }
+        }
+    }
+
+    /// A status the table lists classifies as the table says, in both
+    /// scopes, and a status it does not list leaves the outcome unknown.
+    @Test(arguments: [CommitErrorScope.request, .section])
+    func everyCommitOutcomeMatchesTheClassifier(scope: CommitErrorScope) throws {
+        let outcomes = scope == .request ? fixture.commitOutcomes.request : fixture.commitOutcomes.section
+        #expect(outcomes.contains(where: \.certain) && outcomes.contains { !$0.certain })
+        for outcome in outcomes {
+            let code = try #require(IggyErrorCode(rawValue: outcome.status), "status \(outcome.status)")
+            #expect(code.name == outcome.error)
+            #expect(scope.provesNothingStored(code) == outcome.certain, "\(scope) \(outcome.error)")
+        }
+        let certain = Set(outcomes.filter(\.certain).map(\.status))
+        for code in IggyErrorCode.allCases where scope.provesNothingStored(code) {
+            #expect(certain.contains(code.rawValue), "\(scope) \(code.name) is certain but not listed")
         }
     }
 

@@ -139,6 +139,14 @@ public class IggyTcpClient implements IggyBaseClient, Closeable {
         FutureUtil.resolve(asyncClient.abandonOperation(operationId));
     }
 
+    /**
+     * Drops the connections without a sign-out, see {@link AsyncIggyTcpClient#disconnect()}. {@link #connect()} and a
+     * sign-in continue the client.
+     */
+    public void disconnect() {
+        FutureUtil.resolve(asyncClient.disconnect());
+    }
+
     @Override
     public void close() {
         FutureUtil.resolve(asyncClient.close());

@@ -22,21 +22,24 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
-use iggy_binary_protocol::PartitionContext;
 use iggy_binary_protocol::codes::{
-    DELETE_CONSUMER_OFFSET_CODE, FETCH_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE,
+    CANCEL_DEFERRED_REQUEST_CODE, DELETE_CONSUMER_OFFSET_CODE, FETCH_MESSAGES_CODE,
+    POLL_MESSAGES_DEFERRED_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
+use iggy_binary_protocol::requests::messages::FetchMessagesRequest;
+use iggy_binary_protocol::{PartitionContext, WireDecode, WirePollingStrategy};
 use iggy_common::{
     AutoCommit, Checkpoint, CommitAfter, CommitEvery, CommitPolicy, IggyDuration, IggyError,
-    NonZeroIggyDuration, PollOptions,
+    NonZeroIggyDuration, PollOptions, PollingStrategy,
 };
 use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep, timeout};
 
 use super::{
-    PARTITION_PRIMARY, POLL_RETRY_INTERVAL, POLLED_PARTITION, ROUTE_INCARNATION, builder_on,
-    committing_consumer, connect_to_three_replicas, deleted_partitions, next_message,
-    reading_consumer, reply_of, script_primary, standalone, start_fetch, stored_offsets,
+    PARTITION_PRIMARY, POLL_RETRY_INTERVAL, POLLED_PARTITION, ROUTE_INCARNATION, answer_lookups,
+    builder_on, committing_consumer, connect_to_three_replicas, deleted_partitions, next_message,
+    poll_reply_of, reading_consumer, reply_of, script_primary, standalone, start_fetch,
+    stored_offsets,
 };
 use crate::clients::consumer::{IggyConsumer, IggyConsumerState, ReceivedMessage};
 use crate::clients::consumer_builder::IggyConsumerBuilder;
@@ -595,6 +598,193 @@ async fn given_on_read_when_shutting_down_after_a_partial_yield_should_move_the_
     assert_eq!(
         consumer.get_last_stored_offset(POLLED_PARTITION),
         Some(LAST_YIELDED)
+    );
+}
+
+/// A close cancels a committing fetch that waits on the server, and the one reply to the cancel
+/// tells whether the server stored.
+#[tokio::test(start_paused = true)]
+async fn given_on_read_when_shutting_down_with_a_parked_fetch_should_cancel_it_and_rewind_what_it_stored()
+ {
+    const FIRST: u64 = 5;
+    const MAX_WAIT: Duration = Duration::from_secs(30);
+    for (case, answer, stored) in [
+        (
+            "cancel won",
+            Answer::Refuse(IggyError::TransientNotAccepted),
+            Vec::new(),
+        ),
+        (
+            "store won",
+            reply_of(&[FIRST, FIRST + 1]),
+            vec![(POLLED_PARTITION, FIRST - 1)],
+        ),
+    ] {
+        let (client, cluster) = connect_to_three_replicas().await;
+        answer_lookups(&cluster);
+        script_primary(
+            &cluster,
+            POLL_MESSAGES_DEFERRED_CODE,
+            [poll_reply_of(&[FIRST])],
+        );
+        let mut consumer = builder_on(client, standalone())
+            .partitions([POLLED_PARTITION])
+            .poll_options(PollOptions {
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::wait(IggyDuration::from(MAX_WAIT))
+            })
+            .build();
+        consumer.init().await.unwrap();
+        script_primary(&cluster, FETCH_MESSAGES_CODE, [answer]);
+        cluster.hold(FETCH_MESSAGES_CODE);
+        start_fetch(&mut consumer, &cluster).await;
+        let started = Instant::now();
+        let shutdown = tokio::spawn(async move { consumer.shutdown().await });
+
+        eventually("the close cancelled the parked fetch", || {
+            cluster.count(CANCEL_DEFERRED_REQUEST_CODE) == 1
+        })
+        .await;
+        cluster.release(FETCH_MESSAGES_CODE);
+        shutdown.await.unwrap().unwrap();
+
+        assert!(
+            started.elapsed() < MAX_WAIT,
+            "{case}: the close took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(stored_offsets(&cluster), stored, "{case}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_on_read_when_the_application_stores_an_offset_ahead_should_read_on_after_it_and_keep_it_at_shutdown()
+ {
+    const READ: [u64; 2] = [0, 1];
+    const SKIPPED_TO: u64 = 7;
+    let (mut consumer, cluster) = committing_consumer(READ[0]).await;
+    script_primary(
+        &cluster,
+        FETCH_MESSAGES_CODE,
+        [reply_of(&READ), reply_of(&[SKIPPED_TO + 1, SKIPPED_TO + 2])],
+    );
+    assert_eq!(
+        next_message(&mut consumer).await.message.header.offset,
+        READ[0]
+    );
+
+    consumer
+        .store_offset(SKIPPED_TO, Some(POLLED_PARTITION))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        next_message(&mut consumer).await.message.header.offset,
+        SKIPPED_TO + 1,
+        "the messages up to the stored offset are never delivered"
+    );
+    let fetches = cluster.received(FETCH_MESSAGES_CODE);
+    let after_store = FetchMessagesRequest::decode_from(&fetches.last().unwrap().body).unwrap();
+    assert_eq!(
+        after_store.targets[0].strategy,
+        WirePollingStrategy::offset(SKIPPED_TO + 1),
+        "the read after the store starts after the stored offset"
+    );
+    consumer.shutdown().await.unwrap();
+    assert_eq!(
+        stored_offsets(&cluster),
+        [
+            (POLLED_PARTITION, SKIPPED_TO),
+            (POLLED_PARTITION, SKIPPED_TO + 1)
+        ],
+        "the close moves the offset back to the last yielded message, after the store"
+    );
+}
+
+/// A restart resumes at the sought offset, because the seek stored the one before it.
+#[tokio::test(start_paused = true)]
+async fn given_on_read_when_seeking_to_an_offset_should_store_the_offset_before_it_and_read_from_it()
+ {
+    const SOUGHT: u64 = 7;
+    let (mut consumer, cluster) = committing_consumer(0).await;
+    script_primary(
+        &cluster,
+        FETCH_MESSAGES_CODE,
+        [reply_of(&[0, 1]), reply_of(&[SOUGHT, SOUGHT + 1])],
+    );
+    assert_eq!(next_message(&mut consumer).await.message.header.offset, 0);
+
+    consumer
+        .seek(POLLED_PARTITION, PollingStrategy::offset(SOUGHT))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        stored_offsets(&cluster),
+        [(POLLED_PARTITION, SOUGHT - 1)],
+        "the seek stores the offset before its start"
+    );
+    assert_eq!(
+        next_message(&mut consumer).await.message.header.offset,
+        SOUGHT,
+        "the rest of the held batch is dropped"
+    );
+    let fetches = cluster.received(FETCH_MESSAGES_CODE);
+    let after_seek = FetchMessagesRequest::decode_from(&fetches.last().unwrap().body).unwrap();
+    assert_eq!(
+        after_seek.targets[0].strategy,
+        WirePollingStrategy::offset(SOUGHT),
+        "the read after the seek starts at the sought offset"
+    );
+    consumer.shutdown().await.unwrap();
+    assert_eq!(
+        stored_offsets(&cluster),
+        [(POLLED_PARTITION, SOUGHT - 1), (POLLED_PARTITION, SOUGHT)],
+        "the close moves the offset back to the last yielded message"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_on_read_when_a_seek_store_is_refused_should_fail_the_seek_and_keep_the_position() {
+    let (mut consumer, cluster) = committing_consumer(0).await;
+    script_primary(
+        &cluster,
+        FETCH_MESSAGES_CODE,
+        [reply_of(&[0, 1]), reply_of(&[0])],
+    );
+    assert_eq!(next_message(&mut consumer).await.message.header.offset, 0);
+
+    script_primary(
+        &cluster,
+        STORE_CONSUMER_OFFSET_CODE,
+        [Answer::Refuse(IggyError::Unauthorized)],
+    );
+    assert_eq!(
+        consumer
+            .seek(POLLED_PARTITION, PollingStrategy::offset(7))
+            .await,
+        Err(IggyError::Unauthorized),
+        "a refused store fails the seek"
+    );
+    assert_eq!(
+        next_message(&mut consumer).await.message.header.offset,
+        1,
+        "a failed seek keeps the held batch and the position"
+    );
+
+    consumer
+        .seek(POLLED_PARTITION, PollingStrategy::first())
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_offsets(&cluster).len(),
+        1,
+        "a seek to the first offset stores nothing"
+    );
+    assert_eq!(
+        next_message(&mut consumer).await.message.header.offset,
+        0,
+        "the read after the seek starts at the first offset"
     );
 }
 

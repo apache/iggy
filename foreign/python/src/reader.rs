@@ -41,8 +41,11 @@ use crate::receive_message::{Checkpoint, PolledBatch, PollingStrategy};
 /// - The `commit` of its `PollOptions` says when offsets are stored. With `CommitPolicy.Manual()`
 ///   and `CommitPolicy.Auto`, `commit()` stores the offset of a checkpoint. `CommitPolicy.Auto`
 ///   also stores the latest counted position by itself, and `mark()` counts one. With
-///   `CommitPolicy.OnRead()`, the server stores the offset of each reply, and `close()` moves the
-///   offset back to the last delivered message.
+///   `CommitPolicy.OnRead()`, the server stores the offset of each reply, the reader reads only
+///   while `next()` waits and then fills its budget (one fetch per primary that may wait for
+///   messages, the partitions with messages left behind spread over the other slots), a `seek()`
+///   to an offset stores the offset before it, and `close()` moves the offset back to the last
+///   delivered message.
 /// - The reader stays usable after a `ReadError` and retries by itself. `HistoryUnavailable`
 ///   (87) stops its partition until `seek()`. With `OnRead`, an unknown outcome stops its
 ///   partition until `IggyClient.abandon_operation()` and `seek()`.
@@ -129,18 +132,21 @@ impl PartitionReader {
         })
     }
 
-    /// Sets the next read position of a partition and starts a new generation of it. It stores
-    /// no offset, drops the queued batches of the partition and ignores its late replies. It
-    /// also resumes a stopped partition. `start` is a new strategy or a continuation of the same
-    /// partition, such as `ReadError.skip`.
+    /// Sets the next read position of a partition and starts a new generation of it. It drops
+    /// the queued batches of the partition, ignores its late replies and resumes a stopped
+    /// partition. `start` is a new strategy or a continuation of the same partition, such as
+    /// `ReadError.skip`.
     ///
-    /// With `CommitPolicy.OnRead()`, the new position waits for the end of the committing
-    /// read in flight.
+    /// With `CommitPolicy.OnRead()`, a seek to an offset above 0 first stores the offset before
+    /// it, under the history of a continuation or else of the last delivered message, so a
+    /// restart resumes at the new position. A failed store fails the seek and nothing moves.
+    /// Every other seek stores nothing. The new position waits for the end of the committing
+    /// read in flight, whose reply the new generation drops.
     ///
     /// Raises `IggyError` with `InvalidCommand` (3) for a partition that the reader does not read
     /// and for a continuation of another partition, `PendingOperationError` with `OnRead` while
-    /// a read of the partition has an unknown outcome (abandon its operation first), and
-    /// `RuntimeError` after `close()`.
+    /// a read of the partition has an unknown outcome (abandon its operation first), the errors
+    /// of the offset store with `OnRead`, and `RuntimeError` after `close()`.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn seek<'a>(
         &self,

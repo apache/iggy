@@ -111,7 +111,7 @@ after the server refuses those credentials, it does not sign in by itself, and
 a call fails with status 40 until the caller signs in again. A sign-in or
 logout of the caller ends each earlier call that has to wait for a new session:
 with status 40 if it sent nothing, or with `OperationUncertainError` if its
-outcome is unknown. An auto-commit or Next poll, which has no operation ID, ends with status 57 instead. A typed send and a group poll can send more than one
+outcome is unknown. A Next poll that commits nothing, which has no operation ID, ends with status 57 instead, and an auto-commit poll ends with `FetchProgressUncertainError` (see below). A typed send and a group poll can send more than one
 command. If the caller signs in or logs out before the next command of such a
 call, the call fails with status 40. Only a call that waits for the client's own sign-in goes on
 under the new session. If the server refuses that sign-in, the call fails with
@@ -212,7 +212,9 @@ const next = await client.message.poll({
   history that delivered it, so a store after the partition was deleted and
   created again fails with error 87.
 - `CommitPolicy.OnRead` makes the server store the offset of the last message
-  of the read, as part of the read. A one-shot poll refuses
+  of each read as part of the read, in one round trip. While the primary stays
+  up a message is delivered at most once. A failover before the store
+  replicates can deliver the last batch again. A one-shot poll refuses
   `CommitPolicy.Auto()` with error 2 (InvalidConfiguration), since it has
   nothing to count.
 - `continuation()` continues the partition after the batch, under its context.
@@ -230,7 +232,12 @@ const next = await client.message.poll({
 `message.reader` opens a `PartitionReader`, which reads many partitions in
 batches and keeps the position of each. It reads the partitions of one primary
 in one request, finds a moved primary by itself and gives each partition its
-turn.
+turn. A partition whose last read ended before the end of the partition is read
+in a fetch of its own while the read ahead has room for another full read, up to
+16 reads in flight, so a backlog of many partitions is read as fast as one poll
+of each partition would read it. Under `CommitPolicy.OnRead` the reader starts
+those fetches only while `next()` waits, and each partition is in one committing
+read at a time.
 
 ```typescript
 import { Consumer, ReadError } from "apache-iggy";
@@ -273,8 +280,16 @@ try {
   reads only while `next()` waits, and `close()` moves the offset back to the
   last batch that the application took. A read whose reply was lost is
   repaired: the next read finds what it stored, and the reader reads those
-  messages again by offset without a commit. A batch that the server stored is
-  handed over even when its partition left the assignment of the member.
+  messages again by offset without a commit. Only a lost read makes the reader
+  read skipped offsets again: when the stored offset moved ahead because the
+  application or another session stored it, the reader delivers from there. A
+  batch that the server stored is handed over even when its partition left the
+  assignment of the member. A `seek` to an offset above 0 first stores the
+  offset before it, so a restart resumes at the sought offset, and a refused
+  store fails the seek and moves nothing. Every other `seek` stores nothing.
+- A refusal 5009 of a group partition drops its position, so the next read
+  starts again from `start` under the new owner of the partition. A 5009 that
+  six retries did not change is reported and stops the partition until `seek`.
 - With `CommitPolicy.Auto({ interval, every, after })` the reader counts each
   batch when `next()` returns it (`CommitAfter.Delivery`), at the next `next()`
   or `close()` (`CommitAfter.Processing`), or on `mark` (`CommitAfter.Marked`),
@@ -284,7 +299,8 @@ try {
   after processing.
 - The reader reads ahead up to 16 MiB and 16,000 messages (`prefetchBytes`,
   `prefetchMessages`). Without options a read waits up to 5 s. After a refused
-  read or a failed refresh it waits `retryInterval`, 1 s by default.
+  read, a lost read or a failed refresh it waits `retryInterval`, 1 s by
+  default.
 
 ### Consumers
 
@@ -308,8 +324,11 @@ await consumer.shutdown();
   `client.consumer` reads the given `partitions` under the consumer `name`.
 - Under `CommitAfter.Processing` a message counts once the iterator is read
   again or its handler returns. A handler that throws ends `consume` with its
-  error and leaves its message uncounted. `shutdown()` counts the last message,
-  stores or moves back the offsets and leaves the group.
+  error and leaves its message uncounted, and so does a shutdown while the
+  handler runs. `shutdown()` counts the last message of the iterator, stores or
+  moves back the offsets and leaves the group. A later `shutdown()` waits for
+  the first and ends as it does. `seek` drops the rest of the batch of its
+  partition.
 - A read error that the reader retries by itself goes to `onError` and the
   consumer goes on. A message that does not decode ends the iteration with its
   `ReadError`, whose `skip` passes it with `seek`.
@@ -370,14 +389,16 @@ abandon came before a proved outcome, or the proved outcome aged out.
 discards retained operations. It does not wait for outstanding calls to finish.
 Await those calls before destroying the client when their results are needed.
 
-Auto-commit and Next polls (100/106), and non-committing fetches, hold their progress lane only during the active call.
+Next polls that commit nothing (100/106), and non-committing fetches, hold their progress lane only during the active call.
 Error 57, a lost reply or another unknown outcome ends the call immediately with status 57 and no
 retained operation ID. These polls never replay after uncertainty. Known
 non-admission errors 58/89 remain retryable. Pure reads may retry lost replies.
 Before uncertainty, lifecycle error 88 retries with a fresh ID within the same
 deadline. After uncertainty, only committed-result proof can release the lane.
 
-A committing fetch (109) with an unknown outcome throws `FetchProgressUncertainError` (local code 14010) and retains progress blocks for every affected partition history. Its `operationId` is a client-lifetime recovery key, not a server replay receipt.
+An auto-commit poll (100/106) or a committing fetch (109) with an unknown outcome throws `FetchProgressUncertainError` (local code 14010) and retains progress blocks for every affected partition history. Its `operationId` is a client-lifetime recovery key, not a server replay receipt. A lost reply, a transport failure after the send, a disconnect or a logout while the call waits leave the outcome unknown.
+
+So does every refusal except those that prove the server stored nothing: 5, 6, 58, 80, 87, 89, 90, 1009, 1010, 2010, 2011, 3007, 3024, 4100 and 5009 for a whole reply, and 58, 80, 87, 89, 3007, 3024 and 5009 for a fetch section.
 
 Later progress polls, fetches, stores and deletes fail with `LaneBlockedError` carrying that ID, the blocked partition and `errorCode` 14009. Stateless reads, `GetOffset` inspection and sends remain available. Reconnect, sign-in and late replies do not clear these blocks.
 

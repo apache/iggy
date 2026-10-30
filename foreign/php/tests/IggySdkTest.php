@@ -24,6 +24,7 @@ use Iggy\CommitAfter;
 use Iggy\CommitEvery;
 use Iggy\CommitPolicy;
 use Iggy\Exception\NotFoundException;
+use Iggy\Exception\PendingOperationException;
 use Iggy\PolledMessages;
 use Iggy\PollingStrategy;
 use Iggy\PollOptions;
@@ -43,6 +44,8 @@ final class IggySdkTest extends TestCase
     private const CONSUMER_ID = 1;
     private const INVALID_COMMAND_CODE = 3;
     private const HISTORY_UNAVAILABLE_CODE = 87;
+    private const PARTITION_LANE_BLOCKED_CODE = 14009;
+    private const FETCH_PROGRESS_UNCERTAIN_CODE = 14010;
     private const EMPTY_READ_TIMEOUT_MICROS = 100_000;
     private const DEADLINE_SECONDS = 10;
     private const UNCOUNTED_WAIT_SECONDS = 0.5;
@@ -571,6 +574,58 @@ final class IggySdkTest extends TestCase
             // Past the max wait, after which an uncancelled poll would have stored its offset.
             sleep(2);
             assert_null($client->getConsumerOffset($streamName, $topicName, self::CONSUMER_ID, 0));
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    #[TestDox('A committing poll cut off by a disconnect blocks its partition until its operation is abandoned')]
+    public function testCommittingPollLostToADisconnectBlocksItsPartitionUntilAbandoned(): void
+    {
+        $client = new_client();
+        $streamName = unique_name('lost-stream');
+        $topicName = unique_name('lost-topic');
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName, 1);
+            // A parked poll holds its connection, so it runs on a client of its own.
+            $owner = new_client();
+            $poll = $owner->startPollMessages(
+                $streamName,
+                $topicName,
+                0,
+                self::CONSUMER_ID,
+                PollingStrategy::next(),
+                new PollOptions(max_wait_micros: micros(self::DEADLINE_SECONDS), commit: CommitPolicy::onRead()),
+            );
+            assert_null($poll->wait(self::EMPTY_READ_TIMEOUT_MICROS));
+
+            $owner->disconnect();
+            $lost = assert_throws(static fn () => $poll->wait(micros(self::DEADLINE_SECONDS)));
+            assert_instance_of(PendingOperationException::class, $lost, $lost->getMessage());
+            assert_same(self::FETCH_PROGRESS_UNCERTAIN_CODE, $lost->getCode());
+            assert_same('fetch_progress_uncertain', $lost->kind);
+
+            $owner->connect();
+            $owner->loginUser(env_or_default('IGGY_ROOT_USERNAME', 'iggy'), env_or_default('IGGY_ROOT_PASSWORD', 'iggy'));
+            $pollNext = static fn (): PolledMessages => $owner->pollMessages(
+                $streamName,
+                $topicName,
+                0,
+                self::CONSUMER_ID,
+                PollingStrategy::next(),
+                new PollOptions(count: 1, commit: CommitPolicy::onRead()),
+            );
+            $blocked = assert_throws($pollNext);
+            assert_instance_of(PendingOperationException::class, $blocked, $blocked->getMessage());
+            assert_same(self::PARTITION_LANE_BLOCKED_CODE, $blocked->getCode());
+            assert_same('lane_blocked', $blocked->kind);
+            assert_same(0, $blocked->partition_id);
+            assert_same($lost->operation_id, $blocked->operation_id);
+
+            $owner->abandonOperation($lost->operation_id);
+            $client->sendMessages($streamName, $topicName, 0, [new SendMessage('after')]);
+            assert_same(['after'], collect_payloads($pollNext()->messages));
         } finally {
             cleanup_stream_with_topics($client, $streamName, [$topicName]);
         }

@@ -147,4 +147,39 @@ struct DeferredPollE2ETests {
             #expect(polled.messages.map(\.payloadString) == ["unseen"])
         }
     }
+
+    /// A disconnect while a committing poll waits leaves its outcome unknown,
+    /// so the poll fails as uncertain and its partition is blocked, across
+    /// the new session, until the caller abandons the poll.
+    @Test func aCommittingPollThatWaitsWhenTheClientDisconnectsBlocksItsPartition() async throws {
+        try await E2EEnvironment.withSession { session in
+            let client = session.client
+            let scratch = try await session.scratchTopic(partitions: 1)
+            let consumer = Consumer.consumer(try Identifier(named: E2EEnvironment.uniqueName("swift-e2e-lost")))
+            let options = PollOptions(count: 1, maxWait: Self.parking, commit: .onRead)
+            let poll = { @Sendable in
+                try await client.pollMessages(
+                    streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: consumer, strategy: .next, options: options)
+            }
+            // A read that waits for nothing first opens the route and the
+            // connection, so the committing poll only writes its frame.
+            _ = try await client.pollMessages(
+                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: consumer, strategy: .offset(0),
+                options: PollOptions(count: 1, maxWait: .zero))
+            let parked = Task { try await poll() }
+            try await Task.sleep(for: .milliseconds(500))
+
+            await client.disconnect()
+            let lost = await #expect(throws: IggyError.self) { _ = try await parked.value }
+
+            #expect(lost?.code == .fetchProgressUncertain, "\(String(describing: lost))")
+            try await client.connect()
+            _ = try await client.login(username: E2EEnvironment.rootUsername, password: E2EEnvironment.rootPassword)
+            let blocked = await #expect(throws: IggyError.self) { _ = try await poll() }
+            #expect(blocked?.code == .partitionLaneBlocked && blocked?.operationID == lost?.operationID, "\(String(describing: blocked))")
+            try client.abandonOperation(try #require(lost?.operationID))
+            try await client.sendBatch(streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(0), messages: ["after"])
+            #expect(try await poll().messages.map(\.payloadString) == ["after"])
+        }
+    }
 }

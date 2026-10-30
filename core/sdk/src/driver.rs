@@ -21,7 +21,8 @@
 //! applies a request twice.
 
 use crate::links::{
-    Frame, LateReply, Link, ReplicaLinks, Reply, Target, lost_link, pause_before_retry, read_reply,
+    Frame, LateReply, Link, ReplicaLinks, Reply, Target, committing_cancel_requested, lost_link,
+    pause_before_retry, read_reply,
 };
 use crate::session_owner::{LaneKey, LaneTicket, RetainedOperation, SessionEpoch, SessionOwner};
 use crate::vsr::decode_reply_for;
@@ -55,8 +56,8 @@ use iggy_binary_protocol::{
     WirePollingStrategy,
 };
 use iggy_common::{
-    BinaryOperationLineage, ClientState, Credentials, DeferredPollOptions, DiagnosticEvent,
-    FetchedSection, HeaderKind, Identifier, IggyError, OptionKey,
+    BinaryOperationLineage, ClientState, CommitErrorScope, Credentials, DeferredPollOptions,
+    DiagnosticEvent, FetchedSection, HeaderKind, Identifier, IggyError, OptionKey,
 };
 use route_cache::RouteCache;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -589,6 +590,10 @@ impl OperationDriver {
             match next {
                 Next::Again if Instant::now() < call.deadline => {}
                 Next::Again => return Err(call.expire()),
+                // The reader of the call closes and cancelled it, so its refusal is the answer.
+                Next::Pause if call.committing() && committing_cancel_requested() => {
+                    return Err(call.expire());
+                }
                 Next::Pause => {
                     if !call.pause().await {
                         return Err(call.expire());
@@ -1488,28 +1493,7 @@ struct CallReply {
 /// Whether a committing fetch that failed with `error` can have taken effect. The HTTP client
 /// applies the same list to the error id of a deferred poll reply.
 pub(crate) fn fetch_error_is_uncertain(error: &IggyError) -> bool {
-    !matches!(
-        error,
-        IggyError::FeatureUnavailable
-            | IggyError::InvalidIdentifier
-            | IggyError::TransientNotAccepted
-            | IggyError::HistoryUnavailable
-            | IggyError::NotPrimary
-            | IggyError::DeferredPollCapacityExceeded
-            // The server refuses a first message larger than `max_bytes` before it stores the
-            // offset. A link that refuses a larger reply fails its sent calls with the same
-            // error, and `attempt` marks such a progress call uncertain before this list.
-            | IggyError::InvalidSizeBytes
-            | IggyError::StreamIdNotFound(..)
-            | IggyError::StreamNameNotFound(..)
-            | IggyError::TopicIdNotFound(..)
-            | IggyError::TopicNameNotFound(..)
-            | IggyError::PartitionNotFound(..)
-            | IggyError::InvalidOffset(..)
-            | IggyError::ConsumerGroupPartitionNotOwned(..)
-            // A read that needs a new offset key above the limit returns no messages.
-            | IggyError::TooManyConsumerOffsets
-    )
+    !CommitErrorScope::Request.proves_nothing_stored(error)
 }
 
 /// The targets whose outcome the reply to the cancel of a committing request leaves unknown, or
@@ -1544,15 +1528,7 @@ fn late_uncertain(
 }
 
 fn fetch_section_is_uncertain(error: &IggyError) -> bool {
-    !matches!(
-        error,
-        IggyError::InvalidSizeBytes
-            | IggyError::HistoryUnavailable
-            | IggyError::NotPrimary
-            | IggyError::ConsumerGroupPartitionNotOwned(..)
-            | IggyError::PartitionNotFound(..)
-            | IggyError::TooManyConsumerOffsets
-    )
+    !CommitErrorScope::Section.proves_nothing_stored(error)
 }
 
 struct UncertainFetch {
@@ -1995,9 +1971,9 @@ mod tests {
     };
     use iggy_binary_protocol::{MAX_RECORD_SIZE, WireConsumer, WireIdentifier};
     use iggy_common::{
-        AutoLogin, Client, CommitPolicy, Consumer, Credentials, DiagnosticEvent, IggyMessage,
-        MessageClient, Partitioning, PendingOperationsConfig, PollOptions, PollingStrategy,
-        UserClient,
+        AutoLogin, Client, CommitPolicy, Consumer, Credentials, DiagnosticEvent, IggyDuration,
+        IggyMessage, MessageClient, Partitioning, PendingOperationsConfig, PollOptions,
+        PollingStrategy, UserClient,
     };
     use secrecy::SecretString;
     use std::iter::repeat_n;
@@ -4508,7 +4484,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn given_partial_uncertain_fetch_sections_when_decoded_should_preserve_healthy_sections_and_recovery_identity()
      {
-        for status in [3, 57, 58, 59, 90, 11001] {
+        for status in [3, 57, 59, 90, 11001] {
             let f = Fixture::new().await;
             f.cluster.script(
                 &endpoint(PRIMARY),
@@ -5438,6 +5414,75 @@ mod tests {
             sessions.iter().all(|session| *session == FIRST_SESSION),
             "sent under the sessions {sessions:?}"
         );
+    }
+
+    /// A caller that disconnects while its committing poll waits cannot know what the server
+    /// stored, so the poll ends uncertain and its partition stays blocked in the next session.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_waiting_committing_poll_when_the_caller_disconnects_should_fail_uncertain_and_block_its_partition_in_the_next_session()
+     {
+        let f = Fixture::new().await;
+        f.cluster.hold(POLL_MESSAGES_DEFERRED_CODE);
+        let target = RequestTarget::Partition(PartitionTarget {
+            stream_id: &f.stream_id,
+            topic_id: &f.topic_id,
+            partition_id: PARTITION_ID,
+            context: None,
+        });
+        let client = TcpClient::from_links(f.driver.links);
+        let consumer = Consumer::new(Identifier::numeric(1).unwrap());
+        let next = PollingStrategy::next();
+        let poll = client.poll_messages(
+            &f.stream_id,
+            &f.topic_id,
+            PARTITION_ID,
+            &consumer,
+            &next,
+            PollOptions {
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::wait(IggyDuration::from(Duration::from_secs(10)))
+            },
+        );
+        tokio::pin!(poll);
+        tokio::select! {
+            polled = &mut poll => panic!("the held poll returned: {polled:?}"),
+            () = eventually("the committing poll arrived", || {
+                f.cluster.count(POLL_MESSAGES_DEFERRED_CODE) == 1
+            }) => {}
+        }
+
+        client.disconnect().await.unwrap();
+        let polled = poll.await;
+        let op = f.cluster.received(POLL_MESSAGES_DEFERRED_CODE)[0]
+            .header
+            .request;
+        client.connect().await.unwrap();
+        client.login_user(OTHER_USER, OTHER_PASSWORD).await.unwrap();
+        let stored = client
+            .driver
+            .send(
+                STORE_CONSUMER_OFFSET_CODE,
+                Bytes::from_static(PAYLOAD),
+                target,
+            )
+            .await;
+        let abandoned = client.abandon_operation(op).await;
+        let stored_after_abandon = client
+            .driver
+            .send(
+                STORE_CONSUMER_OFFSET_CODE,
+                Bytes::from_static(PAYLOAD),
+                target,
+            )
+            .await;
+
+        assert_eq!(polled.map(drop), Err(IggyError::FetchProgressUncertain(op)));
+        assert_eq!(
+            stored,
+            Err(IggyError::PartitionLaneBlocked(PARTITION_ID, op))
+        );
+        assert_eq!(abandoned, Ok(()));
+        stored_after_abandon.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

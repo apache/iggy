@@ -30,6 +30,7 @@ import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyValidationException;
 import org.apache.iggy.message.AutoCommit;
+import org.apache.iggy.message.Checkpoint;
 import org.apache.iggy.message.CommitAfter;
 import org.apache.iggy.message.CommitEvery;
 import org.apache.iggy.message.CommitPolicy;
@@ -39,8 +40,10 @@ import org.apache.iggy.message.PollOptions;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingKind;
 import org.apache.iggy.message.PollingStrategy;
+import org.apache.iggy.partition.PartitionContext;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.math.BigInteger;
@@ -764,6 +767,609 @@ class PartitionReaderTest {
         } finally {
             reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
         }
+    }
+
+    /** A gap read that the server refused goes out again, so the messages that the lost read stored still arrive. */
+    @Test
+    void shouldReadTheGapAgainAfterTheServerRefusedItsRead() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, ON_READ, 1L);
+        try {
+            CompletableFuture<PolledMessages> second = loseTheSecondRead(transport, reader);
+            transport.nextRead().answer(section(1, 5, 6));
+            Read refusedGap = transport.nextRead();
+            assertThat(refusedGap.commit()).isFalse();
+            refusedGap.reply().completeExceptionally(serverError(IggyErrorCode.NOT_PRIMARY));
+
+            Read gap = transport.nextRead();
+            assertThat(gap.commit()).isFalse();
+            assertThat(gap.targets().get(1L).value()).isEqualTo(BigInteger.TWO);
+            gap.answer(section(1, 2, 3, 4));
+            assertThat(offsets(second.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)))
+                    .containsExactly(2L, 3L, 4L);
+            assertThat(offsets(next(reader))).containsExactly(5L, 6L);
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** An empty gap section moves the gap to its next offset, past messages that are gone. */
+    @Test
+    void shouldMoveTheGapPastAnEmptyGapSectionAndReadTheRest() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, ON_READ, 1L);
+        try {
+            CompletableFuture<PolledMessages> second = loseTheSecondRead(transport, reader);
+            transport.nextRead().answer(section(1, 5, 6));
+            transport.nextRead().answer(FakeTransport.empty(1, 3));
+
+            Read rest = transport.nextRead();
+            assertThat(rest.commit()).isFalse();
+            assertThat(rest.targets().get(1L).value()).isEqualTo(BigInteger.valueOf(3));
+            rest.answer(section(1, 3, 4));
+            assertThat(offsets(second.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)))
+                    .containsExactly(3L, 4L);
+            assertThat(offsets(next(reader))).containsExactly(5L, 6L);
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * A partition that another owner holds drops its position, whose owner generation is stale after a rejoin, and
+     * resolves its start again. Refusals that last are reported, and the partition keeps reading.
+     */
+    @Test
+    void shouldResolveThePositionAgainAfterTheServerSaysAnotherOwnerHoldsThePartition() throws Exception {
+        FakeTransport transport = new FakeTransport(true);
+        PartitionReader reader = member(transport, MANUAL);
+        try {
+            assignment(transport, 1L);
+            transport.nextRead().answer(section(1, 0, 1));
+            next(reader);
+            Read refusedRead = transport.nextRead();
+            assertThat(refusedRead.targets().get(1L).context()).contains(FakeTransport.CONTEXT);
+            int notOwned = IggyErrorCode.CONSUMER_GROUP_PARTITION_NOT_OWNED.getCode();
+            refusedRead.answer(refused(1, notOwned));
+
+            Read again = transport.nextRead();
+            assertThat(again.targets().get(1L)).isEqualTo(PollingStrategy.next());
+            again.answer(refused(1, notOwned));
+            for (int refusal = 2; refusal < 6; refusal++) {
+                transport.nextRead().answer(refused(1, notOwned));
+            }
+
+            assertThat(readError(reader).errorCode()).hasValue(notOwned);
+            assertThat(transport.nextRead().targets().get(1L)).isEqualTo(PollingStrategy.next());
+        } finally {
+            closeGroupReader(reader, transport);
+        }
+    }
+
+    @Test
+    void shouldStoreACommitAgainAfterItsFirstStoreFailed() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, MANUAL, 1L);
+        try {
+            transport.nextRead().answer(section(1, 3, 4));
+            Checkpoint last = next(reader).checkpoint().orElseThrow();
+            transport.storeFailures.add(new IggyClientException("The connection dropped"));
+
+            assertThatThrownBy(() -> reader.commit(last).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                    .hasCauseInstanceOf(IggyClientException.class);
+            reader.commit(last).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+            assertThat(transport.stores).containsExactly(new Store(1, 4));
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** The server raises the metadata op of a section after any metadata change, in the same history. */
+    @Test
+    void shouldCommitAnEarlierCheckpointAfterTheServerRaisedTheMetadataOp() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, MANUAL, 1L);
+        PartitionContext raised = new PartitionContext(
+                FakeTransport.CONTEXT.incarnation(), FakeTransport.CONTEXT.ownerGeneration(), BigInteger.TWO);
+        try {
+            transport.nextRead().answer(section(1, 0, 1));
+            PolledMessages first = next(reader);
+            transport.nextRead().answer(section(1, raised, 2, 3));
+            next(reader);
+
+            reader.commit(first.checkpointAt(0).orElseThrow()).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+            assertThat(transport.stores).containsExactly(new Store(1, 0));
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** The server can have stored a read whose reply was lost, so the close moves the offset back over it. */
+    @Test
+    void shouldMoveTheOffsetBackOverALostReadOnCloseUnderOnRead() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, ON_READ, 1L);
+        CompletableFuture<PolledMessages> first = reader.next();
+        transport.nextRead().answer(section(1, 0, 1));
+        first.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        CompletableFuture<PolledMessages> cancelled = reader.next();
+        Read lost = transport.nextRead();
+        assertThat(cancelled.cancel(false)).isTrue();
+        lost.answer(FakeTransport.lost(1, 42));
+        assertThat(transport.readsNothingFor(QUIET)).isTrue();
+
+        reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+        assertThat(transport.stores).containsExactly(new Store(1, 1));
+    }
+
+    /** The server stored the whole read, so the close moves the offset back before the message that did not decode. */
+    @Test
+    void shouldMoveTheOffsetBackBeforeAMessageThatDidNotDecodeOnCloseUnderOnRead() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, ON_READ, 1L);
+        CompletableFuture<PolledMessages> first = reader.next();
+        byte[] records = ByteBufUtil.getBytes(
+                Unpooled.wrappedBuffer(FakeTransport.record(0), Unpooled.wrappedBuffer(new byte[] {1, 2, 3})));
+        transport
+                .nextRead()
+                .answer(new FetchedMessages(
+                        1,
+                        FetchedMessages.STATUS_OK,
+                        BigInteger.valueOf(3),
+                        3,
+                        FakeTransport.CONTEXT,
+                        BigInteger.valueOf(3),
+                        records));
+        assertThat(offsets(first.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)))
+                .containsExactly(0L);
+        readError(reader);
+
+        reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+        assertThat(transport.stores).containsExactly(new Store(1, 0));
+    }
+
+    /** A lost read is abandoned also when a seek replaced its generation, or its lane stays blocked. */
+    @Test
+    void shouldAbandonALostReadWhoseReplyArrivesAfterASeek() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, ON_READ, 1L);
+        try {
+            CompletableFuture<PolledMessages> first = reader.next();
+            transport.nextRead().answer(section(1, 0, 1));
+            first.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            reader.next();
+            Read lost = transport.nextRead();
+            CompletableFuture<Void> sought = reader.seek(1L, PollingStrategy.offset(BigInteger.TEN));
+
+            lost.answer(FakeTransport.lost(1, 42));
+            sought.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+            assertThat(transport.abandoned).containsExactly(42L);
+            assertThat(transport.stores).containsExactly(new Store(1, 9));
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** A seek that waits for a read in flight when the close starts still applies, and its store goes before the rewind. */
+    @Test
+    void shouldStoreAPendingSeekOnCloseBeforeTheRewind() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, ON_READ, 1L, 2L);
+        CompletableFuture<PolledMessages> first = reader.next();
+        transport.nextRead().answer(section(2, 0));
+        first.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        reader.next();
+        transport.nextRead();
+        CompletableFuture<Void> sought = reader.seek(1L, PollingStrategy.offset(BigInteger.TEN));
+
+        reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+        sought.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        assertThat(transport.stores).containsExactly(new Store(1, 9), new Store(2, 0));
+    }
+
+    /** A refused store of a seek that applies at close fails the close, and the other partitions still rewind. */
+    @Test
+    void shouldFailTheCloseWhenTheStoreOfAPendingSeekIsRefusedAndStillRewindTheOthers() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, ON_READ, 1L, 2L);
+        CompletableFuture<PolledMessages> first = reader.next();
+        transport.nextRead().answer(section(2, 0));
+        first.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        reader.next();
+        transport.nextRead();
+        CompletableFuture<Void> sought = reader.seek(1L, PollingStrategy.offset(BigInteger.TEN));
+        transport.storeFailures.add(new IggyClientException("The connection dropped"));
+
+        assertThatThrownBy(() -> reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                .hasCauseInstanceOf(IggyClientException.class);
+
+        assertThatThrownBy(() -> sought.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                .hasCauseInstanceOf(IggyClientException.class);
+        assertThat(transport.stores).containsExactly(new Store(2, 0));
+    }
+
+    /**
+     * The server can store until it answers the cancel of a committing read, and that reply lifts the block of its
+     * partitions, so the stores of the close wait for it.
+     */
+    @Test
+    void shouldStoreOnCloseOnlyAfterTheCancelledReadsAnswered() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, ON_READ, 1L);
+        CompletableFuture<PolledMessages> first = reader.next();
+        transport.nextRead().answer(section(1, 0));
+        first.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        reader.next();
+        transport.nextRead();
+        transport.settled = new CompletableFuture<>();
+
+        CompletableFuture<Void> closed = reader.closeAsync();
+
+        assertThat(transport.readsNothingFor(QUIET)).isTrue();
+        assertThat(closed).isNotDone();
+        assertThat(transport.stores).isEmpty();
+        transport.settled.complete(null);
+        closed.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        assertThat(transport.stores).containsExactly(new Store(1, 0));
+    }
+
+    /**
+     * A committing read whose reply never comes during the close leaves its partition blocked on the client, so the
+     * close abandons it, before its rewind store of that partition, since no reader is left to recover it.
+     */
+    @Test
+    void shouldAbandonAReadLostDuringTheCloseBeforeTheRewind() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, ON_READ, 1L);
+        CompletableFuture<PolledMessages> first = reader.next();
+        transport.nextRead().answer(section(1, 0));
+        first.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        reader.next();
+        transport.nextRead();
+        transport.lost.add(42L);
+
+        reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+        assertThat(transport.events).containsExactly("abandon 42", "store 1 0");
+    }
+
+    /** The offset before a seek is the last position of the new generation, so the close moves back to it. */
+    @Test
+    void shouldMoveTheOffsetBackBeforeTheSeekOffsetOnCloseWhileAReadIsInFlight() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, ON_READ, 1L);
+        reader.seek(1L, PollingStrategy.offset(BigInteger.TEN)).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        reader.next();
+        assertThat(transport.nextRead().targets().get(1L).kind()).isEqualTo(PollingKind.Next);
+
+        reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+        assertThat(transport.stores).containsExactly(new Store(1, 9), new Store(1, 9));
+    }
+
+    /** There is no offset before 0, and the other strategies name no offset, so such a seek stores nothing. */
+    @ParameterizedTest
+    @MethodSource("startsThatStoreNothing")
+    void shouldStoreNothingForASeekThatNamesNoOffsetAboveZeroUnderOnRead(PollingStrategy start) throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, ON_READ, 1L);
+        try {
+            reader.seek(1L, start).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            reader.next();
+
+            Read read = transport.nextRead();
+            PollingKind kind = start.kind() == PollingKind.First ? PollingKind.Offset : start.kind();
+            assertThat(read.targets().get(1L).kind()).isEqualTo(kind);
+            assertThat(read.commit()).isTrue();
+            assertThat(transport.stores).isEmpty();
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    static List<PollingStrategy> startsThatStoreNothing() {
+        return List.of(
+                PollingStrategy.first(),
+                PollingStrategy.offset(BigInteger.ZERO),
+                PollingStrategy.last(),
+                PollingStrategy.next(),
+                PollingStrategy.timestamp(BigInteger.TEN));
+    }
+
+    @Test
+    void shouldFailASeekWhoseStoreIsRefusedUnderOnRead() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, ON_READ, 1L);
+        try {
+            transport.storeFailures.add(new IggyClientException("The connection dropped"));
+
+            assertThatThrownBy(() -> reader.seek(1L, PollingStrategy.offset(BigInteger.TEN))
+                            .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                    .hasCauseInstanceOf(IggyClientException.class);
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    @Test
+    void shouldFailAPendingSeekOfAPartitionThatLeavesTheAssignment() throws Exception {
+        FakeTransport transport = new FakeTransport(true);
+        PartitionReader reader = member(transport, ON_READ);
+        try {
+            assignment(transport, 1L, 2L);
+            reader.next();
+            Read read = transport.nextRead();
+            CompletableFuture<Void> sought = reader.seek(1L, PollingStrategy.offset(BigInteger.TEN));
+
+            assignment(transport, 2L);
+
+            assertInvalidCommand(sought);
+            read.answer();
+        } finally {
+            closeGroupReader(reader, transport);
+        }
+    }
+
+    /** A reader that abandons a lost read waits its retry interval before it reads that partition again. */
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void shouldWaitTheRetryIntervalBeforeItReadsAgainAfterALostRead(boolean wholeRead) throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, ON_READ, 1L);
+        try {
+            CompletableFuture<PolledMessages> first = reader.next();
+            transport.nextRead().answer(section(1, 0, 1));
+            first.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            reader.next();
+            Read lost = transport.nextRead();
+            long lostAt = System.nanoTime();
+            if (wholeRead) {
+                lost.reply()
+                        .completeExceptionally(new IggyOperationException(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN, 42));
+            } else {
+                lost.answer(FakeTransport.lost(1, 42));
+            }
+
+            transport.nextRead();
+
+            assertThat(System.nanoTime() - lostAt).isGreaterThanOrEqualTo(RETRY_INTERVAL.toNanos());
+            assertThat(transport.abandoned).containsExactly(42L);
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * Only a lost read explains a read that starts past the expected offset. Once a later read passed the gap check, a
+     * forward jump comes from a store of the application or another session, and is delivered as it is.
+     */
+    @Test
+    void shouldCatchUpAForwardJumpOnlyWhileALostReadCanHaveStoredIt() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, ON_READ, 1L);
+        try {
+            CompletableFuture<PolledMessages> second = loseTheSecondRead(transport, reader);
+            transport.nextRead().answer(section(1, 2, 3));
+            assertThat(offsets(second.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)))
+                    .containsExactly(2L, 3L);
+
+            CompletableFuture<PolledMessages> third = reader.next();
+            Read jump = transport.nextRead();
+            assertThat(jump.commit()).isTrue();
+            jump.answer(section(1, 9));
+
+            assertThat(offsets(third.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)))
+                    .containsExactly(9L);
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** The read of a partition that left and came back ends without freeing the partition for a second read. */
+    @Test
+    void shouldKeepOneReadOfAPartitionThatLeftAndCameBackWhileItsOldReadRuns() throws Exception {
+        FakeTransport transport = new FakeTransport(true);
+        PartitionReader reader = member(transport, MANUAL);
+        try {
+            assignment(transport, 1L);
+            Read old = transport.nextRead();
+            assignment(transport);
+            assignment(transport, 1L);
+            Read current = transport.nextRead();
+
+            old.answer(section(1, 0));
+
+            assertThat(transport.readsNothingFor(QUIET)).isTrue();
+            current.answer(section(1, 0, 1));
+            assertThat(offsets(next(reader))).containsExactly(0L, 1L);
+        } finally {
+            closeGroupReader(reader, transport);
+        }
+    }
+
+    /** The server can end a membership before the close, which then has nothing to leave. */
+    @Test
+    void shouldCloseAGroupReaderWhoseMembershipTheServerAlreadyEnded() throws Exception {
+        FakeTransport transport = new FakeTransport(true);
+        transport.leaveFailure = serverError(IggyErrorCode.CONSUMER_GROUP_MEMBER_NOT_FOUND);
+        PartitionReader reader = member(transport, MANUAL);
+        assignment(transport, 1L);
+
+        closeGroupReader(reader, transport);
+
+        assertThat(transport.membership).containsExactly("join", "leave");
+    }
+
+    @Test
+    void shouldReturnTheFailureOfTheFirstCloseToALaterClose() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        transport.starts.put(1L, 5L);
+        PartitionReader reader = standalone(transport, ON_READ, 1L);
+        reader.next();
+        transport.nextRead();
+        transport.storeFailures.add(new IggyClientException("The connection dropped"));
+
+        assertThatThrownBy(() -> reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                .hasCauseInstanceOf(IggyClientException.class);
+        assertThatThrownBy(() -> reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                .hasCauseInstanceOf(IggyClientException.class);
+    }
+
+    /** A first message that does not decode stops its partition with the skip past it, so a seek moves on. */
+    @Test
+    void shouldNameTheSkipOfAFirstMessageThatDoesNotDecode() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        transport.probes.put(
+                1L,
+                new FetchedMessages(
+                        1,
+                        FetchedMessages.STATUS_OK,
+                        BigInteger.valueOf(4),
+                        1,
+                        FakeTransport.CONTEXT,
+                        BigInteger.valueOf(4),
+                        new byte[] {1, 2, 3}));
+        PartitionReader reader = standalone(transport, ON_READ, 1L);
+        try {
+            ReadException error = readError(reader);
+
+            assertThat(error.skip()).map(PollingStrategy::value).contains(BigInteger.valueOf(4));
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** A lost first read from an offset can have stored from there, so the close moves the offset back before it. */
+    @Test
+    void shouldMoveTheOffsetBackBeforeALostReadFromTheStartOffsetOnCloseUnderOnRead() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = PartitionReader.builder(transport)
+                .partitions(List.of(1L))
+                .start(PollingStrategy.offset(BigInteger.valueOf(5)))
+                .options(ON_READ)
+                .retryInterval(RETRY_INTERVAL)
+                .build()
+                .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        CompletableFuture<PolledMessages> cancelled = reader.next();
+        Read lost = transport.nextRead();
+        assertThat(cancelled.cancel(false)).isTrue();
+        lost.reply().completeExceptionally(new IggyOperationException(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN, 42));
+        assertThat(transport.readsNothingFor(QUIET)).isTrue();
+
+        reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+        assertThat(transport.stores).containsExactly(new Store(1, 4));
+    }
+
+    /**
+     * A read of a partition with a backlog returns at once, so the free slots spread the backlogged partitions of a
+     * group over reads of their own, each with the whole limits, and a quiet one keeps the read that may wait.
+     */
+    @Test
+    void shouldSpreadTheBacklogOfAGroupOverReadsOfTheirOwn() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, MANUAL, 1L, 2L, 3L, 4L);
+        try {
+            Read first = transport.nextRead();
+            assertThat(first.targets()).containsOnlyKeys(1L, 2L, 3L, 4L);
+
+            first.answer(
+                    FakeTransport.backlogged(1, 100, 0),
+                    FakeTransport.backlogged(2, 100, 0),
+                    FakeTransport.backlogged(3, 100, 0),
+                    section(4, 0));
+
+            List<Read> next =
+                    List.of(transport.nextRead(), transport.nextRead(), transport.nextRead(), transport.nextRead());
+            assertThat(next)
+                    .extracting(read -> read.targets().keySet())
+                    .containsExactlyInAnyOrder(Set.of(1L), Set.of(2L), Set.of(3L), Set.of(4L));
+            assertThat(next).extracting(Read::count).containsOnly(MANUAL.count());
+            assertThat(transport.readsNothingFor(QUIET)).isTrue();
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * Under OnRead a waiting call fills the free slots too: the backlogged partitions of a group take committing reads
+     * of their own, each with the whole limits, beside the one read of its quiet partitions that may wait, and a
+     * partition is in one committing read at a time.
+     */
+    @Test
+    void shouldSpreadTheBacklogOfAGroupOverCommittingReadsOfTheirOwnUnderOnRead() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, ON_READ, 1L, 2L, 3L, 4L);
+        try {
+            CompletableFuture<PolledMessages> first = reader.next();
+            Read read = transport.nextRead();
+            assertThat(read.targets()).containsOnlyKeys(1L, 2L, 3L, 4L);
+            read.answer(
+                    FakeTransport.backlogged(1, 100, 0),
+                    FakeTransport.backlogged(2, 100, 0),
+                    FakeTransport.backlogged(3, 100, 0),
+                    section(4, 0));
+            first.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            next(reader);
+            next(reader);
+            next(reader);
+            assertThat(transport.readsNothingFor(QUIET))
+                    .as("the reader reads for a waiting call only")
+                    .isTrue();
+
+            CompletableFuture<PolledMessages> waiting = reader.next();
+            List<Read> spread =
+                    List.of(transport.nextRead(), transport.nextRead(), transport.nextRead(), transport.nextRead());
+            assertThat(spread)
+                    .extracting(sent -> sent.targets().keySet())
+                    .containsExactlyInAnyOrder(Set.of(1L), Set.of(2L), Set.of(3L), Set.of(4L));
+            assertThat(spread).extracting(Read::commit).containsOnly(true);
+            assertThat(spread).extracting(Read::count).containsOnly(ON_READ.count());
+
+            Read quiet = spread.stream()
+                    .filter(sent -> sent.targets().containsKey(4L))
+                    .findFirst()
+                    .orElseThrow();
+            for (Read sent : spread) {
+                if (sent != quiet) {
+                    long partition = sent.targets().keySet().iterator().next();
+                    sent.answer(FakeTransport.backlogged(partition, 100, 1));
+                }
+            }
+            waiting.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            next(reader);
+            next(reader);
+            reader.next();
+
+            List<Read> again = List.of(transport.nextRead(), transport.nextRead(), transport.nextRead());
+            assertThat(again)
+                    .as("the backlog reads again beside the read that waits, which keeps its partition")
+                    .extracting(sent -> sent.targets().keySet())
+                    .containsExactlyInAnyOrder(Set.of(1L), Set.of(2L), Set.of(3L));
+            assertThat(transport.readsNothingFor(QUIET)).isTrue();
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** Delivers offsets 0 and 1, then loses the reply of the next read, and returns the call that waits for it. */
+    private static CompletableFuture<PolledMessages> loseTheSecondRead(FakeTransport transport, PartitionReader reader)
+            throws Exception {
+        CompletableFuture<PolledMessages> first = reader.next();
+        transport.nextRead().answer(section(1, 0, 1));
+        first.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        CompletableFuture<PolledMessages> second = reader.next();
+        transport
+                .nextRead()
+                .reply()
+                .completeExceptionally(new IggyOperationException(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN, 42));
+        return second;
     }
 
     private static PartitionReader standalone(FakeTransport transport, PollOptions options, Long... partitions)

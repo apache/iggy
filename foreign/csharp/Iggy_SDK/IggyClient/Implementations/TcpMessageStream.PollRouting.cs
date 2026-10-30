@@ -288,7 +288,7 @@ public sealed partial class TcpMessageStream
         var rosterRead = false;
         var terminal = false;
         var frameAcquired = false;
-        var fetchMayHaveCommitted = false;
+        var mayHaveCommitted = false;
         var startOver = false;
         IggyInvalidStatusCodeException? refusal = null;
         IggyInvalidStatusCodeException? rejection = null;
@@ -481,12 +481,12 @@ public sealed partial class TcpMessageStream
                         // The cancel won before the read stored anything.
                         throw new OperationCanceledException(token);
                     }
-                    if (commits && attempt.RequestStarted)
+                    if (committing && attempt.RequestStarted)
                     {
-                        fetchMayHaveCommitted = attempt.Error is not IggyInvalidStatusCodeException { FromServer: true } refusalStatus
-                            || !FetchRefusedBeforeRead(refusalStatus.StatusCode);
+                        mayHaveCommitted = attempt.Error is not IggyInvalidStatusCodeException { FromServer: true } refusalStatus
+                            || !CommitErrorScope.Request.ProvesNothingStored(refusalStatus.StatusCode);
                     }
-                    if (fetchMayHaveCommitted && attempt.Error is not null)
+                    if (mayHaveCommitted && attempt.Error is not null)
                     {
                         if (IsSessionFailure(attempt.Error))
                         {
@@ -515,13 +515,13 @@ public sealed partial class TcpMessageStream
                                     throw new MalformedResponseException("Fetch reply names an unrequested partition.");
                                 }
                                 var uncertain = sections.Where(section => section.Status != 0
-                                    && !FetchSectionRefusedBeforeRead(section.Status)).Select(section => section.PartitionId).ToHashSet();
+                                    && !CommitErrorScope.Section.ProvesNothingStored((int)section.Status)).Select(section => section.PartitionId).ToHashSet();
                                 if (uncertain.Count > 0)
                                 {
                                     _mutations.RetainFetch(operation, uncertain);
                                     response = new FetchProgressReply(response, operation.Identity.RequestId, uncertain);
                                 }
-                                fetchMayHaveCommitted = false;
+                                mayHaveCommitted = false;
                                 if (_consensusSession.Ended(generation) is { } replySessionEnded)
                                 {
                                     ExceptionDispatchInfo.Throw(replySessionEnded);
@@ -533,6 +533,7 @@ public sealed partial class TcpMessageStream
                                 throw;
                             }
                         }
+                        mayHaveCommitted = false;
                         terminal = true;
                         RefreshCommittedCredentials(code, (operation?.Body ?? payload).Span, generation);
                         return response;
@@ -575,7 +576,8 @@ public sealed partial class TcpMessageStream
                             terminal = true;
                             rejection = status;
                         }
-                        if (status.StatusCode == VsrError.HISTORY_UNAVAILABLE && target is { } staleHistory)
+                        if (status.StatusCode is VsrError.HISTORY_UNAVAILABLE or VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED
+                            && target is { } staleHistory)
                         {
                             RemovePartitionRoute(staleHistory.Key);
                         }
@@ -733,7 +735,7 @@ public sealed partial class TcpMessageStream
                 }
             }
         }
-        catch (Exception error) when (operation?.FetchProgress is not null && fetchMayHaveCommitted)
+        catch (Exception error) when (operation?.FetchProgress is not null && mayHaveCommitted)
         {
             _mutations.RetainFetch(operation);
             throw error is VsrFetchProgressUncertainException ? error
@@ -785,17 +787,6 @@ public sealed partial class TcpMessageStream
             }
         }
     }
-
-    private static bool FetchRefusedBeforeRead(int status) =>
-        status is VsrError.FEATURE_UNAVAILABLE or VsrError.INVALID_IDENTIFIER or VsrError.TRANSIENT_NOT_ACCEPTED
-            or VsrError.HISTORY_UNAVAILABLE or VsrError.NOT_PRIMARY or VsrError.DEFERRED_POLL_CAPACITY_EXCEEDED
-            or VsrError.STREAM_ID_NOT_FOUND or VsrError.STREAM_NAME_NOT_FOUND or VsrError.TOPIC_ID_NOT_FOUND
-            or VsrError.TOPIC_NAME_NOT_FOUND or VsrError.PARTITION_NOT_FOUND or VsrError.INVALID_OFFSET
-            or VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED;
-
-    private static bool FetchSectionRefusedBeforeRead(uint status) =>
-        status is VsrError.INVALID_SIZE_BYTES or VsrError.HISTORY_UNAVAILABLE or VsrError.NOT_PRIMARY
-            or VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED;
 
     /// <inheritdoc />
     public async Task ResolveOperationAsync(ulong operationId, TimeSpan timeout, CancellationToken token = default)
@@ -909,8 +900,8 @@ public sealed partial class TcpMessageStream
     ///     Sends one fetch to the primary of the first target. A target without a fence, or with incarnation zero as
     ///     the Rust SDK reads it, takes the context of its route, and each target gets the whole byte limit. A
     ///     section or a refusal as not primary, or with a lost history, marks the routes of its partitions stale, so
-    ///     the next grouping looks them up again. A refusal of the whole fetch does not name its partition, so it
-    ///     marks all of them.
+    ///     the next grouping looks them up again. So does a refusal as not owned, whose route names an old owner
+    ///     generation. A refusal of the whole fetch does not name its partition, so it marks all of them.
     /// </summary>
     private async Task<FetchedMessages> FetchMessagesCoreAsync(Identifier streamId, Identifier topicId,
         IReadOnlyList<(uint PartitionId, PollingStrategy Strategy)> targets, Consumer consumer, uint count,
@@ -953,7 +944,8 @@ public sealed partial class TcpMessageStream
                 default(PartitionContext), token, left.RequestTimeout, generation);
         }
         catch (IggyInvalidStatusCodeException error) when (error.StatusCode is VsrError.NOT_PRIMARY
-                                                               or VsrError.HISTORY_UNAVAILABLE)
+                                                               or VsrError.HISTORY_UNAVAILABLE
+                                                               or VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED)
         {
             foreach (var (partitionId, _) in targets)
             {
@@ -976,7 +968,8 @@ public sealed partial class TcpMessageStream
 
         foreach (var section in fetched.Sections)
         {
-            if (section.Status is (uint)VsrError.NOT_PRIMARY or (uint)VsrError.HISTORY_UNAVAILABLE)
+            if (section.Status is (uint)VsrError.NOT_PRIMARY or (uint)VsrError.HISTORY_UNAVAILABLE
+                or (uint)VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED)
             {
                 RemovePartitionRoute(new PartitionRouteKey(streamId, topicId, section.PartitionId));
             }

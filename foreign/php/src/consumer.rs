@@ -130,8 +130,10 @@ impl IggyConsumer {
         self.state.mark(checkpoint.inner).map_err(to_php_exception)
     }
 
-    /// Sets the next read position of a partition and drops the rest of its current batch. It
-    /// stores no offset.
+    /// Sets the next read position of a partition and drops the rest of its current batch. Under
+    /// CommitPolicy::onRead(), a seek to an offset above 0 first stores the offset before it, so
+    /// a restart resumes at the new position, and a failed store fails the seek with its
+    /// exception and moves nothing. Every other seek stores nothing.
     ///
     /// It also resumes a partition that stopped, for example after HistoryUnavailable (87), or
     /// after a message that does not decode: seek to the `skip` of its ReadException. A

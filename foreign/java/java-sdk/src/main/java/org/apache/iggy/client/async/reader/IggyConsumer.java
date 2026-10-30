@@ -26,7 +26,9 @@ import org.apache.iggy.message.CommitAfter;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.function.Function;
@@ -52,7 +54,9 @@ public final class IggyConsumer {
     private final CommitAfter after;
     private PolledMessages batch;
     private int index;
-    private long sought;
+    // The partitions of the seeks that the reader has not applied yet, each with the number of its latest seek.
+    private final Map<Long, Long> seeking = new HashMap<>();
+    private long seeks;
     private ReceivedMessage uncounted;
     private CompletableFuture<ReceivedMessage> waiting;
     private CompletableFuture<PolledMessages> reading;
@@ -110,8 +114,14 @@ public final class IggyConsumer {
         if (uncounted != null && uncounted.partitionId() == partitionId) {
             uncounted = null;
         }
-        sought++;
-        return reader.seek(partitionId, start);
+        long seek = ++seeks;
+        seeking.put(partitionId, seek);
+        try {
+            return reader.seek(partitionId, start, () -> applied(partitionId, seek));
+        } catch (RuntimeException refused) {
+            applied(partitionId, seek);
+            throw refused;
+        }
     }
 
     /** The partitions of the reader. */
@@ -228,12 +238,12 @@ public final class IggyConsumer {
         if (reading != null) {
             return;
         }
-        long seeks = sought;
         reading = reader.nextBatch();
-        reading.whenComplete((next, error) -> receiveBatch(seeks, next, error));
+        reading.whenComplete(this::receiveBatch);
     }
 
-    private synchronized void receiveBatch(long seeks, PolledMessages next, Throwable error) {
+    /** The reader handed a batch of a sought partition over before it applied the seek, so the batch is stale. */
+    private synchronized void receiveBatch(PolledMessages next, Throwable error) {
         reading = null;
         if (error != null) {
             if (waiting != null) {
@@ -241,11 +251,15 @@ public final class IggyConsumer {
             }
             return;
         }
-        if (seeks == sought) {
+        if (!seeking.containsKey(next.partitionId())) {
             batch = next;
             index = 0;
         }
         resumeTake();
+    }
+
+    private synchronized void applied(long partitionId, long seek) {
+        seeking.remove(partitionId, seek);
     }
 
     private ReceivedMessage handOver() {

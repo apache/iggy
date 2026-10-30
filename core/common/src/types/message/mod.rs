@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod commit_outcome;
 mod deferred_poll_options;
 mod fetched_section;
 mod iggy_message;
@@ -38,6 +39,7 @@ mod user_headers;
 
 pub const INDEX_SIZE: usize = 16;
 
+pub use commit_outcome::CommitErrorScope;
 pub use deferred_poll_options::{DEFAULT_POLL_MAX_BYTES, DeferredPollOptions};
 pub use fetched_section::FetchedSection;
 

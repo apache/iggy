@@ -22,7 +22,7 @@ use std::time::Duration;
 use super::*;
 use consensus::{ClientTable, PartitionsHandle, build_reply_message_with};
 use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
-use iggy_binary_protocol::{Operation, PrepareHeader};
+use iggy_binary_protocol::{AckLevel, Operation, PrepareHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerKind, ConsumerOffset, DEFAULT_POLL_MAX_BYTES, IggyByteSize,
     IggyTimestamp,
@@ -38,12 +38,13 @@ use server_common::sharding::{PartitionLocation, ShardId};
 use crate::poll::completion::PollCompletionLane;
 use crate::poll::test_support::{
     PollTestMetadata, commit_messages, install_group_owner, partition_with_messages,
+    store_consumer_offset,
 };
 use crate::poll::timeout_tests::{PollTestBus, evict_messages_for_disk_dispatch};
 use crate::shards_table::PapayaShardsTable;
 use crate::{
-    LifecycleFrame, PARTITION_READ_TIMEOUT, PartitionConsensusConfig, Receiver, ReplicaTopology,
-    ShardFrame, ShardIdentity, channel, shard_channel,
+    ConsumerOffsetRead, LifecycleFrame, PARTITION_READ_TIMEOUT, PartitionConsensusConfig,
+    PartitionRead, Receiver, ReplicaTopology, ShardFrame, ShardIdentity, channel, shard_channel,
 };
 
 const DEADLINE: u64 = 100;
@@ -307,6 +308,36 @@ async fn given_an_oversized_fetch_section_when_a_normal_section_finishes_should_
             stored_offset(&normal, PollingConsumer::Consumer(0, 0)),
             None
         );
+    }
+}
+
+#[compio::test]
+async fn given_a_follower_section_above_its_bytes_when_the_turn_is_open_should_leave_it_uncommitted_for_the_first()
+ {
+    // Every read of a fetch could take the turn, so the reads after the first
+    // had to wait for it, or a later one could take the record above its
+    // bytes that the first target holds.
+    for auto_commit in [false, true] {
+        let oversized_payload = "x".repeat(4096);
+        let follower_owner = owner(&[&oversized_payload]).await;
+        let first_owner = owner(&[&oversized_payload]).await;
+        let turn = OversizedTurn::default();
+        let mut follower = request(&follower_owner, 1, false, auto_commit);
+        follower.options.max_bytes = 1024;
+        follower.oversized_turn = Some(turn.follower());
+        assert!(matches!(
+            submit(&follower_owner, follower).await.try_recv().unwrap(),
+            PartitionReadReply::Rejected(IggyError::DeferredPollCapacityExceeded)
+        ));
+        assert_eq!(
+            stored_offset(&follower_owner, PollingConsumer::Consumer(0, 0)),
+            None
+        );
+
+        let mut first = request(&first_owner, 1, false, auto_commit);
+        first.options.max_bytes = 1024;
+        first.oversized_turn = Some(turn);
+        assert_eq!(offsets(&submit(&first_owner, first).await), [0]);
     }
 }
 
@@ -1124,20 +1155,104 @@ async fn offset_that_another_session_stores_rejects_parked_next_poll() {
 }
 
 #[compio::test]
-async fn offset_that_another_session_stores_again_lets_parked_next_poll_finish() {
+async fn offset_that_another_session_stores_again_rejects_parked_next_poll() {
+    // A close rewind stores the offset that the parked read was admitted
+    // against, and the read must not commit past the messages it rewinds.
+    for group in [false, true] {
+        let owner = owner(&["a", "b", "c", "d"]).await;
+        let poll = request(&owner, 3, group, true);
+        let consumer = poll.consumer;
+        store_offset_explicitly(&owner, (consumer, 1, AckLevel::Quorum), 1).await;
+        owner.bus.now.set(1);
+        let replies = submit(&owner, poll).await;
+        pending(&replies);
+
+        store_offset_explicitly(&owner, (consumer, 1, AckLevel::Quorum), 2).await;
+        commit(&owner, &["e"], 2).await;
+        owner.service_deferred_polls().await;
+
+        let reply = replies.try_recv();
+        assert!(
+            matches!(
+                reply,
+                Ok(PartitionReadReply::Rejected(
+                    IggyError::TransientNotAccepted
+                ))
+            ),
+            "a store of the admitted offset fences the read, group {group}: {reply:?}"
+        );
+        assert_eq!(
+            stored_offset(&owner, consumer),
+            Some(1),
+            "the refused poll commits nothing"
+        );
+        owner.bus.now.set(2);
+        assert_eq!(
+            offsets(&submit(&owner, request(&owner, 3, group, true)).await),
+            [2, 3, 4],
+            "the next poll reads what the fenced one held"
+        );
+    }
+}
+
+#[compio::test]
+async fn offset_stored_before_admission_lets_parked_next_poll_finish() {
     let owner = owner(&["a", "b", "c", "d"]).await;
     let poll = request(&owner, 3, false, true);
     let consumer = poll.consumer;
-    store_offset(&owner, consumer, 1);
+    store_offset_explicitly(&owner, (consumer, 1, AckLevel::Quorum), 1).await;
+    owner.bus.now.set(1);
     let replies = submit(&owner, poll).await;
     pending(&replies);
 
-    store_offset(&owner, consumer, 1);
     commit(&owner, &["e"], 2).await;
     owner.service_deferred_polls().await;
 
     assert_eq!(offsets(&replies), [2, 3, 4]);
     assert_eq!(stored_offset(&owner, consumer), Some(4));
+}
+
+#[compio::test]
+async fn store_after_a_fetch_resolved_its_start_rejects_its_later_read() {
+    let owner = owner(&["a", "b", "c", "d"]).await;
+    let consumer = request(&owner, 2, false, true).consumer;
+    store_offset_explicitly(&owner, (consumer, 1, AckLevel::Quorum), 1).await;
+    owner.bus.now.set(1);
+    // The fetch resolved its start here and waited, then a rewind stored the
+    // same offset before the fetch sent its read.
+    store_offset_explicitly(&owner, (consumer, 1, AckLevel::Quorum), 2).await;
+    owner.bus.now.set(2);
+    let mut read = request(&owner, 2, false, true);
+    read.stores_fenced_from = Some(1);
+
+    let replies = submit(&owner, read).await;
+
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+    assert_eq!(stored_offset(&owner, consumer), Some(1));
+}
+
+/// Stores an offset as a client does, through the commit of the partition.
+async fn store_offset_explicitly(
+    owner: &TestShard,
+    store: (PollingConsumer, u64, AckLevel),
+    request: u64,
+) {
+    let partitions = owner.plane.partitions();
+    let mut partition = partitions.remove(&namespace()).unwrap();
+    store_consumer_offset(
+        &mut partition,
+        partitions.config(),
+        namespace(),
+        store,
+        (request, METADATA_OP),
+    )
+    .await;
+    partitions.insert(namespace(), partition);
 }
 
 #[compio::test]
@@ -1573,17 +1688,15 @@ async fn maintenance_evaluates_a_large_readiness_wait_one_budget_per_tick() {
 }
 
 #[compio::test]
-async fn status_change_ends_a_parked_readiness_wait_on_the_next_tick() {
+async fn status_change_ends_a_parked_readiness_wait_within_one_pass_of_the_ticks() {
     // A partition that stopped serving reads marks nothing, so a large wait
-    // learned it only when the sweep reached its target.
-    let (owner, replies) = parked_wait_on(MAINTENANCE_BUDGET + 1).await;
-    // Two ticks end the first sweep, so the next one starts at the first target.
-    for _ in 0..2 {
+    // learned it only when the sweep of its targets reached it.
+    let (owner, replies) = parked_wait_on(4 * MAINTENANCE_BUDGET).await;
+    begin_state_transfer(&owner, 4 * MAINTENANCE_BUDGET - 1);
+    // A pass over the parked partitions takes four ticks.
+    for _ in 0..4 {
         owner.tick_deferred_polls();
-        owner.service_deferred_polls().await;
     }
-    begin_state_transfer(&owner, MAINTENANCE_BUDGET);
-    owner.tick_deferred_polls();
     owner.service_deferred_polls().await;
     assert!(matches!(
         replies.try_recv(),
@@ -1592,6 +1705,29 @@ async fn status_change_ends_a_parked_readiness_wait_on_the_next_tick() {
         ))
     ));
     assert_released(&owner);
+}
+
+#[compio::test]
+async fn tick_checks_the_status_of_one_budget_of_parked_partitions() {
+    // A tick read the status of every partition with parked reads.
+    const PARTITIONS: usize = 3 * MAINTENANCE_BUDGET;
+    let (owner, _replies) = parked_wait_on(PARTITIONS).await;
+    owner.tick_deferred_polls();
+    for partition in 0..PARTITIONS {
+        begin_state_transfer(&owner, partition);
+    }
+    let changed = |owner: &TestShard| owner.deferred_polls.signals.borrow().changed.len();
+
+    owner.tick_deferred_polls();
+    assert_eq!(changed(&owner), MAINTENANCE_BUDGET);
+    for _ in 0..2 {
+        owner.tick_deferred_polls();
+    }
+    assert_eq!(
+        changed(&owner),
+        PARTITIONS,
+        "one pass over the parked partitions finds every change"
+    );
 }
 
 #[compio::test]
@@ -1719,7 +1855,8 @@ async fn readiness_quota_counts_parked_waiters_only() {
 }
 
 #[compio::test]
-async fn fan_out_merges_admissions_and_cancels_what_stays_parked() {
+async fn fan_out_evaluates_its_own_targets_in_place_merges_admissions_and_cancels_what_stays_parked()
+ {
     for (later, duration) in [
         (false, PARTITION_READ_TIMEOUT),
         // A zero wait still collects every admission answer.
@@ -1741,12 +1878,8 @@ async fn fan_out_merges_admissions_and_cancels_what_stays_parked() {
             readiness_target(&owner, 1, PollingStrategy::offset(0)),
         ];
         let owners = async {
-            let Ok(ShardFrame::Lifecycle(LifecycleFrame::ReadinessWait { wait, reply, watch })) =
-                local_inbox.recv().await
-            else {
-                panic!("shard 0 holds partition 0");
-            };
-            owner.admit_readiness_wait(*wait, &reply, watch);
+            // The wait evaluated partition 0 in place, without a frame to its own inbox.
+            assert!(local_inbox.try_recv().is_err(), "shard 0 holds partition 0");
             let Ok(ShardFrame::Lifecycle(LifecycleFrame::ReadinessWait { wait, reply, watch })) =
                 remote_inbox.recv().await
             else {
@@ -1805,6 +1938,72 @@ async fn fan_out_merges_admissions_and_cancels_what_stays_parked() {
         }
         assert_released(&owner);
     }
+}
+
+#[compio::test]
+async fn given_stored_offsets_of_this_shard_and_another_when_read_should_read_in_place_and_send_one_frame()
+ {
+    // Each stored offset was a frame of its own, also on this shard, so a
+    // fetch of many partitions paid one inbox trip for each of them.
+    const STORED: u64 = 7;
+    let mut owner = owner_of(&[&["first"], &["first"], &["first"]]).await;
+    let (local, local_inbox, _) = shard_channel(0, 4, 1);
+    let (remote, remote_inbox, _) = shard_channel(1, 4, 1);
+    owner.attach_senders(vec![local, remote]);
+    for partition in [1, 2] {
+        owner.shards_table.insert(
+            partition_namespace(partition),
+            PartitionLocation::new(ShardId::new(1), 1),
+        );
+    }
+    store_offset(&owner, PollingConsumer::Consumer(0, 0), STORED);
+    let reads = (0..3)
+        .map(|partition| {
+            let target = readiness_target(&owner, partition, PollingStrategy::next());
+            ConsumerOffsetRead {
+                namespace: target.namespace,
+                consumer: Some(target.consumer),
+                metadata: target.metadata,
+            }
+        })
+        .collect();
+    let remote_owner = async {
+        let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+            namespace,
+            read,
+            reply,
+        })) = remote_inbox.recv().await
+        else {
+            panic!("the other owner gets one frame");
+        };
+        let PartitionRead::ConsumerOffsetsOnPrimary { reads } = &read else {
+            panic!("the frame reads the stored offsets of its partitions");
+        };
+        assert_eq!(
+            reads.iter().map(|read| read.namespace).collect::<Vec<_>>(),
+            [partition_namespace(1), partition_namespace(2)]
+        );
+        owner.on_partition_read(namespace, read, reply).await;
+    };
+
+    let (offsets, ()) = futures::join!(owner.consumer_offsets_on_primary(reads), remote_owner);
+
+    let offsets: Vec<_> = offsets
+        .into_iter()
+        .map(|offset| match offset {
+            Some(PartitionReadReply::ConsumerOffset {
+                stored,
+                current_offset,
+            }) => (stored, current_offset),
+            other => panic!("each partition answers its stored offset, not {other:?}"),
+        })
+        .collect();
+    assert_eq!(offsets, [(Some(STORED), 0), (None, 0), (None, 0)]);
+    assert!(
+        local_inbox.try_recv().is_err(),
+        "the partition of this shard is read in place"
+    );
+    assert!(remote_inbox.try_recv().is_err(), "one frame for one owner");
 }
 
 const WATCHER: u16 = 0;
@@ -1881,6 +2080,11 @@ async fn pump(shard: &TestShard, inbox: &Inbox) {
             LifecycleFrame::ReadinessUnwatch { from, watches } => {
                 shard.unwatch_readiness(from, watches);
             }
+            LifecycleFrame::ReadinessInterest {
+                from,
+                watches,
+                parked,
+            } => shard.set_readiness_interest(from, watches, parked),
             LifecycleFrame::PartitionRead {
                 namespace,
                 read,
@@ -2040,9 +2244,8 @@ async fn mirror_that_refuses_a_target_sends_it_to_the_owner() {
     let (watcher, owner, inboxes) = watched_pair(&[&["first"]]).await;
     mirror(&watcher, &owner, &inboxes, 0).await;
     begin_state_transfer(&owner, 0);
-    // No notifier reports a state transfer, so the sweep pushes it.
-    owner.sweep_readiness_watches();
-    pump(&owner, &inboxes[1]).await;
+    // As a push to a shard with a parked wait carries the state transfer.
+    change_mirror(&watcher, |state| state.status.unstable = true);
     pump(&watcher, &inboxes[0]).await;
     let target = readiness_target(&watcher, 0, PollingStrategy::offset(1));
     let (ready, ()) = futures::join!(
@@ -2108,13 +2311,12 @@ async fn unused_mirror_ends_its_watch() {
         mirror(&watcher, &owner, &inboxes, 0).await;
         watcher.bus.now.set(MIRROR_IDLE_US);
         if commits {
+            // Without a parked wait a commit pushes nothing.
             commit(&owner, &["second"], 2).await;
             pump(&owner, &inboxes[1]).await;
-            pump(&watcher, &inboxes[0]).await;
-        } else {
-            // A partition without commits pushes nothing.
-            watcher.sweep_readiness_watches();
+            assert!(inboxes[0].replies.try_recv().is_err());
         }
+        watcher.sweep_readiness_watches();
         assert!(watcher.deferred_polls.mirrors.borrow().entries.is_empty());
         pump(&owner, &inboxes[1]).await;
         assert!(owner.deferred_polls.state.borrow().watches.is_empty());
@@ -2136,12 +2338,15 @@ async fn finished_poll_keeps_the_notifier_of_a_watched_partition() {
     pump(&owner, &inboxes[1]).await;
     assert_eq!(offsets(&replies), [0, 1]);
     commit(&owner, &["third"], 3).await;
-    pump(&owner, &inboxes[1]).await;
-    pump(&watcher, &inboxes[0]).await;
-    assert!(matches!(
-        &watcher.deferred_polls.mirrors.borrow().entries[&namespace()].state,
-        Some(state) if state.visibility.offset == Some(2)
-    ));
+    assert!(
+        owner
+            .deferred_polls
+            .signals
+            .borrow()
+            .queued
+            .contains(&namespace()),
+        "the commit still reaches the watch"
+    );
 }
 
 #[compio::test]
@@ -2186,6 +2391,7 @@ async fn replacement_history_in_a_push_rejects_a_parked_wait() {
 async fn refused_push_goes_at_the_next_flush() {
     let (watcher, owner, inboxes) = watched_pair(&[&["first"]]).await;
     mirror(&watcher, &owner, &inboxes, 0).await;
+    hold_interest(&watcher, &owner);
     let lane = owner.senders[usize::from(WATCHER)].reply_sender();
     while lane
         .try_send(ShardFrame::lifecycle(LifecycleFrame::ReadinessUpdate {
@@ -2212,6 +2418,173 @@ async fn refused_push_goes_at_the_next_flush() {
         [WatchedState { state: Some(state), .. }] if state.visibility.offset == Some(1)
     ));
     assert!(owner.deferred_polls.state.borrow().pushes.is_empty());
+}
+
+#[compio::test]
+async fn commits_push_nothing_to_a_watcher_without_a_parked_wait() {
+    let (watcher, owner, inboxes) = watched_pair(&[&["first"]]).await;
+    mirror(&watcher, &owner, &inboxes, 0).await;
+    let pushes = owner.metrics.deferred_polls.readiness_pushes.get();
+    // A consumer behind the end names the mirror in every wait and never parks.
+    for request in 2..5 {
+        let target = readiness_target(&watcher, 0, PollingStrategy::offset(0));
+        let (ready, ()) = futures::join!(
+            watcher.wait_for_messages(
+                readiness_caller(),
+                vec![target],
+                PARTITION_READ_TIMEOUT,
+                ANY_MESSAGE
+            ),
+            pump(&watcher, &inboxes[0])
+        );
+        assert_eq!(ids(&ready.unwrap()), [0]);
+        commit(&owner, &["more"], request).await;
+        pump(&owner, &inboxes[1]).await;
+    }
+    assert!(inboxes[0].replies.try_recv().is_err(), "no push goes");
+    assert!(inboxes[1].main.try_recv().is_err(), "and no frame comes");
+    assert_eq!(owner.metrics.deferred_polls.readiness_pushes.get(), pushes);
+}
+
+#[compio::test]
+async fn parked_waits_get_the_pushes_until_a_push_finds_none_parked() {
+    let (watcher, owner, inboxes) = watched_pair(&[&["first"]]).await;
+    mirror(&watcher, &owner, &inboxes, 0).await;
+    let pushes = owner.metrics.deferred_polls.readiness_pushes.get();
+    for (start, request) in [(1, 2), (2, 3)] {
+        let target = readiness_target(&watcher, 0, PollingStrategy::offset(start));
+        let (ready, ()) = futures::join!(
+            watcher.wait_for_messages(
+                readiness_caller(),
+                vec![target],
+                PARTITION_READ_TIMEOUT,
+                ANY_MESSAGE
+            ),
+            async {
+                pump(&watcher, &inboxes[0]).await;
+                assert_eq!(parked_waits(&watcher), 1);
+                let told = inboxes[1].main.try_recv();
+                if start == 1 {
+                    assert!(
+                        matches!(
+                            &told,
+                            Ok(ShardFrame::Lifecycle(LifecycleFrame::ReadinessInterest {
+                                from: WATCHER,
+                                parked: true,
+                                ..
+                            }))
+                        ),
+                        "the first park tells the owner"
+                    );
+                    let Ok(ShardFrame::Lifecycle(LifecycleFrame::ReadinessInterest {
+                        from,
+                        watches,
+                        parked,
+                    })) = told
+                    else {
+                        unreachable!();
+                    };
+                    owner.set_readiness_interest(from, watches, parked);
+                } else {
+                    assert!(
+                        told.is_err(),
+                        "a park before the next commit keeps the pushes on"
+                    );
+                }
+                commit(&owner, &["more"], request).await;
+                pump(&owner, &inboxes[1]).await;
+                pump(&watcher, &inboxes[0]).await;
+            }
+        );
+        assert_eq!(ids(&ready.unwrap()), [0]);
+    }
+    commit(&owner, &["unread"], 4).await;
+    pump(&owner, &inboxes[1]).await;
+    pump(&watcher, &inboxes[0]).await;
+    assert!(
+        matches!(
+            inboxes[1].main.try_recv(),
+            Ok(ShardFrame::Lifecycle(LifecycleFrame::ReadinessInterest {
+                from: WATCHER,
+                parked: false,
+                ..
+            }))
+        ),
+        "a push that finds no parked wait ends the pushes"
+    );
+    owner.set_readiness_interest(
+        WATCHER,
+        vec![(
+            namespace(),
+            watcher.deferred_polls.mirrors.borrow().entries[&namespace()].seq,
+        )],
+        false,
+    );
+    commit(&owner, &["unread"], 5).await;
+    pump(&owner, &inboxes[1]).await;
+    assert!(inboxes[0].replies.try_recv().is_err());
+    assert_eq!(
+        owner.metrics.deferred_polls.readiness_pushes.get(),
+        pushes + 3,
+        "one push per commit with a parked wait, and one that found none"
+    );
+}
+
+#[compio::test]
+async fn pushes_leave_half_the_reply_lane_to_client_replies() {
+    let (watcher, owner, inboxes) = watched_pair(&[&["first"]]).await;
+    mirror(&watcher, &owner, &inboxes, 0).await;
+    hold_interest(&watcher, &owner);
+    let lane = owner.senders[usize::from(WATCHER)].reply_sender();
+    let reply = || {
+        ShardFrame::lifecycle(LifecycleFrame::ReadinessUpdate {
+            from: OWNER,
+            states: Vec::new(),
+        })
+    };
+    for _ in 0..INBOX / 2 {
+        assert!(lane.try_send(reply()).is_ok());
+    }
+    commit(&owner, &["second"], 2).await;
+    pump(&owner, &inboxes[1]).await;
+    assert!(
+        !owner.deferred_polls.state.borrow().pushes.is_empty(),
+        "a lane that holds half its capacity keeps the push"
+    );
+    for _ in 0..INBOX / 2 {
+        assert!(
+            lane.try_send(reply()).is_ok(),
+            "the other half takes client replies"
+        );
+    }
+}
+
+#[compio::test]
+async fn mirror_of_a_partition_that_moved_asks_its_new_owner_for_pushes() {
+    let (watcher, owner, inboxes) = watched_pair(&[&["first"]]).await;
+    mirror(&watcher, &owner, &inboxes, 0).await;
+    hold_interest(&watcher, &owner);
+    let renewed = watcher.next_readiness_watch();
+    watcher.mirror_partitions(OWNER + 1, renewed.seq, &[namespace()], 0);
+    assert!(
+        !watcher.deferred_polls.mirrors.borrow().entries[&namespace()].interest,
+        "the next park tells the new owner"
+    );
+}
+
+/// Holds the interest of the watcher in partition 0 on both sides, as a
+/// parked wait does.
+fn hold_interest(watcher: &TestShard, owner: &TestShard) {
+    let seq = {
+        let mut mirrors = watcher.deferred_polls.mirrors.borrow_mut();
+        let mirror = mirrors
+            .entries
+            .get_mut(&namespace())
+            .expect("the watcher mirrors partition 0");
+        mirror.interest = true;
+        mirror.seq
+    };
+    owner.set_readiness_interest(WATCHER, vec![(namespace(), seq)], true);
 }
 
 /// The messages that a fetch read asks for, more than any test commits.
@@ -2437,7 +2810,8 @@ async fn one_commit_gives_one_push_one_fire_and_no_cancel() {
     assert_eq!(ids(&ready.unwrap()), [0]);
     assert_eq!(
         owner.metrics.deferred_polls.readiness_pushes.get(),
-        pushes + 1
+        pushes + 2,
+        "the park and the commit push both partitions once, in one frame"
     );
     assert_eq!(watcher.metrics.deferred_polls.filled.get(), 1);
     assert!(
@@ -2449,7 +2823,7 @@ async fn one_commit_gives_one_push_one_fire_and_no_cancel() {
     );
     assert!(
         inboxes[1].main.try_recv().is_err(),
-        "nothing goes to the owner"
+        "nothing but the news of the park goes to the owner"
     );
     assert!(inboxes[0].main.try_recv().is_err(), "no cancel");
     assert_released(&watcher);
@@ -2482,8 +2856,17 @@ async fn only_a_mirror_that_lags_an_owner_install_is_not_ready() {
                 begin_state_transfer(&owner, 0);
                 owner.sweep_readiness_watches();
             }
-            "view" => change_mirror(&watcher, |state| state.status.view_started = false),
-            _ => change_mirror(&watcher, |state| state.status.incarnation = None),
+            // The push that the park asked for comes first, so the change stays.
+            "view" => {
+                pump(&owner, &inboxes[1]).await;
+                pump(&watcher, &inboxes[0]).await;
+                change_mirror(&watcher, |state| state.status.view_started = false);
+            }
+            _ => {
+                pump(&owner, &inboxes[1]).await;
+                pump(&watcher, &inboxes[0]).await;
+                change_mirror(&watcher, |state| state.status.incarnation = None);
+            }
         })
         .await;
         if cause == "install" {

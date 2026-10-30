@@ -35,7 +35,7 @@ use iggy_binary_protocol::{
     MAX_RECORD_REPLY_SIZE, MAX_RECORD_SIZE, PartitionContext, RequestHeader, STATUS_OK,
     WireConsumer, WireEncode, WireIdentifier, WirePartitioning, WirePollingStrategy,
 };
-use iggy_common::IggyError;
+use iggy_common::{CommitErrorScope, Identifier as IggyIdentifier, IggyError};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -77,6 +77,7 @@ pub struct DeferredPollingFixture {
     pub cancellations: Vec<CancellationVector>,
     pub fetch_replies: Vec<FetchReplyVector>,
     pub refused: RefusedVectors,
+    pub commit_outcomes: CommitOutcomes,
 }
 
 #[derive(Debug, Serialize)]
@@ -233,6 +234,23 @@ pub struct RefusedVector {
     pub body_hex: String,
 }
 
+/// Which error answers of a committing 106 or 109 prove that nothing was stored.
+#[derive(Debug, Serialize)]
+pub struct CommitOutcomes {
+    pub rule: String,
+    /// An error that is the whole reply.
+    pub request: Vec<CommitOutcomeVector>,
+    /// An error status of one fetch section.
+    pub section: Vec<CommitOutcomeVector>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommitOutcomeVector {
+    pub status: u32,
+    pub error: String,
+    pub certain: bool,
+}
+
 /// One section of a reply to build: its header fields and its messages as
 /// `(id, payload)`, stored from `first_offset` on.
 struct SectionSpec {
@@ -263,6 +281,7 @@ pub fn build() -> FixtureResult<DeferredPollingFixture> {
         cancellations: cancellations()?,
         fetch_replies: fetch_replies()?,
         refused: refused()?,
+        commit_outcomes: commit_outcomes(),
     })
 }
 
@@ -334,6 +353,47 @@ fn constants() -> Constants {
         max_record_reply_size: MAX_RECORD_REPLY_SIZE,
         request_header_size: HEADER_SIZE,
         fetch_section_header_size: FETCH_SECTION_HEADER_SIZE,
+    }
+}
+
+fn commit_outcomes() -> CommitOutcomes {
+    let errors = [
+        IggyError::FeatureUnavailable,
+        IggyError::InvalidIdentifier,
+        IggyError::StaleClient,
+        IggyError::Unauthenticated,
+        IggyError::Unauthorized,
+        IggyError::TransientNotCommitted,
+        IggyError::TransientNotAccepted,
+        IggyError::CannotDecryptData,
+        IggyError::InvalidSizeBytes,
+        IggyError::HistoryUnavailable,
+        IggyError::NotPrimary,
+        IggyError::DeferredPollCapacityExceeded,
+        IggyError::StreamIdNotFound(IggyIdentifier::default()),
+        IggyError::StreamNameNotFound(String::new()),
+        IggyError::TopicIdNotFound(IggyIdentifier::default(), IggyIdentifier::default()),
+        IggyError::TopicNameNotFound(String::new(), String::new()),
+        IggyError::PartitionNotFound(0, IggyIdentifier::default(), IggyIdentifier::default()),
+        IggyError::TooManyConsumerOffsets,
+        IggyError::InvalidOffset(0),
+        IggyError::ConsumerGroupPartitionNotOwned(0, 0),
+        IggyError::ShardCommunicationError,
+    ];
+    let vectors = |scope: CommitErrorScope| {
+        errors
+            .iter()
+            .map(|error| CommitOutcomeVector {
+                status: error.as_code(),
+                error: <&'static str>::from(error).to_string(),
+                certain: scope.proves_nothing_stored(error),
+            })
+            .collect()
+    };
+    CommitOutcomes {
+        rule: "A committing deferred poll (106) or fetch (109) that fails with a certain status stored nothing. Every other status, a status not listed here, a lost reply and a transport failure after the send leave the outcome unknown.".to_string(),
+        request: vectors(CommitErrorScope::Request),
+        section: vectors(CommitErrorScope::Section),
     }
 }
 

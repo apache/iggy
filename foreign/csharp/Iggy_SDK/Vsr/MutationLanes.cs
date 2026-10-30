@@ -144,7 +144,7 @@ internal sealed class MutationLanes(ConsensusSession session, IggyClientConfigur
     internal async Task<ClientOperation> EnterAsync(MutationLane[] lanes, int code, ReadOnlyMemory<byte> body,
         PartitionContext context, bool retainable, ulong generation, CancellationToken token)
     {
-        var commits = code == CommandCodes.FETCH_MESSAGES_CODE && TcpContracts.FetchAutoCommits(body.Span);
+        var commits = TcpContracts.ReadAutoCommits(code, body.Span);
         var waiter = new Waiter(lanes, FrameSize(body, retainable || commits), retainable, restart: false, commits);
         try
         {

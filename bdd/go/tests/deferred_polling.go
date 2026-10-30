@@ -24,6 +24,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/apache/iggy/bdd/go/tests/env"
 	"github.com/apache/iggy/foreign/go/client/reader"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
@@ -43,6 +44,8 @@ type deferredPollingCtx struct {
 	poll       *deferredCall[*iggcon.PolledMessage]
 	reader     *reader.PartitionReader
 	consumer   *reader.IggyConsumer
+	// lostOperation is the operation of the deferred poll that failed as uncertain.
+	lostOperation uint64
 }
 
 func getDeferredPollingCtx(ctx context.Context) *deferredPollingCtx {
@@ -98,6 +101,17 @@ func (s deferredPollingSteps) whenStartCommittingDeferredPoll(
 	options.MinCount = minCount
 	options.Commit = iggcon.OnReadCommit()
 	return s.startPoll(ctx, partition, consumer, iggcon.NextPollingStrategy(), options)
+}
+
+func (s deferredPollingSteps) whenStartOnReadDeferredPoll(ctx context.Context, partition uint32, consumerName string, maxWait int) error {
+	// A read that stores nothing looks up the route first, so the committing
+	// poll reaches the server before a later step drops the connection.
+	state := getResourceOptionsCtx(ctx)
+	if _, err := state.client.PollMessages(ctx, streamIdentifier(state), topicIdentifier(state), partition,
+		iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), iggcon.DefaultPollOptions()); err != nil {
+		return fmt.Errorf("look up the route of partition %d: %w", partition, err)
+	}
+	return s.whenStartCommittingDeferredPoll(ctx, partition, consumerName, 1, maxWait)
 }
 
 func (deferredPollingSteps) startPoll(
@@ -251,6 +265,69 @@ func (deferredPollingSteps) whenCancelDeferredPoll(ctx context.Context, after in
 	return nil
 }
 
+// whenClientDisconnects drops the connection of the client that owns the poll, without a sign-out.
+func (deferredPollingSteps) whenClientDisconnects(ctx context.Context) error {
+	poll := getDeferredPollingCtx(ctx).poll
+	if !poll.running() {
+		return fmt.Errorf("the deferred poll ended before the disconnect, with %+v and %v", poll.value, poll.err)
+	}
+	client, err := disconnectable(getResourceOptionsCtx(ctx).client)
+	if err != nil {
+		return err
+	}
+	return client.Disconnect()
+}
+
+func (deferredPollingSteps) thenDeferredPollUncertain(ctx context.Context) error {
+	state := getDeferredPollingCtx(ctx)
+	polled, err := state.poll.result(5 * time.Second)
+	var unknown ierror.FetchProgressUncertain
+	if !errors.As(err, &unknown) {
+		return fmt.Errorf("the deferred poll ended with %+v and %v, want %v", polled, err, ierror.ErrFetchProgressUncertain)
+	}
+	state.lostOperation = unknown.OperationID
+	return nil
+}
+
+func (deferredPollingSteps) whenClientConnectsAgain(ctx context.Context) error {
+	client := getResourceOptionsCtx(ctx).client
+	if err := client.Connect(ctx); err != nil {
+		return fmt.Errorf("connect client: %w", err)
+	}
+	username, password := env.RootCredentials()
+	if _, err := client.LoginUser(ctx, username, password); err != nil {
+		return fmt.Errorf("authenticate client: %w", err)
+	}
+	return nil
+}
+
+func (deferredPollingSteps) thenOnReadPollBlocked(ctx context.Context, partition uint32, consumerName string) error {
+	state := getResourceOptionsCtx(ctx)
+	consumer, err := namedConsumer(consumerName)
+	if err != nil {
+		return err
+	}
+	options := iggcon.DefaultPollOptions()
+	options.Count = 1
+	options.Commit = iggcon.OnReadCommit()
+	_, err = state.client.PollMessages(ctx, streamIdentifier(state), topicIdentifier(state), partition, consumer,
+		iggcon.NextPollingStrategy(), options)
+	lost := getDeferredPollingCtx(ctx).lostOperation
+	var blocked ierror.PartitionLaneBlocked
+	if !errors.As(err, &blocked) || blocked.PartitionID != partition || blocked.OperationID != lost {
+		return fmt.Errorf("the poll ended with %v, want %v", err, ierror.PartitionLaneBlocked{PartitionID: partition, OperationID: lost})
+	}
+	return nil
+}
+
+func (deferredPollingSteps) whenAbandonDeferredPoll(ctx context.Context) error {
+	operation := getDeferredPollingCtx(ctx).lostOperation
+	if err := getResourceOptionsCtx(ctx).client.AbandonOperation(ctx, operation); err != nil {
+		return fmt.Errorf("abandon operation %d: %w", operation, err)
+	}
+	return nil
+}
+
 func (deferredPollingSteps) whenWait(seconds int) error {
 	time.Sleep(time.Duration(seconds) * time.Second)
 	return nil
@@ -295,6 +372,14 @@ func initDeferredPollingScenario(sc *godog.ScenarioContext) {
 		s.whenStartDeferredPoll)
 	sc.Step(`^I start a deferred poll of partition (\d+) for consumer "([^"]+)" with the on read commit policy, a min count of (\d+) and a max wait of (\d+) seconds?$`,
 		s.whenStartCommittingDeferredPoll)
+	sc.Step(`^I start a deferred poll of partition (\d+) for consumer "([^"]+)" with the on read commit policy and a max wait of (\d+) seconds?$`,
+		s.whenStartOnReadDeferredPoll)
+	sc.Step(`^the client disconnects before the deferred poll answers$`, s.whenClientDisconnects)
+	sc.Step(`^the deferred poll should fail as uncertain$`, s.thenDeferredPollUncertain)
+	sc.Step(`^the client connects again$`, s.whenClientConnectsAgain)
+	sc.Step(`^a poll of partition (\d+) for consumer "([^"]+)" with the next strategy and the on read commit policy should fail as blocked by the deferred poll$`,
+		s.thenOnReadPollBlocked)
+	sc.Step(`^I abandon the operation of the deferred poll$`, s.whenAbandonDeferredPoll)
 	sc.Step(`^I send a message with payload "([^"]+)" to partition (\d+)$`, s.whenSendToPartition)
 	sc.Step(`^the deferred poll should return the payload "([^"]+)" within (\d+) seconds?$`, s.thenDeferredPollReturns)
 	sc.Step(`^the deferred poll should return no messages between (\d+) and (\d+) seconds after it started$`,
@@ -409,6 +494,23 @@ func parked[T any](calls []*deferredCall[T]) error {
 // waitOptions are the poll defaults with the max wait of the step.
 func waitOptions(maxWait int) iggcon.PollOptions {
 	return iggcon.WaitPollOptions(time.Duration(maxWait) * time.Second)
+}
+
+// disconnecter is a client that drops its connection without a sign-out.
+type disconnecter interface{ Disconnect() error }
+
+// disconnectable is client, or the client that it wraps, as a disconnecter.
+func disconnectable(client iggcon.Client) (disconnecter, error) {
+	for {
+		if dropping, ok := client.(disconnecter); ok {
+			return dropping, nil
+		}
+		wrapper, ok := client.(interface{ Unwrap() iggcon.Client })
+		if !ok {
+			return nil, fmt.Errorf("the client %T cannot disconnect", client)
+		}
+		client = wrapper.Unwrap()
+	}
 }
 
 func namedConsumer(name string) (iggcon.Consumer, error) {

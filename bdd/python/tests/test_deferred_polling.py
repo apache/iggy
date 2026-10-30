@@ -38,6 +38,7 @@ from apache_iggy import (
     IggyClient,
     IggyConsumer,
     PartitionReader,
+    PendingOperationError,
     PolledMessages,
     PollingStrategy,
     PollOptions,
@@ -56,6 +57,10 @@ PARK_TIME_SECONDS = 0.1
 # The wait of a consumer whose step names none.
 CONSUMER_MAX_WAIT = timedelta(seconds=10)
 DEFAULT_CONSUMER = Consumer.Single(1)
+# How long a poll whose connection dropped may take to fail.
+LOST_POLL_TIMEOUT_SECONDS = 10
+PARTITION_LANE_BLOCKED = 14009
+FETCH_PROGRESS_UNCERTAIN = 14010
 
 
 @dataclass
@@ -69,6 +74,10 @@ class DeferredState:
     reader: PartitionReader | None = None
     consumer: IggyConsumer | None = None
     consumer_messages: AsyncIterator[ReceiveMessage] | None = None
+    # The client that disconnected under its poll. Its partition block belongs
+    # to it, so the later polls of the scenario run on it.
+    poll_owner: IggyClient | None = None
+    lost_operation_id: int | None = None
 
     def run(
         self, call: Callable[[], Awaitable[Any]], timeout: float | None = None
@@ -179,6 +188,90 @@ def start_committing_deferred_poll(
             commit=CommitPolicy.OnRead(),
         ),
     )
+
+
+@when(
+    parsers.re(
+        r"I start a deferred poll of partition (?P<partition>\d+) for consumer "
+        r'"(?P<name>[^"]+)" with the on read commit policy and a max wait of '
+        r"(?P<seconds>\d+) seconds?"
+    ),
+    converters={"partition": int, "seconds": int},
+)
+def start_on_read_deferred_poll(
+    context, deferred, root_credentials, partition, name, seconds
+):
+    start_poll(
+        context,
+        deferred,
+        root_credentials,
+        partition,
+        Consumer.Single(name),
+        PollingStrategy.Next(),
+        PollOptions(
+            count=MESSAGES_COUNT,
+            max_wait=timedelta(seconds=seconds),
+            commit=CommitPolicy.OnRead(),
+        ),
+    )
+
+
+@when("the client disconnects before the deferred poll answers")
+def disconnect_poll_owner(deferred):
+    client = deferred.background_client
+    poll = deferred.deferred_poll
+    assert client is not None and poll is not None, "deferred poll started"
+    assert not poll.done(), "the deferred poll must still wait"
+    deferred.run(client.disconnect)
+    deferred.poll_owner = client
+
+
+@then("the deferred poll should fail as uncertain")
+def deferred_poll_uncertain(deferred):
+    poll = take_deferred_poll(deferred)
+    with pytest.raises(PendingOperationError) as raised:
+        poll.result(LOST_POLL_TIMEOUT_SECONDS)
+    error = raised.value
+    assert error.code == FETCH_PROGRESS_UNCERTAIN, str(error)
+    assert error.kind == "fetch_progress_uncertain"
+    deferred.lost_operation_id = error.operation_id
+
+
+@when("the client connects again")
+def reconnect_poll_owner(deferred, root_credentials):
+    client = deferred.poll_owner
+    assert client is not None, "the client disconnected"
+
+    async def connect():
+        await client.connect()
+        await client.login_user(*root_credentials)
+
+    deferred.run(connect)
+
+
+@then(
+    parsers.re(
+        r'a poll of partition (?P<partition>\d+) for consumer "(?P<name>[^"]+)" '
+        r"with the next strategy and the on read commit policy should fail as "
+        r"blocked by the deferred poll"
+    ),
+    converters={"partition": int},
+)
+def on_read_poll_blocked(context, deferred, partition, name):
+    with pytest.raises(PendingOperationError) as raised:
+        poll_next(context, deferred, partition, name, CommitPolicy.OnRead())
+    error = raised.value
+    assert error.code == PARTITION_LANE_BLOCKED, str(error)
+    assert error.kind == "lane_blocked"
+    assert error.partition_id == partition
+    assert error.operation_id == deferred.lost_operation_id
+
+
+@when("I abandon the operation of the deferred poll")
+def abandon_lost_poll(deferred):
+    client, operation_id = deferred.poll_owner, deferred.lost_operation_id
+    assert client is not None and operation_id is not None, "the poll was lost"
+    deferred.run(lambda: client.abandon_operation(operation_id))
 
 
 @when(
@@ -384,6 +477,19 @@ def start_poll(
 ):
     client = background_client(context, deferred, root_credentials)
     stream, topic = context.last_stream_id, context.last_topic_id
+    # The first read of a new topic can wait for its partition, so a read that
+    # waits for nothing goes first and the poll then leaves at once.
+    deferred.run(
+        lambda: poll_once(
+            client,
+            stream,
+            topic,
+            partition,
+            DEFAULT_CONSUMER,
+            PollingStrategy.Offset(value=0),
+            PollOptions(count=1),
+        )
+    )
     deferred.deferred_poll_started = time.monotonic()
     deferred.deferred_poll = asyncio.run_coroutine_threadsafe(
         poll_once(client, stream, topic, partition, consumer, strategy, options),
@@ -431,10 +537,16 @@ def take_deferred_poll(deferred) -> concurrent.futures.Future[PolledMessages]:
 
 
 def poll_next_and_expect(context, deferred, partition, name, commit, payload):
+    polled = poll_next(context, deferred, partition, name, commit)
+    assert payloads(polled)[:1] == [payload]
+
+
+def poll_next(context, deferred, partition, name, commit) -> PolledMessages:
     """Polls one message from `Next`, so a poll that commits stores only the
     offset of the payload it returns."""
-    polled = deferred.run(
-        lambda: context.client.poll_messages(
+    client = deferred.poll_owner or context.client
+    return deferred.run(
+        lambda: client.poll_messages(
             stream=context.last_stream_id,
             topic=context.last_topic_id,
             partition_id=partition,
@@ -443,7 +555,6 @@ def poll_next_and_expect(context, deferred, partition, name, commit, payload):
             options=PollOptions(count=1, commit=commit),
         )
     )
-    assert payloads(polled)[:1] == [payload]
 
 
 def open_consumer(context, deferred, group, options):

@@ -112,16 +112,19 @@ public struct ReadError: Error, Sendable, CustomStringConvertible {
 ///   joins again after a lost membership, and leaves it in ``close()``.
 /// - It groups the partitions by their primary and reads each group with one
 ///   request, which the server holds until a message arrives or the wait of
-///   ``PollOptions/maxWait`` ran out. A moved primary, a rebalance and a lost
-///   connection are repaired inside.
+///   ``PollOptions/maxWait`` ran out. Partitions whose last read ended before
+///   their head spread over the free requests, each share in a fetch of its
+///   own beside that one. A moved primary, a rebalance and a lost connection
+///   are repaired inside.
 /// - ``next()`` returns the next batch of one partition, never empty, in
 ///   offset order within one generation of the partition: from its first
 ///   read, from each ``seek(partitionID:to:)``, and from each new assignment
 ///   to this member.
 /// - The ``CommitPolicy`` of the options decides who stores offsets. With
 ///   `manual`, ``commit(_:)`` stores a checkpoint. With `onRead`, the server
-///   stores the offset of each read, the reader reads a group only once
-///   ``next()`` waits with nothing queued, and ``close()`` moves the offset
+///   stores the offset of each read, the reader reads only once ``next()``
+///   waits with nothing queued and then fills its free requests, a seek to an
+///   offset stores the offset before it, and ``close()`` moves the offset
 ///   back to the last delivered message. After a reply lost to a broken
 ///   connection, a read that the server stored but never delivered shows as
 ///   a gap before the next reply, and the reader reads that gap again
@@ -215,11 +218,22 @@ public actor PartitionReader: AsyncSequence {
     private var expected: [UInt32: UInt64] = [:]
     private var baselines: [UInt32: (next: UInt64, context: PartitionContext)] = [:]
     private var uncertain: Set<UInt32> = []
+    /// With `onRead`: the partitions with a committing read whose outcome is
+    /// unknown. Only they read a forward gap again, any other jump is a
+    /// store of the application or of another session.
+    private var lostReads: Set<UInt32> = []
+    /// With `onRead`: the partitions that a committing read of another
+    /// caller blocks, by its operation. They read again once it is
+    /// abandoned.
+    private var blockedBy: [UInt32: UInt128Value] = [:]
     /// With `onRead`: the messages each partition read and the server stored
     /// in its current generation, which the close moves back over.
     private var stored: [UInt32: Span] = [:]
     private var gaps: [UInt32: Gap] = [:]
     private var isolations: [UInt32: Span] = [:]
+    /// The partitions whose last fetch section ended before the head of the
+    /// partition, which a read answers at once.
+    private var backlogged: Set<UInt32> = []
     /// Partitions read with a poll of their own next: a fetch section that
     /// the server refused with `invalidSizeBytes`.
     private var pollAlone: Set<UInt32> = []
@@ -250,6 +264,9 @@ public actor PartitionReader: AsyncSequence {
         let progresses: Bool
         let commits: Bool
         let generations: [UInt32: UInt64]
+        /// Where a poll starts and how many messages it asks for.
+        var start: PollingStrategy?
+        var count: UInt32 = 0
         let task: Task<Void, Never>
     }
 
@@ -259,12 +276,22 @@ public actor PartitionReader: AsyncSequence {
         /// The fetch of the partitions of a group that turned idle while
         /// its main fetch waited.
         case second
+        /// With `onRead`: a committing fetch of backlogged partitions beside
+        /// the fetch of the group that may wait.
+        case backlog
         /// A poll of one partition.
         case single
         /// A poll that reads a gap again, without a commit.
         case gap
         /// A poll of one message of a section that did not decode.
         case isolate
+
+        var isPoll: Bool {
+            switch self {
+            case .main, .second, .backlog: false
+            case .single, .gap, .isolate: true
+            }
+        }
     }
 
     private enum Reply: Sendable {
@@ -411,8 +438,10 @@ public actor PartitionReader: AsyncSequence {
         isStarted = true
     }
 
-    /// Stops the reader. It waits for the committing reads in flight, at most
-    /// their request timeout. With `manual` it stores nothing. With `auto` it
+    /// Stops the reader. It cancels the committing reads in flight, and each
+    /// waits for its one reply: nothing stored when the cancel won, or the
+    /// messages when the store won, which count as undelivered. So the close
+    /// takes about a round trip. With `manual` it stores nothing. With `auto` it
     /// counts the last batch under ``CommitAfter/processing`` and stores the
     /// latest counted position of each partition. With `onRead` it moves the
     /// offset of each partition back to its last delivered message, and a
@@ -432,8 +461,14 @@ public actor PartitionReader: AsyncSequence {
     }
 
     private func drain() async throws {
-        for (id, request) in requests where !request.commits {
-            cancel(id)
+        for (id, request) in requests {
+            if request.commits {
+                // It sends its cancel and keeps waiting for its one reply, which
+                // says whether the server stored it.
+                request.task.cancel()
+            } else {
+                cancel(id)
+            }
         }
         readerWakeup?.yield()
         for task in requests.values.map(\.task) {
@@ -447,6 +482,12 @@ public actor PartitionReader: AsyncSequence {
         intervalTask?.cancel()
         commitTask?.cancel()
         commitWakeup.finish()
+        // A seek that stores while the close starts applies before the rewind.
+        while !storesWaiting.isEmpty {
+            let (ended, wakeup) = AsyncStream<Void>.makeStream()
+            storeWakeups.append(wakeup)
+            for await _ in ended {}
+        }
         var failure: (any Error)?
         if configuration.options.commitsOnRead {
             for partition in uncertain {
@@ -479,16 +520,15 @@ public actor PartitionReader: AsyncSequence {
             }
         }
         // The server refuses a store from a member that left, so the stores go
-        // first.
-        if isGroup, (try? await membership.lock()) != nil {
+        // first. A lost session error clears `joinedGroup` while the client can
+        // still hold the member under the same session, so the leave always goes.
+        if isGroup, configuration.autoJoinConsumerGroup, (try? await membership.lock()) != nil {
             defer { membership.unlock() }
-            if joinedGroup {
-                joinedGroup = false
-                do {
-                    try await client.leaveConsumerGroup(streamID: streamID, topicID: topicID, groupID: consumer.id)
-                } catch {
-                    logger.debug("Failed to leave the consumer group", metadata: metadata.merging(["error": "\(error)"]) { $1 })
-                }
+            joinedGroup = false
+            do {
+                try await client.leaveConsumerGroup(streamID: streamID, topicID: topicID, groupID: consumer.id)
+            } catch {
+                logger.debug("Failed to leave the consumer group", metadata: metadata.merging(["error": "\(error)"]) { $1 })
             }
         }
         eventsTask?.cancel()
@@ -541,6 +581,15 @@ public actor PartitionReader: AsyncSequence {
         return nil
     }
 
+    /// Whether a batch that this reader returned still counts. A seek of its
+    /// partition, or a new assignment without `onRead`, drops it.
+    func holds(_ batch: PolledMessages) -> Bool {
+        guard let stamp = batch.stamp, stamp.reader == id else {
+            return true
+        }
+        return keeps(batch.partitionID, stamp.generation)
+    }
+
     /// Records the last message the application took from its partition.
     /// With `onRead` the close moves the offset back to it.
     func deliver(_ checkpoint: Checkpoint) {
@@ -587,11 +636,16 @@ public actor PartitionReader: AsyncSequence {
     /// Sets the next read position of `partitionID` and starts a new
     /// generation of it. It drops the queued batches of the partition,
     /// ignores its late replies, and resumes a stopped partition. Without
-    /// `onRead` it stores no offset. With `onRead` an offset start stores
-    /// the offset before it first, so the reads go on after it.
+    /// `onRead` it stores no offset. With `onRead` a seek to an offset above
+    /// zero first stores the offset before it, under the history of a
+    /// continuation or else of the last delivered message, once the
+    /// committing read of the partition in flight ended, so a restart resumes
+    /// at the new position. A refused store fails the seek and nothing moves.
+    /// Every other seek stores nothing.
     ///
     /// Throws ``IggyErrorCode/invalidCommand`` for a partition the reader
-    /// does not read and for a continuation of another partition.
+    /// does not read and for a continuation of another partition, and the
+    /// errors of the store.
     public func seek(partitionID: UInt32, to start: PollingStrategy) async throws {
         try start.validate(partitionID: partitionID)
         guard assigned.contains(partitionID) else {
@@ -601,25 +655,28 @@ public actor PartitionReader: AsyncSequence {
         if start.kind == .first {
             start = PollingStrategy(kind: .offset, value: 0, context: start.context, partitionID: start.partitionID)
         }
-        newGeneration(of: partitionID, seeking: true)
-        if configuration.options.commitsOnRead, start.kind == .offset {
-            let context = start.context
-            try await afterProgress(of: partitionID) {
+        var before: Checkpoint?
+        if configuration.options.commitsOnRead, start.kind == .offset, start.value > 0 {
+            let context = start.context ?? delivered[partitionID]?.context ?? .empty
+            let checkpoint = Checkpoint(partitionID: partitionID, offset: start.value - 1, context: context)
+            try await holdingReads(of: partitionID) {
                 try await offsetWrites.lock()
                 defer { offsetWrites.unlock() }
-                if start.value == 0 {
-                    try await client.deleteConsumerOffset(
-                        consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID, context: context)
-                } else {
-                    try await client.storeConsumerPosition(
-                        consumer: consumer, streamID: streamID, topicID: topicID,
-                        checkpoint: Checkpoint(partitionID: partitionID, offset: start.value - 1, context: context ?? .empty))
-                }
+                try await client.storeConsumerPosition(consumer: consumer, streamID: streamID, topicID: topicID, checkpoint: checkpoint)
             }
-            positions[partitionID] = .next
+            before = checkpoint
+            if context != .empty {
+                start = .continuation(partitionID: partitionID, kind: .offset, value: start.value, context: context)
+            }
+        }
+        newGeneration(of: partitionID, seeking: true)
+        positions[partitionID] = start
+        if let before {
+            // The stored offset counts as delivered, so the close moves back to it over a read nobody received.
             expected[partitionID] = start.value
-        } else {
-            positions[partitionID] = start
+            delivered[partitionID] = Checkpoint(
+                partitionID: partitionID, offset: before.offset, context: before.context, stamp: ReaderStamp(reader: id, generation: lastGeneration))
+            stored[partitionID] = Span(first: before.offset, last: before.offset, context: before.context)
         }
         readerWakeup?.yield()
     }
@@ -847,6 +904,9 @@ public actor PartitionReader: AsyncSequence {
         expected[partition] = nil
         baselines[partition] = nil
         uncertain.remove(partition)
+        lostReads.remove(partition)
+        blockedBy[partition] = nil
+        backlogged.remove(partition)
         gaps[partition] = nil
         isolations[partition] = nil
         pollAlone.remove(partition)
@@ -960,14 +1020,12 @@ public actor PartitionReader: AsyncSequence {
         }
         let now = ContinuousClock.now
         pausedUntil = pausedUntil.filter { $0.value > now }
-        if !configuration.options.commitsOnRead {
-            for group in fetchGroups {
-                fetchAhead(group)
-            }
-        } else if onDemand {
-            for group in fetchGroups {
-                takeCommittingTurn(of: group)
-            }
+        for (partition, operation) in blockedBy where !client.core.pollRouter.retainsFetch(operation) {
+            blockedBy[partition] = nil
+            stopped.remove(partition)
+        }
+        if !configuration.options.commitsOnRead || onDemand {
+            fetchAhead()
         }
         pollSingles()
     }
@@ -979,59 +1037,148 @@ public actor PartitionReader: AsyncSequence {
         readerWakeup != nil && arrivals.isEmpty
     }
 
-    /// Fetches the partitions of a group that no request reads. They join
-    /// the main fetch of the group once the last one ended, else its second
-    /// fetch, which starts again with them.
-    private func fetchAhead(_ group: [UInt32]) {
-        guard waitingReplies(of: group) < Self.waitingRepliesPerGroup else {
-            return
-        }
-        let joining = group.filter { isIdle($0) && isFetchable($0) }
-        guard !joining.isEmpty else {
-            return
-        }
-        var hasMain = false
-        var second: UInt64?
-        for partition in group {
-            guard let id = activeReads[partition], let request = requests[id] else {
-                continue
+    /// The idle partitions of a group that its fetches read now.
+    private struct GroupTurn {
+        let group: [UInt32]
+        /// Partitions whose last section ended before their head, least
+        /// recently served first.
+        let backlogged: [UInt32]
+        let quiet: [UInt32]
+        let hasMain: Bool
+        let second: UInt64?
+        /// Whether the turn fetches the quiet partitions. With `onRead` they
+        /// wait for the main fetch of the group in flight instead.
+        let startsQuiet: Bool
+        var extra = 0
+
+        /// A turn that restarts the second fetch of its group takes no new
+        /// request.
+        var needsRequest: Bool { !startsQuiet || second == nil }
+
+        /// Every fetch holds at least one partition.
+        var extraLimit: Int { startsQuiet ? backlogged.count : backlogged.count - 1 }
+    }
+
+    /// Fetches the partitions of each group that no request reads, as the
+    /// Rust reader schedules its groups. Every group gets one fetch before
+    /// any gets more: its quiet partitions join the main fetch of the group
+    /// once none is in flight, else its second fetch, which starts again
+    /// with them, or with `onRead` they wait for the main fetch to end. The
+    /// requests left free, less those the polls of single partitions need
+    /// and those the queued replies hold, go round robin to groups with
+    /// backlogged partitions, which a read answers at once, each share in a
+    /// fetch of its own with the full limits.
+    private func fetchAhead() {
+        let commits = configuration.options.commitsOnRead
+        var turns: [GroupTurn] = []
+        for group in fetchGroups where waitingReplies(of: group) < Self.waitingRepliesPerGroup {
+            let joining = group.filter { isIdle($0) && isFetchable($0) }
+            var hasMain = false
+            var second: UInt64?
+            for partition in group {
+                guard let id = activeReads[partition], let request = requests[id] else {
+                    continue
+                }
+                switch request.kind {
+                case .main: hasMain = true
+                case .second: second = id
+                case .backlog, .single, .gap, .isolate: break
+                }
             }
-            switch request.kind {
-            case .main: hasMain = true
-            case .second: second = id
-            case .single, .gap, .isolate: break
+            let quiet = joining.filter { !backlogged.contains($0) }
+            let turn = GroupTurn(
+                group: group, backlogged: joining.filter(backlogged.contains), quiet: quiet, hasMain: hasMain, second: second,
+                startsQuiet: !quiet.isEmpty && !(commits && hasMain))
+            if turn.startsQuiet || !turn.backlogged.isEmpty {
+                turns.append(turn)
             }
         }
-        guard second != nil || requests.count < Self.maxRequestsInFlight else {
-            return
+        var free = Self.maxRequestsInFlight - requests.count
+        var taking: [Int] = []
+        for index in turns.indices.filter({ !turns[$0].hasMain }) + turns.indices.filter({ turns[$0].hasMain }) {
+            if !turns[index].needsRequest {
+                taking.append(index)
+            } else if free > 0 {
+                free -= 1
+                taking.append(index)
+            }
         }
-        var targets = Set(joining)
-        if let second, let request = finish(second) {
-            request.task.cancel()
-            targets.formUnion(request.partitions)
+        var extra = free - singlePollReserve - queuedReplies
+        var dealt = true
+        while extra > 0, dealt {
+            dealt = false
+            for index in taking where extra > 0 && turns[index].extra < turns[index].extraLimit {
+                turns[index].extra += 1
+                extra -= 1
+                dealt = true
+            }
         }
-        var ordered = group.filter(targets.contains)
-        if ordered.contains(where: { startPoint(of: $0).kind == .next }) {
-            ordered.removeAll { storesWaiting[$0] != nil }
-        }
-        if !ordered.isEmpty {
-            startFetch(ordered, kind: hasMain ? .second : .main)
+        for index in taking {
+            startFetches(of: turns[index])
         }
     }
 
-    /// One committing fetch of the partitions of a group that the fetch can
-    /// read, unless the group is read already or a store of it waits.
-    private func takeCommittingTurn(of group: [UInt32]) {
-        let turnTaken = group.contains { partition in
-            storesWaiting[partition] != nil || activeReads[partition].flatMap { requests[$0] }.map { $0.commits } ?? false
-        }
-        guard !turnTaken, requests.count < Self.maxRequestsInFlight else {
+    private func startFetches(of turn: GroupTurn) {
+        let spread: RequestKind = configuration.options.commitsOnRead ? .backlog : .main
+        guard turn.startsQuiet else {
+            for share in Self.deal(turn.backlogged, into: turn.extra + 1) {
+                startGroupFetch(share, of: turn.group, kind: spread)
+            }
             return
         }
-        let targets = group.filter { isIdle($0) && isFetchable($0) }
-        if !targets.isEmpty {
-            startFetch(targets, kind: .main)
+        let shared = turn.extra == 0 ? turn.quiet + turn.backlogged : turn.quiet
+        var targets = Set(shared)
+        if let second = turn.second, let request = finish(second) {
+            request.task.cancel()
+            targets.formUnion(request.partitions)
         }
+        startGroupFetch(Array(targets), of: turn.group, kind: turn.hasMain ? .second : .main)
+        if turn.extra > 0 {
+            for share in Self.deal(turn.backlogged, into: turn.extra) {
+                startGroupFetch(share, of: turn.group, kind: spread)
+            }
+        }
+    }
+
+    /// A fetch of `partitions` in the order of their group. A fetch that
+    /// moves a stored offset leaves out the partitions whose store waits.
+    private func startGroupFetch(_ partitions: [UInt32], of group: [UInt32], kind: RequestKind) {
+        let members = Set(partitions)
+        var ordered = group.filter(members.contains)
+        if configuration.options.commitsOnRead || ordered.contains(where: { startPoint(of: $0).kind == .next }) {
+            ordered.removeAll { storesWaiting[$0] != nil }
+        }
+        if !ordered.isEmpty {
+            startFetch(ordered, kind: kind)
+        }
+    }
+
+    /// `partitions` dealt round robin into `count` shares.
+    private static func deal(_ partitions: [UInt32], into count: Int) -> [[UInt32]] {
+        var shares = [[UInt32]](repeating: [], count: Swift.max(count, 1))
+        for (index, partition) in partitions.enumerated() {
+            shares[index % shares.count].append(partition)
+        }
+        return shares.filter { !$0.isEmpty }
+    }
+
+    /// The requests that the polls of single partitions waiting now take,
+    /// within the share that ``pollSingles()`` keeps for them.
+    private var singlePollReserve: Int {
+        let limit = Swift.max(Self.maxRequestsInFlight - fetchGroups.count, 1)
+        let polls = requests.values.filter { $0.kind.isPoll }.count
+        let waiting = fetchGroups.joined().filter { isIdle($0) && singleRead(of: $0) != nil }.count
+        return Swift.min(waiting, Swift.max(limit - polls, 0))
+    }
+
+    /// The fetch replies that wait for ``next()``. Each holds a request of
+    /// the budget.
+    private var queuedReplies: Int {
+        Set(
+            arrivals.compactMap { arrival -> UInt64? in
+                if case .section(_, _, let request) = arrival { request } else { nil }
+            }
+        ).count
     }
 
     /// Polls, one partition each, the gaps, the sections that did not
@@ -1040,7 +1187,7 @@ public actor PartitionReader: AsyncSequence {
     private func pollSingles() {
         let partitions = Array(fetchGroups.joined())
         let limit = Swift.max(Self.maxRequestsInFlight - fetchGroups.count, 1)
-        var polls = requests.values.filter { $0.kind != .main && $0.kind != .second }.count
+        var polls = requests.values.filter { $0.kind.isPoll }.count
         let start = pollCursor.flatMap(partitions.firstIndex(of:)).map { $0 + 1 } ?? 0
         for index in partitions.indices {
             guard polls < limit, requests.count < Self.maxRequestsInFlight else {
@@ -1059,12 +1206,15 @@ public actor PartitionReader: AsyncSequence {
 
     /// The poll a partition needs, if a fetch cannot read it.
     private func singleRead(of partition: UInt32) -> (RequestKind, PollingStrategy, UInt32)? {
+        if let isolation = isolations[partition] {
+            let start: PollingStrategy =
+                isolation.context == .empty
+                ? .offset(isolation.first) : .continuation(partitionID: partition, kind: .offset, value: isolation.first, context: isolation.context)
+            return (.isolate, start, 1)
+        }
         if let gap = gaps[partition] {
             let count = UInt32(clamping: Swift.min(gap.end - gap.next, UInt64(configuration.options.count)))
             return (.gap, .continuation(partitionID: partition, kind: .offset, value: gap.next, context: gap.context), count)
-        }
-        if let isolation = isolations[partition] {
-            return (.isolate, .continuation(partitionID: partition, kind: .offset, value: isolation.first, context: isolation.context), 1)
         }
         guard !isFetchable(partition), !configuration.options.commitsOnRead || onDemand else {
             return nil
@@ -1131,7 +1281,8 @@ public actor PartitionReader: AsyncSequence {
             options.maxWait = .zero
         }
         options.minCount = 1
-        start(kind, partitions: [partition], progresses: progresses, commits: commits) { [client, streamID, topicID, consumer, options] in
+        start(kind, partitions: [partition], progresses: progresses, commits: commits, poll: (strategy, count)) {
+            [client, streamID, topicID, consumer, options] in
             .polled(
                 try await client.pollBody(
                     streamID: streamID, topicID: topicID, partitionID: partition, consumer: consumer, strategy: strategy, count: count,
@@ -1141,7 +1292,8 @@ public actor PartitionReader: AsyncSequence {
     }
 
     private func start(
-        _ kind: RequestKind, partitions: [UInt32], progresses: Bool, commits: Bool, _ read: @escaping @Sendable () async throws -> Reply
+        _ kind: RequestKind, partitions: [UInt32], progresses: Bool, commits: Bool, poll: (start: PollingStrategy, count: UInt32)? = nil,
+        _ read: @escaping @Sendable () async throws -> Reply
     ) {
         lastRequestID += 1
         let id = lastRequestID
@@ -1155,7 +1307,9 @@ public actor PartitionReader: AsyncSequence {
             await self?.requestEnded(id, outcome)
         }
         let requestGenerations = Dictionary(uniqueKeysWithValues: partitions.map { ($0, generations[$0] ?? 0) })
-        requests[id] = Request(kind: kind, partitions: partitions, progresses: progresses, commits: commits, generations: requestGenerations, task: task)
+        requests[id] = Request(
+            kind: kind, partitions: partitions, progresses: progresses, commits: commits, generations: requestGenerations, start: poll?.start,
+            count: poll?.count ?? 0, task: task)
         for partition in partitions {
             activeReads[partition] = id
         }
@@ -1214,17 +1368,27 @@ public actor PartitionReader: AsyncSequence {
             guard unanswered.remove(partition) != nil, let generation = request.generations[partition] else {
                 continue
             }
+            if let operation = section.uncertainty?.operationID {
+                // Abandoned first, so a seek or a new assignment meanwhile leaves no block.
+                try? client.abandonOperation(operation)
+            }
             guard generations[partition] == generation else {
-                if request.commits, keeps(partition, generation), section.error == nil, section.messagesCount > 0 {
-                    // The server stored this read, so a partition that left the assignment still hands it over.
-                    arrivals.append(.section(section, generation: generation, request: id))
+                if request.commits, section.error == nil, let first = section.firstOffset {
+                    if keeps(partition, generation) {
+                        // The server stored this read, so a partition that left the assignment still hands it over.
+                        arrivals.append(.section(section, generation: generation, request: id))
+                    } else if assigned.contains(partition) {
+                        // A seek dropped the batch, so the close moves the offset back over it.
+                        recordStored(partition, through: section.nextOffset, from: first, context: section.context)
+                    }
                 }
                 continue
             }
             if let error = section.error {
-                if request.commits, error.code == .shardCommunicationError {
-                    uncertain.insert(partition)
-                    failed([partition], with: IggyError(.transientNotCommitted, context: "\(error)", partitionID: partition))
+                backlogged.remove(partition)
+                if request.commits, error.code == .fetchProgressUncertain {
+                    lost([partition], to: error)
+                    failed([partition], with: error)
                     continue
                 }
                 if error.code == .invalidSizeBytes {
@@ -1238,6 +1402,11 @@ public actor PartitionReader: AsyncSequence {
             }
             if section.messagesCount == 0 {
                 idle.insert(partition)
+            }
+            if section.nextOffset <= section.currentOffset, section.messagesCount > 0 || section.currentOffset > 0 {
+                backlogged.insert(partition)
+            } else {
+                backlogged.remove(partition)
             }
             let arrival = Arrival.section(section, generation: generation, request: id)
             if !accept(arrival, of: partition, reachingThrough: section.nextOffset, context: section.context, firstOffset: section.firstOffset) {
@@ -1274,7 +1443,7 @@ public actor PartitionReader: AsyncSequence {
     ) -> Bool {
         let onRead = configuration.options.commitsOnRead
         let start = firstOffset ?? end
-        if onRead, let expected = expected[partition], start > expected, context.incarnation != 0 {
+        if onRead, lostReads.contains(partition), let expected = expected[partition], start > expected, context.incarnation != 0 {
             logger.warning(
                 "A lost read stored messages that were never delivered, reading them again",
                 metadata: metadata.merging(["partition": "\(partition)", "from": "\(expected)", "to": "\(start)"]) { $1 })
@@ -1287,6 +1456,8 @@ public actor PartitionReader: AsyncSequence {
         if onRead {
             if let firstOffset {
                 recordStored(partition, through: end, from: firstOffset, context: context)
+                // This store fences out any older read of the partition parked on the server.
+                lostReads.remove(partition)
             }
             if firstOffset != nil || expected[partition] != nil {
                 expected[partition] = end
@@ -1321,9 +1492,14 @@ public actor PartitionReader: AsyncSequence {
             return
         }
         guard generations[partition] == generation else {
-            if request.commits, keeps(partition, generation), let polled = try? Responses.polledMessages(body[...]), !polled.messages.isEmpty {
-                // The server stored this read, so a partition that left the assignment still hands it over.
-                arrivals.append(.batch(polled, generation: generation))
+            if request.commits, let polled = try? Responses.polledMessages(body[...]), let first = polled.messages.first, let last = polled.messages.last {
+                if keeps(partition, generation) {
+                    // The server stored this read, so a partition that left the assignment still hands it over.
+                    arrivals.append(.batch(polled, generation: generation))
+                } else if assigned.contains(partition) {
+                    // A seek dropped the batch, so the close moves the offset back over it.
+                    recordStored(partition, through: last.offset + 1, from: first.offset, context: polled.context)
+                }
             }
             return
         }
@@ -1359,6 +1535,7 @@ public actor PartitionReader: AsyncSequence {
             if let message = polled.messages.first {
                 arrivals.append(.batch(polled, generation: generation))
                 isolation.first = message.offset + 1
+                stepPast(message.offset, of: partition, context: polled.context)
             }
             if polled.messages.isEmpty || isolation.first > isolation.last {
                 isolations[partition] = nil
@@ -1367,41 +1544,80 @@ public actor PartitionReader: AsyncSequence {
             }
         default:
             pollAlone.remove(partition)
-            let end = polled.messages.last.map { $0.offset + 1 } ?? 0
-            _ = accept(
-                .batch(polled, generation: generation), of: partition, reachingThrough: end, context: polled.context,
-                firstOffset: polled.messages.first?.offset)
-            if polled.messages.isEmpty {
+            // An empty reply tells nothing about where the next read starts.
+            guard let first = polled.messages.first, let last = polled.messages.last else {
                 pauseIdle([partition])
+                return
             }
+            _ = accept(
+                .batch(polled, generation: generation), of: partition, reachingThrough: last.offset + 1, context: polled.context,
+                firstOffset: first.offset)
         }
     }
 
-    /// A poll reply that does not decode. One message read alone names the
-    /// bad message: its partition stops until a seek steps over it.
+    /// A poll reply that does not decode is read again one message at a
+    /// time from its start. One message read alone names the bad message:
+    /// its partition stops until a seek steps over it. A committing poll
+    /// stored what it read, so the next read finds that as a gap. A poll
+    /// without a known start names no message and stops its partition.
     private func undecodable(_ partition: UInt32, body: [UInt8], error: any Error, of request: Request) {
         let raw = Array(body.dropFirst(Self.pollReplyHeadSize))
-        guard request.kind == .isolate, let isolation = isolations[partition] else {
-            pausedUntil[partition] = .now + configuration.retryInterval
-            report(ReadError(partitionID: partition, error: Self.iggyError(error), raw: raw))
+        if request.kind == .isolate, let isolation = isolations[partition] {
+            isolations[partition] = nil
+            stopped.insert(partition)
+            let skip = PollingStrategy.continuation(partitionID: partition, kind: .offset, value: isolation.first + 1, context: isolation.context)
+            report(ReadError(partitionID: partition, error: Self.iggyError(error), skip: skip, offset: isolation.first, raw: raw))
             return
         }
-        isolations[partition] = nil
+        if request.kind == .gap, let gap = gaps[partition] {
+            isolations[partition] = Span(first: gap.next, last: Swift.min(gap.end, gap.next + UInt64(request.count)) - 1, context: gap.context)
+            return
+        }
+        if request.commits, expected[partition] != nil {
+            lost([partition], to: Self.iggyError(error))
+            pausedUntil[partition] = .now + configuration.retryInterval
+            return
+        }
+        if !request.commits, let start = request.start, start.kind == .offset, request.count > 0 {
+            isolations[partition] = Span(first: start.value, last: start.value + UInt64(request.count) - 1, context: start.context ?? .empty)
+            return
+        }
         stopped.insert(partition)
-        let skip = PollingStrategy.continuation(partitionID: partition, kind: .offset, value: isolation.first + 1, context: isolation.context)
-        report(ReadError(partitionID: partition, error: Self.iggyError(error), skip: skip, offset: isolation.first, raw: raw))
+        report(ReadError(partitionID: partition, error: Self.iggyError(error), raw: raw))
+    }
+
+    /// A message that an isolation delivered moves on the gap it lies in, or
+    /// the position that a poll which did not decode left at its start.
+    private func stepPast(_ offset: UInt64, of partition: UInt32, context: PartitionContext) {
+        if var gap = gaps[partition] {
+            gap.next = Swift.max(gap.next, offset + 1)
+            if gap.next >= gap.end {
+                arrivals.append(contentsOf: gap.held)
+                gaps[partition] = nil
+            } else {
+                gaps[partition] = gap
+            }
+            return
+        }
+        let position = startPoint(of: partition)
+        if !configuration.options.commitsOnRead, position.kind == .offset, position.value <= offset {
+            positions[partition] = .continuation(partitionID: partition, kind: .offset, value: offset + 1, context: context)
+        }
     }
 
     private func failed(_ request: Request, with error: any Error) {
         if error is CancellationError {
             return
         }
+        if let operation = (error as? IggyError)?.operationID, (error as? IggyError)?.code == .fetchProgressUncertain {
+            try? client.abandonOperation(operation)
+        }
         let partitions = request.partitions.filter { request.generations[$0] == generations[$0] }
         guard !partitions.isEmpty else {
             return
         }
-        if request.commits, (error as? IggyError)?.code == .transientNotCommitted {
-            uncertain.formUnion(partitions)
+        if request.commits, let error = error as? IggyError, error.code == .transientNotCommitted || error.code == .fetchProgressUncertain {
+            lost(partitions, to: error)
         }
         if request.kind == .gap, let partition = partitions.first, (error as? IggyError)?.code == .consumerGroupPartitionNotOwned,
             let gap = gaps.removeValue(forKey: partition)
@@ -1409,6 +1625,18 @@ public actor PartitionReader: AsyncSequence {
             giveUp(gap, of: partition)
         }
         failed(partitions, with: Self.iggyError(error))
+    }
+
+    /// A committing read whose outcome is unknown: the close reconciles its
+    /// partitions, the next read finds what it stored as a gap, and its block
+    /// goes now, as `abandon_lost` in the Rust SDK. The partitions read again
+    /// after the retry interval.
+    private func lost(_ partitions: [UInt32], to error: IggyError) {
+        uncertain.formUnion(partitions)
+        lostReads.formUnion(partitions)
+        if let operation = error.operationID {
+            try? client.abandonOperation(operation)
+        }
     }
 
     /// The partition moved to another member before its gap was read again:
@@ -1440,7 +1668,9 @@ public actor PartitionReader: AsyncSequence {
                 positions[partition] = nil
                 expected[partition] = nil
             }
-            client.core.groupState.invalidateAssignment(groupKey)
+            // The next turn syncs the assignment. The cache of the client
+            // still holds the other partitions of this member.
+            lastAssignmentSync = nil
             groupingEpoch += 1
             return
         case .historyUnavailable:
@@ -1460,12 +1690,17 @@ public actor PartitionReader: AsyncSequence {
             if configuration.autoJoinConsumerGroup {
                 return
             }
-        case .transientNotAccepted, .transientNotCommitted, .deferredPollCapacityExceeded:
+        case .transientNotAccepted, .transientNotCommitted, .deferredPollCapacityExceeded, .fetchProgressUncertain:
             for partition in partitions {
                 pausedUntil[partition] = until
             }
             logger.warning("A read was not answered, reading again", metadata: metadata.merging(["error": "\(error)"]) { $1 })
             return
+        case .partitionLaneBlocked where configuration.options.commitsOnRead:
+            for partition in partitions {
+                stopped.insert(partition)
+                blockedBy[partition] = error.operationID
+            }
         case .disconnected, .unauthenticated, .staleClient:
             joinedGroup = false
         default:
@@ -1478,10 +1713,11 @@ public actor PartitionReader: AsyncSequence {
         report(ReadError(partitionID: partitions.count == 1 ? partitions.first : nil, error: error))
     }
 
-    /// Queues an error for ``next()``. One waits at a time.
+    /// Queues an error for ``next()``. The latest one of each partition and
+    /// of the whole reader waits, as `pending_errors` in the Rust SDK.
     private func report(_ error: ReadError) {
-        guard !arrivals.contains(where: \.isFailure) else {
-            return
+        arrivals.removeAll { arrival in
+            if case .failure(let queued) = arrival { queued.partitionID == error.partitionID } else { false }
         }
         arrivals.append(.failure(error))
     }
@@ -1602,7 +1838,7 @@ public actor PartitionReader: AsyncSequence {
     /// Moves the offset of a partition back over the messages the server
     /// stored but nobody received, as `rewind` in the Rust SDK.
     private func rewind(_ partition: UInt32, over span: Span) async throws {
-        if isGroup, client.core.groupState.assignedPartitions(groupKey)?.contains(partition) != true {
+        if isGroup, !assigned.contains(partition) {
             return
         }
         let last = delivered[partition].flatMap { Self.sameHistory($0.context, span.context) && $0.offset >= span.first ? $0.offset : nil }
@@ -1633,10 +1869,17 @@ public actor PartitionReader: AsyncSequence {
         }
     }
 
+    /// Runs a store or delete of `partition` as ``holdingReads(of:_:)``, then
+    /// starts the reads that waited for it.
+    private func afterProgress(of partition: UInt32, _ write: () async throws -> Void) async throws {
+        defer { dispatch() }
+        try await holdingReads(of: partition, write)
+    }
+
     /// Runs a store or delete of `partition` once no read in flight reads or
     /// moves its stored offset, and no such read starts meanwhile, so the two
     /// never reorder on the server.
-    private func afterProgress(of partition: UInt32, _ write: () async throws -> Void) async throws {
+    private func holdingReads(of partition: UInt32, _ write: () async throws -> Void) async throws {
         storesWaiting[partition, default: 0] += 1
         defer {
             if storesWaiting[partition] == 1 {
@@ -1644,7 +1887,12 @@ public actor PartitionReader: AsyncSequence {
             } else {
                 storesWaiting[partition]? -= 1
             }
-            dispatch()
+            if storesWaiting.isEmpty {
+                for wakeup in storeWakeups {
+                    wakeup.finish()
+                }
+                storeWakeups.removeAll()
+            }
         }
         while activeReads[partition].flatMap({ requests[$0] })?.progresses == true {
             let (ended, wakeup) = AsyncStream<Void>.makeStream()

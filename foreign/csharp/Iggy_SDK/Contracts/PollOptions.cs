@@ -22,7 +22,8 @@ using Apache.Iggy.Vsr;
 namespace Apache.Iggy.Contracts;
 
 /// <summary>
-///     The limits of one read of one partition and who stores its offsets.
+///     The limits of one read and who stores its offsets. A read is a poll of one partition, or a fetch of several
+///     partitions of one primary that a reader sends, whose sections share the limits.
 /// </summary>
 /// <remarks>
 ///     A read waits until <see cref="MinCount" /> messages are readable or <see cref="MaxWait" /> passes, and returns

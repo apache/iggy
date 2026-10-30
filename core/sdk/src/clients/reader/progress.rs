@@ -24,7 +24,7 @@ use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     AutoCommit, Checkpoint, Client, CommitEvery, CommitPolicy, Consumer, ConsumerOffsetClient,
-    Identifier, IggyError, PolledMessages, PollingStrategy, ReaderStamp,
+    Identifier, IggyError, PolledMessages, PollingKind, PollingStrategy, ReaderStamp,
 };
 use tokio::sync::Notify;
 use tracing::error;
@@ -177,14 +177,51 @@ impl Progress {
         generations.current.clone()
     }
 
-    /// Starts a new generation of `partition` that reads from `start`.
-    pub(crate) fn seek(&self, partition: u32, start: PollingStrategy) {
+    /// Starts a new generation of `partition` that reads from `start`, and returns it.
+    pub(crate) fn seek(&self, partition: u32, start: PollingStrategy) -> u64 {
         let mut generations = self.generations_mut();
         generations.last += 1;
         let generation = generations.last;
         generations.current.insert(partition, generation);
         generations.seeks.insert(partition, start);
         generations.sought.insert(partition, generation);
+        generation
+    }
+
+    /// With `OnRead`: the application stored the offset of `stored`, so the reader reads the
+    /// partition on after it in a new generation, and the close keeps that offset as the last
+    /// delivered message. A partition that the reader does not read only keeps the store.
+    pub(crate) fn read_after(&self, stored: Checkpoint) {
+        let partition = stored.partition_id();
+        let Some(next) = stored.offset().checked_add(1) else {
+            return;
+        };
+        if self.generation(partition).is_none() {
+            return;
+        }
+        let context = stored.context();
+        let start = if context == PartitionContext::default() {
+            PollingStrategy::offset(next)
+        } else {
+            PollingStrategy::continuation(partition, PollingKind::Offset, next, context)
+        };
+        self.resume_after(stored, start);
+    }
+
+    /// With `OnRead`: the server holds the offset of `stored`, so the reader reads its partition
+    /// from `start` in a new generation, and `stored` is the last delivered message of that
+    /// generation and its commit record, which the close keeps.
+    pub(crate) fn resume_after(&self, stored: Checkpoint, start: PollingStrategy) {
+        let partition = stored.partition_id();
+        let generation = self.seek(partition, start);
+        let stored = Checkpoint::stamped(
+            partition,
+            stored.offset(),
+            stored.context(),
+            Some(self.stamp(generation)),
+        );
+        self.committed.insert(partition, stored);
+        self.deliver(&stored);
     }
 
     /// The seeks that the fetch loop did not apply yet, each with its generation.

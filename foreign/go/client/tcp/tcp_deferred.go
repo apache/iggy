@@ -264,19 +264,20 @@ func classifyFetchReply(ctx context.Context, operation *pendingOperation, ticket
 	return nil
 }
 
+// fetchRefusedBeforeAdmission reports whether a committing poll or fetch that
+// failed with err, as its whole reply or as one fetch section, stored nothing.
 func fetchRefusedBeforeAdmission(err error, section bool) bool {
 	var coded ierror.IggyError
 	if !errors.As(err, &coded) {
 		return false
 	}
 	switch coded.Code() {
-	case ierror.InvalidSizeBytesCode:
-		return section
-	case ierror.HistoryUnavailableCode, ierror.NotPrimaryCode, ierror.ConsumerGroupPartitionNotOwnedCode:
+	case ierror.TransientNotAcceptedCode, ierror.InvalidSizeBytesCode, ierror.HistoryUnavailableCode, ierror.NotPrimaryCode,
+		ierror.PartitionNotFoundCode, ierror.TooManyConsumerOffsetsCode, ierror.ConsumerGroupPartitionNotOwnedCode:
 		return true
-	case ierror.FeatureUnavailableCode, ierror.InvalidIdentifierCode, ierror.TransientNotAcceptedCode,
-		ierror.DeferredPollCapacityExceededCode, ierror.StreamIdNotFoundCode, ierror.StreamNameNotFoundCode,
-		ierror.TopicIdNotFoundCode, ierror.TopicNameNotFoundCode, ierror.PartitionNotFoundCode, ierror.InvalidOffsetCode:
+	case ierror.FeatureUnavailableCode, ierror.InvalidIdentifierCode, ierror.DeferredPollCapacityExceededCode,
+		ierror.StreamIdNotFoundCode, ierror.StreamNameNotFoundCode, ierror.TopicIdNotFoundCode, ierror.TopicNameNotFoundCode,
+		ierror.InvalidOffsetCode:
 		return !section
 	default:
 		return false
@@ -432,9 +433,6 @@ type deferredBudget struct {
 	timeoutAt int
 	// minTimeout is the shortest request timeout that the server accepts.
 	minTimeout time.Duration
-	// commits marks a fetch with auto-commit, whose unknown outcome keeps
-	// its partitions blocked until the caller abandons it.
-	commits bool
 	// storesOnRead marks a poll or fetch with auto-commit. A cancel of one
 	// waits for the single reply of the server, which tells whether it stored.
 	storesOnRead bool
@@ -469,7 +467,6 @@ func newDeferredBudget(code command.Code, frame []byte) *deferredBudget {
 	}
 	if code == command.FetchMessagesCode {
 		budget.minTimeout = iggcon.MinDeferredPollReplyMargin
-		budget.commits = frame[waitAt+fetchAutoCommitAt] != 0
 	}
 	budget.storesOnRead = storesOnRead(code, frame[vsr.HeaderSize:])
 	return budget

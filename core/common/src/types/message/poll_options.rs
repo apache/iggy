@@ -35,8 +35,9 @@ pub enum CommitPolicy {
     /// Nothing is stored. The application commits checkpoints.
     #[default]
     Manual,
-    /// The server stores the offset of the last message of each read as part of the read: one
-    /// round trip, at most once.
+    /// The server stores the offset of the last message of each read as part of the read, in one
+    /// round trip. While the primary stays up a message is delivered at most once. A failover
+    /// before the store replicates can deliver the last batch again.
     OnRead,
     /// The client stores the latest counted position, at least once with
     /// [`CommitAfter::Processing`]. A one-shot poll refuses it with
@@ -84,17 +85,20 @@ pub enum CommitAfter {
     Marked,
 }
 
-/// The limits of one poll of one partition.
+/// The limits of one read: a poll of one partition, or a fetch that a partition reader sends
+/// for several partitions of one primary. A fetch applies `count`, `min_count` and `max_bytes`
+/// to all of its partitions together. A reader runs several fetches at once, each within these
+/// limits, for partitions with more messages waiting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PollOptions {
-    /// Most messages in one batch. Default 1000.
+    /// Most messages in one read, over all partitions of a fetch. Default 1000.
     pub count: u32,
     /// Zero answers at once. At most 600 s.
     pub max_wait: IggyDuration,
-    /// At least 1 and at most `count`. Default 1.
+    /// At least 1 and at most `count`, over all partitions of a fetch. Default 1.
     pub min_count: u32,
-    /// Default 1 MiB. A first message larger than `max_bytes` comes alone in the reply, so a read
-    /// always makes progress.
+    /// Default 1 MiB, over all partitions of a fetch. A first message larger than `max_bytes`
+    /// comes alone in the reply, so a read always makes progress.
     pub max_bytes: u32,
     /// Default [`CommitPolicy::Manual`].
     pub commit: CommitPolicy,

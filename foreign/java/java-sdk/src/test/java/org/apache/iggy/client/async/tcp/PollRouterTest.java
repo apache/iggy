@@ -79,6 +79,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -1038,10 +1039,27 @@ class PollRouterTest {
                 assertThat(offsetRequests.get()).isZero();
                 assertThat(offsets).allSatisfy(offset -> assertThat(offset).isNotDone());
                 assertThat(poll.cancel(false)).isTrue();
-                for (var offset : offsets) {
-                    offset.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS).release();
+                // Until the reply to its cancel, the cancelled poll blocks the writes of its partition, and an
+                // inspection goes after it.
+                for (var write : List.of(offsets.get(0), offsets.get(2))) {
+                    assertThatThrownBy(() -> write.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                            .hasCauseInstanceOf(IggyOperationException.class)
+                            .satisfies(error -> assertThat(((IggyOperationException) error.getCause()).getErrorCode())
+                                    .isEqualTo(IggyErrorCode.PARTITION_LANE_BLOCKED));
                 }
-                assertThat(offsetRequests.get()).isEqualTo(offsets.size());
+                offsets.get(1).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS).release();
+                long deadline = System.nanoTime() + TIMEOUT.toNanos();
+                while (offsetRequests.get() < 2 && System.nanoTime() - deadline < 0) {
+                    try {
+                        router.partitionRequest(
+                                        CommandCode.ConsumerOffset.STORE.getValue(), offsetPayload(), Optional.empty())
+                                .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                                .release();
+                    } catch (ExecutionException blocked) {
+                        TimeUnit.MILLISECONDS.sleep(10);
+                    }
+                }
+                assertThat(offsetRequests.get()).isEqualTo(2);
             } finally {
                 router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
                 parent.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);

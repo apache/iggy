@@ -61,10 +61,7 @@ client.UpdateTopic(stream_id, iggy::Identifier::Numeric(topic.Id()),
 
 A stream key must be 32 random bytes, never derived from a password, because reads expose its fingerprint. It travels inside the create request, so protecting it in transit with TLS is the caller's job. The server stores it wrapped and never returns it. Reads report only its source and fingerprints. Without a key, a server with encryption enabled generates one for the stream. An invalid key is refused before anything is sent.
 
-Binary mutations retain an uncertain operation until it is resolved or abandoned.
-`IggyException::OperationId()` carries an exact `std::uint64_t` for
-`operation_uncertain`, `lane_blocked`, and `operation_not_retained`.
-Keep using the same client to recover:
+Binary mutations retain an uncertain operation until it is resolved or abandoned. `IggyException::OperationId()` carries an exact `std::uint64_t` for `operation_uncertain`, `lane_blocked`, `operation_not_retained`, `partition_lane_blocked`, and `fetch_progress_uncertain`. `IggyException::BlockedPartitionId()` names the partition of a `partition_lane_blocked` error. Keep using the same client to recover:
 
 ```cpp
 try {
@@ -86,12 +83,10 @@ and its lane. An `operation_uncertain` result remains retained.
 result. `operation_not_retained` does not prove noncommit, so submitting the old
 payload again can duplicate work. A `lane_blocked` ID belongs to an earlier call;
 resolve it before submitting the new request again. Polls are never replayed.
-A poll with `CommitPolicy::OnRead` whose reply is lost fails with
-`fetch_progress_uncertain` and blocks its partition on the client: later polls
-of that partition fail with `partition_lane_blocked` until `AbandonOperation`
-releases the operation that the error names.
 
-`Disconnect()` and session reset discard retained operations without settling
+A poll with `CommitPolicy::OnRead` whose reply is lost, also to a `Disconnect()` while it waits, fails with `fetch_progress_uncertain` and blocks its partition on the client: later committing polls and offset stores or deletes of that partition fail with `partition_lane_blocked` until `AbandonOperation` releases the operation that the error names. The block survives a reconnect and a new session.
+
+`Disconnect()` and session reset discard retained mutations without settling
 their outcomes. Reconnecting cannot recover those discarded operations.
 The client keeps the proved outcomes of its last `max_operations` replays, also
 across a session reset. A later `ResolveOperation` of a proved operation returns
@@ -110,7 +105,7 @@ errors from these methods:
 - `CreatePartitions`, `DeletePartitions`, and `DeleteSegments`.
 - `CreateConsumerGroup`, `DeleteConsumerGroup`, `JoinConsumerGroup`, and `LeaveConsumerGroup`.
 - `StoreConsumerOffset`, `StoreConsumerPosition`, `DeleteConsumerOffset`, and `DeleteConsumerPosition`.
-- `PollMessages`, `Reader`, and the calls of `PartitionReader`.
+- `PollMessages`, `PendingPoll::Wait`, `Reader`, and the calls of `PartitionReader`.
 - `GetMetadataChanges`.
 
 Other methods, including `Connect`, `Disconnect`, and `Shutdown`, report errors through the exception message only. C++ and bridge-local argument errors also leave `Code()` and `OperationId()` empty and `Kind()` empty, including for the methods listed above. `GetMetadataChanges` is the exception: it reports every invalid query as `invalid_command`, including one the bridge refuses.

@@ -27,7 +27,7 @@ type Client interface {
 	Close() error
 
 	// ResolveOperation replays a retained mutation until its final result or ctx deadline.
-	// A retained committing fetch returns FetchProgressUncertain without I/O and
+	// A retained committing poll or fetch returns FetchProgressUncertain without I/O and
 	// stays blocked until explicit AbandonOperation. Its ID is not a replay receipt.
 	// The client keeps the last outcomes that its replays proved, as many as the operation
 	// limit of tcp.WithPendingOperations, also across a session reset. So a later call for
@@ -156,8 +156,12 @@ type Client interface {
 	// poll on the server and waits for its one reply: refused with
 	// ierror.ErrTransientNotAccepted when the cancel won and nothing was
 	// stored, or with what it read and stored. A reply that the connection
-	// loses ends the call with ierror.FetchProgressUncertain: the server can
-	// have stored the offset, and the next Next poll starts after it.
+	// loses, or an error reply that does not prove that nothing was stored,
+	// ends the call with ierror.FetchProgressUncertain: the server can have
+	// stored the offset. The next poll of the partition that stores its
+	// offset and every offset store or delete of it then fail with
+	// ierror.PartitionLaneBlocked, also after a reconnect, until
+	// AbandonOperation. The next Next poll starts after what was stored.
 	// CommitAuto is refused with ierror.ErrInvalidConfiguration, because one
 	// poll has nothing to count. A partition reader counts and stores it.
 	//

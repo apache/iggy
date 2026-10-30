@@ -241,6 +241,8 @@ final class FakeVSRServer: @unchecked Sendable {
         var status: UInt32 = 0
         /// After the last message when nil, or zero without one.
         var nextOffset: UInt64?
+        /// The newest offset of the partition, the last one read when nil.
+        var currentOffset: UInt64?
         var context = FakeVSRServer.routeContext
         /// Records that replace the batch of `offsets`, for a section that
         /// does not decode.
@@ -265,7 +267,7 @@ final class FakeVSRServer: @unchecked Sendable {
                 continue
             }
             let batch = section.records ?? Array(polledBody(partitionID: section.partitionID, offsets: section.offsets).dropFirst(polledHeadSize))
-            table.write(section.offsets.max() ?? 0)
+            table.write(section.currentOffset ?? section.offsets.max() ?? 0)
             table.write(UInt32(section.offsets.count))
             section.context.encode(into: &table)
             table.write(section.nextOffset ?? section.offsets.last.map { $0 + 1 } ?? 0)

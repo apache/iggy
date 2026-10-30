@@ -28,6 +28,7 @@ import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.message.CommitErrorScope;
 import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.FetchedMessages;
 import org.apache.iggy.message.PollingKind;
@@ -35,6 +36,7 @@ import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.BytesSerializer;
+import org.apache.iggy.serde.CommandCode;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -105,18 +107,30 @@ final class FetchMessages {
         });
     }
 
+    /**
+     * Settles an attempt of a poll or fetch that stores the offsets that it reads. A refusal that proves nothing stored
+     * frees its partitions, any other failure retains them blocked until an abandon, and a fetch reply retains the
+     * targets of its uncertain sections.
+     */
     static RuntimeException completeAttempt(
-            AsyncTcpConnection.TransientFailoverState state, ByteBuf response, Throwable error, boolean failedByLink) {
-        if (state.ticket() == null || !state.ticket().committingFetch()) {
+            VsrExchange exchange, ByteBuf response, Throwable error, boolean failedByLink) {
+        AsyncTcpConnection.TransientFailoverState state = exchange.failoverState();
+        if (state.ticket() == null || !state.ticket().commitsOnRead()) {
             return null;
         }
         IggyServerException refusal = AsyncTcpConnection.findServerError(error);
         if (error != null) {
-            if (!failedByLink && refusal != null && refusedBeforeAdmission(refusal.getRawErrorCode(), false)) {
+            if (!failedByLink
+                    && refusal != null
+                    && CommitErrorScope.REQUEST.provesNothingStored(refusal.getRawErrorCode())) {
                 state.ticket().settleSent(false);
                 return null;
             }
             return state.retainTicket();
+        }
+        if (exchange.commandCode() != CommandCode.Messages.FETCH_MESSAGES.getValue()) {
+            state.ticket().settleFetch(List.of());
+            return null;
         }
         try {
             classifyReply(state, response);
@@ -135,7 +149,8 @@ final class FetchMessages {
             if (!requested.remove(section.partitionId())) {
                 throw new IggyInvalidArgumentException("Fetch reply contains an unexpected or duplicate partition");
             }
-            if (section.status() != FetchedMessages.STATUS_OK && !refusedBeforeAdmission(section.status(), true)) {
+            if (section.status() != FetchedMessages.STATUS_OK
+                    && !CommitErrorScope.SECTION.provesNothingStored(section.status())) {
                 uncertain.add(section.partitionId());
             }
         }
@@ -144,42 +159,23 @@ final class FetchMessages {
 
     private static List<FetchedMessages> attachRecovery(
             List<FetchedMessages> sections, AsyncTcpConnection.TransientFailoverState state) {
-        if (state.ticket() == null || !state.ticket().committingFetch()) {
+        if (state.ticket() == null || !state.ticket().commitsOnRead()) {
             return sections;
         }
         return sections.stream()
-                .map(section ->
-                        section.status() != FetchedMessages.STATUS_OK && !refusedBeforeAdmission(section.status(), true)
-                                ? new FetchedMessages(
-                                        section.partitionId(),
-                                        section.status(),
-                                        section.currentOffset(),
-                                        section.count(),
-                                        section.context(),
-                                        section.nextOffset(),
-                                        section.records(),
-                                        OptionalLong.of(state.ticket().operationId()))
-                                : section)
+                .map(section -> section.status() != FetchedMessages.STATUS_OK
+                                && !CommitErrorScope.SECTION.provesNothingStored(section.status())
+                        ? new FetchedMessages(
+                                section.partitionId(),
+                                section.status(),
+                                section.currentOffset(),
+                                section.count(),
+                                section.context(),
+                                section.nextOffset(),
+                                section.records(),
+                                OptionalLong.of(state.ticket().operationId()))
+                        : section)
                 .toList();
-    }
-
-    static boolean refusedBeforeAdmission(long status, boolean section) {
-        IggyErrorCode code = IggyErrorCode.fromCode((int) status);
-        return switch (code) {
-            // The server refuses a first message larger than the byte limit before it stores an offset.
-            case INVALID_SIZE_BYTES, HISTORY_UNAVAILABLE, NOT_PRIMARY, CONSUMER_GROUP_PARTITION_NOT_OWNED -> true;
-            case FEATURE_UNAVAILABLE,
-                    INVALID_IDENTIFIER,
-                    TRANSIENT_NOT_ACCEPTED,
-                    DEFERRED_POLL_CAPACITY_EXCEEDED,
-                    STREAM_ID_NOT_FOUND,
-                    STREAM_NAME_NOT_FOUND,
-                    TOPIC_ID_NOT_FOUND,
-                    TOPIC_NAME_NOT_FOUND,
-                    PARTITION_NOT_FOUND,
-                    INVALID_OFFSET -> !section;
-            default -> false;
-        };
     }
 
     /**

@@ -32,7 +32,7 @@ use crate::shell::{ShellBus, ShellShard};
 use ahash::AHashMap;
 use consensus::MetadataHandle;
 use consensus::client_table::SessionAttachment;
-use futures::future::{Either, join_all, select};
+use futures::future::{Either, join, select};
 use futures::stream::{FuturesUnordered, StreamExt};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
@@ -57,11 +57,14 @@ use server_common::{MESSAGE_ALIGN, Message};
 use shard::metrics::FetchRecord;
 use shard::shards_table::ShardsTable;
 use shard::{
-    CommitGate, DeferredPollContext, DeferredPollRequest, KNOWN_BYTES_SLACK, OversizedTurn,
-    PartitionRead, PartitionReadReply, PollQuotaIdentity, ReadinessTarget, ReadyTarget,
+    ANY_MESSAGE, CommitGate, ConsumerOffsetRead, DeferredPollContext, DeferredPollRequest,
+    KNOWN_BYTES_SLACK, OversizedTurn, PartitionReadReply, PollQuotaIdentity, ReadinessTarget,
+    ReadyTarget,
 };
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::iter;
+use std::mem;
 use std::pin::pin;
 use std::rc::Rc;
 use std::time::Duration;
@@ -78,8 +81,11 @@ type Section = (FetchMessagesSectionHeader, Vec<Frozen<MESSAGE_ALIGN>>);
 
 /// Answers a fetch in four steps: resolve the targets once (D9), resolve the
 /// start of each `Next` target from its stored offset (D4), wait until the
-/// targets hold `min_count` messages, then read the ready targets that the
-/// budgets allot (D3, D10, D22).
+/// targets hold `min_count` messages, unless those reads already showed them,
+/// then read the ready targets that the budgets allot (D3, D10, D22). When any
+/// message ends the wait of `Next` targets, the read of the first one goes out
+/// with the stored-offset reads, and one that returns messages answers the
+/// fetch (see [`early_read`]).
 ///
 /// The request timeout `T` starts with this future. Each read must commit
 /// before `T - 2 x FETCH_REPLY_MARGIN_US`, and the reply leaves at the latest
@@ -107,7 +113,6 @@ where
     let timeout = started.saturating_add(wire.request_timeout_us);
     let (mut targets, mut refused) =
         resolve_fetch(shard, wire, request.header(), consumer_client_id, user_id)?;
-    refused.extend(resolve_next_starts(shard, &mut targets).await?);
     let caller = DeferredPollContext {
         session: Some(attachment.clone()),
         user_id,
@@ -115,60 +120,43 @@ where
         quota: PollQuotaIdentity::Session(consumer_client_id),
         primary: true,
     };
-    // The wait ends where the request asked, whatever the stored-offset reads
-    // took, and never after the read deadline.
-    let wait_end = started
-        .saturating_add(shard.deferred_wait_us(wire.wait_us))
-        .min(timeout.saturating_sub(2 * FETCH_REPLY_MARGIN_US));
-    let ready_targets = if targets.is_empty() {
-        Vec::new()
-    } else {
-        match shard
-            .wait_for_messages(
-                caller.clone(),
-                targets.iter().map(FetchTarget::readiness).collect(),
-                Duration::from_micros(wait_end.saturating_sub(shard.bus.monotonic_micros())),
-                wire.min_count,
-            )
-            .await
-        {
-            Ok(ready) => ready,
-            Err(error) if is_caller_condition(&error) => return Err(error),
-            Err(_) => targets
-                .iter()
-                .map(|target| ReadyTarget {
-                    partition_id: target.partition_id,
-                    available: u64::from(wire.count),
-                    known_bytes: None,
-                })
-                .collect(),
-        }
-    };
-    let fired = shard.bus.monotonic_micros();
-    let (allotted, budget_waits) = allot(
-        shard,
-        sessions,
-        &targets,
-        &ready_targets,
-        wire,
-        consumer_client_id,
-    );
-    // An empty reply would bring the next fetch back at once while the quota is still full.
-    if allotted.is_empty() && budget_waits > 0 {
-        shard.metrics().record_fetch(&FetchRecord {
-            budget_waits,
-            ..FetchRecord::default()
-        });
-        return Err(IggyError::DeferredPollCapacityExceeded);
-    }
-    let (replies, held_reads) = read_allotted(
-        shard,
-        &targets,
-        allotted,
-        (caller, wire.auto_commit, commit_gate),
-        timeout,
+    let turn = OversizedTurn::default();
+    let early = early_read(shard, sessions, &targets, wire, consumer_client_id);
+    let (starts, (mut replies, mut held_reads)) = join(
+        next_starts(shard, &targets),
+        read_allotted(
+            shard,
+            &targets,
+            early.into_iter().collect(),
+            (caller.clone(), wire.auto_commit, commit_gate.clone()),
+            (started, timeout, turn.clone()),
+        ),
     )
     .await;
+    let first = replies.first_mut().and_then(Option::take);
+    let first_served =
+        matches!(&first, Some(PartitionReadReply::Poll { fragments, .. }) if !fragments.is_empty());
+    let (next_refused, first_kept) = apply_next_starts(&mut targets, starts, first_served)?;
+    refused.extend(next_refused);
+    let (replies, budget_waits, fired) = if first_served {
+        // The reply carries what that read found, and the next fetch reads the others first.
+        replies = iter::repeat_with(|| None).take(targets.len()).collect();
+        replies[0] = first;
+        (replies, 0, shard.bus.monotonic_micros())
+    } else {
+        let (replies, held, budget_waits, fired) = wait_and_read(
+            shard,
+            (sessions, consumer_client_id),
+            &targets,
+            wire,
+            (caller, commit_gate),
+            (started, timeout),
+            (turn, first.filter(|_| first_kept)),
+        )
+        .await?;
+        held_reads.extend(held);
+        (replies, budget_waits, fired)
+    };
     let served = targets.first().map_or(Ok(()), |target| {
         authorize_served_topic_read(
             shard,
@@ -203,6 +191,182 @@ where
     Ok((reply, held_reads))
 }
 
+/// The wait and the reads of a fetch after its stored-offset reads, when a
+/// read of the first target beside them returned no messages. That read's
+/// reply `first` keeps its target out of the wait and the reads, unless it
+/// found the target empty, which stored nothing. Returns the replies by
+/// target, the room they hold, the reads that the budgets left for a later
+/// fetch and when the wait ended.
+#[allow(clippy::future_not_send, clippy::type_complexity)]
+async fn wait_and_read<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    (sessions, consumer_client_id): (&Rc<RefCell<SessionManager>>, u128),
+    targets: &[FetchTarget],
+    wire: &FetchMessagesRequest,
+    (caller, commit_gate): (DeferredPollContext, Option<CommitGate>),
+    (started, timeout): (u64, u64),
+    (turn, first): (OversizedTurn, Option<PartitionReadReply>),
+) -> Result<
+    (
+        Vec<Option<PartitionReadReply>>,
+        Vec<FetchReadGuard>,
+        u64,
+        u64,
+    ),
+    IggyError,
+>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let first = first.filter(
+        |reply| !matches!(reply, PartitionReadReply::Poll { fragments, .. } if fragments.is_empty()),
+    );
+    // A read that may have taken the oversized turn keeps it, any other read
+    // stored nothing and leaves a turn of its own to the reads after it.
+    let turn = match &first {
+        Some(PartitionReadReply::Rejected(IggyError::ShardCommunicationError)) => turn,
+        _ => OversizedTurn::default(),
+    };
+    // The wait ends where the request asked, whatever the stored-offset reads
+    // took, and never after the read deadline.
+    let wait_end = started
+        .saturating_add(shard.deferred_wait_us(wire.wait_us))
+        .min(timeout.saturating_sub(2 * FETCH_REPLY_MARGIN_US));
+    let waiting = &targets[usize::from(first.is_some()).min(targets.len())..];
+    let (ready_targets, every_target) =
+        wait_for_ready(shard, &caller, waiting, wire, wait_end).await?;
+    let fired = shard.bus.monotonic_micros();
+    let (allotted, budget_waits) = allot(
+        shard,
+        sessions,
+        targets,
+        (&ready_targets, every_target),
+        wire,
+        consumer_client_id,
+    );
+    // An empty reply would bring the next fetch back at once while the quota is still full.
+    if allotted.is_empty() && budget_waits > 0 {
+        shard.metrics().record_fetch(&FetchRecord {
+            budget_waits,
+            ..FetchRecord::default()
+        });
+        return Err(IggyError::DeferredPollCapacityExceeded);
+    }
+    let (mut replies, held_reads) = read_allotted(
+        shard,
+        targets,
+        allotted,
+        (caller, wire.auto_commit, commit_gate),
+        (started, timeout, turn),
+    )
+    .await;
+    if let (Some(first), Some(slot)) = (first, replies.first_mut()) {
+        *slot = Some(first);
+    }
+    Ok((replies, held_reads, budget_waits, fired))
+}
+
+/// The read of the first target of a fetch that goes out with its
+/// stored-offset reads: when every target is a `Next` target and any message
+/// ends the wait, a target that is behind returns its messages one owner round
+/// trip earlier, and the read of an empty one stores nothing. The targets come
+/// least recently read first, so the next fetch reads the others first. `None`
+/// when the fetch waits for more, or the session has no room for the read.
+fn early_read<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    targets: &[FetchTarget],
+    wire: &FetchMessagesRequest,
+    consumer_client_id: u128,
+) -> Option<Read>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let first = targets.first()?;
+    if wire.min_count > ANY_MESSAGE || !targets.iter().all(|target| target.next) {
+        return None;
+    }
+    let limits = shard.deferred_poll_config();
+    let max_bytes = wire
+        .max_bytes
+        .min(u32::try_from(limits.max_read_bytes).unwrap_or(u32::MAX))
+        .min(first.max_bytes);
+    if max_bytes < MIN_READ_BYTES {
+        return None;
+    }
+    let owner = shard.shards_table().shard_for(first.namespace)?;
+    let reservation = SessionManager::reserve_fetch_read(
+        sessions,
+        (consumer_client_id, owner),
+        max_bytes as usize,
+        &limits,
+    )?;
+    Some(Read {
+        index: 0,
+        count: wire.count,
+        max_bytes,
+        covered: false,
+        reservation: Some(reservation),
+    })
+}
+
+/// The ready targets of a fetch at the end of its wait, and whether each
+/// target reads a share because a condition of a target ended the wait, so
+/// that each read reports its own. Only a condition of the caller fails.
+#[allow(clippy::future_not_send)]
+async fn wait_for_ready<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    caller: &DeferredPollContext,
+    targets: &[FetchTarget],
+    wire: &FetchMessagesRequest,
+    wait_end: u64,
+) -> Result<(Vec<ReadyTarget>, bool), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    if targets.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    if let Some(ready) = next_backlog(targets, wire.min_count) {
+        return Ok((ready, false));
+    }
+    match shard
+        .wait_for_messages(
+            caller.clone(),
+            targets.iter().map(FetchTarget::readiness).collect(),
+            Duration::from_micros(wait_end.saturating_sub(shard.bus.monotonic_micros())),
+            wire.min_count,
+        )
+        .await
+    {
+        Ok(ready) => Ok((ready, false)),
+        Err(error) if is_caller_condition(&error) => Err(error),
+        Err(_) => Ok((
+            targets
+                .iter()
+                .map(|target| ReadyTarget {
+                    partition_id: target.partition_id,
+                    available: u64::from(wire.count),
+                    known_bytes: None,
+                })
+                .collect(),
+            true,
+        )),
+    }
+}
+
 /// The sections of a fetch whose caller check after the reads ended with
 /// `served`. A session or permission lost during the reads fails the fetch
 /// only while no read stored an offset. Otherwise the stored sections reach
@@ -234,17 +398,24 @@ fn served_sections(
         .collect())
 }
 
-/// Runs the allotted reads at once and collects the replies that arrive
-/// before the reply deadline, by target, with the session room of each
-/// answered read settled to the bytes it returned. The reads that did not
-/// answer by then are dropped.
+/// Runs the allotted reads and collects the replies that arrive before the
+/// reply deadline, by target, with the session room of each answered read
+/// settled to the bytes it returned. The reads that did not answer by then are
+/// dropped.
+///
+/// Only the first read holds the turn to return a first record above its
+/// bytes, alone, and every other read follows it. A read whose bytes
+/// cover the known bytes of its target cannot return one, so when the first
+/// read is such a read, every read starts with it. Otherwise the others start
+/// together once it answered, and after a first read that stored nothing the
+/// next one holds a turn of its own.
 #[allow(clippy::future_not_send)]
 async fn read_allotted<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     targets: &[FetchTarget],
     allotted: Vec<Read>,
     (caller, auto_commit, commit_gate): (DeferredPollContext, bool, Option<CommitGate>),
-    timeout: u64,
+    (started, timeout, oversized_turn): (u64, u64, OversizedTurn),
 ) -> (Vec<Option<PartitionReadReply>>, Vec<FetchReadGuard>)
 where
     B: ShellBus,
@@ -257,33 +428,17 @@ where
     let reply_at = timeout.saturating_sub(FETCH_REPLY_MARGIN_US);
     let mut replies: Vec<Option<PartitionReadReply>> =
         iter::repeat_with(|| None).take(targets.len()).collect();
-    let mut oversized_turn = OversizedTurn::default();
-    let mut reads = allotted.into_iter();
+    let mut waiting = VecDeque::from(allotted);
     let start_read =
-        |read: Read, oversized_turn: &OversizedTurn, replies: &mut [Option<PartitionReadReply>]| {
+        |read: Read, oversized_turn: OversizedTurn, replies: &mut [Option<PartitionReadReply>]| {
             replies[read.index] = Some(PartitionReadReply::Rejected(
                 IggyError::ShardCommunicationError,
             ));
             let target = &targets[read.index];
-            // The owner resolves a `Next` start again when it admits the read and refuses a
-            // commit once another session stored an offset, as for a deferred poll.
-            let strategy = if target.next {
-                PollingStrategy::next()
-            } else {
-                PollingStrategy::offset(target.start)
-            };
-            let mut poll = DeferredPollRequest::new(
-                target.consumer,
-                PollingArgs::new(strategy, read.count, auto_commit),
-                target.metadata,
-                caller.clone(),
-                DeferredPollOptions {
-                    max_bytes: read.max_bytes,
-                    ..Default::default()
-                },
-            );
+            let mut poll = target.read(&read, caller.clone(), auto_commit);
             poll.commit_gate.clone_from(&commit_gate);
-            poll.oversized_turn = Some(oversized_turn.clone());
+            poll.stores_fenced_from = Some(started);
+            poll.oversized_turn = Some(oversized_turn);
             async move {
                 let reply = shard
                     .deferred_read(target.namespace, poll, read_deadline)
@@ -292,10 +447,21 @@ where
             }
         };
     let mut pending = FuturesUnordered::new();
-    if let Some(read) = reads.next() {
-        pending.push(start_read(read, &oversized_turn, &mut replies));
+    let mut first_answered = true;
+    if let Some(first) = waiting.pop_front() {
+        let covered = first.covered;
+        pending.push(start_read(first, oversized_turn.clone(), &mut replies));
+        if covered {
+            let follower = oversized_turn.follower();
+            pending.extend(
+                mem::take(&mut waiting)
+                    .into_iter()
+                    .map(|read| start_read(read, follower.clone(), &mut replies)),
+            );
+        } else {
+            first_answered = false;
+        }
     }
-    let mut first_nonempty = false;
     let mut reply_timer = pin!(shard.bus.sleep(Duration::from_micros(
         reply_at.saturating_sub(shard.bus.monotonic_micros())
     )));
@@ -321,30 +487,31 @@ where
         if let Some(reply) = reply {
             replies[index] = Some(reply);
         }
-        if !first_nonempty {
+        if !first_answered {
+            first_answered = true;
             if bytes > (max_bytes as usize).saturating_sub(KNOWN_BYTES_SLACK as usize) {
-                break;
+                // A first record above its bytes comes alone.
+                waiting.clear();
             }
-            if bytes > 0 {
-                first_nonempty = true;
-                pending.extend(
-                    reads
-                        .by_ref()
-                        .map(|read| start_read(read, &oversized_turn, &mut replies)),
-                );
-            } else if let Some(read) = reads.next() {
-                if uncommitted {
-                    oversized_turn = OversizedTurn::default();
-                }
-                pending.push(start_read(read, &oversized_turn, &mut replies));
+            let turn = if uncommitted {
+                OversizedTurn::default()
+            } else {
+                oversized_turn.follower()
+            };
+            let mut rest = mem::take(&mut waiting).into_iter();
+            if let Some(next) = rest.next() {
+                pending.push(start_read(next, turn.clone(), &mut replies));
             }
+            let follower = turn.follower();
+            pending.extend(rest.map(|read| start_read(read, follower.clone(), &mut replies)));
         }
     }
     (replies, held_reads)
 }
 
 /// The sections of a fetch in request order, from the read replies (D4, D7).
-/// A served section must still hold the incarnation that its target named.
+/// A served section must still hold the incarnation that its target named,
+/// else it answers `HistoryUnavailable`.
 fn fetch_sections<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     targets: &[FetchTarget],
@@ -389,9 +556,11 @@ where
                 Some(_) => Err(IggyError::ShardCommunicationError),
                 None => Ok(target.start_section(commit)?),
             };
+            // The read may have stored into the named incarnation, so not `TransientNotAccepted`.
             let section = section.and_then(|section| {
                 authorize_served_incarnation(shard, target.namespace, target.incarnation)
                     .map(|()| section)
+                    .map_err(|_| IggyError::HistoryUnavailable)
             });
             Some(section.unwrap_or_else(|error| error_section(target.partition_id, &error)))
         })
@@ -422,6 +591,32 @@ struct FetchTarget {
 }
 
 impl FetchTarget {
+    /// The read of `read` from this target. The owner resolves a `Next`
+    /// start again when it admits the read and refuses a commit once another
+    /// session stored an offset, as for a deferred poll.
+    fn read(
+        &self,
+        read: &Read,
+        caller: DeferredPollContext,
+        auto_commit: bool,
+    ) -> DeferredPollRequest {
+        let strategy = if self.next {
+            PollingStrategy::next()
+        } else {
+            PollingStrategy::offset(self.start)
+        };
+        DeferredPollRequest::new(
+            self.consumer,
+            PollingArgs::new(strategy, read.count, auto_commit),
+            self.metadata,
+            caller,
+            DeferredPollOptions {
+                max_bytes: read.max_bytes,
+                ..Default::default()
+            },
+        )
+    }
+
     fn readiness(&self) -> ReadinessTarget {
         ReadinessTarget {
             namespace: self.namespace,
@@ -489,6 +684,9 @@ struct Read {
     index: usize,
     count: u32,
     max_bytes: u32,
+    /// Whether `max_bytes` covers the known bytes of the target with their
+    /// slack, so that the read cannot return a first record above it.
+    covered: bool,
     /// `None` for a target that no shard owns, which `deferred_read` refuses.
     reservation: Option<FetchReadGuard>,
 }
@@ -615,14 +813,14 @@ where
     Ok((targets, refused))
 }
 
-/// Resolves each `Next` target to the offset after its stored one, with one
-/// stored-offset read per target, all at once (D4). A target whose read is
-/// refused leaves `targets` and comes back with its refusal.
+/// The start after the stored offset of each `Next` target, in target
+/// order, with the current offset of its partition (D4). One read for each
+/// owner shard, in place on this one.
 #[allow(clippy::future_not_send)]
-async fn resolve_next_starts<B, MJ, S, SB>(
+async fn next_starts<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    targets: &mut Vec<FetchTarget>,
-) -> Result<RefusedTargets, IggyError>
+    targets: &[FetchTarget],
+) -> Vec<Result<(u64, u64), IggyError>>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -630,19 +828,21 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let replies = join_all(targets.iter().filter(|target| target.next).map(|target| {
-        shard.partition_read(
-            target.namespace,
-            PartitionRead::ConsumerOffsetOnPrimary {
-                consumer: Some(target.consumer),
-                metadata: target.metadata,
-            },
+    shard
+        .consumer_offsets_on_primary(
+            targets
+                .iter()
+                .filter(|target| target.next)
+                .map(|target| ConsumerOffsetRead {
+                    namespace: target.namespace,
+                    consumer: Some(target.consumer),
+                    metadata: target.metadata,
+                })
+                .collect(),
         )
-    }))
-    .await;
-    let mut refused = Vec::new();
-    for (target, reply) in targets.iter_mut().filter(|target| target.next).zip(replies) {
-        let start = match reply {
+        .await
+        .into_iter()
+        .map(|reply| match reply {
             Some(PartitionReadReply::ConsumerOffset {
                 stored,
                 current_offset,
@@ -656,22 +856,71 @@ where
             Some(PartitionReadReply::Rejected(error)) => Err(error),
             Some(PartitionReadReply::NotFound) => Err(IggyError::TransientNotAccepted),
             _ => Err(IggyError::ShardCommunicationError),
-        };
+        })
+        .collect()
+}
+
+/// Sets the start of each `Next` target from `starts`. A target whose read
+/// was refused leaves `targets` and comes back with its refusal, unless its
+/// read already returned messages (`first_served` for the first target), and
+/// a refusal of the caller fails the fetch only while no read stored. Also
+/// returns whether the first target stays.
+fn apply_next_starts(
+    targets: &mut Vec<FetchTarget>,
+    starts: Vec<Result<(u64, u64), IggyError>>,
+    first_served: bool,
+) -> Result<(RefusedTargets, bool), IggyError> {
+    let mut refused = Vec::new();
+    for ((index, target), start) in targets
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, target)| target.next)
+        .zip(starts)
+    {
         match start {
             Ok((start, current_offset)) => {
                 target.start = start;
                 target.resolved = Some(current_offset);
             }
-            Err(error) if is_caller_condition(&error) => return Err(error),
+            Err(_) if index == 0 && first_served => {}
+            Err(error) if is_caller_condition(&error) && !first_served => return Err(error),
             Err(error) => refused.push((target.partition_id, error)),
         }
     }
+    let first = targets.first().map(|target| target.partition_id);
     targets.retain(|target| {
         !refused
             .iter()
             .any(|(partition_id, _)| *partition_id == target.partition_id)
     });
-    Ok(refused)
+    let first_kept = first.is_some() && targets.first().map(|target| target.partition_id) == first;
+    Ok((refused, first_kept))
+}
+
+/// The ready targets of a fetch whose targets are all `Next` targets, when
+/// the current offsets that their stored-offset reads returned already hold
+/// `min_count` messages after their starts, so that a wait would end at once.
+fn next_backlog(targets: &[FetchTarget], min_count: u32) -> Option<Vec<ReadyTarget>> {
+    let mut held: u64 = 0;
+    let mut ready = Vec::with_capacity(targets.len());
+    for target in targets {
+        let current = target.resolved.filter(|_| target.next)?;
+        // An empty partition also reports the current offset 0.
+        let available = if current == 0 {
+            0
+        } else {
+            current.saturating_add(1).saturating_sub(target.start)
+        };
+        if available > 0 {
+            held = held.saturating_add(available);
+            ready.push(ReadyTarget {
+                partition_id: target.partition_id,
+                available,
+                known_bytes: None,
+            });
+        }
+    }
+    (held >= u64::from(min_count.max(1))).then_some(ready)
 }
 
 /// The reads of a fetch, and the ready targets that wait for a later fetch,
@@ -681,12 +930,12 @@ where
 /// most `max_read_bytes`, the reply cap of a deferred poll. A target wants its
 /// known bytes plus `KNOWN_BYTES_SLACK`, else its cap. The session must also
 /// have room for the read's bytes in what this shard holds for it at the
-/// target's owner.
+/// target's owner. With `every_target`, each target gets a share.
 fn allot<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     targets: &[FetchTarget],
-    ready_targets: &[ReadyTarget],
+    (ready_targets, every_target): (&[ReadyTarget], bool),
     wire: &FetchMessagesRequest,
     consumer_client_id: u128,
 ) -> (Vec<Read>, u64)
@@ -722,7 +971,11 @@ where
         .collect();
     let limits = shard.deferred_poll_config();
     let reply_cap = u32::try_from(limits.max_read_bytes).unwrap_or(u32::MAX);
-    let planned = split_fetch(&wants, wire.count, wire.max_bytes.min(reply_cap));
+    let planned = split_fetch(
+        &wants,
+        (wire.count, wire.max_bytes.min(reply_cap)),
+        every_target,
+    );
     let mut budget_waits = (wants.len() - planned.len()) as u64;
     let mut allotted = Vec::with_capacity(planned.len());
     for read in planned {
@@ -744,10 +997,17 @@ where
             budget_waits += 1;
             continue;
         };
+        let covered = ready
+            .get(&target.partition_id)
+            .and_then(|readiness| readiness.known_bytes)
+            .is_some_and(|known| {
+                u64::from(read.max_bytes) >= known.saturating_add(u64::from(KNOWN_BYTES_SLACK))
+            });
         allotted.push(Read {
             index: read.index,
             count: read.count,
             max_bytes: read.max_bytes,
+            covered,
             reservation,
         });
     }
@@ -772,11 +1032,21 @@ struct PlannedRead {
 }
 
 /// Splits `count` messages and `max_bytes` bytes over `wants`, in request
-/// order. First each target gets an equal share of both, at most what it holds
-/// or wants and at least [`MIN_READ_BYTES`], so a backlog in one target cannot
-/// take the whole fetch. Then the first targets take what is left. A target
-/// that the bytes left cannot read waits for a later fetch.
-fn split_fetch(wants: &[ReadWant], count: u32, max_bytes: u32) -> Vec<PlannedRead> {
+/// order, where readers put the targets that they read last. First each
+/// target whose whole read fits an equal share of both gets it, so a backlog
+/// cannot hold back a target that holds little. Then the other targets read
+/// in request order, each as many messages as it holds and the part of the
+/// bytes left that its messages are of those the rest can take, at least the
+/// smallest read. A backlog that takes the count reads whole, so its read
+/// loads each batch once, and the next fetch, which sends it last, reads
+/// another. A target that the bytes left cannot read waits for a later fetch.
+/// With `every_target`, as after a wait that a target condition ended, each
+/// target reads at most a share, so that each reports its own condition.
+fn split_fetch(
+    wants: &[ReadWant],
+    (count, max_bytes): (u32, u32),
+    every_target: bool,
+) -> Vec<PlannedRead> {
     let Ok(targets) = u32::try_from(wants.len()) else {
         return Vec::new();
     };
@@ -785,38 +1055,55 @@ fn split_fetch(wants: &[ReadWant], count: u32, max_bytes: u32) -> Vec<PlannedRea
     }
     let count_share = count.div_ceil(targets);
     let bytes_share = (max_bytes / targets).max(MIN_READ_BYTES);
+    let shared = |want: &ReadWant| {
+        every_target || (want.available <= count_share && want.bytes <= bytes_share)
+    };
     let mut count_left = count;
     let mut bytes_left = max_bytes;
-    let mut planned = Vec::with_capacity(wants.len());
-    for want in wants {
+    let mut planned: Vec<Option<PlannedRead>> = vec![None; wants.len()];
+    for (slot, want) in planned.iter_mut().zip(wants) {
         let bytes = want.bytes.min(bytes_share).min(bytes_left);
-        if count_left == 0 || bytes < MIN_READ_BYTES {
+        if !shared(want) || count_left == 0 || bytes < MIN_READ_BYTES {
             continue;
         }
         let read_count = want.available.min(count_share).min(count_left);
         count_left -= read_count;
         bytes_left -= bytes;
-        planned.push((
-            *want,
-            PlannedRead {
-                index: want.index,
-                count: read_count,
-                max_bytes: bytes,
-            },
-        ));
+        *slot = Some(PlannedRead {
+            index: want.index,
+            count: read_count,
+            max_bytes: bytes,
+        });
     }
-    planned
-        .into_iter()
-        .map(|(want, mut read)| {
-            let more_count = (want.available - read.count).min(count_left);
-            let more_bytes = (want.bytes - read.max_bytes).min(bytes_left);
-            count_left -= more_count;
-            bytes_left -= more_bytes;
-            read.count += more_count;
-            read.max_bytes += more_bytes;
-            read
-        })
-        .collect()
+    let mut held: u64 = wants
+        .iter()
+        .filter(|want| !shared(want))
+        .map(|want| u64::from(want.available))
+        .sum();
+    for (slot, want) in planned.iter_mut().zip(wants) {
+        if shared(want) {
+            continue;
+        }
+        let taken = held.min(u64::from(count_left)).max(1);
+        held -= u64::from(want.available);
+        let read_count = want.available.min(count_left);
+        let part = u64::from(bytes_left) * u64::from(read_count) / taken;
+        let bytes = want
+            .bytes
+            .min(u32::try_from(part).unwrap_or(u32::MAX).max(MIN_READ_BYTES))
+            .min(bytes_left);
+        if read_count == 0 || bytes < MIN_READ_BYTES {
+            continue;
+        }
+        count_left -= read_count;
+        bytes_left -= bytes;
+        *slot = Some(PlannedRead {
+            index: want.index,
+            count: read_count,
+            max_bytes: bytes,
+        });
+    }
+    planned.into_iter().flatten().collect()
 }
 
 /// Whether `error` concerns the caller of a fetch rather than one of its
@@ -883,7 +1170,7 @@ mod tests {
     use crate::dispatch::reads::handle_non_replicated_request;
     use crate::dispatch::test_support::{
         FIRST_BOOT, SpyBus, TestShard, attach_root_session, recreate_topic_in, request_message,
-        route_partitions, stored_batch_record, test_shard,
+        route_partitions_to, stored_batch_record, test_shard,
     };
     use crate::reply_frame::build_polled_messages_body;
     use crate::session_manager::ConnectionContext;
@@ -909,7 +1196,10 @@ mod tests {
         COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
     };
     use shard::config::DeferredPollConfig;
-    use shard::{LifecycleFrame, ReadinessWait, Receiver, Sender, ShardFrame, shard_channel};
+    use shard::{
+        ANY_MESSAGE, LifecycleFrame, PartitionRead, ReadinessWait, Receiver, Sender, ShardFrame,
+        shard_channel,
+    };
     use std::collections::BTreeMap;
     use std::future::Future;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -920,6 +1210,9 @@ mod tests {
 
     const CLIENT: u128 = 1;
     const SESSION: u64 = 1;
+    /// The shard that owns the partitions of a fixture, which is not the
+    /// shard that serves the fetch.
+    const OWNER: u16 = 1;
     const REQUEST: u64 = 1;
     /// The connection that sends a fetch on the deferred path.
     const TRANSPORT: u128 = 91;
@@ -942,9 +1235,10 @@ mod tests {
     const STORED_BATCH_MESSAGES: u32 = 2;
 
     #[test]
-    fn given_ready_targets_with_backlogs_when_split_should_share_count_and_bytes_first() {
-        // A backlog target wanted the whole byte limit, so each fetch read one
-        // partition while the others waited.
+    fn given_ready_targets_with_backlogs_when_split_should_give_the_first_its_whole_read() {
+        // Each backlog got an equal share, so each read loaded whole batches
+        // from disk to return a fraction of one, and the next fetch loaded
+        // them again.
         let mib = 1024 * 1024;
         let wants = [0, 1, 2].map(|index| ReadWant {
             index,
@@ -952,17 +1246,137 @@ mod tests {
             bytes: 4 * mib,
         });
 
-        let planned = split_fetch(&wants, 900, 4 * mib);
+        let planned = split_fetch(&wants, (900, 4 * mib), false);
 
         assert_eq!(
             planned,
-            [0, 1, 2]
-                .map(|index| PlannedRead {
+            vec![PlannedRead {
+                index: 0,
+                count: 900,
+                max_bytes: 4 * mib,
+            }]
+        );
+    }
+
+    #[test]
+    fn given_a_count_below_the_targets_when_split_should_read_it_from_one_backlog() {
+        // The count went one message per target, so ten reads loaded a batch
+        // each to return one message.
+        const TARGETS: usize = 24;
+        let mib = 1024 * 1024;
+        let wants: Vec<_> = (0..TARGETS)
+            .map(|index| ReadWant {
+                index,
+                available: 10_000,
+                bytes: mib,
+            })
+            .collect();
+
+        let planned = split_fetch(&wants, (10, mib), false);
+
+        assert_eq!(
+            planned,
+            vec![PlannedRead {
+                index: 0,
+                count: 10,
+                max_bytes: mib,
+            }]
+        );
+    }
+
+    #[test]
+    fn given_small_backlogs_when_split_should_give_each_the_bytes_of_the_messages_it_takes() {
+        // A backlog of a few messages without known bytes took every byte, so
+        // the next backlog read nothing although the count had room for it.
+        let mib = 1024 * 1024;
+        let wants = [0, 1, 2].map(|index| ReadWant {
+            index,
+            available: 5,
+            bytes: mib,
+        });
+
+        let planned = split_fetch(&wants, (10, mib), false);
+
+        assert_eq!(
+            planned,
+            vec![
+                PlannedRead {
+                    index: 0,
+                    count: 5,
+                    max_bytes: mib / 2,
+                },
+                PlannedRead {
+                    index: 1,
+                    count: 5,
+                    max_bytes: mib / 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn given_backlogs_sent_least_recently_read_first_when_split_across_fetches_should_give_each_a_turn()
+     {
+        const TARGETS: usize = 24;
+        let mib = 1024 * 1024;
+        let mut order: Vec<usize> = (0..TARGETS).collect();
+        let mut turns = [0_u32; TARGETS];
+        for _ in 0..TARGETS {
+            let wants: Vec<_> = order
+                .iter()
+                .map(|&index| ReadWant {
                     index,
-                    count: 300,
-                    max_bytes: 4 * mib / 3 + u32::from(index == 0) * (4 * mib % 3),
+                    available: 10_000,
+                    bytes: mib,
                 })
-                .to_vec()
+                .collect();
+
+            let planned = split_fetch(&wants, (1000, mib), false);
+
+            assert_eq!(planned.len(), 1, "a whole read takes the fetch");
+            turns[planned[0].index] += 1;
+            // A reader sends the targets that it read last at the end.
+            order.rotate_left(1);
+        }
+        assert_eq!(
+            turns, [1; TARGETS],
+            "every target reads once in as many fetches as there are targets"
+        );
+    }
+
+    #[test]
+    fn given_a_backlog_before_a_small_target_when_split_should_read_the_small_one_first() {
+        let mib = 1024 * 1024;
+        let wants = [
+            ReadWant {
+                index: 0,
+                available: 10_000,
+                bytes: 4 * mib,
+            },
+            ReadWant {
+                index: 1,
+                available: 5,
+                bytes: MIN_READ_BYTES,
+            },
+        ];
+
+        let planned = split_fetch(&wants, (1000, 4 * mib), false);
+
+        assert_eq!(
+            planned,
+            vec![
+                PlannedRead {
+                    index: 0,
+                    count: 995,
+                    max_bytes: 4 * mib - MIN_READ_BYTES,
+                },
+                PlannedRead {
+                    index: 1,
+                    count: 5,
+                    max_bytes: MIN_READ_BYTES,
+                },
+            ],
+            "a target that fits an equal share reads all it holds beside a backlog"
         );
     }
 
@@ -982,7 +1396,7 @@ mod tests {
             },
         ];
 
-        let planned = split_fetch(&wants, 1000, 4 * mib);
+        let planned = split_fetch(&wants, (1000, 4 * mib), false);
 
         assert_eq!(
             planned,
@@ -1009,14 +1423,44 @@ mod tests {
             bytes: 2 * MIN_READ_BYTES,
         });
 
-        let planned = split_fetch(&wants, 30, 2 * MIN_READ_BYTES);
+        let planned = split_fetch(&wants, (30, 2 * MIN_READ_BYTES), false);
 
         assert_eq!(
-            planned.iter().map(|read| read.index).collect::<Vec<_>>(),
-            [0, 1],
+            planned,
+            [0, 1]
+                .map(|index| PlannedRead {
+                    index,
+                    count: 10,
+                    max_bytes: MIN_READ_BYTES,
+                })
+                .to_vec(),
             "a target that the bytes left cannot read waits"
         );
-        assert!(planned.iter().all(|read| read.count == 10));
+    }
+
+    #[test]
+    fn given_a_wait_that_a_target_condition_ended_when_split_should_give_every_target_a_share() {
+        // Each target reads after such a wait to report its own condition, so
+        // a whole read of the first must not leave the others unread.
+        let mib = 1024 * 1024;
+        let wants = [0, 1, 2].map(|index| ReadWant {
+            index,
+            available: 900,
+            bytes: 4 * mib,
+        });
+
+        let planned = split_fetch(&wants, (900, 4 * mib), true);
+
+        assert_eq!(
+            planned,
+            [0, 1, 2]
+                .map(|index| PlannedRead {
+                    index,
+                    count: 300,
+                    max_bytes: 4 * mib / 3,
+                })
+                .to_vec()
+        );
     }
 
     #[compio::test]
@@ -1223,7 +1667,7 @@ mod tests {
             0,
             PartitionReadReply::ConsumerOffset {
                 stored: Some(STORED),
-                current_offset: STORED + 10,
+                current_offset: STORED,
             },
         )]));
         assert!(futures::poll!(fetch.as_mut()).is_pending());
@@ -1234,6 +1678,205 @@ mod tests {
 
         assert_eq!(reads[&0].request.args.kind, PollingKind::Next);
         assert!(reads[&0].request.args.auto_commit);
+    }
+
+    #[compio::test]
+    async fn given_next_targets_behind_and_any_message_ending_the_wait_when_fetching_should_read_the_first_with_the_stored_offsets()
+     {
+        // The read waited for the stored-offset reads, which only confirmed
+        // the backlog, so every read of a committing reader paid two owner
+        // round trips.
+        const STORED: u64 = 3;
+        let fixture = Fixture::new(2);
+        let record = stored_batch_record(None);
+        let wire = FetchMessagesRequest {
+            min_count: 1,
+            auto_commit: true,
+            ..fetch_of(vec![
+                fixture.target(0, WirePollingStrategy::next()),
+                fixture.target(1, WirePollingStrategy::next()),
+            ])
+        };
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+        let (offsets, mut reads) = fixture.offsets_and_reads();
+
+        assert_eq!(
+            reads.keys().copied().collect::<Vec<_>>(),
+            [0],
+            "the first target is read beside the stored-offset reads"
+        );
+        let read = reads.remove(&0).expect("the first target is read");
+        assert_eq!(read.request.args.kind, PollingKind::Next);
+        assert!(read.request.args.auto_commit);
+        assert_eq!(read.request.args.count, COUNT);
+        read.answer(served(fixture.context(0), whole(&record)));
+        offsets.answer(BTreeMap::from([
+            (
+                0,
+                PartitionReadReply::ConsumerOffset {
+                    stored: Some(STORED),
+                    current_offset: CURRENT_OFFSET,
+                },
+            ),
+            (
+                1,
+                PartitionReadReply::ConsumerOffset {
+                    stored: Some(STORED),
+                    current_offset: CURRENT_OFFSET,
+                },
+            ),
+        ]));
+        let Poll::Ready(reply) = futures::poll!(fetch.as_mut()) else {
+            panic!("a read that returned messages answers the fetch");
+        };
+        let reply = reply.expect("the fetch succeeds").into_contiguous();
+        let headers: Vec<_> = sections(reply.as_slice())
+            .iter()
+            .map(|section| section.header)
+            .collect();
+        assert_eq!(
+            headers,
+            [
+                fixture.served_header(0, record.len()),
+                FetchMessagesSectionHeader {
+                    partition_id: 1,
+                    status: STATUS_OK,
+                    current_offset: CURRENT_OFFSET,
+                    messages_count: 0,
+                    context: fixture.context(1),
+                    next_offset: STORED + 1,
+                    records_len: 0,
+                },
+            ],
+            "the other target gets its resolved start"
+        );
+        assert!(
+            fixture.owner_frames().is_empty(),
+            "the fetch neither waits nor reads again"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_first_read_beside_the_stored_offsets_that_finds_nothing_when_fetching_should_wait_and_read_as_before()
+     {
+        let fixture = Fixture::new(2);
+        let record = stored_batch_record(None);
+        let wire = FetchMessagesRequest {
+            min_count: 1,
+            ..fetch_of(vec![
+                fixture.target(0, WirePollingStrategy::next()),
+                fixture.target(1, WirePollingStrategy::next()),
+            ])
+        };
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        let (offsets, mut reads) = fixture.offsets_and_reads();
+        reads
+            .remove(&0)
+            .expect("the first target is read")
+            .answer(served(fixture.context(0), PollFragments::new()));
+        offsets.answer(BTreeMap::from([
+            (
+                0,
+                PartitionReadReply::ConsumerOffset {
+                    stored: Some(4),
+                    current_offset: 4,
+                },
+            ),
+            (
+                1,
+                PartitionReadReply::ConsumerOffset {
+                    stored: Some(4),
+                    current_offset: 4,
+                },
+            ),
+        ]));
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+        let wait = fixture.answer_wait(vec![ready(1, 1)]);
+
+        assert_eq!(
+            wait.targets
+                .iter()
+                .map(|target| target.partition_id)
+                .collect::<Vec<_>>(),
+            [0, 1],
+            "an empty first read stored nothing, so its target waits too"
+        );
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        fixture
+            .reads()
+            .remove(&1)
+            .expect("the ready target is read")
+            .answer(served(fixture.context(1), whole(&record)));
+        let Poll::Ready(reply) = futures::poll!(fetch.as_mut()) else {
+            panic!("the fetch answers once its read answered");
+        };
+        let reply = reply.expect("the fetch succeeds").into_contiguous();
+        let counts: Vec<_> = sections(reply.as_slice())
+            .iter()
+            .map(|section| (section.header.partition_id, section.header.messages_count))
+            .collect();
+        assert_eq!(counts, [(0, 0), (1, STORED_BATCH_MESSAGES)]);
+    }
+
+    #[compio::test]
+    async fn given_next_targets_whose_stored_offsets_show_min_count_messages_when_fetching_should_read_without_a_wait()
+     {
+        // The wait after the stored-offset reads found at once what those reads
+        // had already seen, so a backlog paid one more owner round trip.
+        for (current_offsets, waits) in [([9, 7], false), ([4, 0], true), ([5, 0], true)] {
+            let fixture = Fixture::new(2);
+            let wire = fetch_of(vec![
+                fixture.target(0, WirePollingStrategy::next()),
+                fixture.target(1, WirePollingStrategy::next()),
+            ]);
+            let fetch = fixture.fetch(&wire);
+            let mut fetch = pin!(fetch);
+            assert!(futures::poll!(fetch.as_mut()).is_pending());
+            fixture.answer_stored_offsets(BTreeMap::from([
+                (
+                    0,
+                    PartitionReadReply::ConsumerOffset {
+                        stored: Some(3),
+                        current_offset: current_offsets[0],
+                    },
+                ),
+                (
+                    1,
+                    PartitionReadReply::ConsumerOffset {
+                        stored: None,
+                        current_offset: current_offsets[1],
+                    },
+                ),
+            ]));
+            assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+            let frames = fixture.owner_frames();
+
+            let waited = frames
+                .iter()
+                .any(|frame| matches!(frame, LifecycleFrame::ReadinessWait { .. }));
+            assert_eq!(waited, waits, "current offsets {current_offsets:?}");
+            if !waits {
+                let read: Vec<_> = frames
+                    .iter()
+                    .filter_map(|frame| match frame {
+                        LifecycleFrame::PartitionRead {
+                            namespace,
+                            read: PartitionRead::DeferredPoll(request),
+                            ..
+                        } => Some((namespace.partition_id(), request.args.kind)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(read, [(0, PollingKind::Next)], "the first backlog is read");
+            }
+        }
     }
 
     #[compio::test]
@@ -1284,7 +1927,10 @@ mod tests {
             ],
             "the wait names each next target at the offset after its stored one"
         );
-        assert_eq!(wait.min_count, MIN_COUNT);
+        assert_eq!(
+            wait.min_count, ANY_MESSAGE,
+            "an owner on another shard answers on its first ready target"
+        );
         let Poll::Ready(reply) = futures::poll!(fetch.as_mut()) else {
             panic!("a fetch without ready targets answers at the end of its wait");
         };
@@ -1317,8 +1963,8 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_ready_targets_when_the_count_is_short_should_share_it_before_the_rest_in_order()
-    {
+    async fn given_ready_targets_when_the_count_is_short_should_read_the_small_ones_then_the_rest_in_order()
+     {
         const FETCH_COUNT: u32 = 5;
         const FIRST_AVAILABLE: u32 = 3;
         const STARTS: [u64; 3] = [10, 20, 30];
@@ -1351,11 +1997,11 @@ mod tests {
         assert_eq!(
             allotments,
             BTreeMap::from([
-                (0, (2, STARTS[0], TARGET_MAX_BYTES)),
-                (1, (2, STARTS[1], TARGET_MAX_BYTES)),
+                (0, (FIRST_AVAILABLE, STARTS[0], TARGET_MAX_BYTES)),
+                (1, (1, STARTS[1], TARGET_MAX_BYTES)),
                 (2, (1, STARTS[2], TARGET_MAX_BYTES)),
             ]),
-            "each ready target gets an equal share of the count, at most what it holds"
+            "a target that fits an equal share of the count reads it all, the others read in order"
         );
         for (partition_id, read) in &reads {
             assert_eq!(
@@ -1387,7 +2033,8 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_ready_targets_when_reserving_bytes_should_share_them_before_the_rest_in_order() {
+    async fn given_ready_targets_when_reserving_bytes_should_read_the_small_ones_then_share_the_rest_by_messages()
+     {
         const CAP: u32 = 2048;
         const NARROW_CAP: u32 = 1024;
         // Below the smallest read, also with the slack.
@@ -1402,7 +2049,6 @@ mod tests {
             ..fixture.target(partition_id, WirePollingStrategy::offset(0))
         };
         let max_bytes = MIN_READ_BYTES + NARROW_CAP + CAP + fitting;
-        let share = max_bytes / 5;
         let wire = FetchMessagesRequest {
             max_bytes,
             ..fetch_of(vec![
@@ -1436,18 +2082,18 @@ mod tests {
             .iter()
             .map(|(partition_id, read)| (*partition_id, read.request.options.max_bytes))
             .collect();
-        // Each target gets at most an equal share first: known bytes and the
-        // slack within the target cap and above the smallest read, other
-        // targets their cap. The first ones in request order take the rest.
-        let left = max_bytes - (MIN_READ_BYTES + 3 * share + fitting);
-        let narrow_more = NARROW_CAP - share;
+        // Known bytes and the slack, within the target cap and above the
+        // smallest read, fit an equal share and read first. The other targets
+        // hold one message each, so each takes a third of the bytes left,
+        // within its cap.
+        let third = (max_bytes - MIN_READ_BYTES - fitting) / 3;
         assert_eq!(
             caps,
             BTreeMap::from([
                 (0, MIN_READ_BYTES),
-                (1, NARROW_CAP),
-                (2, share + left - narrow_more),
-                (3, share),
+                (1, NARROW_CAP.min(third)),
+                (2, third),
+                (3, third),
                 (4, fitting)
             ]),
         );
@@ -1586,7 +2232,10 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_a_delayed_first_section_when_fetching_should_resolve_it_before_later_reads() {
+    async fn given_a_delayed_first_section_when_fetching_should_resolve_it_before_starting_the_others_at_once()
+     {
+        // After an empty first read the next one started alone, so every
+        // empty target cost one more owner round trip.
         let fixture = Fixture::new(4);
         let record = stored_batch_record(None);
         let wire = fetch_of(
@@ -1607,16 +2256,24 @@ mod tests {
             .answer(served(fixture.context(0), PollFragments::new()));
 
         assert!(futures::poll!(fetch.as_mut()).is_pending());
-        let mut second = fixture.reads();
-        assert_eq!(second.keys().copied().collect::<Vec<_>>(), [1]);
-        second
-            .remove(&1)
-            .unwrap()
-            .answer(served(fixture.context(1), whole(&record)));
-
-        assert!(futures::poll!(fetch.as_mut()).is_pending());
         let remaining = fixture.reads();
-        assert_eq!(remaining.keys().copied().collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(remaining.keys().copied().collect::<Vec<_>>(), [1, 2, 3]);
+        assert!(
+            remaining[&1]
+                .request
+                .oversized_turn
+                .as_ref()
+                .is_some_and(OversizedTurn::take),
+            "after a first read that stored nothing the next one holds a turn"
+        );
+        assert!(
+            [2, 3].iter().all(|partition| !remaining[partition]
+                .request
+                .oversized_turn
+                .as_ref()
+                .is_some_and(OversizedTurn::take)),
+            "the others follow it"
+        );
         for (partition, read) in remaining {
             read.answer(served(
                 fixture.context(u32::try_from(partition).unwrap()),
@@ -1632,6 +2289,66 @@ mod tests {
             .map(|section| section.header.messages_count)
             .sum();
         assert_eq!(count, 3 * STORED_BATCH_MESSAGES);
+    }
+
+    #[compio::test]
+    async fn given_a_first_read_that_covers_the_known_bytes_of_its_target_when_fetching_should_start_every_read_at_once()
+     {
+        // Each read waited for the one before it, so every ready target cost
+        // one more owner round trip.
+        let fixture = Fixture::new(3);
+        let record = stored_batch_record(None);
+        let known_bytes = Some(u64::try_from(record.len()).expect("a record fits u64"));
+        let wire = fetch_of(
+            (0..3)
+                .map(|partition| fixture.target(partition, WirePollingStrategy::offset(0)))
+                .collect(),
+        );
+        let known = |partition_id| ReadyTarget {
+            partition_id,
+            available: 1,
+            known_bytes,
+        };
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        fixture.answer_wait(vec![known(0), ready(1, 1), known(2)]);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+        let reads = fixture.reads();
+        assert_eq!(
+            reads.keys().copied().collect::<Vec<_>>(),
+            [0, 1, 2],
+            "a first read that cannot return a record above its bytes starts every read"
+        );
+        assert!(
+            [1, 2].iter().all(|partition| !reads[partition]
+                .request
+                .oversized_turn
+                .as_ref()
+                .is_some_and(OversizedTurn::take)),
+            "only the first read may take the turn"
+        );
+        for (partition, read) in reads {
+            read.answer(served(
+                fixture.context(u32::try_from(partition).expect("the partition fits u32")),
+                whole(&record),
+            ));
+        }
+        let Poll::Ready(reply) = futures::poll!(fetch.as_mut()) else {
+            panic!("all reads answered");
+        };
+        let reply = reply.expect("the fetch succeeds").into_contiguous();
+        let headers: Vec<_> = sections(reply.as_slice())
+            .iter()
+            .map(|section| section.header)
+            .collect();
+        assert_eq!(
+            headers,
+            (0..3)
+                .map(|partition| fixture.served_header(partition, record.len()))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[compio::test]
@@ -1896,7 +2613,11 @@ mod tests {
             .values()
             .map(|read| read.allotment().2)
             .collect();
-        assert_eq!(bytes, [TARGET_MAX_BYTES / 2, TARGET_MAX_BYTES / 2]);
+        assert_eq!(
+            bytes,
+            [TARGET_MAX_BYTES / 2, TARGET_MAX_BYTES / 2],
+            "two reads of one message each take half the cap each"
+        );
     }
 
     #[compio::test]
@@ -1904,7 +2625,6 @@ mod tests {
      {
         // A read was charged the cost of a disk read, so a session room of one
         // reply could not hold even a small resident read.
-        const OWNER: u16 = 0;
         let fixture = Fixture::new(1);
         let limits = DeferredPollConfig {
             max_inflight_bytes: TARGET_MAX_BYTES as usize,
@@ -1951,7 +2671,6 @@ mod tests {
     /// the session there. The second target waits for a later fetch, and the
     /// read gives its room back when it ends.
     async fn assert_one_read_under(limits: impl FnOnce() -> DeferredPollConfig) {
-        const OWNER: u16 = 0;
         let fixture = Fixture::new(2);
         let limits = limits();
         fixture.shard.set_deferred_poll_config(limits);
@@ -2324,10 +3043,16 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_a_partition_recreated_during_its_read_when_serving_should_answer_not_accepted() {
+    async fn given_a_committing_fetch_whose_topic_is_recreated_during_its_read_when_serving_should_answer_history_unavailable()
+     {
+        // The section answered 58, which a client takes as nothing stored,
+        // while the read may have stored into the incarnation it named.
         let fixture = Fixture::new(1);
         let context = fixture.context(0);
-        let wire = fetch_of(vec![fixture.target(0, WirePollingStrategy::offset(0))]);
+        let wire = FetchMessagesRequest {
+            auto_commit: true,
+            ..fetch_of(vec![fixture.target(0, WirePollingStrategy::offset(0))])
+        };
         let fetch = fixture.fetch(&wire);
         let mut fetch = pin!(fetch);
         assert!(futures::poll!(fetch.as_mut()).is_pending());
@@ -2355,7 +3080,7 @@ mod tests {
             .collect();
         assert_eq!(
             headers,
-            [error_header(0, &IggyError::TransientNotAccepted)],
+            [error_header(0, &IggyError::HistoryUnavailable)],
             "records of the incarnation that the target named are not served from another"
         );
     }
@@ -2706,16 +3431,18 @@ mod tests {
         namespaces: Vec<IggyNamespace>,
         owner_inbox: Receiver<ShardFrame>,
         _owner_replies: Receiver<ShardFrame>,
+        _own_inbox: (Receiver<ShardFrame>, Receiver<ShardFrame>),
     }
 
     impl Fixture {
         fn new(partitions: u32) -> Self {
             let bus = SpyBus::default();
             let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
-            let (sender, owner_inbox, owner_replies) = shard_channel(0, INBOX_CAPACITY, 1);
-            shard.attach_senders(vec![sender]);
+            let (own, own_inbox, own_replies) = shard_channel(0, INBOX_CAPACITY, 1);
+            let (sender, owner_inbox, owner_replies) = shard_channel(OWNER, INBOX_CAPACITY, 1);
+            shard.attach_senders(vec![own, sender]);
             let shard = Rc::new(shard);
-            let namespaces = route_partitions(&shard, partitions);
+            let namespaces = route_partitions_to(&shard, partitions, OWNER);
             shard.plane.metadata().applied_frontier().advance(COMMIT);
             let attachment = attach_root_session(&shard, CLIENT, SESSION);
             Self {
@@ -2726,6 +3453,7 @@ mod tests {
                 namespaces,
                 owner_inbox,
                 _owner_replies: owner_replies,
+                _own_inbox: (own_inbox, own_replies),
             }
         }
 
@@ -2837,43 +3565,76 @@ mod tests {
         /// Answers the stored-offset read of each `Next` target with the
         /// entry of `answers` for its partition.
         fn answer_stored_offsets(&self, mut answers: BTreeMap<usize, PartitionReadReply>) {
-            for frame in self.owner_frames() {
-                let LifecycleFrame::PartitionRead {
-                    namespace,
-                    read:
-                        PartitionRead::ConsumerOffsetOnPrimary {
-                            consumer: stored_key,
-                            ..
-                        },
-                    reply,
-                } = frame
-                else {
-                    panic!("a fetch reads the stored offsets of its next targets first");
-                };
-                let partition_id = namespace.partition_id();
-                assert_eq!(
-                    stored_key,
-                    Some(offset_key(partition_id)),
-                    "the read names the offset key of the target"
-                );
-                let answer = answers
-                    .remove(&partition_id)
-                    .expect("only a next target reads its stored offset");
-                reply
-                    .try_send(answer)
-                    .expect("the fetch awaits the stored offset");
-            }
+            let mut frames = self.owner_frames();
+            assert_eq!(
+                frames.len(),
+                1,
+                "a fetch reads the stored offsets of one owner in one frame"
+            );
+            let Some(LifecycleFrame::PartitionRead {
+                read: PartitionRead::ConsumerOffsetsOnPrimary { reads },
+                reply,
+                ..
+            }) = frames.pop()
+            else {
+                panic!("a fetch reads the stored offsets of its next targets first");
+            };
+            let offsets = reads
+                .into_iter()
+                .map(|read| {
+                    let partition_id = read.namespace.partition_id();
+                    assert_eq!(
+                        read.consumer,
+                        Some(offset_key(partition_id)),
+                        "the read names the offset key of the target"
+                    );
+                    answers
+                        .remove(&partition_id)
+                        .expect("only a next target reads its stored offset")
+                })
+                .collect();
+            reply
+                .try_send(PartitionReadReply::ConsumerOffsets(offsets))
+                .expect("the fetch awaits the stored offsets");
             assert!(
                 answers.is_empty(),
                 "each next target reads its stored offset"
             );
         }
 
+        /// The stored-offset read and the reads that the shard sent to the
+        /// owner at once, by kind.
+        fn offsets_and_reads(&self) -> (StoredOffsets, BTreeMap<usize, OwnerRead>) {
+            let mut offsets = None;
+            let mut reads = BTreeMap::new();
+            for frame in self.owner_frames() {
+                match frame {
+                    LifecycleFrame::PartitionRead {
+                        read: PartitionRead::ConsumerOffsetsOnPrimary { reads },
+                        reply,
+                        ..
+                    } => offsets = Some(StoredOffsets { reads, reply }),
+                    LifecycleFrame::PartitionRead {
+                        namespace,
+                        read: PartitionRead::DeferredPoll(request),
+                        reply,
+                    } => {
+                        reads.insert(namespace.partition_id(), OwnerRead { request, reply });
+                    }
+                    _ => panic!("a fetch reads stored offsets and messages here"),
+                }
+            }
+            (
+                offsets.expect("a fetch of next targets reads their stored offsets"),
+                reads,
+            )
+        }
+
         /// Answers the readiness wait of the fetch with `ready`, and returns
         /// the wait.
         fn answer_wait(&self, ready: Vec<ReadyTarget>) -> ReadinessWait {
             self.answer_wait_with(PartitionReadReply::Ready {
-                shard: 0,
+                shard: OWNER,
                 parked: None,
                 partitions: ready,
             })
@@ -2899,19 +3660,20 @@ mod tests {
             count: usize,
         ) -> BTreeMap<usize, OwnerRead> {
             let mut reads = BTreeMap::new();
-            for index in 0..count {
+            while reads.len() < count {
                 let current = self.reads();
-                assert_eq!(current.len(), 1);
+                assert!(!current.is_empty(), "a refused read starts the next one");
                 for read in current.values() {
                     read.reply
                         .try_send(PartitionReadReply::Rejected(IggyError::NotPrimary))
                         .unwrap();
                 }
                 reads.extend(current);
-                if index + 1 < count {
+                if reads.len() < count {
                     assert!(futures::poll!(fetch.as_mut()).is_pending());
                 }
             }
+            assert_eq!(reads.len(), count);
             reads
         }
 
@@ -2951,6 +3713,34 @@ mod tests {
             self.reply
                 .try_send(reply)
                 .expect("the fetch awaits its read");
+        }
+    }
+
+    /// The stored-offset read of a fetch, as its owner receives it.
+    struct StoredOffsets {
+        reads: Vec<ConsumerOffsetRead>,
+        reply: Sender<PartitionReadReply>,
+    }
+
+    impl StoredOffsets {
+        /// Answers each read with the entry of `answers` for its partition.
+        fn answer(self, mut answers: BTreeMap<usize, PartitionReadReply>) {
+            let offsets = self
+                .reads
+                .iter()
+                .map(|read| {
+                    answers
+                        .remove(&read.namespace.partition_id())
+                        .expect("each next target reads its stored offset")
+                })
+                .collect();
+            self.reply
+                .try_send(PartitionReadReply::ConsumerOffsets(offsets))
+                .expect("the fetch awaits the stored offsets");
+            assert!(
+                answers.is_empty(),
+                "only next targets read their stored offset"
+            );
         }
     }
 

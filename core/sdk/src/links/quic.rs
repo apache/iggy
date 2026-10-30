@@ -21,7 +21,7 @@
 //! leaves nothing half read on the connection. The echoed request id must
 //! still match before its result can settle that request.
 
-use crate::links::{Frame, LateReply, Reply};
+use crate::links::{Frame, LateReply, Reply, committing_cancelled};
 use crate::vsr::{decode_eviction, eviction_reason, peek_command, reply_request_id};
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
@@ -125,18 +125,47 @@ impl QuicLink {
                 });
         // A stopped stream cancels the request and loses its reply, so a committing request
         // whose caller leaves cancels on a new stream and keeps reading this one.
+        let (cancel, late) = cancellation.zip(late).unzip();
         let mut reading = ReplyStream {
             connection: self.connection.clone(),
+            request,
             reply: Some(Box::pin(
                 async move { recv.read_to_end(response_limit).await },
             )),
-            cancelled: cancellation.zip(late),
+            cancel,
+            late,
         };
-        let Some(reply) = reading.reply.as_mut() else {
+        let committing = reading.late.is_some();
+        let ReplyStream {
+            connection,
+            reply,
+            cancel,
+            ..
+        } = &mut reading;
+        let Some(reply) = reply.as_mut() else {
             return Err(IggyError::Disconnected);
         };
-        let read = timeout_at(deadline, reply).await;
-        reading.cancelled = None;
+        let read = timeout_at(deadline, async {
+            if committing {
+                tokio::select! {
+                    biased;
+                    read = &mut *reply => return read,
+                    () = committing_cancelled() => {}
+                }
+                // The server answers the request once more on its own stream, which settles it.
+                if let Some(cancel) = cancel.take()
+                    && let Err(error) = send_cancel(connection, &cancel).await
+                {
+                    debug!(
+                        "Failed to cancel request {request} on {}: {error}",
+                        connection.remote_address()
+                    );
+                }
+            }
+            reply.await
+        })
+        .await;
+        reading.late = None;
         let reply = match read {
             Ok(Ok(reply)) => reply,
             Ok(Err(error)) => {
@@ -188,31 +217,36 @@ impl QuicLink {
     }
 }
 
-/// The reply stream of a request. Dropped while `cancelled` holds the cancel and the settle
-/// callback of a committing request, it sends the cancel on a new stream and hands the one reply
-/// of this stream to the callback.
+/// The reply stream of a request. Dropped while `late` holds the settle callback of a committing
+/// request, it sends the cancel on a new stream unless it went out already, and hands the one
+/// reply of this stream to the callback.
 struct ReplyStream {
     connection: Connection,
+    request: u64,
     reply: Option<BoxFuture<'static, Result<Vec<u8>, ReadToEndError>>>,
-    cancelled: Option<(RequestHeader, LateReply)>,
+    cancel: Option<RequestHeader>,
+    late: Option<LateReply>,
 }
 
 impl Drop for ReplyStream {
     fn drop(&mut self) {
-        let (Some((cancel, late)), Some(reply)) = (self.cancelled.take(), self.reply.take()) else {
+        let (Some(late), Some(reply)) = (self.late.take(), self.reply.take()) else {
             return;
         };
         let connection = self.connection.clone();
+        let request = self.request;
+        let cancel = self.cancel.take();
         tokio::spawn(async move {
-            if let Err(error) = send_cancel(&connection, &cancel).await {
+            if let Some(cancel) = cancel
+                && let Err(error) = send_cancel(&connection, &cancel).await
+            {
                 debug!(
-                    "Failed to cancel request {} on {}: {error}",
-                    cancel.request,
+                    "Failed to cancel request {request} on {}: {error}",
                     connection.remote_address()
                 );
             }
             let reply = match reply.await {
-                Ok(reply) => late_reply(cancel.request, reply),
+                Ok(reply) => late_reply(request, reply),
                 Err(_) => Err(IggyError::Disconnected),
             };
             late(reply);
@@ -255,14 +289,14 @@ mod tests {
         CLIENT, LOCALHOST, SERVER_NAME, quic_server, read_request_header, reply, request,
         request_with_body,
     };
-    use crate::links::{LateReply, Link};
+    use crate::links::{CANCEL_COMMITTING, LateReply, Link};
     use iggy_binary_protocol::codes::{CANCEL_DEFERRED_REQUEST_CODE, POLL_MESSAGES_DEFERRED_CODE};
     use iggy_binary_protocol::consensus::{EvictionHeader, EvictionReason, RequestHeader};
     use quinn::{ClientConfig, Endpoint, SendStream};
     use rustls::RootCertStore;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::oneshot;
+    use tokio::sync::{oneshot, watch};
     use tokio::time::timeout;
 
     const BOUND_SESSION: u64 = 3;
@@ -382,6 +416,44 @@ mod tests {
         assert_eq!(cancel.reserved, CANCEL_DEFERRED_REQUEST_CODE.to_le_bytes());
         assert_eq!((cancel.request, cancel.session), (1, BOUND_SESSION));
         assert_eq!(settled.unwrap().body[..], *b"stored");
+    }
+
+    /// A reader that closes cancels its committing request, which ends one that waits on the
+    /// server at once, and its caller still takes the one reply.
+    #[tokio::test]
+    async fn given_a_committing_deferred_request_when_its_reader_closes_should_cancel_on_a_new_stream_and_return_its_reply()
+     {
+        let (link, peer) = quic_link().await;
+        let link = Link::Quic(link);
+        let mut frame = request(1, BOUND_SESSION);
+        frame.header.reserved = POLL_MESSAGES_DEFERRED_CODE.to_le_bytes();
+        let late: LateReply = Box::new(|_| panic!("the caller takes the reply"));
+        let (close, closing) = watch::channel(false);
+        let mut left = false;
+        let sent = CANCEL_COMMITTING.scope(
+            closing,
+            link.send_settled(frame, Instant::now() + TEST_BUDGET, &mut left, Some(late)),
+        );
+        tokio::pin!(sent);
+        let stream = tokio::select! {
+            result = &mut sent => panic!("no reply was sent: {result:?}"),
+            (stream, header) = peer.read_request() => {
+                assert_eq!(header.request, 1);
+                stream
+            }
+        };
+
+        close.send_replace(true);
+        let cancel = tokio::select! {
+            result = &mut sent => panic!("no reply was sent: {result:?}"),
+            (_, cancel) = peer.read_request() => cancel,
+        };
+        answer(stream, &reply(1, b"cancelled")).await;
+        let replied = timeout(TEST_BUDGET, sent).await.unwrap();
+
+        assert_eq!(cancel.reserved, CANCEL_DEFERRED_REQUEST_CODE.to_le_bytes());
+        assert_eq!((cancel.request, cancel.session), (1, BOUND_SESSION));
+        assert_eq!(replied.unwrap().body[..], *b"cancelled");
     }
 
     #[tokio::test]

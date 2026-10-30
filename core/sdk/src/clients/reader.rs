@@ -65,22 +65,28 @@ const ORDERING: Ordering = Ordering::SeqCst;
 ///   each new assignment to this member.
 /// - The [`CommitPolicy`] of the options decides who stores offsets. With `Manual`,
 ///   [`commit`](Self::commit) stores the offset of a checkpoint. With `OnRead`, the server stores
-///   the offset of each reply, and [`close`](Self::close) moves the offset back to the last
+///   the offset of each reply, the reader reads only while [`next`](Self::next) waits and then
+///   fills its budget (one fetch per primary that may wait for messages, the partitions with
+///   messages left behind spread over the other slots), a [`seek`](Self::seek) to an offset
+///   stores the offset before it, and [`close`](Self::close) moves the offset back to the last
 ///   delivered message. With `Auto`, the reader counts each batch as its
 ///   [`CommitAfter`] says, or each [`mark`](Self::mark), and stores the
 ///   latest counted position at the interval or the event of the policy, before a rebalance
 ///   takes a partition away, and in [`close`](Self::close).
 /// - The reader stays usable after a [`ReadError`] and retries by itself. `HistoryUnavailable`
 ///   stops its partition until a `seek` when the position came from an earlier read of a history
-///   that is gone. A refusal that a quick retry does not change, such as `Unauthorized` or
-///   `PartitionNotFound`, is retried after a wait that doubles each time, and after six in a row
-///   it stops its partition until a `seek` with one error.
+///   that is gone. A refusal that a quick retry does not change, such as `Unauthorized`,
+///   `PartitionNotFound`, or `ConsumerGroupPartitionNotOwned` again after the refresh that each
+///   one starts, is retried after a wait that doubles each time, and after six in a row it stops
+///   its partition until a `seek` with one error.
 /// - With `OnRead`, the reader reads each partition from its stored offset after a delivery, so
 ///   the server refuses the commit of an older read once the offset moved. A read whose reply is
-///   lost can still have stored its offset. The reader then abandons its operation, and when the
-///   next read starts past the last delivered message, it reads the skipped messages again by
-///   offset without a commit and hands them over first. Messages that a lost read committed are
-///   lost only when a rebalance moves their partition to another member before that.
+///   lost can still have stored its offset. The reader then abandons its operation, and while it
+///   holds that lost read, a next read that starts past the last delivered message makes it read
+///   the skipped messages again by offset without a commit and hand them over first. Without a
+///   lost read, such a read goes on from where it starts, because the application or another
+///   session stored that offset. Messages that a lost read committed are lost only when a
+///   rebalance moves their partition to another member before that.
 /// - Dropping the reader stops its tasks without waiting, and it moves no offset back.
 pub struct PartitionReader {
     config: Arc<Config>,
@@ -322,12 +328,15 @@ impl PartitionReader {
         self.shared.progress.commit(checkpoint).await
     }
 
-    /// Sets the next read position of `partition` and starts a new generation of it. It stores
-    /// no offset, drops the queued batches of the partition and ignores its late replies. It
-    /// also resumes a stopped partition.
+    /// Sets the next read position of `partition` and starts a new generation of it. It drops
+    /// the queued batches of the partition, ignores its late replies and resumes a stopped
+    /// partition.
     ///
-    /// With `OnRead`, the new position waits for the end of the committing read in flight, and
-    /// the first read from it commits as usual.
+    /// With `OnRead`, a seek to an offset above 0 first stores the offset before it, under the
+    /// history of a continuation or else of the last delivered message, so a restart resumes at
+    /// the new position. A failed store fails the seek and nothing moves. Every other seek stores
+    /// nothing. The new position waits for the end of the committing read in flight, whose
+    /// reply the new generation drops, and the first read from it commits as usual.
     ///
     /// # Errors
     ///
@@ -337,6 +346,7 @@ impl PartitionReader {
     /// - [`IggyError::PartitionLaneBlocked`] with `OnRead` while another call on the client left
     ///   a committing read of the partition with an unknown outcome. Call `abandon_operation`
     ///   with its operation first.
+    /// - The errors of the offset store with `OnRead`.
     pub async fn seek(&mut self, partition: u32, start: PollingStrategy) -> Result<(), IggyError> {
         start.validate_partition(partition)?;
         if !self.shared.partitions().contains(&partition) {
@@ -349,14 +359,48 @@ impl PartitionReader {
         {
             return Err(IggyError::PartitionLaneBlocked(partition, operation));
         }
+        let start = first_as_offset(start);
+        let stored = self.store_before(partition, start).await?;
         while let Ok(reply) = self.receiver.try_recv() {
             self.split(reply);
         }
         self.queue
             .retain(|entry| entry.partition() != Some(partition));
-        self.shared.progress.seek(partition, start);
+        match stored {
+            Some(stored) => self.shared.progress.resume_after(stored, start),
+            None => {
+                self.shared.progress.seek(partition, start);
+            }
+        }
         self.shared.wake.notify_one();
         Ok(())
+    }
+
+    /// With `OnRead`, a seek to an offset above 0 stores the offset before it. The store carries
+    /// the history of a continuation, else that of the last delivered message, else none.
+    async fn store_before(
+        &self,
+        partition: u32,
+        start: PollingStrategy,
+    ) -> Result<Option<Checkpoint>, IggyError> {
+        if !self.config.on_read() || start.kind != PollingKind::Offset {
+            return Ok(None);
+        }
+        let Some(before) = start.value.checked_sub(1) else {
+            return Ok(None);
+        };
+        let progress = &self.shared.progress;
+        let context = start.context().or_else(|| {
+            progress
+                .last_delivered(partition)
+                .map(|delivered| delivered.context())
+        });
+        let stored = Checkpoint::new(partition, before, context.unwrap_or_default());
+        match context {
+            Some(_) => progress.store(stored).await?,
+            None => progress.store_offset(partition, before).await?,
+        }
+        Ok(Some(stored))
     }
 
     /// The partitions that the reader reads: those of a standalone consumer, or the current
@@ -366,7 +410,8 @@ impl PartitionReader {
         self.shared.partitions()
     }
 
-    /// Stops the reader. It waits at most until the deadlines of the reads in flight. With
+    /// Stops the reader. With `OnRead`, it cancels each read in flight and takes its one reply,
+    /// which tells what the server stored, at most until the deadline of the read. With
     /// `Manual` it commits nothing. With `Auto`, it counts the last batch under
     /// `CommitAfter::Processing` and stores the latest counted position of each partition.
     ///

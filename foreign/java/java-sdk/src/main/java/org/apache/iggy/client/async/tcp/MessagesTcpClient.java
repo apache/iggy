@@ -304,6 +304,11 @@ public class MessagesTcpClient implements MessagesClient {
                 pollRouter.startCall()));
     }
 
+    /** Completes once no committing read of this client that was cancelled after its send still waits for its reply. */
+    CompletableFuture<Void> cancelledReadsSettled() {
+        return pollRouter.sessionOwner().cancelledReadsSettled();
+    }
+
     /**
      * Fetches the partitions of one primary in one request, sent to the primary of the first target, as a reader
      * reads one readiness group. A committing fetch whose reply is lost fails with
@@ -317,6 +322,20 @@ public class MessagesTcpClient implements MessagesClient {
             Long count,
             boolean autoCommit,
             DeferredPollOptions options) {
+        return fetchMessages(streamId, topicId, targets, consumer, count, autoCommit, options, pollRouter.startCall());
+    }
+
+    /** {@link #fetchMessages}, under a call state whose ticket the caller keeps, to see a retained outcome later. */
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    CompletableFuture<List<FetchedMessages>> fetchMessages(
+            StreamId streamId,
+            TopicId topicId,
+            Map<Long, PollingStrategy> targets,
+            Consumer consumer,
+            Long count,
+            boolean autoCommit,
+            DeferredPollOptions options,
+            AsyncTcpConnection.TransientFailoverState state) {
         requireWirePartitionIds(targets.keySet(), FETCH);
         FetchMessages.validate(targets, count, options);
         long deadline = System.nanoTime() + options.requestTimeout().toNanos();
@@ -331,7 +350,11 @@ public class MessagesTcpClient implements MessagesClient {
                 autoCommit,
                 options,
                 deadline,
-                pollRouter.startCall()));
+                state));
+    }
+
+    AsyncTcpConnection.TransientFailoverState startCall() {
+        return pollRouter.startCall();
     }
 
     @Override

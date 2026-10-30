@@ -39,8 +39,9 @@ use crate::duration::{
 pub enum CommitPolicy {
     /// Nothing is stored. The application commits checkpoints. The default.
     Manual(),
-    /// The server stores the offset of the last message of each read as part of the read: one
-    /// round trip, at most once.
+    /// The server stores the offset of the last message of each read as part of the read, in one
+    /// round trip. While the primary stays up a message is delivered at most once. A failover
+    /// before the store replicates can deliver the last batch again.
     OnRead(),
     /// A `PartitionReader` or an `IggyConsumer` stores the latest counted position, at least
     /// once with `CommitAfter.Processing`. `IggyClient.poll_messages()` refuses it.
@@ -277,7 +278,11 @@ fn commit_every_repr(every: Option<RustCommitEvery>) -> String {
     }
 }
 
-/// The limits of each read and when its offsets are stored.
+/// The limits of each read and when its offsets are stored. A read is a poll of one partition,
+/// or a fetch that a partition reader sends for several partitions of one primary. A fetch
+/// applies `count`, `min_count` and `max_bytes` to all of its partitions together. A reader that
+/// commits nothing runs several fetches at once, each within these limits, for partitions with
+/// more messages waiting.
 #[derive(Clone, Copy)]
 #[gen_stub_pyclass]
 #[pyclass(frozen, from_py_object)]
@@ -291,12 +296,14 @@ impl PollOptions {
     /// Constructs the options of a read.
     ///
     /// Args:
-    ///     count: The most messages in one batch.
+    ///     count: The most messages in one read, over all partitions of a fetch.
     ///     max_wait: How long the server waits for `min_count` messages, at most 600 seconds.
     ///         `None` answers at once. A reader or a consumer with no wait on an idle topic
     ///         polls in a busy loop.
-    ///     min_count: The messages to wait for, from 1 to `count`.
-    ///     max_bytes: The most bytes in one batch. A message larger than that comes alone.
+    ///     min_count: The messages to wait for, from 1 to `count`, over all partitions of a
+    ///         fetch.
+    ///     max_bytes: The most bytes in one read, over all partitions of a fetch. A message
+    ///         larger than that comes alone.
     ///     commit: When offsets are stored. `None` stores none, as `CommitPolicy.Manual()`.
     ///
     /// The limits are checked when the options are used, and a fault raises `IggyError`.
@@ -336,7 +343,7 @@ impl PollOptions {
         })
     }
 
-    /// The most messages in one batch.
+    /// The most messages in one read, over all partitions of a fetch.
     #[getter]
     fn count(&self) -> u32 {
         self.inner.count
@@ -355,7 +362,7 @@ impl PollOptions {
         self.inner.min_count
     }
 
-    /// The most bytes in one batch.
+    /// The most bytes in one read, over all partitions of a fetch.
     #[getter]
     fn max_bytes(&self) -> u32 {
         self.inner.max_bytes

@@ -16,8 +16,8 @@
 // under the License.
 
 // Package reader reads the partitions of a topic with a PartitionReader, which
-// groups them by primary and reads each group with one request, and hands
-// over one message at a time with an IggyConsumer.
+// groups them by primary and reads the partitions of a group together, and
+// hands over one message at a time with an IggyConsumer.
 package reader
 
 import (
@@ -51,8 +51,8 @@ type ReadError struct {
 	// PartitionID is the partition of the error, or nil for an error of the whole reader.
 	PartitionID *uint32
 	Err         error
-	// Skip is, for a section that does not decode, the continuation after it.
-	// The partition stops until a Seek, to Skip to step over the section.
+	// Skip is, for a message that does not decode, the continuation after it.
+	// The partition stops until a Seek, to Skip to step over the message.
 	Skip *iggcon.PollingStrategy
 }
 
@@ -126,9 +126,14 @@ type partition struct {
 	// fromRead marks a position that a read gave, so it carries the history of the partition.
 	fromRead bool
 	inFlight bool
-	retryAt  time.Time
+	// parked marks a partition whose read in flight holds quiet partitions, so it may wait.
+	parked  bool
+	retryAt time.Time
 	// servedAt is the read turn that last returned messages of the partition.
-	servedAt        uint64
+	servedAt uint64
+	// backlogged marks a partition whose last section ended before its last
+	// message, so its next read returns at once.
+	backlogged      bool
 	lastingRefusals int
 	stopped         *ReadError
 	context         iggcon.PartitionContext
@@ -139,11 +144,18 @@ type partition struct {
 	firstDelivered *uint64
 	delivered      *iggcon.Checkpoint
 	committed      *uint64
+	// lostRead marks a committing read whose outcome is unknown, until a later
+	// committing read returns messages without a gap. Only then does a forward
+	// jump mean that the lost read stored.
+	lostRead bool
 	// gapFrom and held: under OnRead, the start of the messages that a lost
 	// read stored, and the batch that was read after them.
-	gapFrom     *uint64
-	gapEnd      uint64
-	held        *iggcon.PolledMessage
+	gapFrom *uint64
+	gapEnd  uint64
+	held    *iggcon.PolledMessage
+	// aloneUntil is the end of a section that did not decode, which the
+	// partition reads one message at a time.
+	aloneUntil  *uint64
 	pendingSeek *iggcon.PollingStrategy
 	counted     *iggcon.Checkpoint
 	stored      *iggcon.Checkpoint
@@ -151,7 +163,7 @@ type partition struct {
 }
 
 func (p *partition) deliveredHere(checkpoint iggcon.Checkpoint) bool {
-	return p.delivered != nil && p.firstDelivered != nil && checkpoint.Context() == p.delivered.Context() &&
+	return p.delivered != nil && p.firstDelivered != nil && sameIncarnationAndOwner(checkpoint.Context(), p.delivered.Context()) &&
 		checkpoint.Offset() >= *p.firstDelivered && checkpoint.Offset() <= p.delivered.Offset()
 }
 
@@ -223,6 +235,11 @@ type PartitionReader struct {
 	stop     context.CancelFunc
 	inFlight sync.WaitGroup
 	loopDone chan struct{}
+	// closeDone closes when the first Close ends, with its result in closeErr.
+	closeDone chan struct{}
+	closeErr  error
+	// seekStores are the stores of the seeks that a read applied after Close started.
+	seekStores []func(context.Context) error
 }
 
 // NewPartitionReader starts a reader. A consumer group reader joins its group first.
@@ -275,7 +292,7 @@ func NewPartitionReader(
 		onRead:     cfg.options.Commit.Kind == iggcon.CommitOnRead,
 		partitions: make(map[uint32]*partition), changed: make(chan struct{}), regroup: true,
 		storeDue: make(chan struct{}, 1), wake: make(chan struct{}, 1), run: run, stop: stop,
-		loopDone: make(chan struct{}),
+		loopDone: make(chan struct{}), closeDone: make(chan struct{}),
 	}
 	if cfg.options.Commit.Kind == iggcon.CommitAuto {
 		auto := cfg.options.Commit.Auto
@@ -299,10 +316,12 @@ func NewPartitionReader(
 // Next returns the next batch of one partition, never empty. A cancelled call
 // leaves its batch in the reader. It fails with a *ReadError for an error of a read.
 func (r *PartitionReader) Next(ctx context.Context) (*iggcon.PolledMessage, error) {
-	return r.next(ctx, true)
+	batch, _, err := r.next(ctx, true)
+	return batch, err
 }
 
-func (r *PartitionReader) next(ctx context.Context, delivers bool) (*iggcon.PolledMessage, error) {
+// next returns the next batch and the generation of its partition that read it.
+func (r *PartitionReader) next(ctx context.Context, delivers bool) (*iggcon.PolledMessage, uint64, error) {
 	r.mu.Lock()
 	if delivers {
 		r.countUncountedLocked()
@@ -310,7 +329,7 @@ func (r *PartitionReader) next(ctx context.Context, delivers bool) (*iggcon.Poll
 	for {
 		if r.closed {
 			r.mu.Unlock()
-			return nil, ierror.ErrClientShutdown
+			return nil, 0, ierror.ErrClientShutdown
 		}
 		for len(r.queue) > 0 {
 			head := r.queue[0]
@@ -321,14 +340,14 @@ func (r *PartitionReader) next(ctx context.Context, delivers bool) (*iggcon.Poll
 			if head.err != nil {
 				r.mu.Unlock()
 				r.signal()
-				return nil, head.err
+				return nil, 0, head.err
 			}
 			if p := r.partitions[uint32(head.partition)]; delivers && p != nil {
 				r.deliveredLocked(p, head.batch)
 			}
 			r.mu.Unlock()
 			r.signal()
-			return head.batch, nil
+			return head.batch, head.generation, nil
 		}
 		r.waiting++
 		changed := r.changed
@@ -340,7 +359,7 @@ func (r *PartitionReader) next(ctx context.Context, delivers bool) (*iggcon.Poll
 			r.mu.Lock()
 			r.waiting--
 			r.mu.Unlock()
-			return nil, ctx.Err()
+			return nil, 0, ctx.Err()
 		}
 		r.mu.Lock()
 		r.waiting--
@@ -383,10 +402,18 @@ func (r *PartitionReader) Commit(ctx context.Context, checkpoint iggcon.Checkpoi
 		r.mu.Unlock()
 		return nil
 	}
-	offset := checkpoint.Offset()
-	p.committed = &offset
+	generation := p.generation
 	r.mu.Unlock()
-	return r.client.StoreConsumerPosition(ctx, r.consumer, r.stream, r.topic, checkpointPosition(checkpoint))
+	if err := r.client.StoreConsumerPosition(ctx, r.consumer, r.stream, r.topic, checkpointPosition(checkpoint)); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if p.generation == generation && (p.committed == nil || checkpoint.Offset() > *p.committed) {
+		offset := checkpoint.Offset()
+		p.committed = &offset
+	}
+	return nil
 }
 
 // Seek sets the next read position of a partition and starts a new generation
@@ -394,8 +421,18 @@ func (r *PartitionReader) Commit(ctx context.Context, checkpoint iggcon.Checkpoi
 // one. Under CommitOnRead, a seek to an offset stores the offset before it
 // once the read in flight ended, so the next read of the server starts there.
 func (r *PartitionReader) Seek(ctx context.Context, partitionID uint32, start iggcon.PollingStrategy) error {
-	if err := start.RequirePartition(partitionID); err != nil {
+	store, err := r.startSeek(partitionID, start)
+	if err != nil || store == nil {
 		return err
+	}
+	return store(ctx)
+}
+
+// startSeek starts the new generation of a seek, and returns the store that
+// must go before its next read under OnRead.
+func (r *PartitionReader) startSeek(partitionID uint32, start iggcon.PollingStrategy) (func(context.Context) error, error) {
+	if err := start.RequirePartition(partitionID); err != nil {
+		return nil, err
 	}
 	if start.Kind == iggcon.POLLING_FIRST {
 		start = iggcon.OffsetPollingStrategy(0)
@@ -404,7 +441,7 @@ func (r *PartitionReader) Seek(ctx context.Context, partitionID uint32, start ig
 	p := r.partitions[partitionID]
 	if p == nil || r.closed {
 		r.mu.Unlock()
-		return ierror.ErrInvalidCommand
+		return nil, ierror.ErrInvalidCommand
 	}
 	r.lastGen++
 	if r.seekGenerations == nil {
@@ -415,15 +452,12 @@ func (r *PartitionReader) Seek(ctx context.Context, partitionID uint32, start ig
 	if r.onRead && p.inFlight {
 		p.pendingSeek = &start
 		r.mu.Unlock()
-		return nil
+		return nil, nil
 	}
 	store := r.applySeekLocked(p, start)
 	r.mu.Unlock()
 	r.signal()
-	if store != nil {
-		return store(ctx)
-	}
-	return nil
+	return store, nil
 }
 
 // Partitions are the partitions that the reader reads now.
@@ -440,15 +474,22 @@ func (r *PartitionReader) Partitions() []uint32 {
 
 // Close stops the reader and waits for its reads, which it lets end. With
 // CommitAuto it counts the last batch under CommitAfterProcessing and stores
-// the latest counted position of each partition. With CommitOnRead it moves
-// the offset of each partition with undelivered batches back to its last
-// delivered message. A group reader then leaves its group. It returns the
-// first failed store or leave.
+// the latest counted position of each partition. With CommitOnRead it first
+// stores the offset of each seek that waited for one of those reads, then
+// moves the offset of each partition with undelivered batches back to its
+// last delivered message. A group reader then leaves its group. It returns the
+// first failed store or leave. A later Close waits for the first one and
+// returns its result.
 func (r *PartitionReader) Close(ctx context.Context) error {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
-		return nil
+		select {
+		case <-r.closeDone:
+			return r.closeErr
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	r.closed = true
 	r.countUncountedLocked()
@@ -458,8 +499,15 @@ func (r *PartitionReader) Close(ctx context.Context) error {
 	<-r.loopDone
 	r.inFlight.Wait()
 	var failure error
+	for _, store := range r.seekStores {
+		if err := store(ctx); err != nil && failure == nil {
+			failure = err
+		}
+	}
 	if r.onRead {
-		failure = r.rewind(ctx)
+		if err := r.rewind(ctx); err != nil && failure == nil {
+			failure = err
+		}
 	}
 	if r.auto != nil {
 		if err := r.flush(ctx); err != nil && failure == nil {
@@ -467,10 +515,14 @@ func (r *PartitionReader) Close(ctx context.Context) error {
 		}
 	}
 	if r.group {
-		if err := r.client.LeaveConsumerGroup(ctx, r.stream, r.topic, r.consumer.Id); err != nil && failure == nil {
+		// A member that the server no longer knows, after a lost session, has left already.
+		err := r.client.LeaveConsumerGroup(ctx, r.stream, r.topic, r.consumer.Id)
+		if err != nil && !errors.Is(err, ierror.ErrConsumerGroupMemberNotFound) && failure == nil {
 			failure = err
 		}
 	}
+	r.closeErr = failure
+	close(r.closeDone)
 	return failure
 }
 
@@ -548,21 +600,22 @@ func (r *PartitionReader) pump() time.Duration {
 		r.inFlight.Add(1)
 		go r.regroupPartitions(ids)
 	}
-	if !r.grouping && len(r.groups) > 0 && (!r.onRead || (r.waiting > 0 && len(r.queue) == 0)) {
-		budget := r.slots - len(r.queue) - r.reads
-		if r.onRead {
-			budget = len(r.groups)
-		}
-		first := r.groupCursor
-		for turn := 0; turn < len(r.groups) && budget > 0; turn++ {
-			index := (first + turn) % len(r.groups)
-			targets := r.readyTargetsLocked(r.groups[index], now)
-			if len(targets) > 0 {
-				r.readLocked(targets, r.config.options.Count, r.onRead)
-				budget--
-				r.groupCursor = index + 1
+	if !r.grouping {
+		// These reads commit nothing, so they go without demand.
+		for _, p := range r.partitions {
+			if p.inFlight || p.stopped != nil || p.retryAt.After(now) {
+				continue
+			}
+			if p.gapFrom != nil {
+				r.readGapLocked(p)
+			} else if p.aloneUntil != nil {
+				r.readLocked([]iggcon.FetchMessagesTarget{{PartitionId: p.id, Strategy: p.position}}, 1, false, false)
 			}
 		}
+	}
+	// Under OnRead each read stores its batch, so the reads go only on demand.
+	if !r.grouping && len(r.groups) > 0 && (!r.onRead || (r.waiting > 0 && len(r.queue) == 0)) {
+		r.readGroupsLocked(now)
 	}
 	wait := r.config.retryInterval
 	for _, p := range r.partitions {
@@ -573,13 +626,101 @@ func (r *PartitionReader) pump() time.Duration {
 	return max(wait, time.Millisecond)
 }
 
+// readGroupsLocked gives every group with ready partitions one read, the
+// groups without a read that may wait in flight first, and deals the free
+// slots left to the backlogged partitions, one read each with the whole count
+// and bytes. The quiet partitions of a group share one read, which may wait on
+// the server. Under OnRead that read stores, so a group holds one at a time.
+func (r *PartitionReader) readGroupsLocked(now time.Time) {
+	budget := r.slots - len(r.queue) - r.reads
+	if budget <= 0 {
+		return
+	}
+	type groupRead struct {
+		turn              int
+		index             int
+		ready             []iggcon.FetchMessagesTarget
+		quiet, backlogged []iggcon.FetchMessagesTarget
+		extra             int
+	}
+	var idle, reading []*groupRead
+	first := r.groupCursor
+	for turn := range len(r.groups) {
+		index := (first + turn) % len(r.groups)
+		parked := r.groupParksLocked(r.groups[index])
+		ready := r.readyTargetsLocked(r.groups[index], now, parked)
+		if len(ready) == 0 {
+			continue
+		}
+		read := &groupRead{turn: turn, index: index, ready: ready}
+		for _, target := range ready {
+			if r.partitions[target.PartitionId].backlogged {
+				read.backlogged = append(read.backlogged, target)
+			} else {
+				read.quiet = append(read.quiet, target)
+			}
+		}
+		if parked {
+			reading = append(reading, read)
+		} else {
+			idle = append(idle, read)
+		}
+	}
+	chosen := append(idle, reading...)
+	chosen = chosen[:min(len(chosen), budget)]
+	sort.Slice(chosen, func(i, j int) bool { return chosen[i].turn < chosen[j].turn })
+	// Every read holds at least one partition.
+	for extra, dealt := budget-len(chosen), true; extra > 0 && dealt; {
+		dealt = false
+		for _, read := range chosen {
+			limit := len(read.backlogged)
+			if len(read.quiet) == 0 {
+				limit--
+			}
+			if extra > 0 && read.extra < limit {
+				read.extra++
+				extra--
+				dealt = true
+			}
+		}
+	}
+	for _, read := range chosen {
+		var reads [][]iggcon.FetchMessagesTarget
+		switch {
+		case read.extra == 0:
+			reads = [][]iggcon.FetchMessagesTarget{read.ready}
+		case len(read.quiet) == 0:
+			reads = dealTargets(read.backlogged, read.extra+1)
+		default:
+			reads = append([][]iggcon.FetchMessagesTarget{read.quiet}, dealTargets(read.backlogged, read.extra)...)
+		}
+		for at, targets := range reads {
+			r.readLocked(targets, r.config.options.Count, r.onRead, at == 0 && len(read.quiet) > 0)
+		}
+		r.groupCursor = read.index + 1
+	}
+}
+
+// groupParksLocked reports whether a read of the group that may wait is in flight.
+func (r *PartitionReader) groupParksLocked(group []uint32) bool {
+	for _, id := range group {
+		if p := r.partitions[id]; p != nil && p.inFlight && p.parked {
+			return true
+		}
+	}
+	return false
+}
+
 // readyTargetsLocked puts the partitions served last at the end, since a fetch
-// that reaches its count serves its first targets.
-func (r *PartitionReader) readyTargetsLocked(group []uint32, now time.Time) []iggcon.FetchMessagesTarget {
+// that reaches its count serves its first targets. Under OnRead a quiet
+// partition waits for the read of the group that may wait, since a second one
+// would store.
+func (r *PartitionReader) readyTargetsLocked(group []uint32, now time.Time, parked bool) []iggcon.FetchMessagesTarget {
 	var ready []*partition
 	for _, id := range group {
 		p := r.partitions[id]
-		if p != nil && !p.inFlight && p.stopped == nil && p.gapFrom == nil && !p.retryAt.After(now) {
+		if p != nil && !p.inFlight && p.stopped == nil && p.gapFrom == nil && p.aloneUntil == nil && !p.retryAt.After(now) &&
+			(p.backlogged || !r.onRead || !parked) {
 			ready = append(ready, p)
 		}
 	}
@@ -591,19 +732,19 @@ func (r *PartitionReader) readyTargetsLocked(group []uint32, now time.Time) []ig
 	return targets
 }
 
-func (r *PartitionReader) readLocked(targets []iggcon.FetchMessagesTarget, count uint32, commit bool) {
+func (r *PartitionReader) readLocked(targets []iggcon.FetchMessagesTarget, count uint32, commit, parked bool) {
 	generations := make(map[uint32]uint64, len(targets))
 	for _, target := range targets {
 		p := r.partitions[target.PartitionId]
 		p.inFlight = true
+		p.parked = parked
 		generations[target.PartitionId] = p.generation
 	}
 	r.reads++
 	r.inFlight.Add(1)
 	options := r.config.options.Deferred()
-	if count == 1 {
-		options.MinCount = 1
-	}
+	// A read of a lost range or of one message asks for fewer messages than the reader.
+	options.MinCount = min(options.MinCount, count)
 	// A fetch needs the reply margin also without a wait.
 	options.RequestTimeout = max(options.RequestTimeout, options.MaxWait+iggcon.MinDeferredPollReplyMargin+time.Second)
 	go func() {
@@ -619,19 +760,23 @@ func (r *PartitionReader) readLocked(targets []iggcon.FetchMessagesTarget, count
 		}
 		r.mu.Lock()
 		r.reads--
-		for id := range generations {
-			if p := r.partitions[id]; p != nil {
+		for id, generation := range generations {
+			// A seek or a new assignment started a new generation, whose own read can be in flight.
+			if p := r.partitions[id]; p != nil && p.generation == generation {
 				p.inFlight = false
 			}
 		}
-		if !r.closed {
+		switch {
+		case !r.closed:
 			if err == nil {
 				r.acceptLocked(generations, commit, sections)
 			} else {
 				r.refuseLocked(generations, err)
 			}
-			r.applyPendingSeeksLocked(generations)
+		case commit:
+			r.settleOnCloseLocked(generations, sections, err)
 		}
+		r.applyPendingSeeksLocked(generations)
 		r.broadcastLocked()
 		r.mu.Unlock()
 		r.signal()
@@ -716,8 +861,16 @@ func (r *PartitionReader) prepareRead(targets []iggcon.FetchMessagesTarget, gene
 func (r *PartitionReader) acceptLocked(generations map[uint32]uint64, commit bool, sections []iggcon.FetchMessagesSection) {
 	now := time.Now()
 	answered := make(map[uint32]bool, len(sections))
+	var abandoned uint64
 	for _, section := range sections {
 		answered[section.PartitionId] = true
+		var unknown ierror.FetchProgressUncertain
+		lost := errors.As(section.Err, &unknown)
+		if lost && unknown.OperationID != abandoned {
+			// The lost read holds the progress of its partition, also after a seek or a new assignment.
+			r.abandon(unknown.OperationID)
+			abandoned = unknown.OperationID
+		}
 		p := r.partitions[section.PartitionId]
 		generation, read := generations[section.PartitionId]
 		if !read || !r.keepsLocked(section.PartitionId, generation) {
@@ -731,10 +884,10 @@ func (r *PartitionReader) acceptLocked(generations map[uint32]uint64, commit boo
 		if p == nil || p.generation != generations[section.PartitionId] || p.pendingSeek != nil {
 			continue
 		}
-		var unknown ierror.FetchProgressUncertain
-		if errors.As(section.Err, &unknown) {
+		if lost {
 			// The next read of the server shows what the lost read stored, and the gap check reads it again.
-			r.abandon(unknown.OperationID)
+			p.lostRead = true
+			p.retryAt = now.Add(r.config.retryInterval)
 			continue
 		}
 		if section.Err != nil {
@@ -753,12 +906,11 @@ func (r *PartitionReader) acceptLocked(generations map[uint32]uint64, commit boo
 }
 
 func (r *PartitionReader) receiveLocked(p *partition, section iggcon.FetchMessagesSection, commit bool, now time.Time) {
+	// An empty partition reports a current offset of 0.
+	p.backlogged = section.NextOffset <= section.CurrentOffset && (section.MessageCount > 0 || section.CurrentOffset > 0)
 	polled, err := binaryserialization.DeserializeSectionMessages(section)
 	if err != nil {
-		skip := iggcon.OffsetPollingStrategy(section.NextOffset).WithContext(section.Context)
-		failure := &ReadError{PartitionID: &p.id, Err: err, Skip: &skip}
-		p.stopped = failure
-		r.queue = append(r.queue, entry{partition: int64(p.id), generation: p.generation, err: failure})
+		r.refuseUndecodedLocked(p, section, commit, err)
 		return
 	}
 	expected := p.baseline
@@ -767,7 +919,7 @@ func (r *PartitionReader) receiveLocked(p *partition, section iggcon.FetchMessag
 		expected = &next
 	}
 	if len(polled.Messages) == 0 {
-		if commit && p.gapFrom == nil && expected != nil && section.NextOffset > *expected {
+		if commit && p.lostRead && p.gapFrom == nil && expected != nil && section.NextOffset > *expected {
 			gap := *expected
 			p.gapFrom = &gap
 			p.gapEnd = section.NextOffset
@@ -775,6 +927,19 @@ func (r *PartitionReader) receiveLocked(p *partition, section iggcon.FetchMessag
 			last := section.NextOffset - 1
 			p.received = &last
 			r.readGapLocked(p)
+			return
+		}
+		if !commit && p.gapFrom != nil {
+			switch {
+			case section.NextOffset >= p.gapEnd:
+				r.acceptGapLocked(p, polled)
+			case section.NextOffset > *p.gapFrom:
+				// The messages before the next offset are gone.
+				next := section.NextOffset
+				p.gapFrom = &next
+			default:
+				p.retryAt = now.Add(r.config.retryInterval)
+			}
 			return
 		}
 		if r.config.options.MaxWait == 0 {
@@ -787,7 +952,7 @@ func (r *PartitionReader) receiveLocked(p *partition, section iggcon.FetchMessag
 	first := polled.Messages[0].Header.Offset
 	last := polled.Messages[len(polled.Messages)-1].Header.Offset
 	switch {
-	case commit && p.gapFrom == nil && expected != nil && first > *expected:
+	case commit && p.lostRead && p.gapFrom == nil && expected != nil && first > *expected:
 		// A read whose reply was lost stored up to here, so the messages in between are read again first.
 		gap := *expected
 		p.gapFrom = &gap
@@ -798,15 +963,55 @@ func (r *PartitionReader) receiveLocked(p *partition, section iggcon.FetchMessag
 	case p.gapFrom != nil && !commit:
 		r.acceptGapLocked(p, polled)
 	default:
-		p.received = &last
+		if commit {
+			// This store fences out any older read that is still parked on the server.
+			p.lostRead = false
+		}
+		// A read alone goes over messages that an earlier read returned.
+		if p.received == nil || last > *p.received {
+			p.received = &last
+		}
 		r.queue = append(r.queue, entry{partition: int64(p.id), generation: p.generation, batch: polled})
 	}
-	if r.onRead {
+	if p.aloneUntil != nil && (p.gapFrom == nil && last+1 >= *p.aloneUntil || p.gapFrom != nil && *p.gapFrom >= *p.aloneUntil) {
+		p.aloneUntil = nil
+	}
+	switch continuation, _ := polled.Continuation(); {
+	case p.aloneUntil != nil && p.gapFrom == nil:
+		p.position = continuation
+	case r.onRead:
 		p.position = iggcon.NextPollingStrategy()
-	} else if continuation, ok := polled.Continuation(); ok {
+	default:
 		p.position = continuation
 	}
-	p.fromRead = !r.onRead
+	p.fromRead = p.position.Context != nil
+}
+
+// refuseUndecodedLocked reads a section that does not decode again one
+// message at a time, so each good message reaches the application. A message
+// that does not decode stops the partition with the continuation after it.
+func (r *PartitionReader) refuseUndecodedLocked(p *partition, section iggcon.FetchMessagesSection, commit bool, err error) {
+	start := section.NextOffset - min(uint64(section.MessageCount), section.NextOffset)
+	if commit && section.NextOffset > 0 {
+		// The server stored the offset of the section, so Close moves it back over what was not delivered.
+		last := section.NextOffset - 1
+		if p.received == nil || last > *p.received {
+			p.received = &last
+		}
+	}
+	if section.MessageCount > 1 {
+		until := section.NextOffset
+		p.aloneUntil = &until
+		if p.gapFrom == nil {
+			p.position = iggcon.OffsetPollingStrategy(start).WithContext(section.Context)
+			p.fromRead = true
+		}
+		return
+	}
+	skip := iggcon.OffsetPollingStrategy(start + 1).WithContext(section.Context)
+	failure := &ReadError{PartitionID: &p.id, Err: err, Skip: &skip}
+	p.stopped = failure
+	r.queue = append(r.queue, entry{partition: int64(p.id), generation: p.generation, err: failure})
 }
 
 // receiveStoredLocked queues the messages of a stored read of a partition that left the assignment.
@@ -820,11 +1025,50 @@ func (r *PartitionReader) receiveStoredLocked(section iggcon.FetchMessagesSectio
 	}
 }
 
+// settleOnCloseLocked records what a committing read that ended during Close
+// stored, so that the rewind moves the offset back over it.
+func (r *PartitionReader) settleOnCloseLocked(generations map[uint32]uint64, sections []iggcon.FetchMessagesSection, err error) {
+	var unknown ierror.FetchProgressUncertain
+	if errors.As(err, &unknown) {
+		r.abandon(unknown.OperationID)
+		for id, generation := range generations {
+			if p := r.partitions[id]; p != nil && p.generation == generation {
+				p.lostRead = true
+			}
+		}
+		return
+	}
+	var abandoned uint64
+	for _, section := range sections {
+		p := r.partitions[section.PartitionId]
+		generation, read := generations[section.PartitionId]
+		if p == nil || !read || p.generation != generation {
+			continue
+		}
+		switch {
+		case errors.As(section.Err, &unknown):
+			if unknown.OperationID != abandoned {
+				r.abandon(unknown.OperationID)
+				abandoned = unknown.OperationID
+			}
+			p.lostRead = true
+		case section.Err == nil && section.MessageCount > 0 && section.NextOffset > 0:
+			last := section.NextOffset - 1
+			if p.received == nil || last > *p.received {
+				p.received = &last
+			}
+		}
+	}
+}
+
 func (r *PartitionReader) readGapLocked(p *partition) {
 	missing := p.gapEnd - *p.gapFrom
 	count := uint32(min(uint64(r.config.options.Count), missing))
+	if p.aloneUntil != nil && *p.gapFrom < *p.aloneUntil {
+		count = 1
+	}
 	strategy := iggcon.OffsetPollingStrategy(*p.gapFrom).WithContext(p.context)
-	r.readLocked([]iggcon.FetchMessagesTarget{{PartitionId: p.id, Strategy: strategy}}, count, false)
+	r.readLocked([]iggcon.FetchMessagesTarget{{PartitionId: p.id, Strategy: strategy}}, count, false, false)
 }
 
 func (r *PartitionReader) acceptGapLocked(p *partition, read *iggcon.PolledMessage) {
@@ -855,6 +1099,7 @@ func (r *PartitionReader) acceptGapLocked(p *partition, read *iggcon.PolledMessa
 }
 
 func (r *PartitionReader) refuseSectionLocked(p *partition, err error, now time.Time) {
+	p.backlogged = false
 	if p.gapFrom != nil && errors.Is(err, ierror.ErrConsumerGroupPartitionNotOwned) {
 		r.giveUpGapLocked(p)
 	}
@@ -883,6 +1128,12 @@ func (r *PartitionReader) refuseLocked(generations map[uint32]uint64, err error)
 	case errors.As(err, &unknown):
 		// The next read of the server starts after what the lost read stored, and the gap check reads it again.
 		r.abandon(unknown.OperationID)
+		for id := range generations {
+			if p := r.partitions[id]; p != nil {
+				p.lostRead = true
+				p.retryAt = now.Add(r.config.retryInterval)
+			}
+		}
 		return
 	case errors.Is(err, ierror.ErrNotPrimary):
 		r.regroup = true
@@ -914,8 +1165,20 @@ func (r *PartitionReader) handleRefusalLocked(p *partition, err error, now time.
 		r.regroup = true
 		return
 	case errors.Is(err, ierror.ErrConsumerGroupPartitionNotOwned):
+		// A rejoin gives the partition a new owner generation, so its next read starts from the stored offset.
+		p.position = r.config.start
+		p.fromRead = r.config.start.Context != nil
+		p.context = iggcon.PartitionContext{}
+		p.received = nil
+		p.baseline = nil
+		p.lostRead = false
 		r.refreshAt = now
 		p.retryAt = now.Add(r.config.retryInterval)
+		p.lastingRefusals++
+		if p.lastingRefusals >= lastingRefusalsBeforeStop {
+			p.lastingRefusals = 0
+			r.queue = append(r.queue, entry{partition: int64(p.id), generation: p.generation, err: &ReadError{PartitionID: &p.id, Err: err}})
+		}
 		return
 	case errors.Is(err, ierror.ErrTransientNotAccepted), errors.Is(err, ierror.ErrTransientNotCommitted),
 		errors.Is(err, ierror.ErrDeferredPollCapacityExceeded):
@@ -949,6 +1212,11 @@ func (r *PartitionReader) applyPendingSeeksLocked(generations map[uint32]uint64)
 		p.pendingSeek = nil
 		r.dropQueuedLocked(id)
 		if store := r.applySeekLocked(p, start); store != nil {
+			if r.closed {
+				// Close runs it after the reads ended and before its rewind.
+				r.seekStores = append(r.seekStores, store)
+				continue
+			}
 			r.inFlight.Add(1)
 			go func() {
 				defer r.inFlight.Done()
@@ -969,17 +1237,17 @@ func (r *PartitionReader) applySeekLocked(p *partition, start iggcon.PollingStra
 		return nil
 	}
 	// The server stores forward only on a read, so a store moves the offset that the next read starts after.
-	before := start.Value - 1
-	p.received = &before
+	if start.Context != nil {
+		p.context = *start.Context
+	}
+	first := start.Value
+	p.baseline = &first
 	p.position = iggcon.NextPollingStrategy()
 	history := p.context
-	if start.Context != nil {
-		history = *start.Context
-	}
 	id := p.id
 	return func(ctx context.Context) error {
 		return r.client.StoreConsumerPosition(ctx, r.consumer, r.stream, r.topic, iggcon.ConsumerPosition{
-			PartitionId: id, Offset: before, Context: history})
+			PartitionId: id, Offset: first - 1, Context: history})
 	}
 }
 
@@ -1001,6 +1269,13 @@ func (r *PartitionReader) currentLocked(queued entry) bool {
 		return true
 	}
 	return r.keepsLocked(uint32(queued.partition), queued.generation)
+}
+
+// keeps reports whether a batch that the generation of its partition read still counts.
+func (r *PartitionReader) keeps(partitionID uint32, generation uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.keepsLocked(partitionID, generation)
 }
 
 func (r *PartitionReader) keepsLocked(partitionID uint32, generation uint64) bool {
@@ -1145,7 +1420,8 @@ func (r *PartitionReader) rewind(ctx context.Context) error {
 	var deletes []iggcon.ConsumerPosition
 	for _, p := range r.partitions {
 		first, queued := firstQueued[p.id]
-		undelivered := queued || (p.readStarted && p.delivered == nil) || (p.received != nil && (p.delivered == nil || *p.received > p.delivered.Offset()))
+		undelivered := queued || p.lostRead || (p.readStarted && p.delivered == nil) ||
+			(p.received != nil && (p.delivered == nil || *p.received > p.delivered.Offset()))
 		switch {
 		case !undelivered:
 		case p.delivered != nil:
@@ -1262,10 +1538,26 @@ func (r *PartitionReader) abandon(operationID uint64) {
 	r.inFlight.Add(1)
 	go func() {
 		defer r.inFlight.Done()
-		if err := r.client.AbandonOperation(r.run, operationID); err != nil {
+		// Close waits for it, so the rewind after it finds the partition open.
+		if err := r.client.AbandonOperation(context.WithoutCancel(r.run), operationID); err != nil {
 			r.config.logger.Warn("Failed to abandon a lost read", "operation", operationID, "error", err)
 		}
 	}()
+}
+
+// dealTargets deals targets round robin into count reads.
+func dealTargets(targets []iggcon.FetchMessagesTarget, count int) [][]iggcon.FetchMessagesTarget {
+	reads := make([][]iggcon.FetchMessagesTarget, count)
+	for index, target := range targets {
+		reads[index%count] = append(reads[index%count], target)
+	}
+	return reads
+}
+
+// sameIncarnationAndOwner reports whether offsets of two contexts compare. The
+// metadata op is left out, because the server raises it per read.
+func sameIncarnationAndOwner(left, right iggcon.PartitionContext) bool {
+	return left.Incarnation == right.Incarnation && left.OwnerGeneration == right.OwnerGeneration
 }
 
 func checkpointPosition(checkpoint iggcon.Checkpoint) iggcon.ConsumerPosition {

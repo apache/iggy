@@ -54,6 +54,9 @@ mod ffi {
         kind: String,
         has_operation_id: bool,
         operation_id: u64,
+        /// The partition that a `partition_lane_blocked` error names.
+        has_blocked_partition_id: bool,
+        blocked_partition_id: u32,
     }
 
     struct Identifier {
@@ -232,7 +235,9 @@ mod ffi {
         /// Nothing is stored. The caller commits checkpoints. The default.
         Manual = 0,
         /// The server stores the offset of the last message of each read as
-        /// part of the read: one round trip, at most once.
+        /// part of the read, in one round trip. While the primary stays up a
+        /// message is delivered at most once. A failover before the store
+        /// replicates can deliver the last batch again.
         OnRead = 1,
         /// The reader stores the latest counted position, as the `auto_`
         /// fields of `PollOptions` say. A one-shot poll refuses it with
@@ -263,20 +268,23 @@ mod ffi {
         Marked = 2,
     }
 
-    /// The limits of one poll of one partition and when its offsets are
-    /// stored. `default_poll_options` returns the defaults, whose `auto_`
-    /// fields hold the defaults of `CommitPolicy::Auto`: every 10,000
-    /// messages or 5 s, after processing. The `auto_` fields count only
-    /// with `CommitPolicy::Auto`, which needs an interval or an event.
+    /// The limits of one read and when its offsets are stored. A read is a
+    /// poll of one partition, or a fetch that a reader sends for several
+    /// partitions of one primary, which applies `count`, `min_count` and
+    /// `max_bytes` to all of them together. `default_poll_options` returns
+    /// the defaults, whose `auto_` fields hold the defaults of
+    /// `CommitPolicy::Auto`: every 10,000 messages or 5 s, after
+    /// processing. The `auto_` fields count only with `CommitPolicy::Auto`,
+    /// which needs an interval or an event.
     #[derive(Clone, Copy)]
     struct PollOptions {
-        /// Most messages in one batch. Default 1000.
+        /// Most messages in one read, over all partitions of a fetch. Default 1000.
         count: u32,
         /// Zero answers at once. At most 600 s.
         max_wait_micros: u64,
-        /// At least 1 and at most `count`. Default 1.
+        /// At least 1 and at most `count`, over all partitions of a fetch. Default 1.
         min_count: u32,
-        /// Default 1 MiB.
+        /// Default 1 MiB, over all partitions of a fetch.
         max_bytes: u32,
         /// Default `CommitPolicy::Manual`.
         commit: CommitPolicy,
@@ -1210,7 +1218,10 @@ mod ffi {
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         /// Sets the next read position of a partition and drops its queued
-        /// batches. It stores no offset, and it resumes a stopped partition.
+        /// batches. It resumes a stopped partition. With `CommitPolicy::OnRead`
+        /// a seek to an offset above 0 first stores the offset before it, so a
+        /// restart resumes at the new position, and a failed store fails the
+        /// seek with nothing moved. Every other seek stores nothing.
         fn seek(
             self: &PartitionReader,
             partition_id: u32,
@@ -1424,7 +1435,10 @@ mod ffi {
         /// `CommitPolicy::Auto`.
         fn mark(self: &Consumer, checkpoint: &Checkpoint, error_info: &mut ErrorInfo)
         -> Result<()>;
-        /// Sets the next read position of a partition. It stores no offset.
+        /// Sets the next read position of a partition. With
+        /// `CommitPolicy::OnRead` a seek to an offset above 0 first stores the
+        /// offset before it, and a failed store fails the seek with nothing
+        /// moved. Every other seek stores nothing.
         fn seek(
             self: &Consumer,
             partition_id: u32,

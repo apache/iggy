@@ -25,6 +25,7 @@ use Iggy\AutoCommit;
 use Iggy\Client as IggyClient;
 use Iggy\CommitPolicy;
 use Iggy\Consumer as IggyConsumer;
+use Iggy\Exception\PendingOperationException;
 use Iggy\PartitionReader;
 use Iggy\PendingPoll;
 use Iggy\PolledMessages;
@@ -46,6 +47,10 @@ final class DeferredPollingFeatureTest extends TestCase
     private const PARK_TIME_MICROS = 100_000;
     // The wait of a consumer whose step names none.
     private const CONSUMER_MAX_WAIT_SECONDS = 10;
+    // How long a poll whose connection dropped may take to fail.
+    private const LOST_POLL_TIMEOUT_SECONDS = 10;
+    private const PARTITION_LANE_BLOCKED_CODE = 14009;
+    private const FETCH_PROGRESS_UNCERTAIN_CODE = 14010;
 
     private ?IggyClient $client = null;
     private ?IggyClient $backgroundClient = null;
@@ -55,6 +60,10 @@ final class DeferredPollingFeatureTest extends TestCase
     private ?float $deferredPollStarted = null;
     private ?PartitionReader $reader = null;
     private ?IggyConsumer $consumer = null;
+    // The client that disconnected under its poll. Its partition block belongs to it, so the
+    // later polls of the scenario run on it.
+    private ?IggyClient $pollOwner = null;
+    private ?string $lostOperationId = null;
 
     #[DataProvider('scenarioCases')]
     #[Group('deferred-polling')]
@@ -141,6 +150,69 @@ final class DeferredPollingFeatureTest extends TestCase
                     commit: CommitPolicy::onRead(),
                 ),
             );
+
+            return;
+        }
+
+        if (preg_match('/^I start a deferred poll of partition (\d+) for consumer "([^"]+)" with the on read commit policy and a max wait of (\d+) seconds?$/', $step, $matches) === 1) {
+            $this->startPoll(
+                (int) $matches[1],
+                $matches[2],
+                PollingStrategy::next(),
+                new PollOptions(
+                    count: self::MESSAGES_COUNT,
+                    max_wait_micros: micros((int) $matches[3]),
+                    commit: CommitPolicy::onRead(),
+                ),
+            );
+
+            return;
+        }
+
+        if ($step === 'the client disconnects before the deferred poll answers') {
+            assert_not_null($this->deferredPoll, 'deferred poll started');
+            assert_null($this->deferredPoll->wait(0), 'the deferred poll must still wait');
+            $this->pollOwner = $this->backgroundClient();
+            $this->pollOwner->disconnect();
+
+            return;
+        }
+
+        if ($step === 'the deferred poll should fail as uncertain') {
+            $poll = $this->takeDeferredPoll();
+            $error = assert_throws(static fn () => $poll->wait(micros(self::LOST_POLL_TIMEOUT_SECONDS)));
+            assert_instance_of(PendingOperationException::class, $error, $error->getMessage());
+            assert_same(self::FETCH_PROGRESS_UNCERTAIN_CODE, $error->getCode(), $error->getMessage());
+            assert_same('fetch_progress_uncertain', $error->kind);
+            $this->lostOperationId = $error->operation_id;
+
+            return;
+        }
+
+        if ($step === 'the client connects again') {
+            assert_not_null($this->pollOwner, 'the client disconnected');
+            $this->pollOwner->connect();
+            $this->pollOwner->loginUser(TestEnvironment::rootUsername(), TestEnvironment::rootPassword());
+
+            return;
+        }
+
+        if (preg_match('/^a poll of partition (\d+) for consumer "([^"]+)" with the next strategy and the on read commit policy should fail as blocked by the deferred poll$/', $step, $matches) === 1) {
+            $partitionId = (int) $matches[1];
+            $error = assert_throws(fn () => $this->pollNext($partitionId, $matches[2], CommitPolicy::onRead()));
+            assert_instance_of(PendingOperationException::class, $error, $error->getMessage());
+            assert_same(self::PARTITION_LANE_BLOCKED_CODE, $error->getCode(), $error->getMessage());
+            assert_same('lane_blocked', $error->kind);
+            assert_same($partitionId, $error->partition_id);
+            assert_same($this->lostOperationId, $error->operation_id);
+
+            return;
+        }
+
+        if ($step === 'I abandon the operation of the deferred poll') {
+            assert_not_null($this->pollOwner, 'the client disconnected');
+            assert_not_null($this->lostOperationId, 'the deferred poll failed as uncertain');
+            $this->pollOwner->abandonOperation($this->lostOperationId);
 
             return;
         }
@@ -282,6 +354,16 @@ final class DeferredPollingFeatureTest extends TestCase
 
     private function startPoll(int $partitionId, int|string $consumer, PollingStrategy $strategy, PollOptions $options): void
     {
+        // The first read of a new topic can wait for its partition, so a read that waits for
+        // nothing goes first and the poll then leaves at once.
+        $this->backgroundClient()->pollMessages(
+            $this->requireStreamName(),
+            $this->requireTopicName(),
+            $partitionId,
+            self::CONSUMER_ID,
+            PollingStrategy::offset(0),
+            new PollOptions(count: 1),
+        );
         $this->deferredPollStarted = microtime(true);
         $this->deferredPoll = $this->backgroundClient()->startPollMessages(
             $this->requireStreamName(),
@@ -317,11 +399,18 @@ final class DeferredPollingFeatureTest extends TestCase
         return $poll;
     }
 
-    // Polls one message from next, so a poll that commits stores only the offset of the payload
-    // it returns.
     private function pollNextAndExpect(int $partitionId, string $consumer, CommitPolicy $commit, string $payload): void
     {
-        $polled = $this->requireClient()->pollMessages(
+        $polled = $this->pollNext($partitionId, $consumer, $commit);
+        assert_instance_of(PolledMessages::class, $polled);
+        assert_same([$payload], array_slice(collect_payloads($polled->messages), 0, 1));
+    }
+
+    // Polls one message from next, so a poll that commits stores only the offset of the payload
+    // it returns.
+    private function pollNext(int $partitionId, string $consumer, CommitPolicy $commit): PolledMessages
+    {
+        return ($this->pollOwner ?? $this->requireClient())->pollMessages(
             $this->requireStreamName(),
             $this->requireTopicName(),
             $partitionId,
@@ -329,8 +418,6 @@ final class DeferredPollingFeatureTest extends TestCase
             PollingStrategy::next(),
             new PollOptions(count: 1, commit: $commit),
         );
-        assert_instance_of(PolledMessages::class, $polled);
-        assert_same([$payload], array_slice(collect_payloads($polled->messages), 0, 1));
     }
 
     private function openConsumer(string $group, PollOptions $options): void

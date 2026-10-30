@@ -76,6 +76,10 @@ struct GlobalContext {
     std::chrono::steady_clock::time_point deferred_poll_started;
     std::optional<iggy::PartitionReader> reader;
     std::optional<iggy::IggyConsumer> consumer;
+    // The client that disconnected under its poll. Its partition block belongs to it, so the
+    // later polls of the scenario run on it.
+    iggy::IggyBlockingClient *poll_owner = nullptr;
+    std::optional<std::uint64_t> lost_operation_id;
 
     GlobalContext()                                 = default;
     GlobalContext(const GlobalContext &)            = delete;

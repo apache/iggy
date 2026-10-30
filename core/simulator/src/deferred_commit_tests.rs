@@ -29,6 +29,9 @@
 use bytes::Bytes;
 use consensus::PartitionsHandle;
 use iggy_binary_protocol::responses::messages::PollMessagesResponse;
+use iggy_binary_protocol::responses::messages::fetch_messages::{
+    FetchMessagesResponse, FetchMessagesSectionHeader,
+};
 use iggy_binary_protocol::{
     AckLevel, Command, KIND_CONSUMER, ReplyHeader, RoutedRequestHeader, WirePollingStrategy,
 };
@@ -384,6 +387,211 @@ fn given_a_committing_read_queued_past_its_timeout_when_the_drain_serves_it_shou
     );
 }
 
+/// (f) A close rewind that stores the very offset a parked read was admitted
+/// against: a half-open link keeps the parked read alive, the rewind comes
+/// from another session, and the produce that fills the read must not let it
+/// commit past messages the client never got.
+#[test]
+fn given_a_parked_committing_read_when_another_session_stores_its_admitted_offset_should_refuse_the_late_commit()
+ {
+    let (mut sim, client, other) = cluster();
+    let mut replies = Vec::new();
+    produce(&mut sim, &client, &["m0", "m1"], &mut replies);
+    let delivered = submit(
+        &mut sim,
+        &client,
+        next_read(&client, (2, 1), (0, QUICK_TIMEOUT_US)),
+    );
+    let reply = await_reply(&mut sim, (CLIENT, delivered), &mut replies);
+    assert_eq!(offsets_of(&reply), vec![0, 1]);
+    assert_eq!(stored_offset(&sim), Some(1));
+
+    let parked = submit(
+        &mut sim,
+        &client,
+        next_read(&client, (2, 2), (PARKED_WAIT_US, PARKED_TIMEOUT_US)),
+    );
+    settle(&mut sim, &mut replies);
+    assert!(
+        replies.iter().all(|reply| reply.header().request != parked),
+        "nothing past 1 yet, the read parks at 2"
+    );
+
+    let rewind = submit(&mut sim, &other, rewind_to(&other, 1));
+    let rewound = await_reply(&mut sim, (OTHER_CLIENT, rewind), &mut replies);
+    assert_eq!(rewound.header().status, 0, "the rewind commits");
+
+    produce(&mut sim, &other, &["m2", "m3"], &mut replies);
+    let late = await_reply(&mut sim, (CLIENT, parked), &mut replies);
+    assert_eq!(
+        late.header().status,
+        IggyError::TransientNotAccepted.as_code(),
+        "a store of the admitted offset fences the read"
+    );
+    assert_eq!(stored_offset(&sim), Some(1), "the rewound offset stands");
+}
+
+/// (f) for a fetch, which resolves its start and then waits with no read at
+/// the owner: the store of the same offset during that wait fences the read
+/// the fetch sends once data comes.
+#[test]
+fn given_a_parked_committing_fetch_when_another_session_stores_its_resolved_offset_should_refuse_the_late_commit()
+ {
+    let (mut sim, client, other) = cluster();
+    let mut replies = Vec::new();
+    produce(&mut sim, &client, &["m0", "m1"], &mut replies);
+    let delivered = submit(
+        &mut sim,
+        &client,
+        fetch_read(&client, (2, 1), (0, QUICK_TIMEOUT_US)),
+    );
+    let reply = await_reply(&mut sim, (CLIENT, delivered), &mut replies);
+    assert_eq!(only_section(&reply).next_offset, 2);
+    assert_eq!(stored_offset(&sim), Some(1));
+
+    let parked = submit(
+        &mut sim,
+        &client,
+        fetch_read(&client, (2, 2), (PARKED_WAIT_US, PARKED_TIMEOUT_US)),
+    );
+    settle(&mut sim, &mut replies);
+    assert!(
+        replies.iter().all(|reply| reply.header().request != parked),
+        "nothing past 1 yet, the fetch waits at 2"
+    );
+
+    let rewind = submit(&mut sim, &other, rewind_to(&other, 1));
+    let rewound = await_reply(&mut sim, (OTHER_CLIENT, rewind), &mut replies);
+    assert_eq!(rewound.header().status, 0, "the rewind commits");
+
+    produce(&mut sim, &other, &["m2", "m3"], &mut replies);
+    let late = await_reply(&mut sim, (CLIENT, parked), &mut replies);
+    let section = only_section(&late);
+    assert_eq!(
+        (section.status, section.messages_count),
+        (IggyError::TransientNotAccepted.as_code(), 0),
+        "a store of the resolved offset fences the read"
+    );
+    assert_eq!(stored_offset(&sim), Some(1), "the rewound offset stands");
+}
+
+/// (g) A committing read parks, then the connection drops before any data
+/// comes. The produce that would fill the read stores nothing.
+#[test]
+fn given_a_parked_committing_read_when_its_connection_drops_should_store_nothing() {
+    for fetch in [false, true] {
+        let (mut sim, client, other) = cluster();
+        let mut replies = Vec::new();
+        produce(&mut sim, &client, &["m0", "m1"], &mut replies);
+        let read = if fetch {
+            fetch_read(&client, (4, 4), (PARKED_WAIT_US, PARKED_TIMEOUT_US))
+        } else {
+            next_read(&client, (4, 4), (PARKED_WAIT_US, PARKED_TIMEOUT_US))
+        };
+        let parked = submit(&mut sim, &client, read);
+        settle(&mut sim, &mut replies);
+        assert!(replies.is_empty(), "the read parks, fetch {fetch}");
+
+        sim.outboxes[usize::from(PRIMARY)].notify_client_connection_lost(CLIENT);
+        sim.run_pumps();
+        produce(&mut sim, &other, &["m2", "m3"], &mut replies);
+        settle(&mut sim, &mut replies);
+
+        assert_eq!(
+            stored_offset(&sim),
+            None,
+            "a read whose connection dropped stores nothing, fetch {fetch}"
+        );
+        assert!(
+            replies
+                .iter()
+                .filter(|reply| reply.header().request == parked)
+                .all(|reply| reply.header().status == IggyError::TransientNotAccepted.as_code()),
+            "the dropped read can only answer that it stored nothing, fetch {fetch}"
+        );
+    }
+}
+
+/// (h) A committing fetch whose reply is lost after the owner stored: the
+/// next fetch starts after that one store.
+#[test]
+fn given_a_committing_fetch_whose_reply_is_lost_when_the_next_fetch_runs_should_start_after_the_single_store()
+ {
+    let (mut sim, client, _) = cluster();
+    let mut replies = Vec::new();
+    produce(&mut sim, &client, &["m0", "m1", "m2", "m3"], &mut replies);
+
+    drop_replies(&mut sim, true);
+    let lost = submit(
+        &mut sim,
+        &client,
+        fetch_read(&client, (2, 1), (0, QUICK_TIMEOUT_US)),
+    );
+    assert!(
+        (0..REPLY_STEPS).any(|_| {
+            replies.extend(sim.step());
+            stored_offset(&sim) == Some(1)
+        }),
+        "the lost fetch stores the offset of its last message"
+    );
+    settle(&mut sim, &mut replies);
+    drop_replies(&mut sim, false);
+
+    let next = submit(
+        &mut sim,
+        &client,
+        fetch_read(&client, (2, 1), (0, QUICK_TIMEOUT_US)),
+    );
+    let reply = await_reply(&mut sim, (CLIENT, next), &mut replies);
+    assert_eq!(reply.header().status, 0, "the next fetch is served");
+    let section = only_section(&reply);
+    assert_eq!(
+        (section.status, section.messages_count, section.next_offset),
+        (0, 2, 4),
+        "the next fetch reads 2 and 3, after the lost fetch's store"
+    );
+    assert_eq!(stored_offset(&sim), Some(3));
+    assert!(
+        replies.iter().all(|reply| reply.header().request != lost),
+        "the lost reply never reached the client"
+    );
+}
+
+/// (i) A fetch that parked before a cancel answers 58 and stores nothing,
+/// also once data comes.
+#[test]
+fn given_a_parked_committing_fetch_when_cancelled_should_answer_58_and_store_nothing() {
+    let (mut sim, client, other) = cluster();
+    let mut replies = Vec::new();
+    produce(&mut sim, &client, &["m0", "m1"], &mut replies);
+    let parked = submit(
+        &mut sim,
+        &client,
+        fetch_read(&client, (4, 4), (PARKED_WAIT_US, PARKED_TIMEOUT_US)),
+    );
+    settle(&mut sim, &mut replies);
+    assert!(replies.is_empty(), "the fetch parks");
+
+    submit(
+        &mut sim,
+        &client,
+        client.cancel_deferred_request(namespace(), parked),
+    );
+    let cancelled = await_reply(&mut sim, (CLIENT, parked), &mut replies);
+    assert_eq!(
+        cancelled.header().status,
+        IggyError::TransientNotAccepted.as_code(),
+        "a cancelled committing fetch answers once with 58"
+    );
+    produce(&mut sim, &other, &["m2", "m3"], &mut replies);
+    settle(&mut sim, &mut replies);
+    assert!(
+        replies.iter().all(|reply| reply.header().request != parked),
+        "the cancelled fetch answers only once"
+    );
+    assert_eq!(stored_offset(&sim), None);
+}
+
 /// Three replicas of one shard each with the dispatch shell on, one seeded
 /// partition, two clients logged in against root on the primary.
 fn cluster() -> (Simulator, SimClient, SimClient) {
@@ -442,6 +650,34 @@ fn next_read(
         counts,
         true,
         timers,
+    )
+}
+
+/// A committing fetch of the client's own consumer from `Next`, on the one
+/// partition of the cluster.
+fn fetch_read(
+    client: &SimClient,
+    counts: (u32, u32),
+    timers: (u64, u64),
+) -> Message<RoutedRequestHeader> {
+    client.fetch_messages(
+        &[namespace()],
+        &WirePollingStrategy::next(),
+        counts,
+        true,
+        timers,
+    )
+}
+
+/// A store of the client's consumer offset by `other`, as the close rewind of
+/// a reader on a new connection.
+fn rewind_to(other: &SimClient, offset: u64) -> Message<RoutedRequestHeader> {
+    other.store_consumer_offset(
+        namespace(),
+        KIND_CONSUMER,
+        u32::try_from(CLIENT).expect("client id fits u32"),
+        offset,
+        AckLevel::Quorum,
     )
 }
 
@@ -507,6 +743,15 @@ fn stored_offset(sim: &Simulator) -> Option<u64> {
         .get_by_ns(&namespace())
         .expect("the primary hosts the partition")
         .get_consumer_offset(consumer)
+}
+
+/// The header of the one section of a fetch reply.
+fn only_section(reply: &Message<ReplyHeader>) -> FetchMessagesSectionHeader {
+    let response = FetchMessagesResponse::decode(reply.body()).expect("a fetch reply decodes");
+    let [section] = response.sections[..] else {
+        panic!("a fetch of one partition answers with one section");
+    };
+    section.header
 }
 
 fn offsets_of(reply: &Message<ReplyHeader>) -> Vec<u64> {

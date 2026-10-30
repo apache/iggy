@@ -247,6 +247,17 @@ namespace Iggy {
         public function describeOptions(\Iggy\OptionsScope $scope): array {}
 
         /**
+         * Closes the current connection. Repeated calls are safe. Call connect() to use the client
+         * again, and loginUser() after it, because the sign-in is dropped. Until then requests
+         * fail, and nothing connects the client in the background. A poll with
+         * CommitPolicy::onRead() that waits throws FetchProgressUncertain (14010), and its partition
+         * stays blocked across the reconnect until abandonOperation().
+         *
+         * @return void
+         */
+        public function disconnect(): void {}
+
+        /**
          * Fingerprint of a stream key given as canonical padded standard base64 of 32 bytes, the
          * value `StreamDetails::$encryption_key_fingerprint` reports for a stream created with it.
          * The key is marked `#[\SensitiveParameter]`, so exception traces never hold it.
@@ -627,8 +638,9 @@ namespace Iggy {
         public static function manual(): \Iggy\CommitPolicy {}
 
         /**
-         * The server stores the offset of the last message of each read as part of the read: one
-         * round trip, at most once.
+         * The server stores the offset of the last message of each read as part of the read, in one
+         * round trip. While the primary stays up a message is delivered at most once. A failover
+         * before the store replicates can deliver the last batch again.
          *
          * @return \Iggy\CommitPolicy
          */
@@ -763,8 +775,10 @@ namespace Iggy {
         public function partitionId(): int {}
 
         /**
-         * Sets the next read position of a partition and drops the rest of its current batch. It
-         * stores no offset.
+         * Sets the next read position of a partition and drops the rest of its current batch. Under
+         * CommitPolicy::onRead(), a seek to an offset above 0 first stores the offset before it, so
+         * a restart resumes at the new position, and a failed store fails the seek with its
+         * exception and moves nothing. Every other seek stores nothing.
          *
          * It also resumes a partition that stopped, for example after HistoryUnavailable (87), or
          * after a message that does not decode: seek to the `skip` of its ReadException. A
@@ -2096,8 +2110,10 @@ namespace Iggy {
      * offsets are stored. With CommitPolicy::manual() and CommitPolicy::auto(), commit() stores the
      * offset of a checkpoint, and CommitPolicy::auto() also stores the latest counted position by
      * itself, which mark() counts under CommitAfter::Marked. With CommitPolicy::onRead(), the server
-     * stores the offset of each reply, and close() moves the offset back to the last delivered
-     * message. Destroying the reader without
+     * stores the offset of each reply, the reader reads only while next() waits and then fills its
+     * budget (one fetch per primary that may wait for messages, the partitions with messages left
+     * behind spread over the other slots), a seek() to an offset stores the offset before it, and
+     * close() moves the offset back to the last delivered message. Destroying the reader without
      * close() stops it without waiting, moves no offset back and does not leave the group.
      */
     class PartitionReader {
@@ -2167,14 +2183,19 @@ namespace Iggy {
         public function partitions(): array {}
 
         /**
-         * Sets the next read position of a partition and starts a new generation of it. It stores
-         * no offset, drops the queued batches of the partition and ignores its late replies. It
-         * also resumes a stopped partition.
+         * Sets the next read position of a partition and starts a new generation of it. It drops
+         * the queued batches of the partition, ignores its late replies and resumes a stopped
+         * partition.
+         *
+         * Under CommitPolicy::onRead(), a seek to an offset above 0 first stores the offset before
+         * it, under the history of a continuation or else of the last delivered message, so a
+         * restart resumes at the new position. A failed store fails the seek with its exception and
+         * nothing moves. Every other seek stores nothing. The new position waits for the end of the
+         * committing read in flight, whose reply the new generation drops.
          *
          * A partition that the reader does not read, and a continuation of another partition,
-         * fail with InvalidCommand (3). Under CommitPolicy::onRead(), the new position waits
-         * for the end of the committing read in flight, and a read with an unknown outcome fails
-         * with PartitionLaneBlocked (14009): abandon its operation first.
+         * fail with InvalidCommand (3). Under CommitPolicy::onRead(), a read with an unknown
+         * outcome fails with PartitionLaneBlocked (14009): abandon its operation first.
          *
          * @param int $partition_id
          * @param \Iggy\PollingStrategy $start
@@ -2229,7 +2250,10 @@ namespace Iggy {
     }
 
     /**
-     * The limits of one poll of one partition.
+     * The limits of one read: a poll of one partition, or a fetch that a partition reader sends
+     * for several partitions of one primary. A fetch applies `count`, `min_count` and `max_bytes`
+     * to all of its partitions together. A reader that commits nothing runs several fetches at
+     * once, each within these limits, for partitions with more messages waiting.
      */
     class PollOptions {
         public readonly \Iggy\CommitPolicy $commit;

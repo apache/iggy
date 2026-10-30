@@ -19,7 +19,9 @@ using System.Diagnostics;
 using System.Text;
 using Apache.Iggy.Consumers;
 using Apache.Iggy.Contracts;
+using Apache.Iggy.Exceptions;
 using Apache.Iggy.Extensions;
+using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -27,6 +29,7 @@ using Reqnroll;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 using TestContext = Apache.Iggy.Tests.BDD.Context.TestContext;
+using TestEnvironment = Apache.Iggy.Tests.BDD.Context.TestEnvironment;
 
 namespace Apache.Iggy.Tests.BDD.StepDefinitions;
 
@@ -50,6 +53,7 @@ public sealed class DeferredPollingSteps : IAsyncDisposable
     private readonly CancellationTokenSource _cancellation = new();
     private readonly TestContext _context;
     private IggyConsumer? _consumer;
+    private ulong? _lostOperation;
     private IAsyncEnumerator<ReceivedMessage>? _messages;
     private Task<PolledMessages>? _poll;
     private Stopwatch? _pollStarted;
@@ -114,6 +118,58 @@ public sealed class DeferredPollingSteps : IAsyncDisposable
     {
         return StartDeferredPollAsync(partition, Consumer.New(consumerName), PollingStrategy.Next(),
             Options(maxWaitSeconds) with { MinCount = (uint)minCount, Commit = CommitPolicy.OnRead });
+    }
+
+    [When("I start a deferred poll of partition {int} for consumer {string} with the on read commit policy and a max wait of {int} second(s)")]
+    public async Task StartOnReadDeferredPoll(int partition, string consumerName, int maxWaitSeconds)
+    {
+        // A read that stores nothing resolves the route first, so the committing poll is on the wire when it parks.
+        await _context.IggyClient.PollMessagesAsync(StreamId(), TopicId(), (uint)partition, Consumer.New(consumerName),
+            PollingStrategy.Offset(0), new PollOptions { Count = 1 });
+        await StartDeferredPollAsync(partition, Consumer.New(consumerName), PollingStrategy.Next(),
+            Options(maxWaitSeconds) with { Commit = CommitPolicy.OnRead });
+    }
+
+    [When("the client disconnects before the deferred poll answers")]
+    public Task DisconnectBeforeThePollAnswers()
+    {
+        _poll.ShouldNotBeNull().IsCompleted.ShouldBeFalse("the deferred poll answered before the disconnect");
+        // The client has no public disconnect, so the step drops its links without a sign-out, as a lost network does.
+        return _context.IggyClient.ShouldBeOfType<TcpMessageStream>().DisconnectAsync();
+    }
+
+    [Then("the deferred poll should fail as uncertain")]
+    public async Task DeferredPollFailsAsUncertain()
+    {
+        var error = await Record.ExceptionAsync(() => _poll.ShouldNotBeNull());
+        var uncertain = error.ShouldBeOfType<VsrFetchProgressUncertainException>();
+        uncertain.StatusCode.ShouldBe(VsrFetchProgressUncertainException.STATUS_CODE);
+        _lostOperation = uncertain.OperationId.ShouldNotBeNull();
+        _poll = null;
+    }
+
+    [When("the client connects again")]
+    public async Task ConnectAgain()
+    {
+        await _context.IggyClient.ConnectAsync();
+        await _context.IggyClient.LoginUserAsync(TestEnvironment.RootUsername, TestEnvironment.RootPassword);
+    }
+
+    [Then("a poll of partition {int} for consumer {string} with the next strategy and the on read commit policy should fail as blocked by the deferred poll")]
+    public async Task OnReadPollIsBlocked(int partition, string consumerName)
+    {
+        var error = await Record.ExceptionAsync(() => _context.IggyClient.PollMessagesAsync(StreamId(), TopicId(),
+            (uint)partition, Consumer.New(consumerName), PollingStrategy.Next(),
+            new PollOptions { Count = 1, Commit = CommitPolicy.OnRead }));
+        var blocked = error.ShouldBeOfType<VsrPartitionLaneBlockedException>();
+        blocked.StatusCode.ShouldBe(VsrPartitionLaneBlockedException.STATUS_CODE);
+        blocked.OperationId.ShouldBe(_lostOperation.ShouldNotBeNull());
+    }
+
+    [When("I abandon the operation of the deferred poll")]
+    public Task AbandonDeferredPoll()
+    {
+        return _context.IggyClient.AbandonOperationAsync(_lostOperation.ShouldNotBeNull());
     }
 
     [When("I send a message with payload {string} to partition {int}")]

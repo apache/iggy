@@ -16,7 +16,8 @@
 // under the License.
 
 use crate::consumer_offset_capacity::{
-    ConsumerOffsetCapacity, ConsumerOffsetCapacityError, DurableConsumerOffsets, DurableOffsetState,
+    ConsumerOffsetCapacity, ConsumerOffsetCapacityError, DurableConsumerOffsets,
+    DurableOffsetState, ExplicitOffsetStores,
 };
 use crate::journal::{
     MessageLookup, PartitionJournal, PartitionJournalMemStorage, RetainedBatchMeta,
@@ -288,6 +289,7 @@ where
     /// transfer artifact. It is the only store of external group offsets: that
     /// kind is never polled, so it has no eager progress to keep apart.
     pub(crate) durable_consumer_offsets: DurableConsumerOffsets,
+    pub(crate) explicit_offset_stores: ExplicitOffsetStores,
     /// Admission capacity of each kind, by [`ConsumerKind::index`].
     pub(crate) consumer_offset_capacities: [ConsumerOffsetCapacity; ConsumerKind::COUNT],
     pub(crate) observed_view: u32,
@@ -937,6 +939,7 @@ where
             workerless_offset_files: Rc::default(),
             poll_notifier: None,
             durable_consumer_offsets: DurableConsumerOffsets::default(),
+            explicit_offset_stores: ExplicitOffsetStores::default(),
             consumer_offset_capacities: ConsumerKind::ALL
                 .map(|kind| ConsumerOffsetCapacity::new(kind, crate::DEFAULT_CONSUMER_OFFSETS_MAX)),
             observed_view,
@@ -4713,6 +4716,19 @@ where
             self.mark_consumer_group_offsets_need_reconcile();
         }
         let id = pending.consumer_id;
+        if !pending.auto_commit {
+            let now = self.consensus.message_bus().monotonic_micros();
+            match pending.mutation {
+                PendingConsumerOffsetMutation::Upsert(_) => {
+                    self.explicit_offset_stores
+                        .record_store(pending.kind, id, now);
+                }
+                PendingConsumerOffsetMutation::Delete => {
+                    self.explicit_offset_stores
+                        .record_delete(pending.kind, id, now);
+                }
+            }
+        }
         let key = usize::try_from(id).expect("u32 consumer id must fit usize");
         match (pending.kind, pending.mutation) {
             (ConsumerKind::Consumer, PendingConsumerOffsetMutation::Upsert(offset)) => {
@@ -4770,6 +4786,30 @@ where
             // table, the only store of an external offset.
             (ConsumerKind::ExternalGroup, _) => {}
         }
+    }
+
+    /// Whether a client stored or deleted the offset of `consumer` at or after
+    /// `since` on the bus clock, also with the value it held, or has such a
+    /// store staged that is not applied yet. A parked committing read is
+    /// fenced by any such store.
+    #[must_use]
+    pub fn consumer_offset_stored_since(&self, consumer: PollingConsumer, since: u64) -> bool {
+        let (kind, id) = match consumer {
+            PollingConsumer::Consumer(id, _) => (ConsumerKind::Consumer, id),
+            PollingConsumer::ConsumerGroup(id, _) => (ConsumerKind::ConsumerGroup, id),
+        };
+        let Ok(id) = u32::try_from(id) else {
+            return false;
+        };
+        // A staged store applies before the commit of a read that finishes
+        // now, which would then pass over it.
+        self.explicit_offset_stores.since(kind, id, since)
+            || self
+                .pending_consumer_offset_commits
+                .values()
+                .any(|pending| {
+                    !pending.auto_commit && pending.kind == kind && pending.consumer_id == id
+                })
     }
 
     /// Group ids that currently have a stored offset on this partition. Used by
@@ -30194,6 +30234,87 @@ mod tests {
             !partition
                 .consumer_offset_capacity_for(ConsumerKind::Consumer)
                 .is_stranded(7)
+        );
+    }
+
+    /// Both the commit walk and a no-ack store apply through
+    /// `apply_consumer_offset_commit`, so its stamps hold for both.
+    #[test]
+    fn given_client_stores_and_auto_commits_when_applied_should_stamp_only_client_stores() {
+        let (partition, _) = recording_partition();
+        let consumer = PollingConsumer::Consumer(7, 0);
+        let before = partition.consensus.message_bus().monotonic_micros();
+        partition.apply_consumer_offset_commit(PendingConsumerOffsetCommit::upsert_auto_commit(
+            ConsumerKind::Consumer,
+            7,
+            3,
+        ));
+        assert!(
+            !partition.consumer_offset_stored_since(consumer, before),
+            "the commit of a read is no client store"
+        );
+        partition.apply_consumer_offset_commit(PendingConsumerOffsetCommit::explicit(
+            ConsumerKind::Consumer,
+            7,
+            Some(3),
+        ));
+        assert_eq!(partition.get_consumer_offset(consumer), Some(3));
+        assert!(
+            partition.consumer_offset_stored_since(consumer, before),
+            "a client store of the value it held stamps the offset"
+        );
+        assert!(
+            !partition.consumer_offset_stored_since(PollingConsumer::ConsumerGroup(7, 0), before),
+            "the stamp names its kind"
+        );
+        let other = PollingConsumer::Consumer(8, 0);
+        assert!(!partition.consumer_offset_stored_since(other, before));
+        partition.apply_consumer_offset_commit(PendingConsumerOffsetCommit::explicit(
+            ConsumerKind::Consumer,
+            7,
+            None,
+        ));
+        assert_eq!(partition.get_consumer_offset(consumer), None);
+        assert!(
+            partition.consumer_offset_stored_since(other, before),
+            "an offset without a stamp of its own counts the last delete"
+        );
+    }
+
+    /// The primary stages a client store when it admits it and stamps it when
+    /// it commits. A parked read that finishes in between would commit at a
+    /// higher op than the store, so its monotone apply would pass over the
+    /// rewind.
+    #[test]
+    fn given_a_staged_client_store_when_checking_since_admission_should_report_it_before_it_applies()
+     {
+        let (mut partition, _) = recording_partition();
+        let consumer = PollingConsumer::Consumer(7, 0);
+        let other = PollingConsumer::Consumer(8, 0);
+        let before = partition.consensus.message_bus().monotonic_micros();
+        partition.stage_consumer_offset_upsert(1, ConsumerKind::Consumer, 7, 3, true);
+        assert!(
+            !partition.consumer_offset_stored_since(consumer, before),
+            "a staged commit of a read is no client store"
+        );
+        partition.stage_consumer_offset_upsert(2, ConsumerKind::Consumer, 7, 1, false);
+        assert_eq!(
+            partition.get_consumer_offset(consumer),
+            None,
+            "the staged store is not applied yet"
+        );
+        assert!(
+            partition.consumer_offset_stored_since(consumer, before),
+            "a staged client store fences a read that finishes before it applies"
+        );
+        assert!(
+            !partition.consumer_offset_stored_since(other, before),
+            "the staged store names its consumer"
+        );
+        partition.stage_consumer_offset_delete(3, ConsumerKind::Consumer, 8);
+        assert!(
+            partition.consumer_offset_stored_since(other, before),
+            "a staged delete fences as a staged store does"
         );
     }
 

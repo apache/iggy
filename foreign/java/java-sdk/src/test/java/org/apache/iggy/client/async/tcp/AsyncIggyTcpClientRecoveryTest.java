@@ -1007,8 +1007,8 @@ class AsyncIggyTcpClientRecoveryTest {
     }
 
     @Test
-    @SuppressWarnings("checkstyle:NPathComplexity")
-    void shouldEndAnEvictedProgressPollWithoutReplayOrRetention() throws Exception {
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
+    void shouldEndAnEvictedProgressPollWithoutReplay() throws Exception {
         try (ServerSocket socket = new ServerSocket(0, 2, InetAddress.getLoopbackAddress())) {
             List<Request> polls = new CopyOnWriteArrayList<>();
             var server = serve(socket, 2, request -> {
@@ -1057,8 +1057,16 @@ class AsyncIggyTcpClientRecoveryTest {
                             polled, autoCommit ? IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode() : 57);
                     assertThat(polls).hasSize(autoCommit ? 2 : 1);
                     long requestId = polls.get(polls.size() - 1).requestId();
+                    // A committing poll is never replayed. Its unknown outcome blocks the partition until abandoned.
                     assertThat(outcome(client.resolveOperation(requestId, Duration.ofSeconds(1))))
-                            .isEqualTo("IggyOperationException " + IggyErrorCode.OPERATION_NOT_RETAINED.getCode());
+                            .isEqualTo("IggyOperationException "
+                                    + (autoCommit
+                                                    ? IggyErrorCode.FETCH_PROGRESS_UNCERTAIN
+                                                    : IggyErrorCode.OPERATION_NOT_RETAINED)
+                                            .getCode());
+                    if (autoCommit) {
+                        client.abandonOperation(requestId).get(5, TimeUnit.SECONDS);
+                    }
                 }
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
@@ -1266,11 +1274,18 @@ class AsyncIggyTcpClientRecoveryTest {
                             polled, autoCommit ? IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode() : 57);
                     assertThat(polls).hasSize(index + 1);
                     long requestId = polls.get(index).requestId();
+                    // A committing poll is never replayed. Its unknown outcome blocks the partition until abandoned.
                     assertThatThrownBy(() -> client.resolveOperation(requestId, Duration.ofSeconds(1))
                                     .join())
                             .hasCauseInstanceOf(IggyOperationException.class)
                             .satisfies(error -> assertThat(((IggyOperationException) error.getCause()).getErrorCode())
-                                    .isEqualTo(IggyErrorCode.OPERATION_NOT_RETAINED));
+                                    .isEqualTo(
+                                            autoCommit
+                                                    ? IggyErrorCode.FETCH_PROGRESS_UNCERTAIN
+                                                    : IggyErrorCode.OPERATION_NOT_RETAINED));
+                    if (autoCommit) {
+                        client.abandonOperation(requestId).get(5, TimeUnit.SECONDS);
+                    }
                     client.consumerOffsets()
                             .storeConsumerOffset(stream, topic, Optional.of(0L), consumer, BigInteger.valueOf(index))
                             .get(5, TimeUnit.SECONDS);

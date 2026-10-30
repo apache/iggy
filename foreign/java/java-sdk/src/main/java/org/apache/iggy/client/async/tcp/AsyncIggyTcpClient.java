@@ -721,6 +721,18 @@ public class AsyncIggyTcpClient {
     }
 
     /**
+     * Drops the connections without a sign-out, as a lost network does, and keeps the event loop group. Every pending
+     * request fails. A poll or fetch with {@code autoCommit} fails with {@code FETCH_PROGRESS_UNCERTAIN}, because the
+     * server can still store its offsets, and the progress of its partitions stays blocked on this client until
+     * {@link #abandonOperation(long)}. {@link #connect()} and a sign-in continue the client.
+     *
+     * @return a {@link CompletableFuture} that completes when the connections are closed
+     */
+    public CompletableFuture<Void> disconnect() {
+        return dropConnections();
+    }
+
+    /**
      * Closes the TCP connection and releases the Netty resources that this client owns.
      *
      * <p>If the client created its own event loop group, it shuts that group down gracefully.
@@ -748,21 +760,7 @@ public class AsyncIggyTcpClient {
     }
 
     private CompletableFuture<Void> closeNow() {
-        // Closing is caller intent, like a logout: connect() clears `closed`
-        // again, and a session the caller ended must not come back with the
-        // credentials the earlier sign-in used.
-        synchronized (this) {
-            closed = true;
-            explicitLoginGeneration++;
-            rememberedLogin = null;
-        }
-        AsyncTcpConnection currentConnection = connection.get();
-        session.endLineage();
-        CompletableFuture<Void> dataClosed = pollRouter.clearSession();
-        session.reset();
-        CompletableFuture<Void> linksClosed =
-                currentConnection == null ? dataClosed : dataClosed.thenCompose(ignored -> currentConnection.close());
-        return linksClosed
+        return dropConnections()
                 .thenCompose(ignored -> {
                     IoEventLoopGroup owned;
                     synchronized (this) {
@@ -792,6 +790,22 @@ public class AsyncIggyTcpClient {
                                 Long.toUnsignedString(unresolved.getOperationId()));
                     }
                 });
+    }
+
+    private CompletableFuture<Void> dropConnections() {
+        // Closing is caller intent, like a logout: connect() clears `closed`
+        // again, and a session the caller ended must not come back with the
+        // credentials the earlier sign-in used.
+        synchronized (this) {
+            closed = true;
+            explicitLoginGeneration++;
+            rememberedLogin = null;
+        }
+        AsyncTcpConnection currentConnection = connection.get();
+        session.endLineage();
+        CompletableFuture<Void> dataClosed = pollRouter.clearSession();
+        session.reset();
+        return currentConnection == null ? dataClosed : dataClosed.thenCompose(ignored -> currentConnection.close());
     }
 
     /**

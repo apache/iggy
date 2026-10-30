@@ -22,6 +22,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"time"
@@ -79,18 +80,23 @@ func consume(ctx context.Context, cli iggcon.Client) error {
 	if err != nil {
 		return err
 	}
+	running, stop := context.WithCancel(ctx)
+	defer stop()
 	handled := 0
-	consumed := consumer.Consume(ctx, func(_ context.Context, message reader.ReceivedMessage) error {
+	consumed := consumer.Consume(running, func(_ context.Context, message reader.ReceivedMessage) error {
 		log.Printf("Partition %d offset %d: %s", message.PartitionID, message.Checkpoint.Offset(), message.Message.Payload)
 		handled++
 		if handled == messagesLimit {
-			go func() { _ = consumer.Shutdown(ctx) }()
+			stop()
 		}
 		return nil
 	})
 	// Counts the last message, stores the counted offsets and leaves the group.
 	if err := consumer.Shutdown(ctx); err != nil {
 		return err
+	}
+	if errors.Is(consumed, context.Canceled) {
+		return nil
 	}
 	return consumed
 }

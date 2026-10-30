@@ -16,13 +16,15 @@
 // under the License.
 
 use crate::common::global_context::{GlobalContext, OpenConsumer};
+use crate::helpers::env::{root_password, root_username};
 use crate::steps::auth::given_authenticated_as_root;
 use cucumber::{given, then, when};
 use futures::StreamExt;
 use iggy::prelude::{
-    AutoCommit, CommitAfter, CommitPolicy, Consumer, Identifier, IggyClient, IggyDuration,
-    IggyMessage, MessageClient, Partitioning, PollOptions, PolledMessages, PollingStrategy,
-    StreamClient, StreamCreateOptions, TopicClient, TopicCreateOptions,
+    AutoCommit, Client, CommitAfter, CommitPolicy, Consumer, Identifier, IggyClient, IggyDuration,
+    IggyError, IggyMessage, MessageClient, Partitioning, PollOptions, PolledMessages,
+    PollingStrategy, StreamClient, StreamCreateOptions, TopicClient, TopicCreateOptions,
+    UserClient,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -121,6 +123,138 @@ pub async fn when_start_committing_deferred_poll(
         },
     )
     .await;
+}
+
+/// The poll runs on the client of the scenario, which a later step disconnects.
+#[when(
+    regex = r#"^I start a deferred poll of partition (\d+) for consumer "([^"]+)" with the on read commit policy and a max wait of (\d+) seconds?$"#
+)]
+pub async fn when_start_committing_poll_on_own_client(
+    world: &mut GlobalContext,
+    partition: u32,
+    consumer_name: String,
+    max_wait_secs: u64,
+) {
+    let client = Arc::new(world.client.take().expect("client"));
+    world.polling_client = Some(Arc::clone(&client));
+    let stream_id = stream_identifier(world);
+    let topic_id = topic_identifier(world);
+    let consumer = named_consumer(&consumer_name);
+    let options = PollOptions {
+        commit: CommitPolicy::OnRead,
+        ..poll_options(max_wait_secs)
+    };
+    // A read that stores nothing routes the partition first, so the committing poll leaves the
+    // client at once. A disconnect before it left would end it as never sent.
+    client
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            partition,
+            &consumer,
+            &PollingStrategy::offset(0),
+            PollOptions {
+                count: 1,
+                commit: CommitPolicy::Manual,
+                ..PollOptions::default()
+            },
+        )
+        .await
+        .expect("route the partition");
+    world.deferred_poll_started = Some(Instant::now());
+    let poll = tokio::spawn(async move {
+        client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                partition,
+                &consumer,
+                &PollingStrategy::next(),
+                options,
+            )
+            .await
+    });
+    sleep(PARK_TIME).await;
+    assert!(!poll.is_finished(), "the deferred poll must park");
+    world.deferred_poll = Some(poll);
+}
+
+/// The SDK's own disconnect, which signs nothing out on the server.
+#[when(regex = r"^the client disconnects before the deferred poll answers$")]
+pub async fn when_client_disconnects(world: &mut GlobalContext) {
+    let client = world.polling_client.as_ref().expect("a deferred poll runs");
+    client.disconnect().await.expect("disconnect");
+}
+
+#[then(regex = r"^the deferred poll should fail as uncertain$")]
+pub async fn then_deferred_poll_fails_as_uncertain(world: &mut GlobalContext) {
+    let poll = world.deferred_poll.take().expect("deferred poll started");
+    let outcome = timeout(Duration::from_secs(CONSUMER_MAX_WAIT_SECS), poll)
+        .await
+        .expect("the deferred poll ends after the disconnect")
+        .expect("the deferred poll task");
+    let Err(IggyError::FetchProgressUncertain(operation)) = outcome else {
+        panic!("the deferred poll must fail as uncertain, not with {outcome:?}");
+    };
+    world.lost_operation = Some(operation);
+}
+
+/// The same client object connects and signs in again, in a new session.
+#[when(regex = r"^the client connects again$")]
+pub async fn when_client_connects_again(world: &mut GlobalContext) {
+    let client = world.polling_client.take().expect("a deferred poll ran");
+    let client = Arc::try_unwrap(client).expect("the ended poll released its client");
+    client.connect().await.expect("connect again");
+    client
+        .login_user(&root_username(), &root_password())
+        .await
+        .expect("sign in again");
+    world.client = Some(client);
+}
+
+#[then(
+    regex = r#"^a poll of partition (\d+) for consumer "([^"]+)" with the next strategy and the on read commit policy should fail as blocked by the deferred poll$"#
+)]
+pub async fn then_on_read_poll_fails_as_blocked(
+    world: &mut GlobalContext,
+    partition: u32,
+    consumer_name: String,
+) {
+    let operation = world
+        .lost_operation
+        .expect("a deferred poll failed as uncertain");
+    let client = world.client.as_ref().expect("client");
+    let polled = client
+        .poll_messages(
+            &stream_identifier(world),
+            &topic_identifier(world),
+            partition,
+            &named_consumer(&consumer_name),
+            &PollingStrategy::next(),
+            PollOptions {
+                count: 1,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
+        )
+        .await;
+    assert_eq!(
+        polled.map(drop),
+        Err(IggyError::PartitionLaneBlocked(partition, operation)),
+        "the poll must be blocked by the lost poll"
+    );
+}
+
+#[when(regex = r"^I abandon the operation of the deferred poll$")]
+pub async fn when_abandon_lost_poll(world: &mut GlobalContext) {
+    let operation = world
+        .lost_operation
+        .expect("a deferred poll failed as uncertain");
+    let client = world.client.as_ref().expect("client");
+    client
+        .abandon_operation(operation)
+        .await
+        .expect("abandon the lost poll");
 }
 
 #[when(regex = r#"^I send a message with payload "([^"]+)" to partition (\d+)$"#)]

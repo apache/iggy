@@ -20,13 +20,49 @@ public enum CommitPolicy: Sendable, Hashable {
     /// Nothing is stored. The application commits checkpoints.
     case manual
     /// The server stores the offset of the last message of each read as part
-    /// of the read: one round trip, at most once.
+    /// of the read, in one round trip. While the primary stays up a message
+    /// is delivered at most once. A failover before the store replicates can
+    /// deliver the last batch again.
     case onRead
     /// The client stores the latest counted position, at least once with
     /// ``CommitAfter/processing``. A single poll refuses it with
     /// ``IggyErrorCode/invalidConfiguration``, as it has nothing to count. A
     /// ``PartitionReader`` and an ``IggyConsumer`` accept it.
     case auto(AutoCommit)
+}
+
+/// Where a committing deferred poll (106) or fetch (109) reported an error,
+/// as `CommitErrorScope` in the Rust SDK.
+enum CommitErrorScope {
+    /// The whole reply is the error.
+    case request
+    /// One section of a fetch reply carries the error status.
+    case section
+
+    /// Whether `code`, reported in this scope, proves that the server stored
+    /// no offset. Any other code, a lost reply and a transport failure after
+    /// the send leave the outcome unknown.
+    func provesNothingStored(_ code: IggyErrorCode) -> Bool {
+        switch self {
+        case .request:
+            switch code {
+            case .featureUnavailable, .invalidIdentifier, .transientNotAccepted, .invalidSizeBytes, .historyUnavailable, .notPrimary,
+                .deferredPollCapacityExceeded, .streamIdNotFound, .streamNameNotFound, .topicIdNotFound, .topicNameNotFound, .partitionNotFound,
+                .tooManyConsumerOffsets, .invalidOffset, .consumerGroupPartitionNotOwned:
+                true
+            default:
+                false
+            }
+        case .section:
+            switch code {
+            case .transientNotAccepted, .invalidSizeBytes, .historyUnavailable, .notPrimary, .partitionNotFound, .tooManyConsumerOffsets,
+                .consumerGroupPartitionNotOwned:
+                true
+            default:
+                false
+            }
+        }
+    }
 }
 
 /// When ``CommitPolicy/auto(_:)`` stores. It needs `interval` or `every`. It

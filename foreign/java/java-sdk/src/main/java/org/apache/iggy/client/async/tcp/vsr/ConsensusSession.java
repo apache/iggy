@@ -682,6 +682,26 @@ public final class ConsensusSession {
         }
     }
 
+    /** Completes once no committing read that its caller cancelled after the send still waits for its reply. */
+    public CompletableFuture<Void> cancelledReadsSettled() {
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        awaitCancelledReads(result);
+        return result;
+    }
+
+    private void awaitCancelledReads(CompletableFuture<Void> result) {
+        ConsensusSession owner = owner();
+        CompletableFuture<Void> changed;
+        synchronized (owner) {
+            if (owner.lanes.values().stream().noneMatch(ticket -> ticket.blockedOnCancel)) {
+                result.complete(null);
+                return;
+            }
+            changed = owner.admissionChanged;
+        }
+        changed.whenComplete((ignored, error) -> awaitCancelledReads(result));
+    }
+
     private static IggyOperationException blockedLane(LaneKey lane, Ticket ticket) {
         return lane.equals(LaneKey.METADATA)
                 ? new IggyOperationException(IggyErrorCode.LANE_BLOCKED, ticket.operationId)
@@ -943,7 +963,8 @@ public final class ConsensusSession {
         private boolean restarting;
         private FetchRecovery fetch;
         private boolean fetchSettled;
-        private boolean committingPoll;
+        // The caller cancelled the committing read after it went out, so its lanes are blocked until its reply.
+        private boolean blockedOnCancel;
         private CompletableFuture<Void> attemptSettled;
 
         private Ticket(ConsensusSession owner, List<LaneKey> lanes, boolean mutation, long bytes, long generation) {
@@ -1037,6 +1058,13 @@ public final class ConsensusSession {
             return operationId;
         }
 
+        /** Whether the committing read of this ticket ended with an unknown outcome that still blocks its lanes. */
+        public boolean fetchRetained() {
+            synchronized (owner) {
+                return fetch != null && fetch.retained && !fetch.abandoned;
+            }
+        }
+
         /** Reserves bounded target metadata, independent of session-bound replay frames. */
         public void reserveFetch() {
             synchronized (owner) {
@@ -1057,20 +1085,10 @@ public final class ConsensusSession {
             }
         }
 
-        /**
-         * Marks a poll that stores its offset on the server. A lost reply leaves its outcome unknown, which a later
-         * read of the partition shows, so it blocks nothing.
-         */
-        public void markCommittingPoll() {
-            synchronized (owner) {
-                committingPoll = true;
-            }
-        }
-
         /** Whether this is a poll or fetch that stores the offsets that it reads. */
         public boolean commitsOnRead() {
             synchronized (owner) {
-                return committingPoll || fetch != null;
+                return fetch != null;
             }
         }
 
@@ -1088,21 +1106,49 @@ public final class ConsensusSession {
             }
         }
 
-        public boolean committingFetch() {
+        /**
+         * Blocks the lanes of a committing read whose caller cancelled it after it went out, because the server can
+         * still store until it answers the cancel. That reply lifts or narrows the block, see {@link #settleFetch}.
+         */
+        public void blockUntilSettled() {
             synchronized (owner) {
-                return fetch != null;
+                if (fetch == null || !sent || fetchSettled || completed || fetch.retained) {
+                    return;
+                }
+                retainFetch(lanes);
+                blockedOnCancel = true;
             }
+            owner.changed();
         }
 
         /** Settles a valid table before record decoding, retaining only uncertain target sections. */
         public void settleFetch(List<Long> uncertainPartitions) {
             synchronized (owner) {
                 fetchSettled = true;
-                if (!uncertainPartitions.isEmpty()) {
-                    retainFetch(lanes.stream()
-                            .filter(lane -> uncertainPartitions.contains(lane.partition()))
-                            .toList());
+                List<LaneKey> uncertain = lanes.stream()
+                        .filter(lane -> uncertainPartitions.contains(lane.partition()))
+                        .toList();
+                if (blockedOnCancel) {
+                    narrowFetch(uncertain);
+                } else if (!uncertain.isEmpty()) {
+                    retainFetch(uncertain);
                 }
+            }
+        }
+
+        /** Keeps the block of a cancelled committing read only on {@code uncertain}, which its reply left unknown. */
+        private void narrowFetch(List<LaneKey> uncertain) {
+            blockedOnCancel = false;
+            if (fetch.abandoned) {
+                return;
+            }
+            fetch.lanes.stream()
+                    .filter(lane -> !uncertain.contains(lane))
+                    .forEach(lane -> owner.blockedFetchLanes.remove(lane, fetch));
+            fetch.lanes = uncertain;
+            if (uncertain.isEmpty()) {
+                fetch.retained = false;
+                owner.retainedFetches.remove(operationId, fetch);
             }
         }
 
@@ -1200,6 +1246,9 @@ public final class ConsensusSession {
         public void settleSent(boolean uncertain) {
             synchronized (owner) {
                 sent = uncertain;
+                if (!uncertain && blockedOnCancel) {
+                    narrowFetch(List.of());
+                }
             }
         }
 
@@ -1253,13 +1302,11 @@ public final class ConsensusSession {
         public RuntimeException retain() {
             boolean saved;
             boolean fetchUnknown;
-            boolean pollUnknown;
             synchronized (owner) {
                 fetchUnknown = retainUnknownFetch();
                 saved = retainMutation();
-                pollUnknown = committingPoll && sent;
             }
-            if (fetchUnknown || pollUnknown) {
+            if (fetchUnknown) {
                 complete();
                 return new IggyOperationException(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN, operationId);
             }

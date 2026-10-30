@@ -392,8 +392,10 @@ struct DeferredRequestTests {
         await client.shutdown()
     }
 
-    /// A poll or fetch may have committed what it read before losing its reply.
-    @Test func aPollOrFetchThatLostItsReplyDoesNotGoAgain() async throws {
+    /// A poll or fetch may have committed what it read before losing its
+    /// reply, so it does not go again, and its partition takes no progress
+    /// until the caller abandons it.
+    @Test func aPollOrFetchThatLostItsReplyBlocksItsPartitionUntilAbandoned() async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
         let dropped = Locked<Set<UInt32>>([])
@@ -405,18 +407,102 @@ struct DeferredRequestTests {
         }
         let client = try await signedInClient(server)
         let options = DeferredPollOptions(maxWait: .milliseconds(200), requestTimeout: .seconds(5))
-        await expectCode(.transientNotCommitted) {
+        let lost = try await reportedError {
             _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 1, strategy: .next, count: 1, autoCommit: true, options: options)
         }
+        #expect(lost.code == .fetchProgressUncertain)
+        let operation = try #require(lost.operationID)
         #expect(await requests(server, .pollMessagesDeferred).count == 1)
-        await expectCode(.transientNotCommitted) {
+
+        let blocked = try await reportedError {
             _ = try await client.fetchMessages(streamID: 1, topicID: 2, targets: [(1, .next)], count: 1, autoCommit: true, options: options)
         }
+        #expect(blocked.code == .partitionLaneBlocked && blocked.operationID == operation && blocked.partitionID == 1)
+        await expectCode(.partitionLaneBlocked) {
+            try await client.storeConsumerOffset(streamID: 1, topicID: 2, partitionID: 1, offset: 7)
+        }
+        #expect(await requests(server, .fetchMessages).isEmpty)
+        #expect(await requests(server, .storeConsumerOffset).isEmpty)
+        try client.abandonOperation(operation)
+        await expectCode(.operationNotRetained) { try client.abandonOperation(operation) }
+
+        let lostFetch = try await reportedError {
+            _ = try await client.fetchMessages(streamID: 1, topicID: 2, targets: [(1, .next)], count: 1, autoCommit: true, options: options)
+        }
+        #expect(lostFetch.code == .fetchProgressUncertain && lostFetch.operationID != operation)
         #expect(await requests(server, .fetchMessages).count == 1)
-        // The unknown outcome blocks nothing: a reader repairs it by reading
-        // again after the stored offset.
+        try client.abandonOperation(try #require(lostFetch.operationID))
         try await client.storeConsumerOffset(streamID: 1, topicID: 2, partitionID: 1, offset: 7)
         _ = try await client.fetchMessages(streamID: 1, topicID: 2, targets: [(1, .next)], count: 1, autoCommit: true, options: options)
+        await client.shutdown()
+    }
+
+    /// A disconnect by the caller ends a committing poll that waits with an
+    /// unknown outcome, and its block outlives the session.
+    @Test func aDisconnectEndsAWaitingCommittingPollAsUncertain() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let released = Locked(false)
+        await server.respond { request in
+            guard request.code == CommandCode.pollMessagesDeferred.rawValue else {
+                return FakeVSRServer.defaultReply(request, address: server.address)
+            }
+            while !released.withLock({ $0 }) {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            return .ok(FakeVSRServer.polledBody(partitionID: 1, offsets: []))
+        }
+        let client = try await signedInClient(server)
+        let options = DeferredPollOptions(maxWait: .seconds(10), requestTimeout: .seconds(20))
+        let poll = { @Sendable in
+            _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 1, strategy: .next, count: 1, autoCommit: true, options: options)
+        }
+        let waiting = Task { try await poll() }
+        #expect(await eventually { await requests(server, .pollMessagesDeferred).count == 1 })
+
+        await client.disconnect()
+        let lost = try await reportedError {
+            let ended: Void? = try await withDeadline(.now + .seconds(2)) { try await waiting.value }
+            #expect(ended != nil, "the poll did not end within 2 seconds of the disconnect")
+        }
+
+        #expect(lost.code == .fetchProgressUncertain)
+        try await client.connect()
+        let blocked = try await reportedError { try await poll() }
+        #expect(blocked.code == .partitionLaneBlocked && blocked.operationID == lost.operationID)
+        released.withLock { $0 = true }
+        try client.abandonOperation(try #require(lost.operationID))
+        try await poll()
+        await client.shutdown()
+    }
+
+    /// A committing poll answered after its caller signed in again may have
+    /// stored a batch that the caller never gets, so it fails as uncertain.
+    @Test func aCommittingPollAnsweredAfterTheCallerSignedInAgainIsUncertain() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let released = Locked(false)
+        await server.respond { request in
+            guard request.code == CommandCode.pollMessagesDeferred.rawValue else {
+                return FakeVSRServer.defaultReply(request, address: server.address)
+            }
+            while !released.withLock({ $0 }) {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            return .ok(FakeVSRServer.polledBody(partitionID: 1, offsets: [0]))
+        }
+        let client = try await signedInClient(server)
+        let options = DeferredPollOptions(maxWait: .seconds(10), requestTimeout: .seconds(20))
+        let waiting = Task {
+            _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 1, strategy: .next, count: 1, autoCommit: true, options: options)
+        }
+        #expect(await eventually { await requests(server, .pollMessagesDeferred).count == 1 })
+        _ = try await client.login(username: "iggy", password: "iggy")
+
+        released.withLock { $0 = true }
+        let lost = try await reportedError { try await waiting.value }
+
+        #expect(lost.code == .fetchProgressUncertain && lost.operationID != nil)
         await client.shutdown()
     }
 

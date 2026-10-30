@@ -28,9 +28,9 @@ use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
 use iggy_common::{
     ConnectionString, ConnectionStringUtils, ConsumerGroupClientState, DecodeError,
-    DeferredPollOptions, DiagnosticEvent, HttpConnectionStringOptions, HttpMethod, IdentityInfo,
-    PollMessages, PolledMessages, PollingKind, TransportProtocol, UndecodedRecord,
-    validate_api_url,
+    DeferredPollOptions, DiagnosticEvent, HttpConnectionStringOptions, HttpMethod, Identifier,
+    IdentityInfo, PartitionContext, PollMessages, PolledMessages, PollingKind, TransportProtocol,
+    UndecodedRecord, validate_api_url,
 };
 use reqwest::{Method, Response, StatusCode, Url};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, RequestBuilder};
@@ -40,7 +40,7 @@ use reqwest_retry::{
 };
 use reqwest_tracing::{SpanBackendWithUrl, TracingMiddleware};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -88,10 +88,11 @@ pub struct HttpClient {
     /// The contexts that fence sends to an explicit partition, read from the topic details.
     pub(super) send_contexts: ConsumerGroupClientState,
     /// The partitions blocked by a poll with `auto_commit` whose outcome is unknown, by the
-    /// local operation id that `abandon_operation` takes. A name and a numeric id can spell
-    /// the same stream or topic, and HTTP has no id independent of the spelling, so a block
-    /// covers its partition id in every stream and topic.
-    progress_blocks: Mutex<BTreeMap<u64, u32>>,
+    /// local operation id that `abandon_operation` takes.
+    progress_blocks: Mutex<BTreeMap<u64, ProgressKey>>,
+    /// One progress poll of a partition at a time, so a poll checks the block that the poll
+    /// before it left. Each lane is keyed without its incarnation.
+    progress_lanes: Mutex<HashMap<ProgressKey, Arc<tokio::sync::Mutex<()>>>>,
     next_operation_id: AtomicU64,
     /// HTTP keeps no connection, so no event is ever published here. The
     /// channel exists only because the `Client` trait requires
@@ -266,7 +267,7 @@ impl HttpClient {
     /// Sends a deferred poll. Only a refusal that admitted nothing is sent again, within the
     /// request timeout. A progress poll, one with `auto_commit` or from
     /// [`PollingKind::Next`], fails with [`IggyError::PartitionLaneBlocked`] while its partition
-    /// is blocked.
+    /// is blocked, and the progress polls of one partition run one at a time.
     ///
     /// The server stores the offset of a poll with `auto_commit` before it answers, and it can
     /// still store it after the client gives up. So such a poll that may have reached the
@@ -284,17 +285,31 @@ impl HttpClient {
         options
             .validate(poll.count)
             .map_err(DecodeError::without_record)?;
-        let partition_id = poll.partition_id.unwrap_or(DEFAULT_PARTITION_ID);
+        let key = ProgressKey::new(
+            &poll.stream_id,
+            &poll.topic_id,
+            poll.partition_id.unwrap_or(DEFAULT_PARTITION_ID),
+            poll.strategy.context(),
+        );
         let progress = poll.auto_commit || poll.strategy.kind == PollingKind::Next;
         // Before the lease wait, so a client full of waiting polls cannot hide the block
         // behind `TransientNotAccepted`.
         if progress {
-            self.fail_if_progress_blocked(partition_id)
+            self.fail_if_progress_blocked(&key)
                 .map_err(DecodeError::without_record)?;
         }
         let limit = deferred_reply_limit(options.max_bytes);
         let started = Instant::now();
         let deadline = started + options.request_timeout.get_duration();
+        let _lane = if progress {
+            Some(
+                self.progress_lane(&key, deadline)
+                    .await
+                    .map_err(DecodeError::without_record)?,
+            )
+        } else {
+            None
+        };
         let _permit = DeferredLease::acquire(&self.deferred_leases, deadline)
             .await
             .map_err(DecodeError::without_record)?;
@@ -304,9 +319,9 @@ impl HttpClient {
             .map_err(DecodeError::without_record)?;
         let mut retry_interval = LIFECYCLE_RETRY_INTERVAL;
         loop {
-            // Another call can block the partition during the lease wait or a retry pause.
+            // Another call can block the partition during the lane wait or a retry pause.
             if progress {
-                self.fail_if_progress_blocked(partition_id)
+                self.fail_if_progress_blocked(&key)
                     .map_err(DecodeError::without_record)?;
             }
             let request = {
@@ -333,7 +348,7 @@ impl HttpClient {
                     .timeout(remaining.request_timeout.get_duration())
             };
             // Armed before the send, because HTTP cannot tell when the request leaves.
-            let attempt = self.poll_attempt(partition_id, poll.auto_commit);
+            let attempt = self.poll_attempt(&key, poll.auto_commit);
             let error = match Self::deferred_reply(request, poll, limit, deadline).await {
                 Ok(messages) => {
                     attempt.settle();
@@ -439,18 +454,38 @@ impl HttpClient {
         Ok(messages)
     }
 
-    /// Fails with [`IggyError::PartitionLaneBlocked`] while a poll with `auto_commit` of
-    /// `partition_id` has an unknown outcome. Polls that store the offset or start at it, and
-    /// offset stores and deletes, check it.
-    pub(super) fn fail_if_progress_blocked(&self, partition_id: u32) -> Result<(), IggyError> {
+    /// Fails with [`IggyError::PartitionLaneBlocked`] while a poll with `auto_commit` of the
+    /// partition of `key` has an unknown outcome. Polls that store the offset or start at it,
+    /// and offset stores and deletes, check it.
+    pub(super) fn fail_if_progress_blocked(&self, key: &ProgressKey) -> Result<(), IggyError> {
         let blocking = self
             .progress_blocks()
             .iter()
-            .find_map(|(&operation_id, &blocked)| {
-                (blocked == partition_id).then_some(operation_id)
-            });
+            .find_map(|(&operation_id, blocked)| blocked.covers(key).then_some(operation_id));
         blocking.map_or(Ok(()), |operation_id| {
-            Err(IggyError::PartitionLaneBlocked(partition_id, operation_id))
+            Err(IggyError::PartitionLaneBlocked(
+                key.partition_id,
+                operation_id,
+            ))
+        })
+    }
+
+    /// Waits until `deadline` for the progress lane of the partition of `key`, which the poll
+    /// holds until it ends, also while its drop arms a block.
+    async fn progress_lane(
+        &self,
+        key: &ProgressKey,
+        deadline: Instant,
+    ) -> Result<ProgressLane<'_>, IggyError> {
+        let key = key.lane();
+        let lane = Arc::clone(self.progress_lanes().entry(key.clone()).or_default());
+        let guard = timeout_at(deadline, lane.lock_owned())
+            .await
+            .map_err(|_| IggyError::TransientNotAccepted)?;
+        Ok(ProgressLane {
+            client: self,
+            key,
+            guard: Some(guard),
         })
     }
 
@@ -459,16 +494,22 @@ impl HttpClient {
         self.progress_blocks().contains_key(&op)
     }
 
-    fn poll_attempt(&self, partition_id: u32, auto_commit: bool) -> PollAttempt<'_> {
+    fn poll_attempt(&self, key: &ProgressKey, auto_commit: bool) -> PollAttempt<'_> {
         PollAttempt {
             client: self,
-            partition_id,
+            key: key.clone(),
             commit: auto_commit.then(|| self.next_operation_id.fetch_add(1, Ordering::Relaxed)),
         }
     }
 
-    fn progress_blocks(&self) -> MutexGuard<'_, BTreeMap<u64, u32>> {
+    fn progress_blocks(&self) -> MutexGuard<'_, BTreeMap<u64, ProgressKey>> {
         self.progress_blocks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn progress_lanes(&self) -> MutexGuard<'_, HashMap<ProgressKey, Arc<tokio::sync::Mutex<()>>>> {
+        self.progress_lanes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
@@ -498,6 +539,7 @@ impl HttpClient {
             access_token: IggyRwLock::new(access_token),
             send_contexts: ConsumerGroupClientState::new(),
             progress_blocks: Mutex::default(),
+            progress_lanes: Mutex::default(),
             next_operation_id: AtomicU64::new(FIRST_OPERATION_ID),
             events: diagnostic_event_channel(),
         })
@@ -675,13 +717,78 @@ enum PollFailure {
     Undecoded(Bytes),
 }
 
+/// The partition of a progress call. HTTP has no partition id independent of the spelling of
+/// the stream and the topic, so a key names them as the call spells them, and adds the
+/// incarnation of the partition when the call carries its context. An incarnation names one
+/// partition in every spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct ProgressKey {
+    stream: String,
+    topic: String,
+    partition_id: u32,
+    incarnation: Option<u64>,
+}
+
+/// The progress lane of one partition, held by one progress poll.
+struct ProgressLane<'a> {
+    client: &'a HttpClient,
+    key: ProgressKey,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
 /// One attempt of a deferred poll. An attempt with `auto_commit` that its caller drops before
 /// it settles blocks its partition, because the server can still store the offset.
 struct PollAttempt<'a> {
     client: &'a HttpClient,
-    partition_id: u32,
+    key: ProgressKey,
     /// The local operation id of an attempt with `auto_commit`.
     commit: Option<u64>,
+}
+
+impl ProgressKey {
+    pub(super) fn new(
+        stream: &Identifier,
+        topic: &Identifier,
+        partition_id: u32,
+        context: Option<PartitionContext>,
+    ) -> Self {
+        Self {
+            stream: stream.as_cow_str().into_owned(),
+            topic: topic.as_cow_str().into_owned(),
+            partition_id,
+            // Metadata revisions start at 1, so incarnation 0 is a context that was never read.
+            incarnation: context
+                .map(|context| context.incarnation)
+                .filter(|incarnation| *incarnation != 0),
+        }
+    }
+
+    /// Whether a block of `self` covers a call of `other`.
+    fn covers(&self, other: &Self) -> bool {
+        self.partition_id == other.partition_id
+            && ((self.stream == other.stream && self.topic == other.topic)
+                || (self.incarnation.is_some() && self.incarnation == other.incarnation))
+    }
+
+    fn lane(&self) -> Self {
+        Self {
+            incarnation: None,
+            ..self.clone()
+        }
+    }
+}
+
+impl Drop for ProgressLane<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        let mut lanes = self.client.progress_lanes();
+        if lanes
+            .get(&self.key)
+            .is_some_and(|lane| Arc::strong_count(lane) == 1)
+        {
+            lanes.remove(&self.key);
+        }
+    }
 }
 
 impl PollAttempt<'_> {
@@ -702,7 +809,7 @@ impl Drop for PollAttempt<'_> {
         if let Some(operation_id) = self.commit {
             self.client
                 .progress_blocks()
-                .insert(operation_id, self.partition_id);
+                .insert(operation_id, self.key.clone());
         }
     }
 }

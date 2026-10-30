@@ -52,7 +52,6 @@ type IggyConsumer struct {
 	mu        sync.Mutex
 	batch     *iggcon.PolledMessage
 	index     int
-	seeks     uint64
 	uncounted *ReceivedMessage
 	stopping  atomic.Bool
 }
@@ -112,6 +111,9 @@ func (c *IggyConsumer) Consume(ctx context.Context, handler func(context.Context
 	c.countUncountedLocked()
 	c.mu.Unlock()
 	for !c.stopping.Load() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		message, err := c.take(ctx)
 		if err != nil {
 			if c.stopping.Load() {
@@ -143,15 +145,20 @@ func (c *IggyConsumer) Mark(checkpoint iggcon.Checkpoint) error {
 // messages of the partition that the consumer still holds are dropped.
 func (c *IggyConsumer) Seek(ctx context.Context, partitionID uint32, start iggcon.PollingStrategy) error {
 	c.mu.Lock()
-	if c.batch != nil && c.batch.PartitionId == partitionID {
-		c.batch = nil
+	store, err := c.reader.startSeek(partitionID, start)
+	if err == nil {
+		if c.batch != nil && c.batch.PartitionId == partitionID {
+			c.batch = nil
+		}
+		if c.uncounted != nil && c.uncounted.PartitionID == partitionID {
+			c.uncounted = nil
+		}
 	}
-	if c.uncounted != nil && c.uncounted.PartitionID == partitionID {
-		c.uncounted = nil
-	}
-	c.seeks++
 	c.mu.Unlock()
-	return c.reader.Seek(ctx, partitionID, start)
+	if err != nil || store == nil {
+		return err
+	}
+	return store(ctx)
 }
 
 // Partitions are the partitions of the reader.
@@ -181,14 +188,14 @@ func (c *IggyConsumer) take(ctx context.Context) (ReceivedMessage, error) {
 			c.mu.Unlock()
 			return message, nil
 		}
-		seeks := c.seeks
 		c.mu.Unlock()
-		batch, err := c.reader.next(ctx, false)
+		batch, generation, err := c.reader.next(ctx, false)
 		if err != nil {
 			return ReceivedMessage{}, err
 		}
 		c.mu.Lock()
-		if seeks == c.seeks {
+		// A seek of the partition that started after the reader handed the batch over drops it.
+		if c.reader.keeps(batch.PartitionId, generation) {
 			c.batch = batch
 			c.index = 0
 		}

@@ -127,6 +127,7 @@ public sealed class DeferredPollingTests
         int code, bool cancelWins)
     {
         using var node = new MockNode();
+        var stores = 0;
         var parked = new TaskCompletionSource<MockRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
         node.Serve(request =>
         {
@@ -134,6 +135,10 @@ public sealed class DeferredPollingTests
             {
                 parked.TrySetResult(request);
                 return null;
+            }
+            if (request.Operation == (byte)VsrOperation.StoreConsumerOffset)
+            {
+                Interlocked.Increment(ref stores);
             }
             return request.Code == CancelCode ? null : Standalone(node, request);
         });
@@ -146,18 +151,25 @@ public sealed class DeferredPollingTests
         await cancellation.CancelAsync();
 
         await UntilAsync(() => node.Requests(CancelCode) == 1);
+        var storing = client.StoreOffsetAsync(Consumer.New(4), Stream, Topic, 0, 1, token);
         await Task.Delay(SettleDelay, token);
         Assert.False(call.IsCompleted);
+        Assert.Equal((false, 0), (storing.IsCompleted, Volatile.Read(ref stores)));
         if (cancelWins)
         {
             await node.AnswerParkedAsync(request, Reply(request.Operation, [], VsrError.TRANSIENT_NOT_ACCEPTED));
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => call.WaitAsync(PromptLimit, token));
-            return;
         }
-        await node.AnswerParkedAsync(request, code == PollCode
-            ? Batch(request, DrainedOffset)
-            : Reply(request.Operation, FetchBody(GoldenSection(1, 0, default))));
-        Assert.Equal(GOLDEN_BATCH_MESSAGES, await call.WaitAsync(PromptLimit, token));
+        else
+        {
+            await node.AnswerParkedAsync(request, code == PollCode
+                ? Batch(request, DrainedOffset)
+                : Reply(request.Operation, FetchBody(GoldenSection(1, 0, default))));
+            Assert.Equal(GOLDEN_BATCH_MESSAGES, await call.WaitAsync(PromptLimit, token));
+        }
+
+        await storing.WaitAsync(PromptLimit, token);
+        Assert.Equal(1, Volatile.Read(ref stores));
     }
 
     /// <summary>
@@ -348,6 +360,72 @@ public sealed class DeferredPollingTests
     ///     A deferred group poll without a partition would park on one partition while another holds messages, so a
     ///     group member fetches its partitions instead.
     /// </summary>
+    /// <summary>
+    ///     A committing poll that the server answers as not committed may have stored its offset. It fails as
+    ///     uncertain with its operation, and its partition takes no committing poll and no offset store until the
+    ///     caller abandons that operation, also after a sign-in.
+    /// </summary>
+    [Fact]
+    public async Task given_a_committing_poll_with_an_unknown_outcome_when_reading_its_partition_should_block_it_until_abandoned()
+    {
+        using var node = new MockNode();
+        var answered = 0;
+        node.Serve(request => request.Code != PollCode ? Standalone(node, request)
+            : Interlocked.Exchange(ref answered, 1) == 0
+                ? Reply(request.Operation, [], VsrError.TRANSIENT_NOT_COMMITTED)
+                : Batch(request, DrainedOffset));
+        using var client = await ConnectAsync(node);
+        var token = TestContext.Current.CancellationToken;
+
+        var uncertain = await Assert.ThrowsAsync<VsrFetchProgressUncertainException>(() => PollOnReadAsync(client, token));
+        await client.LoginUserAsync("user", "secret", token);
+        var blocked = await Assert.ThrowsAsync<VsrPartitionLaneBlockedException>(() => PollOnReadAsync(client, token));
+        var store = await Assert.ThrowsAsync<VsrPartitionLaneBlockedException>(() =>
+            client.StoreOffsetAsync(Consumer.New(4), Stream, Topic, 0, 1, token));
+        var delete = await Assert.ThrowsAsync<VsrPartitionLaneBlockedException>(() =>
+            client.DeleteOffsetAsync(Consumer.New(4), Stream, Topic, 1, token));
+        await client.AbandonOperationAsync(uncertain.OperationId!.Value);
+        var polled = await PollOnReadAsync(client, token);
+
+        Assert.Equal(VsrError.FETCH_PROGRESS_UNCERTAIN, uncertain.StatusCode);
+        Assert.Equal((uncertain.OperationId.Value, 1u), (blocked.OperationId, blocked.PartitionId));
+        Assert.Equal((uncertain.OperationId.Value, 1u), (store.OperationId, store.PartitionId));
+        Assert.Equal((uncertain.OperationId.Value, 1u), (delete.OperationId, delete.PartitionId));
+        Assert.Equal((int)GOLDEN_BATCH_MESSAGES, polled.Messages.Count);
+        Assert.Equal(2, node.Requests(PollCode));
+    }
+
+    /// <summary>
+    ///     The client drops its links while a committing poll waits on the server, which can still store its offset.
+    ///     The poll fails as uncertain, and after the client connects and signs in again its partition stays blocked
+    ///     until the caller abandons that poll.
+    /// </summary>
+    [Fact]
+    public async Task given_a_parked_committing_poll_when_the_client_disconnects_should_fail_it_as_uncertain_until_abandoned()
+    {
+        using var node = new MockNode();
+        var parked = new TaskCompletionSource<MockRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
+        node.Serve(request => request.Code != PollCode ? Standalone(node, request)
+            : parked.TrySetResult(request) ? null
+            : Batch(request, DrainedOffset));
+        using var client = await ConnectAsync(node);
+        var token = TestContext.Current.CancellationToken;
+        var poll = PollOnReadAsync(client, token);
+        await parked.Task.WaitAsync(PromptLimit, token);
+
+        await client.DisconnectAsync();
+        var uncertain = await Assert.ThrowsAsync<VsrFetchProgressUncertainException>(() =>
+            poll.WaitAsync(PromptLimit, token));
+        await client.ConnectAsync(token);
+        await client.LoginUserAsync("user", "secret", token);
+        var blocked = await Assert.ThrowsAsync<VsrPartitionLaneBlockedException>(() => PollOnReadAsync(client, token));
+        await client.AbandonOperationAsync(blocked.OperationId);
+        var polled = await PollOnReadAsync(client, token);
+
+        Assert.Equal(uncertain.OperationId, blocked.OperationId);
+        Assert.Equal((int)GOLDEN_BATCH_MESSAGES, polled.Messages.Count);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -407,6 +485,10 @@ public sealed class DeferredPollingTests
         BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(sizeof(uint)), currentOffset);
         return Reply(request.Operation, body);
     }
+
+    private static Task<PolledMessages> PollOnReadAsync(TcpMessageStream client, CancellationToken token) =>
+        client.PollMessagesAsync(Stream, Topic, 1, Consumer.New(4), PollingStrategy.Next(),
+            new PollOptions { MaxWait = TimeSpan.FromSeconds(1), Commit = CommitPolicy.OnRead }, token);
 
     private static Task<PolledMessages> PollPartitionAsync(TcpMessageStream client, CancellationToken token) =>
         client.PollMessagesAsync(Stream, Topic, 1, Consumer.New(4), PollingStrategy.Offset(0), 10, false, LongWait,

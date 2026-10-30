@@ -18,6 +18,20 @@
 import Foundation
 import Iggy
 
+/// Whether a poll ended, set by the task of the poll.
+final class PollEnd: @unchecked Sendable {
+    private let lock = NSLock()
+    private var endedAt: ContinuousClock.Instant?
+
+    func end() {
+        lock.withLock { endedAt = endedAt ?? .now }
+    }
+
+    var ended: ContinuousClock.Instant? {
+        lock.withLock { endedAt }
+    }
+}
+
 struct StepFailure: Error, CustomStringConvertible {
     let description: String
 
@@ -34,8 +48,11 @@ final class World: @unchecked Sendable {
     var topic: Identifier?
     var poll: Task<PolledMessages, any Error>?
     var pollStarted = ContinuousClock.now
+    var pollEnd = PollEnd()
     var reader: PartitionReader?
     var consumer: IggyConsumer?
+    /// The operation of a committing poll whose outcome is unknown.
+    var lostOperation: UInt128Value?
 
     func requireClient() throws -> IggyClient {
         guard let client else {
@@ -74,6 +91,9 @@ final class World: @unchecked Sendable {
         await client?.shutdown()
     }
 }
+
+/// How long a started poll gets to reach the server and park there.
+private let parkTime: Duration = .milliseconds(500)
 
 struct StepDefinition: Sendable {
     let pattern: String
@@ -127,6 +147,20 @@ private func poll(_ world: World, partition: UInt32, consumer: String, commit: C
     return try await world.requireClient().pollMessages(
         streamID: stream, topicID: topic, partitionID: partition, consumer: .consumer(try Identifier(named: consumer)), strategy: .next,
         options: PollOptions(count: 1, commit: commit))
+}
+
+/// The ``IggyError`` that `body` throws, or a failure when it throws
+/// anything else or returns, which names what it returned.
+private func iggyError(_ what: String, _ body: () async throws -> PolledMessages) async throws -> IggyError {
+    let polled: PolledMessages
+    do {
+        polled = try await body()
+    } catch let error as IggyError {
+        return error
+    } catch {
+        throw StepFailure("\(what) failed with \(error)")
+    }
+    throw StepFailure("\(what) did not fail, it returned \(polled.messages.map(\.payloadString)) from partition \(polled.partitionID)")
 }
 
 private func openConsumer(_ world: World, group: String, options: PollOptions) async throws {
@@ -185,6 +219,67 @@ let stepDefinitions: [StepDefinition] = [
         world.poll = Task {
             try await client.pollMessages(streamID: stream, topicID: topic, partitionID: partition, consumer: consumer, strategy: .next, options: options)
         }
+    },
+    StepDefinition(
+        pattern: #"I start a deferred poll of partition (\d+) for consumer "([^"]+)" with the on read commit policy and a max wait of (\d+) seconds?"#
+    ) { world, values in
+        let (stream, topic) = try world.requireTopic()
+        let client = try world.requireClient()
+        let partition: UInt32 = try number(values[0])
+        let consumer = Consumer.consumer(try Identifier(named: values[1]))
+        let options = PollOptions(count: 10, maxWait: try seconds(values[2]), commit: .onRead)
+        // A read that waits for nothing first opens the route and the
+        // connection, so the parked poll only writes its frame.
+        _ = try await client.pollMessages(
+            streamID: stream, topicID: topic, partitionID: partition, consumer: consumer, strategy: .offset(0), options: PollOptions(count: 1, maxWait: .zero))
+        let end = PollEnd()
+        world.pollEnd = end
+        world.pollStarted = .now
+        world.poll = Task {
+            defer { end.end() }
+            return try await client.pollMessages(
+                streamID: stream, topicID: topic, partitionID: partition, consumer: consumer, strategy: .next, options: options)
+        }
+    },
+    StepDefinition(pattern: #"the client disconnects before the deferred poll answers"#) { world, _ in
+        _ = try world.requirePoll()
+        try await Task.sleep(for: parkTime)
+        if let ended = world.pollEnd.ended {
+            throw StepFailure("the deferred poll ended \(ended - world.pollStarted) after it started, before the disconnect")
+        }
+        await (try world.requireClient()).disconnect()
+    },
+    StepDefinition(pattern: #"the deferred poll should fail as uncertain"#) { world, _ in
+        let poll = try world.requirePoll()
+        world.poll = nil
+        let error = try await iggyError("the deferred poll") { try await within(.seconds(5), "the deferred poll") { try await poll.value } }
+        let ended = world.pollEnd.ended.map { "\($0 - world.pollStarted)" } ?? "never"
+        try expect(error.code == .fetchProgressUncertain, "the deferred poll failed with \(error) \(ended) after it started")
+        guard let operation = error.operationID else {
+            throw StepFailure("the uncertain poll names no operation: \(error)")
+        }
+        world.lostOperation = operation
+    },
+    StepDefinition(pattern: #"the client connects again"#) { world, _ in
+        let client = try world.requireClient()
+        try await client.connect()
+        let environment = ProcessInfo.processInfo.environment
+        _ = try await client.login(username: environment["IGGY_ROOT_USERNAME"] ?? "iggy", password: environment["IGGY_ROOT_PASSWORD"] ?? "iggy")
+    },
+    StepDefinition(
+        pattern:
+            #"a poll of partition (\d+) for consumer "([^"]+)" with the next strategy and the on read commit policy should fail as blocked by the deferred poll"#
+    ) { world, values in
+        let partition: UInt32 = try number(values[0])
+        let error = try await iggyError("the poll") { try await poll(world, partition: partition, consumer: values[1], commit: .onRead) }
+        try expect(error.code == .partitionLaneBlocked, "the poll failed with \(error)")
+        try expect(error.operationID == world.lostOperation && error.partitionID == partition, "the poll was blocked by \(error)")
+    },
+    StepDefinition(pattern: #"I abandon the operation of the deferred poll"#) { world, _ in
+        guard let operation = world.lostOperation else {
+            throw StepFailure("no deferred poll failed as uncertain")
+        }
+        try world.requireClient().abandonOperation(operation)
     },
     StepDefinition(pattern: #"I cancel the deferred poll after (\d+) milliseconds"#) { world, values in
         let poll = try world.requirePoll()

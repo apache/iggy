@@ -268,6 +268,84 @@ func TestE2E_CancelledDeferredPollsFreeTheirServerSlots(t *testing.T) {
 	require.Len(t, polled.Messages, 1)
 }
 
+// A disconnect while a committing poll waits on the server leaves its outcome
+// unknown, so the partition takes no committing poll and no offset store until
+// the caller abandons that poll, also after a reconnect and a new sign-in.
+func TestE2E_LostCommittingPollBlocksItsPartitionUntilAbandoned(t *testing.T) {
+	connected := connect(t)
+	ctx := context.Background()
+	streamId, topicId := scratchTopic(t, connected, 1)
+	consumer := singleConsumer(t)
+	partition := uint32(0)
+	// The route lookup happens first, so the committing poll reaches the server before the disconnect.
+	_, err := connected.PollMessages(ctx, streamId, topicId, partition, consumer, iggcon.OffsetPollingStrategy(0), iggcon.DefaultPollOptions())
+	require.NoError(t, err)
+	committing := longWaitOptions(1)
+	committing.Commit = iggcon.OnReadCommit()
+	lost := make(chan error, 1)
+	go func() {
+		_, err := connected.PollMessages(ctx, streamId, topicId, partition, consumer, iggcon.NextPollingStrategy(), committing)
+		lost <- err
+	}()
+	time.Sleep(200 * time.Millisecond)
+	disconnecting, ok := connected.(interface{ Unwrap() iggcon.Client }).Unwrap().(interface{ Disconnect() error })
+	require.True(t, ok)
+
+	require.NoError(t, disconnecting.Disconnect())
+
+	var unknown ierror.FetchProgressUncertain
+	select {
+	case err := <-lost:
+		require.ErrorAs(t, err, &unknown)
+	case <-time.After(promptReply):
+		t.Fatal("the committing poll outlived the disconnect")
+	}
+	require.NoError(t, connected.Connect(ctx))
+	_, err = connected.LoginUser(ctx, rootUsername, rootPassword)
+	require.NoError(t, err)
+	_, err = connected.PollMessages(ctx, streamId, topicId, partition, consumer, iggcon.NextPollingStrategy(), countOptions(1, true))
+	var blocked ierror.PartitionLaneBlocked
+	require.ErrorAs(t, err, &blocked)
+	assert.Equal(t, unknown.OperationID, blocked.OperationID)
+	require.NoError(t, connected.AbandonOperation(ctx, unknown.OperationID))
+	_, err = connected.SendMessages(ctx, streamId, topicId, iggcon.PartitionId(partition), testMessages(t, 1))
+	require.NoError(t, err)
+	polled, err := connected.PollMessages(ctx, streamId, topicId, partition, consumer, iggcon.NextPollingStrategy(), countOptions(1, true))
+	require.NoError(t, err)
+	assert.Len(t, polled.Messages, 1)
+}
+
+// Close cancels a committing read that waits on the server and takes its one
+// reply, so it ends in about a round trip instead of after the wait.
+func TestE2E_OnReadCloseCancelsItsParkedRead(t *testing.T) {
+	connected := connect(t)
+	ctx := context.Background()
+	streamId, topicId := scratchTopic(t, connected, 1)
+	_, err := connected.SendMessages(ctx, streamId, topicId, iggcon.PartitionId(0), testMessages(t, 1))
+	require.NoError(t, err)
+	options := longWaitOptions(1)
+	options.Commit = iggcon.OnReadCommit()
+	partitionReader, err := reader.NewPartitionReader(ctx, connected, streamId, topicId, singleConsumer(t),
+		reader.WithPartitions(0), reader.WithPollOptions(options))
+	require.NoError(t, err)
+	readCtx, cancel := context.WithTimeout(ctx, promptReply)
+	_, err = partitionReader.Next(readCtx)
+	cancel()
+	require.NoError(t, err)
+	parked := make(chan error, 1)
+	go func() {
+		_, err := partitionReader.Next(context.Background())
+		parked <- err
+	}()
+	time.Sleep(300 * time.Millisecond)
+	started := time.Now()
+
+	require.NoError(t, partitionReader.Close(ctx))
+
+	assert.Less(t, time.Since(started), promptReply, "the close waited out the parked read")
+	require.ErrorIs(t, <-parked, ierror.ErrClientShutdown)
+}
+
 // newGroup creates a consumer group on the topic, which a reader or a consumer then joins.
 func newGroup(t *testing.T, connected iggcon.Client, streamId, topicId iggcon.Identifier) iggcon.Identifier {
 	t.Helper()

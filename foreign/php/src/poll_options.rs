@@ -43,8 +43,9 @@ impl CommitPolicy {
         }
     }
 
-    /// The server stores the offset of the last message of each read as part of the read: one
-    /// round trip, at most once.
+    /// The server stores the offset of the last message of each read as part of the read, in one
+    /// round trip. While the primary stays up a message is delivered at most once. A failover
+    /// before the store replicates can deliver the last batch again.
     pub fn on_read() -> Self {
         Self {
             inner: RustCommitPolicy::OnRead,
@@ -181,7 +182,10 @@ impl From<CommitAfter> for RustCommitAfter {
     }
 }
 
-/// The limits of one poll of one partition.
+/// The limits of one read: a poll of one partition, or a fetch that a partition reader sends
+/// for several partitions of one primary. A fetch applies `count`, `min_count` and `max_bytes`
+/// to all of its partitions together. A reader that commits nothing runs several fetches at
+/// once, each within these limits, for partitions with more messages waiting.
 #[php_class]
 #[php(name = "Iggy\\PollOptions")]
 #[derive(Clone, Copy)]

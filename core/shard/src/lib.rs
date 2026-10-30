@@ -448,6 +448,12 @@ pub enum PartitionRead {
         consumer: Option<PollingConsumer>,
         metadata: metadata::stm::stream::PollMetadata,
     },
+    /// [`Self::ConsumerOffsetOnPrimary`] for each of `reads`, partitions that
+    /// the receiving shard owns, in one frame. See
+    /// [`IggyShard::consumer_offsets_on_primary`].
+    ConsumerOffsetsOnPrimary {
+        reads: Vec<ConsumerOffsetRead>,
+    },
     /// An external group's stored offset. Not a `PollingConsumer`: the kind is never polled.
     ExternalGroupOffsetOnPrimary {
         group_id: u32,
@@ -487,6 +493,7 @@ impl PartitionRead {
             Self::DeferredPoll(_)
             | Self::ConsumerOffset { .. }
             | Self::ConsumerOffsetOnPrimary { .. }
+            | Self::ConsumerOffsetsOnPrimary { .. }
             | Self::ExternalGroupOffsetOnPrimary { .. }
             | Self::PollOnPrimary { .. }
             | Self::UnboundPollOnPrimary { .. }
@@ -497,6 +504,16 @@ impl PartitionRead {
             | Self::ResolveSegmentDeleteOffset { .. } => false,
         }
     }
+}
+
+/// One partition of [`PartitionRead::ConsumerOffsetsOnPrimary`], named as
+/// [`PartitionRead::ConsumerOffsetOnPrimary`] names it.
+#[derive(Debug, Clone, Copy)]
+pub struct ConsumerOffsetRead {
+    pub namespace: IggyNamespace,
+    /// None means the named group does not exist, so no offset can exist.
+    pub consumer: Option<PollingConsumer>,
+    pub metadata: metadata::stm::stream::PollMetadata,
 }
 
 /// Reply to a [`PartitionRead`].
@@ -528,6 +545,9 @@ pub enum PartitionReadReply {
         stored: Option<u64>,
         current_offset: u64,
     },
+    /// Reply to [`PartitionRead::ConsumerOffsetsOnPrimary`]: the reply to
+    /// each of its reads, in order.
+    ConsumerOffsets(Vec<Self>),
     /// The read was refused and returns no messages. A poll that needs a new
     /// consumer offset key beyond the configured limit returns
     /// `TooManyConsumerOffsets`. A completion whose history changed, whose owner
@@ -1036,6 +1056,14 @@ pub enum LifecycleFrame {
     ReadinessUnwatch {
         from: u16,
         watches: Vec<(IggyNamespace, u64)>,
+    },
+    /// The shard `from` holds a parked wait on `watches` of the receiving
+    /// shard, or no longer does. Only a shard with a parked wait gets the
+    /// pushes of the commits.
+    ReadinessInterest {
+        from: u16,
+        watches: Vec<(IggyNamespace, u64)>,
+        parked: bool,
     },
     /// Admit a partition write (`SendMessages` / consumer-offset write) on
     /// the shard owning its namespace, carrying the channel its committed
@@ -2475,6 +2503,72 @@ where
         }
     }
 
+    /// [`PartitionRead::ConsumerOffsetOnPrimary`] for each of `reads`, in
+    /// order. The partitions that this shard owns are read in place, and the
+    /// others in one frame for each owner shard, all at once. `None` where an
+    /// owner dropped the reply or did not answer within `PARTITION_READ_TIMEOUT`.
+    /// A namespace that no shard owns, or an inbox that refuses the frame,
+    /// returns [`PartitionReadReply::Rejected`] with
+    /// [`IggyError::TransientNotAccepted`].
+    #[allow(clippy::future_not_send)]
+    pub async fn consumer_offsets_on_primary(
+        &self,
+        reads: Vec<ConsumerOffsetRead>,
+    ) -> Vec<Option<PartitionReadReply>>
+    where
+        M: StreamsFrontend,
+    {
+        let mut replies: Vec<Option<PartitionReadReply>> =
+            std::iter::repeat_with(|| None).take(reads.len()).collect();
+        let mut owners: BTreeMap<u16, (Vec<usize>, Vec<ConsumerOffsetRead>)> = BTreeMap::new();
+        for (index, read) in reads.into_iter().enumerate() {
+            match self.shards_table.shard_for(read.namespace) {
+                Some(owner) if owner == self.id => {
+                    replies[index] = Some(self.consumer_offset_on_primary(read));
+                }
+                Some(owner) => {
+                    let (indexes, reads) = owners.entry(owner).or_default();
+                    indexes.push(index);
+                    reads.push(read);
+                }
+                None => {
+                    replies[index] = Some(PartitionReadReply::Rejected(
+                        IggyError::TransientNotAccepted,
+                    ));
+                }
+            }
+        }
+        let answers =
+            futures::future::join_all(owners.into_values().map(|(indexes, reads)| async {
+                let Some(namespace) = reads.first().map(|read| read.namespace) else {
+                    return (indexes, None);
+                };
+                let reply = self
+                    .partition_read(namespace, PartitionRead::ConsumerOffsetsOnPrimary { reads })
+                    .await;
+                (indexes, reply)
+            }))
+            .await;
+        for (indexes, reply) in answers {
+            match reply {
+                Some(PartitionReadReply::ConsumerOffsets(offsets))
+                    if offsets.len() == indexes.len() =>
+                {
+                    for (index, offset) in indexes.into_iter().zip(offsets) {
+                        replies[index] = Some(offset);
+                    }
+                }
+                Some(PartitionReadReply::Rejected(error)) => {
+                    for index in indexes {
+                        replies[index] = Some(PartitionReadReply::Rejected(error.clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        replies
+    }
+
     /// One zero-wait read of a fetch on the owner of `namespace`. The owner
     /// tests `request_deadline` before it commits, so a late read commits
     /// nothing. This read has no timer: its caller drops the future at its
@@ -2549,8 +2643,9 @@ where
 
     /// Wait until the targets hold `min_count` messages.
     ///
-    /// This shard evaluates the targets that it mirrors, and it sends one
-    /// [`LifecycleFrame::ReadinessWait`] to the owner of each other target.
+    /// This shard evaluates the targets that it owns or mirrors in place, and
+    /// it sends one [`LifecycleFrame::ReadinessWait`] to the owner of each
+    /// other target.
     /// Every evaluator answers once at admission, so the result covers all
     /// targets that are ready at the start, also for a zero wait. Only this
     /// shard sees a sum, so an owner answers on its first ready target and
@@ -2615,25 +2710,31 @@ where
         let mut admitting = BTreeSet::new();
         for (shard, (targets, watched)) in evaluators {
             let watch = (!watched.is_empty()).then(|| self.next_readiness_watch());
-            let frame = ShardFrame::lifecycle(LifecycleFrame::ReadinessWait {
-                wait: Box::new(ReadinessWait {
-                    context: context.clone(),
-                    targets,
-                    deadline,
-                    min_count: if shard == self.id {
-                        min_count
-                    } else {
-                        ANY_MESSAGE
-                    },
-                }),
-                reply: reply.clone(),
-                watch,
-            });
-            self.senders
-                .get(usize::from(shard))
-                .ok_or(IggyError::TransientNotAccepted)?
-                .try_send(frame)
-                .map_err(|_| IggyError::TransientNotAccepted)?;
+            let wait = ReadinessWait {
+                context: context.clone(),
+                targets,
+                deadline,
+                min_count: if shard == self.id {
+                    min_count
+                } else {
+                    ANY_MESSAGE
+                },
+            };
+            if shard == self.id {
+                // The targets of this shard need no trip through its own inbox.
+                self.admit_readiness_wait(wait, &reply, watch);
+            } else {
+                let frame = ShardFrame::lifecycle(LifecycleFrame::ReadinessWait {
+                    wait: Box::new(wait),
+                    reply: reply.clone(),
+                    watch,
+                });
+                self.senders
+                    .get(usize::from(shard))
+                    .ok_or(IggyError::TransientNotAccepted)?
+                    .try_send(frame)
+                    .map_err(|_| IggyError::TransientNotAccepted)?;
+            }
             if let Some(watch) = watch {
                 self.mirror_partitions(shard, watch.seq, &watched, now);
             }

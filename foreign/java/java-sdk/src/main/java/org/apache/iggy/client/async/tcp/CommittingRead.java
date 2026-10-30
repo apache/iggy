@@ -55,15 +55,10 @@ final class CommittingRead {
         return false;
     }
 
-    /** Marks the ticket of a committing read when it is admitted. */
+    /** Reserves the recovery of a committing read when it is admitted, which blocks its lanes if its outcome is lost. */
     static void admit(ConsensusSession.Ticket ticket, int commandCode, ByteBuf payload) {
-        if (ticket == null || !commits(commandCode, payload)) {
-            return;
-        }
-        if (commandCode == CommandCode.Messages.FETCH_MESSAGES.getValue()) {
+        if (ticket != null && commits(commandCode, payload)) {
             ticket.reserveFetch();
-        } else {
-            ticket.markCommittingPoll();
         }
     }
 
@@ -96,6 +91,8 @@ final class CommittingRead {
             return;
         }
         if (committing(exchange)) {
+            // The server can store until it answers the cancel, so the partitions stay blocked until that reply.
+            exchange.failoverState().ticket().blockUntilSettled();
             pending.cancelOnServer(channel);
         } else {
             attempt.cancel(false);

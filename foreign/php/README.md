@@ -393,9 +393,7 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   shutdown. A message counts as its `CommitAfter` says: after processing (the default),
   at delivery, or when `mark($checkpoint)` marks it. `AutoCommit::default()` stores every
   10,000 messages or 5 seconds after processing. `pollMessages()` refuses `auto()`.
-- With `CommitPolicy::onRead()`, the server stores the offset of each reply.
-  A lost reply then throws `FetchProgressUncertain` (14010), and the partition stays
-  blocked until `abandonOperation()`.
+- With `CommitPolicy::onRead()`, the server stores the offset of each reply. A lost reply, also to a `disconnect()` while the poll waits, then throws `FetchProgressUncertain` (14010), and the partition stays blocked until `abandonOperation()`. `disconnect()` closes the connection until the next `connect()`, after which `loginUser()` signs in again.
 - `consumerGroup()` builds a member of a consumer group, and creates a missing group
   by default. `reader()` builds a batch reader of chosen partitions as a standalone
   consumer, and `groupReader()` a batch reader of an existing consumer group.

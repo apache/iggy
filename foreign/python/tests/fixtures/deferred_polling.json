@@ -389,5 +389,222 @@
         "body_hex": "02000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
       }
     ]
+  },
+  "commit_outcomes": {
+    "rule": "A committing deferred poll (106) or fetch (109) that fails with a certain status stored nothing. Every other status, a status not listed here, a lost reply and a transport failure after the send leave the outcome unknown.",
+    "request": [
+      {
+        "status": 5,
+        "error": "feature_unavailable",
+        "certain": true
+      },
+      {
+        "status": 6,
+        "error": "invalid_identifier",
+        "certain": true
+      },
+      {
+        "status": 30,
+        "error": "stale_client",
+        "certain": false
+      },
+      {
+        "status": 40,
+        "error": "unauthenticated",
+        "certain": false
+      },
+      {
+        "status": 41,
+        "error": "unauthorized",
+        "certain": false
+      },
+      {
+        "status": 57,
+        "error": "transient_not_committed",
+        "certain": false
+      },
+      {
+        "status": 58,
+        "error": "transient_not_accepted",
+        "certain": true
+      },
+      {
+        "status": 72,
+        "error": "cannot_decrypt_data",
+        "certain": false
+      },
+      {
+        "status": 80,
+        "error": "invalid_size_bytes",
+        "certain": true
+      },
+      {
+        "status": 87,
+        "error": "history_unavailable",
+        "certain": true
+      },
+      {
+        "status": 89,
+        "error": "not_primary",
+        "certain": true
+      },
+      {
+        "status": 90,
+        "error": "deferred_poll_capacity_exceeded",
+        "certain": true
+      },
+      {
+        "status": 1009,
+        "error": "stream_id_not_found",
+        "certain": true
+      },
+      {
+        "status": 1010,
+        "error": "stream_name_not_found",
+        "certain": true
+      },
+      {
+        "status": 2010,
+        "error": "topic_id_not_found",
+        "certain": true
+      },
+      {
+        "status": 2011,
+        "error": "topic_name_not_found",
+        "certain": true
+      },
+      {
+        "status": 3007,
+        "error": "partition_not_found",
+        "certain": true
+      },
+      {
+        "status": 3024,
+        "error": "too_many_consumer_offsets",
+        "certain": true
+      },
+      {
+        "status": 4100,
+        "error": "invalid_offset",
+        "certain": true
+      },
+      {
+        "status": 5009,
+        "error": "consumer_group_partition_not_owned",
+        "certain": true
+      },
+      {
+        "status": 11001,
+        "error": "shard_communication_error",
+        "certain": false
+      }
+    ],
+    "section": [
+      {
+        "status": 5,
+        "error": "feature_unavailable",
+        "certain": false
+      },
+      {
+        "status": 6,
+        "error": "invalid_identifier",
+        "certain": false
+      },
+      {
+        "status": 30,
+        "error": "stale_client",
+        "certain": false
+      },
+      {
+        "status": 40,
+        "error": "unauthenticated",
+        "certain": false
+      },
+      {
+        "status": 41,
+        "error": "unauthorized",
+        "certain": false
+      },
+      {
+        "status": 57,
+        "error": "transient_not_committed",
+        "certain": false
+      },
+      {
+        "status": 58,
+        "error": "transient_not_accepted",
+        "certain": true
+      },
+      {
+        "status": 72,
+        "error": "cannot_decrypt_data",
+        "certain": false
+      },
+      {
+        "status": 80,
+        "error": "invalid_size_bytes",
+        "certain": true
+      },
+      {
+        "status": 87,
+        "error": "history_unavailable",
+        "certain": true
+      },
+      {
+        "status": 89,
+        "error": "not_primary",
+        "certain": true
+      },
+      {
+        "status": 90,
+        "error": "deferred_poll_capacity_exceeded",
+        "certain": false
+      },
+      {
+        "status": 1009,
+        "error": "stream_id_not_found",
+        "certain": false
+      },
+      {
+        "status": 1010,
+        "error": "stream_name_not_found",
+        "certain": false
+      },
+      {
+        "status": 2010,
+        "error": "topic_id_not_found",
+        "certain": false
+      },
+      {
+        "status": 2011,
+        "error": "topic_name_not_found",
+        "certain": false
+      },
+      {
+        "status": 3007,
+        "error": "partition_not_found",
+        "certain": true
+      },
+      {
+        "status": 3024,
+        "error": "too_many_consumer_offsets",
+        "certain": true
+      },
+      {
+        "status": 4100,
+        "error": "invalid_offset",
+        "certain": false
+      },
+      {
+        "status": 5009,
+        "error": "consumer_group_partition_not_owned",
+        "certain": true
+      },
+      {
+        "status": 11001,
+        "error": "shard_communication_error",
+        "certain": false
+      }
+    ]
   }
 }

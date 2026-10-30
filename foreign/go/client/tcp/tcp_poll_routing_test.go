@@ -20,6 +20,7 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -283,8 +284,14 @@ func TestPrimaryPoll_UnknownOutcomeDoesNotReplayAndOnlyLostRepliesReplaceDataCon
 			}, nil)
 			_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
 			// The poll stores its offset, so its unknown outcome is uncertain progress.
-			require.ErrorIs(t, err, ierror.FetchProgressUncertain{})
+			var unknown ierror.FetchProgressUncertain
+			require.ErrorAs(t, err, &unknown)
 			require.Equal(t, int32(1), polls.Load(), "the admitted poll is never replayed")
+			_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
+			var blocked ierror.PartitionLaneBlocked
+			require.ErrorAs(t, err, &blocked)
+			assert.Equal(t, unknown.OperationID, blocked.OperationID)
+			require.NoError(t, fixture.client.AbandonOperation(context.Background(), unknown.OperationID))
 			_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
 			require.NoError(t, err)
 			connections := 1
@@ -376,7 +383,7 @@ func TestPrimaryPoll_LogoutRetiresPendingDataAndDoesNotResurrectMembership(t *te
 	require.NoError(t, fixture.client.LogoutUser(context.Background()))
 	select {
 	case err := <-completed:
-		require.ErrorIs(t, err, ierror.ErrTransientNotCommitted)
+		require.ErrorIs(t, err, ierror.FetchProgressUncertain{}, "the server can have stored the offset of the poll")
 	case <-time.After(time.Second):
 		t.Fatal("logout left the data exchange running")
 	}
@@ -400,9 +407,9 @@ func TestPrimaryPoll_CompleteStatusRepliesKeepTheDataConnection(t *testing.T) {
 				}
 				return nil, false
 			}, nil)
-			_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
+			_, err := readPrimaryPartition(context.Background(), fixture.client, 0)
 			require.ErrorIs(t, err, status)
-			_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
+			_, err = readPrimaryPartition(context.Background(), fixture.client, 0)
 			require.NoError(t, err)
 			assert.Equal(t, 1, fixture.primaries[0].connections())
 			assert.Equal(t, 1, requestCount(fixture.primaries[0].recorded(), command.BindSessionCode))
@@ -422,21 +429,30 @@ func TestPrimaryPoll_InvalidReplyFrameDropsTheDataConnectionWithoutReplay(t *tes
 		return nil, false
 	}, nil)
 	_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
-	require.ErrorIs(t, err, ierror.FetchProgressUncertain{})
+	var unknown ierror.FetchProgressUncertain
+	require.ErrorAs(t, err, &unknown)
 	require.Equal(t, int32(1), polls.Load())
+	require.NoError(t, fixture.client.AbandonOperation(context.Background(), unknown.OperationID))
 	_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
 	require.NoError(t, err)
 	assert.Equal(t, 2, fixture.primaries[0].connections())
 }
 
 func TestPrimaryPoll_DetachedLinkPreservesTheSessionAndReplaysOnlyARefusedPoll(t *testing.T) {
+	// The fake server stamps each reply frame, so every case gets its own.
+	unauthenticated := func() []byte {
+		return statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.ErrUnauthenticated.Code()), nil)
+	}
 	for _, test := range []struct {
 		name  string
 		reply []byte
+		poll  func(context.Context, *IggyTcpClient, uint32) (*iggcon.PolledMessage, error)
 		want  error
 	}{
-		{"evicted", evictionFrame(vsr.EvictionNoSession, 0, 0), ierror.FetchProgressUncertain{}},
-		{"unauthenticated", statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.ErrUnauthenticated.Code()), nil), nil},
+		{"evicted", evictionFrame(vsr.EvictionNoSession, 0, 0), pollPrimaryPartition, ierror.FetchProgressUncertain{}},
+		// A poll that stores its offset leaves an unauthenticated reply unknown.
+		{"unauthenticated", unauthenticated(), pollPrimaryPartition, ierror.FetchProgressUncertain{}},
+		{"unauthenticated_read", unauthenticated(), readPrimaryPartition, nil},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var polls atomic.Int32
@@ -446,8 +462,12 @@ func TestPrimaryPoll_DetachedLinkPreservesTheSessionAndReplaysOnlyARefusedPoll(t
 				}
 				return nil, false
 			}, nil)
-			_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
+			_, err := test.poll(context.Background(), fixture.client, 0)
 			require.ErrorIs(t, err, test.want)
+			var unknown ierror.FetchProgressUncertain
+			if errors.As(err, &unknown) {
+				require.NoError(t, fixture.client.AbandonOperation(context.Background(), unknown.OperationID))
+			}
 			require.Eventually(t, func() bool {
 				fixture.client.mtx.Lock()
 				defer fixture.client.mtx.Unlock()
@@ -458,7 +478,7 @@ func TestPrimaryPoll_DetachedLinkPreservesTheSessionAndReplaysOnlyARefusedPoll(t
 			} else {
 				require.Equal(t, int32(1), polls.Load())
 			}
-			_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
+			_, err = test.poll(context.Background(), fixture.client, 0)
 			require.NoError(t, err)
 			assert.Equal(t, 2, fixture.primaries[0].connections())
 			assert.Equal(t, 1, fixture.coordinator.connections())

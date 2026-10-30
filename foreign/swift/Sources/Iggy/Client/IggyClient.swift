@@ -48,9 +48,11 @@ import Logging
 /// ``IggyErrorCode/transientNotCommitted``. The other SDKs keep such
 /// a write in a retained-operation registry and fail it with
 /// ``IggyErrorCode/operationUncertain``. This SDK does not retain replicated
-/// writes, so it keeps `transientNotCommitted` for them, and so does a read
-/// with ``CommitPolicy/onRead`` that lost its reply. A ``PartitionReader``
-/// repairs such a read by itself.
+/// writes, so it keeps `transientNotCommitted` for them. A read with
+/// ``CommitPolicy/onRead`` that lost its reply fails with
+/// ``IggyErrorCode/fetchProgressUncertain`` and blocks the progress of its
+/// partitions until ``abandonOperation(_:)``. A ``PartitionReader`` repairs
+/// such a read by itself.
 ///
 /// A request that was not sent before its deadline fails with
 /// ``IggyErrorCode/transientNotAccepted``, and a retry can succeed. A call
@@ -179,6 +181,17 @@ public final class IggyClient: Sendable {
     /// ``IggyErrorCode/unauthenticated`` and still signs out.
     public func logout() async throws {
         try await core.logout()
+    }
+
+    /// Lifts the block that a committing poll or fetch with an unknown
+    /// outcome left on its partitions, and accepts that outcome as unknown.
+    /// It sends nothing and does not read the poll again. Pass the
+    /// `operationID` of ``IggyErrorCode/fetchProgressUncertain`` or
+    /// ``IggyErrorCode/partitionLaneBlocked``. A poll with `next` then reads
+    /// on from whatever the server stored. An operation the client does not
+    /// block under fails with ``IggyErrorCode/operationNotRetained``.
+    public func abandonOperation(_ operationID: UInt128Value) throws {
+        try core.pollRouter.abandonFetch(operationID)
     }
 
     // MARK: Raw requests

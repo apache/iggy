@@ -17,7 +17,8 @@
 
 use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::codes::{
-    CANCEL_DEFERRED_REQUEST_CODE, GET_STREAM_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE,
+    CANCEL_DEFERRED_REQUEST_CODE, FETCH_MESSAGES_CODE, GET_STREAM_CODE, POLL_MESSAGES_CODE,
+    POLL_MESSAGES_DEFERRED_CODE,
 };
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
@@ -29,7 +30,8 @@ use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::messages::{
-    DeferredPollMessagesRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
+    DeferredPollMessagesRequest, FetchMessagesRequest, FetchMessagesTarget, PollMessagesRequest,
+    RawMessage, SendMessagesEncoder,
 };
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
@@ -917,6 +919,61 @@ impl SimClient {
         self.non_replicated_request(
             POLL_MESSAGES_DEFERRED_CODE,
             group.inner(),
+            &body,
+            self.next_request_id(),
+        )
+    }
+
+    /// Build a `FETCH_MESSAGES` request of the client's own consumer for
+    /// `partitions` of one stream and topic, each read from `strategy` with
+    /// the partition context the client discovered. Spends a request id, so
+    /// the reply and a cancellation can name it.
+    ///
+    /// # Panics
+    /// Panics if `partitions` is empty, the session is unbound or the request
+    /// buffer is invalid.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn fetch_messages(
+        &self,
+        partitions: &[IggyNamespace],
+        strategy: &WirePollingStrategy,
+        (count, min_count): (u32, u32),
+        auto_commit: bool,
+        (wait_us, request_timeout_us): (u64, u64),
+    ) -> Message<RoutedRequestHeader> {
+        let first = *partitions.first().expect("a fetch names a partition");
+        let (stream_id, topic_id, _) = namespace_ids(first);
+        let contexts = self.partition_contexts.borrow();
+        let targets = partitions
+            .iter()
+            .map(|namespace| {
+                let context = contexts.get(namespace).copied().unwrap_or_default();
+                FetchMessagesTarget {
+                    partition_id: namespace.partition_id() as u32,
+                    strategy: strategy.clone(),
+                    max_bytes: DEFAULT_POLL_MAX_BYTES,
+                    incarnation: context.incarnation,
+                    owner_generation: context.owner_generation,
+                }
+            })
+            .collect();
+        drop(contexts);
+        let body = FetchMessagesRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::Numeric(self.client_id as u32)),
+            stream_id,
+            topic_id,
+            wait_us,
+            request_timeout_us,
+            min_count,
+            count,
+            max_bytes: DEFAULT_POLL_MAX_BYTES,
+            auto_commit,
+            targets,
+        }
+        .to_bytes();
+        self.non_replicated_request(
+            FETCH_MESSAGES_CODE,
+            first.inner(),
             &body,
             self.next_request_id(),
         )

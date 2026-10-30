@@ -50,6 +50,9 @@ public sealed class PartitionReaderTests
     private static readonly TimeSpan PromptLimit = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan RetryInterval = TimeSpan.FromMilliseconds(50);
 
+    /// <summary>A lost reply drops the connection, so what follows it waits for the client to connect again.</summary>
+    private static readonly TimeSpan LostReplyLimit = TimeSpan.FromSeconds(30);
+
     [Fact]
     public async Task given_partitions_of_two_primaries_when_reading_should_fetch_each_primary_on_its_own()
     {
@@ -143,6 +146,133 @@ public sealed class PartitionReaderTests
         var other = taken.PartitionId == 1 ? 2u : 1u;
         Assert.Equal(1ul, cluster.Stored[taken.PartitionId]);
         Assert.False(cluster.Stored.ContainsKey(other));
+    }
+
+    [Fact]
+    public async Task given_on_read_when_seeking_to_an_offset_should_store_the_offset_before_it_first()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 10 };
+        using var client = await cluster.ConnectAsync();
+        var reader = await Reader(client, CommitPolicy.OnRead, 1).BuildAsync(Token);
+        try
+        {
+            Assert.Equal([0ul, 1ul], (await reader.NextAsync(Token)).Messages.Select(message => message.Header.Offset));
+
+            await reader.SeekAsync(1, PollingStrategy.Offset(6), Token);
+
+            Assert.Equal(5ul, cluster.Stored[1]);
+            Assert.Equal([6ul, 7ul], (await reader.NextAsync(Token)).Messages.Select(message => message.Header.Offset));
+        }
+        finally
+        {
+            await reader.CloseAsync();
+        }
+
+        Assert.Equal(7ul, cluster.Stored[1]);
+    }
+
+    [Theory]
+    [InlineData(MessagePolling.Offset, 0ul, true)]
+    [InlineData(MessagePolling.First, 0ul, true)]
+    [InlineData(MessagePolling.Next, 0ul, true)]
+    [InlineData(MessagePolling.Last, 0ul, true)]
+    [InlineData(MessagePolling.Timestamp, 0ul, true)]
+    [InlineData(MessagePolling.Offset, 6ul, false)]
+    public async Task given_a_seek_that_moves_no_offset_when_seeking_should_store_nothing(MessagePolling kind, ulong value,
+        bool onRead)
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 10 };
+        using var client = await cluster.ConnectAsync();
+        var reader = await Reader(client, onRead ? CommitPolicy.OnRead : CommitPolicy.Manual, 1).BuildAsync(Token);
+        try
+        {
+            await reader.NextAsync(Token);
+
+            await reader.SeekAsync(1, new PollingStrategy { Kind = kind, Value = value }, Token);
+
+            ulong? expected = onRead ? 1ul : null;
+            Assert.Equal(expected, cluster.Stored.TryGetValue(1, out var stored) ? stored : null);
+        }
+        finally
+        {
+            await reader.CloseAsync();
+        }
+    }
+
+    [Fact]
+    public async Task given_on_read_when_the_seek_store_is_refused_should_fail_the_seek_and_move_nothing()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 10 };
+        using var client = await cluster.ConnectAsync();
+        var reader = await Reader(client, CommitPolicy.OnRead, 1, 2).BuildAsync(Token);
+        try
+        {
+            var taken = await reader.NextAsync(Token);
+            var queued = taken.PartitionId == 1 ? 2u : 1u;
+            cluster.StoresRefused = true;
+
+            var refused = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
+                reader.SeekAsync(queued, PollingStrategy.Offset(6), Token));
+
+            cluster.StoresRefused = false;
+            Assert.Equal(VsrError.HISTORY_UNAVAILABLE, refused.StatusCode);
+            Assert.Equal(1ul, cluster.Stored[queued]);
+            var next = await reader.NextAsync(Token);
+            Assert.Equal(queued, next.PartitionId);
+            Assert.Equal([0ul, 1ul], next.Messages.Select(message => message.Header.Offset));
+            var resumed = await reader.NextAsync(Token);
+            while (resumed.PartitionId != queued)
+            {
+                resumed = await reader.NextAsync(Token);
+            }
+
+            Assert.Equal([2ul, 3ul], resumed.Messages.Select(message => message.Header.Offset));
+        }
+        finally
+        {
+            await reader.CloseAsync();
+        }
+    }
+
+    /// <summary>
+    ///     The store of the seek waits for the committing read in flight, as every offset store of the partition does,
+    ///     and the seek then drops the batch of that read and starts the new generation at the sought offset.
+    /// </summary>
+    [Fact]
+    public async Task given_on_read_when_seeking_while_a_committing_read_is_in_flight_should_store_after_that_read_and_drop_it()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 10, HoldFetches = true };
+        using var client = await cluster.ConnectAsync();
+        var reader = await Reader(client, CommitPolicy.OnRead, 1).BuildAsync(Token);
+        try
+        {
+            using var waiting = CancellationTokenSource.CreateLinkedTokenSource(Token);
+            var next = reader.NextAsync(waiting.Token).AsTask();
+            await UntilAsync(() => cluster.HeldFetches == 1);
+
+            var seek = reader.SeekAsync(1, PollingStrategy.Offset(6), Token);
+
+            await Task.Delay(TimeSpan.FromMilliseconds(200), Token);
+            Assert.Equal((false, false), (cluster.Stored.ContainsKey(1), seek.IsCompleted));
+            await waiting.CancelAsync();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => next);
+            cluster.HoldFetches = false;
+            await cluster.ReleaseHeldAsync();
+            await seek.WaitAsync(PromptLimit, Token);
+            var batch = await reader.NextAsync(Token);
+            Assert.Equal([6ul, 7ul], batch.Messages.Select(message => message.Header.Offset));
+            Assert.Equal(2, cluster.Fetches.Count);
+            var resumed = Assert.Single(cluster.Fetches.Last().Request.Targets);
+            Assert.Equal((MessagePolling.Offset, 6ul), (resumed.Kind, resumed.Value));
+        }
+        finally
+        {
+            cluster.HoldFetches = false;
+            await cluster.ReleaseHeldAsync();
+            await reader.CloseAsync();
+        }
+
+        Assert.Equal(7ul, cluster.Stored[1]);
     }
 
     /// <summary>
@@ -242,8 +372,8 @@ public sealed class PartitionReaderTests
         Assert.Equal([0ul, 1ul], (await reader.NextAsync(Token)).Messages.Select(message => message.Header.Offset));
         await UntilAsync(() => cluster.Stored.TryGetValue(1, out var stored) && stored == 1);
 
-        cluster.Stored[1] = 3;
-        var delivered = await ReadAsync(reader, 3);
+        cluster.LoseNextCommittingRead = true;
+        var delivered = await ReadAsync(reader, 3, LostReplyLimit);
 
         Assert.Equal([2ul, 3ul, 4ul, 5ul, 6ul, 7ul],
             delivered.SelectMany(batch => batch.Messages).Select(message => message.Header.Offset));
@@ -251,6 +381,332 @@ public sealed class PartitionReaderTests
             cluster.Polls.Where(poll => poll.Kind == MessagePolling.Offset)
                 .Select(poll => (poll.Kind, poll.Value, poll.AutoCommit)));
         Assert.Equal(7ul, cluster.Stored[1]);
+    }
+
+    /// <summary>
+    ///     A lost read stored offsets 4 and 5, so the next read from Next skipped to 6 and the server stored up to 9.
+    ///     The reads again by offset stop at 9, so the next read from Next starts at 10 and delivers nothing twice.
+    /// </summary>
+    [Fact]
+    public async Task given_on_read_when_a_lost_read_is_read_again_should_stop_at_the_stored_end()
+    {
+        var log = new ScriptedLog { End = 4 };
+        await using var reader = await log.Client().Reader(Stream, Topic, Consumer.New(4)).WithPartitions(1)
+            .WithOptions(new PollOptions
+            {
+                Count = 4,
+                MaxWait = TimeSpan.FromMilliseconds(100),
+                Commit = CommitPolicy.OnRead
+            })
+            .WithRetryInterval(RetryInterval).BuildAsync(Token);
+        var first = await reader.NextAsync(Token);
+        log.End = 6;
+        log.LoseNextCommittingRead = true;
+
+        var delivered = await ReadAsync(reader, 3);
+
+        Assert.Equal(Enumerable.Range(0, 14).Select(offset => (ulong)offset),
+            delivered.Prepend(first).SelectMany(batch => batch.Messages).Select(message => message.Header.Offset));
+    }
+
+    /// <summary>
+    ///     The committing read of offsets 4 to 7 stored its offset, but its reply does not decode. The reader reads
+    ///     the range again by offset one message at a time, reports the bad message 5 with a skip past it, and after
+    ///     the seek delivers the rest.
+    /// </summary>
+    [Fact]
+    public async Task given_on_read_when_a_committing_poll_does_not_decode_should_read_its_range_again_and_skip_only_the_bad_message()
+    {
+        var log = new ScriptedLog { End = 8, Malformed = { 5 } };
+        await using var reader = await log.Client().Reader(Stream, Topic, Consumer.New(4)).WithPartitions(1)
+            .WithOptions(new PollOptions
+            {
+                Count = 4,
+                MaxWait = TimeSpan.FromMilliseconds(100),
+                Commit = CommitPolicy.OnRead
+            })
+            .WithRetryInterval(RetryInterval).BuildAsync(Token);
+        var first = await reader.NextAsync(Token);
+        var second = await reader.NextAsync(Token);
+
+        var error = await NextErrorAsync(reader);
+        await reader.SeekAsync(1, error.Skip!.Value, Token);
+        var third = await reader.NextAsync(Token);
+
+        Assert.Equal([0ul, 1ul, 2ul, 3ul, 4ul, 6ul, 7ul],
+            new[] { first, second, third }.SelectMany(batch => batch.Messages).Select(message => message.Header.Offset));
+        Assert.Equal((MessagePolling.Offset, 6ul), (error.Skip.Value.Kind, error.Skip.Value.Value));
+    }
+
+    /// <summary>
+    ///     A lost read stored offsets 4 and 5, which the next read skipped, and every read of them again comes back
+    ///     empty. A read again asks for no wait, so the reader waits its retry interval between them.
+    /// </summary>
+    [Fact]
+    public async Task given_on_read_when_reading_a_lost_range_again_finds_nothing_should_wait_its_retry_interval()
+    {
+        var log = new ScriptedLog { End = 4, RecoveryEmpty = true };
+        var reader = await log.Client().Reader(Stream, Topic, Consumer.New(4)).WithPartitions(1)
+            .WithOptions(new PollOptions
+            {
+                Count = 4,
+                MaxWait = TimeSpan.FromMilliseconds(100),
+                Commit = CommitPolicy.OnRead
+            })
+            .WithRetryInterval(RetryInterval).BuildAsync(Token);
+        await reader.NextAsync(Token);
+        log.End = 6;
+        log.LoseNextCommittingRead = true;
+        var window = TimeSpan.FromMilliseconds(500);
+        using (var waiting = CancellationTokenSource.CreateLinkedTokenSource(Token))
+        {
+            waiting.CancelAfter(window);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await reader.NextAsync(waiting.Token));
+        }
+
+        await reader.DisposeAsync();
+
+        Assert.InRange(log.RecoveryReads, 1, (int)(window / RetryInterval) + 2);
+    }
+
+    /// <summary>
+    ///     With on read commits a seek waits for the read of its partition in flight. The reader closes meanwhile, so
+    ///     no read takes the new position and the close does not store it. The seek fails instead of reporting a
+    ///     position that nothing applies.
+    /// </summary>
+    /// <summary>
+    ///     The seek's store waits for the read in flight, and the close waits for the seek before its rewind, so the
+    ///     rewind sees the sought position and keeps that offset instead of moving back before the dropped batch.
+    /// </summary>
+    [Fact]
+    public async Task given_on_read_when_the_reader_closes_while_a_seek_waits_for_its_read_should_apply_the_seek_and_keep_its_offset()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 10, HoldFetches = true };
+        using var client = await cluster.ConnectAsync();
+        var reader = await Reader(client, CommitPolicy.OnRead, 1).BuildAsync(Token);
+        var next = reader.NextAsync(Token).AsTask();
+        await UntilAsync(() => cluster.HeldFetches == 1);
+        var seek = reader.SeekAsync(1, PollingStrategy.Offset(6), Token);
+        await Task.Delay(TimeSpan.FromMilliseconds(200), Token);
+
+        var closing = reader.CloseAsync().AsTask();
+        cluster.HoldFetches = false;
+        await cluster.ReleaseHeldAsync();
+        await closing.WaitAsync(PromptLimit, Token);
+
+        await seek.WaitAsync(PromptLimit, Token);
+        await Assert.ThrowsAnyAsync<Exception>(() => next);
+        Assert.Equal(5ul, cluster.Stored[1]);
+    }
+
+    /// <summary>
+    ///     A committing fetch waits on the server for 30 seconds. The close cancels it on the server and ends once the
+    ///     server answers the cancel, instead of waiting out the fetch.
+    /// </summary>
+    [Fact]
+    public async Task given_on_read_when_closing_with_a_parked_committing_fetch_should_cancel_it_and_end_at_its_answer()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 0 };
+        using var client = await cluster.ConnectAsync();
+        var reader = await client.Reader(Stream, Topic, Consumer.New(4))
+            .WithPartitions(1)
+            .WithStart(PollingStrategy.Offset(0))
+            .WithOptions(new PollOptions { MaxWait = TimeSpan.FromSeconds(30), Commit = CommitPolicy.OnRead })
+            .WithRetryInterval(RetryInterval).BuildAsync(Token);
+        using var waiting = CancellationTokenSource.CreateLinkedTokenSource(Token);
+        var next = reader.NextAsync(waiting.Token).AsTask();
+        await UntilAsync(() => cluster.Fetches.Any(fetch => fetch.Request.AutoCommit));
+
+        await reader.CloseAsync().AsTask().WaitAsync(PromptLimit, Token);
+        await waiting.CancelAsync();
+
+        Assert.Equal(1, cluster.Cancels);
+        await Assert.ThrowsAnyAsync<Exception>(() => next);
+    }
+
+    /// <summary>
+    ///     The first close waits for a committing read whose cancel the server has not answered yet. A second close
+    ///     waits for the first instead of returning while it still runs.
+    /// </summary>
+    [Fact]
+    public async Task given_a_close_in_progress_when_closing_again_should_wait_for_the_first_close()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 4, HoldFetches = true };
+        using var client = await cluster.ConnectAsync();
+        var reader = await Reader(client, CommitPolicy.OnRead, 1).WithStart(PollingStrategy.Offset(0)).BuildAsync(Token);
+        using var waiting = CancellationTokenSource.CreateLinkedTokenSource(Token);
+        var next = reader.NextAsync(waiting.Token).AsTask();
+        await UntilAsync(() => cluster.HeldFetches == 1);
+        var first = reader.CloseAsync().AsTask();
+
+        var second = reader.CloseAsync().AsTask();
+        await Task.WhenAny(second, Task.Delay(TimeSpan.FromMilliseconds(200), Token));
+        var waited = !second.IsCompleted;
+        cluster.HoldFetches = false;
+        await cluster.ReleaseHeldAsync();
+        await first.WaitAsync(PromptLimit, Token);
+        await second.WaitAsync(PromptLimit, Token);
+        await waiting.CancelAsync();
+
+        Assert.True(waited);
+        await Assert.ThrowsAnyAsync<Exception>(() => next);
+    }
+
+    /// <summary>
+    ///     Another session stored offset 3 while no read of this reader was lost, so the next read from Next starts at
+    ///     4. The reader delivers from there and reads nothing again.
+    /// </summary>
+    [Fact]
+    public async Task given_on_read_when_the_stored_offset_moves_ahead_without_a_lost_read_should_deliver_from_there()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 8 };
+        using var client = await cluster.ConnectAsync();
+        await using var reader = await Reader(client, CommitPolicy.OnRead, 1).BuildAsync(Token);
+        Assert.Equal([0ul, 1ul], (await reader.NextAsync(Token)).Messages.Select(message => message.Header.Offset));
+        await UntilAsync(() => cluster.Stored.TryGetValue(1, out var stored) && stored == 1);
+
+        cluster.Stored[1] = 3;
+        var delivered = await ReadAsync(reader, 2);
+
+        Assert.Equal([4ul, 5ul, 6ul, 7ul],
+            delivered.SelectMany(batch => batch.Messages).Select(message => message.Header.Offset));
+        Assert.DoesNotContain(cluster.Polls, poll => poll.Kind == MessagePolling.Offset);
+    }
+
+    /// <summary>
+    ///     Every committing fetch of partition 1 ends with an unknown outcome. The reader abandons each one and waits
+    ///     its retry interval before it reads the partition again, instead of fetching at the pace of the round trip.
+    /// </summary>
+    [Fact]
+    public async Task given_on_read_when_every_committing_read_ends_uncertain_should_wait_its_retry_interval_after_each()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 1000 };
+        cluster.UncertainSections.Add(1);
+        using var client = await cluster.ConnectAsync();
+        var reader = await Reader(client, CommitPolicy.OnRead, 1).BuildAsync(Token);
+        var window = TimeSpan.FromMilliseconds(500);
+        using (var waiting = CancellationTokenSource.CreateLinkedTokenSource(Token))
+        {
+            waiting.CancelAfter(window);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await reader.NextAsync(waiting.Token));
+        }
+
+        await reader.DisposeAsync();
+
+        Assert.InRange(cluster.Fetches.Count(fetch => fetch.Request.AutoCommit), 1, (int)(window / RetryInterval) + 2);
+    }
+
+    /// <summary>
+    ///     A lost read stored offsets 5 and 6, the next read from Next served 7 and 8, and the reader closes while it
+    ///     reads 5 and 6 again. Nothing was delivered, so the close moves the offset back before the lost read.
+    /// </summary>
+    [Fact]
+    public async Task given_on_read_when_closing_while_a_lost_read_is_read_again_should_move_the_offset_back_before_it()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 9, LoseNextCommittingRead = true, RecoveryUnanswered = true };
+        cluster.Stored[1] = 4;
+        using var client = await cluster.ConnectAsync();
+        var reader = await Reader(client, CommitPolicy.OnRead, 1).BuildAsync(Token);
+        using var waiting = CancellationTokenSource.CreateLinkedTokenSource(Token);
+        var next = reader.NextAsync(waiting.Token).AsTask();
+        await UntilAsync(() => cluster.Polls.Any(poll => poll is { Kind: MessagePolling.Offset, Value: 5, AutoCommit: false }),
+            (long)LostReplyLimit.TotalMilliseconds);
+        await waiting.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => next);
+
+        await reader.CloseAsync();
+
+        Assert.Equal(4ul, cluster.Stored[1]);
+    }
+
+    /// <summary>
+    ///     A rejoin gave the partition a new owner generation, so the server refuses a read from the old position as
+    ///     not owned. The reader drops that position and reads on from the stored offset.
+    /// </summary>
+    [Fact]
+    public async Task given_a_new_owner_generation_when_a_read_is_refused_as_not_owned_should_read_on_from_the_stored_offset()
+    {
+        using var cluster = new ReaderCluster(1) { Assignment = [1] };
+        using var client = await cluster.ConnectAsync();
+        var reader = await client.Reader(Stream, Topic, Consumer.Group("readers"))
+            .WithOptions(new PollOptions { MaxWait = TimeSpan.FromMilliseconds(100) })
+            .WithRetryInterval(RetryInterval).BuildAsync(Token);
+        try
+        {
+            await reader.CommitAsync((await reader.NextAsync(Token)).Checkpoint!, Token);
+            cluster.OwnerGeneration = ReaderCluster.Served.OwnerGeneration + 1;
+            cluster.Limit = 4;
+
+            var next = (await ReadAsync(reader, 1))[0];
+
+            Assert.Equal([2ul, 3ul], next.Messages.Select(message => message.Header.Offset));
+            Assert.Equal(cluster.OwnerGeneration, next.Context.OwnerGeneration);
+        }
+        finally
+        {
+            await reader.CloseAsync();
+        }
+    }
+
+    [Fact]
+    public async Task given_a_partition_that_stays_not_owned_when_reading_should_report_it_after_lasting_refusals()
+    {
+        using var cluster = new ReaderCluster(1) { Assignment = [1] };
+        cluster.NotOwned.Add(1);
+        using var client = await cluster.ConnectAsync();
+        var reader = await client.Reader(Stream, Topic, Consumer.Group("readers"))
+            .WithOptions(new PollOptions { MaxWait = TimeSpan.FromMilliseconds(100) })
+            .WithRetryInterval(RetryInterval).BuildAsync(Token);
+        try
+        {
+            var error = await NextErrorAsync(reader);
+
+            Assert.Equal((1u, VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED),
+                (error.PartitionId, Assert.IsType<IggyInvalidStatusCodeException>(error.InnerException).StatusCode));
+        }
+        finally
+        {
+            await reader.CloseAsync();
+        }
+    }
+
+    /// <summary>
+    ///     The read of partition 1 is still in flight when a rebalance takes the partition away and gives it back, and
+    ///     the new assignment starts its own read. The old read ends first, which must not free the new one, or a
+    ///     second read of the same position starts and its batch is delivered twice.
+    /// </summary>
+    [Fact]
+    public async Task given_a_partition_assigned_again_when_its_old_read_ends_should_not_read_the_new_position_twice()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 4, Assignment = [1], HoldFetches = true };
+        using var client = await cluster.ConnectAsync();
+        var reader = await client.Reader(Stream, Topic, Consumer.Group("readers"))
+            .WithStart(PollingStrategy.Offset(0))
+            .WithOptions(new PollOptions { MaxWait = TimeSpan.FromSeconds(30) })
+            .WithRetryInterval(RetryInterval).BuildAsync(Token);
+        try
+        {
+            await UntilAsync(() => cluster.HeldFetches == 1);
+            cluster.Assignment = [];
+            await UntilAsync(() => reader.Partitions.Count == 0, ConsumerGroupClientState.AssignmentRefreshMs * 2);
+            cluster.Assignment = [1];
+            await UntilAsync(() => reader.Partitions.Count == 1 && cluster.HeldFetches == 2,
+                ConsumerGroupClientState.AssignmentRefreshMs * 2);
+
+            await cluster.ReleaseHeldAsync(1);
+            // A second read of the new assignment would start now.
+            await Task.Delay(TimeSpan.FromMilliseconds(200), Token);
+            cluster.HoldFetches = false;
+            await cluster.ReleaseHeldAsync();
+            var delivered = await ReadAsync(reader, 2);
+
+            Assert.Equal([0ul, 1ul, 2ul, 3ul],
+                delivered.SelectMany(batch => batch.Messages).Select(message => message.Header.Offset));
+        }
+        finally
+        {
+            await reader.CloseAsync();
+        }
     }
 
     [Fact]
@@ -264,11 +720,11 @@ public sealed class PartitionReaderTests
         try
         {
             Assert.Equal([0ul, 1ul], (await reader.NextAsync(Token)).Messages.Select(message => message.Header.Offset));
-            cluster.Stored[1] = 3;
+            cluster.LoseNextCommittingRead = true;
             cluster.AssignmentAfterRead = [];
             cluster.RecoveryNotOwned = true;
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(Token);
-            timeout.CancelAfter(TimeSpan.FromSeconds(5));
+            timeout.CancelAfter(LostReplyLimit);
             var error = await Assert.ThrowsAsync<ReadException>(async () => await reader.NextAsync(timeout.Token));
             Assert.Equal(VsrError.FETCH_PROGRESS_UNCERTAIN,
                 Assert.IsAssignableFrom<IggyInvalidStatusCodeException>(error.InnerException).StatusCode);
@@ -437,6 +893,34 @@ public sealed class PartitionReaderTests
     }
 
     /// <summary>
+    ///     The coordinator hands a joining member its partitions one at a time, so the first assignment holds only
+    ///     partition 1. The reader asks again at its refresh interval and reads partition 3 well before the client
+    ///     cache of the assignment expires.
+    /// </summary>
+    [Fact]
+    public async Task given_a_group_reader_when_its_assignment_grows_should_read_the_new_partition_within_its_refresh()
+    {
+        using var cluster = new ReaderCluster(2) { Assignment = [1] };
+        using var client = await cluster.ConnectAsync();
+        var reader = await client.Reader(Stream, Topic, Consumer.Group("readers"))
+            .WithOptions(new PollOptions { MaxWait = TimeSpan.FromMilliseconds(100) })
+            .WithRetryInterval(RetryInterval).BuildAsync(Token);
+        try
+        {
+            Assert.Equal(1u, (await reader.NextAsync(Token)).PartitionId);
+            cluster.Assignment = [1, 3];
+
+            var added = await NextOfAsync(reader, 3, TimeSpan.FromMilliseconds(2500));
+
+            Assert.Equal([0ul, 1ul], added.Messages.Select(message => message.Header.Offset));
+        }
+        finally
+        {
+            await reader.CloseAsync();
+        }
+    }
+
+    /// <summary>
     ///     The server stored the on read fetch of both partitions, then partition 3 left the assignment of the member
     ///     before the application took its batch. Dropping the batch would lose its messages.
     /// </summary>
@@ -547,6 +1031,74 @@ public sealed class PartitionReaderTests
         Assert.Equal([1u, 3u, 5u], delivered.Select(batch => batch.PartitionId));
     }
 
+    /// <summary>
+    ///     Every partition of the primary ended its last read before its head, so each one reads in a fetch of its own,
+    ///     with the full limits, and the reader keeps as many reads in flight as separate polls would.
+    /// </summary>
+    [Fact]
+    public async Task given_backlogged_partitions_of_one_primary_when_slots_are_free_should_read_each_in_its_own_fetch()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 100, ReportsHead = true, HoldFetches = true };
+        using var client = await cluster.ConnectAsync();
+        var reader = await Reader(client, CommitPolicy.Manual, 0, 1, 2, 3).BuildAsync(Token);
+        try
+        {
+            await UntilAsync(() => cluster.HeldFetches == 1);
+            await cluster.ReleaseHeldAsync();
+
+            await UntilAsync(() => cluster.Held.Sum(fetch => fetch.Targets.Length) == 4);
+
+            Assert.All(cluster.Held, fetch => Assert.Single(fetch.Targets));
+            Assert.Equal(4, cluster.HeldFetches);
+        }
+        finally
+        {
+            cluster.HoldFetches = false;
+            await cluster.ReleaseHeldAsync();
+            await reader.CloseAsync();
+        }
+    }
+
+    /// <summary>
+    ///     A committing reader reads only while <c>NextAsync</c> waits, and then deals its backlogged partitions over the
+    ///     free slots as a reader that commits nothing does, one committing fetch per partition.
+    /// </summary>
+    [Fact]
+    public async Task given_backlogged_partitions_of_one_primary_when_reading_on_read_should_commit_each_in_its_own_fetch()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 100, ReportsHead = true, HoldFetches = true };
+        using var client = await cluster.ConnectAsync();
+        // A start by offset needs no check poll, so the four partitions share the first fetch.
+        var reader = await Reader(client, CommitPolicy.OnRead, 0, 1, 2, 3).WithStart(PollingStrategy.Offset(0))
+            .BuildAsync(Token);
+        try
+        {
+            var first = reader.NextAsync(Token).AsTask();
+            await UntilAsync(() => cluster.HeldFetches == 1);
+            await cluster.ReleaseHeldAsync();
+            List<PolledMessages> delivered = [await first.WaitAsync(PromptLimit, Token)];
+            delivered.AddRange(await ReadAsync(reader, 3));
+            Assert.Equal([0u, 1u, 2u, 3u], delivered.Select(batch => batch.PartitionId).Order());
+
+            var fifth = reader.NextAsync(Token).AsTask();
+
+            await UntilAsync(() => cluster.Held.Sum(fetch => fetch.Targets.Length) == 4);
+            Assert.All(cluster.Held, fetch => Assert.Single(fetch.Targets));
+            Assert.All(cluster.Held, fetch => Assert.True(fetch.AutoCommit));
+            Assert.Equal(4, cluster.HeldFetches);
+            cluster.HoldFetches = false;
+            await cluster.ReleaseHeldAsync();
+            Assert.Equal([2ul, 3ul],
+                (await fifth.WaitAsync(PromptLimit, Token)).Messages.Select(message => message.Header.Offset));
+        }
+        finally
+        {
+            cluster.HoldFetches = false;
+            await cluster.ReleaseHeldAsync();
+            await reader.CloseAsync();
+        }
+    }
+
     [Fact]
     public async Task given_reads_that_do_not_wait_when_a_reply_leaves_a_target_out_should_wait_its_retry_interval()
     {
@@ -598,10 +1150,11 @@ public sealed class PartitionReaderTests
             .WithRetryInterval(RetryInterval);
     }
 
-    private static async Task<List<PolledMessages>> ReadAsync(PartitionReader reader, int batches)
+    private static async Task<List<PolledMessages>> ReadAsync(PartitionReader reader, int batches,
+        TimeSpan? limit = null)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(Token);
-        timeout.CancelAfter(PromptLimit);
+        timeout.CancelAfter(limit ?? PromptLimit);
         List<PolledMessages> delivered = [];
         while (delivered.Count < batches)
         {
@@ -611,10 +1164,11 @@ public sealed class PartitionReaderTests
         return delivered;
     }
 
-    private static async Task<PolledMessages> NextOfAsync(PartitionReader reader, uint partition)
+    private static async Task<PolledMessages> NextOfAsync(PartitionReader reader, uint partition,
+        TimeSpan? limit = null)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(Token);
-        timeout.CancelAfter(PromptLimit);
+        timeout.CancelAfter(limit ?? PromptLimit);
         while (true)
         {
             var batch = await reader.NextAsync(timeout.Token);
@@ -649,6 +1203,84 @@ public sealed class PartitionReaderTests
         while (!predicate())
         {
             await Task.Delay(5, timeout.Token);
+        }
+    }
+
+    /// <summary>
+    ///     The log of partition 1 up to <see cref="End" /> behind a client that reads it with polls only. A poll
+    ///     serves its count from its start, and a committing one stores its last offset. The committing poll after
+    ///     <see cref="LoseNextCommittingRead" /> stores, loses its reply and finds the log grown to 20 messages.
+    /// </summary>
+    private sealed class ScriptedLog
+    {
+        private readonly object _gate = new();
+        private int _recoveryReads;
+        private ulong? _stored;
+
+        internal ulong End { get; set; }
+
+        internal bool LoseNextCommittingRead { get; set; }
+
+        /// <summary>Offsets whose message does not decode, so a reply that holds one fails to decode.</summary>
+        internal HashSet<ulong> Malformed { get; } = [];
+
+        /// <summary>A read by offset without a commit finds nothing.</summary>
+        internal bool RecoveryEmpty { get; init; }
+
+        internal int RecoveryReads => Volatile.Read(ref _recoveryReads);
+
+        internal IIggyClient Client()
+        {
+            var client = new Mock<IIggyClient>();
+            client.Setup(instance => instance.PollMessagesAsync(Stream, Topic, 1, It.IsAny<Consumer>(),
+                    It.IsAny<PollingStrategy>(), It.IsAny<PollOptions>(), It.IsAny<CancellationToken>()))
+                .Returns<Identifier, Identifier, uint, Consumer, PollingStrategy, PollOptions, CancellationToken>(
+                    (_, _, _, _, start, options, _) => Poll(start, options));
+            return client.Object;
+        }
+
+        private Task<PolledMessages> Poll(PollingStrategy start, PollOptions options)
+        {
+            lock (_gate)
+            {
+                var from = start.Kind == MessagePolling.Next ? _stored + 1 ?? 0 : start.Value;
+                var until = Math.Min(End, from + options.Count);
+                var commits = options.Commit.Mode == CommitMode.OnRead;
+                if (start.Kind == MessagePolling.Offset && !commits)
+                {
+                    Interlocked.Increment(ref _recoveryReads);
+                    until = RecoveryEmpty ? from : until;
+                }
+
+                MessageResponse[] messages =
+                [
+                    .. Enumerable.Range(0, (int)(until > from ? until - from : 0)).Select(index =>
+                        new MessageResponse { Header = new MessageHeader { Offset = from + (ulong)index }, Payload = [1] })
+                ];
+                if (commits && messages.Length > 0)
+                {
+                    _stored = until - 1;
+                    if (LoseNextCommittingRead)
+                    {
+                        LoseNextCommittingRead = false;
+                        End = 20;
+                        return Task.FromException<PolledMessages>(new VsrFetchProgressUncertainException(7));
+                    }
+                }
+
+                if (messages.Any(message => Malformed.Contains(message.Header.Offset)))
+                {
+                    return Task.FromException<PolledMessages>(new MalformedResponseException("The batch does not decode."));
+                }
+
+                return Task.FromResult(new PolledMessages
+                {
+                    PartitionId = 1,
+                    CurrentOffset = End - 1,
+                    Context = ReaderCluster.Served,
+                    Messages = messages
+                });
+            }
         }
     }
 }

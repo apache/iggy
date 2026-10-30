@@ -107,7 +107,7 @@ public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyCon
     ///     send or another caller of this client replayed it first. <see cref="VsrOperationNotRetainedException" />
     ///     means that the outcome is unknown and this client can no longer recover it: a session reset or an abandon
     ///     dropped the operation before a replay proved its outcome, or that outcome aged out.
-    ///     An uncertain committing fetch instead throws <see cref="VsrFetchProgressUncertainException" />
+    ///     An uncertain committing poll or fetch instead throws <see cref="VsrFetchProgressUncertainException" />
     ///     without I/O. Its recovery id cannot prove completion by replay or offset inspection.
     /// </remarks>
     Task ResolveOperationAsync(ulong operationId, TimeSpan timeout, CancellationToken token = default) =>
@@ -119,8 +119,8 @@ public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyCon
     ///     operation that is already running is not canceled. It keeps the lane until it ends, so later mutations of
     ///     the lane still wait behind it, and the client keeps the outcome it proves for
     ///     <see cref="ResolveOperationAsync" />.
-    ///     For an uncertain committing fetch, this releases every affected partition locally and accepts that
-    ///     the old server request may still commit. It does not cancel or fence that request.
+    ///     For an uncertain committing poll or fetch, this releases every affected partition locally and accepts
+    ///     that the old server request may still commit. It does not cancel or fence that request.
     /// </summary>
     Task AbandonOperationAsync(ulong operationId) => Task.FromException(new FeatureUnavailableException());
 }

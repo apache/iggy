@@ -32,7 +32,9 @@ use iggy_common::DiagnosticEvent;
 use iggy_common::IggyError;
 use mux::MuxLink;
 use quic::QuicLink;
+use std::future::pending;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::time::{Instant, sleep};
 
 pub(crate) mod connect;
@@ -61,6 +63,30 @@ pub(crate) const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 /// Takes the one reply of a cancelled committing request, or the error that ended its link.
 pub(crate) type LateReply = Box<dyn FnOnce(Result<Reply, IggyError>) + Send>;
+
+tokio::task_local! {
+    /// Turns true when the reader of the committing reads of this task closes. A committing
+    /// deferred request then sends its cancel and still takes its one reply, which tells whether
+    /// the server stored.
+    pub(crate) static CANCEL_COMMITTING: watch::Receiver<bool>;
+}
+
+/// Resolves once the committing reads of this task are to cancel. Never without the signal.
+pub(crate) async fn committing_cancelled() {
+    let Ok(mut cancel) = CANCEL_COMMITTING.try_with(Clone::clone) else {
+        return pending().await;
+    };
+    if cancel.wait_for(|cancelled| *cancelled).await.is_err() {
+        pending::<()>().await;
+    }
+}
+
+/// Whether the committing reads of this task are to cancel.
+pub(crate) fn committing_cancel_requested() -> bool {
+    CANCEL_COMMITTING
+        .try_with(|cancel| *cancel.borrow())
+        .unwrap_or(false)
+}
 
 /// A connection to one replica.
 #[derive(Debug)]

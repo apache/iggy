@@ -1318,7 +1318,7 @@ public class AsyncTcpConnection {
         Channel channel = exchange.channel();
         IggyServerException serverError = findServerError(error);
         RuntimeException fetchFailure =
-                FetchMessages.completeAttempt(exchange.failoverState(), response, error, pending.isFailedByLink());
+                FetchMessages.completeAttempt(exchange, response, error, pending.isFailedByLink());
         if (fetchFailure != null) {
             releaseFrame(exchange, frame);
             releaseIfPresent(response);
@@ -1884,7 +1884,7 @@ public class AsyncTcpConnection {
                 }
                 // Retaining wakes resolvers inline, so publish the guard before invoking callbacks without this lock.
                 retainedError = new IggyOperationException(
-                        retained.committingFetch()
+                        retained.commitsOnRead()
                                 ? IggyErrorCode.FETCH_PROGRESS_UNCERTAIN
                                 : IggyErrorCode.OPERATION_UNCERTAIN,
                         retained.operationId());

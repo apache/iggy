@@ -163,6 +163,16 @@ impl IggyClient {
         runtime().block_on(async move { inner.connect().await.map_err(to_php_exception) })
     }
 
+    /// Closes the current connection. Repeated calls are safe. Call connect() to use the client
+    /// again, and loginUser() after it, because the sign-in is dropped. Until then requests
+    /// fail, and nothing connects the client in the background. A poll with
+    /// CommitPolicy::onRead() that waits throws FetchProgressUncertain (14010), and its partition
+    /// stays blocked across the reconnect until abandonOperation().
+    pub fn disconnect(&self) -> PhpResult {
+        let inner = self.inner.clone();
+        runtime().block_on(async move { inner.disconnect().await.map_err(to_php_exception) })
+    }
+
     /// Replays an exact retained operation. A committed rejection raises its original error
     /// and releases its lane; uncertainty keeps it retained. HTTP is unsupported.
     /// A fetch progress block raises code 14010 without replay. Only explicit

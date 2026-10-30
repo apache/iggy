@@ -282,8 +282,8 @@ mod tests {
             partition_id: Some(PARTITION),
             error: IggyError::InvalidMessagePayloadLength,
             skip: Some(skip),
-        offset: None,
-        record: None
+            offset: None,
+            record: None,
         });
         assert!(info.has_partition_id);
         assert_eq!(info.partition_id, PARTITION);
@@ -299,8 +299,8 @@ mod tests {
             partition_id: None,
             error: IggyError::ClientShutdown,
             skip: None,
-        offset: None,
-        record: None
+            offset: None,
+            record: None,
         });
         assert!(!info.has_partition_id);
         assert!(

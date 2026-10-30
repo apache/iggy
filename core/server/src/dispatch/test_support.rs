@@ -594,11 +594,16 @@ pub fn route_one_partition(shard: &TestShard) -> IggyNamespace {
 /// [`create_partitions_in`] on `shard`, with every partition routed to
 /// shard 0.
 pub fn route_partitions(shard: &TestShard, count: u32) -> Vec<IggyNamespace> {
+    route_partitions_to(shard, count, 0)
+}
+
+/// [`route_partitions`] to the shard `owner`.
+pub fn route_partitions_to(shard: &TestShard, count: u32, owner: u16) -> Vec<IggyNamespace> {
     let namespaces = create_partitions_in(&shard.plane.metadata().mux_stm, count);
     for namespace in &namespaces {
         shard
             .shards_table()
-            .insert(*namespace, PartitionLocation::new(ShardId::new(0), 0));
+            .insert(*namespace, PartitionLocation::new(ShardId::new(owner), 0));
     }
     namespaces
 }
