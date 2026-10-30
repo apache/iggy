@@ -92,6 +92,11 @@ impl Validatable<ConfigurationError> for ServerConfig {
         self.encryption.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate encryption config")
         })?;
+        self.external_auth
+            .validate()
+            .error(|e: &ConfigurationError| {
+                format!("{COMPONENT} (error: {e}) - failed to validate external auth config")
+            })?;
 
         if self.http.enabled
             && let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry

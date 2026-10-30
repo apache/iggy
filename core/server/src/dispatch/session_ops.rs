@@ -120,9 +120,10 @@ where
         let Some(user) = users.user_by_name(username) else {
             // Constant-cost path: verify against a dummy hash so a missing
             // username is indistinguishable by response timing from a wrong
-            // password (both return InvalidCredentials).
+            // password. UserNotFound lets the ext-auth guard distinguish the
+            // two cases; on the wire both surface as InvalidCredentials.
             let _ = crypto::verify_password(password, DUMMY_PASSWORD_HASH.as_str());
-            return Err(LoginRegisterError::InvalidCredentials);
+            return Err(LoginRegisterError::UserNotFound);
         };
         // Verify before the status check and collapse inactive to
         // InvalidCredentials: an inactive account must answer exactly like a
@@ -378,7 +379,9 @@ const fn transient_login_code(error: &LoginRegisterError) -> IggyError {
 /// `SessionError`; the SDK maps it to `Unauthenticated`.
 const fn eviction_reason_for(error: &LoginRegisterError) -> EvictionReason {
     match error {
-        LoginRegisterError::InvalidCredentials => EvictionReason::InvalidCredentials,
+        LoginRegisterError::InvalidCredentials | LoginRegisterError::UserNotFound => {
+            EvictionReason::InvalidCredentials
+        }
         LoginRegisterError::InvalidToken => EvictionReason::InvalidToken,
         LoginRegisterError::UserInactive => EvictionReason::UserInactive,
         _ => EvictionReason::SessionError,
@@ -1099,6 +1102,7 @@ const fn logout_deny_code(error: &MetadataSubmitError) -> IggyError {
 pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
+    ext_auth: &configs::external_auth::ExternalAuthConfig,
     origin: ClientOrigin,
     request: Message<RoutedRequestHeader>,
 ) where
@@ -1166,10 +1170,18 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     }
 
     let body_tail = &body[prefix_len..];
-    let mut credentials_rejected = false;
+
+    // A body that decodes as LoginRegisterRequest is always treated as a
+    // password login. A wrong password is final: the handler returns without
+    // trying PAT decode. The context length prevents cross-decode: a PAT
+    // body runs out of bytes before a LoginRegisterRequest can fully parse.
     if let Ok((wire_request, _)) =
         LoginRegisterRequest::decode_after_prefix(version_info.clone(), body_tail)
     {
+        // verify_login_credentials handles not-caught-up (transient),
+        // unknown users (constant-cost dummy hash), and wrong passwords in
+        // one call. On InvalidCredentials with ext-auth enabled, the dummy
+        // hash has already equalized timing before the callout adds to it.
         match verify_login_credentials(
             shard,
             wire_request.username.as_str(),
@@ -1191,22 +1203,42 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                     warn!(transport_client_id, error = %error, "login/register failed");
                     surface_login_failure(shard, origin, request.header(), &error).await;
                 }
-                return;
             }
-            Err(LoginRegisterError::InvalidCredentials) => {
-                // Fall through to PAT attempt so a credential payload that
-                // collides with a valid PAT payload shape still gets a
-                // chance. A password-shaped body rarely parses as a PAT
-                // body, so remember the rejection: the final fall-through
-                // must surface InvalidCredentials, not MalformedLogin.
-                credentials_rejected = true;
+            Err(LoginRegisterError::UserNotFound) if ext_auth.enabled => {
+                // Only the normal-status primary does callouts. Backups
+                // have a partially-replicated user store, and nodes in a
+                // view change cannot complete the Register proposal. Both
+                // cases block: peer shards forward the check to shard 0
+                // (the only shard that holds a consensus instance).
+                if is_metadata_primary(shard).await {
+                    // Boxed to keep the ext-auth state machine out of the
+                    // handle_client_request future, which every request pays.
+                    Box::pin(try_external_auth_login(
+                        shard,
+                        sessions,
+                        ext_auth,
+                        origin,
+                        vsr_client_id,
+                        request.header(),
+                        &wire_request,
+                    ))
+                    .await;
+                } else {
+                    surface_login_failure(
+                        shard,
+                        origin,
+                        request.header(),
+                        &LoginRegisterError::ExternalAuthUnavailable,
+                    )
+                    .await;
+                }
             }
             Err(error) => {
                 warn!(transport_client_id, error = %error, "login/register failed");
                 surface_login_failure(shard, origin, request.header(), &error).await;
-                return;
             }
         }
+        return;
     }
 
     if let Ok((wire_request, _)) =
@@ -1247,22 +1279,6 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
         }
     }
 
-    if credentials_rejected {
-        warn!(
-            transport_client_id,
-            "rejecting register request: invalid credentials"
-        );
-        send_eviction(
-            shard,
-            origin,
-            request.header().client,
-            EvictionReason::InvalidCredentials,
-            "login_rejection",
-        )
-        .await;
-        return;
-    }
-
     warn!(
         transport_client_id,
         "rejecting register request with unsupported payload shape"
@@ -1275,6 +1291,146 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
         "login_rejection",
     )
     .await;
+}
+
+/// `true` when the node's metadata consensus is in normal status and is the
+/// primary. On shard 0 the consensus instance is checked directly. On peer
+/// shards (`consensus: None`) the question is forwarded to shard 0 over the
+/// existing `MetadataSubmit` channel, because all shards on the same node
+/// share the same `LeftRight` user store and the only missing piece is the
+/// consensus role. A dropped channel (shard-0 inbox full / shutdown) answers
+/// `false` so the caller blocks the callout rather than leaking credentials.
+async fn is_metadata_primary<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ, S, SB>>) -> bool
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    if let Some(consensus) = shard.plane.metadata().consensus.as_ref() {
+        return consensus.is_normal() && consensus.is_primary();
+    }
+    // Non-metadata shard: ask shard 0 for the consensus role.
+    let (reply, rx) = shard::channel::<bool>(1);
+    shard.forward_metadata_submit(shard::MetadataSubmit::IsMetadataPrimary { reply });
+    rx.recv().await.unwrap_or(false)
+}
+
+/// Attempt external auth callout and, on success, resolve the returned
+/// username to a pre-provisioned Iggy user and complete the login.
+///
+/// The SDK may replay a login after a transient failure, so the callout can
+/// fire more than once for a single logical login. The external service must
+/// be idempotent; one-time passwords will not work across replays.
+async fn try_external_auth_login<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    ext_auth: &configs::external_auth::ExternalAuthConfig,
+    origin: ClientOrigin,
+    vsr_client_id: u128,
+    header: &RoutedRequestHeader,
+    wire_request: &LoginRegisterRequest,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    use crate::external_auth::{
+        Credentials, ExternalAuthRequest, ValidatedDecision, callout_external_auth,
+    };
+
+    let transport_client_id = origin.id;
+
+    // If the client disconnected while queued, the session slot is gone.
+    // Firing the callout would waste a round-trip and widen the window where
+    // a committed Register holds a slot for a gone connection.
+    let (transport, client_address) = match sessions.borrow().client_record(transport_client_id) {
+        Some(r) => (r.transport.as_str(), r.address.to_string()),
+        None => return,
+    };
+    let connection_id = uuid::Uuid::from_u128(transport_client_id).to_string();
+
+    let ext_request = ExternalAuthRequest {
+        transport,
+        client_address: &client_address,
+        connection_id: &connection_id,
+        credentials: Credentials::UsernamePassword {
+            username: wire_request.username.as_str(),
+            password: &wire_request.password,
+        },
+    };
+
+    let decision = match callout_external_auth(ext_auth, ext_request).await {
+        Ok(decision) => decision,
+        Err(error) => {
+            warn!(transport_client_id, error = %error, "external auth callout failed");
+            let login_error = if error.is_transient() {
+                LoginRegisterError::ExternalAuthUnavailable
+            } else {
+                LoginRegisterError::InvalidCredentials
+            };
+            surface_login_failure(shard, origin, header, &login_error).await;
+            return;
+        }
+    };
+
+    let login_error = match decision {
+        ValidatedDecision::Allow { username } => {
+            let resolve = shard
+                .plane
+                .metadata()
+                .mux_stm
+                .users()
+                .read(|users| crate::external_auth::resolve_username(users, &username));
+            match resolve {
+                Ok(account) => {
+                    match complete_login_register(
+                        shard,
+                        sessions,
+                        origin,
+                        vsr_client_id,
+                        header,
+                        account,
+                        &wire_request.version_info,
+                        &wire_request.bind_secret,
+                    )
+                    .await
+                    {
+                        Ok(()) => return,
+                        Err(error) => {
+                            warn!(
+                                transport_client_id,
+                                error = %error,
+                                "ext-auth login/register failed"
+                            );
+                            error
+                        }
+                    }
+                }
+                Err(iggy_error) => {
+                    warn!(
+                        transport_client_id,
+                        ext_username = %username,
+                        error = %iggy_error,
+                        "ext-auth user resolution failed"
+                    );
+                    LoginRegisterError::InvalidCredentials
+                }
+            }
+        }
+        ValidatedDecision::Deny { reason } => {
+            warn!(
+                transport_client_id,
+                reason = %reason,
+                "external auth denied login"
+            );
+            LoginRegisterError::InvalidCredentials
+        }
+    };
+    surface_login_failure(shard, origin, header, &login_error).await;
 }
 
 #[cfg(test)]
@@ -2086,5 +2242,102 @@ mod tests {
             forward.nonce,
             outcome,
         ))
+    }
+
+    // ── is_metadata_primary ────────────────────────────────────────────
+
+    #[compio::test]
+    async fn given_backup_shard_0_when_checking_primary_should_return_false() {
+        let bus = SpyBus::default();
+        // Replica 1 of 3 at view 0: primary_index(0) == 0, so this is a backup.
+        let shard = Rc::new(test_shard(&bus, 1, 3, FIRST_BOOT));
+        assert!(!is_metadata_primary(&shard).await);
+    }
+
+    #[compio::test]
+    async fn given_primary_shard_0_when_checking_primary_should_return_true() {
+        let bus = SpyBus::default();
+        // Replica 0 of 3 at view 0: primary_index(0) == 0, so this IS the primary.
+        let shard = Rc::new(test_shard(&bus, 0, 3, FIRST_BOOT));
+        assert!(is_metadata_primary(&shard).await);
+    }
+
+    #[compio::test]
+    async fn given_standalone_shard_0_when_checking_primary_should_return_true() {
+        let bus = SpyBus::default();
+        // Solo replica: always primary.
+        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        assert!(is_metadata_primary(&shard).await);
+    }
+
+    /// Build a peer shard (id=1, no consensus) with a shard-0 inbox for
+    /// forwarded `IsMetadataPrimary` queries, then run `is_metadata_primary`
+    /// and answer with `shard0_answer`.
+    async fn peer_shard_primary_check(shard0_answer: bool) -> bool {
+        let bus = SpyBus::default();
+
+        let (senders, mut inboxes, _reply_inboxes) = shard::shard_mesh_channels(2, 16, 16);
+        let shard0_inbox = inboxes[0].take().expect("shard 0 inbox");
+
+        let metadata: IggyMetadata<VsrConsensus<SpyBus>, PrepareJournal, IggySnapshot, TestMux> =
+            IggyMetadata::new(None, None, None, None, TestMux::default(), None);
+        let partitions = IggyPartitions::new(
+            ShardId::new(1),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
+                validate_checksum: true,
+                segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                preallocate_segments: false,
+                key_context: Arc::default(),
+                path_layout: PartitionPathLayout::default(),
+            },
+        );
+        let mut peer = TestShard::without_inbox(
+            ShardIdentity::new(1, "peer-shard-test".to_string()),
+            bus.clone(),
+            metadata,
+            partitions,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 3), bus.clone()),
+        );
+        peer.attach_senders(senders);
+        let peer = Rc::new(peer);
+
+        let peer_clone = Rc::clone(&peer);
+        let check = compio::runtime::spawn(async move { is_metadata_primary(&peer_clone).await });
+
+        let frame = shard0_inbox.recv().await.expect("frame from peer");
+        match frame {
+            shard::ShardFrame::Lifecycle(shard::LifecycleFrame::MetadataSubmit(
+                shard::MetadataSubmit::IsMetadataPrimary { reply },
+            )) => {
+                let _ = reply.try_send(shard0_answer);
+            }
+            _ => panic!("expected IsMetadataPrimary"),
+        }
+
+        check.await.expect("join")
+    }
+
+    /// A non-metadata shard (id > 0, consensus = None) forwards the check to
+    /// shard 0. When shard 0's consensus says "backup", the peer shard must
+    /// get `false` back (not the primary).
+    #[compio::test]
+    async fn given_peer_shard_on_backup_node_when_checking_primary_should_return_false() {
+        assert!(
+            !peer_shard_primary_check(false).await,
+            "peer shard on a backup node must not report primary"
+        );
+    }
+
+    /// Same as above but shard 0 is the primary: the peer shard must get
+    /// `true` back.
+    #[compio::test]
+    async fn given_peer_shard_on_primary_node_when_checking_primary_should_return_true() {
+        assert!(
+            peer_shard_primary_check(true).await,
+            "peer shard on the primary node must report primary"
+        );
     }
 }

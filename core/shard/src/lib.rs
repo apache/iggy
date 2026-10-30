@@ -352,6 +352,14 @@ pub enum MetadataSubmit {
         partition_op: u64,
         reply: Sender<Option<u64>>,
     },
+    /// A peer shard asks whether the local metadata consensus considers
+    /// this node the normal-status primary. Non-metadata shards have
+    /// `consensus: None` and cannot answer this locally; shard 0 reads
+    /// its consensus state and replies. Used by the ext-auth guard to
+    /// allow callouts only on the primary in normal status.
+    IsMetadataPrimary {
+        reply: Sender<bool>,
+    },
 }
 
 /// One connected client's identity, as seen by the shard that homes it.
