@@ -31,7 +31,7 @@ use std::task::{Poll, Waker};
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::Response;
 use configs::server::ServerConfig;
-use consensus::{MetadataHandle, VsrConsensus};
+use consensus::{Consensus, MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
 use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
 use iggy_common::{ClusterMetadata, IggyError, IggyTimestamp, UserStatus};
@@ -346,6 +346,18 @@ impl HttpInner {
             .consensus
             .as_ref()
             .is_some_and(VsrConsensus::is_primary)
+    }
+
+    /// True when this node is both in normal status and the primary. Used
+    /// by the ext-auth gate to block callouts during view changes, matching
+    /// the binary transport path in `session_ops::is_metadata_primary`.
+    pub(in crate::http) fn is_normal_primary(&self) -> bool {
+        self.shard
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .is_some_and(|c| c.is_normal() && c.is_primary())
     }
 
     /// Grade a linearizable read that reached a follower: redirect (307) to the

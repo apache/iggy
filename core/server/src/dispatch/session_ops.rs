@@ -2270,70 +2270,10 @@ mod tests {
         assert!(is_metadata_primary(&shard).await);
     }
 
-    /// A non-metadata shard (id > 0, consensus = None) forwards the check to
-    /// shard 0. When shard 0's consensus says "backup", the peer shard must
-    /// get `false` back (not the primary).
-    #[compio::test]
-    async fn given_peer_shard_on_backup_node_when_checking_primary_should_return_false() {
-        let bus = SpyBus::default();
-
-        // Build the shard-0 inbox so the peer shard can forward to it.
-        let (senders, mut inboxes, _reply_inboxes) = shard::shard_mesh_channels(2, 16, 16);
-        let shard0_inbox = inboxes[0].take().expect("shard 0 inbox");
-
-        // Peer shard: id=1, no consensus (mirrors a non-metadata shard).
-        let metadata: IggyMetadata<VsrConsensus<SpyBus>, PrepareJournal, IggySnapshot, TestMux> =
-            IggyMetadata::new(None, None, None, None, TestMux::default(), None);
-        let partitions = IggyPartitions::new(
-            ShardId::new(1),
-            PartitionsConfig {
-                messages_required_to_save: 1,
-                size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-                validate_checksum: true,
-                segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
-                preallocate_segments: false,
-                key_context: Arc::default(),
-                path_layout: PartitionPathLayout::default(),
-            },
-        );
-        let mut peer = TestShard::without_inbox(
-            ShardIdentity::new(1, "peer-shard-test".to_string()),
-            bus.clone(),
-            metadata,
-            partitions,
-            PapayaShardsTable::new(),
-            PartitionConsensusConfig::new(1, ReplicaTopology::new(1, 3), bus.clone()),
-        );
-        peer.attach_senders(senders);
-        let peer = Rc::new(peer);
-
-        // Spawn the check on the peer shard; it will forward to shard 0's inbox.
-        let peer_clone = Rc::clone(&peer);
-        let check = compio::runtime::spawn(async move { is_metadata_primary(&peer_clone).await });
-
-        // Simulate shard 0 draining its inbox: pull the MetadataSubmit frame
-        // and answer as a backup would (not the primary).
-        let frame = shard0_inbox.recv().await.expect("frame from peer");
-        match frame {
-            shard::ShardFrame::Lifecycle(shard::LifecycleFrame::MetadataSubmit(
-                shard::MetadataSubmit::IsMetadataPrimary { reply },
-            )) => {
-                // Shard 0 on a backup node: is_normal() && is_primary() → false.
-                let _ = reply.try_send(false);
-            }
-            _ => panic!("expected IsMetadataPrimary"),
-        }
-
-        assert!(
-            !check.await.expect("join"),
-            "peer shard on a backup node must not report primary"
-        );
-    }
-
-    /// Same as above but shard 0 is the primary: the peer shard must get
-    /// `true` back.
-    #[compio::test]
-    async fn given_peer_shard_on_primary_node_when_checking_primary_should_return_true() {
+    /// Build a peer shard (id=1, no consensus) with a shard-0 inbox for
+    /// forwarded `IsMetadataPrimary` queries, then run `is_metadata_primary`
+    /// and answer with `shard0_answer`.
+    async fn peer_shard_primary_check(shard0_answer: bool) -> bool {
         let bus = SpyBus::default();
 
         let (senders, mut inboxes, _reply_inboxes) = shard::shard_mesh_channels(2, 16, 16);
@@ -2372,13 +2312,31 @@ mod tests {
             shard::ShardFrame::Lifecycle(shard::LifecycleFrame::MetadataSubmit(
                 shard::MetadataSubmit::IsMetadataPrimary { reply },
             )) => {
-                let _ = reply.try_send(true);
+                let _ = reply.try_send(shard0_answer);
             }
             _ => panic!("expected IsMetadataPrimary"),
         }
 
+        check.await.expect("join")
+    }
+
+    /// A non-metadata shard (id > 0, consensus = None) forwards the check to
+    /// shard 0. When shard 0's consensus says "backup", the peer shard must
+    /// get `false` back (not the primary).
+    #[compio::test]
+    async fn given_peer_shard_on_backup_node_when_checking_primary_should_return_false() {
         assert!(
-            check.await.expect("join"),
+            !peer_shard_primary_check(false).await,
+            "peer shard on a backup node must not report primary"
+        );
+    }
+
+    /// Same as above but shard 0 is the primary: the peer shard must get
+    /// `true` back.
+    #[compio::test]
+    async fn given_peer_shard_on_primary_node_when_checking_primary_should_return_true() {
+        assert!(
+            peer_shard_primary_check(true).await,
             "peer shard on the primary node must report primary"
         );
     }

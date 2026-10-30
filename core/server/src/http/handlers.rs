@@ -210,11 +210,11 @@ pub(in crate::http) async fn login_user(
     ) {
         Ok((user_id, created_at)) => issue_identity(&state, user_id, created_at),
         Err(LoginRegisterError::UserNotFound) if state.server_config.external_auth.enabled => {
-            if state.is_metadata_primary() {
+            if state.is_normal_primary() {
                 SendWrapper::new(try_external_auth_http_login(
                     &state,
                     &command.username,
-                    command.password.expose_secret(),
+                    &command.password,
                     &client_addr,
                 ))
                 .await
@@ -2258,7 +2258,7 @@ fn issue_identity(
 async fn try_external_auth_http_login(
     state: &HttpInner,
     username: &str,
-    password: &str,
+    password: &SecretString,
     client_addr: &crate::http::ClientAddr,
 ) -> Result<Json<IdentityInfo>, CustomError> {
     use crate::external_auth::{
@@ -2268,15 +2268,11 @@ async fn try_external_auth_http_login(
     let ext_config = &state.server_config.external_auth;
     let client_address = client_addr.addr.to_string();
     let connection_id = uuid::Uuid::now_v7().to_string();
-    let password_secret = SecretString::from(password);
     let ext_request = ExternalAuthRequest {
         transport: "http",
         client_address: &client_address,
         connection_id: &connection_id,
-        credentials: Credentials::UsernamePassword {
-            username,
-            password: &password_secret,
-        },
+        credentials: Credentials::UsernamePassword { username, password },
     };
 
     let decision = callout_external_auth(ext_config, ext_request)
