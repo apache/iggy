@@ -57,6 +57,7 @@ mod benchmark;
 pub(crate) mod configs;
 pub(crate) mod context;
 pub(crate) mod error;
+mod exactly_once;
 mod log;
 mod manager;
 pub(crate) mod metrics;
@@ -584,6 +585,8 @@ struct SourceConnectorPlugin {
 struct SourceConnectorProducer {
     encoder: Arc<dyn StreamEncoder>,
     producer: IggyProducer,
+    /// Set when the source delivers exactly once. See `exactly_once`.
+    exactly_once: Option<exactly_once::ExactlyOnceTarget>,
 }
 
 struct SourceConnectorWrapper {
