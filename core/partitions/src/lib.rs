@@ -73,8 +73,8 @@ pub use io::{
     largest_legal_job_charge,
 };
 pub use journal::{
-    BodyPosition, EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY, EvictedHeader,
-    read_released_bodies,
+    BodyPosition, EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY, EvictedHeader, ReleasedBodies,
+    ReleasedRead,
 };
 pub use view_fence::ViewWindowVerdict;
 

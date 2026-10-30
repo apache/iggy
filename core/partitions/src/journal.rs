@@ -163,69 +163,152 @@ impl EvictedHeader {
     pub const fn segment_start(&self) -> u64 {
         self.body.segment_start
     }
+
+    const fn same_prepare(&self, other: &Self) -> bool {
+        self.header.op == other.header.op && self.header.checksum == other.header.checksum
+    }
 }
 
-/// Reads the bodies of `released`, in op order, back from the log files of
-/// their segments in `log`, and pushes each prepare to `bodies`. Bodies that
-/// lie back to back in one file come back in one read.
-///
-/// # Errors
-/// Returns an error if a segment left `log`, if a body cannot be read, or if
-/// the bytes there are not the released body: a torn or corrupt batch, or
-/// another batch at the same position. Such bytes are never returned. The
-/// bodies before the one that failed, `released[bodies.len()]`, stay in
-/// `bodies`.
-pub async fn read_released_bodies<J: Debug + Journal>(
-    log: &SegmentedLog<J>,
-    released: &[EvictedHeader],
-    bodies: &mut Vec<JournalBuffer>,
-) -> io::Result<()> {
-    let mut file: Option<(u64, compio::fs::File)> = None;
-    let runs = released
-        .chunk_by(EvictedHeader::followed_by)
-        .flat_map(|run| run.chunks(IOV_MAX));
-    for run in runs {
-        let Some(first) = run.first() else {
-            continue;
-        };
-        let segment = first.body.segment_start;
-        let file = match &mut file {
-            Some((start, file)) if *start == segment => file,
-            slot => {
-                let path = log.messages_path(segment).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "the segment left the log")
-                })?;
-                &slot
-                    .insert((segment, compio::fs::File::open(path).await?))
-                    .1
-            }
-        };
-        // A vectored file read in compio fills only the initialized bytes of
-        // each buffer, so the bodies start zeroed.
-        let buffers: Vec<_> = run
-            .iter()
-            .map(|evicted| {
-                let size = evicted.header.size as usize;
-                let mut prepare = Owned::<4096>::zeroed(size);
-                prepare.as_mut_slice()[..PREPARE_HEADER_SIZE]
-                    .copy_from_slice(bytemuck::bytes_of(&evicted.header));
-                prepare.slice(PREPARE_HEADER_SIZE..size)
-            })
-            .collect();
-        let compio::BufResult(read, buffers) = file
-            .read_vectored_exact_at(buffers, first.body.position)
-            .await;
-        for (evicted, body) in run.iter().zip(buffers) {
-            match evicted.verified(body.into_inner()) {
-                Ok(prepare) => bodies.push(prepare),
-                // Only the released body itself passes the checks, and a
-                // failed read leaves zeros where it stopped, so after a failed
-                // read the first body that fails is where the read stopped.
-                Err(error) => return Err(read.err().unwrap_or(error)),
+/// The released bodies that one serve reads back, with the log file of each
+/// segment that holds one. It owns what it reads, so a task that runs beside
+/// the pump can read the bodies while the log changes.
+#[derive(Debug)]
+pub struct ReleasedRead {
+    released: Vec<EvictedHeader>,
+    /// The log file of each segment by its start offset, `None` when the
+    /// segment left the log.
+    files: Vec<(u64, Option<String>)>,
+}
+
+impl ReleasedRead {
+    #[must_use]
+    pub fn new<J: Debug + Journal>(log: &SegmentedLog<J>, released: Vec<EvictedHeader>) -> Self {
+        let mut files: Vec<(u64, Option<String>)> = Vec::new();
+        for evicted in &released {
+            let segment = evicted.body.segment_start;
+            if files.iter().all(|(start, _)| *start != segment) {
+                files.push((segment, log.messages_path(segment)));
             }
         }
+        Self { released, files }
     }
-    Ok(())
+
+    /// Reads the bodies back in op order. Bodies that lie back to back in one
+    /// file come back in one read.
+    ///
+    /// The read stops at the first body that it cannot serve: the segment
+    /// left the log, the read failed, or the bytes there are not the released
+    /// body, such as a torn or corrupt batch or another batch at the same
+    /// position. Such bytes are never returned.
+    pub async fn read(self) -> ReleasedBodies {
+        let mut bodies = ReleasedBodies {
+            read: VecDeque::with_capacity(self.released.len()),
+            failed: None,
+        };
+        if let Err(error) = self.read_runs(&mut bodies.read).await {
+            bodies.failed = self
+                .released
+                .get(bodies.read.len())
+                .map(|evicted| (*evicted, error));
+        }
+        bodies
+    }
+
+    async fn read_runs(
+        &self,
+        read: &mut VecDeque<(EvictedHeader, JournalBuffer)>,
+    ) -> io::Result<()> {
+        let mut file: Option<(u64, compio::fs::File)> = None;
+        let runs = self
+            .released
+            .chunk_by(EvictedHeader::followed_by)
+            .flat_map(|run| run.chunks(IOV_MAX));
+        for run in runs {
+            let Some(first) = run.first() else {
+                continue;
+            };
+            let segment = first.body.segment_start;
+            let file = match &mut file {
+                Some((start, file)) if *start == segment => file,
+                slot => {
+                    let path = self
+                        .files
+                        .iter()
+                        .find(|(start, _)| *start == segment)
+                        .and_then(|(_, path)| path.as_deref())
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::NotFound, "the segment left the log")
+                        })?;
+                    &slot
+                        .insert((segment, compio::fs::File::open(path).await?))
+                        .1
+                }
+            };
+            // A vectored file read in compio fills only the initialized bytes of
+            // each buffer, so the bodies start zeroed.
+            let buffers: Vec<_> = run
+                .iter()
+                .map(|evicted| {
+                    let size = evicted.header.size as usize;
+                    let mut prepare = Owned::<4096>::zeroed(size);
+                    prepare.as_mut_slice()[..PREPARE_HEADER_SIZE]
+                        .copy_from_slice(bytemuck::bytes_of(&evicted.header));
+                    prepare.slice(PREPARE_HEADER_SIZE..size)
+                })
+                .collect();
+            let compio::BufResult(result, buffers) = file
+                .read_vectored_exact_at(buffers, first.body.position)
+                .await;
+            for (evicted, body) in run.iter().zip(buffers) {
+                match evicted.verified(body.into_inner()) {
+                    Ok(prepare) => read.push_back((*evicted, prepare)),
+                    // Only the released body itself passes the checks, and a
+                    // failed read leaves zeros where it stopped, so after a failed
+                    // read the first body that fails is where the read stopped.
+                    Err(error) => return Err(result.err().unwrap_or(error)),
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The bodies that a [`ReleasedRead`] brought back, in op order.
+#[derive(Debug)]
+pub struct ReleasedBodies {
+    read: VecDeque<(EvictedHeader, JournalBuffer)>,
+    /// The body that the read could not serve, and why. The read stopped
+    /// there.
+    failed: Option<(EvictedHeader, io::Error)>,
+}
+
+impl ReleasedBodies {
+    /// The body read back for `evicted`. Callers take ops in ascending order,
+    /// so the bodies of lower ops are dropped.
+    pub fn take(&mut self, evicted: &EvictedHeader) -> Option<JournalBuffer> {
+        while self
+            .read
+            .front()
+            .is_some_and(|(front, _)| front.header.op < evicted.header.op)
+        {
+            self.read.pop_front();
+        }
+        if !self
+            .read
+            .front()
+            .is_some_and(|(front, _)| front.same_prepare(evicted))
+        {
+            return None;
+        }
+        self.read.pop_front().map(|(_, body)| body)
+    }
+
+    /// Why the read could not serve `evicted`, if it stopped there.
+    pub fn take_failure(&mut self, evicted: &EvictedHeader) -> Option<io::Error> {
+        self.failed
+            .take_if(|(failed, _)| failed.same_prepare(evicted))
+            .map(|(_, error)| error)
+    }
 }
 
 /// A committed prepare the repair ring holds in memory, with the place of its
@@ -1000,7 +1083,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     /// The header the evicted ring keeps for `op` after the byte cap released
     /// its body to a segment. [`Self::repair_entry`] and
     /// [`Self::repair_header`] do not serve such an op: its body must be read
-    /// back with [`read_released_bodies`].
+    /// back with a [`ReleasedRead`].
     #[must_use]
     pub fn evicted_header(&self, op: u64) -> Option<EvictedHeader> {
         let headers = unsafe { &*self.evicted_headers.get() };

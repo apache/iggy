@@ -25,6 +25,7 @@ pub use partition_io::{PartitionIoLimits, PartitionIoLimitsError};
 mod poll;
 mod primary_rebalance;
 mod router;
+mod served_reads;
 pub mod shards_table;
 #[cfg(test)]
 mod test_support;
@@ -88,6 +89,7 @@ use partitions::{
     FatalCommit, IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer,
     RepairIngest,
 };
+use served_reads::{LandedRead, ServedReadKey};
 use server_common::sharding::{
     IggyNamespace, LIST_CLIENTS_GATHER_TIMEOUT, PartitionLocation, ShardId,
 };
@@ -1225,12 +1227,12 @@ pub const REPAIR_CHUNK_MAX: u64 = 128;
 
 /// Prepare bytes one partition `RequestPrepares` round serves.
 ///
-/// The reads run on the pump, so this shard's consensus ticks wait for them.
-/// Bodies that lie back to back in a segment come back in one read. Resident
-/// responses share the bound so receivers can reserve WAL space. 8 MiB
-/// takes about 4 ms from a warm local SSD at 2 GB/s, under one 10 ms tick,
-/// but about 67 ms from a block volume at 125 MB/s. The first body always
-/// goes, so a batch above the budget still makes progress.
+/// Bodies that the ring released come back in one detached read per round,
+/// and a shard runs one such read at a time, so this bounds the bytes that
+/// read holds. Bodies that lie back to back in a segment come back in one
+/// read. Resident responses share the bound so receivers can reserve WAL
+/// space. The first body always goes, so a batch above the budget still
+/// makes progress.
 const REPAIR_BYTES_MAX: u64 = 8 * 1024 * 1024;
 
 /// One in-flight metadata journal-repair stream (shard 0 only).
@@ -1830,6 +1832,8 @@ where
     /// displace their results. Only the owner pump validates completions.
     poll_completions: poll::completion::PollCompletionLane,
     partition_io: partition_io::PartitionIoLane<SB>,
+    /// Disk reads that answer peers, which the pump serves once they land.
+    served_reads: served_reads::ServedReads,
     cooperative_events: Cell<usize>,
     deferred_polls: poll::deferred::DeferredPolls,
 
@@ -2170,6 +2174,7 @@ where
             reply_inbox,
             poll_completions,
             partition_io,
+            served_reads: served_reads::ServedReads::default(),
             cooperative_events: Cell::new(0),
             deferred_polls: poll::deferred::DeferredPolls::new(metrics.deferred_polls.clone()),
             shards_table,
@@ -3067,6 +3072,7 @@ where
                     .expect("simulator supports the production partition I/O limits"),
                 &metrics,
             ),
+            served_reads: served_reads::ServedReads::default(),
             cooperative_events: Cell::new(0),
             shards_table,
             partition_consensus,
@@ -6178,7 +6184,11 @@ where
                             .await;
                     }
                     Some(consensus::ReplicationWork::Replay { from_op, .. })
-                        if replay.is_none_or(|(selected_group, selected_peer, _)| {
+                        if !self.served_reads.reading(ServedReadKey::Prepares {
+                            group,
+                            target: replica,
+                            live: true,
+                        }) && replay.is_none_or(|(selected_group, selected_peer, _)| {
                             rank((group, replica)) < rank((selected_group, selected_peer))
                         }) =>
                     {
@@ -6210,10 +6220,75 @@ where
                     header.to_op = consensus.sequencer().current_sequence();
                 })
         };
-        if self.serve_prepares(&request, true).await < from_op
+        let served = self.serve_prepares(&request, true, None).await;
+        self.defer_unserved_replay(group, replica, from_op, served);
+    }
+
+    /// A replay that served nothing waits before the next one, so a body or a
+    /// peer that is not there is not asked for on every tick.
+    fn defer_unserved_replay(&self, group: u64, replica: u8, from_op: u64, served: Option<u64>)
+    where
+        B: MessageBus,
+    {
+        if served.is_some_and(|served| served < from_op)
             && let Some(consensus) = self.replication_consensus(group)
         {
             consensus.defer_replication(replica);
+        }
+    }
+
+    /// Serve the oldest request whose disk read landed, against the state of
+    /// now, as the pump serves any request.
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn serve_landed_read(&self)
+    where
+        B: MessageBus,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    {
+        match self.served_reads.take_landed() {
+            Some(LandedRead::Prepares {
+                request,
+                live,
+                mut bodies,
+            }) => {
+                let served = self.serve_prepares(&request, live, Some(&mut bodies)).await;
+                if live {
+                    let header = request.header();
+                    self.defer_unserved_replay(
+                        header.group,
+                        header.replica,
+                        header.from_op,
+                        served,
+                    );
+                }
+            }
+            Some(LandedRead::Chunk {
+                header,
+                artifact,
+                load,
+            }) => {
+                self.serve_partition_chunk(header, Some((artifact, load)))
+                    .await;
+            }
+            None => {}
+        }
+    }
+
+    /// Serve landed reads, as the pump does, until no read runs or waits.
+    #[cfg(test)]
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn settle_served_reads(&self)
+    where
+        B: MessageBus,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    {
+        while !self.served_reads.is_empty() {
+            self.served_reads.landed().await;
+            self.serve_landed_read().await;
         }
     }
 
@@ -6257,15 +6332,25 @@ where
         <MJ as JournalHandle>::Target:
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     {
-        self.serve_prepares(msg, false).await;
+        self.serve_prepares(msg, false, None).await;
     }
 
     /// Serve a repair range from this replica's journal: stream
     /// `RepairPrepare` frames (stored prepares verbatim, command byte
     /// rewritten) in op order, prefixed by `RangeEvicted` when the front of
     /// the range is no longer retained, terminated by `RepairDone`.
+    ///
+    /// Returns the last op served. A partition range that needs bodies the
+    /// ring released sends nothing and returns `None`: a detached read brings
+    /// the bodies back, and the pump serves the request again with them in
+    /// `landed`.
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
-    async fn serve_prepares(&self, msg: &Message<RequestPreparesHeader>, live: bool) -> u64
+    async fn serve_prepares(
+        &self,
+        msg: &Message<RequestPreparesHeader>,
+        live: bool,
+        mut landed: Option<&mut partitions::ReleasedBodies>,
+    ) -> Option<u64>
     where
         B: MessageBus,
         MJ: JournalHandle,
@@ -6285,13 +6370,13 @@ where
             // Other requesters may receive only those peers' committed prefix.
             if consensus.is_transferring() {
                 // Transfer can replace these entries.
-                return header.from_op.saturating_sub(1);
+                return Some(header.from_op.saturating_sub(1));
             }
             if !matches!(consensus.status(), Status::Normal | Status::ViewChange) {
-                return header.from_op.saturating_sub(1);
+                return Some(header.from_op.saturating_sub(1));
             }
             let Some(journal) = planes.0.journal.as_ref() else {
-                return header.from_op.saturating_sub(1);
+                return Some(header.from_op.saturating_sub(1));
             };
             let journal = journal.handle();
             let cluster = consensus.cluster();
@@ -6312,7 +6397,7 @@ where
             // servable anyway. The partition arm jumps to `retained_from` likewise.
             let mut from_op = header.from_op.max(journal.snapshot_op() + 1);
             if !consensus.view_log_entry_proven(from_op) {
-                return header.from_op.saturating_sub(1);
+                return Some(header.from_op.saturating_sub(1));
             }
             #[allow(clippy::cast_possible_truncation)]
             while from_op <= to_op && journal.header(from_op as usize).is_none() {
@@ -6320,7 +6405,7 @@ where
             }
             if from_op > to_op {
                 if live {
-                    return header.from_op.saturating_sub(1);
+                    return Some(header.from_op.saturating_sub(1));
                 }
                 // Nothing in the requested range is retained. Answer the
                 // eviction honestly: a bare `RepairDone(to_op)` here would
@@ -6348,11 +6433,11 @@ where
                     consensus.partition_incarnation(),
                 )
                 .await;
-                return header.from_op.saturating_sub(1);
+                return Some(header.from_op.saturating_sub(1));
             }
             if from_op > header.from_op {
                 if live {
-                    return header.from_op.saturating_sub(1);
+                    return Some(header.from_op.saturating_sub(1));
                 }
                 self.send_repair_range_reply(
                     cluster,
@@ -6412,25 +6497,33 @@ where
                 )
                 .await;
             }
-            return served_through;
+            return Some(served_through);
         }
         let namespace = IggyNamespace::from_raw(header.group);
         let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
-            return header.from_op.saturating_sub(1);
+            return Some(header.from_op.saturating_sub(1));
         };
         if !self.partition_incarnation_matches(
             partition,
             header.partition_incarnation,
             Command::RequestPrepares,
         ) {
-            return header.from_op.saturating_sub(1);
+            return Some(header.from_op.saturating_sub(1));
         }
         if !matches!(
             partition.consensus().status(),
             Status::Normal | Status::ViewChange
         ) || partition.view_truncation_pending()
         {
-            return header.from_op.saturating_sub(1);
+            return Some(header.from_op.saturating_sub(1));
+        }
+        let read_key = ServedReadKey::Prepares {
+            group: header.group,
+            target,
+            live,
+        };
+        if landed.is_none() && self.served_reads.reading(read_key) {
+            return None;
         }
         if !live {
             partition.renew_transfer_tail_for_repair(target, self.ticks.get());
@@ -6470,23 +6563,13 @@ where
             .unwrap_or_else(|| partition.consensus().commit_min().saturating_add(1));
         let mut from_op = header.from_op;
         if !partition.consensus().view_log_entry_proven(from_op) {
-            return header.from_op.saturating_sub(1);
+            return Some(header.from_op.saturating_sub(1));
         }
-        if retained_from > from_op {
+        let range_evicted = retained_from > from_op;
+        if range_evicted {
             if live {
-                return header.from_op.saturating_sub(1);
+                return Some(header.from_op.saturating_sub(1));
             }
-            self.send_repair_range_reply(
-                cluster,
-                self_id,
-                target,
-                Command::RangeEvicted,
-                header.nonce,
-                retained_from,
-                header.group,
-                partition.created_revision(),
-            )
-            .await;
             from_op = retained_from;
         }
         let chunk_ops_max = if live {
@@ -6496,10 +6579,9 @@ where
         };
         let chunk_end = to_op.min(from_op.saturating_add(chunk_ops_max - 1));
         let journal = &partition.log.journal().inner;
-        // Every op is checked and taken before the first await, and the bodies
-        // the ring released come back from disk in one pass, so the bodies that
-        // lie back to back in a segment take one read. `None` stands for the
-        // next body read back.
+        // Every op is checked and taken before the first await. A body that the
+        // ring released comes from `landed`, and `None` stands for one that no
+        // read brought back yet.
         let mut entries = Vec::new();
         let mut released = Vec::new();
         let mut response_bytes = 0;
@@ -6532,8 +6614,13 @@ where
             }
             response_bytes += size;
             if let Some(evicted) = evicted {
-                released.push(evicted);
-                entries.push(None);
+                let body = landed
+                    .as_deref_mut()
+                    .and_then(|landed| landed.take(&evicted));
+                if body.is_none() {
+                    released.push(evicted);
+                }
+                entries.push(body);
             } else {
                 let Some(entry) = journal.repair_entry(op) else {
                     break;
@@ -6541,18 +6628,41 @@ where
                 entries.push(Some(entry));
             }
         }
-        let mut bodies = Vec::with_capacity(released.len());
-        let failed =
-            match partitions::read_released_bodies(&partition.log, &released, &mut bodies).await {
-                Ok(()) => None,
-                Err(error) => released
-                    .get(bodies.len())
-                    .map(|evicted| (evicted.header().op, error)),
-            };
-        let mut bodies = bodies.into_iter();
+        if landed.is_none() && !released.is_empty() {
+            // Bodies that lie back to back in a segment take one read. Nothing
+            // goes out before they land, so the frames keep op order.
+            let read = partitions::ReleasedRead::new(&partition.log, released);
+            let request = msg.clone();
+            self.served_reads.start(&self.bus, read_key, async move {
+                LandedRead::Prepares {
+                    request,
+                    live,
+                    bodies: read.read().await,
+                }
+            });
+            return None;
+        }
+        if range_evicted {
+            self.send_repair_range_reply(
+                cluster,
+                self_id,
+                target,
+                Command::RangeEvicted,
+                header.nonce,
+                retained_from,
+                header.group,
+                partition.created_revision(),
+            )
+            .await;
+        }
+        // The serve ends at the first body that no read brought back.
+        let failed = released.first().and_then(|unread| {
+            let error = landed.as_mut()?.take_failure(unread)?;
+            Some((unread.header().op, error))
+        });
         let mut served_through = from_op.saturating_sub(1);
         for (op, entry) in (from_op..).zip(entries) {
-            let Some(entry) = entry.or_else(|| bodies.next()) else {
+            let Some(entry) = entry else {
                 break;
             };
             if !self
@@ -6610,7 +6720,7 @@ where
                 "served partition repair range"
             );
         }
-        served_through
+        Some(served_through)
     }
 
     /// Ingest one repaired prepare. Metadata journals it into the WAL (the
@@ -10410,27 +10520,44 @@ where
         .await;
     }
 
+    #[allow(clippy::future_not_send)]
+    async fn on_partition_request_state_chunk(&self, msg: &Message<RequestStateChunkHeader>)
+    where
+        B: MessageBus,
+    {
+        self.serve_partition_chunk(*msg.header(), None).await;
+    }
+
     /// Serve one partition chunk. Segment payloads are loaded from disk on
     /// demand into the shard-wide [`ServedSegmentCache`] (content-addressed,
     /// so simultaneous rejoiners share one resident copy); a load or
     /// re-verification failure (GC unlinked the file, bytes changed) evicts
     /// the offer and tells the requester to restart with a fresh one --
     /// which then reflects the current segment set, so the retry converges.
+    ///
+    /// A detached read loads the segment bytes, and the pump serves the
+    /// request again with them in `loaded`, beside the artifact they came from.
     #[allow(
         clippy::future_not_send,
         clippy::cast_possible_truncation,
         clippy::too_many_lines
     )]
-    async fn on_partition_request_state_chunk(&self, msg: &Message<RequestStateChunkHeader>)
-    where
+    async fn serve_partition_chunk(
+        &self,
+        header: RequestStateChunkHeader,
+        mut loaded: Option<(
+            consensus::StateArtifact,
+            Result<Vec<u8>, partitions::state_transfer::SegmentLoadError>,
+        )>,
+    ) where
         B: MessageBus,
     {
-        // TODO: Move partition offer hashing, segment loads and receiver spills
-        // into bounded file-lane jobs so they cannot stall consensus ticks.
+        // TODO: Move partition offer hashing off the pump, so it cannot stall
+        // consensus ticks.
         // Pass 1 inside the borrow decides; a segment artifact that is not
-        // resident exits with its path and is loaded OUTSIDE the borrow (a
-        // RefCell borrow must not be held across an await), then pass 2
-        // stores and serves it.
+        // resident exits with its path and a detached read loads it (a
+        // RefCell borrow must not be held across an await), then pass 2 of
+        // the serve that gets the bytes stores and serves them.
         enum ChunkAttempt {
             Reply(Option<ChunkReply>),
             Load {
@@ -10439,9 +10566,15 @@ where
             },
         }
 
-        let header = *msg.header();
         // The requester id keys the offer map, whose bound is the replica count.
         if !self.peer_is_known(header.replica, "RequestStateChunk") {
+            return;
+        }
+        let read_key = ServedReadKey::Chunk {
+            group: header.group,
+            requester: header.replica,
+        };
+        if loaded.is_none() && self.served_reads.reading(read_key) {
             return;
         }
         let planes = self.plane.inner();
@@ -10567,28 +10700,43 @@ where
             match attempt {
                 ChunkAttempt::Reply(reply) => break reply,
                 ChunkAttempt::Load { log_path, entry } => {
-                    // A whole-segment read on the pump can outlive the requester's
-                    // retry budget. Cache only artifacts that fit one chunk;
-                    // the receiver verifies larger artifacts before install.
+                    // A whole-segment read can outlive the requester's retry
+                    // budget. Cache only artifacts that fit one chunk; the
+                    // receiver verifies larger artifacts before install.
                     let cache_whole = header.offset == 0 && entry.len <= chunk_len_max as u64;
-                    let loaded = if cache_whole {
-                        partitions::state_transfer::load_verified_segment_artifact(
-                            &log_path, &entry,
-                        )
-                        .await
-                    } else {
+                    // The offer can change while a read runs. Bytes of another
+                    // artifact must never serve, or fill the cache for, this one.
+                    let Some(load) = loaded
+                        .take()
+                        .and_then(|(artifact, load)| (artifact == entry).then_some(load))
+                    else {
                         let len = u64::from(header.len)
                             .min(chunk_len_max as u64)
                             .min(entry.len - header.offset)
                             as usize;
-                        partitions::state_transfer::load_segment_chunk(
-                            &log_path,
-                            header.offset,
-                            len,
-                        )
-                        .await
+                        self.served_reads.start(&self.bus, read_key, async move {
+                            let load = if cache_whole {
+                                partitions::state_transfer::load_verified_segment_artifact(
+                                    &log_path, &entry,
+                                )
+                                .await
+                            } else {
+                                partitions::state_transfer::load_segment_chunk(
+                                    &log_path,
+                                    header.offset,
+                                    len,
+                                )
+                                .await
+                            };
+                            LandedRead::Chunk {
+                                header,
+                                artifact: entry,
+                                load,
+                            }
+                        });
+                        return;
                     };
-                    let reason = match loaded {
+                    let reason = match load {
                         Ok(bytes) => {
                             if cache_whole {
                                 self.served_segment_cache.borrow_mut().insert(

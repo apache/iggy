@@ -529,7 +529,11 @@ where
                 () = poll_fn(|context| {
                     self.plane.partitions().register_loopback_waker(context.waker());
                     self.partition_io.register_waker(context.waker());
-                    if self.has_pending_loopback(&loopback_buf) || self.partition_io.has_ready() {
+                    self.served_reads.register_waker(context.waker());
+                    if self.has_pending_loopback(&loopback_buf)
+                        || self.partition_io.has_ready()
+                        || self.served_reads.has_landed()
+                    {
                         Poll::Ready(())
                     } else {
                         Poll::Pending
@@ -540,6 +544,9 @@ where
                 }
             }
             self.service_partition_io().await;
+            // After every event, as partition I/O, so a busy inbox cannot
+            // starve the serves that wait for a disk read.
+            self.serve_landed_read().await;
         }
 
         self.poll_completions.close();

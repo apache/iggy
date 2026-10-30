@@ -1296,6 +1296,11 @@ mod tests {
             owner
                 .on_message(MessageBag::RequestStateChunk(request))
                 .await;
+            assert!(
+                sent.borrow().is_empty(),
+                "the chunk goes out once its read lands"
+            );
+            owner.settle_served_reads().await;
             let frames = sent.borrow();
             assert_eq!(frames.len(), 1, "one reply for the requested chunk");
             assert_eq!(
@@ -1313,6 +1318,90 @@ mod tests {
                     .fully_served
             );
         }
+    }
+
+    /// The offer can change while a chunk read runs. Bytes read for the
+    /// artifact of the old offer never answer the request or fill the cache:
+    /// the serve reads the artifact of the offer of now.
+    #[compio::test]
+    async fn given_a_chunk_read_when_the_offer_changes_before_it_lands_should_serve_the_new_artifact()
+     {
+        const NONCE: u128 = 1;
+        const OLD: &[u8] = b"old segment bytes";
+        const NEW: &[u8] = b"new segment bytes";
+        const CHUNK_LEN: u32 = 8;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&sent);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            captured.borrow_mut().push(frame);
+            Ok(())
+        }));
+        connect_replica_on(&bus, TRANSFER_REQUESTER, 1);
+        let (mut owner, _sender) = test_owner(&bus, None);
+        owner.partition_consensus.replica_count = TRANSFER_REQUESTER + 1;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        owner
+            .plane
+            .partitions()
+            .get_mut_by_ns(&namespace)
+            .unwrap()
+            .set_created_revision(SERVED_INCARNATION);
+        let directory = tempfile::tempdir().unwrap();
+        let offer_of = |name: &str, bytes: &[u8]| {
+            let log_path = directory.path().join(name);
+            std::fs::write(&log_path, bytes).unwrap();
+            let offer = partitions::state_transfer::PartitionStateTransferOffer {
+                commit_op: 0,
+                segments: vec![partitions::state_transfer::SegmentArtifactSource {
+                    entry: StateArtifact::for_bytes(artifact_kind::SEGMENT_LOG, 0, bytes),
+                    log_path: log_path.to_str().unwrap().to_owned(),
+                }],
+                offsets: (
+                    StateArtifact::for_bytes(artifact_kind::CONSUMER_OFFSETS, 0, &[]),
+                    Rc::new(Vec::new()),
+                ),
+            };
+            crate::ServedStateTransfer {
+                nonce: NONCE,
+                offer: crate::ServedOffer::Partition(Rc::new(offer)),
+                idle_ticks: 0,
+                fully_served: false,
+            }
+        };
+        let offer_key = (namespace.inner(), TRANSFER_REQUESTER);
+        owner
+            .state_transfer_offers
+            .borrow_mut()
+            .insert(offer_key, offer_of("old.log", OLD));
+        let request = Message::<RequestStateChunkHeader>::new(size_of::<RequestStateChunkHeader>())
+            .transmute_header(|_, header: &mut RequestStateChunkHeader| {
+                header.command = Command::RequestStateChunk;
+                header.size = u32::try_from(size_of::<RequestStateChunkHeader>()).unwrap();
+                header.cluster = 1;
+                header.group = namespace.inner();
+                header.replica = TRANSFER_REQUESTER;
+                header.partition_incarnation = SERVED_INCARNATION;
+                header.nonce = NONCE;
+                header.len = CHUNK_LEN;
+                header.seal();
+            });
+
+        owner
+            .on_message(MessageBag::RequestStateChunk(request))
+            .await;
+        owner
+            .state_transfer_offers
+            .borrow_mut()
+            .insert(offer_key, offer_of("new.log", NEW));
+        owner.settle_served_reads().await;
+
+        let frames = sent.borrow();
+        assert_eq!(frames.len(), 1, "one reply for the requested chunk");
+        let chunk =
+            Message::<StateChunkHeader>::try_from(Owned::copy_from_slice(frames[0].as_slice()))
+                .unwrap();
+        assert_eq!(chunk.body(), &NEW[..CHUNK_LEN as usize]);
     }
 
     /// A request frame that fails the gates, here one with a stale partition
@@ -8840,6 +8929,196 @@ mod tests {
         );
     }
 
+    /// A round that needs released bodies sends nothing until a detached read
+    /// brings them back, so the pump goes on while the disk works: another
+    /// requester's round of a resident op goes out first. A request that
+    /// repeats the round waits for its read. Once the bodies land, the round
+    /// goes out in op order and `RepairDone` ends it.
+    #[compio::test]
+    async fn given_a_read_of_released_bodies_when_other_requests_arrive_should_serve_them_meanwhile()
+     {
+        const OTHER_REQUESTER: u8 = 0;
+        let donor = Box::pin(SegmentDonor::new(4)).await;
+        connect_replica_on(&donor.owner.bus, OTHER_REQUESTER, 1);
+        donor.sent.borrow_mut().clear();
+        let request = repair_request(donor.namespace, 1, donor.prepares.len());
+        let resident = repair_request(donor.namespace, 4, donor.prepares.len()).transmute_header(
+            |old, header: &mut RequestPreparesHeader| {
+                *header = old;
+                header.replica = OTHER_REQUESTER;
+            },
+        );
+
+        let held = donor.owner.served_reads.hold();
+        donor.owner.on_request_prepares(&request).await;
+        donor.owner.on_request_prepares(&request).await;
+        donor.owner.on_request_prepares(&resident).await;
+        assert_eq!(
+            sent_answers(&donor.sent, &donor.prepares),
+            [(Command::RepairPrepare, 4), (Command::RepairDone, 4)],
+            "only the resident round goes out while the read waits"
+        );
+
+        drop(held);
+        donor.owner.settle_served_reads().await;
+        assert_eq!(
+            sent_answers(&donor.sent, &donor.prepares),
+            [
+                (Command::RepairPrepare, 1),
+                (Command::RepairPrepare, 2),
+                (Command::RepairPrepare, 3),
+                (Command::RepairPrepare, 4),
+                (Command::RepairDone, 4),
+            ],
+            "the repeated request is answered once"
+        );
+    }
+
+    /// The running pump serves other frames while a round waits for its
+    /// released bodies, and answers that round once the bodies land.
+    #[compio::test]
+    async fn given_a_running_pump_when_a_round_waits_for_released_bodies_should_serve_other_frames()
+    {
+        const OTHER_REQUESTER: u8 = 0;
+        const PUMP_WAITS_MAX: usize = 1000;
+        let donor = &Box::pin(SegmentDonor::new(4)).await;
+        connect_replica_on(&donor.owner.bus, OTHER_REQUESTER, 1);
+        donor.sent.borrow_mut().clear();
+        let deliver = |request: Message<RequestPreparesHeader>| {
+            donor
+                .sender
+                .try_send(ShardFrame::consensus(
+                    donor.owner.id,
+                    MessageBag::RequestPrepares(request),
+                ))
+                .expect("fixture request fits the inbox");
+        };
+        let sent_frames = |count: usize| async move {
+            for _ in 0..PUMP_WAITS_MAX {
+                if donor.sent.borrow().len() >= count {
+                    return;
+                }
+                donor.owner.bus.sleep(Duration::from_millis(1)).await;
+            }
+            panic!(
+                "the pump sent {} of {count} frames",
+                donor.sent.borrow().len()
+            );
+        };
+        let (stop, stopped) = channel(1);
+        let pump = donor
+            .owner
+            .run_message_pump(stopped, Arc::new(AtomicBool::new(false)));
+        let exercise = async {
+            let held = donor.owner.served_reads.hold();
+            deliver(repair_request(donor.namespace, 1, donor.prepares.len()));
+            deliver(
+                repair_request(donor.namespace, 4, donor.prepares.len()).transmute_header(
+                    |old, header: &mut RequestPreparesHeader| {
+                        *header = old;
+                        header.replica = OTHER_REQUESTER;
+                    },
+                ),
+            );
+            sent_frames(2).await;
+            assert_eq!(
+                sent_answers(&donor.sent, &donor.prepares),
+                [(Command::RepairPrepare, 4), (Command::RepairDone, 4)]
+            );
+
+            drop(held);
+            sent_frames(5).await;
+            assert_eq!(
+                sent_answers(&donor.sent, &donor.prepares),
+                [
+                    (Command::RepairPrepare, 1),
+                    (Command::RepairPrepare, 2),
+                    (Command::RepairPrepare, 3),
+                    (Command::RepairPrepare, 4),
+                    (Command::RepairDone, 4),
+                ]
+            );
+            stop.try_send(()).unwrap();
+        };
+        let (fault, ()) = futures::join!(pump, exercise);
+        assert!(fault.is_none());
+    }
+
+    /// The bodies can land after the partition left the shard. The serve
+    /// checks the state again, so it sends nothing, and a later request reads
+    /// again.
+    #[compio::test]
+    async fn given_a_read_of_released_bodies_when_the_partition_leaves_should_send_nothing() {
+        let donor = Box::pin(SegmentDonor::new(4)).await;
+        let partitions = donor.owner.plane.partitions();
+        donor.sent.borrow_mut().clear();
+        donor
+            .owner
+            .on_request_prepares(&repair_request(donor.namespace, 1, donor.prepares.len()))
+            .await;
+        let partition = partitions.remove(&donor.namespace).unwrap();
+        donor.owner.settle_served_reads().await;
+        assert!(donor.sent.borrow().is_empty());
+
+        partitions.insert(donor.namespace, partition);
+        assert_eq!(
+            donor.answers(1).await,
+            [
+                (Command::RepairPrepare, 1),
+                (Command::RepairPrepare, 2),
+                (Command::RepairPrepare, 3),
+                (Command::RepairPrepare, 4),
+                (Command::RepairDone, 4),
+            ]
+        );
+    }
+
+    /// A read starts only after the pump took the bytes of the read before
+    /// it, so a busy pump holds the bodies of one round, not of every round
+    /// that waits.
+    #[compio::test]
+    async fn given_a_landed_read_when_the_pump_has_not_taken_it_should_start_no_other_read() {
+        const OTHER_REQUESTER: u8 = 0;
+        // Ample time for a second read of the fixture segment to land, if it
+        // could start before the take.
+        const SECOND_READ_WINDOW: Duration = Duration::from_millis(10);
+        let donor = Box::pin(SegmentDonor::new(4)).await;
+        connect_replica_on(&donor.owner.bus, OTHER_REQUESTER, 1);
+        donor.sent.borrow_mut().clear();
+        let round = [
+            (Command::RepairPrepare, 1),
+            (Command::RepairPrepare, 2),
+            (Command::RepairPrepare, 3),
+            (Command::RepairPrepare, 4),
+            (Command::RepairDone, 4),
+        ];
+        let other = repair_request(donor.namespace, 1, donor.prepares.len()).transmute_header(
+            |old, header: &mut RequestPreparesHeader| {
+                *header = old;
+                header.replica = OTHER_REQUESTER;
+            },
+        );
+        donor
+            .owner
+            .on_request_prepares(&repair_request(donor.namespace, 1, donor.prepares.len()))
+            .await;
+        donor.owner.on_request_prepares(&other).await;
+
+        donor.owner.served_reads.landed().await;
+        donor.owner.bus.sleep(SECOND_READ_WINDOW).await;
+        assert_eq!(
+            donor.owner.served_reads.landed_count(),
+            1,
+            "the second read waits for the pump to take the first"
+        );
+
+        donor.owner.settle_served_reads().await;
+        assert_eq!(
+            sent_answers(&donor.sent, &donor.prepares),
+            [round, round].concat()
+        );
+    }
+
     /// A replay to a backup reads no released body that the replication
     /// window refuses. A window with room for op 1 reads op 1 only, and a full
     /// window reads nothing. The body of op 2 is corrupt, so a read of it
@@ -8908,14 +9187,19 @@ mod tests {
                 .repair_retained_from()
         };
 
-        assert_eq!(owner.serve_prepares(&replay(1), true).await, 1);
+        assert_eq!(
+            owner.serve_prepares(&replay(1), true, None).await,
+            None,
+            "the body of op 1 is on disk"
+        );
+        owner.settle_served_reads().await;
         assert_eq!(*replayed.borrow(), [1], "the window must take op 1 only");
         assert_eq!(
             retained_from(),
             Some(1),
             "the replay must not read the body of op 2 that the window refuses"
         );
-        assert_eq!(owner.serve_prepares(&replay(2), true).await, 1);
+        assert_eq!(owner.serve_prepares(&replay(2), true, None).await, Some(1));
         assert_eq!(*replayed.borrow(), [1], "a full window must take nothing");
         assert_eq!(
             retained_from(),
@@ -9059,8 +9343,8 @@ mod tests {
     }
 
     /// Asks `owner` for ops `from_op..` of `prepares` as the primary of
-    /// [`REPAIR_VIEW`], and returns the command and op of each frame it sent.
-    /// Each `RepairPrepare` must carry its prepare from `prepares` verbatim.
+    /// [`REPAIR_VIEW`], serves the reads that land, and returns what
+    /// [`sent_answers`] finds.
     #[allow(clippy::future_not_send)]
     async fn repair_answers(
         owner: &IoTestShard,
@@ -9069,21 +9353,43 @@ mod tests {
         from_op: u64,
         prepares: &[Message<PrepareHeader>],
     ) -> Vec<(Command, u64)> {
-        const COMMAND_OFFSET: usize = std::mem::offset_of!(GenericHeader, command);
-        let request = Message::<RequestPreparesHeader>::new(size_of::<RequestPreparesHeader>())
-            .transmute_header(|_, header: &mut RequestPreparesHeader| {
+        sent.borrow_mut().clear();
+        owner
+            .on_request_prepares(&repair_request(namespace, from_op, prepares.len()))
+            .await;
+        owner.settle_served_reads().await;
+        sent_answers(sent, prepares)
+    }
+
+    /// A request of [`REPAIR_PRIMARY`] in [`REPAIR_VIEW`] for ops
+    /// `from_op..=head`.
+    fn repair_request(
+        namespace: IggyNamespace,
+        from_op: u64,
+        head: usize,
+    ) -> Message<RequestPreparesHeader> {
+        Message::<RequestPreparesHeader>::new(size_of::<RequestPreparesHeader>()).transmute_header(
+            |_, header: &mut RequestPreparesHeader| {
                 header.command = Command::RequestPrepares;
                 header.cluster = 1;
                 header.group = namespace.inner();
                 header.replica = REPAIR_PRIMARY;
                 header.view = REPAIR_VIEW;
                 header.from_op = from_op;
-                header.to_op = u64::try_from(prepares.len()).unwrap();
+                header.to_op = u64::try_from(head).unwrap();
                 header.size = u32::try_from(size_of::<RequestPreparesHeader>()).unwrap();
                 header.seal();
-            });
-        sent.borrow_mut().clear();
-        owner.on_request_prepares(&request).await;
+            },
+        )
+    }
+
+    /// Takes the frames in `sent`, and returns the command and op of each.
+    /// Each `RepairPrepare` must carry its prepare from `prepares` verbatim.
+    fn sent_answers(
+        sent: &RefCell<Vec<Message<GenericHeader>>>,
+        prepares: &[Message<PrepareHeader>],
+    ) -> Vec<(Command, u64)> {
+        const COMMAND_OFFSET: usize = std::mem::offset_of!(GenericHeader, command);
         sent.borrow_mut()
             .drain(..)
             .map(|message| {
@@ -9274,6 +9580,7 @@ mod tests {
                 primary_owner
                     .on_request_prepares(&request.try_into_typed().unwrap())
                     .await;
+                primary_owner.settle_served_reads().await;
             }
             let frames: Vec<_> = served.borrow_mut().drain(..).collect();
             for (_, frame) in frames {
@@ -9337,7 +9644,7 @@ mod tests {
         log_path: PathBuf,
         /// The position of each released body in the log file.
         positions: BTreeMap<u64, u64>,
-        _sender: TaggedSender,
+        sender: TaggedSender,
         _directory: tempfile::TempDir,
     }
 
@@ -9376,7 +9683,7 @@ mod tests {
                 prepares,
                 log_path,
                 positions,
-                _sender: sender,
+                sender,
                 _directory: directory,
             }
         }

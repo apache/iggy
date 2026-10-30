@@ -17497,12 +17497,13 @@ mod tests {
                     .expect("the byte cap released this body")
             })
             .collect();
-        let mut bodies = Vec::new();
-        crate::read_released_bodies(&partition.log, &released, &mut bodies)
-            .await
-            .unwrap();
-        assert_eq!(bodies.len(), released.len());
-        for (body, prepare) in bodies.iter().zip(&prepares) {
+        let mut bodies = crate::ReleasedRead::new(&partition.log, released.clone())
+            .read()
+            .await;
+        for (evicted, prepare) in released.iter().zip(&prepares) {
+            let body = bodies
+                .take(evicted)
+                .expect("the read brings every body back");
             assert_eq!(body.as_slice(), prepare.as_slice());
         }
 
