@@ -72,13 +72,18 @@ impl Validatable<ConfigurationError> for ExternalAuthConfig {
             eprintln!("external_auth.url must be set when external_auth.enabled = true");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
-        if !self.url.starts_with("http://") && !self.url.starts_with("https://") {
-            eprintln!("external_auth.url must start with http:// or https://");
-            return Err(ConfigurationError::InvalidConfigurationValue);
+        let parsed = url::Url::parse(&self.url).map_err(|e| {
+            eprintln!("external_auth.url is not a valid URL: {e}");
+            ConfigurationError::InvalidConfigurationValue
+        })?;
+        match parsed.scheme() {
+            "http" | "https" => {}
+            _ => {
+                eprintln!("external_auth.url must use http or https");
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
         }
-        // Catch bare schemes ("http://") with no host.
-        let after_scheme = self.url.split_once("://").map_or("", |(_, rest)| rest);
-        if after_scheme.is_empty() || after_scheme.starts_with('/') {
+        if parsed.host_str().is_none_or(|h| h.is_empty()) {
             eprintln!("external_auth.url has no host");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -145,10 +150,21 @@ mod tests {
     }
 
     #[test]
-    fn given_enabled_config_with_scheme_and_path_only_when_validating_should_reject() {
+    fn given_enabled_config_with_scheme_slash_slash_slash_when_validating_should_reject() {
+        // WHATWG parses "http:///" as empty-host, which we reject.
         let config = ExternalAuthConfig {
             enabled: true,
-            url: "http:///path".to_owned(),
+            url: "http:///".to_owned(),
+            ..ExternalAuthConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_enabled_config_with_query_only_url_when_validating_should_reject() {
+        let config = ExternalAuthConfig {
+            enabled: true,
+            url: "https://?x".to_owned(),
             ..ExternalAuthConfig::default()
         };
         assert!(config.validate().is_err());
