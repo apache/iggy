@@ -38,7 +38,7 @@ jobs:
         include: ${{ fromJSON(inputs.plan).checks }}
     runs-on: ${{
       (matrix.task == 'build-aarch64-gnu' || matrix.task == 'build-aarch64-musl') && 'ubuntu-26.04-arm' ||
-      (matrix.task == 'build-macos-aarch64' || matrix.task == 'clippy-macos-aarch64') && 'macos-14' ||
+      (matrix.task == 'build-macos-aarch64' || matrix.task == 'clippy-macos-aarch64') && 'macos-15' ||
       matrix.task == 'build-windows-sdk' && 'windows-latest' ||
       'ubuntu-26.04'
       }}
