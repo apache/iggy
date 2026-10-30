@@ -30,7 +30,7 @@ use crate::poll_plan::{
     DiskReadPlan, DiskSegment, PartitionDirResolution, PollContext, PollPlan, PollReadResult,
     PollTier, ResidentTailSnapshot,
 };
-use crate::producer_state::{ProducerAdmission, ProducerTable, StampedBatch};
+use crate::producer_state::{ProducerAdmission, ProducerEntry, ProducerTable, StampedBatch};
 use crate::segment::Segment;
 use crate::state_transfer::{
     PartitionTransferSession, PartitionTransferUnavailable, PendingTransferRearm, TransferPlanSlot,
@@ -1409,6 +1409,21 @@ where
     #[must_use]
     pub const fn consensus(&self) -> &VsrConsensus<B> {
         &self.consensus
+    }
+
+    /// The committed producer table, ascending by producer id, as a
+    /// checkpoint or a transfer offer carries it.
+    pub(crate) fn producer_entries(&self) -> Vec<(u64, ProducerEntry)> {
+        self.producers
+            .entries()
+            .map(|(producer_id, entry)| (producer_id, entry.clone()))
+            .collect()
+    }
+
+    /// Replace the committed producer table with the one a checkpoint or a
+    /// transfer carried.
+    pub(crate) fn restore_producers(&mut self, entries: Vec<(u64, ProducerEntry)>) {
+        self.producers = ProducerTable::from_entries(entries);
     }
 
     /// This group's dedup slice. Read at admission to classify a request,
@@ -2993,6 +3008,7 @@ where
             consumer_group_owners: std::mem::take(&mut self.consumer_group_owners),
             history_transition: self.history_transition,
             owner_retirement: self.owner_retirement.take(),
+            producers: std::mem::take(&mut self.producers),
             durable_offset: self.offset.load(Ordering::Acquire),
             write_offset: self.dirty_offset.load(Ordering::Relaxed),
             offset_space: self.offset_space,
@@ -3032,11 +3048,13 @@ where
             consumer_group_owners,
             history_transition,
             owner_retirement,
+            producers,
         } = state;
         self.log = log;
         self.consumer_group_owners = consumer_group_owners;
         self.history_transition = history_transition;
         self.owner_retirement = owner_retirement;
+        self.producers = producers;
         if let Some(capacity) = retry_capacity {
             self.dedup
                 .install_watermarks(capacity, retry_protection)
@@ -14389,6 +14407,7 @@ mod tests {
                     groups: Vec::new(),
                     external_groups: Vec::new(),
                     dedup: Vec::new(),
+                    producers: Vec::new(),
                 };
                 partition
                     .install_state_transfer(&repair_config(), 1, staged, &offsets.encode())
@@ -14460,6 +14479,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         partition
             .install_state_transfer(&repair_config(), 3, staged, &offsets.encode())
@@ -14510,6 +14530,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         assert!(matches!(
             partition
@@ -14736,6 +14757,7 @@ mod tests {
             owners: Vec::new(),
             history_transition: None,
             owner_retirement: None,
+            producers: Vec::new(),
         };
 
         let result = partition
@@ -17714,6 +17736,7 @@ mod tests {
             owners: Vec::new(),
             history_transition: None,
             owner_retirement: None,
+            producers: Vec::new(),
         };
         let installed = backup
             .install_state_transfer(&repair_config(), 1, vec![staged], &offsets.encode())
@@ -18498,6 +18521,7 @@ mod tests {
                     dedup: partition.dedup.watermarks_sorted(),
                     owners: Vec::new(),
                     history_transition: None,
+                    producers: Vec::new(),
                 };
                 partition
                     .install_state_transfer(&config, 2, vec![staged], &offsets.encode())
@@ -22045,6 +22069,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         let outcome = partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &offer.encode())
@@ -23160,6 +23185,7 @@ mod tests {
             groups: vec![(9, 3)],
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &wire.encode())
@@ -24913,6 +24939,7 @@ mod tests {
             groups: vec![(8, 5)],
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         partition
             .install_state_transfer(&repair_config(), 1, Vec::new(), &wire.encode())
@@ -28459,6 +28486,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         let installed_commit_operation = 12;
         partition
@@ -28642,6 +28670,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         let offered_commit_operation = 12;
         let install_error = partition
@@ -33721,6 +33750,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         let refused = partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &behind.encode())
@@ -33776,6 +33806,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         let refused = partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &stale.encode())
@@ -33854,6 +33885,39 @@ mod tests {
 
         assert_holds_message_less_state(&receiver, &origin, &transition);
         assert_eq!(receiver.created_revision(), incarnation);
+    }
+
+    /// The offer carries the committed producer table, so a replica that
+    /// catches up by transfer answers a resent batch as its donor does.
+    #[compio::test]
+    async fn given_a_producer_table_when_a_replica_transfers_should_hold_it() {
+        let (_origin_directory, mut origin, _) = message_less_origin().await;
+        origin.producers.record(&StampedBatch {
+            producer: BatchProducer::new(7, 2, 0).unwrap(),
+            message_count: 3,
+            base_offset: 0,
+            timestamp: 1,
+        });
+
+        let offer = origin.state_transfer_offer(&repair_config()).await.unwrap();
+        let (_receiver_directory, mut receiver) = transfer_receiver();
+        receiver
+            .install_state_transfer(
+                &repair_config(),
+                offer.commit_op,
+                Vec::new(),
+                &offer.offsets.1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(receiver.producer_entries(), origin.producer_entries());
+        assert_eq!(
+            receiver
+                .producers
+                .admit(BatchProducer::new(7, 2, 0).unwrap(), 3, &[]),
+            ProducerAdmission::Duplicate { base_offset: 0 }
+        );
     }
 
     /// A replica that never took a message and lags past every op its peers
@@ -34950,6 +35014,7 @@ mod tests {
             owners: Vec::new(),
             history_transition: None,
             owner_retirement: None,
+            producers: Vec::new(),
         };
         partition
             .install_state_transfer(&repair_config(), INSTALLED_OPS, staged, &offsets.encode())

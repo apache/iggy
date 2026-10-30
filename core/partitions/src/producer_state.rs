@@ -24,7 +24,7 @@
 //! Every replica records a committed batch in op order, so the tables agree.
 
 use iggy_binary_protocol::batch::BatchProducer;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Batches each producer keeps.
 ///
@@ -32,6 +32,16 @@ use std::collections::{BTreeMap, VecDeque};
 /// spreads them over several sessions, and a resend of any of them still finds
 /// the offset of its first write.
 pub const PRODUCER_BATCHES_RETAINED: usize = 5;
+
+/// Producers a partition keeps, which bounds its memory. Past this, the one
+/// idle the longest goes, and its next batch starts at sequence 0, as the
+/// first batch of a new producer does.
+pub const PRODUCERS_MAX: usize = 4096;
+
+/// A producer idle this long goes. A day lets a producer resend after a
+/// restart or a long outage. Measured in prepare timestamps, so every replica
+/// drops the same producers at the same op.
+pub const PRODUCER_IDLE_EXPIRY_MICROS: u64 = 24 * 60 * 60 * 1_000_000;
 
 /// One batch of a producer, as the partition wrote it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,15 +161,54 @@ impl ProducerEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProducerTable {
     entries: BTreeMap<u64, ProducerEntry>,
+    /// `(last_timestamp, producer_id)` of every entry, the longest idle first.
+    by_idle: BTreeSet<(u64, u64)>,
 }
 
 impl ProducerTable {
-    /// Record a committed batch. Every replica calls this in op order.
-    pub fn record(&mut self, batch: &StampedBatch) {
+    /// A table of entries that a checkpoint or a transfer carried.
+    #[must_use]
+    pub fn from_entries(entries: impl IntoIterator<Item = (u64, ProducerEntry)>) -> Self {
+        let entries: BTreeMap<u64, ProducerEntry> = entries.into_iter().collect();
+        let by_idle = entries
+            .iter()
+            .map(|(producer_id, entry)| (entry.last_timestamp, *producer_id))
+            .collect();
+        Self { entries, by_idle }
+    }
+
+    /// Every entry, ascending by producer id.
+    pub fn entries(&self) -> impl Iterator<Item = (u64, &ProducerEntry)> {
         self.entries
-            .entry(batch.producer.producer_id)
-            .and_modify(|entry| entry.record(batch))
-            .or_insert_with(|| ProducerEntry::new(batch));
+            .iter()
+            .map(|(producer_id, entry)| (*producer_id, entry))
+    }
+
+    /// Record a committed batch. Every replica calls this in op order, so
+    /// every replica also drops the same idle producers.
+    pub fn record(&mut self, batch: &StampedBatch) {
+        let producer_id = batch.producer.producer_id;
+        if let Some(entry) = self.entries.get_mut(&producer_id) {
+            self.by_idle.remove(&(entry.last_timestamp, producer_id));
+            entry.record(batch);
+            self.by_idle.insert((entry.last_timestamp, producer_id));
+        } else {
+            let entry = ProducerEntry::new(batch);
+            self.by_idle.insert((entry.last_timestamp, producer_id));
+            self.entries.insert(producer_id, entry);
+        }
+        self.expire(batch.timestamp);
+    }
+
+    fn expire(&mut self, now: u64) {
+        while let Some(&(last_timestamp, producer_id)) = self.by_idle.first() {
+            let idle = last_timestamp.saturating_add(PRODUCER_IDLE_EXPIRY_MICROS) < now;
+            if !idle && self.entries.len() <= PRODUCERS_MAX {
+                break;
+            }
+            self.by_idle.pop_first();
+            self.entries.remove(&producer_id);
+        }
     }
 
     /// Check a batch against the committed state and then `in_flight`, the
@@ -378,6 +427,69 @@ mod tests {
         assert_eq!(
             table.admit(producer(0, 2), 1, &[]),
             ProducerAdmission::Duplicate { base_offset: 102 }
+        );
+    }
+
+    #[test]
+    fn given_a_producer_idle_past_the_expiry_when_another_records_should_drop_it() {
+        let mut table = table(&[stamped(0, 0, 1, 100)]);
+        let other = StampedBatch {
+            producer: BatchProducer::new(PRODUCER_ID + 1, 0, 0).unwrap(),
+            message_count: 1,
+            base_offset: 101,
+            timestamp: 100 + PRODUCER_IDLE_EXPIRY_MICROS,
+        };
+        table.record(&other);
+        assert!(table.get(PRODUCER_ID).is_some(), "idle exactly the expiry");
+
+        table.record(&StampedBatch {
+            timestamp: other.timestamp + 1,
+            ..other
+        });
+
+        assert!(table.get(PRODUCER_ID).is_none());
+        assert_eq!(table.len(), 1);
+        assert_eq!(
+            table.admit(producer(0, 9), 1, &[]),
+            ProducerAdmission::Unknown,
+            "a dropped producer starts again at sequence 0"
+        );
+        assert_eq!(
+            table.admit(producer(0, 0), 1, &[]),
+            ProducerAdmission::Append
+        );
+    }
+
+    #[test]
+    fn given_a_full_table_when_a_new_producer_records_should_drop_the_longest_idle() {
+        let mut table = ProducerTable::default();
+        for producer_id in 0..=PRODUCERS_MAX as u64 {
+            table.record(&StampedBatch {
+                producer: BatchProducer::new(producer_id, 0, 0).unwrap(),
+                message_count: 1,
+                base_offset: producer_id,
+                timestamp: producer_id,
+            });
+        }
+
+        assert_eq!(table.len(), PRODUCERS_MAX);
+        assert!(table.get(0).is_none(), "the longest idle producer goes");
+        assert!(table.get(1).is_some());
+    }
+
+    #[test]
+    fn given_entries_when_rebuilt_should_admit_and_expire_as_the_original() {
+        let original = table(&[stamped(0, 0, 3, 100), stamped(0, 3, 1, 103)]);
+        let rebuilt = ProducerTable::from_entries(
+            original
+                .entries()
+                .map(|(producer_id, entry)| (producer_id, entry.clone())),
+        );
+
+        assert_eq!(rebuilt, original);
+        assert_eq!(
+            rebuilt.admit(producer(0, 3), 1, &[]),
+            ProducerAdmission::Duplicate { base_offset: 103 }
         );
     }
 

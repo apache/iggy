@@ -60,6 +60,12 @@ async fn given_a_producer_batch_when_the_node_restarts_should_serve_it_and_keep_
 
     let client = reconnect(harness).await;
     assert_eq!(poll_payloads(&client).await, payloads);
+    assert_eq!(
+        send(&client, producer, &payloads).await,
+        Some(0),
+        "the WAL replay must rebuild the producer table"
+    );
+    assert_eq!(poll_payloads(&client).await, payloads);
     let stored = stored_batches(&harness.node(0).data_path());
     assert!(
         stored
@@ -153,6 +159,45 @@ async fn given_a_batch_resent_after_its_primary_stops_when_sent_through_another_
     assert_eq!(poll_payloads(&second).await, ["a", "b", "c", "x", "d"]);
 }
 
+/// A 128 MiB WAL checkpoints after two batches of 33 MiB, as in `partition_dedup`.
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(partition.wal_bytes_max = "134225920 B", sharding.cpu_allocation = "0..1")
+)]
+async fn given_a_checkpointed_producer_table_when_the_node_restarts_should_still_know_the_first_write(
+    harness: &mut TestHarness,
+) {
+    const CHECKPOINT_OP: u64 = 2;
+    let producer = |base_sequence| BatchProducer::new(13_000, 0, base_sequence).unwrap();
+    let client = connect(harness).await;
+    create_topic(&client).await;
+    assert_eq!(
+        try_send_messages(&client, Some(producer(0)), bulky_messages(1)).await,
+        Ok(Some(0))
+    );
+    assert_eq!(
+        try_send_messages(&client, None, bulky_messages(2)).await,
+        Ok(Some(u64::from(BULKY_MESSAGES)))
+    );
+    await_receipt_checkpoint(harness, CHECKPOINT_OP).await;
+    drop(client);
+
+    harness.node_mut(0).stop().expect("stop the node");
+    harness.node_mut(0).start().expect("restart the node");
+
+    let client = reconnect(harness).await;
+    assert_eq!(
+        try_send_messages(&client, Some(producer(0)), bulky_messages(1)).await,
+        Ok(Some(0)),
+        "the checkpoint must hold the first write"
+    );
+    assert_eq!(
+        send(&client, producer(BULKY_MESSAGES), &["next"]).await,
+        Some(2 * u64::from(BULKY_MESSAGES)),
+        "the resent batch must not take offsets"
+    );
+}
+
 pub(crate) async fn connect(harness: &TestHarness) -> IggyClient {
     harness
         .node(0)
@@ -223,23 +268,76 @@ async fn try_send(
     producer: BatchProducer,
     payloads: &[&str],
 ) -> Result<Option<u64>, IggyError> {
-    let mut messages: Vec<IggyMessage> = payloads
+    let messages = payloads
         .iter()
         .map(|payload| IggyMessage::from_str(payload).expect("message"))
         .collect();
-    let response = client
-        .send_producer_messages(
-            &stream_id(),
-            &topic_id(),
-            &Partitioning::partition_id(PARTITION_ID),
-            producer,
-            &mut messages,
-        )
-        .await?;
+    try_send_messages(client, Some(producer), messages).await
+}
+
+async fn try_send_messages(
+    client: &IggyClient,
+    producer: Option<BatchProducer>,
+    mut messages: Vec<IggyMessage>,
+) -> Result<Option<u64>, IggyError> {
+    let partitioning = Partitioning::partition_id(PARTITION_ID);
+    let response = match producer {
+        Some(producer) => {
+            client
+                .send_producer_messages(
+                    &stream_id(),
+                    &topic_id(),
+                    &partitioning,
+                    producer,
+                    &mut messages,
+                )
+                .await?
+        }
+        None => {
+            client
+                .send_messages(&stream_id(), &topic_id(), &partitioning, &mut messages)
+                .await?
+        }
+    };
     Ok(response
         .confirmations
         .first()
         .map(|confirmation| confirmation.base_offset))
+}
+
+const BULKY_MESSAGES: u32 = 33;
+
+/// 33 messages of 1 MiB, a quarter of the 128 MiB WAL.
+fn bulky_messages(fill: u8) -> Vec<IggyMessage> {
+    (0..BULKY_MESSAGES)
+        .map(|_| {
+            IggyMessage::builder()
+                .payload(vec![fill; 1024 * 1024].into())
+                .build()
+                .expect("build a message")
+        })
+        .collect()
+}
+
+/// Wait until the partition published the retry checkpoint of `op`, which also
+/// lets it reclaim the WAL below.
+async fn await_receipt_checkpoint(harness: &TestHarness, op: u64) {
+    let name = format!("receipts-{op}.checkpoint");
+    let deadline = Instant::now() + RECOVER_TIMEOUT;
+    loop {
+        let mut files = Vec::new();
+        collect_files(&harness.node(0).data_path(), &mut files, &|path| {
+            path.file_name().is_some_and(|file| *file == *name)
+        });
+        if !files.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the partition never published {name}"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// The node that holds the partition's primary.
@@ -290,7 +388,9 @@ fn topic_id() -> Identifier {
 /// The header of every batch in the node's segment files.
 fn stored_batches(data_path: &Path) -> Vec<BatchHeader> {
     let mut segments = Vec::new();
-    collect_segments(data_path, &mut segments);
+    collect_files(data_path, &mut segments, &|path| {
+        path.extension().is_some_and(|extension| extension == "log")
+    });
     let mut headers = Vec::new();
     for segment in segments {
         let bytes = std::fs::read(&segment).expect("read a segment file");
@@ -306,16 +406,16 @@ fn stored_batches(data_path: &Path) -> Vec<BatchHeader> {
     headers
 }
 
-fn collect_segments(directory: &Path, segments: &mut Vec<PathBuf>) {
+fn collect_files(directory: &Path, files: &mut Vec<PathBuf>, wanted: &dyn Fn(&Path) -> bool) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_segments(&path, segments);
-        } else if path.extension().is_some_and(|extension| extension == "log") {
-            segments.push(path);
+            collect_files(&path, files, wanted);
+        } else if wanted(&path) {
+            files.push(path);
         }
     }
 }
