@@ -123,8 +123,10 @@ Some options read differently than in Rust:
   takes it as the base of a jittered backoff capped at 10 seconds.
 - `reestablish_after` is how long after the last successful connection the client
   waits before redialing that endpoint. Rust takes it as the uptime that resets the
-  backoff. With one endpoint, a long value holds the redial back, and requests made
-  while it waits fail.
+  backoff.
+- A request that needs the connection waits for the redial, up to the request timeout
+  (30 seconds by default), and fails when the wait, or the `reconnection_interval`
+  pause, outlasts it. An explicit `connect()` waits it out.
 - The pending operation limits are checked and then ignored, since this client keeps
   no operations to replay.
 

@@ -44,12 +44,13 @@ struct ConnectionStringTests {
         #expect(configuration.address == "[::1]:8090")
     }
 
-    @Test(arguments: ["", "?nodelay=true"])
-    func unsetOptionsTakeTheRustDefaults(_ options: String) throws {
+    @Test(arguments: ["", "?max_pending_operations=1"])
+    func unsetOptionsTakeTheDefaults(_ options: String) throws {
         let configuration = try ClientConfiguration(connectionString: "iggy://user:secret@127.0.0.1:1234\(options)")
         #expect(configuration.reconnection == ReconnectionOptions(enabled: true, maxRetries: nil, interval: .seconds(1), reestablishAfter: .seconds(5)))
         #expect(configuration.heartbeatInterval == .seconds(5))
         #expect(configuration.noDelay)
+        #expect(configuration.tls == nil)
     }
 
     @Test func readsEveryOption() throws {
