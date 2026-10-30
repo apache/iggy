@@ -248,7 +248,9 @@ internal sealed class MockNode : IDisposable
         }
     }
 
-    public void Serve(Func<MockRequest, byte[]> handler, Action<MockRequest, byte[]>? beforeSend = null)
+    /// <param name="handler">Answers each request.</param>
+    /// <param name="beforeSend">Runs before each reply goes out. The reply waits until its task ends.</param>
+    public void Serve(Func<MockRequest, byte[]> handler, Func<MockRequest, byte[], Task>? beforeSend = null)
     {
         _ = Task.Run(async () =>
         {
@@ -296,7 +298,8 @@ internal sealed class MockNode : IDisposable
         Kill();
     }
 
-    private async Task Exchange(TcpClient connection, Func<MockRequest, byte[]> handler, Action<MockRequest, byte[]>? beforeSend)
+    private async Task Exchange(TcpClient connection, Func<MockRequest, byte[]> handler,
+        Func<MockRequest, byte[], Task>? beforeSend)
     {
         try
         {
@@ -335,7 +338,10 @@ internal sealed class MockNode : IDisposable
 
                 var reply = handler(request);
                 CorrelateReply(request, reply);
-                beforeSend?.Invoke(request, reply);
+                if (beforeSend is not null)
+                {
+                    await beforeSend(request, reply);
+                }
                 await stream.WriteAsync(reply);
                 await stream.FlushAsync();
             }

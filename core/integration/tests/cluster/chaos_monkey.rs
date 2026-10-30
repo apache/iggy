@@ -88,7 +88,7 @@
 //! | `cascading-crash` | for each node: SIGKILL it, SIGKILL its successor `SECOND_KILL_DELAY_SECS` later during the view change, restart both `d` after the second kill; `persisted` | fails on master with `persisted`: after the restarted pair elected a new view, the surviving node fenced partition 0 as divergent (`partition WAL append does not extend its history`, then a ShardFatal and a process exit) and the partition stayed frozen. With `replicated` on 3 nodes one node stays alive alone for `d`, so acknowledged writes held only by the killed pair are lost by design, the same mechanism as `full-outage`. #4476 and #4500 cover the fenced replica and the survivor election, not that loss |
 //! | `full-outage` | SIGKILL every node at once after `g`, restart all after `d`; `persisted` | fails on master with `persisted`: the cluster recovers and loses nothing, but every producer stays `disconnected` until the end, the producer stall described below. With `replicated`, unflushed acknowledged writes are lost by design, so that setting is expected to fail |
 //! | `rolling-crash` | `crash-restart` on 1 partition at 30k messages/s from 12 producers in batches of 100, `persisted`, a kill every 80 s and 40 s down, for 360 s | #4438: a restarted replica logs `needs state transfer`, never finishes the transfer and keeps serving a stale prefix. Timing dependent; the loss reaches millions of messages at this load. Expected: pass |
-//! | `split-primaries` | `crash-restart`, then a 60 s window without faults, opened once the replica mesh has formed, in which the p99 latency of an acknowledged batch and the longest gap between acknowledgements must stay under `IGGY_TEST_CHAOS_P99_LIMIT_MS` | #4436: once partition primaries sit on different nodes, the SDK moves its session on nearly every send. #4437 is the deterministic test. Expected: pass |
+//! | `split-primaries` | `crash-restart`, then a 60 s window without faults, opened once the replica mesh has formed, in which the p99 latency of an acknowledged batch and the longest gap between acknowledgements must stay under `IGGY_TEST_CHAOS_P99_LIMIT_MS` | #4436: once partition primaries sit on different nodes, the SDK moves its session on nearly every send. `given_partitions_on_different_primaries_when_sending_round_robin_should_keep_the_session` in `partition_primary_routing.rs` is the deterministic test. Expected: pass |
 //!
 //! `isolate` needs no privileges: the harness relays every replica link over
 //! loopback. A cut closes the node's relayed connections, so its peers see EOF
@@ -1285,7 +1285,7 @@ async fn create_topic_and_group(harness: &TestHarness, config: &ChaosConfig) {
     let target = Target::new();
     let client = harness.tcp_root_client().await.expect("root client");
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create the stream");
     let options = TopicCreateOptions {
@@ -2441,7 +2441,10 @@ async fn start_iggy_consumer(builder: IggyConsumerBuilder) -> IggyConsumer {
             AutoCommitWhen::ConsumingAllMessages,
         ))
         .batch_length(POLL_BATCH)
-        .poll_interval(IggyDuration::from(POLL_PAUSE))
+        .poll_options(DeferredPollOptions {
+            max_wait: IggyDuration::from(POLL_PAUSE),
+            ..Default::default()
+        })
         .build();
     consumer.init().await.expect("init the IggyConsumer");
     consumer

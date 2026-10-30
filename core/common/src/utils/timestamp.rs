@@ -55,6 +55,14 @@ impl IggyTimestamp {
         IggyTimestamp(UNIX_EPOCH)
     }
 
+    /// `micros` after the Unix epoch, `None` past what this platform's clock
+    /// holds, for example above year 30828 on Windows.
+    pub fn checked_from_micros(micros: u64) -> Option<Self> {
+        UNIX_EPOCH
+            .checked_add(Duration::from_micros(micros))
+            .map(IggyTimestamp)
+    }
+
     pub fn to_secs(&self) -> u64 {
         self.0.duration_since(UNIX_EPOCH).unwrap().as_secs()
     }

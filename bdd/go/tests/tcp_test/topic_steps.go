@@ -33,14 +33,13 @@ import (
 func successfullyCreateTopic(streamId uint32, client iggcon.Client) (uint32, string) {
 	name := createRandomString(128)
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	partitions := uint32(2)
+	maxTopicSize := uint64(math.MaxUint64)
 	topic, err := client.CreateTopic(
 		context.Background(),
 		streamIdentifier,
 		name,
-		2,
-		1,
-		0,
-		math.MaxUint64)
+		&iggcon.TopicOptions{PartitionsCount: &partitions, MaxTopicSize: &maxTopicSize})
 
 	itShouldSuccessfullyCreateTopic(streamId, topic.Id, name, client)
 	itShouldNotReturnError(err)

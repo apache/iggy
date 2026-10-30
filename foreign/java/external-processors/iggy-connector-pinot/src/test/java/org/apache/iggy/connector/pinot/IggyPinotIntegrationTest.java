@@ -29,7 +29,6 @@ import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.pinot.spi.exception.QueryErrorCode;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -42,7 +41,6 @@ import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.utility.MountableFile;
 
 import java.io.IOException;
-import java.math.BigInteger;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -294,9 +292,7 @@ class IggyPinotIntegrationTest {
     private static void createIggyResources() {
         iggyClient.streams().createStream(STREAM_NAME);
         StreamId streamId = StreamId.of(STREAM_NAME);
-        iggyClient
-                .topics()
-                .createTopic(streamId, 2L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, TOPIC_NAME);
+        iggyClient.topics().createTopic(streamId, TOPIC_NAME, 2L);
         iggyClient.consumerGroups().createConsumerGroup(streamId, TopicId.of(TOPIC_NAME), CONSUMER_GROUP_NAME);
     }
 

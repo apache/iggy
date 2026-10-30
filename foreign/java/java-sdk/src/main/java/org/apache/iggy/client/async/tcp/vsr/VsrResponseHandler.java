@@ -20,20 +20,26 @@
 package org.apache.iggy.client.async.tcp.vsr;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.util.concurrent.ScheduledFuture;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
+import org.apache.iggy.serde.CommandCode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.IntConsumer;
@@ -66,6 +72,13 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         session.onChannelCreated();
     }
 
+    public long maxResponseFrameSize(long requestId, int defaultLimit) {
+        PendingRequest pending = pendingRequests.get(requestId);
+        return pending == null
+                ? defaultLimit
+                : Math.min(defaultLimit, pending.maxResponseBody + VsrHeaders.HEADER_SIZE);
+    }
+
     public PendingRequest registerRequest(
             Channel channel,
             ByteBuf requestFrame,
@@ -77,14 +90,36 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 VsrHeaders.readRequestOperation(requestFrame),
                 VsrHeaders.readRequestId(requestFrame),
                 RequestIdentity.from(requestFrame));
-        registerRequest(pending);
+        if (commandCode == CommandCode.Messages.POLL_DEFERRED.getValue()) {
+            pending.maxResponseBody =
+                    requestFrame.getUnsignedIntLE(requestFrame.writerIndex() - Long.BYTES - Integer.BYTES);
+            pending.cancellation = new byte[VsrHeaders.HEADER_SIZE];
+            requestFrame.getBytes(requestFrame.readerIndex(), pending.cancellation);
+            ByteBuffer.wrap(pending.cancellation)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .putInt(VsrHeaders.SIZE_OFFSET, VsrHeaders.HEADER_SIZE)
+                    .putInt(
+                            VsrHeaders.REQUEST_RESERVED_CODE_OFFSET,
+                            CommandCode.Messages.CANCEL_DEFERRED_REQUEST.getValue());
+        }
+        registerRequest(pending, channel);
         long timeoutNanos = Math.max(0, deadlineNanos - System.nanoTime());
         ScheduledFuture<?> timeoutFuture;
         try {
             timeoutFuture = channel.eventLoop()
                     .schedule(
-                            () -> future.completeExceptionally(new IggyTimeoutException(
-                                    "Timed out waiting for a response to command code " + commandCode)),
+                            () -> {
+                                if (pending.operation == VsrOperation.REGISTER
+                                        && pendingRequests.remove(pending.requestId, pending)) {
+                                    // Every Register has the same request id, so its late reply would answer the next
+                                    // Register on this channel and fail its proof check.
+                                    closeChannel(
+                                            channel,
+                                            new IggyNotConnectedException("A Register timed out on this channel"));
+                                }
+                                future.completeExceptionally(new IggyTimeoutException(
+                                        "Timed out waiting for a response to command code " + commandCode));
+                            },
                             timeoutNanos,
                             TimeUnit.NANOSECONDS);
         } catch (RuntimeException error) {
@@ -95,7 +130,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         return pending;
     }
 
-    private void registerRequest(PendingRequest pending) {
+    private void registerRequest(PendingRequest pending, Channel channel) {
         pendingRequests.compute(pending.requestId, (requestId, previous) -> {
             if (previous != null && !previous.future.isDone()) {
                 throw new IllegalStateException(
@@ -104,7 +139,11 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
             // Timeout and cancellation callbacks can replay before the previous entry's cleanup runs.
             return pending;
         });
-        pending.future.whenComplete((response, error) -> pendingRequests.remove(pending.requestId, pending));
+        pending.future.whenComplete((response, error) -> {
+            if (pendingRequests.remove(pending.requestId, pending)) {
+                pending.abandon(channel);
+            }
+        });
     }
 
     public void closeChannel(Channel channel, Throwable cause) {
@@ -214,26 +253,34 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         pending.committed = marked
                 && resultCode != VsrHeaders.ERROR_TRANSIENT_NOT_COMMITTED
                 && resultCode != VsrHeaders.ERROR_TRANSIENT_NOT_ACCEPTED
-                && resultCode != IggyErrorCode.NOT_PRIMARY.getCode();
-        synchronized (session) {
-            if (pending.identity.matches(session)) {
-                if (pending.committed
-                        && (VsrOperation.isMetadata(operation)
-                                || operation == VsrOperation.REGISTER
-                                || operation == VsrOperation.LOGOUT)) {
-                    session.observeMetadata(frame.getLongLE(frame.readerIndex() + VsrHeaders.REPLY_COMMIT_OFFSET));
-                }
-                if (resultCode == 0) {
-                    applySessionEffects(frame, operation, bodyStart, bodyLength);
-                }
-            }
-        }
-        resetLogoutSession(pending, operation, resultCode);
+                && resultCode != IggyErrorCode.NOT_PRIMARY.getCode()
+                && resultCode != IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode();
+        recordSessionReply(frame, pending, operation, resultCode, bodyStart, bodyLength);
         if (resultCode != 0) {
             throw IggyServerException.fromTcpResponse(resultCode, new byte[0]);
         }
 
         return frame.retainedSlice(bodyStart, bodyLength);
+    }
+
+    private void recordSessionReply(
+            ByteBuf frame, PendingRequest pending, int operation, long resultCode, int bodyStart, int bodyLength) {
+        boolean sessionBound = false;
+        synchronized (session) {
+            if (pending.identity.matches(session)) {
+                if (pending.committed && advancesMetadata(operation)) {
+                    session.observeMetadata(frame.getLongLE(frame.readerIndex() + VsrHeaders.REPLY_COMMIT_OFFSET));
+                }
+                if (resultCode == 0) {
+                    applySessionEffects(frame, operation, bodyStart, bodyLength);
+                    sessionBound = operation == VsrOperation.REGISTER;
+                }
+            }
+        }
+        if (sessionBound) {
+            session.owner().changed();
+        }
+        resetLogoutSession(pending, operation, resultCode);
     }
 
     private int validatedOperation(ByteBuf frame) {
@@ -270,8 +317,18 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private void resetLogoutSession(PendingRequest pending, int operation, long resultCode) {
         if (resultCode == 0 && operation == VsrOperation.LOGOUT) {
-            session.resetIfCurrent(pending.identity.clientLow, pending.identity.clientHigh);
+            if (pending.keepsLineage) {
+                session.resetForSignIn(pending.identity.clientLow, pending.identity.clientHigh);
+            } else {
+                session.resetIfCurrent(pending.identity.clientLow, pending.identity.clientHigh);
+            }
         }
+    }
+
+    private static boolean advancesMetadata(int operation) {
+        return VsrOperation.isMetadata(operation)
+                || operation == VsrOperation.REGISTER
+                || operation == VsrOperation.LOGOUT;
     }
 
     private void applySessionEffects(ByteBuf frame, int operation, int bodyStart, int bodyLength) {
@@ -282,7 +339,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
             if (bodyLength < REGISTER_BODY_MIN_LEN) {
                 throw IggyServerException.fromTcpResponse(VsrHeaders.ERROR_UNAUTHENTICATED, new byte[0]);
             }
-            session.bind(frame.getLongLE(bodyStart + 4));
+            session.bindWithoutSignal(frame.getLongLE(bodyStart + 4));
         }
     }
 
@@ -306,9 +363,14 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         private final int operation;
         private final long requestId;
         private final RequestIdentity identity;
+        private long maxResponseBody = Integer.MAX_VALUE;
         private volatile boolean committed;
         private volatile boolean failedByLink;
         private volatile boolean detachedSession;
+        private volatile boolean keepsLineage;
+        private byte[] cancellation;
+        private boolean sent;
+        private boolean abandoned;
 
         private PendingRequest(
                 CompletableFuture<ByteBuf> future, int operation, long requestId, RequestIdentity identity) {
@@ -322,6 +384,33 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
             return committed;
         }
 
+        /**
+         * Called after the original write is issued. Off the loop that write is a queued task, and the
+         * cancellation is queued behind it, so it cannot overtake the request.
+         */
+        public synchronized void sent(Channel channel) {
+            sent = true;
+            sendCancellation(channel);
+        }
+
+        private synchronized void abandon(Channel channel) {
+            abandoned = true;
+            sendCancellation(channel);
+        }
+
+        private void sendCancellation(Channel channel) {
+            if (sent && abandoned && cancellation != null) {
+                byte[] frame = cancellation;
+                cancellation = null;
+                // On the loop a write runs inline, ahead of the queued original write.
+                try {
+                    channel.eventLoop().execute(() -> channel.writeAndFlush(Unpooled.wrappedBuffer(frame)));
+                } catch (RejectedExecutionException ignored) {
+                    // A loop that rejects tasks is closing the channel, which ends the request as well.
+                }
+            }
+        }
+
         /** Whether the link failed this request, so no reply answered it. */
         public boolean isFailedByLink() {
             return failedByLink;
@@ -329,6 +418,11 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
         public boolean isSessionDetached() {
             return detachedSession;
+        }
+
+        /** Marks the logout that a sign-in sends first, so that its reply keeps the lineage that the sign-in began. */
+        public void keepLineage() {
+            keepsLineage = true;
         }
     }
 

@@ -19,22 +19,32 @@ use crate::IggyError;
 use crate::text;
 use aes_gcm::aead::{Aead, Generate};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use aes_gcm_siv::aead::AeadInOut;
+use aes_gcm_siv::{Aes256GcmSiv, Nonce as SivNonce, Tag as SivTag};
 use std::fmt::Debug;
+
+const AES_GCM_NONCE_SIZE: usize = 12;
+const AES_GCM_TAG_SIZE: usize = 16;
+const AES_GCM_SIV_NONCE_SIZE: usize = 12;
+const AES_GCM_SIV_TAG_SIZE: usize = 16;
 
 #[derive(Debug, Clone)]
 pub enum EncryptorKind {
     Aes256Gcm(Aes256GcmEncryptor),
+    Aes256GcmSiv(Aes256GcmSivEncryptor),
 }
 
 impl EncryptorKind {
     pub fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
         match self {
             EncryptorKind::Aes256Gcm(e) => e.encrypt(data),
+            EncryptorKind::Aes256GcmSiv(e) => e.encrypt(data),
         }
     }
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
         match self {
             EncryptorKind::Aes256Gcm(e) => e.decrypt(data),
+            EncryptorKind::Aes256GcmSiv(e) => e.decrypt(data),
         }
     }
 }
@@ -79,14 +89,65 @@ impl Encryptor for Aes256GcmEncryptor {
     }
 
     fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
-        let nonce = (&data[0..12])
-            .try_into()
-            .map_err(|_| IggyError::CannotDecryptData)?;
-        let payload = self.cipher.decrypt(nonce, &data[12..]);
-        if payload.is_err() {
+        if data.len() < AES_GCM_NONCE_SIZE + AES_GCM_TAG_SIZE {
             return Err(IggyError::CannotDecryptData);
         }
-        Ok(payload.unwrap())
+        let (nonce, ciphertext) = data.split_at(AES_GCM_NONCE_SIZE);
+        let nonce = nonce.try_into().map_err(|_| IggyError::CannotDecryptData)?;
+        self.cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|_| IggyError::CannotDecryptData)
+    }
+}
+
+#[derive(Clone)]
+pub struct Aes256GcmSivEncryptor {
+    cipher: Aes256GcmSiv,
+}
+
+impl Debug for Aes256GcmSivEncryptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Aes256GcmSivEncryptor").finish()
+    }
+}
+
+impl Aes256GcmSivEncryptor {
+    pub fn new(key: &[u8]) -> Result<Self, IggyError> {
+        Ok(Self {
+            cipher: Aes256GcmSiv::new_from_slice(key)
+                .map_err(|_| IggyError::InvalidEncryptionKey)?,
+        })
+    }
+}
+
+impl Encryptor for Aes256GcmSivEncryptor {
+    fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
+        let nonce = SivNonce::generate();
+        let mut output =
+            Vec::with_capacity(AES_GCM_SIV_NONCE_SIZE + data.len() + AES_GCM_SIV_TAG_SIZE);
+        output.extend_from_slice(&nonce);
+        output.extend_from_slice(data);
+        let tag = self
+            .cipher
+            .encrypt_inout_detached(&nonce, b"", (&mut output[AES_GCM_SIV_NONCE_SIZE..]).into())
+            .map_err(|_| IggyError::CannotEncryptData)?;
+        output.extend_from_slice(&tag);
+        Ok(output)
+    }
+
+    fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
+        if data.len() < AES_GCM_SIV_NONCE_SIZE + AES_GCM_SIV_TAG_SIZE {
+            return Err(IggyError::CannotDecryptData);
+        }
+        let (nonce, body) = data.split_at(AES_GCM_SIV_NONCE_SIZE);
+        let (ciphertext, tag) = body.split_at(body.len() - AES_GCM_SIV_TAG_SIZE);
+        let nonce = SivNonce::try_from(nonce).map_err(|_| IggyError::CannotDecryptData)?;
+        let tag = SivTag::try_from(tag).map_err(|_| IggyError::CannotDecryptData)?;
+        let mut plaintext = ciphertext.to_vec();
+        self.cipher
+            .decrypt_inout_detached(&nonce, b"", plaintext.as_mut_slice().into(), &tag)
+            .map_err(|_| IggyError::CannotDecryptData)?;
+        Ok(plaintext)
     }
 }
 
@@ -94,6 +155,80 @@ impl Encryptor for Aes256GcmEncryptor {
 mod tests {
     use super::*;
     use crate::{HeaderKey, HeaderValue, IggyMessage};
+
+    #[test]
+    fn given_siv_ciphertext_when_decrypting_should_authenticate_every_byte() {
+        let encryptor = Aes256GcmSivEncryptor::new(&[7u8; 32]).expect("valid key");
+        let other = Aes256GcmSivEncryptor::new(&[8u8; 32]).expect("valid key");
+        let first = encryptor.encrypt(b"stream payload").expect("encrypts");
+        let second = encryptor
+            .encrypt(b"stream payload")
+            .expect("encrypts again");
+        assert_ne!(first, second);
+        assert_eq!(
+            encryptor.decrypt(&first).expect("decrypts"),
+            b"stream payload"
+        );
+        assert_eq!(other.decrypt(&first), Err(IggyError::CannotDecryptData));
+
+        let mut tampered_ciphertext = first.clone();
+        tampered_ciphertext[AES_GCM_SIV_NONCE_SIZE] ^= 1;
+        assert_eq!(
+            encryptor.decrypt(&tampered_ciphertext),
+            Err(IggyError::CannotDecryptData)
+        );
+        let mut tampered_tag = first.clone();
+        *tampered_tag.last_mut().expect("tag exists") ^= 1;
+        assert_eq!(
+            encryptor.decrypt(&tampered_tag),
+            Err(IggyError::CannotDecryptData)
+        );
+    }
+
+    #[test]
+    fn given_short_or_empty_siv_payload_when_decrypting_should_handle_lengths() {
+        let encryptor = Aes256GcmSivEncryptor::new(&[7u8; 32]).expect("valid key");
+        for length in 0..AES_GCM_SIV_NONCE_SIZE + AES_GCM_SIV_TAG_SIZE {
+            assert_eq!(
+                encryptor.decrypt(&vec![0x5a; length]),
+                Err(IggyError::CannotDecryptData),
+                "length {length}"
+            );
+        }
+        let encrypted = encryptor.encrypt(&[]).expect("empty plaintext encrypts");
+        assert_eq!(
+            encrypted.len(),
+            AES_GCM_SIV_NONCE_SIZE + AES_GCM_SIV_TAG_SIZE
+        );
+        assert_eq!(
+            encryptor
+                .decrypt(&encrypted)
+                .expect("empty plaintext decrypts"),
+            b""
+        );
+    }
+
+    #[test]
+    fn given_short_ciphertext_when_decrypting_should_return_cannot_decrypt_data() {
+        let encryptor = Aes256GcmEncryptor::new(&[3; 32]).expect("valid key");
+        for length in 0..28 {
+            let ciphertext = vec![0xA5; length];
+            assert_eq!(
+                encryptor
+                    .decrypt(&ciphertext)
+                    .expect_err("ciphertext shorter than nonce and tag must fail")
+                    .as_code(),
+                IggyError::CannotDecryptData.as_code(),
+                "length {length}"
+            );
+        }
+        let empty = encryptor.encrypt(&[]).expect("encrypt empty payload");
+        assert_eq!(empty.len(), 28);
+        assert_eq!(
+            encryptor.decrypt(&empty).expect("decrypt empty payload"),
+            Vec::<u8>::new()
+        );
+    }
 
     #[test]
     fn given_the_same_key_data_should_be_encrypted_and_decrypted_correctly() {

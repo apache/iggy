@@ -397,6 +397,13 @@ a `ProduceRequest` is a real one and `Partitioning::balanced()` has no trigger o
 `-1` that `SCOPE.md` refers to belongs to CreateTopics, where it means "use the broker default
 partition count", and it is handled there rather than here.
 
+`CreatePartitions` grows a topic through Iggy's `create_partitions`, which appends the new
+partitions after the current last index. Every existing index keeps naming the same Iggy
+partition and no stored record moves, so a key that hashed to partition 1 before the grow is
+still read from partition 1 afterwards. New records of that key may land elsewhere, as they do
+after a Kafka broker grows a topic: the producer's partitioner sees more partitions and Kafka
+makes no ordering promise across a grow either.
+
 Kafka consumer groups are not mapped onto Iggy consumer groups. The gateway assigns partitions
 to group members the way Kafka does, in the client, and polls every partition by explicit offset.
 Iggy's group registry is used as an offset key and for nothing else, which

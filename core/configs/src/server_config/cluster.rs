@@ -205,7 +205,8 @@ pub struct ClusterConfig {
     /// (`normal_heartbeat_timeout`). Raise it on oversubscribed hosts where
     /// scheduling stalls fake primary death; sub-`MIN_CLUSTER_HEARTBEAT_TIMEOUT`
     /// values (including the `0` / `disabled` / `unlimited` sentinels, which
-    /// all parse to zero) are rejected at boot.
+    /// all parse to zero) are rejected at boot. On Linux it is also the
+    /// `TCP_USER_TIMEOUT` of every replica link.
     #[serde(default = "default_heartbeat_timeout")]
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
@@ -296,7 +297,7 @@ pub struct ClusterConfig {
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
     pub repair_gap_debounce_interval: IggyDuration,
-    /// Prepares a peer serves per repair round before the requester walks to
+    /// Prepares a peer serves per repair round before the requester asks for
     /// the next chunk. Each frame rides the per-peer message-bus queue, so this
     /// must stay below `message_bus.peer_queue_capacity` or a full round
     /// overruns the queue and silently drops frames (enforced at the top
@@ -343,12 +344,22 @@ pub struct ClusterConfig {
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterCoordinatorConfig {
-    /// When `total_shards > 1`, exclude shard 0 from replica placement.
-    /// Shard 0 already hosts the coordinator, the metadata writer, and both
-    /// listeners; replicas are long-lived steady flows, so offload them to
-    /// peer shards by default.
+    /// Keep replica links off shard 0 while the shard range of link 0 has
+    /// another shard. Shard 0 already hosts the coordinator, the metadata
+    /// writer, and both listeners; replica links are long-lived steady
+    /// flows, so offload them to peer shards by default.
     #[serde(default = "default_skip_shard_zero_for_replicas")]
     pub skip_shard_zero_for_replicas: bool,
+    /// TCP links to each peer replica, at most the shard count. Link `j`
+    /// carries the frames of the shards in range `j`, so more links spread
+    /// replication over more shards. Every node must run the same value:
+    /// the replica handshake refuses a peer that differs. Shard counts may
+    /// differ between nodes. A range with fewer shards than there are peers
+    /// puts links to two peers on one shard. With
+    /// `skip_shard_zero_for_replicas` on, range 0 keeps its links off shard
+    /// 0, so it needs one shard more than there are peers.
+    #[serde(default = "default_replica_connections_per_peer")]
+    pub replica_connections_per_peer: u16,
     /// When `total_shards > 1`, exclude shard 0 from client placement.
     /// Default false: client connections are short-lived and benefit from
     /// shard-0 parallelism more than replicas do.
@@ -360,10 +371,15 @@ fn default_skip_shard_zero_for_replicas() -> bool {
     true
 }
 
+fn default_replica_connections_per_peer() -> u16 {
+    1
+}
+
 impl Default for ClusterCoordinatorConfig {
     fn default() -> Self {
         Self {
             skip_shard_zero_for_replicas: default_skip_shard_zero_for_replicas(),
+            replica_connections_per_peer: default_replica_connections_per_peer(),
             skip_shard_zero_for_clients: false,
         }
     }
@@ -852,20 +868,31 @@ impl fmt::Display for AdvertisedAddressError {
 
 impl std::error::Error for AdvertisedAddressError {}
 
-/// Whether cluster-wide JWT key material exists: a configured `http.jwt`
-/// secret, or the signing key derived from the cluster PSK. When it does, a
-/// bearer minted on any node verifies on every node - the invariant
-/// follower-to-primary HTTP forwarding depends on. Callers gate `http.enabled`
-/// themselves; this covers only the key material.
+/// The cluster-wide JWT key material, when it exists: a configured `http.jwt`
+/// secret, else the cluster PSK the signing key derives from - the precedence
+/// the JWT manager applies. With it, a bearer minted on any node verifies on
+/// every node - the invariant follower-to-primary HTTP forwarding depends on.
+/// The key that proves a relay comes from a node derives from the same
+/// material, so relay proofs verify exactly where bearers do. Callers gate
+/// `http.enabled` themselves; this covers only the key material.
 ///
 /// Forwarding targets resolve from the roster (`ip:ports.http`); the config
 /// validator unconditionally requires a roster port for every enabled
 /// transport, so a forward never dials a node without a declared http port.
-pub fn http_forwarding_key_material(jwt: &HttpJwtConfig, cluster: &ClusterConfig) -> bool {
-    cluster.enabled
-        && ((cluster.auth.enabled && !cluster.auth.shared_secret.is_empty())
-            || !jwt.encoding_secret.is_empty()
-            || !jwt.decoding_secret.is_empty())
+pub fn http_forwarding_key_material<'a>(
+    jwt: &'a HttpJwtConfig,
+    cluster: &'a ClusterConfig,
+) -> Option<&'a str> {
+    if !cluster.enabled {
+        return None;
+    }
+    let psk = (cluster.auth.enabled && !cluster.auth.shared_secret.is_empty())
+        .then_some(&cluster.auth.shared_secret);
+    [&jwt.encoding_secret, &jwt.decoding_secret]
+        .into_iter()
+        .find(|secret| !secret.is_empty())
+        .or(psk)
+        .map(String::as_str)
 }
 
 impl Validatable<ConfigurationError> for ClusterConfig {
@@ -1945,6 +1972,40 @@ mod cluster_validate_tests {
             tls: ClusterTlsConfig::default(),
             coordinator: ClusterCoordinatorConfig::default(),
         }
+    }
+
+    /// Every node must pick the same material, or nodes refuse each other's
+    /// relay proofs: the secret the JWT manager signs with, else the PSK.
+    #[test]
+    fn given_jwt_secrets_and_a_psk_when_choosing_key_material_should_follow_the_jwt_signing_secret()
+    {
+        let jwt = |encoding: &str, decoding: &str| HttpJwtConfig {
+            encoding_secret: encoding.to_owned(),
+            decoding_secret: decoding.to_owned(),
+            ..HttpJwtConfig::default()
+        };
+        let mut cluster = cfg(Vec::new());
+        cluster.auth = ClusterAuthConfig {
+            enabled: true,
+            shared_secret: "psk".to_owned(),
+            previous_shared_secret: String::new(),
+        };
+        let material = |jwt: &HttpJwtConfig, cluster: &ClusterConfig| {
+            http_forwarding_key_material(jwt, cluster).map(str::to_owned)
+        };
+        assert_eq!(
+            material(&jwt("enc", "dec"), &cluster).as_deref(),
+            Some("enc")
+        );
+        assert_eq!(material(&jwt("", "dec"), &cluster).as_deref(), Some("dec"));
+        assert_eq!(material(&jwt("", ""), &cluster).as_deref(), Some("psk"));
+
+        cluster.auth.enabled = false;
+        assert_eq!(material(&jwt("", ""), &cluster), None);
+        assert_eq!(material(&jwt("enc", ""), &cluster).as_deref(), Some("enc"));
+
+        cluster.enabled = false;
+        assert_eq!(material(&jwt("enc", "dec"), &cluster), None);
     }
 
     #[test]

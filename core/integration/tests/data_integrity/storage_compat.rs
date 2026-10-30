@@ -321,7 +321,10 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     // 1. The topic carrying the segment chain. The flush thresholds are load
     //    bearing: without them committed messages stay in the journal and the
     //    partition directory looks empty until shutdown.
-    let data_stream_details = client.create_stream(DATA_STREAM).await.unwrap();
+    let data_stream_details = client
+        .create_stream(DATA_STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let data_stream = Identifier::numeric(data_stream_details.id).unwrap();
     let data_topic_details =
         create_baseline_topic(&client, &data_stream, DATA_TOPIC, &data_topic_options())
@@ -475,7 +478,10 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
 
     // 5. A second topic, in its own stream: the only snapshot topic that sends
     //    `compression_algorithm`.
-    let compression_stream_details = client.create_stream(COMPRESSION_STREAM).await.unwrap();
+    let compression_stream_details = client
+        .create_stream(COMPRESSION_STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let compression_stream = Identifier::numeric(compression_stream_details.id).unwrap();
     create_baseline_topic(
         &client,
@@ -494,6 +500,7 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
             USER_PASSWORD,
             UserStatus::Active,
             Some(permissions.clone()),
+            &UserCreateOptions::default(),
         )
         .await
         .unwrap();
@@ -516,7 +523,10 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     //    records replayed on top of it.
     for index in 0..SEED_STREAMS {
         client
-            .create_stream(&format!("compat-seed-{index}"))
+            .create_stream(
+                &format!("compat-seed-{index}"),
+                &StreamCreateOptions::default(),
+            )
             .await
             .unwrap_or_else(|error| panic!("create seed stream {index}: {error}"));
     }
@@ -553,6 +563,7 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
             USER_PASSWORD,
             UserStatus::Active,
             Some(tail_permissions.clone()),
+            &UserCreateOptions::default(),
         )
         .await
         .unwrap();
@@ -573,7 +584,10 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
 
     for index in 0..WAL_TAIL_STREAMS {
         client
-            .create_stream(&format!("compat-tail-{index}"))
+            .create_stream(
+                &format!("compat-tail-{index}"),
+                &StreamCreateOptions::default(),
+            )
             .await
             .unwrap_or_else(|error| panic!("create tail stream {index}: {error}"));
     }
@@ -1267,9 +1281,13 @@ async fn assert_topic_recovered(
         partitions_count: seed.partitions_count.map(|_| topic.partitions_count),
         compression_algorithm: seed
             .compression_algorithm
-            .map(|_| topic.compression_algorithm),
-        message_expiry: seed.message_expiry.map(|_| topic.message_expiry),
-        max_topic_size: seed.max_topic_size.map(|_| topic.max_topic_size),
+            .map(|_| topic.resolved_options().compression_algorithm),
+        message_expiry: seed
+            .message_expiry
+            .map(|_| topic.resolved_options().message_expiry),
+        max_topic_size: seed
+            .max_topic_size
+            .map(|_| topic.resolved_options().max_topic_size),
         segment_size: seed.segment_size.and(recovered.segment_size),
         durability: recovered.durability,
         consumer_offset_durability: recovered.consumer_offset_durability,

@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::diagnostic_events::diagnostic_event_channel;
+use crate::driver::{DeferredLease, MAX_DEFERRED_REQUESTS};
 use crate::http::http_transport::HttpTransport;
 use crate::prelude::{Client, HttpClientConfig, IggyError, NonZeroIggyDuration};
 use crate::vsr::LIFECYCLE_RETRY_MAX_INTERVAL;
@@ -64,6 +65,7 @@ pub struct HttpClient {
     pub(crate) heartbeat_interval: NonZeroIggyDuration,
     client: reqwest::Client,
     retry_policy: ExponentialBackoff,
+    deferred_leases: tokio::sync::Semaphore,
     access_token: IggyRwLock<String>,
     /// The contexts that fence sends to an explicit partition, read from the topic details.
     pub(super) send_contexts: ConsumerGroupClientState,
@@ -223,6 +225,94 @@ impl HttpTransport for HttpClient {
 }
 
 impl HttpClient {
+    pub(super) async fn get_deferred_poll(
+        &self,
+        path: &str,
+        poll: &iggy_common::PollMessages,
+        options: iggy_common::DeferredPollOptions,
+    ) -> Result<iggy_common::PolledMessages, IggyError> {
+        options.validate(poll.count)?;
+        let started = tokio::time::Instant::now();
+        let deadline = started + options.request_timeout.get_duration();
+        let _permit = DeferredLease::acquire(&self.deferred_leases, deadline).await?;
+        let url = self.get_url(path)?;
+        self.fail_if_not_authenticated(path).await?;
+        let mut retry_interval = LIFECYCLE_RETRY_INTERVAL;
+        loop {
+            let request = {
+                let token = self.access_token.read().await;
+                let remaining = options.remaining(started.elapsed())?;
+                // Deferred auto-commits cannot replay an ambiguous transport failure.
+                self.client
+                    .get(url.clone())
+                    .bearer_auth(token.as_str())
+                    .query(poll)
+                    .query(&[
+                        ("wait_us", remaining.max_wait.as_micros()),
+                        ("min_count", u64::from(remaining.min_count)),
+                        ("max_bytes", u64::from(remaining.max_bytes)),
+                        ("request_timeout_us", remaining.request_timeout.as_micros()),
+                    ])
+                    .timeout(remaining.request_timeout.get_duration())
+            };
+            let sent = request
+                .send()
+                .await
+                .map_err(reqwest_middleware::Error::Reqwest);
+            // A poll that may have reached the server has an unknown commit.
+            let uncertain = may_have_committed(&sent);
+            let mut response = sent.map_err(|_| {
+                if uncertain {
+                    IggyError::TransientNotCommitted
+                } else {
+                    IggyError::InvalidHttpRequest
+                }
+            })?;
+            let status = response.status();
+            // Bound JSON expansion and error bodies under the same request budget.
+            const MAX_JSON_EXPANSION: usize = 16;
+            let limit = (options.max_bytes as usize).saturating_mul(MAX_JSON_EXPANSION);
+            if response
+                .content_length()
+                .is_some_and(|length| length > limit as u64)
+            {
+                return Err(IggyError::InvalidSizeBytes);
+            }
+            let mut body = Vec::new();
+            while let Some(chunk) = tokio::time::timeout_at(deadline, response.chunk())
+                .await
+                .map_err(|_| IggyError::TransientNotCommitted)?
+                .map_err(|_| IggyError::TransientNotCommitted)?
+            {
+                if chunk.len() > limit.saturating_sub(body.len()) {
+                    return Err(IggyError::InvalidSizeBytes);
+                }
+                body.extend_from_slice(&chunk);
+            }
+            if status.is_success() {
+                let messages: iggy_common::PolledMessages =
+                    serde_json::from_slice(&body).map_err(|_| IggyError::InvalidJsonResponse)?;
+                if messages.count > poll.count || messages.messages.len() != messages.count as usize
+                {
+                    return Err(IggyError::InvalidMessagesCount);
+                }
+                return Ok(messages);
+            }
+            let error = Self::response_error(status, String::from_utf8_lossy(&body).into_owned());
+            if !matches!(
+                error,
+                IggyError::TransientNotAccepted | IggyError::DeferredPollCapacityExceeded
+            ) {
+                return Err(error);
+            }
+            if tokio::time::Instant::now() + retry_interval >= deadline {
+                return Err(error);
+            }
+            tokio::time::sleep(retry_interval).await;
+            retry_interval = (retry_interval * 2).min(LIFECYCLE_RETRY_MAX_INTERVAL);
+        }
+    }
+
     /// Create a new HTTP client for interacting with the Iggy API using the provided API URL.
     pub fn new(api_url: &str) -> Result<Self, IggyError> {
         Self::create(Arc::new(HttpClientConfig {
@@ -243,6 +333,7 @@ impl HttpClient {
             api_url,
             client: reqwest::Client::new(),
             retry_policy,
+            deferred_leases: tokio::sync::Semaphore::new(MAX_DEFERRED_REQUESTS),
             heartbeat_interval: config.heartbeat_interval,
             access_token: IggyRwLock::new(access_token),
             send_contexts: ConsumerGroupClientState::new(),
@@ -303,15 +394,15 @@ impl HttpClient {
 
     /// Sends one request. Each [`IggyError::LifecycleBusy`] refusal commits, so the request is
     /// sent again as a new one after a pause that doubles up to [`LIFECYCLE_RETRY_MAX_INTERVAL`],
-    /// until a retry would start past [`LIFECYCLE_RETRY_DEADLINE`].
+    /// until a retry would start past [`LIFECYCLE_RETRY_DEADLINE`]. A write whose outcome is
+    /// unknown is never sent again and fails with [`IggyError::TransientNotCommitted`].
     async fn execute<F>(&self, method: Method, url: Url, decorate: F) -> Result<Response, IggyError>
     where
         F: Fn(RequestBuilder) -> RequestBuilder + Send + Sync,
     {
-        let uncertain_attempt = Arc::new(AtomicBool::new(false));
-        let client = self.retrying_client(&uncertain_attempt);
-        // Reads commit nothing, so only a write can leave an uncertain outcome behind.
-        let may_commit = method != Method::GET;
+        let outcome_unknown = Arc::new(AtomicBool::new(false));
+        // Reads commit nothing, so only a write can leave an unknown outcome behind.
+        let client = self.retrying_client(method != Method::GET, &outcome_unknown);
         let deadline = Instant::now() + LIFECYCLE_RETRY_DEADLINE;
         let mut pause = LIFECYCLE_RETRY_INTERVAL;
         loop {
@@ -324,33 +415,38 @@ impl HttpClient {
                         .bearer_auth(token.as_str()),
                 )
             };
-            let response = request
-                .send()
-                .await
-                .map_err(|_| IggyError::InvalidHttpRequest)?;
-            let error = match Self::handle_response(response).await {
+            let response = request.send().await;
+            // The middleware stops at such an attempt, so it was the last one.
+            if outcome_unknown.load(Ordering::Relaxed) {
+                return Err(IggyError::TransientNotCommitted);
+            }
+            let response = response.map_err(|_| IggyError::InvalidHttpRequest)?;
+            match Self::handle_response(response).await {
                 Ok(response) => return Ok(response),
-                Err(error) => error,
-            };
-            let uncertain = may_commit && uncertain_attempt.load(Ordering::Relaxed);
-            match settle(error, uncertain) {
-                IggyError::LifecycleBusy if Instant::now() + pause < deadline => {
+                Err(IggyError::LifecycleBusy) if Instant::now() + pause < deadline => {
                     sleep(pause).await;
                     pause = (pause * 2).min(LIFECYCLE_RETRY_MAX_INTERVAL);
                 }
-                error => return Err(error),
+                Err(error) => return Err(error),
             }
         }
     }
 
-    /// The retry middleware resends transient failures. It reports each of them to
-    /// `uncertain_attempt` unless the server provably never took the request.
-    fn retrying_client(&self, uncertain_attempt: &Arc<AtomicBool>) -> ClientWithMiddleware {
+    /// The retry middleware resends transient failures. It stops at an attempt of a write whose
+    /// outcome is unknown and reports it to `outcome_unknown`.
+    fn retrying_client(
+        &self,
+        may_commit: bool,
+        outcome_unknown: &Arc<AtomicBool>,
+    ) -> ClientWithMiddleware {
         ClientBuilder::new(self.client.clone())
             .with(TracingMiddleware::<SpanBackendWithUrl>::new())
             .with(RetryTransientMiddleware::new_with_policy_and_strategy(
                 self.retry_policy,
-                UncertainAttempts(Arc::clone(uncertain_attempt)),
+                SafeResends {
+                    may_commit,
+                    outcome_unknown: Arc::clone(outcome_unknown),
+                },
             ))
             .build()
     }
@@ -361,13 +457,7 @@ impl HttpClient {
             true => Ok(response),
             false => {
                 let reason = response.text().await.unwrap_or("error".to_string());
-                match status {
-                    StatusCode::UNAUTHORIZED => Err(IggyError::Unauthenticated),
-                    StatusCode::FORBIDDEN => Err(IggyError::Unauthorized),
-                    StatusCode::NOT_FOUND => Err(IggyError::ResourceNotFound(reason)),
-                    _ => Err(typed_refusal(&reason)
-                        .unwrap_or_else(|| IggyError::HttpResponseError(status.as_u16(), reason))),
-                }
+                Err(Self::response_error(status, reason))
             }
         }
     }
@@ -389,6 +479,16 @@ impl HttpClient {
     async fn disconnect(&self) -> Result<(), IggyError> {
         Ok(())
     }
+
+    fn response_error(status: StatusCode, reason: String) -> IggyError {
+        match status {
+            StatusCode::UNAUTHORIZED => IggyError::Unauthenticated,
+            StatusCode::FORBIDDEN => IggyError::Unauthorized,
+            StatusCode::NOT_FOUND => IggyError::ResourceNotFound(reason),
+            _ => typed_refusal(&reason)
+                .unwrap_or_else(|| IggyError::HttpResponseError(status.as_u16(), reason)),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -396,47 +496,41 @@ struct RefreshToken {
     token: String,
 }
 
-/// Marks the request uncertain when the middleware treats an attempt as transient and the
-/// attempt may have committed. A 503 can mean either, and only the body tells, so every
-/// transient answer counts except an admission refusal (429) and a failed connection.
-struct UncertainAttempts(Arc<AtomicBool>);
+/// Resends what the default strategy calls transient, but never a write that may have committed.
+struct SafeResends {
+    may_commit: bool,
+    outcome_unknown: Arc<AtomicBool>,
+}
 
-impl RetryableStrategy for UncertainAttempts {
+impl RetryableStrategy for SafeResends {
     fn handle(&self, result: &Result<Response, reqwest_middleware::Error>) -> Option<Retryable> {
-        let retryable = DefaultRetryableStrategy.handle(result);
-        let never_taken = match result {
-            Ok(response) => response.status() == StatusCode::TOO_MANY_REQUESTS,
-            Err(reqwest_middleware::Error::Reqwest(error)) => error.is_connect(),
-            Err(reqwest_middleware::Error::Middleware(_)) => false,
-        };
-        if retryable == Some(Retryable::Transient) && !never_taken {
-            self.0.store(true, Ordering::Relaxed);
+        if self.may_commit && may_have_committed(result) {
+            self.outcome_unknown.store(true, Ordering::Relaxed);
+            return Some(Retryable::Fatal);
         }
-        retryable
+        DefaultRetryableStrategy.handle(result)
     }
 }
 
-/// HTTP has no request dedup: a resend is a new request, so its refusal cannot tell whether an
-/// earlier attempt committed. Such a refusal reports an unknown outcome, which nothing refreshes
-/// or repeats.
-fn settle(error: IggyError, uncertain: bool) -> IggyError {
-    if uncertain
-        && matches!(
-            error,
-            IggyError::HistoryUnavailable
-                | IggyError::LifecycleBusy
-                | IggyError::Unauthorized
-                | IggyError::Unauthenticated
-        )
-    {
-        IggyError::TransientNotCommitted
-    } else {
-        error
+/// HTTP has no request dedup, so a resend is a new request that can apply a write twice. A 503
+/// refuses a request before the server takes it, and a request that was never built or never
+/// connected was never sent.
+fn may_have_committed(result: &Result<Response, reqwest_middleware::Error>) -> bool {
+    match result {
+        Ok(response) => {
+            response.status().is_server_error()
+                && response.status() != StatusCode::SERVICE_UNAVAILABLE
+        }
+        Err(reqwest_middleware::Error::Reqwest(error)) => {
+            !error.is_builder() && !error.is_connect()
+        }
+        Err(reqwest_middleware::Error::Middleware(_)) => false,
     }
 }
 
 /// Decodes the refusals the client acts on: a producer never repeats `RequestTooOld`, a send
-/// refreshes its context once on `HistoryUnavailable`, and `LifecycleBusy` is retried.
+/// refreshes its context once on `HistoryUnavailable`, `LifecycleBusy` is retried, and
+/// non-admission and capacity refusals permit a retry without risking duplicate progress.
 fn typed_refusal(body: &str) -> Option<IggyError> {
     #[derive(Deserialize)]
     struct ErrorId {
@@ -447,6 +541,8 @@ fn typed_refusal(body: &str) -> Option<IggyError> {
         IggyError::RequestTooOld,
         IggyError::HistoryUnavailable,
         IggyError::LifecycleBusy,
+        IggyError::TransientNotAccepted,
+        IggyError::DeferredPollCapacityExceeded,
     ]
     .into_iter()
     .find(|error| error.as_code() == id)
@@ -525,30 +621,54 @@ mod tests {
         );
     }
 
-    /// The first attempt may have committed and the resend is a new request, so the refusal
-    /// of the resend reports an unknown outcome that nothing retries.
+    /// A resend is a new request, so a write that may have committed is never sent again.
     #[tokio::test(start_paused = true)]
-    async fn given_resend_after_uncertain_attempt_when_refused_should_report_not_committed() {
-        for (status, refusal) in [
-            (400, IggyError::LifecycleBusy),
-            (403, IggyError::Unauthorized),
-            (401, IggyError::Unauthenticated),
+    async fn given_write_when_it_may_have_committed_should_report_not_committed_without_resend() {
+        for unknown in [
+            Reply::empty(500),
+            Reply::empty(502),
+            Reply::error(504, &IggyError::TransientNotCommitted),
+            Reply::hang_up(),
         ] {
-            let server = ScriptedServer::start(vec![
-                Reply::empty(503),
-                Reply::error(status, &refusal),
-                Reply::empty(200),
-            ])
-            .await;
+            let server = ScriptedServer::start(vec![unknown, Reply::empty(200)]).await;
 
-            let unknown = server.client().delete_stream(&stream_id()).await;
+            let deleted = server.client().delete_stream(&stream_id()).await;
 
             assert!(
-                matches!(unknown, Err(IggyError::TransientNotCommitted)),
-                "{refusal}: {unknown:?}"
+                matches!(deleted, Err(IggyError::TransientNotCommitted)),
+                "{deleted:?}"
             );
-            assert_eq!(server.requests().len(), 2, "{refusal}");
+            assert_eq!(server.requests().len(), 1);
         }
+    }
+
+    /// A 503 refuses a write before the server takes it, so the refusal of its resend is
+    /// definitive.
+    #[tokio::test(start_paused = true)]
+    async fn given_write_refused_before_taken_when_resend_is_refused_should_report_the_refusal() {
+        let server = ScriptedServer::start(vec![
+            Reply::error(503, &IggyError::TransientNotAccepted),
+            Reply::error(403, &IggyError::Unauthorized),
+        ])
+        .await;
+
+        let refused = server.client().delete_stream(&stream_id()).await;
+
+        assert!(
+            matches!(refused, Err(IggyError::Unauthorized)),
+            "{refused:?}"
+        );
+        assert_eq!(server.requests().len(), 2);
+    }
+
+    /// A read commits nothing, so a timed out read is sent again.
+    #[tokio::test(start_paused = true)]
+    async fn given_read_when_it_times_out_should_resend_it() {
+        let server = ScriptedServer::start(vec![Reply::empty(504), Reply::stream()]).await;
+
+        server.client().get_stream(&stream_id()).await.unwrap();
+
+        assert_eq!(server.requests().len(), 2);
     }
 
     /// A read commits nothing, so the refusal of its resend is definitive.
@@ -574,6 +694,8 @@ mod tests {
             IggyError::RequestTooOld,
             IggyError::HistoryUnavailable,
             IggyError::LifecycleBusy,
+            IggyError::TransientNotAccepted,
+            IggyError::DeferredPollCapacityExceeded,
         ] {
             let body = format!(r#"{{"id":{},"reason":"unavailable"}}"#, error.as_code());
             assert_eq!(typed_refusal(&body), Some(error));
@@ -581,6 +703,193 @@ mod tests {
         for body in ["", "unavailable", r#"{"id":500}"#, r#"{"id":"87"}"#] {
             assert_eq!(typed_refusal(body), None);
         }
+    }
+
+    use iggy_common::{Consumer, PollMessages, PollingStrategy};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+
+    #[tokio::test]
+    async fn deferred_poll_retries_only_nonadmission_with_remaining_wait() {
+        let (client, requests) = deferred_response_server(
+            [
+                IggyError::TransientNotAccepted.as_code(),
+                IggyError::DeferredPollCapacityExceeded.as_code(),
+                IggyError::TransientNotCommitted.as_code(),
+            ]
+            .into_iter()
+            .map(|id| (503, format!(r#"{{"id":{id}}}"#)))
+            .collect(),
+        )
+        .await;
+        let result = client
+            .get_deferred_poll(
+                "messages/deferred",
+                &deferred_request(),
+                iggy_common::DeferredPollOptions::default(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(IggyError::HttpResponseError(503, body))
+            if serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_u64().unwrap() as u32
+                == IggyError::TransientNotCommitted.as_code())
+        );
+        let waits = requests.await.unwrap();
+        assert_eq!(waits.len(), 3);
+        assert!(waits[0] <= 1_000_000);
+        assert!(
+            waits
+                .windows(2)
+                .all(|pair| pair[1] > 0 && pair[1] < pair[0]),
+            "waits: {waits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_poll_exhausted_retry_budget_does_not_send_zero_wait() {
+        let (client, requests) = deferred_response_server(vec![(
+            503,
+            format!(r#"{{"id":{}}}"#, IggyError::TransientNotAccepted.as_code()),
+        )])
+        .await;
+        let result = client
+            .get_deferred_poll(
+                "messages/deferred",
+                &deferred_request(),
+                iggy_common::DeferredPollOptions {
+                    max_wait: 0.into(),
+                    request_timeout: 50_000.into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(IggyError::TransientNotAccepted)));
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), requests)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_poll_lost_after_sending_reports_an_unknown_commit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = HttpClient::create(Arc::new(HttpClientConfig {
+            api_url: format!("http://{}", listener.local_addr().unwrap()),
+            jwt: Some("test-token".to_owned()),
+            ..HttpClientConfig::default()
+        }))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            while stream.read_line(&mut line).await.unwrap() > 0 && line != "\r\n" {
+                line.clear();
+            }
+        });
+        let result = client
+            .get_deferred_poll(
+                "messages/deferred",
+                &deferred_request(),
+                iggy_common::DeferredPollOptions::default(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(IggyError::TransientNotCommitted)),
+            "{result:?}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_poll_bounds_success_and_error_bodies() {
+        const MAX_BYTES: u32 = iggy_common::MIN_DEFERRED_POLL_MAX_BYTES as u32;
+        for status in [200, 503] {
+            let (client, requests) =
+                deferred_response_server(vec![(status, " ".repeat(16 * MAX_BYTES as usize + 1))])
+                    .await;
+            let result = client
+                .get_deferred_poll(
+                    "messages/deferred",
+                    &deferred_request(),
+                    iggy_common::DeferredPollOptions {
+                        max_bytes: MAX_BYTES,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(
+                matches!(result, Err(IggyError::InvalidSizeBytes)),
+                "status {status}: {result:?}"
+            );
+            assert_eq!(requests.await.unwrap().len(), 1);
+        }
+    }
+
+    fn deferred_request() -> PollMessages {
+        PollMessages {
+            consumer: Consumer::default(),
+            stream_id: Identifier::default(),
+            topic_id: Identifier::default(),
+            partition_id: Some(0),
+            strategy: PollingStrategy::default(),
+            count: 1,
+            auto_commit: true,
+        }
+    }
+
+    async fn deferred_response_server(
+        responses: Vec<(u16, String)>,
+    ) -> (HttpClient, JoinHandle<Vec<u64>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = HttpClient::create(Arc::new(HttpClientConfig {
+            api_url: format!("http://{}", listener.local_addr().unwrap()),
+            jwt: Some("test-token".to_owned()),
+            ..HttpClientConfig::default()
+        }))
+        .unwrap();
+        let requests = tokio::spawn(async move {
+            let mut waits = Vec::new();
+            for (status, body) in responses {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                let path = line.split_whitespace().nth(1).unwrap();
+                let url = Url::parse(&format!("http://localhost{path}")).unwrap();
+                let wait = url
+                    .query_pairs()
+                    .find(|(name, _)| name == "wait_us")
+                    .unwrap()
+                    .1
+                    .parse::<u64>()
+                    .unwrap();
+                waits.push(wait);
+                loop {
+                    line.clear();
+                    assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+            waits
+        });
+        (client, requests)
     }
 
     #[test]

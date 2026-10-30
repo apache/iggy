@@ -50,9 +50,9 @@ use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig, SyncRe
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_DESCRIBE_GROUPS, API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_JOIN_GROUP,
     API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS, API_KEY_SYNC_GROUP, BrokerAdvertise,
-    ERROR_GROUP_ID_NOT_FOUND, ERROR_GROUP_MAX_SIZE_REACHED, ERROR_ILLEGAL_GENERATION,
-    ERROR_INCONSISTENT_GROUP_PROTOCOL, ERROR_INVALID_GROUP_ID, ERROR_INVALID_REQUEST,
-    ERROR_INVALID_SESSION_TIMEOUT, ERROR_MEMBER_ID_REQUIRED, ERROR_NONE,
+    ERROR_FENCED_INSTANCE_ID, ERROR_GROUP_ID_NOT_FOUND, ERROR_GROUP_MAX_SIZE_REACHED,
+    ERROR_ILLEGAL_GENERATION, ERROR_INCONSISTENT_GROUP_PROTOCOL, ERROR_INVALID_GROUP_ID,
+    ERROR_INVALID_REQUEST, ERROR_INVALID_SESSION_TIMEOUT, ERROR_MEMBER_ID_REQUIRED, ERROR_NONE,
     ERROR_REBALANCE_IN_PROGRESS, ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
     ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_SERVER_ERROR, GatewayState, handle_request_bounded,
 };
@@ -74,6 +74,8 @@ const HEARTBEAT_VERSION: i16 = 4;
 const LEAVE_VERSION: i16 = 5;
 const SESSION_TIMEOUT_MS: i32 = 10_000;
 const REBALANCE_TIMEOUT_MS: i32 = 20_000;
+/// The `client_id` of every request header that `write_request` sends.
+const CLIENT_ID: &str = "consumer-group-test";
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -679,6 +681,7 @@ async fn given_a_follower_parked_in_sync_should_hold_none_of_its_assignment_blob
         let request = SyncRequest {
             group_id: StrBytes::from_static_str(GROUP),
             generation_id: 2,
+            group_instance_id: None,
             member_id: StrBytes::from_string(follower.clone()),
             protocol_type: None,
             protocol_name: None,
@@ -1129,10 +1132,11 @@ async fn given_an_unknown_group_when_leaving_at_v5_should_answer_unknown_member_
 }
 
 /// A Java client raises `IllegalStateException` on more than one member response, and admin
-/// `removeMembersFromConsumerGroup` keys results by the echoed pair, so a leave that removes
-/// two holders of one instance id still answers once, with what was sent.
+/// `removeMembersFromConsumerGroup` keys results by the echoed pair. A static member that came
+/// back replaced its old incarnation, so the leave removes one holder and answers once, with what
+/// was sent.
 #[tokio::test(start_paused = true)]
-async fn given_one_identity_that_removed_two_holders_should_answer_one_member() {
+async fn given_a_replaced_static_member_when_left_by_instance_should_answer_one_member() {
     let state = test_state(immediate_config());
     let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
     let static_params = |member_id| JoinGroupParams {
@@ -1142,23 +1146,9 @@ async fn given_one_identity_that_removed_two_holders_should_answer_one_member() 
     let first = join(&state, JOIN_VERSION, &static_params(""))
         .await
         .member_id;
-    let joined = join(&state, JOIN_VERSION, &static_params(&first)).await;
-    assert_eq!(joined.generation_id, 1);
-    let second = join(&state, JOIN_VERSION, &static_params(""))
-        .await
-        .member_id;
-    let parked = {
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
-            let params = JoinGroupParams {
-                group_instance_id: Some("instance-a"),
-                ..join_params(&second, protocols)
-            };
-            join(&state, JOIN_VERSION, &params).await
-        })
-    };
-    yield_to_parked().await;
+    let returned = join(&state, JOIN_VERSION, &static_params("")).await;
+    assert_eq!(returned.error, ERROR_NONE);
+    assert_ne!(returned.member_id, first);
 
     let left = leave(&state, LEAVE_VERSION, &[("", Some("instance-a"))]).await;
 
@@ -1166,12 +1156,53 @@ async fn given_one_identity_that_removed_two_holders_should_answer_one_member() 
         left.members,
         vec![(String::new(), Some("instance-a".to_owned()), ERROR_NONE)]
     );
-    let parked = timeout(PROMPT, parked)
-        .await
-        .expect("the removed holder's parked join must be answered")
-        .expect("parked JoinGroup task");
-    assert_eq!(parked.error, ERROR_UNKNOWN_MEMBER_ID);
     assert_eq!(heartbeat(&state, 1, &first).await, ERROR_UNKNOWN_MEMBER_ID);
+    assert_eq!(
+        heartbeat(&state, 1, &returned.member_id).await,
+        ERROR_UNKNOWN_MEMBER_ID
+    );
+}
+
+/// The replacement's wake must reach the old incarnation's join parked on the barrier and fence
+/// it, not leave it waiting out the rebalance window.
+#[tokio::test(start_paused = true)]
+async fn given_a_static_join_parked_while_preparing_when_its_instance_returns_should_answer_it_fenced()
+ {
+    let state = test_state(immediate_config());
+    let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+    let leader = join(
+        &state,
+        JOIN_VERSION,
+        &JoinGroupParams {
+            group_instance_id: Some("instance-a"),
+            ..join_params("", protocols)
+        },
+    )
+    .await;
+    assert_eq!(leader.error, ERROR_NONE);
+    let spawn_static_join = || {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+            let params = JoinGroupParams {
+                group_instance_id: Some("instance-b"),
+                ..join_params("", protocols)
+            };
+            join(&state, JOIN_VERSION, &params).await
+        })
+    };
+    let parked = spawn_static_join();
+    yield_to_parked().await;
+    assert!(!parked.is_finished(), "the barrier waits for the leader");
+
+    let replacement = spawn_static_join();
+
+    let fenced = timeout(PROMPT, parked)
+        .await
+        .expect("the replacement must answer the parked join")
+        .expect("parked JoinGroup task");
+    assert_eq!(fenced.error, ERROR_FENCED_INSTANCE_ID);
+    replacement.abort();
 }
 
 /// Partitions are opaque assignor blobs here, so what proves reassignment is the leader's
@@ -1469,6 +1500,9 @@ struct Described {
 }
 
 struct DescribedMember {
+    member_id: String,
+    client_id: String,
+    client_host: String,
     metadata: Bytes,
     assignment: Bytes,
 }
@@ -1496,20 +1530,21 @@ impl DescribeResponse {
             let member_count = read_array_count(&mut decoder, flexible);
             let mut members = Vec::with_capacity(member_count);
             for _ in 0..member_count {
-                let _member_id = read_nullable(&mut decoder, flexible);
+                let member_id = read_nullable(&mut decoder, flexible).unwrap_or_default();
                 if version >= 4 {
                     let _instance_id = read_nullable(&mut decoder, flexible);
                 }
-                let client_id = read_nullable(&mut decoder, flexible);
-                let client_host = read_nullable(&mut decoder, flexible);
-                assert_eq!(client_id.as_deref(), Some(""));
-                assert_eq!(client_host.as_deref(), Some(""));
+                let client_id = read_nullable(&mut decoder, flexible).unwrap_or_default();
+                let client_host = read_nullable(&mut decoder, flexible).unwrap_or_default();
                 let metadata = read_bytes_field(&mut decoder, flexible);
                 let assignment = read_bytes_field(&mut decoder, flexible);
                 if flexible {
                     decoder.read_tagged_fields().unwrap();
                 }
                 members.push(DescribedMember {
+                    member_id,
+                    client_id,
+                    client_host,
                     metadata,
                     assignment,
                 });
@@ -2226,6 +2261,12 @@ async fn given_a_live_group_over_tcp_should_describe_and_list_it_through_the_rea
     assert_eq!(described.groups[0].group_id, GROUP);
     assert_eq!(described.groups[0].state, "Stable");
     assert_eq!(described.groups[0].members.len(), 1);
+    // The client id of the request headers and the address of the socket, as Kafka reports them.
+    let described_member = &described.groups[0].members[0];
+    assert_eq!(described_member.member_id, member);
+    assert!(member.starts_with(&format!("{CLIENT_ID}-")));
+    assert_eq!(described_member.client_id, CLIENT_ID);
+    assert_eq!(described_member.client_host, "/127.0.0.1");
 
     write_request(
         &mut stream,
@@ -2249,13 +2290,7 @@ async fn write_request(
     correlation_id: i32,
     body: &Bytes,
 ) {
-    let frame = build_request_frame(
-        api_key,
-        api_version,
-        correlation_id,
-        Some("consumer-group-test"),
-        body,
-    );
+    let frame = build_request_frame(api_key, api_version, correlation_id, Some(CLIENT_ID), body);
     stream.write_all(&frame).await.expect("write request");
 }
 

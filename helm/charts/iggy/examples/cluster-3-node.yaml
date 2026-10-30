@@ -71,9 +71,8 @@ server:
     storageClass: ""
     size: 8Gi
 
-  # Encrypts message payloads and state commands at rest with AES-256-GCM. The
-  # key is cluster-wide: a node that holds a different one cannot read what its
-  # peers wrote.
+  # Encrypts message data at rest with AES-256-GCM. The key is cluster-wide: a
+  # node that holds a different one cannot read what its peers wrote.
   encryption:
     enabled: true
     existingSecret:

@@ -25,6 +25,7 @@ use iggy::prelude::Identifier;
 use iggy::prelude::IggyExpiry;
 use iggy::prelude::IggyMessage;
 use iggy::prelude::Partitioning;
+use iggy::prelude::StreamCreateOptions;
 use iggy::prelude::TopicCreateOptions;
 use iggy_cli::commands::binary_system::stats::GetStatsOutput;
 use iggy_common::Stats;
@@ -67,7 +68,9 @@ impl TestStatsCmd {
 impl IggyCmdTestCase for TestStatsCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         let stream_id = Identifier::from_str_value("logs").unwrap();
-        let stream = client.create_stream(&stream_id.as_string()).await;
+        let stream = client
+            .create_stream(&stream_id.as_string(), &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
 
         let topic = client
@@ -183,7 +186,9 @@ impl TestStatsCmdWithMessages {
 #[async_trait]
 impl IggyCmdTestCase for TestStatsCmdWithMessages {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream("size-test").await;
+        let stream = client
+            .create_stream("size-test", &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
         let stream_details = stream.unwrap();
         self.stream_id = stream_details.id;

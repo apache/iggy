@@ -483,6 +483,21 @@ impl SimJournal<MemStorage> {
         (prefix.commit_watermark, prefix.chain_break_op)
     }
 
+    /// The retained headers in op order, matching the disk journal's recovery scan.
+    #[must_use]
+    pub fn iter_headers_from(&self, from: u64) -> Vec<PrepareHeader> {
+        #[cfg(debug_assertions)]
+        let _guard = JournalAccessGuard::new(&self.accessing);
+        let headers = unsafe { &*self.headers.get() };
+        let mut retained: Vec<_> = headers
+            .values()
+            .filter(|header| header.op >= from)
+            .copied()
+            .collect();
+        retained.sort_unstable_by_key(|header| header.op);
+        retained
+    }
+
     /// The head prepare's header, `None` when empty. Restores the last-prepare
     /// checksum (hash-chain continuity) and the prepare-timestamp floor at restart,
     /// mirroring `restore_metadata_consensus`.

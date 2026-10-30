@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use futures::future::join_all;
 use iggy::prelude::{IggyClient, IggyError, IggyMessage, MessageClient, Partitioning};
+use iggy_common::{binary_operation_deadline, with_binary_deadline};
 use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout, timeout_at};
@@ -38,6 +39,10 @@ use crate::bridge::error::BridgeError;
 
 /// Frame bytes besides the messages: request header, batch header and ids.
 const SEND_FRAME_ROOM: u64 = 4 * 1024;
+
+/// How much sooner than its request the SDK stops a send. The SDK's own answer then tells whether
+/// the send went out, before the request gives up on it with 7.
+const SDK_STOP_ROOM: Duration = Duration::from_millis(50);
 
 /// Sessions that connect and sign in at once. A sign-in costs Iggy a password hash on a shard
 /// thread, so a burst of new producers must not start them all together.
@@ -374,6 +379,9 @@ impl IggyBridge {
     /// `Ok(None)`: committed, but the server named no offset (a duplicate request, or a journal
     /// entry that is gone). Do not retry it.
     ///
+    /// The SDK stops the send by `deadline`, so no attempt of it starts after the request
+    /// answered, and a client retry is the only copy of a send that never went out.
+    ///
     /// A send still running at `deadline` keeps `turn` and `kept`, and hands back `None` for
     /// them. So the producer's later requests answer 7 meanwhile and cannot overtake it, and what
     /// `kept` reserves for `messages` stays reserved. Other producers send on.
@@ -386,7 +394,8 @@ impl IggyBridge {
     /// [`BridgeError::Timeout`] if `deadline` passes. The send may have landed.
     /// [`BridgeError::SendLost`] if the connection broke during the send. It may have landed.
     /// [`BridgeError::Iggy`] if the session cannot connect, if the stream, topic or partition is
-    /// missing, or if the send is too large.
+    /// missing, or if the send is too large. Also when the SDK stopped the send at `deadline`:
+    /// `OperationUncertain` if it went out, so it may have landed, and its refusal if it did not.
     pub async fn send_records<K: Send + 'static>(
         &self,
         turn: ProduceTurn,
@@ -408,7 +417,13 @@ impl IggyBridge {
             return (Err(BridgeError::Timeout), Some((turn, kept)));
         }
         let (stream_id, topic_id) = (target.stream_id.clone(), target.topic_id.clone());
-        let recovery_deadline = (Instant::now() + SLOT_LIMIT).into_std();
+        // With less than the room left, the SDK keeps the whole deadline, and the send answers 7.
+        // Never past the SDK's own limit, which `SLOT_LIMIT` counts on.
+        let sdk_deadline = deadline
+            .checked_sub(SDK_STOP_ROOM)
+            .filter(|stop| *stop > Instant::now())
+            .unwrap_or(deadline)
+            .min(binary_operation_deadline());
         let send = async move {
             // Owns the messages, so a send cut off at the limit drops them.
             let send = {
@@ -421,13 +436,15 @@ impl IggyBridge {
                             .await
                         {
                             Err(IggyError::LaneBlocked(operation)) => {
-                                resolve_blocker(&client, operation, recovery_deadline).await?;
+                                resolve_blocker(&client, operation, sdk_deadline.into_std())
+                                    .await?;
                             }
                             result => return result,
                         }
                     }
                 }
             };
+            let send = with_binary_deadline(sdk_deadline, send);
             within_slot_limit(&session, &client, kept, send).await
         };
         // The SDK cannot cancel a send. One that outlives this call keeps the turn in its task,
@@ -469,13 +486,13 @@ async fn within_slot_limit<T, K>(
     }
 }
 
-/// The SDK does not replay a send after these, so it may have landed.
+/// The SDK does not replay a send after these, so it may have landed. `StaleClient` is not one:
+/// the SDK returns it only for a send that Iggy rejected, so it answers 6.
 const fn send_error(error: IggyError) -> BridgeError {
     match error {
-        IggyError::Disconnected
-        | IggyError::EmptyResponse
-        | IggyError::TcpError
-        | IggyError::StaleClient => BridgeError::SendLost(error),
+        IggyError::Disconnected | IggyError::EmptyResponse | IggyError::TcpError => {
+            BridgeError::SendLost(error)
+        }
         error => BridgeError::Iggy(error),
     }
 }
@@ -487,6 +504,7 @@ mod tests {
     use iggy::prelude::{IggyClientBuilder, SystemClient};
 
     use super::*;
+    use crate::protocol::api::ERROR_NOT_LEADER_OR_FOLLOWER;
 
     const WAIT: Duration = Duration::from_millis(20);
     const IDLE: Duration = Duration::from_secs(60);
@@ -601,6 +619,14 @@ mod tests {
             within_slot_limit(&session, &unconnected(), 7, lost).await,
             (Err(BridgeError::SendLost(IggyError::Disconnected)), Some(7))
         ));
+    }
+
+    #[test]
+    fn given_a_stale_client_rejection_when_sending_should_answer_not_leader_or_follower() {
+        assert_eq!(
+            send_error(IggyError::StaleClient).to_kafka_error_code(),
+            ERROR_NOT_LEADER_OR_FOLLOWER
+        );
     }
 
     #[tokio::test(start_paused = true)]

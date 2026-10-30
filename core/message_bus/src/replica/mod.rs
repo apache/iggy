@@ -19,12 +19,18 @@
 //! listener (`listener`), and the handshake halves run on the owning
 //! shard (`handshake`).
 //!
+//! Each peer gets k links (`links`), placed by a preamble (`preamble`) and
+//! tracked as one bundle (`bundle`).
+//!
 //! The replica plane is TCP-only by design — see [`listener`] for the
 //! load-bearing invariants. Outbound dialing and the per-process
 //! shard-0 bootstrap (which also binds the SDK client listeners) live
 //! in [`io`].
 
 pub mod auth;
+pub mod bundle;
 pub mod handshake;
 pub mod io;
+pub mod links;
 pub mod listener;
+pub mod preamble;

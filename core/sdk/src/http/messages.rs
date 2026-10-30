@@ -30,6 +30,55 @@ use iggy_common::SendMessagesConfirmations;
 
 #[async_trait]
 impl MessageClient for HttpClient {
+    async fn poll_messages_with_strategy_for_and_options(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
+        count: u32,
+        auto_commit: bool,
+        options: Option<iggy_common::DeferredPollOptions>,
+    ) -> Result<PolledMessages, IggyError> {
+        let Some(options) = options else {
+            return self
+                .poll_messages_with_strategy_for(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    consumer,
+                    strategy_for,
+                    count,
+                    auto_commit,
+                )
+                .await;
+        };
+        if consumer.kind == ConsumerKind::ExternalGroup
+            || (consumer.kind == ConsumerKind::ConsumerGroup && partition_id.is_none())
+        {
+            return Err(IggyError::FeatureUnavailable);
+        }
+        let path = format!(
+            "{}/deferred",
+            get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str())
+        );
+        self.get_deferred_poll(
+            &path,
+            &PollMessages {
+                stream_id: stream_id.clone(),
+                topic_id: topic_id.clone(),
+                partition_id,
+                consumer: consumer.clone(),
+                strategy: strategy_for(partition_id.unwrap_or(0)),
+                count,
+                auto_commit,
+            },
+            options,
+        )
+        .await
+    }
+
     async fn poll_messages(
         &self,
         stream_id: &Identifier,
@@ -230,8 +279,9 @@ mod tests {
     use crate::http::http_client::HttpClient;
     use crate::http::scripted_server::{Recorded, Reply, ScriptedServer};
     use crate::prelude::{
-        Identifier, IggyError, IggyMessage, MessageClient, PartitionClient, PartitionContext,
-        Partitioning, SendMessagesConfirmationResponse, StreamClient, TopicClient,
+        Consumer, DeferredPollOptions, Identifier, IggyError, IggyMessage, MessageClient,
+        PartitionClient, PartitionContext, Partitioning, PollingStrategy,
+        SendMessagesConfirmationResponse, StreamClient, StreamCreateOptions, TopicClient,
         TopicCreateOptions,
     };
     use bytes::Bytes;
@@ -279,6 +329,29 @@ mod tests {
             .iter()
             .map(|request| request.line.as_str())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn given_an_external_group_when_polling_deferred_should_refuse_it_before_sending() {
+        let server = ScriptedServer::start(vec![]).await;
+        let client = server.client();
+        let (stream_id, topic_id) = ids();
+
+        let polled = client
+            .poll_messages_deferred(
+                &stream_id,
+                &topic_id,
+                Some(PARTITION_ID),
+                &Consumer::external_group(Identifier::numeric(1).unwrap()),
+                &PollingStrategy::next(),
+                1,
+                false,
+                DeferredPollOptions::default(),
+            )
+            .await;
+
+        assert_eq!(polled.map(|_| ()), Err(IggyError::FeatureUnavailable));
+        assert!(server.requests().is_empty());
     }
 
     #[tokio::test]
@@ -407,14 +480,13 @@ mod tests {
         );
     }
 
-    /// The timed out attempt may have committed, and the resend is a new request, so its
-    /// refusal cannot tell whether the batch landed.
+    /// The timed out attempt may have committed, and a resend would be a new request that
+    /// lands the batch twice, so the send reports the unknown outcome without a resend.
     #[tokio::test(start_paused = true)]
-    async fn given_resend_after_timeout_when_history_unavailable_should_report_not_committed() {
+    async fn given_timeout_when_sending_should_report_not_committed_without_resend() {
         let server = ScriptedServer::start(vec![
             Reply::topic(&[(PARTITION_ID, CURRENT)]),
             Reply::empty(504),
-            Reply::error(400, &IggyError::HistoryUnavailable),
             Reply::empty(201),
         ])
         .await;
@@ -426,10 +498,7 @@ mod tests {
         let sent = send(&client, &partitioning).await;
 
         let requests = server.requests();
-        assert_eq!(
-            lines(&requests),
-            [TOPIC_LINE, SEND_LINE, SEND_LINE, SEND_LINE]
-        );
+        assert_eq!(lines(&requests), [TOPIC_LINE, SEND_LINE, SEND_LINE]);
         assert!(
             requests[1..]
                 .iter()
@@ -564,7 +633,10 @@ mod tests {
             let first = send(&client, &partitioning).await;
 
             let changed = match change {
-                Change::CreateStream => client.create_stream("stream").await.map(drop),
+                Change::CreateStream => client
+                    .create_stream("stream", &StreamCreateOptions::default())
+                    .await
+                    .map(drop),
                 Change::CreateTopic => client
                     .create_topic(&stream_id, "topic", &TopicCreateOptions::default())
                     .await

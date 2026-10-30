@@ -26,13 +26,17 @@
 
 pub mod alter_configs;
 pub mod api_versions;
+pub mod create_partitions;
 pub mod create_topics;
+pub mod delete_groups;
 pub mod delete_topics;
+pub mod describe_cluster;
 pub mod describe_configs;
 pub mod describe_groups;
 pub mod fetch;
 pub mod find_coordinator;
 pub mod heartbeat;
+pub mod incremental_alter_configs;
 pub mod init_producer_id;
 pub mod join_group;
 pub mod leave_group;
@@ -40,15 +44,18 @@ pub mod list_groups;
 pub mod list_offsets;
 pub mod metadata;
 pub mod offset_commit;
+pub mod offset_delete;
 pub mod offset_fetch;
 pub mod produce;
 pub mod sync_group;
 pub(crate) mod topic_config;
 
+use std::fmt::Display;
 use std::time::Duration;
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::Bytes;
 use iggy::prelude::IggyError;
+use iggy_kafka_wire::codec;
 use kafka_protocol::messages::TransactionalId;
 use kafka_protocol::protocol::{Decodable, Encodable};
 use tokio::runtime::{Handle, RuntimeFlavor};
@@ -56,15 +63,17 @@ use tokio::time::Instant;
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::BridgeError;
-use crate::error::{KafkaProtocolError, Result};
+use crate::error::Result;
 use crate::protocol::api::{
-    API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_DELETE_TOPICS,
+    API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_PARTITIONS, API_KEY_CREATE_TOPICS,
+    API_KEY_DELETE_GROUPS, API_KEY_DELETE_TOPICS, API_KEY_DESCRIBE_CLUSTER,
     API_KEY_DESCRIBE_CONFIGS, API_KEY_DESCRIBE_GROUPS, API_KEY_FETCH, API_KEY_FIND_COORDINATOR,
-    API_KEY_HEARTBEAT, API_KEY_INIT_PRODUCER_ID, API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP,
-    API_KEY_LIST_GROUPS, API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_OFFSET_COMMIT,
-    API_KEY_OFFSET_FETCH, API_KEY_PRODUCE, API_KEY_SYNC_GROUP, ConnectionState,
-    ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
-    is_supported_version, supported_max_version,
+    API_KEY_HEARTBEAT, API_KEY_INCREMENTAL_ALTER_CONFIGS, API_KEY_INIT_PRODUCER_ID,
+    API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS, API_KEY_LIST_OFFSETS,
+    API_KEY_METADATA, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_DELETE, API_KEY_OFFSET_FETCH,
+    API_KEY_PRODUCE, API_KEY_SYNC_GROUP, ConnectionState, ERROR_INVALID_REQUEST,
+    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, is_supported_version,
+    supported_max_version,
 };
 
 /// Record encodes and decodes of this many bytes or more run off the async worker.
@@ -79,8 +88,8 @@ pub(crate) const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Clamps KIP-4 `timeout_ms` into `[MIN_REQUEST_TIMEOUT, MAX_REQUEST_TIMEOUT]`.
 ///
-/// `CreateTopics` and `DeleteTopics` honor the request's own deadline. `ListOffsets` and
-/// `Metadata` do not: they have no such field.
+/// `CreateTopics`, `DeleteTopics` and `CreatePartitions` honor the request's own deadline.
+/// `ListOffsets` and `Metadata` do not: they have no such field.
 pub(crate) fn clamp_request_timeout(timeout_ms: i32) -> Duration {
     let requested = Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0));
     requested.clamp(MIN_REQUEST_TIMEOUT, MAX_REQUEST_TIMEOUT)
@@ -120,17 +129,34 @@ pub async fn dispatch(
         API_KEY_API_VERSIONS => api_versions::handle(connection, api_version, body).await,
         API_KEY_CREATE_TOPICS => create_topics::handle(state, api_version, body).await,
         API_KEY_DELETE_TOPICS => delete_topics::handle(state, principal, api_version, body).await,
+        API_KEY_CREATE_PARTITIONS => {
+            create_partitions::handle(state, principal, api_version, body).await
+        }
         API_KEY_DESCRIBE_CONFIGS => describe_configs::handle(state, api_version, body).await,
         API_KEY_ALTER_CONFIGS => alter_configs::handle(state, principal, api_version, body).await,
+        API_KEY_INCREMENTAL_ALTER_CONFIGS => {
+            incremental_alter_configs::handle(state, principal, api_version, body).await
+        }
         API_KEY_FIND_COORDINATOR => {
             find_coordinator::handle(state, connection, api_version, body).await
         }
-        API_KEY_JOIN_GROUP => join_group::handle(state, api_version, body).await,
+        API_KEY_JOIN_GROUP => join_group::handle(state, connection, api_version, body).await,
         API_KEY_HEARTBEAT => heartbeat::handle(state, connection, api_version, body).await,
         API_KEY_LEAVE_GROUP => leave_group::handle(state, api_version, body).await,
         API_KEY_SYNC_GROUP => sync_group::handle(state, api_version, body).await,
-        API_KEY_DESCRIBE_GROUPS => describe_groups::handle(state, api_version, body).await,
-        API_KEY_LIST_GROUPS => list_groups::handle(state, api_version, body).await,
+        API_KEY_DESCRIBE_GROUPS => {
+            describe_groups::handle(state, connection, api_version, body).await
+        }
+        API_KEY_DESCRIBE_CLUSTER => {
+            describe_cluster::handle(state, connection, api_version, body).await
+        }
+        API_KEY_LIST_GROUPS => list_groups::handle(state, connection, api_version, body).await,
+        API_KEY_DELETE_GROUPS => {
+            delete_groups::handle(state, connection, principal, api_version, body).await
+        }
+        API_KEY_OFFSET_DELETE => {
+            offset_delete::handle(state, connection, principal, api_version, body).await
+        }
         API_KEY_INIT_PRODUCER_ID => init_producer_id::handle(state, api_version, body).await,
         _ => HandleOutcome::Close,
     }
@@ -145,10 +171,40 @@ pub(crate) fn is_transactional(transactional_id: Option<&TransactionalId>) -> bo
     transactional_id.is_some_and(|id| !id.is_empty())
 }
 
+/// Whether `principal` may delete a group or its offsets. `None` means no listener of this gateway
+/// names principals, with nothing to enforce against, as in `DeleteTopics`.
+///
+/// Kafka asks for `DELETE` on the group. Iggy has no group permission, and lets any reader of a
+/// topic delete a group on it, so the gate asks for what `DeleteTopics` asks for: a global
+/// `manage_topics` or `manage_streams`, which the principal's `manage_topics` stands for.
+fn may_delete_groups(principal: Option<&AuthenticatedPrincipal>, api: &str) -> bool {
+    let Some(principal) = principal else {
+        return true;
+    };
+    if !principal.permissions_known {
+        // Denying is the fail-closed choice: granting would authorize an irreversible delete off
+        // a value nothing ever actually read.
+        tracing::warn!(
+            principal = %principal.username,
+            "{api} asked on a connection whose permissions were never read; denying"
+        );
+        return false;
+    }
+    principal.permissions.manage_topics
+}
+
 /// When an offset call on `connection` gives up. See `GroupCoordinator::offset_hold`.
 async fn offset_deadline(state: &GatewayState, connection: &ConnectionState) -> Instant {
     let member = connection.heartbeat_member();
     let hold = state.groups.offset_hold(member.as_ref()).await;
+    Instant::now() + hold
+}
+
+/// When the Iggy calls of a `DeleteGroups` or `OffsetDelete` on `connection` give up. See
+/// `GroupCoordinator::deletion_hold`.
+async fn deletion_deadline(state: &GatewayState, connection: &ConnectionState) -> Instant {
+    let member = connection.heartbeat_member();
+    let hold = state.groups.deletion_hold(member.as_ref()).await;
     Instant::now() + hold
 }
 
@@ -167,55 +223,30 @@ const fn offset_refusal_cause(error: &BridgeError) -> &'static str {
     }
 }
 
-/// Encode a `kafka_protocol` message, mapping its `anyhow::Error` (the crate has no stable
-/// decode/encode error taxonomy) to a variant callers can log or fold into
-/// [`HandleOutcome::Close`].
+/// [`codec::encode_message`] with the error lifted into this crate's [`Result`].
 pub(crate) fn encode_message<T: Encodable>(
     msg: &T,
     version: i16,
     capacity: usize,
 ) -> Result<Bytes> {
-    let mut buf = BytesMut::with_capacity(capacity);
-    msg.encode(&mut buf, version)
-        .map_err(|e| KafkaProtocolError::Malformed(e.to_string()))?;
-    Ok(buf.freeze())
+    codec::encode_message(msg, version, capacity).map_err(Into::into)
 }
 
-/// Decode `T` from the whole request body and reject unconsumed trailing bytes.
-///
-/// `kafka_protocol`'s `Decodable` stops once it has read the fields its schema defines; it does
-/// not know (or care) whether the caller handed it an exact-length body, so the trailing-bytes
-/// check has to live here.
-pub(crate) fn decode_exhaustive<T: Decodable>(version: i16, mut body: Bytes) -> Result<T> {
-    let value =
-        T::decode(&mut body, version).map_err(|e| KafkaProtocolError::Malformed(e.to_string()))?;
-    if body.has_remaining() {
-        return Err(KafkaProtocolError::Malformed(
-            "unexpected trailing bytes in request body".to_string(),
-        ));
-    }
-    Ok(value)
-}
-
-/// Runs `validate` (see [`crate::protocol::bounds_guard`]) before [`decode_exhaustive`].
-///
-/// `kafka_protocol` validates wire-declared array/string lengths as non-negative but never
-/// against the bytes actually remaining in the frame, so a tiny frame declaring a huge count
-/// drives an allocation attempt that aborts the whole process (`handle_alloc_error`, not a
-/// panic - uncatchable, and it kills every connection, not just the offending one). `validate`
-/// rejects that class of frame first, on a walk that never allocates a collection.
+/// [`codec::decode_guarded`] with the error lifted into this crate's [`Result`].
 pub(crate) fn decode_guarded<T: Decodable>(
     version: i16,
     body: Bytes,
-    validate: impl FnOnce(i16, &Bytes) -> Result<()>,
+    validate: impl FnOnce(i16, &Bytes) -> iggy_kafka_wire::Result<()>,
 ) -> Result<T> {
-    validate(version, &body)?;
-    decode_exhaustive(version, body)
+    codec::decode_guarded(version, body, validate).map_err(Into::into)
 }
 
 /// Turn an encode [`Result`] into a [`HandleOutcome`], closing the connection when encoding
 /// fails rather than propagating - there is no parseable response to send in that case.
-pub(crate) fn respond_or_close(result: Result<Bytes>, api_name: &str) -> HandleOutcome {
+pub(crate) fn respond_or_close<E: Display>(
+    result: core::result::Result<Bytes, E>,
+    api_name: &str,
+) -> HandleOutcome {
     match result {
         Ok(body) => HandleOutcome::Respond(body),
         Err(error) => {

@@ -44,6 +44,8 @@ pub(crate) mod shard_allocator;
 
 // spine: the request path - shell vocabulary, dispatch funnel, per-domain ops.
 pub(crate) mod consumer_group;
+pub use consumer_group::liveness::run as run_consumer_group_liveness;
+pub use dispatch::session_ops::run_heartbeat_verifier;
 pub(crate) mod dispatch;
 pub(crate) mod namespace;
 pub(crate) mod pat;
@@ -52,6 +54,8 @@ pub(crate) mod responses;
 pub(crate) mod rewrite;
 pub(crate) mod session_manager;
 pub mod shell;
+pub(crate) mod stream_key_rewrapper;
+pub(crate) mod stream_keys;
 
 pub(crate) mod users;
 pub(crate) mod wire;
@@ -62,7 +66,8 @@ pub(crate) mod http;
 // background: per-shard maintenance loops.
 pub(crate) mod partition_reconciler;
 pub use partition_reconciler::{
-    LifecycleReports, reconcile_partition_lifecycles, reconcile_pending_revocations,
+    GroupOffsetCleanup, LifecycleReports, reconcile_consumer_group_offsets,
+    reconcile_partition_lifecycles, reconcile_pending_revocations,
 };
 pub(crate) mod personal_access_token_cleaner;
 pub(crate) mod segment_cleaner;

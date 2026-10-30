@@ -25,13 +25,17 @@ const requiredEnv = (name: string): string => {
   return value;
 };
 
-export const getServerAddress = (): [string, number] => {
-  const address = requiredEnv('IGGY_TCP_ADDRESS');
+const getAddress = (name: string): [string, number] => {
+  const address = requiredEnv(name);
   const [host, port] = address.split(':');
   if (!host || !port)
-    throw new Error(`IGGY_TCP_ADDRESS must be "host:port", got "${address}"`);
+    throw new Error(`${name} must be "host:port", got "${address}"`);
   return [host, parseInt(port, 10)];
 };
+
+export const getServerAddress = (): [string, number] => getAddress('IGGY_TCP_ADDRESS');
+
+export const getNoQuorumAddress = (): [string, number] => getAddress('IGGY_TCP_ADDRESS_NO_QUORUM');
 
 export const getRootCredentials = () => ({
   username: requiredEnv('IGGY_ROOT_USERNAME'),

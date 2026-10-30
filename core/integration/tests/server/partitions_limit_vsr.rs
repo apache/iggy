@@ -64,7 +64,7 @@ fn assert_limit_reached<T: std::fmt::Debug>(result: &Result<T, IggyError>, conte
 async fn given_partitions_cap_when_creating_past_it_should_reject_typed(harness: &TestHarness) {
     let client = harness.tcp_root_client().await.expect("TCP root client");
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let stream_id = Identifier::named(STREAM_NAME).expect("stream identifier");

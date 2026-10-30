@@ -48,7 +48,7 @@ var _ = ginkgo.Describe("CREATE USER:", func() {
 						PollMessages:  true,
 						SendMessages:  true,
 					},
-				})
+				}, nil)
 			identifier, _ := iggcon.NewIdentifier(username)
 			defer deleteUserAfterTests(identifier, client)
 
@@ -104,7 +104,7 @@ var _ = ginkgo.Describe("CREATE USER:", func() {
 						SendMessages:  true,
 					},
 					Streams: userStreamPermissions,
-				})
+				}, nil)
 			identifier, _ := iggcon.NewIdentifier(username)
 			defer deleteUserAfterTests(identifier, client)
 			defer deleteStreamAfterTests(streamId, client)
@@ -137,7 +137,7 @@ var _ = ginkgo.Describe("CREATE USER:", func() {
 						PollMessages:  true,
 						SendMessages:  true,
 					},
-				})
+				}, nil)
 
 			itShouldReturnUnauthenticatedError(err)
 		})

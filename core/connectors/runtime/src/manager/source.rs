@@ -266,7 +266,7 @@ impl SourceManager {
         let instance_guard =
             source::SourceInstanceGuard::for_container(container.clone(), plugin_id, key);
 
-        let (producer, batch_length, encoder, transforms) =
+        let (producer, transforms) =
             match source::setup_source_producer(key, config, iggy_client).await {
                 Ok(parts) => parts,
                 Err(error) => {
@@ -304,8 +304,6 @@ impl SourceManager {
                 config.verbose,
                 config.benchmark,
                 producer,
-                batch_length,
-                encoder,
                 transforms,
                 state_storage,
                 handle_callback,

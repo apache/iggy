@@ -143,6 +143,9 @@ not_before = "0 s"
 # secrets take precedence over the PSK. Identical keys on every node make bearers
 # valid cluster-wide and activate follower-to-primary HTTP forwarding. Without
 # configured JWT secrets or a cluster PSK, tokens are node-local and forwarding stays disabled.
+# HTTP message sends, polls and consumer offset calls that reach a node that is
+# not the partition primary then answer a transient 503 (code 58). Partition
+# primaries are spread over the nodes, which makes that the common case.
 encoding_secret = ""
 
 # Secret key for decoding JWTs.
@@ -421,14 +424,38 @@ sysinfo_print_interval = "10 s"
 # Encryption configuration
 [encryption]
 # Encrypt message payloads and user headers. Metadata and structural headers remain unencrypted.
-# `true` enables encryption for stored data using AES-256-GCM.
+# `true` enables encryption for stored payloads and user headers using AES-256-GCM-SIV.
 # `false` means data is stored without encryption.
 enabled = false
 
-# The encryption key used when encryption is enabled (string).
-# Should be a 32 bytes length key, provided as a base64 encoded string.
-# This key is required and used only if encryption is enabled.
+# The server encryption key (string), 32 bytes as standard base64.
+# Every encrypted stream has its own data key, stored wrapped under a key derived from this one.
+# Required when encryption is enabled. With encryption disabled a key may still be set:
+# streams created with their own key are then encrypted, keyless streams stay plaintext.
+# A stream created without encryption stays plaintext for life.
 key = ""
+
+# Earlier server keys (list of strings) a key rotation still needs, at most two.
+# A node unwraps stream keys with them and wraps every new stream key under them too.
+# Rotation runs in two phases:
+# 1. Set `key` to the new key and `previous_keys` to the old one on every node. The metadata
+#    primary adds a wrap under the new key to every encrypted stream and keeps the old wraps,
+#    so nodes still on the old key keep serving and booting, new streams included.
+# 2. Once every node runs the phase 1 config and every encrypted stream reports the new
+#    key's fingerprint in `encryption_kek_fingerprint`, empty `previous_keys` and put the
+#    old key's fingerprint in `retired_kek_fingerprints`. The primary drops the wraps under it.
+# 3. Once every stream has dropped the old wrap, clear `retired_kek_fingerprints` on every node.
+# A stream holds at most three wraps. Retire an old fingerprint before adding a fourth key.
+# Messages are never re-encrypted. Losing a key that still wraps a stream makes it unreadable.
+# As an environment variable: IGGY_ENCRYPTION_PREVIOUS_KEYS='["<old base64 key>"]', a single key may also be given bare.
+previous_keys = []
+
+# Fingerprints of retired server keys (list of strings), 16 lowercase hex characters each, as
+# `encryption_kek_fingerprint` reports them. The metadata primary drops stream key wraps under
+# these keys and never drops a wrap under a key that is not listed, even one this node lacks.
+# Needs `key`, and may not name `key` or a key in `previous_keys`. Not secret.
+# As an environment variable: IGGY_ENCRYPTION_RETIRED_KEK_FINGERPRINTS='["<fingerprint>"]'.
+retired_kek_fingerprints = []
 
 # Memory pool configuration
 [memory_pool]
@@ -476,6 +503,8 @@ name = "iggy-cluster"
 # death. Must be at least "2s" and at least 4x commit_broadcast_interval: the
 # primary signals liveness through its commit broadcast, and the window must
 # span several broadcasts so one delayed broadcast never trips an election.
+# On Linux it is also the TCP_USER_TIMEOUT of every replica link: sent data
+# or keepalive probes that stay unacknowledged this long close the link.
 heartbeat_timeout = "5s"
 
 # How often the primary broadcasts its commit point to every backup (duration).
@@ -519,6 +548,9 @@ view_probe_attempts_max = 5
 # on a single dropped frame. Paces both the metadata and partition repair loops;
 # must be nonzero. Paces streams that are already OPEN only: how long a hole
 # waits before one is opened for it is repair_gap_debounce_interval below.
+# Also paces the RequestStartView probe a partition backup sends while its
+# entries from before a newer view wait for a header to prove them against;
+# those probes have no attempt cap.
 repair_retry_interval = "1s"
 
 # How long a backup must hold committed ops it cannot walk to before the shard's
@@ -539,7 +571,7 @@ repair_retry_interval = "1s"
 # per node, so its detector is not rate-capped.
 repair_gap_debounce_interval = "1s"
 
-# Prepares a peer serves per repair round before the requester walks to the next
+# Prepares a peer serves per repair round before the requester asks for the next
 # chunk (integer). Each frame rides the per-peer message-bus queue, so this must
 # stay strictly below message_bus.peer_queue_capacity or a full round overruns
 # the queue and drops frames. Must be > 0 and <= 1024.
@@ -557,10 +589,11 @@ repair_chunk_max = 128
 # a transient disk hiccup cannot kill the process.
 superblock_wedged_fatal_timeout = "2m"
 
-# Superblock compatibility: 74-byte records include the partition offset
-# reservation frontier; legacy 66-byte records remain readable. Every server
-# writes a metadata superblock, including standalone deployments. Builds
-# without this field reject the larger record and cannot boot from it.
+# Superblock compatibility: version 2 atomically records adopted view/head/header
+# identity separately from WAL body certification. Legacy version 1 records with
+# 66/74-byte payloads remain readable. After a version 2 write, an older binary
+# refuses boot; rollback needs a consistent pre-upgrade data backup or a deliberate
+# clean rejoin. Do not remove individual superblock slots to force a downgrade.
 
 # Replica-to-replica authentication (PSK + BLAKE3 keyed-MAC handshake).
 [cluster.auth]
@@ -618,11 +651,20 @@ ca_file = ""
 
 # Shard-0 coordinator placement.
 [cluster.coordinator]
-# When the server runs more than one shard, exclude shard 0 from replica
-# placement. Shard 0 already hosts the coordinator, the metadata writer, and
-# both listeners; replica connections are long-lived steady flows, so they are
-# offloaded to peer shards by default.
+# Keep replica links off shard 0 while the shard range of link 0 has another
+# shard. Shard 0 already hosts the coordinator, the metadata writer, and both
+# listeners; replica links are long-lived steady flows, so they are offloaded
+# to peer shards by default.
 skip_shard_zero_for_replicas = true
+
+# TCP links to each peer replica, at most the shard count. Link j carries the
+# frames of the shards in range j, so more links spread replication over more
+# shards. Every node must run the same value: the replica handshake refuses a
+# peer that differs. Shard counts may differ between nodes. A range with fewer
+# shards than there are peers puts links to two peers on one shard. With
+# skip_shard_zero_for_replicas on, range 0 keeps its links off shard 0, so it
+# needs one shard more than there are peers.
+replica_connections_per_peer = 1
 
 # When the server runs more than one shard, exclude shard 0 from client
 # placement. Off by default: client connections are short-lived and benefit
@@ -763,6 +805,25 @@ reply_inbox_capacity = 1024
 # separate capacity. This limits operation count, not retained message bytes.
 poll_completion_capacity = 1024
 
+# Longest wait of a deferred poll or readiness wait (at most 10 minutes). A
+# longer requested wait is shortened to it.
+deferred_poll_max_wait = "30 s"
+# Deferred polls and readiness waits parked on one shard, and the part of
+# them that one session may hold. An HTTP request without a binary session
+# counts against its user. A request above either limit is refused with a
+# retryable error.
+deferred_poll_max_pending = 1024
+deferred_poll_max_pending_per_session = 64
+# A deferred disk read reserves three times the max_bytes of its poll, and at
+# least three times 1 MiB, because one disk read can take a 1 MiB chunk
+# whatever its max_bytes. It reserves no more than the first value. The
+# deferred reads of one shard reserve no more than the second value together
+# (at most 1 GiB). A read that finds no room waits for one, behind the reads
+# that found no room before it. A reply carries no more than the first value,
+# unless its first message alone is wider.
+deferred_poll_max_read_bytes = "16 MiB"
+deferred_poll_max_inflight_bytes = "64 MiB"
+
 # Active partition file jobs plus results awaiting owner acceptance per shard (1..=256).
 # Exhausting either limit queues partition file work until capacity is released.
 # Running jobs use [cluster] superblock_wedged_fatal_timeout, counted in pump ticks.
@@ -883,11 +944,26 @@ clients_table_max = 8192
 # Cap on the partitions of all streams and topics. A request to create a
 # topic or partitions that would exceed it fails with PartitionsLimitReached.
 # The metadata primary checks it with its own value, so give every node the
-# same value. The check counts committed partitions only and does not add up
-# the creates in flight. Up to 3 x prepare_queue_depth creates (96 at the
-# default) can be in flight, with up to 1000 partitions each, so the count
-# can exceed the cap by that much. 0 means no cap.
+# same value. The check counts the committed partitions and those of the
+# creates still in flight, so creates never take the count past the cap. A
+# create that will fail holds its partitions until it commits. If only the
+# creates in flight leave no room, the request gets 58 (TransientNotAccepted)
+# instead, and the client retries it until its deadline. 0 means no cap.
 partitions_max = 0
+
+# Records the metadata change log keeps for streams, topics, partitions,
+# consumer groups, users and personal access tokens. Once the count passes
+# it, the oldest records go, and a reader whose position they held must
+# rebuild from current state. The log is part of the metadata snapshot, so a
+# larger value costs memory and checkpoint size. Node-local: replicas may keep
+# different depths. Must be between 1 and 1048576. Each of the two record
+# budgets also keeps at most 128 MiB of record bodies.
+change_log_resource_capacity = 65536
+
+# Records the metadata change log keeps for sessions and consumer group
+# membership. A separate budget, so a login or membership storm cannot evict
+# resource history. Must be between 1 and 1048576.
+change_log_activity_capacity = 16384
 
 # Per-partition consensus plane tunables. Unlike [metadata] (one shard-0
 # plane), a pipeline exists per partition, so raising this multiplies pinned
@@ -1134,7 +1210,28 @@ peer_queue_capacity = 4096
 
 # Each SDK connection allocates separate inbound and outbound queues.
 # Keep their capacity independent of replica repair bursts.
+# The capacity is also the most requests the server runs at once for one
+# connection. A reply waits for room in the outbound queue, so a client that
+# reads its replies keeps its connection. Requests past the cap wait in a
+# queue of 1024 per connection. A request that finds that queue full gets the
+# retryable error 58 (TransientNotAccepted), and if the outbound queue is full
+# too, the server closes the connection. A heartbeat eviction also closes a
+# connection whose outbound queue is full.
 client_queue_capacity = 256
+
+# How long a reply waits for room in a connection's outbound queue before the
+# server closes that connection. The queue stays full only while the client
+# leaves its socket unread, so this bounds how long such a client pins its
+# queued replies and request tasks. The client then reconnects and recovers
+# its session. Must be > 0.
+client_write_stall_timeout = "30 s"
+
+# Bytes of requests that wait in the per-connection queue of 1024 described
+# above. A request that would take the queue past it gets the same retryable
+# error 58, unless the queue is empty, so one request of any legal size always
+# fits. The default holds the 256 requests one connection runs at once at
+# 1 MiB each. Must be > 0.
+client_request_queue_bytes_max = "256 MiB"
 
 # Interval between outbound reconnect attempts to peers with peer_id > self_id.
 # Also bounds each dial, so a peer that drops SYNs cannot stall the sweep.
@@ -1153,6 +1250,11 @@ close_grace = "2 s"
 # (TCP-TLS rustls accept, WS HTTP-Upgrade, WSS combined TLS+WS, QUIC
 # connecting.await + accept_bi.await) so a slowloris peer cannot pin
 # per-conn channels + registry slot + spawned task indefinitely.
+# A replica link gets one such window for the placement preamble, TLS and
+# the replica handshake together. The window also bounds how long the links
+# to a peer may stay incomplete before they close and redial, so keep it
+# above reconnect_period: below it, the links to a peer form only when all
+# of them connect in one sweep.
 handshake_grace = "10 s"
 
 # Cap on open client sockets of the node: TCP, TCP-TLS, WebSocket, WSS, HTTP

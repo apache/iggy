@@ -16,27 +16,16 @@
 # under the License.
 
 # Floor for the flags CI and scripts/ci/storage-compat.sh pass: --no-tests
-# (0.9.75), --run-ignored only (0.9.76) and --ignore-default-filter (0.9.77).
+# (0.9.75), --run-ignored only (0.9.76), --ignore-default-filter (0.9.77),
+# archive -E (0.9.109), and --partition slice (0.9.127).
 # nextest refuses to run below it; setup-rust installs a pinned version above this floor.
-nextest-version = { required = "0.9.77" }
+nextest-version = { required = "0.9.127" }
 
 [[profile.default.overrides]]
 # This is a solution (or actually a workaround) for the problem that nextest does not support
 # #[serial] macro which shall enforce sequential execution of the test case.
 filter = 'package(integration) and test(cli::system::test_cli_session_scenario::should_be_successful)'
 threads-required = "num-cpus"
-
-# Elasticsearch tests share one reusable container (fixed name
-# `iggy-test-elasticsearch`, ReuseDirective::Always). Serializing the group
-# lets the first test create it and the rest attach by name, instead of racing
-# to create the same name concurrently (Docker 409 Conflict). Per-test
-# isolation comes from a unique index per fixture, not a fresh container.
-[test-groups.elasticsearch]
-max-threads = 1
-
-[[profile.default.overrides]]
-filter = 'package(integration) and test(/connectors::elasticsearch::/)'
-test-group = "elasticsearch"
 
 # Each test in these binaries spawns its own real iggy-server subprocess (isolated data dir, port
 # from PortGuard's own flock, so no two ever share a port). #[serial] on them is a dead letter
@@ -59,14 +48,18 @@ max-threads = 4
 [[profile.default.overrides]]
 filter = '''
     binary_id(iggy-gateway-kafka::bridge_iggy_integration_tests)
+    + binary_id(iggy-gateway-kafka::cluster_id_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::fetch_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::list_offsets_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::produce_real_bridge_tests)
+    + binary_id(iggy-gateway-kafka::configs_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::create_topics_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::delete_topics_real_bridge_tests)
+    + binary_id(iggy-gateway-kafka::create_partitions_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::metadata_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::offsets_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::phase1_e2e_tests)
+    + binary_id(iggy-gateway-kafka::sasl_real_server_tests)
 '''
 test-group = "kafka_bridge"
 
@@ -92,6 +85,35 @@ slow-timeout = { period = "60s", terminate-after = 60 }
 
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+[profile.default-miri]
+# Keep consensus logic scenarios and large options boundaries in native CI.
+# Miri retains protocol validation and message ownership checks.
+default-filter = '''
+not (
+    (package(=consensus) & (
+        test(/^client_table::tests::/)
+        | test(/^dvc_merge::tests::/)
+        | test(/^metadata_helpers::tests::/)
+        | test(/^plane_helpers::tests::/)
+        | test(/^impls::adopted_view_claim_tests::/)
+        | test(/^impls::history_certificate_tests::/)
+        | test(/^impls::probe_answer_tests::/)
+        | test(/^impls::quorum_tests::/)
+        | test(/^impls::recovery_barrier_tests::/)
+        | test(/^impls::recovery_election_tests::/)
+        | test(/^impls::timestamp_clamp_tests::/)
+        | test(/^impls::view_source_tests::/)
+        | test(/^impls::vsr_consensus_tests::/)
+    ))
+    | (package(=iggy_binary_protocol) & (
+        test(=primitives::options::tests::entry_count_over_limit_is_rejected)
+        | test(=primitives::options::tests::block_over_byte_limit_is_rejected)
+    ))
+)
+'''
+# Keep Miri bounded by the CI job timeout instead of the native-test limit.
+slow-timeout = { period = "60s" }
 
 [profile.ci]
 retries = 3

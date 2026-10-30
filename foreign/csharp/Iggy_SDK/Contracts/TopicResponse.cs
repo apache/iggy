@@ -19,6 +19,7 @@ using System.Text.Json.Serialization;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Headers;
 using Apache.Iggy.JsonConverters;
+using Apache.Iggy.Utils;
 
 namespace Apache.Iggy.Contracts;
 
@@ -44,9 +45,16 @@ public sealed class TopicResponse
     public required string Name { get; init; }
 
     /// <summary>
-    ///     Compression algorithm used for the topic.
+    ///     Compression algorithm label stored with the topic, read from its options.
     /// </summary>
-    public CompressionAlgorithm CompressionAlgorithm { get; set; }
+    [JsonIgnore]
+    public CompressionAlgorithm CompressionAlgorithm =>
+        OptionValues.Find(Options, DerivedOptions, TopicOptionKey.CompressionAlgorithm) switch
+        {
+            { Kind: HeaderKind.String } value when value.ToString() == "gzip" => CompressionAlgorithm.Gzip,
+            { Kind: HeaderKind.Uint8 } value => (CompressionAlgorithm)value.Value[0],
+            _ => CompressionAlgorithm.None
+        };
 
     /// <summary>
     ///     Topic size in bytes.
@@ -55,15 +63,17 @@ public sealed class TopicResponse
     public required ulong Size { get; init; }
 
     /// <summary>
-    ///     Message expiry in milliseconds.
+    ///     How long a message is kept, read from the topic's options. <see cref="TimeSpan.MaxValue" /> never expires.
     /// </summary>
-    [JsonConverter(typeof(TimeSpanConverter))]
-    public TimeSpan MessageExpiry { get; init; }
+    [JsonIgnore]
+    public TimeSpan MessageExpiry =>
+        DurationHelpers.FromDuration(OptionValues.UInt64(Options, DerivedOptions, TopicOptionKey.MessageExpiry));
 
     /// <summary>
-    ///     Maximum topic size in bytes.
+    ///     Topic-wide size cap in bytes, read from the topic's options. <see cref="ulong.MaxValue" /> is unlimited.
     /// </summary>
-    public required ulong MaxTopicSize { get; init; }
+    [JsonIgnore]
+    public ulong MaxTopicSize => OptionValues.UInt64(Options, DerivedOptions, TopicOptionKey.MaxTopicSize);
 
     /// <summary>
     ///     Number of messages in the topic.
@@ -82,17 +92,15 @@ public sealed class TopicResponse
     public IEnumerable<PartitionResponse>? Partitions { get; init; }
 
     /// <summary>
-    ///     Options explicitly set by the client at topic creation. Over REST the values arrive in
-    ///     their readable string form, so every one of them is <see cref="HeaderKind.String" />;
-    ///     the binary transports carry the server's canonical kind per key.
+    ///     Options the client set, at creation or through an update, each in the server's canonical kind for
+    ///     its key on every transport.
     /// </summary>
     [JsonIgnore]
     public Dictionary<HeaderKey, HeaderValue>? Options { get; init; }
 
     /// <summary>
-    ///     Options resolved from server defaults at topic creation. Over REST the values arrive in
-    ///     their readable string form, so every one of them is <see cref="HeaderKind.String" />;
-    ///     the binary transports carry the server's canonical kind per key.
+    ///     Options resolved from server defaults, at creation or by a reset, each in the server's canonical
+    ///     kind for its key on every transport.
     /// </summary>
     [JsonIgnore]
     public Dictionary<HeaderKey, HeaderValue>? DerivedOptions { get; init; }

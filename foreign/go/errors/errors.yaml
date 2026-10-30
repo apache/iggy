@@ -237,7 +237,7 @@
   fields: []
 - name: TransientNotCommitted
   code: 57
-  format: "request transiently not committed; retry"
+  format: "request outcome unknown; it may have applied"
   fields: []
 - name: TransientNotAccepted
   code: 58
@@ -1097,6 +1097,38 @@
       type: uint64
     - name: Expected
       type: uint64
+- name: OptionNotUpdatable
+  code: 4103
+  format: "option cannot be updated after creation: %s"
+  fields:
+    - name: Key
+      type: string
+- name: OptionNotResettable
+  code: 4104
+  format: "option cannot be reset: %s"
+  fields:
+    - name: Key
+      type: string
+- name: ReadOnlyOption
+  code: 4105
+  format: "option is read-only: %s"
+  fields:
+    - name: Key
+      type: string
+- name: StreamEncryptionUnavailable
+  code: 4106
+  format: "stream encryption key requires a server encryption key"
+  fields: []
+- name: UnsupportedCriticalOption
+  code: 4107
+  format: "unsupported critical option: %s"
+  fields:
+    - name: Key
+      type: string
+- name: CannotModifyRootUser
+  code: 4108
+  format: "cannot modify root user"
+  fields: []
 - name: ConsumerGroupIdNotFound
   code: 5000
   format: "consumer group with id: %d for topic with id: %d was not found."
@@ -1161,10 +1193,8 @@
       type: uint32
 - name: ConsumerGroupPartitionNotOwned
   code: 5009
-  format: "consumer group member with client id: %d does not own partition: %d at the current generation (rebalance in progress)."
+  format: "consumer group member does not own partition: %d at the current generation (rebalance in progress)."
   fields:
-    - name: ClientId
-      type: uint32
     - name: PartitionId
       type: uint32
 - name: TooManyConsumerGroups
@@ -1338,7 +1368,7 @@
 - name: RequestIdExhausted
   code: 14005
   format: "vsr request id exhausted"
-- name: UncertainOutcome
+- name: OperationUncertain
   code: 14006
   format: "operation %d has an uncertain outcome"
   fields:

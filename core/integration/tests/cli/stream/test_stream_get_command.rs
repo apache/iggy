@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::test_stream_create_command::{SERVER_KEY, encrypted_server};
 use crate::cli::common::{
     CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
     USAGE_PREFIX,
@@ -22,6 +23,8 @@ use crate::cli::common::{
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
+use iggy::prelude::{StreamCreateOptions, StreamEncryptionKey};
+use iggy_common::ServerKeyContext;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
 
@@ -51,7 +54,9 @@ impl TestStreamGetCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestStreamGetCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name).await;
+        let stream = client
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
     }
 
@@ -81,10 +86,78 @@ impl IggyCmdTestCase for TestStreamGetCmd {
             )))
             .stdout(contains("Stream size          | 0"))
             .stdout(contains("Stream message count | 0"))
-            .stdout(contains("Stream topics count  | 0"));
+            .stdout(contains("Stream topics count  | 0"))
+            .stdout(contains("Encryption source    | none"));
     }
 
     async fn verify_server_state(&self, _client: &dyn Client) {}
+}
+
+struct TestStreamGetEncryptedCmd {
+    stream_name: String,
+    key: StreamEncryptionKey,
+}
+
+#[async_trait]
+impl IggyCmdTestCase for TestStreamGetEncryptedCmd {
+    async fn prepare_server_state(&mut self, client: &dyn Client) {
+        client
+            .create_stream(
+                &self.stream_name,
+                &StreamCreateOptions {
+                    encryption_key: Some(self.key.clone()),
+                    ..StreamCreateOptions::default()
+                },
+            )
+            .await
+            .expect("create encrypted stream");
+    }
+
+    fn get_command(&self) -> IggyCmdCommand {
+        IggyCmdCommand::new()
+            .arg("stream")
+            .arg("get")
+            .arg(&self.stream_name)
+            .with_env_credentials()
+    }
+
+    fn verify_command(&self, command_state: Assert) {
+        let kek_fingerprint = ServerKeyContext::from_config(SERVER_KEY, &[], true)
+            .expect("server key")
+            .kek_fingerprint()
+            .expect("KEK fingerprint");
+        command_state
+            .success()
+            .stdout(contains("Encryption source    | stream"))
+            .stdout(contains(format!(
+                "Key fingerprint      | {}",
+                self.key.fingerprint()
+            )))
+            .stdout(contains(format!(
+                "KEK fingerprints     | {kek_fingerprint}"
+            )));
+    }
+
+    async fn verify_server_state(&self, client: &dyn Client) {
+        client
+            .delete_stream(&self.stream_name.clone().try_into().unwrap())
+            .await
+            .expect("delete");
+    }
+}
+
+#[tokio::test]
+#[parallel]
+pub async fn given_encrypted_stream_when_getting_should_show_source_and_fingerprints() {
+    let mut iggy_cmd_test = IggyCmdTest::with_server(encrypted_server());
+
+    iggy_cmd_test.setup().await;
+    iggy_cmd_test
+        .execute_test(TestStreamGetEncryptedCmd {
+            stream_name: String::from("secured"),
+            key: StreamEncryptionKey::try_from([3u8; 32].as_slice()).expect("valid key"),
+        })
+        .await;
 }
 
 #[tokio::test]

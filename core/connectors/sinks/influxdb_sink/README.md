@@ -126,7 +126,6 @@ stream = "metrics"
 topics = ["cpu"]
 schema = "json"
 batch_length = 100
-poll_interval = "10ms"
 consumer_group = "influxdb_sink"
 
 [plugin_config]

@@ -34,7 +34,8 @@ use iggy::prelude::{AutoLogin, Client, Credentials, IggyClient, IggyClientBuilde
 use secrecy::SecretString;
 
 use iggy_gateway_kafka::bridge::{
-    DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, ProduceSessionLimits, TopicMapping,
+    DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, KnownNodes, ProduceSessionLimits,
+    TopicMapping,
 };
 
 /// Desired slot count - the actual count `port_band()` computes may be smaller if the machine's
@@ -262,12 +263,12 @@ impl TestServer {
     /// its assertions, orphaning a process that still holds its `PortGuard` slot, which then
     /// fails the next test that draws that slot to bind.
     pub async fn spawn_with_password(data_dir: &std::path::Path, password: &str) -> Self {
-        Self::spawn_configured(data_dir, password, None, &[]).await
+        Self::spawn_configured(data_dir, password, None, &[], PortGuard::acquire()).await
     }
 
     /// [`Self::spawn`] with server settings of its own, as `IGGY_*` variables.
     pub async fn spawn_with_env(data_dir: &std::path::Path, env: &[(&str, &str)]) -> Self {
-        Self::spawn_configured(data_dir, "iggy", None, env).await
+        Self::spawn_configured(data_dir, "iggy", None, env, PortGuard::acquire()).await
     }
 
     /// Spawns `iggy-server` whose TCP listener speaks only TLS, with the given PEM pair.
@@ -279,7 +280,19 @@ impl TestServer {
         cert_file: &std::path::Path,
         key_file: &std::path::Path,
     ) -> Self {
-        Self::spawn_configured(data_dir, "iggy", Some((cert_file, key_file)), &[]).await
+        Self::spawn_configured(
+            data_dir,
+            "iggy",
+            Some((cert_file, key_file)),
+            &[],
+            PortGuard::acquire(),
+        )
+        .await
+    }
+
+    /// [`Self::spawn`] on the port that [`Self::stop`] kept, as a node that comes back.
+    pub async fn spawn_on(data_dir: &std::path::Path, port_guard: PortGuard) -> Self {
+        Self::spawn_configured(data_dir, "iggy", None, &[], port_guard).await
     }
 
     async fn spawn_configured(
@@ -287,8 +300,8 @@ impl TestServer {
         password: &str,
         tls: Option<(&std::path::Path, &std::path::Path)>,
         env: &[(&str, &str)],
+        port_guard: PortGuard,
     ) -> Self {
-        let port_guard = PortGuard::acquire();
         let address = format!("127.0.0.1:{}", port_guard.port);
 
         let mut command = Command::new(iggy_server_binary());
@@ -361,6 +374,13 @@ impl TestServer {
         port_guard
     }
 
+    /// Kills the server with SIGKILL, skipping its shutdown path the way a crash would. The data
+    /// dir stays, for a new server to start on.
+    pub fn crash(mut self) {
+        self.child.kill().expect("SIGKILL iggy-server");
+        let _ = self.child.wait();
+    }
+
     /// Polls with a bare TCP connect, not a full `IggyBridge::connect`: the latter carries
     /// `RECONNECTION_RETRIES` (3 retries after the first attempt, 4 dials at ~1s apart total) on
     /// every failed attempt, so a poll loop built
@@ -383,6 +403,7 @@ impl TestServer {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             tls: IggyTls::default(),
             produce_sessions: ProduceSessionLimits::default(),
+            nodes: KnownNodes::default(),
         }
     }
 }

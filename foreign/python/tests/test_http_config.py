@@ -251,9 +251,7 @@ class TestHttpConfigAgainstServer:
         await client.login_user("iggy", "iggy")
 
         await client.create_stream(stream_name)
-        await client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await client.create_topic(stream=stream_name, name=topic_name)
         await client.send_messages(
             stream=stream_name,
             topic=topic_name,
@@ -353,9 +351,7 @@ class TestHttpConfigAgainstServer:
         await client.login_user("iggy", "iggy")
 
         await client.create_stream(stream_name)
-        await client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await client.create_topic(stream=stream_name, name=topic_name)
 
         with pytest.raises(RuntimeError, match="Feature is unavailable"):
             await client.consumer_group(

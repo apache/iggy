@@ -541,6 +541,28 @@ async fn should_create_personal_access_token(harness: &TestHarness) {
     assert!(!token.token.is_empty());
 }
 
+#[iggy_harness(server(mcp))]
+async fn should_refuse_personal_access_token_with_unparsable_expiry(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let name = "test_token";
+    let arguments = json!({"name": name, "expiry": "tomorrow"});
+    let params = CallToolRequestParams::new("create_personal_access_token".to_owned())
+        .with_arguments(arguments.as_object().expect("Tool arguments").clone());
+    let result = mcp_client.call_tool(params).await;
+
+    assert!(
+        matches!(&result, Err(ServiceError::McpError(error))
+            if error.message.starts_with("Failed to parse personal access token expiry")),
+        "Expected an expiry parse error, got {result:?}"
+    );
+    let tokens: Vec<PersonalAccessTokenInfo> =
+        invoke(&mcp_client, "get_personal_access_tokens", None).await;
+    assert!(
+        tokens.iter().all(|token| token.name != name),
+        "A refused expiry must not create a token: {tokens:?}"
+    );
+}
+
 #[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
 async fn should_delete_personal_access_token(harness: &TestHarness) {
     let mcp_client = harness.mcp_client().await.expect("MCP client required");

@@ -39,6 +39,8 @@ import java.util.function.Supplier;
 
 /**
  * Async TCP implementation of consumer offsets client.
+ *
+ * <p>Its futures complete on the client event loop, as the callbacks section of {@link AsyncIggyTcpClient} says.
  */
 public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
     private static final Logger log = LoggerFactory.getLogger(ConsumerOffsetsTcpClient.class);
@@ -98,7 +100,7 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
                 partitionId,
                 consumer);
 
-        return AsyncTcpConnection.mapResponse(
+        return pollRouter.onClientLoop(AsyncTcpConnection.mapResponse(
                 pollRouter.partitionRequest(CommandCode.ConsumerOffset.GET.getValue(), payload, Optional.empty()),
                 response -> {
                     try {
@@ -110,7 +112,7 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
                     } finally {
                         response.release();
                     }
-                });
+                }));
     }
 
     private CompletableFuture<Void> store(
@@ -121,23 +123,21 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
             BigInteger offset,
             Optional<PartitionContext> context) {
         var payload = offsetTarget(consumer, streamId, topicId, partitionId);
-        int targetLength = payload.readableBytes();
         payload.writeBytes(BytesSerializer.toBytesAsU64(offset));
         payload.writeByte(ACK_QUORUM);
-        return AsyncTcpConnection.mapResponse(write(STORE, payload, targetLength, context), response -> {
+        return pollRouter.onClientLoop(AsyncTcpConnection.mapResponse(write(STORE, payload, context), response -> {
             response.release();
             return null;
-        });
+        }));
     }
 
     /**
      * Routes an offset write as Rust's {@code send_offset_write_with_response} does:
      * a cluster takes it to the partition primary, a single node serves it here.
-     * Takes ownership of {@code payload}, whose first {@code targetLength} bytes
-     * name the consumer and the partition.
+     * Takes ownership of {@code payload}, which starts with the consumer and the
+     * partition.
      */
-    CompletableFuture<ByteBuf> write(
-            int command, ByteBuf payload, int targetLength, Optional<PartitionContext> context) {
+    CompletableFuture<ByteBuf> write(int command, ByteBuf payload, Optional<PartitionContext> context) {
         return pollRouter.partitionRequest(command, payload, context);
     }
 

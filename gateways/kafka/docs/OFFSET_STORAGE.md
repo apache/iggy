@@ -3,7 +3,8 @@
 Status: accepted. Replaces the first design ([#4205](https://github.com/apache/iggy/pull/4205),
 [#4289](https://github.com/apache/iggy/pull/4289)). Answers
 [#3540](https://github.com/apache/iggy/issues/3540). Used by OffsetCommit and OffsetFetch
-([#3542](https://github.com/apache/iggy/issues/3542)).
+([#3542](https://github.com/apache/iggy/issues/3542)), and by DeleteGroups and OffsetDelete
+([#4511](https://github.com/apache/iggy/issues/4511)).
 
 ## Decision
 
@@ -88,8 +89,11 @@ leaves it behind.
 | Keys per partition, per kind | 4096, at most 262144: `partition.consumer_offsets_max` |
 | Past the limit | `TooManyConsumerOffsets` (3024). Sent as `UNKNOWN_SERVER_ERROR`, logged at `error!` |
 
-The gateway never deletes a `kafka.cg.<group>` group, and does not serve DeleteGroups (42). A group
-nobody uses keeps its keys until an operator deletes its Iggy group on each topic:
+DeleteGroups (42) deletes the `kafka.cg.<group>` group on every Kafka topic, and its keys go with
+it. OffsetDelete (47) deletes single keys
+([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md#deleting-groups-and-offsets)). The gateway deletes
+nothing on its own. So a group nobody uses keeps its keys until an admin tool deletes the group, or
+an operator deletes its Iggy group on each topic:
 
 ```bash
 iggy consumer-group list <stream> <topic>
@@ -102,7 +106,10 @@ consumer still uses a group, and Iggy keeps no commit time.
 ## More than one gateway
 
 Offsets are shared, since the key depends only on the Kafka group id. Membership is not
-([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)).
+([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)). With `IGGY_KAFKA_BROKERS`, `FindCoordinator` names
+one gateway for every group, so consumers and admin tools commit through that gateway. The cases
+below remain for gateways without that list, and for a client that sends group requests to
+another gateway.
 
 - A gateway with no members in a group accepts a commit with no generation, as admin tools and
   `assign()` consumers send, even when another gateway has live members in it. That commit
@@ -110,6 +117,9 @@ Offsets are shared, since the key depends only on the Kafka group id. Membership
 - A commit that a gateway gave up on can still land after a newer commit made through another
   gateway. It then puts back the older offset, or deletes the key. Iggy cannot refuse the older
   write yet.
+- `DeleteGroups` and `OffsetDelete` see only the members on their own gateway. Through a gateway
+  with no members in a group, they delete offsets of a group that is live on another gateway. That
+  includes offsets of the topics that its members subscribe to.
 
 ## Server side
 
@@ -135,16 +145,8 @@ The Iggy HTTP API cannot carry kind 3. The gateway uses TCP, so this does not li
 
 ## Reads in a cluster
 
-An offset read goes to the Iggy node that the gateway is connected to. That is not always the
-partition primary (the node that orders the partition writes). So an OffsetFetch right after an
-OffsetCommit can return the older value until that node applies the commit.
-
-- After a later commit, the consumer reads some records again.
-- After the first commit of a group, the node has no offset and answers -1. The consumer then
-  applies `auto.offset.reset`. With `latest`, it skips records.
-
-Reads from the primary are [#4409](https://github.com/apache/iggy/issues/4409). Until then, use
-`auto.offset.reset=earliest` for a group that a cluster serves.
+OffsetCommit and OffsetFetch both go to the partition primary, whichever Iggy node the gateway
+dials. So an OffsetFetch right after an OffsetCommit returns the committed offset.
 
 ## References
 

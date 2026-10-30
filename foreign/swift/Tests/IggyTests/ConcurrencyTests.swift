@@ -207,6 +207,36 @@ struct ConcurrencyTests {
         #expect(!outcome.isUncertain)
     }
 
+    @Test func aSemaphoreServesWaitersInOrder() async throws {
+        let semaphore = AsyncSemaphore(permits: 5)
+        #expect(try await semaphore.acquire(5))
+        let large = Task { try await semaphore.acquire(3) }
+        #expect(await eventually { !semaphore.tryAcquire(0) })
+        let small = Task { try await semaphore.acquire(1) }
+        semaphore.release(1)
+        // The small waiter fits but queues behind the large one.
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(semaphore.availablePermits == 1)
+        semaphore.release(3)
+        #expect(try await large.value)
+        #expect(try await small.value)
+        #expect(semaphore.availablePermits == 0)
+    }
+
+    @Test func aSemaphoreWaitEndsAtItsDeadlineOrCancellation() async throws {
+        let semaphore = AsyncSemaphore(permits: 1)
+        #expect(semaphore.tryAcquire(1))
+        #expect(try await !semaphore.acquire(1, deadline: .now + .milliseconds(30)))
+        #expect(try await !semaphore.acquire(1, deadline: .now - .milliseconds(1)))
+        let cancelled = Task { try await semaphore.acquire(1) }
+        try await Task.sleep(for: .milliseconds(20))
+        cancelled.cancel()
+        await #expect(throws: CancellationError.self) { try await cancelled.value }
+        semaphore.release(1)
+        // Nobody who gave up holds a permit.
+        #expect(semaphore.availablePermits == 1)
+    }
+
     /// The server took a later request of the session first, so an earlier
     /// attempt of this one may have committed.
     @Test func retryOutcomeReportsARequestTooOldAsUnknown() {

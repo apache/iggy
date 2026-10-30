@@ -26,7 +26,7 @@ use crate::harness::port_reserver::PortReserver;
 use crate::harness::traits::{IggyServerDependent, Restartable, TestBinary};
 use assert_cmd::prelude::CommandCargoExt;
 use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
-use iggy_common::TransportProtocol;
+use iggy_common::{IggyDuration, TransportProtocol};
 use rand::RngExt as _;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -35,6 +35,7 @@ use std::net::SocketAddr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle, available_parallelism, sleep};
@@ -50,6 +51,8 @@ const FAILURE_LOG_TAIL_LINES: usize = 8;
 /// between parses as valid TOML with sections or keys missing; readiness
 /// retries on this message.
 const INCOMPLETE_DUMP_MESSAGE: &str = "Failed to parse server config: the dump is incomplete";
+/// The effective config the server dumps at boot, relative to its data path.
+const CONFIG_DUMP_PATH: &str = "runtime/current_config.toml";
 
 /// How the last [`TestBinary::stop`] of a running server ended.
 #[derive(Debug, Clone, Copy)]
@@ -153,6 +156,30 @@ impl ServerHandle {
         self.context
             .base_dir()
             .join(format!("server_{}_local_data", self.server_id))
+    }
+
+    /// The `cluster.commit_broadcast_interval` the server runs with, read from
+    /// the config it dumped at boot.
+    ///
+    /// # Errors
+    ///
+    /// [`TestBinaryError::InvalidState`] when the dump cannot be read or holds
+    /// no valid interval.
+    pub fn commit_broadcast_interval(&self) -> Result<Duration, TestBinaryError> {
+        let path = self.data_path().join(CONFIG_DUMP_PATH);
+        let invalid = |reason: String| TestBinaryError::InvalidState {
+            message: format!("{}: {reason}", path.display()),
+        };
+        let dump = fs::read_to_string(&path).map_err(|error| invalid(error.to_string()))?;
+        let config: Value = toml::from_str(&dump).map_err(|error| invalid(error.to_string()))?;
+        let interval = config
+            .get("cluster")
+            .and_then(|cluster| cluster.get("commit_broadcast_interval"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("no cluster.commit_broadcast_interval".to_string()))?;
+        IggyDuration::from_str(interval)
+            .map(|interval| interval.get_duration())
+            .map_err(|error| invalid(format!("commit_broadcast_interval {interval:?}: {error}")))
     }
 
     fn stdout_log_path(&self) -> PathBuf {
@@ -259,6 +286,15 @@ impl ServerHandle {
     #[must_use]
     pub fn replica_mesh_complete(&self) -> bool {
         self.stdout_contains("replica mesh complete")
+    }
+
+    /// True once this node has logged that it admits partition requests.
+    /// A replica in a multi-node cluster refuses them as transient until it
+    /// holds fresh quorum evidence, which arrives one probe round after the
+    /// mesh forms. A single-node server never emits the marker.
+    #[must_use]
+    pub fn partition_admission_open(&self) -> bool {
+        self.stdout_contains("partition admission opened")
     }
 
     /// True once this node's stdout log contains `marker`. Spec tests use
@@ -572,7 +608,7 @@ impl ServerHandle {
 
     fn wait_for_server_ready(&mut self) -> Result<(), TestBinaryError> {
         let data_path = self.data_path();
-        let config_path = data_path.join("runtime/current_config.toml");
+        let config_path = data_path.join(CONFIG_DUMP_PATH);
 
         let max_attempts = (MAX_PORT_WAIT_DURATION_S * 1000) / SLEEP_INTERVAL_MS;
         let deadline = Instant::now() + Duration::from_secs(MAX_PORT_WAIT_DURATION_S);
@@ -1017,7 +1053,7 @@ impl TestBinary for ServerHandle {
         self.build_envs()?;
 
         let data_path = self.data_path();
-        let config_path = data_path.join("runtime/current_config.toml");
+        let config_path = data_path.join(CONFIG_DUMP_PATH);
         if config_path.exists() {
             let _ = fs::remove_file(&config_path);
         }

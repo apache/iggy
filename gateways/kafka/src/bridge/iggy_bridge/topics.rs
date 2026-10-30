@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use iggy::prelude::{
-    Identifier, IggyClient, IggyError, IggyExpiry, StreamClient, Topic, TopicClient,
-    TopicCreateOptions, TopicDetails, TopicUpdateOptions,
+    Identifier, IggyClient, IggyError, IggyExpiry, PartitionClient, StreamClient,
+    StreamCreateOptions, Topic, TopicClient, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
 };
 use kafka_protocol::protocol::StrBytes;
 use tokio::time::{Instant, timeout_at};
@@ -37,7 +37,8 @@ use crate::protocol::handlers::topic_config::message_expiry_is_explicit;
 /// `num.partitions` default.
 pub const DEFAULT_TOPIC_PARTITIONS: u32 = 1;
 
-/// Iggy's own server-side per-topic partition cap (`IggyError::TooManyPartitions`).
+/// Iggy's own server-side cap on the partitions one create or one add names
+/// (`IggyError::TooManyPartitions`).
 ///
 /// Not exported by `iggy::prelude`. Checked before a create so a count Iggy can never create is
 /// refused the same way on every path, including `CreateTopics`' `validate_only`.
@@ -72,6 +73,14 @@ pub enum TopicCreationOutcome {
 pub struct KafkaTopicMetadata {
     pub kafka_topic: String,
     pub partitions_count: u32,
+}
+
+/// [`IggyBridge::list_kafka_topics`], with the override topics that it leaves out because the
+/// bridge user may not read them.
+pub(super) struct KafkaTopicListing {
+    pub(super) topics: Vec<KafkaTopicMetadata>,
+    /// The Kafka names of those override topics.
+    pub(super) unreadable: Vec<String>,
 }
 
 impl IggyBridge {
@@ -265,6 +274,49 @@ impl IggyBridge {
             .await
     }
 
+    /// Adds `partitions_count` partitions to the Iggy topic backing `kafka_topic`, resolved
+    /// through the configured [`TopicMapping`](crate::bridge::topic_map::TopicMapping).
+    ///
+    /// Takes the number to add, as Iggy's own `create_partitions` does, not the number to reach
+    /// that a Kafka `CreatePartitions` carries. The caller has already read the current count to
+    /// check Kafka's grow-only rule, and the difference is what it asks for here. Iggy appends
+    /// the new partitions after the current last index, so no existing Kafka partition index
+    /// changes meaning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::InvalidKafkaTopicName`] if `kafka_topic` fails Kafka's own
+    /// topic-naming rules. Returns [`BridgeError::InvalidPartitionCount`] if `partitions_count`
+    /// is 0, which Iggy would refuse as `TooManyPartitions`, a code whose text says the opposite.
+    /// Returns [`BridgeError::Timeout`] if the call takes longer than `REQUEST_TIMEOUT`. Returns
+    /// [`BridgeError::Iggy`] with `TopicIdNotFound` (2010) or `StreamIdNotFound` (1009) if the
+    /// mapped topic or stream does not exist, `TooManyPartitions` above Iggy's per-call cap of
+    /// 1000, `PartitionsLimitReached` when the node is at `metadata.partitions_max`,
+    /// `PartitionResizeDisabled` for a topic created with a fixed partition count, or for
+    /// connectivity/auth failures.
+    pub async fn create_kafka_partitions(
+        &self,
+        kafka_topic: &str,
+        partitions_count: u32,
+    ) -> Result<(), BridgeError> {
+        validate_kafka_topic_name("kafka_topic", kafka_topic)?;
+        if partitions_count == 0 {
+            return Err(BridgeError::InvalidPartitionCount {
+                kafka_topic: kafka_topic.to_string(),
+            });
+        }
+        let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
+        let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
+        let topic_id = Identifier::named(topic_name).map_err(BridgeError::Iggy)?;
+        self.metadata_write(|| {
+            self.client
+                .create_partitions(&stream_id, &topic_id, partitions_count)
+        })
+        .await?;
+        info!("added {partitions_count} partitions to Iggy topic '{topic_name}'");
+        Ok(())
+    }
+
     /// Looks up `kafka_topic`, resolved through the configured
     /// [`TopicMapping`](crate::bridge::topic_map::TopicMapping), without creating it.
     ///
@@ -285,7 +337,7 @@ impl IggyBridge {
     }
 
     /// [`Self::get_kafka_topic`] on `client`.
-    async fn get_kafka_topic_on(
+    pub(super) async fn get_kafka_topic_on(
         &self,
         client: &IggyClient,
         kafka_topic: &str,
@@ -302,8 +354,7 @@ impl IggyBridge {
 
     /// Sets `message_expiry` on the Iggy topic backing `kafka_topic`.
     ///
-    /// Does not create the topic and does not rename it: `name` is the mapped Iggy
-    /// topic name, which `update_topic` also takes as the topic's new name.
+    /// Does not create the topic and does not rename it.
     ///
     /// # Errors
     ///
@@ -324,11 +375,8 @@ impl IggyBridge {
             message_expiry: Some(message_expiry),
             ..TopicUpdateOptions::default()
         };
-        self.metadata_write(|| {
-            self.client
-                .update_topic(&stream_id, &topic_id, topic_name, &options)
-        })
-        .await
+        self.metadata_write(|| self.client.update_topic(&stream_id, &topic_id, &options))
+            .await
     }
 
     async fn topics_in_stream(&self, stream_name: &str) -> Result<Vec<Topic>, BridgeError> {
@@ -547,10 +595,20 @@ impl IggyBridge {
         &self,
         client: &IggyClient,
     ) -> Result<Vec<KafkaTopicMetadata>, BridgeError> {
+        Ok(self.kafka_topic_listing_on(client).await?.topics)
+    }
+
+    /// [`Self::list_kafka_topics_on`], with the override topics that it leaves out because the
+    /// bridge user may not read them.
+    pub(super) async fn kafka_topic_listing_on(
+        &self,
+        client: &IggyClient,
+    ) -> Result<KafkaTopicListing, BridgeError> {
         let default_stream = self.config.topic_mapping.default_stream();
         let mut default_stream_override_targets: HashSet<&str> = HashSet::new();
         let mut override_keys: HashSet<&str> = HashSet::new();
         let mut results = Vec::new();
+        let mut unreadable = Vec::new();
 
         for (kafka_topic, over) in self.config.topic_mapping.overrides() {
             override_keys.insert(kafka_topic);
@@ -574,6 +632,7 @@ impl IggyBridge {
                          unauthorized to read it",
                         over.stream, over.topic
                     );
+                    unreadable.push(kafka_topic.to_string());
                 }
                 Err(err) => return Err(err),
             }
@@ -610,7 +669,10 @@ impl IggyBridge {
             });
         }
 
-        Ok(results)
+        Ok(KafkaTopicListing {
+            topics: results,
+            unreadable,
+        })
     }
 }
 
@@ -639,9 +701,10 @@ impl IggyBridge {
 /// this pays one round trip in every case instead of up to two in the common one.
 async fn ensure_stream(client: &IggyClient, stream_name: &str) -> Result<Identifier, BridgeError> {
     let identifier = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
+    let options = StreamCreateOptions::default();
     stream_ensured(
         stream_name,
-        metadata_write_on(client, || client.create_stream(stream_name)).await,
+        metadata_write_on(client, || client.create_stream(stream_name, &options)).await,
     )?;
     Ok(identifier)
 }
@@ -765,10 +828,11 @@ async fn load_stream(
                 .into_iter()
                 .map(|topic| {
                     let message_expiry_explicit = message_expiry_is_explicit(&topic.options);
+                    let message_expiry = topic.resolved_options().message_expiry;
                     (
                         topic.name,
                         TopicConfigSnapshot {
-                            message_expiry: topic.message_expiry,
+                            message_expiry,
                             message_expiry_explicit,
                         },
                     )

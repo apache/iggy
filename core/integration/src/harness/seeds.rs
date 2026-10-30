@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy::prelude::StreamCreateOptions;
+use iggy::prelude::UserCreateOptions;
 use iggy::prelude::{IggyClient, StreamClient, TopicClient, TopicCreateOptions};
 use iggy_common::{
     Consumer, Durability, Identifier, IggyExpiry, IggyMessage, MaxTopicSize, Partitioning,
@@ -44,13 +46,17 @@ pub mod names {
 
 /// Creates a single stream named "test".
 pub async fn stream_only(client: &IggyClient) -> Result<(), SeedError> {
-    client.create_stream("test").await?;
+    client
+        .create_stream("test", &StreamCreateOptions::default())
+        .await?;
     Ok(())
 }
 
 /// Creates a stream with a topic.
 pub async fn stream_with_topic(client: &IggyClient) -> Result<(), SeedError> {
-    client.create_stream("test_stream").await?;
+    client
+        .create_stream("test_stream", &StreamCreateOptions::default())
+        .await?;
     client
         .create_topic(
             &"test_stream".try_into()?,
@@ -70,7 +76,9 @@ pub async fn stream_with_topic(client: &IggyClient) -> Result<(), SeedError> {
 pub async fn connector_stream(client: &IggyClient) -> Result<(), SeedError> {
     let stream_id: Identifier = names::STREAM.try_into()?;
 
-    client.create_stream(names::STREAM).await?;
+    client
+        .create_stream(names::STREAM, &StreamCreateOptions::default())
+        .await?;
 
     client
         .create_topic(
@@ -94,7 +102,9 @@ pub async fn connector_stream(client: &IggyClient) -> Result<(), SeedError> {
 pub async fn connector_multi_topic_stream(client: &IggyClient) -> Result<(), SeedError> {
     let stream_id: Identifier = names::STREAM.try_into()?;
 
-    client.create_stream(names::STREAM).await?;
+    client
+        .create_stream(names::STREAM, &StreamCreateOptions::default())
+        .await?;
 
     client
         .create_topic(
@@ -130,7 +140,9 @@ pub async fn mcp_standard(client: &IggyClient) -> Result<(), SeedError> {
     let stream_id: Identifier = names::STREAM.try_into()?;
     let topic_id: Identifier = names::TOPIC.try_into()?;
 
-    client.create_stream(names::STREAM).await?;
+    client
+        .create_stream(names::STREAM, &StreamCreateOptions::default())
+        .await?;
 
     client
         .create_topic(
@@ -168,7 +180,13 @@ pub async fn mcp_standard(client: &IggyClient) -> Result<(), SeedError> {
         .await?;
 
     client
-        .create_user(names::USER, names::USER_PASSWORD, UserStatus::Active, None)
+        .create_user(
+            names::USER,
+            names::USER_PASSWORD,
+            UserStatus::Active,
+            None,
+            &UserCreateOptions::default(),
+        )
         .await?;
 
     client

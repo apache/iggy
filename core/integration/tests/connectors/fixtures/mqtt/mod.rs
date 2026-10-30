@@ -17,7 +17,7 @@
 
 use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
-use rumqttc::v5::mqttbytes::v5::PublishProperties;
+use rumqttc_v5::mqttbytes::v5::PublishProperties;
 use std::collections::HashMap;
 
 mod container;

@@ -28,6 +28,7 @@
 using System.Text;
 using Apache.Iggy;
 using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Factory;
@@ -85,7 +86,7 @@ async Task InitSystem()
             Identifier.String(streamName),
             topicName,
             1,
-            CompressionAlgorithm.None
+            new TopicOptions { CompressionAlgorithm = CompressionAlgorithm.None }
         );
         logger.LogInformation("Topic was created.");
     }

@@ -37,8 +37,10 @@ func createDefaultMessageHeaders() []iggcon.HeaderEntry {
 
 func createDefaultMessages() []iggcon.IggyMessage {
 	headers := createDefaultMessageHeaders()
-	msg1, _ := iggcon.NewIggyMessage([]byte(createRandomString(256)), iggcon.WithID(uuid.New()), iggcon.WithUserHeaders(headers))
-	msg2, _ := iggcon.NewIggyMessage([]byte(createRandomString(256)), iggcon.WithID(uuid.New()), iggcon.WithUserHeaders(headers))
+	msg1, err := iggcon.NewIggyMessage([]byte(createRandomString(256)), iggcon.WithID(uuid.New()), iggcon.WithUserHeaders(headers))
+	gomega.Expect(err).To(gomega.BeNil())
+	msg2, err := iggcon.NewIggyMessage([]byte(createRandomString(256)), iggcon.WithID(uuid.New()), iggcon.WithUserHeaders(headers))
+	gomega.Expect(err).To(gomega.BeNil())
 	return []iggcon.IggyMessage{msg1, msg2}
 }
 

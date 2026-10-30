@@ -24,7 +24,7 @@ describe('ConsensusSession', () => {
     const session = new ConsensusSession();
     assert.notEqual(session.clientId, 0n);
     assert.equal(session.session, null);
-    assert.equal(session.currentRequestId(), 1n);
+    assert.equal(session.nextRequestId(false), 1n);
   });
 
   it('generates client IDs with the top bit clear', () => {
@@ -52,7 +52,7 @@ describe('ConsensusSession', () => {
     session.bind(42n);
     assert.equal(session.nextRequestId(), 1n);
     assert.equal(session.nextRequestId(), 2n);
-    assert.equal(session.currentRequestId(), 3n);
+    assert.equal(session.nextRequestId(), 3n);
   });
 
   it('resets activity and identity while preserving the shared request counter', () => {
@@ -92,9 +92,9 @@ describe('ConsensusSession', () => {
     assert.deepEqual(session.bindSecret, proof);
     session.bind(42n);
     assert.equal(session.nextRequestId(), 1n);
-    session.beginRegister();
+    assert.equal(session.beginRegister(), 0n);
     assert.equal(session.session, 42n);
-    assert.equal(session.currentRequestId(), 2n);
+    assert.equal(session.nextRequestId(), 2n);
     assert.equal(session.clientId, 7n);
     assert.deepEqual(session.bindSecret, proof);
   });

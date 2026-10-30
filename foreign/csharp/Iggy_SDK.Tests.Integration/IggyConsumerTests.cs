@@ -422,13 +422,12 @@ public class IggyConsumerTests
 
         await foreach (var message in consumer.ReceiveAsync(cts.Token))
         {
+            lastOffset = message.CurrentOffset;
+            receivedCount++;
             if (receivedCount >= 5)
             {
                 break;
             }
-
-            lastOffset = message.CurrentOffset;
-            receivedCount++;
         }
 
         await consumer.DisposeAsync();
@@ -439,7 +438,10 @@ public class IggyConsumerTests
             1u);
 
         offset.ShouldNotBeNull();
-        offset.StoredOffset.ShouldBe(4ul);
+        receivedCount.ShouldBe(5);
+        lastOffset.ShouldBe(4ul);
+        // The loop broke inside the body of offset 4, so that message is delivered again.
+        offset.StoredOffset.ShouldBe(3ul);
     }
 
     [Test]

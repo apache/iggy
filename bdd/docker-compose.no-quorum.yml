@@ -1,0 +1,134 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# A cluster node that can never reach quorum: replica 0 of a two-node roster
+# whose replica 1 is never started.
+# Activated by: ./scripts/run-bdd-tests.sh <sdk> session_contract
+#               ./scripts/run-bdd-tests.sh <sdk> all
+#
+# A two-replica cluster needs both replicas to commit, so this node answers
+# pings but refuses every sign-in as not accepted (58) for as long as it runs.
+# An SDK keeps retrying until the call's deadline, which makes the deadline
+# outcome deterministic. The roster IPs follow the same static-address rules
+# as docker-compose.cluster.yml, and the absent replica's address is never
+# assigned to a container.
+
+x-no-quorum-bdd-deps: &no-quorum-bdd-deps
+  depends_on:
+    iggy-no-quorum:
+      condition: service_healthy
+  environment:
+    - IGGY_TCP_ADDRESS_NO_QUORUM=iggy-no-quorum:8093
+
+services:
+  iggy-no-quorum:
+    image: iggy-bdd-server
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: core/server/Dockerfile
+      target: runtime-prebuilt
+      args:
+        PREBUILT_IGGY_SERVER: ${IGGY_SERVER_PATH:-target/debug/iggy-server}
+        PREBUILT_IGGY_CLI: ${IGGY_CLI_PATH:-target/debug/iggy}
+        LIBC: glibc
+        PROFILE: debug
+    command: [ "--replica-id", "0" ]
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "172.28.0.111:8093", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+    environment:
+      LLVM_PROFILE_FILE: ${BDD_SERVER_PROFILE_FILE:-}
+      RUST_LOG: info
+      IGGY_ROOT_USERNAME: iggy
+      IGGY_ROOT_PASSWORD: iggy
+      IGGY_CLUSTER_ENABLED: "true"
+      IGGY_CLUSTER_NAME: no-quorum-cluster
+      IGGY_CLUSTER_NODES_0_NAME: no-quorum-node
+      IGGY_CLUSTER_NODES_0_IP: 172.28.0.111
+      IGGY_CLUSTER_NODES_0_REPLICA_ID: "0"
+      IGGY_CLUSTER_NODES_0_PORTS_TCP: "8093"
+      IGGY_CLUSTER_NODES_0_PORTS_QUIC: "8083"
+      IGGY_CLUSTER_NODES_0_PORTS_HTTP: "3003"
+      IGGY_CLUSTER_NODES_0_PORTS_WEBSOCKET: "8073"
+      IGGY_CLUSTER_NODES_0_PORTS_TCP_REPLICA: "8193"
+      IGGY_CLUSTER_NODES_1_NAME: absent-node
+      IGGY_CLUSTER_NODES_1_IP: 172.28.0.112
+      IGGY_CLUSTER_NODES_1_REPLICA_ID: "1"
+      IGGY_CLUSTER_NODES_1_PORTS_TCP: "8094"
+      IGGY_CLUSTER_NODES_1_PORTS_QUIC: "8084"
+      IGGY_CLUSTER_NODES_1_PORTS_HTTP: "3004"
+      IGGY_CLUSTER_NODES_1_PORTS_WEBSOCKET: "8074"
+      IGGY_CLUSTER_NODES_1_PORTS_TCP_REPLICA: "8194"
+      IGGY_CLUSTER_AUTH_ENABLED: "true"
+      IGGY_CLUSTER_AUTH_SHARED_SECRET: "bdd-vsr-no-quorum-shared-secret-0123456789"
+      IGGY_PATH: local_data_no_quorum
+      IGGY_TCP_ADDRESS: 0.0.0.0:8093
+      IGGY_HTTP_ADDRESS: 0.0.0.0:3003
+      IGGY_QUIC_ADDRESS: 0.0.0.0:8083
+      IGGY_WEBSOCKET_ADDRESS: 0.0.0.0:8073
+    networks:
+      iggy-bdd-network:
+        ipv4_address: 172.28.0.111
+    volumes:
+      - iggy_no_quorum_data:/app/local_data_no_quorum
+      - ../target:/profiles
+
+  rust-bdd:
+    <<: *no-quorum-bdd-deps
+
+  python-bdd:
+    <<: *no-quorum-bdd-deps
+
+  php-bdd:
+    <<: *no-quorum-bdd-deps
+
+  go-bdd:
+    <<: *no-quorum-bdd-deps
+
+  node-bdd:
+    <<: *no-quorum-bdd-deps
+
+  csharp-bdd:
+    <<: *no-quorum-bdd-deps
+
+  java-bdd:
+    <<: *no-quorum-bdd-deps
+
+  cpp-bdd:
+    <<: *no-quorum-bdd-deps
+
+networks:
+  iggy-bdd-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  iggy_no_quorum_data:

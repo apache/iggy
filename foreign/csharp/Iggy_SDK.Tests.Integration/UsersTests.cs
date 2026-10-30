@@ -103,7 +103,8 @@ public class UsersTests
         var newUsername = $"new-{Guid.NewGuid():N}"[..20];
         await client.CreateUserAsync(username, "test1", UserStatus.Active);
 
-        await Should.NotThrowAsync(client.UpdateUserAsync(Identifier.String(username), newUsername, UserStatus.Active));
+        await Should.NotThrowAsync(client.UpdateUserAsync(Identifier.String(username),
+            new UserUpdate { Username = newUsername, Status = UserStatus.Active }));
 
         var user = await client.GetUserAsync(Identifier.String(newUsername));
 

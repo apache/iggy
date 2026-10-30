@@ -24,6 +24,7 @@ from apache_iggy import (
     Permissions,
     SendMessage,
     StreamPermissions,
+    TopicOptions,
     TopicPermissions,
 )
 
@@ -36,7 +37,7 @@ async def _create_topic(iggy_client: IggyClient, unique_name):
 
     await iggy_client.create_stream(stream_name)
     await iggy_client.create_topic(
-        stream=stream_name, name=topic_name, partitions_count=2
+        stream=stream_name, name=topic_name, options=TopicOptions(partitions_count=2)
     )
     return stream_name, topic_name
 
@@ -182,7 +183,7 @@ class TestPartitionManagement:
         stream_name, topic_name = await _create_topic(iggy_client, unique_name)
         other_topic_name = unique_name()
         await iggy_client.create_topic(
-            stream_name, other_topic_name, partitions_count=2
+            stream_name, other_topic_name, TopicOptions(partitions_count=2)
         )
         stream = await iggy_client.get_stream(stream_name)
         assert stream is not None

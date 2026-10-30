@@ -19,6 +19,7 @@
 
 package org.apache.iggy.topic;
 
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.partition.Partition;
 import org.apache.iggy.partition.PartitionContext;
 import org.junit.jupiter.api.Test;
@@ -37,13 +38,14 @@ class TopicDetailsTest {
                 BigInteger.TEN,
                 "foo",
                 "size",
-                BigInteger.valueOf(10000L),
-                CompressionAlgorithm.Gzip,
-                BigInteger.TWO,
                 BigInteger.ZERO,
                 1L,
-                Map.of(),
-                Map.of());
+                Map.of(
+                        "message_expiry",
+                        HeaderValue.fromUint64(BigInteger.valueOf(10000L)),
+                        "compression_algorithm",
+                        HeaderValue.fromString("gzip")),
+                Map.of("max_topic_size", HeaderValue.fromUint64(BigInteger.TWO)));
         var partitions = List.of(
                 new Partition(1L, BigInteger.TEN, 2L, BigInteger.ZERO, "size", BigInteger.ONE, PartitionContext.EMPTY));
 
@@ -53,9 +55,9 @@ class TopicDetailsTest {
         assertThat(topicDetails.createdAt()).isEqualTo(BigInteger.TEN);
         assertThat(topicDetails.name()).isEqualTo("foo");
         assertThat(topicDetails.size()).isEqualTo("size");
-        assertThat(topicDetails.messageExpiry()).isEqualTo(BigInteger.valueOf(10000L));
-        assertThat(topicDetails.compressionAlgorithm()).isEqualTo(CompressionAlgorithm.Gzip);
-        assertThat(topicDetails.maxTopicSize()).isEqualTo(BigInteger.TWO);
+        assertThat(topicDetails.messageExpiry()).contains(BigInteger.valueOf(10000L));
+        assertThat(topicDetails.compressionAlgorithm()).contains(CompressionAlgorithm.Gzip);
+        assertThat(topicDetails.maxTopicSize()).contains(BigInteger.TWO);
         assertThat(topicDetails.messagesCount()).isEqualTo(BigInteger.ZERO);
         assertThat(topicDetails.partitionsCount()).isEqualTo(1L);
         assertThat(topicDetails.partitions()).isEqualTo(partitions);

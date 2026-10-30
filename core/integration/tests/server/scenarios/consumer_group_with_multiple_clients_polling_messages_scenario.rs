@@ -52,7 +52,10 @@ async fn init_system(
     create_users: bool,
 ) {
     // 1. Create the stream
-    system_client.create_stream(STREAM_NAME).await.unwrap();
+    system_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     // 2. Create the topic
     system_client

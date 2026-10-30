@@ -21,7 +21,9 @@
 //! and the sole outbound dialer for higher-id peer replicas. On every
 //! accept / successful dial the coordinator:
 //!
-//! 1. picks the next target shard via round-robin,
+//! 1. takes the target shard: the owner of the replica link, which the
+//!    caller derives from the link placement, or the next client shard
+//!    via round-robin,
 //! 2. duplicates the TCP fd,
 //! 3. sends a connection-setup `LifecycleFrame`
 //!    (`ReplicaInboundSetup` / `ReplicaOutboundSetup` /
@@ -29,13 +31,14 @@
 //! 4. drops its own `TcpStream` so only the target shard's wrapped fd
 //!    keeps the socket alive.
 //!
-//! Replica delegation is blind: no byte is read or written on shard 0,
-//! the owning shard runs the handshake and reports the outcome back via
+//! Shard 0 reads only the 8-byte placement preamble of an inbound replica
+//! link and writes nothing on either direction; the owning shard runs the
+//! handshake and reports the outcome back via
 //! `Replica{Inbound,Outbound}HandshakeDone`.
 //!
 //! The shard-shared [`message_bus::ReplicaOwnerTable`] is the
-//! authoritative `replica_id -> owning_shard` view; the owning shard
-//! stamps and CAS-clears its slot synchronously through
+//! authoritative `(replica_id, link) -> owning_shard` view; the owning
+//! shard claims and releases its slot synchronously through
 //! `mark_replica_owned` / `clear_replica_owned`, so the coordinator does
 //! not need a separate mapping cache or broadcast subsystem.
 //!
@@ -53,9 +56,10 @@ use crate::metrics::{frame_drop_reason, frame_drop_variant};
 use crate::{LifecycleFrame, ShardCtorError, ShardFrame, TaggedSender, validate_sender_ordering};
 use compio::net::TcpStream;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
-use message_bus::{ConnectionPermit, SendError, SharedTlsServerConfig, fd_transfer};
+use message_bus::{ConnectionPermit, ReplicaLinkId, SendError, SharedTlsServerConfig, fd_transfer};
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::Instant;
 use tracing::warn;
 
 /// Bit position of the target-shard tag inside a minted client id: the top 16
@@ -89,7 +93,6 @@ pub struct ShardZeroCoordinator {
     metrics: crate::metrics::ShardMetrics,
     total_shards: u16,
     cfg: CoordinatorConfig,
-    replica_rr: Cell<u16>,
     client_rr: Cell<u16>,
     client_seq: Cell<u128>,
     /// Fresh per boot, see [`Self::mint_client_id`].
@@ -124,23 +127,10 @@ impl ShardZeroCoordinator {
             metrics,
             total_shards,
             cfg,
-            replica_rr: Cell::new(0),
             client_rr: Cell::new(0),
             client_seq: Cell::new(1),
             boot_nonce,
         })
-    }
-
-    /// Pick the next target shard for a replica connection.
-    ///
-    /// When `total_shards > 1` and `cfg.skip_shard_zero_for_replicas` is
-    /// true (the default), the selection wraps over `[1, total_shards)`.
-    fn next_replica_target(&self) -> u16 {
-        rr_pick(
-            &self.replica_rr,
-            self.total_shards,
-            self.cfg.skip_shard_zero_for_replicas,
-        )
     }
 
     /// Pick the next target shard for a client connection.
@@ -195,66 +185,106 @@ impl ShardZeroCoordinator {
         self.mint_client_id(0)
     }
 
-    /// Ship a blind-delegated inbound replica connection to the next
-    /// round-robin target shard. No byte has been read: the owning shard
-    /// runs the acceptor handshake and answers shard 0 with
-    /// [`LifecycleFrame::ReplicaInboundHandshakeDone`] echoing `slot`
+    /// Ship an inbound replica link to `target`, the shard that owns
+    /// `link`. Shard 0 read only the placement preamble: the owning shard
+    /// runs the acceptor handshake until `deadline` and answers shard 0
+    /// with [`LifecycleFrame::ReplicaInboundHandshakeDone`] echoing `slot`
     /// (the in-flight cap slot acquired by the accept callback).
     ///
-    /// Returns `Ok(target_shard)` on a successful `try_send`. The owning
-    /// shard records itself in the shard-shared
+    /// The owning shard records itself in the shard-shared
     /// [`message_bus::ReplicaOwnerTable`] once its installer accepts the
-    /// handshaked connection, so no extra broadcast or mapping cache is
-    /// needed here. On inter-shard channel failure closes the duplicated
-    /// fd and returns `Err(SendError::RoutingFailed)`; the caller must
-    /// release `slot`.
+    /// handshaked link, so no extra broadcast or mapping cache is needed
+    /// here. On inter-shard channel failure closes the duplicated fd and
+    /// returns `Err(SendError::RoutingFailed)`; the caller must release
+    /// `slot`.
     ///
     /// # Errors
     ///
-    /// Returns an error when `dup(2)` fails or when the target shard's
-    /// inbox refuses the setup frame (full or disconnected).
-    pub fn delegate_replica_inbound(&self, stream: TcpStream, slot: u64) -> Result<u16, SendError> {
-        self.ship_replica_fd(stream, "delegate_replica_inbound", |fd| {
-            LifecycleFrame::ReplicaInboundSetup { fd, slot }
+    /// Returns an error when `dup(2)` fails, when `target` is not a shard
+    /// of this node, or when the target shard's inbox refuses the setup
+    /// frame (full or disconnected).
+    pub fn delegate_replica_inbound(
+        &self,
+        stream: TcpStream,
+        link: ReplicaLinkId,
+        target: u16,
+        slot: u64,
+        deadline: Instant,
+    ) -> Result<(), SendError> {
+        self.ship_replica_fd(stream, target, "delegate_replica_inbound", |fd| {
+            LifecycleFrame::ReplicaInboundSetup {
+                fd,
+                slot,
+                link,
+                deadline,
+            }
         })
     }
 
-    /// Ship a dialed outbound replica connection to the next round-robin
-    /// target shard. The owning shard runs the dialer handshake toward
-    /// `replica_id` and answers shard 0 with
+    /// Ship a dialed outbound replica link to `target`, the shard that owns
+    /// `link`. The owning shard writes the placement preamble, runs the
+    /// dialer handshake toward `link.replica` and answers shard 0 with
     /// [`LifecycleFrame::ReplicaOutboundHandshakeDone`]; on success the
-    /// caller marks the peer dial-pending so the reconnect sweep skips
-    /// it until the handshake outcome arrives.
+    /// caller marks the link dial-pending so the reconnect sweep skips it
+    /// until the handshake outcome arrives.
     ///
     /// # Errors
     ///
-    /// Returns an error when `dup(2)` fails or when the target shard's
-    /// inbox refuses the setup frame (full or disconnected).
+    /// Returns an error when `dup(2)` fails, when `target` is not a shard
+    /// of this node, or when the target shard's inbox refuses the setup
+    /// frame (full or disconnected).
     pub fn delegate_replica_outbound(
         &self,
         stream: TcpStream,
-        replica_id: u8,
-    ) -> Result<u16, SendError> {
-        self.ship_replica_fd(stream, "delegate_replica_outbound", |fd| {
-            LifecycleFrame::ReplicaOutboundSetup { fd, replica_id }
+        link: ReplicaLinkId,
+        target: u16,
+    ) -> Result<(), SendError> {
+        self.ship_replica_fd(stream, target, "delegate_replica_outbound", |fd| {
+            LifecycleFrame::ReplicaOutboundSetup { fd, link }
         })
     }
 
-    /// Shared dup-and-ship leg of the two replica delegation paths: pick
-    /// the round-robin target, dup the fd, `try_send` the built setup
-    /// frame, drop the original stream so the target's dup keeps the
-    /// socket alive.
+    /// Ask `owner` to close `link`, a link of a torn down bundle. A dropped
+    /// request is counted and sent again by the next bundle refresh.
+    pub fn close_replica_link(&self, owner: u16, link: ReplicaLinkId) {
+        let Some(sender) = self.senders.get(usize::from(owner)) else {
+            self.metrics.record_frame_drop(
+                frame_drop_variant::REPLICA_LINK_CLOSE,
+                frame_drop_reason::UNROUTABLE,
+            );
+            return;
+        };
+        let frame = ShardFrame::lifecycle(LifecycleFrame::ReplicaLinkClose { link });
+        if let Err(e) = sender.try_send(frame) {
+            self.metrics.record_frame_drop(
+                frame_drop_variant::REPLICA_LINK_CLOSE,
+                classify_try_send_err(&e),
+            );
+        }
+    }
+
+    /// Shared dup-and-ship leg of the two replica delegation paths: dup
+    /// the fd, `try_send` the built setup frame to `target`, drop the
+    /// original stream so the target's dup keeps the socket alive.
     fn ship_replica_fd(
         &self,
         stream: TcpStream,
+        target: u16,
         label: &'static str,
         build_frame: impl FnOnce(fd_transfer::DupedFd) -> LifecycleFrame,
-    ) -> Result<u16, SendError> {
-        let target = self.next_replica_target();
+    ) -> Result<(), SendError> {
+        let Some(sender) = self.senders.get(usize::from(target)) else {
+            self.metrics.record_frame_drop(
+                frame_drop_variant::FD_TRANSFER,
+                frame_drop_reason::UNROUTABLE,
+            );
+            warn!(target, "{label}: no such shard");
+            return Err(SendError::RoutingFailed(target));
+        };
         let fd = fd_transfer::dup_fd(&stream).map_err(SendError::DupFailed)?;
 
         let setup = build_frame(fd);
-        if let Err(e) = self.senders[target as usize].try_send(ShardFrame::lifecycle(setup)) {
+        if let Err(e) = sender.try_send(ShardFrame::lifecycle(setup)) {
             // The frame (and the `DupedFd` inside) is returned in `e` and
             // dropped at end-of-block, which closes the dup. No explicit
             // `close_fd` needed.
@@ -268,7 +298,7 @@ impl ShardZeroCoordinator {
         // the socket open.
         drop(stream);
 
-        Ok(target)
+        Ok(())
     }
 
     /// Ship a client TCP connection to the next round-robin target shard.
@@ -455,6 +485,11 @@ mod tests {
     ];
     const SOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
     const BOOT_NONCE: u64 = 0x5eed_b007_c0de_f00d;
+    const LINK: ReplicaLinkId = ReplicaLinkId {
+        replica: 7,
+        link: 1,
+        epoch: 3,
+    };
 
     fn build_senders(total: u16) -> Rc<Vec<TaggedSender>> {
         let mut senders = Vec::with_capacity(total as usize);
@@ -506,8 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn replica_rr_default_skips_shard_zero() {
-        // Default config: replicas skip shard 0, clients include it.
+    fn client_rr_spans_every_shard_by_default() {
         let senders = build_senders(4);
         let coord = ShardZeroCoordinator::new(
             senders,
@@ -518,14 +552,6 @@ mod tests {
         )
         .expect("coord ctor ok");
 
-        // Replicas wrap over [1, 4).
-        assert_eq!(coord.next_replica_target(), 1);
-        assert_eq!(coord.next_replica_target(), 2);
-        assert_eq!(coord.next_replica_target(), 3);
-        assert_eq!(coord.next_replica_target(), 1);
-        assert_eq!(coord.next_replica_target(), 2);
-
-        // Clients span [0, 4).
         assert_eq!(coord.next_client_target(), 0);
         assert_eq!(coord.next_client_target(), 1);
         assert_eq!(coord.next_client_target(), 2);
@@ -534,36 +560,9 @@ mod tests {
     }
 
     #[test]
-    fn rr_includes_shard_zero_when_skip_flags_off() {
+    fn client_rr_skips_shard_zero_when_the_flag_is_on() {
         let senders = build_senders(4);
         let cfg = CoordinatorConfig {
-            skip_shard_zero_for_replicas: false,
-            skip_shard_zero_for_clients: false,
-        };
-        let coord = ShardZeroCoordinator::new(
-            senders,
-            4,
-            cfg,
-            crate::metrics::ShardMetrics::for_shard(),
-            BOOT_NONCE,
-        )
-        .expect("coord ctor ok");
-
-        assert_eq!(coord.next_replica_target(), 0);
-        assert_eq!(coord.next_replica_target(), 1);
-        assert_eq!(coord.next_replica_target(), 2);
-        assert_eq!(coord.next_replica_target(), 3);
-        assert_eq!(coord.next_replica_target(), 0);
-
-        assert_eq!(coord.next_client_target(), 0);
-        assert_eq!(coord.next_client_target(), 1);
-    }
-
-    #[test]
-    fn rr_skips_shard_zero_when_both_flags_on() {
-        let senders = build_senders(4);
-        let cfg = CoordinatorConfig {
-            skip_shard_zero_for_replicas: true,
             skip_shard_zero_for_clients: true,
         };
         let coord = ShardZeroCoordinator::new(
@@ -576,18 +575,15 @@ mod tests {
         .expect("coord ctor ok");
 
         for _ in 0..8 {
-            let r = coord.next_replica_target();
             let c = coord.next_client_target();
-            assert!((1..4).contains(&r), "replica target {r} must skip shard 0");
             assert!((1..4).contains(&c), "client target {c} must skip shard 0");
         }
     }
 
     #[test]
-    fn rr_single_shard_returns_zero_regardless_of_flags() {
+    fn client_rr_single_shard_returns_zero_regardless_of_the_flag() {
         let senders = build_senders(1);
         let cfg = CoordinatorConfig {
-            skip_shard_zero_for_replicas: true,
             skip_shard_zero_for_clients: true,
         };
         let coord = ShardZeroCoordinator::new(
@@ -599,7 +595,6 @@ mod tests {
         )
         .expect("coord ctor ok");
         for _ in 0..4 {
-            assert_eq!(coord.next_replica_target(), 0);
             assert_eq!(coord.next_client_target(), 0);
         }
     }
@@ -687,7 +682,7 @@ mod tests {
                 validate_checksum: true,
                 segment_size,
                 preallocate_segments: false,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );
@@ -803,19 +798,24 @@ mod tests {
         let client = TcpStream::connect(addr).await.unwrap();
         let (_server, _peer_addr) = accept.await.unwrap();
 
-        let target = coord
-            .delegate_replica_inbound(client, 42)
+        let target = 2;
+        let admission_deadline = Instant::now();
+        coord
+            .delegate_replica_inbound(client, LINK, target, 42, admission_deadline)
             .expect("delegate ok");
-        assert_eq!(
-            target, 1,
-            "first replica target skips shard 0 under default config",
-        );
 
         // Target shard should observe ReplicaInboundSetup echoing the slot.
-        let setup_frame = receivers[target as usize].recv().await.unwrap();
+        let setup_frame = receivers[usize::from(target)].recv().await.unwrap();
         match setup_frame {
-            ShardFrame::Lifecycle(LifecycleFrame::ReplicaInboundSetup { fd, slot }) => {
+            ShardFrame::Lifecycle(LifecycleFrame::ReplicaInboundSetup {
+                fd,
+                slot,
+                link,
+                deadline,
+            }) => {
                 assert_eq!(slot, 42);
+                assert_eq!(link, LINK);
+                assert_eq!(deadline, admission_deadline);
                 drop(fd);
             }
             _ => panic!("expected ReplicaInboundSetup on target shard"),
@@ -825,7 +825,7 @@ mod tests {
         // does not broadcast a mapping update, the shard-shared
         // owner table covers cross-shard routing.
         for (idx, rx) in receivers.iter().enumerate() {
-            if idx == target as usize {
+            if idx == usize::from(target) {
                 continue;
             }
             assert!(
@@ -837,7 +837,7 @@ mod tests {
 
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn delegate_replica_outbound_ships_setup_with_peer_id() {
+    async fn delegate_replica_outbound_ships_setup_with_link() {
         let (senders, receivers) = build_senders_with_rx(4);
         let coord = ShardZeroCoordinator::new(
             senders,
@@ -854,18 +854,61 @@ mod tests {
         let client = TcpStream::connect(addr).await.unwrap();
         let (_server, _peer_addr) = accept.await.unwrap();
 
-        let target = coord
-            .delegate_replica_outbound(client, 7)
+        coord
+            .delegate_replica_outbound(client, LINK, 3)
             .expect("delegate ok");
 
-        let setup_frame = receivers[target as usize].recv().await.unwrap();
+        let setup_frame = receivers[3].recv().await.unwrap();
         match setup_frame {
-            ShardFrame::Lifecycle(LifecycleFrame::ReplicaOutboundSetup { fd, replica_id }) => {
-                assert_eq!(replica_id, 7);
+            ShardFrame::Lifecycle(LifecycleFrame::ReplicaOutboundSetup { fd, link }) => {
+                assert_eq!(link, LINK);
                 drop(fd);
             }
             _ => panic!("expected ReplicaOutboundSetup on target shard"),
         }
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn delegate_replica_to_a_shard_the_node_lacks_is_refused() {
+        let (senders, receivers) = build_senders_with_rx(4);
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            4,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+            BOOT_NONCE,
+        )
+        .expect("coord ctor ok");
+        let (stream, _peer) = tcp_pair().await;
+
+        assert!(matches!(
+            coord.delegate_replica_outbound(stream, LINK, 4),
+            Err(SendError::RoutingFailed(4))
+        ));
+        assert!(receivers.iter().all(|rx| rx.try_recv().is_err()));
+    }
+
+    #[test]
+    fn close_replica_link_reaches_only_the_owner() {
+        let (senders, receivers) = build_senders_with_rx(4);
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            4,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+            BOOT_NONCE,
+        )
+        .expect("coord ctor ok");
+
+        coord.close_replica_link(2, LINK);
+        coord.close_replica_link(9, LINK);
+
+        assert!(matches!(
+            receivers[2].try_recv(),
+            Ok(ShardFrame::Lifecycle(LifecycleFrame::ReplicaLinkClose { link })) if link == LINK
+        ));
+        assert!(receivers.iter().all(|rx| rx.try_recv().is_err()));
     }
 
     #[compio::test]
@@ -963,7 +1006,6 @@ mod tests {
                     total_shards,
                     CoordinatorConfig {
                         skip_shard_zero_for_clients: skip_zero,
-                        ..CoordinatorConfig::default()
                     },
                     crate::metrics::ShardMetrics::for_shard(),
                     BOOT_NONCE,
@@ -1017,7 +1059,10 @@ mod tests {
                 if !disconnected {
                     while senders[1]
                         .try_send(ShardFrame::lifecycle(
-                            LifecycleFrame::ReplicaInboundHandshakeDone { slot: 0 },
+                            LifecycleFrame::ReplicaInboundHandshakeDone {
+                                slot: 0,
+                                link: LINK,
+                            },
                         ))
                         .is_ok()
                     {}
@@ -1033,7 +1078,6 @@ mod tests {
                     2,
                     CoordinatorConfig {
                         skip_shard_zero_for_clients: true,
-                        ..CoordinatorConfig::default()
                     },
                     crate::metrics::ShardMetrics::for_shard(),
                     BOOT_NONCE,

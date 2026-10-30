@@ -28,7 +28,6 @@ stream = "example_stream"
 topics = ["example_topic"]
 schema = "json"
 batch_length = 1000
-poll_interval = "5ms"
 consumer_group = "bigquery_sink_connector"
 
 [plugin_config]

@@ -30,7 +30,8 @@ public static class UsersFactory
         return new CreateUserRequest(username ?? Utility.RandomString(Random.Shared.Next(5, 25)),
             password ?? Utility.RandomString(Random.Shared.Next(5, 25)),
             UserStatus.Active,
-            permissions ?? CreatePermissions());
+            permissions ?? CreatePermissions(),
+            null);
     }
 
     internal static Dictionary<uint, StreamPermissions> CreateStreamPermissions(uint streamId = 1, uint topicId = 1)

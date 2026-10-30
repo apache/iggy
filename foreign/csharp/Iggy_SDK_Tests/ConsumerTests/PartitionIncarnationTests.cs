@@ -33,7 +33,7 @@ namespace Apache.Iggy.Tests.ConsumerTests;
 ///     0, so the consumer has to deliver its messages even below the last offset the old incarnation delivered,
 ///     and must never commit an offset of the old incarnation into it.
 /// </summary>
-public sealed class PartitionIncarnationTests
+public sealed partial class PartitionIncarnationTests
 {
     private const uint PartitionId = 3;
     private const ulong OriginalOffset = 100;
@@ -63,7 +63,7 @@ public sealed class PartitionIncarnationTests
 
         Assert.DoesNotContain((OriginalOffset, Recreated), stores);
         Assert.Equal(0ul, Assert.IsType<ReceivedMessage>(delivered).CurrentOffset);
-        Assert.Equal([(OriginalOffset, Original)], stores);
+        Assert.Equal([(OriginalOffset, Original)], stores.ToArray());
     }
 
     [Fact]
@@ -90,7 +90,7 @@ public sealed class PartitionIncarnationTests
 
         Assert.DoesNotContain((OriginalOffset, Recreated), stores);
         Assert.Equal(0ul, Assert.IsType<ReceivedRentedMessage>(delivered).CurrentOffset);
-        Assert.Equal([(OriginalOffset, Original)], stores);
+        Assert.Equal([(OriginalOffset, Original)], stores.ToArray());
     }
 
     [Fact]
@@ -117,7 +117,7 @@ public sealed class PartitionIncarnationTests
         await consumer.StoreOffsetAsync(early.CurrentOffset, early.PartitionId, early.Context,
             TestContext.Current.CancellationToken);
 
-        Assert.Equal([(OriginalOffset, Original)], stores);
+        Assert.Equal([(OriginalOffset, Original)], stores.ToArray());
     }
 
     public enum OffsetMutation

@@ -29,8 +29,8 @@ use kafka_protocol::protocol::StrBytes;
 use crate::error::Result;
 use crate::group::{JoinRequest, JoinResult};
 use crate::protocol::api::{
-    API_KEY_JOIN_GROUP, ApiVersionRange, ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION,
-    GatewayState, HandleOutcome, is_supported_version,
+    API_KEY_JOIN_GROUP, ApiVersionRange, ConnectionState, ERROR_INVALID_REQUEST,
+    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, is_supported_version,
 };
 use crate::protocol::bounds_guard::validate_join_group_shape;
 use crate::protocol::handlers::{
@@ -48,7 +48,12 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 /// rejects, so an error response carries an empty name instead.
 const FIRST_NULLABLE_PROTOCOL_NAME_VERSION: i16 = 7;
 
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     if !is_supported_version(API_KEY_JOIN_GROUP, api_version) {
         return unsupported_version_response(API_KEY_JOIN_GROUP, api_version, |version| {
             encode_error_response(version, ERROR_UNSUPPORTED_VERSION)
@@ -71,7 +76,11 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         tracing::debug!(%reason, "JoinGroup rejoin reason");
     }
 
-    let join_request = JoinRequest::from((api_version, &request));
+    let join_request = JoinRequest {
+        client_id: connection.client_id(),
+        client_host: connection.client_host(),
+        ..JoinRequest::from((api_version, &request))
+    };
     // The join can park for a whole rebalance timeout, and the decoded request is a view into
     // the frame it arrived in.
     drop(request);
@@ -100,8 +109,9 @@ pub fn encode_response(version: i16, result: &JoinResult) -> Result<Bytes> {
         (None, _) => Some(StrBytes::new()),
     };
 
-    // `skip_assignment` stays at its `false` default: the encoder bails on `true` below v9.
+    // Set only for a v9+ request: the encoder bails on `true` below v9.
     let response = JoinGroupResponse::default()
+        .with_skip_assignment(result.skip_assignment)
         .with_error_code(result.error)
         .with_generation_id(result.generation_id)
         .with_protocol_type(result.protocol_type.clone())
@@ -152,6 +162,7 @@ mod tests {
             leader: StrBytes::from_static_str("m-1"),
             member_id: StrBytes::from_static_str("m-1"),
             members: Vec::new(),
+            skip_assignment: false,
         };
         assert!(encode_response(9, &result).is_ok());
     }

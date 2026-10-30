@@ -32,17 +32,25 @@ use iggy::prelude::*;
 use iggy_binary_protocol::WireEncode;
 use iggy_binary_protocol::codes::*;
 use iggy_binary_protocol::dispatch::COMMAND_TABLE;
-use iggy_binary_protocol::requests::messages::GetPartitionRouteRequest;
+use iggy_binary_protocol::requests::messages::{
+    DeferredPollMessagesRequest, GetPartitionRouteRequest, PollMessagesRequest,
+    WaitForMessagesRequest, WaitForMessagesTarget,
+};
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::{ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireName};
-use iggy_common::VsrSessionControl;
-use iggy_common::wire_conversions::identifier_to_wire;
+use iggy_common::wire_conversions::{
+    consumer_to_wire, identifier_to_wire, polling_strategy_to_wire,
+};
+use iggy_common::{MetadataChangeGroups, VsrSessionControl};
 use integration::harness::{TestHarness, login_root};
 
 const STREAM_NAME: &str = "auth-test-stream";
 const TOPIC_NAME: &str = "auth-test-topic";
 const INVALID_BIND_SECRET: [u8; 32] = [0; 32];
+const METADATA_READER_USERNAME: &str = "auth-test-metadata-reader";
+const METADATA_SERVER_MANAGER_USERNAME: &str = "auth-test-metadata-manager";
+const METADATA_USER_PASSWORD: &str = "auth-test-secret";
 
 /// Shared test context with identifiers used across command tests.
 struct TestContext {
@@ -89,6 +97,7 @@ pub async fn run(harness: &TestHarness) {
     assert_eq!(identity.user_id, 0, "root user should have id 0");
     setup_test_resources(&client).await;
     verify_auth_works(&client).await;
+    verify_metadata_changes_need_manage_servers(harness, &client).await;
 
     // Phase 4: Logout and verify commands fail again
     client.logout_user().await.expect("logout should succeed");
@@ -155,6 +164,11 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
         ) {
             continue;
         }
+        // The SDK refuses a raw cancel, because a cancel names a parked
+        // request by its id. The server `classify` test covers its auth gate.
+        if code == CANCEL_DEFERRED_REQUEST_CODE {
+            continue;
+        }
         // Special setup required
         if matches!(
             code,
@@ -175,6 +189,10 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
             GET_CLUSTER_METADATA_CODE => client.get_cluster_metadata().await.map(|_| ()),
             DESCRIBE_OPTIONS_CODE => client
                 .describe_options(OptionsScope::Topic)
+                .await
+                .map(|_| ()),
+            GET_METADATA_CHANGES_CODE => client
+                .get_metadata_changes(&MetadataChangesQuery::default())
                 .await
                 .map(|_| ()),
             BIND_SESSION_CODE => client
@@ -198,15 +216,16 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
             GET_USER_CODE => client.get_user(&ctx.user_id).await.map(|_| ()),
             GET_USERS_CODE => client.get_users().await.map(|_| ()),
             CREATE_USER_CODE => client
-                .create_user("test", "test", UserStatus::Active, None)
+                .create_user(
+                    "test",
+                    "test",
+                    UserStatus::Active,
+                    None,
+                    &UserCreateOptions::default(),
+                )
                 .await
                 .map(|_| ()),
             DELETE_USER_CODE => client.delete_user(&ctx.user_id).await,
-            UPDATE_USER_CODE => {
-                client
-                    .update_user(&ctx.user_id, Some("x"), None, &UserUpdateOptions::default())
-                    .await
-            }
             UPDATE_PERMISSIONS_CODE => client.update_permissions(&ctx.user_id, None).await,
             CHANGE_PASSWORD_CODE => client.change_password(&ctx.user_id, "old", "new").await,
 
@@ -223,11 +242,20 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
             // Streams
             GET_STREAM_CODE => client.get_stream(&ctx.stream_id).await.map(|_| ()),
             GET_STREAMS_CODE => client.get_streams().await.map(|_| ()),
-            CREATE_STREAM_CODE => client.create_stream("x").await.map(|_| ()),
+            CREATE_STREAM_CODE => client
+                .create_stream("x", &StreamCreateOptions::default())
+                .await
+                .map(|_| ()),
             DELETE_STREAM_CODE => client.delete_stream(&ctx.stream_id).await,
-            UPDATE_STREAM_CODE => {
+            UPDATE_RESOURCE_CODE => {
                 client
-                    .update_stream(&ctx.stream_id, "x", &StreamUpdateOptions::default())
+                    .update_stream(
+                        &ctx.stream_id,
+                        &StreamUpdateOptions {
+                            name: Some("x".to_owned()),
+                            ..StreamUpdateOptions::default()
+                        },
+                    )
                     .await
             }
 
@@ -250,16 +278,6 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
                 .await
                 .map(|_| ()),
             DELETE_TOPIC_CODE => client.delete_topic(&ctx.stream_id, &ctx.topic_id).await,
-            UPDATE_TOPIC_CODE => {
-                client
-                    .update_topic(
-                        &ctx.stream_id,
-                        &ctx.topic_id,
-                        "x",
-                        &TopicUpdateOptions::default(),
-                    )
-                    .await
-            }
 
             // Partitions
             CREATE_PARTITIONS_CODE => {
@@ -315,6 +333,39 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
                 )
                 .await
                 .map(|_| ()),
+            POLL_MESSAGES_DEFERRED_CODE => {
+                let options = DeferredPollOptions::default();
+                let request = DeferredPollMessagesRequest {
+                    poll: poll_request(&ctx),
+                    wait_us: options.max_wait.as_micros(),
+                    min_count: options.min_count,
+                    max_bytes: options.max_bytes,
+                    request_timeout_us: options.request_timeout.as_micros(),
+                };
+                client
+                    .send_binary_request(code, request.to_bytes())
+                    .await
+                    .map(|_| ())
+            }
+            WAIT_FOR_MESSAGES_CODE => {
+                let options = DeferredPollOptions::default();
+                let poll = poll_request(&ctx);
+                let request = WaitForMessagesRequest {
+                    consumer: poll.consumer,
+                    stream_id: poll.stream_id,
+                    topic_id: poll.topic_id,
+                    wait_us: options.max_wait.as_micros(),
+                    request_timeout_us: options.request_timeout.as_micros(),
+                    partitions: vec![WaitForMessagesTarget {
+                        partition_id: 0,
+                        strategy: poll.strategy,
+                    }],
+                };
+                client
+                    .send_binary_request(code, request.to_bytes())
+                    .await
+                    .map(|_| ())
+            }
             // Consumer Offsets
             GET_CONSUMER_OFFSET_CODE => client
                 .get_consumer_offset(&ctx.consumer, &ctx.stream_id, &ctx.topic_id, Some(0))
@@ -354,6 +405,18 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
         };
 
         assert_unauthenticated(result, name);
+    }
+}
+
+fn poll_request(ctx: &TestContext) -> PollMessagesRequest {
+    PollMessagesRequest {
+        consumer: consumer_to_wire(&ctx.consumer).unwrap(),
+        stream_id: identifier_to_wire(&ctx.stream_id).unwrap(),
+        topic_id: identifier_to_wire(&ctx.topic_id).unwrap(),
+        partition_id: Some(0),
+        strategy: polling_strategy_to_wire(&PollingStrategy::offset(0)),
+        count: 1,
+        auto_commit: true,
     }
 }
 
@@ -427,9 +490,81 @@ async fn verify_auth_works(client: &IggyClient) {
     client.get_personal_access_tokens().await.expect("get_pats");
 }
 
+/// Reading metadata changes needs `manage_servers`, whatever groups are asked
+/// for and however the scan starts.
+async fn verify_metadata_changes_need_manage_servers(harness: &TestHarness, root: &IggyClient) {
+    let mut queries = vec![
+        MetadataChangesQuery::default(),
+        MetadataChangesQuery {
+            start: MetadataChangeStart::Latest,
+            ..MetadataChangesQuery::default()
+        },
+        MetadataChangesQuery {
+            start: MetadataChangeStart::Current(None),
+            ..MetadataChangesQuery::default()
+        },
+    ];
+    queries.extend(
+        MetadataChangeGroups::all()
+            .iter()
+            .map(|group| MetadataChangesQuery {
+                groups: vec![group],
+                ..MetadataChangesQuery::default()
+            }),
+    );
+    for (username, manage_servers) in [
+        (METADATA_READER_USERNAME, false),
+        (METADATA_SERVER_MANAGER_USERNAME, true),
+    ] {
+        root.create_user(
+            username,
+            METADATA_USER_PASSWORD,
+            UserStatus::Active,
+            Some(Permissions {
+                global: GlobalPermissions {
+                    manage_servers,
+                    read_servers: true,
+                    read_streams: true,
+                    read_users: true,
+                    ..GlobalPermissions::default()
+                },
+                streams: None,
+            }),
+            &UserCreateOptions::default(),
+        )
+        .await
+        .expect("create metadata user");
+        let client = create_client(harness).await;
+        client
+            .login_user(username, METADATA_USER_PASSWORD)
+            .await
+            .expect("metadata user login");
+        for query in &queries {
+            let result = client.get_metadata_changes(query).await;
+            if manage_servers {
+                result.expect("manage_servers reads metadata changes");
+            } else {
+                let error = result.expect_err("reading metadata changes needs manage_servers");
+                assert_eq!(
+                    error.as_code(),
+                    IggyError::Unauthorized.as_code(),
+                    "{query:?}"
+                );
+            }
+        }
+        client.logout_user().await.expect("metadata user logout");
+        root.delete_user(&Identifier::named(username).unwrap())
+            .await
+            .expect("delete metadata user");
+    }
+    root.get_metadata_changes(&MetadataChangesQuery::default())
+        .await
+        .expect("root reads metadata changes");
+}
+
 async fn setup_test_resources(client: &IggyClient) {
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     client

@@ -48,12 +48,53 @@ __all__ = [
     "IdentityInfo",
     "IggyClient",
     "IggyConsumer",
+    "IggyError",
     "IggyExpiry",
     "IggyProducer",
     "MaxTopicSize",
+    "MetadataChangeCursor",
+    "MetadataChangeGroup",
+    "MetadataChangeKind",
+    "MetadataChangePhase",
+    "MetadataChangeRecord",
+    "MetadataChangeStart",
+    "MetadataChangeStatus",
+    "MetadataChanges",
+    "MetadataConsumerGroupCreated",
+    "MetadataConsumerGroupDeleted",
+    "MetadataConsumerGroupItem",
+    "MetadataCurrentItem",
+    "MetadataCurrentPageToken",
+    "MetadataMemberItem",
+    "MetadataMemberJoined",
+    "MetadataMemberLeft",
+    "MetadataMemberLeftReason",
+    "MetadataPartitionHandedOver",
+    "MetadataPartitionsChanged",
+    "MetadataPartitionsItem",
+    "MetadataPermissionsUpdatedReason",
+    "MetadataSession",
+    "MetadataSessionClosed",
+    "MetadataSessionClosedReason",
+    "MetadataStreamChange",
+    "MetadataStreamDeleted",
+    "MetadataTokenChange",
+    "MetadataTokenDeleted",
+    "MetadataTokenDeletedReason",
+    "MetadataTopicChange",
+    "MetadataTopicDeleted",
+    "MetadataTopicItem",
+    "MetadataUnknownChange",
+    "MetadataUnknownItem",
+    "MetadataUserChange",
+    "MetadataUserIdentity",
+    "MetadataUserPermissionsUpdated",
+    "OptionError",
+    "OptionKey",
     "OptionSpec",
     "Partition",
     "PartitionContext",
+    "PartitionResizePolicy",
     "Partitioning",
     "PendingOperationError",
     "PendingOperationsConfig",
@@ -70,20 +111,24 @@ __all__ = [
     "Stats",
     "Stream",
     "StreamDetails",
+    "StreamOptions",
     "StreamPermissions",
     "TcpConfig",
     "TcpReconnectionConfig",
     "TokenInfo",
     "Topic",
     "TopicDetails",
+    "TopicOptions",
     "TopicPermissions",
     "UserHeaders",
     "UserInfo",
     "UserInfoDetails",
+    "UserOptions",
     "UserStatus",
     "WebSocketConfig",
     "WebSocketFramingConfig",
     "WebSocketReconnectionConfig",
+    "encryption_key_fingerprint",
 ]
 
 class AutoCommit:
@@ -1236,6 +1281,41 @@ class IggyClient:
             ValueError: If the scope name is not one of the three above.
             RuntimeError: If the request fails.
         """
+    def get_metadata_changes(
+        self,
+        start: MetadataChangeStart,
+        *,
+        groups: builtins.list[MetadataChangeGroup] | None = None,
+        since: builtins.int | None = None,
+        until: builtins.int | None = None,
+        limit: builtins.int | None = None,
+    ) -> collections.abc.Awaitable[MetadataChanges]:
+        r"""
+        Reads one page of the metadata change log, or of the current state.
+
+        Requires root or the global `manage_servers` permission. Keep the
+        page's `next` cursor and send it back in `MetadataChangeStart.After`.
+
+        Args:
+            start: Where to start, as `MetadataChangeStart`.
+            groups: The groups to read as `list[MetadataChangeGroup] | None`.
+                `None` or an empty list reads every group. A current state scan
+                needs the parent groups of each group, for example `Topics`
+                with `Streams`.
+            since: Keep records prepared at or after this Unix time in
+                microseconds. Only with `Earliest` and `After`.
+            until: Keep records prepared at or before this Unix time in
+                microseconds. Only with `Earliest` and `After`.
+            limit: Records or items per page, 1 to 1000. Defaults to 100.
+
+        Returns:
+            An awaitable that resolves to `MetadataChanges`.
+
+        Raises:
+            IggyError: With the invalid command code before anything is sent
+                when the query is refused, or when the request fails. A user
+                without the permission gets the unauthorized code.
+        """
     def login_user(
         self, username: builtins.str, password: builtins.str
     ) -> collections.abc.Awaitable[IdentityInfo]:
@@ -1297,6 +1377,7 @@ class IggyClient:
         password: builtins.str,
         status: UserStatus | None = None,
         permissions: Permissions | None = None,
+        options: UserOptions | None = None,
     ) -> collections.abc.Awaitable[UserInfoDetails]:
         r"""
         Create a new user.
@@ -1306,6 +1387,7 @@ class IggyClient:
             password: Password as `str`.
             status: User status as `UserStatus | None`; defaults to `UserStatus.Active`.
             permissions: Permissions as `Permissions | None`; the user has none when `None`.
+            options: User options as `UserOptions | None`.
 
         Returns:
             An awaitable that resolves to the created `UserInfoDetails`.
@@ -1318,25 +1400,41 @@ class IggyClient:
         user_id: builtins.str | builtins.int,
         username: builtins.str | None = None,
         status: UserStatus | None = None,
+        reset: builtins.list[OptionKey] | None = None,
         options: builtins.dict[builtins.str, builtins.str] | None = None,
+        raw_reset: builtins.list[builtins.str] | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update a user by unique ID or username.
+
+        A patch: only the fields passed change, every other setting keeps its
+        value. Renaming the user this client is signed in as also updates the
+        credentials a reconnect replays.
 
         Args:
             user_id: User identifier as `str | int`.
             username: New username as `str | None`; unchanged when `None`.
             status: New status as `UserStatus | None`; unchanged when `None`.
-            options: Reserved for future use. Additional option keys as
-                `dict[str, str] | None`, forwarded to the server. No user update
-                option key exists yet, so a current server rejects every key.
+                Deactivating a user ends its sessions.
+            reset: Keys to return to their defaults as `list[OptionKey] | None`.
+                No user key is resettable yet, so any key is refused.
+            options: Additional option keys as `dict[str, str] | None`,
+                forwarded to the server. No other user key exists yet, so a
+                current server rejects every key.
+            raw_reset: Additional reset names as `list[str] | None`, sent
+                verbatim so a key newer than this build can be reset. The
+                server decides them.
 
         Returns:
             An awaitable that resolves to `None` when the user is updated.
 
         Raises:
             ValueError: If a string identifier is invalid.
-            RuntimeError: If the request fails.
+            OptionError: A `RuntimeError` carrying the error `code` and
+                `kind` when the client or the server refuses an option.
+            RuntimeError: Before anything is sent, if the update changes
+                nothing, names a key both set and reset, or resets a key that
+                cannot be reset. Otherwise if the request fails.
         """
     def delete_user(
         self, user_id: builtins.str | builtins.int
@@ -1455,10 +1553,26 @@ class IggyClient:
         Raises:
             RuntimeError: If the client cannot be shut down.
         """
-    def create_stream(self, name: builtins.str) -> collections.abc.Awaitable[None]:
+    def create_stream(
+        self, name: builtins.str, options: StreamOptions | None = None
+    ) -> collections.abc.Awaitable[StreamDetails]:
         r"""
-        Creates a new stream with the provided ID and name.
-        Raises `RuntimeError` if the stream cannot be created.
+        Create a new stream.
+
+        On a server with encryption enabled every stream is stored under its
+        own key: the one `options` carries, or one the server generates. The
+        returned details report only the key's source and fingerprints.
+
+        Args:
+            name: Stream name as `str`, between 1 and 255 UTF-8 bytes.
+            options: Stream options as `StreamOptions | None`.
+
+        Returns:
+            An awaitable that resolves to the created `StreamDetails`.
+
+        Raises:
+            RuntimeError: If the stream cannot be created, for example when
+                `options` carries a key and the server has no encryption key.
         """
     def get_stream(
         self, stream_id: builtins.str | builtins.int
@@ -1482,23 +1596,32 @@ class IggyClient:
     def update_stream(
         self,
         stream_id: builtins.str | builtins.int,
-        name: builtins.str,
+        name: builtins.str | None = None,
+        reset: builtins.list[OptionKey] | None = None,
         options: builtins.dict[builtins.str, builtins.str] | None = None,
+        raw_reset: builtins.list[builtins.str] | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
-        Rename a stream selected by name or numeric ID.
+        Update a stream selected by name or numeric ID.
 
-        `stream_id` accepts a stream name as `str` or numeric ID as `int`. A
-        decimal-only string is interpreted as a numeric ID. `name` must be unique
-        and contain between 1 and 255 UTF-8 bytes. Renaming a stream to its current
-        name succeeds without changing it.
+        A patch: only the fields passed change. The stream keeps its id, its
+        encryption key and its data. `stream_id` accepts a stream name as `str`
+        or numeric ID as `int`. A decimal-only string is interpreted as a
+        numeric ID. Renaming a stream to its current name succeeds without
+        changing it.
 
         Args:
             stream_id: Stream identifier as `str | int`.
-            name: New stream name as `str`.
+            name: New stream name as `str | None`, unique and between 1 and 255
+                UTF-8 bytes, unchanged when `None`.
+            reset: Keys to return to their defaults as `list[OptionKey] | None`.
+                No stream key is resettable, so any key is refused.
             options: Additional option keys as `dict[str, str] | None`, forwarded
                 to the server. Current server versions reject all stream update
                 option keys.
+            raw_reset: Additional reset names as `list[str] | None`, sent
+                verbatim so a key newer than this build can be reset. The
+                server decides them.
 
         Returns:
             None.
@@ -1507,10 +1630,14 @@ class IggyClient:
             TypeError: If `stream_id` is not `str` or an integer in
                 `0..=2**32 - 1`, or `name` is not `str`.
             ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
-            RuntimeError: If the client is not authenticated, the user lacks global
-                `manage_streams` or per-stream `manage_stream` permission, the
-                stream does not exist, the new name is invalid or already used, or
-                the request fails.
+            OptionError: A `RuntimeError` carrying the error `code` and
+                `kind` when the client or the server refuses an option.
+            RuntimeError: Before anything is sent, if the update changes
+                nothing, the name does not fit, or a reset key cannot be reset.
+                Otherwise if the client is not authenticated, the user lacks
+                global `manage_streams` or per-stream `manage_stream` permission,
+                the stream does not exist, the new name is already used, or the
+                request fails.
         """
     def delete_stream(
         self, stream_id: builtins.str | builtins.int
@@ -1537,48 +1664,23 @@ class IggyClient:
         self,
         stream: builtins.str | builtins.int,
         name: builtins.str,
-        partitions_count: builtins.int,
-        compression_algorithm: builtins.str | None = None,
-        message_expiry: IggyExpiry | None = None,
-        max_topic_size: MaxTopicSize | None = None,
-        segment_size: builtins.int | None = None,
-        durability: Durability | None = None,
-        consumer_offset_durability: Durability | None = None,
-        messages_required_to_save: builtins.int | None = None,
-        size_of_messages_required_to_save: builtins.int | None = None,
-        preallocate_segments: builtins.bool | None = None,
-        options: builtins.dict[builtins.str, builtins.str] | None = None,
+        options: TopicOptions | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
-        Creates a new topic with the given parameters.
+        Creates a new topic.
 
         Args:
             stream: Stream identifier as `str | int`.
             name: Topic name as `str`.
-            partitions_count: Number of partitions as `int`, at most 1000.
-            compression_algorithm: Compression algorithm as `str | None`.
-            message_expiry: Message expiry as `IggyExpiry | None`.
-            max_topic_size: Maximum topic size as `MaxTopicSize | None`.
-            segment_size: Per-topic segment size in bytes as `int | None`.
-            durability: Message completion policy, defaulting to replicated.
-            consumer_offset_durability: Independent offset policy, defaulting to replicated.
-            messages_required_to_save: Message-count flush threshold as `int | None`.
-            size_of_messages_required_to_save: Byte flush threshold as `int | None`.
-            preallocate_segments: Reserve segment bytes on open as `bool | None`.
-            options: Additional option keys as `dict[str, str] | None`, sent
-                verbatim so a newer server key can be set from this build.
-                `{"partition_resize_policy": "fixed"}` makes the server reject
-                later partition creation and deletion on this topic.
-
-        Every option left as `None` resolves against the server default at
-        admission.
+            options: Topic options as `TopicOptions | None`. Without options the
+                topic gets one partition and every setting resolves against the
+                server default at admission.
 
         Returns:
             An awaitable that resolves to `None` when the topic is created.
 
         Raises:
-            ValueError: If `message_expiry` or `max_topic_size` is out of range.
-            PyRuntimeError: If another argument is invalid or the request fails.
+            RuntimeError: If an argument is invalid or the request fails.
         """
     def get_topic(
         self,
@@ -1609,36 +1711,50 @@ class IggyClient:
         self,
         stream_id: builtins.str | builtins.int,
         topic_id: builtins.str | builtins.int,
-        name: builtins.str,
-        compression_algorithm: builtins.str | None = None,
+        name: builtins.str | None = None,
         message_expiry: IggyExpiry | None = None,
         max_topic_size: MaxTopicSize | None = None,
+        reset: builtins.list[OptionKey] | None = None,
         options: builtins.dict[builtins.str, builtins.str] | None = None,
+        raw_reset: builtins.list[builtins.str] | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update an existing topic.
 
-        A patch, not a replacement: every setting rides the options block, so a
-        field left unset keeps the topic's current value rather than resetting
-        it to a server default.
+        A patch, not a replacement: only the fields passed change, every other
+        setting keeps its value. Settings fixed at creation, such as the
+        compression algorithm, have no field here.
 
         Args:
             stream_id: Stream identifier as `str | int`.
             topic_id: Topic identifier as `str | int`.
-            name: New topic name as `str`.
-            compression_algorithm: Compression algorithm as `str | None`.
-            message_expiry: Message expiry as `IggyExpiry | None`.
-            max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+            name: New topic name as `str | None`, unchanged when `None`.
+            message_expiry: Message expiry as `IggyExpiry | None`, unchanged
+                when `None`. `IggyExpiry.ServerDefault()` changes nothing either,
+                reset `OptionKey.MessageExpiry` to return to the default.
+            max_topic_size: Maximum topic size as `MaxTopicSize | None`,
+                unchanged when `None`. `MaxTopicSize.ServerDefault()` changes
+                nothing either, reset `OptionKey.MaxTopicSize` to return to the
+                default.
+            reset: Keys to return to their defaults as `list[OptionKey] | None`:
+                `OptionKey.MessageExpiry` or `OptionKey.MaxTopicSize`.
             options: Additional option keys as `dict[str, str] | None`, sent
                 verbatim so an updatable server key can be set from this build.
                 A create-only key is refused by name.
+            raw_reset: Additional reset names as `list[str] | None`, sent
+                verbatim so a key newer than this build can be reset. The
+                server decides them.
 
         Returns:
             An awaitable that resolves to `None` when the topic is updated.
 
         Raises:
             ValueError: If `message_expiry` or `max_topic_size` is out of range.
-            PyRuntimeError: If another argument is invalid or the request fails.
+            OptionError: A `RuntimeError` carrying the error `code` and
+                `kind` when the client or the server refuses an option.
+            RuntimeError: Before anything is sent, if the update changes
+                nothing, names a key both set and reset, the name does not fit,
+                or a reset key cannot be reset. Otherwise if the request fails.
         """
     def delete_topic(
         self,
@@ -1982,7 +2098,7 @@ class IggyClient:
         auto_commit: AutoCommit | None = None,
         create_consumer_group_if_not_exists: builtins.bool = True,
         auto_join_consumer_group: builtins.bool = True,
-        poll_interval: datetime.timedelta | None = None,
+        *,
         polling_retry_interval: datetime.timedelta | None = None,
         init_retries: builtins.int | None = None,
         init_retry_interval: datetime.timedelta | None = None,
@@ -1992,10 +2108,11 @@ class IggyClient:
         Creates a new consumer group consumer.
         `partition_id` is ignored for a consumer group: the member reads the partitions
         the server assigns to it.
+        `auto_commit` defaults to `AutoCommit.Disabled()`: the consumer stores no offset,
+        so store positions after processing, or each restart reads the same messages again.
         Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
-        `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
-        `AutoCommit` interval is negative, or if any of those except `poll_interval`
-        is zero.
+        `polling_retry_interval`, `init_retry_interval` or an `AutoCommit` interval
+        is negative or zero.
 
         Consumer groups are not available over HTTP. With `auto_join_consumer_group`
         left on, this call fails at the join with `Feature is unavailable`.
@@ -2024,6 +2141,31 @@ class IggyClient:
 
         Raises:
             RuntimeError: If the command cannot be sent or the server returns an error.
+        """
+    def send_binary_request_to_replica(
+        self, code: builtins.int, payload: builtins.bytes, replica_id: builtins.int
+    ) -> collections.abc.Awaitable[bytes]:
+        r"""
+        Send a command code with a payload to the replica with the given id and
+        return the raw response bytes.
+
+        The replica id is the one cluster metadata names for the node. Every
+        node answers non-replicated commands such as GetStats from its own
+        state. Replicated commands, polls, consumer-offset reads and
+        session-control codes are rejected client-side, and a replica id that
+        cluster metadata does not name fails. HTTP transport does not support
+        raw binary commands.
+
+        Args:
+            code: Command code as `int`.
+            payload: Request payload as `bytes`.
+            replica_id: Replica id as `int`, as cluster metadata names it.
+
+        Returns:
+            An awaitable that resolves to the raw response `bytes`.
+
+        Raises:
+            RuntimeError: If the command cannot be sent or the replica returns an error.
         """
 
 @typing.final
@@ -2135,6 +2277,14 @@ class IggyConsumer:
         next poll routes again.
         """
 
+class IggyError(builtins.RuntimeError):
+    r"""
+    An error of the Iggy SDK. `code` is the numeric Iggy error code, the same
+    code that every other Iggy SDK reports for it.
+    """
+    @property
+    def code(self) -> builtins.int: ...
+
 class IggyExpiry:
     r"""
     The expiry of the messages in a topic.
@@ -2160,7 +2310,7 @@ class IggyExpiry:
         microsecond count a `u64` can hold (about 584,542 years): those two
         values are reserved on the wire for `ServerDefault` and `NeverExpire`
         respectively, so a `duration` at either boundary raises `ValueError`
-        when passed to `create_topic`/`update_topic`. A negative `timedelta`
+        when passed to `TopicOptions`/`update_topic`. A negative `timedelta`
         also raises `ValueError`.
         """
 
@@ -2266,7 +2416,7 @@ class MaxTopicSize:
         an unsigned 64-bit integer: those two values are reserved on the wire
         for `ServerDefault` and `Unlimited` respectively, so a `Custom` size
         at either boundary raises `ValueError` when passed to
-        `create_topic`/`update_topic`.
+        `TopicOptions`/`update_topic`.
         """
 
         __match_args__ = ("bytes",)
@@ -2288,6 +2438,1104 @@ class MaxTopicSize:
     ...
 
 @typing.final
+class MetadataChangeCursor:
+    r"""
+    Position of the last change record a reader consumed or scanned. Send it
+    back in `MetadataChangeStart.After` to read the records after it.
+
+    `str()` gives its `mc1_` text, which `parse` reads back. The 128-bit
+    values are Python ints.
+    """
+    @property
+    def log_id(self) -> builtins.int:
+        r"""
+        Prepare checksum of op 1, which names the history the cursor belongs to.
+        """
+    @property
+    def op(self) -> builtins.int:
+        r"""
+        The operation of the last record, 0 before the first record.
+        """
+    @property
+    def checksum(self) -> builtins.int:
+        r"""
+        Prepare checksum of `op`.
+        """
+    @property
+    def ordinal(self) -> builtins.int:
+        r"""
+        Position of the record within `op`.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __hash__(self) -> builtins.int: ...
+    def __new__(
+        cls,
+        log_id: builtins.int,
+        op: builtins.int,
+        checksum: builtins.int,
+        ordinal: builtins.int,
+    ) -> MetadataChangeCursor: ...
+    @staticmethod
+    def parse(text: builtins.str) -> MetadataChangeCursor:
+        r"""
+        Reads a cursor from its `mc1_` text.
+
+        Raises:
+            ValueError: If the text is not a canonical cursor.
+        """
+    def __str__(self) -> builtins.str: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataChangeGroup:
+    r"""
+    Family of change records and the unit of filtering. `str()` gives the
+    name the HTTP API uses.
+    """
+
+    Streams: typing.ClassVar[MetadataChangeGroup]
+    Topics: typing.ClassVar[MetadataChangeGroup]
+    Partitions: typing.ClassVar[MetadataChangeGroup]
+    ConsumerGroups: typing.ClassVar[MetadataChangeGroup]
+    ConsumerGroupMembers: typing.ClassVar[MetadataChangeGroup]
+    Users: typing.ClassVar[MetadataChangeGroup]
+    PersonalAccessTokens: typing.ClassVar[MetadataChangeGroup]
+    Sessions: typing.ClassVar[MetadataChangeGroup]
+    def __str__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataChangeKind:
+    r"""
+    Kind of a change record. `str()` gives the name the HTTP API uses.
+    """
+
+    StreamCreated: typing.ClassVar[MetadataChangeKind]
+    StreamUpdated: typing.ClassVar[MetadataChangeKind]
+    StreamDeleted: typing.ClassVar[MetadataChangeKind]
+    TopicCreated: typing.ClassVar[MetadataChangeKind]
+    TopicUpdated: typing.ClassVar[MetadataChangeKind]
+    TopicDeleted: typing.ClassVar[MetadataChangeKind]
+    PartitionsChanged: typing.ClassVar[MetadataChangeKind]
+    ConsumerGroupCreated: typing.ClassVar[MetadataChangeKind]
+    ConsumerGroupDeleted: typing.ClassVar[MetadataChangeKind]
+    ConsumerGroupMemberJoined: typing.ClassVar[MetadataChangeKind]
+    ConsumerGroupMemberLeft: typing.ClassVar[MetadataChangeKind]
+    ConsumerGroupPartitionHandedOver: typing.ClassVar[MetadataChangeKind]
+    UserCreated: typing.ClassVar[MetadataChangeKind]
+    UserUpdated: typing.ClassVar[MetadataChangeKind]
+    UserDeleted: typing.ClassVar[MetadataChangeKind]
+    UserPasswordChanged: typing.ClassVar[MetadataChangeKind]
+    UserPermissionsUpdated: typing.ClassVar[MetadataChangeKind]
+    PersonalAccessTokenCreated: typing.ClassVar[MetadataChangeKind]
+    PersonalAccessTokenDeleted: typing.ClassVar[MetadataChangeKind]
+    SessionRegistered: typing.ClassVar[MetadataChangeKind]
+    SessionClosed: typing.ClassVar[MetadataChangeKind]
+    def __str__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataChangePhase:
+    r"""
+    Whether a page carries change records or current state items.
+    """
+
+    Changes: typing.ClassVar[MetadataChangePhase]
+    Current: typing.ClassVar[MetadataChangePhase]
+    def __str__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataChangeRecord:
+    r"""
+    One change record: the committed operation that produced it, its position
+    within that operation and the typed body of what is true after it.
+    """
+    @property
+    def op(self) -> builtins.int:
+        r"""
+        The metadata operation that produced the record.
+        """
+    @property
+    def ordinal(self) -> builtins.int:
+        r"""
+        Position of the record within `op`.
+        """
+    @property
+    def checksum(self) -> builtins.int:
+        r"""
+        Prepare checksum of `op`.
+        """
+    @property
+    def timestamp(self) -> builtins.int:
+        r"""
+        Prepare timestamp of `op` in microseconds.
+        """
+    @property
+    def actor_user_id(self) -> builtins.int | None:
+        r"""
+        The acting user, `None` for server actions.
+        """
+    @property
+    def group(self) -> MetadataChangeGroup | None:
+        r"""
+        The group, `None` for a record this build does not know.
+        """
+    @property
+    def kind(self) -> MetadataChangeKind | None:
+        r"""
+        The kind, `None` for a record this build does not know.
+        """
+    @property
+    def change(
+        self,
+    ) -> (
+        MetadataStreamChange
+        | MetadataStreamDeleted
+        | MetadataTopicChange
+        | MetadataTopicDeleted
+        | MetadataPartitionsChanged
+        | MetadataConsumerGroupCreated
+        | MetadataConsumerGroupDeleted
+        | MetadataMemberJoined
+        | MetadataMemberLeft
+        | MetadataPartitionHandedOver
+        | MetadataUserChange
+        | MetadataUserIdentity
+        | MetadataUserPermissionsUpdated
+        | MetadataTokenChange
+        | MetadataTokenDeleted
+        | MetadataSession
+        | MetadataSessionClosed
+        | MetadataUnknownChange
+    ):
+        r"""
+        The typed body `kind` names, or `MetadataUnknownChange`.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+class MetadataChangeStart:
+    r"""
+    Where `get_metadata_changes` starts reading.
+    """
+    @typing.final
+    class Earliest(MetadataChangeStart):
+        r"""
+        The oldest operation the requested groups still hold completely.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> MetadataChangeStart.Earliest: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    @typing.final
+    class Latest(MetadataChangeStart):
+        r"""
+        No records, only a cursor at the newest retained record.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> MetadataChangeStart.Latest: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    @typing.final
+    class After(MetadataChangeStart):
+        r"""
+        The records after `cursor`.
+        """
+
+        __match_args__ = ("cursor",)
+        @property
+        def cursor(self) -> MetadataChangeCursor: ...
+        def __new__(cls, cursor: MetadataChangeCursor) -> MetadataChangeStart.After: ...
+
+    @typing.final
+    class Current(MetadataChangeStart):
+        r"""
+        Current state pages: `None` starts a scan, a token continues it.
+        """
+
+        __match_args__ = ("page_token",)
+        @property
+        def page_token(self) -> MetadataCurrentPageToken | None: ...
+        def __new__(
+            cls, page_token: MetadataCurrentPageToken | None = None
+        ) -> MetadataChangeStart.Current: ...
+
+    ...
+
+@typing.final
+class MetadataChangeStatus:
+    r"""
+    Outcome of a change log query.
+    """
+
+    Ok: typing.ClassVar[MetadataChangeStatus]
+    r"""
+    Records or items after the requested position. Apply them and keep
+    `next`.
+    """
+    Behind: typing.ClassVar[MetadataChangeStatus]
+    r"""
+    The answering node has not applied the requested position yet. Ask
+    again later or ask another node.
+    """
+    Expired: typing.ClassVar[MetadataChangeStatus]
+    r"""
+    The node no longer holds every record after the position. Rebuild
+    from current state.
+    """
+    Reset: typing.ClassVar[MetadataChangeStatus]
+    r"""
+    The position belongs to another history. Rebuild from current state.
+    """
+    def __str__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataChanges:
+    r"""
+    One page of the metadata change log, or of the current state, as
+    `IggyClient.get_metadata_changes` returns it.
+
+    The page is converted once: `records` and `items` hand back the same
+    objects on every access.
+    """
+    @property
+    def log_id(self) -> builtins.int | None:
+        r"""
+        This node's log id, or `None` before it applied op 1.
+        """
+    @property
+    def oldest_op(self) -> builtins.int:
+        r"""
+        Lowest whole operation from which the requested groups are complete.
+        """
+    @property
+    def retained_since(self) -> builtins.int:
+        r"""
+        The requested groups are complete for every timestamp above this
+        value in microseconds, 0 when nothing was evicted.
+        """
+    @property
+    def head_op(self) -> builtins.int:
+        r"""
+        Highest metadata operation the answering node applied.
+        """
+    @property
+    def has_more(self) -> builtins.bool:
+        r"""
+        More entries remain after `next`, or another state page exists.
+        """
+    @property
+    def status(self) -> MetadataChangeStatus: ...
+    @property
+    def phase(self) -> MetadataChangePhase:
+        r"""
+        `Changes` for `Earliest`, `Latest` and `After`, `Current` for state
+        pages.
+        """
+    @property
+    def next(self) -> MetadataChangeCursor | None:
+        r"""
+        The cursor to send back. Present on `Ok`, echoed on `Behind`, `None`
+        on `Expired` and `Reset`. The last state page returns the anchor to
+        follow from.
+        """
+    @property
+    def records(self) -> builtins.list[MetadataChangeRecord]:
+        r"""
+        Change records in `(op, ordinal)` order, empty on state pages.
+        """
+    @property
+    def items(self) -> builtins.list[MetadataCurrentItem]:
+        r"""
+        Current state items, empty on change pages.
+        """
+    @property
+    def current_page_token(self) -> MetadataCurrentPageToken | None:
+        r"""
+        Continuation of a current state scan, `None` once it is complete.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataConsumerGroupCreated:
+    r"""
+    A created consumer group with the topic's resulting group count.
+    """
+    @property
+    def stream_id(self) -> builtins.int: ...
+    @property
+    def stream_created_op(self) -> builtins.int: ...
+    @property
+    def topic_id(self) -> builtins.int: ...
+    @property
+    def topic_created_op(self) -> builtins.int: ...
+    @property
+    def group_id(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def consumer_groups_count(self) -> builtins.int: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataConsumerGroupDeleted:
+    r"""
+    A removed consumer group with the topic's resulting group count.
+    """
+    @property
+    def stream_id(self) -> builtins.int: ...
+    @property
+    def stream_created_op(self) -> builtins.int: ...
+    @property
+    def topic_id(self) -> builtins.int: ...
+    @property
+    def topic_created_op(self) -> builtins.int: ...
+    @property
+    def group_id(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def consumer_groups_count(self) -> builtins.int: ...
+    @property
+    def requested_op(self) -> builtins.int | None:
+        r"""
+        The operation of the delete request when the delete completed later.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataConsumerGroupItem:
+    r"""
+    A `consumer_groups` current state item.
+    """
+    @property
+    def stream_id(self) -> builtins.int: ...
+    @property
+    def stream_created_op(self) -> builtins.int: ...
+    @property
+    def topic_id(self) -> builtins.int: ...
+    @property
+    def topic_created_op(self) -> builtins.int: ...
+    @property
+    def group_id(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataCurrentItem:
+    r"""
+    One current state item of a `MetadataChangeStart.Current` page.
+    """
+    @property
+    def group(self) -> MetadataChangeGroup | None:
+        r"""
+        The group, `None` for an item this build does not know.
+        """
+    @property
+    def body(
+        self,
+    ) -> (
+        MetadataStreamChange
+        | MetadataTopicItem
+        | MetadataPartitionsItem
+        | MetadataConsumerGroupItem
+        | MetadataMemberItem
+        | MetadataUserChange
+        | MetadataTokenChange
+        | MetadataSession
+        | MetadataUnknownItem
+    ):
+        r"""
+        The typed body `group` names, or `MetadataUnknownItem`.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataCurrentPageToken:
+    r"""
+    Opaque continuation of a current state scan. Send it back unchanged in
+    `MetadataChangeStart.Current` with the same groups.
+
+    `str()` gives its `cs1_` text, which `parse` reads back.
+    """
+    @property
+    def anchor(self) -> MetadataChangeCursor:
+        r"""
+        The cursor captured before the scan's first page.
+        """
+    @property
+    def required_head(self) -> builtins.int:
+        r"""
+        The highest head any page of the scan reported so far.
+        """
+    @property
+    def groups(self) -> builtins.list[MetadataChangeGroup]:
+        r"""
+        The groups the scan was started with, in code order.
+        """
+    @property
+    def last_group(self) -> MetadataChangeGroup:
+        r"""
+        The group of the last item returned.
+        """
+    @property
+    def last_key(self) -> bytes:
+        r"""
+        The key of the last item returned, in the page token key layout.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    @staticmethod
+    def parse(text: builtins.str) -> MetadataCurrentPageToken:
+        r"""
+        Reads a page token from its `cs1_` text.
+
+        Raises:
+            ValueError: If the text is not a canonical page token.
+        """
+    def __str__(self) -> builtins.str: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataMemberItem:
+    r"""
+    A `consumer_group_members` current state item.
+    """
+    @property
+    def stream_id(self) -> builtins.int: ...
+    @property
+    def stream_created_op(self) -> builtins.int: ...
+    @property
+    def topic_id(self) -> builtins.int: ...
+    @property
+    def topic_created_op(self) -> builtins.int: ...
+    @property
+    def group_id(self) -> builtins.int: ...
+    @property
+    def member_id(self) -> builtins.int: ...
+    @property
+    def client_id(self) -> builtins.int: ...
+    @property
+    def partition_ids(self) -> builtins.list[builtins.int]:
+        r"""
+        Installed partitions, ascending.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataMemberJoined:
+    r"""
+    A member that joined a consumer group.
+    """
+    @property
+    def stream_id(self) -> builtins.int: ...
+    @property
+    def stream_created_op(self) -> builtins.int: ...
+    @property
+    def topic_id(self) -> builtins.int: ...
+    @property
+    def topic_created_op(self) -> builtins.int: ...
+    @property
+    def group_id(self) -> builtins.int: ...
+    @property
+    def member_id(self) -> builtins.int: ...
+    @property
+    def client_id(self) -> builtins.int: ...
+    @property
+    def members_count(self) -> builtins.int: ...
+    @property
+    def partition_ids(self) -> builtins.list[builtins.int]:
+        r"""
+        Installed partitions, normally none because a handover installs them.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataMemberLeft:
+    r"""
+    A member that left a consumer group.
+    """
+    @property
+    def stream_id(self) -> builtins.int: ...
+    @property
+    def stream_created_op(self) -> builtins.int: ...
+    @property
+    def topic_id(self) -> builtins.int: ...
+    @property
+    def topic_created_op(self) -> builtins.int: ...
+    @property
+    def group_id(self) -> builtins.int: ...
+    @property
+    def member_id(self) -> builtins.int: ...
+    @property
+    def client_id(self) -> builtins.int: ...
+    @property
+    def members_count(self) -> builtins.int: ...
+    @property
+    def reason(self) -> MetadataMemberLeftReason: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataMemberLeftReason:
+    r"""
+    Why a consumer group member was removed.
+    """
+
+    Left: typing.ClassVar[MetadataMemberLeftReason]
+    SessionEnded: typing.ClassVar[MetadataMemberLeftReason]
+    def __str__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataPartitionHandedOver:
+    r"""
+    A completed partition handover.
+    """
+    @property
+    def stream_id(self) -> builtins.int: ...
+    @property
+    def stream_created_op(self) -> builtins.int: ...
+    @property
+    def topic_id(self) -> builtins.int: ...
+    @property
+    def topic_created_op(self) -> builtins.int: ...
+    @property
+    def group_id(self) -> builtins.int: ...
+    @property
+    def partition_id(self) -> builtins.int: ...
+    @property
+    def member_id(self) -> builtins.int | None:
+        r"""
+        The new owner, `None` when the last member left.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataPartitionsChanged:
+    r"""
+    A partition count change.
+    """
+    @property
+    def stream_id(self) -> builtins.int: ...
+    @property
+    def stream_created_op(self) -> builtins.int: ...
+    @property
+    def topic_id(self) -> builtins.int: ...
+    @property
+    def topic_created_op(self) -> builtins.int: ...
+    @property
+    def partitions_count(self) -> builtins.int:
+        r"""
+        The partition count after the change.
+        """
+    @property
+    def removed_partition_ids(self) -> builtins.list[builtins.int]:
+        r"""
+        The deleted partition ids, ascending, empty on create.
+        """
+    @property
+    def requested_op(self) -> builtins.int | None:
+        r"""
+        The operation of the delete request when the delete completed later.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataPartitionsItem:
+    r"""
+    A `partitions` current state item.
+    """
+    @property
+    def stream_id(self) -> builtins.int: ...
+    @property
+    def stream_created_op(self) -> builtins.int: ...
+    @property
+    def topic_id(self) -> builtins.int: ...
+    @property
+    def topic_created_op(self) -> builtins.int: ...
+    @property
+    def partitions_count(self) -> builtins.int: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataPermissionsUpdatedReason:
+    r"""
+    Why a user's public permission set changed.
+    """
+
+    Updated: typing.ClassVar[MetadataPermissionsUpdatedReason]
+    r"""
+    An `update_permissions` call replaced the set.
+    """
+    ResourceDeleted: typing.ClassVar[MetadataPermissionsUpdatedReason]
+    r"""
+    A stream or topic delete pruned the user's grants on it.
+    """
+    def __str__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataSession:
+    r"""
+    A registered session, and a `sessions` current state item.
+    """
+    @property
+    def user_id(self) -> builtins.int: ...
+    @property
+    def user_created_at(self) -> builtins.int: ...
+    @property
+    def client_id(self) -> builtins.int: ...
+    @property
+    def session(self) -> builtins.int:
+        r"""
+        The session epoch.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataSessionClosed:
+    r"""
+    A closed session.
+    """
+    @property
+    def user_id(self) -> builtins.int: ...
+    @property
+    def user_created_at(self) -> builtins.int: ...
+    @property
+    def client_id(self) -> builtins.int: ...
+    @property
+    def session(self) -> builtins.int: ...
+    @property
+    def reason(self) -> MetadataSessionClosedReason: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataSessionClosedReason:
+    r"""
+    Why a session was closed.
+    """
+
+    Logout: typing.ClassVar[MetadataSessionClosedReason]
+    Expired: typing.ClassVar[MetadataSessionClosedReason]
+    Revoked: typing.ClassVar[MetadataSessionClosedReason]
+    r"""
+    The user was deactivated or deleted.
+    """
+    def __str__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataStreamChange:
+    r"""
+    A stream after a create or update, and a `streams` current state item.
+    """
+    @property
+    def stream_id(self) -> builtins.int:
+        r"""
+        Stream id. Ids are reused after a delete.
+        """
+    @property
+    def stream_created_op(self) -> builtins.int:
+        r"""
+        The operation that created the stream, which tells it from an earlier
+        stream with the same id.
+        """
+    @property
+    def created_at(self) -> builtins.int:
+        r"""
+        Stream creation time as Unix time in microseconds.
+        """
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def options(self) -> UserHeaders | None:
+        r"""
+        Options the creating client set explicitly, the same mapping
+        `StreamDetails.options` returns, or `None` when `options_unreadable`.
+        The stream's encryption key never appears here.
+        """
+    @property
+    def derived_options(self) -> UserHeaders | None:
+        r"""
+        Options the server resolved or computed, including the key source and
+        fingerprints. Same shape as `options`.
+        """
+    @property
+    def options_unreadable(self) -> builtins.bool:
+        r"""
+        The server could not read the stream's stored options. Keep the
+        previous values.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataStreamDeleted:
+    r"""
+    A removed stream.
+    """
+    @property
+    def stream_id(self) -> builtins.int: ...
+    @property
+    def stream_created_op(self) -> builtins.int: ...
+    @property
+    def created_at(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def requested_op(self) -> builtins.int | None:
+        r"""
+        The operation of the delete request when the delete completed later.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataTokenChange:
+    r"""
+    A created personal access token, and a `personal_access_tokens` current
+    state item. Never the token itself.
+    """
+    @property
+    def user_id(self) -> builtins.int: ...
+    @property
+    def user_created_at(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def expiry(self) -> builtins.int | None:
+        r"""
+        Expiry in microseconds, `None` for a token that never expires.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataTokenDeleted:
+    r"""
+    A removed personal access token.
+    """
+    @property
+    def user_id(self) -> builtins.int: ...
+    @property
+    def user_created_at(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def reason(self) -> MetadataTokenDeletedReason: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataTokenDeletedReason:
+    r"""
+    Why a personal access token was removed.
+    """
+
+    Deleted: typing.ClassVar[MetadataTokenDeletedReason]
+    Expired: typing.ClassVar[MetadataTokenDeletedReason]
+    def __str__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataTopicChange:
+    r"""
+    A topic after a create or update.
+    """
+    @property
+    def stream_id(self) -> builtins.int: ...
+    @property
+    def stream_created_op(self) -> builtins.int: ...
+    @property
+    def topic_id(self) -> builtins.int: ...
+    @property
+    def topic_created_op(self) -> builtins.int:
+        r"""
+        The operation that created the topic, which tells it from an earlier
+        topic with the same id.
+        """
+    @property
+    def created_at(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def partitions_count(self) -> builtins.int: ...
+    @property
+    def options(self) -> UserHeaders | None:
+        r"""
+        Options the creating client set explicitly, the same mapping
+        `TopicDetails.options` returns, or `None` when `options_unreadable`.
+        """
+    @property
+    def derived_options(self) -> UserHeaders | None:
+        r"""
+        Options the server resolved for the keys the client did not send.
+        """
+    @property
+    def options_unreadable(self) -> builtins.bool:
+        r"""
+        The server could not read the topic's stored options. Keep the
+        previous values.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataTopicDeleted:
+    r"""
+    A removed topic.
+    """
+    @property
+    def stream_id(self) -> builtins.int: ...
+    @property
+    def stream_created_op(self) -> builtins.int: ...
+    @property
+    def topic_id(self) -> builtins.int: ...
+    @property
+    def topic_created_op(self) -> builtins.int: ...
+    @property
+    def created_at(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def requested_op(self) -> builtins.int | None:
+        r"""
+        The operation of the delete request when the delete completed later.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataTopicItem:
+    r"""
+    A `topics` current state item. Partition counts come as `partitions`
+    items.
+    """
+    @property
+    def stream_id(self) -> builtins.int: ...
+    @property
+    def stream_created_op(self) -> builtins.int: ...
+    @property
+    def topic_id(self) -> builtins.int: ...
+    @property
+    def topic_created_op(self) -> builtins.int: ...
+    @property
+    def created_at(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def options(self) -> UserHeaders | None:
+        r"""
+        Options the creating client set explicitly, or `None` when
+        `options_unreadable`.
+        """
+    @property
+    def derived_options(self) -> UserHeaders | None:
+        r"""
+        Options the server resolved for the keys the client did not send.
+        """
+    @property
+    def options_unreadable(self) -> builtins.bool:
+        r"""
+        The server could not read the topic's stored options.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataUnknownChange:
+    r"""
+    A record of a group or kind this build does not know. A mirror stops on
+    it rather than skip a possible state change.
+    """
+    @property
+    def group(self) -> builtins.int | builtins.str:
+        r"""
+        The group code on binary transports, or the group name over HTTP.
+        """
+    @property
+    def kind(self) -> builtins.int | builtins.str:
+        r"""
+        The kind code on binary transports, or the kind name over HTTP.
+        """
+    @property
+    def body(self) -> builtins.bytes | builtins.str:
+        r"""
+        The raw body on binary transports, or the record's whole JSON object
+        over HTTP.
+        """
+
+@typing.final
+class MetadataUnknownItem:
+    r"""
+    A current state item of a group this build does not know.
+    """
+    @property
+    def group(self) -> builtins.int | builtins.str:
+        r"""
+        The group code on binary transports, or the group name over HTTP.
+        """
+    @property
+    def body(self) -> builtins.bytes | builtins.str:
+        r"""
+        The raw body on binary transports, or the item's whole JSON object
+        over HTTP.
+        """
+
+@typing.final
+class MetadataUserChange:
+    r"""
+    A user after a create or update, and a `users` current state item.
+    """
+    @property
+    def user_id(self) -> builtins.int:
+        r"""
+        User id. Ids are reused after a delete.
+        """
+    @property
+    def user_created_at(self) -> builtins.int:
+        r"""
+        User creation time in microseconds, which tells the user from an
+        earlier user with the same id.
+        """
+    @property
+    def username(self) -> builtins.str: ...
+    @property
+    def status(self) -> UserStatus: ...
+    @property
+    def permissions(self) -> Permissions | None:
+        r"""
+        The public permission set, or `None` when the user has none.
+        """
+    @property
+    def options(self) -> UserHeaders | None:
+        r"""
+        Options the creating client set explicitly, or `None` when
+        `options_unreadable`.
+        """
+    @property
+    def derived_options(self) -> UserHeaders | None:
+        r"""
+        Options the server resolved for the keys the client did not send.
+        """
+    @property
+    def options_unreadable(self) -> builtins.bool:
+        r"""
+        The server could not read the user's stored options.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataUserIdentity:
+    r"""
+    A deleted user, or one whose password changed.
+    """
+    @property
+    def user_id(self) -> builtins.int: ...
+    @property
+    def user_created_at(self) -> builtins.int: ...
+    @property
+    def username(self) -> builtins.str: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataUserPermissionsUpdated:
+    r"""
+    A user's public permission set after a change.
+    """
+    @property
+    def user_id(self) -> builtins.int: ...
+    @property
+    def user_created_at(self) -> builtins.int: ...
+    @property
+    def username(self) -> builtins.str: ...
+    @property
+    def permissions(self) -> Permissions | None:
+        r"""
+        The public permission set after the change, or `None` when the user
+        has none.
+        """
+    @property
+    def reason(self) -> MetadataPermissionsUpdatedReason: ...
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class OptionError(IggyError):
+    r"""
+    An option refusal, with the server error code and its snake_case name as `kind`.
+    """
+    @property
+    def kind(self) -> builtins.str: ...
+
+@typing.final
+class OptionKey:
+    r"""
+    A catalog option key, as `update_stream`, `update_topic` and `update_user`
+    take it in `reset`. `str()` gives the key as it travels on the wire.
+    """
+
+    Name: typing.ClassVar[OptionKey]
+    r"""
+    Stream or topic name.
+    """
+    Username: typing.ClassVar[OptionKey]
+    r"""
+    User name.
+    """
+    Status: typing.ClassVar[OptionKey]
+    r"""
+    User status.
+    """
+    CompressionAlgorithm: typing.ClassVar[OptionKey]
+    r"""
+    Topic compression algorithm, fixed at creation.
+    """
+    MessageExpiry: typing.ClassVar[OptionKey]
+    r"""
+    Topic message expiry, resettable to never expire.
+    """
+    MaxTopicSize: typing.ClassVar[OptionKey]
+    r"""
+    Topic size cap, resettable to unlimited.
+    """
+    SegmentSize: typing.ClassVar[OptionKey]
+    r"""
+    Topic segment size, fixed at creation.
+    """
+    Durability: typing.ClassVar[OptionKey]
+    r"""
+    Topic message durability, fixed at creation.
+    """
+    ConsumerOffsetDurability: typing.ClassVar[OptionKey]
+    r"""
+    Topic consumer offset durability, fixed at creation.
+    """
+    PartitionResizePolicy: typing.ClassVar[OptionKey]
+    r"""
+    Topic partition resize policy, fixed at creation.
+    """
+    MessagesRequiredToSave: typing.ClassVar[OptionKey]
+    r"""
+    Topic message-count flush threshold, fixed at creation.
+    """
+    SizeOfMessagesRequiredToSave: typing.ClassVar[OptionKey]
+    r"""
+    Topic byte flush threshold, fixed at creation.
+    """
+    PreallocateSegments: typing.ClassVar[OptionKey]
+    r"""
+    Topic segment preallocation, fixed at creation.
+    """
+    EncryptionKey: typing.ClassVar[OptionKey]
+    r"""
+    Stream encryption key, write-only and fixed at creation.
+    """
+    EncryptionKeySource: typing.ClassVar[OptionKey]
+    r"""
+    Who chose the stream's key, computed by the server.
+    """
+    EncryptionKeyFingerprint: typing.ClassVar[OptionKey]
+    r"""
+    Fingerprint of the stream's key, computed by the server.
+    """
+    EncryptionKekFingerprint: typing.ClassVar[OptionKey]
+    r"""
+    Fingerprints of the server keys wrapping the stream's key, computed by
+    the server.
+    """
+    def __str__(self) -> builtins.str: ...
+
+@typing.final
 class OptionSpec:
     r"""
     One entry of a resource's option catalog, as served by `describe_options`.
@@ -2301,10 +3549,9 @@ class OptionSpec:
     def kind(self) -> builtins.str:
         r"""
         Name of this key's canonical kind: what the server encodes its default
-        under, and what a value set by `create_topic` is stored as whatever kind
-        it was sent in, since create admission re-encodes the block from its own
-        parse. `update_topic` stores what the client sent verbatim and is the
-        exception.
+        under, and what a value set by a create or an update is stored as
+        whatever kind it was sent in, since admission re-encodes the block from
+        its own parse.
         """
     @property
     def default_value(self) -> HeaderValue | None:
@@ -2319,6 +3566,33 @@ class OptionSpec:
     def description(self) -> builtins.str:
         r"""
         What the option does, including the bounds its value is checked against.
+        """
+    @property
+    def updatable(self) -> builtins.bool:
+        r"""
+        Whether an update may set the key.
+        """
+    @property
+    def resettable(self) -> builtins.bool:
+        r"""
+        Whether an update may reset the key to its default.
+        """
+    @property
+    def secret(self) -> builtins.bool:
+        r"""
+        Whether the key is write-only: accepted on create, never returned.
+        """
+    @property
+    def read_only(self) -> builtins.bool:
+        r"""
+        Whether the server computes the key and returns it on reads, never
+        accepting it.
+        """
+    @property
+    def critical(self) -> builtins.bool:
+        r"""
+        Whether a node that does not understand the key must refuse to serve
+        the resource.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -2398,6 +3672,21 @@ class PartitionContext:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class PartitionResizePolicy:
+    r"""
+    Whether partitions can be added to or deleted from a topic after creation.
+    """
+
+    Mutable: typing.ClassVar[PartitionResizePolicy]
+    r"""
+    Partitions can be added and deleted.
+    """
+    Fixed: typing.ClassVar[PartitionResizePolicy]
+    r"""
+    The partition set is fixed at topic creation.
+    """
+
+@typing.final
 class Partitioning:
     r"""
     Defines how a batch of messages is assigned to a topic partition.
@@ -2434,14 +3723,12 @@ class Partitioning:
         """
 
 @typing.final
-class PendingOperationError(builtins.RuntimeError):
+class PendingOperationError(IggyError):
     r"""
     An operation whose retained identity is needed to recover or release its lane.
     """
     @property
     def operation_id(self) -> builtins.int: ...
-    @property
-    def code(self) -> builtins.int: ...
     @property
     def kind(self) -> builtins.str: ...
 
@@ -2526,9 +3813,10 @@ class PollingStrategy:
     ...
 
 @typing.final
-class ProducerSendError(builtins.RuntimeError):
+class ProducerSendError(IggyError):
     r"""
-    A direct producer error that preserves partial-send recovery state.
+    A direct producer error that preserves partial-send recovery state. Its
+    `__cause__` is the `IggyError` that ended the send.
     """
     @property
     def operation_id(self) -> builtins.int | None:
@@ -2544,17 +3832,33 @@ class ProducerSendError(builtins.RuntimeError):
     def failed(self) -> builtins.list[SendMessage]:
         r"""
         Messages without a usable confirmation after the failure.
-        For an `uncertain` cause, the first chunk may already have committed:
-        resolve its operation ID without resubmitting the payload as a new send.
+        For an `uncertain` cause, the first `uncertain` messages may already have
+        committed: resolve its operation ID without resubmitting them as a new send.
         For `lane_blocked`, none of these messages was sent; resolve the earlier
         blocker before retrying. `not_retained` does not prove non-commit.
         Before any safe resubmission, restore payloads changed by encryption.
+        """
+    @property
+    def uncertain(self) -> builtins.int:
+        r"""
+        How many messages at the head of `failed` may have committed: those the
+        operation of an `uncertain` cause carried, or those of an HTTP send whose
+        outcome is unknown (code 57). Zero for any other cause.
         """
     @property
     def committed(self) -> builtins.list[SendMessagesConfirmation]:
         r"""
         Confirmations returned for chunks committed before the failure.
         """
+
+@typing.final
+class ProducerSharding:
+    r"""
+    How a background producer distributes sends among its workers.
+    """
+
+    ORDERED: typing.ClassVar[ProducerSharding]
+    BALANCED: typing.ClassVar[ProducerSharding]
 
 @typing.final
 class QuicConfig:
@@ -3073,6 +4377,43 @@ class Stream:
         r"""
         Number of topics in the stream.
         """
+    @property
+    def options(self) -> UserHeaders:
+        r"""
+        Options the creating client set explicitly. The stream's encryption
+        key is write-only and never appears here.
+
+        The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+        returns, since options ride that codec. `to_scalar_dict()` gives the
+        plain-scalar form.
+        """
+    @property
+    def derived_options(self) -> UserHeaders:
+        r"""
+        Options the server resolved or computed, including the encryption key
+        projections. Same shape as `options`.
+        """
+    @property
+    def encryption_key_source(self) -> builtins.str | None:
+        r"""
+        Who chose the key the stream's data is stored under: `"stream"` for a
+        key the client sent, `"server"` for a key the server generated, or
+        `"none"` for a plaintext stream. `None` when the server reported no
+        source.
+        """
+    @property
+    def encryption_key_fingerprint(self) -> builtins.str | None:
+        r"""
+        Fingerprint of the stream's key, 16 lowercase hex characters. `None`
+        for a plaintext stream. Compare it with `encryption_key_fingerprint()`
+        of the key the stream was created with.
+        """
+    @property
+    def encryption_kek_fingerprints(self) -> builtins.list[builtins.str]:
+        r"""
+        Fingerprints of the server keys that wrap the stream's key: one outside
+        a key rotation, empty for a plaintext stream.
+        """
 
 @typing.final
 class StreamDetails:
@@ -3099,6 +4440,85 @@ class StreamDetails:
         r"""
         Returns the topics in the stream.
         """
+    @property
+    def options(self) -> UserHeaders:
+        r"""
+        Options the creating client set explicitly. The stream's encryption
+        key is write-only and never appears here.
+
+        The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+        returns, since options ride that codec. `to_scalar_dict()` gives the
+        plain-scalar form.
+        """
+    @property
+    def derived_options(self) -> UserHeaders:
+        r"""
+        Options the server resolved or computed, including the encryption key
+        projections. Same shape as `options`.
+        """
+    @property
+    def encryption_key_source(self) -> builtins.str | None:
+        r"""
+        Who chose the key the stream's data is stored under: `"stream"` for a
+        key the client sent, `"server"` for a key the server generated, or
+        `"none"` for a plaintext stream. `None` when the server reported no
+        source.
+        """
+    @property
+    def encryption_key_fingerprint(self) -> builtins.str | None:
+        r"""
+        Fingerprint of the stream's key, 16 lowercase hex characters. `None`
+        for a plaintext stream. Compare it with `encryption_key_fingerprint()`
+        of the key the stream was created with.
+        """
+    @property
+    def encryption_kek_fingerprints(self) -> builtins.list[builtins.str]:
+        r"""
+        Fingerprints of the server keys that wrap the stream's key: one outside
+        a key rotation, empty for a plaintext stream.
+        """
+
+@typing.final
+class StreamOptions:
+    r"""
+    Options for `create_stream`.
+
+    The encryption key is write-only: the server stores it wrapped and returns
+    only its source and fingerprints, and this object never shows it.
+    """
+    @property
+    def has_encryption_key(self) -> builtins.bool:
+        r"""
+        Whether an encryption key is set, without exposing the key itself.
+        """
+    def __new__(
+        cls,
+        *,
+        encryption_key: builtins.bytes | builtins.str | None = None,
+        raw: builtins.dict[builtins.str, builtins.str] | None = None,
+    ) -> StreamOptions:
+        r"""
+        Constructs stream create options.
+
+        Args:
+            encryption_key: The stream's own data key: exactly 32 bytes, or
+                their canonical standard padded base64 text. Use 32 random
+                bytes, for example `secrets.token_bytes(32)`. The key travels
+                inside the create request over whatever transport the client
+                uses, so protecting it in transit (TLS) is the caller's
+                responsibility. The server never returns it, only its source
+                and fingerprints. Without a key, a server with encryption
+                enabled generates one for the stream.
+            raw: Additional option keys as `dict[str, str]`, sent as string
+                values so a key newer than this build can be set. A typed field
+                wins on collision.
+
+        Raises:
+            ValueError: If `encryption_key` is not exactly 32 bytes or their
+                canonical base64 text. The message never contains the key.
+            TypeError: If `encryption_key` is neither `bytes` nor `str`.
+        """
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class StreamPermissions:
@@ -3353,17 +4773,19 @@ class Topic:
     @property
     def message_expiry(self) -> IggyExpiry:
         r"""
-        The expiry of the messages in the topic.
+        The expiry of the messages in the topic, the server default when the
+        topic does not set one.
         """
     @property
     def compression_algorithm(self) -> builtins.str:
         r"""
-        Compression algorithm for the topic.
+        Compression algorithm for the topic, fixed at creation.
         """
     @property
     def max_topic_size(self) -> MaxTopicSize:
         r"""
-        The maximum size of the topic.
+        The maximum size of the topic, the server default when the topic does
+        not set one.
         """
     @property
     def options(self) -> UserHeaders:
@@ -3418,17 +4840,19 @@ class TopicDetails:
     @property
     def message_expiry(self) -> IggyExpiry:
         r"""
-        The expiry of the messages in the topic.
+        The expiry of the messages in the topic, the server default when the
+        topic does not set one.
         """
     @property
     def compression_algorithm(self) -> builtins.str:
         r"""
-        Compression algorithm for the topic.
+        Compression algorithm for the topic, fixed at creation.
         """
     @property
     def max_topic_size(self) -> MaxTopicSize:
         r"""
-        The maximum size of the topic.
+        The maximum size of the topic, the server default when the topic does
+        not set one.
         """
     @property
     def options(self) -> UserHeaders:
@@ -3454,6 +4878,64 @@ class TopicDetails:
 
         Rebuilds the list from scratch on every access; cache the result
         rather than reading this repeatedly in a loop.
+        """
+
+@typing.final
+class TopicOptions:
+    r"""
+    Options for `create_topic`.
+    """
+    def __new__(
+        cls,
+        *,
+        partitions_count: builtins.int = 1,
+        compression_algorithm: builtins.str | None = None,
+        message_expiry: IggyExpiry | None = None,
+        max_topic_size: MaxTopicSize | None = None,
+        segment_size: builtins.int | None = None,
+        durability: Durability | None = None,
+        consumer_offset_durability: Durability | None = None,
+        partition_resize_policy: PartitionResizePolicy | None = None,
+        messages_required_to_save: builtins.int | None = None,
+        size_of_messages_required_to_save: builtins.int | None = None,
+        preallocate_segments: builtins.bool | None = None,
+        raw: builtins.dict[builtins.str, builtins.str] | None = None,
+    ) -> TopicOptions:
+        r"""
+        Constructs topic create options.
+
+        Every setting left as `None` resolves against the server default at
+        admission. Only `message_expiry`, `max_topic_size` and the name can
+        change after creation, through `update_topic`.
+
+        Args:
+            partitions_count: Number of partitions as `int`, at most 1000.
+                Defaults to 1.
+            compression_algorithm: Compression algorithm as `str | None`.
+            message_expiry: Message expiry as `IggyExpiry | None`.
+                `IggyExpiry.ServerDefault()` is the same as `None`.
+            max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+                `MaxTopicSize.ServerDefault()` is the same as `None`.
+            segment_size: Per-topic segment size in bytes as `int | None`.
+            durability: Message completion policy, defaulting to replicated.
+            consumer_offset_durability: Independent offset policy, defaulting
+                to replicated.
+            partition_resize_policy: `PartitionResizePolicy.Fixed` makes the
+                server reject later partition creation and deletion on this
+                topic.
+            messages_required_to_save: Message-count flush threshold as
+                `int | None`.
+            size_of_messages_required_to_save: Byte flush threshold as
+                `int | None`.
+            preallocate_segments: Reserve segment bytes on open as `bool | None`.
+            raw: Additional option keys as `dict[str, str]`, sent as string
+                values so a key newer than this build can be set. A typed field
+                wins on collision.
+
+        Raises:
+            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            RuntimeError: If `compression_algorithm` names no known algorithm.
+            TypeError: If a durability is not a `Durability`.
         """
 
 @typing.final
@@ -3564,6 +5046,21 @@ class UserInfo:
         r"""
         The username of the user.
         """
+    @property
+    def options(self) -> UserHeaders:
+        r"""
+        Options the creating client set explicitly. No user key exists yet,
+        so this is empty unless a newer server added one.
+
+        The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+        returns, since options ride that codec.
+        """
+    @property
+    def derived_options(self) -> UserHeaders:
+        r"""
+        Options the server resolved for the keys the client did not send.
+        Same shape as `options`.
+        """
 
 @typing.final
 class UserInfoDetails:
@@ -3592,6 +5089,54 @@ class UserInfoDetails:
         r"""
         The permissions of the user, or `None` when the user has none assigned.
         """
+    @property
+    def options(self) -> UserHeaders:
+        r"""
+        Options the creating client set explicitly. No user key exists yet,
+        so this is empty unless a newer server added one.
+
+        The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+        returns, since options ride that codec.
+        """
+    @property
+    def derived_options(self) -> UserHeaders:
+        r"""
+        Options the server resolved for the keys the client did not send.
+        Same shape as `options`.
+        """
+
+@typing.final
+class UserOptions:
+    r"""
+    Options for `create_user`. No user key exists yet, so only the raw escape
+    hatch is available.
+    """
+    def __new__(
+        cls, *, raw: builtins.dict[builtins.str, builtins.str] | None = None
+    ) -> UserOptions:
+        r"""
+        Constructs user create options.
+
+        Args:
+            raw: Option keys as `dict[str, str]`, sent as string values so a
+                key newer than this build can be set. A current server rejects
+                every key.
+        """
+
+@typing.final
+class UserStatus:
+    r"""
+    The status of a user account.
+    """
+
+    Active: typing.ClassVar[UserStatus]
+    r"""
+    The user account is active and can be used.
+    """
+    Inactive: typing.ClassVar[UserStatus]
+    r"""
+    The user account is inactive and cannot be used.
+    """
 
 @typing.final
 class WebSocketConfig:
@@ -3775,28 +5320,21 @@ class WebSocketReconnectionConfig:
         """
     def __repr__(self) -> builtins.str: ...
 
-@typing.final
-class ProducerSharding(enum.Enum):
+def encryption_key_fingerprint(key: builtins.bytes | builtins.str) -> builtins.str:
     r"""
-    How a background producer distributes sends among its workers.
-    """
+    Fingerprint of a stream encryption key: the first 8 bytes of SHA-256 over
+    the label `iggy/stream-key-fingerprint/v1` followed by the key, as 16
+    lowercase hex characters. Streams report the same value in
+    `encryption_key_fingerprint`, so a caller can match a key to its stream
+    without the server ever returning the key.
 
-    ORDERED = ...
-    BALANCED = ...
+    Args:
+        key: Exactly 32 bytes, or their canonical standard padded base64 text.
 
-@typing.final
-class UserStatus(enum.Enum):
-    r"""
-    The status of a user account.
-    """
-
-    Active = ...
-    r"""
-    The user account is active and can be used.
-    """
-    Inactive = ...
-    r"""
-    The user account is inactive and cannot be used.
+    Raises:
+        ValueError: If `key` is not exactly 32 bytes or their canonical base64
+            text. The message never contains the key.
+        TypeError: If `key` is neither `bytes` nor `str`.
     """
 
 class Durability(str, enum.Enum):  # noqa: UP042

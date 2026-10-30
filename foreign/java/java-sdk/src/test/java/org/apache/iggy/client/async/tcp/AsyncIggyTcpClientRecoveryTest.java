@@ -37,6 +37,7 @@ import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
@@ -53,6 +54,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.EVICTION_STALE_CLIENT;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.TRANSIENT_NOT_ACCEPTED;
@@ -65,6 +67,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class AsyncIggyTcpClientRecoveryTest {
+    // A call that paces its retries binds a few times a second, and one that does not binds thousands of times.
+    private static final int MAX_PACED_BINDS = 100;
+
     @Test
     void shouldPreserveTheOperationIdWhenClearingARouterWithAnUnansweredWrite() throws Exception {
         try (ServerSocket socket = new ServerSocket(0, 2, InetAddress.getLoopbackAddress())) {
@@ -382,6 +387,70 @@ class AsyncIggyTcpClientRecoveryTest {
                 client.close().get(5, TimeUnit.SECONDS);
             }
             server.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * The receipt policy: a write loses its reply, and then its session ends, by a refused bind, an evicted bind or
+     * a refused sign-in. The write never goes out again, and it ends uncertain, not with the error that ended the
+     * session.
+     */
+    @ParameterizedTest(name = "sessionEnd={0}")
+    @EnumSource(SessionEnd.class)
+    void shouldEndAWriteWhoseReplyWasLostUncertainWhenItsSessionEnds(SessionEnd sessionEnd) throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 3, InetAddress.getLoopbackAddress())) {
+            List<Request> writes = new CopyOnWriteArrayList<>();
+            AtomicInteger registers = new AtomicInteger();
+            var server = serve(socket, 3, request -> {
+                if (request.operation() == VsrOperation.REGISTER) {
+                    return registers.incrementAndGet() > 1 && sessionEnd == SessionEnd.REFUSED_SIGN_IN
+                            ? Response.error(VsrOperation.REGISTER, IggyErrorCode.USER_INACTIVE.getCode())
+                            : Response.success(VsrOperation.REGISTER, registerBody(41 + registers.get()));
+                }
+                if (request.commandCode() == CommandCode.System.BIND_SESSION.getValue()) {
+                    return switch (sessionEnd) {
+                        case REFUSED_BIND ->
+                            Response.error(VsrOperation.NON_REPLICATED, IggyErrorCode.STALE_CLIENT.getCode());
+                        case EVICTED_BIND -> Response.eviction(SessionEviction.NO_SESSION.reason);
+                        case REFUSED_SIGN_IN ->
+                            Response.error(VsrOperation.NON_REPLICATED, IggyErrorCode.UNAUTHENTICATED.getCode());
+                    };
+                }
+                if (request.commandCode() == CommandCode.System.GET_CLUSTER_METADATA.getValue()) {
+                    return Response.success(VsrOperation.NON_REPLICATED, singleNodeMetadata(socket.getLocalPort()));
+                }
+                if (request.operation() == VsrOperation.DELETE_STREAM) {
+                    writes.add(request);
+                    // The reply is lost with the link.
+                    return Response.disconnect();
+                }
+                throw new IllegalStateException("Unexpected request " + request);
+            });
+            var client = AsyncIggyTcpClient.builder()
+                    .host(socket.getInetAddress().getHostAddress())
+                    .port(socket.getLocalPort())
+                    .credentials("iggy", "iggy")
+                    .requestTimeout(Duration.ofSeconds(3))
+                    .heartbeatInterval(Duration.ofMinutes(1))
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+
+                var written = writeMutation(client, false);
+
+                assertThatThrownBy(() -> written.get(5, TimeUnit.SECONDS))
+                        .cause()
+                        .isInstanceOfSatisfying(IggyOperationException.class, uncertain -> {
+                            assertThat(uncertain.getErrorCode()).isEqualTo(IggyErrorCode.OPERATION_UNCERTAIN);
+                            assertThat(uncertain.getOperationId())
+                                    .isEqualTo(writes.get(0).requestId());
+                        });
+                assertThat(writes).as("the attempts of the write").hasSize(1);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            assertThat(server).isNotCompletedExceptionally();
         }
     }
 
@@ -1377,6 +1446,130 @@ class AsyncIggyTcpClientRecoveryTest {
         }
     }
 
+    @ParameterizedTest(name = "routed={0}, eviction={1}")
+    @CsvSource({"false,NO_SESSION", "false,STALE_CLIENT", "true,NO_SESSION", "true,SESSION_TOO_LOW"})
+    void shouldEndTheSentMutationUncertainAndRestartTheUnsentCallUnderTheNextSession(
+            boolean routed, SessionEviction eviction) throws Exception {
+        try (LostSession lost = new LostSession(eviction, true)) {
+            var calls = lost.writeTwoAndEvict(routed);
+
+            assertThatThrownBy(() -> calls.sent().get(5, TimeUnit.SECONDS))
+                    .cause()
+                    .isInstanceOfSatisfying(IggyOperationException.class, uncertain -> {
+                        assertThat(uncertain.getErrorCode()).isEqualTo(IggyErrorCode.OPERATION_UNCERTAIN);
+                        assertThat(uncertain.getOperationId())
+                                .isEqualTo(lost.writes.get(0).requestId());
+                    });
+            calls.unsent().get(5, TimeUnit.SECONDS);
+            // The sent write never went out again. The unsent one went out once, under the next session.
+            assertThat(lost.registers).hasSize(2);
+            assertThat(lost.writes).hasSize(2);
+            Request restarted = lost.writes.get(1);
+            assertThat(restarted.clientLow()).isEqualTo(lost.registers.get(1).clientLow());
+            assertThat(restarted.clientHigh()).isEqualTo(lost.registers.get(1).clientHigh());
+        }
+    }
+
+    @Test
+    void shouldEndAnUnsentCallWith58WhenNoSessionIsBoundByItsDeadline() throws Exception {
+        try (LostSession lost = new LostSession(SessionEviction.NO_SESSION, false)) {
+            var calls = lost.writeTwoAndEvict(false);
+
+            AsyncIggyTcpClientTransientFailoverTest.assertServerError(
+                    calls.sent(), IggyErrorCode.OPERATION_UNCERTAIN.getCode());
+            AsyncIggyTcpClientTransientFailoverTest.assertServerError(calls.unsent(), TRANSIENT_NOT_ACCEPTED);
+            assertThat(lost.registers).hasSize(2);
+            assertThat(lost.writes).hasSize(1);
+        }
+    }
+
+    @ParameterizedTest(name = "refusal={0}")
+    @ValueSource(ints = {TRANSIENT_NOT_ACCEPTED, AsyncTcpConnection.NOT_PRIMARY})
+    void shouldPaceRefusedBindsAndEndTheSentMutationUncertainAtItsDeadline(int refusal) throws Exception {
+        try (LostSession lost = new LostSession(SessionEviction.NO_SESSION, true, refusal)) {
+            var calls = lost.writeTwoAndEvict(false);
+
+            AsyncIggyTcpClientTransientFailoverTest.assertServerError(
+                    calls.sent(), IggyErrorCode.OPERATION_UNCERTAIN.getCode());
+            // The sent write stays retained in the lane that the unsent one waits for.
+            AsyncIggyTcpClientTransientFailoverTest.assertServerError(
+                    calls.unsent(), IggyErrorCode.LANE_BLOCKED.getCode());
+            assertThat(lost.registers).hasSize(1);
+            assertThat(lost.writes).hasSize(1);
+            assertThat(lost.binds).hasValueLessThan(MAX_PACED_BINDS);
+        }
+    }
+
+    @Test
+    void shouldEndAnUnsentCallWith58AtItsDeadlineWhenItsLinkDropsBeforeItsWriteAndEveryBindIsRefused()
+            throws Exception {
+        try (DroppedLink dropped = new DroppedLink()) {
+            var unsent = dropped.admitOnTheDroppedLink();
+
+            AsyncIggyTcpClientTransientFailoverTest.assertServerError(unsent, TRANSIENT_NOT_ACCEPTED);
+            assertThat(dropped.deletes).isEmpty();
+            assertThat(dropped.binds).hasValueLessThan(MAX_PACED_BINDS);
+        }
+    }
+
+    /**
+     * A node refuses the first write with 89 and drops its link. The next link finds the session lost: the node
+     * refuses its bind, and the sign-in gets a new session. No node admitted the write, so it goes out again under
+     * that session with a new request id and does not end uncertain.
+     */
+    @Test
+    void shouldSendARefusedWriteAgainUnderTheNextSessionWhenTheSessionIsLostBeforeItsRetry() throws Exception {
+        // The link that refuses the write and the link that finds the session lost.
+        int connections = 2;
+        try (ServerSocket socket = new ServerSocket(0, connections, InetAddress.getLoopbackAddress())) {
+            List<Request> registers = new CopyOnWriteArrayList<>();
+            List<Request> writes = new CopyOnWriteArrayList<>();
+            var server = serve(socket, connections, request -> {
+                if (request.operation() == VsrOperation.REGISTER) {
+                    registers.add(request);
+                    return Response.success(VsrOperation.REGISTER, registerBody(registers.size()));
+                }
+                if (request.commandCode() == CommandCode.System.BIND_SESSION.getValue()) {
+                    return Response.error(VsrOperation.NON_REPLICATED, IggyErrorCode.UNAUTHENTICATED.getCode());
+                }
+                if (request.commandCode() == CommandCode.System.GET_CLUSTER_METADATA.getValue()) {
+                    return Response.success(VsrOperation.NON_REPLICATED, singleNodeMetadata(socket.getLocalPort()));
+                }
+                if (request.operation() != VsrOperation.DELETE_STREAM) {
+                    throw new IllegalStateException("Unexpected request " + request);
+                }
+                writes.add(request);
+                return writes.size() == 1
+                        ? Response.errorAndDisconnect(VsrOperation.DELETE_STREAM, AsyncTcpConnection.NOT_PRIMARY)
+                        : Response.committed(
+                                VsrOperation.DELETE_STREAM, 2, Unpooled.buffer().writeIntLE(0));
+            });
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(socket.getInetAddress().getHostAddress())
+                    .port(socket.getLocalPort())
+                    .credentials("iggy", "iggy")
+                    .requestTimeout(Duration.ofSeconds(2))
+                    .heartbeatInterval(Duration.ofHours(1))
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+
+                writeMutation(client, false).get(5, TimeUnit.SECONDS);
+
+                assertThat(registers).hasSize(2);
+                assertThat(writes).hasSize(2);
+                Request retried = writes.get(1);
+                assertThat(retried.requestId()).isNotEqualTo(writes.get(0).requestId());
+                assertThat(retried.clientLow()).isEqualTo(registers.get(1).clientLow());
+                assertThat(retried.clientHigh()).isEqualTo(registers.get(1).clientHigh());
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            server.get(5, TimeUnit.SECONDS);
+        }
+    }
+
     /** The outcome of a resolve as text: the reply body of a commit, or the type and code of its error. */
     private static String outcome(CompletableFuture<byte[]> resolved) throws Exception {
         try {
@@ -1508,10 +1701,214 @@ class AsyncIggyTcpClientRecoveryTest {
         }
     }
 
+    /**
+     * One node that loses the session of the first write: it holds that write until a second write waits in the
+     * same lane, then evicts it and answers every bind of the lost session with {@code bindReply}. The sign-in after
+     * a refused bind gets a new session, or no reply when the session does not recover. Later writes commit.
+     */
+    private static final class LostSession implements AutoCloseable {
+        // The evicted link and the link that recovers the session.
+        private static final int CONNECTIONS = 2;
+        private static final long FIRST_SESSION = 42;
+        private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(1);
+        // The second write needs it to reach the lane of the first one.
+        private static final Duration QUEUE_TIME = Duration.ofMillis(200);
+
+        private final SessionEviction eviction;
+        private final boolean recovers;
+        private final int bindReply;
+        private final ServerSocket socket;
+        private final CompletableFuture<Void> server;
+        private final AsyncIggyTcpClient client;
+        private final List<Request> registers = new CopyOnWriteArrayList<>();
+        private final List<Request> writes = new CopyOnWriteArrayList<>();
+        private final AtomicInteger binds = new AtomicInteger();
+        private final CompletableFuture<Void> firstSent = new CompletableFuture<>();
+        private final CompletableFuture<Void> evict = new CompletableFuture<>();
+
+        LostSession(SessionEviction eviction, boolean recovers) throws IOException {
+            this(eviction, recovers, IggyErrorCode.UNAUTHENTICATED.getCode());
+        }
+
+        LostSession(SessionEviction eviction, boolean recovers, int bindReply) throws IOException {
+            this.eviction = eviction;
+            this.recovers = recovers;
+            this.bindReply = bindReply;
+            socket = new ServerSocket(0, CONNECTIONS, InetAddress.getLoopbackAddress());
+            server = serve(socket, CONNECTIONS, this::respond);
+            client = AsyncIggyTcpClient.builder()
+                    .host(socket.getInetAddress().getHostAddress())
+                    .port(socket.getLocalPort())
+                    .credentials("iggy", "iggy")
+                    .requestTimeout(REQUEST_TIMEOUT)
+                    .heartbeatInterval(Duration.ofHours(1))
+                    .build();
+        }
+
+        /** Sends a write, queues a second one in its lane and then evicts the session of the first. */
+        Calls writeTwoAndEvict(boolean routed) throws Exception {
+            client.connect().get(5, TimeUnit.SECONDS);
+            client.login().get(5, TimeUnit.SECONDS);
+            var sent = writeMutation(client, routed);
+            firstSent.get(5, TimeUnit.SECONDS);
+            var unsent = writeMutation(client, routed);
+            Thread.sleep(QUEUE_TIME.toMillis());
+            evict.complete(null);
+            return new Calls(sent, unsent);
+        }
+
+        private long session() {
+            return FIRST_SESSION + registers.size() - 1;
+        }
+
+        private Response respond(Request request) {
+            if (request.operation() == VsrOperation.REGISTER) {
+                registers.add(request);
+                return registers.size() == 1 || recovers
+                        ? Response.success(VsrOperation.REGISTER, registerBody(session()))
+                        : Response.noReply();
+            }
+            if (request.commandCode() == CommandCode.System.BIND_SESSION.getValue()) {
+                binds.incrementAndGet();
+                return Response.error(VsrOperation.NON_REPLICATED, bindReply);
+            }
+            if (request.commandCode() == CommandCode.System.GET_CLUSTER_METADATA.getValue()) {
+                return Response.success(VsrOperation.NON_REPLICATED, singleNodeMetadata(socket.getLocalPort()));
+            }
+            if (request.commandCode() == CommandCode.Messages.GET_PARTITION_ROUTE.getValue()) {
+                return Response.success(
+                        VsrOperation.NON_REPLICATED,
+                        AsyncIggyTcpClientTransientFailoverTest.pollRoute(
+                                request, session(), 1, socket.getLocalPort()));
+            }
+            if (request.operation() != VsrOperation.DELETE_STREAM
+                    && request.operation() != VsrOperation.STORE_CONSUMER_OFFSET) {
+                throw new IllegalStateException("Unexpected request " + request);
+            }
+            writes.add(request);
+            if (writes.size() > 1) {
+                return Response.committed(
+                        request.operation(), 2, Unpooled.buffer().writeIntLE(0));
+            }
+            firstSent.complete(null);
+            evict.join();
+            return Response.eviction(eviction.reason);
+        }
+
+        @Override
+        public void close() throws Exception {
+            evict.complete(null);
+            try {
+                client.close().get(5, TimeUnit.SECONDS);
+            } finally {
+                socket.close();
+            }
+            server.get(5, TimeUnit.SECONDS);
+        }
+
+        private record Calls(CompletableFuture<byte[]> sent, CompletableFuture<byte[]> unsent) {}
+    }
+
+    /**
+     * One node and a client with one pending operation. An unanswered offset write ends uncertain and keeps that
+     * operation, so a delete waits for it in its own free lane. A ping that the node answers with an eviction drops
+     * the link under the waiting delete, and every bind on the next link is refused with {@code NOT_PRIMARY}.
+     */
+    private static final class DroppedLink implements AutoCloseable {
+        // The dropped link and the link that never binds.
+        private static final int CONNECTIONS = 2;
+        private static final long SESSION = 42;
+        private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(1);
+        // The delete needs it to reach its wait for the pending operation.
+        private static final Duration QUEUE_TIME = Duration.ofMillis(200);
+        private static final long PENDING_BYTES = 4L * VsrHeaders.HEADER_SIZE;
+
+        private final ServerSocket socket;
+        private final CompletableFuture<Void> server;
+        private final AsyncIggyTcpClient client;
+        private final List<Request> offsetWrites = new CopyOnWriteArrayList<>();
+        private final List<Request> deletes = new CopyOnWriteArrayList<>();
+        private final AtomicInteger binds = new AtomicInteger();
+
+        DroppedLink() throws IOException {
+            socket = new ServerSocket(0, CONNECTIONS, InetAddress.getLoopbackAddress());
+            server = serve(socket, CONNECTIONS, this::respond);
+            client = AsyncIggyTcpClient.builder()
+                    .host(socket.getInetAddress().getHostAddress())
+                    .port(socket.getLocalPort())
+                    .credentials("iggy", "iggy")
+                    .requestTimeout(REQUEST_TIMEOUT)
+                    .heartbeatInterval(Duration.ofHours(1))
+                    .pendingOperations(1, PENDING_BYTES)
+                    .build();
+        }
+
+        /** Returns the delete, which the client admits on the dropped link once the offset write is abandoned. */
+        CompletableFuture<byte[]> admitOnTheDroppedLink() throws Exception {
+            client.connect().get(5, TimeUnit.SECONDS);
+            client.login().get(5, TimeUnit.SECONDS);
+            AsyncIggyTcpClientTransientFailoverTest.assertServerError(
+                    writeMutation(client, true), IggyErrorCode.OPERATION_UNCERTAIN.getCode());
+            var delete = writeMutation(client, false);
+            Thread.sleep(QUEUE_TIME.toMillis());
+            assertThatThrownBy(() -> client.system().ping().get(5, TimeUnit.SECONDS));
+            client.abandonOperation(offsetWrites.get(0).requestId()).get(5, TimeUnit.SECONDS);
+            return delete;
+        }
+
+        private Response respond(Request request) {
+            if (request.operation() == VsrOperation.REGISTER) {
+                return Response.success(VsrOperation.REGISTER, registerBody(SESSION));
+            }
+            if (request.commandCode() == CommandCode.System.BIND_SESSION.getValue()) {
+                binds.incrementAndGet();
+                return Response.error(VsrOperation.NON_REPLICATED, AsyncTcpConnection.NOT_PRIMARY);
+            }
+            if (request.commandCode() == CommandCode.System.GET_CLUSTER_METADATA.getValue()) {
+                return Response.success(VsrOperation.NON_REPLICATED, singleNodeMetadata(socket.getLocalPort()));
+            }
+            if (request.commandCode() == CommandCode.Messages.GET_PARTITION_ROUTE.getValue()) {
+                return Response.success(
+                        VsrOperation.NON_REPLICATED,
+                        AsyncIggyTcpClientTransientFailoverTest.pollRoute(request, SESSION, 1, socket.getLocalPort()));
+            }
+            if (request.commandCode() == CommandCode.System.PING.getValue()) {
+                return Response.eviction(SessionEviction.NO_SESSION.reason);
+            }
+            if (request.operation() == VsrOperation.STORE_CONSUMER_OFFSET) {
+                offsetWrites.add(request);
+                return Response.noReply();
+            }
+            if (request.operation() == VsrOperation.DELETE_STREAM) {
+                deletes.add(request);
+                return Response.committed(
+                        request.operation(), 2, Unpooled.buffer().writeIntLE(0));
+            }
+            throw new IllegalStateException("Unexpected request " + request);
+        }
+
+        @Override
+        public void close() throws Exception {
+            try {
+                client.close().get(5, TimeUnit.SECONDS);
+            } finally {
+                socket.close();
+            }
+            server.get(5, TimeUnit.SECONDS);
+        }
+    }
+
     private enum LostLink {
         DISCONNECT,
         STALE_CLIENT_EVICTION,
         UNPROVED_REPLY
+    }
+
+    /** How the server ends the session of a write whose reply was lost. */
+    private enum SessionEnd {
+        REFUSED_BIND,
+        EVICTED_BIND,
+        REFUSED_SIGN_IN
     }
 
     /** The eviction reasons that the client reads as unauthenticated, with their wire codes. */

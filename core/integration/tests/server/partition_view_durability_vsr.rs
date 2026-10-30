@@ -75,7 +75,7 @@ async fn given_advanced_partition_view_when_survivor_restarts_should_recover_vie
         .await
         .expect("connect a root client to the node");
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream on the view-0 primary");
     let stream_id = Identifier::named(STREAM_NAME).expect("stream identifier");

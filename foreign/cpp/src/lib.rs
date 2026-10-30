@@ -22,7 +22,13 @@ mod messages;
 mod producer;
 mod type_conversion;
 
-use client::{Client, delete_connection as delete_client, from_connection_string, new_connection};
+use client::{
+    Client, decode_metadata_change_record, decode_metadata_changes, decode_metadata_current_item,
+    delete_connection as delete_client, encode_metadata_changes_query, encryption_key_fingerprint,
+    encryption_key_fingerprint_base64, from_connection_string, new_connection,
+    parse_metadata_change_cursor, parse_metadata_current_page_token,
+    validate_metadata_changes_query,
+};
 use consumer::Consumer;
 use messages::make_message;
 use producer::Producer;
@@ -117,9 +123,27 @@ mod ffi {
         size_bytes: u64,
         messages_count: u64,
         topics_count: u32,
-        /// Creation options. Streams have no catalog keys yet, so this is
-        /// empty until one lands.
+        /// Options the creating client set explicitly. Key material is never
+        /// returned.
         options: Vec<HeaderEntry>,
+        /// Options the server filled in, including the read-only encryption
+        /// projections.
+        derived_options: Vec<HeaderEntry>,
+        has_encryption_key_source: bool,
+        encryption_key_source: StreamEncryptionSource,
+        has_encryption_key_fingerprint: bool,
+        encryption_key_fingerprint: String,
+        /// One per server key that wraps the stream's key, empty for a
+        /// plaintext stream.
+        encryption_kek_fingerprints: Vec<String>,
+    }
+
+    /// Who chose a stream's at-rest data key.
+    #[repr(u8)]
+    enum StreamEncryptionSource {
+        None = 0,
+        Stream = 1,
+        Server = 2,
     }
 
     #[repr(u8)]
@@ -151,13 +175,13 @@ mod ffi {
         value: HeaderField,
     }
 
-    /// One key a resource's create command accepts, as served by
+    /// One key of a resource's option catalog, as served by
     /// `describe_options`.
     ///
-    /// This is the discovery surface for the keys `create_topic` takes. A key
-    /// outside the server catalog is refused at create, and the binary
-    /// transports carry back only an error code, so nothing in the rejection
-    /// names the keys that would have worked.
+    /// This is the discovery surface for the keys a create or an update takes.
+    /// A key outside the server catalog is refused, and the binary transports
+    /// carry back only an error code, so nothing in the rejection names the
+    /// keys that would have worked.
     struct OptionSpec {
         key: String,
         /// Wire kind code the value is encoded under, the same encoding
@@ -166,6 +190,15 @@ mod ffi {
         /// The default in `kind`'s encoding. Empty when the key has no default.
         default_value: Vec<u8>,
         description: String,
+        updatable: bool,
+        resettable: bool,
+        /// Write-only: accepted at create, never returned.
+        secret: bool,
+        /// Computed by the server and returned on reads, never accepted.
+        read_only: bool,
+        /// A node that does not understand the key refuses to serve the
+        /// resource.
+        critical: bool,
     }
 
     struct IggyMessageToSend {
@@ -234,6 +267,13 @@ mod ffi {
         topics: Vec<Topic>,
         /// See [`Stream::options`].
         options: Vec<HeaderEntry>,
+        /// See [`Stream::derived_options`].
+        derived_options: Vec<HeaderEntry>,
+        has_encryption_key_source: bool,
+        encryption_key_source: StreamEncryptionSource,
+        has_encryption_key_fingerprint: bool,
+        encryption_key_fingerprint: String,
+        encryption_kek_fingerprints: Vec<String>,
     }
 
     struct ConsumerGroupMember {
@@ -414,6 +454,7 @@ mod ffi {
         status: UserStatus,
         username: String,
         options: Vec<HeaderEntry>,
+        derived_options: Vec<HeaderEntry>,
     }
 
     struct UserInfoDetails {
@@ -424,6 +465,7 @@ mod ffi {
         has_permissions: bool,
         permissions: Permissions,
         options: Vec<HeaderEntry>,
+        derived_options: Vec<HeaderEntry>,
     }
 
     struct LoginInfo {
@@ -485,18 +527,201 @@ mod ffi {
         size_of_messages_required_to_save: u64,
         has_preallocate_segments: bool,
         preallocate_segments: bool,
+        has_partition_resize_policy: bool,
+        partition_resize_policy: String,
         raw_options: Vec<HeaderEntry>,
     }
 
+    /// Reset keys travel as catalog names and are validated against the
+    /// scope's catalog before anything is sent. Raw reset names are left to
+    /// the server.
     struct TopicUpdateOptions {
-        has_compression_algorithm: bool,
-        compression_algorithm: String,
+        has_name: bool,
+        name: String,
         has_message_expiry: bool,
         message_expiry_kind: String,
         message_expiry_value: u64,
         has_max_topic_size: bool,
         max_topic_size: String,
+        reset: Vec<String>,
+        raw_reset: Vec<String>,
         raw_options: Vec<HeaderEntry>,
+    }
+
+    /// The key is either 32 raw bytes or their canonical padded base64, never
+    /// both. An invalid key is refused before anything is sent.
+    struct StreamCreateOptions {
+        has_encryption_key: bool,
+        encryption_key: Vec<u8>,
+        has_encryption_key_base64: bool,
+        encryption_key_base64: String,
+        raw_options: Vec<HeaderEntry>,
+    }
+
+    struct StreamUpdateOptions {
+        has_name: bool,
+        name: String,
+        reset: Vec<String>,
+        raw_reset: Vec<String>,
+        raw_options: Vec<HeaderEntry>,
+    }
+
+    struct UserCreateOptions {
+        raw_options: Vec<HeaderEntry>,
+    }
+
+    struct UserUpdateOptions {
+        has_username: bool,
+        username: String,
+        has_status: bool,
+        status: UserStatus,
+        reset: Vec<String>,
+        raw_reset: Vec<String>,
+        raw_options: Vec<HeaderEntry>,
+    }
+
+    /// Where a metadata change query starts. The values are the wire codes.
+    #[repr(u8)]
+    enum MetadataChangeStart {
+        Earliest = 0,
+        Latest = 1,
+        After = 2,
+        Current = 3,
+    }
+
+    /// Position of the last change record a caller consumed, with its `mc1_`
+    /// text form.
+    #[derive(Default)]
+    struct MetadataChangeCursor {
+        log_id_lo: u64,
+        log_id_hi: u64,
+        op: u64,
+        checksum_lo: u64,
+        checksum_hi: u64,
+        ordinal: u32,
+        text: String,
+    }
+
+    /// Continuation of a current state scan, with its `cs1_` text form.
+    #[derive(Default)]
+    struct MetadataCurrentPageToken {
+        text: String,
+        anchor: MetadataChangeCursor,
+        required_head: u64,
+        groups_mask: u8,
+        last_group: u8,
+        last_key: Vec<u8>,
+    }
+
+    /// A metadata change query. Cursor and page token travel as their text
+    /// forms, an empty page token starts a current state scan.
+    struct MetadataChangesQuery {
+        start: MetadataChangeStart,
+        cursor: String,
+        page_token: String,
+        groups: Vec<u8>,
+        has_since: bool,
+        since: u64,
+        has_until: bool,
+        until: u64,
+        limit: u32,
+    }
+
+    /// Whether this build knows a record's or item's group and kind.
+    #[repr(u8)]
+    enum MetadataChangeForm {
+        Known = 0,
+        /// A binary body this build does not know, kept in `unknown_body`.
+        Unknown = 1,
+        /// A JSON object this build does not know, kept whole in `unknown_body`.
+        UnknownJson = 2,
+    }
+
+    /// Every field a record or item body can carry. A body fills the fields
+    /// its kind carries and leaves the rest at zero.
+    struct MetadataChangeBody {
+        stream_id: u32,
+        stream_created_op: u64,
+        topic_id: u32,
+        topic_created_op: u64,
+        group_id: u32,
+        has_member_id: bool,
+        member_id: u32,
+        partition_id: u32,
+        created_at: u64,
+        /// The stream, topic, consumer group or token name, or the username.
+        name: String,
+        partitions_count: u32,
+        consumer_groups_count: u32,
+        members_count: u32,
+        client_id_lo: u64,
+        client_id_hi: u64,
+        /// Removed ids of a partition count change, installed ids of a member.
+        partition_ids: Vec<u32>,
+        has_requested_op: bool,
+        requested_op: u64,
+        /// Wire code of a removal or permission change reason.
+        reason: u8,
+        user_id: u32,
+        user_created_at: u64,
+        status: UserStatus,
+        has_permissions: bool,
+        permissions: Permissions,
+        /// False when the server holds option state this build cannot read.
+        options_readable: bool,
+        options: Vec<HeaderEntry>,
+        derived_options: Vec<HeaderEntry>,
+        has_expiry: bool,
+        expiry: u64,
+        session: u64,
+        unknown_body: Vec<u8>,
+    }
+
+    /// One change record. `group` and `kind` are wire codes, the names of a
+    /// JSON record this build does not know are in `group_name` and
+    /// `kind_name`.
+    struct MetadataChangeRecord {
+        op: u64,
+        ordinal: u32,
+        checksum_lo: u64,
+        checksum_hi: u64,
+        timestamp: u64,
+        has_actor_user_id: bool,
+        actor_user_id: u32,
+        form: MetadataChangeForm,
+        group: u8,
+        kind: u8,
+        group_name: String,
+        kind_name: String,
+        body: MetadataChangeBody,
+    }
+
+    /// One current state item. See [`MetadataChangeRecord`] for the codes.
+    struct MetadataCurrentItem {
+        form: MetadataChangeForm,
+        group: u8,
+        group_name: String,
+        body: MetadataChangeBody,
+    }
+
+    /// One page of the change log or of the current state. `status` and
+    /// `phase` are wire codes.
+    struct MetadataChanges {
+        status: u8,
+        phase: u8,
+        has_log_id: bool,
+        log_id_lo: u64,
+        log_id_hi: u64,
+        oldest_op: u64,
+        retained_since: u64,
+        head_op: u64,
+        has_next: bool,
+        next: MetadataChangeCursor,
+        has_more: bool,
+        records: Vec<MetadataChangeRecord>,
+        items: Vec<MetadataCurrentItem>,
+        has_current_page_token: bool,
+        current_page_token: MetadataCurrentPageToken,
     }
 
     extern "Rust" {
@@ -525,13 +750,13 @@ mod ffi {
         fn create_stream(
             self: &Client,
             stream_name: String,
+            options: StreamCreateOptions,
             error_info: &mut ErrorInfo,
         ) -> Result<StreamDetails>;
         fn update_stream(
             self: &Client,
             stream_id: Identifier,
-            stream_name: String,
-            options: Vec<HeaderEntry>,
+            options: StreamUpdateOptions,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
@@ -558,7 +783,6 @@ mod ffi {
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
-            topic_name: String,
             options: TopicUpdateOptions,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
@@ -723,6 +947,51 @@ mod ffi {
         /// "user". A scope with no keys yet answers with an empty vector, which
         /// is an empty catalog rather than a failure.
         fn describe_options(self: &Client, scope: String) -> Result<Vec<OptionSpec>>;
+        /// Reads one page of the metadata change log or of the current state.
+        /// Needs root or the global manage_servers permission. An invalid
+        /// query fails with InvalidCommand (3) before anything is sent.
+        fn get_metadata_changes(
+            self: &Client,
+            query: MetadataChangesQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<MetadataChanges>;
+        /// Fingerprint of a 32-byte stream key, computed locally.
+        fn encryption_key_fingerprint(key: &[u8], error_info: &mut ErrorInfo) -> Result<String>;
+        /// Fingerprint of a stream key given as canonical padded base64.
+        fn encryption_key_fingerprint_base64(
+            key: &str,
+            error_info: &mut ErrorInfo,
+        ) -> Result<String>;
+        fn parse_metadata_change_cursor(
+            text: &[u8],
+            error_info: &mut ErrorInfo,
+        ) -> Result<MetadataChangeCursor>;
+        fn parse_metadata_current_page_token(
+            text: &[u8],
+            error_info: &mut ErrorInfo,
+        ) -> Result<MetadataCurrentPageToken>;
+        fn validate_metadata_changes_query(
+            query: MetadataChangesQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
+        /// The binary request payload of a query, without validating it.
+        fn encode_metadata_changes_query(
+            query: MetadataChangesQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<Vec<u8>>;
+        /// Decodes a response payload as the binary transports carry it.
+        fn decode_metadata_changes(
+            payload: &[u8],
+            error_info: &mut ErrorInfo,
+        ) -> Result<MetadataChanges>;
+        fn decode_metadata_change_record(
+            bytes: &[u8],
+            error_info: &mut ErrorInfo,
+        ) -> Result<MetadataChangeRecord>;
+        fn decode_metadata_current_item(
+            bytes: &[u8],
+            error_info: &mut ErrorInfo,
+        ) -> Result<MetadataCurrentItem>;
         fn ping(self: &Client) -> Result<()>;
         fn heartbeat_interval(self: &Client) -> u64;
         fn snapshot(
@@ -734,6 +1003,13 @@ mod ffi {
             self: &Client,
             code: u32,
             payload: Vec<u8>,
+            error_info: &mut ErrorInfo,
+        ) -> Result<Vec<u8>>;
+        fn send_binary_request_to_replica(
+            self: &Client,
+            code: u32,
+            payload: Vec<u8>,
+            replica_id: u8,
             error_info: &mut ErrorInfo,
         ) -> Result<Vec<u8>>;
 
@@ -750,6 +1026,7 @@ mod ffi {
         ) -> Result<()>;
         fn get_user(self: &Client, user_id: Identifier) -> Result<UserInfoDetails>;
         fn get_users(self: &Client) -> Result<Vec<UserInfo>>;
+        #[allow(clippy::too_many_arguments)]
         fn create_user(
             self: &Client,
             username: String,
@@ -757,6 +1034,7 @@ mod ffi {
             status: UserStatus,
             has_permissions: bool,
             permissions: Permissions,
+            options: UserCreateOptions,
             error_info: &mut ErrorInfo,
         ) -> Result<UserInfoDetails>;
         fn delete_user(
@@ -764,15 +1042,10 @@ mod ffi {
             user_id: Identifier,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
-        #[allow(clippy::too_many_arguments)]
         fn update_user(
             self: &Client,
             user_id: Identifier,
-            has_username: bool,
-            username: String,
-            has_status: bool,
-            status: UserStatus,
-            options: Vec<HeaderEntry>,
+            options: UserUpdateOptions,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn update_permissions(
@@ -791,11 +1064,12 @@ mod ffi {
         ) -> Result<()>;
         fn get_cluster_metadata(self: &Client) -> Result<ClusterMetadata>;
         // fn get_personal_access_tokens(self: &Client) -> Result<Vec<PersonalAccessTokenInfo>>;
-        // fn create_personal_access_token(
-        //     self: &Client,
-        //     name: String,
-        //     expiry: u64,
-        // ) -> Result<RawPersonalAccessToken>;
+        fn create_personal_access_token(
+            self: &Client,
+            name: String,
+            expiry_kind: String,
+            expiry_value: u64,
+        ) -> Result<String>;
         // fn delete_personal_access_token(self: &Client, name: String) -> Result<()>;
         // fn login_with_personal_access_token(self: &Client, token: String) -> Result<IdentityInfo>;
 

@@ -24,7 +24,6 @@ import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import tools.jackson.core.JacksonException;
@@ -110,14 +109,7 @@ public final class SinkDataProducer {
         client.topics()
                 .getTopic(streamId, topicId)
                 .ifPresentOrElse(existing -> log.info("Topic {} already exists.", topicId.getName()), () -> {
-                    client.topics()
-                            .createTopic(
-                                    streamId,
-                                    1L,
-                                    CompressionAlgorithm.None,
-                                    java.math.BigInteger.ZERO,
-                                    java.math.BigInteger.ZERO,
-                                    topicId.getName());
+                    client.topics().createTopic(streamId, topicId.getName(), 1L);
                     log.info("Created topic {}.", topicId.getName());
                 });
     }

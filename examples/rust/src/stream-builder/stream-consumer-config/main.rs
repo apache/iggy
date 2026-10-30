@@ -17,7 +17,6 @@
 
 use iggy::prelude::*;
 use iggy_examples::shared::stream::PrintEventConsumer;
-use std::str::FromStr;
 use tokio::sync::oneshot;
 
 const IGGY_URL: &str = "iggy://iggy:iggy@localhost:8090";
@@ -55,8 +54,8 @@ async fn main() -> Result<(), IggyError> {
         .consumer_kind(ConsumerKind::ConsumerGroup)
         // Topic creation count. Ordinary consumers select a partition separately with partition_id.
         .partitions_count(1)
-        // The polling interval for messages.
-        .polling_interval(IggyDuration::from_str("5ms").unwrap())
+        // A poll returns when `min_count` messages are ready, `max_bytes` is reached or `max_wait` expires.
+        .poll_options(DeferredPollOptions::default())
         // `PollingStrategy` specifies from where to start polling messages.
         // It has the following kinds:
         // - `Offset` - start polling from the specified offset.

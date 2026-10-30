@@ -85,7 +85,7 @@ public sealed class HttpPartitionContextTests
         var client = Client(handler);
 
         await SendAsync(client);
-        await client.CreateStreamAsync("created", TestContext.Current.CancellationToken);
+        await client.CreateStreamAsync("created", token: TestContext.Current.CancellationToken);
         await client.CreateTopicAsync(Identifier.Numeric(1), "created", 1,
             token: TestContext.Current.CancellationToken);
         await SendAsync(client);

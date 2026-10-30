@@ -15,6 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
+/// Forwards a trait method to the concrete client using static dispatch.
+macro_rules! dispatch_client {
+    ($wrapper:expr, $trait:ident::$method:ident($($arg:expr),* $(,)?)) => {
+        match $wrapper {
+            Self::Iggy(client) => $trait::$method(client $(, $arg)*),
+            Self::Http(client) => $trait::$method(client $(, $arg)*),
+            Self::Tcp(client) => $trait::$method(client $(, $arg)*),
+            Self::Quic(client) => $trait::$method(client $(, $arg)*),
+            Self::WebSocket(client) => $trait::$method(client $(, $arg)*),
+        }
+    };
+}
+
+pub(crate) use dispatch_client;
+
 mod binary_client;
 mod binary_cluster_client;
 mod binary_consumer_group_client;

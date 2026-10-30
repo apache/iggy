@@ -19,13 +19,11 @@ use crate::Sizeable;
 use crate::Validatable;
 use crate::error::IggyError;
 use crate::utils::byte_size::IggyByteSize;
-use iggy_binary_protocol::WireIdentifier;
 use serde::{Deserialize, Serialize};
 use serde_with::base64::Base64;
 use serde_with::serde_as;
 use std::borrow::Cow;
 use std::fmt::Display;
-use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
 /// `Identifier` represents the unique identifier of the resources such as stream, topic, partition, user etc.
@@ -34,7 +32,7 @@ use std::str::FromStr;
 /// - `length`: the length of the identifier payload.
 /// - `value`: the binary value of the identifier payload.
 #[serde_as]
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq, Hash)]
 pub struct Identifier {
     /// The kind of the identifier.
     pub kind: IdKind,
@@ -47,7 +45,7 @@ pub struct Identifier {
 }
 
 /// `IdKind` represents the kind of the identifier.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Copy, Clone, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Copy, Clone, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum IdKind {
     /// The identifier is numeric.
@@ -101,7 +99,9 @@ impl Identifier {
             return Err(IggyError::InvalidIdentifier);
         }
 
-        Ok(u32::from_le_bytes(self.value.clone().try_into().unwrap()))
+        <[u8; 4]>::try_from(self.value.as_slice())
+            .map(u32::from_le_bytes)
+            .map_err(|_| IggyError::InvalidIdentifier)
     }
 
     /// Returns the string value of the identifier.
@@ -260,17 +260,6 @@ impl TryFrom<u32> for Identifier {
     }
 }
 
-impl TryFrom<&WireIdentifier> for Identifier {
-    type Error = IggyError;
-
-    fn try_from(value: &WireIdentifier) -> Result<Self, Self::Error> {
-        match value {
-            WireIdentifier::Numeric(id) => Self::numeric(*id),
-            WireIdentifier::String(name) => Self::named(name),
-        }
-    }
-}
-
 impl TryFrom<String> for Identifier {
     type Error = IggyError;
     fn try_from(value: String) -> Result<Self, Self::Error> {
@@ -307,22 +296,59 @@ impl Display for IdKind {
     }
 }
 
-impl Hash for Identifier {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self.kind {
-            IdKind::Numeric => {
-                self.get_u32_value().unwrap().hash(state);
-            }
-            IdKind::String => {
-                self.get_cow_str_value().unwrap().hash(state);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::hash::{BuildHasher, RandomState};
+
+    #[test]
+    fn equal_identifiers_should_hash_equally() {
+        let state = RandomState::new();
+        let named = Identifier::named("orders").unwrap();
+        let mut named_bytes = vec![named.kind.as_code(), named.length];
+        named_bytes.extend_from_slice(&named.value);
+        for (left, right) in [
+            (
+                Identifier::numeric(7).unwrap(),
+                Identifier::from_str("7").unwrap(),
+            ),
+            (named, Identifier::from_raw_bytes(&named_bytes).unwrap()),
+        ] {
+            assert_eq!(left, right);
+            assert_eq!(state.hash_one(&left), state.hash_one(&right));
+        }
+    }
+
+    #[test]
+    fn malformed_identifier_should_miss_a_map_without_panicking() {
+        let id = Identifier::numeric(7).unwrap();
+        let map = HashMap::from([(id.clone(), ())]);
+        // serde skips the length, so it reads back as 0.
+        let read_back: Identifier =
+            serde_json::from_str(&serde_json::to_string(&id).unwrap()).unwrap();
+        let short = Identifier {
+            kind: IdKind::Numeric,
+            length: 4,
+            value: vec![7, 0, 0],
+        };
+        for malformed in [read_back, short] {
+            assert!(malformed.validate().is_err(), "{malformed:?}");
+            assert!(!map.contains_key(&malformed), "{malformed:?}");
+        }
+    }
+
+    #[test]
+    fn numeric_identifier_with_a_value_of_another_size_should_fail_to_read_without_panicking() {
+        let short = Identifier {
+            kind: IdKind::Numeric,
+            length: 4,
+            value: vec![7, 0, 0],
+        };
+
+        assert_eq!(short.get_u32_value(), Err(IggyError::InvalidIdentifier));
+        assert_eq!(Identifier::numeric(7).unwrap().get_u32_value(), Ok(7));
+    }
 
     #[test]
     fn identifier_with_a_value_of_greater_than_zero_should_be_valid() {

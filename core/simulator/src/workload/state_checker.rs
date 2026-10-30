@@ -34,6 +34,9 @@
 //! positions. Also asserts the chain is hash-linked (`header_b.parent ==
 //! checksum_a`). Recording which replicas reached each op keeps the check provably
 //! non-vacuous: a chain nothing was compared against passes silently.
+//!
+//! A partition prepare's identity leaves its message batch out, so
+//! [`assert_applied_data_agrees`] compares the committed batches themselves.
 
 use crate::Simulator;
 use consensus::PartitionsHandle;
@@ -48,8 +51,11 @@ use iggy_binary_protocol::requests::partitions::{
 use iggy_binary_protocol::{HEADER_SIZE, Operation, PrepareHeader, WireDecode};
 use journal::Journal;
 use message_bus::is_auto_commit_client;
+use server_common::send_messages::decode_prepare_slice_trusted;
 use server_common::sharding::IggyNamespace;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
+use std::hash::{DefaultHasher, Hasher};
 
 /// One op of the canonical committed chain.
 #[derive(Debug)]
@@ -115,6 +121,8 @@ pub struct StateChecker {
     incarnations: BTreeMap<u8, u128>,
     partition_commits: BTreeMap<(IggyNamespace, u64, u64), CanonicalCommit>,
     partition_verified_upto: BTreeMap<(u8, IggyNamespace), PartitionProgress>,
+    /// Canonical partition commits that retire consumer group owners.
+    owner_retirements_committed: usize,
 }
 
 impl StateChecker {
@@ -155,7 +163,16 @@ impl StateChecker {
                 self.verified_upto
                     .insert(replica_idx, replica.metadata_journal.snapshot_op());
             }
-            let verified = self.verified_upto.get(&replica_idx).copied().unwrap_or(0);
+            // A state transfer raises the floor without a restart and keeps the
+            // residents below it, one of which can be a prepare a view change
+            // discarded. The snapshot superseded them, so the walk starts at the floor
+            // here too.
+            let verified = self
+                .verified_upto
+                .get(&replica_idx)
+                .copied()
+                .unwrap_or(0)
+                .max(replica.metadata_journal.snapshot_op());
             for op in (verified + 1)..=committed {
                 self.verify(replica_idx, replica, op, committed, seed);
             }
@@ -220,6 +237,13 @@ impl StateChecker {
         };
         for (op, header) in headers {
             let identity = header.identity_checksum();
+            if header.operation == Operation::RetireConsumerGroupOwners
+                && !self
+                    .partition_commits
+                    .contains_key(&(namespace, incarnation, op))
+            {
+                self.owner_retirements_committed += 1;
+            }
             let canonical = self
                 .partition_commits
                 .entry((namespace, incarnation, op))
@@ -301,6 +325,13 @@ impl StateChecker {
     #[must_use]
     pub fn chain_len(&self) -> usize {
         self.commits.len()
+    }
+
+    /// Committed `RetireConsumerGroupOwners` ops, each counted once however many
+    /// replicas committed it.
+    #[must_use]
+    pub const fn owner_retirements_committed(&self) -> usize {
+        self.owner_retirements_committed
     }
 
     /// Ops witnessed by more than one replica, the only ones that exercised the
@@ -601,6 +632,133 @@ pub fn assert_partition_prefixes_agree(
     compared
 }
 
+/// What [`assert_applied_data_agrees`] compared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AppliedDataReport {
+    /// Namespaces in which at least one committed batch was compared.
+    pub namespaces: usize,
+    /// Messages in the compared batches, each batch counted once however many
+    /// replicas hold it.
+    pub records: usize,
+}
+
+/// One committed batch as the first replica that holds it applied it.
+struct AppliedBatch {
+    replica: u8,
+    digest: u64,
+    base_offset: u64,
+    messages: u32,
+    witnesses: usize,
+}
+
+/// Assert live replicas that committed the same `SendMessages` prepare hold the
+/// same applied message data.
+///
+/// The data twin of [`assert_partition_prefixes_agree`]. A `SendMessages` prepare
+/// carries a zero `checksum_body`, so its identity leaves the message batch out,
+/// and two replicas can agree on every identity and offset while serving
+/// different messages. This hashes the batch each replica retains for a committed
+/// op, the bytes a poll reads back and a flush writes, and compares the digests.
+///
+/// Keyed by incarnation, op and prepare identity, so only replicas that committed
+/// the exact same prepare in the same history are compared; an identity
+/// divergence is the prefix check's to report. Each replica contributes the ops
+/// up to its own `commit_min` that its journal still retains, so the ops compared
+/// are the ones at or below the common commit point that both replicas hold.
+///
+/// # Panics
+/// If two live replicas hold different data for one committed prepare, or a
+/// committed batch does not decode.
+#[must_use]
+pub fn assert_applied_data_agrees(
+    sim: &Simulator,
+    namespaces: &[IggyNamespace],
+    seed: u64,
+) -> AppliedDataReport {
+    let mut report = AppliedDataReport::default();
+    for &namespace in namespaces {
+        let mut canonical: BTreeMap<(u64, u64, u128), AppliedBatch> = BTreeMap::new();
+        for replica_idx in 0..sim.replica_count {
+            if sim.is_crashed(replica_idx) {
+                continue;
+            }
+            let Some(partition) = sim.replicas[usize::from(replica_idx)]
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+            else {
+                continue;
+            };
+            let incarnation = partition.created_revision();
+            let journal = &partition.log.journal().inner;
+            for (op, header) in journal.repair_headers_in(1..=partition.consensus().commit_min()) {
+                if header.operation != Operation::SendMessages {
+                    continue;
+                }
+                let Some(entry) = journal.repair_entry(op) else {
+                    continue;
+                };
+                let batch = applied_batch(replica_idx, op, entry.as_slice(), seed);
+                match canonical.entry((incarnation, op, header.identity_checksum())) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(batch);
+                    }
+                    Entry::Occupied(mut slot) => {
+                        let expected = slot.get_mut();
+                        assert_eq!(
+                            batch.digest,
+                            expected.digest,
+                            "replicas {replica_idx} and {} committed the same prepare at partition \
+                             op {op} of ns {namespace:?} incarnation {incarnation} but hold \
+                             different applied message data: digest {:#x} vs {:#x}, base offset \
+                             {} vs {}, {} vs {} messages (seed={seed:#x})",
+                            expected.replica,
+                            batch.digest,
+                            expected.digest,
+                            batch.base_offset,
+                            expected.base_offset,
+                            batch.messages,
+                            expected.messages,
+                        );
+                        expected.witnesses += 1;
+                    }
+                }
+            }
+        }
+        let records: usize = canonical
+            .values()
+            .filter(|batch| batch.witnesses > 1)
+            .map(|batch| batch.messages as usize)
+            .sum();
+        if records > 0 {
+            report.namespaces += 1;
+            report.records += records;
+        }
+    }
+    report
+}
+
+/// Digest of the batch body a committed `SendMessages` entry carries, the batch
+/// header included because it holds the stamped offsets and timestamp.
+fn applied_batch(replica: u8, op: u64, entry: &[u8], seed: u64) -> AppliedBatch {
+    let batch = decode_prepare_slice_trusted(entry).unwrap_or_else(|error| {
+        panic!(
+            "replica {replica} holds committed partition op {op} whose batch does not \
+             decode: {error} (seed={seed:#x})"
+        )
+    });
+    let mut hasher = DefaultHasher::new();
+    hasher.write(&entry[HEADER_SIZE..HEADER_SIZE + batch.header.total_size()]);
+    AppliedBatch {
+        replica,
+        digest: hasher.finish(),
+        base_offset: batch.header.base_offset,
+        messages: batch.message_count(),
+        witnesses: 1,
+    }
+}
+
 /// Whether a committed op having no journal header is legitimate rather than a
 /// hole.
 ///
@@ -629,7 +787,7 @@ fn journaled_header(replica: &crate::SimReplica, op: u64) -> Option<PrepareHeade
 mod tests {
     use super::*;
     use crate::client::SimClient;
-    use crate::packet::PacketSimulatorOptions;
+    use crate::packet::{Packet, PacketSimulatorOptions, ProcessId};
     use crate::workload::Workload;
     use crate::workload::invariants::Invariants;
     use crate::workload::options::WorkloadOptions;
@@ -1152,6 +1310,132 @@ mod tests {
             checker.ops_compared() > 0,
             "no op was witnessed by more than one replica, so the recheck compared \
              nothing"
+        );
+    }
+
+    /// A state transfer keeps the receiver's residents below the floor it installs,
+    /// and one of them can be a prepare its view lost: here the op an isolated
+    /// primary journaled before it crashed. The snapshot superseded it, so it is not
+    /// the receiver's committed history.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_a_transfer_over_a_lost_prepare_when_checked_every_step_should_not_compare_the_superseded_resident()
+     {
+        const OLD_PRIMARY: u8 = 0;
+        const BACKUPS: [u8; 2] = [1, 2];
+        // Crosses the checkpoint margin within the sends below, so the survivors
+        // compact the prefix the old primary is missing.
+        const JOURNAL_SLOTS: usize = 80;
+        const SENDS: u32 = 40;
+        const STEPS_PER_SEND: usize = 40;
+        const ELECTION_STEPS: usize = 4_000;
+        const REJOIN_STEPS: usize = 8_000;
+
+        fn drop_every_packet(_: &Packet) -> bool {
+            true
+        }
+
+        fn run(sim: &mut Simulator, checker: &mut StateChecker, steps: usize) {
+            for _ in 0..steps {
+                sim.step();
+                checker.check(sim, SEED);
+            }
+        }
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let root = tempfile::tempdir().expect("temp dir for the simulator's snapshots");
+        let client_id: u128 = 1;
+        let mut sim = Simulator::with_checkpoints(
+            3,
+            std::iter::once(client_id),
+            PacketSimulatorOptions {
+                node_count: 3,
+                client_count: 1,
+                seed: SEED,
+                ..PacketSimulatorOptions::default()
+            },
+            false,
+            root.path(),
+        );
+        sim.set_metadata_journal_slots(JOURNAL_SLOTS);
+        let client = SimClient::new(client_id);
+        sim.register_client_with_primary(&client);
+        let mut checker = StateChecker::new();
+        assert_eq!(sim.metadata_primary_index(), Some(OLD_PRIMARY));
+
+        let lost_op = sim.replicas[usize::from(OLD_PRIMARY)]
+            .metadata_journal
+            .last_op()
+            .unwrap_or(0)
+            + 1;
+        for backup in BACKUPS {
+            *sim.network
+                .link_drop_packet_fn(ProcessId::Replica(OLD_PRIMARY), ProcessId::Replica(backup)) =
+                Some(drop_every_packet);
+        }
+        let lost = client.create_stream("wl-chk-lost");
+        sim.submit_request(client_id, OLD_PRIMARY, lost.clone().into_generic());
+        run(&mut sim, &mut checker, STEPS_PER_SEND);
+        let lost_checksum = journaled_header(&sim.replicas[usize::from(OLD_PRIMARY)], lost_op)
+            .expect("the isolated primary never journaled the prepare its backups miss")
+            .checksum;
+        sim.replica_crash(OLD_PRIMARY);
+        for backup in BACKUPS {
+            *sim.network
+                .link_drop_packet_fn(ProcessId::Replica(OLD_PRIMARY), ProcessId::Replica(backup)) =
+                None;
+        }
+
+        let new_primary =
+            (0..ELECTION_STEPS)
+                .find_map(|_| {
+                    run(&mut sim, &mut checker, 1);
+                    sim.metadata_primary_index().filter(|&primary| {
+                        primary != OLD_PRIMARY
+                            && sim.metadata_consensus(usize::from(primary)).is_some_and(
+                                |consensus| consensus.status() == consensus::Status::Normal,
+                            )
+                    })
+                })
+                .expect("the survivors never elected a primary");
+        sim.submit_request(client_id, new_primary, lost.into_generic());
+        run(&mut sim, &mut checker, STEPS_PER_SEND);
+        for sequence in 0..SENDS {
+            let msg = client.create_stream(&format!("wl-chk-{sequence}"));
+            sim.submit_request(client_id, new_primary, msg.into_generic());
+            run(&mut sim, &mut checker, STEPS_PER_SEND);
+        }
+
+        sim.replica_restart(OLD_PRIMARY);
+        run(&mut sim, &mut checker, REJOIN_STEPS);
+
+        let rejoined = &sim.replicas[usize::from(OLD_PRIMARY)];
+        assert!(
+            rejoined.metadata_journal.snapshot_op() > lost_op,
+            "the old primary rejoined without a state transfer over op {lost_op}, so no \
+             resident was left below a floor"
+        );
+        assert_eq!(
+            journaled_header(rejoined, lost_op).map(|header| header.checksum),
+            Some(lost_checksum),
+            "the lost prepare is gone from the old primary's WAL, so nothing superseded \
+             was left to compare"
+        );
+        let canonical = checker
+            .commits
+            .get(&lost_op)
+            .expect("the survivors' commit at the lost op was never recorded");
+        assert_ne!(
+            canonical.checksum, lost_checksum,
+            "the survivors committed the lost prepare itself, so the resident is not stale"
+        );
+        assert!(
+            canonical.witnesses.len() > 1,
+            "no two survivors witnessed op {lost_op}, so the canonical entry compares nothing"
         );
     }
 }

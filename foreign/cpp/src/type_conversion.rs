@@ -15,23 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{collections::BTreeMap, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 use bytes::Bytes;
 use iggy::prelude::{
     CompressionAlgorithm as RustCompressionAlgorithm,
     ConsumerGroupDetails as RustConsumerGroupDetails, Durability as RustDurability, IdKind,
     Identifier as RustIdentifier, IggyByteSize as RustIggyByteSize, IggyExpiry as RustIggyExpiry,
-    IggyMessage as RustIggyMessage, MaxTopicSize as RustMaxTopicSize, OptionSpec as RustOptionSpec,
-    Partition as RustPartition, PartitionContext as RustPartitionContext,
+    IggyMessage as RustIggyMessage, MaxTopicSize as RustMaxTopicSize, OptionKey,
+    OptionSpec as RustOptionSpec, Partition as RustPartition,
+    PartitionContext as RustPartitionContext, PartitionResizePolicy as RustPartitionResizePolicy,
     PolledMessages as RustPolledMessages,
     SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
     SendMessagesResponse as RustSendMessagesResponse, Stream as RustStream,
-    StreamDetails as RustStreamDetails, Topic as RustTopic,
+    StreamDetails as RustStreamDetails, StreamEncryptionKey,
+    StreamEncryptionSource as RustStreamEncryptionSource,
+    StreamUpdateOptions as RustStreamUpdateOptions, Topic as RustTopic,
     TopicCreateOptions as RustTopicCreateOptions, TopicDetails as RustTopicDetails,
-    TopicUpdateOptions as RustTopicUpdateOptions, Validatable,
+    TopicUpdateOptions as RustTopicUpdateOptions, UserCreateOptions as RustUserCreateOptions,
+    UserUpdateOptions as RustUserUpdateOptions, Validatable,
 };
 use iggy_binary_protocol::WireUserHeaders;
+use iggy_binary_protocol::primitives::metadata_changes::{
+    WireMemberLeftReason, WireMetadataChangeGroup, WireMetadataChangeKind, WireMetadataChangePhase,
+    WireMetadataChangeStatus, WirePermissionsUpdatedReason, WireSessionClosedReason,
+    WireTokenDeletedReason,
+};
 use iggy_common::{
     CacheMetrics as RustCacheMetrics, CacheMetricsKey as RustCacheMetricsKey,
     ClientInfo as RustClientInfo, ClientInfoDetails as RustClientInfoDetails,
@@ -40,9 +52,18 @@ use iggy_common::{
     ConsumerGroupMember as RustConsumerGroupMember, ConsumerOffsetInfo as RustConsumerOffsetInfo,
     GlobalPermissions as RustGlobalPermissions, HeaderEntry as RustHeaderEntry,
     HeaderField as RustHeaderField, HeaderKind as RustHeaderKind, IdentityInfo as RustIdentityInfo,
-    Permissions as RustPermissions, Stats as RustStats, StreamPermissions as RustStreamPermissions,
-    TopicPermissions as RustTopicPermissions, TransportEndpoints as RustTransportEndpoints,
-    UserInfo as RustUserInfo, UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
+    IggyError, IggyTimestamp, MetadataChange, MetadataChangeCursor, MetadataChangeGroup,
+    MetadataChangeRecord, MetadataChangeStart, MetadataChanges, MetadataChangesQuery,
+    MetadataConsumerGroupCreated, MetadataConsumerGroupDeleted, MetadataConsumerGroupItem,
+    MetadataCurrentItem, MetadataCurrentPageToken, MetadataMemberItem, MetadataMemberJoined,
+    MetadataMemberLeft, MetadataOptions, MetadataPartitionHandedOver, MetadataPartitionsChanged,
+    MetadataPartitionsItem, MetadataSession, MetadataSessionClosed, MetadataStreamChange,
+    MetadataStreamDeleted, MetadataTokenChange, MetadataTokenDeleted, MetadataTopicChange,
+    MetadataTopicDeleted, MetadataTopicItem, MetadataUserChange, MetadataUserIdentity,
+    MetadataUserPermissionsUpdated, Permissions as RustPermissions, Stats as RustStats,
+    StreamPermissions as RustStreamPermissions, TopicPermissions as RustTopicPermissions,
+    TransportEndpoints as RustTransportEndpoints, UserInfo as RustUserInfo,
+    UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
 };
 
 use crate::ffi;
@@ -160,6 +181,7 @@ impl From<RustUserInfo> for ffi::UserInfo {
             status: ffi::UserStatus::from(user.status),
             username: user.username,
             options: resource_options_to_ffi(&user.options, true),
+            derived_options: resource_options_to_ffi(&user.options, false),
         }
     }
 }
@@ -175,6 +197,7 @@ impl From<RustUserInfoDetails> for ffi::UserInfoDetails {
             has_permissions,
             permissions: ffi::Permissions::from(user.permissions.unwrap_or_default()),
             options: resource_options_to_ffi(&user.options, true),
+            derived_options: resource_options_to_ffi(&user.options, false),
         }
     }
 }
@@ -529,24 +552,61 @@ fn resource_options_to_ffi(
 /// handed in here is rendered rather than passed through: sending `Uint64`
 /// 134217728 for `segment_size` and sending `"134217728"` land the same stored
 /// value. A key this build cannot read at all is dropped rather than guessed.
+/// String entries skip the header codec so the Rust SDK reports length bounds
+/// with the same error categories it uses for its own raw entries.
 pub(crate) fn ffi_options_to_raw(
     options: Vec<ffi::HeaderEntry>,
 ) -> Result<BTreeMap<String, String>, String> {
+    let string_kind = RustHeaderKind::String.as_code();
     let mut raw = BTreeMap::new();
     for entry in options {
-        let RustHeaderEntry { key, value } = RustHeaderEntry::try_from(entry)?;
-        let key = key
-            .as_str()
-            .map_err(|error| format!("Option key is not a string: {error}"))?
-            .to_owned();
-        if raw.insert(key.clone(), value.to_string_value()).is_some() {
+        let (key, value) = if entry.key.kind == string_kind && entry.value.kind == string_kind {
+            let key = String::from_utf8(entry.key.value)
+                .map_err(|error| format!("Option key is not a string: {error}"))?;
+            let value = String::from_utf8(entry.value.value)
+                .map_err(|error| format!("Option value of '{key}' is not a string: {error}"))?;
+            (key, value)
+        } else {
+            let RustHeaderEntry { key, value } = RustHeaderEntry::try_from(entry)?;
+            let key = key
+                .as_str()
+                .map_err(|error| format!("Option key is not a string: {error}"))?
+                .to_owned();
+            (key, value.to_string_value())
+        };
+        if raw.insert(key.clone(), value).is_some() {
             return Err(format!("Duplicate option key: {key}"));
         }
     }
     Ok(raw)
 }
 
-fn parse_message_expiry(kind: &str, value: u64) -> Result<RustIggyExpiry, String> {
+/// Resolve reset key names into the typed set the Rust SDK validates against
+/// the scope's catalog. The C++ wrapper sends only catalog names.
+pub(crate) fn ffi_reset_keys(names: Vec<String>) -> Result<BTreeSet<OptionKey>, String> {
+    names
+        .into_iter()
+        .map(|name| {
+            OptionKey::from_str(&name).map_err(|_| format!("Unknown option key to reset: {name}"))
+        })
+        .collect()
+}
+
+impl ffi::StreamCreateOptions {
+    /// The typed key, refused with `InvalidEncryptionKey` before anything is
+    /// sent. The error never carries key material.
+    pub(crate) fn encryption_key(&self) -> Result<Option<StreamEncryptionKey>, IggyError> {
+        if self.has_encryption_key {
+            return StreamEncryptionKey::try_from(self.encryption_key.as_slice()).map(Some);
+        }
+        if self.has_encryption_key_base64 {
+            return StreamEncryptionKey::from_str(&self.encryption_key_base64).map(Some);
+        }
+        Ok(None)
+    }
+}
+
+pub(crate) fn parse_message_expiry(kind: &str, value: u64) -> Result<RustIggyExpiry, String> {
     match kind {
         "server_default" | "default" => Ok(RustIggyExpiry::ServerDefault),
         "never_expire" => Ok(RustIggyExpiry::NeverExpire),
@@ -565,6 +625,15 @@ fn parse_compression_algorithm(value: &str) -> Result<RustCompressionAlgorithm, 
         .map_err(|error| format!("invalid compression algorithm '{value}': {error}"))
 }
 
+fn parse_user_status(
+    has_status: bool,
+    status: ffi::UserStatus,
+) -> Result<Option<RustUserStatus>, String> {
+    has_status
+        .then(|| RustUserStatus::try_from(status))
+        .transpose()
+}
+
 fn parse_max_topic_size(value: &str) -> Result<RustMaxTopicSize, String> {
     RustMaxTopicSize::from_str(value)
         .map_err(|error| format!("invalid max topic size '{value}': {error}"))
@@ -577,6 +646,11 @@ impl From<RustOptionSpec> for ffi::OptionSpec {
             kind: spec.kind.as_code(),
             default_value: spec.default_value,
             description: spec.description,
+            updatable: spec.updatable,
+            resettable: spec.resettable,
+            secret: spec.secret,
+            read_only: spec.read_only,
+            critical: spec.critical,
         }
     }
 }
@@ -619,6 +693,20 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
         } else {
             RustDurability::default()
         };
+        let partition_resize_policy = if options.has_partition_resize_policy {
+            Some(
+                RustPartitionResizePolicy::from_str(&options.partition_resize_policy).map_err(
+                    |error| {
+                        format!(
+                            "invalid partition resize policy '{}': {error}",
+                            options.partition_resize_policy
+                        )
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
         let mut raw = ffi_options_to_raw(options.raw_options)?;
         if options.has_durability {
             raw.remove("durability");
@@ -642,7 +730,7 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
             },
             durability,
             consumer_offset_durability,
-            partition_resize_policy: None,
+            partition_resize_policy,
             messages_required_to_save: if options.has_messages_required_to_save {
                 Some(options.messages_required_to_save)
             } else {
@@ -669,11 +757,6 @@ impl TryFrom<ffi::TopicUpdateOptions> for RustTopicUpdateOptions {
     type Error = String;
 
     fn try_from(options: ffi::TopicUpdateOptions) -> Result<Self, Self::Error> {
-        let compression_algorithm = if options.has_compression_algorithm {
-            Some(parse_compression_algorithm(&options.compression_algorithm)?)
-        } else {
-            None
-        };
         let message_expiry = if options.has_message_expiry {
             Some(parse_message_expiry(
                 &options.message_expiry_kind,
@@ -687,26 +770,75 @@ impl TryFrom<ffi::TopicUpdateOptions> for RustTopicUpdateOptions {
         } else {
             None
         };
-        let raw = ffi_options_to_raw(options.raw_options)?;
         Ok(RustTopicUpdateOptions {
-            compression_algorithm,
+            name: options.has_name.then_some(options.name),
             message_expiry,
             max_topic_size,
-            raw,
+            reset: ffi_reset_keys(options.reset)?,
+            raw_reset: options.raw_reset.into_iter().collect(),
+            raw: ffi_options_to_raw(options.raw_options)?,
         })
+    }
+}
+
+impl TryFrom<ffi::StreamUpdateOptions> for RustStreamUpdateOptions {
+    type Error = String;
+
+    fn try_from(options: ffi::StreamUpdateOptions) -> Result<Self, Self::Error> {
+        Ok(RustStreamUpdateOptions {
+            name: options.has_name.then_some(options.name),
+            reset: ffi_reset_keys(options.reset)?,
+            raw_reset: options.raw_reset.into_iter().collect(),
+            raw: ffi_options_to_raw(options.raw_options)?,
+        })
+    }
+}
+
+impl TryFrom<ffi::UserCreateOptions> for RustUserCreateOptions {
+    type Error = String;
+
+    fn try_from(options: ffi::UserCreateOptions) -> Result<Self, Self::Error> {
+        Ok(RustUserCreateOptions {
+            raw: ffi_options_to_raw(options.raw_options)?,
+        })
+    }
+}
+
+impl TryFrom<ffi::UserUpdateOptions> for RustUserUpdateOptions {
+    type Error = String;
+
+    fn try_from(options: ffi::UserUpdateOptions) -> Result<Self, Self::Error> {
+        Ok(RustUserUpdateOptions {
+            username: options.has_username.then_some(options.username),
+            status: parse_user_status(options.has_status, options.status)?,
+            reset: ffi_reset_keys(options.reset)?,
+            raw_reset: options.raw_reset.into_iter().collect(),
+            raw: ffi_options_to_raw(options.raw_options)?,
+        })
+    }
+}
+
+impl From<RustStreamEncryptionSource> for ffi::StreamEncryptionSource {
+    fn from(source: RustStreamEncryptionSource) -> Self {
+        match source {
+            RustStreamEncryptionSource::None => ffi::StreamEncryptionSource::None,
+            RustStreamEncryptionSource::Stream => ffi::StreamEncryptionSource::Stream,
+            RustStreamEncryptionSource::Server => ffi::StreamEncryptionSource::Server,
+        }
     }
 }
 
 impl From<RustTopic> for ffi::Topic {
     fn from(topic: RustTopic) -> Self {
+        let resolved = topic.resolved_options();
         ffi::Topic {
             id: topic.id,
             created_at: topic.created_at.as_micros(),
             name: topic.name,
             size_bytes: topic.size.as_bytes_u64(),
-            message_expiry: u64::from(topic.message_expiry),
-            compression_algorithm: topic.compression_algorithm.to_string(),
-            max_topic_size: u64::from(topic.max_topic_size),
+            message_expiry: u64::from(resolved.message_expiry),
+            compression_algorithm: resolved.compression_algorithm.to_string(),
+            max_topic_size: u64::from(resolved.max_topic_size),
             messages_count: topic.messages_count,
             partitions_count: topic.partitions_count,
             options: resource_options_to_ffi(&topic.options, true),
@@ -717,14 +849,15 @@ impl From<RustTopic> for ffi::Topic {
 
 impl From<RustTopicDetails> for ffi::TopicDetails {
     fn from(topic: RustTopicDetails) -> Self {
+        let resolved = topic.resolved_options();
         ffi::TopicDetails {
             id: topic.id,
             created_at: topic.created_at.as_micros(),
             name: topic.name,
             size_bytes: topic.size.as_bytes_u64(),
-            message_expiry: u64::from(topic.message_expiry),
-            compression_algorithm: topic.compression_algorithm.to_string(),
-            max_topic_size: u64::from(topic.max_topic_size),
+            message_expiry: u64::from(resolved.message_expiry),
+            compression_algorithm: resolved.compression_algorithm.to_string(),
+            max_topic_size: u64::from(resolved.max_topic_size),
             messages_count: topic.messages_count,
             partitions_count: topic.partitions_count,
             partitions: topic
@@ -740,6 +873,9 @@ impl From<RustTopicDetails> for ffi::TopicDetails {
 
 impl From<RustStream> for ffi::Stream {
     fn from(stream: RustStream) -> Self {
+        let source = stream.encryption_key_source();
+        let fingerprint = stream.encryption_key_fingerprint();
+        let kek_fingerprints = stream.encryption_kek_fingerprints();
         ffi::Stream {
             id: stream.id,
             created_at: stream.created_at.as_micros(),
@@ -748,12 +884,21 @@ impl From<RustStream> for ffi::Stream {
             messages_count: stream.messages_count,
             topics_count: stream.topics_count,
             options: resource_options_to_ffi(&stream.options, true),
+            derived_options: resource_options_to_ffi(&stream.options, false),
+            has_encryption_key_source: source.is_some(),
+            encryption_key_source: source.map_or(ffi::StreamEncryptionSource::None, Into::into),
+            has_encryption_key_fingerprint: fingerprint.is_some(),
+            encryption_key_fingerprint: fingerprint.unwrap_or_default(),
+            encryption_kek_fingerprints: kek_fingerprints,
         }
     }
 }
 
 impl From<RustStreamDetails> for ffi::StreamDetails {
     fn from(stream: RustStreamDetails) -> Self {
+        let source = stream.encryption_key_source();
+        let fingerprint = stream.encryption_key_fingerprint();
+        let kek_fingerprints = stream.encryption_kek_fingerprints();
         ffi::StreamDetails {
             id: stream.id,
             created_at: stream.created_at.as_micros(),
@@ -763,6 +908,12 @@ impl From<RustStreamDetails> for ffi::StreamDetails {
             topics_count: stream.topics_count,
             topics: stream.topics.into_iter().map(ffi::Topic::from).collect(),
             options: resource_options_to_ffi(&stream.options, true),
+            derived_options: resource_options_to_ffi(&stream.options, false),
+            has_encryption_key_source: source.is_some(),
+            encryption_key_source: source.map_or(ffi::StreamEncryptionSource::None, Into::into),
+            has_encryption_key_fingerprint: fingerprint.is_some(),
+            encryption_key_fingerprint: fingerprint.unwrap_or_default(),
+            encryption_kek_fingerprints: kek_fingerprints,
         }
     }
 }
@@ -1049,10 +1200,585 @@ impl From<RustSendMessagesResponse> for ffi::SendMessagesResponse {
     }
 }
 
+impl TryFrom<ffi::MetadataChangesQuery> for MetadataChangesQuery {
+    type Error = IggyError;
+
+    fn try_from(query: ffi::MetadataChangesQuery) -> Result<Self, Self::Error> {
+        let timestamp =
+            |micros| IggyTimestamp::checked_from_micros(micros).ok_or(IggyError::InvalidCommand);
+        let start = match query.start {
+            ffi::MetadataChangeStart::Earliest => MetadataChangeStart::Earliest,
+            ffi::MetadataChangeStart::Latest => MetadataChangeStart::Latest,
+            ffi::MetadataChangeStart::After => {
+                MetadataChangeStart::After(MetadataChangeCursor::from_str(&query.cursor)?)
+            }
+            ffi::MetadataChangeStart::Current if query.page_token.is_empty() => {
+                MetadataChangeStart::Current(None)
+            }
+            ffi::MetadataChangeStart::Current => MetadataChangeStart::Current(Some(
+                MetadataCurrentPageToken::from_str(&query.page_token)?,
+            )),
+            _ => return Err(IggyError::InvalidCommand),
+        };
+        let groups = query
+            .groups
+            .iter()
+            .map(|&code| {
+                WireMetadataChangeGroup::from_code(code)
+                    .map(MetadataChangeGroup::from)
+                    .map_err(|_| IggyError::InvalidCommand)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            start,
+            groups,
+            since: query
+                .has_since
+                .then(|| timestamp(query.since))
+                .transpose()?,
+            until: query
+                .has_until
+                .then(|| timestamp(query.until))
+                .transpose()?,
+            limit: query.limit,
+        })
+    }
+}
+
+impl From<MetadataChangeCursor> for ffi::MetadataChangeCursor {
+    fn from(cursor: MetadataChangeCursor) -> Self {
+        ffi::MetadataChangeCursor {
+            log_id_lo: cursor.log_id as u64,
+            log_id_hi: (cursor.log_id >> 64) as u64,
+            op: cursor.op,
+            checksum_lo: cursor.checksum as u64,
+            checksum_hi: (cursor.checksum >> 64) as u64,
+            ordinal: cursor.ordinal,
+            text: cursor.to_string(),
+        }
+    }
+}
+
+impl From<MetadataCurrentPageToken> for ffi::MetadataCurrentPageToken {
+    fn from(token: MetadataCurrentPageToken) -> Self {
+        ffi::MetadataCurrentPageToken {
+            text: token.to_string(),
+            anchor: token.anchor().into(),
+            required_head: token.required_head(),
+            groups_mask: token.groups().mask(),
+            last_group: WireMetadataChangeGroup::from(token.last_group()).as_u8(),
+            last_key: token.last_key().to_vec(),
+        }
+    }
+}
+
+impl From<MetadataChanges> for ffi::MetadataChanges {
+    fn from(changes: MetadataChanges) -> Self {
+        let log_id = changes.log_id.unwrap_or_default();
+        ffi::MetadataChanges {
+            status: WireMetadataChangeStatus::from(changes.status).as_u8(),
+            phase: WireMetadataChangePhase::from(changes.phase).as_u8(),
+            has_log_id: changes.log_id.is_some(),
+            log_id_lo: log_id as u64,
+            log_id_hi: (log_id >> 64) as u64,
+            oldest_op: changes.oldest_op,
+            retained_since: changes.retained_since,
+            head_op: changes.head_op,
+            has_next: changes.next.is_some(),
+            next: changes.next.map(Into::into).unwrap_or_default(),
+            has_more: changes.has_more,
+            records: changes
+                .records
+                .into_iter()
+                .map(ffi::MetadataChangeRecord::from)
+                .collect(),
+            items: changes
+                .items
+                .into_iter()
+                .map(ffi::MetadataCurrentItem::from)
+                .collect(),
+            has_current_page_token: changes.current_page_token.is_some(),
+            current_page_token: changes
+                .current_page_token
+                .map(Into::into)
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl From<MetadataChangeRecord> for ffi::MetadataChangeRecord {
+    fn from(record: MetadataChangeRecord) -> Self {
+        let mut converted = ffi::MetadataChangeRecord {
+            op: record.op,
+            ordinal: record.ordinal,
+            checksum_lo: record.checksum as u64,
+            checksum_hi: (record.checksum >> 64) as u64,
+            timestamp: record.timestamp,
+            has_actor_user_id: record.actor_user_id.is_some(),
+            actor_user_id: record.actor_user_id.unwrap_or_default(),
+            form: ffi::MetadataChangeForm::Known,
+            group: 0,
+            kind: 0,
+            group_name: String::new(),
+            kind_name: String::new(),
+            body: ffi::MetadataChangeBody::default(),
+        };
+        if let Some(kind) = record.change.kind() {
+            converted.kind = WireMetadataChangeKind::from(kind).as_u8();
+            converted.group = WireMetadataChangeGroup::from(kind.group()).as_u8();
+        }
+        converted.body = match record.change {
+            MetadataChange::StreamCreated(body) | MetadataChange::StreamUpdated(body) => {
+                body.into()
+            }
+            MetadataChange::StreamDeleted(body) => body.into(),
+            MetadataChange::TopicCreated(body) | MetadataChange::TopicUpdated(body) => body.into(),
+            MetadataChange::TopicDeleted(body) => body.into(),
+            MetadataChange::PartitionsChanged(body) => body.into(),
+            MetadataChange::ConsumerGroupCreated(body) => body.into(),
+            MetadataChange::ConsumerGroupDeleted(body) => body.into(),
+            MetadataChange::ConsumerGroupMemberJoined(body) => body.into(),
+            MetadataChange::ConsumerGroupMemberLeft(body) => body.into(),
+            MetadataChange::ConsumerGroupPartitionHandedOver(body) => body.into(),
+            MetadataChange::UserCreated(body) | MetadataChange::UserUpdated(body) => body.into(),
+            MetadataChange::UserDeleted(body) | MetadataChange::UserPasswordChanged(body) => {
+                body.into()
+            }
+            MetadataChange::UserPermissionsUpdated(body) => body.into(),
+            MetadataChange::PersonalAccessTokenCreated(body) => body.into(),
+            MetadataChange::PersonalAccessTokenDeleted(body) => body.into(),
+            MetadataChange::SessionRegistered(body) => body.into(),
+            MetadataChange::SessionClosed(body) => body.into(),
+            MetadataChange::Unknown { group, kind, body } => {
+                converted.form = ffi::MetadataChangeForm::Unknown;
+                converted.group = group;
+                converted.kind = kind;
+                ffi::MetadataChangeBody {
+                    unknown_body: body.to_vec(),
+                    ..ffi::MetadataChangeBody::default()
+                }
+            }
+            MetadataChange::UnknownJson { group, kind, body } => {
+                converted.form = ffi::MetadataChangeForm::UnknownJson;
+                converted.group_name = group;
+                converted.kind_name = kind;
+                ffi::MetadataChangeBody {
+                    unknown_body: body.get().as_bytes().to_vec(),
+                    ..ffi::MetadataChangeBody::default()
+                }
+            }
+        };
+        converted
+    }
+}
+
+impl From<MetadataCurrentItem> for ffi::MetadataCurrentItem {
+    fn from(item: MetadataCurrentItem) -> Self {
+        let group = item
+            .group()
+            .map_or(0, |group| WireMetadataChangeGroup::from(group).as_u8());
+        let known = |body: ffi::MetadataChangeBody| ffi::MetadataCurrentItem {
+            form: ffi::MetadataChangeForm::Known,
+            group,
+            group_name: String::new(),
+            body,
+        };
+        match item {
+            MetadataCurrentItem::Stream(body) => known(body.into()),
+            MetadataCurrentItem::Topic(body) => known(body.into()),
+            MetadataCurrentItem::Partitions(body) => known(body.into()),
+            MetadataCurrentItem::ConsumerGroup(body) => known(body.into()),
+            MetadataCurrentItem::ConsumerGroupMember(body) => known(body.into()),
+            MetadataCurrentItem::User(body) => known(body.into()),
+            MetadataCurrentItem::PersonalAccessToken(body) => known(body.into()),
+            MetadataCurrentItem::Session(body) => known(body.into()),
+            MetadataCurrentItem::Unknown { group, body } => ffi::MetadataCurrentItem {
+                form: ffi::MetadataChangeForm::Unknown,
+                group,
+                group_name: String::new(),
+                body: ffi::MetadataChangeBody {
+                    unknown_body: body.to_vec(),
+                    ..ffi::MetadataChangeBody::default()
+                },
+            },
+            MetadataCurrentItem::UnknownJson { group, body } => ffi::MetadataCurrentItem {
+                form: ffi::MetadataChangeForm::UnknownJson,
+                group: 0,
+                group_name: group,
+                body: ffi::MetadataChangeBody {
+                    unknown_body: body.get().as_bytes().to_vec(),
+                    ..ffi::MetadataChangeBody::default()
+                },
+            },
+        }
+    }
+}
+
+impl Default for ffi::MetadataChangeBody {
+    fn default() -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: 0,
+            stream_created_op: 0,
+            topic_id: 0,
+            topic_created_op: 0,
+            group_id: 0,
+            has_member_id: false,
+            member_id: 0,
+            partition_id: 0,
+            created_at: 0,
+            name: String::new(),
+            partitions_count: 0,
+            consumer_groups_count: 0,
+            members_count: 0,
+            client_id_lo: 0,
+            client_id_hi: 0,
+            partition_ids: Vec::new(),
+            has_requested_op: false,
+            requested_op: 0,
+            reason: 0,
+            user_id: 0,
+            user_created_at: 0,
+            status: ffi::UserStatus::Active,
+            has_permissions: false,
+            permissions: ffi::Permissions::from(RustPermissions::default()),
+            options_readable: false,
+            options: Vec::new(),
+            derived_options: Vec::new(),
+            has_expiry: false,
+            expiry: 0,
+            session: 0,
+            unknown_body: Vec::new(),
+        }
+    }
+}
+
+impl From<MetadataOptions> for ffi::MetadataChangeBody {
+    fn from(options: MetadataOptions) -> Self {
+        match options {
+            MetadataOptions::Readable(options) => ffi::MetadataChangeBody {
+                options_readable: true,
+                options: resource_options_to_ffi(&options, true),
+                derived_options: resource_options_to_ffi(&options, false),
+                ..ffi::MetadataChangeBody::default()
+            },
+            MetadataOptions::Unreadable => ffi::MetadataChangeBody::default(),
+        }
+    }
+}
+
+impl From<MetadataStreamChange> for ffi::MetadataChangeBody {
+    fn from(body: MetadataStreamChange) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            created_at: body.created_at,
+            name: body.name,
+            ..body.options.into()
+        }
+    }
+}
+
+impl From<MetadataStreamDeleted> for ffi::MetadataChangeBody {
+    fn from(body: MetadataStreamDeleted) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            created_at: body.created_at,
+            name: body.name,
+            has_requested_op: body.requested_op.is_some(),
+            requested_op: body.requested_op.unwrap_or_default(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataTopicChange> for ffi::MetadataChangeBody {
+    fn from(body: MetadataTopicChange) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            created_at: body.created_at,
+            name: body.name,
+            partitions_count: body.partitions_count,
+            ..body.options.into()
+        }
+    }
+}
+
+impl From<MetadataTopicItem> for ffi::MetadataChangeBody {
+    fn from(body: MetadataTopicItem) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            created_at: body.created_at,
+            name: body.name,
+            ..body.options.into()
+        }
+    }
+}
+
+impl From<MetadataTopicDeleted> for ffi::MetadataChangeBody {
+    fn from(body: MetadataTopicDeleted) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            created_at: body.created_at,
+            name: body.name,
+            has_requested_op: body.requested_op.is_some(),
+            requested_op: body.requested_op.unwrap_or_default(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataPartitionsChanged> for ffi::MetadataChangeBody {
+    fn from(body: MetadataPartitionsChanged) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            partitions_count: body.partitions_count,
+            partition_ids: body.removed_partition_ids,
+            has_requested_op: body.requested_op.is_some(),
+            requested_op: body.requested_op.unwrap_or_default(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataPartitionsItem> for ffi::MetadataChangeBody {
+    fn from(body: MetadataPartitionsItem) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            partitions_count: body.partitions_count,
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataConsumerGroupCreated> for ffi::MetadataChangeBody {
+    fn from(body: MetadataConsumerGroupCreated) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            group_id: body.group_id,
+            name: body.name,
+            consumer_groups_count: body.consumer_groups_count,
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataConsumerGroupDeleted> for ffi::MetadataChangeBody {
+    fn from(body: MetadataConsumerGroupDeleted) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            group_id: body.group_id,
+            name: body.name,
+            consumer_groups_count: body.consumer_groups_count,
+            has_requested_op: body.requested_op.is_some(),
+            requested_op: body.requested_op.unwrap_or_default(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataConsumerGroupItem> for ffi::MetadataChangeBody {
+    fn from(body: MetadataConsumerGroupItem) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            group_id: body.group_id,
+            name: body.name,
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataMemberJoined> for ffi::MetadataChangeBody {
+    fn from(body: MetadataMemberJoined) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            group_id: body.group_id,
+            has_member_id: true,
+            member_id: body.member_id,
+            client_id_lo: body.client_id as u64,
+            client_id_hi: (body.client_id >> 64) as u64,
+            members_count: body.members_count,
+            partition_ids: body.partition_ids,
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataMemberLeft> for ffi::MetadataChangeBody {
+    fn from(body: MetadataMemberLeft) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            group_id: body.group_id,
+            has_member_id: true,
+            member_id: body.member_id,
+            client_id_lo: body.client_id as u64,
+            client_id_hi: (body.client_id >> 64) as u64,
+            members_count: body.members_count,
+            reason: WireMemberLeftReason::from(body.reason).as_u8(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataPartitionHandedOver> for ffi::MetadataChangeBody {
+    fn from(body: MetadataPartitionHandedOver) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            group_id: body.group_id,
+            partition_id: body.partition_id,
+            has_member_id: body.member_id.is_some(),
+            member_id: body.member_id.unwrap_or_default(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataMemberItem> for ffi::MetadataChangeBody {
+    fn from(body: MetadataMemberItem) -> Self {
+        ffi::MetadataChangeBody {
+            stream_id: body.stream_id,
+            stream_created_op: body.stream_created_op,
+            topic_id: body.topic_id,
+            topic_created_op: body.topic_created_op,
+            group_id: body.group_id,
+            has_member_id: true,
+            member_id: body.member_id,
+            client_id_lo: body.client_id as u64,
+            client_id_hi: (body.client_id >> 64) as u64,
+            partition_ids: body.partition_ids,
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataUserChange> for ffi::MetadataChangeBody {
+    fn from(body: MetadataUserChange) -> Self {
+        ffi::MetadataChangeBody {
+            user_id: body.user_id,
+            user_created_at: body.user_created_at,
+            name: body.username,
+            status: body.status.into(),
+            has_permissions: body.permissions.is_some(),
+            permissions: ffi::Permissions::from(body.permissions.unwrap_or_default()),
+            ..body.options.into()
+        }
+    }
+}
+
+impl From<MetadataUserIdentity> for ffi::MetadataChangeBody {
+    fn from(body: MetadataUserIdentity) -> Self {
+        ffi::MetadataChangeBody {
+            user_id: body.user_id,
+            user_created_at: body.user_created_at,
+            name: body.username,
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataUserPermissionsUpdated> for ffi::MetadataChangeBody {
+    fn from(body: MetadataUserPermissionsUpdated) -> Self {
+        ffi::MetadataChangeBody {
+            user_id: body.user_id,
+            user_created_at: body.user_created_at,
+            name: body.username,
+            has_permissions: body.permissions.is_some(),
+            permissions: ffi::Permissions::from(body.permissions.unwrap_or_default()),
+            reason: WirePermissionsUpdatedReason::from(body.reason).as_u8(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataTokenChange> for ffi::MetadataChangeBody {
+    fn from(body: MetadataTokenChange) -> Self {
+        ffi::MetadataChangeBody {
+            user_id: body.user_id,
+            user_created_at: body.user_created_at,
+            name: body.name,
+            has_expiry: body.expiry.is_some(),
+            expiry: body.expiry.unwrap_or_default(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataTokenDeleted> for ffi::MetadataChangeBody {
+    fn from(body: MetadataTokenDeleted) -> Self {
+        ffi::MetadataChangeBody {
+            user_id: body.user_id,
+            user_created_at: body.user_created_at,
+            name: body.name,
+            reason: WireTokenDeletedReason::from(body.reason).as_u8(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataSession> for ffi::MetadataChangeBody {
+    fn from(body: MetadataSession) -> Self {
+        ffi::MetadataChangeBody {
+            user_id: body.user_id,
+            user_created_at: body.user_created_at,
+            client_id_lo: body.client_id as u64,
+            client_id_hi: (body.client_id >> 64) as u64,
+            session: body.session,
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
+impl From<MetadataSessionClosed> for ffi::MetadataChangeBody {
+    fn from(body: MetadataSessionClosed) -> Self {
+        ffi::MetadataChangeBody {
+            user_id: body.user_id,
+            user_created_at: body.user_created_at,
+            client_id_lo: body.client_id as u64,
+            client_id_hi: (body.client_id >> 64) as u64,
+            session: body.session,
+            reason: WireSessionClosedReason::from(body.reason).as_u8(),
+            ..ffi::MetadataChangeBody::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy::prelude::IggyTimestamp;
+    use iggy::prelude::{HeaderKey, HeaderValue, IggyTimestamp, OptionValue, ResourceOptions};
 
     // Distinct values so a swapped field fails the comparison.
     const CONTEXT: RustPartitionContext = RustPartitionContext {
@@ -1067,6 +1793,195 @@ mod tests {
             context.owner_generation,
             context.metadata_op,
         )
+    }
+
+    #[test]
+    fn given_optional_bridge_fields_when_converting_should_preserve_presence() {
+        let unnamed = RustStreamUpdateOptions::try_from(ffi::StreamUpdateOptions {
+            has_name: false,
+            name: "ignored".to_owned(),
+            reset: vec!["name".to_owned()],
+            raw_reset: Vec::new(),
+            raw_options: Vec::new(),
+        })
+        .expect("stream update");
+        assert_eq!(
+            unnamed,
+            RustStreamUpdateOptions {
+                reset: BTreeSet::from([OptionKey::Name]),
+                ..RustStreamUpdateOptions::default()
+            }
+        );
+        let empty_name = RustStreamUpdateOptions::try_from(ffi::StreamUpdateOptions {
+            has_name: true,
+            name: String::new(),
+            reset: Vec::new(),
+            raw_reset: Vec::new(),
+            raw_options: Vec::new(),
+        })
+        .expect("stream update");
+        assert_eq!(empty_name.name, Some(String::new()));
+
+        let topic = RustTopicUpdateOptions::try_from(ffi::TopicUpdateOptions {
+            has_name: false,
+            name: "ignored".to_owned(),
+            has_message_expiry: false,
+            message_expiry_kind: "duration".to_owned(),
+            message_expiry_value: 5,
+            has_max_topic_size: false,
+            max_topic_size: "unlimited".to_owned(),
+            reset: vec!["max_topic_size".to_owned()],
+            raw_reset: Vec::new(),
+            raw_options: Vec::new(),
+        })
+        .expect("topic update");
+        assert_eq!(
+            topic,
+            RustTopicUpdateOptions {
+                reset: BTreeSet::from([OptionKey::MaxTopicSize]),
+                ..RustTopicUpdateOptions::default()
+            }
+        );
+
+        let user = RustUserUpdateOptions::try_from(ffi::UserUpdateOptions {
+            has_username: false,
+            username: "ignored".to_owned(),
+            has_status: true,
+            status: ffi::UserStatus::Inactive,
+            reset: Vec::new(),
+            raw_reset: Vec::new(),
+            raw_options: Vec::new(),
+        })
+        .expect("user update");
+        assert_eq!(
+            user,
+            RustUserUpdateOptions {
+                status: Some(RustUserStatus::Inactive),
+                ..RustUserUpdateOptions::default()
+            }
+        );
+        assert!(
+            RustUserUpdateOptions::try_from(ffi::UserUpdateOptions {
+                has_username: false,
+                username: String::new(),
+                has_status: false,
+                status: ffi::UserStatus { repr: 0 },
+                reset: vec!["not_a_catalog_key".to_owned()],
+                raw_reset: Vec::new(),
+                raw_options: Vec::new(),
+            })
+            .is_err()
+        );
+
+        let key: Vec<u8> = (0..32).collect();
+        let keyless = ffi::StreamCreateOptions {
+            has_encryption_key: false,
+            encryption_key: key.clone(),
+            has_encryption_key_base64: false,
+            encryption_key_base64: String::new(),
+            raw_options: Vec::new(),
+        };
+        assert_eq!(keyless.encryption_key(), Ok(None));
+        let keyed = ffi::StreamCreateOptions {
+            has_encryption_key: true,
+            ..keyless
+        };
+        assert_eq!(
+            keyed
+                .encryption_key()
+                .map(|key| key.map(|key| key.fingerprint())),
+            Ok(Some("8441e38538cbfa57".to_owned()))
+        );
+        let short = ffi::StreamCreateOptions {
+            encryption_key: key[..31].to_vec(),
+            ..keyed
+        };
+        assert_eq!(short.encryption_key(), Err(IggyError::InvalidEncryptionKey));
+    }
+
+    #[test]
+    fn given_raw_reset_names_when_converting_should_leave_them_to_the_server() {
+        let topic = RustTopicUpdateOptions::try_from(ffi::TopicUpdateOptions {
+            has_name: false,
+            name: String::new(),
+            has_message_expiry: false,
+            message_expiry_kind: String::new(),
+            message_expiry_value: 0,
+            has_max_topic_size: false,
+            max_topic_size: String::new(),
+            reset: vec!["max_topic_size".to_owned()],
+            raw_reset: vec!["future_key".to_owned()],
+            raw_options: Vec::new(),
+        })
+        .expect("topic update");
+        assert_eq!(
+            topic,
+            RustTopicUpdateOptions {
+                reset: BTreeSet::from([OptionKey::MaxTopicSize]),
+                raw_reset: BTreeSet::from(["future_key".to_owned()]),
+                ..RustTopicUpdateOptions::default()
+            }
+        );
+    }
+
+    #[test]
+    fn given_raw_entry_outside_codec_bounds_when_converting_should_keep_the_sdk_error_category() {
+        let entry = |key: &str, value: &str| ffi::HeaderEntry {
+            key: ffi::HeaderField {
+                kind: RustHeaderKind::String.as_code(),
+                value: key.as_bytes().to_vec(),
+            },
+            value: ffi::HeaderField {
+                kind: RustHeaderKind::String.as_code(),
+                value: value.as_bytes().to_vec(),
+            },
+        };
+        let patch = |raw_options: Vec<ffi::HeaderEntry>| {
+            RustStreamUpdateOptions::try_from(ffi::StreamUpdateOptions {
+                has_name: false,
+                name: String::new(),
+                reset: Vec::new(),
+                raw_reset: Vec::new(),
+                raw_options,
+            })
+            .map(|options| options.to_patch().map(|_| ()))
+        };
+        let long_key = "k".repeat(256);
+
+        assert!(matches!(
+            patch(vec![entry("future_key", "")]),
+            Ok(Err(IggyError::InvalidOptionValue(_)))
+        ));
+        assert!(matches!(
+            patch(vec![entry(&long_key, "value")]),
+            Ok(Err(IggyError::UnsupportedOptionKey(_)))
+        ));
+    }
+
+    #[test]
+    fn given_stream_projection_when_converting_should_split_provenance() {
+        let mut options = ResourceOptions::new();
+        options.insert(
+            HeaderKey::from(OptionKey::EncryptionKeySource),
+            OptionValue::derived(HeaderValue::from_str("none").expect("source")),
+        );
+        let stream = ffi::StreamDetails::from(RustStreamDetails {
+            id: 1,
+            created_at: IggyTimestamp::from(2),
+            name: "plain".to_owned(),
+            size: RustIggyByteSize::from(0),
+            messages_count: 0,
+            topics_count: 0,
+            topics: Vec::new(),
+            options,
+        });
+
+        assert!(stream.options.is_empty());
+        assert_eq!(stream.derived_options.len(), 1);
+        assert!(stream.has_encryption_key_source);
+        assert!(stream.encryption_key_source == ffi::StreamEncryptionSource::None);
+        assert!(!stream.has_encryption_key_fingerprint);
+        assert!(stream.encryption_kek_fingerprints.is_empty());
     }
 
     #[test]
@@ -1113,6 +2028,77 @@ mod tests {
         assert_eq!(
             fields(&ffi::PolledMessages::from(polled).context),
             (3, 5, 7)
+        );
+    }
+
+    #[test]
+    fn given_json_record_of_unknown_kind_when_converting_should_keep_names_and_the_whole_object() {
+        let json = r#"{"op":5,"ordinal":1,"checksum":"0000000000000000000000000000002a","timestamp":7,"group":"future_group","kind":"future_kind","extra":true}"#;
+        let record: MetadataChangeRecord = serde_json::from_str(json).expect("record parses");
+
+        let converted = ffi::MetadataChangeRecord::from(record);
+
+        assert!(converted.form == ffi::MetadataChangeForm::UnknownJson);
+        assert_eq!(
+            (converted.group_name.as_str(), converted.kind_name.as_str()),
+            ("future_group", "future_kind")
+        );
+        assert_eq!((converted.op, converted.ordinal), (5, 1));
+        assert_eq!((converted.checksum_lo, converted.checksum_hi), (42, 0));
+        assert!(!converted.has_actor_user_id);
+        assert_eq!(converted.body.unknown_body, json.as_bytes());
+    }
+
+    #[test]
+    fn given_json_item_of_unknown_group_when_converting_should_keep_the_whole_object() {
+        let json = r#"{"group":"future_group","count":3}"#;
+        let item: MetadataCurrentItem = serde_json::from_str(json).expect("item parses");
+
+        let converted = ffi::MetadataCurrentItem::from(item);
+
+        assert!(converted.form == ffi::MetadataChangeForm::UnknownJson);
+        assert_eq!(converted.group_name, "future_group");
+        assert_eq!(converted.body.unknown_body, json.as_bytes());
+    }
+
+    #[test]
+    fn given_bridge_query_when_converting_should_map_every_start_mode_and_refuse_unknown_codes() {
+        let query = |start: ffi::MetadataChangeStart, groups: Vec<u8>| ffi::MetadataChangesQuery {
+            start,
+            cursor: String::new(),
+            page_token: String::new(),
+            groups,
+            has_since: false,
+            since: 9,
+            has_until: true,
+            until: 11,
+            limit: 7,
+        };
+
+        let current =
+            MetadataChangesQuery::try_from(query(ffi::MetadataChangeStart::Current, vec![1]))
+                .expect("current query");
+        assert_eq!(
+            current,
+            MetadataChangesQuery {
+                start: MetadataChangeStart::Current(None),
+                groups: vec![MetadataChangeGroup::Streams],
+                since: None,
+                until: Some(IggyTimestamp::from(11)),
+                limit: 7,
+            }
+        );
+        assert_eq!(
+            MetadataChangesQuery::try_from(query(ffi::MetadataChangeStart { repr: 4 }, Vec::new())),
+            Err(IggyError::InvalidCommand)
+        );
+        assert_eq!(
+            MetadataChangesQuery::try_from(query(ffi::MetadataChangeStart::Earliest, vec![9])),
+            Err(IggyError::InvalidCommand)
+        );
+        assert_eq!(
+            MetadataChangesQuery::try_from(query(ffi::MetadataChangeStart::After, Vec::new())),
+            Err(IggyError::InvalidCommand)
         );
     }
 }

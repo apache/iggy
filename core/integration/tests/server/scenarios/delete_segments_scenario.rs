@@ -82,7 +82,10 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
     client.connect().await.unwrap();
     let data_path = harness.server().data_path().to_path_buf();
 
-    let stream = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id;
 
     let topic = client
@@ -366,7 +369,10 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
     client.connect().await.unwrap();
     let data_path = harness.server().data_path().to_path_buf();
 
-    let stream = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id;
 
     let topic = client
@@ -457,7 +463,10 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
 ///
 /// No restart_server variant — 25 delete_segments calls would mean 25 restarts.
 pub async fn run_consumer_group_barrier(client: &IggyClient, data_path: &Path) {
-    let stream = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id;
 
     let topic = client
@@ -598,7 +607,10 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
     client.connect().await.unwrap();
     let data_path = harness.server().data_path().to_path_buf();
 
-    let stream = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id;
 
     let topic = client
@@ -647,6 +659,10 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         }
         assert_eq!(consumed, TOTAL_MESSAGES);
     }
+
+    // Stop polling before restarts so teardown cannot cancel a group rejoin.
+    fast_consumer.shutdown().await.unwrap();
+    drop(fast_consumer);
 
     let fast_group_details = client
         .get_consumer_group(
@@ -812,8 +828,6 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
     await_segment_layout(&partition_path, &active_only).await;
     assert_no_orphaned_segment_files(&partition_path, 1).await;
 
-    // Cleanup: drop high-level consumer, delete stream resources
-    drop(fast_consumer);
     client
         .delete_topic(&stream_ident, &topic_ident)
         .await

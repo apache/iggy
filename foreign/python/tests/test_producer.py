@@ -44,6 +44,7 @@ from apache_iggy import (
     ProducerSharding,
     SendMessage,
     SendMessagesResponse,
+    TopicOptions,
 )
 
 from .utils import wait_for_server
@@ -467,7 +468,7 @@ class TestProducerCreation:
         stream_name = unique_name()
         topic_name = unique_name()
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(stream_name, topic_name, 1)
+        await iggy_client.create_topic(stream_name, topic_name)
 
         producer = await iggy_client.producer(
             stream_name,
@@ -646,7 +647,9 @@ class TestProducerSends:
         destination_stream = unique_name()
         destination_topic = unique_name()
         await iggy_client.create_stream(destination_stream)
-        await iggy_client.create_topic(destination_stream, destination_topic, 2)
+        await iggy_client.create_topic(
+            destination_stream, destination_topic, TopicOptions(partitions_count=2)
+        )
         stream = await iggy_client.get_stream(destination_stream)
         topic = await iggy_client.get_topic(destination_stream, destination_topic)
         assert stream is not None
@@ -754,7 +757,7 @@ class TestBackgroundProducerSends:
         destination_stream = unique_name("to-stream-", min_bytes=20, max_bytes=20)
         destination_topic = unique_name("to-topic-", min_bytes=20, max_bytes=20)
         await iggy_client.create_stream(destination_stream)
-        await iggy_client.create_topic(destination_stream, destination_topic, 1)
+        await iggy_client.create_topic(destination_stream, destination_topic)
 
         producer = await iggy_client.producer(
             stream_name,
@@ -1466,7 +1469,7 @@ class TestProducerValidationAndRecovery:
             await producer.shutdown()
 
         await iggy_client.create_stream(destination_stream)
-        await iggy_client.create_topic(destination_stream, destination_topic, 1)
+        await iggy_client.create_topic(destination_stream, destination_topic)
         assert (
             await poll_payloads(iggy_client, destination_stream, destination_topic)
             == []

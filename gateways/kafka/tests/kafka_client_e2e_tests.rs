@@ -53,10 +53,10 @@ use tokio::task::JoinHandle;
 
 use iggy_gateway_kafka::auth::IggyAuthenticator;
 use iggy_gateway_kafka::bridge::{
-    DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls, ProduceSessionLimits,
-    TopicMapping,
+    DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls, KnownNodes,
+    ProduceSessionLimits, TopicMapping,
 };
-use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol};
+use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol, parse_brokers};
 use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
 use iggy_gateway_kafka::server::{BoundListener, bind_listener};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
@@ -83,6 +83,11 @@ const RECORDS: [(&str, &str); 3] = [("k1", "alpha"), ("k2", "beta"), ("k3", "gam
 /// The topic the group member test shares. Two partitions, so two members get one each.
 const GROUP_TOPIC: &str = "payments";
 const GROUP_TOPIC_PARTITIONS: u32 = 2;
+/// The topic the producer writes while one of two gateways stops.
+const FAILOVER_TOPIC: &str = "failover";
+/// Records the producer writes there, at [`FAILOVER_RATE`] a second.
+const FAILOVER_RECORDS: u32 = 600;
+const FAILOVER_RATE: u32 = 60;
 
 /// Budget for `iggy-server` to start listening. Generous: it is a cold process start, and a debug
 /// build on a loaded machine is not quick.
@@ -352,6 +357,47 @@ async fn start_bridged_gateway_with(
     start_gateway(server, topics, false, gateway_config).await
 }
 
+/// Two bridged gateways that list each other in `IGGY_KAFKA_BROKERS`, as nodes 1 and 2. A short
+/// drain lets a stop take effect at once.
+async fn start_listed_gateways(server: &TestServer) -> (BridgedGateway, BridgedGateway) {
+    let sockets = [
+        bind_listener("127.0.0.1:0").expect("bind ephemeral port"),
+        bind_listener("127.0.0.1:0").expect("bind ephemeral port"),
+    ];
+    let addrs = sockets
+        .each_ref()
+        .map(|socket| socket.local_addr().expect("local addr"));
+    let brokers =
+        parse_brokers(&format!("1@{},2@{}", addrs[0], addrs[1])).expect("two listed gateways");
+    let mut gateways = Vec::with_capacity(2);
+    for ((node_id, socket), addr) in (1_u16..).zip(sockets).zip(addrs) {
+        let config = GatewayConfig {
+            node_id,
+            brokers: brokers.clone(),
+            shutdown_drain_timeout: Duration::from_secs(1),
+            ..GatewayConfig::default()
+        };
+        let listener = BoundListener::new(
+            ListenerConfig::new(SecurityProtocol::Plaintext, addr.to_string()),
+            socket,
+        );
+        let bridge = Arc::new(root_bridge(server).await);
+        let gateway = KafkaGateway::new(config).with_bridge(Some(bridge));
+        let (shutdown, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(async move {
+            let _ = gateway.run(vec![listener], receiver).await;
+        });
+        gateways.push(BridgedGateway {
+            addr,
+            shutdown,
+            task,
+        });
+    }
+    let second = gateways.pop().expect("the second gateway");
+    let first = gateways.pop().expect("the first gateway");
+    (first, second)
+}
+
 /// A bridge to `server` as the root user, with the default topic mapping.
 async fn root_bridge(server: &TestServer) -> IggyBridge {
     let config = IggyBridgeConfig {
@@ -363,6 +409,7 @@ async fn root_bridge(server: &TestServer) -> IggyBridge {
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
+        nodes: KnownNodes::default(),
     };
     IggyBridge::connect(config)
         .await
@@ -1155,6 +1202,98 @@ fn kafka_topics(gateway: SocketAddr, args: &[&str]) -> ClientRun {
     run_client(KAFKA_IMAGE, &full_args, &[])
 }
 
+/// Runs `kafka-configs.sh` with `args` against `gateway`, with SASL off like [`kafka_topics`].
+fn kafka_configs(gateway: SocketAddr, args: &[&str]) -> ClientRun {
+    let bootstrap = gateway.to_string();
+    let mut full_args: Vec<&str> = vec![
+        "/opt/kafka/bin/kafka-configs.sh",
+        "--bootstrap-server",
+        &bootstrap,
+    ];
+    full_args.extend_from_slice(args);
+    run_client(KAFKA_IMAGE, &full_args, &[])
+}
+
+/// `kafka-configs.sh --alter` on a topic sends only `IncrementalAlterConfigs` (44): a `SET` for
+/// `--add-config` and a `DELETE` for `--delete-config`, after a describe of the topic's dynamic
+/// configs. This is the real-tool round trip for that key through the bridge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_configs_sh_when_adding_then_deleting_retention_should_round_trip_through_the_bridge()
+ {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    let completed = format!("Completed updating config for topic {TOPIC}.");
+
+    let added = kafka_configs(
+        gateway,
+        &[
+            "--alter",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            TOPIC,
+            "--add-config",
+            "retention.ms=8000",
+        ],
+    )
+    .expect_ran("kafka-configs.sh --add-config");
+    assert!(
+        added.contains(&completed),
+        "kafka-configs.sh must report the alter completed, got: {added}"
+    );
+
+    let described = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            TOPIC,
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe after --add-config");
+    assert!(
+        described.contains("retention.ms=8000 sensitive=false"),
+        "the describe must show the stored retention.ms, got: {described}"
+    );
+
+    let deleted = kafka_configs(
+        gateway,
+        &[
+            "--alter",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            TOPIC,
+            "--delete-config",
+            "retention.ms",
+        ],
+    )
+    .expect_ran("kafka-configs.sh --delete-config");
+    assert!(
+        deleted.contains(&completed),
+        "kafka-configs.sh must report the delete completed, got: {deleted}"
+    );
+
+    let described_after = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            TOPIC,
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe after --delete-config");
+    assert!(
+        described_after.contains("retention.ms=-1 sensitive=false"),
+        "a deleted retention.ms reads as never expire, got: {described_after}"
+    );
+}
+
 /// #3546's own acceptance criterion: `kafka-topics.sh` must work against the gateway for create
 /// and delete. (`--describe` needs `DescribeConfigs`, not yet implemented, so it is not covered
 /// here.) Runs against the bridged stack, since this exercises the real `CreateTopics`/
@@ -1210,6 +1349,70 @@ async fn given_kafka_topics_sh_when_creating_then_deleting_a_topic_should_round_
         listed_after.lines().any(|line| line.trim() == TOPIC),
         "deleting one topic must not take the shared default stream, and `{TOPIC}`, with it, got: \
          {listed_after}"
+    );
+}
+
+/// `kafka-topics.sh --alter --partitions N` grows a topic through
+/// the bridge and `--describe` (Metadata) reports the new count, while a smaller count fails
+/// with `INVALID_PARTITIONS` and leaves the count alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_topics_sh_when_altering_the_partition_count_should_grow_the_topic_through_the_bridge()
+ {
+    const NEW_TOPIC: &str = "kafka-topics-grow";
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let created = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            NEW_TOPIC,
+            "--partitions",
+            "1",
+            "--replication-factor",
+            "1",
+        ],
+    )
+    .expect_ran("kafka-topics.sh --create");
+    assert!(
+        created.contains(&format!("Created topic {NEW_TOPIC}")),
+        "kafka-topics.sh must report the topic created, got: {created}"
+    );
+
+    let altered = kafka_topics(
+        gateway,
+        &["--alter", "--topic", NEW_TOPIC, "--partitions", "3"],
+    )
+    .expect_ran("kafka-topics.sh --alter --partitions 3");
+    assert!(
+        !altered.to_lowercase().contains("error"),
+        "kafka-topics.sh --alter must succeed, got: {altered}"
+    );
+
+    let described = kafka_topics(gateway, &["--describe", "--topic", NEW_TOPIC])
+        .expect_ran("kafka-topics.sh --describe after the grow");
+    assert!(
+        described.contains("PartitionCount: 3"),
+        "Metadata must report the grown count, got: {described}"
+    );
+
+    let shrunk = kafka_topics(
+        gateway,
+        &["--alter", "--topic", NEW_TOPIC, "--partitions", "2"],
+    )
+    .text();
+    assert!(
+        shrunk.contains("InvalidPartitionsException"),
+        "a smaller count must fail with INVALID_PARTITIONS, got: {shrunk}"
+    );
+
+    let described_after = kafka_topics(gateway, &["--describe", "--topic", NEW_TOPIC])
+        .expect_ran("kafka-topics.sh --describe after the refused shrink");
+    assert!(
+        described_after.contains("PartitionCount: 3"),
+        "a refused shrink must leave the count alone, got: {described_after}"
     );
 }
 
@@ -1335,6 +1538,198 @@ fn consume_as_group(gateway: SocketAddr, count: usize) -> String {
         &[],
     )
     .expect_ran("java console consumer in a group")
+}
+
+/// KIP-345 with the Java client. A static consumer sends no `LeaveGroup` on close, so its
+/// member stays in the group, holding the only partition, for its whole session. The second run
+/// comes back under the same `group.instance.id` and must take that member over at once. Without
+/// replacement it would join as a new member, wait out a rebalance its old incarnation never
+/// rejoins, and exit after `--timeout-ms` with nothing read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_static_java_consumer_when_it_restarts_within_its_session_should_resume_at_once() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway, &RECORDS);
+    let first = consume_as_static_member(gateway, RECORDS.len());
+    assert_eq!(
+        records_read(&first).len(),
+        RECORDS.len(),
+        "the first run must read every record, got: {first}"
+    );
+
+    produce_with_kcat(gateway, &[("k4", "delta")]);
+    let second = consume_as_static_member(gateway, 1);
+    assert_eq!(
+        records_read(&second),
+        vec![format!("Offset:{}\tk4\tdelta", RECORDS.len())],
+        "the returning static member must take its partition back, got: {second}"
+    );
+}
+
+/// [`consume_as_group`] as static member `e2e-static-0` of group `e2e-static`, with a session long
+/// enough that its previous incarnation is still a member when it returns.
+fn consume_as_static_member(gateway: SocketAddr, count: usize) -> String {
+    let count = count.to_string();
+    run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            &gateway.to_string(),
+            "--topic",
+            TOPIC,
+            "--group",
+            "e2e-static",
+            "--consumer-property",
+            "group.instance.id=e2e-static-0",
+            "--consumer-property",
+            "session.timeout.ms=60000",
+            "--from-beginning",
+            "--max-messages",
+            &count,
+            "--timeout-ms",
+            "20000",
+            "--property",
+            "print.offset=true",
+            "--property",
+            "print.key=true",
+        ],
+        &[],
+    )
+    .expect_ran("java console consumer as a static member")
+}
+
+/// `kafka-consumer-groups --describe --members` shows the client id and host of each member, as
+/// Kafka does (#4511). A static member stays in its group for its whole session after its
+/// consumer exits, so the tool still finds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_java_consumer_when_describing_the_members_should_show_its_client_id_and_host() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway, &RECORDS);
+    let consumed = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            &gateway.to_string(),
+            "--topic",
+            TOPIC,
+            "--group",
+            "e2e-members",
+            "--consumer-property",
+            "group.instance.id=e2e-members-0",
+            "--consumer-property",
+            "client.id=e2e-members-client",
+            "--consumer-property",
+            "session.timeout.ms=60000",
+            "--from-beginning",
+            "--max-messages",
+            &RECORDS.len().to_string(),
+            "--timeout-ms",
+            "20000",
+            "--property",
+            "print.offset=true",
+            "--property",
+            "print.key=true",
+        ],
+        &[],
+    )
+    .expect_ran("java console consumer with a client id");
+    assert_eq!(
+        records_read(&consumed).len(),
+        RECORDS.len(),
+        "the consumer must join the group and read every record, got: {consumed}"
+    );
+
+    let described = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-consumer-groups.sh",
+            "--bootstrap-server",
+            &gateway.to_string(),
+            "--describe",
+            "--group",
+            "e2e-members",
+            "--members",
+        ],
+        &[],
+    )
+    .expect_ran("kafka-consumer-groups --describe --members");
+    // GROUP, CONSUMER-ID, GROUP-INSTANCE-ID, HOST, CLIENT-ID, then #PARTITIONS. Matched as a
+    // run of fields, as the reset test above does.
+    let fields: Vec<&str> = described.split_whitespace().collect();
+    let shown = fields.windows(5).any(|row| {
+        row[0] == "e2e-members"
+            && row[1].starts_with("e2e-members-0-")
+            && row[2] == "e2e-members-0"
+            && row[3] == "/127.0.0.1"
+            && row[4] == "e2e-members-client"
+    });
+    assert!(
+        shown,
+        "the member must show its client id and host, got: {described}"
+    );
+}
+
+/// KIP-345 with librdkafka, which sends `JoinGroup` below v9: the returning member is told the
+/// previous leader, acts as a follower, and gets its old assignment back through `SyncGroup`.
+/// Without replacement the second run would wait on a rebalance its old incarnation never rejoins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_static_kcat_consumer_when_it_restarts_within_its_session_should_resume_at_once() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway, &RECORDS);
+    let first = consume_as_static_kcat(gateway);
+    assert_eq!(
+        kcat_records_read(&first).len(),
+        RECORDS.len(),
+        "the first run must read every record, got: {first}"
+    );
+
+    produce_with_kcat(gateway, &[("k4", "delta")]);
+    let second = consume_as_static_kcat(gateway);
+    assert_eq!(
+        kcat_records_read(&second),
+        vec![format!("record {} k4=delta", RECORDS.len())],
+        "the returning static member must take its partition back, got: {second}"
+    );
+}
+
+/// kcat in balanced mode as static member `e2e-kcat-0` of group `e2e-kcat-static`, reading to
+/// the end of its partitions. It commits as it closes and sends no `LeaveGroup`.
+fn consume_as_static_kcat(gateway: SocketAddr) -> String {
+    run_client(
+        KCAT_IMAGE,
+        &[
+            "-b",
+            &gateway.to_string(),
+            "-G",
+            "e2e-kcat-static",
+            "-X",
+            "group.instance.id=e2e-kcat-0",
+            "-X",
+            "session.timeout.ms=60000",
+            "-X",
+            "auto.offset.reset=earliest",
+            "-e",
+            "-f",
+            "record %o %k=%s\n",
+            TOPIC,
+        ],
+        &[],
+    )
+    .expect_ran("kcat as a static member")
+}
+
+fn kcat_records_read(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter(|line| line.starts_with("record "))
+        .collect()
 }
 
 /// With auto topic creation on, a stock Java producer sends to a topic nobody created and succeeds.
@@ -1490,6 +1885,44 @@ async fn given_a_group_that_committed_when_the_gateway_restarts_should_resume_af
         vec![format!("Offset:{}\tk4\tdelta", RECORDS.len())],
         "the group must resume after its commit on a gateway that never saw it, got: {second}"
     );
+}
+
+/// The id `kafka-cluster.sh cluster-id` prints, which it reads through `DescribeCluster`.
+fn cluster_id(gateway: SocketAddr) -> String {
+    let bootstrap = gateway.to_string();
+    let output = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-cluster.sh",
+            "cluster-id",
+            "--bootstrap-server",
+            &bootstrap,
+        ],
+        &[],
+    )
+    .expect_ran("kafka-cluster.sh cluster-id");
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("Cluster ID: "))
+        .unwrap_or_else(|| panic!("no cluster id printed, got: {output}"))
+        .trim()
+        .to_string()
+}
+
+/// The Java tool prints the same id before and after a gateway restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_gateway_restart_when_kafka_cluster_prints_the_id_should_print_the_same_one() {
+    let Some(server) = ready_server() else {
+        return;
+    };
+    let gateway = start_bridged_gateway(&server, &[]).await;
+    let before = cluster_id(gateway.addr);
+    gateway.stop().await;
+
+    let restarted = start_bridged_gateway(&server, &[]).await;
+    let after = cluster_id(restarted.addr);
+    assert_eq!(before, after, "the id must survive a restart");
+    assert_ne!(before, "None", "a null id prints as None");
 }
 
 /// G11 of `docs/MANUAL_TESTING.md`. Two members split the topic. When one leaves, the other
@@ -1869,6 +2302,7 @@ async fn tls_stack() -> Option<TlsStack> {
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         produce_sessions: ProduceSessionLimits::default(),
         tls: IggyTls::default(),
+        nodes: KnownNodes::default(),
     })
     .await
     .expect("the bridge connects to a ready server");
@@ -2157,5 +2591,93 @@ async fn given_the_java_client_with_a_client_certificate_should_be_described_as_
     assert!(
         grants(&listing, "TOPIC", "READ"),
         "the mapped user's read_topics grant renders, got: {listing}"
+    );
+}
+
+/// A Java producer that knows only the first gateway learns the second from Metadata. When the
+/// first stops, the producer goes on through the second, and every record lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_two_listed_gateways_when_the_first_stops_should_keep_producing_through_the_second() {
+    let Some(server) = ready_server() else {
+        return;
+    };
+    root_bridge(&server)
+        .await
+        .ensure_stream_and_topic(FAILOVER_TOPIC, 1)
+        .await
+        .expect("create the topic");
+    let (first, second) = start_listed_gateways(&server).await;
+    let (first_addr, second_addr) = (first.addr.to_string(), second.addr.to_string());
+
+    let listing = run_client(KCAT_IMAGE, &["-b", &first_addr, "-L"], &[]).expect_ran("kcat -L");
+    assert!(
+        listing.contains(&format!("broker 1 at {first_addr}"))
+            && listing.contains(&format!("broker 2 at {second_addr}")),
+        "the first gateway must list both gateways: {listing}"
+    );
+
+    let bootstrap = format!("bootstrap.servers={first_addr}");
+    let (records, rate) = (FAILOVER_RECORDS.to_string(), FAILOVER_RATE.to_string());
+    let mut producer = RunningClient::start(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-producer-perf-test.sh",
+            "--topic",
+            FAILOVER_TOPIC,
+            "--num-records",
+            &records,
+            "--throughput",
+            &rate,
+            "--record-size",
+            "64",
+            "--producer-props",
+            &bootstrap,
+            "acks=all",
+            "request.timeout.ms=10000",
+            "delivery.timeout.ms=60000",
+        ],
+    );
+    producer.wait_for("the producer reports progress", |line| {
+        line.contains("records sent").then_some(())
+    });
+    first.stop().await;
+
+    let output = producer.wait_exit("the producer finishes");
+    assert!(
+        output
+            .iter()
+            .any(|line| line.starts_with(&format!("{FAILOVER_RECORDS} records sent"))),
+        "every record must be acknowledged: {output:#?}"
+    );
+    assert!(
+        !output.iter().any(|line| line.contains("Exception")),
+        "no send may fail: {output:#?}"
+    );
+    let read = run_client(
+        KCAT_IMAGE,
+        &[
+            "-b",
+            &second_addr,
+            "-C",
+            "-t",
+            FAILOVER_TOPIC,
+            "-p",
+            "0",
+            "-o",
+            "beginning",
+            "-e",
+            "-f",
+            "%o\n",
+        ],
+        &[],
+    )
+    .expect_ran("kcat reads the topic through the second gateway");
+    let stored = read
+        .lines()
+        .filter(|line| line.parse::<u64>().is_ok())
+        .count();
+    assert!(
+        stored >= FAILOVER_RECORDS as usize,
+        "{stored} of {FAILOVER_RECORDS} records stored"
     );
 }

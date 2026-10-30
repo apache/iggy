@@ -25,7 +25,7 @@ verified on every connection, against Iggy, and that verification is deliberatel
 
 **Authorization is meant to stay in Iggy.** The gateway will not implement its own ACL model. The intent is
 to carry the authenticated Iggy identity onto the data plane and let the server's existing permission checks
-decide what it can do. That is later work: today the verified client is shut down as soon as the credential
+decide what it can do. That is later work: today the verified client signs out and shuts down as soon as the credential
 clears, and nothing carries the principal past authentication.
 
 **A client certificate is an identity too, with the same reach.** On an `SSL` listener that verifies client
@@ -63,12 +63,12 @@ connection. The cost rules it out.
 | Argon2id verify, run inline on the shard thread | 19 MiB, t=2, p=1 |
 | Replicated VSR `Register` | one consensus commit |
 | Leader settlement round trip, plus a second login if it redirects | one or two round trips |
-| Session slots, cluster-wide across all transports | 8192, oldest committed evicted past it |
+| Session slots, cluster-wide across all transports | 8192, and a full table refuses new logins |
 
 The Argon2 verify runs on the shard's compio runtime, which has no blocking pool. A burst of Kafka
 connections therefore stalls that shard's entire request loop, including produce and fetch traffic that has
-nothing to do with authentication. The 8192 ceiling (`core/consensus/src/impls.rs:178`) is cluster-wide, so
-connection churn on the Kafka side turns directly into session-table pressure and eviction on the Iggy side.
+nothing to do with authentication. The 8192 ceiling (`[metadata] clients_table_max`, `core/consensus/src/impls.rs:211`) is cluster-wide.
+So connection churn on the Kafka side turns directly into session-table pressure on the Iggy side.
 
 ## Why not a shared service account
 
@@ -103,7 +103,7 @@ Two consequences worth naming rather than discovering:
   traffic on that shard. Measured on debug builds, a single login takes about 10 ms and 32 concurrent
   logins take about 75 ms each, with throughput flattening near 410 per second. The shape is the point,
   latency climbing while throughput plateaus, not the absolute numbers. `MANUAL_TESTING.md` has the table.
-- **Nothing holds the verified session.** The connection that proved a credential drops it at once.
+- **Nothing holds the verified session.** The connection that proved a credential signs out at once.
   Produce and Fetch act as the bridge's Iggy user for every client. A data client per principal needs
   pooling, a separate question from how credentials are verified. Pooling is gateway-side code over the
   public SDK and needs no SDK change.
@@ -272,9 +272,10 @@ first frame:
    the name unchecked.
 
 With `requested`, a client that presents no certificate is Kafka's `ANONYMOUS` principal, which holds no
-permissions: `DescribeAcls` describes it as holding nothing, and `DeleteTopics`, `AlterConfigs` and the auto
-topic creation a `Metadata` request asks for, which need a global `manage_topics`, are refused. Everything
-else is served as the bridge's user. With `required`, rustls fails the handshake instead.
+permissions: `DescribeAcls` describes it as holding nothing, and `DeleteTopics`, `AlterConfigs`,
+`DeleteGroups`, `OffsetDelete` and the auto topic creation a `Metadata` request asks for, which need a global
+`manage_topics` or `manage_streams`, are refused. Everything else is served as the bridge's user. With
+`required`, rustls fails the handshake instead.
 
 The same holds on every listener that names nobody once any listener names principals: a `PLAINTEXT`
 listener beside a `SASL_SSL` or mTLS one serves `ANONYMOUS`, so it cannot do what an authenticated user

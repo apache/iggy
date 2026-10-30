@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Buffers;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
@@ -26,6 +27,21 @@ namespace Apache.Iggy.Tests.VsrTests;
 
 public sealed class MutationLaneTests
 {
+    // The generation of a session that a test never resets.
+    private const ulong FirstGeneration = 0;
+
+    private static readonly TimeSpan WaitLimit = TimeSpan.FromSeconds(2);
+
+    // Long enough for every waiter that a release woke to run its admission check.
+    private static readonly TimeSpan SettleTime = TimeSpan.FromMilliseconds(200);
+
+    public enum BuildInterruption
+    {
+        EncodeFailure,
+        Cancellation,
+        SessionReset
+    }
+
     [Fact]
     public async Task given_a_retained_operation_when_an_alias_enters_the_group_should_block_without_consuming_an_id()
     {
@@ -118,7 +134,7 @@ public sealed class MutationLaneTests
         var lanes = new MutationLanes(session, Configuration(bytes: VsrHeader.HEADER_SIZE));
         var counter = session.RequestCounter;
         var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => lanes.EnterAsync(
-            new MutationLane(17, 3), CommandCodes.SEND_MESSAGES_CODE, new byte[1], default, true,
+            new MutationLane(17, 3), CommandCodes.SEND_MESSAGES_CODE, new byte[1], default, true, session.Generation,
             TestContext.Current.CancellationToken));
         Assert.Equal(VsrError.INVALID_SIZE_BYTES, error.StatusCode);
         Assert.False(error.FromServer);
@@ -138,9 +154,53 @@ public sealed class MutationLaneTests
         session.Resolve(VsrOperation.Register);
         session.Bind(43, new byte[LoginRegister.BIND_SECRET_BYTES]);
         Assert.Throws<VsrOperationNotRetainedException>(() => lanes.Retained(old.Identity.RequestId));
-        var next = await EnterAsync(lanes, new MutationLane(17, 3));
+        var next = await EnterAsync(lanes, new MutationLane(17, 3), generation: session.Generation);
         Assert.True(next.Identity.RequestId > old.Identity.RequestId);
         lanes.Complete(next);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task given_a_session_recovery_when_operations_wait_should_go_on_only_under_a_session_that_continues_theirs(
+        bool continues)
+    {
+        var session = Session();
+        var recovery = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var lanes = new MutationLanes(session, Configuration(2), () => recovery.Task.IsCompleted ? null : recovery.Task);
+        var live = await EnterAsync(lanes, new MutationLane(17, 3));
+        var retained = await EnterAsync(lanes, new MutationLane(17, 4));
+        lanes.Retain(retained);
+        var waiting = EnterAsync(lanes, new MutationLane(17, 5));
+
+        session.Reset(continues: true);
+        lanes.DropRetained();
+        Assert.True(lanes.Owns(live));
+        Assert.Throws<VsrOperationNotRetainedException>(() => lanes.Retained(retained.Identity.RequestId));
+        var restarting = lanes.RestartAsync(live, ReadOnlyMemory<byte>.Empty, TestContext.Current.CancellationToken);
+        session.Resolve(VsrOperation.Register);
+        session.Bind(43, new byte[LoginRegister.BIND_SECRET_BYTES], continues);
+        Assert.False(waiting.IsCompleted);
+        Assert.False(restarting.IsCompleted);
+        recovery.SetResult();
+
+        if (continues)
+        {
+            ClientOperation[] operations =
+            [
+                await restarting.WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken),
+                await waiting.WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken)
+            ];
+            Assert.All(operations, operation => Assert.Equal((session.Generation, session.ClientId),
+                (operation.Generation, operation.Identity.ClientId)));
+            Array.ForEach(operations, lanes.Complete);
+        }
+        else
+        {
+            await AssertUnauthenticatedAsync(restarting);
+            await AssertUnauthenticatedAsync(waiting);
+            lanes.Complete(live);
+        }
     }
 
     [Fact]
@@ -188,7 +248,7 @@ public sealed class MutationLaneTests
         try
         {
             var progress = await lanes.EnterAsync(new MutationLane(17, 4), CommandCodes.POLL_MESSAGES_CODE,
-                ReadOnlyMemory<byte>.Empty, new PartitionContext(17, 0, 1), false, cancellation.Token)
+                ReadOnlyMemory<byte>.Empty, new PartitionContext(17, 0, 1), false, FirstGeneration, cancellation.Token)
                 .WaitAsync(TimeSpan.FromSeconds(2), cancellation.Token);
             lanes.Complete(progress);
             Assert.True(lanes.Owns(mutation));
@@ -209,7 +269,7 @@ public sealed class MutationLaneTests
         try
         {
             var progress = await lanes.EnterAsync(lane, CommandCodes.POLL_MESSAGES_CODE, new byte[1],
-                new PartitionContext(17, 0, 1), false, cancellation.Token);
+                new PartitionContext(17, 0, 1), false, FirstGeneration, cancellation.Token);
             var follower = EnterAsync(lanes, lane, cancellation.Token);
             var independent = await EnterAsync(lanes, new MutationLane(17, 4), cancellation.Token)
                 .WaitAsync(TimeSpan.FromSeconds(2), cancellation.Token);
@@ -236,7 +296,7 @@ public sealed class MutationLaneTests
         var counter = session.RequestCounter;
         var blocked = await Assert.ThrowsAsync<VsrLaneBlockedException>(() => lanes.EnterAsync(lane,
             CommandCodes.POLL_MESSAGES_CODE, ReadOnlyMemory<byte>.Empty, new PartitionContext(17, 0, 1),
-            false, TestContext.Current.CancellationToken));
+            false, session.Generation, TestContext.Current.CancellationToken));
         Assert.Equal(mutation.Identity.RequestId, blocked.OperationId);
         Assert.Equal(counter, session.RequestCounter);
         lanes.Complete(mutation);
@@ -363,8 +423,7 @@ public sealed class MutationLaneTests
                 lanes.Reset();
                 session.Resolve(VsrOperation.Register);
                 session.Bind(43, new byte[LoginRegister.BIND_SECRET_BYTES]);
-                await Assert.ThrowsAsync<NotConnectedException>(() => restarting)
-                    .WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+                await AssertUnauthenticatedAsync(restarting);
             }
             else
             {
@@ -373,7 +432,7 @@ public sealed class MutationLaneTests
                 lanes.Complete(previous);
             }
             Assert.False(lanes.Owns(previous));
-            var next = EnterAsync(lanes, new MutationLane(17, 4));
+            var next = EnterAsync(lanes, new MutationLane(17, 4), generation: session.Generation);
             Assert.False(next.IsCompleted);
             previous.Frame.Release();
             writerReleased = true;
@@ -390,10 +449,205 @@ public sealed class MutationLaneTests
         }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task given_a_large_frame_waiting_for_bytes_when_a_smaller_one_enters_should_wait_until_the_large_one_leaves_the_queue(
+        bool canceled)
+    {
+        var lanes = new MutationLanes(Session(), Configuration(bytes: VsrHeader.HEADER_SIZE * 2 + 1));
+        var active = await EnterAsync(lanes, new MutationLane(17, 3));
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var large = EnterAsync(lanes, new MutationLane(17, 4), cancellation.Token,
+            body: new byte[VsrHeader.HEADER_SIZE + 1]);
+        var small = EnterAsync(lanes, new MutationLane(17, 5));
+        Assert.False(large.IsCompleted);
+        Assert.False(small.IsCompleted);
+
+        if (canceled)
+        {
+            await cancellation.CancelAsync();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => large);
+            lanes.Complete(await small.WaitAsync(WaitLimit, TestContext.Current.CancellationToken));
+            lanes.Complete(active);
+        }
+        else
+        {
+            lanes.Complete(active);
+            var admitted = await large.WaitAsync(WaitLimit, TestContext.Current.CancellationToken);
+            Assert.False(small.IsCompleted);
+            lanes.Complete(admitted);
+            lanes.Complete(await small.WaitAsync(WaitLimit, TestContext.Current.CancellationToken));
+        }
+    }
+
+    [Fact]
+    public async Task given_waiters_on_many_lanes_when_one_lane_completes_should_wake_only_its_waiter()
+    {
+        const int LaneCount = 8;
+        var session = Session();
+        var recovery = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var woken = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var checks = 0;
+        // While the session signs in again, every admission check asks for the recovery, once per wake.
+        var lanes = new MutationLanes(session, Configuration(), () =>
+        {
+            if (Interlocked.Increment(ref checks) > LaneCount)
+            {
+                woken.TrySetResult();
+            }
+            return recovery.Task;
+        });
+        var active = new ClientOperation[LaneCount];
+        for (var index = 0; index < LaneCount; index++)
+        {
+            active[index] = await EnterAsync(lanes, new MutationLane(17, (uint)index));
+        }
+        session.Reset(continues: true);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var waiting = active.Select(operation => EnterAsync(lanes, operation.Lane, cancellation.Token)).ToArray();
+        Assert.Equal(LaneCount, Volatile.Read(ref checks));
+
+        lanes.Complete(active[0]);
+        await woken.Task.WaitAsync(WaitLimit, TestContext.Current.CancellationToken);
+        await Task.Delay(SettleTime, TestContext.Current.CancellationToken);
+
+        Assert.Equal(LaneCount + 1, Volatile.Read(ref checks));
+        await cancellation.CancelAsync();
+        foreach (var task in waiting)
+        {
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => task);
+        }
+        lanes.Reset();
+    }
+
+    [Theory]
+    [InlineData(BuildInterruption.EncodeFailure, false)]
+    [InlineData(BuildInterruption.Cancellation, false)]
+    [InlineData(BuildInterruption.SessionReset, false)]
+    [InlineData(BuildInterruption.EncodeFailure, true)]
+    [InlineData(BuildInterruption.Cancellation, true)]
+    [InlineData(BuildInterruption.SessionReset, true)]
+    public async Task given_a_reserved_frame_when_its_build_is_interrupted_should_give_the_reservation_to_the_next_waiter(
+        BuildInterruption interruption, bool restart)
+    {
+        var session = Session();
+        var lanes = new MutationLanes(session, Configuration(2, VsrHeader.HEADER_SIZE + 1));
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var failure = new InvalidOperationException("The body failed to encode.");
+        Task<ClientOperation>? next = null;
+        // The build reads the body, so the interruption lands after the reservation and before the commit.
+        var body = new InterruptingBody(() =>
+        {
+            if (interruption == BuildInterruption.SessionReset)
+            {
+                session.Reset();
+                lanes.Reset();
+                session.Resolve(VsrOperation.Register);
+                session.Bind(43, new byte[LoginRegister.BIND_SECRET_BYTES]);
+            }
+            next = EnterAsync(lanes, new MutationLane(17, 4), generation: session.Generation);
+            if (interruption == BuildInterruption.EncodeFailure)
+            {
+                throw failure;
+            }
+            if (interruption == BuildInterruption.Cancellation)
+            {
+                cancellation.Cancel();
+            }
+        });
+        var previous = restart ? await EnterAsync(lanes, MutationLane.Metadata) : null;
+
+        var building = previous is null
+            ? EnterAsync(lanes, new MutationLane(17, 3), cancellation.Token, body: body.Body)
+            : lanes.RestartAsync(previous, body.Body, cancellation.Token);
+
+        switch (interruption)
+        {
+            case BuildInterruption.EncodeFailure:
+                Assert.Same(failure, await Assert.ThrowsAsync<InvalidOperationException>(() => building));
+                break;
+            case BuildInterruption.Cancellation:
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => building);
+                break;
+            default:
+                await AssertUnauthenticatedAsync(building);
+                break;
+        }
+        Assert.NotNull(next);
+        lanes.Complete(await next.WaitAsync(WaitLimit, TestContext.Current.CancellationToken));
+        if (previous is not null)
+        {
+            Assert.Equal(interruption != BuildInterruption.SessionReset, lanes.Owns(previous));
+            lanes.Complete(previous);
+        }
+    }
+
+    [Fact]
+    public async Task given_waiters_for_a_lane_a_slot_and_bytes_when_the_lanes_reset_should_fail_each_of_them()
+    {
+        var session = Session();
+        var lanes = new MutationLanes(session, Configuration(2, VsrHeader.HEADER_SIZE * 2));
+        var lane = new MutationLane(17, 3);
+        var active = await EnterAsync(lanes, lane);
+        var restarted = await EnterAsync(lanes, MutationLane.Metadata);
+        // Writer aliases keep both frames charged, so no release after the reset reaches the slot and byte waiters.
+        active.Frame.Acquire();
+        restarted.Frame.Acquire();
+        try
+        {
+            Task[] waiting =
+            [
+                EnterAsync(lanes, lane),
+                EnterAsync(lanes, new MutationLane(17, 4)),
+                lanes.RestartAsync(restarted, ReadOnlyMemory<byte>.Empty, TestContext.Current.CancellationToken)
+            ];
+            Assert.DoesNotContain(waiting, task => task.IsCompleted);
+
+            session.Reset();
+            lanes.Reset();
+
+            foreach (var task in waiting)
+            {
+                await AssertUnauthenticatedAsync(task);
+            }
+        }
+        finally
+        {
+            active.Frame.Release();
+            restarted.Frame.Release();
+        }
+    }
+
+    [Fact]
+    public async Task given_a_waiter_made_while_no_session_is_bound_when_the_caller_signs_in_should_end_it()
+    {
+        var session = Session();
+        var lanes = new MutationLanes(session, Configuration(1));
+        var holder = await EnterAsync(lanes, new MutationLane(17, 3));
+        session.Reset(continues: true);
+        var waiting = EnterAsync(lanes, new MutationLane(17, 4), generation: session.Generation);
+        Assert.False(waiting.IsCompleted);
+
+        session.Resolve(VsrOperation.Register);
+        session.Bind(43, new byte[LoginRegister.BIND_SECRET_BYTES]);
+        lanes.Complete(holder);
+
+        await AssertUnauthenticatedAsync(waiting);
+    }
+
+    private static async Task AssertUnauthenticatedAsync(Task task)
+    {
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => task)
+            .WaitAsync(WaitLimit, TestContext.Current.CancellationToken);
+        Assert.Equal(VsrError.UNAUTHENTICATED, error.StatusCode);
+        Assert.False(error.FromServer);
+    }
+
     private static Task<ClientOperation> EnterAsync(MutationLanes lanes, MutationLane lane,
-        CancellationToken? token = null) => lanes.EnterAsync(lane, CommandCodes.SEND_MESSAGES_CODE,
-        ReadOnlyMemory<byte>.Empty, new PartitionContext(lane.Incarnation, 0, 1), true,
-        token ?? TestContext.Current.CancellationToken);
+        CancellationToken? token = null, ulong generation = FirstGeneration, ReadOnlyMemory<byte> body = default) =>
+        lanes.EnterAsync(lane, CommandCodes.SEND_MESSAGES_CODE, body, new PartitionContext(lane.Incarnation, 0, 1), true,
+            generation, token ?? TestContext.Current.CancellationToken);
 
     private static ConsensusSession Session() => new(7, 42, new byte[LoginRegister.BIND_SECRET_BYTES]);
 
@@ -404,4 +658,30 @@ public sealed class MutationLaneTests
         MaxPendingOperations = count,
         MaxPendingOperationBytes = bytes
     };
+
+    /// <summary>A one-byte body that runs <paramref name="interrupt" /> the first time its bytes are read.</summary>
+    private sealed class InterruptingBody(Action interrupt) : MemoryManager<byte>
+    {
+        private readonly byte[] _bytes = new byte[1];
+        private Action? _interrupt = interrupt;
+
+        // MemoryManager.Memory reads the span for its length, which would interrupt before the build.
+        internal ReadOnlyMemory<byte> Body => CreateMemory(_bytes.Length);
+
+        public override Span<byte> GetSpan()
+        {
+            Interlocked.Exchange(ref _interrupt, null)?.Invoke();
+            return _bytes;
+        }
+
+        public override MemoryHandle Pin(int elementIndex = 0) => throw new NotSupportedException();
+
+        public override void Unpin()
+        {
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+        }
+    }
 }

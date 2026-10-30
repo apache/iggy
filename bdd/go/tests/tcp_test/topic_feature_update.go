@@ -37,14 +37,13 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			newName := createRandomString(128)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+			expiry := iggcon.Microsecond
+			maxTopicSize := uint64(math.MaxUint64)
 			err := client.UpdateTopic(
 				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
-				newName,
-				iggcon.CompressionAlgorithmNone,
-				iggcon.Microsecond,
-				math.MaxUint64)
+				iggcon.TopicUpdate{Name: &newName, MessageExpiry: &expiry, MaxTopicSize: &maxTopicSize})
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyUpdateTopic(streamId, topicId, newName, client)
 		})
@@ -57,28 +56,25 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			topic2Id, _ := successfullyCreateTopic(streamId, client)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topic2Identifier, _ := iggcon.NewIdentifier(topic2Id)
+			maxTopicSize := uint64(math.MaxUint64)
 			err := client.UpdateTopic(
 				context.Background(),
 				streamIdentifier,
 				topic2Identifier,
-				topic1Name,
-				iggcon.CompressionAlgorithmNone,
-				iggcon.IggyExpiryServerDefault,
-				math.MaxUint64)
+				iggcon.TopicUpdate{Name: &topic1Name, MaxTopicSize: &maxTopicSize})
 
 			itShouldReturnSpecificError(err, ierror.ErrTopicNameAlreadyExists)
 		})
 
 		ginkgo.Context("and tries to update non-existing topic", func() {
 			client := createAuthorizedConnection()
+			name := createRandomString(128)
+			maxTopicSize := uint64(math.MaxUint64)
 			err := client.UpdateTopic(
 				context.Background(),
 				randomU32Identifier(),
 				randomU32Identifier(),
-				createRandomString(128),
-				1,
-				0,
-				math.MaxUint64)
+				iggcon.TopicUpdate{Name: &name, MaxTopicSize: &maxTopicSize})
 
 			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
@@ -88,14 +84,13 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, createAuthorizedConnection())
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			name := createRandomString(128)
+			maxTopicSize := uint64(math.MaxUint64)
 			err := client.UpdateTopic(
 				context.Background(),
 				streamIdentifier,
 				randomU32Identifier(),
-				createRandomString(128),
-				1,
-				0,
-				math.MaxUint64)
+				iggcon.TopicUpdate{Name: &name, MaxTopicSize: &maxTopicSize})
 
 			itShouldReturnSpecificError(err, ierror.ErrTopicIdNotFound)
 		})
@@ -107,14 +102,13 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+			name := createRandomString(256)
+			maxTopicSize := uint64(math.MaxUint64)
 			err := client.UpdateTopic(
 				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
-				createRandomString(256),
-				1,
-				0,
-				math.MaxUint64)
+				iggcon.TopicUpdate{Name: &name, MaxTopicSize: &maxTopicSize})
 
 			itShouldReturnSpecificError(err, ierror.ErrInvalidTopicName)
 		})
@@ -123,7 +117,8 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 	ginkgo.When("User is not logged in", func() {
 		ginkgo.Context("and tries to update stream", func() {
 			client := createClient()
-			err := client.UpdateStream(context.Background(), randomU32Identifier(), createRandomString(128))
+			name := createRandomString(128)
+			err := client.UpdateStream(context.Background(), randomU32Identifier(), iggcon.StreamUpdate{Name: &name})
 
 			itShouldReturnUnauthenticatedError(err)
 		})

@@ -26,8 +26,17 @@ WORKDIR /build
 # vendored C. No libssl-dev - core/sdk's TLS is rustls, not openssl.
 RUN apt-get update && apt-get install -y \
     build-essential \
+    curl \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
+
+RUN TARGET="$(uname -m)-unknown-linux-musl" && \
+    tarball="$(mktemp)" && \
+    curl -sSfL --retry 5 --retry-all-errors -o "$tarball" \
+      "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz" && \
+    tar -xzf "$tarball" -C /usr/local/bin --strip-components=1 \
+      "cargo-about-0.9.0-${TARGET}/cargo-about" && \
+    rm -f "$tarball"
 
 COPY rust-toolchain.toml rust-toolchain.toml
 # Resolves/installs the toolchain now, in a layer keyed only on rust-toolchain.toml - matching
@@ -45,6 +54,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo build --release --locked --package iggy-gateway-kafka --bin iggy-gateway-kafka && \
     cp target/release/iggy-gateway-kafka /iggy-gateway-kafka
 
+# ASF convenience binaries must include the license text of bundled third-party code.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    ./scripts/ci/third-party-licenses.sh --generate \
+      --manifest gateways/kafka/Cargo.toml \
+      --output /build/LICENSE-binary
+
 FROM debian:trixie-slim
 # netcat-openbsd: nothing in the gateway's own dependency graph needs it - it's here only so
 # docker-compose.yml's healthcheck has a TCP-probe primitive to call.
@@ -53,6 +68,8 @@ RUN apt-get update && apt-get install -y \
     netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /iggy-gateway-kafka .
+COPY --from=builder /build/LICENSE-binary /usr/share/doc/iggy-kafka-gateway/LICENSE-binary
+COPY LICENSE NOTICE /usr/share/doc/iggy-kafka-gateway/
 
 ENV IGGY_KAFKA_BIND_ADDR=0.0.0.0:9093
 # No baked IGGY_KAFKA_ADVERTISED_HOST default: wildcard bind means the gateway cannot derive

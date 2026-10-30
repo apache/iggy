@@ -21,6 +21,8 @@
 
 namespace iggy {
 
+using detail::RethrowAsIggyException;
+
 namespace {
 
 rust::Vec<ffi::HeaderEntry> ToFfiRawOptions(const std::map<std::string, std::string> &raw_options) {
@@ -43,12 +45,37 @@ rust::Vec<ffi::HeaderEntry> ToFfiRawOptions(const std::map<std::string, std::str
     return ffi_options;
 }
 
+template <typename Key>
+rust::Vec<rust::String> ToFfiResetKeys(const std::set<Key> &keys) {
+    rust::Vec<rust::String> ffi_keys;
+    ffi_keys.reserve(keys.size());
+    for (const auto key : keys) {
+        const auto name = to_string(key);
+        ffi_keys.push_back(rust::String(name.data(), name.size()));
+    }
+    return ffi_keys;
+}
+
+rust::Vec<rust::String> ToFfiRawResetKeys(const std::set<std::string> &keys) {
+    rust::Vec<rust::String> ffi_keys;
+    ffi_keys.reserve(keys.size());
+    for (const auto &key : keys) {
+        ffi_keys.push_back(rust::String(key));
+    }
+    return ffi_keys;
+}
+
+rust::Vec<std::uint8_t> ToFfiBytes(const std::vector<std::uint8_t> &bytes) {
+    rust::Vec<std::uint8_t> ffi_bytes;
+    ffi_bytes.reserve(bytes.size());
+    for (const auto byte : bytes) {
+        ffi_bytes.push_back(byte);
+    }
+    return ffi_bytes;
+}
+
 template <typename FfiOptions, typename Options>
 void SetMutableTopicOptions(FfiOptions &ffi_options, const Options &options) {
-    if (const auto &value = options.CompressionAlgorithm()) {
-        ffi_options.has_compression_algorithm = true;
-        ffi_options.compression_algorithm     = std::string(value->Value());
-    }
     if (const auto &value = options.MessageExpiry()) {
         ffi_options.has_message_expiry   = true;
         ffi_options.message_expiry_kind  = std::string(value->Kind());
@@ -138,12 +165,16 @@ std::vector<UserInfo> IggyBlockingClient::GetUsers() {
 UserInfoDetails IggyBlockingClient::CreateUser(std::string username,
                                                std::string password,
                                                UserStatus status,
-                                               const std::optional<Permissions> &permissions) {
-    return RethrowAsIggyException([this, &username, &password, status, &permissions](ffi::ErrorInfo &error_info) {
+                                               const std::optional<Permissions> &permissions,
+                                               const UserCreateOptions &options) {
+    return RethrowAsIggyException([this, &username, &password, status, &permissions,
+                                   &options](ffi::ErrorInfo &error_info) {
         auto ffi_permissions = permissions ? permissions->ToFfi() : ffi::Permissions{};
+        ffi::UserCreateOptions ffi_options{};
+        ffi_options.raw_options = ToFfiRawOptions(options.RawEntries());
         return UserInfoDetails::FromFfi(Handle()->create_user(username, password, static_cast<ffi::UserStatus>(status),
                                                               permissions.has_value(), std::move(ffi_permissions),
-                                                              error_info));
+                                                              std::move(ffi_options), error_info));
     });
 }
 
@@ -152,28 +183,52 @@ void IggyBlockingClient::DeleteUser(const Identifier &user) {
         [this, &user](ffi::ErrorInfo &error_info) { Handle()->delete_user(user.ToFfi(), error_info); });
 }
 
-void IggyBlockingClient::UpdateUser(const Identifier &user,
-                                    std::optional<std::string> username,
-                                    std::optional<UserStatus> status,
-                                    const UserUpdateOptions &options) {
-    RethrowAsIggyException([this, &user, &username, status, &options](ffi::ErrorInfo &error_info) {
-        auto ffi_options = ToFfiRawOptions(options.RawEntries());
-        Handle()->update_user(user.ToFfi(), username.has_value(), username.value_or(""), status.has_value(),
-                              static_cast<ffi::UserStatus>(status.value_or(UserStatus::Active)), std::move(ffi_options),
-                              error_info);
+void IggyBlockingClient::UpdateUser(const Identifier &user, const UserUpdateOptions &options) {
+    RethrowAsIggyException([this, &user, &options](ffi::ErrorInfo &error_info) {
+        ffi::UserUpdateOptions ffi_options{};
+        ffi_options.has_username = options.Username().has_value();
+        ffi_options.username     = options.Username().value_or("");
+        ffi_options.has_status   = options.Status().has_value();
+        ffi_options.status       = static_cast<ffi::UserStatus>(options.Status().value_or(UserStatus::Active));
+        ffi_options.reset        = ToFfiResetKeys(options.ResetKeys());
+        ffi_options.raw_reset    = ToFfiRawResetKeys(options.RawResetKeys());
+        ffi_options.raw_options  = ToFfiRawOptions(options.RawEntries());
+        Handle()->update_user(user.ToFfi(), std::move(ffi_options), error_info);
     });
 }
 
-StreamDetails IggyBlockingClient::CreateStream(std::string name) {
-    return RethrowAsIggyException([this, &name](ffi::ErrorInfo &error_info) {
-        return StreamDetails::FromFfi(Handle()->create_stream(name, error_info));
+std::string IggyBlockingClient::CreatePersonalAccessToken(std::string name, const Expiry &expiry) {
+    return RethrowAsIggyException([this, &name, &expiry] {
+        return std::string(
+            Handle()->create_personal_access_token(std::move(name), std::string(expiry.Kind()), expiry.Value()));
     });
 }
 
-void IggyBlockingClient::UpdateStream(const Identifier &stream, std::string name, const StreamUpdateOptions &options) {
-    RethrowAsIggyException([this, &stream, &name, &options](ffi::ErrorInfo &error_info) {
-        auto ffi_options = ToFfiRawOptions(options.RawEntries());
-        Handle()->update_stream(stream.ToFfi(), name, std::move(ffi_options), error_info);
+StreamDetails IggyBlockingClient::CreateStream(std::string name, const StreamCreateOptions &options) {
+    return RethrowAsIggyException([this, &name, &options](ffi::ErrorInfo &error_info) {
+        ffi::StreamCreateOptions ffi_options{};
+        if (options.encryption_key_) {
+            ffi_options.has_encryption_key = true;
+            ffi_options.encryption_key     = ToFfiBytes(*options.encryption_key_);
+        }
+        if (options.encryption_key_base64_) {
+            ffi_options.has_encryption_key_base64 = true;
+            ffi_options.encryption_key_base64     = *options.encryption_key_base64_;
+        }
+        ffi_options.raw_options = ToFfiRawOptions(options.RawEntries());
+        return StreamDetails::FromFfi(Handle()->create_stream(name, std::move(ffi_options), error_info));
+    });
+}
+
+void IggyBlockingClient::UpdateStream(const Identifier &stream, const StreamUpdateOptions &options) {
+    RethrowAsIggyException([this, &stream, &options](ffi::ErrorInfo &error_info) {
+        ffi::StreamUpdateOptions ffi_options{};
+        ffi_options.has_name    = options.Name().has_value();
+        ffi_options.name        = options.Name().value_or("");
+        ffi_options.reset       = ToFfiResetKeys(options.ResetKeys());
+        ffi_options.raw_reset   = ToFfiRawResetKeys(options.RawResetKeys());
+        ffi_options.raw_options = ToFfiRawOptions(options.RawEntries());
+        Handle()->update_stream(stream.ToFfi(), std::move(ffi_options), error_info);
     });
 }
 
@@ -205,6 +260,10 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
     return RethrowAsIggyException([this, &stream, &name, &options](ffi::ErrorInfo &error_info) {
         ffi::TopicCreateOptions ffi_options{};
         SetMutableTopicOptions(ffi_options, options);
+        if (const auto &value = options.CompressionAlgorithm()) {
+            ffi_options.has_compression_algorithm = true;
+            ffi_options.compression_algorithm     = std::string(value->Value());
+        }
         if (auto value = options.PartitionsCount()) {
             ffi_options.has_partitions_count = true;
             ffi_options.partitions_count     = *value;
@@ -233,6 +292,10 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
             ffi_options.has_consumer_offset_durability = false;
             ffi_options.consumer_offset_durability     = "";
         }
+        if (auto value = options.PartitionResizePolicy()) {
+            ffi_options.has_partition_resize_policy = true;
+            ffi_options.partition_resize_policy     = std::string(iggy::to_string(*value));
+        }
         if (auto value = options.MessagesRequiredToSave()) {
             ffi_options.has_messages_required_to_save = true;
             ffi_options.messages_required_to_save     = *value;
@@ -260,13 +323,16 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
 
 void IggyBlockingClient::UpdateTopic(const Identifier &stream,
                                      const Identifier &topic,
-                                     std::string name,
                                      const TopicUpdateOptions &options) {
-    RethrowAsIggyException([this, &stream, &topic, &name, &options](ffi::ErrorInfo &error_info) {
+    RethrowAsIggyException([this, &stream, &topic, &options](ffi::ErrorInfo &error_info) {
         ffi::TopicUpdateOptions ffi_options{};
         SetMutableTopicOptions(ffi_options, options);
+        ffi_options.has_name  = options.Name().has_value();
+        ffi_options.name      = options.Name().value_or("");
+        ffi_options.reset     = ToFfiResetKeys(options.ResetKeys());
+        ffi_options.raw_reset = ToFfiRawResetKeys(options.RawResetKeys());
 
-        Handle()->update_topic(stream.ToFfi(), topic.ToFfi(), name, std::move(ffi_options), error_info);
+        Handle()->update_topic(stream.ToFfi(), topic.ToFfi(), std::move(ffi_options), error_info);
     });
 }
 
@@ -450,6 +516,25 @@ std::vector<ClientInfo> IggyBlockingClient::GetClients() {
     });
 }
 
+std::vector<OptionSpec> IggyBlockingClient::DescribeOptions(OptionsScope scope) {
+    return RethrowAsIggyException([this, scope] {
+        const auto scope_name = to_string(scope);
+        std::vector<OptionSpec> specs;
+        auto ffi_specs = Handle()->describe_options(rust::String(scope_name.data(), scope_name.size()));
+        specs.reserve(ffi_specs.size());
+        for (auto &spec : ffi_specs) {
+            specs.push_back(OptionSpec::FromFfi(std::move(spec)));
+        }
+        return specs;
+    });
+}
+
+MetadataChanges IggyBlockingClient::GetMetadataChanges(const MetadataChangesQuery &query) {
+    return RethrowAsIggyException([this, &query](ffi::ErrorInfo &error_info) {
+        return MetadataChanges::FromFfi(Handle()->get_metadata_changes(query.ToFfi(), error_info));
+    });
+}
+
 Stats IggyBlockingClient::GetStats() {
     return RethrowAsIggyException([this] { return Stats::FromFfi(Handle()->get_stats()); });
 }
@@ -474,6 +559,71 @@ void IggyBlockingClient::Reset() noexcept {
 
     ffi::Client *client{std::exchange(client_, nullptr)};
     ffi::delete_client(client);
+}
+
+std::string EncryptionKeyFingerprint(const std::vector<std::uint8_t> &key) {
+    return RethrowAsIggyException([&key](ffi::ErrorInfo &error_info) {
+        const auto fingerprint =
+            ffi::encryption_key_fingerprint(rust::Slice<const std::uint8_t>(key.data(), key.size()), error_info);
+        return std::string(fingerprint.data(), fingerprint.size());
+    });
+}
+
+std::string EncryptionKeyFingerprint(const std::string &key_base64) {
+    return RethrowAsIggyException([&key_base64](ffi::ErrorInfo &error_info) {
+        const auto fingerprint =
+            ffi::encryption_key_fingerprint_base64(rust::Str(key_base64.data(), key_base64.size()), error_info);
+        return std::string(fingerprint.data(), fingerprint.size());
+    });
+}
+
+MetadataChangeCursor MetadataChangeCursor::Parse(const std::string &text) {
+    return RethrowAsIggyException([&text](ffi::ErrorInfo &error_info) {
+        return FromFfi(ffi::parse_metadata_change_cursor(
+            rust::Slice<const std::uint8_t>(reinterpret_cast<const std::uint8_t *>(text.data()), text.size()),
+            error_info));
+    });
+}
+
+MetadataCurrentPageToken MetadataCurrentPageToken::Parse(const std::string &text) {
+    return RethrowAsIggyException([&text](ffi::ErrorInfo &error_info) {
+        return FromFfi(ffi::parse_metadata_current_page_token(
+            rust::Slice<const std::uint8_t>(reinterpret_cast<const std::uint8_t *>(text.data()), text.size()),
+            error_info));
+    });
+}
+
+void MetadataChangesQuery::Validate() const {
+    RethrowAsIggyException(
+        [this](ffi::ErrorInfo &error_info) { ffi::validate_metadata_changes_query(ToFfi(), error_info); });
+}
+
+std::vector<std::uint8_t> MetadataChangesQuery::ToBytes() const {
+    return RethrowAsIggyException([this](ffi::ErrorInfo &error_info) {
+        const auto bytes = ffi::encode_metadata_changes_query(ToFfi(), error_info);
+        return std::vector<std::uint8_t>(bytes.begin(), bytes.end());
+    });
+}
+
+MetadataChanges MetadataChanges::FromBytes(const std::vector<std::uint8_t> &payload) {
+    return RethrowAsIggyException([&payload](ffi::ErrorInfo &error_info) {
+        return FromFfi(
+            ffi::decode_metadata_changes(rust::Slice<const std::uint8_t>(payload.data(), payload.size()), error_info));
+    });
+}
+
+MetadataChangeRecord MetadataChangeRecord::FromBytes(const std::vector<std::uint8_t> &bytes) {
+    return RethrowAsIggyException([&bytes](ffi::ErrorInfo &error_info) {
+        return FromFfi(ffi::decode_metadata_change_record(rust::Slice<const std::uint8_t>(bytes.data(), bytes.size()),
+                                                          error_info));
+    });
+}
+
+MetadataCurrentItem MetadataCurrentItem::FromBytes(const std::vector<std::uint8_t> &bytes) {
+    return RethrowAsIggyException([&bytes](ffi::ErrorInfo &error_info) {
+        return FromFfi(
+            ffi::decode_metadata_current_item(rust::Slice<const std::uint8_t>(bytes.data(), bytes.size()), error_info));
+    });
 }
 
 IggyBlockingClient::Builder::Builder() = default;
@@ -577,7 +727,7 @@ IggyBlockingClient::Builder &IggyBlockingClient::Builder::WithPendingOperations(
 }
 
 IggyBlockingClient IggyBlockingClient::Builder::Build() const {
-    return IggyBlockingClient::RethrowAsIggyException([this] {
+    return RethrowAsIggyException([this] {
         ffi::IggyClientConfig config{};
         config.server_address               = server_address_;
         config.auto_login_kind              = auto_login_kind_;

@@ -32,19 +32,16 @@
 //!
 //! # Auth
 //!
-//! Neither plane is authenticated at the bus layer. Both connect first
-//! and let the caller (`core/server`) gate command access via
-//! application-level LOGIN commands:
-//!
-//! - SDK-client plane: `LOGIN_USER` / `LOGIN_WITH_PERSONAL_ACCESS_TOKEN`,
+//! - SDK-client plane: the bus does not authenticate clients. The caller
+//!   (`core/server`) gates command access with application-level LOGIN
+//!   commands: `LOGIN_USER` / `LOGIN_WITH_PERSONAL_ACCESS_TOKEN`,
 //!   pre-LOGIN allowlist `PING`, `LOGIN_USER`, `LOGIN_WITH_PAT`.
-//! - Replica plane: a future `LOGIN_REPLICA` command carries the
-//!   cluster's shared secret. Until that command succeeds the caller
-//!   MUST NOT honor consensus messages from the connection. The
-//!   `Ping` frame at connect time announces `replica_id` and
-//!   `cluster_id` (the listener checks `cluster_id` matches the local
-//!   cluster and uses `replica_id` to key its registry); it carries
-//!   no MAC.
+//! - Replica plane: every link opens with a placement preamble
+//!   ([`replica::preamble`]) and then the replica handshake
+//!   ([`replica::handshake`]). The handshake checks the cluster id, the
+//!   build, the dialer direction and the link placement. With a shared
+//!   secret configured, it also authenticates both ends with a MAC
+//!   ([`replica::auth`]).
 //!
 //! # Invariants worth naming
 //!
@@ -76,7 +73,6 @@
 //! registry, fencing, and dispatch logic.
 
 pub mod accept;
-pub mod cache;
 pub mod client_listener;
 pub mod config;
 pub mod connection_cap;
@@ -106,15 +102,20 @@ pub use transports::tls::TlsServerCredentials;
 
 pub use compio::runtime::JoinHandle;
 use configs::server::ServerConfig;
-use iggy_binary_protocol::{GenericHeader, ReplyHeader};
-use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
+use iggy_binary_protocol::{Command, GenericHeader, ReplyHeader};
+use replica::bundle::{Bundle, BundleChange, BundlePhase};
+use replica::links::{LinkClaim, peer_slot};
+pub use replica::links::{LinkLayout, LinkLayoutError, ReplicaLinkId};
+use replica::preamble::{Preamble, PreambleError};
+use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use std::array;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tracing::{info, warn};
 
 /// Maximum number of replicas a single cluster supports. Replica ids are
 /// `u8`, so the address space is 0..=255.
@@ -124,9 +125,10 @@ pub const MAX_REPLICAS: usize = 256;
 /// enforced globally on shard 0 (the sole acceptor) regardless of which
 /// shard the delegated handshake runs on.
 ///
-/// A legitimate dialer set is bounded by `self_id`
-/// (< `replica_count` <= 255), so the cap only sheds load under a
-/// hostile flood; it bounds fd / memory without ever stalling the
+/// A legitimate dialer set opens at most `self_id` times the link count
+/// sockets (`self_id` < `replica_count` <= 255). [`LinkLayout::new`]
+/// keeps that product at or below this cap, so the cap only sheds load
+/// under a hostile flood. It bounds fd / memory without ever stalling the
 /// accept loop.
 pub const MAX_INFLIGHT_REPLICA_HANDSHAKES: usize = 256;
 
@@ -138,7 +140,7 @@ pub const MAX_INFLIGHT_REPLICA_HANDSHAKES: usize = 256;
 /// a permanently suppressed redial.
 const REPLICA_HANDSHAKE_ACK_MARGIN: Duration = Duration::from_secs(5);
 
-/// Sentinel stored in [`ReplicaOwnerTable`] slots that have no current owner.
+/// Owner shard stored in [`ReplicaOwnerTable`] slots that have no current owner.
 ///
 /// `u16::MAX` is reserved by the server bootstrap so it can never be a real
 /// shard id: `bootstrap` rejects any server whose shard count does not fit
@@ -146,103 +148,122 @@ const REPLICA_HANDSHAKE_ACK_MARGIN: Duration = Duration::from_secs(5);
 /// than minting a shard id that collides with this sentinel.
 pub const OWNER_NONE: u16 = u16::MAX;
 
-/// Shared atomic owner table mapping `replica_id` to `owning_shard_id`.
+/// A free owner-table slot: no owner, epoch bits zero.
+const LINK_FREE: u64 = OWNER_NONE as u64;
+
+/// A slot keeps the owner shard in its low bits and the epoch above them.
+const LINK_EPOCH_SHIFT: u32 = u16::BITS;
+
+/// The link that carries every frame the peer routes to the metadata group.
+/// That group lives on shard 0 of every node, and shard 0 is in range 0.
+const METADATA_LINK: u16 = 0;
+
+const COMMAND_OFFSET: usize = std::mem::offset_of!(GenericHeader, command);
+
+/// Shared atomic owner table of the replica links of this node.
 ///
-/// One Arc-cloned instance is allocated per the server process at
-/// bootstrap and shared across every shard's [`IggyMessageBus`]. The owning shard
-/// stamps its id into a slot when an inbound replica connection passes
-/// the registry-insert race; the same shard CAS-clears the slot when
-/// its connection dies (`notify_connection_lost`). Non-owning shards
-/// only ever read.
+/// One Arc-cloned instance is allocated per server process at bootstrap and
+/// shared across every shard's [`IggyMessageBus`]. It holds the
+/// [`LinkLayout`], one slot per (peer, link) and one Up flag per peer.
 ///
-/// Lock-free by construction: every operation is a single relaxed-or-
-/// stronger atomic on a fixed `[AtomicU16; MAX_REPLICAS]`. Sized for
-/// 256 slots upfront, so install / disconnect cost is `O(1)` and no
-/// hashing or allocation happens on the hot path.
+/// A slot names the shard that owns the link and the bundle epoch the link
+/// was placed in. The owner shard claims the slot before it installs the
+/// link and releases it when the link closes. Both are CAS operations. A
+/// claim only takes a free slot, so a second link for an installed (peer,
+/// link) is refused and never replaces the live one. A release only frees
+/// the claim it made, so a late release never frees a newer link.
+///
+/// Only shard 0 writes the Up flags (see [`replica::bundle`]). Every shard
+/// reads them on each send, so a peer gets frames only while all the links
+/// of its bundle are installed.
 ///
 /// The table is the sole authority for cross-shard replica routing:
-/// `send_to_replica`'s slow path and [`IggyMessageBus::owning_shard`]
-/// both read it directly. No separate broadcast or reconcile loop is
-/// involved.
+/// `send_to_replica`'s slow path reads it directly. No broadcast or
+/// reconcile loop is involved.
 pub struct ReplicaOwnerTable {
-    slots: [AtomicU16; MAX_REPLICAS],
+    layout: LinkLayout,
+    /// Slot of link `j` to peer `p` at `p * links + j`.
+    links: Box<[AtomicU64]>,
+    up: [AtomicBool; MAX_REPLICAS],
 }
 
 impl ReplicaOwnerTable {
-    /// Build a fresh table with every slot initialised to [`OWNER_NONE`].
+    /// A table for one link per peer on a single shard.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_layout(LinkLayout::default())
+    }
+
+    #[must_use]
+    pub fn with_layout(layout: LinkLayout) -> Self {
+        let slots = MAX_REPLICAS * usize::from(layout.links());
         Self {
-            slots: array::from_fn(|_| AtomicU16::new(OWNER_NONE)),
+            layout,
+            links: (0..slots).map(|_| AtomicU64::new(LINK_FREE)).collect(),
+            up: array::from_fn(|_| AtomicBool::new(false)),
         }
     }
 
-    /// Try to claim `shard_id` as the current owner of `replica_id`.
-    ///
-    /// Returns `true` when the caller now owns the slot. Two paths
-    /// resolve to `true`:
-    /// * `compare_exchange(OWNER_NONE -> shard_id)` wins. Common case.
-    /// * The CAS fails because the slot already stores `shard_id`. A
-    ///   same-shard reclaim during the post-loop clear window
-    ///   (`IggyMessageBus::notify_connection_lost`) is benign: the
-    ///   slot already names us, and the stale post-loop will stand
-    ///   down once it observes a live registry entry.
-    ///
-    /// Returns `false` only when a **different** shard owns the slot.
-    /// In that case the caller must drop the inbound fd without
-    /// spawning, mirroring the existing local-`replicas().contains`
-    /// early-return at [`installer::install_replica_conn`].
-    ///
-    /// Closes the multi-shard install race where two parallel inbound
-    /// shard-delegated installs for the same `replica_id` both pass
-    /// their local per-shard registry check and both stamp the
-    /// owner-table: the second stamp would clobber the first, leaving
-    /// the loser's registry as an orphan that no cross-shard route
-    /// reaches. The CAS gates the install before any task is spawned.
-    ///
-    /// The inverse op is [`Self::clear_if_owned_by`]; both must agree on
-    /// `shard_id` to keep the slot self-consistent.
-    pub fn try_claim(&self, replica_id: u8, shard_id: u16) -> bool {
-        match self.slots[usize::from(replica_id)].compare_exchange(
-            OWNER_NONE,
-            shard_id,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => true,
-            Err(actual) => actual == shard_id,
-        }
+    #[must_use]
+    pub const fn layout(&self) -> LinkLayout {
+        self.layout
     }
 
-    /// Clear the slot iff its current owner is `shard_id`. Returns
-    /// `true` when the CAS succeeded.
+    /// Claim the slot of `link` for `shard_id` in the epoch of `link`.
     ///
-    /// The CAS prevents a stale post-loop on shard A from clobbering a
-    /// slot that has since been re-registered on shard B.
-    pub fn clear_if_owned_by(&self, replica_id: u8, shard_id: u16) -> bool {
-        self.slots[usize::from(replica_id)]
-            .compare_exchange(shard_id, OWNER_NONE, Ordering::AcqRel, Ordering::Acquire)
+    /// Returns `false` when an install of any epoch holds the slot, or when
+    /// the link index is out of range. The caller then drops the connection
+    /// without spawning a task.
+    pub fn try_claim(&self, link: ReplicaLinkId, shard_id: u16) -> bool {
+        self.slot(link.replica, link.link).is_some_and(|slot| {
+            slot.compare_exchange(
+                LINK_FREE,
+                pack_claim(shard_id, link.epoch),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
+        })
     }
 
-    /// Read the current owner of `replica_id`. Returns `None` when the
-    /// slot is [`OWNER_NONE`].
+    /// Free the slot of `link` if `shard_id` still holds it in the epoch of
+    /// `link`. Returns whether the slot was freed.
+    pub fn release(&self, link: ReplicaLinkId, shard_id: u16) -> bool {
+        self.slot(link.replica, link.link).is_some_and(|slot| {
+            slot.compare_exchange(
+                pack_claim(shard_id, link.epoch),
+                LINK_FREE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        })
+    }
+
+    /// The install that holds link `link` to `replica`, if any.
     #[must_use]
-    pub fn owner(&self, replica_id: u8) -> Option<u16> {
-        match self.slots[usize::from(replica_id)].load(Ordering::Acquire) {
-            OWNER_NONE => None,
-            owner => Some(owner),
+    pub fn claim(&self, replica: u8, link: u16) -> Option<LinkClaim> {
+        unpack_claim(self.slot(replica, link)?.load(Ordering::Acquire))
+    }
+
+    /// Whether frames flow to `replica`: every link of its bundle is
+    /// installed in the current epoch.
+    #[must_use]
+    pub fn is_up(&self, replica: u8) -> bool {
+        self.up[usize::from(replica)].load(Ordering::Acquire)
+    }
+
+    fn set_up(&self, replica: u8, up: bool) {
+        self.up[usize::from(replica)].store(up, Ordering::Release);
+    }
+
+    fn slot(&self, replica: u8, link: u16) -> Option<&AtomicU64> {
+        let links = self.layout.links();
+        if link >= links {
+            return None;
         }
-    }
-
-    /// Number of slots currently claimed by any shard, i.e. live peer
-    /// replica connections on this node.
-    #[must_use]
-    pub fn owned_count(&self) -> usize {
-        self.slots
-            .iter()
-            .filter(|slot| slot.load(Ordering::Acquire) != OWNER_NONE)
-            .count()
+        self.links
+            .get(usize::from(replica) * usize::from(links) + usize::from(link))
     }
 }
 
@@ -250,6 +271,22 @@ impl Default for ReplicaOwnerTable {
     fn default() -> Self {
         Self::new()
     }
+}
+
+const fn pack_claim(owner: u16, epoch: u32) -> u64 {
+    ((epoch as u64) << LINK_EPOCH_SHIFT) | owner as u64
+}
+
+#[allow(clippy::cast_possible_truncation)]
+const fn unpack_claim(slot: u64) -> Option<LinkClaim> {
+    let owner = slot as u16;
+    if owner == OWNER_NONE {
+        return None;
+    }
+    Some(LinkClaim {
+        owner,
+        epoch: (slot >> LINK_EPOCH_SHIFT) as u32,
+    })
 }
 
 /// Callback for forwarding a consensus replica message to the owning shard.
@@ -271,51 +308,48 @@ impl Default for ReplicaOwnerTable {
 /// that outlive the caller and need independent ownership.
 pub type ReplicaForwardFn = Box<dyn Fn(u8, u16, Frozen<MESSAGE_ALIGN>) -> Result<(), SendError>>;
 
-/// Callback for forwarding a client-bound message to the owning shard.
-///
-/// Provided by the shard layer at bus construction and installed via
-/// [`IggyMessageBus::set_client_forward_fn`]. Arguments:
-/// `(client_id, owning_shard_id, message)`. Returns `Ok(())` on successful
-/// enqueue into the inter-shard channel.
-///
-/// `owning_shard_id` is the value returned by [`client_id_owning_shard`];
-/// the slow path passes it pre-resolved so the closure does not redo the
-/// shift. `client_id` is carried so the receiver can rebuild the
-/// `ShardFrame::Lifecycle`'s `ForwardClientSend { client_id, msg }`
-/// payload.
-pub type ClientForwardFn = Box<dyn Fn(u128, u16, BusMessage) -> Result<(), SendError>>;
-
 /// Callback invoked when a client connection metadata entry is removed.
 pub type ClientConnectionLostFn = std::rc::Rc<dyn Fn(u128)>;
 
 /// Callback invoked on every accepted inbound replica connection.
 ///
-/// Fired by the replica listener BEFORE any byte is read: the peer id is
-/// unknown (blind delegation), validation happens on the owning shard
-/// inside [`replica::handshake::acceptor_handshake`]. Takes ownership of
-/// the `TcpStream`. The callback enforces the shard-0-global in-flight
-/// handshake cap ([`IggyMessageBus::try_acquire_replica_handshake_slot`])
-/// and ships the raw fd to the owning shard.
+/// Fired by the replica listener BEFORE any byte is read. Takes ownership
+/// of the `TcpStream`. The callback enforces the shard-0-global in-flight
+/// handshake cap ([`IggyMessageBus::try_acquire_replica_handshake_slot`]),
+/// reads the placement preamble ([`IggyMessageBus::place_replica_inbound`])
+/// in a task of its own and ships the raw fd to the shard that owns the
+/// link. The owning shard validates the peer inside
+/// [`replica::handshake::acceptor_handshake`].
 pub type AcceptedReplicaFn = std::rc::Rc<dyn Fn(compio::net::TcpStream)>;
 
-/// Callback invoked on every successfully dialed outbound replica
-/// connection.
+/// Callback invoked on every successfully dialed outbound replica link.
 ///
-/// Fired by the outbound connector right after the TCP connect; the
-/// dialer handshake runs on the owning shard after delegation. The
-/// dialer trusts the configured peer list, so the pre-configured peer id
-/// rides along. Takes ownership of the `TcpStream`.
-pub type DialedReplicaFn = std::rc::Rc<dyn Fn(compio::net::TcpStream, u8)>;
+/// Fired by the outbound connector right after the TCP connect, with the
+/// link and the shard that owns it. The dialer handshake runs on that
+/// shard after delegation. The dialer trusts the configured peer list, so
+/// the pre-configured peer id rides along. Takes ownership of the
+/// `TcpStream`.
+pub type DialedReplicaFn = std::rc::Rc<dyn Fn(compio::net::TcpStream, ReplicaLinkId, u16)>;
 
 /// One-shot ack a delegated replica handshake fires when it finishes,
 /// success or failure.
 ///
 /// Built by the owning shard's router around its inter-shard sender to
 /// shard 0, where it releases the in-flight cap slot (inbound) or clears
-/// the pending-dial entry (outbound). Invoked exactly once at the end of
-/// the spawned handshake task. A lost ack (full inbox, wedged shard) is
-/// covered by the deadline expiry on the shard-0 entry.
+/// the pending-dial entry (outbound) and refreshes the bundle of the peer.
+/// Invoked exactly once at the end of the spawned handshake task. A lost
+/// ack (full inbox, wedged shard) is covered by the deadline expiry on the
+/// shard-0 entry and by the next reconnect sweep.
 pub type ReplicaHandshakeDoneFn = Box<dyn FnOnce()>;
+
+/// Shard 0 tells the owner shard of a replica link to close it.
+///
+/// Installed once on shard 0's bus at bootstrap via
+/// [`IggyMessageBus::set_replica_link_close_fn`]. Arguments: `(owner_shard,
+/// link)`. The closure ships the request to the owner shard, which closes
+/// the link only while it still holds it in the epoch of `link`. A lost
+/// request is sent again by the next bundle refresh.
+pub type ReplicaLinkCloseFn = Box<dyn Fn(u16, ReplicaLinkId)>;
 
 /// Callback invoked on every accepted SDK client connection.
 ///
@@ -427,21 +461,21 @@ pub type AcceptedTlsClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream, Shared
 /// subsequent I/O. No subprotocol negotiation is performed.
 pub type AcceptedWssClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream, SharedTlsServerConfig)>;
 
-/// Notifier fired when a delegated replica connection dies.
+/// Notifier fired when an installed replica link closes.
 ///
-/// The delegated replica connection's writer / reader tasks invoke this on
-/// abnormal exit (peer closed, write failed). The shard bootstrap wraps
-/// this closure around a `try_send` into shard 0's inbox so shard 0 can
-/// clear the replica mapping and re-dial.
-pub type ConnectionLostFn = std::rc::Rc<dyn Fn(u8)>;
+/// The link's writer / reader tasks invoke this once, after the owner
+/// shard released the link's owner-table slot. The shard bootstrap wraps
+/// this closure around a `try_send` into shard 0's inbox, where the close
+/// tears the bundle of the peer down (see [`replica::bundle`]).
+pub type ConnectionLostFn = std::rc::Rc<dyn Fn(ReplicaLinkId)>;
 
 /// Socket-read accounting for this shard's plaintext replica links.
 ///
 /// One instance covers every such link the shard owns, so the ratio of
 /// decoded frames to completed socket reads is their aggregate batching
-/// factor, which is what the read-ahead buffer exists to raise. Only link
-/// shards read replica sockets, so a nonzero value also identifies the
-/// link shard.
+/// factor, which is what the read-ahead buffer exists to raise. Only shards
+/// that own replica links read replica sockets, so a nonzero value also
+/// identifies a shard that owns a replica link.
 ///
 /// `Cell` rather than atomics: the reader task that bumps these and the
 /// shard sweep that drains them run on the same compio thread. Shared
@@ -488,6 +522,29 @@ pub struct ReplicaReadMetrics {
     pub frames: u64,
 }
 
+/// Replica link events on one shard since the previous
+/// [`MessageBus::take_replica_link_stats`].
+///
+/// Shard 0 tracks the bundles and reads the preambles, so the other shards
+/// report zero for those fields.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaLinkMetrics {
+    pub bundle_teardowns: u64,
+    /// Accepted sockets closed before delegation: no preamble in time, or
+    /// a preamble this node refuses.
+    pub preamble_refusals: u64,
+    /// Delegated handshakes that failed or ran out of `handshake_grace` on
+    /// this shard, refused hellos included.
+    pub handshake_failures: u64,
+    /// Frames refused at a full peer queue on the fast path of
+    /// [`MessageBus::send_to_replica`]. Forwarded frames count here too,
+    /// because the link shard re-enters that path for them.
+    pub outbound_drops: u64,
+    /// Peers whose bundle is Up at the time of the take. A gauge, not a
+    /// delta.
+    pub bundles_up: u64,
+}
+
 /// Point-to-point message delivery between consensus participants.
 ///
 /// `Ok(())` means "accepted for delivery" - NOT "delivered to peer".
@@ -515,31 +572,45 @@ pub struct ReplicaReadMetrics {
 /// / view-change / `Commit`). A `ReplicaForwardFailed` on full
 /// inter-shard inbox is recovered by VSR retransmit and is
 /// informational.
-/// `send_to_client` carries the final Reply payload to the originating
-/// client; it has no in-protocol retransmit. A `ClientForwardFailed` is
-/// terminal: the client never receives the reply and times out.
-/// Operators must size `inbox_capacity` for the worst-case cross-shard
-/// reply burst. Each drop is logged at the drop site via `tracing`;
-/// alert on those logs today. The `frame_drops_total`
-/// `{variant="forward_client_send"}` counter is the structured
-/// complement and becomes scrape-able once a per-shard exporter lands.
-/// The symmetric `{variant="forward_replica_send"}` counter stays
-/// informational only.
+/// `send_to_client` carries a Reply by client id; it has no in-protocol
+/// retransmit. Real socket and HTTP targets require the installation
+/// captured when dispatch admitted the request
+/// ([`ConnectionInstaller::send_to_client_instance`]); a client id alone
+/// cannot prove reply ownership, so [`IggyMessageBus`] refuses every frame
+/// sent by id with `ClientNotFound`, and never forwards it to another shard.
+/// A `Backpressure` from the client's own queue closes that connection, so
+/// the client fails the pending request at once and recovers on a new
+/// connection. A reply sent with
+/// [`ConnectionInstaller::send_to_client_instance_waiting`] waits for room
+/// instead, up to `client_write_stall_timeout`, and then closes the
+/// connection the same way. A request the dispatch host relays to another
+/// shard gets its reply back over the request's own channel, and the shard
+/// holding the connection sends it as above. The
+/// `{variant="forward_replica_send"}` drop counter stays informational
+/// only.
 ///
 /// # Setter install contract
 ///
-/// The three setters below do NOT share one install rule:
+/// The two setters below do NOT share one install rule:
 /// - [`Self::set_connection_lost_fn`] is re-installable (`RefCell`
-///   slot); it is a test observation hook some setups swap mid-test.
-/// - [`Self::set_replica_forward_fn`] and [`Self::set_client_forward_fn`]
-///   are one-shot (`OnceCell` slot) and panic on a second install;
-///   they are bootstrap-only wiring invariants.
+///   slot): a second install replaces the bundle close report.
+/// - [`Self::set_replica_forward_fn`] is one-shot (`OnceCell` slot) and
+///   panics on a second install, as a bootstrap-only wiring invariant.
 ///
 /// A bus impl must preserve this divergence - see each method.
 pub trait MessageBus {
+    /// Process-wide monotonic microseconds, on the same timeline as `sleep`.
+    /// Virtual-time implementations must override both methods together.
+    fn monotonic_micros(&self) -> u64 {
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        u64::try_from(ORIGIN.get_or_init(Instant::now).elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+
     /// Queue one frame for `client_id`. Takes anything that converts into a
     /// [`BusMessage`]: a single `Frozen<MESSAGE_ALIGN>` buffer or an
-    /// already fragmented frame.
+    /// already fragmented frame. [`IggyMessageBus`] refuses every such frame
+    /// with `ClientNotFound`, because socket and HTTP targets need the
+    /// installation captured at admission (see the recovery asymmetry above).
     fn send_to_client(
         &self,
         client_id: u128,
@@ -552,24 +623,22 @@ pub trait MessageBus {
         data: Frozen<MESSAGE_ALIGN>,
     ) -> impl Future<Output = Result<(), SendError>>;
 
-    /// Install a notifier the bus will invoke when a delegated replica
-    /// connection dies abnormally. Production wiring leaves this unset
-    /// because the shard-shared [`ReplicaOwnerTable`] is CAS-cleared
-    /// inside `IggyMessageBus::notify_connection_lost` before the
-    /// callback runs, so cross-shard routing recovers without any
-    /// follow-up message. Test code installs a callback to assert the
-    /// notifier path fires exactly once per disconnect.
+    /// Install a notifier the bus will invoke when an installed replica
+    /// link closes. The shard bootstrap installs one on every shard that
+    /// reports the close to shard 0, which tears the bundle of the peer
+    /// down. The shard-shared [`ReplicaOwnerTable`] slot of the link is
+    /// already released when the callback runs. Test code installs a
+    /// callback to assert the notifier path fires exactly once per close.
     ///
     /// No default: every bus must explicitly opt in or stub. A silent
     /// no-op default previously masked a wiring bug where shard 0 never
     /// learned a delegated replica died.
     ///
-    /// Re-installing is allowed by design - the backing slot is a
-    /// `RefCell`, so a second call overwrites the first. This is the
+    /// Re-installing is allowed by design: the backing slot is a
+    /// `RefCell`, so a second install replaces the first, the bundle close
+    /// report included. Tests rely on this to observe closes. This is the
     /// deliberate exception to the install rules of
-    /// [`Self::set_replica_forward_fn`] / [`Self::set_client_forward_fn`]:
-    /// the notifier is a test observation hook some setups swap
-    /// mid-test, not a one-shot bootstrap invariant.
+    /// [`Self::set_replica_forward_fn`].
     fn set_connection_lost_fn(&self, f: ConnectionLostFn);
 
     /// Install the replica-plane inter-shard forward closure.
@@ -586,17 +655,6 @@ pub trait MessageBus {
     /// one-shot bootstrap invariant backed by a `OnceCell`, so a
     /// double-install is a wiring bug rather than a supported re-bind.
     fn set_replica_forward_fn(&self, f: ReplicaForwardFn);
-
-    /// Install the client-plane inter-shard forward closure.
-    ///
-    /// No default: every bus must explicitly opt in or stub. Same
-    /// rationale as [`Self::set_replica_forward_fn`].
-    ///
-    /// # Panics
-    ///
-    /// Panics on a second install on the same bus, same one-shot
-    /// `OnceCell` invariant as [`Self::set_replica_forward_fn`].
-    fn set_client_forward_fn(&self, f: ClientForwardFn);
 
     /// Register a detached `compio::runtime::spawn` handle so
     /// [`shutdown`](IggyMessageBus::shutdown) can await it before the
@@ -684,6 +742,12 @@ pub trait MessageBus {
         iggy_common::IggyTimestamp::now().as_micros()
     }
 
+    /// Monotonic time for local deadlines, independent of message-pump progress.
+    /// Simulator overrides must share one timeline across replicas and restarts.
+    fn monotonic_now(&self) -> Instant {
+        Instant::now()
+    }
+
     /// Drain this bus's plaintext replica socket-read counters.
     ///
     /// The provided default returns zeros so the simulator bus and the
@@ -693,6 +757,12 @@ pub trait MessageBus {
     fn take_replica_read_stats(&self) -> ReplicaReadMetrics {
         ReplicaReadMetrics::default()
     }
+
+    /// Drain the replica link events of this bus. Zero by default for the
+    /// same reason as [`Self::take_replica_read_stats`].
+    fn take_replica_link_stats(&self) -> ReplicaLinkMetrics {
+        ReplicaLinkMetrics::default()
+    }
 }
 
 /// Production message bus backed by real TCP connections.
@@ -701,7 +771,7 @@ pub trait MessageBus {
 /// - a root [`Shutdown`] / [`ShutdownToken`] that fans cancellation to every
 ///   accept loop, read loop, periodic task, and per-connection writer task,
 /// - a [`ConnectionRegistry<u128>`] for clients (`u128` id is shard-packed),
-/// - a [`ReplicaRegistry`] for replicas (`u8` id from the Ping handshake,
+/// - a [`ReplicaRegistry`] for replicas (`u8` id from the replica handshake,
 ///   backed by a fixed-size array to avoid hash lookup on every send),
 /// - the `JoinHandle`s of background tasks (accept loops, reconnect periodic).
 ///
@@ -709,10 +779,13 @@ pub trait MessageBus {
 /// - `send_to_*` clones the per-peer `Sender` out of the registry, calls
 ///   `try_send` on it, and returns. No `.await` happens in the body. Drops
 ///   on `Full` (returned as [`SendError::Backpressure`]) are recovered by
-///   VSR retransmission for replica-bound consensus traffic. Client Reply
-///   drops returned as [`SendError::ClientForwardFailed`] have no
-///   retransmit and are terminal; see the trait-level "Recovery
-///   asymmetry" section on [`MessageBus`].
+///   VSR retransmission for replica-bound consensus traffic. A client
+///   reply refused on `Full` also closes that client's connection (see
+///   [`ConnectionRegistry::try_send_to_instance`]). The one exception is
+///   [`Self::send_to_client_instance_waiting`], which waits for room in the
+///   client's queue for up to `client_write_stall_timeout`. A client reply
+///   sent by id alone is refused, as the trait-level "Recovery asymmetry"
+///   section on [`MessageBus`] explains.
 /// - The per-connection writer task batches up to `config.max_batch` messages into
 ///   a single `writev` syscall on the plaintext TCP plane (see
 ///   [`transports::tcp`]).
@@ -732,28 +805,28 @@ pub struct IggyMessageBus {
     /// once at bootstrap via [`Self::set_replica_forward_fn`]; the slow
     /// path reads through [`OnceCell::get`] without a runtime borrow.
     replica_forward_fn: OnceCell<ReplicaForwardFn>,
-    /// Forwards a client-bound message to the shard that owns the client's
-    /// TCP connection (the owning shard is encoded in the top 16 bits of
-    /// the client id). Empty on single-shard setups and tests. Installed
-    /// once at bootstrap via [`Self::set_client_forward_fn`]; the slow
-    /// path reads through [`OnceCell::get`] without a runtime borrow.
-    client_forward_fn: OnceCell<ClientForwardFn>,
-    /// Optional disconnect notifier invoked by
-    /// `Self::notify_connection_lost` after it CAS-clears the owner
-    /// table. Production leaves this unset; tests install a callback to
-    /// observe the path.
+    /// Close notifier invoked by `Self::notify_connection_lost` after it
+    /// releases the link's owner-table slot. The shard bootstrap installs
+    /// the report to shard 0; tests install a callback to observe the path.
     connection_lost_fn: RefCell<Option<ConnectionLostFn>>,
+    /// Shard 0 only: asks the owner shard of a link to close it. See
+    /// [`ReplicaLinkCloseFn`].
+    replica_link_close_fn: OnceCell<ReplicaLinkCloseFn>,
     /// Invoked when a client connection metadata entry is removed during
     /// connection teardown.
     client_connection_lost_fn: RefCell<Option<ClientConnectionLostFn>>,
     /// Per-connection metadata exposed to the caller via
-    /// [`Self::client_meta`]. Populated by the install path on
-    /// successful registry insert; removed on connection teardown.
-    client_meta: RefCell<ahash::AHashMap<u128, Rc<ClientConnMeta>>>,
-    /// Shard-shared atomic owner table. Stamped by the install path
-    /// after a successful registry insert; CAS-cleared by
+    /// [`Self::client_meta`], with the installation it belongs to. Populated
+    /// by the install path on successful registry insert; removed on that
+    /// installation's teardown only, so a late teardown spares a reinstall.
+    client_meta: RefCell<ahash::AHashMap<u128, (InstanceToken, Rc<ClientConnMeta>)>>,
+    /// Shard-shared atomic owner table. Claimed by the install path
+    /// before a registry insert; released by
     /// `Self::notify_connection_lost`. See [`ReplicaOwnerTable`].
     owner_table: Arc<ReplicaOwnerTable>,
+    /// The link of this shard's range. Neither the layout nor the shard id
+    /// changes, so `send_to_replica` reads it instead of dividing per frame.
+    own_link: u16,
     /// Identity + auth parameters for delegated replica handshakes,
     /// installed once at bootstrap via
     /// [`Self::set_replica_handshake_ctx`]. Read by the
@@ -767,12 +840,18 @@ pub struct IggyMessageBus {
     replica_handshake_slots: RefCell<ahash::AHashMap<u64, Instant>>,
     /// Monotonic id source for [`Self::replica_handshake_slots`].
     replica_slot_seq: Cell<u64>,
-    /// Peers with a delegated outbound handshake still in flight:
-    /// replica id -> expiry deadline. Consulted by the reconnect sweep
-    /// so a peer is not redialed while its previous handshake is
+    /// Links with a delegated outbound handshake still in flight:
+    /// (replica id, link) -> expiry deadline. Consulted by the reconnect
+    /// sweep so a link is not redialed while its previous handshake is
     /// pending; entries expire lazily inside [`Self::check_dial_pending`].
     /// Only shard 0's bus ever populates this.
-    pending_dials: RefCell<ahash::AHashMap<u8, Instant>>,
+    pending_dials: RefCell<ahash::AHashMap<(u8, u16), Instant>>,
+    /// Shard 0 only: the bundle of every peer, in both roles. A peer
+    /// without an entry is Down in epoch 0.
+    bundles: RefCell<ahash::AHashMap<u8, Bundle>>,
+    /// Drained through [`MessageBus::take_replica_link_stats`]; the
+    /// `bundles_up` field is filled at the take.
+    replica_link_stats: Cell<ReplicaLinkMetrics>,
     /// Socket-read counters shared by the reader task of every plaintext
     /// replica link this shard owns. Drained through
     /// [`MessageBus::take_replica_read_stats`] by the shard's tick;
@@ -804,12 +883,16 @@ impl IggyMessageBus {
 
     /// Construct a bus from the validated the server schema.
     ///
-    /// Production constructor: takes a fully-validated
+    /// Single-bus constructor: takes a fully-validated
     /// [`ServerConfig`] and derives the runtime [`MessageBusConfig`]
     /// internally. Field conversions ([`iggy_common::IggyDuration`] -> [`Duration`],
     /// [`iggy_common::IggyByteSize`] -> `usize`, schema WS knobs ->
     /// tungstenite [`WebSocketConfig`]) happen once here so hot paths
     /// read pre-converted values.
+    ///
+    /// The bus gets its own owner table with the one-shard, one-link
+    /// [`LinkLayout::default`], so `replica_connections_per_peer` has no
+    /// effect. The server uses [`Self::with_config_and_owner_table`].
     ///
     /// # Panics
     ///
@@ -872,6 +955,7 @@ impl IggyMessageBus {
             config.max_batch,
         );
         let (shutdown, token) = Shutdown::new();
+        let own_link = owner_table.layout().range_of(shard_id);
         Self {
             shard_id,
             shutdown,
@@ -881,15 +965,18 @@ impl IggyMessageBus {
             background_tasks: RefCell::new(Vec::new()),
             config,
             replica_forward_fn: OnceCell::new(),
-            client_forward_fn: OnceCell::new(),
             connection_lost_fn: RefCell::new(None),
+            replica_link_close_fn: OnceCell::new(),
             client_connection_lost_fn: RefCell::new(None),
             client_meta: RefCell::new(ahash::AHashMap::new()),
             owner_table,
+            own_link,
             replica_handshake_ctx: OnceCell::new(),
             replica_handshake_slots: RefCell::new(ahash::AHashMap::new()),
             replica_slot_seq: Cell::new(0),
             pending_dials: RefCell::new(ahash::AHashMap::new()),
+            bundles: RefCell::new(ahash::AHashMap::new()),
+            replica_link_stats: Cell::new(ReplicaLinkMetrics::default()),
             replica_read_stats: Rc::new(ReplicaReadStats::default()),
         }
     }
@@ -900,30 +987,28 @@ impl IggyMessageBus {
         Arc::clone(&self.owner_table)
     }
 
-    /// Try to claim this bus' shard id as owner of `replica_id`.
-    ///
-    /// Returns `true` when the claim succeeded (the slot now points at
-    /// `self.shard_id`, either because it was `OWNER_NONE` or because
-    /// it already stored `self.shard_id`). Returns `false` when a
-    /// different shard owns the slot; the caller must drop the
-    /// inbound connection.
-    ///
-    /// Called by [`installer::install_replica_conn`] **before**
-    /// spawning tasks or inserting into the local registry. See
-    /// [`ReplicaOwnerTable::try_claim`] for the multi-shard race this
-    /// closes.
+    /// Placement of the replica links of this node.
     #[must_use]
-    pub fn mark_replica_owned(&self, replica_id: u8) -> bool {
-        self.owner_table.try_claim(replica_id, self.shard_id)
+    pub fn link_layout(&self) -> LinkLayout {
+        self.owner_table.layout()
     }
 
-    /// CAS-clear the owner-table slot for `replica_id` if its current
-    /// owner is this bus' shard id. The CAS prevents a stale post-loop
-    /// from clobbering a slot that has since been re-registered on a
-    /// different shard.
-    pub fn clear_replica_owned(&self, replica_id: u8) -> bool {
-        self.owner_table
-            .clear_if_owned_by(replica_id, self.shard_id)
+    /// Claim the owner-table slot of `link` for this shard. Returns
+    /// `false` when an install of any epoch holds it; the caller must drop
+    /// the connection.
+    ///
+    /// Called by [`installer::install_replica_conn`] **before** spawning
+    /// tasks or inserting into the local registry, so two installs of one
+    /// (peer, link) never both reach a registry.
+    #[must_use]
+    pub fn mark_replica_owned(&self, link: ReplicaLinkId) -> bool {
+        self.owner_table.try_claim(link, self.shard_id)
+    }
+
+    /// Release the owner-table slot of `link` if this shard still holds it
+    /// in the epoch of `link`.
+    pub fn clear_replica_owned(&self, link: ReplicaLinkId) -> bool {
+        self.owner_table.release(link, self.shard_id)
     }
 
     /// Install the identity + auth parameters used by delegated replica
@@ -987,40 +1072,262 @@ impl IggyMessageBus {
             .is_some()
     }
 
-    /// Record that an outbound connection to `replica_id` was delegated
-    /// and its dialer handshake is in flight on the owning shard. The
-    /// reconnect sweep skips pending peers; the entry is cleared by the
+    /// Record that link `link` to `replica_id` was dialed and delegated and
+    /// its dialer handshake is in flight on the owning shard. The
+    /// reconnect sweep skips pending links; the entry is cleared by the
     /// handshake-outcome ack ([`Self::clear_dial_pending`]) or expires
     /// on its own after `handshake_grace` plus margin.
-    pub fn mark_dial_pending(&self, replica_id: u8) {
+    pub fn mark_dial_pending(&self, replica_id: u8, link: u16) {
         self.pending_dials
             .borrow_mut()
-            .insert(replica_id, self.replica_handshake_deadline());
+            .insert((replica_id, link), self.replica_handshake_deadline());
     }
 
-    /// Whether an outbound handshake to `replica_id` is still in flight.
-    /// An expired entry is removed here (lazy expiry) and reported as
-    /// not pending, re-enabling the redial.
+    /// Whether an outbound handshake of link `link` to `replica_id` is
+    /// still in flight. An expired entry is removed here (lazy expiry) and
+    /// reported as not pending, re-enabling the redial.
     #[must_use]
-    pub fn check_dial_pending(&self, replica_id: u8) -> bool {
+    pub fn check_dial_pending(&self, replica_id: u8, link: u16) -> bool {
         let mut pending = self.pending_dials.borrow_mut();
-        match pending.get(&replica_id) {
+        match pending.get(&(replica_id, link)) {
             Some(deadline) if *deadline > Instant::now() => true,
             Some(_) => {
-                pending.remove(&replica_id);
+                pending.remove(&(replica_id, link));
                 false
             }
             None => false,
         }
     }
 
-    /// Clear the pending-dial entry for `replica_id`. Idempotent; returns
-    /// whether an entry was present.
-    pub fn clear_dial_pending(&self, replica_id: u8) -> bool {
+    /// Clear the pending-dial entry of link `link` to `replica_id`.
+    /// Idempotent; returns whether an entry was present.
+    pub fn clear_dial_pending(&self, replica_id: u8, link: u16) -> bool {
         self.pending_dials
             .borrow_mut()
-            .remove(&replica_id)
+            .remove(&(replica_id, link))
             .is_some()
+    }
+
+    /// Shard 0: read the placement preamble of an accepted replica socket
+    /// and place its link. Returns the link, in the current epoch of the
+    /// dialer's bundle, and the shard that owns it.
+    ///
+    /// Reads exactly the preamble bytes, before `deadline`, so the owner
+    /// shard still finds the TLS `ClientHello` or the hello first.
+    ///
+    /// # Errors
+    ///
+    /// See [`PreambleError`]. The caller closes the socket.
+    #[allow(clippy::future_not_send)]
+    pub async fn place_replica_inbound(
+        &self,
+        stream: &mut compio::net::TcpStream,
+        deadline: Instant,
+    ) -> Result<(ReplicaLinkId, u16), PreambleError> {
+        let placed = self.read_and_place_preamble(stream, deadline).await;
+        if placed.is_err() {
+            self.count_link_event(|stats| stats.preamble_refusals += 1);
+        }
+        placed
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn read_and_place_preamble(
+        &self,
+        stream: &mut compio::net::TcpStream,
+        deadline: Instant,
+    ) -> Result<(ReplicaLinkId, u16), PreambleError> {
+        let (self_id, replica_count) = self
+            .replica_handshake_ctx()
+            .map(|ctx| (ctx.self_id, ctx.replica_count))
+            .ok_or(PreambleError::NoHandshakeContext)?;
+        let budget = deadline.saturating_duration_since(Instant::now());
+        let bytes = replica::preamble::read_preamble(stream, budget).await?;
+        let layout = self.link_layout();
+        let preamble = Preamble::admit(bytes, self_id, replica_count, layout.links())?;
+        let link = ReplicaLinkId {
+            replica: preamble.dialer,
+            link: preamble.link,
+            epoch: self.bundle(preamble.dialer).epoch(),
+        };
+        let owner = layout.link_owner(preamble.link, peer_slot(self_id, preamble.dialer));
+        Ok((link, owner))
+    }
+
+    /// Shard 0: the links to `replica` to dial now. Empty while the bundle
+    /// of the peer is Up or tearing down.
+    #[must_use]
+    pub(crate) fn replica_links_to_dial(&self, replica: u8) -> Vec<ReplicaLinkId> {
+        let epoch = self.bundle(replica).epoch();
+        (0..self.link_layout().links())
+            .map(|link| ReplicaLinkId {
+                replica,
+                link,
+                epoch,
+            })
+            .filter(|&link| self.wants_replica_dial(link))
+            .collect()
+    }
+
+    /// Shard 0: whether `link` is still missing from the current bundle of
+    /// its peer and no handshake of it is in flight. A dial that outlived
+    /// a teardown fails this check and is dropped.
+    #[must_use]
+    pub(crate) fn wants_replica_dial(&self, link: ReplicaLinkId) -> bool {
+        let bundle = self.bundle(link.replica);
+        bundle.dials()
+            && bundle.epoch() == link.epoch
+            && self.owner_table.claim(link.replica, link.link).is_none()
+            && !self.check_dial_pending(link.replica, link.link)
+    }
+
+    /// Shard 0: move the bundle of `replica` to match the owner table, then
+    /// apply what changed. Runs after every handshake outcome and on every
+    /// reconnect sweep.
+    pub fn refresh_replica_bundle(&self, replica: u8) {
+        self.update_bundle(replica, |bundle, claims, now, forming_limit| {
+            bundle.refresh(claims, now, forming_limit)
+        });
+    }
+
+    /// Shard 0: an installed link closed. A close in the current epoch of
+    /// the peer's bundle tears the bundle down.
+    pub fn replica_link_closed(&self, link: ReplicaLinkId) {
+        self.update_bundle(link.replica, |bundle, claims, now, forming_limit| {
+            bundle.link_closed(link.epoch, claims, now, forming_limit)
+        });
+    }
+
+    /// Close `link` if this shard holds it in the epoch of `link`. The
+    /// connection's own exit path then releases the slot and reports the
+    /// close to shard 0.
+    pub fn close_replica_link(&self, link: ReplicaLinkId) {
+        let held = Some(LinkClaim {
+            owner: self.shard_id,
+            epoch: link.epoch,
+        });
+        // A shard holds at most one link per peer, so while the claim names
+        // this shard the registry entry of the peer is this link.
+        if self.owner_table.claim(link.replica, link.link) == held
+            && self.replicas.shutdown_connection(link.replica)
+        {
+            info!(
+                replica = link.replica,
+                link = link.link,
+                epoch = link.epoch,
+                "closing replica link of a torn down bundle"
+            );
+        }
+    }
+
+    /// Install the closure shard 0 uses to close links on other shards.
+    /// Bootstrap-only wiring; same one-shot contract as
+    /// [`Self::set_replica_forward_fn`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once on the same bus.
+    pub fn set_replica_link_close_fn(&self, f: ReplicaLinkCloseFn) {
+        assert!(
+            self.replica_link_close_fn.set(f).is_ok(),
+            "replica_link_close_fn installed twice (bootstrap invariant)"
+        );
+    }
+
+    fn bundle(&self, replica: u8) -> Bundle {
+        self.bundles
+            .borrow()
+            .get(&replica)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn update_bundle(
+        &self,
+        replica: u8,
+        step: impl FnOnce(&mut Bundle, &[Option<LinkClaim>], Instant, Duration) -> BundleChange,
+    ) {
+        let claims: Vec<Option<LinkClaim>> = (0..self.link_layout().links())
+            .map(|link| self.owner_table.claim(replica, link))
+            .collect();
+        let (epoch, change) = {
+            let mut bundles = self.bundles.borrow_mut();
+            let bundle = bundles.entry(replica).or_default();
+            let change = step(bundle, &claims, Instant::now(), self.config.handshake_grace);
+            (bundle.epoch(), change)
+        };
+        self.apply_bundle_change(replica, epoch, change);
+    }
+
+    fn apply_bundle_change(&self, replica: u8, epoch: u32, change: BundleChange) {
+        let expected = self.config.mesh_expected_peers;
+        if change.tore_down {
+            // Before the closes, so no shard queues another frame on them.
+            self.owner_table.set_up(replica, false);
+            self.count_link_event(|stats| stats.bundle_teardowns += 1);
+            warn!(
+                replica,
+                epoch, "replica bundle torn down, closing its links"
+            );
+            if expected > 0 {
+                warn!(
+                    connected = self.bundles_up(),
+                    expected, "replica mesh degraded"
+                );
+            }
+        }
+        for (link, claim) in change.stale {
+            let link = ReplicaLinkId {
+                replica,
+                link,
+                epoch: claim.epoch,
+            };
+            if claim.owner == self.shard_id {
+                self.close_replica_link(link);
+            } else if let Some(close) = self.replica_link_close_fn.get() {
+                close(claim.owner, link);
+            } else {
+                warn!(
+                    replica,
+                    owner = claim.owner,
+                    "no replica link close route installed; stale link stays open"
+                );
+            }
+        }
+        if change.came_up {
+            self.owner_table.set_up(replica, true);
+            info!(
+                replica,
+                epoch,
+                links = self.link_layout().links(),
+                "replica bundle up"
+            );
+            if expected > 0 {
+                let connected = self.bundles_up();
+                if connected == expected {
+                    info!(
+                        expected,
+                        "replica mesh complete: all peer connections established"
+                    );
+                } else {
+                    info!(connected, expected, "replica mesh forming");
+                }
+            }
+        }
+    }
+
+    fn bundles_up(&self) -> usize {
+        self.bundles
+            .borrow()
+            .values()
+            .filter(|bundle| bundle.phase() == BundlePhase::Up)
+            .count()
+    }
+
+    pub(crate) fn count_link_event(&self, count: impl FnOnce(&mut ReplicaLinkMetrics)) {
+        let mut stats = self.replica_link_stats.get();
+        count(&mut stats);
+        self.replica_link_stats.set(stats);
     }
 
     /// Look up the per-connection metadata recorded for `client_id`.
@@ -1029,15 +1336,126 @@ impl IggyMessageBus {
     /// its connection has already been torn down.
     #[must_use]
     pub fn client_meta(&self, client_id: u128) -> Option<Rc<ClientConnMeta>> {
-        self.client_meta.borrow().get(&client_id).map(Rc::clone)
+        self.client_meta
+            .borrow()
+            .get(&client_id)
+            .map(|(_, meta)| Rc::clone(meta))
     }
 
-    pub(crate) fn insert_client_meta(&self, meta: Rc<ClientConnMeta>) {
-        self.client_meta.borrow_mut().insert(meta.client_id, meta);
+    /// The installation currently serving `client_id` on this shard, or
+    /// `None` when no connection is installed under it here.
+    #[must_use]
+    pub fn client_instance(&self, client_id: u128) -> Option<InstanceToken> {
+        self.clients.instance(client_id)
     }
 
-    pub(crate) fn remove_client_meta(&self, client_id: u128) {
-        if self.client_meta.borrow_mut().remove(&client_id).is_some() {
+    /// [`MessageBus::send_to_client`] for the installation `instance` names,
+    /// as [`Self::client_instance`] captured it on this bus.
+    ///
+    /// A reply that outlived its connection reports `ClientNotFound` instead
+    /// of reaching a later connection under the same id, and a full queue
+    /// closes only the installation the reply belongs to. `None` means no
+    /// connection was installed at capture, so nothing can take the reply.
+    /// Never forwarded: an installation exists only on the shard that owns
+    /// the connection.
+    ///
+    /// # Errors
+    ///
+    /// The local-path errors of [`MessageBus::send_to_client`].
+    pub fn send_to_client_instance(
+        &self,
+        client_id: u128,
+        instance: Option<InstanceToken>,
+        message: BusMessage,
+    ) -> Result<(), SendError> {
+        let instance = self.reply_instance(client_id, instance)?;
+        let route = self
+            .clients
+            .try_send_to_instance(client_id, instance, message);
+        self.finish_local_reply(client_id, route)
+    }
+
+    /// [`Self::send_to_client_instance`] that waits for room in a full queue
+    /// instead of closing the connection. Unlike every other send, it yields.
+    /// A queue that stays full for `client_write_stall_timeout` closes the
+    /// connection, because its client stopped reading.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::send_to_client_instance`]. `Backpressure` means
+    /// the wait stalled and the connection was closed.
+    #[allow(clippy::future_not_send)]
+    pub async fn send_to_client_instance_waiting(
+        &self,
+        client_id: u128,
+        instance: Option<InstanceToken>,
+        message: BusMessage,
+    ) -> Result<(), SendError> {
+        let instance = self.reply_instance(client_id, instance)?;
+        let route = self
+            .clients
+            .send_to_instance(
+                client_id,
+                instance,
+                message,
+                self.config.client_write_stall_timeout,
+            )
+            .await;
+        self.finish_local_reply(client_id, route)
+    }
+
+    /// The installation a reply goes to, while the bus still sends.
+    fn reply_instance(
+        &self,
+        client_id: u128,
+        instance: Option<InstanceToken>,
+    ) -> Result<InstanceToken, SendError> {
+        if self.is_shutting_down() {
+            return Err(SendError::BusShuttingDown);
+        }
+        instance.ok_or(SendError::ClientNotFound(client_id))
+    }
+
+    /// Map a socket send onto the bus error, or fire the in-process waiter
+    /// of the reply's request.
+    fn finish_local_reply(&self, client_id: u128, route: ReplyRoute) -> Result<(), SendError> {
+        match route {
+            ReplyRoute::Delivered(send_result) => send_result.map_err(map_try_send_err),
+            ReplyRoute::InProcess(mut message) => {
+                let request = reply_request_id(&message);
+                let receipt = message.take_write_receipt();
+                self.clients
+                    .fire_in_process(client_id, request, message)
+                    .map_err(|_| SendError::ClientNotFound(client_id))?;
+                if let Some(receipt) = receipt {
+                    receipt.complete();
+                }
+                Ok(())
+            }
+            ReplyRoute::NoSlot(_message) => Err(SendError::ClientNotFound(client_id)),
+            ReplyRoute::Stalled => Err(SendError::Backpressure),
+        }
+    }
+
+    pub(crate) fn insert_client_meta(&self, meta: Rc<ClientConnMeta>, instance: InstanceToken) {
+        self.client_meta
+            .borrow_mut()
+            .insert(meta.client_id, (instance, meta));
+    }
+
+    /// Remove the metadata of the installation `instance` names and report
+    /// its connection lost. A no-op once a reinstall holds `client_id`: the
+    /// metadata, and the session the dispatch host keys by that id, belong
+    /// to the reinstall.
+    pub(crate) fn remove_client_meta(&self, client_id: u128, instance: InstanceToken) {
+        let removed = {
+            let mut metas = self.client_meta.borrow_mut();
+            let owned = metas
+                .get(&client_id)
+                .is_some_and(|(token, _)| *token == instance);
+            owned && metas.remove(&client_id).is_some()
+        };
+        if removed {
             self.notify_client_connection_lost(client_id);
         }
     }
@@ -1063,54 +1481,36 @@ impl IggyMessageBus {
         *self.connection_lost_fn.borrow_mut() = Some(f);
     }
 
-    /// Invoke the registered connection-lost notifier, if any.
+    /// Release the slot of a closed link, then invoke the registered
+    /// connection-lost notifier, if any.
+    ///
+    /// Every caller removed the link's registry entry first. No newer
+    /// install of the link can sit in the registry here: it needs the slot,
+    /// and the slot is still claimed until the release below.
     ///
     /// Clones the `Rc` out of the `RefCell` borrow before invoking the
     /// closure so the closure body is free to call
     /// [`Self::set_connection_lost_fn`] (which takes a `borrow_mut`)
     /// without tripping the runtime borrow check.
-    pub(crate) fn notify_connection_lost(&self, replica_id: u8, reason: &'static str) {
-        // Stand down if a live registry entry exists for this replica. A
-        // reconnect that round-robined back to this same shard installs a
-        // fresh entry before this stale post-loop runs; the owner-table
-        // CAS in `clear_replica_owned` only guards *different*-shard
-        // re-registration, so a same-shard reinstall leaves the slot
-        // == self.shard_id and the clear below would clobber the live
-        // connection's slot, stranding cross-shard `send_to_replica`
-        // forever. Every caller removes its own registry entry before
-        // invoking this, so a live entry here is always a newer install
-        // that now owns the slot. No token needed: the bus is
-        // single-threaded (compio), so this check, the clear, and a
-        // competing `install_replica_conn` cannot interleave.
-        if self.replicas.contains(replica_id) {
-            return;
-        }
-        // CAS-clear first so any reader racing the user callback already
-        // sees the slot vacated. The CAS no-ops if a different shard
-        // already owns the slot (post-loop arriving after a
-        // re-installation on another shard).
-        self.clear_replica_owned(replica_id);
-        tracing::warn!(
+    pub(crate) fn notify_connection_lost(&self, link: ReplicaLinkId, reason: &'static str) {
+        // Release first so any reader racing the callback already sees the
+        // slot vacated.
+        self.clear_replica_owned(link);
+        warn!(
             shard_id = self.shard_id,
-            replica_id,
+            replica_id = link.replica,
+            link = link.link,
+            epoch = link.epoch,
             reason,
             "replica connection lost"
         );
-        let expected = self.config.mesh_expected_peers;
-        if expected > 0 {
-            tracing::warn!(
-                connected = self.owner_table.owned_count(),
-                expected,
-                "replica mesh degraded"
-            );
-        }
         let cb = self
             .connection_lost_fn
             .borrow()
             .as_ref()
             .map(std::rc::Rc::clone);
         if let Some(f) = cb {
-            f(replica_id);
+            f(link);
         }
     }
 
@@ -1135,33 +1535,16 @@ impl IggyMessageBus {
             .expect("replica_forward_fn installed twice (bootstrap invariant)");
     }
 
-    /// Install the client-plane inter-shard forward closure.
+    /// The shard that owns link `link` to `replica`, if it is installed.
     ///
-    /// Shards invoke this from `send_to_client`'s slow path when the client
-    /// connection lives on a different shard (top 16 bits of `client_id`).
-    ///
-    /// Takes `&self` so it can be called through an `Rc<IggyMessageBus>`
-    /// wrapper. Call sites are bootstrap only.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called more than once on the same bus. Same rationale as
-    /// [`Self::set_replica_forward_fn`].
-    pub fn set_client_forward_fn(&self, f: ClientForwardFn) {
-        self.client_forward_fn
-            .set(f)
-            .ok()
-            .expect("client_forward_fn installed twice (bootstrap invariant)");
-    }
-
-    /// Get the owning shard for a replica, if any.
-    ///
-    /// Reads the shard-shared [`ReplicaOwnerTable`], which is stamped
-    /// synchronously by the owning shard's installer and CAS-cleared on
-    /// disconnect inside `Self::notify_connection_lost`.
+    /// Reads the shard-shared [`ReplicaOwnerTable`], which the owning
+    /// shard's installer claims synchronously and
+    /// `Self::notify_connection_lost` releases on close.
     #[must_use]
-    pub fn owning_shard(&self, replica: u8) -> Option<u16> {
-        self.owner_table.owner(replica)
+    pub fn owning_shard(&self, replica: u8, link: u16) -> Option<u16> {
+        self.owner_table
+            .claim(replica, link)
+            .map(|claim| claim.owner)
     }
 
     #[must_use]
@@ -1350,19 +1733,19 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
         (**self).set_replica_forward_fn(f);
     }
 
-    fn set_client_forward_fn(&self, f: ClientForwardFn) {
-        (**self).set_client_forward_fn(f);
-    }
-
     fn track_background(&self, handle: JoinHandle<()>) {
         (**self).track_background(handle);
     }
 
     // Forward the defaulted methods too. Without this, a `Rc`-wrapped bus that
-    // overrides `sleep`/`spawn`/`realtime_micros` (the simulator's virtual timer,
+    // overrides `sleep`/`spawn`/clock reads (the simulator's virtual timer,
     // spawn queue, and virtual clock) would be silently reverted to the defaults
     // through the wrapper. No-op for production, whose `IggyMessageBus` uses those
     // defaults anyway.
+    fn monotonic_micros(&self) -> u64 {
+        (**self).monotonic_micros()
+    }
+
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
         (**self).sleep(duration)
     }
@@ -1375,8 +1758,16 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
         (**self).realtime_micros()
     }
 
+    fn monotonic_now(&self) -> Instant {
+        (**self).monotonic_now()
+    }
+
     fn take_replica_read_stats(&self) -> ReplicaReadMetrics {
         (**self).take_replica_read_stats()
+    }
+
+    fn take_replica_link_stats(&self) -> ReplicaLinkMetrics {
+        (**self).take_replica_link_stats()
     }
 }
 
@@ -1385,38 +1776,12 @@ impl MessageBus for IggyMessageBus {
     async fn send_to_client(
         &self,
         client_id: u128,
-        message: impl Into<BusMessage>,
+        _message: impl Into<BusMessage>,
     ) -> Result<(), SendError> {
         if self.is_shutting_down() {
             return Err(SendError::BusShuttingDown);
         }
-        let message = message.into();
-        // Owning shard is encoded in the top 16 bits of client_id.
-        let owning_shard = client_id_owning_shard(client_id);
-        if owning_shard == self.shard_id {
-            // Route by the entry's reply target. Socket is the unchanged
-            // fast path and never decodes. InProcess resolves the waiting
-            // request id from the reply header and fires its oneshot; that
-            // decode stays off the socket path. No slot surfaces
-            // ClientNotFound (prior behaviour: SendError did not preserve
-            // the payload either).
-            return match self.clients.try_send_or_return(client_id, message) {
-                ReplyRoute::Delivered(send_result) => send_result.map_err(map_try_send_err),
-                ReplyRoute::InProcess(message) => {
-                    let request = reply_request_id(&message);
-                    self.clients
-                        .fire_in_process(client_id, request, message)
-                        .map_err(|_| SendError::ClientNotFound(client_id))
-                }
-                ReplyRoute::NoSlot(_message) => Err(SendError::ClientNotFound(client_id)),
-            };
-        }
-        let forward = self
-            .client_forward_fn
-            .get()
-            .ok_or(SendError::ClientRouteMissing(client_id))?;
-        forward(client_id, owning_shard, message)
-            .map_err(|_| SendError::ClientForwardFailed(client_id))
+        Err(SendError::ClientNotFound(client_id))
     }
 
     async fn send_to_replica(
@@ -1427,20 +1792,41 @@ impl MessageBus for IggyMessageBus {
         if self.is_shutting_down() {
             return Err(SendError::BusShuttingDown);
         }
-        // Fast path: this shard owns a connection to the replica. On no-slot
-        // the registry returns the message unchanged so the slow path can
-        // forward it via the inter-shard channel without a wasted clone.
-        let message = match self.replicas.try_send_or_return(replica, message.into()) {
-            Ok(send_result) => return send_result.map_err(map_try_send_err),
-            Err(message) => message.into_contiguous(),
+        if !self.owner_table.is_up(replica) {
+            return Err(SendError::ReplicaNotConnected(replica));
+        }
+        // Shards of range 0 send every frame over the metadata link, so
+        // only the other shards decode the command.
+        let link = if self.own_link != METADATA_LINK && routes_to_metadata(&message) {
+            METADATA_LINK
+        } else {
+            self.own_link
+        };
+        // Fast path: this shard owns the link. A shard owns at most one link
+        // per peer, the link of its own range, so the registry entry of the
+        // peer is that link. On no-slot the registry returns the message
+        // unchanged so the slow path can forward it via the inter-shard
+        // channel without a wasted clone.
+        let message = if link == self.own_link {
+            match self.replicas.try_send_or_return(replica, message.into()) {
+                Ok(send_result) => {
+                    let result = send_result.map_err(map_try_send_err);
+                    if matches!(result, Err(SendError::Backpressure)) {
+                        self.count_link_event(|stats| stats.outbound_drops += 1);
+                    }
+                    return result;
+                }
+                Err(message) => message.into_contiguous(),
+            }
+        } else {
+            message
         };
         // Slow path: route via the inter-shard channel to the owning shard.
         // The shard-shared `owner_table` is the authoritative routing
-        // view: `mark_replica_owned` stamps it on install and
-        // `clear_replica_owned` CAS-clears it on disconnect.
+        // view: `mark_replica_owned` claims it on install and
+        // `clear_replica_owned` releases it on close.
         let owning_shard = self
-            .owner_table
-            .owner(replica)
+            .owning_shard(replica, link)
             .ok_or(SendError::ReplicaNotConnected(replica))?;
         // The fast path already failed (no live registry slot), so a
         // self-owner here means the disconnect is mid-flight:
@@ -1469,10 +1855,6 @@ impl MessageBus for IggyMessageBus {
         Self::set_replica_forward_fn(self, f);
     }
 
-    fn set_client_forward_fn(&self, f: ClientForwardFn) {
-        Self::set_client_forward_fn(self, f);
-    }
-
     fn track_background(&self, handle: JoinHandle<()>) {
         Self::track_background(self, handle);
     }
@@ -1480,6 +1862,23 @@ impl MessageBus for IggyMessageBus {
     fn take_replica_read_stats(&self) -> ReplicaReadMetrics {
         self.replica_read_stats.take()
     }
+
+    fn take_replica_link_stats(&self) -> ReplicaLinkMetrics {
+        ReplicaLinkMetrics {
+            bundles_up: self.bundles_up() as u64,
+            ..self.replica_link_stats.take()
+        }
+    }
+}
+
+/// Whether the peer routes `message` to its metadata group by command alone.
+/// An unknown command byte is not such a frame; the peer refuses it anyway.
+fn routes_to_metadata(message: &Frozen<MESSAGE_ALIGN>) -> bool {
+    message
+        .as_slice()
+        .get(COMMAND_OFFSET)
+        .and_then(|&byte| bytemuck::checked::try_cast::<u8, Command>(byte).ok())
+        .is_some_and(MessageBag::routes_to_metadata)
 }
 
 /// Extract the owning shard from a client id.
@@ -1572,34 +1971,66 @@ mod tests {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn dummy_message() -> Message<GenericHeader> {
+    fn command_message(command: Command) -> Message<GenericHeader> {
         Message::<GenericHeader>::new(HEADER_SIZE).transmute_header(|_, h: &mut GenericHeader| {
-            h.command = Command::Prepare;
+            h.command = command;
             h.size = HEADER_SIZE as u32;
         })
     }
 
-    #[compio::test]
-    #[allow(clippy::future_not_send)]
-    async fn send_to_client_slow_path_forwards_to_owning_shard() {
-        // Bus on shard 5; client id encodes owning shard = 7.
-        let bus = IggyMessageBus::new(5);
-        let captured: std::rc::Rc<RefCell<Option<u16>>> = std::rc::Rc::new(RefCell::new(None));
-        let captured_clone = captured.clone();
-        let client_id = (7u128 << 112) | 0x2a;
-        let captured_id: std::rc::Rc<RefCell<Option<u128>>> = std::rc::Rc::new(RefCell::new(None));
-        let captured_id_clone = captured_id.clone();
-        bus.set_client_forward_fn(Box::new(move |id, target, _msg| {
-            *captured_id_clone.borrow_mut() = Some(id);
-            *captured_clone.borrow_mut() = Some(target);
+    fn dummy_message() -> Message<GenericHeader> {
+        command_message(Command::Prepare)
+    }
+
+    const fn link(replica: u8, link: u16, epoch: u32) -> ReplicaLinkId {
+        ReplicaLinkId {
+            replica,
+            link,
+            epoch,
+        }
+    }
+
+    fn bus_with_layout(shard_id: u16, shards: u16, links: u16) -> IggyMessageBus {
+        let layout = LinkLayout::new(shards, links, true, 2).expect("valid layout");
+        IggyMessageBus::with_tunables_and_owner_table(
+            shard_id,
+            MessageBusConfig::default(),
+            Arc::new(ReplicaOwnerTable::with_layout(layout)),
+        )
+    }
+
+    /// Records `(replica, owner shard)` of every forwarded frame.
+    fn capture_forwards(bus: &IggyMessageBus) -> Rc<RefCell<Vec<(u8, u16)>>> {
+        let forwards = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&forwards);
+        bus.set_replica_forward_fn(Box::new(move |replica, owner, _message| {
+            sink.borrow_mut().push((replica, owner));
             Ok(())
         }));
+        forwards
+    }
 
-        bus.send_to_client(client_id, dummy_message().into_frozen())
-            .await
-            .expect("forward_fn should accept");
-        assert_eq!(*captured.borrow(), Some(7));
-        assert_eq!(*captured_id.borrow(), Some(client_id));
+    /// Records `(owner shard, link)` of every close request shard 0 sends.
+    fn capture_close_requests(bus: &IggyMessageBus) -> Rc<RefCell<Vec<(u16, ReplicaLinkId)>>> {
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&requests);
+        bus.set_replica_link_close_fn(Box::new(move |owner, link| {
+            sink.borrow_mut().push((owner, link));
+        }));
+        requests
+    }
+
+    /// A registry entry for `replica` whose per-connection token the test
+    /// can observe.
+    fn insert_replica_entry(bus: &IggyMessageBus, replica: u8) -> ShutdownToken {
+        let (sender, _receiver) = async_channel::bounded(8);
+        let writer = compio::runtime::spawn(async {});
+        let reader = compio::runtime::spawn(async {});
+        let (conn_shutdown, conn_token) = Shutdown::new();
+        bus.replicas()
+            .insert(replica, sender, writer, reader, conn_shutdown)
+            .expect("free registry slot");
+        conn_token
     }
 
     #[compio::test]
@@ -1624,11 +2055,11 @@ mod tests {
         })
     }
 
-    /// Full in-process seam: entry + slot installed, `send_to_client`
-    /// resolves the request id from the reply header and fires the oneshot.
+    /// An HTTP reply needs its captured installation as well as the request
+    /// id. A raw client id must leave the legitimate waiter untouched.
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn send_to_client_in_process_fires_matching_reply_slot() {
+    async fn send_to_client_instance_in_process_fires_matching_reply_slot() {
         let bus = IggyMessageBus::new(0);
         let client_id = 1u128;
         bus.clients()
@@ -1639,8 +2070,12 @@ mod tests {
             .install_reply_slot(client_id, 42)
             .expect("slot installs");
 
-        bus.send_to_client(client_id, reply_message(42).into_generic().into_frozen())
-            .await
+        let message = reply_message(42).into_generic().into_frozen();
+        assert!(matches!(
+            bus.send_to_client(client_id, message.clone()).await,
+            Err(SendError::ClientNotFound(_))
+        ));
+        bus.send_to_client_instance(client_id, bus.client_instance(client_id), message.into())
             .expect("in-process delivery");
 
         let received = reply_rx.await.expect("reply delivered");
@@ -1651,7 +2086,7 @@ mod tests {
     /// removed its slot): shed as `ClientNotFound`, nothing panics.
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn send_to_client_in_process_sheds_reply_without_waiter() {
+    async fn send_to_client_instance_in_process_sheds_reply_without_waiter() {
         let bus = IggyMessageBus::new(0);
         let client_id = 1u128;
         bus.clients()
@@ -1659,46 +2094,133 @@ mod tests {
             .expect("fresh key");
 
         let err = bus
-            .send_to_client(client_id, reply_message(42).into_generic().into_frozen())
-            .await
+            .send_to_client_instance(
+                client_id,
+                bus.client_instance(client_id),
+                reply_message(42).into_generic().into_frozen().into(),
+            )
             .unwrap_err();
         assert!(matches!(err, SendError::ClientNotFound(_)));
     }
 
+    /// A socket takes only replies addressed to its installation. A reply by
+    /// client id carries the id a request header names, which a client picks
+    /// when it registers, so it must neither reach a socket installed under
+    /// that id nor close it on a full queue.
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn send_to_client_returns_route_missing_when_remote_and_no_forward_fn() {
-        // shard_id != top-16-bits and no forward_fn installed.
+    async fn given_socket_client_when_replying_by_client_id_should_neither_deliver_nor_close() {
+        const STALLED_QUEUE_CAPACITY: usize = 1;
+        let bus = IggyMessageBus::new(0);
+        let client_id = 0x2a_u128;
+        let (sender, queue) = async_channel::bounded(STALLED_QUEUE_CAPACITY);
+        let (conn_shutdown, conn_token) = Shutdown::new();
+        let writer_token = conn_token.clone();
+        let writer = compio::runtime::spawn(async move { writer_token.wait().await });
+        let reader_token = conn_token.clone();
+        let reader = compio::runtime::spawn(async move { reader_token.wait().await });
+        let instance = bus
+            .clients()
+            .insert(client_id, sender, writer, reader, conn_shutdown)
+            .expect("the client id is free");
+
+        let by_id = bus
+            .send_to_client(client_id, dummy_message().into_frozen())
+            .await;
+        assert!(matches!(by_id, Err(SendError::ClientNotFound(_))));
+        assert!(queue.is_empty(), "a reply by id must not reach a socket");
+
+        bus.send_to_client_instance(
+            client_id,
+            Some(instance),
+            dummy_message().into_frozen().into(),
+        )
+        .expect("a reply addressed to the installation is delivered");
+        let by_id = bus
+            .send_to_client(client_id, dummy_message().into_frozen())
+            .await;
+        assert!(matches!(by_id, Err(SendError::ClientNotFound(_))));
+        assert!(
+            !conn_token.is_triggered(),
+            "a reply by id must not close a socket whose queue is full"
+        );
+
+        let refused = bus.send_to_client_instance(
+            client_id,
+            Some(instance),
+            dummy_message().into_frozen().into(),
+        );
+        assert!(matches!(refused, Err(SendError::Backpressure)));
+        assert!(
+            conn_token.is_triggered(),
+            "a full queue still closes the installation the reply belongs to"
+        );
+    }
+
+    /// The owning shard refuses a frame without its installation too, so a
+    /// by-id frame for a client homed elsewhere is refused here, not forwarded.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn given_client_homed_on_another_shard_when_sending_by_id_should_refuse_without_forwarding()
+     {
         let bus = IggyMessageBus::new(0);
         let client_id = (9u128 << 112) | 1;
         let err = bus
             .send_to_client(client_id, dummy_message().into_frozen())
             .await
             .unwrap_err();
-        assert!(matches!(err, SendError::ClientRouteMissing(_)));
+        assert!(matches!(err, SendError::ClientNotFound(id) if id == client_id));
     }
 
     #[compio::test]
     #[allow(clippy::future_not_send)]
     async fn send_to_replica_slow_path_uses_owner_table_and_forwards() {
         let bus = IggyMessageBus::new(0);
-        let captured: std::rc::Rc<RefCell<Option<u16>>> = std::rc::Rc::new(RefCell::new(None));
-        let captured_clone = captured.clone();
-        let captured_id: std::rc::Rc<RefCell<Option<u8>>> = std::rc::Rc::new(RefCell::new(None));
-        let captured_id_clone = captured_id.clone();
-        bus.set_replica_forward_fn(Box::new(move |id, target, _msg| {
-            *captured_id_clone.borrow_mut() = Some(id);
-            *captured_clone.borrow_mut() = Some(target);
-            Ok(())
-        }));
-        assert!(bus.owner_table().try_claim(5, 3));
+        let forwards = capture_forwards(&bus);
+        assert!(bus.owner_table().try_claim(link(5, 0, 0), 3));
+        bus.refresh_replica_bundle(5);
 
         bus.send_to_replica(5, dummy_message().into_frozen())
             .await
             .expect("forward ok");
 
-        assert_eq!(*captured.borrow(), Some(3));
-        assert_eq!(*captured_id.borrow(), Some(5));
+        assert_eq!(*forwards.borrow(), [(5, 3)]);
+    }
+
+    /// Frames flow only once every link of the bundle is installed, a group
+    /// frame takes the link of the sending shard's range, and a frame the
+    /// peer routes to its metadata group takes link 0.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn send_to_replica_waits_for_the_bundle_and_routes_metadata_over_link_0() {
+        const PEER: u8 = 1;
+        // 4 shards, 2 links: range 0 = shards {0, 1}, range 1 = {2, 3}.
+        let bus = bus_with_layout(3, 4, 2);
+        let forwards = capture_forwards(&bus);
+        assert!(bus.owner_table().try_claim(link(PEER, 1, 0), 2));
+        bus.refresh_replica_bundle(PEER);
+        assert!(
+            matches!(
+                bus.send_to_replica(PEER, dummy_message().into_frozen())
+                    .await,
+                Err(SendError::ReplicaNotConnected(PEER))
+            ),
+            "a bundle with a missing link must refuse frames"
+        );
+
+        assert!(bus.owner_table().try_claim(link(PEER, 0, 0), 1));
+        bus.refresh_replica_bundle(PEER);
+        assert!(bus.owner_table().is_up(PEER));
+        bus.send_to_replica(PEER, dummy_message().into_frozen())
+            .await
+            .expect("group frame forwarded");
+        bus.send_to_replica(
+            PEER,
+            command_message(Command::SessionRetirementProgress).into_frozen(),
+        )
+        .await
+        .expect("metadata frame forwarded");
+        assert_eq!(*forwards.borrow(), [(PEER, 2), (PEER, 1)]);
     }
 
     #[compio::test]
@@ -1721,7 +2243,8 @@ mod tests {
     #[allow(clippy::future_not_send)]
     async fn send_to_replica_slow_path_self_owner_returns_not_connected() {
         let bus = IggyMessageBus::new(3);
-        assert!(bus.owner_table().try_claim(5, 3));
+        assert!(bus.owner_table().try_claim(link(5, 0, 0), 3));
+        bus.refresh_replica_bundle(5);
 
         let err = bus
             .send_to_replica(5, dummy_message().into_frozen())
@@ -1812,7 +2335,7 @@ mod tests {
         let bus_for_closure = bus.clone();
         let counter: std::rc::Rc<std::cell::Cell<u8>> = std::rc::Rc::new(std::cell::Cell::new(0));
         let counter_inner = counter.clone();
-        let cb: ConnectionLostFn = std::rc::Rc::new(move |_replica: u8| {
+        let cb: ConnectionLostFn = std::rc::Rc::new(move |_link: ReplicaLinkId| {
             counter_inner.set(counter_inner.get() + 1);
             // Reentrant install: replace the closure mid-invoke.
             let counter_replacement = counter_inner.clone();
@@ -1822,48 +2345,127 @@ mod tests {
         });
         bus.set_connection_lost_fn(cb);
 
-        bus.notify_connection_lost(1, "test"); // first closure runs (+1) and swaps
+        bus.notify_connection_lost(link(1, 0, 0), "test"); // first closure runs (+1) and swaps
         assert_eq!(counter.get(), 1);
 
-        bus.notify_connection_lost(1, "test"); // second closure runs (+10)
+        bus.notify_connection_lost(link(1, 0, 0), "test"); // second closure runs (+10)
         assert_eq!(counter.get(), 11);
     }
 
-    /// Same-shard reconnect race: a stale post-loop from a dead connection
-    /// must not CAS-clear the owner-table slot that a live reinstall
-    /// (round-robined back to this shard) just stamped. The slot is only
-    /// released once no live registry entry remains.
+    /// A close releases only the claim of its own epoch, so the late close
+    /// of an old link never frees the slot of the link that replaced it.
+    #[test]
+    fn notify_connection_lost_releases_only_its_own_epoch() {
+        let bus = IggyMessageBus::new(3);
+        assert!(bus.mark_replica_owned(link(7, 0, 1)));
+
+        bus.notify_connection_lost(link(7, 0, 0), "late close of an older link");
+        assert_eq!(bus.owning_shard(7, 0), Some(3));
+
+        bus.notify_connection_lost(link(7, 0, 1), "test");
+        assert_eq!(bus.owning_shard(7, 0), None);
+    }
+
+    /// A current-epoch close tears the bundle down: frames stop, every other
+    /// link of the bundle gets a close request at its owner, and the sweep
+    /// dials the next epoch only once they are gone.
+    #[test]
+    fn closing_a_link_tears_the_bundle_down_and_closes_the_others() {
+        const PEER: u8 = 1;
+        let bus = bus_with_layout(0, 4, 2);
+        let requests = capture_close_requests(&bus);
+        assert!(bus.owner_table().try_claim(link(PEER, 0, 0), 1));
+        assert!(bus.owner_table().try_claim(link(PEER, 1, 0), 2));
+        bus.refresh_replica_bundle(PEER);
+        assert!(bus.owner_table().is_up(PEER));
+        assert_eq!(bus.replica_links_to_dial(PEER), Vec::<ReplicaLinkId>::new());
+
+        assert!(bus.owner_table().release(link(PEER, 1, 0), 2));
+        bus.replica_link_closed(link(PEER, 1, 0));
+        assert!(!bus.owner_table().is_up(PEER));
+        assert_eq!(*requests.borrow(), [(1, link(PEER, 0, 0))]);
+        assert!(
+            bus.replica_links_to_dial(PEER).is_empty(),
+            "no dial while a link of the old epoch is open"
+        );
+
+        assert!(bus.owner_table().release(link(PEER, 0, 0), 1));
+        bus.replica_link_closed(link(PEER, 0, 0));
+        assert_eq!(
+            bus.replica_links_to_dial(PEER),
+            [link(PEER, 0, 1), link(PEER, 1, 1)]
+        );
+        assert_eq!(
+            bus.take_replica_link_stats(),
+            ReplicaLinkMetrics {
+                bundle_teardowns: 1,
+                ..ReplicaLinkMetrics::default()
+            }
+        );
+    }
+
+    /// The owner closes a link only while it holds the link in the epoch of
+    /// the request, so a late request never closes a newer link.
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn notify_connection_lost_stands_down_when_replica_reregistered() {
-        let bus = IggyMessageBus::new(3);
+    async fn close_replica_link_closes_only_the_held_epoch() {
+        let bus = IggyMessageBus::new(2);
+        let conn_token = insert_replica_entry(&bus, 4);
+        assert!(bus.mark_replica_owned(link(4, 0, 1)));
 
-        // Live reinstall: registry entry present + owner table stamped.
-        let (tx, _rx) = async_channel::bounded(8);
-        let writer = compio::runtime::spawn(async {});
-        let reader = compio::runtime::spawn(async {});
-        let (conn_shutdown, _conn_token) = Shutdown::new();
-        bus.replicas()
-            .insert(7, tx, writer, reader, conn_shutdown)
-            .expect("insert ok");
-        assert!(bus.mark_replica_owned(7), "owner-table claim must succeed");
-
-        // Stale predecessor post-loop fires while the reinstall is live.
-        bus.notify_connection_lost(7, "test");
-        assert_eq!(
-            bus.owning_shard(7),
-            Some(3),
-            "stale post-loop cleared a re-registered replica's owner slot",
+        bus.close_replica_link(link(4, 0, 0));
+        assert!(
+            !conn_token.is_triggered(),
+            "an older epoch must not close it"
         );
 
-        // Genuine disconnect: no live entry, the slot is released.
-        bus.replicas().remove(7);
-        bus.notify_connection_lost(7, "test");
-        assert_eq!(
-            bus.owning_shard(7),
-            None,
-            "owner slot must clear once no live connection remains",
-        );
+        bus.close_replica_link(link(4, 0, 1));
+        assert!(conn_token.is_triggered());
+    }
+
+    /// Shard 0 reads exactly the preamble and leaves the next bytes, the TLS
+    /// `ClientHello` or the hello, to the owner shard.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn place_replica_inbound_reads_only_the_preamble() {
+        const NEXT: &[u8] = b"hello";
+        let bus = bus_with_layout(0, 4, 2);
+        bus.set_replica_handshake_ctx(replica::handshake::ReplicaHandshakeCtx {
+            binary_identity: [0; replica::auth::IDENTITY_LEN],
+            cluster_id: 1,
+            self_id: 2,
+            replica_count: 3,
+            auth: None,
+            tls: None,
+        });
+        let listener = compio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let mut dialer = compio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect");
+        let (mut accepted, _) = listener.accept().await.expect("accept");
+        let mut bytes = Preamble { dialer: 1, link: 1 }.encode().to_vec();
+        bytes.extend_from_slice(NEXT);
+        compio::io::AsyncWriteExt::write_all(&mut dialer, bytes)
+            .await
+            .0
+            .expect("write");
+
+        let deadline = Instant::now() + bus.config().handshake_grace;
+        let (placed, owner) = bus
+            .place_replica_inbound(&mut accepted, deadline)
+            .await
+            .expect("valid preamble");
+        assert_eq!(placed, link(1, 1, 0));
+        // Range 1 = shards {2, 3}; peer 1 sits in slot 1 of node 2.
+        assert_eq!(owner, 3);
+        let compio::BufResult(read, rest) =
+            compio::io::AsyncReadExt::read_exact(&mut accepted, Vec::with_capacity(NEXT.len()))
+                .await;
+        read.expect("read");
+        assert_eq!(rest, NEXT);
     }
 
     #[compio::test]
@@ -1895,42 +2497,54 @@ mod tests {
     }
 
     #[test]
-    fn try_claim_wins_from_none() {
+    fn try_claim_wins_a_free_slot() {
         let table = ReplicaOwnerTable::new();
-        assert!(table.try_claim(42, 3), "claim from OWNER_NONE must win");
-        assert_eq!(table.owner(42), Some(3));
+        assert!(
+            table.try_claim(link(42, 0, 7), 3),
+            "a free slot must be won"
+        );
+        assert_eq!(table.claim(42, 0), Some(LinkClaim { owner: 3, epoch: 7 }));
+    }
+
+    /// A second install of a held link loses, from any shard and in any
+    /// epoch, and leaves the slot untouched.
+    #[test]
+    fn try_claim_refuses_a_held_link() {
+        let table = ReplicaOwnerTable::new();
+        assert!(table.try_claim(link(42, 0, 0), 5));
+        for (shard, epoch) in [(7, 0), (5, 0), (5, 1)] {
+            assert!(
+                !table.try_claim(link(42, 0, epoch), shard),
+                "shard {shard} epoch {epoch} must lose"
+            );
+        }
+        assert_eq!(table.claim(42, 0), Some(LinkClaim { owner: 5, epoch: 0 }));
     }
 
     #[test]
-    fn try_claim_loses_to_different_shard() {
+    fn release_frees_only_the_matching_claim() {
         let table = ReplicaOwnerTable::new();
-        assert!(table.try_claim(42, 5));
-        assert!(
-            !table.try_claim(42, 7),
-            "claim from different shard must lose"
-        );
+        assert!(table.try_claim(link(42, 0, 2), 5));
+        assert!(!table.release(link(42, 0, 2), 6), "another shard");
+        assert!(!table.release(link(42, 0, 1), 5), "another epoch");
+        assert!(table.release(link(42, 0, 2), 5));
+        assert_eq!(table.claim(42, 0), None);
+    }
+
+    #[test]
+    fn links_past_the_layout_have_no_slot() {
+        let table =
+            ReplicaOwnerTable::with_layout(LinkLayout::new(4, 2, true, 2).expect("valid layout"));
+        assert!(table.try_claim(link(u8::MAX, 1, u32::MAX), 3));
         assert_eq!(
-            table.owner(42),
-            Some(5),
-            "losing claim must not mutate the slot",
+            table.claim(u8::MAX, 1),
+            Some(LinkClaim {
+                owner: 3,
+                epoch: u32::MAX
+            })
         );
-    }
-
-    #[test]
-    fn try_claim_same_shard_returns_true() {
-        // Models the same-shard reclaim window: previous install on
-        // this shard stamped the slot, post-loop's
-        // `clear_replica_owned` has not run yet, a new install for the
-        // same replica id arrives. The CAS-from-NONE fails but
-        // `try_claim` treats `actual == shard_id` as success so the
-        // new install proceeds.
-        let table = ReplicaOwnerTable::new();
-        assert!(table.try_claim(42, 5));
-        assert!(
-            table.try_claim(42, 5),
-            "same-shard reclaim must be accepted",
-        );
-        assert_eq!(table.owner(42), Some(5));
+        assert!(!table.try_claim(link(0, 2, 0), 3));
+        assert_eq!(table.claim(0, 2), None);
     }
 
     fn bus_with_grace(grace: Duration) -> IggyMessageBus {
@@ -1971,25 +2585,29 @@ mod tests {
     #[test]
     fn dial_pending_marks_clears_and_expires() {
         let bus = bus_with_grace(Duration::ZERO);
-        bus.mark_dial_pending(7);
-        assert!(bus.check_dial_pending(7), "fresh entry must be pending");
-        assert!(bus.clear_dial_pending(7), "ack clears the entry");
-        assert!(!bus.check_dial_pending(7), "cleared entry must not block");
-        assert!(!bus.clear_dial_pending(7), "double clear is a no-op");
+        bus.mark_dial_pending(7, 1);
+        assert!(bus.check_dial_pending(7, 1), "fresh entry must be pending");
+        assert!(!bus.check_dial_pending(7, 0), "other links stay dialable");
+        assert!(bus.clear_dial_pending(7, 1), "ack clears the entry");
+        assert!(
+            !bus.check_dial_pending(7, 1),
+            "cleared entry must not block"
+        );
+        assert!(!bus.clear_dial_pending(7, 1), "double clear is a no-op");
 
         // Force-expire: rewrite the deadline into the past, mimicking a
         // lost ack after grace + margin elapsed.
-        bus.mark_dial_pending(9);
+        bus.mark_dial_pending(9, 0);
         let past = Instant::now()
             .checked_sub(Duration::from_secs(1))
             .expect("test clock past epoch");
-        bus.pending_dials.borrow_mut().insert(9, past);
+        bus.pending_dials.borrow_mut().insert((9, 0), past);
         assert!(
-            !bus.check_dial_pending(9),
+            !bus.check_dial_pending(9, 0),
             "expired entry must report not-pending"
         );
         assert!(
-            !bus.clear_dial_pending(9),
+            !bus.clear_dial_pending(9, 0),
             "lazy expiry must have removed the entry"
         );
     }

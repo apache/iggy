@@ -93,11 +93,25 @@ extension IggyError {
         isConnectionLoss || code == .unauthenticated
     }
 
+    /// Whether the replica found no stream, topic, or partition for the
+    /// request. A replica that has not applied the commit creating one
+    /// answers this too.
+    var isNamespaceMiss: Bool {
+        switch code {
+        case .streamIdNotFound, .streamNameNotFound, .topicIdNotFound, .topicNameNotFound, .partitionNotFound:
+            true
+        default:
+            false
+        }
+    }
+
     /// Whether a sign-in that failed this way would fail the same way on a
-    /// retry, so the remembered credentials are dropped.
+    /// retry, so the remembered credentials are dropped. The same refusals
+    /// as `rejects_credentials` in the Rust SDK.
     var isCredentialRejection: Bool {
         switch code {
-        case .invalidCredentials, .invalidUsername, .invalidPassword, .unauthenticated:
+        case .invalidCredentials, .invalidUsername, .invalidPassword, .invalidPersonalAccessToken, .personalAccessTokenExpired, .userInactive,
+            .unauthenticated, .invalidFormat:
             true
         default:
             false

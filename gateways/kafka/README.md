@@ -1,44 +1,50 @@
 # Kafka gateway (`iggy-gateway-kafka`)
 
-Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests and validates scoped API keys and versions. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs use Iggy. InitProducerId and consumer group coordination work with or without one.
+Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests and validates scoped API keys and versions. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs use Iggy. InitProducerId and consumer group coordination work with or without one.
 
 > **Stub warning:** with `IGGY_KAFKA_BRIDGE_ENABLED=true`, Produce, Fetch, ListOffsets, Metadata,
-> CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs use Iggy. With the bridge off (the
-> default), those eight are stubs: Produce, Fetch and ListOffsets answer retriable
-> `NOT_LEADER_OR_FOLLOWER` (6), CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs answer
+> CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs, AlterConfigs and
+> IncrementalAlterConfigs use Iggy. With the bridge off (the default), those ten are stubs:
+> Produce, Fetch and ListOffsets answer retriable `NOT_LEADER_OR_FOLLOWER` (6), CreateTopics,
+> DeleteTopics, CreatePartitions, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs answer
 > `NOT_CONTROLLER` (41), and Metadata reports every requested topic unknown. **CreateTopics,
-> DeleteTopics and AlterConfigs run as the bridge's own Iggy user**: with the bridge on and
-> `IGGY_KAFKA_SASL_ENABLED` off (the default), any client that can reach this port can create
-> topics (up to 1000 partitions each), delete topics and their data, or shorten a topic's
+> DeleteTopics, CreatePartitions and both alter APIs run as the bridge's own Iggy user**: with the
+> bridge on and `IGGY_KAFKA_SASL_ENABLED` off (the default), any client that can reach this port
+> can create topics (up to 1000 partitions each), grow them by up to 1000 partitions per topic per
+> request (100 topics per request), delete topics and their data, or shorten a topic's
 > `retention.ms` low enough that the cleaner drops sealed segments, deleting data. With
 > `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` and no listener that names principals, any client
 > that reaches this port can also create topics just by naming them in a `Metadata` request. When
 > the connection has a principal (SASL, or a client certificate mapped to an Iggy user),
-> `DeleteTopics`, `AlterConfigs` and `Metadata` auto-creation additionally require it to hold a
-> global `manage_topics` or `manage_streams`; without it every resource of a `DeleteTopics` or
-> `AlterConfigs` request, and every missing topic a `Metadata` request would create, fails
-> `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is written, created or deleted. `CreateTopics` has
-> no such gate yet - SASL on does not protect it. Every client reads and writes as the bridge's
-> Iggy user.
-> See [docs/SCOPE.md](docs/SCOPE.md).
+> `DeleteTopics`, `CreatePartitions`, `AlterConfigs`, `IncrementalAlterConfigs` and `Metadata`
+> auto-creation additionally require it to hold a global `manage_topics` or `manage_streams`;
+> without it every resource of a `DeleteTopics`, `CreatePartitions`, `AlterConfigs` or
+> `IncrementalAlterConfigs` request, and every missing topic a `Metadata` request would create,
+> fails `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is written, created or deleted.
+> `CreateTopics` has no such gate yet - SASL on does not protect it. Every client reads and writes
+> as the bridge's Iggy user. DeleteGroups and OffsetDelete also run as that user. When no listener
+> names a principal, any client can delete committed offsets. When one does (SASL, or client
+> certificates), they also require a global `manage_topics` or `manage_streams`, and without it
+> they answer `GROUP_AUTHORIZATION_FAILED` (30). Iggy's `metadata.partitions_max` defaults to 0
+> (unlimited), so set it before exposing the gateway. See [docs/SCOPE.md](docs/SCOPE.md).
 >
 > InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
 >
 > Consumer group coordination is not a stub either: `FindCoordinator`, `JoinGroup`, `Heartbeat`,
 > `LeaveGroup`, `SyncGroup`, `DescribeGroups` and `ListGroups` are real, with real membership,
 > rebalances, graceful leave, session expiry and admin views of that membership
-> ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). `kafka-consumer-groups.sh --list`,
-> `--describe --members` and `--describe --state` use those views. The default `--describe`
-> calls OffsetFetch (API key 9), which is not implemented, so that mode does not work. With the bridge off,
-> Metadata reports every topic unknown, so a consumer joins a group and is assigned 0 partitions.
+> ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). `kafka-consumer-groups.sh --list` and
+> `--describe` use those views. With the bridge on, they also show a group whose consumers stopped,
+> as `Empty`, while it holds offsets. The default `--describe` then prints each committed offset
+> and its lag. `--delete` deletes such a group with its offsets, and `--delete-offsets` deletes
+> single offsets. With the bridge off, the default `--describe` gets `COORDINATOR_LOAD_IN_PROGRESS`
+> (14) from OffsetFetch (API key 9), and Metadata reports every topic unknown, so a consumer joins
+> a group and is assigned 0 partitions.
 > With the bridge on, OffsetCommit and OffsetFetch keep each group's offsets in Iggy, so a group
 > resumes from its last commit, also after a gateway restart
 > ([docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md)). Every Iggy server must run a build with the
 > external group consumer kind ([#4392](https://github.com/apache/iggy/pull/4392)) before the first
-> commit. In a partly upgraded cluster, one commit can make a partition stop committing. In a
-> cluster, a node that has not applied a group's first commit answers "no offset", so a consumer on
-> `auto.offset.reset=latest` can skip records until
-> [#4409](https://github.com/apache/iggy/issues/4409).
+> commit. In a partly upgraded cluster, one commit can make a partition stop committing.
 
 ## Run
 
@@ -67,13 +73,39 @@ Default bind: a `PLAINTEXT` listener on `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_READ_TIMEOUT_SECS` | `15` | Seconds allowed to read a frame body once its length prefix arrives |
 | `IGGY_KAFKA_WRITE_TIMEOUT_SECS` | `10` | Seconds allowed to write a response frame |
 | `IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Seconds graceful shutdown waits for in-flight connections before abandoning them. The bridge then signs its Iggy clients out, 5 s at most |
-| `IGGY_KAFKA_INSTANCE_ID` | `0` | This gateway's number among the gateways fronting one Iggy cluster. It is the high half of every producer id `InitProducerId` hands out, and Kafka requires those to be cluster-unique, so give every gateway its own value. A single gateway can leave it at `0`. |
-| `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. A failed connection is fatal, not a downgrade to stubs. |
+| `IGGY_KAFKA_INSTANCE_ID` | `IGGY_KAFKA_NODE_ID`, else `0` | This gateway's number among the gateways fronting one Iggy cluster. It is the high half of every producer id `InitProducerId` hands out, and Kafka requires those to be cluster-unique, so give every gateway its own value. Unset, it follows `IGGY_KAFKA_NODE_ID`. A single gateway can leave both unset. |
+| `IGGY_KAFKA_NODE_ID` | `1` | This gateway's broker id in Metadata, 0 to 65535. Beside each Iggy node, use that node's replica id. Required with `IGGY_KAFKA_BROKERS` |
+| `IGGY_KAFKA_BROKERS` | unset | Every gateway in front of the Iggy cluster, this one included, as `id@host:port` entries separated by commas. With several listeners, one `id@PROTOCOL://host:port` entry per gateway and listener. Give every gateway the same list. See [Several gateways](#several-gateways-4515) |
+| `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. If Iggy does not answer, startup tries again 1 s after each failed connect, for up to 60 s, and then the gateway stops. A wrong password or a missing permission stops it at once. It never falls back to stubs. |
 | `IGGY_KAFKA_SASL_ENABLED` | `false` | Single-listener form: require SASL/PLAIN before serving any other API (`true` or `false`, nothing else). With `IGGY_KAFKA_LISTENERS`, a `SASL_PLAINTEXT` or `SASL_SSL` listener says the same |
 | `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` | `15` | Seconds an unauthenticated connection may sit between frames. Waiting for an authentication slot and the verification itself each get this budget, the verification's starting once it holds a slot. Separate from the 10-minute idle timeout that applies once authenticated |
 | `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` | `4` | Credential verifications the gateway runs at once, across all connections. Each costs a password hash on an Iggy shard thread. This bounds the gateway's side only: a check that times out frees its slot while its hash keeps running inside Iggy. Size it below the Iggy node's shard count |
 | `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` | `false` | Kafka's `auto.create.topics.enable`: a `Metadata` lookup of a missing topic creates it ([Auto topic creation](#auto-topic-creation)). Needs `IGGY_KAFKA_BRIDGE_ENABLED=true`. Off by default, unlike Kafka |
 | `IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS` | `1` | Partitions of an auto-created topic, at most 1000. Only read while auto-creation is on, and refused otherwise |
+
+## Docker image
+
+CI publishes [`apache/iggy-kafka-gateway`](https://hub.docker.com/r/apache/iggy-kafka-gateway)
+for `linux/amd64` and `linux/arm64`, using the same publishing rules as the Iggy server and
+connectors runtime:
+
+| Tag | Publishing rule |
+| --- | --- |
+| `edge` | Rolling build refreshed by successful publishing after affected changes merge to `master`. It can lag after a failed publish run. |
+| `<version>` | Version from `gateways/kafka/Cargo.toml`. Stable releases are published manually; new prereleases can be published automatically. |
+| `latest` | Updated only by a manual stable release. |
+
+CI treats only versions containing `-edge` or `-rc` as prereleases, such as `0.2.0-edge.1`
+or `0.2.0-rc.1`.
+
+```bash
+docker pull apache/iggy-kafka-gateway:edge
+```
+
+With the image's default listener, set `IGGY_KAFKA_ADVERTISED_HOST` to a host reachable by
+Kafka clients; see [Run](#run). Produce and Fetch need `IGGY_KAFKA_BRIDGE_ENABLED=true`
+and the Iggy connection settings. The [Compose quick start](#quick-start-docker-compose)
+sets both the advertised address and the bridge configuration.
 
 ## Quick start (Docker Compose)
 
@@ -91,13 +123,26 @@ cd gateways/kafka
 docker compose up --build
 ```
 
-`iggy-server` pulls the prebuilt `apache/iggy:edge` image (refreshed on a master push only when `server` or `iggy-cli` is affected, or `web` or `core/server/Dockerfile` changes),
+By default, `iggy-server` pulls the prebuilt `apache/iggy:edge` image,
 so only `iggy-gateway-kafka` compiles from source. Its Dockerfile mounts a cargo registry/target
 cache, so a first run costs one real compile and every run after reuses it, even across a source
 change elsewhere in the workspace. Testing a local `iggy-server` change: comment out `image:` and
 uncomment `build:` in `docker-compose.yml` first. That build mounts cargo registry, git, and
 target caches, so the first run is still a full release build of several minutes and later runs
 reuse those mounts.
+
+To use the prebuilt gateway too, comment out its `build:` block in
+[`docker-compose.yml`](docker-compose.yml) and uncomment its `image:` and `pull_policy:` lines.
+The [`pull_policy: always`](https://docs.docker.com/reference/compose-file/services/#pull_policy)
+setting checks for a newer rolling image each time. From `gateways/kafka`, start both images
+without compiling:
+
+```bash
+docker compose up --no-build
+```
+
+Before testing local gateway changes or running [manual testing](docs/MANUAL_TESTING.md)
+Category I, restore the `build:` block and comment out `image:` and `pull_policy:`.
 
 This starts `iggy-server` (the real Iggy broker) and `iggy-gateway-kafka` (bridge enabled,
 pointed at that server) on a shared Docker network, with the gateway waiting for the server's
@@ -149,9 +194,7 @@ stack. See `gateways/kafka/docker-compose.yml` and the environment variable tabl
 every other knob.
 
 **Limitations** (see the stub warning above for the full list): single gateway, single Iggy node,
-SASL off by default. This is a development quick start, not a production deployment shape. If your
-local `apache/iggy:edge` predates [#4392](https://github.com/apache/iggy/pull/4392), run
-`docker compose pull`, because that server refuses every offset commit.
+SASL off by default. This is a development quick start, not a production deployment shape.
 
 This quick start's topics use Iggy's default `Durability::Replicated` - a Produce ack is a
 quorum commit, not an fsync. A `docker kill` or host power loss can lose acked records despite
@@ -211,10 +254,10 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 - [docs/BRIDGE_MAPPING.md](docs/BRIDGE_MAPPING.md) — how a Kafka record becomes an Iggy message, and back
 - [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) — InitProducerId, and why delivery is at-least-once
 - [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md) — where Kafka consumer group offsets live
-- [docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md) — group membership, rebalances, and why one gateway per bootstrap endpoint
+- [docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md) — group membership, rebalances, and which gateway coordinates a group
 - [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — how a Kafka client authenticates, and why PLAIN only
 - [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) — how Iggy permissions are described as Kafka ACLs
-- [docs/CONFIGS.md](docs/CONFIGS.md) — DescribeConfigs and AlterConfigs for topic `retention.ms`
+- [docs/CONFIGS.md](docs/CONFIGS.md) — DescribeConfigs, AlterConfigs and IncrementalAlterConfigs for topic `retention.ms`
 
 ### Delivery guarantees
 
@@ -244,16 +287,47 @@ member that leaves hands its partition to the other at its commit.
 
 Limits:
 
-- One gateway per bootstrap endpoint. Group membership is gateway memory
+- Group membership is gateway memory. With several gateways, the one with the lowest node id
+  coordinates every group, and while it is down the groups wait for it
   ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)).
 - Classic protocol only. A consumer with `group.protocol=consumer` (KIP-848) fails.
-- `group.instance.id` is accepted but not honoured. A static member that restarts causes two
-  rebalances.
-- No DescribeGroups or ListGroups yet ([#3548](https://github.com/apache/iggy/issues/3548)), so
-  `kafka-consumer-groups.sh` cannot list or describe a group.
-- No DeleteGroups or OffsetDelete, and offsets never expire. An operator deletes a group's offsets
-  in Iggy ([docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md#limits)).
+- Offsets never expire. `kafka-consumer-groups.sh --delete` and `--delete-offsets` delete them
+  ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md#deleting-groups-and-offsets)).
+- If `--delete` fails with `GroupAuthorizationException` although the principal holds a global
+  `manage_topics` or `manage_streams`, look in the gateway log for `the bridge user may not list
+  the Iggy groups of these Kafka topics, so DeleteGroups deletes nothing`. The bridge's Iggy user,
+  not the principal, lacks the permission to read the topics that the line names. `--list` still
+  shows the group as `Empty`, because its scan leaves those topics out.
 - Delivery is at-least-once. A consumer that stops before it commits reads those records again.
+
+## Several gateways ([#4515](https://github.com/apache/iggy/issues/4515))
+
+Run one gateway beside each Iggy node, and list every gateway in the clients'
+`bootstrap.servers`. Give each gateway the same `IGGY_KAFKA_BROKERS` and its own
+`IGGY_KAFKA_NODE_ID`, and point its `IGGY_KAFKA_IGGY_ADDR` at the node beside it:
+
+```bash
+# The gateway beside Iggy node 1.
+IGGY_KAFKA_NODE_ID=1 \
+IGGY_KAFKA_BROKERS=0@gateway-0:9093,1@gateway-1:9093,2@gateway-2:9093 \
+IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 \
+cargo run -p iggy-gateway-kafka
+```
+
+- Metadata lists every gateway and names the one that answers as the leader of every partition.
+  Any gateway can serve any partition, because the Iggy SDK sends each partition request to its
+  primary. A client of a stopped gateway goes on through the others.
+- `FindCoordinator` names the gateway with the lowest node id for every consumer group, so a
+  group never splits over two gateways. While that gateway is down, the groups wait for it.
+  Committed offsets stay in Iggy.
+- A new Iggy client dials `IGGY_KAFKA_IGGY_ADDR` first, then the other nodes of the roster that
+  the bridge read. Beside a stopped node, new producers and SASL logins go on through the other
+  nodes. The bridge itself needs that address at startup. To start while that node is down,
+  point it at a load balancer in front of the cluster. A DNS name with one record per node can
+  bind a client's first link to the wrong node (not tested).
+- An idempotent producer can still write a batch twice when it moves to another gateway.
+- With TLS to Iggy, the SDK dials each node at the address the roster advertises, so each
+  node's certificate must name that address, or set `IGGY_KAFKA_IGGY_TLS_DOMAIN`.
 
 ## Listeners and TLS ([#4510](https://github.com/apache/iggy/issues/4510))
 
@@ -270,6 +344,10 @@ IGGY_KAFKA_LISTENERS=PLAINTEXT://127.0.0.1:9093,SSL://0.0.0.0:9094,SASL_SSL://0.
 ```
 
 Each security protocol can be bound once, since the protocol is also the listener's name.
+
+No `accept()` error stops a listener. An error of one pending connection, such as a reset, retries
+at once. Any other error, such as no free file descriptor, waits 10 ms before the next accept.
+The wait doubles up to 1 s while the error continues.
 
 TLS is rustls. One certificate serves every `SSL` and `SASL_SSL` listener, and the files are
 re-read every `IGGY_KAFKA_TLS_RELOAD_INTERVAL_SECS`: a rotated certificate takes effect for new
@@ -309,10 +387,11 @@ protocol: SASL names the principal there.
 With `requested`, a client that presents no certificate is Kafka's `ANONYMOUS` principal, which
 holds no permissions. Once any listener names principals (a SASL listener, or an `SSL` listener
 with client authentication), every connection that proved no identity is `ANONYMOUS`, on a
-`PLAINTEXT` listener beside it too. The requests the gateway checks against a principal,
-`DeleteTopics`, `AlterConfigs` and the auto-creation a `Metadata` request asks for, need
-`manage_topics` and are refused for it; everything else is served as the bridge's user. A gateway whose listeners name nobody serves every request as the
-bridge's user.
+`PLAINTEXT` listener beside it too. The requests the gateway checks against a principal are
+`DeleteTopics`, `AlterConfigs`, `DeleteGroups`, `OffsetDelete` and the auto-creation a `Metadata`
+request asks for. Each needs a global `manage_topics` or `manage_streams`, so the gateway refuses
+them for `ANONYMOUS`. Everything else is served as the bridge's user. A gateway whose listeners
+name nobody serves every request as the bridge's user.
 
 The rules are Kafka's syntax, tried in order: `RULE:pattern/replacement/[LU]` applies when the
 pattern matches the whole subject, `DEFAULT` keeps the subject as is. Iggy accepts any username of
@@ -376,8 +455,10 @@ Four things to know before switching it on:
 - **Enabling it breaks every existing client at once.** The two SASL keys appear in the
   `ApiVersions` advertisement only while it is on, and unauthenticated clients are refused.
 - **Every connection costs a login**, meaning one password hash on an Iggy shard thread and one
-  replicated registration. Verification is deliberately not cached, since caching it per username
-  would let a second connection present any password. Connection churn is therefore server load.
+  replicated registration. The check then signs out, so its Iggy session ends at once. Without
+  the sign out, Iggy keeps the session for 36 s, and a full session table refuses new logins.
+  Verification is deliberately not cached, since caching it per username would let a second
+  connection present any password. Connection churn is therefore server load.
   `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` bounds the checks the gateway runs at once, and a peer
   whose login was rejected is refused for a delay that doubles per rejection, from 0.5s up to 30s.
 - **Authentication and an ACL view, not enforcement.** The gateway verifies the credentials and
@@ -410,9 +491,9 @@ topic per call) and records by time for `ListOffsets`, probes and polls partitio
 stores and reads group offsets for OffsetCommit and OffsetFetch.
 Produce ([#3535](https://github.com/apache/iggy/issues/3535)), Fetch ([#3536](https://github.com/apache/iggy/issues/3536)), ListOffsets
 ([#3537](https://github.com/apache/iggy/issues/3537)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)), CreateTopics
-([#3538](https://github.com/apache/iggy/issues/3538)), DescribeConfigs and AlterConfigs , OffsetCommit and OffsetFetchcall it.
+([#3538](https://github.com/apache/iggy/issues/3538)), DescribeConfigs, AlterConfigs, IncrementalAlterConfigs,
+OffsetCommit and OffsetFetch ([#3542](https://github.com/apache/iggy/issues/3542)) call it.
 Topic configuration behavior is in [docs/CONFIGS.md](docs/CONFIGS.md).
-([#3542](https://github.com/apache/iggy/issues/3542)) call it.
 Tested by `bridge`'s own unit tests, `tests/bridge_iggy_integration_tests.rs` and the
 `tests/*_real_bridge_tests.rs` suites. All but the unit tests start a real `iggy-server`.
 
@@ -428,7 +509,7 @@ One partition, one Iggy send. Each partition answers for itself.
 | `acks` | `0`, `1`, `-1` write the same. Other values: 21, before any per-partition check. |
 | `acks=0` | Writes, answers nothing. Any failed partition closes the connection. |
 | Topics | Creates none. Missing: 3. Bad name: 17. |
-| `timeout_ms` | Honored, max 20 s. Past it: 7. |
+| `timeout_ms` | Honored, max 20 s. The Iggy send stops by then too. Past it: 7. A send that never went out: 6. |
 | Compression | gzip, snappy, lz4. zstd from v7, else 76. |
 | Producer id | Picks the producer's Iggy session. See [Concurrency ceiling](#concurrency-ceiling). |
 | Producer epoch, sequence | Ignored, so a retry writes twice. |
@@ -446,8 +527,8 @@ One partition, one Iggy send. Each partition answers for itself.
 | 10 | Record, send or partition too large, even alone | Java splits multi-record batches. Else fails. |
 | 87 | Record the gateway cannot map. Reason in `error_message` from v8. | Fails. |
 | 35 | Transactional or control batch | Fails. |
-| 6 | Request budget ran out. Nothing written. | Retries. |
-| 7 | Deadline passed: in the send, waiting for decode memory, or behind the producer's own earlier send. Or connection lost mid-send. May be written. | Retries. Can duplicate. |
+| 6 | Request budget ran out. Or the send did not reach Iggy by the deadline, or Iggy refused it: no primary, partition busy or recreated, client shut down. Nothing written. | Retries. |
+| 7 | Deadline passed: after the send went out, waiting for decode memory, or behind the producer's own earlier send. Or connection lost mid-send. Possibly written. | Retries. Can duplicate. |
 
 Partition cap: `max_frame_size` decompressed bytes, `max_frame_size / 64` record slots, 3 headers
 per slot. Past it: 10.
@@ -537,7 +618,7 @@ Limits:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `IGGY_KAFKA_IGGY_ADDR` | `127.0.0.1:8090` | Address of the Iggy server to bridge to |
+| `IGGY_KAFKA_IGGY_ADDR` | `127.0.0.1:8090` | Address of the Iggy server to bridge to. Each new Iggy client dials it first, then the other nodes of the roster that the bridge read. Beside each Iggy node, set it to that node |
 | `IGGY_KAFKA_IGGY_USERNAME` | `iggy` | Iggy username |
 | `IGGY_KAFKA_IGGY_PASSWORD` | none - **required** | Iggy password. No default: `iggy-server` only uses the well-known `iggy`/`iggy` root credentials when started with `--with-default-root-credentials` (dev-only). Otherwise the operator sets the root password, so a hardcoded default here could never be right and would invite running as root unnoticed |
 | `IGGY_KAFKA_IGGY_STREAM` | `kafka` | Default Iggy stream for a Kafka topic with no explicit mapping override |
@@ -550,7 +631,9 @@ The initial connect retries a fixed, bounded number of times (`RECONNECTION_RETR
 Iggy SDK client's own default of unlimited retries, one dial per second, forever), and the whole
 attempt - retries included - is capped at `REQUEST_TIMEOUT` (15s) wall-clock, so `IggyBridge::connect`
 fails in bounded time whether the address refuses the connection or silently drops it, instead of
-blocking the calling task indefinitely. Every other bridge call (`ensure_stream_and_topic`,
+blocking the calling task indefinitely. At startup, the gateway retries a connect that a retry can
+fix (6 or 7). It waits 1 s between tries, for up to 60 s. The cluster id load after it does the same.
+So a gateway that starts before its Iggy node waits for it. Every other bridge call (`ensure_stream_and_topic`,
 `high_watermark(s)`, `probe`, `close`) carries the same `REQUEST_TIMEOUT` for the same
 reason: the SDK reconnects internally, mid-call, on a transport error, through the same
 undead-lined dial path - a bridge call made well after the initial connect can still hit this if
@@ -559,8 +642,10 @@ Iggy becomes unreachable later.
 `send_records` uses the Produce deadline instead:
 
 - One request of a producer runs at a time, on that producer's client.
-- A send past its deadline keeps the producer's turn until it ends. That producer's requests answer
-  7 meanwhile. Other producers send on.
+- The SDK stops retrying the send 50 ms before the deadline. So it sends nothing after the request
+  answered, and the client's retry is the only copy of a send that never went out.
+- A send still running past its deadline keeps the producer's turn until it ends. That producer's
+  requests answer 7 meanwhile. Other producers send on.
 - After 45 s the gateway gives up on the send. It then closes that connection before the turn
   frees, so the send cannot land after a later one. The SDK ends its write within 30 s more,
   unless Iggy stopped reading: the producer then waits until that connection breaks.
@@ -607,7 +692,7 @@ call created it." A *different* `partition_count` against an already-existing to
 two concurrent callers requesting different counts for the same topic must not both see success.
 
 Topics created this way have **no message expiry** - Iggy's own server default, not Kafka's 7-day
-default. `AlterConfigs` can set that expiry afterwards through `retention.ms`
+default. `AlterConfigs` or `IncrementalAlterConfigs` can set that expiry afterwards through `retention.ms`
 ([docs/CONFIGS.md](docs/CONFIGS.md)). Until a client does, messages never expire, so a Kafka app
 that assumes the 7-day default will accumulate data on this bridge.
 
@@ -616,6 +701,16 @@ additional stable-storage barrier, with the disk write itself threshold-gated (f
 messages or 1 MiB of unflushed data, whichever comes first). Kafka's own defaults take the same
 posture, so this isn't a wrong choice, but on a single node both can lose an acked write to a power
 cut before that threshold is reached - worth knowing rather than discovering later.
+
+The bridge also keeps the Kafka cluster id in Iggy, in topic `cluster_id` of stream
+`<default stream>.meta`, created on the first start with durability `persisted`, no expiry and no
+size cap. Leave that stream alone: deleting it gives the next start a new id, and a topic mapping
+override that targets it is refused at startup. On the start that stores the id, the bridge's Iggy
+user needs to create whichever of that stream and topic is missing, then `send_messages` and
+`poll_messages` on the stream. Every later start only polls. A user without `manage_streams` can
+still run the gateway once an operator creates the stream and the topic (one partition,
+durability `persisted`) and grants it `poll_messages` and `send_messages` on the stream: the
+bridge creates only what it finds missing. See [docs/SCOPE.md](docs/SCOPE.md#cluster-id).
 
 ### Auto topic creation
 
@@ -690,11 +785,19 @@ With auto-creation off, the default, nothing changes: a missing topic is answere
   other closes after `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` (600) unused, checked every 30 s.
 - 4 clients sign in at once, 80 a second at most. More wait, up to their request's deadline.
 - `IGGY_KAFKA_PRODUCE_SESSIONS=0`: all producers share one client, one request at a time.
-- Metadata, CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs share 1 more client, one
-  Iggy request at a time. Fetch polls use 4 more, one per read slot, and a `ListOffsets` lookup
-  by time borrows one of those slots for its request. Topic probes use 1 more. With auto topic
-  creation on, creations use 1 more, opened at the first one.
+- Metadata, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs, AlterConfigs and
+  IncrementalAlterConfigs share 1 more client, one Iggy request at a time. Fetch polls use 4
+  more, one per read slot, and a `ListOffsets` lookup by time borrows one of those slots for its
+  request. Topic probes use 1
+  more. With auto topic creation on, creations use 1 more, opened at the first one.
   Offset calls use 8 more: a commit client and a read client per offset slot.
+- CreateTopics, DeleteTopics and CreatePartitions writes also take one gateway-wide lock, so a
+  CreatePartitions can read a topic's count and add to it with nothing in between. A
+  CreatePartitions whose write outcome is unknown keeps the lock while it re-reads the topic, for
+  at most 50 s after its request arrived: the 30 s request ceiling plus 20 s from the write. Admin
+  calls behind it wait up to their own deadline, then answer retriable `REQUEST_TIMED_OUT` (7).
+  The Java admin client does not retry that code by itself: `kafka-topics.sh` and
+  `Admin.createPartitions` report a `TimeoutException`, and the caller must retry.
 - OffsetCommit and OffsetFetch cost one Iggy call per partition, spread over the offset slots. In a
   cluster, an offset commit client can also open one connection per node for stores.
 - Order: set `max.in.flight.requests.per.connection=1`, or `retries=0`. Otherwise a retried batch
@@ -721,10 +824,14 @@ costs about 10 `get_topic` calls per second per topic. `ListOffsets` probes on t
   credential misconfiguration, and blaming its own ACLs for one is worse than an unexplained
   fatal error
 - Connection-shaped failures → `NOT_LEADER_OR_FOLLOWER` (6). On a send, `Disconnected`,
-  `EmptyResponse`, `TcpError` and `StaleClient` → 7 instead: the write may have landed
+  `EmptyResponse` and `TcpError` → 7 instead: the write may have landed. `StaleClient` stays 6:
+  the SDK returns it only for a send that Iggy rejected
 - An Iggy commit whose outcome is genuinely unknown (`TransientNotCommitted`) →
   `REQUEST_TIMED_OUT` (7) - retriable in real Kafka too, chosen because it's what a real broker
   sends for the same shape of failure, not to make a client stop retrying
+- A call behind an earlier operation whose outcome the SDK no longer keeps
+  (`OperationNotRetained`) → `REQUEST_TIMED_OUT` (7), not -1. The call itself was not sent, so a
+  retry cannot write it twice.
 - A bridge-side call timeout (`BridgeError::Timeout`) → `REQUEST_TIMED_OUT` (7), the same code and
   the same reasoning as `TransientNotCommitted` above - the SDK's write/read run on a task this
   timeout cannot abort, so the outcome is unknown, not known-safe-to-retry (see Connection config's
@@ -748,6 +855,10 @@ instead of -1, because the Java `AdminClient` fails a partition on any non-retri
 incarnation of the partition, as after a delete and recreate; the retry probes again and answers 3
 if the topic is gone. ListOffsets reads do not get `RequestTooOld` today, so that arm is defensive.
 
+Produce also answers `HistoryUnavailable`, `LifecycleBusy` and `ClientShutdown` with 6 instead of
+-1 (`to_produce_error_code`). The SDK returns them only for a send that wrote nothing. A send that
+possibly landed ends as `OperationUncertain`, which answers 7.
+
 ### Server limits the gateway inherits
 
 These are Iggy server limits, not gateway settings. A Kafka client cannot act on any of them, so
@@ -767,9 +878,12 @@ against one partition. Passing it returns `TooManyConsumerOffsets` (3024), which
 client as `UNKNOWN_SERVER_ERROR` because Kafka has no code for the condition. The gateway logs
 the real Iggy error, so the server log is where an operator diagnoses it.
 
-A `CreateTopics` that would take the node past `metadata.partitions_max` returns
-`PartitionsLimitReached` (2022), which reaches the client as `POLICY_VIOLATION` (44). The cap
-counts committed partitions only, so creates that run at the same time can go past it.
+A `CreateTopics` or `CreatePartitions` that would take the node past `metadata.partitions_max`
+returns `PartitionsLimitReached` (2022), which reaches the client as `POLICY_VIOLATION` (44). The
+cap counts committed partitions only, so creates that run at the same time can go past it. A
+`CreatePartitions` on a topic created with a fixed partition count (`PartitionResizeDisabled`,
+2023) reaches the client as `POLICY_VIOLATION` too, `validate_only` included. Topics the gateway
+creates are resizable.
 
 The other three decide when a Kafka record goes into the envelope instead of being stored
 natively. See [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md) and

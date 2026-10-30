@@ -25,17 +25,17 @@ namespace Apache.Iggy.Contracts;
 public enum OptionsScope
 {
     /// <summary>
-    ///     Keys a CreateTopic accepts.
+    ///     Topic options.
     /// </summary>
     Topic = 1,
 
     /// <summary>
-    ///     Keys a CreateStream accepts; none yet.
+    ///     Stream options.
     /// </summary>
     Stream = 2,
 
     /// <summary>
-    ///     Keys a CreateUser accepts; none yet.
+    ///     User options.
     /// </summary>
     User = 3
 }
@@ -46,17 +46,41 @@ public enum OptionsScope
 public class OptionSpec
 {
     /// <summary>
-    ///     Option key the create command accepts.
+    ///     Option key, as a create, an update or a read names it.
     /// </summary>
     public required string Key { get; set; }
 
     /// <summary>
     ///     Canonical kind for this key: what the server encodes its default under, and
-    ///     what a value set at create is stored as whatever kind the client sent, since
-    ///     create admission re-encodes the block from its own parse. An update stores
-    ///     the client's bytes verbatim and is the exception.
+    ///     what a value set at create or update is stored as whatever kind the client sent,
+    ///     since admission re-encodes every block from its own parse.
     /// </summary>
     public required HeaderKind Kind { get; set; }
+
+    /// <summary>
+    ///     An update may set the key. A key that is neither updatable nor read-only is set only at creation.
+    /// </summary>
+    public bool Updatable { get; set; }
+
+    /// <summary>
+    ///     An update may reset the key to its default.
+    /// </summary>
+    public bool Resettable { get; set; }
+
+    /// <summary>
+    ///     Write-only: accepted at creation, never returned.
+    /// </summary>
+    public bool Secret { get; set; }
+
+    /// <summary>
+    ///     Computed by the server and returned on reads, never accepted from a client.
+    /// </summary>
+    public bool ReadOnly { get; set; }
+
+    /// <summary>
+    ///     A server that does not understand the key refuses to serve the resource rather than ignore it.
+    /// </summary>
+    public bool Critical { get; set; }
 
     /// <summary>
     ///     The key's default in <see cref="Kind" />'s encoding; empty when the key

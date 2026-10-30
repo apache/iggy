@@ -31,6 +31,7 @@ use crate::error::{CmdToolError, IggyCmdError};
 use crate::logging::Logging;
 use args::context::ContextAction;
 use args::message::MessageAction;
+use args::metadata::MetadataAction;
 use args::partition::PartitionAction;
 use args::segment::SegmentAction;
 use args::user::UserAction;
@@ -38,13 +39,17 @@ use args::{CliOptions, IggyMergedConsoleArgs};
 use clap::Parser;
 use iggy::client_provider::{self, ClientProviderConfig};
 use iggy::clients::client::IggyClient;
-use iggy::prelude::{Aes256GcmEncryptor, ClientError, EncryptorKind, PersonalAccessTokenExpiry};
+use iggy::prelude::{
+    Aes256GcmEncryptor, ClientError, EncryptorKind, MetadataChangesQuery,
+    PersonalAccessTokenExpiry, StreamUpdateOptions, TopicUpdateOptions,
+};
 use iggy_cli::commands::binary_context::common::{ContextManager, validate_transport};
 use iggy_cli::commands::binary_context::create_context::CreateContextCmd;
 use iggy_cli::commands::binary_context::delete_context::DeleteContextCmd;
 use iggy_cli::commands::binary_context::show_context::ShowContextCmd;
 use iggy_cli::commands::binary_context::use_context::UseContextCmd;
 use iggy_cli::commands::binary_segments::delete_segments::DeleteSegmentsCmd;
+use iggy_cli::commands::binary_system::metadata_changes::GetMetadataChangesCmd;
 use iggy_cli::commands::binary_system::snapshot::GetSnapshotCmd;
 #[cfg(feature = "login-session")]
 use iggy_cli::commands::cli_command::DIAGNOSTIC_TARGET;
@@ -89,6 +94,7 @@ use iggy_cli::commands::{
         update_user::{UpdateUserCmd, UpdateUserType},
     },
 };
+use std::error::Error;
 use std::sync::Arc;
 use tracing::{Level, event};
 
@@ -112,11 +118,14 @@ fn get_command(
     #[warn(clippy::let_and_return)]
     match command {
         Command::Stream(command) => match command {
-            StreamAction::Create(args) => Box::new(CreateStreamCmd::new(args.name.clone())),
+            StreamAction::Create(args) => Box::new(CreateStreamCmd::new(
+                args.name.clone(),
+                args.stream_key_file.clone(),
+            )),
             StreamAction::Delete(args) => Box::new(DeleteStreamCmd::new(args.stream_id.clone())),
             StreamAction::Update(args) => Box::new(UpdateStreamCmd::new(
                 args.stream_id.clone(),
-                args.name.clone(),
+                StreamUpdateOptions::from(&args),
             )),
             StreamAction::Get(args) => Box::new(GetStreamCmd::new(args.stream_id.clone())),
             StreamAction::List(args) => Box::new(GetStreamsCmd::new(args.list_mode.into())),
@@ -140,10 +149,7 @@ fn get_command(
             TopicAction::Update(args) => Box::new(UpdateTopicCmd::new(
                 args.stream_id.clone(),
                 args.topic_id.clone(),
-                args.compression_algorithm,
-                args.name.clone(),
-                args.message_expiry.clone().into(),
-                args.max_topic_size,
+                TopicUpdateOptions::from(&args),
             )),
             TopicAction::Get(args) => Box::new(GetTopicCmd::new(
                 args.stream_id.clone(),
@@ -183,6 +189,13 @@ fn get_command(
             args.snapshot_types,
             args.out_dir,
         )),
+        Command::Metadata(command) => match command {
+            MetadataAction::Changes(args) => Box::new(GetMetadataChangesCmd::new(
+                MetadataChangesQuery::from(&args),
+                args.follow,
+                args.interval,
+            )),
+        },
         Command::Pat(command) => match command {
             PersonalAccessTokenAction::Create(pat_create_args) => {
                 Box::new(CreatePersonalAccessTokenCmd::new(
@@ -349,7 +362,19 @@ fn get_command(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), IggyCmdError> {
+async fn main() {
+    if let Err(err) = run().await {
+        eprintln!("Error: {}", err);
+        let mut source = err.source();
+        while let Some(cause) = source {
+            eprintln!("Caused by: {}", cause);
+            source = cause.source();
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), IggyCmdError> {
     let args = IggyConsoleArgs::parse();
 
     if let Some(generator) = args.cli.generator {
@@ -423,7 +448,11 @@ async fn main() -> Result<(), IggyCmdError> {
     credentials.set_iggy_client(&client);
     credentials.login_user().await?;
 
-    if command.use_tracing() {
+    if command.stdout_is_data() {
+        if !cli_options.quiet {
+            eprintln!("Executing {}", command.explain());
+        }
+    } else if command.use_tracing() {
         event!(target: PRINT_TARGET, Level::INFO, "Executing {}", command.explain());
     } else {
         println!("Executing {}", command.explain());
