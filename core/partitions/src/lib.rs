@@ -33,6 +33,7 @@ pub mod offset_storage;
 mod partition_storage;
 mod persistence;
 mod poll_plan;
+pub mod producer_state;
 pub use persistence::FileSyncBarrier;
 pub(crate) use persistence::PersistenceDrain;
 pub use persistence::{
