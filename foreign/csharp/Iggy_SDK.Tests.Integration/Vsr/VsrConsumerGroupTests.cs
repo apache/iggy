@@ -206,8 +206,8 @@ public class VsrConsumerGroupTests
 
     /// <summary>
     ///     A partition with a backlog does not hide a partition of the same primary that holds a message too: the
-    ///     server shares the count of one read among the partitions that hold messages. One partition more than nodes
-    ///     puts two partitions on one primary.
+    ///     reader gives the partition that the backlog left out a fetch of its own beside the next read of the
+    ///     backlog. One partition more than nodes puts two partitions on one primary.
     /// </summary>
     [Test]
     public async Task GroupReader_With_ABacklog_Should_Serve_AnotherPartitionOfItsPrimary()
@@ -233,10 +233,16 @@ public class VsrConsumerGroupTests
             .BuildAsync();
         await WaitForAssignmentAsync(reader, (int)partitionsCount);
 
-        var first = await reader.NextAsync();
-        var second = await reader.NextAsync();
+        // A fetch from an offset fills its count from the backlog in request order, so the first reply may hold the
+        // backlog alone. The other partition then gets a fetch of its own beside the next backlog fetch, whose replies
+        // land in either order, so it shows by the third batch, and one more backlog reply may overtake its reply.
+        List<uint> read = [];
+        while (read.Count < 4 && !read.Contains(shared[^1]))
+        {
+            read.Add((await reader.NextAsync()).PartitionId);
+        }
 
-        new[] { first.PartitionId, second.PartitionId }.ShouldContain(shared[^1]);
+        read.ShouldContain(shared[^1], $"read {string.Join(", ", read)} before {shared[^1]}");
     }
 
     private static async Task WaitForAssignmentAsync(PartitionReader reader, int partitions)

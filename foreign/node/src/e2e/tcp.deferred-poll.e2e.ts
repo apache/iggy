@@ -126,8 +126,9 @@ describe('e2e -> deferred-poll', async () => {
     });
     try {
       while (reader.partitions().length < backlogPartitions) await sleep(50);
-      // A fetch fills its count from the backlog, so the late partition gets a fetch of its own next, whose
-      // reply races the next read of the backlog.
+      // A fetch from an offset fills its count from the backlog in request order, so the first reply may hold the
+      // backlog alone. The late partition then gets a fetch of its own beside the next backlog fetch, whose replies
+      // land in either order, so it shows by the third batch, and one more backlog reply may overtake its reply.
       const read: number[] = [];
       while (read.length < 4 && !read.includes(latePartition)) read.push((await reader.next()).partitionId);
       assert.ok(read.includes(latePartition), `read ${read.join(', ')} before ${latePartition}`);
