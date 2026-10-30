@@ -21,8 +21,8 @@ use crate::wire_conversions::{
     consumer_to_wire, identifier_to_wire, partitioning_to_wire, polling_strategy_to_wire,
 };
 use crate::{
-    CommitPolicy, Consumer, DecodeError, DeferredPollOptions, FetchedSection, Identifier,
-    IggyError, IggyMessage, MessageClient, Partitioning, PollOptions, PolledMessages,
+    BatchProducer, CommitPolicy, Consumer, DecodeError, DeferredPollOptions, FetchedSection,
+    Identifier, IggyError, IggyMessage, MessageClient, Partitioning, PollOptions, PolledMessages,
     PollingStrategy, SendMessagesResponse,
 };
 use crate::{
@@ -142,11 +142,13 @@ async fn fresh_topic_partition_count<B: BinaryClient>(
 
 /// A chunk keeps its selected partition while an earlier lane blocker resolves.
 /// Only a definitive missing-partition result permits one fresh selection.
+/// An idempotent producer rides along, so every send of the chunk carries it.
 #[doc(hidden)]
 pub struct BinarySendPartitioning<'a> {
     original: &'a Partitioning,
     selected: Option<Cow<'a, Partitioning>>,
     refreshed: bool,
+    producer: Option<BatchProducer>,
 }
 
 impl<'a> BinarySendPartitioning<'a> {
@@ -155,11 +157,22 @@ impl<'a> BinarySendPartitioning<'a> {
             original,
             selected: None,
             refreshed: false,
+            producer: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_producer(mut self, producer: BatchProducer) -> Self {
+        self.producer = Some(producer);
+        self
     }
 
     pub fn original(&self) -> &Partitioning {
         self.original
+    }
+
+    pub const fn producer(&self) -> Option<BatchProducer> {
+        self.producer
     }
 
     pub fn is_resolved(&self) -> bool {
@@ -199,7 +212,13 @@ pub async fn send_binary_messages<B: BinaryClient>(
                     .selected
                     .as_deref()
                     .ok_or(IggyError::InvalidCommand)?;
-                let payload = encode_messages(stream_id, topic_id, selected, messages)?;
+                let payload = encode_messages(
+                    stream_id,
+                    topic_id,
+                    selected,
+                    partitioning.producer,
+                    messages,
+                )?;
                 match client
                     .send_raw_with_context(
                         SEND_MESSAGES_CODE,
@@ -495,12 +514,31 @@ impl<B: BinaryClient> MessageClient for B {
         )
         .await
     }
+
+    async fn send_producer_messages(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitioning: &Partitioning,
+        producer: BatchProducer,
+        messages: &mut [IggyMessage],
+    ) -> Result<SendMessagesResponse, IggyError> {
+        send_binary_messages(
+            self,
+            stream_id,
+            topic_id,
+            &mut BinarySendPartitioning::new(partitioning).with_producer(producer),
+            messages,
+        )
+        .await
+    }
 }
 
 fn encode_messages(
     stream_id: &Identifier,
     topic_id: &Identifier,
     partitioning: &Partitioning,
+    producer: Option<BatchProducer>,
     messages: &mut [IggyMessage],
 ) -> Result<Bytes, IggyError> {
     let wire_stream_id = identifier_to_wire(stream_id)?;
@@ -530,11 +568,12 @@ fn encode_messages(
         &raw_messages,
     );
     let mut buf = BytesMut::with_capacity(size);
-    SendMessagesEncoder::encode(
+    SendMessagesEncoder::encode_with_producer(
         &mut buf,
         &wire_stream_id,
         &wire_topic_id,
         &wire_partitioning,
+        producer,
         &raw_messages,
     )
     .map_err(|error| match error {
