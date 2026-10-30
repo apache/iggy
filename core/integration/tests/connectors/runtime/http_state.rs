@@ -33,8 +33,8 @@
 //!     the ETag chain,
 //!   * exactly-once source whose save after a send fails -> the batch that the
 //!     plugin produces again lands once,
-//!   * exactly-once source restarted with a batch in flight -> the batch lands
-//!     once, and new batches use the next epoch.
+//!   * exactly-once source restarted before its first save after a send -> the
+//!     batch lands once, and new batches use the next epoch.
 
 use assert_cmd::prelude::CommandCargoExt;
 use async_trait::async_trait;
@@ -67,9 +67,8 @@ const EXACTLY_ONCE_KEY: &str = "random_exactly_once";
 const EXACTLY_ONCE_RESOURCE_PATH: &str = "/source_random_exactly_once";
 /// Starts the state of an exactly-once source.
 const EXACTLY_ONCE_MAGIC: &[u8] = b"\0IGGYEO\x01";
-/// The flag after the magic, producer id, epoch, partition id and next sequence. It is 1 while
-/// the state names a batch in flight.
-const EXACTLY_ONCE_IN_FLIGHT_AT: usize = 26;
+/// The next sequence, after the magic, producer id, epoch and partition id.
+const EXACTLY_ONCE_NEXT_SEQUENCE_AT: usize = 22;
 /// The `messages_range` and `max_count` of the exactly-once source.
 const EXACTLY_ONCE_BATCH: usize = 3;
 const EXACTLY_ONCE_MESSAGES: usize = 60;
@@ -89,8 +88,8 @@ struct SharedStore {
     committed_requests: StdMutex<HashMap<String, (Vec<u8>, String)>>,
     conflict_mode: AtomicBool,
     fail_next_puts: AtomicU64,
-    /// Fails writes of an exactly-once state with no batch in flight, which the runtime saves
-    /// after a send.
+    /// Fails writes of an exactly-once state past the first batch, which the runtime saves after a
+    /// send.
     fail_next_settled_puts: AtomicU64,
     get_count: AtomicU64,
     put_count: AtomicU64,
@@ -145,7 +144,7 @@ impl Respond for StateStoreResponder {
             }
             return ResponseTemplate::new(200).insert_header(ETAG, etag.as_str());
         }
-        if names_batch_in_flight(&request.body) == Some(false)
+        if stored_next_sequence(&request.body).is_some_and(|sequence| sequence > 0)
             && store
                 .fail_next_settled_puts
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -219,8 +218,8 @@ impl TestFixture for HttpStateStoreFixture {
 }
 
 /// The state server of the exactly-once source. Its first `FAILED_SETTLED_PUTS` writes of a
-/// state with no batch in flight answer `503`, so the save after a send fails and the runtime
-/// Nacks a batch that Iggy holds.
+/// state past the first batch answer `503`, so the save after a send fails and the runtime Nacks a
+/// batch that Iggy holds.
 pub struct ExactlyOnceStateStore<const FAILED_SETTLED_PUTS: u64> {
     server: MockServer,
     store: Arc<SharedStore>,
@@ -264,11 +263,15 @@ fn state_server_envs(server: &MockServer) -> HashMap<String, String> {
     HashMap::from([("IGGY_CONNECTORS_STATE_HTTP_URL".to_string(), server.uri())])
 }
 
-/// Whether the state of an exactly-once source names a batch in flight. `None` for any other
-/// state.
-fn names_batch_in_flight(body: &[u8]) -> Option<bool> {
-    body.starts_with(EXACTLY_ONCE_MAGIC)
-        .then(|| body.get(EXACTLY_ONCE_IN_FLIGHT_AT) == Some(&1))
+/// The first sequence of the next batch that the state of an exactly-once source names. `None`
+/// for any other state.
+fn stored_next_sequence(body: &[u8]) -> Option<u32> {
+    if !body.starts_with(EXACTLY_ONCE_MAGIC) {
+        return None;
+    }
+    body.get(EXACTLY_ONCE_NEXT_SEQUENCE_AT..EXACTLY_ONCE_NEXT_SEQUENCE_AT + 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_le_bytes)
 }
 
 async fn wait_until<F: Fn() -> bool>(what: &str, condition: F) {
@@ -645,8 +648,8 @@ async fn given_a_failed_save_after_a_send_when_the_source_sends_again_should_wri
         "the Nacked batch went out again and must land once"
     );
     assert_eq!(
-        names_batch_in_flight(&fixture.store.body.lock().expect("store lock")),
-        Some(false),
+        stored_next_sequence(&fixture.store.body.lock().expect("store lock")),
+        u32::try_from(EXACTLY_ONCE_MESSAGES).ok(),
         "the last save must settle the last batch"
     );
 }
@@ -657,19 +660,19 @@ async fn given_a_failed_save_after_a_send_when_the_source_sends_again_should_wri
     )),
     seed = seeds::connector_stream
 )]
-async fn given_a_batch_in_flight_when_the_source_restarts_should_write_the_batch_once(
+async fn given_an_unsaved_batch_when_the_source_restarts_should_write_the_batch_once(
     harness: &TestHarness,
     fixture: FailingSavesFixture,
 ) {
-    // No save after a send lands, so the stored state names the first batch in flight until the
-    // source stops at its Nack limit.
+    // No save after a send lands, so the stored state names the first batch until the source
+    // stops at its Nack limit.
     wait_for_last_error(harness, EXACTLY_ONCE_KEY, "consecutive NACK limit reached").await;
     let client = harness.root_client().await.expect("root client");
     assert_eq!(stored_messages(&client).await, EXACTLY_ONCE_BATCH);
     assert_eq!(
-        names_batch_in_flight(&fixture.store.body.lock().expect("store lock")),
-        Some(true),
-        "the stored state must name the first batch in flight"
+        stored_next_sequence(&fixture.store.body.lock().expect("store lock")),
+        Some(0),
+        "the stored state must name the first batch"
     );
     fixture
         .store
@@ -683,7 +686,7 @@ async fn given_a_batch_in_flight_when_the_source_restarts_should_write_the_batch
     assert_eq!(
         stored_messages(&client).await,
         EXACTLY_ONCE_MESSAGES,
-        "the batch in flight went out again after the restart and must land once"
+        "the unsaved batch went out again after the restart and must land once"
     );
     let (stdout, stderr) = harness
         .connectors_runtime()

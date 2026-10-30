@@ -1416,7 +1416,7 @@ where
     pub(crate) fn producer_entries(&self) -> Vec<(u64, ProducerEntry)> {
         self.producers
             .entries()
-            .map(|(producer_id, entry)| (producer_id, entry.clone()))
+            .map(|(producer_id, entry)| (producer_id, *entry))
             .collect()
     }
 
@@ -4583,9 +4583,60 @@ where
         prepare
     }
 
-    /// The primary's check of an idempotent producer's batch, made right
-    /// before the request becomes a prepare and its batch gets offsets.
-    fn admit_producer_batch(
+    /// Checks the batch of an idempotent producer right before the request
+    /// becomes a prepare and its batch gets offsets. Answers a batch that the
+    /// partition does not write, and returns whether the request goes on.
+    async fn admit_producer_batch(
+        &self,
+        message: &Message<RoutedRequestHeader>,
+        reply: &mut Option<consensus::Sender<Message<ReplyHeader>>>,
+    ) -> bool {
+        let header = message.header();
+        let refusal = match self.check_producer_batch(message) {
+            Ok(ProducerAdmission::Append) => return true,
+            Ok(ProducerAdmission::Duplicate { base_offset }) => {
+                // The batch committed, so the answer is a committed result,
+                // which also settles a send the client holds as uncertain.
+                let duplicate = build_reply_from_request(
+                    &self.consensus,
+                    header,
+                    send_confirmation_body(header.group, base_offset),
+                )
+                .transmute_header(|mut duplicate, output: &mut ReplyHeader| {
+                    duplicate.reserved[0] = ReplyHeader::COMMITTED_RESULT;
+                    duplicate.partition_incarnation = header.partition_incarnation;
+                    *output = duplicate;
+                });
+                Self::deliver_reply_or_log(
+                    &self.consensus,
+                    header,
+                    CachedReply::from(duplicate),
+                    reply.take(),
+                    "producer duplicate reply send failed",
+                )
+                .await;
+                return false;
+            }
+            // The first copy can still commit, so the outcome of this send
+            // stays unknown, as for a request that is still pending.
+            Ok(ProducerAdmission::DuplicateInFlight) => IggyError::TransientNotCommitted,
+            Ok(ProducerAdmission::OutOfOrder) => IggyError::ProducerSequenceOutOfOrder,
+            Ok(ProducerAdmission::Unknown) => IggyError::ProducerUnknown,
+            Ok(ProducerAdmission::StaleEpoch) => IggyError::ProducerEpochFenced,
+            Err(error) => error,
+        };
+        Self::send_partition_deny_or_log(
+            &self.consensus,
+            header,
+            refusal.as_code(),
+            "producer batch refusal reply failed",
+            reply.take(),
+        )
+        .await;
+        false
+    }
+
+    fn check_producer_batch(
         &self,
         message: &Message<RoutedRequestHeader>,
     ) -> Result<ProducerAdmission, IggyError> {
@@ -4600,7 +4651,7 @@ where
         let Some(producer) = batch.producer else {
             return Ok(ProducerAdmission::Append);
         };
-        let in_flight = self.in_flight_producer_batches(producer.producer_id)?;
+        let in_flight = self.in_flight_producer_batches(producer.producer_id())?;
         Ok(self
             .producers
             .admit(producer, batch.message_count, &in_flight))
@@ -4630,7 +4681,7 @@ where
                 .ok_or(IggyError::TransientNotAccepted)?;
             if let Some(producer) = batch
                 .producer
-                .filter(|producer| producer.producer_id == producer_id)
+                .filter(|producer| producer.producer_id() == producer_id)
             {
                 batches.push(StampedBatch {
                     producer,
@@ -4641,55 +4692,6 @@ where
             }
         }
         Ok(batches)
-    }
-
-    /// Answer a producer batch that the partition does not write: a duplicate
-    /// gets the offset of its first write, anything else its refusal.
-    /// [`ProducerAdmission::Append`] needs no answer.
-    async fn answer_producer_batch(
-        consensus: &VsrConsensus<B>,
-        header: &RoutedRequestHeader,
-        admission: ProducerAdmission,
-        waiter: Option<consensus::Sender<Message<ReplyHeader>>>,
-    ) {
-        let refusal = match admission {
-            ProducerAdmission::Append => return,
-            ProducerAdmission::Duplicate { base_offset } => {
-                // The batch committed, so the answer is a committed result,
-                // which also settles a send the client holds as uncertain.
-                let reply = build_reply_from_request(
-                    consensus,
-                    header,
-                    send_confirmation_body(header.group, base_offset),
-                )
-                .transmute_header(|mut reply, output: &mut ReplyHeader| {
-                    reply.reserved[0] = ReplyHeader::COMMITTED_RESULT;
-                    reply.partition_incarnation = header.partition_incarnation;
-                    *output = reply;
-                });
-                Self::deliver_reply_or_log(
-                    consensus,
-                    header,
-                    CachedReply::from(reply),
-                    waiter,
-                    "producer duplicate reply send failed",
-                )
-                .await;
-                return;
-            }
-            ProducerAdmission::DuplicateInFlight => IggyError::TransientNotAccepted,
-            ProducerAdmission::OutOfOrder => IggyError::ProducerSequenceOutOfOrder,
-            ProducerAdmission::Unknown => IggyError::ProducerUnknown,
-            ProducerAdmission::StaleEpoch => IggyError::ProducerEpochFenced,
-        };
-        Self::send_partition_deny_or_log(
-            consensus,
-            header,
-            refusal.as_code(),
-            "producer batch refusal reply failed",
-            waiter,
-        )
-        .await;
     }
 
     fn local_request_must_queue(&self) -> bool {
@@ -8012,29 +8014,8 @@ where
                         .await;
                     return;
                 }
-                match self.admit_producer_batch(&message) {
-                    Ok(ProducerAdmission::Append) => {}
-                    Ok(admission) => {
-                        Self::answer_producer_batch(
-                            consensus,
-                            message.header(),
-                            admission,
-                            reply.take(),
-                        )
-                        .await;
-                        return;
-                    }
-                    Err(error) => {
-                        Self::send_partition_deny_or_log(
-                            consensus,
-                            message.header(),
-                            error.as_code(),
-                            "producer batch check reply failed",
-                            reply.take(),
-                        )
-                        .await;
-                        return;
-                    }
+                if !self.admit_producer_batch(&message, &mut reply).await {
+                    return;
                 }
                 if let Some((kind, consumer_id, Some(_), _)) = consumer_offset
                     && !self
@@ -8309,36 +8290,14 @@ where
                     continue;
                 }
             }
-            match self.admit_producer_batch(&request.message) {
-                Ok(ProducerAdmission::Append) => {}
-                Ok(admission) => {
-                    Self::answer_producer_batch(
-                        &self.consensus,
-                        &header,
-                        admission,
-                        reply_sender.take(),
-                    )
-                    .await;
-                    if Self::record_promotion_denial(&mut consecutive_denials) {
-                        break;
-                    }
-                    continue;
+            if !self
+                .admit_producer_batch(&request.message, &mut reply_sender)
+                .await
+            {
+                if Self::record_promotion_denial(&mut consecutive_denials) {
+                    break;
                 }
-                Err(error) => {
-                    if self
-                        .deny_queued_request(
-                            &header,
-                            error.as_code(),
-                            "queued producer batch check reply failed",
-                            reply_sender.take(),
-                            &mut consecutive_denials,
-                        )
-                        .await
-                    {
-                        break;
-                    }
-                    continue;
-                }
+                continue;
             }
             consecutive_denials = 0;
             if queued_install.is_some() {

@@ -393,10 +393,10 @@ The client puts the producer id, the epoch and the sequence of the first message
 
 `next_producer_id` returns a producer id that no other client of the cluster gets. It sends no request, because the id holds the session number of the client and a local index. One session hands out 2^20 ids. After that, the call fails with `ProducerIdsExhausted` (91), and a new sign-in starts a new range. An id stays unique after its session ends, so a producer can store its id and use it again after a restart.
 
-`send_producer_messages` sends one batch with its producer. The batch must name its partition with `Partitioning::partition_id`, because each partition counts the sequence of a producer separately. For any other partitioning, the call fails with `ProducerPartitionRequired` (95). The partition keeps the last five batches of each producer and answers as follows:
+`send_producer_messages` sends one batch with its producer to the partition that you name, because each partition counts the sequence of a producer separately. The partition keeps the last five batches of each producer and answers as follows:
 
 - If the partition holds the batch, it does not write the batch again. The reply holds the offset of the first write.
-- If an uncommitted write holds the batch, the answer is `TransientNotAccepted` (58). The client sends the batch again and gets the offset of the first write.
+- If an uncommitted write holds the batch, the answer is `TransientNotCommitted` (57). The outcome stays unknown, so the client sends the batch again and gets the offset of the first write.
 - If the batch does not follow the last batch of its producer, the answer is `ProducerSequenceOutOfOrder` (92).
 - If the epoch is older than the newest epoch of the producer, the answer is `ProducerEpochFenced` (93).
 - If the partition does not hold the producer and the batch does not start at sequence 0, the answer is `ProducerUnknown` (94). The producer starts the next epoch at sequence 0.
@@ -414,24 +414,23 @@ async fn produce(
 ) -> Result<(), IggyError> {
     let producer_id = client.next_producer_id().await?;
     let mut producer = BatchProducer::new(producer_id, 0, 0).ok_or(IggyError::InvalidCommand)?;
-    let partitioning = Partitioning::partition_id(0);
     for batch in batches.iter_mut() {
         // A retry of this batch sends the same producer and sequence.
         client
-            .send_producer_messages(stream, topic, &partitioning, producer, batch)
+            .send_producer_messages(stream, topic, 0, producer, batch)
             .await?;
         let count = u32::try_from(batch.len()).map_err(|_| IggyError::InvalidCommand)?;
-        producer.base_sequence = BatchProducer::advance(producer.base_sequence, count);
+        producer = producer.next(count);
     }
     Ok(())
 }
 ```
 
-`IggyProducer` has an idempotent mode, which `idempotent()` on its builder turns on. The producer then gets its id from `next_producer_id`, picks the partition of each chunk itself and numbers the chunks of each partition. After an unknown outcome, it sends a chunk again with the same producer section. The mode is off by default, because released consumers cannot poll the batches that it writes.
+`IggyProducer` has an idempotent mode, which `idempotent()` on its builder turns on. The producer then gets its id from `next_producer_id`, picks the partition of each chunk as a plain send does and numbers the chunks of each partition. After an unknown outcome, it sends a chunk again with the same producer section. The mode is off by default, because released consumers cannot poll the batches that it writes.
 
-A partition keeps 4096 producers. Past that limit, it drops the producer that was idle the longest. It also drops a producer after 24 hours without a batch. The producer state stays through restarts, checkpoints and state transfer between replicas. HTTP clients get `FeatureUnavailable` from `next_producer_id` and `send_producer_messages`.
+A partition keeps 4096 producers. Past that limit, it drops the producer that was idle the longest. It also drops a producer after 24 hours without a batch. The producer state stays through restarts, checkpoints and state transfer between replicas. HTTP clients get `FeatureUnavailable` from `next_producer_id` and `send_producer_messages`. A client with an encryptor encrypts the messages of `send_producer_messages` in place, so pass the plaintext messages again to resend a batch.
 
-Rust and Swift SDKs released before this version refuse a binary poll that returns a batch with a producer. They require zero bytes in that part of the header. Upgrade the SDK of every binary consumer before a producer writes such batches to a topic.
+Released builds of the Rust SDK refuse a binary poll that returns a batch with a producer. They require zero bytes in that part of the header. The same holds for every client that embeds the Rust SDK: the Python, C++ and PHP SDKs, the CLI, the Kafka gateway and the connectors runtime. Released Swift SDKs refuse the batch too. The Go, Java, C# and Node.js SDKs do not read that part of the header. Upgrade every consumer of a topic before a producer writes such batches to it.
 
 ## Metadata changes
 

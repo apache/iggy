@@ -24,9 +24,9 @@ use crate::websocket::websocket_client::WebSocketClient;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
     AssignmentVersion, BinaryClient, BinaryOperationLineage, BinarySendPartitioning,
-    BinaryTransport, ClientState, Identifier, IggyError, IggyMessage, MessageClient,
-    SendMessagesResponse, SystemClient, group_cache_key, send_binary_messages,
-    sync_group_assignment,
+    BinaryTransport, ClientState, Identifier, IggyError, IggyMessage, MessageClient, Partitioning,
+    SendMessagesResponse, SystemClient, group_cache_key, select_send_partition,
+    send_binary_messages, sync_group_assignment,
 };
 
 #[allow(clippy::large_enum_variant)]
@@ -67,24 +67,14 @@ impl ClientWrapper {
                 ))
                 .await
             }
-            Self::Http(client) => match partitioning.producer() {
-                Some(producer) => {
-                    client
-                        .send_producer_messages(
-                            stream,
-                            topic,
-                            partitioning.original(),
-                            producer,
-                            messages,
-                        )
-                        .await
-                }
-                None => {
-                    client
-                        .send_messages(stream, topic, partitioning.original(), messages)
-                        .await
-                }
-            },
+            Self::Http(_) if partitioning.producer().is_some() => {
+                Err(IggyError::FeatureUnavailable)
+            }
+            Self::Http(client) => {
+                client
+                    .send_messages(stream, topic, partitioning.original(), messages)
+                    .await
+            }
             Self::Tcp(client) => {
                 send_binary_messages(client, stream, topic, partitioning, messages).await
             }
@@ -93,6 +83,38 @@ impl ClientWrapper {
             }
             Self::WebSocket(client) => {
                 send_binary_messages(client, stream, topic, partitioning, messages).await
+            }
+        }
+    }
+
+    /// The partition that a send with `partitioning` goes to. See
+    /// [`select_send_partition`].
+    pub(crate) async fn select_send_partition(
+        &self,
+        stream: &Identifier,
+        topic: &Identifier,
+        partitioning: &Partitioning,
+        fresh: bool,
+    ) -> Result<u32, IggyError> {
+        match self {
+            Self::Iggy(client) => {
+                Box::pin(client.client.read().await.select_send_partition(
+                    stream,
+                    topic,
+                    partitioning,
+                    fresh,
+                ))
+                .await
+            }
+            Self::Http(_) => Err(IggyError::FeatureUnavailable),
+            Self::Tcp(client) => {
+                select_send_partition(client, stream, topic, partitioning, fresh).await
+            }
+            Self::Quic(client) => {
+                select_send_partition(client, stream, topic, partitioning, fresh).await
+            }
+            Self::WebSocket(client) => {
+                select_send_partition(client, stream, topic, partitioning, fresh).await
             }
         }
     }

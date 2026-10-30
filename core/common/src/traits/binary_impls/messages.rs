@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::BinaryClient;
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::{
     consumer_to_wire, identifier_to_wire, partitioning_to_wire, polling_strategy_to_wire,
@@ -24,6 +23,7 @@ use crate::{
     BatchProducer, Consumer, Identifier, IggyError, IggyMessage, MessageClient, Partitioning,
     PolledMessages, PollingStrategy, SendMessagesResponse,
 };
+use crate::{BinaryClient, VsrSessionControl};
 use crate::{
     ConsumerKind, PartitioningKind, TopicClient, binary_operation_deadline, calculate_32,
     with_binary_deadline, with_binary_lineage,
@@ -166,8 +166,11 @@ impl<'a> BinarySendPartitioning<'a> {
         }
     }
 
+    /// The producer counts its sequence per partition, so `original` must
+    /// name the partition.
     #[must_use]
     pub const fn with_producer(mut self, producer: BatchProducer) -> Self {
+        debug_assert!(matches!(self.original.kind, PartitioningKind::PartitionId));
         self.producer = Some(producer);
         self
     }
@@ -193,11 +196,6 @@ pub async fn send_binary_messages<B: BinaryClient>(
     partitioning: &mut BinarySendPartitioning<'_>,
     messages: &mut [IggyMessage],
 ) -> Result<SendMessagesResponse, IggyError> {
-    if partitioning.producer.is_some()
-        && partitioning.original.kind != PartitioningKind::PartitionId
-    {
-        return Err(IggyError::ProducerPartitionRequired);
-    }
     with_binary_lineage(
         client.operation_lineage(),
         with_binary_deadline(binary_operation_deadline(), async {
@@ -207,13 +205,13 @@ pub async fn send_binary_messages<B: BinaryClient>(
                     PartitioningKind::PartitionId => Cow::Borrowed(partitioning.original),
                     _ => {
                         let count = topic_partition_count(client, stream_id, topic_id).await?;
-                        Cow::Owned(select_partition(
+                        Cow::Owned(Partitioning::partition_id(select_partition(
                             client,
                             stream_id,
                             topic_id,
                             partitioning.original,
                             count,
-                        )?)
+                        )?))
                     }
                 });
             }
@@ -244,13 +242,14 @@ pub async fn send_binary_messages<B: BinaryClient>(
                         partitioning.refreshed = true;
                         let count =
                             fresh_topic_partition_count(client, stream_id, topic_id).await?;
-                        partitioning.selected = Some(Cow::Owned(select_partition(
-                            client,
-                            stream_id,
-                            topic_id,
-                            partitioning.original,
-                            count,
-                        )?));
+                        partitioning.selected =
+                            Some(Cow::Owned(Partitioning::partition_id(select_partition(
+                                client,
+                                stream_id,
+                                topic_id,
+                                partitioning.original,
+                                count,
+                            )?)));
                     }
                     result => {
                         return result.map(|response| committed_send_confirmations(&response));
@@ -262,13 +261,40 @@ pub async fn send_binary_messages<B: BinaryClient>(
     .await
 }
 
+/// The partition that a send with `partitioning` goes to, picked as
+/// [`send_binary_messages`] picks it. With `fresh`, the partition count comes
+/// from the topic details instead of a cached route.
+#[doc(hidden)]
+pub async fn select_send_partition<B: BinaryClient>(
+    client: &B,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    partitioning: &Partitioning,
+    fresh: bool,
+) -> Result<u32, IggyError> {
+    if partitioning.kind == PartitioningKind::PartitionId {
+        return partitioning
+            .value
+            .get(..4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_le_bytes)
+            .ok_or(IggyError::InvalidCommand);
+    }
+    let count = if fresh {
+        fresh_topic_partition_count(client, stream_id, topic_id).await?
+    } else {
+        topic_partition_count(client, stream_id, topic_id).await?
+    };
+    select_partition(client, stream_id, topic_id, partitioning, count)
+}
+
 fn select_partition<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,
     topic_id: &Identifier,
     partitioning: &Partitioning,
     count: u32,
-) -> Result<Partitioning, IggyError> {
+) -> Result<u32, IggyError> {
     if count == 0 {
         return Err(IggyError::TopicIdNotFound(
             topic_id.clone(),
@@ -282,7 +308,7 @@ fn select_partition<B: BinaryClient>(
         PartitioningKind::MessagesKey => calculate_32(&partitioning.value) % count,
         PartitioningKind::PartitionId => return Err(IggyError::InvalidCommand),
     };
-    Ok(Partitioning::partition_id(partition))
+    Ok(partition)
 }
 
 /// Poll a consumer group: select one of the member's assigned partitions
@@ -590,7 +616,7 @@ impl<B: BinaryClient> MessageClient for B {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partitioning: &Partitioning,
+        partition_id: u32,
         producer: BatchProducer,
         messages: &mut [IggyMessage],
     ) -> Result<SendMessagesResponse, IggyError> {
@@ -598,14 +624,15 @@ impl<B: BinaryClient> MessageClient for B {
             self,
             stream_id,
             topic_id,
-            &mut BinarySendPartitioning::new(partitioning).with_producer(producer),
+            &mut BinarySendPartitioning::new(&Partitioning::partition_id(partition_id))
+                .with_producer(producer),
             messages,
         )
         .await
     }
 
     async fn next_producer_id(&self) -> Result<u64, IggyError> {
-        self.allocate_producer_id()
+        VsrSessionControl::next_producer_id(self)
     }
 }
 

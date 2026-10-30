@@ -79,6 +79,10 @@ impl TestGateway {
             .env("IGGY_KAFKA_IGGY_ADDR", &config.address)
             .env("IGGY_KAFKA_IGGY_USERNAME", &config.username)
             .env(
+                "IGGY_KAFKA_IDEMPOTENT_PRODUCERS",
+                config.idempotent_producers.to_string(),
+            )
+            .env(
                 "IGGY_KAFKA_IGGY_PASSWORD",
                 secrecy::ExposeSecret::expose_secret(&config.password),
             );

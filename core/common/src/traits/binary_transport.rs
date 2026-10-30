@@ -365,7 +365,7 @@ pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
     /// The next producer id of this client's session. See
     /// [`crate::MessageClient::next_producer_id`].
     #[doc(hidden)]
-    fn allocate_producer_id(&self) -> Result<u64, IggyError> {
+    fn next_producer_id(&self) -> Result<u64, IggyError> {
         Err(IggyError::FeatureUnavailable)
     }
 }
@@ -778,33 +778,6 @@ mod tests {
                 )]
             );
         }
-    }
-
-    #[tokio::test]
-    async fn given_a_producer_batch_without_a_partition_when_sent_should_fail_before_sending() {
-        let transport = Recorder::default();
-        let producer = crate::BatchProducer::new(1, 0, 0).unwrap();
-        for partitioning in [
-            crate::Partitioning::balanced(),
-            crate::Partitioning::messages_key_str("key").unwrap(),
-        ] {
-            let mut messages = [crate::IggyMessage::builder()
-                .payload(Bytes::from_static(b"x"))
-                .build()
-                .unwrap()];
-            let result = transport
-                .send_producer_messages(
-                    &crate::Identifier::numeric(STREAM).unwrap(),
-                    &crate::Identifier::named(TOPIC).unwrap(),
-                    &partitioning,
-                    producer,
-                    &mut messages,
-                )
-                .await;
-
-            assert_eq!(result, Err(IggyError::ProducerPartitionRequired));
-        }
-        assert!(transport.take_calls().is_empty());
     }
 
     #[tokio::test]

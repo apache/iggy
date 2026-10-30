@@ -363,6 +363,13 @@ impl IggyBridge {
         self.config.max_message_size.saturating_sub(SEND_FRAME_ROOM)
     }
 
+    /// Whether a batch of an idempotent Kafka producer carries its producer to Iggy. See
+    /// [`IggyBridgeConfig::idempotent_producers`](crate::bridge::IggyBridgeConfig::idempotent_producers).
+    #[must_use]
+    pub const fn writes_producers(&self) -> bool {
+        self.config.idempotent_producers
+    }
+
     /// The turn of `producer` on its session. `None` if it does not free by `deadline`: an
     /// earlier request of the producer, or a send that outlived one, still holds it.
     ///
@@ -455,7 +462,7 @@ impl IggyBridge {
                                     .send_producer_messages(
                                         &stream_id,
                                         &topic_id,
-                                        &partitioning,
+                                        partition,
                                         producer,
                                         &mut messages,
                                     )

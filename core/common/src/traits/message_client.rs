@@ -238,21 +238,26 @@ pub trait MessageClient {
         messages: &mut [IggyMessage],
     ) -> Result<SendMessagesResponse, IggyError>;
 
-    /// [`Self::send_messages`] for one batch of an idempotent producer.
+    /// [`Self::send_messages`] for one batch of an idempotent producer, to
+    /// the partition `partition_id`. The producer counts its sequence per
+    /// partition, so the caller names the partition.
     ///
     /// The partition keeps the last batches of each producer. A batch it
     /// already holds is not written again: the reply names the offset of its
     /// first write. Only binary clients send a producer, and HTTP returns
     /// [`IggyError::FeatureUnavailable`].
+    ///
+    /// A client with an encryptor encrypts `messages` in place. To resend a
+    /// batch, pass its plaintext messages again.
     async fn send_producer_messages(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partitioning: &Partitioning,
+        partition_id: u32,
         producer: BatchProducer,
         messages: &mut [IggyMessage],
     ) -> Result<SendMessagesResponse, IggyError> {
-        let _ = (stream_id, topic_id, partitioning, producer, messages);
+        let _ = (stream_id, topic_id, partition_id, producer, messages);
         Err(IggyError::FeatureUnavailable)
     }
 

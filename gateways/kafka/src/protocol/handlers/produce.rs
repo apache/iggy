@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use iggy::prelude::{BatchProducer, IggyError, IggyMessage, Sizeable};
+use iggy::prelude::{BatchProducer, IggyError, Sizeable};
 use kafka_protocol::messages::produce_request::PartitionProduceData;
 use kafka_protocol::messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
 use kafka_protocol::messages::{ProduceRequest, ProduceResponse};
@@ -375,6 +375,7 @@ async fn write_request(
     deadline: Deadline,
 ) -> Vec<TopicProduceResponse> {
     let max_send = bridge.max_send_bytes();
+    let writes_producers = bridge.writes_producers();
     let mut held = Some(held);
     let mut topics = Vec::with_capacity(request.topic_data.len());
     for topic in &request.topic_data {
@@ -386,9 +387,12 @@ async fn write_request(
             let (outcome, kept) = match (&target, held.take()) {
                 (Ok(target), Some(kept)) if !deadline.passed() => {
                     match plan(&budget, zstd, name, partition, max_send) {
-                        Ok(planned) => {
+                        Ok(mut batch) => {
+                            if !writes_producers {
+                                batch.producer = None;
+                            }
                             let (sent, kept) =
-                                send_by(bridge, kept, target, name, planned, deadline).await;
+                                send_by(bridge, kept, target, name, batch, deadline).await;
                             (sent.map_err(Refusal::from), kept)
                         }
                         Err(refusal) => (Err(refusal), Some(kept)),
@@ -425,7 +429,7 @@ fn plan(
     kafka_topic: &str,
     partition: &PartitionProduceData,
     max_send: u64,
-) -> std::result::Result<Planned, Refusal> {
+) -> std::result::Result<PartitionBatch, Refusal> {
     let run = || plan_partition(budget, zstd, kafka_topic, partition, max_send);
     // A spent budget refuses before it reads a byte, so there is nothing to move off the worker.
     let heavy = !budget.is_spent()
@@ -462,15 +466,6 @@ fn partition_outcome(
     }
 }
 
-/// One partition's messages, ready for one Iggy send.
-#[derive(Debug)]
-struct Planned {
-    partition_id: u32,
-    messages: Vec<IggyMessage>,
-    /// The Kafka producer of an idempotent batch.
-    producer: Option<BatchProducer>,
-}
-
 /// One partition's batch in, its messages out. A batch that cannot be mapped is refused whole,
 /// never half-stored.
 fn plan_partition(
@@ -479,7 +474,7 @@ fn plan_partition(
     kafka_topic: &str,
     partition: &PartitionProduceData,
     max_send: u64,
-) -> std::result::Result<Planned, Refusal> {
+) -> std::result::Result<PartitionBatch, Refusal> {
     // The records are not what is wrong with a negative index, so not `INVALID_RECORD`.
     let Ok(partition_id) = u32::try_from(partition.index) else {
         return Err(ERROR_UNKNOWN_TOPIC_OR_PARTITION.into());
@@ -533,10 +528,10 @@ fn plan_partition(
         );
         return Err(ERROR_MESSAGE_TOO_LARGE.into());
     }
-    Ok(Planned {
-        partition_id,
-        messages,
+    Ok(PartitionBatch {
+        partition: partition_id,
         producer,
+        messages,
     })
 }
 
@@ -563,19 +558,10 @@ async fn send_by(
     (turn, admission): Held,
     target: &TopicTarget,
     kafka_topic: &str,
-    planned: Planned,
+    batch: PartitionBatch,
     deadline: Deadline,
 ) -> (std::result::Result<Option<u64>, i16>, Option<Held>) {
-    let Planned {
-        partition_id,
-        messages,
-        producer,
-    } = planned;
-    let batch = PartitionBatch {
-        partition: partition_id,
-        producer,
-        messages,
-    };
+    let partition_id = batch.partition;
     let (sent, held) = bridge
         .send_records(turn, admission, target, batch, deadline.at)
         .await;
@@ -737,6 +723,7 @@ fn partition_response(index: i32, error_code: i16) -> PartitionProduceResponse {
 mod tests {
     use super::*;
     use bytes::BytesMut;
+    use iggy::prelude::IggyMessage;
     use kafka_protocol::indexmap::IndexMap;
     use kafka_protocol::messages::TopicName;
     use kafka_protocol::messages::produce_request::TopicProduceData;
@@ -800,7 +787,7 @@ mod tests {
         entry: &PartitionProduceData,
     ) -> std::result::Result<(u32, Vec<IggyMessage>), i16> {
         plan_partition(budget, zstd, TOPIC, entry, u64::MAX)
-            .map(|planned| (planned.partition_id, planned.messages))
+            .map(|batch| (batch.partition, batch.messages))
             .map_err(|refusal| refusal.code)
     }
 

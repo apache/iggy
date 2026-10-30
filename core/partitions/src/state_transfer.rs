@@ -77,6 +77,9 @@ pub(crate) const CONSUMER_OFFSETS_MAGIC: [u8; 4] = *b"ICO1";
 /// Version 8 carries the op of the delete that emptied the offset table.
 /// Version 9 carries the producer table of idempotent producers.
 pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 9;
+/// The oldest version that [`ConsumerOffsetsWire::decode`] reads. Version 8
+/// builds kept no producers, so its artifact reads as an empty producer table.
+const CONSUMER_OFFSETS_VERSION_MIN: u8 = 8;
 pub(crate) const SEGMENT_SWEEP_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 const RETRY_CHECKPOINT_MAGIC: [u8; 4] = *b"IRP2";
@@ -463,8 +466,8 @@ impl ConsumerOffsetsWire {
             out.extend_from_slice(&entry.epoch.to_le_bytes());
             out.extend_from_slice(&entry.last_timestamp.to_le_bytes());
             #[allow(clippy::cast_possible_truncation)]
-            out.push(entry.batches.len() as u8);
-            for batch in &entry.batches {
+            out.push(entry.batches().len() as u8);
+            for batch in entry.batches() {
                 out.extend_from_slice(&batch.first_sequence.to_le_bytes());
                 out.extend_from_slice(&batch.last_sequence.to_le_bytes());
                 out.extend_from_slice(&batch.base_offset.to_le_bytes());
@@ -502,7 +505,7 @@ impl ConsumerOffsetsWire {
         if magic != CONSUMER_OFFSETS_MAGIC {
             return Err(ConsumerOffsetsWireError::BadMagic);
         }
-        if version != CONSUMER_OFFSETS_VERSION {
+        if !(CONSUMER_OFFSETS_VERSION_MIN..=CONSUMER_OFFSETS_VERSION).contains(&version) {
             return Err(ConsumerOffsetsWireError::UnsupportedVersion { version });
         }
         let next_offset = cursor.u64()?;
@@ -561,7 +564,11 @@ impl ConsumerOffsetsWire {
             return Err(ConsumerOffsetsWireError::InvalidPrepareChecksum);
         }
         let checkpoint_prepare = cursor.take(prepare_length)?.to_vec();
-        let producers = Self::decode_producer_section(&mut cursor)?;
+        let producers = if version == CONSUMER_OFFSETS_VERSION_MIN {
+            Vec::new()
+        } else {
+            Self::decode_producer_section(&mut cursor)?
+        };
         if !cursor.remaining().is_empty() {
             // Distinct from `Truncated`: extra bytes point at a NEWER
             // encoder, and telling the operator the artifact is short would
@@ -625,9 +632,9 @@ impl ConsumerOffsetsWire {
                 return Err(ConsumerOffsetsWireError::InvalidProducer);
             }
             previous = Some(producer_id);
-            let mut batches = std::collections::VecDeque::with_capacity(batch_count);
-            for _ in 0..batch_count {
-                let batch = ProducerBatch {
+            let mut batches = [ProducerBatch::default(); PRODUCER_BATCHES_RETAINED];
+            for batch in &mut batches[..batch_count] {
+                *batch = ProducerBatch {
                     first_sequence: cursor.u32()?,
                     last_sequence: cursor.u32()?,
                     base_offset: cursor.u64()?,
@@ -637,16 +644,10 @@ impl ConsumerOffsetsWire {
                 {
                     return Err(ConsumerOffsetsWireError::InvalidProducer);
                 }
-                batches.push_back(batch);
             }
-            producers.push((
-                producer_id,
-                ProducerEntry {
-                    epoch,
-                    batches,
-                    last_timestamp,
-                },
-            ));
+            let entry = ProducerEntry::restored(epoch, last_timestamp, &batches[..batch_count])
+                .ok_or(ConsumerOffsetsWireError::InvalidProducer)?;
+            producers.push((producer_id, entry));
         }
         Ok(producers)
     }
@@ -693,7 +694,7 @@ impl ConsumerOffsetsWire {
                 .producers
                 .iter()
                 .map(|(_, entry)| {
-                    PRODUCER_ENTRY_PREFIX_LEN + entry.batches.len() * PRODUCER_BATCH_LEN
+                    PRODUCER_ENTRY_PREFIX_LEN + entry.batches().len() * PRODUCER_BATCH_LEN
                 })
                 .sum::<usize>()
             + size_of::<u64>()
@@ -968,7 +969,7 @@ impl fmt::Display for ConsumerOffsetsWireError {
             Self::UnsupportedVersion { version } => write!(
                 f,
                 "consumer-offsets artifact version {version} is not understood \
-                 (this build speaks {CONSUMER_OFFSETS_VERSION})"
+                 (this build reads {CONSUMER_OFFSETS_VERSION_MIN} to {CONSUMER_OFFSETS_VERSION})"
             ),
             Self::ChecksumMismatch { expected, actual } => write!(
                 f,
@@ -1113,22 +1114,19 @@ mod tests {
     /// A producer entry with `(first_sequence, last_sequence, base_offset)`
     /// batches, oldest first.
     fn producer_entry(producer_id: u64, batches: &[(u32, u32, u64)]) -> (u64, ProducerEntry) {
+        let batches: Vec<ProducerBatch> = batches
+            .iter()
+            .map(
+                |&(first_sequence, last_sequence, base_offset)| ProducerBatch {
+                    first_sequence,
+                    last_sequence,
+                    base_offset,
+                },
+            )
+            .collect();
         (
             producer_id,
-            ProducerEntry {
-                epoch: 3,
-                batches: batches
-                    .iter()
-                    .map(
-                        |&(first_sequence, last_sequence, base_offset)| ProducerBatch {
-                            first_sequence,
-                            last_sequence,
-                            base_offset,
-                        },
-                    )
-                    .collect(),
-                last_timestamp: 1_000,
-            },
+            ProducerEntry::restored(3, 1_000, &batches).expect("at most the retained batches"),
         )
     }
 
@@ -1154,10 +1152,6 @@ mod tests {
             vec![producer_entry(2, &one), producer_entry(2, &one)],
             vec![producer_entry(3, &one), producer_entry(2, &one)],
             vec![producer_entry(1, &[])],
-            vec![producer_entry(
-                1,
-                &[(0, 0, 1); PRODUCER_BATCHES_RETAINED + 1],
-            )],
             vec![producer_entry(BatchProducer::PRODUCER_ID_MAX + 1, &one)],
             vec![epoch_over_max],
             vec![producer_entry(
@@ -1181,13 +1175,25 @@ mod tests {
             producers: vec![producer_entry(1, &[(0, 0, 1); PRODUCER_BATCHES_RETAINED])],
             ..table()
         };
-        assert!(ConsumerOffsetsWire::decode(&full.encode()).is_ok());
+        let mut encoded = full.encode();
+        assert!(ConsumerOffsetsWire::decode(&encoded).is_ok());
+
+        // An entry cannot hold one batch more, so the count is set on the wire.
+        let content_len = encoded.len() - size_of::<u64>();
+        let batch_count_at = content_len - PRODUCER_BATCHES_RETAINED * PRODUCER_BATCH_LEN - 1;
+        encoded[batch_count_at] += 1;
+        let trailer = state_artifact_checksum(&encoded[..content_len]);
+        encoded[content_len..].copy_from_slice(&trailer.to_le_bytes());
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&encoded),
+            Err(ConsumerOffsetsWireError::InvalidProducer)
+        );
     }
 
-    /// Version 8 ended at the checkpoint prepare. Read as version 9, its
-    /// trailer would land in the producer count.
+    /// Version 8 ended at the checkpoint prepare, and its builds kept no
+    /// producers.
     #[test]
-    fn given_version_8_offsets_artifact_when_decoded_should_reject_it() {
+    fn given_version_8_offsets_artifact_when_decoded_should_read_no_producers() {
         const RELEASED_VERSION: u8 = 8;
         let encoded = table().encode();
         let content_end = encoded.len() - size_of::<u64>() - size_of::<u32>();
@@ -1196,12 +1202,7 @@ mod tests {
         let trailer = state_artifact_checksum(&released);
         released.extend_from_slice(&trailer.to_le_bytes());
 
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&released),
-            Err(ConsumerOffsetsWireError::UnsupportedVersion {
-                version: RELEASED_VERSION
-            })
-        );
+        assert_eq!(ConsumerOffsetsWire::decode(&released), Ok(table()));
     }
 
     fn dedup_entry(client: u128, watermark: u64, latest_commit: u64) -> DedupWatermark {
@@ -1452,7 +1453,10 @@ mod tests {
 
     #[test]
     fn given_unknown_version_when_decoded_should_reject() {
-        for version in [CONSUMER_OFFSETS_VERSION - 1, CONSUMER_OFFSETS_VERSION + 1] {
+        for version in [
+            CONSUMER_OFFSETS_VERSION_MIN - 1,
+            CONSUMER_OFFSETS_VERSION + 1,
+        ] {
             let mut wrong = table().encode();
             wrong[CONSUMER_OFFSETS_MAGIC.len()] = version;
             let content_len = wrong.len() - size_of::<u64>();

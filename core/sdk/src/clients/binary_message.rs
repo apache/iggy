@@ -150,14 +150,15 @@ impl MessageClient for IggyClient {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partitioning: &Partitioning,
+        partition_id: u32,
         producer: BatchProducer,
         messages: &mut [IggyMessage],
     ) -> Result<SendMessagesResponse, IggyError> {
         self.send_messages_with_partitioning(
             stream_id,
             topic_id,
-            &mut BinarySendPartitioning::new(partitioning).with_producer(producer),
+            &mut BinarySendPartitioning::new(&Partitioning::partition_id(partition_id))
+                .with_producer(producer),
             messages,
         )
         .await

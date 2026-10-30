@@ -73,11 +73,12 @@ pub const MAX_TIMESTAMP_DELTA_MICROS: u64 = u32::MAX as u64;
 ///
 /// Each field stays in the non-negative range of a signed integer of its
 /// width, so SDKs in languages without unsigned integers read it as is.
+/// [`Self::new`] enforces those limits, so the fields are private.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BatchProducer {
-    pub producer_id: u64,
-    pub epoch: u16,
-    pub base_sequence: u32,
+    producer_id: u64,
+    epoch: u16,
+    base_sequence: u32,
 }
 
 impl BatchProducer {
@@ -100,6 +101,31 @@ impl BatchProducer {
             epoch,
             base_sequence,
         })
+    }
+
+    #[must_use]
+    pub const fn producer_id(&self) -> u64 {
+        self.producer_id
+    }
+
+    #[must_use]
+    pub const fn epoch(&self) -> u16 {
+        self.epoch
+    }
+
+    #[must_use]
+    pub const fn base_sequence(&self) -> u32 {
+        self.base_sequence
+    }
+
+    /// The producer of the batch after this one, when this one holds `count`
+    /// messages.
+    #[must_use]
+    pub const fn next(&self, count: u32) -> Self {
+        Self {
+            base_sequence: Self::advance(self.base_sequence, count),
+            ..*self
+        }
     }
 
     /// The sequence number of the last message of a batch of `count`

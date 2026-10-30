@@ -273,7 +273,7 @@ async fn given_an_idempotent_producer_when_its_chunk_comes_again_should_answer_t
     let id = written
         .first()
         .expect("a batch with a producer")
-        .producer_id;
+        .producer_id();
     let numbered = |base_sequence| BatchProducer::new(id, 0, base_sequence).unwrap();
     assert_eq!(written, [numbered(0), numbered(1)]);
     assert_eq!(
@@ -373,7 +373,7 @@ async fn try_send_messages(
                 .send_producer_messages(
                     &stream_id(),
                     &topic_id(),
-                    &partitioning,
+                    PARTITION_ID,
                     producer,
                     &mut messages,
                 )

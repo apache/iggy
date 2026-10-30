@@ -204,8 +204,9 @@ builds one, so the answer does not depend on allocating a payload already known 
 ## Batch-level fields
 
 Per-record storage drops the transactional flag, the compression and the batch CRC of the Kafka
-record batch header. The producer id, the epoch and the base sequence of an idempotent batch go
-to the Iggy batch header, and the partition keeps them as producer state. Fetch synthesizes a
+record batch header. With `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, the producer id, the epoch and
+the base sequence of an idempotent batch go to the Iggy batch header, and the partition keeps them
+as producer state. Otherwise the gateway drops them. Fetch synthesizes a
 batch with producer id `-1`, epoch `-1`, base sequence `-1`, no compression, `CreateTime`
 timestamps, and a recomputed CRC32C.
 

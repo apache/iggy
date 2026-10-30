@@ -21,17 +21,18 @@
 //! and the sequence of its first message. A partition writes a batch of one producer once, so a
 //! batch sent again after a lost reply or a crash lands once.
 //!
-//! The runtime keeps the producer in the source's state, around the plugin's own bytes, and
-//! stores the range of a batch before it sends the batch. After a restart, the plugin produces
-//! that batch again from its saved state. A batch with the same message count goes with the
-//! stored range and the old epoch, so the partition answers it with its first offset. New batches
-//! use the next epoch, which fences an older copy of the runtime.
+//! The runtime keeps the producer in the source's state, around the plugin's own bytes. The record
+//! names the epoch and the sequence of the next batch, and the save after a batch moves the
+//! sequence past it. After a NACK or a restart, the plugin produces the unsaved batch again from
+//! its saved state, and the batch goes with the same section, so the partition answers it with its
+//! first offset. A new record or a new epoch is saved before its first batch goes. The save after
+//! the first batch of a restarted source moves to the next epoch, which fences an older copy of the
+//! runtime.
 
 use std::time::Instant;
 
 use iggy::prelude::{
     BatchProducer, Client, Identifier, IggyClient, IggyError, IggyMessage, MessageClient,
-    Partitioning,
 };
 use iggy_common::BINARY_OPERATION_TIMEOUT;
 use iggy_connector_sdk::{ConnectorState, Error as SdkError};
@@ -44,7 +45,7 @@ use crate::state::StateStorage;
 const MAGIC: [u8; 8] = *b"\0IGGYEO\x01";
 
 /// Magic, the record, and the plugin flag, before the plugin's bytes.
-const HEADER_SIZE: usize = MAGIC.len() + 8 + 2 + 4 + 4 + 1 + 8 + 2 + 4 + 4 + 1;
+const HEADER_SIZE: usize = MAGIC.len() + 8 + 2 + 4 + 4 + 1;
 
 /// Sends of one batch after an unknown outcome or a lost producer, before the batch fails.
 const RESENDS: usize = 3;
@@ -61,22 +62,11 @@ pub(crate) struct ExactlyOnceTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProducerRecord {
     pub producer_id: u64,
-    /// The epoch of new batches.
     pub epoch: u16,
     /// The partition that `next_sequence` counts for.
     pub partition_id: u32,
+    /// The first sequence of the next batch. A batch that no save settled goes again with it.
     pub next_sequence: u32,
-    /// The batch stored before its send, which no later save settled.
-    pub in_flight: Option<InFlight>,
-}
-
-/// The producer section of one batch, and its message count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct InFlight {
-    pub producer_id: u64,
-    pub epoch: u16,
-    pub base_sequence: u32,
-    pub count: u32,
 }
 
 /// A stored state, split into the plugin's bytes and the producer record.
@@ -107,17 +97,15 @@ impl StoredState {
             bytes,
             at: MAGIC.len(),
         };
-        let producer_id = reader.u64();
-        let epoch = reader.u16();
-        let partition_id = reader.u32();
-        let next_sequence = reader.u32();
-        let has_in_flight = reader.flag()?;
-        let in_flight = InFlight {
+        let record = ProducerRecord {
             producer_id: reader.u64(),
             epoch: reader.u16(),
-            base_sequence: reader.u32(),
-            count: reader.u32(),
+            partition_id: reader.u32(),
+            next_sequence: reader.u32(),
         };
+        if record.producer().is_err() {
+            return Err(SdkError::InvalidState);
+        }
         let has_plugin = reader.flag()?;
         let rest = &bytes[HEADER_SIZE..];
         if !has_plugin && !rest.is_empty() {
@@ -125,36 +113,19 @@ impl StoredState {
         }
         Ok(Self {
             plugin: has_plugin.then(|| ConnectorState(rest.to_vec())),
-            record: Some(ProducerRecord {
-                producer_id,
-                epoch,
-                partition_id,
-                next_sequence,
-                in_flight: has_in_flight.then_some(in_flight),
-            }),
+            record: Some(record),
         })
     }
 }
 
 /// The state that an exactly-once source saves: the record, then the plugin's bytes.
 pub(crate) fn encode(record: &ProducerRecord, plugin: Option<&[u8]>) -> ConnectorState {
-    let in_flight = record.in_flight.unwrap_or(InFlight {
-        producer_id: 0,
-        epoch: 0,
-        base_sequence: 0,
-        count: 0,
-    });
     let mut bytes = Vec::with_capacity(HEADER_SIZE + plugin.map_or(0, <[u8]>::len));
     bytes.extend_from_slice(&MAGIC);
     bytes.extend_from_slice(&record.producer_id.to_le_bytes());
     bytes.extend_from_slice(&record.epoch.to_le_bytes());
     bytes.extend_from_slice(&record.partition_id.to_le_bytes());
     bytes.extend_from_slice(&record.next_sequence.to_le_bytes());
-    bytes.push(u8::from(record.in_flight.is_some()));
-    bytes.extend_from_slice(&in_flight.producer_id.to_le_bytes());
-    bytes.extend_from_slice(&in_flight.epoch.to_le_bytes());
-    bytes.extend_from_slice(&in_flight.base_sequence.to_le_bytes());
-    bytes.extend_from_slice(&in_flight.count.to_le_bytes());
     bytes.push(u8::from(plugin.is_some()));
     if let Some(plugin) = plugin {
         bytes.extend_from_slice(plugin);
@@ -170,6 +141,12 @@ pub(crate) fn plugin_state(
 }
 
 impl ProducerRecord {
+    /// The producer section of the next batch.
+    fn producer(&self) -> Result<BatchProducer, IggyError> {
+        BatchProducer::new(self.producer_id, self.epoch, self.next_sequence)
+            .ok_or(IggyError::InvalidCommand)
+    }
+
     /// The record with the next epoch, whose sequences start at 0. `None` after the last epoch.
     fn next_epoch(self) -> Option<Self> {
         let epoch = self
@@ -183,31 +160,10 @@ impl ProducerRecord {
         })
     }
 
-    /// The section of a batch of `count` messages. The batch in flight goes again when the count
-    /// matches, so the partition finds its first write. Any other batch is a new one.
-    fn batch(&self, count: u32) -> InFlight {
-        match self.in_flight {
-            Some(in_flight) if in_flight.count == count => in_flight,
-            _ => InFlight {
-                producer_id: self.producer_id,
-                epoch: self.epoch,
-                base_sequence: self.next_sequence,
-                count,
-            },
-        }
-    }
-
-    /// The record after `batch` was written. A batch of an older epoch leaves the sequences of
-    /// the current one alone.
-    fn settled(self, batch: InFlight) -> Self {
-        let next_sequence = if batch.producer_id == self.producer_id && batch.epoch == self.epoch {
-            BatchProducer::advance(batch.base_sequence, batch.count)
-        } else {
-            self.next_sequence
-        };
+    /// The record after `producer` wrote a batch of `count` messages.
+    fn settled(self, producer: BatchProducer, count: u32) -> Self {
         Self {
-            next_sequence,
-            in_flight: None,
+            next_sequence: producer.next(count).base_sequence(),
             ..self
         }
     }
@@ -220,10 +176,13 @@ pub(crate) struct ExactlyOnce {
     target: ExactlyOnceTarget,
     /// Read from the state at the first batch of this run.
     record: Option<ProducerRecord>,
-    /// The plugin's bytes of the last save. A save before a send keeps them.
+    /// The plugin's bytes of the last save. A save of a new record keeps them.
     plugin: Option<Vec<u8>>,
-    /// The batch that went out, until a save settles it.
-    sent: Option<InFlight>,
+    /// The batch that went out and its message count, until a save settles it.
+    sent: Option<(BatchProducer, u32)>,
+    /// An earlier run wrote with the record, so the save after the first batch of this run moves
+    /// to the next epoch.
+    fence: bool,
 }
 
 impl ExactlyOnce {
@@ -234,12 +193,13 @@ impl ExactlyOnce {
             record: None,
             plugin: None,
             sent: None,
+            fence: false,
         }
     }
 
-    /// Sends `messages` as one batch with the producer section of the source. The state names the
-    /// batch before it goes, so a batch that a crash or a lost reply leaves in doubt goes again
-    /// with the same section.
+    /// Sends `messages` as one batch with the producer section of the source. A batch that a crash
+    /// or a lost reply leaves in doubt goes again with the same section, because no save moved the
+    /// record past it.
     pub(crate) async fn send(
         &mut self,
         client: &IggyClient,
@@ -251,36 +211,22 @@ impl ExactlyOnce {
         }
         let count = u32::try_from(messages.len()).map_err(|_| IggyError::InvalidMessagesCount)?;
         let mut record = self.record(client, storage).await?;
-        let mut batch = record.batch(count);
-        if let Some(stored) = record.in_flight
-            && stored != batch
-        {
-            warn!(
-                "Exactly-once source {} stored a batch of {} messages, but its plugin produced {count}. The stored batch can land twice.",
-                self.key, stored.count
-            );
-        }
-        record.in_flight = Some(batch);
-        self.store(storage, &record).await?;
-
-        let partitioning = Partitioning::partition_id(self.target.partition_id);
+        let mut producer = record.producer()?;
         let mut attempts = 0;
         loop {
             attempts += 1;
-            let producer = BatchProducer::new(batch.producer_id, batch.epoch, batch.base_sequence)
-                .ok_or(IggyError::InvalidCommand)?;
             match client
                 .send_producer_messages(
                     &self.target.stream,
                     &self.target.topic,
-                    &partitioning,
+                    self.target.partition_id,
                     producer,
                     messages,
                 )
                 .await
             {
                 Ok(_) => {
-                    self.sent = Some(batch);
+                    self.sent = Some((producer, count));
                     return Ok(());
                 }
                 // The same section makes a resend safe, whether or not the first one landed.
@@ -313,13 +259,10 @@ impl ExactlyOnce {
                         "Exactly-once source {} moves to a new epoch: {error}",
                         self.key
                     );
-                    record = ProducerRecord {
-                        in_flight: None,
-                        ..self.next_epoch(client, record).await?
-                    };
-                    batch = record.batch(count);
-                    record.in_flight = Some(batch);
+                    record = self.next_epoch(client, record).await?;
                     self.store(storage, &record).await?;
+                    self.fence = false;
+                    producer = record.producer()?;
                 }
                 Err(error) => return Err(error),
             }
@@ -342,20 +285,45 @@ impl ExactlyOnce {
             Ok(record) => record,
             Err(error) => return Some(Err(SdkError::TransientState(error.to_string()))),
         };
-        // A batch that this run did not send keeps its place in flight, so a replay finds it.
-        let record = sent.map_or(record, |batch| record.settled(batch));
-        let plugin = plugin.map(|state| state.0).or_else(|| self.plugin.clone());
-        let saved = storage.save(encode(&record, plugin.as_deref())).await;
+        let mut record = match sent {
+            Some((producer, count)) => record.settled(producer, count),
+            None => record,
+        };
+        // The first batch of this run went at the epoch of the last run, so a replay found its
+        // first write. Later batches take the next epoch, which fences an older copy.
+        let fences = sent.is_some() && self.fence;
+        if fences {
+            record = match self.next_epoch(client, record).await {
+                Ok(record) => record,
+                Err(error) => return Some(Err(SdkError::TransientState(error.to_string()))),
+            };
+        }
+        let plugin = plugin.map(|state| state.0);
+        let saved = storage
+            .save(encode(
+                &record,
+                plugin.as_deref().or(self.plugin.as_deref()),
+            ))
+            .await;
         if saved.is_ok() {
+            if fences {
+                self.fence = false;
+                info!(
+                    "Exactly-once source {} writes as producer {} at epoch {} to partition {}.",
+                    self.key, record.producer_id, record.epoch, record.partition_id
+                );
+            }
             self.record = Some(record);
-            self.plugin = plugin;
+            if plugin.is_some() {
+                self.plugin = plugin;
+            }
         }
         Some(saved)
     }
 
     /// The record of this run, read from the state at the first batch. A new source gets a new
-    /// producer id. A source that ran before moves to the next epoch, which fences an older copy
-    /// of the runtime, and keeps the batch it had in flight.
+    /// producer id. A source that ran before keeps its record, so the batch that no save settled
+    /// goes again with the same section.
     async fn record(
         &mut self,
         client: &IggyClient,
@@ -376,33 +344,39 @@ impl ExactlyOnce {
                 IggyError::Error
             })?;
         self.plugin = stored.plugin.map(|state| state.0);
-        let mut record = match stored.record {
-            Some(record) => self.next_epoch(client, record).await?,
+        let record = match stored.record {
+            Some(record) if record.partition_id == self.target.partition_id => {
+                self.fence = true;
+                info!(
+                    "Exactly-once source {} resumes as producer {} at epoch {} to partition {}.",
+                    self.key, record.producer_id, record.epoch, record.partition_id
+                );
+                self.record = Some(record);
+                return Ok(record);
+            }
+            Some(record) => {
+                warn!(
+                    "Exactly-once source {} moved from partition {} to {}. Its unsaved batch can land twice.",
+                    self.key, record.partition_id, self.target.partition_id
+                );
+                ProducerRecord {
+                    partition_id: self.target.partition_id,
+                    ..self.next_epoch(client, record).await?
+                }
+            }
             None => ProducerRecord {
                 producer_id: client.next_producer_id().await?,
                 epoch: 0,
                 partition_id: self.target.partition_id,
                 next_sequence: 0,
-                in_flight: None,
             },
         };
-        if record.partition_id != self.target.partition_id {
-            warn!(
-                "Exactly-once source {} moved from partition {} to {}. Its batch in flight can land twice.",
-                self.key, record.partition_id, self.target.partition_id
-            );
-            record = ProducerRecord {
-                partition_id: self.target.partition_id,
-                next_sequence: 0,
-                in_flight: None,
-                ..record
-            };
-        }
+        // A restart must find the producer of a batch that went out before any save settled it.
+        self.store(storage, &record).await?;
         info!(
             "Exactly-once source {} writes as producer {} at epoch {} to partition {}.",
             self.key, record.producer_id, record.epoch, record.partition_id
         );
-        self.record = Some(record);
         Ok(record)
     }
 
@@ -423,7 +397,7 @@ impl ExactlyOnce {
         }
     }
 
-    /// Saves `record` with the plugin's last bytes, before a batch goes out.
+    /// Saves `record` with the plugin's last bytes, before a batch goes out with it.
     async fn store(
         &mut self,
         storage: &StateStorage,
@@ -434,7 +408,7 @@ impl ExactlyOnce {
             .await
             .map_err(|error| {
                 error!(
-                    "Exactly-once source {} could not store its batch before the send: {error}",
+                    "Exactly-once source {} could not store its producer before the send: {error}",
                     self.key
                 );
                 IggyError::Error
@@ -483,37 +457,25 @@ impl Reader<'_> {
 mod tests {
     use super::*;
 
-    fn record(in_flight: Option<InFlight>) -> ProducerRecord {
+    fn record() -> ProducerRecord {
         ProducerRecord {
             producer_id: 7 << 20,
             epoch: 2,
             partition_id: 1,
             next_sequence: 9,
-            in_flight,
-        }
-    }
-
-    fn in_flight(epoch: u16, base_sequence: u32, count: u32) -> InFlight {
-        InFlight {
-            producer_id: 7 << 20,
-            epoch,
-            base_sequence,
-            count,
         }
     }
 
     #[test]
     fn given_a_record_and_plugin_bytes_when_round_tripped_should_split_back() {
         for plugin in [None, Some(&[][..]), Some(&b"\x91\x05"[..])] {
-            for in_flight in [None, Some(in_flight(2, 9, 3))] {
-                let stored = StoredState::split(Some(encode(&record(in_flight), plugin))).unwrap();
+            let stored = StoredState::split(Some(encode(&record(), plugin))).unwrap();
 
-                assert_eq!(stored.record, Some(record(in_flight)));
-                assert_eq!(
-                    stored.plugin.map(|state| state.0),
-                    plugin.map(<[u8]>::to_vec)
-                );
-            }
+            assert_eq!(stored.record, Some(record()));
+            assert_eq!(
+                stored.plugin.map(|state| state.0),
+                plugin.map(<[u8]>::to_vec)
+            );
         }
     }
 
@@ -531,7 +493,7 @@ mod tests {
 
     #[test]
     fn given_a_damaged_record_when_split_should_refuse_it() {
-        let state = encode(&record(None), Some(b"plugin")).0;
+        let state = encode(&record(), Some(b"plugin")).0;
 
         let short = ConnectorState(state[..HEADER_SIZE - 1].to_vec());
         assert!(matches!(
@@ -544,7 +506,15 @@ mod tests {
             StoredState::split(Some(ConnectorState(bad_flag))),
             Err(SdkError::InvalidState)
         ));
-        let no_plugin = encode(&record(None), None).0;
+        let over_max = ProducerRecord {
+            epoch: BatchProducer::EPOCH_MAX + 1,
+            ..record()
+        };
+        assert!(matches!(
+            StoredState::split(Some(encode(&over_max, None))),
+            Err(SdkError::InvalidState)
+        ));
+        let no_plugin = encode(&record(), None).0;
         let mut trailing = no_plugin.clone();
         trailing.push(0);
         assert!(matches!(
@@ -554,38 +524,26 @@ mod tests {
     }
 
     #[test]
-    fn given_a_stored_batch_when_the_count_matches_should_send_it_again() {
-        let stored = in_flight(1, 4, 3);
+    fn given_a_written_batch_when_settled_should_name_the_sequence_after_it() {
+        let producer = record().producer().unwrap();
 
-        assert_eq!(record(Some(stored)).batch(3), stored);
-        assert_eq!(record(Some(stored)).batch(5), in_flight(2, 9, 5));
-        assert_eq!(record(None).batch(3), in_flight(2, 9, 3));
-    }
-
-    #[test]
-    fn given_a_written_batch_when_settled_should_count_only_the_current_epoch() {
         assert_eq!(
-            record(Some(in_flight(2, 9, 3))).settled(in_flight(2, 9, 3)),
+            record().settled(producer, 3),
             ProducerRecord {
                 next_sequence: 12,
-                ..record(None)
+                ..record()
             }
-        );
-        assert_eq!(
-            record(Some(in_flight(1, 4, 3))).settled(in_flight(1, 4, 3)),
-            record(None),
-            "a replay of the old epoch leaves the new one at its sequence"
         );
     }
 
     #[test]
     fn given_the_last_epoch_when_moving_on_should_need_a_new_id() {
-        let next = record(None).next_epoch().unwrap();
+        let next = record().next_epoch().unwrap();
         assert_eq!((next.epoch, next.next_sequence), (3, 0));
 
         let last = ProducerRecord {
             epoch: BatchProducer::EPOCH_MAX,
-            ..record(None)
+            ..record()
         };
         assert_eq!(last.next_epoch(), None);
     }

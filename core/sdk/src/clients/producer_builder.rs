@@ -200,8 +200,9 @@ impl IggyProducerBuilder {
     /// The producer gets its id from [`next_producer_id`] during
     /// [`init()`](IggyProducer::init), so it needs a binary client. It picks the
     /// partition of a chunk itself, and it sends the chunks of one partition one
-    /// at a time. Released Rust and Swift SDKs cannot poll the batches that it
-    /// writes, so upgrade every consumer of the topic first.
+    /// at a time. Released builds of this SDK, of every client that embeds it
+    /// and of the Swift SDK cannot poll the batches that it writes, so upgrade
+    /// every consumer of the topic first. See [`IggyProducer`].
     ///
     /// [`next_producer_id`]: iggy_common::MessageClient::next_producer_id
     pub fn idempotent(self) -> Self {
