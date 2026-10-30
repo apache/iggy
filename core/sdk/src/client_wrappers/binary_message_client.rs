@@ -104,4 +104,8 @@ impl MessageClient for ClientWrapper {
         )
         .await
     }
+
+    async fn next_producer_id(&self) -> Result<u64, IggyError> {
+        super::dispatch_client!(self, MessageClient::next_producer_id()).await
+    }
 }

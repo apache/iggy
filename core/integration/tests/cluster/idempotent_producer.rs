@@ -198,6 +198,41 @@ async fn given_a_checkpointed_producer_table_when_the_node_restarts_should_still
     );
 }
 
+#[iggy_harness(cluster_nodes = 1, server(sharding.cpu_allocation = "0..1"))]
+async fn given_two_clients_and_a_new_sign_in_when_taking_producer_ids_should_never_repeat_one(
+    harness: &mut TestHarness,
+) {
+    let first = connect(harness).await;
+    create_topic(&first).await;
+    let second = connect(harness).await;
+
+    let first_id = first.next_producer_id().await.expect("an id of the first");
+    let second_id = second
+        .next_producer_id()
+        .await
+        .expect("an id of the second");
+    assert_ne!(first_id >> 20, second_id >> 20, "each session owns a range");
+    assert_eq!(first.next_producer_id().await, Ok(first_id + 1));
+
+    first.logout_user().await.expect("sign out");
+    first
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .expect("sign in again");
+    let renewed = first
+        .next_producer_id()
+        .await
+        .expect("an id of the new session");
+    assert!(
+        renewed >> 20 > (first_id >> 20).max(second_id >> 20),
+        "a new session starts a range above every earlier one"
+    );
+
+    let producer = BatchProducer::new(renewed, 0, 0).expect("an id within the field limits");
+    assert_eq!(send(&first, producer, &["a"]).await, Some(0));
+    assert_eq!(send(&second, producer, &["a"]).await, Some(0));
+}
+
 pub(crate) async fn connect(harness: &TestHarness) -> IggyClient {
     harness
         .node(0)
