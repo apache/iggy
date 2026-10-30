@@ -300,15 +300,15 @@ async fn given_ext_auth_when_server_timeout_should_deny_login() {
     );
 }
 
-// ── multi-shard ext-auth (login may land on a non-metadata shard) ─
+// ── multi-shard callout (TCP, verifies peer shards call out) ──────
 
 #[tokio::test]
-async fn given_ext_auth_multi_shard_when_allow_login_should_authorize_on_any_shard() {
+async fn given_ext_auth_multi_shard_when_logins_spread_should_callout_on_every_shard() {
     let ext_server = ExtAuthServer::start().await;
     let mut envs = ext_auth_envs(&ext_server.url());
-    // Two shards: login requests round-robin across shard 0 and shard 1.
-    // Shard 1 has no local consensus and must forward the backup check to
-    // shard 0 before proceeding with the ext-auth callout.
+    // Two shards: TCP connections round-robin, so successive logins
+    // alternate between shard 0 (has consensus) and shard 1 (forwards
+    // the IsMetadataBackup check to shard 0 before calling out).
     envs.insert("IGGY_SHARDING_CPU_ALLOCATION".to_owned(), "2".to_owned());
 
     let mut harness = TestHarness::builder()
@@ -328,9 +328,10 @@ async fn given_ext_auth_multi_shard_when_allow_login_should_authorize_on_any_sha
 
     create_user(&root_client, EXT_AUTH_IGGY_USERNAME).await;
 
-    // Open several connections so at least one lands on shard 1 (TCP
-    // connections are distributed round-robin across shards).
-    for i in 0..4 {
+    // Four logins over round-robin across 2 shards: each shard sees ~2.
+    // Every login must reach the mock, proving peer shards call out too.
+    let login_count = 4u32;
+    for i in 0..login_count {
         let client = harness
             .client_builder_for(TransportProtocol::Tcp)
             .expect("tcp builder")
@@ -340,83 +341,88 @@ async fn given_ext_auth_multi_shard_when_allow_login_should_authorize_on_any_sha
         client
             .login_user(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
             .await
-            .unwrap_or_else(|e| panic!("ext-auth login {i} must succeed on any shard: {e}"));
+            .unwrap_or_else(|e| panic!("ext-auth login {i}: {e}"));
     }
 
-    assert!(
-        ext_server.request_count() >= 4,
-        "all ext-auth logins must reach the mock (got {} callouts)",
-        ext_server.request_count()
+    assert_eq!(
+        ext_server.request_count(),
+        login_count,
+        "every ext-auth login must produce exactly one callout, \
+         including logins that land on a non-metadata shard"
     );
 }
 
-// ── callout cap saturation (TCP only, transport-independent) ───────
+/// Tests with timing-dependent assertions that flake under CPU contention.
+/// Nextest serializes this module with `threads-required = "num-cpus"`.
+mod serialized {
+    use super::*;
 
-#[tokio::test]
-async fn given_ext_auth_when_callout_cap_saturated_should_return_retryable_error() {
-    let ext_server = ExtAuthServer::start_slow(Duration::from_secs(30)).await;
-    let mut envs = ext_auth_envs(&ext_server.url());
-    envs.insert("IGGY_EXTERNAL_AUTH_TIMEOUT".to_owned(), "60 s".to_owned());
-    envs.insert(
-        "IGGY_EXTERNAL_AUTH_MAX_CONCURRENT_CALLOUTS".to_owned(),
-        "2".to_owned(),
-    );
-    // Pin to one shard so all logins hit the same per-shard cap.
-    envs.insert("IGGY_SHARDING_CPU_ALLOCATION".to_owned(), "1".to_owned());
+    #[tokio::test]
+    async fn given_ext_auth_when_callout_cap_saturated_should_return_retryable_error() {
+        let ext_server = ExtAuthServer::start_slow(Duration::from_secs(30)).await;
+        let mut envs = ext_auth_envs(&ext_server.url());
+        envs.insert("IGGY_EXTERNAL_AUTH_TIMEOUT".to_owned(), "60 s".to_owned());
+        envs.insert(
+            "IGGY_EXTERNAL_AUTH_MAX_CONCURRENT_CALLOUTS".to_owned(),
+            "2".to_owned(),
+        );
+        // Pin to one shard so all logins hit the same per-shard cap.
+        envs.insert("IGGY_SHARDING_CPU_ALLOCATION".to_owned(), "1".to_owned());
 
-    let mut harness = TestHarness::builder()
-        .server(TestServerConfig::builder().extra_envs(envs).build())
-        .cluster_nodes(1)
-        .build()
-        .expect("build harness");
-    harness.start().await.expect("start server");
+        let mut harness = TestHarness::builder()
+            .server(TestServerConfig::builder().extra_envs(envs).build())
+            .cluster_nodes(1)
+            .build()
+            .expect("build harness");
+        harness.start().await.expect("start server");
 
-    let mut handles = Vec::new();
-    for _ in 0..2 {
-        let client = harness
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let client = harness
+                .client_builder_for(TransportProtocol::Tcp)
+                .expect("tcp builder")
+                .connect()
+                .await
+                .expect("connect");
+            handles.push(tokio::spawn(async move {
+                client
+                    .login_user(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
+                    .await
+            }));
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // The two slow callouts above should have reached the mock.
+        assert_eq!(
+            ext_server.request_count(),
+            2,
+            "both slot-filling logins must reach the ext-auth service"
+        );
+
+        let overflow_client = harness
             .client_builder_for(TransportProtocol::Tcp)
             .expect("tcp builder")
             .connect()
             .await
-            .expect("connect");
-        handles.push(tokio::spawn(async move {
-            client
-                .login_user(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
-                .await
-        }));
+            .expect("connect for overflow");
+        let result = overflow_client
+            .login_user(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
+            .await;
+
+        let err = result.expect_err("overloaded login must fail");
+        assert!(
+            matches!(
+                err,
+                IggyError::TransientNotAccepted | IggyError::TransientNotCommitted
+            ),
+            "overloaded callout must return a retryable error, got: {err}"
+        );
+        // The overflow login must have been rejected before reaching the service.
+        assert_eq!(
+            ext_server.request_count(),
+            2,
+            "the overflow login must not reach the ext-auth service"
+        );
     }
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // The two slow callouts above should have reached the mock.
-    assert_eq!(
-        ext_server.request_count(),
-        2,
-        "both slot-filling logins must reach the ext-auth service"
-    );
-
-    let overflow_client = harness
-        .client_builder_for(TransportProtocol::Tcp)
-        .expect("tcp builder")
-        .connect()
-        .await
-        .expect("connect for overflow");
-    let result = overflow_client
-        .login_user(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
-        .await;
-
-    let err = result.expect_err("overloaded login must fail");
-    assert!(
-        matches!(
-            err,
-            IggyError::TransientNotAccepted | IggyError::TransientNotCommitted
-        ),
-        "overloaded callout must return a retryable error, got: {err}"
-    );
-    // The overflow login must have been rejected before reaching the service.
-    assert_eq!(
-        ext_server.request_count(),
-        2,
-        "the overflow login must not reach the ext-auth service"
-    );
 }
