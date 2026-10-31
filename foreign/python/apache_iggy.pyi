@@ -114,11 +114,13 @@ __all__ = [
     "SendMessage",
     "SendMessagesConfirmation",
     "SendMessagesResponse",
+    "SnapshotCompression",
     "Stats",
     "Stream",
     "StreamDetails",
     "StreamOptions",
     "StreamPermissions",
+    "SystemSnapshotType",
     "TcpConfig",
     "TcpReconnectionConfig",
     "TokenInfo",
@@ -1240,6 +1242,36 @@ class IggyClient:
             RuntimeError: If the client is not connected, the session is not
                 authenticated, the user lacks the permission, or the request
                 fails.
+        """
+    def snapshot(
+        self,
+        snapshot_compression: SnapshotCompression,
+        snapshot_types: typing.Sequence[SystemSnapshotType],
+    ) -> collections.abc.Awaitable[bytes]:
+        r"""
+        Capture a diagnostic snapshot of the server as a compressed ZIP archive.
+
+        Requires an authenticated session whose user holds the `manage_servers`
+        global permission.
+
+        Args:
+            snapshot_compression: Archive compression method as a
+                `SnapshotCompression` enum.
+            snapshot_types: Data to include in the snapshot as a list of
+                `SystemSnapshotType` enums. `SystemSnapshotType.All` cannot be
+                combined with any other snapshot type.
+
+        Returns:
+            An awaitable that resolves to the ZIP archive `bytes`.
+
+        Raises:
+            TypeError: If `snapshot_compression` is not a `SnapshotCompression`
+                or `snapshot_types` contains elements other than `SystemSnapshotType`.
+            ValueError: If `snapshot_types` is empty.
+            RuntimeError: If the client is not connected, the session is not
+                authenticated, the user lacks the permission, `SystemSnapshotType.All` is
+                combined with another snapshot type, the 30-second binary
+                operation deadline expires, or the request fails.
         """
     def describe_options(
         self, scope: builtins.str
@@ -4570,6 +4602,37 @@ class SendMessagesResponse:
         """
 
 @typing.final
+class SnapshotCompression:
+    r"""
+    Compression method for server snapshots.
+    """
+
+    Stored: typing.ClassVar[SnapshotCompression]
+    r"""
+    Store the file as is without compression.
+    """
+    Deflated: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using Deflate.
+    """
+    Bzip2: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using BZIP2.
+    """
+    Zstd: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using ZStandard.
+    """
+    Lzma: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using LZMA.
+    """
+    Xz: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using XZ.
+    """
+
+@typing.final
 class Stats:
     r"""
     The statistics and details of the server and its running process.
@@ -5023,6 +5086,41 @@ class StreamPermissions:
                 `dict[int, TopicPermissions] | None`; an empty dict is
                 treated as `None`.
         """
+
+@typing.final
+class SystemSnapshotType:
+    r"""
+    Type of system data to include in a snapshot.
+    """
+
+    FilesystemOverview: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Overview of the filesystem.
+    """
+    ProcessList: typing.ClassVar[SystemSnapshotType]
+    r"""
+    List of currently running processes.
+    """
+    ResourceUsage: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Resource usage statistics of the system.
+    """
+    Test: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Test snapshot type for development purposes.
+    """
+    ServerLogs: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Server logs.
+    """
+    ServerConfig: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Server configuration.
+    """
+    All: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Everything.
+    """
 
 @typing.final
 class TcpConfig:

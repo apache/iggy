@@ -55,6 +55,9 @@ use crate::reader::PartitionReader;
 use crate::receive_message::{Checkpoint, PolledBatch, PollingStrategy};
 use crate::resource_options::{OptionKey, StreamOptions, TopicOptions, UserOptions};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
+use crate::snapshot::{
+    SnapshotCompression as PySnapshotCompression, SystemSnapshotType as PySystemSnapshotType,
+};
 use crate::stats::Stats as PyStats;
 use crate::stream::{Stream, StreamDetails};
 use crate::topic::{IggyExpiry, MaxTopicSize, Topic, TopicDetails};
@@ -412,6 +415,59 @@ impl IggyClient {
         future_into_py(py, async move {
             let stats = inner.get_stats().await.map_err(to_runtime_error)?;
             Ok(PyStats::from(stats))
+        })
+    }
+
+    /// Capture a diagnostic snapshot of the server as a compressed ZIP archive.
+    ///
+    /// Requires an authenticated session whose user holds the `manage_servers`
+    /// global permission.
+    ///
+    /// Args:
+    ///     snapshot_compression: Archive compression method as a
+    ///         `SnapshotCompression` enum.
+    ///     snapshot_types: Data to include in the snapshot as a list of
+    ///         `SystemSnapshotType` enums. `SystemSnapshotType.All` cannot be
+    ///         combined with any other snapshot type.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to the ZIP archive `bytes`.
+    ///
+    /// Raises:
+    ///     TypeError: If `snapshot_compression` is not a `SnapshotCompression`
+    ///         or `snapshot_types` contains elements other than `SystemSnapshotType`.
+    ///     ValueError: If `snapshot_types` is empty.
+    ///     RuntimeError: If the client is not connected, the session is not
+    ///         authenticated, the user lacks the permission, `SystemSnapshotType.All` is
+    ///         combined with another snapshot type, the 30-second binary
+    ///         operation deadline expires, or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[bytes]", imports=("collections.abc")))]
+    fn snapshot<'a>(
+        &self,
+        py: Python<'a>,
+        snapshot_compression: PySnapshotCompression,
+        snapshot_types: Vec<PySystemSnapshotType>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        if snapshot_types.is_empty() {
+            return Err(PyValueError::new_err("snapshot_types must not be empty"));
+        }
+
+        let mut parsed_types = Vec::with_capacity(snapshot_types.len());
+        for snapshot_type in snapshot_types {
+            let rust_type = SystemSnapshotType::from(snapshot_type);
+            if !parsed_types.contains(&rust_type) {
+                parsed_types.push(rust_type);
+            }
+        }
+
+        let inner = self.inner.clone();
+        let compression = SnapshotCompression::from(snapshot_compression);
+        future_into_py(py, async move {
+            let snapshot = inner
+                .snapshot(compression, parsed_types)
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(Python::attach(|py| PyBytes::new(py, &snapshot.0).unbind()))
         })
     }
 
