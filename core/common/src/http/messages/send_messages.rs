@@ -577,4 +577,73 @@ mod tests {
         let result = parse_message_id(Some(&value));
         assert!(result.is_err());
     }
+
+    fn send(headers: serde_json::Value) -> Result<SendMessages, serde_json::Error> {
+        serde_json::from_value(serde_json::json!({
+            "partitioning": { "kind": "balanced", "value": "" },
+            "messages": [{ "id": 1, "payload": "aGVsbG8=", "user_headers": headers }]
+        }))
+    }
+
+    #[test]
+    fn typed_header_with_valid_headers_is_accepted_at_the_http_boundary() {
+        let parsed = send(serde_json::json!([{
+            "key":   { "kind": "string", "value": "a2V5" },
+            "value": { "kind": "string", "value": "dmFs" }
+        }]));
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn typed_header_with_wrong_size_value_is_rejected_at_the_http_boundary() {
+        let parsed = send(serde_json::json!([{
+            "key":   { "kind": "string", "value": "a2V5" },
+            "value": { "kind": "int32",  "value": "AQ==" }
+        }]));
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn typed_header_with_empty_value_is_rejected_at_the_http_boundary() {
+        let parsed = send(serde_json::json!([
+            { "key": { "kind": "string", "value": "b2s=" }, "value": { "kind": "string", "value": "dmFs" } },
+            { "key": { "kind": "string", "value": "a2V5" }, "value": { "kind": "raw", "value": "" } }
+        ]));
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn typed_header_with_wrong_size_key_is_rejected_at_the_http_boundary() {
+        let parsed = send(serde_json::json!([{
+            "key":   { "kind": "int32", "value": "AQ==" },
+            "value": { "kind": "string", "value": "dmFs" }
+        }]));
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn typed_header_with_empty_key_is_rejected_at_the_http_boundary() {
+        let parsed = send(serde_json::json!([{
+            "key":   { "kind": "string", "value": "" },
+            "value": { "kind": "string", "value": "dmFs" }
+        }]));
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn typed_header_with_oversized_fields_is_rejected_at_the_http_boundary() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+        let oversized = BASE64.encode([0u8; 256]);
+        let parsed_key = send(serde_json::json!([{
+            "key":   { "kind": "string", "value": oversized },
+            "value": { "kind": "string", "value": "dmFs" }
+        }]));
+        assert!(parsed_key.is_err());
+
+        let parsed_val = send(serde_json::json!([{
+            "key":   { "kind": "string", "value": "a2V5" },
+            "value": { "kind": "string", "value": oversized }
+        }]));
+        assert!(parsed_val.is_err());
+    }
 }

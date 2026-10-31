@@ -71,6 +71,6 @@ pub use polled_messages::{DecodeError, PolledMessages, UndecodedRecord, record_a
 pub use polling_kind::PollingKind;
 pub use polling_strategy::PollingStrategy;
 pub use user_headers::{
-    HeaderEntry, HeaderField, HeaderKey, HeaderKind, HeaderValue, KeyMarker, UserHeaders,
-    ValueMarker, deserialize_headers, serialize_headers,
+    HeaderEntry, HeaderField, HeaderFieldMarker, HeaderKey, HeaderKind, HeaderValue, KeyMarker,
+    UserHeaders, ValueMarker, deserialize_headers, serialize_headers,
 };

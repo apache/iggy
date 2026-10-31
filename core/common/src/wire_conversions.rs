@@ -787,6 +787,10 @@ pub fn user_headers_to_wire(
     }
     // Buffer was just encoded from valid HeaderKey/HeaderValue entries,
     // so structural TLV validity is guaranteed by construction.
+    debug_assert!(
+        iggy_binary_protocol::validate_user_headers(&buf).is_ok(),
+        "encoded user headers must be structurally valid TLV"
+    );
     WireUserHeaders::from_validated(buf.freeze())
 }
 
@@ -848,20 +852,10 @@ fn headers_from_validated_slice(
                 return Err(error);
             }
         };
-        if let Some(expected) = key_kind.expected_size()
-            && entry.key.len() != expected
-        {
-            return Err(IggyError::InvalidHeaderKey);
-        }
-        if let Some(expected) = value_kind.expected_size()
-            && entry.value.len() != expected
-        {
-            return Err(IggyError::InvalidHeaderValue);
-        }
 
         headers.insert(
-            HeaderKey::new_unchecked(key_kind, entry.key),
-            HeaderValue::new_unchecked(value_kind, entry.value),
+            HeaderKey::from_raw(key_kind, entry.key)?,
+            HeaderValue::from_raw(value_kind, entry.value)?,
         );
     }
     Ok(headers)
