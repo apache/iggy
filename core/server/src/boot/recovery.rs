@@ -107,6 +107,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     reply_inbox: ShardReceiver<ShardFrame>,
     metrics: ShardMetrics,
     roster_cells: &RosterCells,
+    repair_memory: Arc<partitions::RepairMemoryBudget>,
 ) -> Result<ShardBuild, ServerError> {
     let shard_local_id = ShardId::new(shard_id);
     let retired_key: iggy_common::HeaderKey =
@@ -172,7 +173,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         refuse_partitionless_stream_keys(metadata.mux_stm.streams(), &key_context, solo)?;
     }
     refuse_unreadable_topics(metadata.mux_stm.streams())?;
-    let partitions = IggyPartitions::with_capacity(
+    let partitions = IggyPartitions::with_repair_memory(
         shard_local_id,
         PartitionsConfig {
             messages_required_to_save: iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
@@ -188,6 +189,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
             },
         },
         owned_partitions_capacity,
+        repair_memory,
     );
     let shards_table = PapayaShardsTable::with_capacity(total_partitions);
 
