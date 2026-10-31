@@ -465,8 +465,9 @@ impl IggyClient {
     ///         through the HTTP API or another SDK.
     ///     RuntimeError: If the server refuses the request. On TCP, QUIC, and
     ///         WebSocket, an empty name or a name over 255 bytes raises code 4
-    ///         before anything is sent. On HTTP, a name outside 3 to 30 bytes is
-    ///         refused with code 300.
+    ///         before anything is sent. Names from 1 to 255 bytes reach the
+    ///         server, which accepts them on TCP, QUIC, and WebSocket. On HTTP,
+    ///         a name outside 3 to 30 bytes is refused with code 300.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[str]", imports=("collections.abc")))]
     fn create_personal_access_token<'a>(
         &self,
