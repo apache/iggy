@@ -1264,7 +1264,10 @@ mod tests {
             segments_count: 1,
             in_sync_nodes,
         };
-        streams.stats_registry.directory().record([report(0b101)]);
+        streams
+            .stats_registry
+            .directory()
+            .record([report(0b101)], std::time::Instant::now());
         let reported = partition_response(&streams, 0, 0, &legacy, 0, 3).unwrap();
         assert_eq!(reported.in_sync_members, [0, 2]);
 

@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
 
 /// What each partition's primary last reported, as this node heard it.
 ///
@@ -29,7 +30,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// node answers for partitions it does not store.
 #[derive(Debug)]
 pub struct PartitionDirectory {
-    entries: Mutex<BTreeMap<u64, PartitionStatusEntry>>,
+    entries: Mutex<BTreeMap<u64, Recorded>>,
     /// Nodes the metadata primary hears from, bit `n` for node `n`, or every
     /// bit without that evidence. Reports leave the reads with their in-sync
     /// nodes narrowed to these, so a primary that died does not keep claiming
@@ -37,6 +38,15 @@ pub struct PartitionDirectory {
     ready_nodes: AtomicU32,
     /// Locked after `entries` whenever both are held.
     changes: Mutex<Changes>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Recorded {
+    report: PartitionStatusEntry,
+    received_at: Instant,
+    /// The metadata primary found no copy newer than its stale cutoff, so the
+    /// reads list no member in sync until the primary reports again.
+    stale: bool,
 }
 
 /// The order in which reports last changed what a route or an in-sync list
@@ -82,18 +92,25 @@ impl PartitionDirectory {
         self.ready_nodes.store(ready_nodes, Ordering::Relaxed);
     }
 
-    fn narrowed(&self, entry: &PartitionStatusEntry) -> PartitionStatusEntry {
+    fn narrowed(&self, recorded: &Recorded) -> PartitionStatusEntry {
+        let in_sync_nodes = if recorded.stale {
+            0
+        } else {
+            recorded.report.in_sync_nodes & self.ready_nodes.load(Ordering::Relaxed)
+        };
         PartitionStatusEntry {
-            in_sync_nodes: entry.in_sync_nodes & self.ready_nodes.load(Ordering::Relaxed),
-            ..*entry
+            in_sync_nodes,
+            ..recorded.report
         }
     }
 
     /// Keep the newest report of each partition, ordered by incarnation, then
-    /// view, then the primary's commit. Returns the reports it kept.
+    /// view, then the primary's commit, received at `now`. Returns the reports
+    /// it kept.
     pub fn record(
         &self,
         reports: impl IntoIterator<Item = PartitionStatusEntry>,
+        now: Instant,
     ) -> Vec<PartitionStatusEntry> {
         let mut entries = self.lock();
         let mut changes = self.changes();
@@ -102,14 +119,29 @@ impl PartitionDirectory {
             let known = entries.get(&report.namespace);
             let replace = known.is_none_or(|known| {
                 (report.created_revision, report.view, report.commit)
-                    >= (known.created_revision, known.view, known.commit)
+                    >= (
+                        known.report.created_revision,
+                        known.report.view,
+                        known.report.commit,
+                    )
             });
             if replace {
                 let moved = known.is_none_or(|known| {
-                    (known.created_revision, known.view, known.in_sync_nodes)
-                        != (report.created_revision, report.view, report.in_sync_nodes)
+                    known.stale
+                        || (
+                            known.report.created_revision,
+                            known.report.view,
+                            known.report.in_sync_nodes,
+                        ) != (report.created_revision, report.view, report.in_sync_nodes)
                 });
-                entries.insert(report.namespace, report);
+                entries.insert(
+                    report.namespace,
+                    Recorded {
+                        report,
+                        received_at: now,
+                        stale: false,
+                    },
+                );
                 if moved {
                     changes.mark(report.namespace);
                 }
@@ -119,6 +151,18 @@ impl PartitionDirectory {
         drop(changes);
         drop(entries);
         accepted
+    }
+
+    /// The newest change, 0 before the first.
+    #[must_use]
+    pub fn last_change(&self) -> u64 {
+        self.changes().last
+    }
+
+    /// How many reports this node holds, of every incarnation not yet swept.
+    #[must_use]
+    pub fn report_count(&self) -> usize {
+        self.lock().len()
     }
 
     /// Up to `limit` reports whose incarnation, view or in-sync nodes changed
@@ -140,8 +184,11 @@ impl PartitionDirectory {
                 break;
             }
             last = seq;
-            if let Some(entry) = entries.get(namespace).filter(|entry| include(entry)) {
-                batch.push(self.narrowed(entry));
+            if let Some(recorded) = entries
+                .get(namespace)
+                .filter(|recorded| include(&recorded.report))
+            {
+                batch.push(self.narrowed(recorded));
             }
         }
         drop(changes);
@@ -158,8 +205,30 @@ impl PartitionDirectory {
     ) -> Option<PartitionStatusEntry> {
         self.lock()
             .get(&namespace.inner())
-            .filter(|entry| entry.created_revision == created_revision)
-            .map(|entry| self.narrowed(entry))
+            .filter(|recorded| recorded.report.created_revision == created_revision)
+            .map(|recorded| self.narrowed(recorded))
+    }
+
+    /// Like [`Self::get`], after marking the report stale when it was received
+    /// before `stale_before`. Only a newer report clears the mark. A report
+    /// turning stale counts as a change, so the other nodes hear of it first.
+    pub fn expire_and_get(
+        &self,
+        namespace: IggyNamespace,
+        created_revision: u64,
+        stale_before: Option<Instant>,
+    ) -> Option<PartitionStatusEntry> {
+        let mut entries = self.lock();
+        let recorded = entries
+            .get_mut(&namespace.inner())
+            .filter(|recorded| recorded.report.created_revision == created_revision)?;
+        if !recorded.stale && stale_before.is_some_and(|before| recorded.received_at < before) {
+            recorded.stale = true;
+            self.changes().mark(namespace.inner());
+        }
+        let status = self.narrowed(recorded);
+        drop(entries);
+        Some(status)
     }
 
     /// Up to `limit` reports in namespace order after `after`, wrapping to the
@@ -184,7 +253,7 @@ impl PartitionDirectory {
         let end = after.map_or(Bound::Excluded(0), Bound::Included);
         let mut batch = Vec::new();
         let mut last = after;
-        for (namespace, entry) in entries
+        for (namespace, recorded) in entries
             .range((start, Bound::Unbounded))
             .chain(entries.range((Bound::Unbounded, end)))
             .take(scan_max.min(entries.len()))
@@ -193,8 +262,8 @@ impl PartitionDirectory {
                 break;
             }
             last = Some(*namespace);
-            if include(entry) {
-                batch.push(self.narrowed(entry));
+            if include(&recorded.report) {
+                batch.push(self.narrowed(recorded));
             }
         }
         drop(entries);
@@ -215,10 +284,10 @@ impl PartitionDirectory {
         let mut visited = 0;
         let mut last = None;
         let mut rejected = Vec::new();
-        for (namespace, entry) in entries.range((start, Bound::Unbounded)).take(limit) {
+        for (namespace, recorded) in entries.range((start, Bound::Unbounded)).take(limit) {
             visited += 1;
             last = Some(*namespace);
-            if !keep(entry) {
+            if !keep(&recorded.report) {
                 rejected.push(*namespace);
             }
         }
@@ -232,7 +301,7 @@ impl PartitionDirectory {
         (visited == limit).then_some(last).flatten()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, PartitionStatusEntry>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, Recorded>> {
         self.entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -248,6 +317,7 @@ impl PartitionDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn report(namespace: u64, created_revision: u64, view: u32) -> PartitionStatusEntry {
         PartitionStatusEntry {
@@ -266,17 +336,20 @@ mod tests {
     #[test]
     fn given_reports_when_their_view_or_in_sync_nodes_change_should_list_them_in_change_order() {
         let directory = PartitionDirectory::default();
-        directory.record([report(1, 1, 0), report(2, 1, 0), report(3, 1, 0)]);
+        directory.record(
+            [report(1, 1, 0), report(2, 1, 0), report(3, 1, 0)],
+            Instant::now(),
+        );
         let (all, seen) = directory.changed_after(0, 8, |_| true);
         assert_eq!(all.len(), 3);
 
         let mut counters_only = report(1, 1, 0);
         counters_only.messages_count = 5;
         counters_only.commit = 2;
-        directory.record([report(3, 1, 1), counters_only]);
+        directory.record([report(3, 1, 1), counters_only], Instant::now());
         let mut in_sync = report(2, 1, 0);
         in_sync.in_sync_nodes = 0b11;
-        directory.record([in_sync]);
+        directory.record([in_sync], Instant::now());
         let (changed, last) = directory.changed_after(seen, 8, |_| true);
         assert_eq!(
             changed
@@ -305,37 +378,40 @@ mod tests {
     fn given_reports_when_recording_should_keep_the_newest_incarnation_and_view() {
         let directory = PartitionDirectory::default();
         let namespace = IggyNamespace::from_raw(7);
-        directory.record([report(7, 1, 4), report(7, 1, 2)]);
+        directory.record([report(7, 1, 4), report(7, 1, 2)], Instant::now());
         assert_eq!(directory.get(namespace, 1).unwrap().view, 4);
 
         let mut refreshed = report(7, 1, 4);
         refreshed.messages_count = 9;
         refreshed.commit = 3;
-        assert_eq!(directory.record([refreshed]), [refreshed]);
+        assert_eq!(directory.record([refreshed], Instant::now()), [refreshed]);
         assert_eq!(directory.get(namespace, 1).unwrap().messages_count, 9);
         let mut reordered = refreshed;
         reordered.commit = 2;
         reordered.messages_count = 1;
         assert_eq!(
-            directory.record([reordered]),
+            directory.record([reordered], Instant::now()),
             [],
             "an older commit of the same view must not regress the counters"
         );
         assert_eq!(directory.get(namespace, 1).unwrap().messages_count, 9);
 
-        directory.record([report(7, 2, 0)]);
+        directory.record([report(7, 2, 0)], Instant::now());
         assert!(
             directory.get(namespace, 1).is_none(),
             "a newer incarnation replaces it"
         );
-        directory.record([report(7, 1, 9)]);
+        directory.record([report(7, 1, 9)], Instant::now());
         assert_eq!(directory.get(namespace, 2).unwrap().view, 0);
     }
 
     #[test]
     fn given_a_cursor_when_batching_should_cycle_through_every_report() {
         let directory = PartitionDirectory::default();
-        directory.record((1..=5).map(|namespace| report(namespace, 1, 0)));
+        directory.record(
+            (1..=5).map(|namespace| report(namespace, 1, 0)),
+            Instant::now(),
+        );
         let namespaces = |batch: Vec<PartitionStatusEntry>| {
             batch
                 .iter()
@@ -351,7 +427,10 @@ mod tests {
     #[test]
     fn given_a_chunked_retain_when_cycling_should_visit_every_report_eventually() {
         let directory = PartitionDirectory::default();
-        directory.record((1..=5).map(|namespace| report(namespace, 1, 0)));
+        directory.record(
+            (1..=5).map(|namespace| report(namespace, 1, 0)),
+            Instant::now(),
+        );
         let odd = |entry: &PartitionStatusEntry| entry.namespace % 2 == 1;
         assert_eq!(directory.retain_chunk(None, 2, odd), Some(2));
         assert_eq!(directory.retain_chunk(Some(2), 2, odd), Some(4));
@@ -369,5 +448,46 @@ mod tests {
             "a filtered scan still advances past what it skips"
         );
         assert_eq!(directory.scan(Some(5), 10, 1, |_| true).1, Some(1));
+    }
+
+    #[test]
+    fn given_a_report_received_before_the_cutoff_when_expiring_should_list_no_member_in_sync_until_the_next_one()
+     {
+        let directory = PartitionDirectory::default();
+        let namespace = IggyNamespace::from_raw(7);
+        let received = Instant::now();
+        let later = received + Duration::from_secs(1);
+        let mut healthy = report(7, 1, 0);
+        healthy.in_sync_nodes = 0b11;
+        directory.record([healthy], received);
+        let seen = directory.last_change();
+        let in_sync = |stale_before| {
+            directory
+                .expire_and_get(namespace, 1, stale_before)
+                .unwrap()
+                .in_sync_nodes
+        };
+        assert_eq!(in_sync(Some(received)), 0b11, "received at the cutoff");
+        assert_eq!(in_sync(None), 0b11);
+        assert_eq!(in_sync(Some(later)), 0);
+        assert_eq!(directory.get(namespace, 1).unwrap().in_sync_nodes, 0);
+        assert_eq!(
+            directory.changed_after(seen, 8, |_| true).0,
+            [PartitionStatusEntry {
+                in_sync_nodes: 0,
+                ..healthy
+            }],
+            "the other nodes hear that no member is in sync"
+        );
+        let seen = directory.last_change();
+        assert_eq!(in_sync(None), 0, "only a new report clears the mark");
+
+        directory.record([healthy], later);
+        assert_eq!(directory.get(namespace, 1).unwrap().in_sync_nodes, 0b11);
+        assert_eq!(
+            directory.changed_after(seen, 8, |_| true).0,
+            [healthy],
+            "the same report arriving again is a change once it was stale"
+        );
     }
 }

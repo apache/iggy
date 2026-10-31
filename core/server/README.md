@@ -360,20 +360,25 @@ every partition it is a member of keeps, without it, enough in-sync members to
 elect a primary: 2 of 2 or 3, 3 of 4 or 5, 4 of 6, and 5 of 7. A restart of a
 node that leads a partition needs that many, not just a write quorum.
 The in-sync list is empty until a partition's primary first reports, about a
-second after it is created, and while none of its members that are up leads it.
+second after it is created, and from shortly after its primary stops leading it
+until a member leads it again. A primary reports only while it leads, and the
+metadata primary drops a report it has not heard again for 6 seconds, 2 more for
+every 512 partitions past the first 512 in the cluster.
 
 At create the metadata primary picks each partition's nodes: the primary is the
 ready node leading the fewest partitions, and the other members are the nodes
 storing the fewest, each in a rack the partition does not use yet while one has
 a ready node, like Kafka's `broker.rack`. A node names its rack, or availability
-zone, with `rack` in its `[[cluster.nodes]]` entry, and a node without one
-shares a rack with no other. A node that is down is picked only when too few are
-up. The
-assignment never moves. While a member is down its partitions run with fewer
-copies, and the member catches up from the others when it comes back. A new
-metadata primary refuses creates with `TransientNotAccepted` (58) until every
-node has answered its probe or missed it, so the node whose failure started the
-view is not picked.
+zone, with `rack` in its `[[cluster.nodes]]` entry. Set it on every node or on
+none: a node starts with a configuration that sets it on only some. Each rack
+then holds about an equal share of the copies, so a rack with fewer nodes puts
+more on each of them, and with a factor equal to the number of racks a rack of
+one node stores every partition. A node that is down is picked only when too few
+are up. The assignment never moves. While a member is down its partitions run
+with fewer copies, and the member catches up from the others when it comes back.
+A new metadata primary refuses creates with `TransientNotAccepted` (58) until
+every node has answered its probe or missed it, so the node whose failure
+started the view is not picked.
 
 The metadata primary reports in `/metrics`, on its first shard, the cluster's
 `partitions_under_replicated`, partitions with a member out of sync, and
@@ -381,11 +386,13 @@ The metadata primary reports in `/metrics`, on its first shard, the cluster's
 whose primary answers its probes, it counts the members of the primary's last
 report that answer too: a member is out of the report while the primary cannot
 reach it or while it has trailed the commit point for 30 seconds, Kafka's
-`replica.lag.time.max.ms` default. For a partition whose primary does not answer,
-it counts the members that answer, which must be enough to elect a primary
-before anything commits. Every other node reports 0, so, like Kafka's
-`UnderReplicatedPartitions`, summing the series over every node gives the
-cluster's total.
+`replica.lag.time.max.ms` default. A dropped report, or none that long after the
+partition is created, counts no member, as when every member is up but none can
+lead, such as both members of a factor-2 partition back on empty storage. For a
+partition whose primary does not answer, it counts the members that answer,
+which must be enough to elect a primary before anything commits. Every other
+node reports 0, so, like Kafka's `UnderReplicatedPartitions`, summing the series
+over every node gives the cluster's total.
 
 A write commits on a quorum of a partition's members: 2 of 3, 3 of 5, and at
 most 3 for wider groups. A factor of 2 keeps two copies but stops accepting
@@ -397,7 +404,10 @@ to acknowledge only written data.
 
 Deleting a topic or stream waits while one of its partitions lacks a quorum of
 its members, and completes once they return, like Kafka's pending deletes, or
-once enough of them came back without their copy that the rest cannot commit.
+once enough of them came back without their copy that the rest cannot elect a
+primary: 1 of 2, 2 of 3 or 4, and 3 of 5. A pending consumer group deletion on
+the topic does not hold the delete back: the delete takes it over and removes
+the group with the topic.
 
 Logins keep working while a partition lacks a quorum of its members. A session
 that ends then cannot be retired on that partition, so the partition owes the
@@ -417,10 +427,16 @@ kept the data once fewer than a write quorum of members lost theirs. So a
 2-member partition elects its other member when one member comes back empty, as
 replacing one disk at a time with `--fresh` does, and a 3-member partition with
 one member down and another back on empty storage waits for the one that is
-down. If a write quorum of members lost their storage, none of them serves the
-partition rather than restart it at offset 0 or without ops that only they
-held. Delete and recreate the topic to accept the loss: the delete completes once
-the members that lost their copy leave too few to commit, and frees the name.
+down. With `durability` and `consumer_offset_durability` both `persisted`, if a
+write quorum of members lost their storage, none of them serves the partition
+rather than restart it at offset 0 or without ops that only they held, like Kafka
+with `unclean.leader.election.enable` off. Delete and recreate the topic to
+accept the loss: the delete completes once the members that lost their copy
+leave too few to elect a primary, and frees the name. The default `replicated`
+durability acknowledges a write before it reaches the disk, so a restart of
+every member can lose acknowledged writes, and members that lost their storage
+are counted the same way: once every member reports, the partition elects on the
+logs that are left, like Kafka with `unclean.leader.election.enable` on.
 
 A node that does not store a partition answers its route lookups from what the
 partition's primary last reported, or from the partition's initial primary

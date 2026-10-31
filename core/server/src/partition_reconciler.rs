@@ -158,7 +158,7 @@ use crate::shell::{ServerShard, ShellBus, ShellShard};
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
 use consensus::Consensus;
-use consensus::{MetadataHandle, PartitionsHandle, ReplicaSet, quorum_replication};
+use consensus::{MetadataHandle, PartitionsHandle, ReplicaSet, quorum_view_change};
 use futures::FutureExt;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_offsets::DeleteConsumerOffsetRequest;
@@ -1866,8 +1866,9 @@ pub fn reconcile_partition_lifecycles<B, MJ, S, SB>(
 ///
 /// A wider partition being deleted gets the same exit once enough of its
 /// members lost their copies: each such member retires its copy durably and
-/// reports it, and when the members still holding one are too few to commit,
-/// a member completes the target. No log could install the fence after that.
+/// reports it, and when the members still holding one are too few to elect a
+/// primary, a member completes the target. No log could install the fence
+/// after that.
 async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) {
     if ctx.lifecycle_reports.batch_in_flight.get() {
         return;
@@ -1977,7 +1978,8 @@ struct RetirementTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetirementStep {
-    /// Too few members still hold a copy to commit, so no log can fence it.
+    /// Too few members still hold a copy to elect a primary, so no log can
+    /// fence it.
     Complete,
     /// This member's copy is lost: retire it durably and report it.
     RetireCopy,
@@ -2000,8 +2002,12 @@ fn retirement_step(
         .iter()
         .filter(|&&node| retired_bit(node).is_some_and(|bit| target.retired_members & bit != 0))
         .count();
-    let still_commit = usize::from(members.len()) - retired >= quorum_replication(members.len());
-    if !still_commit {
+    // Electing the primary that installs the fence takes a view-change quorum
+    // of the members that kept a copy. A primary that kept its copy may still
+    // commit with fewer, but it installs the fence itself, and what it commits
+    // afterwards belongs to a partition being deleted.
+    let holding = usize::from(members.len()) - retired;
+    if holding < quorum_view_change(members.len()) {
         return Some(RetirementStep::Complete);
     }
     let retired_here =
@@ -4604,10 +4610,10 @@ mod tests {
 
     /// A delete of a partition whose members lost their copies: each such
     /// member retires its copy and reports it, and once too few members still
-    /// hold one to commit, a member completes the target, since no log can
-    /// install its fence any more.
+    /// hold one to elect a primary, a member completes the target, since no
+    /// log can install its fence any more.
     #[compio::test]
-    async fn given_a_deleted_partition_whose_members_lost_their_copies_when_reconciling_should_complete_once_too_few_can_commit()
+    async fn given_a_deleted_partition_whose_members_lost_their_copies_when_reconciling_should_complete_once_too_few_can_elect()
      {
         const NODES: u8 = 3;
         let tmp = TempDir::new().unwrap();
@@ -4689,7 +4695,7 @@ mod tests {
         let (_, batches) = drain_lifecycle_reports(&lanes);
         assert!(
             batches.is_empty(),
-            "two members still hold a copy and can commit the fence themselves"
+            "two members still hold a copy and can elect the primary that fences it"
         );
 
         let other =
@@ -4703,7 +4709,7 @@ mod tests {
         assert_eq!(
             batches[0].0.completions(),
             [completion(RETIRED_PARTITION_OP)],
-            "one member left cannot commit, so the target completes"
+            "one member left cannot elect, so the target completes"
         );
         let (request, _) = batches.pop().unwrap();
         stm.update(build_prepare(13, Operation::CompleteLifecycle, &request))
@@ -4711,6 +4717,67 @@ mod tests {
         assert!(
             !stm.streams().lifecycle_pending(10),
             "the delete finishes and frees the topic"
+        );
+    }
+
+    /// Four members elect with three votes and commit with two, so two lost
+    /// copies leave survivors that could commit under a primary but cannot
+    /// elect one. The target completes then, or the delete would wait forever.
+    #[compio::test]
+    async fn given_four_members_when_two_lost_their_copies_should_complete_the_delete() {
+        const NODES: u8 = 4;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        let namespace = IggyNamespace::new(0, 0, 0);
+        mux.streams().seed_namespace_on(
+            namespace,
+            1,
+            0,
+            iggy_common::Durability::Persisted,
+            &[0, 1, 2, 3],
+        );
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = Rc::new(ReconcilerCtx::new(
+            Rc::clone(&shard),
+            1,
+            Rc::new(config),
+            CLUSTER_ID,
+            0,
+            NODES,
+        ));
+        let stm = &shard.plane.metadata().mux_stm;
+        stm.update(build_prepare(
+            10,
+            Operation::DeleteTopic,
+            &DeleteTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+            },
+        ))
+        .expect("DeleteTopic apply succeeds");
+        let completion = |partition_op| LifecycleCompletion {
+            topic_id: 0,
+            partition_id: 0,
+            partition_op,
+        };
+        // This node kept its copy; nodes 1 and 2 came back without theirs.
+        assert!(!shard.plane.partitions().is_tombstoned(&namespace));
+        for (op, node) in [(11, 1), (12, 2)] {
+            let retired =
+                CompleteLifecycleRequest::new(10, 0, vec![completion(retired_member_op(node))])
+                    .unwrap();
+            stm.update(build_prepare(op, Operation::CompleteLifecycle, &retired))
+                .expect("a member's retirement applies");
+        }
+
+        reconcile_retired_lifecycles(&ctx).await;
+        let (_, batches) = drain_lifecycle_reports(&lanes);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].0.completions(),
+            [completion(RETIRED_PARTITION_OP)],
+            "two copies left cannot elect a primary of four"
         );
     }
 

@@ -87,6 +87,7 @@ use serde::{Deserialize, Serialize};
 use server_common::sharding::{IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 /// Removals [`RemovedPartitions`] keeps. A reader that falls further behind
 /// rebuilds from the tree, which a delete of this many partitions costs anyway.
@@ -207,6 +208,14 @@ fn committed_report(inner: &StreamsInner, status: &PartitionStatusEntry) -> bool
 pub struct PartitionReplication {
     pub under_replicated: usize,
     pub below_write_quorum: usize,
+}
+
+/// When each committed partition, by namespace and incarnation, was first
+/// found without a report, kept by the metadata primary from one
+/// [`Streams::partition_replication`] scan to the next.
+#[derive(Debug, Default)]
+pub struct UnreportedPartitions {
+    since: AHashMap<(u64, u64), Instant>,
 }
 
 /// Node id of the primary `view` assigns among `members`, or among nodes
@@ -2292,18 +2301,19 @@ impl Streams {
         self.with_committed_partition(namespace, |partition| partition.created_view)
     }
 
-    /// Take in partition reports from their primaries. Counters of a
-    /// partition `self_node` does not store follow its report; a stored one
-    /// keeps its own.
+    /// Take in partition reports from their primaries, received at `now`.
+    /// Counters of a partition `self_node` does not store follow its report;
+    /// a stored one keeps its own.
     pub fn record_partition_statuses(
         &self,
         statuses: &[PartitionStatusEntry],
         self_node: u8,
         nodes: u8,
+        now: Instant,
     ) {
         self.inner.read(|inner| {
             let registry = &inner.stats_registry;
-            for status in registry.directory().record(statuses.iter().copied()) {
+            for status in registry.directory().record(statuses.iter().copied(), now) {
                 let namespace = IggyNamespace::from_raw(status.namespace);
                 let Some(topic) = inner
                     .items
@@ -2336,6 +2346,21 @@ impl Streams {
                     );
             }
         });
+    }
+
+    /// The newest directory change, so a cursor starting there sends only
+    /// later ones.
+    #[must_use]
+    pub fn partition_status_last_change(&self) -> u64 {
+        self.inner
+            .read(|inner| inner.stats_registry.directory().last_change())
+    }
+
+    /// How many partition reports this node holds.
+    #[must_use]
+    pub fn partition_status_count(&self) -> usize {
+        self.inner
+            .read(|inner| inner.stats_registry.directory().report_count())
     }
 
     /// Up to `limit` directory reports that still name a committed incarnation
@@ -2574,15 +2599,28 @@ impl Streams {
     }
 
     /// How many committed partitions run short of their factor, and how many
-    /// cannot commit, counted once for the whole cluster. A partition whose
-    /// primary, as last reported or created before any report, is `live`
+    /// cannot commit, counted once for the whole cluster at `now`. A partition
+    /// whose primary, as last reported or created before any report, is `live`
     /// counts the members of its last report that are live too. One whose
     /// primary is not live counts its live members, which must elect a primary
-    /// before anything commits. A live primary yet to report is not counted.
+    /// before anything commits.
+    ///
+    /// A primary reports only while it leads, so a report received before
+    /// `stale_before` lists no member in sync, here and in every read of it
+    /// on this node. A partition with no report counts the same way once it
+    /// was first found without one before `stale_before`, and is left out
+    /// until then.
     #[must_use]
-    pub fn partition_replication(&self, live: &[bool]) -> PartitionReplication {
+    pub fn partition_replication(
+        &self,
+        live: &[bool],
+        now: Instant,
+        stale_before: Option<Instant>,
+        unreported: &mut UnreportedPartitions,
+    ) -> PartitionReplication {
         let nodes = u8::try_from(live.len()).unwrap_or(u8::MAX);
         let is_live = |node: u8| live.get(usize::from(node)).copied().unwrap_or(false);
+        let mut previous = std::mem::take(&mut unreported.since);
         self.inner.read(|inner| {
             let directory = inner.stats_registry.directory();
             let mut counts = PartitionReplication::default();
@@ -2590,15 +2628,25 @@ impl Streams {
                 for (topic_id, topic) in &stream.topics {
                     for partition in &topic.partitions {
                         let members = partition.replica_set(nodes);
-                        let report = directory.get(
-                            IggyNamespace::new(stream_id, topic_id, partition.id),
+                        let namespace = IggyNamespace::new(stream_id, topic_id, partition.id);
+                        let report = directory.expire_and_get(
+                            namespace,
                             partition.created_revision,
+                            stale_before,
                         );
+                        let unreported_long = report.is_none() && {
+                            let key = (namespace.inner(), partition.created_revision);
+                            let since = previous.remove(&key).unwrap_or(now);
+                            unreported.since.insert(key, since);
+                            stale_before.is_some_and(|before| since < before)
+                        };
                         let view = report.map_or(partition.created_view, |status| status.view);
                         let (holding, quorum) =
                             if partition.primary_node(view, nodes).is_some_and(is_live) {
-                                let Some(report) = report else {
-                                    continue;
+                                let in_sync_nodes = match report {
+                                    Some(report) => report.in_sync_nodes,
+                                    None if unreported_long => 0,
+                                    None => continue,
                                 };
                                 let in_sync = members
                                     .nodes()
@@ -2606,7 +2654,7 @@ impl Streams {
                                     .filter(|&&node| {
                                         1_u32
                                             .checked_shl(u32::from(node))
-                                            .is_some_and(|bit| report.in_sync_nodes & bit != 0)
+                                            .is_some_and(|bit| in_sync_nodes & bit != 0)
                                     })
                                     .count();
                                 (in_sync, consensus::quorum_replication(members.len()))
@@ -4203,6 +4251,7 @@ mod tests {
         topic_option_keys,
     };
     use std::str::FromStr;
+    use std::time::Duration;
 
     #[test]
     fn truncate_partition_request_round_trips() {
@@ -7092,7 +7141,12 @@ mod tests {
             segments_count: 1,
             in_sync_nodes: 0,
         };
-        streams.record_partition_statuses(&[status(stored_by_peer), status(elsewhere)], 0, 3);
+        streams.record_partition_statuses(
+            &[status(stored_by_peer), status(elsewhere)],
+            0,
+            3,
+            Instant::now(),
+        );
         let (batch, cursor) = streams.partition_status_batch(None, 4, 4);
         assert_eq!(
             batch,
@@ -7108,6 +7162,7 @@ mod tests {
             }],
             0,
             3,
+            Instant::now(),
         );
         streams.set_partition_directory_ready_nodes(0b011);
         assert_eq!(
@@ -7124,6 +7179,7 @@ mod tests {
             }],
             0,
             3,
+            Instant::now(),
         );
         assert_eq!(
             streams.retain_partition_directory(None, 1),
@@ -7179,17 +7235,88 @@ mod tests {
             }],
             2,
             3,
+            Instant::now(),
         );
+        let counts = |live: &[bool]| {
+            streams.partition_replication(
+                live,
+                Instant::now(),
+                None,
+                &mut UnreportedPartitions::default(),
+            )
+        };
         assert_eq!(
-            streams
-                .partition_replication(&[false, true, true])
-                .below_write_quorum,
+            counts(&[false, true, true]).below_write_quorum,
             2,
             "only the pair led by the down node and the single copy on it"
         );
+        assert_eq!(counts(&[true; 3]).below_write_quorum, 0);
+    }
+
+    /// A primary reports only while it leads, so a pair whose members are
+    /// both up but neither leads, as after both came back on empty storage,
+    /// keeps the last healthy report until it goes stale.
+    #[test]
+    fn given_reports_no_primary_refreshed_when_counting_should_count_no_member_in_sync() {
+        let streams = Streams::default();
+        let reported = IggyNamespace::new(0, 0, 0);
+        let silent = IggyNamespace::new(1, 0, 0);
+        streams.seed_namespace_on(reported, 1, 0, iggy_common::Durability::Persisted, &[0, 1]);
+        streams.seed_namespace_on(silent, 2, 0, iggy_common::Durability::Persisted, &[1, 2]);
+        let healthy = PartitionStatusEntry {
+            namespace: reported.inner(),
+            created_revision: streams.created_revision_for_namespace(reported).unwrap(),
+            view: 0,
+            commit: 0,
+            current_offset: 0,
+            messages_count: 0,
+            size_bytes: 0,
+            segments_count: 1,
+            in_sync_nodes: 0b011,
+        };
+        let received = Instant::now();
+        let cutoff = received + Duration::from_secs(1);
+        let later = received + Duration::from_secs(10);
+        streams.record_partition_statuses(&[healthy], 2, 3, received);
+        let mut unreported = UnreportedPartitions::default();
+        let mut counts = |now: Instant, stale_before: Option<Instant>| {
+            streams.partition_replication(&[true; 3], now, stale_before, &mut unreported)
+        };
         assert_eq!(
-            streams.partition_replication(&[true; 3]).below_write_quorum,
-            0
+            counts(received, None),
+            PartitionReplication::default(),
+            "a partition yet to report is left out"
+        );
+        assert_eq!(
+            counts(later, Some(received)),
+            PartitionReplication::default(),
+            "both were seen at the cutoff"
+        );
+        assert_eq!(
+            counts(later, Some(cutoff)),
+            PartitionReplication {
+                under_replicated: 2,
+                below_write_quorum: 2,
+            }
+        );
+        assert_eq!(
+            streams.partition_status(reported).unwrap().in_sync_nodes,
+            0,
+            "GetTopic lists no member in sync either"
+        );
+
+        streams.record_partition_statuses(&[healthy], 2, 3, later);
+        assert_eq!(
+            counts(later, Some(cutoff)),
+            PartitionReplication {
+                under_replicated: 1,
+                below_write_quorum: 1,
+            },
+            "a primary that reports again holds its members"
+        );
+        assert_eq!(
+            streams.partition_status(reported).unwrap().in_sync_nodes,
+            0b011
         );
     }
 
@@ -7206,7 +7333,14 @@ mod tests {
             iggy_common::Durability::Persisted,
             &[0, 1, 2, 3],
         );
-        let counts = |live: &[bool]| streams.partition_replication(live);
+        let counts = |live: &[bool]| {
+            streams.partition_replication(
+                live,
+                Instant::now(),
+                None,
+                &mut UnreportedPartitions::default(),
+            )
+        };
         assert_eq!(
             counts(&[false, false, true, true]),
             PartitionReplication {

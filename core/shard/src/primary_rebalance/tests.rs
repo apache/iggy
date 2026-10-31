@@ -1482,13 +1482,13 @@ async fn given_more_reports_than_a_probe_carries_when_a_primary_changes_should_s
         in_sync_nodes: 0,
     };
     let reports: Vec<_> = (0..PARTITIONS).map(|id| status(id, 0)).collect();
-    streams.record_partition_statuses(&reports, 0, REPLICAS);
+    streams.record_partition_statuses(&reports, 0, REPLICAS, Instant::now());
     shard.primary_rebalance.borrow_mut().peers = vec![Peer::default(); usize::from(REPLICAS)];
-    let sent: usize = (0..2).map(|_| shard.next_status_batch(PEER).len()).sum();
+    let sent: usize = (0..2).map(|_| shard.next_status_batch(PEER).0.len()).sum();
     assert!(sent > PARTITIONS, "every first report went out once");
 
-    streams.record_partition_statuses(&[status(MOVED, 1)], 0, REPLICAS);
-    let batch = shard.next_status_batch(PEER);
+    streams.record_partition_statuses(&[status(MOVED, 1)], 0, REPLICAS, Instant::now());
+    let (batch, _) = shard.next_status_batch(PEER);
     assert_eq!(
         batch.len(),
         STATUS_ENTRIES_PER_FRAME,
@@ -1497,5 +1497,161 @@ async fn given_more_reports_than_a_probe_carries_when_a_primary_changes_should_s
     assert_eq!(
         (batch[0].namespace, batch[0].view),
         (namespace(MOVED).inner(), 1)
+    );
+}
+
+/// A new metadata view rebuilds the peers. The partition primaries a failover
+/// moves report after it, so they must not wait behind every older change.
+#[compio::test]
+async fn given_a_new_metadata_view_when_a_primary_changes_should_send_it_before_older_changes() {
+    const PARTITIONS: usize = STATUS_ENTRIES_PER_FRAME * 2;
+    const PEER: u8 = 1;
+    const MOVED: usize = PARTITIONS - 1;
+    let (shard, _inbox) = owner();
+    let streams = shard.plane.metadata().mux_stm.streams();
+    let namespace = |id: usize| IggyNamespace::new(1, 1, id);
+    streams.seed_namespace(namespace(PARTITIONS - 1), 1, 0);
+    let status = |id: usize, view: u32| PartitionStatusEntry {
+        namespace: namespace(id).inner(),
+        created_revision: streams
+            .created_revision_for_namespace(namespace(id))
+            .unwrap(),
+        view,
+        commit: 0,
+        current_offset: 0,
+        messages_count: 0,
+        size_bytes: 0,
+        segments_count: 1,
+        in_sync_nodes: 0,
+    };
+    let reports: Vec<_> = (0..PARTITIONS).map(|id| status(id, 0)).collect();
+    streams.record_partition_statuses(&reports, 0, REPLICAS, Instant::now());
+    shard.primary_rebalance.borrow_mut().view = None;
+    // The probes this tick sends fail, so the cursors stay where the view
+    // started them.
+    shard.bus.disconnected.set(true);
+    shard.tick_primary_rebalance().await;
+    shard.bus.disconnected.set(false);
+    assert_eq!(
+        shard.primary_rebalance.borrow().peers.len(),
+        usize::from(REPLICAS),
+        "the new view rebuilt the peers"
+    );
+
+    streams.record_partition_statuses(&[status(MOVED, 1)], 0, REPLICAS, Instant::now());
+    let (batch, _) = shard.next_status_batch(PEER);
+    assert_eq!(
+        (batch[0].namespace, batch[0].view),
+        (namespace(MOVED).inner(), 1)
+    );
+}
+
+/// The bus refused the probe, so the peer never got its reports.
+#[compio::test]
+async fn given_an_unsent_probe_when_probing_again_should_carry_its_reports() {
+    const PEER: u8 = 1;
+    let (shard, _inbox) = owner();
+    let streams = shard.plane.metadata().mux_stm.streams();
+    let namespace = IggyNamespace::new(1, 1, 0);
+    streams.seed_namespace(namespace, 1, 0);
+    streams.record_partition_statuses(
+        &[PartitionStatusEntry {
+            namespace: namespace.inner(),
+            created_revision: streams.created_revision_for_namespace(namespace).unwrap(),
+            view: 2,
+            commit: 0,
+            current_offset: 0,
+            messages_count: 0,
+            size_bytes: 0,
+            segments_count: 1,
+            in_sync_nodes: 0,
+        }],
+        0,
+        REPLICAS,
+        Instant::now(),
+    );
+    shard.primary_rebalance.borrow_mut().peers = vec![Peer::default(); usize::from(REPLICAS)];
+    let (sent, unsent) = shard.next_status_batch(PEER);
+    assert_eq!(sent.len(), 2, "the change, then the cycle");
+    shard
+        .primary_rebalance
+        .borrow_mut()
+        .forget_unsent(PEER, NONCE, unsent);
+    let (again, _) = shard.next_status_batch(PEER);
+    assert_eq!(again, sent);
+}
+
+#[test]
+fn given_more_reports_than_a_probe_carries_when_sizing_the_stale_wait_should_allow_two_passes_each()
+{
+    assert_eq!(report_stale_after(1), Duration::from_secs(6));
+    assert_eq!(
+        report_stale_after(STATUS_ENTRIES_PER_FRAME + 1),
+        Duration::from_secs(8)
+    );
+}
+
+/// A primary reports only while it leads, so a report nobody refreshes names
+/// a partition no member leads. One received before the coordinator's view
+/// came through the last metadata primary and gets a full wait in this view.
+#[compio::test]
+async fn given_a_report_no_primary_refreshes_when_the_coordinator_scans_should_count_no_member_in_sync()
+ {
+    let (shard, _inbox) = owner();
+    let streams = shard.plane.metadata().mux_stm.streams();
+    let namespace = IggyNamespace::new(1, 1, 0);
+    streams.seed_namespace(namespace, 1, 0);
+    let start = shard.bus.monotonic_now();
+    let received = start.checked_sub(Duration::from_secs(60)).unwrap();
+    streams.record_partition_statuses(
+        &[PartitionStatusEntry {
+            namespace: namespace.inner(),
+            created_revision: streams.created_revision_for_namespace(namespace).unwrap(),
+            view: 0,
+            commit: 0,
+            current_offset: 0,
+            messages_count: 0,
+            size_bytes: 0,
+            segments_count: 1,
+            in_sync_nodes: 0b111,
+        }],
+        0,
+        REPLICAS,
+        received,
+    );
+    // The probes carry reports, which the recording bus does not take.
+    shard.bus.disconnected.set(true);
+    shard.primary_rebalance.borrow_mut().view = None;
+    shard.tick_primary_rebalance().await;
+    let scan = async |at: Instant| {
+        for peer in &mut shard.primary_rebalance.borrow_mut().peers {
+            peer.heard = true;
+            peer.live_at = Some(at);
+        }
+        shard.bus.now.set(Some(at));
+        shard.tick_primary_rebalance().await;
+        shard.primary_rebalance.borrow().partition_replication()
+    };
+
+    assert_eq!(
+        scan(start + PROBE_INTERVAL).await,
+        PartitionReplication::default(),
+        "the view is younger than the wait"
+    );
+    assert_eq!(
+        streams.partition_status(namespace).unwrap().in_sync_nodes,
+        0b111
+    );
+    let aged = start + report_stale_after(1) + PROBE_INTERVAL;
+    assert_eq!(
+        scan(aged).await,
+        PartitionReplication {
+            under_replicated: 1,
+            below_write_quorum: 1,
+        }
+    );
+    assert_eq!(
+        streams.partition_status(namespace).unwrap().in_sync_nodes,
+        0
     );
 }

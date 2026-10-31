@@ -43,7 +43,7 @@ use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use metadata::impls::metadata::PartitionPrimaryTransfer;
-use metadata::stm::stream::PartitionReplication;
+use metadata::stm::stream::{PartitionReplication, UnreportedPartitions};
 use partitions::{IggyPartition, PreparedPrimaryTransfer};
 use server_common::Message;
 use server_common::MessageBag;
@@ -141,6 +141,9 @@ pub struct PrimaryRebalance {
     replication: PartitionReplication,
     /// The nodes the directory last narrowed in-sync reports to.
     live_nodes: u32,
+    unreported: UnreportedPartitions,
+    /// When this node started coordinating `view`.
+    view_since: Instant,
     next_quorum_scan: Instant,
     stable_since: Instant,
     next_move: Instant,
@@ -207,6 +210,13 @@ struct Peer {
     changes_sent: u64,
 }
 
+/// Where a peer's reports stood before a probe that may not leave this node.
+#[derive(Debug, Clone, Copy, Default)]
+struct StatusCursors {
+    status_cursor: Option<u64>,
+    changes_sent: u64,
+}
+
 struct PendingMove {
     plan: PartitionPrimaryTransfer,
     probe: PrimaryRebalanceHeader,
@@ -266,13 +276,16 @@ impl PrimaryRebalance {
     }
 
     /// A probe the bus refused never left this node, so nothing can answer it.
-    /// The peer is probed again at the regular cadence, not after the timeout.
-    fn forget_unsent(&mut self, replica: u8, nonce: u128) {
-        if let Some(peer) = self.peers.get_mut(usize::from(replica))
-            && peer.nonce == Some(nonce)
-        {
-            peer.nonce = None;
-            peer.heard = true;
+    /// The peer is probed again at the regular cadence, not after the timeout,
+    /// and gets the reports that probe carried in the next one.
+    fn forget_unsent(&mut self, replica: u8, nonce: u128, unsent: StatusCursors) {
+        if let Some(peer) = self.peers.get_mut(usize::from(replica)) {
+            if peer.nonce == Some(nonce) {
+                peer.nonce = None;
+                peer.heard = true;
+            }
+            peer.status_cursor = unsent.status_cursor;
+            peer.changes_sent = unsent.changes_sent;
         }
     }
 
@@ -363,6 +376,8 @@ impl Default for PrimaryRebalance {
             readiness_known: false,
             replication: PartitionReplication::default(),
             live_nodes: u32::MAX,
+            unreported: UnreportedPartitions::default(),
+            view_since: Instant::now(),
             next_quorum_scan: Instant::now(),
             stable_since: Instant::now(),
             next_move: Instant::now(),
@@ -447,8 +462,18 @@ where
                     // A partition's members never move, so placement waits to
                     // hear from every peer rather than presume the node whose
                     // failure started this view is ready.
-                    peers: vec![Peer::default(); replicas],
+                    // Reports from before this view went out under the last
+                    // metadata primary or come round in the cycle. The changes
+                    // a failover makes come after it, so they go first.
+                    peers: vec![
+                        Peer {
+                            changes_sent: metadata.mux_stm.streams().partition_status_last_change(),
+                            ..Peer::default()
+                        };
+                        replicas
+                    ],
                     eligible: vec![false; replicas],
+                    view_since: now,
                     next_quorum_scan: now,
                     backoffs: vec![TargetBackoff::default(); replicas],
                     stable_since: now,
@@ -542,7 +567,18 @@ where
             }
             if readiness_known && now >= state.next_quorum_scan {
                 state.next_quorum_scan = now + PROBE_INTERVAL;
-                state.replication = metadata.mux_stm.streams().partition_replication(&live);
+                let streams = metadata.mux_stm.streams();
+                // Reports from before this view came through the last metadata
+                // primary, so they get as long as this view's own to come round.
+                let stale_before = now
+                    .checked_sub(report_stale_after(streams.partition_status_count()))
+                    .filter(|cutoff| *cutoff >= state.view_since);
+                let PrimaryRebalance {
+                    replication,
+                    unreported,
+                    ..
+                } = &mut *state;
+                *replication = streams.partition_replication(&live, now, stale_before, unreported);
             }
             if let Some(pending) = state.pending.as_ref() {
                 let elapsed = now.duration_since(pending.since);
@@ -641,20 +677,25 @@ where
             self.send_rebalance(source, probe, &[]).await;
         }
         for (replica, probe) in outgoing {
-            let statuses = self.next_status_batch(replica);
+            let (statuses, unsent) = self.next_status_batch(replica);
             if !self.send_rebalance(replica, probe, &statuses).await {
                 self.primary_rebalance
                     .borrow_mut()
-                    .forget_unsent(replica, probe.nonce);
+                    .forget_unsent(replica, probe.nonce, unsent);
             }
         }
     }
 
-    /// The next run of directory reports for `peer`, advancing its cursor.
-    fn next_status_batch(&self, peer: u8) -> Vec<PartitionStatusEntry> {
+    /// The next run of directory reports for `peer`, advancing its cursors,
+    /// with the cursors from before it for a send that fails.
+    fn next_status_batch(&self, peer: u8) -> (Vec<PartitionStatusEntry>, StatusCursors) {
         let mut state = self.primary_rebalance.borrow_mut();
         let Some(cursor) = state.peers.get_mut(usize::from(peer)) else {
-            return Vec::new();
+            return (Vec::new(), StatusCursors::default());
+        };
+        let before = StatusCursors {
+            status_cursor: cursor.status_cursor,
+            changes_sent: cursor.changes_sent,
         };
         let streams = self.plane.metadata().mux_stm.streams();
         // Changes first: a new primary reaches every node within a probe, not
@@ -672,7 +713,7 @@ where
             cursor.status_cursor = last;
             batch.extend(cycle);
         }
-        batch
+        (batch, before)
     }
 
     /// Node id of the primary `view` assigns in the committed partition behind
@@ -725,7 +766,12 @@ where
             .metadata()
             .mux_stm
             .streams()
-            .record_partition_statuses(statuses, consensus.node_id(), consensus.replica_count());
+            .record_partition_statuses(
+                statuses,
+                consensus.node_id(),
+                consensus.replica_count(),
+                self.bus.monotonic_now(),
+            );
     }
 
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
@@ -1168,6 +1214,18 @@ where
         self.partition_status_outbox
             .next_batch(STATUS_ENTRIES_PER_FRAME)
     }
+}
+
+/// How long a partition report goes without a newer copy before its primary
+/// counts as no longer leading. A node sends the reports of what it leads one
+/// frame per probe and leads at most the `reports` held here, so one it keeps
+/// sending comes round within that many frames. Twice that, a probe and a
+/// probe timeout cover the shards' own pass and a lost reply.
+fn report_stale_after(reports: usize) -> Duration {
+    let passes = u32::try_from(reports.div_ceil(STATUS_ENTRIES_PER_FRAME)).unwrap_or(u32::MAX);
+    PROBE_INTERVAL
+        .saturating_mul(passes.saturating_mul(2).saturating_add(1))
+        .saturating_add(PROBE_TIMEOUT)
 }
 
 /// `eligible` as a mask of node ids, bit `n` for node `n`.

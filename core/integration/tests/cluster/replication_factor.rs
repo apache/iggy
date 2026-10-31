@@ -33,6 +33,7 @@ use tokio::time::{sleep, timeout};
 
 const STREAM_NAME: &str = "replication-factor-stream";
 const TOPIC_NAME: &str = "replication-factor-topic";
+const WITNESS_TOPIC_NAME: &str = "replication-factor-witness";
 const PARTITIONS: u32 = 3;
 const POLL_BUDGET: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -605,6 +606,55 @@ const STORAGE_EPOCH_SKEW: Duration = Duration::from_secs(11);
 /// Rejoining on empty storage takes a metadata catch-up, an election and a
 /// partition state transfer before a write commits again.
 const REJOIN_BUDGET: Duration = Duration::from_secs(120);
+/// Consecutive polls, 5 seconds, a check must pass: past the 3 second probe
+/// timeout, after which a new metadata primary narrows every in-sync list to
+/// the nodes it hears.
+const STEADY_POLLS: u32 = 25;
+
+/// Waits until partition 0 of `topic` lists in-sync members that pass `check`
+/// on [`STEADY_POLLS`] polls in a row.
+async fn await_steady_in_sync(
+    client: &TcpClient,
+    topic: &Identifier,
+    check: impl Fn(&[u8]) -> bool,
+) {
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    timeout(REJOIN_BUDGET, async {
+        let mut passed = 0;
+        while passed < STEADY_POLLS {
+            let in_sync = client
+                .get_topic(&stream, topic)
+                .await
+                .ok()
+                .flatten()
+                .map(|details| details.partitions[0].in_sync_members.clone());
+            passed = if in_sync.is_some_and(|in_sync| check(&in_sync)) {
+                passed + 1
+            } else {
+                0
+            };
+            sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the in-sync list of {topic} never settled"));
+}
+
+async fn await_steady_replication_gauges(sessions: &[HttpClient], expected: (i64, i64)) {
+    timeout(REJOIN_BUDGET, async {
+        let mut passed = 0;
+        while passed < STEADY_POLLS {
+            let observed = (
+                summed_gauge(sessions, "partitions_under_replicated").await,
+                summed_gauge(sessions, "partitions_below_write_quorum").await,
+            );
+            passed = if observed == expected { passed + 1 } else { 0 };
+            sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("replication gauges never settled at {expected:?}"));
+}
 
 async fn create_factor_two_topic(client: &TcpClient, durability: Durability) {
     client
@@ -718,6 +768,19 @@ async fn given_a_factor_of_two_when_both_members_return_on_empty_storage_should_
         .clone();
     assert_eq!(members.len(), 2);
     send_within_budget(&creator, &stream, &topic, 0, "lost").await;
+    let witness = Identifier::named(WITNESS_TOPIC_NAME).unwrap();
+    creator
+        .create_topic(
+            &stream,
+            WITNESS_TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                replication_factor: Some(u32::try_from(NODES).unwrap()),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
     drop(creator);
     let outsider = (0..NODES)
         .find(|node| !members.contains(&u8::try_from(*node).unwrap()))
@@ -733,6 +796,20 @@ async fn given_a_factor_of_two_when_both_members_return_on_empty_storage_should_
             .restart_node_from_clean_slate(usize::from(member))
             .unwrap();
     }
+    for &member in &members {
+        drop(login_within_budget(harness, usize::from(member)).await);
+    }
+    // The metadata primary lists a node in sync only while it hears the node,
+    // so the partition every node stores shows when it hears every node again.
+    await_steady_in_sync(&admin, &witness, |in_sync| in_sync.len() == NODES).await;
+    await_steady_in_sync(&admin, &topic, <[u8]>::is_empty).await;
+    let mut sessions = Vec::with_capacity(NODES);
+    for node in 0..NODES {
+        sessions.push(HttpClient::login_root_no_redirect(node_url(harness, node)).await);
+    }
+    // Neither member leads the lost pair, whether or not the metadata primary
+    // still holds the last report from before the wipe.
+    await_steady_replication_gauges(&sessions, (1, 1)).await;
 
     timeout(REJOIN_BUDGET, async {
         loop {

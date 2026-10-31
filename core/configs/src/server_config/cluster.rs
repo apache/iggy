@@ -1237,6 +1237,28 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             ConfigurationError::InvalidConfigurationValue
         })?;
 
+        // Placement treats a node without a rack as alone in one, so a single
+        // unlabeled node would take a copy of nearly every partition. Kafka
+        // likewise refuses a rack-aware assignment when only some brokers set
+        // `broker.rack`.
+        let racked = self.nodes.iter().filter(|node| node.rack.is_some()).count();
+        if racked != 0 && racked != self.nodes.len() {
+            eprintln!(
+                "Invalid cluster configuration: {racked} of {} nodes set 'rack'; set it on every \
+                 node or on none",
+                self.nodes.len()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.nodes.iter().any(|node| {
+            node.rack
+                .as_deref()
+                .is_some_and(|rack| rack.trim().is_empty())
+        }) {
+            eprintln!("Invalid cluster configuration: a node's 'rack' cannot be empty");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         let mut seen_ids = std::collections::HashSet::new();
         let mut seen_names = std::collections::HashSet::new();
         let mut used_endpoints = std::collections::HashSet::new();
@@ -2361,6 +2383,30 @@ mod cluster_validate_tests {
     fn validate_rejects_duplicate_replica_ids() {
         let c = cfg(vec![node("n1", 0), node("n2", 0)]);
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_requires_a_rack_on_every_node_or_on_none() {
+        let racked = |name: &str, id: u8, rack: Option<&str>| ClusterNodeConfig {
+            rack: rack.map(str::to_owned),
+            ..node(name, id)
+        };
+        assert!(
+            cfg(vec![racked("n1", 0, Some("a")), racked("n2", 1, None)])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            cfg(vec![racked("n1", 0, Some("a")), racked("n2", 1, Some(" "))])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            cfg(vec![racked("n1", 0, Some("a")), racked("n2", 1, Some("b"))])
+                .validate()
+                .is_ok()
+        );
+        assert!(cfg(vec![node("n1", 0), node("n2", 1)]).validate().is_ok());
     }
 
     #[test]

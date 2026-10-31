@@ -291,6 +291,9 @@ impl Streams {
                 return state.lifecycle_blocks_topic_creation(stream_id);
             }
             if !topic_scoped {
+                if operation == Operation::DeleteStream {
+                    return state.lifecycle_blocks_delete(stream_id, None);
+                }
                 return state.lifecycle_blocks(stream_id, None);
             }
             let Ok((topic, topic_bytes)) = WireIdentifier::decode(&body[consumed..]) else {
@@ -316,6 +319,9 @@ impl Streams {
                     .and_then(|topic| topic.resolve_group_id(&group));
                 return state.lifecycle_blocks_consumer(stream_id, topic_id, group_id);
             }
+            if operation == Operation::DeleteTopic {
+                return state.lifecycle_blocks_delete(stream_id, Some(topic_id));
+            }
             state.lifecycle_blocks(stream_id, Some(topic_id))
         })
     }
@@ -326,6 +332,32 @@ impl StreamsInner {
         self.lifecycle_blockers(stream_id, topic_id)
             .next()
             .is_some()
+    }
+
+    /// A topic or stream delete removes the topic's consumer groups too, so a
+    /// pending group deletion does not hold it back: the delete takes it over.
+    /// A group deletion whose partition can never elect a primary would
+    /// otherwise keep the topic from ever being deleted.
+    pub(crate) fn lifecycle_blocks_delete(
+        &self,
+        stream_id: usize,
+        topic_id: Option<usize>,
+    ) -> bool {
+        self.lifecycle_blockers(stream_id, topic_id)
+            .any(|intent| !matches!(intent.action, LifecycleAction::DeleteConsumerGroup { .. }))
+    }
+
+    fn take_over_group_deletions(&mut self, stream_id: usize, topic_id: Option<usize>) {
+        let taken: Vec<u64> = self
+            .lifecycle_blockers(stream_id, topic_id)
+            .filter(|intent| matches!(intent.action, LifecycleAction::DeleteConsumerGroup { .. }))
+            .map(|intent| intent.context.metadata_op)
+            .collect();
+        for metadata_op in taken {
+            if let Some(intent) = self.lifecycle_intents.remove(&metadata_op) {
+                self.lifecycle_scopes.remove(&intent.scope());
+            }
+        }
     }
 
     /// A topic-scoped intent leaves the rest of its stream writable, so only a
@@ -391,7 +423,16 @@ impl StreamsInner {
         if self.finalizing_lifecycle.is_some() {
             return None;
         }
-        if self.lifecycle_blocks(stream_id, topic_id) {
+        let deletes = matches!(
+            action,
+            LifecycleAction::DeleteStream | LifecycleAction::DeleteTopic
+        );
+        let busy = if deletes {
+            self.lifecycle_blocks_delete(stream_id, topic_id)
+        } else {
+            self.lifecycle_blocks(stream_id, topic_id)
+        };
+        if busy {
             return Some(ApplyReply::err(IggyError::LifecycleBusy.as_code()));
         }
         let stream = self.items.get(stream_id)?;
@@ -449,6 +490,9 @@ impl StreamsInner {
                     retired_members: 0,
                 });
             }
+        }
+        if deletes {
+            self.take_over_group_deletions(stream_id, topic_id);
         }
         if partitions.is_empty() {
             return None;
@@ -1527,14 +1571,15 @@ mod tests {
         }
         assert!(!streams.request_lifecycle_blocked(Operation::SendMessages, &[]));
         assert!(
-            streams.request_lifecycle_blocked(
+            !streams.request_lifecycle_blocked(
                 Operation::DeleteTopic,
                 &DeleteTopicRequest {
                     stream_id: WireIdentifier::numeric(0),
                     topic_id: WireIdentifier::numeric(0),
                 }
                 .to_bytes()
-            )
+            ),
+            "a topic delete takes the group deletion over"
         );
         complete(&streams, 0, 12);
         assert!(streams.read(|inner| inner.lifecycle_blocks_consumer(0, 0, Some(0))));
@@ -1720,6 +1765,66 @@ mod tests {
             crate::stm::snapshot::MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
         let restored = Streams::from_snapshot(decoded.streams.unwrap()).unwrap();
         assert_eq!(catalog(&restored), (REMOVAL_OP, 2, vec![1]));
+    }
+
+    /// A group deletion can wait forever on a partition that cannot elect, so
+    /// it must not keep its topic from being deleted: the topic delete takes
+    /// it over and removes the group with the topic.
+    #[test]
+    fn given_a_pending_group_deletion_when_deleting_its_topic_should_take_it_over() {
+        const TOPIC_DELETE_OP: u64 = INTENT_OP + 10;
+        let streams = pending_owned_group_deletion(INTENT_OP - 1);
+        let delete = DeleteTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+        };
+        assert!(!streams.request_lifecycle_blocked(Operation::DeleteTopic, &delete.to_bytes()));
+        let create_partitions =
+            iggy_binary_protocol::requests::partitions::CreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+            };
+        assert!(
+            streams.request_lifecycle_blocked(
+                Operation::CreatePartitions,
+                &create_partitions.to_bytes()
+            ),
+            "only a delete of the scope takes a group deletion over"
+        );
+
+        let reply = apply(
+            &streams,
+            Operation::DeleteTopic,
+            &delete,
+            ApplyContext {
+                metadata_op: TOPIC_DELETE_OP,
+                ..context()
+            },
+        );
+        assert_eq!(reply.code, 0);
+        assert!(!streams.lifecycle_pending(INTENT_OP));
+        assert!(streams.lifecycle_pending(TOPIC_DELETE_OP));
+
+        for (partition_id, metadata_op) in [(0, TOPIC_DELETE_OP + 1), (1, TOPIC_DELETE_OP + 2)] {
+            let reply = apply(
+                &streams,
+                Operation::CompleteLifecycle,
+                &CompleteLifecycleRequest::new(
+                    TOPIC_DELETE_OP,
+                    0,
+                    vec![completion(partition_id, 3)],
+                )
+                .unwrap(),
+                ApplyContext {
+                    metadata_op,
+                    ..ApplyContext::default()
+                },
+            );
+            assert_eq!(reply.code, 0);
+        }
+        assert!(!streams.lifecycle_pending(TOPIC_DELETE_OP));
+        assert!(streams.read(|inner| inner.items[0].topics.is_empty()));
     }
 
     #[test]

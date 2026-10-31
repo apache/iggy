@@ -15920,6 +15920,8 @@ mod tests {
                         .segment_checkpoint()
                         .is_none()
                 );
+                assert!(!partition.consensus().recovery_election_allowed());
+                assert!(!partition.consensus().recovered_log_complete());
                 let prepare = checksummed_segment_prepare(1, 0, 0, b"transferred");
                 let mut staged = Vec::new();
                 if materialized {
@@ -15974,6 +15976,15 @@ mod tests {
                 assert!(partition.log.messages_writers().iter().all(Option::is_none));
                 assert!(partition.log.index_writers().last().unwrap().is_some());
                 assert_eq!(partition.consensus().commit_min(), 1);
+                assert!(!partition.requires_state_transfer());
+                assert!(
+                    partition.consensus().recovery_election_allowed(),
+                    "{durability:?}: the installed copy may vote and lead again"
+                );
+                assert_eq!(
+                    partition.consensus().recovered_log_complete(),
+                    durability.is_persisted()
+                );
             }
         }
     }

@@ -4333,6 +4333,12 @@ where
                 if let (Some(persistence), Some(drain)) = (&self.persistence, &install.drain) {
                     persistence.finish_drain(drain);
                 }
+                // The installed copy is what a primary of this view committed, so
+                // this member may vote and lead again. Nothing else lifts the bar
+                // a member that came back without its data was held under.
+                if install.failure.is_none() {
+                    self.consensus().set_recovery_election_allowed(true);
+                }
                 let outcome = install.failure.take().map_or_else(
                     || {
                         Ok(PartitionInstallOutcome {

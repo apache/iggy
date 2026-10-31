@@ -15901,6 +15901,23 @@ mod metadata_read_frontier_tests {
             step_until_applied(&mut sim, replica, created);
         }
         sim.init_partition(namespace);
+        if factor < replicas {
+            // The gauges count a partition no member runs as unable to commit,
+            // so the filler runs too.
+            sim.init_partition(
+                sim.replicas[0].shards[0]
+                    .plane
+                    .metadata()
+                    .mux_stm
+                    .streams()
+                    .namespace_from_partition(
+                        &iggy_binary_protocol::WireIdentifier::named("freshness").unwrap(),
+                        &iggy_binary_protocol::WireIdentifier::named("filler").unwrap(),
+                        0,
+                    )
+                    .unwrap(),
+            );
+        }
         let members = partition_members(&sim, namespace);
         assert_eq!(members.len(), factor);
         assert!(
