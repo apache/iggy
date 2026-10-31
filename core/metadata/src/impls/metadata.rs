@@ -44,7 +44,7 @@ use consensus::{
     build_result_rejection_reply, emit_sim_event, fatal, fence_old_prepare_by_commit,
     is_caught_up_primary, is_caught_up_primary_except_barrier,
     panic_if_hash_chain_would_break_in_same_view, peek_committable_head, pipeline_prepare_common,
-    register_preflight, replicate_preflight, replicate_to_next_in_chain, request_preflight,
+    register_preflight, replicate_preflight, replicate_prepare, request_preflight,
     send_eviction_to_client, send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
 use futures::channel::oneshot;
@@ -1932,15 +1932,13 @@ where
 
         // Durable here but not yet committed, and the primary is retransmitting
         // it: our original PrepareOk was lost (e.g. the primary's inbox
-        // overflowed under a client burst). Re-forward the tail down the chain
-        // so a downstream replica that missed it recovers, then re-ack ONLY
-        // the retransmitted op. The primary's retransmit cycle walks every
+        // overflowed under a client burst). Re-ack only the retransmitted op.
+        // The primary's retransmit cycle walks every
         // un-acked op in the window (`prepare_timeout_targets`), so a lost ack
         // for a lower op gets its own retransmit and its own re-ack; re-acking the
         // whole suffix here is O(window^2) PrepareOks per cycle across the
         // backups, which can overflow the primary's inbox -- the very failure
-        // this path recovers from. Both downstream and primary are idempotent
-        // on a duplicate (replica, op).
+        // this path recovers from. The primary is idempotent on duplicate acks.
         #[allow(clippy::cast_possible_truncation)]
         if journal.handle().header(header.op as usize).is_some() {
             warn!(
@@ -1951,7 +1949,7 @@ where
                 op = header.op,
                 commit = consensus.commit_max(),
                 operation = ?header.operation,
-                "journal already holds prepare, re-forwarding + re-acking it"
+                "journal already holds prepare, re-acking it"
             );
             self.replicate(&message).await;
             self.send_prepare_ok(&header).await;
@@ -5094,8 +5092,8 @@ where
             journal.handle().header(op).is_some(),
             "replicate: prepare must be durable in local journal before chain-forward"
         );
-        if let Err(e) = replicate_to_next_in_chain(consensus, message).await {
-            tracing::warn!(op = header.op, error = ?e, "chain replication failed");
+        if let Err(e) = replicate_prepare(consensus, message).await {
+            tracing::warn!(op = header.op, error = ?e, "prepare replication enqueue failed");
         }
     }
 

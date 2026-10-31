@@ -193,6 +193,10 @@ impl Default for PartitionConfig {
                 .wal_bytes_max
                 .parse()
                 .expect("embedded WAL capacity is valid"),
+            repair_memory_bytes_max: partition
+                .repair_memory_bytes_max
+                .parse()
+                .expect("embedded repair memory capacity is valid"),
             wal_group_commit_delay_micros: u64::try_from(partition.wal_group_commit_delay_micros)
                 .expect("embedded WAL group commit delay is valid"),
             validate_checksum: SERVER_CONFIG.partition.validate_checksum,

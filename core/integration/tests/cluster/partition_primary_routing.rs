@@ -731,6 +731,7 @@ async fn given_partitions_on_different_primaries_when_sending_round_robin_should
 }
 
 #[iggy_harness(cluster_nodes = 5, server(sharding.cpu_allocation = "2"))]
+#[ignore = "slow: about two minutes against a five-node cluster, run with --run-ignored only"]
 async fn given_balanced_primaries_when_a_replica_fails_and_returns_should_rebalance_without_data_loss(
     harness: &mut TestHarness,
 ) {

@@ -71,10 +71,12 @@ struct DeferredPollE2ETests {
                 streamID: scratch.stream, topicID: scratch.topic, consumer: .consumer(try Identifier(named: E2EEnvironment.uniqueName("swift-e2e-backlog"))),
                 configuration: ReaderConfiguration(partitions: [0, 1], start: .first, options: PollOptions(count: 1, maxWait: .seconds(1))))
             var payloads: [String] = []
-            for _ in 0..<4 {
+            // Each fetch in flight takes a data connection of its own, so the
+            // backlog can answer a few times while the other fetch opens one.
+            while !payloads.contains("late"), payloads.count < backlog.count / 2 {
                 payloads += try #require(try await reader.next()).messages.map(\.payloadString)
             }
-            #expect(payloads.contains("late"), "\(payloads)")
+            #expect(payloads.contains("late"), "\(payloads.count) messages came without it")
             try await reader.close()
         }
     }

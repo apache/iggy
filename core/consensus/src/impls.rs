@@ -1049,8 +1049,9 @@ impl StateTransferStage {
 /// drain the journal or correct a stale peer.
 #[derive(Debug, Clone, Copy)]
 pub enum CommitOutcome {
-    /// Nothing to do: the heartbeat was absorbed (or ignored as stale /
-    /// foreign / wrong-status) without moving `commit_max`.
+    /// Stale, foreign, or wrong-status heartbeat. Send no reply.
+    Ignored,
+    /// Valid heartbeat without a new commit point. Reply for quorum liveness.
     Accepted,
     /// `commit_max` advanced; run `commit_journal`.
     Advanced,
@@ -1058,6 +1059,22 @@ pub enum CommitOutcome {
     /// primary; this replica is the current view's primary and should
     /// broadcast `StartView` so the stale replica adopts the view.
     RespondStartView,
+}
+
+impl CommitOutcome {
+    /// Reply only to a heartbeat accepted from the current primary.
+    #[must_use]
+    pub const fn reply(self, header: &iggy_binary_protocol::CommitHeader) -> Option<VsrAction> {
+        match self {
+            Self::Accepted | Self::Advanced => Some(VsrAction::SendCommitReply {
+                view: header.view,
+                group: header.group,
+                timestamp_monotonic: header.timestamp_monotonic,
+                target: header.replica,
+            }),
+            Self::Ignored | Self::RespondStartView => None,
+        }
+    }
 }
 
 /// Actions to be taken by the caller after processing a VSR event.
@@ -1156,6 +1173,13 @@ pub enum VsrAction {
         timestamp_monotonic: u64,
         target: Option<u8>,
     },
+    /// Echo a valid primary heartbeat without promising log durability.
+    SendCommitReply {
+        view: u32,
+        group: u64,
+        timestamp_monotonic: u64,
+        target: u8,
+    },
 }
 
 impl VsrAction {
@@ -1176,6 +1200,16 @@ impl VsrAction {
             } if suffix.is_empty()
         )
     }
+}
+
+/// Whether a received `DoViewChange` is the empty vote of
+/// [`VsrAction::is_empty_vote`].
+fn is_empty_vote(header: &DoViewChangeHeader, suffix: &DvcSuffix) -> bool {
+    header.untrusted_log()
+        && header.log_view == 0
+        && header.op == 0
+        && header.commit == 0
+        && suffix.is_empty()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1199,13 +1233,8 @@ impl PrepareOkOutcome {
     }
 }
 
-/// What the primary of the current view knows of each replica's log and has
-/// told it of the commit point, so an eager `Commit` reaches a backup only once
-/// that backup holds the op it announces.
-///
-/// Chain replication forwards a prepare to the last backups after the quorum
-/// commits it. A `Commit` sent to every backup at once overtakes the prepare
-/// there, and the backup repairs an op that is still on its way to it.
+/// Eager commits wait for each backup's confirmed durable progress. A peer
+/// paused for progress must not repair fresh operations still waiting to be sent.
 #[derive(Debug)]
 struct CommitAnnouncements {
     /// Commit point the planes asked the backups to learn without waiting for
@@ -1385,6 +1414,10 @@ where
     loopback_notifier: RefCell<Option<LoopbackNotifier>>,
     /// Tracks start view change messages received from all replicas (including self)
     start_view_change_from_all_replicas: RefCell<BitSet<u32>>,
+    /// The view the votes in `start_view_change_from_all_replicas` are for. Never
+    /// below `view`, and above it while this replica votes to leave its view
+    /// without having left it, see [`Self::handle_start_view_change`].
+    start_view_change_view: Cell<u32>,
     /// Consecutive unanswered `RequestStartView` probes while Recovering;
     /// at the `probe_attempts_max` ceiling the replica falls back to an
     /// election.
@@ -1426,8 +1459,8 @@ where
     /// `StartView` or by starting a view as primary, whose merged log either
     /// rule makes safe.
     untrusted_log: Cell<bool>,
-    /// View-change escalations since [`Self::untrusted_log`] was last set, for
-    /// rate-limiting the halt warning.
+    /// View-change status timeouts since [`Self::untrusted_log`] was last set,
+    /// for rate-limiting the halt warning.
     untrusted_view_change_timeouts: Cell<u32>,
 
     /// This replica's own uncommitted suffix, with the head, commit point and
@@ -1519,10 +1552,14 @@ where
     /// View and counter of the last emitted or accepted heartbeat. A new
     /// primary's counter can be lower, so freshness is scoped to its view.
     heartbeat_watermark: Cell<(u32, u64)>,
+    /// Only replies to counters emitted after this window began can count.
+    quorum_heartbeat_floor: Cell<u64>,
+    heartbeat_replies: RefCell<BitSet<u32>>,
     /// The next tick looks for backups owed an eager `Commit`; see
     /// [`Self::request_eager_commit`].
     eager_commit: Cell<bool>,
     commit_announcements: RefCell<CommitAnnouncements>,
+    pub(crate) replication: RefCell<crate::replication::ReplicationFlow>,
     /// Views whose logs were refused for naming a different prepare at an op
     /// this replica applied; see [`Self::contradicts_applied_log`].
     applied_log_contradictions: Cell<u64>,
@@ -1892,6 +1929,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             loopback_queue: RefCell::new(VecDeque::with_capacity(prepare_queue_max)),
             loopback_notifier: RefCell::new(None),
             start_view_change_from_all_replicas: RefCell::new(BitSet::with_capacity(REPLICAS_MAX)),
+            start_view_change_view: Cell::new(0),
             probe_attempts: Cell::new(0),
             probe_attempts_max: Cell::new(PROBE_ATTEMPTS_MAX),
             recovery_election_allowed: Cell::new(true),
@@ -1918,8 +1956,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             sent_own_do_view_change: Cell::new(false),
             timeouts: RefCell::new(TimeoutManager::new(timeout_seed)),
             heartbeat_watermark: Cell::new((0, 0)),
+            quorum_heartbeat_floor: Cell::new(0),
+            heartbeat_replies: RefCell::new(BitSet::with_capacity(REPLICAS_MAX)),
             eager_commit: Cell::new(false),
             commit_announcements: RefCell::new(CommitAnnouncements::new(replica_count)),
+            replication: RefCell::new(crate::replication::ReplicationFlow::new(replica_count)),
             applied_log_contradictions: Cell::new(0),
             applied_log_contradictions_taken: Cell::new(0),
             contradiction_reported_view: Cell::new(None),
@@ -2028,6 +2069,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     pub fn init(&self) {
         self.status.set(Status::Normal);
         self.rejoined_on_recovered_log.set(false);
+        self.reset_quorum_window();
         let mut timeouts = self.timeouts.borrow_mut();
         if self.is_primary() {
             // Prepare is deliberately NOT armed here: a fresh primary has an
@@ -2037,6 +2079,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             // `push_prepare_entry` arms it, timed from that push rather than from
             // boot.
             timeouts.start(TimeoutKind::CommitMessage);
+            timeouts.start(TimeoutKind::CheckQuorum);
         } else {
             timeouts.start(TimeoutKind::NormalHeartbeat);
         }
@@ -2105,12 +2148,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// The primary of a Normal view, unless it ceded at boot
     /// (`init_as_backup`): then it is a backup by role however the view math
     /// reads, so it neither retransmits prepares nor announces commits.
-    fn is_acting_primary(&self) -> bool {
+    pub(crate) fn is_acting_primary(&self) -> bool {
         self.is_primary() && self.status.get() == Status::Normal && !self.ceded_primaryship.get()
     }
 
     /// Ask the partition quorum to elect `target` in the next view assigned to it.
-    /// A ready backup may initiate this too. Refusal leaves consensus unchanged.
+    /// Only the primary can: its `StartViewChange` leaves its view, so its backups
+    /// follow it, while that of a backup is only a vote. Refusal leaves consensus
+    /// unchanged.
     /// The caller fences the incarnation, drains history work, refreshes the DVC
     /// suffix and persists the new view before dispatching the returned actions.
     pub fn request_primary_transfer(&self, expected_view: u32, target: u8) -> Vec<VsrAction> {
@@ -2118,8 +2163,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         if self.group == METADATA_GROUP
             || target >= self.replica_count
             || view != expected_view
-            || !self.is_normal()
-            || self.has_ceded_primaryship()
+            || !self.is_acting_primary()
             || self.is_transferring()
             || self.view_log_unproven()
             || self.observed_newer_view.get() > view
@@ -2362,6 +2406,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     pub fn set_view(&mut self, view: u32) {
         self.view.set(view);
+        self.start_view_change_view.set(view);
     }
 
     #[must_use]
@@ -3128,9 +3173,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// `drain_request_queue_into_prepares` could project stale entries
     /// via `pipeline_prepare_common`, which panics on non-normal status.
     pub(crate) fn reset_view_change_state(&self) {
-        self.reset_svc_quorum();
+        self.timeouts.borrow_mut().stop(TimeoutKind::CheckQuorum);
         self.reset_dvc_quorum();
-        self.sent_own_start_view_change.set(false);
         self.sent_own_do_view_change.set(false);
         // A merge parked for the superseded view may describe a different log, so
         // drop it and let the new attempt re-derive from the DVCs it collects.
@@ -3151,6 +3195,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     }
 
     /// Timers and retransmissions continue while storage leases defer history changes.
+    #[allow(clippy::too_many_lines)]
     pub fn tick_with_history_fence(
         &self,
         plane: PlaneKind,
@@ -3163,6 +3208,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         timeouts.tick();
 
         // Phase 2: Handle fired timeouts
+        if timeouts.fired(TimeoutKind::CheckQuorum) {
+            drop(timeouts);
+            self.handle_check_quorum_timeout();
+            timeouts = self.timeouts.borrow_mut();
+        }
         if !history_fenced && timeouts.fired(TimeoutKind::NormalHeartbeat) {
             drop(timeouts);
             actions.extend(self.handle_normal_heartbeat_timeout(plane));
@@ -3206,10 +3256,10 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             //   primary answers or an election's StartView adopts us.
             // - ViewChange backup: the election may have concluded with our
             //   copy of the StartView lost; re-requesting it is a
-            //   two-message fix, while the ViewChangeStatus escalation
-            //   backstop burns a fresh cluster-wide election. The would-be
-            //   primary of the view skips the probe (it concludes the view
-            //   itself or escalates).
+            //   two-message fix, while the ViewChangeStatus backstop votes
+            //   for a fresh cluster-wide election. The primary candidate of
+            //   the view skips the probe (it concludes the view itself, or
+            //   probes from its status timeout once it saw a newer view).
             match self.status.get() {
                 Status::Recovering => {
                     // A probe answered by nobody, repeatedly, means nobody is
@@ -3301,8 +3351,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         actions
     }
 
-    /// Called when `normal_heartbeat` timeout fires.
-    /// Backup hasn't heard from primary - start view change.
+    /// Called when `normal_heartbeat` timeout fires: the backup did not hear its
+    /// primary, so it votes to replace it.
     fn handle_normal_heartbeat_timeout(&self, plane: PlaneKind) -> Vec<VsrAction> {
         // A recovering replica makes progress through RequestStartView
         // retries, not elections; it is quorum-invisible.
@@ -3350,12 +3400,121 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
-        self.start_election(plane, ViewChangeReason::NormalHeartbeatTimeout)
+        // The timer keeps running: each firing starts a fresh round of votes, and
+        // the heartbeat that resets it withdraws the vote.
+        self.timeouts
+            .borrow_mut()
+            .reset(TimeoutKind::NormalHeartbeat);
+        self.vote_for_next_view(plane, ViewChangeReason::NormalHeartbeatTimeout)
     }
 
     /// Advance to `view + 1` and start a view change (own SVC counted).
     fn start_election(&self, plane: PlaneKind, reason: ViewChangeReason) -> Vec<VsrAction> {
         self.enter_view_change(plane, self.view.get() + 1, reason)
+    }
+
+    /// Start a fresh round of votes to leave this view, for the next view or for
+    /// the higher one this replica already votes for. A round drops the votes of
+    /// the last one, so a peer that heard the primary again stops counting once it
+    /// stops sending its vote.
+    fn vote_for_next_view(&self, plane: PlaneKind, reason: ViewChangeReason) -> Vec<VsrAction> {
+        let view = self.start_view_change_view.get().max(self.view.get() + 1);
+        tracing::info!(
+            replica = self.replica,
+            namespace_raw = self.group,
+            view = self.view.get(),
+            next_view = view,
+            reason = reason.as_str(),
+            "voting to leave the view"
+        );
+        self.start_view_change_view.set(view);
+        self.reset_svc_quorum();
+        self.count_view_change_vote(plane, view, None, reason)
+    }
+
+    /// Count the vote of `voter` to leave this view for `view`, and the vote of
+    /// this replica. A view-change quorum of votes enters `view`. The votes carry
+    /// into it, so the `DoViewChange` goes out at once.
+    fn count_view_change_vote(
+        &self,
+        plane: PlaneKind,
+        view: u32,
+        voter: Option<u8>,
+        reason: ViewChangeReason,
+    ) -> Vec<VsrAction> {
+        if view > self.start_view_change_view.get() {
+            self.start_view_change_view.set(view);
+            self.reset_svc_quorum();
+        }
+        let (vote_count, own_vote_is_new) = {
+            let mut voters = self.start_view_change_from_all_replicas.borrow_mut();
+            if let Some(voter) = voter {
+                voters.insert(usize::from(voter));
+            }
+            let own_vote_is_new = voters.insert(usize::from(self.replica));
+            (voters.count(), own_vote_is_new)
+        };
+        if vote_count >= self.quorum_view_change() {
+            let mut actions = self.enter_view_change(plane, view, reason);
+            actions.extend(self.send_do_view_change_on_votes(plane));
+            return actions;
+        }
+        if !own_vote_is_new {
+            return Vec::new();
+        }
+        self.sent_own_start_view_change.set(true);
+        self.timeouts
+            .borrow_mut()
+            .start(TimeoutKind::StartViewChangeMessage);
+        let action = VsrAction::SendStartViewChange {
+            view,
+            group: self.group,
+        };
+        emit_sim_event(
+            SimEventKind::ControlMessageScheduled,
+            &ControlActionLogEvent::from_vsr_action(
+                ReplicaLogContext::from_consensus(self, plane),
+                &action,
+            ),
+        );
+        vec![action]
+    }
+
+    /// Whether this replica votes to leave its view for `view`, a higher one,
+    /// with `voter`.
+    ///
+    /// A replica in normal operation that heard its primary since its last
+    /// heartbeat timeout refuses, and so does the primary itself, so a replica
+    /// that stops hearing a primary its peers still hear cannot depose it. A
+    /// replica that saw a newer view catches up through its probe instead, so its
+    /// vote never counts against a primary it did not hear.
+    fn joins_view_change_vote(&self, voter: u8, view: u32) -> bool {
+        let current = self.view.get();
+        view >= self.start_view_change_view.get()
+            && !self.has_observed_newer_view()
+            && (self.status.get() == Status::ViewChange
+                || self.votes_to_leave_view()
+                // The primary left its view.
+                || voter == self.primary_index(current)
+                // The voter left this view already. Only a replica that entered a
+                // view alone gets there while its peers stay behind.
+                || view - current > 1)
+    }
+
+    /// Whether this replica votes to leave a view it has not left yet.
+    const fn votes_to_leave_view(&self) -> bool {
+        self.start_view_change_view.get() > self.view.get()
+    }
+
+    /// Drop the vote of this replica to leave its view, and the votes it counted
+    /// with it: it follows a primary of its view again.
+    fn withdraw_view_change_vote(&self) {
+        self.start_view_change_view.set(self.view.get());
+        self.reset_svc_quorum();
+        self.sent_own_start_view_change.set(false);
+        self.timeouts
+            .borrow_mut()
+            .stop(TimeoutKind::StartViewChangeMessage);
     }
 
     /// Enter `Status::ViewChange` at `new_view`: count this replica's own SVC,
@@ -3380,6 +3539,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ) -> Vec<VsrAction> {
         let old_view = self.view.get();
 
+        // Votes counted for `new_view` carry into it.
+        if self.start_view_change_view.get() != new_view {
+            self.start_view_change_view.set(new_view);
+            self.reset_svc_quorum();
+        }
         self.view.set(new_view);
         self.status.set(Status::ViewChange);
         self.reset_view_change_state();
@@ -3421,7 +3585,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         vec![action]
     }
 
-    /// Resend SVC message if we've started view change.
+    /// Resend the vote of this replica, while it has one.
     fn handle_start_view_change_message_timeout(&self, plane: PlaneKind) -> Vec<VsrAction> {
         if !self.sent_own_start_view_change.get() {
             return Vec::new();
@@ -3432,7 +3596,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             .reset(TimeoutKind::StartViewChangeMessage);
 
         let action = VsrAction::SendStartViewChange {
-            view: self.view.get(),
+            view: self.start_view_change_view.get(),
             group: self.group,
         };
         emit_sim_event(
@@ -3481,7 +3645,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         vec![action]
     }
 
-    /// Escalate to next view if stuck in view change.
+    /// Vote for the next view if this view change is stuck. The replica stays in
+    /// its view change, so a late `StartView` still lands, and leaves the view
+    /// only once a view-change quorum votes with it. The primary candidate of the
+    /// view does not probe, so once it saw a newer view it probes from here: the
+    /// cluster elected past this view without it.
     fn handle_view_change_status_timeout(&self, plane: PlaneKind) -> Vec<VsrAction> {
         if self.status.get() != Status::ViewChange {
             return Vec::new();
@@ -3489,18 +3657,20 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         if self.untrusted_log.get() {
             self.warn_untrusted_halt();
         }
-
-        self.enter_view_change(
-            plane,
-            self.view.get() + 1,
-            ViewChangeReason::ViewChangeStatusTimeout,
-        )
+        if self.has_observed_newer_view() {
+            self.begin_view_probe();
+            return Vec::new();
+        }
+        self.timeouts
+            .borrow_mut()
+            .reset(TimeoutKind::ViewChangeStatus);
+        self.vote_for_next_view(plane, ViewChangeReason::ViewChangeStatusTimeout)
     }
 
     /// No view starts without a quorum of trusted logs or every replica
     /// reporting, which looks like an ordinary stuck view change unless it says
-    /// so. Logged on the 1st, 2nd, 4th ... 64th escalation and every 64th after,
-    /// so a halt that lasts hours stays visible without a line per timeout.
+    /// so. Logged on the 1st, 2nd, 4th ... 64th status timeout and every 64th
+    /// after, so a halt that lasts hours stays visible without a line per timeout.
     fn warn_untrusted_halt(&self) {
         const STEADY_INTERVAL: u32 = 64;
         let timeouts = self.untrusted_view_change_timeouts.get().saturating_add(1);
@@ -3734,9 +3904,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     /// Handle a received `StartViewChange` message.
     ///
-    /// "When replica i receives STARTVIEWCHANGE messages for its view-number
-    /// from f OTHER replicas, it sends a DOVIEWCHANGE message to the node
-    /// that will be the primary in the new view."
+    /// For a higher view it is a vote to leave this view for that one. This
+    /// replica joins the vote only as `Self::joins_view_change_vote` allows,
+    /// and enters the view once a view-change quorum voted for it, its own vote
+    /// included. A replica that votes stays in its view meanwhile.
+    ///
+    /// For the view this replica changes to, it sends its `DoViewChange` once a
+    /// view-change quorum voted for that view. With `2f + 1` replicas that is the
+    /// vote of `f` other replicas, as in the paper.
     ///
     /// # Panics
     /// If `header.group` does not match this replica's namespace.
@@ -3760,31 +3935,40 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         let from_replica = header.replica;
         let msg_view = header.view;
 
-        // Ignore SVCs for old views
-        if msg_view < self.view.get() {
-            return Vec::new();
-        }
-
-        let mut actions = Vec::new();
-
-        // If SVC is for a higher view, advance to that view
         if msg_view > self.view.get() {
-            actions.extend(self.enter_view_change(
+            if !self.joins_view_change_vote(from_replica, msg_view) {
+                return Vec::new();
+            }
+            return self.count_view_change_vote(
                 plane,
                 msg_view,
+                Some(from_replica),
                 ViewChangeReason::ReceivedStartViewChange,
-            ));
+            );
         }
 
-        // Record the SVC from sender
+        // Normal operation has no use for a vote for its own view, and a replica
+        // that votes for the next view dropped the votes for this one.
+        if msg_view < self.view.get()
+            || self.status.get() != Status::ViewChange
+            || self.votes_to_leave_view()
+        {
+            return Vec::new();
+        }
         self.start_view_change_from_all_replicas
             .borrow_mut()
             .insert(from_replica as usize);
+        self.send_do_view_change_on_votes(plane)
+    }
 
-        // Check if we have f SVCs from OTHER replicas
-        // We need f SVCs from others to send DVC
+    /// Send the `DoViewChange` of this replica once a view-change quorum, this
+    /// replica included, voted for the view it changes to. A `DoViewChange` pulls
+    /// every replica into its view, so fewer votes than that can depose a primary
+    /// that the rest still hear.
+    fn send_do_view_change_on_votes(&self, plane: PlaneKind) -> Vec<VsrAction> {
+        let mut actions = Vec::new();
         if !self.sent_own_do_view_change.get()
-            && self.svc_count_excluding_self() >= self.max_faulty()
+            && self.svc_count_excluding_self() + 1 >= self.quorum_view_change()
         {
             self.sent_own_do_view_change.set(true);
 
@@ -3977,13 +4161,31 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         let mut actions = Vec::new();
 
-        // If DVC is for a higher view, advance to that view
+        // The sender of a real DVC for a higher view counted a view-change quorum
+        // of votes for that view. A barred replica sends its empty vote to answer
+        // any `StartViewChange`, a vote nobody joined included, so that one counts
+        // only as the vote of its sender.
         if msg_view > self.view.get() {
-            actions.extend(self.enter_view_change(
-                plane,
-                msg_view,
-                ViewChangeReason::ReceivedDoViewChange,
-            ));
+            if is_empty_vote(header, &msg_suffix) {
+                if !self.joins_view_change_vote(from_replica, msg_view) {
+                    return actions;
+                }
+                actions.extend(self.count_view_change_vote(
+                    plane,
+                    msg_view,
+                    Some(from_replica),
+                    ViewChangeReason::ReceivedDoViewChange,
+                ));
+                if self.view.get() != msg_view {
+                    return actions;
+                }
+            } else {
+                actions.extend(self.enter_view_change(
+                    plane,
+                    msg_view,
+                    ViewChangeReason::ReceivedDoViewChange,
+                ));
+            }
         }
 
         // Only the primary candidate processes DVCs for quorum
@@ -4063,10 +4265,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         );
         self.status.set(Status::Recovering);
         self.probe_attempts.set(0);
+        self.withdraw_view_change_vote();
         let mut timeouts = self.timeouts.borrow_mut();
         timeouts.stop(TimeoutKind::Prepare);
         timeouts.stop(TimeoutKind::CommitMessage);
+        timeouts.stop(TimeoutKind::CheckQuorum);
         timeouts.stop(TimeoutKind::NormalHeartbeat);
+        timeouts.stop(TimeoutKind::DoViewChangeMessage);
+        timeouts.stop(TimeoutKind::ViewChangeStatus);
         timeouts.start(TimeoutKind::RequestStartViewMessage);
     }
 
@@ -4169,9 +4375,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// backups stay silent and the prober retries. Special case: a probe
     /// FROM the replica that is the current view's primary-by-index proves
     /// that primary cannot lead (a probing replica has either lost its
-    /// state or abandoned the view), so a peer receiving it elects
-    /// immediately instead of waiting out the heartbeat timeout on a slot
-    /// known to be dead.
+    /// state or abandoned the view), so a peer receiving it votes for the
+    /// next view immediately instead of waiting out the heartbeat timeout on
+    /// a slot known to be dead.
     ///
     /// # Panics
     /// Panics when the probe is routed to the wrong group.
@@ -4199,7 +4405,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             // through (a backup answers nothing, and the true primary of a
             // newer view answers with its StartView).
             if header.view == self.view.get() {
-                return self.start_election(plane, ViewChangeReason::PrimaryProbedView);
+                return self.vote_for_next_view(plane, ViewChangeReason::PrimaryProbedView);
             }
             return Vec::new();
         }
@@ -4261,6 +4467,31 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             self.view_log_unproven_through.set(u64::MAX);
             self.invalidate_local_dvc_suffix();
         }
+    }
+
+    /// Adopt a state-transfer checkpoint at `commit_op`, whose prepare has
+    /// `checksum`, and clear the pipeline. The last prepare checksum becomes
+    /// `checksum` only when the head moves to `commit_op`: a head above it keeps
+    /// its own, and without a checksum it stays as it is.
+    ///
+    /// Raises the commit floor and never lowers the head. A head above the
+    /// checkpoint came from an adopted `StartView` or from prepares journaled
+    /// before the install wiped the journal, and the `DoViewChange` suffix still
+    /// reaches up to it, so a rewound sequencer would stamp a vote whose header op
+    /// disagrees with its own suffix. Journal repair fetches the ops between the
+    /// checkpoint and the head, as after a restart.
+    pub fn install_checkpoint(&self, commit_op: u64, checksum: Option<u128>) {
+        if commit_op > self.commit_min.get() {
+            self.set_commit_floor(commit_op);
+        }
+        if commit_op >= self.sequencer.current_sequence() {
+            self.sequencer.set_sequence(commit_op);
+            if let Some(checksum) = checksum {
+                self.set_last_prepare_checksum(checksum);
+            }
+        }
+        self.clear_pipeline();
+        self.advance_commit_max(commit_op);
     }
 
     fn finish_view_probe(&self) {
@@ -4608,6 +4839,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
         self.advance_commit_max(msg_commit);
         self.reset_view_change_state();
+        self.withdraw_view_change_vote();
 
         // Stale pipeline entries from the old view must be discarded
         self.view_log_unproven.set(needs_reconciliation);
@@ -4673,11 +4905,13 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Handle a `Commit` (heartbeat) message from the primary.
     ///
     /// Advances `commit_max` and resets the backup's `NormalHeartbeat` timeout
-    /// so it doesn't start a spurious view change. Returns `true` if
-    /// `commit_max` advanced, signalling the caller to run `commit_journal`.
+    /// so it doesn't start a spurious view change. Returns
+    /// [`CommitOutcome::Advanced`] if `commit_max` advanced, signalling the
+    /// caller to run `commit_journal`.
     ///
-    /// Only refreshes liveness for a newer heartbeat within its view, so
-    /// old/replayed messages cannot suppress view changes.
+    /// Only refreshes liveness for a newer heartbeat within its view, so old or
+    /// replayed messages cannot suppress the `NormalHeartbeat` vote. Such a
+    /// heartbeat also withdraws the vote of this replica to replace the primary.
     ///
     /// # Panics
     /// If `header.group` does not match this replica's namespace.
@@ -4707,11 +4941,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             if header.view > self.view.get() {
                 self.observe_newer_view(header.view);
             }
-            return CommitOutcome::Accepted;
+            return CommitOutcome::Ignored;
         }
 
         if self.status.get() != Status::Normal {
-            return CommitOutcome::Accepted;
+            return CommitOutcome::Ignored;
         }
 
         if header.view != self.view.get() {
@@ -4722,13 +4956,13 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             if header.view > self.view.get() {
                 self.observe_newer_view(header.view);
             }
-            return CommitOutcome::Accepted;
+            return CommitOutcome::Ignored;
         }
 
         // Tolerant skip, not an assert: the replica handshake proves cluster
         // membership only, so nothing binds `header.replica` to the sender.
         if header.replica != self.primary_index(header.view) {
-            return CommitOutcome::Accepted;
+            return CommitOutcome::Ignored;
         }
 
         let heartbeat = (header.view, header.timestamp_monotonic);
@@ -4737,6 +4971,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             self.timeouts
                 .borrow_mut()
                 .reset(TimeoutKind::NormalHeartbeat);
+            if self.votes_to_leave_view() {
+                self.withdraw_view_change_vote();
+            }
         }
 
         let old_commit_max = self.commit_max.get();
@@ -4746,6 +4983,54 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         } else {
             CommitOutcome::Accepted
         }
+    }
+
+    /// Count a replica once for a heartbeat emitted during this quorum window.
+    pub fn handle_commit_reply(&self, header: &iggy_binary_protocol::CommitReplyHeader) {
+        if !self.is_acting_primary()
+            || header.cluster != self.cluster
+            || header.group != self.group
+            || header.partition_incarnation != self.partition_incarnation.get()
+            || header.view != self.view.get()
+            || header.replica >= self.replica_count
+            || header.replica == self.replica
+            || header.timestamp_monotonic <= self.quorum_heartbeat_floor.get()
+            || header.timestamp_monotonic > self.heartbeat_watermark.get().1
+        {
+            return;
+        }
+        self.heartbeat_replies
+            .borrow_mut()
+            .insert(usize::from(header.replica));
+    }
+
+    fn reset_quorum_window(&self) {
+        self.quorum_heartbeat_floor
+            .set(self.heartbeat_watermark.get().1);
+        self.heartbeat_replies.borrow_mut().make_empty();
+    }
+
+    fn handle_check_quorum_timeout(&self) {
+        if !self.is_acting_primary() {
+            return;
+        }
+        let responding = self.heartbeat_replies.borrow().count() + 1;
+        if responding < self.quorum_replication() {
+            tracing::warn!(
+                replica = self.replica,
+                namespace_raw = self.group,
+                view = self.view.get(),
+                responding,
+                quorum = self.quorum_replication(),
+                "primary lost heartbeat quorum; relinquishing leadership and probing the view"
+            );
+            // Probing stops admission and heartbeats without replacing history
+            // that an outstanding file lease may still own.
+            self.begin_view_probe();
+            return;
+        }
+        self.reset_quorum_window();
+        self.timeouts.borrow_mut().reset(TimeoutKind::CheckQuorum);
     }
 
     /// Complete view change as the new primary after collecting DVC quorum.
@@ -4806,8 +5091,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // than its peers can be handed a range it cannot rebuild.
         //
         // Refuse rather than panic: a further DoViewChange can raise `commit_max`
-        // and shrink the range, and otherwise the status timeout escalates. A panic
-        // would restart into the same merge.
+        // and shrink the range, and otherwise the status timeout votes to leave the
+        // view. A panic would restart into the same merge.
         if merged.op_head.saturating_sub(merged.commit_max) > self.prepare_queue_max as u64 {
             tracing::error!(
                 replica = self.replica,
@@ -4951,6 +5236,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     }
 
     /// Re-establish the announced head after recovering the physical body log.
+    ///
+    /// A certificate that names the adopted view does not prove its head. A
+    /// state-transfer install and a fenced view window both certify only the
+    /// prefix the WAL holds, so a recovered head below the adopted one resumes
+    /// the view too.
     pub fn resume_adopted_view(&self) {
         let adopted = self.adopted_view.borrow();
         let Some(adopted) = adopted.as_ref() else {
@@ -4963,7 +5253,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         } else {
             self.log_view_proven.get()
         };
-        if adopted.view > proven {
+        let below_adopted_head = self.sequencer.current_sequence() < adopted.op_head;
+        if adopted.view > proven || (adopted.view == proven && below_adopted_head) {
             self.log_view.set(adopted.view);
             self.view_log_unproven.set(true);
             self.view_log_unproven_through.set(u64::MAX);
@@ -5292,14 +5583,19 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             self.log_view_proven.set(self.view.get());
         }
 
+        // A vote for the next view, cast while the merge waited on repair, ends
+        // with the view this replica now leads.
+        self.withdraw_view_change_vote();
+
         // Update timeouts for normal primary operation
+        self.reset_quorum_window();
         {
             let mut timeouts = self.timeouts.borrow_mut();
             timeouts.stop(TimeoutKind::ViewChangeStatus);
             timeouts.stop(TimeoutKind::DoViewChangeMessage);
-            timeouts.stop(TimeoutKind::StartViewChangeMessage);
             timeouts.stop(TimeoutKind::RequestStartViewMessage);
             timeouts.start(TimeoutKind::CommitMessage);
+            timeouts.start(TimeoutKind::CheckQuorum);
             // If there are uncommitted ops in the rebuilt pipeline, start the
             // Prepare timeout so that lost PrepareOks trigger retransmission.
             if rebuild_after < new_op {
@@ -5472,7 +5768,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     /// Record that `replica` holds `op`, and wake the next tick if that makes
     /// it owed a `Commit`.
-    fn note_backup_ack(&self, replica: u8, op: u64) {
+    pub(crate) fn note_backup_ack(&self, replica: u8, op: u64) {
         if replica == self.replica {
             return;
         }
@@ -6226,7 +6522,7 @@ mod pipeline_entry_tests {
 /// Fixtures every consensus test module needs.
 #[cfg(test)]
 pub mod test_bus {
-    use super::{Command, METADATA_GROUP, Message, StartViewHeader};
+    use super::{Command, METADATA_GROUP, Message, StartViewChangeHeader, StartViewHeader};
     use iggy_binary_protocol::{CommitHeader, ConsensusHeader};
     use message_bus::{BusMessage, MessageBus};
     use server_common::MESSAGE_ALIGN;
@@ -6284,6 +6580,43 @@ pub mod test_bus {
         )
     }
 
+    #[must_use]
+    pub fn make_commit_reply(
+        view: u32,
+        replica: u8,
+        counter: u64,
+    ) -> Message<iggy_binary_protocol::CommitReplyHeader> {
+        make_commit(view, replica, counter).transmute_header(
+            |old, header: &mut iggy_binary_protocol::CommitReplyHeader| {
+                header.command = Command::CommitReply;
+                header.cluster = old.cluster;
+                header.size = old.size;
+                header.view = old.view;
+                header.replica = old.replica;
+                header.group = old.group;
+                header.timestamp_monotonic = old.timestamp_monotonic;
+            },
+        )
+    }
+
+    /// A `StartViewChange` from `replica` that votes for `view`.
+    ///
+    /// # Panics
+    /// Never: the header size fits in `u32`.
+    #[must_use]
+    pub fn make_start_view_change(view: u32, replica: u8) -> Message<StartViewChangeHeader> {
+        Message::<StartViewChangeHeader>::new(std::mem::size_of::<StartViewChangeHeader>())
+            .transmute_header(|_, header: &mut StartViewChangeHeader| {
+                header.command = Command::StartViewChange;
+                header.cluster = 1;
+                header.replica = replica;
+                header.view = view;
+                header.group = METADATA_GROUP;
+                header.size = u32::try_from(std::mem::size_of::<StartViewChangeHeader>()).unwrap();
+                header.seal();
+            })
+    }
+
     /// A [`MessageBus`] that accepts everything and remembers nothing.
     pub struct NoopBus;
 
@@ -6319,7 +6652,7 @@ mod timestamp_clamp_tests {
     use super::*;
     use crate::LocalPipeline;
 
-    use crate::test_bus::{NoopBus, make_commit, make_start_view};
+    use crate::test_bus::{NoopBus, make_commit, make_start_view, make_start_view_change};
     use aligned_vec::{AVec, ConstAlign};
     use iggy_binary_protocol::CommitHeader;
 
@@ -6827,6 +7160,8 @@ mod timestamp_clamp_tests {
         const VIEW: u32 = 4;
         const FIRST_HEAD: u64 = 20;
         const NEXT_HEAD: u64 = FIRST_HEAD + 1;
+        /// The backup other than this replica, which votes with it.
+        const PEER: u8 = 2;
         let consensus = VsrConsensus::with_clock(
             1,
             0,
@@ -6854,6 +7189,8 @@ mod timestamp_clamp_tests {
                 .handle_normal_heartbeat_timeout(PlaneKind::Metadata)
                 .is_empty()
         );
+        let vote = make_start_view_change(VIEW + 1, PEER);
+        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, vote.header());
         assert_eq!(consensus.status(), Status::ViewChange);
         assert_eq!(consensus.view(), VIEW + 1);
         assert!(consensus.view_log_unproven());
@@ -7030,12 +7367,12 @@ mod vsr_consensus_tests {
         const REPLICAS: u8 = 5;
         const INCARNATION: u64 = 17;
         for (replica, view, target, next_view) in [
-            (1, 0, 3, 3),
-            (3, 6, 3, 8),
+            (0, 0, 3, 3),
+            (1, 6, 3, 8),
             (1, 6, 4, 9),
-            (2, 9, 1, 11),
-            (2, 4, 0, 5),
-            (2, u32::MAX - 1, 0, u32::MAX),
+            (4, 9, 1, 11),
+            (4, 4, 0, 5),
+            (4, u32::MAX - 1, 0, u32::MAX),
         ] {
             let mut consensus =
                 VsrConsensus::new(1, replica, REPLICAS, 0, StageNoopBus, LocalPipeline::new());
@@ -7063,45 +7400,12 @@ mod vsr_consensus_tests {
     }
 
     #[test]
-    fn given_backup_transfer_when_primary_receives_svc_should_join_the_target_election() {
-        const TARGET: u8 = 2;
+    fn given_a_backup_when_requesting_primary_transfer_should_refuse() {
         let backup = VsrConsensus::new(1, 1, 3, 0, StageNoopBus, LocalPipeline::new());
-        let primary = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
         backup.init();
-        primary.init();
-        assert!(!backup.request_primary_transfer(0, TARGET).is_empty());
-        assert_eq!(primary.status(), Status::Normal);
 
-        let message = Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>())
-            .transmute_header(|_, header: &mut StartViewChangeHeader| {
-                header.command = Command::StartViewChange;
-                header.cluster = 1;
-                header.replica = backup.replica();
-                header.view = backup.view();
-                header.group = backup.group();
-                header.size = u32::try_from(size_of::<StartViewChangeHeader>()).unwrap();
-                header.seal();
-            });
-        let actions = primary.handle_start_view_change(PlaneKind::Partitions, message.header());
-
-        assert_eq!(primary.view(), u32::from(TARGET));
-        assert_eq!(primary.status(), Status::ViewChange);
-        assert_eq!(primary.log_view(), 0);
-        assert!(
-            actions.iter().any(|action| matches!(
-                action,
-                VsrAction::SendStartViewChange { view: 2, group: 0 }
-            ))
-        );
-        assert!(actions.iter().any(|action| matches!(
-            action,
-            VsrAction::SendDoViewChange {
-                target: TARGET,
-                view: 2,
-                ..
-            }
-        )));
-        assert!(primary.pending_view_log().is_none());
+        assert!(backup.request_primary_transfer(0, 2).is_empty());
+        assert_eq!((backup.view(), backup.status()), (0, Status::Normal));
     }
 
     #[test]
@@ -7166,7 +7470,8 @@ mod vsr_consensus_tests {
             "recovery barrier",
             "view start head",
         ] {
-            let mut consensus = VsrConsensus::new(1, 2, 5, 0, StageNoopBus, LocalPipeline::new());
+            // Replica 1 leads `VIEW`.
+            let mut consensus = VsrConsensus::new(1, 1, 5, 0, StageNoopBus, LocalPipeline::new());
             consensus.set_view(VIEW);
             consensus.set_log_view(VIEW);
             consensus.mark_superblock_durable(VIEW, VIEW);
@@ -7290,29 +7595,6 @@ mod vsr_consensus_tests {
         );
     }
 
-    // No newer view seen means the primary is presumed dead, so the timeout
-    // must still elect -- the split must not swallow the ordinary case.
-    #[test]
-    fn heartbeat_timeout_with_no_newer_view_still_elects() {
-        let consensus = VsrConsensus::new(1, 1, 3, 0, StageNoopBus, LocalPipeline::new());
-        consensus.init();
-
-        let actions = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata);
-
-        assert_eq!(
-            consensus.status(),
-            Status::ViewChange,
-            "a silent primary must still trigger an election"
-        );
-        assert_eq!(consensus.view(), 1, "election advances the view");
-        assert!(
-            actions
-                .iter()
-                .any(|action| matches!(action, VsrAction::SendStartViewChange { .. })),
-            "election must broadcast its SVC"
-        );
-    }
-
     // A recorded view at or below the current one is stale (already caught up)
     // and must not divert a genuine election, since the guard is a strict `>`.
     #[test]
@@ -7321,12 +7603,13 @@ mod vsr_consensus_tests {
         consensus.init();
         consensus.observe_newer_view(0);
 
-        let _ = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata);
+        let actions = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata);
 
-        assert_eq!(
-            consensus.status(),
-            Status::ViewChange,
-            "a stale observed view must not suppress the election"
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, VsrAction::SendStartViewChange { view: 1, .. })),
+            "a stale observed view must not suppress the vote: {actions:?}"
         );
     }
 
@@ -7362,9 +7645,11 @@ mod vsr_consensus_tests {
     }
 
     #[test]
-    fn given_a_stalled_candidate_when_it_escalates_should_recover_a_lost_start_view() {
+    fn given_a_stalled_candidate_when_a_newer_view_settles_should_recover_a_lost_start_view() {
         const REJOINING_REPLICA: u8 = 1;
         const NEXT_PRIMARY: u8 = 2;
+        /// The view `NEXT_PRIMARY` settled while the candidate stalled.
+        const SETTLED_VIEW: u32 = 2;
         const REPLICA_COUNT: u8 = 3;
         const LOCAL_HEAD: u64 = 20;
         const PRIMARY_HEAD: u64 = LOCAL_HEAD + 1;
@@ -7389,13 +7674,6 @@ mod vsr_consensus_tests {
         assert_eq!(backup.status(), Status::ViewChange);
         assert!(backup.is_primary_for_view(backup.view()));
 
-        for _ in 0..TimeoutManager::VIEW_CHANGE_STATUS_TICKS {
-            backup.tick(plane);
-        }
-        assert_eq!(backup.view(), 2);
-        assert_eq!(backup.status(), Status::ViewChange);
-        assert!(!backup.is_primary_for_view(backup.view()));
-
         // Model a settled primary whose initial StartView was withheld by persistence.
         let mut primary = VsrConsensus::new(
             1,
@@ -7405,11 +7683,18 @@ mod vsr_consensus_tests {
             StageNoopBus,
             LocalPipeline::new(),
         );
-        primary.set_view(backup.view());
-        primary.set_log_view(backup.view());
+        primary.set_view(SETTLED_VIEW);
+        primary.set_log_view(SETTLED_VIEW);
         primary.sequencer().set_sequence(PRIMARY_HEAD);
         primary.restore_commit_state(LOCAL_HEAD, LOCAL_HEAD);
         primary.init();
+        // Its heartbeat names the settled view.
+        backup.observe_newer_view(SETTLED_VIEW);
+
+        for _ in 0..TimeoutManager::VIEW_CHANGE_STATUS_TICKS {
+            backup.tick(plane);
+        }
+        assert_eq!((backup.view(), backup.status()), (1, Status::Recovering));
 
         let probe = (0..TimeoutManager::REQUEST_START_VIEW_MESSAGE_TICKS)
             .flat_map(|_| backup.tick(plane))
@@ -7429,7 +7714,7 @@ mod vsr_consensus_tests {
                 ),
                 _ => None,
             })
-            .expect("an escalated candidate must request the missing StartView as a backup");
+            .expect("a candidate behind a settled view must request the missing StartView");
         let replies = primary.handle_request_start_view(plane, probe.header());
         let [
             VsrAction::SendStartView {
@@ -7670,7 +7955,17 @@ mod vsr_consensus_tests {
                 VsrConsensus::new(1, 0, 3, METADATA_GROUP, StageNoopBus, LocalPipeline::new());
             consensus.init();
             for _ in 0..TimeoutManager::NORMAL_HEARTBEAT_TICKS {
-                let _ = consensus.tick(PlaneKind::Metadata);
+                for action in consensus.tick(PlaneKind::Metadata) {
+                    if let VsrAction::SendCommit {
+                        view,
+                        timestamp_monotonic,
+                        ..
+                    } = action
+                    {
+                        let reply = test_bus::make_commit_reply(view, 1, timestamp_monotonic);
+                        consensus.handle_commit_reply(reply.header());
+                    }
+                }
             }
             assert_eq!(
                 consensus.heartbeat_watermark.get(),
@@ -7698,8 +7993,8 @@ mod vsr_consensus_tests {
                 }
                 let _ = consensus.tick(PlaneKind::Metadata);
                 assert_eq!(
-                    consensus.view(),
-                    1,
+                    (consensus.view(), consensus.votes_to_leave_view()),
+                    (1, false),
                     "fresh heartbeats must keep the adopted view alive at tick {tick}, \
                      enters_election={enters_election}"
                 );
@@ -7709,9 +8004,9 @@ mod vsr_consensus_tests {
                 let _ = consensus.tick(PlaneKind::Metadata);
             }
             assert_eq!(
-                consensus.view(),
-                2,
-                "losing the new primary must still trigger an election"
+                (consensus.view(), consensus.votes_to_leave_view()),
+                (1, true),
+                "losing the new primary must still start a vote to replace it"
             );
         }
     }
@@ -7744,9 +8039,9 @@ mod vsr_consensus_tests {
             let _ = consensus.tick(PlaneKind::Metadata);
         }
         assert_eq!(
-            consensus.view(),
-            2,
-            "replayed, older-view, and non-primary heartbeats must not suppress an election"
+            (consensus.view(), consensus.votes_to_leave_view()),
+            (1, true),
+            "replayed, older-view, and non-primary heartbeats must not suppress the vote"
         );
     }
 
@@ -8788,7 +9083,7 @@ mod recovery_election_tests {
     use crate::dvc_merge::suffix_all_present;
     use crate::test_bus::NoopBus;
     use crate::view_change_quorum::encode_prepare_headers;
-    use iggy_binary_protocol::{CommitHeader, HEADER_SIZE, Operation};
+    use iggy_binary_protocol::{CommitHeader, CommitReplyHeader, HEADER_SIZE, Operation};
 
     const REPLICA_COUNT: u8 = 3;
     /// Primary of `OLD_VIEW`, crashed holding only part of what it committed.
@@ -8874,12 +9169,12 @@ mod recovery_election_tests {
         consensus
     }
 
-    /// A backup of `OLD_VIEW` holding the whole committed log, left in the view
-    /// change its primary's crash started and escalated while nobody else was up.
-    fn survivor_in_view_change(plane: PlaneKind) -> VsrConsensus<NoopBus, LocalPipeline> {
+    /// A backup of `OLD_VIEW` holding the whole committed log, in normal
+    /// operation.
+    fn backup_in_old_view(replica: u8) -> VsrConsensus<NoopBus, LocalPipeline> {
         let mut consensus = VsrConsensus::new(
             1,
-            SURVIVOR,
+            replica,
             REPLICA_COUNT,
             group(),
             NoopBus,
@@ -8893,10 +9188,20 @@ mod recovery_election_tests {
             (COMMITTED - 1..=COMMITTED).rev().map(prepare).collect(),
         ));
         consensus.init();
-        while consensus.view() <= OLD_VIEW + 1 {
+        consensus
+    }
+
+    /// A backup of `OLD_VIEW` holding the whole committed log, voting to replace
+    /// its crashed primary while nobody else is up to join the vote.
+    fn survivor_voting_alone(plane: PlaneKind) -> VsrConsensus<NoopBus, LocalPipeline> {
+        let consensus = backup_in_old_view(SURVIVOR);
+        while !consensus.votes_to_leave_view() {
             consensus.tick(plane);
         }
-        assert_eq!(consensus.status(), Status::ViewChange);
+        assert_eq!(
+            (consensus.status(), consensus.view()),
+            (Status::Normal, OLD_VIEW)
+        );
         consensus
     }
 
@@ -9090,7 +9395,28 @@ mod recovery_election_tests {
                         header.group = *group;
                         header.timestamp_monotonic = *timestamp_monotonic;
                     });
-                    let _ = receiver.handle_commit(heartbeat.header());
+                    receiver
+                        .handle_commit(heartbeat.header())
+                        .reply(heartbeat.header())
+                        .into_iter()
+                        .collect()
+                }
+                VsrAction::SendCommitReply {
+                    view,
+                    group,
+                    timestamp_monotonic,
+                    target,
+                } if *target == to => {
+                    let reply = message(0, |header: &mut CommitReplyHeader| {
+                        header.command = Command::CommitReply;
+                        header.cluster = 1;
+                        header.size = u32::try_from(HEADER_SIZE).unwrap();
+                        header.replica = from;
+                        header.view = *view;
+                        header.group = *group;
+                        header.timestamp_monotonic = *timestamp_monotonic;
+                    });
+                    receiver.handle_commit_reply(reply.header());
                     Vec::new()
                 }
                 _ => Vec::new(),
@@ -9166,19 +9492,19 @@ mod recovery_election_tests {
     }
 
     /// Two replicas restart after a double crash, the primary having lost the
-    /// tail of what it committed. The survivor holding that tail is mid view
-    /// change, so it answers no probe. Its view-change traffic reaches the
-    /// restarted pair while they probe (and is ignored) and is then delayed past
-    /// their fallback election, which an asynchronous network permits. Whatever
-    /// the restarted pair decide without it must still contain the committed ops.
+    /// tail of what it committed. The survivor holding that tail is a backup, so
+    /// it answers no probe. Its votes reach the restarted pair while they probe
+    /// (and are ignored), and its traffic is then delayed past their fallback
+    /// election, which an asynchronous network permits. Whatever the restarted
+    /// pair decide without it must still contain the committed ops.
     #[test]
-    fn given_survivor_in_view_change_when_restarted_pair_elects_should_keep_committed_ops() {
+    fn given_survivor_voting_alone_when_restarted_pair_elects_should_keep_committed_ops() {
         let plane = PlaneKind::Partitions;
         let mut cluster = Cluster {
             replicas: vec![
                 restarted(RESTARTED_PRIMARY, RECOVERED_HEAD, false),
                 restarted(LAGGING_BACKUP, LAGGING_HEAD, false),
-                survivor_in_view_change(plane),
+                survivor_voting_alone(plane),
             ],
             plane,
             do_view_changes: Vec::new(),
@@ -9210,13 +9536,13 @@ mod recovery_election_tests {
     /// restarted pair may not settle a view without it, and once it reports
     /// the cluster settles holding every committed op.
     #[test]
-    fn given_survivor_in_view_change_when_it_stays_reachable_should_settle_with_committed_ops() {
+    fn given_survivor_voting_alone_when_it_stays_reachable_should_settle_with_committed_ops() {
         let plane = PlaneKind::Partitions;
         let mut cluster = Cluster {
             replicas: vec![
                 restarted(RESTARTED_PRIMARY, RECOVERED_HEAD, false),
                 restarted(LAGGING_BACKUP, LAGGING_HEAD, false),
-                survivor_in_view_change(plane),
+                survivor_voting_alone(plane),
             ],
             plane,
             do_view_changes: Vec::new(),
@@ -9229,6 +9555,64 @@ mod recovery_election_tests {
         cluster.assert_settled(COMMITTED);
     }
 
+    /// A primary that restarts with its whole log probes for its own view. Each
+    /// backup that gets the probe votes at once, so the group elects before a
+    /// heartbeat timeout. The backups never tick here, so neither can time out.
+    #[test]
+    fn given_a_restarted_primary_when_both_backups_get_its_probe_should_elect_without_a_heartbeat_timeout()
+     {
+        const NEXT_PRIMARY: u8 = 1;
+        let plane = PlaneKind::Partitions;
+        let mut cluster = Cluster {
+            replicas: vec![
+                restarted(RESTARTED_PRIMARY, COMMITTED, true),
+                backup_in_old_view(NEXT_PRIMARY),
+                backup_in_old_view(SURVIVOR),
+            ],
+            plane,
+            do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
+        };
+
+        let probe = (0..TimeoutManager::NORMAL_HEARTBEAT_TICKS)
+            .find_map(|_| {
+                cluster
+                    .replica(RESTARTED_PRIMARY)
+                    .tick(plane)
+                    .into_iter()
+                    .find(|action| matches!(action, VsrAction::SendRequestStartView { .. }))
+            })
+            .expect("a restarted replica must probe before a heartbeat timeout");
+        cluster.deliver(VecDeque::from([(RESTARTED_PRIMARY, probe)]), |_, _| true);
+
+        cluster.assert_settled(COMMITTED);
+        assert!(cluster.replica(NEXT_PRIMARY).is_primary());
+    }
+
+    #[test]
+    fn given_a_one_way_partition_when_heartbeat_replies_cannot_return_should_elect_a_reachable_primary()
+     {
+        for plane in [PlaneKind::Metadata, PlaneKind::Partitions] {
+            let mut cluster = Cluster {
+                replicas: (0..REPLICA_COUNT).map(backup_in_old_view).collect(),
+                plane,
+                do_view_changes: Vec::new(),
+                broadcast_do_view_changes: true,
+                delivered: 0,
+            };
+            cluster.run(TICKS, |_, to| to != RESTARTED_PRIMARY);
+            assert!(!cluster.replica(RESTARTED_PRIMARY).is_acting_primary());
+            for replica in [LAGGING_BACKUP, SURVIVOR] {
+                assert_eq!(cluster.replica(replica).status(), Status::Normal);
+                assert_eq!(cluster.replica(replica).view(), OLD_VIEW + 1);
+            }
+            assert!(cluster.replica(LAGGING_BACKUP).is_primary());
+            cluster.run(TICKS, |_, _| true);
+            cluster.assert_settled(COMMITTED);
+        }
+    }
+
     /// The survivor is cut off for good. The restarted pair, a quorum by
     /// count, must stay unavailable rather than settle on their short logs, and
     /// recover as soon as the survivor is back.
@@ -9239,7 +9623,7 @@ mod recovery_election_tests {
             replicas: vec![
                 restarted(RESTARTED_PRIMARY, RECOVERED_HEAD, false),
                 restarted(LAGGING_BACKUP, LAGGING_HEAD, false),
-                survivor_in_view_change(plane),
+                survivor_voting_alone(plane),
             ],
             plane,
             do_view_changes: Vec::new(),
@@ -9478,7 +9862,7 @@ mod recovery_election_tests {
             replicas: vec![
                 restarted(RESTARTED_PRIMARY, COMMITTED, true),
                 restarted(LAGGING_BACKUP, LAGGING_HEAD, true),
-                survivor_in_view_change(plane),
+                survivor_voting_alone(plane),
             ],
             plane,
             do_view_changes: Vec::new(),
@@ -9521,7 +9905,7 @@ mod recovery_election_tests {
             replicas: vec![
                 restarted(RESTARTED_PRIMARY, RECOVERED_HEAD, false),
                 candidate,
-                survivor_in_view_change(plane),
+                survivor_voting_alone(plane),
             ],
             plane,
             do_view_changes: Vec::new(),
@@ -9603,7 +9987,7 @@ mod recovery_election_tests {
             replicas: vec![
                 restarted(RESTARTED_PRIMARY, RECOVERED_HEAD, false),
                 lagging,
-                survivor_in_view_change(plane),
+                survivor_voting_alone(plane),
             ],
             plane,
             do_view_changes: Vec::new(),
@@ -9660,6 +10044,8 @@ mod recovery_election_tests {
             ));
             consensus.set_recovered_log_complete(false);
             consensus.init();
+            // Its primary crashed, so it votes to replace it.
+            let _ = consensus.handle_normal_heartbeat_timeout(plane);
             consensus
         };
         let view = OLD_VIEW + 1;
@@ -9668,7 +10054,7 @@ mod recovery_election_tests {
             replicas: vec![
                 restarted(RESTARTED_PRIMARY, COMMITTED, false),
                 candidate,
-                survivor_in_view_change(plane),
+                survivor_voting_alone(plane),
             ],
             plane,
             do_view_changes: Vec::new(),
@@ -9802,7 +10188,7 @@ mod recovery_election_tests {
             replicas: vec![
                 probing(RESTARTED_PRIMARY),
                 probing(LAGGING_BACKUP),
-                survivor_in_view_change(plane),
+                survivor_voting_alone(plane),
             ],
             plane,
             do_view_changes: Vec::new(),
@@ -9961,7 +10347,7 @@ mod recovery_election_tests {
             replicas: vec![
                 restarted(RESTARTED_PRIMARY, RECOVERED_HEAD, false),
                 candidate,
-                survivor_in_view_change(plane),
+                survivor_voting_alone(plane),
             ],
             plane,
             do_view_changes: Vec::new(),
@@ -10044,6 +10430,379 @@ mod recovery_election_tests {
             assert_eq!(barred.status(), Status::Recovering);
             assert_eq!(barred.view(), OLD_VIEW);
         }
+    }
+}
+
+#[cfg(test)]
+mod check_quorum_tests {
+    use super::*;
+    use crate::test_bus::NoopBus;
+    use iggy_binary_protocol::CommitReplyHeader;
+
+    const WINDOW_TICKS: u64 = 8;
+
+    fn primary(replicas: u8) -> VsrConsensus<NoopBus> {
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            replicas,
+            METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus
+            .timeouts
+            .borrow_mut()
+            .set_normal_heartbeat_ticks(WINDOW_TICKS);
+        consensus.timeouts.borrow_mut().set_commit_message_ticks(1);
+        consensus.init();
+        consensus
+    }
+
+    fn reply(replica: u8, counter: u64) -> CommitReplyHeader {
+        *test_bus::make_commit_reply(0, replica, counter).header()
+    }
+
+    #[test]
+    fn given_idle_quorums_when_fresh_heartbeats_are_answered_should_retain_the_primary() {
+        for replicas in 1..=5 {
+            let consensus = primary(replicas);
+            for _ in 0..3 * WINDOW_TICKS {
+                for action in consensus.tick(PlaneKind::Metadata) {
+                    if let VsrAction::SendCommit {
+                        timestamp_monotonic,
+                        ..
+                    } = action
+                    {
+                        for replica in 1..u8::try_from(consensus.quorum_replication()).unwrap() {
+                            consensus.handle_commit_reply(&reply(replica, timestamp_monotonic));
+                        }
+                    }
+                }
+                assert!(consensus.is_acting_primary(), "{replicas} replicas");
+            }
+        }
+    }
+
+    #[test]
+    fn given_duplicate_replies_below_quorum_when_history_is_leased_should_stop_leading() {
+        let consensus = primary(5);
+        for _ in 0..WINDOW_TICKS {
+            for action in consensus.tick_with_history_fence(PlaneKind::Metadata, true) {
+                if let VsrAction::SendCommit {
+                    timestamp_monotonic,
+                    ..
+                } = action
+                {
+                    for _ in 0..5 {
+                        consensus.handle_commit_reply(&reply(1, timestamp_monotonic));
+                    }
+                }
+            }
+        }
+        assert_eq!(consensus.status(), Status::Recovering);
+        assert_eq!(
+            consensus.view(),
+            0,
+            "step-down must not replace leased history"
+        );
+        assert!(
+            !consensus
+                .timeouts
+                .borrow()
+                .is_ticking(TimeoutKind::CommitMessage)
+        );
+        assert!(
+            !consensus
+                .timeouts
+                .borrow()
+                .is_ticking(TimeoutKind::CheckQuorum)
+        );
+    }
+
+    #[test]
+    fn given_a_delayed_reply_when_replayed_in_the_next_window_should_not_extend_leadership() {
+        let consensus = primary(3);
+        let _ = consensus.commit_heartbeat();
+        let delayed = reply(1, 1);
+        let _ = consensus.commit_heartbeat();
+        consensus.handle_commit_reply(&delayed);
+        for _ in 0..WINDOW_TICKS {
+            consensus.tick(PlaneKind::Metadata);
+        }
+        assert!(
+            consensus.is_acting_primary(),
+            "a reply need not echo the latest broadcast"
+        );
+        for _ in 0..WINDOW_TICKS {
+            consensus.handle_commit_reply(&delayed);
+            consensus.tick(PlaneKind::Metadata);
+        }
+        assert_eq!(
+            consensus.status(),
+            Status::Recovering,
+            "a previous-window reply cannot count again"
+        );
+    }
+
+    #[test]
+    fn given_foreign_or_unsent_replies_when_a_window_expires_should_not_count_them() {
+        let valid = reply(1, 1);
+        let invalid = [
+            CommitReplyHeader {
+                cluster: 2,
+                ..valid
+            },
+            CommitReplyHeader {
+                group: METADATA_GROUP + 1,
+                ..valid
+            },
+            CommitReplyHeader {
+                partition_incarnation: 1,
+                ..valid
+            },
+            CommitReplyHeader { view: 1, ..valid },
+            CommitReplyHeader {
+                replica: 0,
+                ..valid
+            },
+            CommitReplyHeader {
+                replica: 3,
+                ..valid
+            },
+            CommitReplyHeader {
+                timestamp_monotonic: 0,
+                ..valid
+            },
+            CommitReplyHeader {
+                timestamp_monotonic: 2,
+                ..valid
+            },
+        ];
+        for header in invalid {
+            let consensus = primary(3);
+            let _ = consensus.commit_heartbeat();
+            consensus.handle_commit_reply(&header);
+            for _ in 0..WINDOW_TICKS {
+                consensus.tick(PlaneKind::Metadata);
+            }
+            assert_eq!(consensus.status(), Status::Recovering, "{header:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod view_change_vote_tests {
+    //! A replica that stops hearing its primary votes to replace it, and leaves
+    //! its view only once a view-change quorum votes with it.
+
+    use super::*;
+    use crate::LocalPipeline;
+    use crate::test_bus::{NoopBus, make_commit, make_start_view_change};
+
+    const REPLICA_COUNT: u8 = 3;
+    const VIEW: u32 = 0;
+    const NEXT_VIEW: u32 = VIEW + 1;
+    /// Leads `VIEW`.
+    const PRIMARY: u8 = 0;
+    /// Leads `NEXT_VIEW`.
+    const CANDIDATE: u8 = 1;
+    const BACKUP: u8 = 2;
+    const PLANE: PlaneKind = PlaneKind::Metadata;
+
+    fn replica(replica: u8) -> VsrConsensus<NoopBus, LocalPipeline> {
+        replica_of(REPLICA_COUNT, replica)
+    }
+
+    fn replica_of(replica_count: u8, replica: u8) -> VsrConsensus<NoopBus, LocalPipeline> {
+        let consensus = VsrConsensus::new(
+            1,
+            replica,
+            replica_count,
+            METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        consensus
+    }
+
+    /// A replica that entered `NEXT_VIEW` alone, because nobody answered its view
+    /// probe.
+    fn alone_in_next_view(replica_count: u8, replica: u8) -> VsrConsensus<NoopBus, LocalPipeline> {
+        let consensus = replica_of(replica_count, replica);
+        consensus.begin_view_probe();
+        let probing =
+            TimeoutManager::REQUEST_START_VIEW_MESSAGE_TICKS * u64::from(PROBE_ATTEMPTS_MAX);
+        let actions = (0..probing)
+            .flat_map(|_| consensus.tick(PLANE))
+            .collect::<Vec<_>>();
+        assert!(!sends_do_view_change(&actions), "{actions:?}");
+        assert_eq!(
+            (consensus.status(), consensus.view()),
+            (Status::ViewChange, NEXT_VIEW)
+        );
+        consensus
+    }
+
+    fn start_view_change(
+        consensus: &VsrConsensus<NoopBus, LocalPipeline>,
+        from: u8,
+        view: u32,
+    ) -> Vec<VsrAction> {
+        consensus.handle_start_view_change(PLANE, make_start_view_change(view, from).header())
+    }
+
+    fn votes_for(actions: &[VsrAction], view: u32) -> bool {
+        actions.iter().any(|action| {
+            matches!(action, VsrAction::SendStartViewChange { view: voted, .. } if *voted == view)
+        })
+    }
+
+    fn sends_do_view_change(actions: &[VsrAction]) -> bool {
+        actions
+            .iter()
+            .any(|action| matches!(action, VsrAction::SendDoViewChange { .. }))
+    }
+
+    #[test]
+    fn given_a_heartbeat_timeout_should_vote_for_the_next_view_without_leaving_its_own() {
+        let consensus = replica(BACKUP);
+
+        let actions = consensus.handle_normal_heartbeat_timeout(PLANE);
+
+        assert!(votes_for(&actions, NEXT_VIEW), "{actions:?}");
+        assert_eq!(consensus.status(), Status::Normal);
+        assert_eq!(consensus.view(), VIEW);
+    }
+
+    #[test]
+    fn given_a_backup_that_hears_its_primary_when_a_peer_votes_should_not_join() {
+        let consensus = replica(BACKUP);
+
+        let actions = start_view_change(&consensus, CANDIDATE, NEXT_VIEW);
+
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!(consensus.status(), Status::Normal);
+        assert_eq!(consensus.view(), VIEW);
+    }
+
+    #[test]
+    fn given_its_vote_when_a_peer_votes_too_should_enter_the_view_change_and_send_its_do_view_change()
+     {
+        let consensus = replica(BACKUP);
+        let _ = consensus.handle_normal_heartbeat_timeout(PLANE);
+
+        let actions = start_view_change(&consensus, CANDIDATE, NEXT_VIEW);
+
+        assert!(sends_do_view_change(&actions), "{actions:?}");
+        assert_eq!(consensus.status(), Status::ViewChange);
+        assert_eq!(consensus.view(), NEXT_VIEW);
+    }
+
+    #[test]
+    fn given_its_vote_when_the_primary_heartbeats_should_withdraw_the_vote() {
+        let consensus = replica(BACKUP);
+        let _ = consensus.handle_normal_heartbeat_timeout(PLANE);
+
+        let _ = consensus.handle_commit(make_commit(VIEW, PRIMARY, 1).header());
+
+        let resent = (0..TimeoutManager::START_VIEW_CHANGE_MESSAGE_TICKS)
+            .flat_map(|_| consensus.tick(PLANE))
+            .collect::<Vec<_>>();
+        assert!(!votes_for(&resent, NEXT_VIEW), "{resent:?}");
+        let actions = start_view_change(&consensus, CANDIDATE, NEXT_VIEW);
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!(consensus.status(), Status::Normal);
+        assert_eq!(consensus.view(), VIEW);
+    }
+
+    #[test]
+    fn given_the_primary_leaves_its_view_should_follow_it() {
+        let consensus = replica(BACKUP);
+
+        let actions = start_view_change(&consensus, PRIMARY, NEXT_VIEW);
+
+        assert!(sends_do_view_change(&actions), "{actions:?}");
+        assert_eq!(consensus.view(), NEXT_VIEW);
+    }
+
+    #[test]
+    fn given_a_vote_two_views_ahead_should_join_it() {
+        let consensus = replica(BACKUP);
+
+        let actions = start_view_change(&consensus, CANDIDATE, NEXT_VIEW + 1);
+
+        assert!(sends_do_view_change(&actions), "{actions:?}");
+        assert_eq!(consensus.view(), NEXT_VIEW + 1);
+    }
+
+    #[test]
+    fn given_a_view_change_status_timeout_should_vote_for_the_next_view_without_entering_it() {
+        let consensus = replica(BACKUP);
+        let _ = start_view_change(&consensus, PRIMARY, NEXT_VIEW);
+
+        let actions = consensus.handle_view_change_status_timeout(PLANE);
+
+        assert!(votes_for(&actions, NEXT_VIEW + 1), "{actions:?}");
+        assert_eq!(consensus.status(), Status::ViewChange);
+        assert_eq!(consensus.view(), NEXT_VIEW);
+    }
+
+    /// A barred replica answers every `StartViewChange` with an empty vote, so
+    /// the vote alone must not depose a primary.
+    #[test]
+    fn given_an_empty_vote_for_the_next_view_should_keep_the_primary_in_its_view() {
+        let consensus = replica(PRIMARY);
+        let message = Message::<DoViewChangeHeader>::new(size_of::<DoViewChangeHeader>())
+            .transmute_header(|_, header: &mut DoViewChangeHeader| {
+                header.command = Command::DoViewChange;
+                header.cluster = 1;
+                header.replica = BACKUP;
+                header.view = NEXT_VIEW;
+                header.group = METADATA_GROUP;
+                header.flags = DoViewChangeHeader::FLAG_UNTRUSTED_LOG;
+                header.size = u32::try_from(size_of::<DoViewChangeHeader>()).unwrap();
+            });
+
+        let actions = consensus.handle_do_view_change(PLANE, message.header(), &[]);
+
+        assert!(actions.is_empty(), "{actions:?}");
+        assert!(consensus.is_primary());
+        assert_eq!(consensus.status(), Status::Normal);
+        assert_eq!(consensus.view(), VIEW);
+    }
+
+    /// With 4 replicas `max_faulty` is 1, but a view-change quorum is 3. A
+    /// `DoViewChange` pulls every replica into its view, so one vote beside a
+    /// replica that entered the view alone must not send one.
+    #[test]
+    fn given_four_replicas_when_a_lone_view_change_counts_votes_should_send_its_do_view_change_at_a_quorum()
+     {
+        const FOURTH: u8 = 3;
+        let consensus = alone_in_next_view(4, BACKUP);
+
+        let one_vote = start_view_change(&consensus, FOURTH, NEXT_VIEW);
+        let quorum = start_view_change(&consensus, PRIMARY, NEXT_VIEW);
+
+        assert!(!sends_do_view_change(&one_vote), "{one_vote:?}");
+        assert!(sends_do_view_change(&quorum), "{quorum:?}");
+    }
+
+    /// With 2 replicas a view change needs the `DoViewChange` of both, so a
+    /// replica alone in the view sends none until its peer votes.
+    #[test]
+    fn given_two_replicas_when_a_replica_is_alone_in_a_view_change_should_wait_for_the_vote_of_its_peer()
+     {
+        let consensus = alone_in_next_view(2, PRIMARY);
+
+        let alone = (0..TimeoutManager::DO_VIEW_CHANGE_MESSAGE_TICKS)
+            .flat_map(|_| consensus.tick(PLANE))
+            .collect::<Vec<_>>();
+        let with_peer = start_view_change(&consensus, CANDIDATE, NEXT_VIEW);
+
+        assert!(!sends_do_view_change(&alone), "{alone:?}");
+        assert!(sends_do_view_change(&with_peer), "{with_peer:?}");
     }
 }
 
@@ -10361,6 +11120,37 @@ mod adopted_view_claim_tests {
              scanned op {HEAD}, which view {OLD_VIEW} committed",
             durable.log_view,
             HEAD - 1,
+        );
+    }
+
+    /// A partition WAL can name the adopted view below its head: an install to a
+    /// checkpoint and a fenced view window both certify only the prefix they hold.
+    #[test]
+    fn given_a_wal_certified_below_the_adopted_head_when_the_backup_restarts_should_keep_the_committed_head()
+     {
+        let history = history_in(PARTITION_GROUP);
+        let adopted = adopt_unrepaired(&history);
+        let durable = adopted.vsr_state(0, 0);
+
+        let restarted = backup_in(
+            PARTITION_GROUP,
+            ADOPTED_VIEW,
+            durable.view,
+            HEAD - 1,
+            HEAD - 2,
+        );
+        restarted.restore_adopted_view(durable.adopted_view.as_ref());
+        restarted.resume_adopted_view();
+        restarted.fence_view_log(HEAD, 0);
+        let adopted_headers = restarted.adopted_view_log().unwrap().headers;
+        restarted.set_local_dvc_suffix(DvcSuffix::new(adopted_headers, 0, 0b10));
+        assert_eq!(restarted.sequencer().current_sequence(), HEAD);
+        assert!(restarted.view_log_unproven());
+
+        assert_eq!(
+            merged_head(&restarted, [dvc_of(&restarted), old_primary(&history)]),
+            HEAD,
+            "the merge must keep op {HEAD}, which view {OLD_VIEW} committed"
         );
     }
 

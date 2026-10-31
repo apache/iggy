@@ -497,8 +497,10 @@ name = "iggy-cluster"
 # whole ticks: values are rounded down to a multiple of 10ms, and anything under
 # 10ms is raised to a single tick rather than firing sooner.
 
-# Backup-side liveness window for a consensus plane's primary (duration).
-# A replica that sees no primary traffic for this long starts a view change.
+# Liveness window for a consensus primary and its replication quorum (duration).
+# Backups vote after primary silence. A primary without heartbeat replies from
+# a quorum relinquishes leadership. Heartbeat replies require a coordinated
+# node upgrade; mixed versions cannot sustain a primary's quorum checks.
 # Raise it on oversubscribed hosts where scheduling stalls fake primary
 # death. Must be at least "2s" and at least 4x commit_broadcast_interval: the
 # primary signals liveness through its commit broadcast, and the window must
@@ -1035,7 +1037,18 @@ change_log_activity_capacity = 16384
 # partition_wal_prepares_total over partition_wal_batches_total is the prepares per durable group, and
 # partition_wal_group_commit_waits_total counts the groups that actually took the optional wait
 # below, so a delay that never fires is distinguishable from one that fires and buys nothing.
+# A backup whose log the adopted view has not proven yet repairs it from the
+# head down and holds every batch it fetches in memory until the repair reaches
+# its commit point. Once it holds more than this budget, it stops and catches up
+# by state transfer instead. This bound is per partition, with the shared
+# allocation cap below limiting concurrent walks across all shards.
 wal_bytes_max = "256 MiB"
+
+# Node-wide allocation cap shared by unproven repair walks and snapshot repair
+# tails. Exhausted walks fall back to state transfer; exhausted tails require
+# a fresh snapshot. Normal prepare queues and transfer buffers have separate limits.
+# Must be > 0.
+repair_memory_bytes_max = "1 GiB"
 
 # Bounded wait for more prepares before a persisted partition's WAL writer
 # starts its durability barrier, in microseconds. 0 disables it. Max 10000.
@@ -1113,19 +1126,26 @@ consumer_offsets_max = 4096
 # For superblock compatibility, see superblock_wedged_fatal_timeout in [cluster].
 offset_reservation_lease = 65536
 
-# Entries the evicted ring retains per multi-replica partition for journal
-# repair after a peer rejoins. Larger widens the window a restarting peer can be
-# served from the ring before falling back to bulk sync, at the cost of pinned
-# memory per partition. Must be > 0 and <= 65536. Single-replica partitions
-# retain nothing regardless.
+# Entries the evicted ring retains with their batches in memory per
+# multi-replica partition for journal repair after a peer rejoins. Larger
+# widens the window a restarting peer can be served from memory, at the cost of
+# pinned memory per partition. Must be > 0 and <= 65536. Single-replica
+# partitions retain nothing regardless. The ops whose batches the ring released
+# to their segments do not count here. The ring keeps up to 16384 of them, 288
+# bytes each, and repair reads their batches back from disk.
 evicted_ring_capacity = 65536
 
-# Payload-byte ceiling per partition and replica; the first ring cap reached
-# evicts the lowest ops, retaining the newest entry even if it alone exceeds
-# this budget. Must be > 0 and <= "256 MiB". Allocation capacity, alignment and
-# index overhead are additional memory, especially for small offset commits.
-# There is no node-wide budget. partition_repair_ring_bytes reports payload
-# bytes summed across a shard's partitions, not their allocated memory or RSS.
+# Byte ceiling per partition and replica for the batches the ring holds in
+# memory. Past the cap the oldest batches that a segment holds leave memory
+# first, and repair reads them back from disk. When none can leave, the lowest
+# ops go, but the newest entry stays even if it alone exceeds this budget. Must
+# be > 0 and <= "256 MiB". The ops whose batches left memory take up to
+# 4.5 MiB more. Allocation capacity, alignment and index overhead are
+# additional memory, especially for small offset commits. There is no node-wide
+# budget.
+# partition_repair_ring_bytes reports these bytes plus 288 bytes for each
+# released op, summed across a shard's partitions, not their allocated memory
+# or RSS.
 evicted_ring_bytes_max = "64 MiB"
 
 # Byte budget for segment payloads a SERVING shard keeps resident to answer

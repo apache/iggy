@@ -33,11 +33,13 @@ pub mod offset_storage;
 mod partition_storage;
 mod persistence;
 mod poll_plan;
+mod repair_memory;
 pub use persistence::FileSyncBarrier;
 pub(crate) use persistence::PersistenceDrain;
 pub use persistence::{
     PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
 };
+pub use repair_memory::RepairMemoryBudget;
 mod segment;
 pub mod segment_anchor;
 mod segment_recovery;
@@ -70,7 +72,10 @@ pub use io::{
     PartitionIoResult, PartitionIoStep, PartitionTeardown, PreparedPrimaryTransfer,
     largest_legal_job_charge,
 };
-pub use journal::{EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY};
+pub use journal::{
+    BodyPosition, EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY, EvictedHeader, ReleasedBodies,
+    ReleasedRead,
+};
 pub use view_fence::ViewWindowVerdict;
 
 /// Offsets a partition claims in its superblock ahead of the mint counter
