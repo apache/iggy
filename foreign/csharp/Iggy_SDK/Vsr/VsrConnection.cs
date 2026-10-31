@@ -27,8 +27,10 @@ using Microsoft.Extensions.Logging;
 namespace Apache.Iggy.Vsr;
 
 /// <summary>
-///     A bounded multiplexed connection. The writer owns frame boundaries; the reader correlates replies
-///     by request id. Canceling one exchange never interrupts either task or another request.
+///     A bounded multiplexed connection. The writer owns frame boundaries. The reader correlates replies
+///     by request id. Canceling one exchange never interrupts either task or another request. A canceled deferred
+///     request that already went out is also canceled on the server, with a header-only frame that the server
+///     never answers.
 /// </summary>
 internal sealed class VsrConnection : IDisposable
 {
@@ -49,13 +51,20 @@ internal sealed class VsrConnection : IDisposable
         internal readonly UInt128 RequestChecksum = BinaryPrimitives.ReadUInt128LittleEndian(frame.AsSpan(VsrHeader.REQUEST_CHECKSUM_OFFSET));
         internal readonly ulong Incarnation = BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(VsrHeader.REQUEST_INCARNATION_OFFSET));
         internal bool Started;
+        internal bool CancelSent;
     }
 
     private readonly object _gate = new();
     private readonly Dictionary<ulong, PendingRequest> _pending = [];
     private readonly SemaphoreSlim _pendingCapacity = new(MAX_PENDING_REQUESTS, MAX_PENDING_REQUESTS);
-    private readonly Channel<PendingRequest> _writes = Channel.CreateBounded<PendingRequest>(
-        new BoundedChannelOptions(WRITE_QUEUE_CAPACITY) { SingleReader = true, FullMode = BoundedChannelFullMode.Wait });
+
+    /// <summary>
+    ///     Bounds the queued request frames instead of the channel: a cancel is queued from a cancellation callback,
+    ///     which cannot wait for room.
+    /// </summary>
+    private readonly SemaphoreSlim _writeSlots = new(WRITE_QUEUE_CAPACITY, WRITE_QUEUE_CAPACITY);
+    private readonly Channel<PendingRequest> _writes = Channel.CreateUnbounded<PendingRequest>(
+        new UnboundedChannelOptions { SingleReader = true });
     private readonly CancellationTokenSource _lifetime = new();
     private readonly Stream _stream;
     private readonly ConsensusSession _session;
@@ -97,10 +106,15 @@ internal sealed class VsrConnection : IDisposable
         Reason: EvictionReason.NoSession or EvictionReason.StaleClient
     };
 
+    /// <summary>
+    ///     Sends a retained frame. <paramref name="serverCancellation" /> ends the request while it has not gone out.
+    ///     After that it only asks the server to cancel it and the request keeps its reply slot, because a read that
+    ///     commits answers once either way: refused when the cancel won, or with what it stored.
+    /// </summary>
     internal Task<VsrAttempt> SendFrameAsync(ClientOperation operation, long deadline, bool clearSensitiveReply,
-        CancellationToken token) =>
+        CancellationToken token, CancellationToken serverCancellation = default) =>
         ExchangeAsync(operation.Code, operation.Body, operation.Identity, operation.Context, deadline, clearSensitiveReply, token,
-            operation.Frame);
+            operation.Frame, serverCancellation);
 
     internal async ValueTask<VsrAttempt> SendAttemptAsync(int code, ReadOnlyMemory<byte> body,
         long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token,
@@ -158,15 +172,19 @@ internal sealed class VsrConnection : IDisposable
 
     private async Task<VsrAttempt> ExchangeAsync(int code, ReadOnlyMemory<byte> body, SessionFrame frame,
         PartitionContext context, long deadline, bool clearSensitiveReply, CancellationToken token,
-        SharedRequestFrame? owner = null)
+        SharedRequestFrame? owner = null, CancellationToken serverCancellation = default)
     {
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token, _lifetime.Token);
         cancellation.CancelAfter((int)Math.Clamp(deadline - Environment.TickCount64, 0, int.MaxValue));
+        using var unsent = serverCancellation.CanBeCanceled
+            ? CancellationTokenSource.CreateLinkedTokenSource(cancellation.Token, serverCancellation)
+            : null;
+        var sendToken = unsent?.Token ?? cancellation.Token;
         var admitted = false;
         PendingRequest? request = null;
         try
         {
-            await _pendingCapacity.WaitAsync(cancellation.Token);
+            await _pendingCapacity.WaitAsync(sendToken);
             admitted = true;
             var encoded = owner?.Bytes ?? new byte[checked(VsrHeader.HEADER_SIZE + body.Length)];
             if (owner is null)
@@ -194,34 +212,40 @@ internal sealed class VsrConnection : IDisposable
                 }
             }
             using var registration = cancellation.Token.Register(() => Cancel(request, token));
+            using var serverRegistration = serverCancellation.Register(() => CancelOnServer(request, serverCancellation));
             try
             {
-                while (await _writes.Writer.WaitToWriteAsync(cancellation.Token))
+                await _writeSlots.WaitAsync(sendToken);
+                lock (_gate)
                 {
-                    lock (_gate)
+                    // Fail completes every pending request under this lock before it completes the channel, so an
+                    // open request always finds the channel open.
+                    if (request.Completion.Task.IsCompleted)
                     {
-                        if (request.Completion.Task.IsCompleted)
-                        {
-                            break;
-                        }
+                        _writeSlots.Release();
+                    }
+                    else
+                    {
                         owner?.Acquire();
                         request.Started = true;
-                        if (_writes.Writer.TryWrite(request))
+                        _writes.Writer.TryWrite(request);
+                        if (_replySilenceDeadline == 0)
                         {
-                            if (_replySilenceDeadline == 0)
-                            {
-                                _replySilenceDeadline = Environment.TickCount64 + _requestTimeoutMs;
-                            }
-                            break;
+                            _replySilenceDeadline = Environment.TickCount64 + _requestTimeoutMs;
                         }
-                        owner?.Release();
-                        request.Started = false;
                     }
                 }
             }
             catch (OperationCanceledException)
             {
-                Cancel(request, token);
+                if (serverCancellation.IsCancellationRequested)
+                {
+                    CancelOnServer(request, serverCancellation);
+                }
+                else
+                {
+                    Cancel(request, token);
+                }
             }
             return await request.Completion.Task;
         }
@@ -237,7 +261,8 @@ internal sealed class VsrConnection : IDisposable
                     }
                 }
             }
-            if (error is OperationCanceledException && !token.IsCancellationRequested)
+            if (error is OperationCanceledException && !token.IsCancellationRequested
+                && !serverCancellation.IsCancellationRequested)
             {
                 error = _failure ?? new IOException($"Timed out after {_requestTimeoutMs} ms waiting for a consensus reply.");
             }
@@ -262,8 +287,59 @@ internal sealed class VsrConnection : IDisposable
             }
             var error = token.IsCancellationRequested ? new OperationCanceledException(token)
                 : _failure ?? new IOException($"Timed out after {_requestTimeoutMs} ms waiting for a consensus reply.");
-            request.Completion.TrySetResult(VsrAttempt.Failed(true, error, request.Started));
+            if (request.Completion.TrySetResult(VsrAttempt.Failed(true, error, request.Started)) && request.Started
+                && IsDeferred(request.Code) && !request.CancelSent)
+            {
+                // A parked request would hold its server slot until its wait ends. A frame the writer skips gets
+                // the cancel too, and the server ignores a cancel for a request it does not hold.
+                _writes.Writer.TryWrite(DeferredCancellation(request));
+                // The server answers neither the cancel nor the canceled request, so the silence watchdog must not
+                // wait for a reply that never comes. An expired deadline keeps it: a missing reply is the symptom.
+                if (token.IsCancellationRequested && _pending.Count == 0)
+                {
+                    _replySilenceDeadline = 0;
+                    _waitingForActiveDeadlines = false;
+                }
+            }
         }
+    }
+
+    private void CancelOnServer(PendingRequest request, CancellationToken serverCancellation)
+    {
+        lock (_gate)
+        {
+            if (request.Completion.Task.IsCompleted || request.CancelSent)
+            {
+                return;
+            }
+            if (!request.Started)
+            {
+                if (_pending.TryGetValue(request.RequestId, out var active) && ReferenceEquals(active, request))
+                {
+                    _pending.Remove(request.RequestId);
+                }
+                request.Completion.TrySetResult(VsrAttempt.Failed(true,
+                    new OperationCanceledException(serverCancellation), false));
+                return;
+            }
+            if (IsDeferred(request.Code))
+            {
+                request.CancelSent = true;
+                _writes.Writer.TryWrite(DeferredCancellation(request));
+            }
+        }
+    }
+
+    private static bool IsDeferred(int code) =>
+        code is CommandCodes.POLL_MESSAGES_DEFERRED_CODE or CommandCodes.FETCH_MESSAGES_CODE;
+
+    private PendingRequest DeferredCancellation(PendingRequest request)
+    {
+        var frame = new byte[VsrHeader.HEADER_SIZE];
+        var session = BinaryPrimitives.ReadUInt64LittleEndian(request.Frame.AsSpan(VsrHeader.REQUEST_SESSION_OFFSET));
+        VsrHeader.EncodeRequestHeader(frame, _session, CommandCodes.CANCEL_DEFERRED_REQUEST_CODE,
+            ReadOnlySpan<byte>.Empty, retainedFrame: new SessionFrame(request.ClientId, request.RequestId, session));
+        return new PendingRequest(frame, CommandCodes.CANCEL_DEFERRED_REQUEST_CODE, request.Deadline, false, null);
     }
 
     private async Task WriteFramesAsync()
@@ -274,6 +350,11 @@ internal sealed class VsrConnection : IDisposable
             {
                 try
                 {
+                    // A cancel took no slot. Its completion never ends, so it is always written.
+                    if (request.Code != CommandCodes.CANCEL_DEFERRED_REQUEST_CODE)
+                    {
+                        _writeSlots.Release();
+                    }
                     if (!request.Completion.Task.IsCompleted)
                     {
                         using var writeCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
@@ -510,7 +591,7 @@ internal sealed class VsrConnection : IDisposable
     }
 }
 
-/// <summary>A correlated attempt outcome; Committed is independent of a successful weak acknowledgement.</summary>
+/// <summary>A correlated attempt outcome. Committed is independent of a successful weak acknowledgement.</summary>
 internal readonly record struct VsrAttempt(
     bool Encoded,
     IMemoryOwner<byte>? Response,
@@ -525,7 +606,7 @@ internal readonly record struct VsrAttempt(
         new(encoded, null, error, requestStarted, error is IggyInvalidStatusCodeException { Committed: true });
 }
 
-/// <summary>Shared empty reply payload; disposes to nothing, so it is safe to hand out repeatedly.</summary>
+/// <summary>Shared empty reply payload. Disposes to nothing, so it is safe to hand out repeatedly.</summary>
 internal sealed class EmptyMemoryOwner : IMemoryOwner<byte>
 {
     public static readonly EmptyMemoryOwner Instance = new();

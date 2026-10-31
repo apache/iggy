@@ -684,11 +684,13 @@ async fn poll_count(client: &IggyClient, count: u32) -> Result<u32, IggyError> {
         .poll_messages(
             &Identifier::named(STREAM_NAME).expect("stream identifier"),
             &Identifier::named(TOPIC_NAME).expect("topic identifier"),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            count,
-            false,
+            PollOptions {
+                count,
+                ..PollOptions::default()
+            },
         )
         .await?;
     #[allow(clippy::cast_possible_truncation)]

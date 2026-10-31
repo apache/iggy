@@ -714,7 +714,8 @@ mod tests {
             None,
         )
         .expect("re-encodes wire body");
-        let polled = PolledMessages::from_bytes(body).expect("decodes as the SDK does");
+        let polled = PolledMessages::from_bytes(body, &PollingStrategy::offset(41))
+            .expect("decodes as the SDK does");
 
         assert_eq!(polled.partition_id, 3);
         assert_eq!(polled.current_offset, 42);

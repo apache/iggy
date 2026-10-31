@@ -27,6 +27,7 @@ from apache_iggy import (
     Consumer,
     OptionKey,
     PollingStrategy,
+    PollOptions,
     SendMessage,
     StreamDetails,
     encryption_key_fingerprint,
@@ -200,11 +201,10 @@ def poll_first(context):
             consumer=Consumer.Single(1),
             partition_id=PARTITION_ID,
             polling_strategy=PollingStrategy.Offset(value=0),
-            count=1,
-            auto_commit=False,
+            options=PollOptions(count=1),
         )
 
-    messages = asyncio.run(poll())
+    messages = asyncio.run(poll()).messages
     assert messages
     return messages[0]
 

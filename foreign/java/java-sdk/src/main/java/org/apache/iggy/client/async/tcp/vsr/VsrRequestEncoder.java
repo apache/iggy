@@ -22,6 +22,7 @@ package org.apache.iggy.client.async.tcp.vsr;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import org.apache.iggy.partition.PartitionContext;
+import org.apache.iggy.serde.CommandCode;
 
 import java.security.SecureRandom;
 import java.util.Arrays;
@@ -134,16 +135,20 @@ public final class VsrRequestEncoder {
             frame.setLongLE(VsrHeaders.REQUEST_ID_OFFSET, requestId);
             frame.setByte(VsrHeaders.REQUEST_OPERATION_OFFSET, operation);
             frame.setLongLE(VsrHeaders.REQUEST_SESSION_OFFSET, sessionId);
-            frame.setLongLE(
-                    VsrHeaders.REQUEST_INCARNATION_OFFSET, context.incarnation().longValue());
-            frame.setLongLE(
-                    VsrHeaders.REQUEST_OWNER_GENERATION_OFFSET,
-                    context.ownerGeneration().longValue());
-            frame.setLongLE(
-                    VsrHeaders.REQUEST_METADATA_OP_OFFSET,
-                    context.equals(PartitionContext.EMPTY)
-                            ? session.metadataWatermark()
-                            : context.metadataOp().longValue());
+            // A fetch carries its fences per target and does not inherit the session's metadata watermark.
+            if (commandCode != CommandCode.Messages.FETCH_MESSAGES.getValue()) {
+                frame.setLongLE(
+                        VsrHeaders.REQUEST_INCARNATION_OFFSET,
+                        context.incarnation().longValue());
+                frame.setLongLE(
+                        VsrHeaders.REQUEST_OWNER_GENERATION_OFFSET,
+                        context.ownerGeneration().longValue());
+                frame.setLongLE(
+                        VsrHeaders.REQUEST_METADATA_OP_OFFSET,
+                        context.equals(PartitionContext.EMPTY)
+                                ? session.metadataWatermark()
+                                : context.metadataOp().longValue());
+            }
             if (operation == VsrOperation.NON_REPLICATED) {
                 frame.setIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET, commandCode);
             }

@@ -201,11 +201,13 @@ async fn wait_for_acked_readable(
             .poll_messages(
                 &stream,
                 &topic,
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                want,
-                false,
+                PollOptions {
+                    count: want,
+                    ..PollOptions::default()
+                },
             )
             .await
         {

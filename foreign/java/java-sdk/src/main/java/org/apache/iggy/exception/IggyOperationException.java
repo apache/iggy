@@ -20,23 +20,42 @@
 package org.apache.iggy.exception;
 
 import java.util.Optional;
+import java.util.OptionalLong;
 
-/** A local recovery outcome carrying the exact unsigned wire operation id. */
+/** A local recovery outcome carrying an unsigned recovery id, also for fetches without replayable receipts. */
 public final class IggyOperationException extends IggyServerException {
     private final long operationId;
+    private final OptionalLong partitionId;
 
     public IggyOperationException(IggyErrorCode code, long operationId) {
+        this(code, operationId, OptionalLong.empty());
+    }
+
+    public IggyOperationException(IggyErrorCode code, long operationId, long partitionId) {
+        this(code, operationId, OptionalLong.of(partitionId));
+    }
+
+    private IggyOperationException(IggyErrorCode code, long operationId, OptionalLong partitionId) {
         super(
                 code,
                 code.getCode(),
-                "Operation " + Long.toUnsignedString(operationId),
+                code == IggyErrorCode.PARTITION_LANE_BLOCKED && partitionId.isPresent()
+                        ? "Partition " + partitionId.getAsLong() + " blocked by operation "
+                                + Long.toUnsignedString(operationId)
+                        : "Operation " + Long.toUnsignedString(operationId),
                 Optional.empty(),
                 Optional.empty());
         this.operationId = operationId;
+        this.partitionId = partitionId;
     }
 
-    /** Returns the u64 wire bits. Negative values are valid operation ids. */
+    /** Returns the unsigned recovery id bits. Negative values are valid ids. Fetch ids cannot be replayed. */
     public long getOperationId() {
         return operationId;
+    }
+
+    /** Returns the blocked partition as an unsigned 32-bit value, if this outcome names a partition. */
+    public OptionalLong getPartitionId() {
+        return partitionId;
     }
 }

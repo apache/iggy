@@ -20,38 +20,44 @@
 //! A frame that can have taken effect is never frozen again, so a retry never
 //! applies a request twice.
 
-use crate::links::{Frame, Link, ReplicaLinks, Target, lost_link, pause_before_retry, read_reply};
+use crate::links::{
+    Frame, LateReply, Link, ReplicaLinks, Reply, Target, committing_cancel_requested, lost_link,
+    pause_before_retry, read_reply,
+};
 use crate::session_owner::{LaneKey, LaneTicket, RetainedOperation, SessionEpoch, SessionOwner};
 use crate::vsr::decode_reply_for;
 use bytes::Bytes;
-use futures::stream::{self, FuturesUnordered, StreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use iggy_binary_protocol::codes::{
     BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, CHANGE_PASSWORD_CODE,
-    DELETE_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_CODE, GET_PARTITION_ROUTE_CODE,
-    LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, POLL_MESSAGES_CODE,
-    POLL_MESSAGES_DEFERRED_CODE, SEND_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE,
-    UPDATE_RESOURCE_CODE, WAIT_FOR_MESSAGES_CODE,
+    DELETE_CONSUMER_OFFSET_CODE, FETCH_MESSAGES_CODE, GET_CONSUMER_OFFSET_CODE,
+    GET_PARTITION_ROUTE_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
+    POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE, SEND_MESSAGES_CODE,
+    STORE_CONSUMER_OFFSET_CODE, UPDATE_RESOURCE_CODE,
 };
-use iggy_binary_protocol::consensus::{Operation, operation_for_code};
+use iggy_binary_protocol::consensus::{Operation, RequestHeader, operation_for_code};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::messages::{
-    DeferredPollMessagesRequest, GetPartitionRouteRequest, MIN_DEFERRED_POLL_REPLY_MARGIN_US,
-    PollMessagesRequest, SendMessagesHeader, WaitForMessagesRequest,
+    DeferredPollMessagesRequest, FetchMessagesRequest, GetPartitionRouteRequest,
+    MIN_DEFERRED_POLL_MAX_BYTES, MIN_DEFERRED_POLL_REPLY_MARGIN_US, PollMessagesRequest,
+    SendMessagesHeader,
 };
 use iggy_binary_protocol::requests::system::{ResourceTarget, UpdateResourceRequest};
 use iggy_binary_protocol::requests::users::ChangePasswordRequest;
-use iggy_binary_protocol::responses::messages::{PartitionRouteResponse, WaitForMessagesResponse};
+use iggy_binary_protocol::responses::messages::{
+    FetchMessagesResponse, FetchMessagesSectionIterator, PartitionRouteResponse,
+};
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
-    MAX_PARTITIONS_PER_REQUEST, WireDecode, WireEncode, WireOptions, WirePartitioning,
+    MAX_PARTITIONS_PER_REQUEST, STATUS_OK, WireDecode, WireEncode, WireOptions, WirePartitioning,
     WirePollingStrategy,
 };
 use iggy_common::{
-    BinaryOperationLineage, ClientState, Credentials, DeferredPollOptions, DiagnosticEvent,
-    HeaderKind, Identifier, IggyError, OptionKey,
+    BinaryOperationLineage, ClientState, CommitErrorScope, Credentials, DeferredPollOptions,
+    DiagnosticEvent, FetchedSection, HeaderKind, Identifier, IggyError, OptionKey,
 };
 use route_cache::RouteCache;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -215,6 +221,9 @@ impl OperationDriver {
         self.poll_with_options(request, context, None).await
     }
 
+    /// An `auto_commit` poll whose outcome is unknown after it left the client
+    /// ends with `FetchProgressUncertain` and blocks its partition until an
+    /// abandon, because the server can still store its offset.
     pub(crate) async fn poll_with_options(
         &self,
         request: &PollMessagesRequest,
@@ -282,6 +291,7 @@ impl OperationDriver {
                 started,
                 progress_poll: request.auto_commit
                     || request.strategy.kind == WirePollingStrategy::next().kind,
+                committing_poll: request.auto_commit,
                 deadline: operation_deadline(),
                 ..call
             })
@@ -300,26 +310,19 @@ impl OperationDriver {
         partitions: &[u32],
     ) -> Result<Vec<Vec<u32>>, IggyError> {
         let lineage = self.session.operation_lineage().lineage();
-        let deadline = operation_deadline();
-        let mut routes = stream::iter(partitions.iter().copied())
-            .map(|partition_id| {
-                let key = PartitionKey {
-                    stream_id: stream_id.clone(),
-                    topic_id: topic_id.clone(),
-                    partition_id,
-                };
-                async move {
-                    self.route(&key, lineage, deadline)
-                        .await
-                        .map(|route| (route.primary_replica, partition_id))
-                }
-            })
-            .buffered(MAX_ROUTE_LOOKUPS_IN_FLIGHT);
+        let routes = self
+            .routes_of(
+                stream_id,
+                topic_id,
+                partitions,
+                lineage,
+                operation_deadline(),
+            )
+            .await?;
         let mut endpoints = std::collections::BTreeMap::<u8, Vec<u32>>::new();
-        while let Some(route) = routes.next().await {
-            let (primary_replica, partition_id) = route?;
+        for (&partition_id, route) in partitions.iter().zip(routes) {
             endpoints
-                .entry(primary_replica)
+                .entry(route.primary_replica)
                 .or_default()
                 .push(partition_id);
         }
@@ -334,114 +337,74 @@ impl OperationDriver {
         Ok(groups)
     }
 
-    pub(crate) async fn wait_for_messages(
+    /// One fetch on the primary of its targets. The targets of a readiness
+    /// group share it, so the call routes by the first one. The header
+    /// carries context zero, and each target its own fence.
+    pub(crate) async fn fetch_messages(
         &self,
-        request: &WaitForMessagesRequest,
+        request: &FetchMessagesRequest,
     ) -> Result<Bytes, IggyError> {
+        self.fetch_response(request).await.map(|reply| reply.body)
+    }
+
+    pub(crate) async fn fetch_sections(
+        &self,
+        request: &FetchMessagesRequest,
+    ) -> Result<Vec<FetchedSection>, IggyError> {
+        let reply = self.fetch_response(request).await?;
+        let mut sections = FetchedSection::from_reply(&reply.body)?;
+        if let Some(uncertain) = reply.uncertain_fetch {
+            for section in &mut sections {
+                if uncertain.partitions.contains(&section.partition_id) {
+                    section.status = Err(IggyError::FetchProgressUncertain(uncertain.operation_id));
+                }
+            }
+        }
+        Ok(sections)
+    }
+
+    async fn fetch_response(&self, request: &FetchMessagesRequest) -> Result<CallReply, IggyError> {
+        DeferredPollOptions::from(request).validate_fetch(request.count)?;
         let started = Instant::now();
         let deadline = started
             .checked_add(std::time::Duration::from_micros(request.request_timeout_us))
             .ok_or(IggyError::InvalidCommand)?;
         let stream_id = Identifier::try_from(&request.stream_id)?;
         let topic_id = Identifier::try_from(&request.topic_id)?;
-        let partitions: Vec<u32> = request
-            .partitions
-            .iter()
-            .map(|target| target.partition_id)
-            .collect();
-        let wait = move |group: Vec<u32>| {
-            let mut request = request.clone();
-            request
-                .partitions
-                .retain(|target| group.contains(&target.partition_id));
-            async move { (self.wait_on_primary(request, started).await, group) }
-        };
-        with_deadline(deadline, async {
-            let mut waits: FuturesUnordered<_> = self
-                .wait_groups(&stream_id, &topic_id, &partitions)
-                .await?
-                .into_iter()
-                .map(wait)
-                .collect();
-            let mut moves = 0;
-            while let Some((reply, group)) = waits.next().await {
-                let body = match reply {
-                    Err(IggyError::NotPrimary) => {
-                        self.routes().may_have_moved(&stream_id, &topic_id, &group);
-                        if !pause_before_retry(moves, operation_deadline(), rand::random()).await {
-                            return Err(IggyError::TransientNotAccepted);
-                        }
-                        moves = moves.saturating_add(1);
-                        let groups = self.wait_groups(&stream_id, &topic_id, &group).await?;
-                        waits.extend(groups.into_iter().map(wait));
-                        continue;
-                    }
-                    reply => reply?,
-                };
-                let response = WaitForMessagesResponse::decode_from(&body)
-                    .map_err(|_| IggyError::InvalidCommand)?;
-                if !response.partitions.is_empty() {
-                    return Ok(body);
-                }
-            }
-            Ok(WaitForMessagesResponse {
-                partitions: Vec::new(),
-            }
-            .to_bytes())
-        })
-        .await
-    }
-
-    /// [`Self::readiness_groups`], retried until a lookup answers or the
-    /// deadline passes.
-    async fn wait_groups(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partitions: &[u32],
-    ) -> Result<Vec<Vec<u32>>, IggyError> {
-        let mut retries = 0;
-        loop {
-            match self.readiness_groups(stream_id, topic_id, partitions).await {
-                Err(error) if retries_lookup(&error) => {
-                    if !pause_before_retry(retries, operation_deadline(), rand::random()).await {
-                        return Err(IggyError::TransientNotAccepted);
-                    }
-                    retries = retries.saturating_add(1);
-                }
-                groups => return groups,
-            }
-        }
-    }
-
-    /// `started` is when the wait began, before routing. The caller's deadline
-    /// ends the wait.
-    async fn wait_on_primary(
-        &self,
-        request: WaitForMessagesRequest,
-        started: Instant,
-    ) -> Result<Bytes, IggyError> {
         let partition_id = request
-            .partitions
+            .targets
             .first()
             .ok_or(IggyError::InvalidCommand)?
             .partition_id;
-        let stream_id = Identifier::try_from(&request.stream_id)?;
-        let topic_id = Identifier::try_from(&request.topic_id)?;
-        let _lease = self.deferred_lease().await?;
-        self.drive(Call {
-            started,
-            ..Call::new(
-                WAIT_FOR_MESSAGES_CODE,
+        let mut request = request.clone();
+        if let Some(limit) = self.links.reply_body_limit() {
+            fit_fetch_reply(&mut request, limit)?;
+        }
+        let progress_poll = request.auto_commit
+            || request
+                .targets
+                .iter()
+                .any(|target| target.strategy.kind == WirePollingStrategy::next().kind);
+        with_deadline(deadline, async {
+            let _lease = self.deferred_lease().await?;
+            let call = Call::new(
+                FETCH_MESSAGES_CODE,
                 request.to_bytes(),
                 RequestTarget::Partition(PartitionTarget {
                     stream_id: &stream_id,
                     topic_id: &topic_id,
                     partition_id,
-                    context: None,
+                    context: Some(PartitionContext::default()),
                 }),
                 operation_deadline(),
-            )
+            );
+            self.drive_reply(Call {
+                started,
+                progress_poll,
+                fetch: Some(request),
+                ..call
+            })
+            .await
         })
         .await
     }
@@ -484,10 +447,11 @@ impl OperationDriver {
                     .poll_with_options(&request.poll, context, Some((&request).into()))
                     .await;
             }
-            WAIT_FOR_MESSAGES_CODE => {
-                let request = WaitForMessagesRequest::decode_from(&payload)
+            // Each target carries its own fence, and a zero one takes the route.
+            FETCH_MESSAGES_CODE => {
+                let request = FetchMessagesRequest::decode_from(&payload)
                     .map_err(|_| IggyError::InvalidCommand)?;
-                return self.wait_for_messages(&request).await;
+                return self.fetch_messages(&request).await;
             }
             // A cancel names a pending request by its id, and the server answers no
             // cancel, so a new raw request could only wait for its deadline.
@@ -538,9 +502,9 @@ impl OperationDriver {
 
     /// Sends a non-replicated request to replica `replica_id` and returns its
     /// reply. Writes and partition reads go through the routing of their own
-    /// kind: a poll, a readiness wait or a consumer-offset read needs the
-    /// partition's primary and its incarnation, which a request to a chosen
-    /// replica does not carry. The server answers no cancel, so a raw one
+    /// kind: a poll, a fetch or a consumer-offset read needs
+    /// the partition's primary and its incarnation, which a request to a
+    /// chosen replica does not carry. The server answers no cancel, so a raw one
     /// could only wait for its deadline.
     pub(crate) async fn send_to_replica(
         &self,
@@ -553,7 +517,7 @@ impl OperationDriver {
                 code,
                 POLL_MESSAGES_CODE
                     | POLL_MESSAGES_DEFERRED_CODE
-                    | WAIT_FOR_MESSAGES_CODE
+                    | FETCH_MESSAGES_CODE
                     | CANCEL_DEFERRED_REQUEST_CODE
                     | GET_CONSUMER_OFFSET_CODE
             )
@@ -596,7 +560,11 @@ impl OperationDriver {
         self.session.abandon(op)
     }
 
-    async fn drive(&self, mut call: Call) -> Result<Bytes, IggyError> {
+    async fn drive(&self, call: Call) -> Result<Bytes, IggyError> {
+        self.drive_reply(call).await.map(|reply| reply.body)
+    }
+
+    async fn drive_reply(&self, mut call: Call) -> Result<CallReply, IggyError> {
         let lineage = self.session.operation_lineage().lineage();
         let started = SessionEpoch {
             lineage,
@@ -605,9 +573,16 @@ impl OperationDriver {
         loop {
             let next = match self.attempt(&mut call, started).await {
                 Ok(body) => {
+                    let uncertain_fetch = match call.accept_fetch_reply(&body) {
+                        Ok(uncertain) => uncertain,
+                        Err(error) => return Err(call.end(error)),
+                    };
                     self.refresh_sign_in(&call);
                     call.complete(Ok(()));
-                    return Ok(body);
+                    return Ok(CallReply {
+                        body,
+                        uncertain_fetch,
+                    });
                 }
                 Err(next) => next,
             };
@@ -615,6 +590,10 @@ impl OperationDriver {
             match next {
                 Next::Again if Instant::now() < call.deadline => {}
                 Next::Again => return Err(call.expire()),
+                // The reader of the call closes and cancelled it, so its refusal is the answer.
+                Next::Pause if call.committing() && committing_cancel_requested() => {
+                    return Err(call.expire());
+                }
                 Next::Pause => {
                     if !call.pause().await {
                         return Err(call.expire());
@@ -686,10 +665,32 @@ impl OperationDriver {
             self.wait_for_session(call, started).await?;
         }
         let route = self.route_for(call, started.lineage).await?;
+        self.fence_targets(call, started.lineage).await?;
         let context = self.context(call, route.as_ref());
+        let mut lane_context = context;
+        if lane_context.incarnation == 0
+            && (call.progress_poll
+                || matches!(
+                    call.code,
+                    GET_CONSUMER_OFFSET_CODE
+                        | STORE_CONSUMER_OFFSET_CODE
+                        | DELETE_CONSUMER_OFFSET_CODE
+                ))
+            && let Some(route) = &route
+        {
+            // Keep an explicit zero wire fence invalid while sharing local
+            // progress admission with callers that captured the route.
+            lane_context.incarnation = route.incarnation;
+        }
         // The lane comes first, so a blocked lane ends the call at once, also
         // while no link is ready.
-        let mut ticket = self.ticket(call, &context).await?;
+        let mut ticket = self.ticket(call, &lane_context).await?;
+        if call.committing()
+            && let Err(error) = ticket.reserve_fetch(call.deadline).await
+        {
+            call.ticket = Some(ticket);
+            return Err(Next::Fail(error));
+        }
         let body_len = call
             .frame
             .as_ref()
@@ -706,9 +707,25 @@ impl OperationDriver {
             }
         };
         let deadline = call.deadline;
+        let fetch = call.fetch.is_some();
+        let committing = call.committing();
         let (frame, ticket) = call.frame(ticket, context, started.lineage)?;
         let request = frame.header;
-        let result = hop.link.send(frame, deadline, ticket.sent_flag()).await;
+        // A committing request whose caller leaves gets one reply to its cancel, which settles it.
+        let late = ticket
+            .settlement()
+            .filter(|_| committing)
+            .map(|settlement| -> LateReply {
+                Box::new(move |reply| {
+                    if let Some(uncertain) = late_uncertain(&request, fetch, reply) {
+                        settlement.settle(uncertain);
+                    }
+                })
+            });
+        let result = hop
+            .link
+            .send_settled(frame, deadline, ticket.sent_flag(), late)
+            .await;
         let sent = *ticket.sent_flag();
         let result = match result {
             Ok(reply) => match decode_reply_for(&request, &reply.header, reply.body) {
@@ -716,12 +733,22 @@ impl OperationDriver {
                     if request.operation == Operation::NonReplicated
                         && self.session.epoch().lineage != started.lineage
                     {
-                        // Progress polls can move a cursor without a replayable receipt.
-                        call.uncertain |= call.progress_poll
-                            && matches!(
-                                &outcome.result,
-                                Ok(_) | Err(IggyError::TransientNotCommitted)
-                            );
+                        if call.fetch.is_some()
+                            && let Ok(body) = &outcome.result
+                        {
+                            // Caller isolation still rejects the call, but a received
+                            // table proves which progress lanes can reopen.
+                            call.accept_fetch_reply(body).map_err(Next::Fail)?;
+                        } else {
+                            // Progress polls can move a cursor without a replayable receipt.
+                            call.uncertain |= call.committing()
+                                && outcome.result.as_ref().is_err_and(fetch_error_is_uncertain);
+                            call.uncertain |= call.progress_poll
+                                && matches!(
+                                    &outcome.result,
+                                    Ok(_) | Err(IggyError::TransientNotCommitted)
+                                );
+                        }
                         return Err(Next::Fail(IggyError::Unauthenticated));
                     }
                     self.session.observe_metadata_reply(&reply.header);
@@ -735,6 +762,7 @@ impl OperationDriver {
                     }
                     if bound
                         && request.operation == Operation::NonReplicated
+                        && !call.committing_fetch()
                         && !is_sign_in(call.code)
                         && outcome.result == Err(IggyError::Unauthenticated)
                     {
@@ -840,12 +868,51 @@ impl OperationDriver {
         };
         match self.route(&partition.key, lineage, call.deadline).await {
             Ok(route) => Ok(Some(route)),
-            Err(error) if retries_lookup(&error) => {
-                call.refusal = IggyError::TransientNotAccepted;
-                Err(Next::Pause)
-            }
-            Err(error) => Err(Next::Fail(error)),
+            Err(error) => Err(call.lookup_failed(error)),
         }
+    }
+
+    /// Gives each target of a fetch without a fence the incarnation of its
+    /// route, before the call freezes its first frame. Every later attempt
+    /// keeps these fences.
+    async fn fence_targets(&self, call: &mut Call, lineage: u64) -> Result<(), Next> {
+        let (Some(partition), Some(request), None) =
+            (&call.partition, &mut call.fetch, &call.frame)
+        else {
+            return Ok(());
+        };
+        let unfenced: Vec<u32> = request
+            .targets
+            .iter()
+            .filter(|target| target.incarnation == 0)
+            .map(|target| target.partition_id)
+            .collect();
+        if unfenced.is_empty() {
+            return Ok(());
+        }
+        let routes = self
+            .routes_of(
+                &partition.key.stream_id,
+                &partition.key.topic_id,
+                &unfenced,
+                lineage,
+                call.deadline,
+            )
+            .await;
+        let routes = match routes {
+            Ok(routes) => routes,
+            Err(error) => return Err(call.lookup_failed(error)),
+        };
+        for (target, route) in request
+            .targets
+            .iter_mut()
+            .filter(|target| target.incarnation == 0)
+            .zip(routes)
+        {
+            target.incarnation = route.incarnation;
+        }
+        call.payload = request.to_bytes();
+        Ok(())
     }
 
     /// The context that a new frame of `call` carries. Every attempt and
@@ -876,8 +943,43 @@ impl OperationDriver {
     ) -> Result<LaneTicket, Next> {
         match call.ticket.take() {
             Some(ticket) => Ok(ticket),
+            None if call.progress_poll && (call.fetch.is_some() || call.committing_poll) => {
+                // A ticket blocks only the progress lanes that it holds besides
+                // its own, so a committing poll enters its lane as a fetch
+                // target does. A fetch that commits nothing guards only the
+                // stored offsets that its `Next` targets read.
+                let partitions: Vec<_> = match &call.fetch {
+                    Some(request) => request
+                        .targets
+                        .iter()
+                        .filter(|target| {
+                            request.auto_commit
+                                || target.strategy.kind == WirePollingStrategy::next().kind
+                        })
+                        .map(|target| (target.partition_id, target.incarnation))
+                        .collect(),
+                    None => vec![(call.partition_id(), context.incarnation)],
+                };
+                self.session
+                    .enter_progress_lanes(&partitions, call.deadline)
+                    .await
+                    .map_err(Next::Fail)
+            }
             None => {
                 let key = LaneKey::of(call.code, context, call.partition_id());
+                if call.code == GET_CONSUMER_OFFSET_CODE {
+                    return self
+                        .session
+                        .enter_progress_inspection(
+                            LaneKey::Progress {
+                                incarnation: context.incarnation,
+                                partition_id: call.partition_id(),
+                            },
+                            call.deadline,
+                        )
+                        .await
+                        .map_err(Next::Fail);
+                }
                 if call.progress_poll
                     || matches!(
                         call.code,
@@ -969,9 +1071,16 @@ impl OperationDriver {
         sent: bool,
     ) -> Result<Bytes, Next> {
         let error = match result {
-            Ok(body) => return self.signed_in(call, hop, body),
+            Ok(body) => {
+                self.refused_sections(call, &body);
+                return self.signed_in(call, hop, body);
+            }
             Err(error) => error,
         };
+        if call.committing() && sent && fetch_error_is_uncertain(&error) {
+            call.uncertain = true;
+            return Err(Next::Fail(error));
+        }
         if call.progress_poll
             && (error == IggyError::TransientNotCommitted || (sent && lost_link(&error)))
         {
@@ -1000,9 +1109,11 @@ impl OperationDriver {
                 call.settle_sent();
                 Err(Next::Pause)
             }
-            // A wait names several partitions and its refusal does not name
-            // the one that moved, so the caller looks up every route again.
-            IggyError::NotPrimary if call.code == WAIT_FOR_MESSAGES_CODE => Err(Next::Fail(error)),
+            // The refusal does not name the moved target, so the caller regroups.
+            IggyError::NotPrimary if call.fetch.is_some() => {
+                self.mark_targets(call, RouteCache::may_have_moved);
+                Err(Next::Fail(error))
+            }
             IggyError::NotPrimary => {
                 // Neither was admitted, so the deadline reports both as 58.
                 call.refusal = IggyError::TransientNotAccepted;
@@ -1102,9 +1213,91 @@ impl OperationDriver {
     }
 
     fn invalidate(&self, call: &Call, hop: &Hop) {
-        if let (Some(partition), Some(route)) = (&call.partition, &hop.route) {
+        if call.fetch.is_some() {
+            // A fetch refusal does not name its target.
+            self.mark_targets(call, RouteCache::invalidate_partitions);
+        } else if let (Some(partition), Some(route)) = (&call.partition, &hop.route) {
             self.routes().invalidate(route, partition.key.partition_id);
         }
+    }
+
+    /// Applies `mark` to the routes of every target of a fetch `call`.
+    fn mark_targets(
+        &self,
+        call: &Call,
+        mark: fn(&mut RouteCache, &Identifier, &Identifier, &[u32]),
+    ) {
+        let (Some(partition), Some(request)) = (&call.partition, &call.fetch) else {
+            return;
+        };
+        let partitions: Vec<u32> = request
+            .targets
+            .iter()
+            .map(|target| target.partition_id)
+            .collect();
+        mark(
+            &mut self.routes(),
+            &partition.key.stream_id,
+            &partition.key.topic_id,
+            &partitions,
+        );
+    }
+
+    /// Marks the routes of refused fetch sections as [`Self::settle`] marks
+    /// the route of a refused call. `NotPrimary` sections make the next
+    /// readiness groups look their routes up again.
+    fn refused_sections(&self, call: &Call, body: &[u8]) {
+        let (Some(partition), Some(_)) = (&call.partition, &call.fetch) else {
+            return;
+        };
+        let Ok(sections) = FetchMessagesSectionIterator::new(body) else {
+            return;
+        };
+        let mut moved = Vec::new();
+        let mut invalid = Vec::new();
+        for section in sections.filter(|section| section.header.status != STATUS_OK) {
+            let partition_id = section.header.partition_id;
+            match IggyError::from_code(section.header.status) {
+                IggyError::NotPrimary => moved.push(partition_id),
+                IggyError::HistoryUnavailable | IggyError::ConsumerGroupPartitionNotOwned(..) => {
+                    invalid.push(partition_id);
+                }
+                error if is_namespace_miss(&error) => invalid.push(partition_id),
+                _ => {}
+            }
+        }
+        if moved.is_empty() && invalid.is_empty() {
+            return;
+        }
+        let (stream_id, topic_id) = (&partition.key.stream_id, &partition.key.topic_id);
+        let mut routes = self.routes();
+        routes.may_have_moved(stream_id, topic_id, &moved);
+        routes.invalidate_partitions(stream_id, topic_id, &invalid);
+    }
+
+    /// The routes of `partitions` in their order, with at most
+    /// [`MAX_ROUTE_LOOKUPS_IN_FLIGHT`] lookups at once. The first failed
+    /// lookup in that order is the error.
+    async fn routes_of(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitions: &[u32],
+        lineage: u64,
+        deadline: Instant,
+    ) -> Result<Vec<PartitionRouteResponse>, IggyError> {
+        stream::iter(partitions.iter().copied())
+            .map(|partition_id| {
+                let key = PartitionKey {
+                    stream_id: stream_id.clone(),
+                    topic_id: topic_id.clone(),
+                    partition_id,
+                };
+                async move { self.route(&key, lineage, deadline).await }
+            })
+            .buffered(MAX_ROUTE_LOOKUPS_IN_FLIGHT)
+            .try_collect()
+            .await
     }
 
     /// The route of `key`: the cached one if it is usable, else a lookup.
@@ -1131,7 +1324,8 @@ impl OperationDriver {
     /// retries until its deadline. A client with no ready replica, no session
     /// and no credentials cannot get a route, because the server refuses it
     /// every read and it never signs in by itself, so its lookup ends with
-    /// `Unauthenticated` at once.
+    /// `Unauthenticated` at once. A shut down or disconnected client without
+    /// a ready replica ends with the error of its state.
     async fn lookup(
         &self,
         key: &PartitionKey,
@@ -1144,11 +1338,13 @@ impl OperationDriver {
         let metadata_primary = self.links.metadata_primary();
         let first = hinted.or(metadata_primary);
         let mut replicas = self.links.ready_replicas();
-        if replicas.is_empty()
-            && !self.session.epoch().bound
-            && self.session.sign_in_credentials().is_none()
-        {
-            return Err(IggyError::Unauthenticated);
+        if replicas.is_empty() {
+            if let Some(error) = self.stopped() {
+                return Err(error);
+            }
+            if !self.session.epoch().bound && self.session.sign_in_credentials().is_none() {
+                return Err(IggyError::Unauthenticated);
+            }
         }
         let start = first.map_or(0, |first| replicas.partition_point(|id| *id < first));
         replicas.rotate_left(start);
@@ -1271,6 +1467,8 @@ struct Call {
     frame: Option<Frame>,
     /// Replaying a progress poll can advance its offset again without delivering the first result.
     progress_poll: bool,
+    /// A poll that has the server store the offset of its last message.
+    committing_poll: bool,
     /// An attempt of the frame can have taken effect, so the call never
     /// freezes again.
     uncertain: bool,
@@ -1282,6 +1480,60 @@ struct Call {
     not_primary: bool,
     /// A send that got `HistoryUnavailable` started over once.
     restarted: bool,
+    /// The request of a fetch. Its targets name the progress lanes and the
+    /// routes of the call, and a refusal of the fetch concerns all of them.
+    fetch: Option<FetchMessagesRequest>,
+}
+
+struct CallReply {
+    body: Bytes,
+    uncertain_fetch: Option<UncertainFetch>,
+}
+
+/// Whether a committing fetch that failed with `error` can have taken effect. The HTTP client
+/// applies the same list to the error id of a deferred poll reply.
+pub(crate) fn fetch_error_is_uncertain(error: &IggyError) -> bool {
+    !CommitErrorScope::Request.proves_nothing_stored(error)
+}
+
+/// The targets whose outcome the reply to the cancel of a committing request leaves unknown, or
+/// `None` when the reply proves nothing.
+fn late_uncertain(
+    request: &RequestHeader,
+    fetch: bool,
+    reply: Result<Reply, IggyError>,
+) -> Option<Vec<u32>> {
+    let reply = reply.ok()?;
+    match decode_reply_for(request, &reply.header, reply.body)
+        .ok()?
+        .result
+    {
+        Err(error) if fetch_error_is_uncertain(&error) => None,
+        Err(_) => Some(Vec::new()),
+        Ok(body) if fetch => FetchMessagesSectionIterator::new(&body)
+            .ok()
+            .map(|sections| {
+                sections
+                    .filter(|section| {
+                        section.header.status != STATUS_OK
+                            && fetch_section_is_uncertain(&IggyError::from_code(
+                                section.header.status,
+                            ))
+                    })
+                    .map(|section| section.header.partition_id)
+                    .collect()
+            }),
+        Ok(_) => Some(Vec::new()),
+    }
+}
+
+fn fetch_section_is_uncertain(error: &IggyError) -> bool {
+    !CommitErrorScope::Section.proves_nothing_stored(error)
+}
+
+struct UncertainFetch {
+    operation_id: u64,
+    partitions: Vec<u32>,
 }
 
 struct PartitionCall {
@@ -1341,6 +1593,69 @@ enum Failure {
 }
 
 impl Call {
+    fn committing_fetch(&self) -> bool {
+        self.fetch
+            .as_ref()
+            .is_some_and(|request| request.auto_commit)
+    }
+
+    /// The server can store a consumer offset after the client loses the
+    /// reply, so an unknown outcome blocks the progress lanes of the call
+    /// until an abandon.
+    fn committing(&self) -> bool {
+        self.committing_poll || self.committing_fetch()
+    }
+
+    /// Validate the table while the progress gates still belong to the call.
+    /// Records remain opaque so a decode failure keeps the normal rewind path.
+    fn accept_fetch_reply(&mut self, body: &Bytes) -> Result<Option<UncertainFetch>, IggyError> {
+        let Some(request) = &self.fetch else {
+            return Ok(None);
+        };
+        let sections = FetchMessagesSectionIterator::new(body).map_err(|_| {
+            self.uncertain |= request.auto_commit;
+            IggyError::InvalidFormat
+        })?;
+        let mut targets: Vec<u32> = request
+            .targets
+            .iter()
+            .map(|target| target.partition_id)
+            .collect();
+        targets.sort_unstable();
+        let mut seen = vec![false; targets.len()];
+        let mut uncertain = Vec::new();
+        let mut messages = 0_u64;
+        for section in sections {
+            let partition_id = section.header.partition_id;
+            messages += u64::from(section.header.messages_count);
+            let first_of_target = targets
+                .binary_search(&partition_id)
+                .is_ok_and(|target| !std::mem::replace(&mut seen[target], true));
+            if !first_of_target || messages > u64::from(request.count) {
+                self.uncertain |= request.auto_commit;
+                return Err(IggyError::InvalidFormat);
+            }
+            if request.auto_commit
+                && section.header.status != STATUS_OK
+                && fetch_section_is_uncertain(&IggyError::from_code(section.header.status))
+            {
+                uncertain.push(partition_id);
+            }
+        }
+        if uncertain.is_empty() {
+            return Ok(None);
+        }
+        let mut ticket = self.ticket.take().ok_or(IggyError::InvalidConfiguration)?;
+        let operation_id = ticket
+            .retain_fetch_targets(uncertain.clone())
+            .ok_or(IggyError::InvalidConfiguration)?;
+        drop(ticket);
+        Ok(Some(UncertainFetch {
+            operation_id,
+            partitions: uncertain,
+        }))
+    }
+
     fn new(code: u32, payload: Bytes, target: RequestTarget<'_>, deadline: Instant) -> Self {
         let (partition, replica) = match target {
             RequestTarget::Metadata => (None, None),
@@ -1364,11 +1679,13 @@ impl Call {
             ticket: None,
             frame: None,
             progress_poll: false,
+            committing_poll: false,
             uncertain: false,
             refusal: IggyError::TransientNotAccepted,
             retries: 0,
             not_primary: false,
             restarted: false,
+            fetch: None,
         }
     }
 
@@ -1470,11 +1787,14 @@ impl Call {
                     remaining(request.wait_us, request.request_timeout_us)?;
                 Ok(Some(request.to_bytes()))
             }
-            WAIT_FOR_MESSAGES_CODE => {
-                let mut request = WaitForMessagesRequest::decode_from(&self.payload)
-                    .map_err(|_| IggyError::InvalidCommand)?;
+            FETCH_MESSAGES_CODE => {
+                let mut request = self.fetch.clone().ok_or(IggyError::InvalidCommand)?;
                 (request.wait_us, request.request_timeout_us) =
                     remaining(request.wait_us, request.request_timeout_us)?;
+                // A fetch needs the reply margin also without a wait.
+                if request.request_timeout_us < MIN_DEFERRED_POLL_REPLY_MARGIN_US {
+                    return Err(IggyError::TransientNotAccepted);
+                }
                 Ok(Some(request.to_bytes()))
             }
             _ => Ok(None),
@@ -1511,6 +1831,16 @@ impl Call {
         let uncertain = self.uncertain;
         if let Some(ticket) = &mut self.ticket {
             *ticket.sent_flag() = uncertain;
+        }
+    }
+
+    /// The next step after a route lookup of the call failed with `error`.
+    fn lookup_failed(&mut self, error: IggyError) -> Next {
+        if retries_lookup(&error) {
+            self.refusal = IggyError::TransientNotAccepted;
+            Next::Pause
+        } else {
+            Next::Fail(error)
         }
     }
 
@@ -1575,6 +1905,23 @@ fn retries_lookup(error: &IggyError) -> bool {
     ) || lost_link(error)
 }
 
+/// Lowers the byte limits of `request` until its whole reply fits in
+/// `limit`, the largest reply body that a link reads. A link fails on a
+/// larger reply, so the server must not fill more.
+fn fit_fetch_reply(request: &mut FetchMessagesRequest, limit: usize) -> Result<(), IggyError> {
+    let records = limit
+        .checked_sub(FetchMessagesResponse::head_size(request.targets.len()))
+        .filter(|records| *records >= MIN_DEFERRED_POLL_MAX_BYTES)
+        .ok_or(IggyError::InvalidSizeBytes)?;
+    request.max_bytes = request
+        .max_bytes
+        .min(u32::try_from(records).unwrap_or(u32::MAX));
+    for target in &mut request.targets {
+        target.max_bytes = target.max_bytes.min(request.max_bytes);
+    }
+    Ok(())
+}
+
 /// Whether `error` tells that the metadata of the replica has no such
 /// stream, topic or partition.
 fn is_namespace_miss(error: &IggyError) -> bool {
@@ -1609,25 +1956,32 @@ mod tests {
     };
     use crate::tcp::tcp_client::TcpClient;
     use bytes::BytesMut;
+    use futures::stream::FuturesUnordered;
     use iggy_binary_protocol::codes::{
         CREATE_STREAM_CODE, GET_CLUSTER_METADATA_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
         STORE_CONSUMER_OFFSET_CODE,
     };
     use iggy_binary_protocol::consensus::EvictionReason;
     use iggy_binary_protocol::requests::messages::{
-        RawMessage, SendMessagesEncoder, WaitForMessagesTarget,
+        FetchMessagesTarget, RawMessage, SendMessagesEncoder,
     };
-    use iggy_binary_protocol::{WireConsumer, WireIdentifier};
+    use iggy_binary_protocol::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
+    use iggy_binary_protocol::responses::messages::{
+        FetchMessagesSection, FetchMessagesSectionHeader, PollMessagesResponseHeader,
+    };
+    use iggy_binary_protocol::{MAX_RECORD_SIZE, WireConsumer, WireIdentifier};
     use iggy_common::{
-        AutoLogin, Client, Credentials, DiagnosticEvent, IggyMessage, MessageClient, Partitioning,
-        PendingOperationsConfig, UserClient,
+        AutoLogin, Client, CommitPolicy, Consumer, Credentials, DiagnosticEvent, IggyDuration,
+        IggyMessage, MessageClient, Partitioning, PendingOperationsConfig, PollOptions,
+        PollingStrategy, UserClient,
     };
     use secrecy::SecretString;
     use std::iter::repeat_n;
     use std::num::NonZeroUsize;
     use std::str::FromStr;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
-    use tokio::time::{sleep, timeout};
+    use tokio::time::{sleep, sleep_until, timeout};
 
     const REPLICAS: u8 = 3;
     const PRIMARY: u8 = 1;
@@ -1764,6 +2118,15 @@ mod tests {
                 POLL_MESSAGES_CODE => {
                     self.driver
                         .poll(&self.poll(true, WirePollingStrategy::first()), None)
+                        .await
+                }
+                POLL_MESSAGES_DEFERRED_CODE => {
+                    self.driver
+                        .poll_with_options(
+                            &self.poll(true, WirePollingStrategy::first()),
+                            None,
+                            Some(DeferredPollOptions::default()),
+                        )
                         .await
                 }
                 _ => self.call(code, RequestTarget::Metadata).await,
@@ -2038,6 +2401,59 @@ mod tests {
 
     fn route_body(route: PartitionRouteResponse) -> Answer {
         Answer::Body(route.to_bytes().to_vec())
+    }
+
+    /// A fetch of consumer 1 from `partitions` by the default options. No
+    /// target carries a fence.
+    fn fetch(
+        partitions: impl IntoIterator<Item = u32>,
+        auto_commit: bool,
+        strategy: WirePollingStrategy,
+    ) -> FetchMessagesRequest {
+        let options = DeferredPollOptions::default();
+        FetchMessagesRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: WireIdentifier::numeric(1),
+            topic_id: WireIdentifier::numeric(2),
+            wait_us: options.max_wait.as_micros(),
+            request_timeout_us: options.request_timeout.as_micros(),
+            min_count: options.min_count,
+            count: options.min_count,
+            max_bytes: options.max_bytes,
+            auto_commit,
+            targets: partitions
+                .into_iter()
+                .map(|partition_id| FetchMessagesTarget {
+                    partition_id,
+                    strategy: strategy.clone(),
+                    max_bytes: options.max_bytes,
+                    incarnation: 0,
+                    owner_generation: 0,
+                })
+                .collect(),
+        }
+    }
+
+    /// A fetch reply with an empty section of each `(partition_id, status)`.
+    fn fetched_body(sections: &[(u32, u32)]) -> Answer {
+        let response = FetchMessagesResponse {
+            sections: sections
+                .iter()
+                .map(|&(partition_id, status)| FetchMessagesSection {
+                    header: FetchMessagesSectionHeader {
+                        partition_id,
+                        status,
+                        current_offset: 0,
+                        messages_count: 0,
+                        context: PartitionContext::default(),
+                        next_offset: 0,
+                        records_len: 0,
+                    },
+                    records: &[],
+                })
+                .collect(),
+        };
+        Answer::Body(response.to_bytes().unwrap().to_vec())
     }
 
     fn endpoints(received: &[Received]) -> Vec<String> {
@@ -2457,7 +2873,6 @@ mod tests {
             STORE_CONSUMER_OFFSET_CODE,
             POLL_MESSAGES_CODE,
             POLL_MESSAGES_DEFERRED_CODE,
-            WAIT_FOR_MESSAGES_CODE,
             CANCEL_DEFERRED_REQUEST_CODE,
             GET_CONSUMER_OFFSET_CODE,
         ] {
@@ -2750,24 +3165,38 @@ mod tests {
                         code,
                         [failure, Answer::Body(Vec::new())],
                     );
-                    let result = f
-                        .driver
-                        .poll_with_options(
-                            &f.poll(auto_commit, strategy.clone()),
-                            None,
-                            (code == POLL_MESSAGES_DEFERRED_CODE)
-                                .then(DeferredPollOptions::default),
-                        )
-                        .await;
+                    let request = f.poll(auto_commit, strategy.clone());
+                    let options =
+                        (code == POLL_MESSAGES_DEFERRED_CODE).then(DeferredPollOptions::default);
+                    let result = f.driver.poll_with_options(&request, None, options).await;
                     let polls = f.cluster.received(code);
                     if progress && uncertain {
-                        assert_eq!(result, Err(IggyError::TransientNotCommitted));
                         assert_eq!(polls.len(), 1, "uncertain progress must not be replayed");
                         let operation_id = polls[0].header.request;
-                        assert_eq!(
-                            f.driver.abandon(operation_id),
-                            Err(IggyError::OperationNotRetained(operation_id))
-                        );
+                        if auto_commit {
+                            assert_eq!(
+                                result,
+                                Err(IggyError::FetchProgressUncertain(operation_id))
+                            );
+                            let blocked =
+                                Err(IggyError::PartitionLaneBlocked(PARTITION_ID, operation_id));
+                            assert_eq!(
+                                f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None)).await,
+                                blocked
+                            );
+                            assert_eq!(
+                                f.driver.poll_with_options(&request, None, options).await,
+                                blocked
+                            );
+                            assert_eq!(f.cluster.count(code), 1);
+                            f.driver.abandon(operation_id).unwrap();
+                        } else {
+                            assert_eq!(result, Err(IggyError::TransientNotCommitted));
+                            assert_eq!(
+                                f.driver.abandon(operation_id),
+                                Err(IggyError::OperationNotRetained(operation_id))
+                            );
+                        }
                         f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None))
                             .await
                             .unwrap();
@@ -2787,58 +3216,165 @@ mod tests {
             STORE_CONSUMER_OFFSET_CODE,
             DELETE_CONSUMER_OFFSET_CODE,
         ] {
-            for (auto_commit, strategy) in [
-                (true, WirePollingStrategy::first()),
-                (false, WirePollingStrategy::next()),
+            let f = Fixture::new().await;
+            f.cluster.script(
+                &endpoint(PRIMARY),
+                POLL_MESSAGES_DEFERRED_CODE,
+                [Answer::Silence],
+            );
+            let request = f.poll(false, WirePollingStrategy::next());
+            let poll =
+                f.driver
+                    .poll_with_options(&request, None, Some(DeferredPollOptions::default()));
+            let offset = f.call(code, f.partition(None));
+            tokio::pin!(offset);
+            let expired = timeout(CALLER_TIMEOUT, async {
+                tokio::pin!(poll);
+                tokio::select! {
+                    _ = &mut poll => panic!("the unanswered poll returned"),
+                    () = eventually("the progress poll arrived", || f.cluster.count(POLL_MESSAGES_DEFERRED_CODE) == 1) => {}
+                }
+                assert!(futures::poll!(&mut offset).is_pending());
+                tokio::select! {
+                    _ = &mut poll => panic!("the unanswered poll returned"),
+                    _ = &mut offset => panic!("the offset request bypassed the progress barrier"),
+                    sent = f.send_messages() => { sent.unwrap(); }
+                }
+                tokio::select! {
+                    _ = &mut poll => panic!("the unanswered poll returned"),
+                    _ = &mut offset => panic!("the offset request bypassed the progress barrier"),
+                }
+            })
+            .await;
+            assert!(expired.is_err());
+            assert_eq!(
+                f.cluster.count(SEND_MESSAGES_CODE),
+                1,
+                "an offset request waiting behind a poll must leave sends unblocked"
+            );
+            assert_eq!(f.cluster.count(code), 0);
+            let poll_id = f.cluster.received(POLL_MESSAGES_DEFERRED_CODE)[0]
+                .header
+                .request;
+            assert_eq!(
+                f.driver.abandon(poll_id),
+                Err(IggyError::OperationNotRetained(poll_id))
+            );
+            offset.await.unwrap();
+            assert_eq!(f.cluster.count(code), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_committing_poll_when_dropped_after_the_send_should_block_its_partition_until_abandoned()
+     {
+        for poll_code in [POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE] {
+            for code in [
+                GET_CONSUMER_OFFSET_CODE,
+                STORE_CONSUMER_OFFSET_CODE,
+                DELETE_CONSUMER_OFFSET_CODE,
             ] {
                 let f = Fixture::new().await;
-                f.cluster.script(
-                    &endpoint(PRIMARY),
-                    POLL_MESSAGES_DEFERRED_CODE,
-                    [Answer::Silence],
-                );
-                let request = f.poll(auto_commit, strategy);
-                let poll = f.driver.poll_with_options(
-                    &request,
-                    None,
-                    Some(DeferredPollOptions::default()),
-                );
-                let offset = f.call(code, f.partition(None));
-                tokio::pin!(offset);
-                let expired = timeout(CALLER_TIMEOUT, async {
-                    tokio::pin!(poll);
-                    tokio::select! {
-                        _ = &mut poll => panic!("the unanswered poll returned"),
-                        () = eventually("the progress poll arrived", || f.cluster.count(POLL_MESSAGES_DEFERRED_CODE) == 1) => {}
-                    }
-                    assert!(futures::poll!(&mut offset).is_pending());
-                    tokio::select! {
-                        _ = &mut poll => panic!("the unanswered poll returned"),
-                        _ = &mut offset => panic!("the offset request bypassed the progress barrier"),
-                        sent = f.send_messages() => { sent.unwrap(); }
-                    }
-                    tokio::select! {
-                        _ = &mut poll => panic!("the unanswered poll returned"),
-                        _ = &mut offset => panic!("the offset request bypassed the progress barrier"),
-                    }
-                }).await;
-                assert!(expired.is_err());
+                let case = format!("{poll_code} then {code}");
+                f.cluster
+                    .script(&endpoint(PRIMARY), poll_code, [Answer::Silence]);
+                let mut poll = Box::pin(f.call_to(poll_code));
+                let mut offset = Box::pin(f.call(code, f.partition(None)));
+                tokio::select! {
+                    polled = &mut poll => panic!("the unanswered poll returned: {polled:?}"),
+                    () = eventually("the committing poll arrived", || f.cluster.count(poll_code) == 1) => {}
+                }
+                assert!(futures::poll!(&mut offset).is_pending(), "{case}");
+                tokio::select! {
+                    polled = &mut poll => panic!("the unanswered poll returned: {polled:?}"),
+                    _ = &mut offset => panic!("the offset request bypassed the progress barrier"),
+                    sent = f.send_messages() => { sent.unwrap(); }
+                }
+
+                drop(poll);
+
+                let op = f.cluster.received(poll_code)[0].header.request;
+                let blocked = Err(IggyError::PartitionLaneBlocked(PARTITION_ID, op));
+                if code == GET_CONSUMER_OFFSET_CODE {
+                    offset.await.unwrap();
+                } else {
+                    assert_eq!(offset.await, blocked, "{case}");
+                }
+                assert_eq!(f.call_to(poll_code).await, blocked, "{case}");
                 assert_eq!(
-                    f.cluster.count(SEND_MESSAGES_CODE),
-                    1,
-                    "an offset request waiting behind a poll must leave sends unblocked"
+                    f.driver.resolve(op, Instant::now() + CALLER_TIMEOUT).await,
+                    Err(IggyError::FetchProgressUncertain(op)),
+                    "{case}"
                 );
-                assert_eq!(f.cluster.count(code), 0);
-                let poll_id = f.cluster.received(POLL_MESSAGES_DEFERRED_CODE)[0]
-                    .header
-                    .request;
-                assert_eq!(
-                    f.driver.abandon(poll_id),
-                    Err(IggyError::OperationNotRetained(poll_id))
-                );
-                offset.await.unwrap();
-                assert_eq!(f.cluster.count(code), 1);
+                assert_eq!(f.cluster.count(poll_code), 1, "{case}");
+                f.driver.abandon(op).unwrap();
+                f.call(code, f.partition(None)).await.unwrap();
+                f.call_to(poll_code).await.unwrap();
+                assert_eq!(f.cluster.count(poll_code), 2, "{case}");
             }
+        }
+    }
+
+    /// The server answers a cancelled committing poll once: `TransientNotAccepted` when the
+    /// cancel won before any store, its normal reply when the store won. Either reply proves the
+    /// outcome, so the partition opens again without an abandon.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_committing_poll_dropped_after_the_send_when_its_one_reply_arrives_should_open_its_partition()
+     {
+        let stored = PollMessagesResponseHeader {
+            partition_id: PARTITION_ID,
+            current_offset: 0,
+            messages_count: 0,
+            context: PartitionContext::default(),
+        }
+        .to_bytes()
+        .to_vec();
+        for (case, answer) in [
+            (
+                "cancel won",
+                Answer::Refuse(IggyError::TransientNotAccepted),
+            ),
+            ("store won", Answer::Body(stored)),
+        ] {
+            let f = Fixture::new().await;
+            f.cluster
+                .script(&endpoint(PRIMARY), POLL_MESSAGES_DEFERRED_CODE, [answer]);
+            f.cluster.hold(POLL_MESSAGES_DEFERRED_CODE);
+            let mut poll = Box::pin(f.call_to(POLL_MESSAGES_DEFERRED_CODE));
+            tokio::select! {
+                polled = &mut poll => panic!("{case}: the held poll returned: {polled:?}"),
+                () = eventually("the committing poll arrived", || {
+                    f.cluster.count(POLL_MESSAGES_DEFERRED_CODE) == 1
+                }) => {}
+            }
+
+            drop(poll);
+
+            eventually("the cancel arrived", || {
+                f.cluster.count(CANCEL_DEFERRED_REQUEST_CODE) == 1
+            })
+            .await;
+            let op = f.cluster.received(POLL_MESSAGES_DEFERRED_CODE)[0]
+                .header
+                .request;
+            assert_eq!(
+                f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None)).await,
+                Err(IggyError::PartitionLaneBlocked(PARTITION_ID, op)),
+                "{case}: the outcome waits for the one reply"
+            );
+            f.cluster.release(POLL_MESSAGES_DEFERRED_CODE);
+            eventually("the reply settled the poll", || {
+                !f.driver.session.retains_operation(op)
+            })
+            .await;
+            f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None))
+                .await
+                .unwrap();
+            assert_eq!(
+                f.driver.abandon(op),
+                Err(IggyError::OperationNotRetained(op)),
+                "{case}"
+            );
         }
     }
 
@@ -2861,12 +3397,22 @@ mod tests {
                 f.call(GET_CONSUMER_OFFSET_CODE, f.partition(None)).await,
                 Err(IggyError::LaneBlocked(op))
             );
-            for (auto_commit, strategy) in [
-                (true, WirePollingStrategy::first()),
-                (false, WirePollingStrategy::next()),
+            // A committing poll enters its lane as a fetch target, which names
+            // the partition.
+            for (auto_commit, strategy, blocked) in [
+                (
+                    true,
+                    WirePollingStrategy::first(),
+                    IggyError::PartitionLaneBlocked(PARTITION_ID, op),
+                ),
+                (
+                    false,
+                    WirePollingStrategy::next(),
+                    IggyError::LaneBlocked(op),
+                ),
             ] {
                 let polled = f.driver.poll(&f.poll(auto_commit, strategy), None).await;
-                assert_eq!(polled, Err(IggyError::LaneBlocked(op)));
+                assert_eq!(polled, Err(blocked));
             }
             assert_eq!(f.cluster.count(POLL_MESSAGES_CODE), 0);
             f.driver
@@ -3340,7 +3886,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_more_partitions_on_one_endpoint_than_a_wait_holds_when_grouping_should_split_them()
+    async fn given_more_partitions_on_one_endpoint_than_a_fetch_holds_when_grouping_should_split_them()
      {
         let f = Fixture::new().await;
         let partitions: Vec<u32> = (0..=MAX_PARTITIONS_PER_REQUEST).collect();
@@ -3398,141 +3944,47 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_89_on_a_wait_when_one_of_its_partitions_moved_should_regroup_and_keep_the_other_route()
+    async fn given_a_consumer_limit_when_fetch_groups_share_capacity_should_bound_requests_and_release_leases()
      {
-        let f = Fixture::new().await;
-        let options = DeferredPollOptions::default();
-        let wait = WaitForMessagesRequest {
-            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
-            stream_id: WireIdentifier::numeric(1),
-            topic_id: WireIdentifier::numeric(2),
-            wait_us: options.max_wait.as_micros(),
-            request_timeout_us: options.request_timeout.as_micros(),
-            partitions: [STAYED, PARTITION_ID]
-                .map(|partition_id| WaitForMessagesTarget {
-                    partition_id,
-                    strategy: WirePollingStrategy::next(),
-                })
-                .to_vec(),
-        };
-        let ready = |partitions: Vec<u32>| {
-            Answer::Body(WaitForMessagesResponse { partitions }.to_bytes().to_vec())
-        };
-        f.cluster.script(
-            &endpoint(PRIMARY),
-            WAIT_FOR_MESSAGES_CODE,
-            [Answer::Refuse(IggyError::NotPrimary), ready(Vec::new())],
-        );
-        // The refusing primary answers the lookups in partition order.
-        f.cluster.script(
-            &endpoint(PRIMARY),
-            GET_PARTITION_ROUTE_CODE,
-            [route_body(ROUTE), route_body(MOVED)],
-        );
-        f.cluster.script(
-            &endpoint(MOVED.primary_replica),
-            WAIT_FOR_MESSAGES_CODE,
-            [ready(vec![PARTITION_ID])],
-        );
-
-        let reply = f.driver.wait_for_messages(&wait).await.unwrap();
-
-        let ready = WaitForMessagesResponse::decode_from(&reply).unwrap();
-        assert_eq!(ready.partitions, [PARTITION_ID]);
-        let waits = f.cluster.received(WAIT_FOR_MESSAGES_CODE);
-        let targets = |received: &Received| -> Vec<u32> {
-            WaitForMessagesRequest::decode_from(&received.body)
-                .unwrap()
-                .partitions
-                .iter()
-                .map(|target| target.partition_id)
-                .collect()
-        };
-        assert_eq!(waits[0].endpoint, endpoint(PRIMARY));
-        assert_eq!(targets(&waits[0]), [STAYED, PARTITION_ID]);
-        let moved: Vec<_> = waits
-            .iter()
-            .filter(|received| received.endpoint == endpoint(MOVED.primary_replica))
-            .map(targets)
-            .collect();
-        assert_eq!(moved, [[PARTITION_ID]]);
-        let stayed = PartitionKey {
-            stream_id: f.stream_id.clone(),
-            topic_id: f.topic_id.clone(),
-            partition_id: STAYED,
-        };
-        let route = f.driver.routes().usable(
-            &stayed,
-            f.driver.session.fence(),
-            f.driver.session.metadata_watermark(),
-        );
-        assert_eq!(route, Some(ROUTE));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn given_a_consumer_limit_when_readiness_regroups_should_bound_fetches_and_release_leases()
-     {
+        const QUEUED_TIMEOUT: Duration = Duration::from_secs(2);
         let fixture = Fixture::new().await;
         let capacity = Arc::new(Semaphore::new(1));
         let options = DeferredPollOptions::default();
-        let wait = WaitForMessagesRequest {
-            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
-            stream_id: WireIdentifier::numeric(1),
-            topic_id: WireIdentifier::numeric(2),
-            wait_us: options.max_wait.as_micros(),
-            request_timeout_us: options.request_timeout.as_micros(),
-            partitions: [STAYED, PARTITION_ID]
-                .map(|partition_id| WaitForMessagesTarget {
-                    partition_id,
-                    strategy: WirePollingStrategy::next(),
-                })
-                .to_vec(),
-        };
+        let first = fetch([STAYED], false, WirePollingStrategy::offset(0));
+        let second = fetch([PARTITION_ID], false, WirePollingStrategy::offset(0));
         fixture.cluster.script(
-            &endpoint(PRIMARY),
-            WAIT_FOR_MESSAGES_CODE,
-            [Answer::Refuse(IggyError::NotPrimary), Answer::Silence],
-        );
-        fixture.cluster.script(
-            &endpoint(PRIMARY),
+            &endpoint(0),
             GET_PARTITION_ROUTE_CODE,
             [route_body(ROUTE), route_body(MOVED)],
         );
-        fixture.cluster.script(
-            &endpoint(MOVED.primary_replica),
-            WAIT_FOR_MESSAGES_CODE,
-            [Answer::Silence],
+        fixture
+            .cluster
+            .script(&endpoint(PRIMARY), FETCH_MESSAGES_CODE, [Answer::Silence]);
+        let mut parked = Box::pin(
+            DEFERRED_CONSUMER_CAPACITY
+                .scope(Arc::clone(&capacity), fixture.driver.fetch_messages(&first)),
         );
-        let mut waiting = Box::pin(DEFERRED_CONSUMER_CAPACITY.scope(
-            Arc::clone(&capacity),
-            fixture.driver.wait_for_messages(&wait),
-        ));
         tokio::select! {
-            reply = &mut waiting => panic!("a regrouped wait ended: {reply:?}"),
-            () = eventually("one regrouped wait reaches its primary", || {
-                fixture.cluster.count(WAIT_FOR_MESSAGES_CODE) >= 2
+            reply = &mut parked => panic!("a parked fetch ended: {reply:?}"),
+            () = eventually("the first group reaches its primary", || {
+                fixture.cluster.count(FETCH_MESSAGES_CODE) == 1
             }) => {}
         }
-        let poll = fixture.poll(false, WirePollingStrategy::first());
-        let short_options = DeferredPollOptions {
-            max_wait: Duration::ZERO.into(),
-            request_timeout: CALLER_TIMEOUT.into(),
-            ..options
+        let short = FetchMessagesRequest {
+            wait_us: 0,
+            request_timeout_us: QUEUED_TIMEOUT.as_micros().try_into().unwrap(),
+            ..second.clone()
         };
-        let mut fetching = Box::pin(
-            DEFERRED_CONSUMER_CAPACITY.scope(
-                Arc::clone(&capacity),
-                fixture
-                    .driver
-                    .poll_with_options(&poll, None, Some(short_options)),
-            ),
+        let mut queued = Box::pin(
+            DEFERRED_CONSUMER_CAPACITY
+                .scope(Arc::clone(&capacity), fixture.driver.fetch_messages(&short)),
         );
-        let mut other_poll = poll.clone();
+        let mut other_poll = fixture.poll(false, WirePollingStrategy::first());
         other_poll.consumer = WireConsumer::consumer(WireIdentifier::numeric(2));
         tokio::select! {
             biased;
-            reply = &mut waiting => panic!("a parked wait ended: {reply:?}"),
-            reply = &mut fetching => panic!("a fetch passed its consumer's wait: {reply:?}"),
+            reply = &mut parked => panic!("a parked fetch ended: {reply:?}"),
+            reply = &mut queued => panic!("the second group passed its consumer's fetch: {reply:?}"),
             reply = DEFERRED_CONSUMER_CAPACITY.scope(
                 Arc::new(Semaphore::new(1)),
                 fixture.driver.poll_with_options(&other_poll, None, Some(options)),
@@ -3545,18 +3997,14 @@ mod tests {
             "queued work must not reserve another consumer's client slots"
         );
         tokio::select! {
-            reply = &mut waiting => panic!("a parked wait ended before the fetch deadline: {reply:?}"),
-            reply = &mut fetching => assert_eq!(reply, Err(IggyError::TransientNotAccepted)),
+            reply = &mut parked => panic!("a parked fetch ended before the queued deadline: {reply:?}"),
+            reply = &mut queued => assert_eq!(reply, Err(IggyError::TransientNotAccepted)),
         }
-        assert_eq!(
-            fixture.cluster.count(WAIT_FOR_MESSAGES_CODE),
-            2,
-            "regrouping must not admit both primaries at once"
-        );
+        assert_eq!(fixture.cluster.count(FETCH_MESSAGES_CODE), 1);
         assert_eq!(fixture.cluster.count(POLL_MESSAGES_DEFERRED_CODE), 1);
         assert_eq!(capacity.available_permits(), 0);
-        drop(fetching);
-        drop(waiting);
+        drop(queued);
+        drop(parked);
         assert_eq!(capacity.available_permits(), 1);
         assert_eq!(
             fixture.driver.deferred_requests.available_permits(),
@@ -3565,12 +4013,1021 @@ mod tests {
         DEFERRED_CONSUMER_CAPACITY
             .scope(
                 Arc::clone(&capacity),
-                fixture.driver.poll_with_options(&poll, None, Some(options)),
+                fixture.driver.fetch_messages(&second),
             )
             .await
             .unwrap();
-        assert_eq!(fixture.cluster.count(POLL_MESSAGES_DEFERRED_CODE), 2);
+        let fetched = fixture.cluster.received(FETCH_MESSAGES_CODE);
+        assert_eq!(
+            endpoints(&fetched),
+            [endpoint(PRIMARY), endpoint(MOVED.primary_replica)]
+        );
         assert_eq!(capacity.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_fetch_timeout_equal_to_the_margin_when_called_should_fail_before_routing() {
+        for raw in [false, true] {
+            let fixture = Fixture::new().await;
+            let request = FetchMessagesRequest {
+                wait_us: 0,
+                request_timeout_us: MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+                ..fetch([PARTITION_ID], false, WirePollingStrategy::offset(0))
+            };
+
+            let result = if raw {
+                fixture
+                    .driver
+                    .send_raw(FETCH_MESSAGES_CODE, request.to_bytes(), None)
+                    .await
+            } else {
+                fixture.driver.fetch_messages(&request).await
+            };
+
+            assert_eq!(result, Err(IggyError::InvalidCommand));
+            assert_eq!(fixture.cluster.count(GET_PARTITION_ROUTE_CODE), 0);
+            assert_eq!(fixture.cluster.count(FETCH_MESSAGES_CODE), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_zero_wait_fetch_when_routing_spends_budget_should_send_only_with_the_reply_margin()
+     {
+        const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+        const ROUTE_DELAY: Duration = Duration::from_millis(500);
+        const REPLY_MARGIN: Duration = Duration::from_micros(MIN_DEFERRED_POLL_REPLY_MARGIN_US);
+        for delay in [
+            ROUTE_DELAY,
+            REQUEST_TIMEOUT - REPLY_MARGIN,
+            REQUEST_TIMEOUT - ROUTE_DELAY,
+        ] {
+            let fixture = Fixture::new().await;
+            let request = FetchMessagesRequest {
+                wait_us: 0,
+                request_timeout_us: REQUEST_TIMEOUT.as_micros() as u64,
+                ..fetch([PARTITION_ID], false, WirePollingStrategy::offset(0))
+            };
+            fixture.cluster.hold(GET_PARTITION_ROUTE_CODE);
+
+            let started = Instant::now();
+            let (result, ()) = tokio::join!(fixture.driver.fetch_messages(&request), async {
+                eventually("fetch route is held", || {
+                    fixture.cluster.count(GET_PARTITION_ROUTE_CODE) == 1
+                })
+                .await;
+                sleep_until(started + delay).await;
+                fixture.cluster.release(GET_PARTITION_ROUTE_CODE);
+            });
+
+            let sent = fixture.cluster.received(FETCH_MESSAGES_CODE);
+            if delay <= REQUEST_TIMEOUT - REPLY_MARGIN {
+                result.unwrap();
+                assert_eq!(sent.len(), 1);
+                let sent = FetchMessagesRequest::decode_from(&sent[0].body).unwrap();
+                assert_eq!(sent.wait_us, 0);
+                assert!(sent.request_timeout_us >= MIN_DEFERRED_POLL_REPLY_MARGIN_US);
+                assert!(sent.request_timeout_us <= (REQUEST_TIMEOUT - delay).as_micros() as u64);
+            } else {
+                assert_eq!(result, Err(IggyError::TransientNotAccepted));
+                assert!(sent.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_fetch_of_1_or_1000_targets_when_sent_should_reach_their_primary_with_context_zero_and_fence_each_target()
+     {
+        const OWNER_GENERATION: u64 = 4;
+        for targets in [1, MAX_PARTITIONS_PER_REQUEST] {
+            for raw in [false, true] {
+                let f = Fixture::new().await;
+                let mut request = fetch(0..targets, false, WirePollingStrategy::offset(0));
+                // The fence of the caller stays, also one of an older route.
+                request.targets[0].incarnation = RECREATED.incarnation;
+                request.targets[0].owner_generation = OWNER_GENERATION;
+
+                let reply = if raw {
+                    f.driver
+                        .send_raw(FETCH_MESSAGES_CODE, request.to_bytes(), None)
+                        .await
+                } else {
+                    f.driver.fetch_messages(&request).await
+                };
+
+                reply.unwrap();
+                let fetches = f.cluster.received(FETCH_MESSAGES_CODE);
+                assert_eq!(endpoints(&fetches), [endpoint(PRIMARY)]);
+                assert_eq!(stamped_context(&fetches[0]), PartitionContext::default());
+                let sent = FetchMessagesRequest::decode_from(&fetches[0].body).unwrap();
+                let fences: Vec<_> = sent
+                    .targets
+                    .iter()
+                    .map(|target| (target.incarnation, target.owner_generation))
+                    .collect();
+                let mut expected = vec![(ROUTE.incarnation, 0); targets as usize];
+                expected[0] = (RECREATED.incarnation, OWNER_GENERATION);
+                assert_eq!(fences, expected);
+                let frame = Frame {
+                    header: fetches[0].header,
+                    body: Bytes::from(fetches[0].body.clone()),
+                };
+                assert_eq!(
+                    frame.response_body_limit(),
+                    Some(
+                        FetchMessagesResponse::head_size(targets as usize)
+                            + (request.max_bytes as usize).max(MAX_RECORD_SIZE)
+                    ),
+                    "a link reads the table and the records, or a first record above max_bytes"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_deferred_poll_below_the_largest_record_when_bounding_its_reply_should_fit_that_record()
+     {
+        let f = Fixture::new().await;
+        let options = DeferredPollOptions::default();
+        let body = DeferredPollMessagesRequest {
+            poll: f.poll(false, WirePollingStrategy::next()),
+            wait_us: options.max_wait.as_micros(),
+            min_count: options.min_count,
+            max_bytes: options.max_bytes,
+            request_timeout_us: options.request_timeout.as_micros(),
+        }
+        .to_bytes();
+        let frame = Frame {
+            header: iggy_binary_protocol::consensus::RequestHeader::for_request(
+                POLL_MESSAGES_DEFERRED_CODE,
+                1,
+                1,
+                1,
+                &body,
+            )
+            .unwrap(),
+            body,
+        };
+
+        assert_eq!(
+            frame.response_body_limit(),
+            Some(POLL_RESPONSE_HEADER_SIZE + MAX_RECORD_SIZE),
+            "the server returns a first record above max_bytes alone"
+        );
+    }
+
+    #[test]
+    fn given_a_link_reply_limit_when_fitting_a_fetch_of_1_or_1000_targets_should_bound_its_whole_reply()
+     {
+        for targets in [1, MAX_PARTITIONS_PER_REQUEST] {
+            let mut request = fetch(0..targets, false, WirePollingStrategy::offset(0));
+            let unbounded = request.clone();
+            fit_fetch_reply(&mut request, usize::MAX).unwrap();
+            assert_eq!(
+                request, unbounded,
+                "a link that reads more keeps the limits"
+            );
+
+            let limit =
+                FetchMessagesResponse::head_size(targets as usize) + MIN_DEFERRED_POLL_MAX_BYTES;
+            fit_fetch_reply(&mut request, limit).unwrap();
+
+            assert_eq!(request.reply_limit(), limit);
+            assert!(
+                request
+                    .targets
+                    .iter()
+                    .all(|target| target.max_bytes == request.max_bytes)
+            );
+            request.validate().unwrap();
+            assert_eq!(
+                fit_fetch_reply(&mut request, limit - 1),
+                Err(IggyError::InvalidSizeBytes)
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_live_old_fetch_when_reconnected_should_block_stores_until_explicit_abandon() {
+        for raw in [false, true] {
+            let f = Fixture::new().await;
+            let release = Arc::new(tokio::sync::Notify::new());
+            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            f.cluster.script(
+                &endpoint(PRIMARY),
+                FETCH_MESSAGES_CODE,
+                [Answer::GatedBody {
+                    release: Arc::clone(&release),
+                    completed: Arc::clone(&completed),
+                    body: 0_u32.to_le_bytes().to_vec(),
+                }],
+            );
+            let request = fetch([STAYED, PARTITION_ID], true, WirePollingStrategy::offset(0));
+            let result = if raw {
+                f.driver
+                    .send_raw(
+                        FETCH_MESSAGES_CODE,
+                        request.to_bytes(),
+                        Some(PartitionContext::default()),
+                    )
+                    .await
+            } else {
+                f.driver.fetch_messages(&request).await
+            };
+            let operation_id = f.cluster.received(FETCH_MESSAGES_CODE)[0].header.request;
+            assert!(
+                matches!(result, Err(IggyError::FetchProgressUncertain(operation)) if operation == operation_id)
+            );
+            assert!(!completed.load(Ordering::SeqCst));
+            f.cluster.drop_connections(&endpoint(PRIMARY));
+            for partition_id in [STAYED, PARTITION_ID] {
+                for context in [None, Some(PartitionContext::default())] {
+                    let target = RequestTarget::Partition(PartitionTarget {
+                        stream_id: &f.stream_id,
+                        topic_id: &f.topic_id,
+                        partition_id,
+                        context,
+                    });
+                    if context.is_some() {
+                        f.cluster.script(
+                            &endpoint(PRIMARY),
+                            GET_CONSUMER_OFFSET_CODE,
+                            [Answer::Refuse(IggyError::HistoryUnavailable)],
+                        );
+                        assert_eq!(
+                            f.call(GET_CONSUMER_OFFSET_CODE, target).await,
+                            Err(IggyError::HistoryUnavailable),
+                        );
+                    } else {
+                        f.call(GET_CONSUMER_OFFSET_CODE, target).await.unwrap();
+                    }
+                    for code in [STORE_CONSUMER_OFFSET_CODE, DELETE_CONSUMER_OFFSET_CODE] {
+                        assert!(matches!(f.call(code, target).await,
+                            Err(IggyError::PartitionLaneBlocked(partition, operation))
+                            if partition == partition_id && operation == operation_id));
+                    }
+                }
+            }
+            for options in [None, Some(DeferredPollOptions::default())] {
+                assert!(matches!(
+                    f.driver.poll_with_options(
+                        &f.poll(true, WirePollingStrategy::next()),
+                        Some(PartitionContext::default()),
+                        options,
+                    ).await,
+                    Err(IggyError::PartitionLaneBlocked(partition, operation))
+                    if partition == PARTITION_ID && operation == operation_id));
+            }
+            let alias = Identifier::from_str("same-stream-alias").unwrap();
+            let alias_target = RequestTarget::Partition(PartitionTarget {
+                stream_id: &alias,
+                topic_id: &f.topic_id,
+                partition_id: PARTITION_ID,
+                context: Some(PartitionContext::default()),
+            });
+            assert!(
+                matches!(f.call(STORE_CONSUMER_OFFSET_CODE, alias_target).await,
+            Err(IggyError::PartitionLaneBlocked(partition, operation))
+            if partition == PARTITION_ID && operation == operation_id)
+            );
+            let sent = &f.cluster.received(FETCH_MESSAGES_CODE)[0].body;
+            let wire = FetchMessagesRequest::decode_from(sent).unwrap();
+            assert!(
+                wire.targets
+                    .iter()
+                    .all(|target| target.incarnation == ROUTE.incarnation)
+            );
+            assert_eq!(f.cluster.count(STORE_CONSUMER_OFFSET_CODE), 0);
+            assert_eq!(f.cluster.count(DELETE_CONSUMER_OFFSET_CODE), 0);
+            assert_eq!(f.cluster.count(POLL_MESSAGES_CODE), 0);
+            assert_eq!(f.cluster.count(POLL_MESSAGES_DEFERRED_CODE), 0);
+            assert!(
+                matches!(f.driver.resolve(operation_id, Instant::now() + CALLER_TIMEOUT).await,
+            Err(IggyError::FetchProgressUncertain(operation)) if operation == operation_id)
+            );
+            assert_eq!(f.cluster.count(FETCH_MESSAGES_CODE), 1);
+            assert!(
+                !completed.load(Ordering::SeqCst),
+                "the old server request has not finished"
+            );
+            f.driver.abandon(operation_id).unwrap();
+            f.cluster.script(
+                &endpoint(PRIMARY),
+                STORE_CONSUMER_OFFSET_CODE,
+                [Answer::Refuse(IggyError::HistoryUnavailable)],
+            );
+            assert_eq!(
+                f.call(
+                    STORE_CONSUMER_OFFSET_CODE,
+                    f.partition(Some(PartitionContext::default())),
+                )
+                .await,
+                Err(IggyError::HistoryUnavailable),
+            );
+            assert_eq!(
+                stamped_context(&f.cluster.received(STORE_CONSUMER_OFFSET_CODE)[0]),
+                PartitionContext::default(),
+            );
+            f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None))
+                .await
+                .unwrap();
+            assert_eq!(f.cluster.count(STORE_CONSUMER_OFFSET_CODE), 2);
+            assert!(
+                !completed.load(Ordering::SeqCst),
+                "abandon accepts uncertainty without stopping the old request"
+            );
+            release.notify_one();
+            eventually("the old request completed after explicit release", || {
+                completed.load(Ordering::SeqCst)
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_stale_alias_route_when_a_zero_context_store_is_sent_should_preserve_its_invalid_wire_fence()
+     {
+        let f = Fixture::new().await;
+        let alias = Identifier::from_str("same-stream-alias").unwrap();
+        let alias_target = RequestTarget::Partition(PartitionTarget {
+            stream_id: &alias,
+            topic_id: &f.topic_id,
+            partition_id: PARTITION_ID,
+            context: Some(PartitionContext::default()),
+        });
+        f.call(
+            GET_CONSUMER_OFFSET_CODE,
+            RequestTarget::Partition(PartitionTarget {
+                stream_id: &alias,
+                topic_id: &f.topic_id,
+                partition_id: PARTITION_ID,
+                context: None,
+            }),
+        )
+        .await
+        .unwrap();
+        *f.cluster.route.lock().unwrap() = Some(RECREATED);
+        f.cluster
+            .script(&endpoint(PRIMARY), FETCH_MESSAGES_CODE, [Answer::Silence]);
+        let fetched = f
+            .driver
+            .fetch_messages(&fetch([PARTITION_ID], true, WirePollingStrategy::offset(0)))
+            .await;
+        let operation_id = f.cluster.received(FETCH_MESSAGES_CODE)[0].header.request;
+        assert!(matches!(fetched,
+            Err(IggyError::FetchProgressUncertain(operation)) if operation == operation_id));
+        f.cluster.script(
+            &endpoint(PRIMARY),
+            STORE_CONSUMER_OFFSET_CODE,
+            [Answer::Refuse(IggyError::HistoryUnavailable)],
+        );
+        assert_eq!(
+            f.call(STORE_CONSUMER_OFFSET_CODE, alias_target).await,
+            Err(IggyError::HistoryUnavailable),
+        );
+        let stores = f.cluster.received(STORE_CONSUMER_OFFSET_CODE);
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stamped_context(&stores[0]), PartitionContext::default());
+        assert!(!f.driver.session.retains_operation(stores[0].header.request));
+        assert!(f.driver.session.retains_operation(operation_id));
+        assert!(
+            matches!(f.call(STORE_CONSUMER_OFFSET_CODE, alias_target).await,
+            Err(IggyError::PartitionLaneBlocked(partition, operation))
+            if partition == PARTITION_ID && operation == operation_id)
+        );
+        assert_eq!(f.cluster.count(STORE_CONSUMER_OFFSET_CODE), 1);
+        assert_eq!(f.cluster.count(FETCH_MESSAGES_CODE), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_fetch_reply_after_session_reset_when_classified_should_preserve_known_outcomes_and_caller_isolation()
+     {
+        for automatic in [false, true] {
+            for uncertain in [false, true] {
+                let f = Fixture::new().await;
+                let release = Arc::new(tokio::sync::Notify::new());
+                let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let status = if uncertain {
+                    IggyError::TransientNotCommitted.as_code()
+                } else {
+                    STATUS_OK
+                };
+                let Answer::Body(body) =
+                    fetched_body(&[(STAYED, STATUS_OK), (PARTITION_ID, status)])
+                else {
+                    unreachable!();
+                };
+                f.cluster.script(
+                    &endpoint(PRIMARY),
+                    FETCH_MESSAGES_CODE,
+                    [Answer::GatedBody {
+                        release: Arc::clone(&release),
+                        completed,
+                        body,
+                    }],
+                );
+                let request = fetch([STAYED, PARTITION_ID], true, WirePollingStrategy::offset(0));
+                let (result, ()) = tokio::join!(f.driver.fetch_sections(&request), async {
+                    eventually("the fetch reached the old session", || {
+                        f.cluster.count(FETCH_MESSAGES_CODE) == 1
+                    })
+                    .await;
+                    if automatic {
+                        f.driver
+                            .session
+                            .reset_if_fence(f.driver.session.fence(), true)
+                            .unwrap();
+                    } else {
+                        f.driver.session.reset().unwrap();
+                    }
+                    release.notify_one();
+                });
+                let operation_id = f.cluster.received(FETCH_MESSAGES_CODE)[0].header.request;
+                if automatic {
+                    let sections = result.unwrap();
+                    assert_eq!(sections.len(), 2);
+                    assert!(sections[0].status.is_ok());
+                    if uncertain {
+                        assert!(matches!(sections[1].status,
+                            Err(IggyError::FetchProgressUncertain(operation)) if operation == operation_id));
+                    } else {
+                        assert!(sections[1].status.is_ok());
+                    }
+                } else {
+                    assert_eq!(result.unwrap_err(), IggyError::Unauthenticated);
+                }
+                assert_eq!(f.driver.session.retains_operation(operation_id), uncertain);
+                for partition_id in [STAYED, PARTITION_ID] {
+                    let entered = f
+                        .driver
+                        .session
+                        .enter_lane(
+                            Some(LaneKey::Progress {
+                                partition_id,
+                                incarnation: ROUTE.incarnation,
+                            }),
+                            Instant::now() + CALLER_TIMEOUT,
+                        )
+                        .await;
+                    if uncertain && partition_id == PARTITION_ID {
+                        assert!(matches!(entered,
+                            Err(IggyError::PartitionLaneBlocked(partition, operation))
+                            if partition == partition_id && operation == operation_id));
+                    } else {
+                        entered.unwrap().complete();
+                    }
+                }
+                assert_eq!(f.cluster.count(FETCH_MESSAGES_CODE), 1);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_partial_uncertain_fetch_sections_when_decoded_should_preserve_healthy_sections_and_recovery_identity()
+     {
+        for status in [3, 57, 59, 90, 11001] {
+            let f = Fixture::new().await;
+            f.cluster.script(
+                &endpoint(PRIMARY),
+                FETCH_MESSAGES_CODE,
+                [fetched_body(&[(STAYED, STATUS_OK), (PARTITION_ID, status)])],
+            );
+            let sections = f
+                .driver
+                .fetch_sections(&fetch(
+                    [STAYED, PARTITION_ID],
+                    true,
+                    WirePollingStrategy::offset(0),
+                ))
+                .await
+                .unwrap();
+            let operation_id = f.cluster.received(FETCH_MESSAGES_CODE)[0].header.request;
+            assert!(sections[0].status.is_ok());
+            assert!(sections[0].decode().is_ok());
+            assert!(
+                matches!(sections[1].status, Err(IggyError::FetchProgressUncertain(operation)) if operation == operation_id)
+            );
+            let target = RequestTarget::Partition(PartitionTarget {
+                stream_id: &f.stream_id,
+                topic_id: &f.topic_id,
+                partition_id: STAYED,
+                context: None,
+            });
+            f.call(STORE_CONSUMER_OFFSET_CODE, target).await.unwrap();
+            assert!(
+                matches!(f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None)).await,
+                Err(IggyError::PartitionLaneBlocked(partition, operation))
+                if partition == PARTITION_ID && operation == operation_id)
+            );
+            f.driver.abandon(operation_id).unwrap();
+        }
+    }
+
+    /// A fetch that commits nothing guards only the stored offsets that its `Next` targets read.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_fetch_with_one_next_target_when_it_waits_should_hold_only_the_lane_of_that_target()
+     {
+        const SHORT_WAIT: Duration = Duration::from_millis(100);
+        let f = Fixture::new().await;
+        f.cluster
+            .script(&endpoint(PRIMARY), FETCH_MESSAGES_CODE, [Answer::Silence]);
+        let mut request = fetch(
+            [STAYED, PARTITION_ID],
+            false,
+            WirePollingStrategy::offset(0),
+        );
+        request.targets[0].strategy = WirePollingStrategy::next();
+        let mut parked = Box::pin(f.driver.fetch_messages(&request));
+        tokio::select! {
+            reply = &mut parked => panic!("a parked fetch ended: {reply:?}"),
+            () = eventually("the fetch reaches its primary", || {
+                f.cluster.count(FETCH_MESSAGES_CODE) == 1
+            }) => {}
+        }
+        let next_target = RequestTarget::Partition(PartitionTarget {
+            stream_id: &f.stream_id,
+            topic_id: &f.topic_id,
+            partition_id: STAYED,
+            context: None,
+        });
+
+        tokio::select! {
+            biased;
+            reply = &mut parked => panic!("the store waited for the whole fetch: {reply:?}"),
+            stored = f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None)) => {
+                stored.unwrap();
+            }
+        }
+        tokio::select! {
+            biased;
+            reply = &mut parked => panic!("a parked fetch ended: {reply:?}"),
+            stored = timeout(SHORT_WAIT, f.call(STORE_CONSUMER_OFFSET_CODE, next_target)) => {
+                assert!(stored.is_err(), "the store of the `Next` target waits for the fetch");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_definitive_section_refusals_of_a_committing_fetch_when_decoded_should_leave_their_partitions_unblocked()
+     {
+        for status in [
+            IggyError::TooManyConsumerOffsets.as_code(),
+            IggyError::PartitionNotFound(0, Identifier::default(), Identifier::default()).as_code(),
+        ] {
+            let f = Fixture::new().await;
+            f.cluster.script(
+                &endpoint(PRIMARY),
+                FETCH_MESSAGES_CODE,
+                [fetched_body(&[(STAYED, STATUS_OK), (PARTITION_ID, status)])],
+            );
+
+            let sections = f
+                .driver
+                .fetch_sections(&fetch(
+                    [STAYED, PARTITION_ID],
+                    true,
+                    WirePollingStrategy::offset(0),
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                sections[1].status.as_ref().map_err(IggyError::as_code),
+                Err(status),
+                "the refusal reaches the caller as it is"
+            );
+            f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_malformed_committing_fetch_table_when_returned_should_retain_all_targets() {
+        for answer in [
+            Answer::Body(Vec::new()),
+            fetched_body(&[(STAYED, STATUS_OK), (STAYED, STATUS_OK)]),
+            fetched_body(&[(PARTITION_ID + 1, STATUS_OK)]),
+        ] {
+            let f = Fixture::new().await;
+            f.cluster
+                .script(&endpoint(PRIMARY), FETCH_MESSAGES_CODE, [answer]);
+            let result = f
+                .driver
+                .fetch_messages(&fetch(
+                    [STAYED, PARTITION_ID],
+                    true,
+                    WirePollingStrategy::offset(0),
+                ))
+                .await;
+            let operation_id = f.cluster.received(FETCH_MESSAGES_CODE)[0].header.request;
+            assert!(
+                matches!(result, Err(IggyError::FetchProgressUncertain(operation)) if operation == operation_id)
+            );
+            for partition_id in [STAYED, PARTITION_ID] {
+                let target = RequestTarget::Partition(PartitionTarget {
+                    stream_id: &f.stream_id,
+                    topic_id: &f.topic_id,
+                    partition_id,
+                    context: None,
+                });
+                assert!(matches!(f.call(STORE_CONSUMER_OFFSET_CODE, target).await,
+                    Err(IggyError::PartitionLaneBlocked(partition, operation))
+                    if partition == partition_id && operation == operation_id));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_fetch_refusals_when_classified_should_keep_only_unknown_progress_blocked() {
+        for (status, unknown) in [
+            (5, false),
+            (6, false),
+            (58, false),
+            (87, false),
+            (89, false),
+            (90, false),
+            (1009, false),
+            (1010, false),
+            (2010, false),
+            (2011, false),
+            (3007, false),
+            (4100, false),
+            (5009, false),
+            // The server refuses an oversized first message before it stores the offset.
+            (80, false),
+            // A new offset key above the limit refuses the read before it returns messages.
+            (3024, false),
+            (3, true),
+            (30, true),
+            (40, true),
+            (41, true),
+            (57, true),
+            (59, true),
+            (11001, true),
+        ] {
+            let f = Fixture::new().await;
+            let fence = f.driver.session.fence();
+            f.cluster.script(
+                &endpoint(PRIMARY),
+                FETCH_MESSAGES_CODE,
+                [Answer::Refuse(IggyError::from_code(status))],
+            );
+            let result = f
+                .driver
+                .fetch_messages(&fetch(
+                    [STAYED, PARTITION_ID],
+                    true,
+                    WirePollingStrategy::offset(0),
+                ))
+                .await;
+            let operation_id = f.cluster.received(FETCH_MESSAGES_CODE)[0].header.request;
+            if unknown {
+                assert!(
+                    matches!(result, Err(IggyError::FetchProgressUncertain(operation)) if operation == operation_id),
+                    "status {status}: {result:?}"
+                );
+                if status == IggyError::StaleClient.as_code() {
+                    f.next_session(fence).await;
+                }
+                assert!(
+                    matches!(f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None)).await,
+                    Err(IggyError::PartitionLaneBlocked(partition, operation))
+                    if partition == PARTITION_ID && operation == operation_id),
+                    "status {status}"
+                );
+                assert_eq!(
+                    f.cluster.count(FETCH_MESSAGES_CODE),
+                    1,
+                    "unknown fetches never replay"
+                );
+            } else {
+                assert!(
+                    !matches!(result, Err(IggyError::FetchProgressUncertain(_))),
+                    "status {status}: {result:?}"
+                );
+                assert!(matches!(
+                    f.driver.abandon(operation_id),
+                    Err(IggyError::OperationNotRetained(_))
+                ));
+                f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None))
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_proved_fetch_sections_when_records_fail_to_decode_should_leave_rewind_available()
+    {
+        let f = Fixture::new().await;
+        let records = b"invalid batch";
+        let body = FetchMessagesResponse {
+            sections: vec![FetchMessagesSection {
+                header: FetchMessagesSectionHeader {
+                    partition_id: PARTITION_ID,
+                    status: STATUS_OK,
+                    current_offset: 7,
+                    messages_count: 1,
+                    context: PartitionContext::default(),
+                    next_offset: 8,
+                    records_len: records.len().try_into().unwrap(),
+                },
+                records,
+            }],
+        }
+        .to_bytes()
+        .unwrap();
+        f.cluster.script(
+            &endpoint(PRIMARY),
+            FETCH_MESSAGES_CODE,
+            [Answer::Body(body.to_vec())],
+        );
+        let sections = f
+            .driver
+            .fetch_sections(&fetch([PARTITION_ID], true, WirePollingStrategy::offset(0)))
+            .await
+            .unwrap();
+        assert!(sections[0].decode().is_err());
+        f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None))
+            .await
+            .unwrap();
+        assert_eq!(f.cluster.count(STORE_CONSUMER_OFFSET_CODE), 1);
+        for status in [80, 87, 89, 5009] {
+            f.cluster.script(
+                &endpoint(PRIMARY),
+                FETCH_MESSAGES_CODE,
+                [fetched_body(&[(PARTITION_ID, status)])],
+            );
+            let sections = f
+                .driver
+                .fetch_sections(&fetch([PARTITION_ID], true, WirePollingStrategy::offset(0)))
+                .await
+                .unwrap();
+            assert_eq!(sections[0].status.as_ref().unwrap_err().as_code(), status);
+            f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_lost_fetch_reply_when_retrying_should_resend_only_a_fetch_that_moves_no_consumer()
+     {
+        for (auto_commit, strategy, progress) in [
+            (true, WirePollingStrategy::offset(0), true),
+            (false, WirePollingStrategy::next(), true),
+            (false, WirePollingStrategy::offset(0), false),
+        ] {
+            for (failure, uncertain) in [
+                (Answer::Refuse(IggyError::TransientNotCommitted), true),
+                (Answer::HangUp, true),
+                (Answer::Refuse(IggyError::TransientNotAccepted), false),
+            ] {
+                let f = Fixture::new().await;
+                f.cluster.script(
+                    &endpoint(PRIMARY),
+                    FETCH_MESSAGES_CODE,
+                    [failure, fetched_body(&[])],
+                );
+
+                let result = f
+                    .driver
+                    .fetch_messages(&fetch(
+                        [STAYED, PARTITION_ID],
+                        auto_commit,
+                        strategy.clone(),
+                    ))
+                    .await;
+
+                let fetches = f.cluster.received(FETCH_MESSAGES_CODE);
+                if progress && uncertain {
+                    let operation_id = fetches[0].header.request;
+                    let expected = if auto_commit {
+                        IggyError::FetchProgressUncertain(operation_id)
+                    } else {
+                        IggyError::TransientNotCommitted
+                    };
+                    assert_eq!(result, Err(expected));
+                    assert_eq!(
+                        fetches.len(),
+                        1,
+                        "an uncertain progress fetch is never resent"
+                    );
+                    if auto_commit {
+                        assert!(
+                            matches!(f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None)).await,
+                            Err(IggyError::PartitionLaneBlocked(partition, operation))
+                            if partition == PARTITION_ID && operation == operation_id)
+                        );
+                        f.driver.abandon(operation_id).unwrap();
+                    } else {
+                        assert_eq!(
+                            f.driver.abandon(operation_id),
+                            Err(IggyError::OperationNotRetained(operation_id))
+                        );
+                    }
+                    f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None))
+                        .await
+                        .unwrap();
+                } else {
+                    result.unwrap();
+                    assert_eq!(
+                        fetches.len(),
+                        2,
+                        "pure reads and refused fetches go out again"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_fetch_in_flight_when_offsets_of_its_targets_change_should_hold_them_only_for_a_progress_fetch()
+     {
+        for (auto_commit, strategy, progress) in [
+            (true, WirePollingStrategy::offset(0), true),
+            (false, WirePollingStrategy::next(), true),
+            (false, WirePollingStrategy::offset(0), false),
+        ] {
+            let f = Fixture::new().await;
+            f.cluster
+                .script(&endpoint(PRIMARY), FETCH_MESSAGES_CODE, [Answer::Silence]);
+            let request = fetch([STAYED, PARTITION_ID], auto_commit, strategy);
+            let mut fetched = Box::pin(f.driver.fetch_messages(&request));
+            tokio::select! {
+                result = &mut fetched => panic!("the unanswered fetch returned: {result:?}"),
+                () = eventually("the fetch arrived", || f.cluster.count(FETCH_MESSAGES_CODE) == 1) => {}
+            }
+            timeout(CALLER_TIMEOUT, f.send_messages())
+                .await
+                .expect("a fetch takes no mutation lane")
+                .unwrap();
+            let store = |partition_id| {
+                f.call(
+                    STORE_CONSUMER_OFFSET_CODE,
+                    RequestTarget::Partition(PartitionTarget {
+                        stream_id: &f.stream_id,
+                        topic_id: &f.topic_id,
+                        partition_id,
+                        context: None,
+                    }),
+                )
+            };
+            let mut stores = Box::pin(futures::future::join_all([
+                store(STAYED),
+                store(PARTITION_ID),
+            ]));
+
+            let stored = timeout(CALLER_TIMEOUT, &mut stores).await;
+
+            if progress {
+                assert!(
+                    stored.is_err(),
+                    "a store waits for a progress fetch of its partition"
+                );
+                assert_eq!(f.cluster.count(STORE_CONSUMER_OFFSET_CODE), 0);
+                drop(fetched);
+                for stored in stores.await {
+                    if auto_commit {
+                        assert!(matches!(stored, Err(IggyError::PartitionLaneBlocked(..))));
+                    } else {
+                        stored.unwrap();
+                    }
+                }
+            } else {
+                for stored in stored.unwrap() {
+                    stored.unwrap();
+                }
+            }
+            assert_eq!(
+                f.cluster.count(STORE_CONSUMER_OFFSET_CODE),
+                if auto_commit { 0 } else { 2 }
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_retained_offset_mutation_of_a_target_when_a_progress_fetch_enters_should_fail_naming_its_partition()
+     {
+        let f = Fixture::new().await;
+        f.cluster.script(
+            &endpoint(PRIMARY),
+            STORE_CONSUMER_OFFSET_CODE,
+            [
+                Answer::Refuse(IggyError::TransientNotCommitted),
+                Answer::Refuse(IggyError::RequestTooOld),
+            ],
+        );
+        let result = f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None)).await;
+        let op = f.cluster.received(STORE_CONSUMER_OFFSET_CODE)[0]
+            .header
+            .request;
+        assert_eq!(result, Err(IggyError::OperationUncertain(op)));
+
+        for (auto_commit, strategy) in [
+            (true, WirePollingStrategy::offset(0)),
+            (false, WirePollingStrategy::next()),
+        ] {
+            let fetched = f
+                .driver
+                .fetch_messages(&fetch([STAYED, PARTITION_ID], auto_commit, strategy))
+                .await;
+            assert!(
+                matches!(
+                    fetched,
+                    Err(IggyError::PartitionLaneBlocked(partition_id, blocking))
+                        if partition_id == PARTITION_ID && blocking == op
+                ),
+                "{fetched:?}"
+            );
+        }
+
+        assert_eq!(f.cluster.count(FETCH_MESSAGES_CODE), 0);
+        f.driver
+            .fetch_messages(&fetch(
+                [STAYED, PARTITION_ID],
+                false,
+                WirePollingStrategy::offset(0),
+            ))
+            .await
+            .expect("a fetch that moves no consumer takes no lane");
+        f.driver.abandon(op).unwrap();
+        f.driver
+            .fetch_messages(&fetch(
+                [STAYED, PARTITION_ID],
+                true,
+                WirePollingStrategy::offset(0),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(f.cluster.count(FETCH_MESSAGES_CODE), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_89_for_a_fetch_or_one_of_its_sections_when_settled_should_mark_the_refused_routes_moved()
+     {
+        // A partition whose section is refused because its route no longer holds.
+        const REFUSED: u32 = 2;
+        let stale_route_refusals = [
+            None,
+            Some(IggyError::HistoryUnavailable),
+            Some(IggyError::ConsumerGroupPartitionNotOwned(0, REFUSED)),
+            Some(IggyError::PartitionNotFound(
+                REFUSED as usize,
+                Identifier::default(),
+                Identifier::default(),
+            )),
+        ];
+        for refusal in stale_route_refusals {
+            let whole_request = refusal.is_none();
+            let f = Fixture::new().await;
+            let answer = match &refusal {
+                None => Answer::Refuse(IggyError::NotPrimary),
+                Some(refusal) => fetched_body(&[
+                    (STAYED, STATUS_OK),
+                    (PARTITION_ID, IggyError::NotPrimary.as_code()),
+                    (REFUSED, refusal.as_code()),
+                ]),
+            };
+            f.cluster
+                .script(&endpoint(PRIMARY), FETCH_MESSAGES_CODE, [answer]);
+
+            let result = f
+                .driver
+                .fetch_messages(&fetch(
+                    [STAYED, PARTITION_ID, REFUSED],
+                    false,
+                    WirePollingStrategy::offset(0),
+                ))
+                .await;
+
+            assert_eq!(
+                f.cluster.count(FETCH_MESSAGES_CODE),
+                1,
+                "the caller regroups a moved fetch"
+            );
+            let usable = |partition_id| {
+                let key = PartitionKey {
+                    stream_id: f.stream_id.clone(),
+                    topic_id: f.topic_id.clone(),
+                    partition_id,
+                };
+                f.driver.routes().usable(
+                    &key,
+                    f.driver.session.fence(),
+                    f.driver.session.metadata_watermark(),
+                )
+            };
+            if whole_request {
+                assert_eq!(result, Err(IggyError::NotPrimary));
+                assert_eq!(usable(STAYED), None);
+            } else {
+                result.unwrap();
+                assert_eq!(usable(STAYED), Some(ROUTE), "{refusal:?}");
+            }
+            assert_eq!(usable(PARTITION_ID), None);
+            assert_eq!(usable(REFUSED), None, "{refusal:?}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -3633,22 +5090,12 @@ mod tests {
         ));
         f.driver.links.connect().await.unwrap();
         assert!(f.driver.links.ready_replicas().is_empty());
-        let options = DeferredPollOptions::default();
-        let wait = WaitForMessagesRequest {
-            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
-            stream_id: WireIdentifier::numeric(1),
-            topic_id: WireIdentifier::numeric(2),
-            wait_us: options.max_wait.as_micros(),
-            request_timeout_us: options.request_timeout.as_micros(),
-            partitions: vec![WaitForMessagesTarget {
-                partition_id: PARTITION_ID,
-                strategy: WirePollingStrategy::next(),
-            }],
-        };
-
         for (code, payload) in [
             (POLL_MESSAGES_DEFERRED_CODE, f.deferred_poll()),
-            (WAIT_FOR_MESSAGES_CODE, wait.to_bytes()),
+            (
+                FETCH_MESSAGES_CODE,
+                fetch([PARTITION_ID], false, WirePollingStrategy::next()).to_bytes(),
+            ),
         ] {
             let result = timeout(RECOVERY_TIMEOUT, f.driver.send_raw(code, payload, None))
                 .await
@@ -3779,6 +5226,35 @@ mod tests {
                 "{code}"
             );
             assert_eq!(f.cluster.count(code), 0, "{code}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_committing_poll_when_its_deadline_passes_before_the_send_should_fail_with_58_and_leave_no_block()
+     {
+        for code in [POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE] {
+            let f = Fixture::new().await;
+            f.cluster.down.lock().unwrap().insert(endpoint(PRIMARY));
+            f.cluster.drop_connections(&endpoint(PRIMARY));
+            eventually("the link to the primary is gone", || {
+                !f.driver.links.ready_replicas().contains(&PRIMARY)
+            })
+            .await;
+
+            let result = f.call_to(code).await;
+
+            assert_eq!(result, Err(IggyError::TransientNotAccepted), "{code}");
+            assert_eq!(f.cluster.count(code), 0, "{code}");
+            f.cluster.down.lock().unwrap().clear();
+            eventually("the link to the primary is back", || {
+                f.driver.links.ready_replicas().contains(&PRIMARY)
+            })
+            .await;
+            f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None))
+                .await
+                .unwrap();
+            f.call_to(code).await.unwrap();
+            assert_eq!(f.cluster.count(code), 1, "{code}");
         }
     }
 
@@ -3938,6 +5414,75 @@ mod tests {
             sessions.iter().all(|session| *session == FIRST_SESSION),
             "sent under the sessions {sessions:?}"
         );
+    }
+
+    /// A caller that disconnects while its committing poll waits cannot know what the server
+    /// stored, so the poll ends uncertain and its partition stays blocked in the next session.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_waiting_committing_poll_when_the_caller_disconnects_should_fail_uncertain_and_block_its_partition_in_the_next_session()
+     {
+        let f = Fixture::new().await;
+        f.cluster.hold(POLL_MESSAGES_DEFERRED_CODE);
+        let target = RequestTarget::Partition(PartitionTarget {
+            stream_id: &f.stream_id,
+            topic_id: &f.topic_id,
+            partition_id: PARTITION_ID,
+            context: None,
+        });
+        let client = TcpClient::from_links(f.driver.links);
+        let consumer = Consumer::new(Identifier::numeric(1).unwrap());
+        let next = PollingStrategy::next();
+        let poll = client.poll_messages(
+            &f.stream_id,
+            &f.topic_id,
+            PARTITION_ID,
+            &consumer,
+            &next,
+            PollOptions {
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::wait(IggyDuration::from(Duration::from_secs(10)))
+            },
+        );
+        tokio::pin!(poll);
+        tokio::select! {
+            polled = &mut poll => panic!("the held poll returned: {polled:?}"),
+            () = eventually("the committing poll arrived", || {
+                f.cluster.count(POLL_MESSAGES_DEFERRED_CODE) == 1
+            }) => {}
+        }
+
+        client.disconnect().await.unwrap();
+        let polled = poll.await;
+        let op = f.cluster.received(POLL_MESSAGES_DEFERRED_CODE)[0]
+            .header
+            .request;
+        client.connect().await.unwrap();
+        client.login_user(OTHER_USER, OTHER_PASSWORD).await.unwrap();
+        let stored = client
+            .driver
+            .send(
+                STORE_CONSUMER_OFFSET_CODE,
+                Bytes::from_static(PAYLOAD),
+                target,
+            )
+            .await;
+        let abandoned = client.abandon_operation(op).await;
+        let stored_after_abandon = client
+            .driver
+            .send(
+                STORE_CONSUMER_OFFSET_CODE,
+                Bytes::from_static(PAYLOAD),
+                target,
+            )
+            .await;
+
+        assert_eq!(polled.map(drop), Err(IggyError::FetchProgressUncertain(op)));
+        assert_eq!(
+            stored,
+            Err(IggyError::PartitionLaneBlocked(PARTITION_ID, op))
+        );
+        assert_eq!(abandoned, Ok(()));
+        stored_after_abandon.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -4266,8 +5811,7 @@ mod tests {
                 GET_PARTITION_ROUTE_CODE,
                 refused.clone(),
             ),
-            (GET_STREAMS_CODE, 0, GET_STREAMS_CODE, refused.clone()),
-            (POLL_MESSAGES_CODE, PRIMARY, POLL_MESSAGES_CODE, refused),
+            (GET_STREAMS_CODE, 0, GET_STREAMS_CODE, refused),
         ];
         for (code, replica, rejected, answer) in cases {
             let f = Fixture::new().await;
@@ -4297,6 +5841,214 @@ mod tests {
             let published: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
             assert_eq!(published.last(), Some(&DiagnosticEvent::SignedIn), "{case}");
             f.call_to(code).await.unwrap();
+        }
+    }
+
+    /// The shard watchdog can refuse a read after the read stored the offset,
+    /// so a committing poll treats every refusal outside the deny list of a
+    /// committing fetch as an unknown outcome.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_refusal_that_can_follow_the_read_when_the_poll_commits_should_block_its_partition_until_abandoned()
+     {
+        for code in [POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE] {
+            for refusal in [IggyError::ShardCommunicationError, IggyError::StaleClient] {
+                for auto_commit in [true, false] {
+                    let f = Fixture::new().await;
+                    let fence = f.driver.session.fence();
+                    let case = format!("{code} auto_commit={auto_commit}: {refusal}");
+                    f.cluster
+                        .script(&endpoint(PRIMARY), code, [Answer::Refuse(refusal.clone())]);
+                    let request = f.poll(auto_commit, WirePollingStrategy::next());
+                    let options =
+                        (code == POLL_MESSAGES_DEFERRED_CODE).then(DeferredPollOptions::default);
+
+                    let result = f.driver.poll_with_options(&request, None, options).await;
+
+                    let op = f.cluster.received(code)[0].header.request;
+                    if refusal == IggyError::StaleClient {
+                        f.next_session(fence).await;
+                    }
+                    if auto_commit {
+                        assert_eq!(result, Err(IggyError::FetchProgressUncertain(op)), "{case}");
+                        let blocked = Err(IggyError::PartitionLaneBlocked(PARTITION_ID, op));
+                        assert_eq!(
+                            f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None)).await,
+                            blocked,
+                            "{case}"
+                        );
+                        assert_eq!(
+                            f.driver.poll_with_options(&request, None, options).await,
+                            blocked,
+                            "{case}"
+                        );
+                        f.driver.abandon(op).unwrap();
+                    } else {
+                        assert_eq!(result, Err(refusal.clone()), "{case}");
+                        assert_eq!(
+                            f.driver.abandon(op),
+                            Err(IggyError::OperationNotRetained(op)),
+                            "{case}"
+                        );
+                    }
+                    f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None))
+                        .await
+                        .unwrap();
+                    f.driver
+                        .poll_with_options(&request, None, options)
+                        .await
+                        .unwrap();
+                    assert_eq!(f.cluster.count(code), 2, "{case}");
+                }
+            }
+        }
+    }
+
+    /// The server refuses a first message larger than `max_bytes`, and a read that needs a new
+    /// offset key above the limit, before it stores the offset, so each refusal proves the
+    /// outcome of a committing poll.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_refusal_before_the_store_when_a_committing_poll_is_refused_should_return_it_and_leave_its_partition_open()
+     {
+        for refusal in [
+            IggyError::InvalidSizeBytes,
+            IggyError::TooManyConsumerOffsets,
+        ] {
+            let f = Fixture::new().await;
+            f.cluster.script(
+                &endpoint(PRIMARY),
+                POLL_MESSAGES_DEFERRED_CODE,
+                [Answer::Refuse(refusal.clone())],
+            );
+            let request = f.poll(true, WirePollingStrategy::next());
+            let options = Some(DeferredPollOptions::default());
+
+            let result = f.driver.poll_with_options(&request, None, options).await;
+
+            assert_eq!(result, Err(refusal.clone()));
+            let op = f.cluster.received(POLL_MESSAGES_DEFERRED_CODE)[0]
+                .header
+                .request;
+            assert_eq!(
+                f.driver.abandon(op),
+                Err(IggyError::OperationNotRetained(op)),
+                "{refusal}"
+            );
+            f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None))
+                .await
+                .unwrap();
+            f.driver
+                .poll_with_options(&request, None, options)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The server returns a first record above `max_bytes` alone in the reply of a poll, so it
+    /// refuses a poll with `InvalidSizeBytes` only for a byte limit it cannot serve, before it
+    /// stores anything. The refusal comes back from one read and leaves no block.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_byte_limit_refusal_when_polled_should_return_it_from_one_read_without_a_block()
+    {
+        for commit in [CommitPolicy::Manual, CommitPolicy::OnRead] {
+            for strategy in [
+                PollingStrategy::offset(COMMIT),
+                PollingStrategy::timestamp(COMMIT.into()),
+                PollingStrategy::first(),
+                PollingStrategy::next(),
+                PollingStrategy::last(),
+            ] {
+                let case = format!("{commit:?} {strategy}");
+                let f = Fixture::new().await;
+                f.cluster.script(
+                    &endpoint(PRIMARY),
+                    POLL_MESSAGES_DEFERRED_CODE,
+                    [Answer::Refuse(IggyError::InvalidSizeBytes)],
+                );
+                let client = TcpClient::from_links(f.driver.links);
+                let options = PollOptions {
+                    commit,
+                    ..PollOptions::default()
+                };
+
+                let polled = client
+                    .poll_messages(
+                        &f.stream_id,
+                        &f.topic_id,
+                        PARTITION_ID,
+                        &Consumer::default(),
+                        &strategy,
+                        options,
+                    )
+                    .await;
+
+                assert_eq!(polled.map(drop), Err(IggyError::InvalidSizeBytes), "{case}");
+                let reads = f.cluster.received(POLL_MESSAGES_DEFERRED_CODE);
+                let [read] = reads.as_slice() else {
+                    panic!("{case}: one read, got {}", reads.len());
+                };
+                let request = DeferredPollMessagesRequest::decode_from(&read.body).unwrap();
+                assert_eq!(
+                    (request.poll.count, request.max_bytes),
+                    (options.count, options.max_bytes),
+                    "{case}"
+                );
+                let op = read.header.request;
+                assert_eq!(
+                    client.driver.abandon(op),
+                    Err(IggyError::OperationNotRetained(op)),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// A partition that cannot serve a poll answers empty with a zero context, and the server
+    /// refuses that context as a fence with `HistoryUnavailable`. A loop that reads on with the
+    /// continuation repeats its start under the context of the route instead.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_fail_fast_empty_reply_when_polling_its_continuation_should_send_the_route_context()
+     {
+        const OFFSET: u64 = 3;
+        let f = Fixture::new().await;
+        let fail_fast = PollMessagesResponseHeader {
+            partition_id: PARTITION_ID,
+            current_offset: 0,
+            messages_count: 0,
+            context: PartitionContext::default(),
+        }
+        .to_bytes()
+        .to_vec();
+        f.cluster.script(
+            &endpoint(PRIMARY),
+            POLL_MESSAGES_DEFERRED_CODE,
+            [Answer::Body(fail_fast.clone()), Answer::Body(fail_fast)],
+        );
+        let client = TcpClient::from_links(f.driver.links);
+        let start = PollingStrategy::offset(OFFSET);
+
+        let mut strategy = start;
+        for _ in 0..2 {
+            strategy = client
+                .poll_messages(
+                    &f.stream_id,
+                    &f.topic_id,
+                    PARTITION_ID,
+                    &Consumer::default(),
+                    &strategy,
+                    PollOptions::default(),
+                )
+                .await
+                .unwrap()
+                .continuation();
+        }
+
+        assert_eq!(strategy, start);
+        let reads = f.cluster.received(POLL_MESSAGES_DEFERRED_CODE);
+        assert_eq!(reads.len(), 2);
+        for read in &reads {
+            let request = DeferredPollMessagesRequest::decode_from(&read.body).unwrap();
+            assert_eq!(request.poll.strategy, WirePollingStrategy::offset(OFFSET));
+            assert_eq!(stamped_context(read), ROUTE.context());
         }
     }
 
@@ -4495,8 +6247,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_an_evicted_poll_when_it_moves_its_consumer_should_end_with_57_without_retention()
-    {
+    async fn given_an_evicted_poll_when_it_moves_its_consumer_should_end_uncertain_without_a_replay()
+     {
         for (auto_commit, strategy, progress) in [
             (true, WirePollingStrategy::first(), true),
             (false, WirePollingStrategy::next(), true),
@@ -4512,18 +6264,25 @@ mod tests {
             let result = f.driver.poll(&f.poll(auto_commit, strategy), None).await;
 
             let polls = f.cluster.received(POLL_MESSAGES_CODE);
+            let op = polls[0].header.request;
             if progress {
-                assert_eq!(result, Err(IggyError::TransientNotCommitted));
+                let uncertain = if auto_commit {
+                    IggyError::FetchProgressUncertain(op)
+                } else {
+                    IggyError::TransientNotCommitted
+                };
+                assert_eq!(result, Err(uncertain));
                 assert_eq!(polls.len(), 1);
             } else {
                 assert!(result.is_ok(), "{result:?}");
                 assert_eq!(polls.len(), 2);
             }
-            let op = polls[0].header.request;
-            assert_eq!(
-                f.driver.abandon(op),
+            let abandoned = if auto_commit {
+                Ok(())
+            } else {
                 Err(IggyError::OperationNotRetained(op))
-            );
+            };
+            assert_eq!(f.driver.abandon(op), abandoned);
         }
     }
 
@@ -4591,11 +6350,8 @@ mod tests {
                 POLL_MESSAGES_DEFERRED_CODE,
                 IggyError::DeferredPollCapacityExceeded,
             ),
-            (WAIT_FOR_MESSAGES_CODE, IggyError::TransientNotAccepted),
-            (
-                WAIT_FOR_MESSAGES_CODE,
-                IggyError::DeferredPollCapacityExceeded,
-            ),
+            (FETCH_MESSAGES_CODE, IggyError::TransientNotAccepted),
+            (FETCH_MESSAGES_CODE, IggyError::DeferredPollCapacityExceeded),
         ] {
             let fixture = Fixture::new().await;
             let options = DeferredPollOptions {
@@ -4604,16 +6360,10 @@ mod tests {
                 ..DeferredPollOptions::default()
             };
             let poll = fixture.poll(true, WirePollingStrategy::next());
-            let wait = WaitForMessagesRequest {
-                consumer: poll.consumer.clone(),
-                stream_id: poll.stream_id.clone(),
-                topic_id: poll.topic_id.clone(),
+            let fetch_request = FetchMessagesRequest {
                 wait_us: options.max_wait.as_micros(),
                 request_timeout_us: options.request_timeout.as_micros(),
-                partitions: vec![WaitForMessagesTarget {
-                    partition_id: PARTITION_ID,
-                    strategy: poll.strategy.clone(),
-                }],
+                ..fetch([PARTITION_ID], poll.auto_commit, poll.strategy.clone())
             };
             fixture.cluster.hold(GET_PARTITION_ROUTE_CODE);
             fixture.cluster.hold(code);
@@ -4632,24 +6382,23 @@ mod tests {
                 code,
                 [
                     Answer::Refuse(refusal),
-                    Answer::Body(
-                        WaitForMessagesResponse {
-                            partitions: Vec::new(),
-                        }
-                        .to_bytes()
-                        .to_vec(),
-                    ),
+                    if code == FETCH_MESSAGES_CODE {
+                        fetched_body(&[])
+                    } else {
+                        Answer::Body(Vec::new())
+                    },
                 ],
             );
             let (result, ()) = tokio::join!(
                 async {
-                    if code == POLL_MESSAGES_DEFERRED_CODE {
-                        fixture
-                            .driver
-                            .poll_with_options(&poll, None, Some(options))
-                            .await
-                    } else {
-                        fixture.driver.wait_for_messages(&wait).await
+                    match code {
+                        POLL_MESSAGES_DEFERRED_CODE => {
+                            fixture
+                                .driver
+                                .poll_with_options(&poll, None, Some(options))
+                                .await
+                        }
+                        _ => fixture.driver.fetch_messages(&fetch_request).await,
                     }
                 },
                 async {
@@ -4681,17 +6430,22 @@ mod tests {
             );
             let budgets: Vec<_> = attempts
                 .iter()
-                .map(|attempt| {
-                    if code == POLL_MESSAGES_DEFERRED_CODE {
+                .map(|attempt| match code {
+                    POLL_MESSAGES_DEFERRED_CODE => {
                         let request =
                             DeferredPollMessagesRequest::decode_from(&attempt.body).unwrap();
                         assert_eq!(request.poll, poll);
                         assert_eq!(request.min_count, options.min_count);
                         assert_eq!(request.max_bytes, options.max_bytes);
                         (request.wait_us, request.request_timeout_us)
-                    } else {
-                        let request = WaitForMessagesRequest::decode_from(&attempt.body).unwrap();
-                        assert_eq!(request.partitions, wait.partitions);
+                    }
+                    _ => {
+                        let request = FetchMessagesRequest::decode_from(&attempt.body).unwrap();
+                        let fenced = FetchMessagesTarget {
+                            incarnation: ROUTE.incarnation,
+                            ..fetch_request.targets[0].clone()
+                        };
+                        assert_eq!(request.targets, [fenced]);
                         (request.wait_us, request.request_timeout_us)
                     }
                 })

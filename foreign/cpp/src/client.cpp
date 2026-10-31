@@ -455,13 +455,20 @@ void IggyBlockingClient::StoreConsumerOffset(const Consumer &consumer,
 void IggyBlockingClient::StoreConsumerPosition(const Consumer &consumer,
                                                const Identifier &stream,
                                                const Identifier &topic,
-                                               const std::uint32_t partition_id,
-                                               const std::uint64_t offset,
-                                               const PartitionContext &context) {
-    RethrowAsIggyException([this, &consumer, &stream, &topic, partition_id, offset,
-                            &context](ffi::ErrorInfo &error_info) {
-        Handle()->store_consumer_position(stream.ToFfi(), topic.ToFfi(), partition_id, std::string(consumer.KindName()),
-                                          consumer.Id().ToFfi(), offset, context.ToFfi(), error_info);
+                                               const Checkpoint &checkpoint) {
+    RethrowAsIggyException([this, &consumer, &stream, &topic, &checkpoint](ffi::ErrorInfo &error_info) {
+        Handle()->store_consumer_position(stream.ToFfi(), topic.ToFfi(), std::string(consumer.KindName()),
+                                          consumer.Id().ToFfi(), *checkpoint.inner_, error_info);
+    });
+}
+
+void IggyBlockingClient::DeleteConsumerPosition(const Consumer &consumer,
+                                                const Identifier &stream,
+                                                const Identifier &topic,
+                                                const Checkpoint &checkpoint) {
+    RethrowAsIggyException([this, &consumer, &stream, &topic, &checkpoint](ffi::ErrorInfo &error_info) {
+        Handle()->delete_consumer_position(stream.ToFfi(), topic.ToFfi(), std::string(consumer.KindName()),
+                                           consumer.Id().ToFfi(), *checkpoint.inner_, error_info);
     });
 }
 

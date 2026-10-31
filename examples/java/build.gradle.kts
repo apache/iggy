@@ -29,7 +29,7 @@ repositories {
 dependencies {
     implementation("org.apache.iggy:iggy:local-dev")
     implementation("org.slf4j:slf4j-simple:2.0.20")
-    implementation("tools.jackson.core:jackson-databind:3.2.3")
+    implementation("tools.jackson.core:jackson-databind:3.2.4")
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.bundles.testing)
 }
@@ -114,6 +114,11 @@ tasks.register<JavaExec>("runAsyncProducer") {
 tasks.register<JavaExec>("runAsyncConsumer") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("org.apache.iggy.examples.async.AsyncConsumer")
+}
+
+tasks.register<JavaExec>("runReaderConsumer") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.apache.iggy.examples.reader.ReaderConsumer")
 }
 
 tasks.register<JavaExec>("runTcpTlsProducer") {

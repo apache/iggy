@@ -111,6 +111,21 @@ public sealed class IggyClientFactoryTests
         Assert.Throws<ArgumentOutOfRangeException>(() => IggyClientFactory.CreateClient(options));
     }
 
+    /// <summary>A deferred poll may keep its request open for up to 630 seconds and ends it itself.</summary>
+    [Fact]
+    public void CreateHttpClient_OutlastsTheLongestDeferredPollRequest()
+    {
+        var options = new IggyClientConfigurator
+        {
+            BaseAddress = "http://127.0.0.1:3000",
+            Protocol = Protocol.Http
+        };
+
+        using var client = IggyClientFactory.CreateHttpClient(options);
+
+        Assert.True(client.Timeout > TimeSpan.FromSeconds(630), $"the client times out after {client.Timeout}");
+    }
+
     [Fact]
     public void CreateClient_TcpClientDisposesTwice()
     {

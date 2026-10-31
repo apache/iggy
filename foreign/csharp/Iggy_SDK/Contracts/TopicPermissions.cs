@@ -94,7 +94,8 @@ public sealed class TopicPermissions
     ///                 cref="Apache.Iggy.IggyClient.IIggyOffset.StoreOffsetAsync(Consumer, Identifier, Identifier, ulong, uint, PartitionContext, CancellationToken)" />
     ///         </item>
     ///         <item>
-    ///             <see cref="Apache.Iggy.IggyClient.IIggyOffset.DeleteOffsetAsync" />
+    ///             <see
+    ///                 cref="Apache.Iggy.IggyClient.IIggyOffset.DeleteOffsetAsync(Consumer, Identifier, Identifier, uint?, CancellationToken)" />
     ///         </item>
     ///     </list>
     /// </summary>

@@ -32,17 +32,17 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::future::join_all;
 use iggy::prelude::{
-    Consumer, ConsumerGroupClient, DeferredPollOptions, Durability, Identifier, IggyByteSize,
-    IggyClient, IggyDuration, IggyError, IggyExpiry, IggyMessage, MaxTopicSize, MessageClient,
-    Partitioning, PollingStrategy, TopicClient, TopicCreateOptions, TopicDetails,
+    Consumer, ConsumerGroupClient, Durability, Identifier, IggyByteSize, IggyClient, IggyDuration,
+    IggyError, IggyExpiry, IggyMessage, MaxTopicSize, MessageClient, Partitioning, PollOptions,
+    PollingStrategy, TopicClient, TopicCreateOptions, TopicDetails,
 };
 use iggy_common::MIN_TOPIC_SEGMENT_SIZE;
 use tokio::time::Instant;
 use tracing::{debug, info};
 
 use super::{
-    IggyBridge, REQUEST_TIMEOUT, cluster_id_stream, connect_client, metadata_write_on,
-    resolve_blocker, sign_out_and_shut_down, with_request_timeout,
+    IggyBridge, ONE_MESSAGE_MAX_BYTES, REQUEST_TIMEOUT, cluster_id_stream, connect_client,
+    metadata_write_on, resolve_blocker, sign_out_and_shut_down, with_request_timeout,
 };
 use crate::bridge::error::BridgeError;
 
@@ -70,11 +70,8 @@ const OWNER_SEGMENT_BYTES: u64 = MIN_TOPIC_SEGMENT_SIZE;
 /// Records a read returns at most.
 const READ_COUNT: u32 = 1_000;
 
-/// The bytes a waiting read returns at most. Above the largest group state a record can hold.
+/// The bytes a read returns at most. Above the largest group state a record can hold.
 const READ_BYTES: u32 = 64 * 1024 * 1024;
-
-/// What a waiting read adds to its wait for the reply to arrive.
-const READ_REPLY_MARGIN: Duration = Duration::from_secs(10);
 
 /// One record as the log returns it.
 #[derive(Debug, Clone)]
@@ -435,11 +432,14 @@ impl CoordinatorLink {
         let polled = with_request_timeout(self.reader.poll_messages(
             &self.stream_id,
             &self.log_topic,
-            Some(partition),
+            partition,
             &Consumer::default(),
             &PollingStrategy::last(),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                max_bytes: ONE_MESSAGE_MAX_BYTES,
+                ..PollOptions::default()
+            },
         ))
         .await?;
         Ok(polled.messages.into_iter().last().map(LoggedRecord::from))
@@ -540,43 +540,25 @@ async fn read_topic(
     from: u64,
     wait: Duration,
 ) -> Result<Vec<LoggedRecord>, BridgeError> {
-    let consumer = Consumer::default();
-    let strategy = PollingStrategy::offset(from);
-    let polled = if wait.is_zero() {
-        with_request_timeout(client.poll_messages(
+    let options = PollOptions {
+        count: READ_COUNT,
+        max_bytes: READ_BYTES,
+        ..PollOptions::wait(IggyDuration::from(wait))
+    };
+    let polled = tokio::time::timeout(
+        options.request_timeout().get_duration(),
+        client.poll_messages(
             stream_id,
             topic_id,
-            Some(partition),
-            &consumer,
-            &strategy,
-            READ_COUNT,
-            false,
-        ))
-        .await?
-    } else {
-        let options = DeferredPollOptions {
-            max_wait: IggyDuration::from(wait),
-            min_count: 1,
-            max_bytes: READ_BYTES,
-            request_timeout: IggyDuration::from(wait + READ_REPLY_MARGIN),
-        };
-        tokio::time::timeout(
-            wait + READ_REPLY_MARGIN,
-            client.poll_messages_deferred(
-                stream_id,
-                topic_id,
-                Some(partition),
-                &consumer,
-                &strategy,
-                READ_COUNT,
-                false,
-                options,
-            ),
-        )
-        .await
-        .map_err(|_elapsed| BridgeError::Timeout)?
-        .map_err(BridgeError::Iggy)?
-    };
+            partition,
+            &Consumer::default(),
+            &PollingStrategy::offset(from),
+            options,
+        ),
+    )
+    .await
+    .map_err(|_elapsed| BridgeError::Timeout)?
+    .map_err(BridgeError::Iggy)?;
     Ok(polled
         .messages
         .into_iter()

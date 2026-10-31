@@ -180,21 +180,24 @@ async fn given_consumer_and_group_offsets_when_managed_over_any_transport_should
                 "expected a feature-unavailable rejection for HTTP delete with consumer_kind=consumer_group, got {delete_error:?}"
             );
 
+            // The SDK refuses a group poll over HTTP before it sends anything.
             let poll_error = client
                 .poll_messages(
                     &stream_id,
                     &topic_id,
-                    Some(OFFSET_PARTITION_ID),
+                    OFFSET_PARTITION_ID,
                     consumer,
                     &PollingStrategy::first(),
-                    1,
-                    false,
+                    PollOptions {
+                        count: 1,
+                        ..PollOptions::default()
+                    },
                 )
                 .await
                 .expect_err("HTTP poll must reject a consumer-group kind");
             assert!(
-                is_feature_unavailable(&poll_error),
-                "expected a feature-unavailable rejection for HTTP poll with consumer_kind=consumer_group, got {poll_error:?}"
+                matches!(poll_error, IggyError::FeatureUnavailable),
+                "expected FeatureUnavailable for HTTP poll with consumer_kind=consumer_group, got {poll_error:?}"
             );
         }
     }
@@ -302,11 +305,13 @@ async fn given_external_group_offset_when_managed_over_http_should_store_read_de
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(OFFSET_PARTITION_ID),
+            OFFSET_PARTITION_ID,
             &external_group,
             &PollingStrategy::first(),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect_err("HTTP poll must reject an external-group kind");
@@ -364,15 +369,13 @@ async fn standalone_consumer_deletes_partition_zero_on_none_in_delete_offset(
 
     // get consumer assigned to last partition
     let mut consumer = client
-        .consumer(
-            CONSUMER_NAME,
-            STREAM_NAME,
-            TOPIC_NAME,
-            ASSIGNED_PARTITION_ID,
-        )
+        .consumer(CONSUMER_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
-        .auto_commit(AutoCommit::Disabled)
-        .batch_length(1)
+        .partitions([ASSIGNED_PARTITION_ID])
+        .poll_options(PollOptions {
+            count: 1,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .build();
     consumer.init().await.unwrap();
 
@@ -425,13 +428,14 @@ async fn given_standalone_stream_consumer_when_creating_topic_should_select_part
             .topic_name(topic_name)
             .consumer_name(CONSUMER_NAME)
             .consumer_kind(ConsumerKind::Consumer)
-            .auto_commit(AutoCommit::Disabled)
-            .batch_length(1)
             .create_stream_if_not_exists(true)
             .create_topic_if_not_exists(true)
             .partitions_count(partitions_count)
-            .maybe_partition_id(partition_id)
-            .poll_options(iggy::prelude::DeferredPollOptions::default())
+            .maybe_partitions(partition_id.map(|partition_id| vec![partition_id]))
+            .poll_options(PollOptions {
+                count: 1,
+                ..PollOptions::wait(IggyDuration::ONE_SECOND)
+            })
             .polling_strategy(PollingStrategy::first())
             .polling_retry_interval(NonZeroIggyDuration::ONE_SECOND)
             .init_retries(0)

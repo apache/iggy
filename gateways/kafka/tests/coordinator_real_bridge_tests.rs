@@ -32,7 +32,7 @@ mod wire;
 use std::collections::BTreeSet;
 
 use iggy::prelude::{
-    Consumer, Identifier, IggyMessage, MessageClient, Partitioning, PollingStrategy,
+    Consumer, Identifier, IggyMessage, MessageClient, Partitioning, PollOptions, PollingStrategy,
 };
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
@@ -414,11 +414,13 @@ async fn given_checkpoints_in_the_log_when_the_gateway_restarts_should_load_the_
         .poll_messages(
             &Identifier::named(&cluster_id_stream("kafka")).expect("stream name"),
             &Identifier::named(COORDINATOR_LOG_TOPIC).expect("topic name"),
-            Some(partition_of_group(group)),
+            partition_of_group(group),
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1_000,
-            false,
+            PollOptions {
+                count: 1_000,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("read the log partition");

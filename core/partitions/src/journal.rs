@@ -1351,7 +1351,7 @@ pub fn push_selected_batch_fragments(
 /// cover the reply's absolute size. The resident tier applies the same ratio
 /// per prepare entry but only copies up to [`RESIDENT_SPARSE_COPY_MAX_BYTES`];
 /// a sparse selection past that stays a slice and pins its prepare.
-const SPARSE_CHUNK_PIN_DIVISOR: usize = 4;
+pub const SPARSE_CHUNK_PIN_DIVISOR: usize = 4;
 
 /// Resident copies run inline on the shard pump (the disk walk is detached),
 /// and a poll selects at most two partial batches (its first and last), so

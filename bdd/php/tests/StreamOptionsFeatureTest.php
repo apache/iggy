@@ -26,6 +26,7 @@ use Iggy\Client as IggyClient;
 use Iggy\OptionSpec;
 use Iggy\OptionsScope;
 use Iggy\PollingStrategy;
+use Iggy\PollOptions;
 use Iggy\SendMessage;
 use Iggy\StreamDetails;
 use Iggy\StreamOptionKey;
@@ -36,6 +37,8 @@ use PHPUnit\Framework\TestCase;
 final class StreamOptionsFeatureTest extends TestCase
 {
     use StreamSteps;
+
+    private const CONSUMER_ID = 1;
 
     private bool $updateRejected = false;
     /** @var array<string, OptionSpec> */
@@ -124,8 +127,9 @@ final class StreamOptionsFeatureTest extends TestCase
         if (preg_match('/^polling the topic should return the payload "([^"]+)"$/', $step, $matches) === 1) {
             assert_not_null($this->topicName);
             $messages = $this->requireClient()->pollMessages(
-                $this->requireStreamId(), $this->topicName, 0, PollingStrategy::offset(0), 10, false,
-            );
+                $this->requireStreamId(), $this->topicName, 0, self::CONSUMER_ID, PollingStrategy::offset(0),
+                new PollOptions(count: 10),
+            )->messages;
             assert_same([$matches[1]], collect_payloads($messages));
             return;
         }

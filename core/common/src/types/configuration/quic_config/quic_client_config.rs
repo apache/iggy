@@ -19,6 +19,7 @@ use crate::{
     AutoLogin, ConnectionString, ConnectionStringOptions, NonZeroIggyDuration,
     PendingOperationsConfig, QuicClientReconnectionConfig, QuicConnectionStringOptions,
 };
+use iggy_binary_protocol::MAX_RECORD_REPLY_SIZE;
 use std::str::FromStr;
 
 /// Configuration for the QUIC client.
@@ -68,7 +69,7 @@ impl Default for QuicClientConfig {
             pending_operations: PendingOperationsConfig::default(),
             heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
             reconnection: QuicClientReconnectionConfig::default(),
-            response_buffer_size: 1000 * 1000 * 10,
+            response_buffer_size: MAX_RECORD_REPLY_SIZE as u64,
             max_concurrent_bidi_streams: 10000,
             datagram_send_buffer_size: 100_000,
             initial_mtu: 1200,

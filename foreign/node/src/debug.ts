@@ -85,8 +85,7 @@ try {
     streamId: streamName,
     topicId: topicName,
     pollingStrategy: PollingStrategy.Next,
-    count: 5,
-    interval: 5000
+    count: 5
   };
 
   console.log('poll req', pollReq);

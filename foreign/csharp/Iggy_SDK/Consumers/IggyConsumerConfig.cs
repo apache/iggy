@@ -16,6 +16,7 @@
 // under the License.
 
 using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Kinds;
 using Microsoft.Extensions.Logging;
@@ -100,10 +101,10 @@ public class IggyConsumerConfig
     public Identifier TopicId { get; set; }
 
     /// <summary>
-    ///     Optional partition ID to consume from. If null, selects partition 0.
-    ///     Note: This is ignored when using consumer groups.
+    ///     The partitions of a standalone consumer. A consumer group reads the assignment of its member and refuses
+    ///     partitions here.
     /// </summary>
-    public uint? PartitionId { get; set; }
+    public IReadOnlyList<uint> Partitions { get; set; } = [];
 
     /// <summary>
     ///     The consumer configuration (single consumer or consumer group)
@@ -113,22 +114,7 @@ public class IggyConsumerConfig
     /// <summary>
     ///     The polling strategy defining from where to start consuming messages
     /// </summary>
-    public PollingStrategy PollingStrategy { get; set; }
-
-    /// <summary>
-    ///     The maximum number of messages to fetch in a single poll. Default is 100.
-    /// </summary>
-    public uint BatchSize { get; set; } = 100;
-
-    /// <summary>
-    ///     Whether to enable automatic offset committing
-    /// </summary>
-    public bool AutoCommit { get; set; }
-
-    /// <summary>
-    ///     The auto-commit mode determining when offsets are stored
-    /// </summary>
-    public AutoCommitMode AutoCommitMode { get; set; }
+    public PollingStrategy PollingStrategy { get; set; } = PollingStrategy.Next();
 
     /// <summary>
     ///     The name of the consumer group (used when consumer ID is numeric)
@@ -141,14 +127,12 @@ public class IggyConsumerConfig
     public bool CreateConsumerGroupIfNotExists { get; set; } = true;
 
     /// <summary>
-    ///     Whether to automatically join the consumer group. Default is true.
+    ///     The limits of each read and the commit policy. By default a read waits up to 5 seconds for messages,
+    ///     returns up to 1000 messages and 1 MiB, and nothing is stored: commit
+    ///     <see cref="ReceivedMessage.Checkpoint" /> with <see cref="IggyConsumer.CommitAsync" />, or choose
+    ///     <see cref="CommitPolicy.OnRead" /> or <see cref="CommitPolicy.Auto" />.
     /// </summary>
-    public bool JoinConsumerGroup { get; set; } = true;
-
-    /// <summary>
-    ///     The interval in milliseconds between message polls. Default is 100ms.
-    /// </summary>
-    public int PollingIntervalMs { get; set; } = 100;
+    public PollOptions PollOptions { get; set; } = new() { MaxWait = TimeSpan.FromSeconds(5) };
 
     /// <summary>
     ///     Optional logger factory for creating loggers

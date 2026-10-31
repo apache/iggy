@@ -117,8 +117,10 @@ decltype(auto) RethrowAsIggyException(Operation &&operation);
  * C++ or bridge-local argument errors leave Code() empty and Kind() empty,
  * except the metadata change calls, which report invalid input with the kind
  * each one documents.
- * OperationId() is present only for operation_uncertain, lane_blocked, and
- * operation_not_retained errors and preserves the full unsigned 64-bit ID.
+ * OperationId() is present only for operation_uncertain, lane_blocked,
+ * operation_not_retained, partition_lane_blocked and fetch_progress_uncertain
+ * errors and preserves the full unsigned 64-bit ID. BlockedPartitionId() is
+ * present only for partition_lane_blocked.
  */
 class IggyException : public std::runtime_error {
   public:
@@ -131,6 +133,7 @@ class IggyException : public std::runtime_error {
         return kind_ ? *kind_ : kNoKind;
     }
     [[nodiscard]] std::optional<std::uint64_t> OperationId() const noexcept { return operation_id_; }
+    [[nodiscard]] std::optional<std::uint32_t> BlockedPartitionId() const noexcept { return blocked_partition_id_; }
 
   private:
     IggyException(const std::string &message, const ffi::ErrorInfo &error) : std::runtime_error(message) {
@@ -141,15 +144,20 @@ class IggyException : public std::runtime_error {
         if (error.has_operation_id) {
             operation_id_ = error.operation_id;
         }
+        if (error.has_blocked_partition_id) {
+            blocked_partition_id_ = error.blocked_partition_id;
+        }
     }
 
     template <typename Operation>
     friend decltype(auto) detail::RethrowAsIggyException(Operation &&operation);
+    friend class ReadException;
 
     std::optional<std::uint32_t> code_;
     // Shared, so that copying the exception cannot throw.
     std::shared_ptr<const std::string> kind_;
     std::optional<std::uint64_t> operation_id_;
+    std::optional<std::uint32_t> blocked_partition_id_;
 };
 
 namespace detail {
@@ -1126,6 +1134,8 @@ class IggyMessagePolled final {
     static IggyMessagePolled FromFfi(ffi::IggyMessagePolled message);
 
     friend class IggyBlockingClient;
+    friend class PolledMessages;
+    friend class ReceivedMessage;
 
     std::uint64_t checksum_;
     absl::uint128 id_;
@@ -1444,18 +1454,19 @@ class Topic final {
 };
 
 /**
- * @brief Partition incarnation and consumer-group owner captured by a read or
- *        a poll.
+ * @brief Partition incarnation and consumer-group owner that
+ *        Partition::Context() reports.
  *
- * Store an offset under the context that delivered it with
- * IggyBlockingClient::StoreConsumerPosition(). The store then fails instead of
- * landing on a recreated partition or under a newer consumer-group owner. The
- * server refuses a context whose incarnation is zero.
+ * A checkpoint keeps the context of its batch privately, and
+ * IggyBlockingClient::StoreConsumerPosition() stores under it. The store then
+ * fails instead of landing on a recreated partition or under a newer
+ * consumer-group owner.
  */
 class PartitionContext final {
   public:
     /**
-     * @brief Creates a context from the values a poll or a read returned.
+     * @brief Creates a context from the values that Partition::Context()
+     *        reports.
      * @param incarnation Creation revision of the partition. It changes when a
      *        deleted partition ID is created again.
      * @param owner_generation Consumer-group owner generation, or zero outside
@@ -1484,11 +1495,9 @@ class PartitionContext final {
     [[nodiscard]] std::uint64_t MetadataOp() const noexcept { return metadata_op_; }
 
   private:
-    [[nodiscard]] ffi::PartitionContext ToFfi() const;
     static PartitionContext FromFfi(ffi::PartitionContext context);
 
     friend class Partition;
-    friend class IggyBlockingClient;
 
     std::uint64_t incarnation_;
     std::uint64_t owner_generation_;
@@ -5676,6 +5685,635 @@ class PollingStrategy final {
 };
 
 /**
+ * @brief When the offsets of the messages that a read returns are stored.
+ */
+enum class CommitPolicy : std::uint8_t {
+    /** Nothing is stored. The caller commits checkpoints. The default. */
+    Manual = 0,
+    /**
+     * The server stores the offset of the last message of each read as part of the read, in one round trip. While the
+     * primary stays up a message is delivered at most once. A failover before the store replicates can deliver the
+     * last batch again.
+     */
+    OnRead = 1,
+    /** A reader stores the latest counted position, as its AutoCommit says. A one-shot poll refuses it. */
+    Auto = 2,
+};
+
+/**
+ * @brief When a message counts for CommitPolicy::Auto.
+ */
+enum class CommitAfter : std::uint8_t {
+    /** When the caller asks for the next batch or closes the reader. */
+    Processing = 0,
+    /** When the batch is handed over. */
+    Delivery = 1,
+    /** Only when the caller marks its checkpoint with PartitionReader::Mark(). */
+    Marked = 2,
+};
+
+/**
+ * @brief The event on which CommitPolicy::Auto also stores.
+ */
+class CommitEvery final {
+  public:
+    enum class Kind : std::uint8_t {
+        /** Each counted batch of a reader. */
+        Message = 0,
+        /** Count() counted messages of a partition since its last store. */
+        Messages = 1,
+        /** The last message of each batch. */
+        Batch = 2,
+    };
+
+    static CommitEvery Message() { return CommitEvery(Kind::Message, 0); }
+
+    /** @param count Counted messages between two stores. Zero is refused when the options are used. */
+    static CommitEvery Messages(std::uint32_t count) { return CommitEvery(Kind::Messages, count); }
+
+    static CommitEvery Batch() { return CommitEvery(Kind::Batch, 0); }
+
+    [[nodiscard]] Kind GetKind() const noexcept { return kind_; }
+
+    /** @return The count of Kind::Messages, zero otherwise. */
+    [[nodiscard]] std::uint32_t Count() const noexcept { return count_; }
+
+  private:
+    CommitEvery(Kind kind, std::uint32_t count) : kind_(kind), count_(count) {}
+
+    Kind kind_;
+    std::uint32_t count_;
+};
+
+/**
+ * @brief When CommitPolicy::Auto stores.
+ *
+ * A default AutoCommit stores every 10,000 messages or every 5 seconds,
+ * whichever comes first, after processing. It also stores when the reader
+ * closes. It needs an interval or an event, otherwise the options are refused
+ * when they are used.
+ */
+class AutoCommit final {
+  public:
+    AutoCommit();
+
+    /** @return The interval of the stores, or `std::nullopt`. */
+    [[nodiscard]] std::optional<std::chrono::microseconds> Interval() const noexcept { return interval_; }
+
+    /** @param interval Store the latest counted position at this interval, not zero, or never on a timer. */
+    AutoCommit &SetInterval(std::optional<std::chrono::microseconds> interval) noexcept {
+        interval_ = interval;
+        return *this;
+    }
+
+    /** @return The event of the stores, or `std::nullopt`. */
+    [[nodiscard]] const std::optional<CommitEvery> &Every() const noexcept { return every_; }
+
+    /** @param every Also store on this event, or on none. */
+    AutoCommit &SetEvery(std::optional<CommitEvery> every) noexcept {
+        every_ = every;
+        return *this;
+    }
+
+    [[nodiscard]] CommitAfter After() const noexcept { return after_; }
+
+    AutoCommit &SetAfter(CommitAfter after) noexcept {
+        after_ = after;
+        return *this;
+    }
+
+  private:
+    std::optional<std::chrono::microseconds> interval_;
+    std::optional<CommitEvery> every_;
+    CommitAfter after_ = CommitAfter::Processing;
+};
+
+/**
+ * @brief The limits of one read and when its offsets are stored.
+ *
+ * A read is a poll of one partition, or a fetch that a PartitionReader sends for
+ * several partitions of one primary. A fetch applies Count(), MinCount() and
+ * MaxBytes() to all of its partitions together. A reader that commits nothing
+ * runs several fetches at once, each within these limits, for partitions with
+ * more messages waiting.
+ *
+ * A default PollOptions reads up to 1000 messages and 1 MiB, answers at once,
+ * waits for at least one message and stores nothing. A reader or a poll checks
+ * the limits when it uses them and throws IggyException for an invalid one.
+ */
+class PollOptions final {
+  public:
+    PollOptions();
+
+    [[nodiscard]] std::uint32_t Count() const noexcept { return options_.count; }
+
+    /** @param count Most messages in one read, over all partitions of a fetch. */
+    PollOptions &SetCount(std::uint32_t count) noexcept {
+        options_.count = count;
+        return *this;
+    }
+
+    [[nodiscard]] std::chrono::microseconds MaxWait() const noexcept {
+        return std::chrono::microseconds(options_.max_wait_micros);
+    }
+
+    /** @param max_wait How long the server waits for MinCount() messages, at most 600 s. Zero or less answers at once.
+     */
+    PollOptions &SetMaxWait(std::chrono::microseconds max_wait) noexcept {
+        options_.max_wait_micros = max_wait.count() > 0 ? static_cast<std::uint64_t>(max_wait.count()) : 0;
+        return *this;
+    }
+
+    [[nodiscard]] std::uint32_t MinCount() const noexcept { return options_.min_count; }
+
+    /** @param min_count Messages to wait for, from 1 to Count(), over all partitions of a fetch. */
+    PollOptions &SetMinCount(std::uint32_t min_count) noexcept {
+        options_.min_count = min_count;
+        return *this;
+    }
+
+    [[nodiscard]] std::uint32_t MaxBytes() const noexcept { return options_.max_bytes; }
+
+    /** @param max_bytes Most bytes in one read, over all partitions of a fetch. A first message larger than that comes
+     * alone. */
+    PollOptions &SetMaxBytes(std::uint32_t max_bytes) noexcept {
+        options_.max_bytes = max_bytes;
+        return *this;
+    }
+
+    [[nodiscard]] CommitPolicy Commit() const noexcept { return static_cast<CommitPolicy>(options_.commit); }
+
+    /** @param commit When offsets are stored. CommitPolicy::Auto uses the AutoCommit of SetAutoCommit(), the default
+     * one until then. */
+    PollOptions &SetCommit(CommitPolicy commit) noexcept {
+        options_.commit = static_cast<ffi::CommitPolicy>(commit);
+        return *this;
+    }
+
+    /** @return The AutoCommit that CommitPolicy::Auto uses. */
+    [[nodiscard]] AutoCommit AutoCommitSettings() const;
+
+    /** @brief Sets CommitPolicy::Auto with these settings. */
+    PollOptions &SetAutoCommit(const AutoCommit &auto_commit);
+
+  private:
+    friend class IggyBlockingClient;
+    friend class ReaderOptions;
+    friend class ConsumerOptions;
+
+    ffi::PollOptions options_;
+};
+
+/**
+ * @brief The position after one delivered message, bound to its partition and
+ *        to the partition history that delivered it.
+ *
+ * Only a polled batch makes one. A commit of it after the partition was deleted
+ * and created again, or after its consumer group owner changed, is refused
+ * instead of landing on the new partition.
+ */
+class Checkpoint final {
+  public:
+    Checkpoint(const Checkpoint &other) : inner_(other.inner_->copy()) {}
+    Checkpoint(Checkpoint &&) noexcept = default;
+    Checkpoint &operator=(const Checkpoint &other) {
+        if (this != &other) {
+            inner_ = other.inner_->copy();
+        }
+        return *this;
+    }
+    Checkpoint &operator=(Checkpoint &&) noexcept = default;
+    ~Checkpoint()                                 = default;
+
+    [[nodiscard]] std::uint32_t PartitionId() const { return inner_->partition_id(); }
+
+    [[nodiscard]] std::uint64_t Offset() const { return inner_->offset(); }
+
+  private:
+    explicit Checkpoint(rust::Box<ffi::Checkpoint> inner) : inner_(std::move(inner)) {}
+
+    friend class PolledMessages;
+    friend class PartitionReader;
+    friend class ReceivedMessage;
+    friend class IggyConsumer;
+    friend class IggyBlockingClient;
+
+    rust::Box<ffi::Checkpoint> inner_;
+};
+
+/**
+ * @brief Where the next read of one partition starts after a batch.
+ *
+ * It belongs to the partition of its batch, and a read or a seek of another
+ * partition refuses it with InvalidCommand (3).
+ */
+class Continuation final {
+  public:
+    Continuation(const Continuation &other) : inner_(other.inner_->copy()) {}
+    Continuation(Continuation &&) noexcept = default;
+    Continuation &operator=(const Continuation &other) {
+        if (this != &other) {
+            inner_ = other.inner_->copy();
+        }
+        return *this;
+    }
+    Continuation &operator=(Continuation &&) noexcept = default;
+    ~Continuation()                                   = default;
+
+    /** @return The strategy kind: offset, timestamp, first, last or next. */
+    [[nodiscard]] std::string Kind() const { return std::string(inner_->kind()); }
+
+    [[nodiscard]] std::uint64_t Value() const { return inner_->value(); }
+
+  private:
+    explicit Continuation(rust::Box<ffi::Continuation> inner) : inner_(std::move(inner)) {}
+
+    friend class PolledMessages;
+    friend class PartitionReader;
+    friend class IggyConsumer;
+    friend class ReadException;
+    friend class IggyBlockingClient;
+
+    rust::Box<ffi::Continuation> inner_;
+};
+
+/**
+ * @brief One batch of one partition, as a poll or a reader delivered it.
+ *
+ * Its checkpoints name the messages as they were delivered.
+ */
+class PolledMessages final {
+  public:
+    [[nodiscard]] std::uint32_t PartitionId() const noexcept { return partition_id_; }
+
+    [[nodiscard]] std::uint64_t CurrentOffset() const noexcept { return current_offset_; }
+
+    [[nodiscard]] const std::vector<IggyMessagePolled> &Messages() const noexcept { return messages_; }
+
+    /**
+     * @brief The position after the last message, to commit the whole batch.
+     * @throws IggyException for an empty batch.
+     */
+    [[nodiscard]] ::iggy::Checkpoint Checkpoint() const;
+
+    /**
+     * @brief The position after the message at `index`, to commit a processed part of the batch.
+     * @throws IggyException for an index out of range.
+     */
+    [[nodiscard]] ::iggy::Checkpoint CheckpointAt(std::size_t index) const;
+
+    /** @brief The position after the batch, for the next read of its partition. */
+    [[nodiscard]] ::iggy::Continuation Continuation() const;
+
+  private:
+    explicit PolledMessages(ffi::PolledMessages batch);
+
+    friend class PartitionReader;
+    friend class PendingPoll;
+    friend class IggyBlockingClient;
+
+    std::uint32_t partition_id_;
+    std::uint64_t current_offset_;
+    std::vector<IggyMessagePolled> messages_;
+    // Keeps the delivered positions. Its messages were moved into messages_.
+    ffi::PolledMessages batch_;
+};
+
+/**
+ * @brief A failed read of a PartitionReader. The reader stays usable after it
+ *        and retries by itself.
+ */
+class ReadException final : public IggyException {
+  public:
+    /** @return The partition of the error, or `std::nullopt` for an error of the whole reader. */
+    [[nodiscard]] std::optional<std::uint32_t> PartitionId() const noexcept { return partition_id_; }
+
+    /**
+     * @return For a message that does not decode, the continuation after it,
+     *         to pass to PartitionReader::Seek(), otherwise `nullptr`.
+     */
+    [[nodiscard]] const ::iggy::Continuation *Skip() const noexcept { return skip_.get(); }
+
+  private:
+    ReadException(const std::string &message, ffi::ReadErrorInfo &error);
+
+    friend class PartitionReader;
+    friend class IggyConsumer;
+
+    std::optional<std::uint32_t> partition_id_;
+    // Shared, so that copying the exception cannot throw.
+    std::shared_ptr<const ::iggy::Continuation> skip_;
+};
+
+/**
+ * @brief The settings of a PartitionReader. A setting left unset keeps its default.
+ */
+class ReaderOptions final {
+  public:
+    ReaderOptions() = default;
+
+    /** @param partitions The partitions of a standalone consumer, which needs them. A consumer group reads its
+     * assignment. */
+    ReaderOptions &SetPartitions(std::vector<std::uint32_t> partitions) {
+        partitions_ = std::move(partitions);
+        return *this;
+    }
+
+    /** @param start Where a partition without a stored offset starts. Default next. A continuation is refused. */
+    ReaderOptions &SetStart(const PollingStrategy &start) {
+        start_ = start;
+        return *this;
+    }
+
+    /** @param options The options of each request. Default: the poll defaults with a five-second wait. */
+    ReaderOptions &SetPollOptions(const PollOptions &options) {
+        poll_options_ = options;
+        return *this;
+    }
+
+    /** @param prefetch_bytes Encoded bytes of the requests in flight and the queued batches. Default 16 MiB. */
+    ReaderOptions &SetPrefetchBytes(std::uint32_t prefetch_bytes) noexcept {
+        prefetch_bytes_ = prefetch_bytes;
+        return *this;
+    }
+
+    /** @param prefetch_messages Messages in flight and queued. Default: the larger of 16,000 and the count. */
+    ReaderOptions &SetPrefetchMessages(std::uint32_t prefetch_messages) noexcept {
+        prefetch_messages_ = prefetch_messages;
+        return *this;
+    }
+
+  private:
+    [[nodiscard]] ffi::ReaderOptions ToFfi() const;
+
+    friend class IggyBlockingClient;
+
+    std::vector<std::uint32_t> partitions_;
+    std::optional<PollingStrategy> start_;
+    std::optional<PollOptions> poll_options_;
+    std::optional<std::uint32_t> prefetch_bytes_;
+    std::optional<std::uint32_t> prefetch_messages_;
+};
+
+/**
+ * @brief A poll that runs in the background, from
+ *        IggyBlockingClient::StartPollMessages().
+ *
+ * Wait for its batch in steps, or cancel it. Destroying it cancels the poll.
+ */
+class PendingPoll final {
+  public:
+    PendingPoll(PendingPoll &&) noexcept            = default;
+    PendingPoll &operator=(PendingPoll &&) noexcept = default;
+    PendingPoll(const PendingPoll &)                = delete;
+    PendingPoll &operator=(const PendingPoll &)     = delete;
+
+    /**
+     * @brief Waits up to `timeout` for the batch of the poll.
+     * @return The batch, or `std::nullopt` while the poll still runs. The
+     *         batch is empty when a deferred poll found no message in its max wait.
+     * @throws IggyException for a failed poll, and after the batch was
+     *         returned or the poll was cancelled.
+     */
+    std::optional<PolledMessages> Wait(std::chrono::microseconds timeout);
+
+    /**
+     * @brief Drops the request, also while another thread waits for it.
+     *
+     * A parked deferred poll is cancelled on the server. A poll with
+     * CommitPolicy::OnRead that the server had not answered stores nothing. It
+     * returns after the request was dropped and does nothing after the poll ended.
+     */
+    void Cancel();
+
+  private:
+    explicit PendingPoll(rust::Box<ffi::PendingPoll> poll) : poll_(std::move(poll)) {}
+
+    friend class IggyBlockingClient;
+
+    rust::Box<ffi::PendingPoll> poll_;
+};
+
+/**
+ * @brief Reads the partitions of a topic in batches, with routing, prefetch
+ *        and the position of each partition inside.
+ *
+ * IggyBlockingClient::Reader() builds one. Its calls are safe from several
+ * threads and run one at a time. Destroying it stops its work without waiting,
+ * moves no offset back and does not leave a consumer group: call Close().
+ */
+class PartitionReader final {
+  public:
+    PartitionReader(PartitionReader &&) noexcept            = default;
+    PartitionReader &operator=(PartitionReader &&) noexcept = default;
+    PartitionReader(const PartitionReader &)                = delete;
+    PartitionReader &operator=(const PartitionReader &)     = delete;
+
+    /**
+     * @brief Waits up to `timeout` for the next batch of one partition.
+     * @return The batch, or `std::nullopt` when the time ran out. A batch that
+     *         arrives later stays in the reader.
+     * @throws ReadException for a failed read, IggyException after Close().
+     */
+    std::optional<PolledMessages> Next(std::chrono::microseconds timeout);
+
+    /**
+     * @brief Stores the offset of a checkpoint that this reader delivered.
+     * @throws IggyException with CommitPolicy::OnRead, for a checkpoint this
+     *         reader did not deliver, and for a failed store.
+     */
+    void Commit(const Checkpoint &checkpoint);
+
+    /**
+     * @brief Counts a checkpoint that this reader delivered under CommitPolicy::Auto.
+     * @throws IggyException without CommitPolicy::Auto and for a checkpoint this reader did not deliver.
+     */
+    void Mark(const Checkpoint &checkpoint);
+
+    /**
+     * @brief Sets the next read position of a partition and drops its queued batches.
+     *
+     * With CommitPolicy::OnRead, a seek to an offset above 0 first stores the
+     * offset before it, so a restart resumes at the new position. Every other
+     * seek stores nothing.
+     * @throws IggyException for a partition this reader does not read, and for
+     *         a failed store, after which nothing moved.
+     */
+    void Seek(std::uint32_t partition_id, const PollingStrategy &start);
+
+    /** @brief Moves a partition to a continuation of one of its batches, or past a message with ReadException::Skip().
+     */
+    void Seek(std::uint32_t partition_id, const Continuation &continuation);
+
+    /** @return The partitions of a standalone consumer, or the current assignment of a group member. */
+    [[nodiscard]] std::vector<std::uint32_t> Partitions() const;
+
+    /**
+     * @brief Stops the reader. With CommitPolicy::Auto it stores the latest
+     *        counted positions, with CommitPolicy::OnRead it moves the offsets
+     *        back to the last delivered messages, and a group reader then
+     *        leaves its group. A second call does nothing.
+     */
+    void Close();
+
+  private:
+    explicit PartitionReader(rust::Box<ffi::PartitionReader> reader) : reader_(std::move(reader)) {}
+
+    friend class IggyBlockingClient;
+
+    rust::Box<ffi::PartitionReader> reader_;
+};
+
+/**
+ * @brief One message that an IggyConsumer handed over.
+ */
+class ReceivedMessage final {
+  public:
+    [[nodiscard]] std::uint32_t PartitionId() const noexcept { return partition_id_; }
+
+    /** @return The offset of the newest message of the partition when it was polled. */
+    [[nodiscard]] std::uint64_t CurrentOffset() const noexcept { return current_offset_; }
+
+    [[nodiscard]] const IggyMessagePolled &Message() const noexcept { return message_; }
+
+    /** @return The position after the message, to commit or mark it. */
+    [[nodiscard]] const ::iggy::Checkpoint &Checkpoint() const noexcept { return checkpoint_; }
+
+  private:
+    // Copies the checkpoint, since a Box cannot leave a rust::Vec.
+    explicit ReceivedMessage(ffi::ReceivedMessage &received);
+
+    friend class IggyConsumer;
+
+    std::uint32_t partition_id_;
+    std::uint64_t current_offset_;
+    IggyMessagePolled message_;
+    ::iggy::Checkpoint checkpoint_;
+};
+
+/**
+ * @brief The settings of an IggyConsumer. A setting left unset keeps its default.
+ */
+class ConsumerOptions final {
+  public:
+    ConsumerOptions() = default;
+
+    /** @param partitions The partitions of a standalone consumer, which needs them. A group consumer ignores them. */
+    ConsumerOptions &SetPartitions(std::vector<std::uint32_t> partitions) {
+        partitions_ = std::move(partitions);
+        return *this;
+    }
+
+    /** @param start Where a partition without a stored offset starts. Default next. */
+    ConsumerOptions &SetStart(const PollingStrategy &start) {
+        start_ = start;
+        return *this;
+    }
+
+    /** @param options The options of each request and the commit policy. Default: the poll defaults with a five-second
+     * wait. */
+    ConsumerOptions &SetPollOptions(const PollOptions &options) {
+        poll_options_ = options;
+        return *this;
+    }
+
+    /** @param prefetch_bytes Encoded bytes of the requests in flight and the queued batches. Default 16 MiB. */
+    ConsumerOptions &SetPrefetchBytes(std::uint32_t prefetch_bytes) noexcept {
+        prefetch_bytes_ = prefetch_bytes;
+        return *this;
+    }
+
+    /** @param prefetch_messages Messages in flight and queued. Default: the larger of 16,000 and the count. */
+    ConsumerOptions &SetPrefetchMessages(std::uint32_t prefetch_messages) noexcept {
+        prefetch_messages_ = prefetch_messages;
+        return *this;
+    }
+
+    /** @param allow_replay Hand over again the messages that a seek back reads twice. Default false. */
+    ConsumerOptions &SetAllowReplay(bool allow_replay) noexcept {
+        allow_replay_ = allow_replay;
+        return *this;
+    }
+
+  private:
+    [[nodiscard]] ffi::ConsumerOptions ToFfi() const;
+
+    friend class IggyBlockingClient;
+
+    std::vector<std::uint32_t> partitions_;
+    std::optional<PollingStrategy> start_;
+    std::optional<PollOptions> poll_options_;
+    std::optional<std::uint32_t> prefetch_bytes_;
+    std::optional<std::uint32_t> prefetch_messages_;
+    bool allow_replay_ = false;
+};
+
+/**
+ * @brief Hands over the messages of a topic one at a time, through one
+ *        PartitionReader, with the commit policy of its PollOptions.
+ *
+ * IggyBlockingClient::StandaloneConsumer() and GroupConsumer() build one. Its
+ * calls are safe from several threads and run one at a time. Destroying it
+ * stops its work without waiting and stores nothing: call Close().
+ */
+class IggyConsumer final {
+  public:
+    IggyConsumer(IggyConsumer &&) noexcept            = default;
+    IggyConsumer &operator=(IggyConsumer &&) noexcept = default;
+    IggyConsumer(const IggyConsumer &)                = delete;
+    IggyConsumer &operator=(const IggyConsumer &)     = delete;
+
+    /**
+     * @brief Waits up to `timeout` for the next message.
+     *
+     * Under CommitAfter::Processing it counts the message handed over before.
+     *
+     * @return The message, or `std::nullopt` when the time ran out.
+     * @throws ReadException for a failed read, IggyException after Close().
+     */
+    std::optional<ReceivedMessage> Next(std::chrono::microseconds timeout);
+
+    /**
+     * @brief Stores the offset of a checkpoint that this consumer handed over.
+     * @throws IggyException with CommitPolicy::OnRead and for a failed store.
+     */
+    void Commit(const Checkpoint &checkpoint);
+
+    /**
+     * @brief Counts a checkpoint that this consumer handed over under CommitPolicy::Auto.
+     * @throws IggyException without CommitPolicy::Auto and for a checkpoint this consumer did not hand over.
+     */
+    void Mark(const Checkpoint &checkpoint);
+
+    /**
+     * @brief Sets the next read position of a partition.
+     *
+     * With CommitPolicy::OnRead, a seek to an offset above 0 first stores the
+     * offset before it, so a restart resumes at the new position. Every other
+     * seek stores nothing.
+     * @throws IggyException for a partition this consumer does not read, and
+     *         for a failed store, after which nothing moved.
+     */
+    void Seek(std::uint32_t partition_id, const PollingStrategy &start);
+    void Seek(std::uint32_t partition_id, const Continuation &continuation);
+
+    /**
+     * @brief Stops the consumer. With CommitPolicy::Auto it stores the latest
+     *        counted positions, with CommitPolicy::OnRead it moves the offsets
+     *        back to the last handed over messages, and a group consumer then
+     *        leaves its group. A second call does nothing.
+     */
+    void Close();
+
+  private:
+    explicit IggyConsumer(rust::Box<ffi::Consumer> consumer) : consumer_(std::move(consumer)) {}
+
+    friend class IggyBlockingClient;
+
+    rust::Box<ffi::Consumer> consumer_;
+};
+
+/**
  * @brief Owning client connection to an Apache Iggy server.
  *
  * Create instances with Builder or FromConnectionString(). The client owns a
@@ -5699,7 +6337,10 @@ class PollingStrategy final {
  * - CreatePartitions(), DeletePartitions(), and DeleteSegments().
  * - CreateConsumerGroup(), DeleteConsumerGroup(), JoinConsumerGroup(), and
  *   LeaveConsumerGroup().
- * - StoreConsumerOffset(), StoreConsumerPosition(), and DeleteConsumerOffset().
+ * - StoreConsumerOffset(), StoreConsumerPosition(), DeleteConsumerOffset(), and
+ *   DeleteConsumerPosition().
+ * - PollMessages(), Reader(), StandaloneConsumer(), GroupConsumer(),
+ *   PendingPoll::Wait(), and the calls of PartitionReader and IggyConsumer.
  * - GetMetadataChanges().
  *
  * Other methods report errors through the exception message only. C++ and
@@ -5872,8 +6513,11 @@ class IggyBlockingClient final {
      * changes the client state to disconnected, but keeps the client reusable.
      * Call Connect() to establish a new connection. Configured automatic login
      * is applied when reconnecting.
-     * For binary transports, disconnect also drops all retained operations
+     * For binary transports, disconnect also drops all retained mutations
      * without settling their outcomes. They cannot be resolved after reconnecting.
+     * A poll with CommitPolicy::OnRead that waits fails with
+     * fetch_progress_uncertain, and its partition stays blocked across the
+     * reconnect until AbandonOperation().
      *
      * @note The disconnect holds until the next Connect(): requests fail and
      *       nothing reconnects the client in the background, even with
@@ -6428,30 +7072,150 @@ class IggyBlockingClient final {
                              std::uint64_t offset);
 
     /**
-     * @brief Stores an offset under the partition context that delivered it.
+     * @brief Stores the offset of a checkpoint under the partition context
+     *        that delivered it.
      *
-     * Every retry keeps @p context. The store fails instead of landing on a
-     * recreated partition or under a newer consumer-group owner. Otherwise it
-     * behaves as StoreConsumerOffset() with @p partition_id set.
+     * Every retry keeps the context of @p checkpoint. The store fails instead
+     * of landing on a recreated partition or under a newer consumer-group
+     * owner. Otherwise it behaves as StoreConsumerOffset() with the partition
+     * of @p checkpoint.
      *
      * @param consumer Consumer identity that owns the offset.
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Parent topic, addressed by numeric ID or name.
-     * @param partition_id Partition that delivered @p offset.
-     * @param offset Message offset to store.
-     * @param context Context the poll that delivered @p offset returned.
+     * @param checkpoint Position after a delivered message, from a batch
+     *        that PollMessages() or PartitionReader::Next() returned.
      * @throws IggyException if the partition was deleted or recreated after
-     *         @p context was captured (HistoryUnavailable, 87); this client no
-     *         longer owns the partition in the consumer group
-     *         (ConsumerGroupPartitionNotOwned, 5009); or for any reason
+     *         the context of @p checkpoint was captured (HistoryUnavailable,
+     *         87), if this client no longer owns the partition in the consumer
+     *         group (ConsumerGroupPartitionNotOwned, 5009), or for any reason
      *         StoreConsumerOffset() throws.
      */
     void StoreConsumerPosition(const Consumer &consumer,
                                const Identifier &stream,
                                const Identifier &topic,
-                               std::uint32_t partition_id,
-                               std::uint64_t offset,
-                               const PartitionContext &context);
+                               const Checkpoint &checkpoint);
+
+    /**
+     * @brief Deletes the stored offset of the partition of a checkpoint under
+     *        the partition context that delivered it.
+     *
+     * The delete fails instead of removing the offset of a recreated
+     * partition or of a newer consumer-group owner. The offset of
+     * @p checkpoint is not used.
+     *
+     * @param consumer Consumer identity that owns the offset.
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @param checkpoint Position after a delivered message of the partition,
+     *        from a batch that PollMessages() or PartitionReader::Next()
+     *        returned.
+     * @throws IggyException if no offset is stored (ConsumerOffsetNotFound,
+     *         3021), if the partition was deleted or recreated after the
+     *         context of @p checkpoint was captured (HistoryUnavailable, 87),
+     *         or if this client no longer owns the partition in the consumer
+     *         group (ConsumerGroupPartitionNotOwned, 5009).
+     */
+    void DeleteConsumerPosition(const Consumer &consumer,
+                                const Identifier &stream,
+                                const Identifier &topic,
+                                const Checkpoint &checkpoint);
+
+    /**
+     * @brief Reads one partition once.
+     *
+     * A strategy takes the partition context that the cached route reports.
+     * After another client deleted and recreated the partition, one call can
+     * fail with HistoryUnavailable (87), or ConsumerGroupPartitionNotOwned
+     * (5009) for a consumer group. The failed route is dropped and the next
+     * call routes again.
+     *
+     * With CommitPolicy::OnRead, a lost reply fails with
+     * FetchProgressUncertain (14010) and blocks the partition on this client:
+     * later polls of it fail with PartitionLaneBlocked (14009) until
+     * AbandonOperation() of the operation that the error names.
+     *
+     * @param consumer Consumer identity of the read.
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @param partition_id Partition to read.
+     * @param strategy Where the read starts.
+     * @param options Limits of the read and when its offset is stored.
+     * @return The batch, empty when the partition has no message there.
+     * @throws IggyException for CommitPolicy::Auto (invalid_configuration),
+     *         invalid options, or a failed read.
+     */
+    PolledMessages PollMessages(const Consumer &consumer,
+                                const Identifier &stream,
+                                const Identifier &topic,
+                                std::uint32_t partition_id,
+                                const PollingStrategy &strategy,
+                                const PollOptions &options = PollOptions());
+
+    /**
+     * @brief Reads on from the continuation of a batch of the same partition.
+     * @throws IggyException as the strategy overload does, and with
+     *         InvalidCommand (3) for a continuation of another partition.
+     */
+    PolledMessages PollMessages(const Consumer &consumer,
+                                const Identifier &stream,
+                                const Identifier &topic,
+                                std::uint32_t partition_id,
+                                const Continuation &continuation,
+                                const PollOptions &options = PollOptions());
+
+    /**
+     * @brief Builds a reader of the partitions of a topic.
+     *
+     * A consumer group reads the assignment of its member: the reader joins
+     * the group here, joins again after a session loss, and leaves it in
+     * PartitionReader::Close().
+     *
+     * @param consumer Consumer identity of the reader.
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @param options Settings of the reader. A standalone consumer needs its partitions.
+     * @throws IggyException for invalid options or a failed join.
+     */
+    PartitionReader Reader(const Consumer &consumer,
+                           const Identifier &stream,
+                           const Identifier &topic,
+                           const ReaderOptions &options = ReaderOptions());
+
+    /**
+     * @brief Starts a poll in the background, as PollMessages() does, so the
+     *        caller can wait for its batch in steps or cancel it.
+     * @throws IggyException for invalid arguments. A failed poll throws from PendingPoll::Wait().
+     */
+    PendingPoll StartPollMessages(const Consumer &consumer,
+                                  const Identifier &stream,
+                                  const Identifier &topic,
+                                  std::uint32_t partition_id,
+                                  const PollingStrategy &strategy,
+                                  const PollOptions &options = PollOptions());
+
+    /**
+     * @brief Builds and initializes a standalone consumer named `name` that
+     *        reads the partitions of @p options.
+     * @throws IggyException for invalid options or a failed initialization.
+     */
+    IggyConsumer StandaloneConsumer(const std::string &name,
+                                    const Identifier &stream,
+                                    const Identifier &topic,
+                                    const ConsumerOptions &options);
+
+    /**
+     * @brief Builds and initializes a member of the consumer group `name`.
+     *
+     * It creates the group if it does not exist, joins it here, reads the
+     * assignment of its member, and leaves the group in IggyConsumer::Close().
+     *
+     * @throws IggyException for invalid options or a failed join.
+     */
+    IggyConsumer GroupConsumer(const std::string &name,
+                               const Identifier &stream,
+                               const Identifier &topic,
+                               const ConsumerOptions &options = ConsumerOptions());
 
     /**
      * @brief Retrieves the stored offset for a consumer or consumer group.
@@ -6618,7 +7382,7 @@ class IggyBlockingClient final {
      * An operation_uncertain result keeps the original frame and lane for a later
      * resolve. operation_not_retained does not prove that the original command
      * failed or make resending it safe. Disconnect() and session reset drop
-     * retained operations without settling them or allowing later recovery.
+     * retained mutations without settling them or allowing later recovery.
      * The client keeps the proved outcomes of its last max_operations replays,
      * also across a session reset. A later resolve of a proved operation returns
      * the same outcome without a request.
@@ -6636,10 +7400,12 @@ class IggyBlockingClient final {
     /**
      * @brief Releases a retained operation and its local lane.
      *
-     * Abandonment does not undo or determine the server result. HTTP reports
-     * feature_unavailable because it does not retain operations.
+     * Abandonment does not undo or determine the server result. HTTP retains
+     * only the poll operations of fetch_progress_uncertain, so it reports
+     * operation_not_retained for every other operation.
      *
-     * @param operation_id ID carried by operation_uncertain or lane_blocked.
+     * @param operation_id ID carried by operation_uncertain, lane_blocked,
+     *        fetch_progress_uncertain, or partition_lane_blocked.
      * @throws IggyException if the operation is not retained, recovery is
      *         unsupported, or the client handle is unavailable.
      */

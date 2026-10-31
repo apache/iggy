@@ -57,6 +57,13 @@ fn restart_off() -> bool {
     false
 }
 
+#[iggy_harness(cluster_nodes = 1, test_client_transport = [Tcp, WebSocket, Quic])]
+async fn given_empty_active_segment_after_retention_when_fetching_should_advance_then_park(
+    harness: &TestHarness,
+) {
+    delete_segments_scenario::run_fetch_after_retention(harness).await;
+}
+
 fn restart_on() -> bool {
     true
 }

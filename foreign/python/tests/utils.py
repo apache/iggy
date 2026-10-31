@@ -20,9 +20,12 @@ Utility functions for tests.
 """
 
 import asyncio
+import contextlib
+import itertools
 import os
 import socket
 import time
+from collections.abc import Awaitable, Callable
 
 from apache_iggy import (
     IggyClient,
@@ -48,6 +51,11 @@ METADATA_CHANGES_PAGE_LIMIT = 1000
 # A two phase delete commits its record after the call returns.
 METADATA_FOLLOW_ATTEMPTS = 100
 METADATA_FOLLOW_INTERVAL_SECONDS = 0.1
+
+# Deadlines around a local round trip, so a cancel lands before, at or after a reply.
+CANCEL_DEADLINES_SECONDS = (0.0001, 0.0005, 0.001, 0.002)
+# Bounds a whole read loop, so a lost last message fails the test instead of hanging it.
+CANCELLED_READS_TIMEOUT_SECONDS = 10
 
 
 def get_transport_config(port_env_var: str, default_port: int) -> tuple[str, int]:
@@ -229,6 +237,28 @@ async def wait_for_consumer_group_assignment(
                 f"{timeout}s. Last (member id, partitions): {owners}"
             )
         await asyncio.sleep(interval)
+
+
+async def read_offsets_with_cancels(
+    read_offsets: Callable[[], Awaitable[list[int]]], last_offset: int
+) -> list[int]:
+    """
+    Read offsets up to `last_offset` with reads that time out at short deadlines.
+
+    Args:
+        read_offsets: Reads the offsets of the next batch or message
+        last_offset: The offset that ends the reading
+
+    Returns:
+        The offsets in the order read
+    """
+    offsets: list[int] = []
+    deadlines = itertools.cycle(CANCEL_DEADLINES_SECONDS)
+    async with asyncio.timeout(CANCELLED_READS_TIMEOUT_SECONDS):
+        while not offsets or offsets[-1] < last_offset:
+            with contextlib.suppress(TimeoutError):
+                offsets.extend(await asyncio.wait_for(read_offsets(), next(deadlines)))
+    return offsets
 
 
 def unique_credentials(unique_name) -> tuple[str, str]:

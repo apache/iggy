@@ -17,18 +17,23 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    num::NonZeroU32,
     str::FromStr,
+    time::Duration,
 };
 
 use bytes::Bytes;
 use iggy::prelude::{
-    CompressionAlgorithm as RustCompressionAlgorithm,
+    AutoCommit as RustAutoCommit, CommitAfter as RustCommitAfter, CommitEvery as RustCommitEvery,
+    CommitPolicy as RustCommitPolicy, CompressionAlgorithm as RustCompressionAlgorithm,
     ConsumerGroupDetails as RustConsumerGroupDetails, Durability as RustDurability, IdKind,
-    Identifier as RustIdentifier, IggyByteSize as RustIggyByteSize, IggyExpiry as RustIggyExpiry,
-    IggyMessage as RustIggyMessage, MaxTopicSize as RustMaxTopicSize, OptionKey,
+    Identifier as RustIdentifier, IggyByteSize as RustIggyByteSize,
+    IggyDuration as RustIggyDuration, IggyExpiry as RustIggyExpiry, IggyMessage as RustIggyMessage,
+    MaxTopicSize as RustMaxTopicSize, NonZeroIggyDuration as RustNonZeroIggyDuration, OptionKey,
     OptionSpec as RustOptionSpec, Partition as RustPartition,
     PartitionContext as RustPartitionContext, PartitionResizePolicy as RustPartitionResizePolicy,
-    PolledMessages as RustPolledMessages,
+    PollOptions as RustPollOptions, PolledMessages as RustPolledMessages,
+    PollingStrategy as RustPollingStrategy,
     SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
     SendMessagesResponse as RustSendMessagesResponse, Stream as RustStream,
     StreamDetails as RustStreamDetails, StreamEncryptionKey,
@@ -66,7 +71,7 @@ use iggy_common::{
     UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
 };
 
-use crate::ffi;
+use crate::{ffi, messages::BatchPositions};
 
 impl From<RustIdentifier> for ffi::Identifier {
     fn from(identifier: RustIdentifier) -> Self {
@@ -489,16 +494,6 @@ impl TryFrom<ffi::Permissions> for RustPermissions {
 impl From<RustPartitionContext> for ffi::PartitionContext {
     fn from(context: RustPartitionContext) -> Self {
         ffi::PartitionContext {
-            incarnation: context.incarnation,
-            owner_generation: context.owner_generation,
-            metadata_op: context.metadata_op,
-        }
-    }
-}
-
-impl From<ffi::PartitionContext> for RustPartitionContext {
-    fn from(context: ffi::PartitionContext) -> Self {
-        RustPartitionContext {
             incarnation: context.incarnation,
             owner_generation: context.owner_generation,
             metadata_op: context.metadata_op,
@@ -1163,6 +1158,7 @@ impl TryFrom<ffi::IggyMessageToSend> for RustIggyMessage {
 
 impl From<RustPolledMessages> for ffi::PolledMessages {
     fn from(messages: RustPolledMessages) -> Self {
+        let positions = Box::new(BatchPositions::from(&messages));
         ffi::PolledMessages {
             partition_id: messages.partition_id,
             current_offset: messages.current_offset,
@@ -1172,7 +1168,114 @@ impl From<RustPolledMessages> for ffi::PolledMessages {
                 .into_iter()
                 .map(ffi::IggyMessagePolled::from)
                 .collect(),
-            context: messages.context.into(),
+            positions,
+        }
+    }
+}
+
+impl From<RustPollOptions> for ffi::PollOptions {
+    fn from(options: RustPollOptions) -> Self {
+        let (commit, auto) = match options.commit {
+            RustCommitPolicy::Manual => (ffi::CommitPolicy::Manual, RustAutoCommit::default()),
+            RustCommitPolicy::OnRead => (ffi::CommitPolicy::OnRead, RustAutoCommit::default()),
+            RustCommitPolicy::Auto(auto) => (ffi::CommitPolicy::Auto, auto),
+        };
+        let (auto_every, auto_every_messages) = match auto.every {
+            Some(RustCommitEvery::Message) | None => (ffi::CommitEvery::Message, 0),
+            Some(RustCommitEvery::Messages(count)) => (ffi::CommitEvery::Messages, count.get()),
+            Some(RustCommitEvery::Batch) => (ffi::CommitEvery::Batch, 0),
+        };
+        ffi::PollOptions {
+            count: options.count,
+            max_wait_micros: options.max_wait.as_micros(),
+            min_count: options.min_count,
+            max_bytes: options.max_bytes,
+            commit,
+            has_auto_interval: auto.interval.is_some(),
+            auto_interval_micros: auto
+                .interval
+                .map_or(0, |interval| interval.get().as_micros()),
+            has_auto_every: auto.every.is_some(),
+            auto_every,
+            auto_every_messages,
+            auto_after: match auto.after {
+                RustCommitAfter::Processing => ffi::CommitAfter::Processing,
+                RustCommitAfter::Delivery => ffi::CommitAfter::Delivery,
+                RustCommitAfter::Marked => ffi::CommitAfter::Marked,
+            },
+        }
+    }
+}
+
+impl TryFrom<ffi::PollOptions> for RustPollOptions {
+    type Error = String;
+
+    fn try_from(options: ffi::PollOptions) -> Result<Self, Self::Error> {
+        let commit = match options.commit {
+            ffi::CommitPolicy::Manual => RustCommitPolicy::Manual,
+            ffi::CommitPolicy::OnRead => RustCommitPolicy::OnRead,
+            ffi::CommitPolicy::Auto => RustCommitPolicy::Auto(RustAutoCommit::try_from(&options)?),
+            _ => return Err("invalid commit policy".to_owned()),
+        };
+        Ok(RustPollOptions {
+            count: options.count,
+            max_wait: RustIggyDuration::from(options.max_wait_micros),
+            min_count: options.min_count,
+            max_bytes: options.max_bytes,
+            commit,
+        })
+    }
+}
+
+impl TryFrom<&ffi::PollOptions> for RustAutoCommit {
+    type Error = String;
+
+    fn try_from(options: &ffi::PollOptions) -> Result<Self, Self::Error> {
+        let interval = options
+            .has_auto_interval
+            .then(|| {
+                RustNonZeroIggyDuration::new(Duration::from_micros(options.auto_interval_micros))
+                    .map_err(|_| "the auto commit interval must not be zero".to_owned())
+            })
+            .transpose()?;
+        let every = options
+            .has_auto_every
+            .then(|| match options.auto_every {
+                ffi::CommitEvery::Message => Ok(RustCommitEvery::Message),
+                ffi::CommitEvery::Messages => NonZeroU32::new(options.auto_every_messages)
+                    .map(RustCommitEvery::Messages)
+                    .ok_or_else(|| "the auto commit message count must not be zero".to_owned()),
+                ffi::CommitEvery::Batch => Ok(RustCommitEvery::Batch),
+                _ => Err("invalid auto commit event".to_owned()),
+            })
+            .transpose()?;
+        let after = match options.auto_after {
+            ffi::CommitAfter::Processing => RustCommitAfter::Processing,
+            ffi::CommitAfter::Delivery => RustCommitAfter::Delivery,
+            ffi::CommitAfter::Marked => RustCommitAfter::Marked,
+            _ => return Err("invalid auto commit point".to_owned()),
+        };
+        Ok(RustAutoCommit {
+            interval,
+            every,
+            after,
+        })
+    }
+}
+
+impl TryFrom<ffi::PollingStrategy> for RustPollingStrategy {
+    type Error = String;
+
+    fn try_from(strategy: ffi::PollingStrategy) -> Result<Self, Self::Error> {
+        match strategy.kind.as_str() {
+            "offset" => Ok(RustPollingStrategy::offset(strategy.value)),
+            "timestamp" => Ok(RustPollingStrategy::timestamp(IggyTimestamp::from(
+                strategy.value,
+            ))),
+            "first" => Ok(RustPollingStrategy::first()),
+            "last" => Ok(RustPollingStrategy::last()),
+            "next" => Ok(RustPollingStrategy::next()),
+            kind => Err(format!("invalid polling strategy: {kind}")),
         }
     }
 }
@@ -1778,7 +1881,11 @@ impl From<MetadataSessionClosed> for ffi::MetadataChangeBody {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy::prelude::{HeaderKey, HeaderValue, IggyTimestamp, OptionValue, ResourceOptions};
+    use iggy::prelude::{
+        Checkpoint as RustCheckpoint, HeaderKey, HeaderValue, IggyTimestamp, OptionValue,
+        ResourceOptions,
+    };
+    use iggy_common::ReaderStamp as RustReaderStamp;
 
     // Distinct values so a swapped field fails the comparison.
     const CONTEXT: RustPartitionContext = RustPartitionContext {
@@ -1786,6 +1893,20 @@ mod tests {
         owner_generation: 5,
         metadata_op: 7,
     };
+    const PARTITION: u32 = 2;
+    const STAMP: RustReaderStamp = RustReaderStamp {
+        reader: 11,
+        generation: 13,
+    };
+
+    fn message_at(offset: u64) -> RustIggyMessage {
+        let mut message = RustIggyMessage::builder()
+            .payload(Bytes::from_static(b"payload"))
+            .build()
+            .expect("message builds");
+        message.header.offset = offset;
+        message
+    }
 
     fn fields(context: &ffi::PartitionContext) -> (u64, u64, u64) {
         (
@@ -1997,7 +2118,6 @@ mod tests {
         let bridged = ffi::PartitionContext::from(CONTEXT);
 
         assert_eq!(fields(&bridged), (3, 5, 7));
-        assert_eq!(RustPartitionContext::from(bridged), CONTEXT);
     }
 
     #[test]
@@ -2017,18 +2137,226 @@ mod tests {
 
     #[test]
     fn should_keep_the_partition_context_of_polled_messages() {
-        let polled = RustPolledMessages {
-            context: CONTEXT,
-            partition_id: 1,
-            current_offset: 2,
-            count: 0,
-            messages: Vec::new(),
+        let polled = RustPolledMessages::new(CONTEXT, PARTITION, 8, 1, vec![message_at(7)]);
+
+        let bridged = ffi::PolledMessages::from(polled);
+
+        assert_eq!(
+            bridged.checkpoint().map(|checkpoint| checkpoint.0),
+            Ok(RustCheckpoint::new(PARTITION, 7, CONTEXT)),
+            "A batch of poll_messages belongs to no reader"
+        );
+        assert_eq!(bridged.continuation().0.context(), Some(CONTEXT));
+    }
+
+    #[test]
+    fn given_reader_batch_when_bridged_should_keep_its_checkpoints_and_continuation() {
+        let mut polled =
+            RustPolledMessages::new(CONTEXT, PARTITION, 9, 2, vec![message_at(7), message_at(8)]);
+        polled.set_stamp(STAMP);
+        let last = polled.checkpoint();
+        let first = polled.checkpoint_at(0);
+        let continuation = polled.continuation();
+        assert_eq!(last.and_then(|checkpoint| checkpoint.stamp()), Some(STAMP));
+
+        let bridged = ffi::PolledMessages::from(polled);
+
+        assert_eq!(
+            bridged.checkpoint().map(|checkpoint| checkpoint.0).ok(),
+            last
+        );
+        assert_eq!(
+            bridged.checkpoint_at(0).map(|checkpoint| checkpoint.0).ok(),
+            first
+        );
+        assert!(bridged.checkpoint_at(2).is_err());
+        assert_eq!(bridged.continuation().0, continuation);
+    }
+
+    #[test]
+    fn given_bridged_batch_edited_by_the_caller_when_taking_checkpoints_should_keep_delivered_positions()
+     {
+        let mut polled =
+            RustPolledMessages::new(CONTEXT, PARTITION, 9, 2, vec![message_at(7), message_at(8)]);
+        polled.set_stamp(STAMP);
+        let last = polled.checkpoint();
+        let first = polled.checkpoint_at(0);
+        let mut bridged = ffi::PolledMessages::from(polled);
+
+        bridged.partition_id = PARTITION + 1;
+        bridged.messages.reverse();
+        bridged.messages[0].offset = 100;
+        bridged.messages.pop();
+
+        assert_eq!(
+            bridged.checkpoint().map(|checkpoint| checkpoint.0).ok(),
+            last
+        );
+        assert_eq!(
+            bridged.checkpoint_at(0).map(|checkpoint| checkpoint.0).ok(),
+            first
+        );
+        assert_eq!(
+            bridged.checkpoint_at(1).map(|checkpoint| checkpoint.0).ok(),
+            last
+        );
+        assert!(bridged.checkpoint_at(2).is_err());
+    }
+
+    #[test]
+    fn given_empty_batch_when_bridged_should_continue_from_the_start_of_its_request() {
+        for start in [
+            RustPollingStrategy::offset(4),
+            RustPollingStrategy::timestamp(IggyTimestamp::from(5)),
+            RustPollingStrategy::first(),
+            RustPollingStrategy::last(),
+            RustPollingStrategy::next(),
+        ] {
+            let mut polled = RustPolledMessages::new(CONTEXT, PARTITION, 0, 0, Vec::new());
+            polled.set_request_start(&start);
+            let continuation = polled.continuation();
+
+            let bridged = ffi::PolledMessages::from(polled);
+
+            assert!(bridged.checkpoint().is_err(), "{start}");
+            assert_eq!(bridged.continuation().0, continuation, "{start}");
+        }
+    }
+
+    #[test]
+    fn should_convert_each_kind_to_a_strategy_without_partition_or_context() {
+        for (kind, expected) in [
+            ("offset", RustPollingStrategy::offset(9)),
+            (
+                "timestamp",
+                RustPollingStrategy::timestamp(IggyTimestamp::from(9)),
+            ),
+            ("first", RustPollingStrategy::first()),
+            ("last", RustPollingStrategy::last()),
+            ("next", RustPollingStrategy::next()),
+        ] {
+            let strategy = RustPollingStrategy::try_from(ffi::PollingStrategy {
+                kind: kind.to_owned(),
+                value: 9,
+            });
+
+            assert_eq!(strategy, Ok(expected), "{kind}");
+        }
+    }
+
+    #[test]
+    fn should_reject_an_unknown_polling_strategy() {
+        let strategy = ffi::PollingStrategy {
+            kind: "latest".to_owned(),
+            value: 0,
         };
 
         assert_eq!(
-            fields(&ffi::PolledMessages::from(polled).context),
-            (3, 5, 7)
+            RustPollingStrategy::try_from(strategy).err().as_deref(),
+            Some("invalid polling strategy: latest")
         );
+    }
+
+    #[test]
+    fn given_each_commit_policy_when_bridged_should_keep_every_poll_option() {
+        let auto = RustAutoCommit {
+            interval: RustNonZeroIggyDuration::new(Duration::from_micros(9)).ok(),
+            every: NonZeroU32::new(11).map(RustCommitEvery::Messages),
+            after: RustCommitAfter::Marked,
+        };
+        for commit in [
+            RustCommitPolicy::Manual,
+            RustCommitPolicy::OnRead,
+            RustCommitPolicy::Auto(auto),
+            RustCommitPolicy::Auto(RustAutoCommit {
+                interval: None,
+                every: Some(RustCommitEvery::Batch),
+                after: RustCommitAfter::Delivery,
+            }),
+            RustCommitPolicy::Auto(RustAutoCommit {
+                every: None,
+                ..RustAutoCommit::default()
+            }),
+        ] {
+            let options = RustPollOptions {
+                count: 3,
+                max_wait: RustIggyDuration::from(5),
+                min_count: 2,
+                max_bytes: 7,
+                commit,
+            };
+
+            assert_eq!(
+                RustPollOptions::try_from(ffi::PollOptions::from(options)),
+                Ok(options),
+                "{commit:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_default_options_when_switched_to_auto_should_take_the_auto_commit_defaults() {
+        let mut options = ffi::PollOptions::from(RustPollOptions::default());
+
+        options.commit = ffi::CommitPolicy::Auto;
+
+        assert_eq!(
+            RustPollOptions::try_from(options).map(|options| options.commit),
+            Ok(RustCommitPolicy::Auto(RustAutoCommit::default()))
+        );
+    }
+
+    #[test]
+    fn given_invalid_commit_settings_when_bridged_should_refuse_them() {
+        let auto = ffi::PollOptions {
+            commit: ffi::CommitPolicy::Auto,
+            ..ffi::PollOptions::from(RustPollOptions::default())
+        };
+        let cases = [
+            (
+                ffi::PollOptions {
+                    commit: ffi::CommitPolicy { repr: 3 },
+                    ..ffi::PollOptions::from(RustPollOptions::default())
+                },
+                "invalid commit policy",
+            ),
+            (
+                ffi::PollOptions {
+                    auto_interval_micros: 0,
+                    ..auto
+                },
+                "the auto commit interval must not be zero",
+            ),
+            (
+                ffi::PollOptions {
+                    auto_every: ffi::CommitEvery::Messages,
+                    auto_every_messages: 0,
+                    ..auto
+                },
+                "the auto commit message count must not be zero",
+            ),
+            (
+                ffi::PollOptions {
+                    auto_every: ffi::CommitEvery { repr: 3 },
+                    ..auto
+                },
+                "invalid auto commit event",
+            ),
+            (
+                ffi::PollOptions {
+                    auto_after: ffi::CommitAfter { repr: 3 },
+                    ..auto
+                },
+                "invalid auto commit point",
+            ),
+        ];
+
+        for (options, expected) in cases {
+            assert_eq!(
+                RustPollOptions::try_from(options).err().as_deref(),
+                Some(expected)
+            );
+        }
     }
 
     #[test]

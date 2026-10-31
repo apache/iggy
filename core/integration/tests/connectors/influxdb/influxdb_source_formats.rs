@@ -34,7 +34,8 @@ use crate::connectors::fixtures::{
 use base64::{Engine as _, engine::general_purpose};
 use iggy_common::MessageClient;
 use iggy_common::Utc;
-use iggy_common::{Consumer, Identifier, PollingStrategy};
+use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
+use iggy_common::{CommitPolicy, Consumer, Identifier, PollOptions, PollingStrategy};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use serde_json::Value;
@@ -79,11 +80,14 @@ async fn influxdb_source_text_payload_column(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                None,
+                DEFAULT_PARTITION_ID,
                 &consumer,
                 &PollingStrategy::next(),
-                100,
-                true,
+                PollOptions {
+                    count: 100,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
             .expect("poll failed");
@@ -134,11 +138,14 @@ async fn influxdb_source_text_whitespace_value(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                None,
+                DEFAULT_PARTITION_ID,
                 &consumer,
                 &PollingStrategy::next(),
-                10,
-                true,
+                PollOptions {
+                    count: 10,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
             .expect("poll failed");
@@ -198,11 +205,14 @@ async fn influxdb_source_raw_payload_column(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                None,
+                DEFAULT_PARTITION_ID,
                 &consumer,
                 &PollingStrategy::next(),
-                10,
-                true,
+                PollOptions {
+                    count: 10,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
             .expect("poll failed");
@@ -258,11 +268,14 @@ async fn influxdb_source_raw_multiple_rows(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                None,
+                DEFAULT_PARTITION_ID,
                 &consumer,
                 &PollingStrategy::next(),
-                100,
-                true,
+                PollOptions {
+                    count: 100,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
             .expect("poll failed");
@@ -312,11 +325,14 @@ async fn influxdb_source_scalar_type_integer(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                None,
+                DEFAULT_PARTITION_ID,
                 &consumer,
                 &PollingStrategy::next(),
-                10,
-                true,
+                PollOptions {
+                    count: 10,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
             .expect("poll failed");
@@ -368,11 +384,14 @@ async fn influxdb_source_scalar_type_float(harness: &TestHarness, fixture: Influ
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                None,
+                DEFAULT_PARTITION_ID,
                 &consumer,
                 &PollingStrategy::next(),
-                10,
-                true,
+                PollOptions {
+                    count: 10,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
             .expect("poll failed");
@@ -419,11 +438,14 @@ async fn influxdb_source_scalar_type_bool(harness: &TestHarness, fixture: Influx
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                None,
+                DEFAULT_PARTITION_ID,
                 &consumer,
                 &PollingStrategy::next(),
-                10,
-                true,
+                PollOptions {
+                    count: 10,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
             .expect("poll failed");
@@ -532,11 +554,14 @@ async fn influxdb_source_cursor_advances_between_batches(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                None,
+                DEFAULT_PARTITION_ID,
                 &consumer,
                 &PollingStrategy::next(),
-                100,
-                true,
+                PollOptions {
+                    count: 100,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
             .expect("poll failed");
@@ -586,11 +611,14 @@ async fn influxdb_source_no_metadata_core_fields_present(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                None,
+                DEFAULT_PARTITION_ID,
                 &consumer,
                 &PollingStrategy::next(),
-                10,
-                true,
+                PollOptions {
+                    count: 10,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
             .expect("poll failed");

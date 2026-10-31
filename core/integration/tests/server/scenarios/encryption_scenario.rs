@@ -167,11 +167,13 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .poll_messages(
             &Identifier::named(stream_name).unwrap(),
             &Identifier::named(topic_name).unwrap(),
-            Some(0),
+            0,
             &consumer,
             &PollingStrategy::offset(0),
-            messages_per_batch.try_into().unwrap(),
-            false,
+            PollOptions {
+                count: messages_per_batch.try_into().unwrap(),
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -271,11 +273,13 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .poll_messages(
             &Identifier::named(stream_name).unwrap(),
             &Identifier::named(topic_name).unwrap(),
-            Some(0),
+            0,
             &consumer,
             &PollingStrategy::offset(0),
-            messages_per_batch as u32 * 2,
-            false,
+            PollOptions {
+                count: messages_per_batch as u32 * 2,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -425,11 +429,13 @@ async fn should_encrypt_and_decrypt_headers_with_client_side_encryption(
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            10,
-            false,
+            PollOptions {
+                count: 10,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -465,11 +471,13 @@ async fn should_encrypt_and_decrypt_headers_with_client_side_encryption(
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            10,
-            false,
+            PollOptions {
+                count: 10,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -1064,11 +1072,13 @@ async fn poll_single_partition(
         .poll_messages(
             stream_id,
             topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(offset),
-            count,
-            false,
+            PollOptions {
+                count,
+                ..PollOptions::default()
+            },
         )
         .await
 }

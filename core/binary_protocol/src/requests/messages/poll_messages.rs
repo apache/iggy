@@ -60,8 +60,18 @@ pub const MAX_DEFERRED_POLL_TIMEOUT_US: u64 =
 /// Least time a waiting request leaves between the end of its wait and its request timeout.
 ///
 /// The server spends it on the final read and the reply, so an idle wait answers before the
-/// client gives up. A zero wait answers at once and needs no margin.
+/// client gives up. A zero wait of a 106 answers at once and needs no margin. A 109
+/// needs it at any wait.
 pub const MIN_DEFERRED_POLL_REPLY_MARGIN_US: u64 = 1_000_000;
+/// Reply margin of a `FetchMessages` request.
+///
+/// The server gives each partition read of a 109 the deadline `timeout - 2 x margin` and
+/// replies by `timeout - margin`, so a read that committed always has one margin to reach the
+/// reply.
+pub const FETCH_REPLY_MARGIN_US: u64 = 200_000;
+// A 109 timeout leaves the reply margin after the wait, so every read deadline falls after
+// the wait.
+const _: () = assert!(2 * FETCH_REPLY_MARGIN_US < MIN_DEFERRED_POLL_REPLY_MARGIN_US);
 /// Smallest byte limit that can return a message: the reply header, one batch
 /// header and one message header.
 pub const MIN_DEFERRED_POLL_MAX_BYTES: usize = POLL_RESPONSE_HEADER_SIZE

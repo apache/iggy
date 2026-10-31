@@ -22,16 +22,22 @@ use comfy_table::{Cell, CellAlignment, Row, Table};
 use iggy_binary_protocol::WireUserHeaders;
 use iggy_common::Client;
 use iggy_common::{
-    Consumer, HeaderKey, HeaderKind, Identifier, IggyByteSize, IggyDuration, IggyMessage,
-    IggyTimestamp, PollMessages, PollingStrategy, Sizeable,
+    CommitPolicy, Consumer, HeaderKey, HeaderKind, Identifier, IggyByteSize, IggyDuration,
+    IggyMessage, IggyTimestamp, PollOptions, PollingStrategy, Sizeable,
     wire_conversions::user_headers_from_wire,
 };
 use std::collections::HashSet;
-use tokio::io::AsyncWriteExt;
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tracing::{Level, event};
 
 pub struct PollMessagesCmd {
-    poll_messages: PollMessages,
+    stream_id: Identifier,
+    topic_id: Identifier,
+    partition_id: u32,
+    consumer: Consumer,
+    strategy: PollingStrategy,
+    options: PollOptions,
     show_headers: bool,
     output_file: Option<String>,
 }
@@ -59,19 +65,70 @@ impl PollMessagesCmd {
             (None, false, false, true) => PollingStrategy::next(),
             _ => unreachable!("Either offset or first, last or next must be specified"),
         };
+        let commit = if auto_commit {
+            CommitPolicy::OnRead
+        } else {
+            CommitPolicy::Manual
+        };
         Self {
-            poll_messages: PollMessages {
-                consumer: Consumer::new(consumer),
-                stream_id,
-                topic_id,
-                partition_id: Some(partition_id),
-                strategy,
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer: Consumer::new(consumer),
+            strategy,
+            options: PollOptions {
                 count: message_count,
-                auto_commit,
+                commit,
+                ..PollOptions::default()
             },
             show_headers,
             output_file,
         }
+    }
+
+    async fn print_batch(
+        &self,
+        messages: &[IggyMessage],
+        elapsed: IggyDuration,
+        output: Option<&mut OutputFile<'_>>,
+    ) -> anyhow::Result<(), anyhow::Error> {
+        let polled_size = IggyByteSize::from(
+            messages
+                .iter()
+                .map(|m| m.get_size_bytes().as_bytes_u64())
+                .sum::<u64>(),
+        );
+
+        let message_count_message = match messages.len() {
+            1 => "1 message".into(),
+            count => format!("{count} messages"),
+        };
+        event!(target: PRINT_TARGET, Level::INFO, "Polled {message_count_message} of total size {polled_size}, it took {}", elapsed.as_human_time_string());
+
+        if let Some(output) = output {
+            let output_file = output.path;
+            event!(target: PRINT_TARGET, Level::INFO, "Storing messages to {output_file} binary file");
+
+            let saved_size = output
+                .store(messages)
+                .await
+                .with_context(|| format!("Problem writing message to file: {output_file}"))?;
+
+            let saved_size_str = saved_size.as_human_string();
+            event!(target: PRINT_TARGET, Level::INFO, "Stored {message_count_message} of total size {saved_size_str} to {output_file} binary file");
+        } else {
+            let message_header_keys = self.create_message_header_keys(messages);
+
+            let mut table = Table::new();
+            let table_header = Self::create_table_header(&message_header_keys);
+            let table_content = Self::create_table_content(messages, &message_header_keys);
+            table.set_header(table_header);
+            table.add_rows(table_content);
+
+            event!(target: PRINT_TARGET, Level::INFO, "{table}");
+        }
+
+        Ok(())
     }
 
     fn create_message_header_keys(
@@ -169,86 +226,149 @@ impl CliCommand for PollMessagesCmd {
     fn explain(&self) -> String {
         format!(
             "poll messages from topic ID: {} and stream with ID: {}",
-            self.poll_messages.topic_id, self.poll_messages.stream_id
+            self.topic_id, self.stream_id
         )
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
-        let start = std::time::Instant::now();
-        let polled_messages = client
-            .poll_messages(
-                &self.poll_messages.stream_id,
-                &self.poll_messages.topic_id,
-                self.poll_messages.partition_id,
-                &self.poll_messages.consumer,
-                &self.poll_messages.strategy,
-                self.poll_messages.count,
-                self.poll_messages.auto_commit,
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "Problem polling messages to topic with ID: {} and stream with ID: {}",
-                    self.poll_messages.topic_id, self.poll_messages.stream_id
-                )
-            })?;
-        let elapsed = IggyDuration::new(start.elapsed());
-
-        event!(target: PRINT_TARGET, Level::INFO,
-            "Polled messages from topic with ID: {} and stream with ID: {} (from partition with ID: {})",
-            self.poll_messages.topic_id,
-            self.poll_messages.stream_id,
-            polled_messages.partition_id,
-        );
-
-        let polled_size = IggyByteSize::from(
-            polled_messages
-                .messages
-                .iter()
-                .map(|m| m.get_size_bytes().as_bytes_u64())
-                .sum::<u64>(),
-        );
-
-        let message_count_message = match polled_messages.messages.len() {
-            1 => "1 message".into(),
-            count => format!("{count} messages"),
+        // Before the first poll, so a file that does not open fails the command before
+        // `--auto-commit` stores an offset.
+        let mut output = match self.output_file.as_deref() {
+            Some(path) => Some(OutputFile::open(path).await?),
+            None => None,
         };
-        event!(target: PRINT_TARGET, Level::INFO, "Polled {message_count_message} of total size {polled_size}, it took {}", elapsed.as_human_time_string());
-
-        if let Some(output_file) = &self.output_file {
-            event!(target: PRINT_TARGET, Level::INFO, "Storing messages to {output_file} binary file");
-
-            let mut saved_size = IggyByteSize::default();
-            let mut file = tokio::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(output_file)
+        let mut strategy = self.strategy;
+        let mut polled_count = 0;
+        // One reply holds at most `max_bytes`, so the command reads on until it has
+        // `--message-count` messages or gets an empty batch.
+        while polled_count < self.options.count {
+            let start = std::time::Instant::now();
+            let polled_messages = client
+                .poll_messages(
+                    &self.stream_id,
+                    &self.topic_id,
+                    self.partition_id,
+                    &self.consumer,
+                    &strategy,
+                    PollOptions {
+                        count: self.options.count - polled_count,
+                        ..self.options
+                    },
+                )
                 .await
-                .with_context(|| format!("Problem opening file for writing: {output_file}"))?;
+                .with_context(|| {
+                    format!(
+                        "Problem polling messages to topic with ID: {} and stream with ID: {}",
+                        self.topic_id, self.stream_id
+                    )
+                })?;
+            let elapsed = IggyDuration::new(start.elapsed());
 
-            for message in polled_messages.messages.iter() {
-                let message = message.to_bytes();
-                saved_size += IggyByteSize::from(message.len() as u64);
-                file.write_all(&message)
-                    .await
-                    .with_context(|| format!("Problem writing message to file: {output_file}"))?;
+            // An empty first batch is still printed, so the operator sees that nothing matched.
+            if polled_count == 0 {
+                event!(target: PRINT_TARGET, Level::INFO,
+                    "Polled messages from topic with ID: {} and stream with ID: {} (from partition with ID: {})",
+                    self.topic_id,
+                    self.stream_id,
+                    polled_messages.partition_id,
+                );
+            } else if polled_messages.messages.is_empty() {
+                break;
             }
-
-            let saved_size_str = saved_size.as_human_string();
-            event!(target: PRINT_TARGET, Level::INFO, "Stored {message_count_message} of total size {saved_size_str} to {output_file} binary file");
-        } else {
-            let message_header_keys = self.create_message_header_keys(&polled_messages.messages);
-
-            let mut table = Table::new();
-            let table_header = Self::create_table_header(&message_header_keys);
-            let table_content =
-                Self::create_table_content(&polled_messages.messages, &message_header_keys);
-            table.set_header(table_header);
-            table.add_rows(table_content);
-
-            event!(target: PRINT_TARGET, Level::INFO, "{table}");
+            self.print_batch(&polled_messages.messages, elapsed, output.as_mut())
+                .await?;
+            if polled_messages.messages.is_empty() {
+                break;
+            }
+            polled_count += polled_messages.messages.len() as u32;
+            strategy = polled_messages.continuation();
         }
 
         Ok(())
+    }
+}
+
+/// The `--output-file`, open for the whole command.
+struct OutputFile<'a> {
+    path: &'a str,
+    writer: BufWriter<File>,
+}
+
+impl<'a> OutputFile<'a> {
+    async fn open(path: &'a str) -> anyhow::Result<Self> {
+        let file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .await
+            .with_context(|| format!("Problem opening file for writing: {path}"))?;
+        Ok(Self {
+            path,
+            writer: BufWriter::new(file),
+        })
+    }
+
+    /// Appends `messages` and flushes them. A file reports a failed write only at a later write
+    /// or a flush, so the flush fails the command before it polls again.
+    async fn store(&mut self, messages: &[IggyMessage]) -> std::io::Result<IggyByteSize> {
+        let mut saved_size = IggyByteSize::default();
+        for message in messages {
+            let message = message.to_bytes();
+            saved_size += IggyByteSize::from(message.len() as u64);
+            self.writer.write_all(&message).await?;
+        }
+        self.writer.flush().await?;
+        Ok(saved_size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn batch(payloads: &[&'static str]) -> Vec<IggyMessage> {
+        payloads
+            .iter()
+            .map(|payload| IggyMessage::from(*payload))
+            .collect()
+    }
+
+    fn stored_bytes(batches: &[&[IggyMessage]]) -> Vec<u8> {
+        batches
+            .iter()
+            .flat_map(|batch| batch.iter())
+            .flat_map(|message| message.to_bytes())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn given_batches_when_stored_should_be_in_the_file_in_order_before_it_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.bin");
+        let path = path.to_str().unwrap();
+        let (first, second) = (batch(&["one", "two"]), batch(&["three"]));
+        let mut output = OutputFile::open(path).await.unwrap();
+
+        output.store(&first).await.unwrap();
+        output.store(&second).await.unwrap();
+
+        assert_eq!(
+            tokio::fs::read(path).await.unwrap(),
+            stored_bytes(&[&first, &second]),
+            "each batch is in the file once it is stored"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn given_a_full_device_when_storing_a_batch_should_fail() {
+        let mut output = OutputFile::open("/dev/full").await.unwrap();
+
+        let error = output
+            .store(&batch(&["lost"]))
+            .await
+            .expect_err("a write that the device refused must fail the command");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
     }
 }

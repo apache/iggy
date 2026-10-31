@@ -54,7 +54,7 @@ pub use coordinator_log::{
     CoordinatorLogCall, LoggedRecord,
 };
 use fetch::{FetchPool, LazyClient};
-pub(crate) use fetch::{FetchSlot, PartitionProbe, TopicProbe};
+pub(crate) use fetch::{FetchSlot, ONE_MESSAGE_MAX_BYTES, PartitionProbe, TopicProbe};
 use group_index::GroupIndex;
 pub use group_index::{OffsetGroupSource, OffsetGroups, ScannedGroups};
 use group_offsets::OffsetPool;

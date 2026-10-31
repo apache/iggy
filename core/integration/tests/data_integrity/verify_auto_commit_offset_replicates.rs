@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A poll with `auto_commit = true` must replicate the consumer offset through
+//! A poll with `CommitPolicy::OnRead` must replicate the consumer offset through
 //! the partition consensus, not merely persist it on the serving node -- else a
 //! failover to a backup silently loses the committed offset.
 //!
-//! Discriminator: drive the poll+auto_commit on the primary (node 0) and read
+//! Discriminator: drive the `OnRead` poll on the primary (node 0) and read
 //! the offset from a backup's (node 1) on-disk store. The backup holds it only
 //! if the commit rode consensus; the pre-fix node-local persist never reaches
 //! it, so the file stays absent until the deadline and the test fails.
@@ -58,7 +58,7 @@ async fn run(harness: &TestHarness) {
     let consumer = Consumer::new(Identifier::numeric(CONSUMER_ID).unwrap());
 
     // Primary (node 0, the view-0 primary): create the topic, produce, then poll
-    // with auto_commit so the offset is committed server-side.
+    // with `OnRead` so the offset is committed server-side.
     let primary = harness.tcp_root_client().await.unwrap();
     primary
         .create_stream(STREAM_NAME, &StreamCreateOptions::default())
@@ -99,11 +99,14 @@ async fn run(harness: &TestHarness) {
         .poll_messages(
             &stream,
             &topic,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::offset(0),
-            MESSAGE_COUNT,
-            true,
+            PollOptions {
+                count: MESSAGE_COUNT,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();

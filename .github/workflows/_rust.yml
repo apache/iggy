@@ -38,7 +38,7 @@ jobs:
         include: ${{ fromJSON(inputs.plan).checks }}
     runs-on: ${{
       (matrix.task == 'build-aarch64-gnu' || matrix.task == 'build-aarch64-musl') && 'ubuntu-26.04-arm' ||
-      (matrix.task == 'build-macos-aarch64' || matrix.task == 'clippy-macos-aarch64') && 'macos-14' ||
+      (matrix.task == 'build-macos-aarch64' || matrix.task == 'clippy-macos-aarch64') && 'macos-15' ||
       matrix.task == 'build-windows-sdk' && 'windows-latest' ||
       'ubuntu-26.04'
       }}
@@ -48,6 +48,8 @@ jobs:
 
       # Re-runs replay the original event labels. Read live labels so applying
       # breaking:storage followed by a re-run can skip an intentional format break.
+      # breaking:protocol skips it for a protocol bump that a baseline server
+      # refuses at login, with the storage format unchanged.
       - name: Resolve breaking:storage escape hatch
         id: storage_hatch
         if: matrix.task == 'test-storage-compat' && github.event.pull_request.number
@@ -65,11 +67,13 @@ jobs:
                   per_page: 100,
                 },
               );
-              skip = labels.some(l => l.name === 'breaking:storage');
+              skip = labels.some(
+                l => l.name === 'breaking:storage' || l.name === 'breaking:protocol' || l.name === 'breaking:client-to-replica-protocol',
+              );
             } catch (e) {
               core.warning(`listLabelsOnIssue failed (${e.status ?? e.code ?? 'network'}), running the check`);
             }
-            core.info(`breaking:storage escape hatch: skip=${skip}`);
+            core.info(`breaking:storage or breaking:protocol escape hatch: skip=${skip}`);
             core.setOutput('skip', String(skip));
 
       - name: Run Rust check
