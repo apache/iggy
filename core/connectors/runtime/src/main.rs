@@ -32,7 +32,7 @@ use dlopen2::wrapper::{Container, WrapperApi};
 use dotenvy::dotenv;
 use error::RuntimeError;
 use figlet_rs::FIGlet;
-use iggy::prelude::{Client, IggyConsumer, IggyProducer};
+use iggy::prelude::{Client, IggyClient, IggyConsumer, IggyProducer};
 use iggy_connector_sdk::{
     StreamDecoder, StreamEncoder,
     api::ConnectorStatus,
@@ -60,6 +60,7 @@ pub(crate) mod error;
 mod log;
 mod manager;
 pub(crate) mod metrics;
+mod plugin_instance;
 mod sink;
 mod source;
 mod state;
@@ -247,7 +248,7 @@ async fn run() -> Result<(), RuntimeError> {
     .await?;
 
     let sinks_config = connectors_config.sinks();
-    let (sinks, failed_sinks) = sink::init(sinks_config.clone(), &iggy_clients.consumer).await?;
+    let (sinks, failed_sinks) = sink::init(sinks_config.clone(), &iggy_clients).await?;
 
     let mut sink_wrappers = vec![];
     let mut sink_containers_by_key: HashMap<String, Arc<Container<SinkApi>>> = HashMap::new();
@@ -386,7 +387,6 @@ async fn run() -> Result<(), RuntimeError> {
     }
 
     iggy_clients.producer.shutdown().await?;
-    iggy_clients.consumer.shutdown().await?;
     info!("All connectors closed. Runtime shutdown complete.");
     Ok(())
 }
@@ -521,6 +521,7 @@ struct SinkConnectorPlugin {
     version: String,
     config_format: Option<ConfigFormat>,
     consumers: Vec<SinkConnectorConsumer>,
+    client: Option<Arc<IggyClient>>,
     error: Option<String>,
     verbose: bool,
     benchmark: bool,

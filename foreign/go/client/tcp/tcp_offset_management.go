@@ -68,7 +68,16 @@ func (c *IggyTcpClient) DeleteConsumerOffset(ctx context.Context, consumer iggco
 	}, nil)
 }
 
+func (c *IggyTcpClient) DeleteConsumerPosition(ctx context.Context, consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, position iggcon.ConsumerPosition) error {
+	return c.writeOffset(ctx, &command.DeleteConsumerOffset{
+		Consumer:    consumer,
+		StreamId:    streamId,
+		TopicId:     topicId,
+		PartitionId: &position.PartitionId,
+	}, &position.Context)
+}
+
 func (c *IggyTcpClient) writeOffset(ctx context.Context, cmd command.Command, captured *iggcon.PartitionContext) error {
-	_, err := c.doCaptured(ctx, cmd, captured)
+	_, err := c.doCaptured(ctx, cmd, captured, nil)
 	return err
 }

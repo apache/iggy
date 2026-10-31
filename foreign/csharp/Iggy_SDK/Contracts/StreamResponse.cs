@@ -81,13 +81,7 @@ public sealed class StreamResponse
     /// </summary>
     [JsonIgnore]
     public StreamEncryptionSource? EncryptionKeySource =>
-        OptionValues.Text(Options, DerivedOptions, StreamOptionKey.EncryptionKeySource) switch
-        {
-            "none" => StreamEncryptionSource.None,
-            "stream" => StreamEncryptionSource.Stream,
-            "server" => StreamEncryptionSource.Server,
-            _ => null
-        };
+        OptionValues.EncryptionKeySource(Options, DerivedOptions);
 
     /// <summary>
     ///     Fingerprint of the stream's key, the value <see cref="Encryption.EncryptionKeys.Fingerprint(ReadOnlySpan{byte})" />

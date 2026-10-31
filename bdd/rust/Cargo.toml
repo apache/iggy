@@ -29,6 +29,7 @@ bdd = []
 [dev-dependencies]
 bytes = { workspace = true }
 cucumber = { workspace = true }
+futures = { workspace = true }
 iggy = { workspace = true }
 tokio = { workspace = true }
 
@@ -67,6 +68,16 @@ required-features = ["bdd"]
 
 [[test]]
 name = "resource_options_patch"
+harness = false
+required-features = ["bdd"]
+
+[[test]]
+name = "metadata_changes"
+harness = false
+required-features = ["bdd"]
+
+[[test]]
+name = "deferred_polling"
 harness = false
 required-features = ["bdd"]
 

@@ -34,8 +34,10 @@
 
 mod authz;
 mod failure;
+mod fetch;
 pub mod host;
 pub mod login_error;
+pub mod metadata_changes;
 pub mod partition;
 pub mod reads;
 mod segment_delete;
@@ -50,7 +52,7 @@ use crate::dispatch::failure::{
     send_unbound_deny_reply, send_undeclared_operation_deny,
 };
 use crate::dispatch::partition::{
-    dispatch_partition_request, handle_delete_segments_request, progress_key,
+    dispatch_partition_request, handle_delete_segments_request, progress_keys,
 };
 use crate::dispatch::reads::handle_non_replicated_request;
 use crate::dispatch::session_ops::{handle_login_register_request, handle_logout_request};
@@ -65,12 +67,16 @@ use consensus::MetadataHandle;
 use futures::future::{Either, select};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
-    BIND_SESSION_CODE, LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, PING_CODE,
+    BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, FETCH_MESSAGES_CODE, LOGIN_REGISTER_CODE,
+    LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, LOGOUT_USER_CODE, PING_CODE,
+    POLL_MESSAGES_DEFERRED_CODE,
 };
+use iggy_binary_protocol::requests::messages::{FetchMessagesRequest, PollMessagesRequest};
 use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::{
     EvictionReason, GenericHeader, HEADER_SIZE, Operation, RequestHeader, RoutedRequestHeader,
+    WireDecode,
 };
 use iggy_common::{IggyError, UserStatus};
 use journal::superblock::SuperblockStore;
@@ -124,7 +130,7 @@ struct QueuedClientRequest {
     origin: ClientOrigin,
     message: Message<GenericHeader>,
     // A queued metadata barrier can change the namespace resolved by this frame.
-    progress: Option<(u64, Option<ConsumerProgress>)>,
+    progress: Option<(u64, Option<ProgressKeys>)>,
 }
 
 impl QueuedClientRequest {
@@ -140,19 +146,15 @@ impl QueuedClientRequest {
         self.message.as_slice().len() as u64
     }
 
-    fn progress_key(
+    fn progress_keys(
         &mut self,
         metadata_frontier: u64,
-        resolve: impl FnOnce(&Message<GenericHeader>) -> Option<ConsumerProgress>,
-    ) -> Option<ConsumerProgress> {
-        if let Some((frontier, key)) = self.progress
-            && frontier == metadata_frontier
-        {
-            return key;
+        resolve: impl FnOnce(&Message<GenericHeader>) -> Option<ProgressKeys>,
+    ) -> Option<&ProgressKeys> {
+        if !matches!(self.progress, Some((frontier, _)) if frontier == metadata_frontier) {
+            self.progress = Some((metadata_frontier, resolve(&self.message)));
         }
-        let key = resolve(&self.message);
-        self.progress = Some((metadata_frontier, key));
-        key
+        self.progress.as_ref().and_then(|(_, keys)| keys.as_ref())
     }
 }
 
@@ -180,6 +182,28 @@ const MAX_QUEUED_CLIENT_REQUESTS: usize = 1024;
 type ActiveClientRequests = Rc<RefCell<AHashMap<u128, Rc<ClientDrain>>>>;
 type ConsumerProgress = (u64, u8, usize);
 
+/// The progress lanes of one frame: one, or one per partition of a fetch.
+/// [`ClientDrain`] admits a frame only when it can take all of its lanes at
+/// once, so a frame never holds part of them and needs no lane order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProgressKeys {
+    One(ConsumerProgress),
+    Many(Vec<ConsumerProgress>),
+}
+
+impl ProgressKeys {
+    fn as_slice(&self) -> &[ConsumerProgress] {
+        match self {
+            Self::One(key) => std::slice::from_ref(key),
+            Self::Many(keys) => keys,
+        }
+    }
+}
+
+/// No command has this code, so the request counter books a frame without a
+/// declared command as unknown.
+const UNDECLARED_COMMAND_CODE: u32 = u32::MAX;
+
 // BindSession authenticates with the registered secret, never with the
 // public client id and epoch alone. It retains the original retry identity;
 // unbound replicated frames still fail with Eviction(NoSession).
@@ -201,9 +225,62 @@ fn enqueue_client_request<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    if let Some(shard) = upgrade_shard_handle(shard_handle) {
+        shard
+            .metrics()
+            .record_client_request(client_request_code(&message));
+    }
     // Captured on arrival: every reply to this frame, however late, goes to the
     // connection that sent it.
     let origin = ClientOrigin::capture(bus, client_id);
+    if let Ok(cancel) = message.try_as_typed::<RequestHeader>()
+        && cancel.header().operation == Operation::NonReplicated
+        && cancel.header().reserved == CANCEL_DEFERRED_REQUEST_CODE.to_le_bytes()
+        && cancel.body().is_empty()
+        && sessions.borrow().cancel_deferred_request(
+            client_id,
+            cancel.header().client,
+            cancel.header().session,
+            cancel.header().request,
+        )
+    {
+        // Cancellation bypasses admission limits. A poll still queued behind
+        // another operation must be removed before it can be admitted.
+        let mut cancelled = Vec::new();
+        let mut queues = queues.borrow_mut();
+        if let Some(queue) = queues.get_mut(&client_id) {
+            for index in (0..queue.requests.len()).rev() {
+                let matches = queue.requests[index]
+                    .message
+                    .try_as_typed::<RequestHeader>()
+                    .is_ok_and(|request| {
+                        let header = request.header();
+                        header.deferred_cancellation().is_some()
+                            && header.client == cancel.header().client
+                            && header.session == cancel.header().session
+                            && header.request == cancel.header().request
+                    });
+                if matches
+                    && let Some(removed) = queue.remove(index)
+                    && commits_on_read(&removed.message)
+                {
+                    cancelled.push(removed);
+                }
+            }
+            if queue.requests.is_empty() {
+                queues.remove(&client_id);
+            }
+        }
+        drop(queues);
+        // A committing request answers its cancel once, so the client knows it stored nothing.
+        for removed in cancelled {
+            deny_cancelled_client_request(shard_handle, removed.origin, removed.message);
+        }
+        if let Some(drain) = active.borrow().get(&client_id) {
+            drain.wake();
+        }
+        return;
+    }
     {
         let request = QueuedClientRequest::new(origin.queued(), message);
         let bytes_max = server_config
@@ -247,6 +324,24 @@ fn enqueue_client_request<B, MJ, S, SB>(
         };
         drain_client_requests(shard, sessions, server_config, queues, &drain, client_id).await;
     });
+}
+
+/// The command code of a client frame: the code in the header of a
+/// non-replicated request, else the code of its operation.
+fn client_request_code(message: &Message<GenericHeader>) -> u32 {
+    let Ok(request) = message.try_as_typed::<RequestHeader>() else {
+        return UNDECLARED_COMMAND_CODE;
+    };
+    let header = request.header();
+    match header.operation {
+        Operation::NonReplicated => u32::from_le_bytes(header.reserved),
+        // Both logins travel as `Register`, which no command code names.
+        Operation::Register => LOGIN_REGISTER_CODE,
+        Operation::Logout => LOGOUT_USER_CODE,
+        operation => operation
+            .to_command_code()
+            .unwrap_or(UNDECLARED_COMMAND_CODE),
+    }
 }
 
 /// Answer a request that arrived with this client's queue already at
@@ -295,6 +390,54 @@ fn deny_overflowing_client_request<B, MJ, S, SB>(
             operation = ?request.header().operation,
             "denying client request retryable: this connection's request queue is full"
         );
+        send_deny_reply(
+            &shard,
+            origin,
+            request.header(),
+            IggyError::TransientNotAccepted.as_code(),
+        )
+        .await;
+    });
+}
+
+/// Whether a deferred request stores the offset of what it reads.
+fn commits_on_read(message: &Message<GenericHeader>) -> bool {
+    let Ok(request) = message.try_as_typed::<RequestHeader>() else {
+        return false;
+    };
+    match u32::from_le_bytes(request.header().reserved) {
+        POLL_MESSAGES_DEFERRED_CODE => {
+            PollMessagesRequest::peek_progress(request.body()).is_ok_and(|(_, commits)| commits)
+        }
+        FETCH_MESSAGES_CODE => {
+            FetchMessagesRequest::decode_from(request.body()).is_ok_and(|fetch| fetch.auto_commit)
+        }
+        _ => false,
+    }
+}
+
+/// Answers a committing request that a cancel removed from the queue before
+/// it ran with `TransientNotAccepted`: it stored nothing.
+fn deny_cancelled_client_request<B, MJ, S, SB>(
+    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
+    origin: ClientOrigin,
+    message: Message<GenericHeader>,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let Some(shard) = upgrade_shard_handle(shard_handle) else {
+        return;
+    };
+    let bus = shard.bus.clone();
+    bus.spawn(async move {
+        let Some(request) = decode_or_deny_client_request(&shard, origin, message).await else {
+            return;
+        };
+        let request = request.into_routed();
         send_deny_reply(
             &shard,
             origin,
@@ -416,13 +559,15 @@ impl ClientDrain {
         }
     }
 
-    fn admit_progress(self: &Rc<Self>, progress: ConsumerProgress) -> InFlight {
-        self.progress.borrow_mut().insert(progress);
+    fn admit_progress(self: &Rc<Self>, keys: ProgressKeys) -> InFlight {
+        self.progress
+            .borrow_mut()
+            .extend(keys.as_slice().iter().copied());
         self.in_flight.set(self.in_flight.get() + 1);
         InFlight {
             drain: Rc::clone(self),
             metadata_write: false,
-            progress: Some(progress),
+            progress: Some(keys),
         }
     }
 
@@ -453,7 +598,7 @@ impl ClientDrain {
 pub struct InFlight {
     drain: Rc<ClientDrain>,
     metadata_write: bool,
-    progress: Option<ConsumerProgress>,
+    progress: Option<ProgressKeys>,
 }
 
 impl Drop for InFlight {
@@ -462,8 +607,11 @@ impl Drop for InFlight {
         if self.metadata_write {
             self.drain.metadata_write.set(false);
         }
-        if let Some(progress) = self.progress {
-            self.drain.progress.borrow_mut().remove(&progress);
+        if let Some(keys) = &self.progress {
+            let mut progress = self.drain.progress.borrow_mut();
+            for key in keys.as_slice() {
+                progress.remove(key);
+            }
         }
         self.drain.wake();
     }
@@ -493,18 +641,29 @@ async fn drain_client_requests<B, MJ, S, SB>(
             if drain.metadata_write.get() {
                 return false;
             }
+            // A deferred request waits for room in the queue, where a cancel
+            // still finds it, not at the cap where nothing does.
+            if drain.in_flight.get() >= drain.capacity
+                && queued
+                    .message
+                    .try_as_typed::<RequestHeader>()
+                    .is_ok_and(|request| request.header().deferred_cancellation().is_some())
+            {
+                return false;
+            }
             queued
-                .progress_key(metadata_frontier, |message| progress_key(&shard, message))
-                .is_none_or(|key| {
+                .progress_keys(metadata_frontier, |message| progress_keys(&shard, message))
+                .is_none_or(|keys| {
+                    let held = drain.progress.borrow();
                     drain.in_flight.get() < drain.capacity
-                        && !drain.progress.borrow().contains(&key)
+                        && !keys.as_slice().iter().any(|key| held.contains(key))
                 })
         });
         if let Some(queued) = next {
             let progress = queued
                 .progress
-                .and_then(|(_, key)| key)
-                .map(|key| drain.admit_progress(key));
+                .and_then(|(_, keys)| keys)
+                .map(|keys| drain.admit_progress(keys));
             handle_client_request(
                 &shard,
                 &sessions,
@@ -859,7 +1018,10 @@ async fn handle_client_request<B, MJ, S, SB>(
                 metadata_watermark,
             };
             // `ClientDrain` says which frames stay on the drain.
-            if matches!(non_replicated_code(header), PING_CODE | BIND_SESSION_CODE) {
+            if matches!(
+                non_replicated_code(header),
+                PING_CODE | BIND_SESSION_CODE | CANCEL_DEFERRED_REQUEST_CODE
+            ) {
                 handle_non_replicated_request(
                     shard,
                     sessions,
@@ -914,7 +1076,14 @@ async fn handle_client_request<B, MJ, S, SB>(
         }
         RequestClass::LoginRegister => {
             let _in_flight = drain.admit(Admission::MetadataLane).await;
-            handle_login_register_request(shard, sessions, origin, request).await;
+            handle_login_register_request(
+                shard,
+                sessions,
+                &server_config.external_auth,
+                origin,
+                request,
+            )
+            .await;
         }
         RequestClass::Logout => {
             let _in_flight = drain.admit(Admission::MetadataLane).await;
@@ -1212,31 +1381,40 @@ mod tests {
     use super::*;
     use crate::cluster_meta::ClusterRoster;
     use crate::dispatch::host::ServerHost;
+    use crate::dispatch::partition::progress_key;
     use crate::dispatch::test_support::{
         FIRST_BOOT, SpyBus, TestMux, TestShard, UNDECLARED_OPERATION, create_one_partition,
-        create_reader_request, prepare_message, recreate_topic_in, register_reply, request_message,
-        test_shard, test_shard_with_frontier,
+        create_partitions_in, create_reader_request, prepare_message, recreate_topic_in,
+        register_reply, request_message, test_shard, test_shard_with_frontier,
     };
     use bytes::Bytes;
     use consensus::Sequencer;
     use consensus::client_table::bind_verifier;
     use iggy_binary_protocol::Command;
     use iggy_binary_protocol::codes::{
-        GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
-        GET_ME_CODE, GET_PARTITION_ROUTE_CODE, GET_STATS_CODE, POLL_MESSAGES_CODE,
+        FETCH_MESSAGES_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE,
+        GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE,
+        GET_STATS_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE,
+        STORE_CONSUMER_OFFSET_CODE,
     };
+    use iggy_binary_protocol::dispatch::lookup_command;
+    use iggy_binary_protocol::primitives::metadata_changes::WireMetadataChangeStatus;
     use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
     use iggy_binary_protocol::requests::consumer_offsets::{
         GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
     };
-    use iggy_binary_protocol::requests::messages::{GetPartitionRouteRequest, PollMessagesRequest};
+    use iggy_binary_protocol::requests::messages::{
+        DeferredPollMessagesRequest, FetchMessagesRequest, FetchMessagesTarget,
+        GetPartitionRouteRequest, MIN_DEFERRED_POLL_MAX_BYTES, MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+        PollMessagesRequest,
+    };
     use iggy_binary_protocol::requests::personal_access_tokens::CreatePersonalAccessTokenRequest as WireCreatePersonalAccessTokenRequest;
     use iggy_binary_protocol::requests::streams::{
         CreateStreamRequest, UpdateStreamResolvedRequest,
     };
     use iggy_binary_protocol::requests::system::{
-        BindSessionRequest, GetClientRequest, GetClientsRequest, GetStatsRequest, ResourceTarget,
-        UpdateResourceRequest,
+        BindSessionRequest, GetClientRequest, GetClientsRequest, GetMetadataChangesRequest,
+        GetStatsRequest, ResourceTarget, UpdateResourceRequest,
     };
     use iggy_binary_protocol::requests::topics::{DeleteTopicRequest, UpdateTopicResolvedRequest};
     use iggy_binary_protocol::requests::users::login_register::{
@@ -1246,13 +1424,14 @@ mod tests {
     use iggy_binary_protocol::requests::users::{
         CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest, UpdateUserResolvedRequest,
     };
+    use iggy_binary_protocol::responses::system::GetMetadataChangesResponse;
     use iggy_binary_protocol::{
         AckLevel, ClientVersionInfo, EvictionHeader, IGGY_PROTOCOL_VERSION, ReplyHeader,
         WireConsumer,
     };
-    use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions};
+    use iggy_binary_protocol::{WireDecode, WireEncode, WireIdentifier, WireName, WireOptions};
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
-    use iggy_common::{Identifier, IggyByteSize};
+    use iggy_common::{Identifier, IggyByteSize, MetadataChangeStart, MetadataChangesQuery};
     use journal::prepare_journal::PrepareJournal;
     use message_bus::installer::conn_info::ClientTransportKind;
     use metadata::impls::metadata::IggySnapshot;
@@ -1260,6 +1439,8 @@ mod tests {
     use metadata::stm::user::{CreatePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES};
     use metadata::{IggyMetadata, MetadataSubmitError};
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
+    use prometheus_client::encoding::text::encode;
+    use prometheus_client::registry::Registry;
     use server_common::MESSAGE_ALIGN;
     use server_common::sharding::{PartitionLocation, ShardId};
     use shard::metrics::ShardMetrics;
@@ -1272,6 +1453,9 @@ mod tests {
     use std::mem::size_of;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
+
+    /// Partitions of the topic that the lane tests of a fetch create.
+    const FETCH_PARTITIONS: u32 = 3;
 
     #[compio::test]
     #[allow(clippy::too_many_lines)]
@@ -1309,6 +1493,7 @@ mod tests {
                     |_| {},
                     prepare,
                 )
+                .reply
             };
             let create = CreateUserRequest {
                 username: WireName::new("original").unwrap(),
@@ -1445,10 +1630,12 @@ mod tests {
                 message_bus::server_internal_client_id(0),
                 message_bus::AUTO_COMMIT_CLIENT_ID,
             ] {
+                let ext_auth = configs::external_auth::ExternalAuthConfig::default();
                 for body in &bodies {
                     handle_login_register_request(
                         &shard,
                         &sessions,
+                        &ext_auth,
                         ClientOrigin::capture(&shard.bus, TRANSPORT),
                         request_message(Operation::Register, client, 0, 0, body),
                     )
@@ -1689,6 +1876,61 @@ mod tests {
         )
         .minimum_metadata_op = metadata_op;
         read.into_generic()
+    }
+
+    #[compio::test]
+    async fn given_root_session_when_reading_metadata_changes_should_answer_pages_and_refuse_bad_bodies()
+     {
+        let (bus, shard, host) = root_host(ServerConfig::default());
+        bind_root_session(&shard, host.sessions()).await;
+        let metadata = shard.plane.metadata();
+        metadata
+            .change_log()
+            .append(
+                &PrepareHeader {
+                    op: 1,
+                    checksum: 0x5eed,
+                    ..PrepareHeader::default()
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        let read = |request, body: &[u8]| {
+            let mut read = wire_request(
+                Operation::NonReplicated,
+                ROOT_CLIENT,
+                ROOT_SESSION,
+                request,
+                body,
+            );
+            bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                &mut read.as_mut_slice()[..size_of::<RequestHeader>()],
+            )
+            .reserved[..4]
+                .copy_from_slice(&GET_METADATA_CHANGES_CODE.to_le_bytes());
+            read.into_generic()
+        };
+        let latest = GetMetadataChangesRequest::from(&MetadataChangesQuery {
+            start: MetadataChangeStart::Latest,
+            ..MetadataChangesQuery::default()
+        })
+        .to_bytes();
+
+        host.on_client_request(ROOT_TRANSPORT, read(1, &latest));
+        host.on_client_request(ROOT_TRANSPORT, read(2, &[0xff]));
+        await_replies(&bus, 2).await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 2);
+        let (header, body) = replies[0].1.split_at(size_of::<ReplyHeader>());
+        assert_eq!(reply_status(header), 0);
+        let page = GetMetadataChangesResponse::decode_from(body).expect("a change page");
+        assert_eq!(page.status, WireMetadataChangeStatus::Ok);
+        assert_eq!(page.log_id, Some(0x5eed));
+        assert_eq!(
+            reply_status(&replies[1].1),
+            IggyError::InvalidCommand.as_code()
+        );
     }
 
     #[compio::test]
@@ -1970,7 +2212,7 @@ mod tests {
 
         let queues = ClientRequestQueues::default();
         let drain = Rc::new(ClientDrain::new(&server_config));
-        let dispatched = handle_client_request(
+        let mut dispatched = Box::pin(handle_client_request(
             &shard,
             &sessions,
             &server_config,
@@ -1979,8 +2221,7 @@ mod tests {
             ClientOrigin::capture(&shard.bus, READER_TRANSPORT),
             read.into_generic(),
             None,
-        );
-        futures::pin_mut!(dispatched);
+        ));
         assert!(futures::poll!(dispatched.as_mut()).is_pending());
         let Ok(ShardFrame::Lifecycle(frame)) = shard_inbox.try_recv() else {
             panic!("code {code} must wait on a shard");
@@ -2184,6 +2425,7 @@ mod tests {
                     fragments: Vec::new().into(),
                     current_offset: STORED_OFFSET,
                     encryptor: None,
+                    next_offset: None,
                 })
                 .unwrap(),
             LifecycleFrame::PartitionRead {
@@ -2348,7 +2590,8 @@ mod tests {
                 true,
                 |_| {},
                 consensus::seal_prepare_checksum(revocation),
-            );
+            )
+            .reply;
             assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
         }
         let old_binding = sessions.borrow().get_session(TRANSPORT);
@@ -2829,6 +3072,12 @@ mod tests {
             (
                 "cluster metadata is not pre-auth",
                 nr(GET_CLUSTER_METADATA_CODE),
+                false,
+                RequestClass::UnauthenticatedRead,
+            ),
+            (
+                "a deferred-request cancel is not pre-auth",
+                nr(CANCEL_DEFERRED_REQUEST_CODE),
                 false,
                 RequestClass::UnauthenticatedRead,
             ),
@@ -3405,6 +3654,254 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_a_deferred_poll_when_resolving_progress_should_take_the_lane_of_its_plain_poll()
+    {
+        let (_bus, shard, _host) = root_host(ServerConfig::default());
+        create_one_partition(&shard);
+        let key = |code: u32, body: &[u8]| {
+            let mut message =
+                wire_request(Operation::NonReplicated, ROOT_CLIENT, ROOT_SESSION, 1, body);
+            bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                &mut message.as_mut_slice()[..size_of::<RequestHeader>()],
+            )
+            .reserved[..4]
+                .copy_from_slice(&code.to_le_bytes());
+            progress_key(&shard, &message.into_generic())
+        };
+        for (strategy, auto_commit, takes_lane) in [
+            (WirePollingStrategy::next(), false, true),
+            (WirePollingStrategy::offset(0), true, true),
+            (WirePollingStrategy::offset(0), false, false),
+        ] {
+            let poll = PollMessagesRequest {
+                consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: Some(0),
+                strategy,
+                count: 1,
+                auto_commit,
+            };
+            let plain = key(POLL_MESSAGES_CODE, &poll.to_bytes());
+            assert_eq!(plain.is_some(), takes_lane);
+            let deferred = DeferredPollMessagesRequest {
+                poll,
+                wait_us: 1,
+                min_count: 1,
+                max_bytes: u32::try_from(MIN_DEFERRED_POLL_MAX_BYTES).unwrap(),
+                request_timeout_us: 1 + MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+            };
+            assert_eq!(
+                key(POLL_MESSAGES_DEFERRED_CODE, &deferred.to_bytes()),
+                plain
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_full_cap_when_a_deferred_poll_queues_should_keep_it_where_a_cancel_finds_it() {
+        let (bus, shard, host) = root_host(ServerConfig::default());
+        create_one_partition(&shard);
+        bind_root_session(&shard, host.sessions()).await;
+        let mut config = ServerConfig::default();
+        config.message_bus.client_queue_capacity = 1;
+        let config = Arc::new(config);
+        let drain = Rc::new(ClientDrain::new(&config));
+        let held = drain.admit(Admission::Cap).await;
+        let message = root_deferred_poll(1, false);
+        let mut queue = ClientRequestQueue::default();
+        queue.push_back(QueuedClientRequest::new(
+            ClientOrigin::capture(&bus, ROOT_TRANSPORT),
+            message.into_generic(),
+        ));
+        let queues = Rc::new(RefCell::new(AHashMap::from_iter([(ROOT_TRANSPORT, queue)])));
+        let queued = || {
+            queues
+                .borrow()
+                .get(&ROOT_TRANSPORT)
+                .map_or(0, |queue| queue.requests.len())
+        };
+        let running = drain_client_requests(
+            Rc::clone(&shard),
+            Rc::clone(host.sessions()),
+            config,
+            Rc::clone(&queues),
+            &drain,
+            ROOT_TRANSPORT,
+        );
+        futures::pin_mut!(running);
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        assert_eq!(queued(), 1, "at the cap the deferred poll stays queued");
+
+        drop(held);
+        let _ = futures::poll!(running.as_mut());
+        assert_eq!(queued(), 0, "room under the cap admits it");
+    }
+
+    #[compio::test]
+    async fn given_a_queued_deferred_poll_when_its_cancel_arrives_should_drop_it_before_admission()
+    {
+        assert_cancel_of_queued_deferred_poll(true).await;
+    }
+
+    #[compio::test]
+    async fn given_a_queued_deferred_poll_when_a_cancel_names_another_request_should_still_admit_it()
+     {
+        assert_cancel_of_queued_deferred_poll(false).await;
+    }
+
+    /// Queues an auto-commit deferred poll behind a drain whose only place
+    /// under the cap is taken, then sends a cancellation the way the transport
+    /// does. A poll admitted after its own cancellation would park and commit
+    /// with nothing left to abort it, so only that cancellation may keep it
+    /// from its owner.
+    #[allow(clippy::too_many_lines)]
+    async fn assert_cancel_of_queued_deferred_poll(cancel_names_the_poll: bool) {
+        const POLL_REQUEST: u64 = 3;
+        let cancelled = if cancel_names_the_poll {
+            POLL_REQUEST
+        } else {
+            POLL_REQUEST + 1
+        };
+        let bus = SpyBus::default();
+        let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
+        let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        let shard = Rc::new(shard);
+        let namespace = create_one_partition(&shard);
+        shard
+            .shards_table()
+            .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+        commit_root_session(&shard);
+        let shard_handle = Rc::new(RefCell::new(Some(Rc::downgrade(&shard))));
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        bind_root_session(&shard, &sessions).await;
+        let mut server_config = ServerConfig::default();
+        server_config.message_bus.client_queue_capacity = 1;
+        let server_config = Arc::new(server_config);
+        let queues: ClientRequestQueues = Rc::default();
+        let active: ActiveClientRequests = Rc::default();
+        let enqueue = |message| {
+            enqueue_client_request(
+                &bus,
+                &shard_handle,
+                &sessions,
+                &server_config,
+                &queues,
+                &active,
+                ROOT_TRANSPORT,
+                message,
+            );
+        };
+        let poll_queued = || {
+            queues.borrow().get(&ROOT_TRANSPORT).is_some_and(|queue| {
+                queue.requests.iter().any(|queued| {
+                    queued
+                        .message
+                        .try_as_typed::<RequestHeader>()
+                        .is_ok_and(|request| request.header().request == POLL_REQUEST)
+                })
+            })
+        };
+
+        // The first read takes the only place under the cap and the second
+        // holds the drain, so the poll behind them stays queued.
+        enqueue(held_get_me(1, UNAPPLIED_OP));
+        enqueue(held_get_me(2, UNAPPLIED_OP));
+        settle().await;
+        let mut poll = root_deferred_poll(POLL_REQUEST, true);
+        bytemuck::checked::from_bytes_mut::<RequestHeader>(
+            &mut poll.as_mut_slice()[..size_of::<RequestHeader>()],
+        )
+        .partition_incarnation = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        enqueue(poll.into_generic());
+        assert!(poll_queued(), "the full cap keeps the poll queued");
+
+        enqueue(root_read(CANCEL_DEFERRED_REQUEST_CODE, cancelled).into_generic());
+        assert_eq!(
+            poll_queued(),
+            !cancel_names_the_poll,
+            "a cancellation removes only the queued poll that it names"
+        );
+
+        shard
+            .plane
+            .metadata()
+            .applied_frontier()
+            .advance(UNAPPLIED_OP);
+        await_replies(&bus, 2).await;
+        settle().await;
+        let reached_owner = std::iter::from_fn(|| owner_inbox.try_recv().ok()).any(|frame| {
+            matches!(
+                frame,
+                ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                    read: PartitionRead::DeferredPoll(_),
+                    ..
+                })
+            )
+        });
+        assert_eq!(
+            reached_owner, !cancel_names_the_poll,
+            "only a poll that was not cancelled reaches its owner"
+        );
+        let mut replies: Vec<u64> = bus
+            .client_replies
+            .borrow()
+            .iter()
+            .map(|(_, frame)| reply_request(frame))
+            .collect();
+        replies.sort_unstable();
+        let expected: &[u64] = if cancel_names_the_poll {
+            &[1, 2, POLL_REQUEST]
+        } else {
+            &[1, 2]
+        };
+        assert_eq!(
+            replies, expected,
+            "a cancelled committing poll answers once, and the cancellation gets no reply of its own"
+        );
+    }
+
+    /// A deferred poll of partition 0 by the root session, sent as `request`.
+    fn root_deferred_poll(request: u64, auto_commit: bool) -> Message<RequestHeader> {
+        let poll = DeferredPollMessagesRequest {
+            poll: PollMessagesRequest {
+                consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: Some(0),
+                strategy: WirePollingStrategy::offset(0),
+                count: 1,
+                auto_commit,
+            },
+            wait_us: 1,
+            min_count: 1,
+            max_bytes: u32::try_from(MIN_DEFERRED_POLL_MAX_BYTES).unwrap(),
+            request_timeout_us: 1 + MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+        }
+        .to_bytes();
+        let mut message = wire_request(
+            Operation::NonReplicated,
+            ROOT_CLIENT,
+            ROOT_SESSION,
+            request,
+            &poll,
+        );
+        bytemuck::checked::from_bytes_mut::<RequestHeader>(
+            &mut message.as_mut_slice()[..size_of::<RequestHeader>()],
+        )
+        .reserved[..4]
+            .copy_from_slice(&POLL_MESSAGES_DEFERRED_CODE.to_le_bytes());
+        message
+    }
+
+    #[compio::test]
     async fn given_a_held_store_when_next_and_offset_reads_queue_should_wait_for_its_guard() {
         const CONSUMER_ID: u32 = 1;
         const NEXT_REQUEST: u64 = 2;
@@ -3433,7 +3930,7 @@ mod tests {
         .into_generic();
         let key = progress_key(&shard, &store).expect("store must take a consumer progress lane");
         assert_eq!(key.0, namespace.inner());
-        let held = drain.admit_progress(key);
+        let held = drain.admit_progress(ProgressKeys::One(key));
         let poll = PollMessagesRequest {
             consumer: WireConsumer::consumer(WireIdentifier::numeric(CONSUMER_ID)),
             stream_id: WireIdentifier::numeric(0),
@@ -3508,6 +4005,333 @@ mod tests {
         );
     }
 
+    /// A fetch of `targets` of the first topic by the root session, sent as
+    /// `request`.
+    fn root_fetch(
+        request: u64,
+        auto_commit: bool,
+        targets: &[(u32, WirePollingStrategy)],
+    ) -> Message<GenericHeader> {
+        let max_bytes = u32::try_from(MIN_DEFERRED_POLL_MAX_BYTES).unwrap();
+        let fetch = FetchMessagesRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            wait_us: 0,
+            request_timeout_us: MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+            min_count: 1,
+            count: 1,
+            max_bytes,
+            auto_commit,
+            targets: targets
+                .iter()
+                .map(|(partition_id, strategy)| FetchMessagesTarget {
+                    partition_id: *partition_id,
+                    strategy: strategy.clone(),
+                    max_bytes,
+                    incarnation: 0,
+                    owner_generation: 0,
+                })
+                .collect(),
+        }
+        .to_bytes();
+        let mut message = wire_request(
+            Operation::NonReplicated,
+            ROOT_CLIENT,
+            ROOT_SESSION,
+            request,
+            &fetch,
+        );
+        bytemuck::checked::from_bytes_mut::<RequestHeader>(
+            &mut message.as_mut_slice()[..size_of::<RequestHeader>()],
+        )
+        .reserved[..4]
+            .copy_from_slice(&FETCH_MESSAGES_CODE.to_le_bytes());
+        message.into_generic()
+    }
+
+    /// A store of offset 0 of `partition_id` of the first topic by the root
+    /// session, sent as `request`.
+    fn root_store(request: u64, partition_id: u32) -> Message<GenericHeader> {
+        let store = StoreConsumerOffsetRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: Some(partition_id),
+            offset: 0,
+            ack: AckLevel::Quorum,
+        }
+        .to_bytes();
+        wire_request(
+            Operation::StoreConsumerOffset,
+            ROOT_CLIENT,
+            ROOT_SESSION,
+            request,
+            &store,
+        )
+        .into_generic()
+    }
+
+    /// The queue of the root transport, holding `messages` in order.
+    fn root_queue<const N: usize>(
+        bus: &SpyBus,
+        messages: [Message<GenericHeader>; N],
+    ) -> ClientRequestQueues {
+        let queue = messages
+            .into_iter()
+            .map(|message| {
+                QueuedClientRequest::new(ClientOrigin::capture(bus, ROOT_TRANSPORT), message)
+            })
+            .collect();
+        Rc::new(RefCell::new(AHashMap::from_iter([(ROOT_TRANSPORT, queue)])))
+    }
+
+    /// The request ids that wait in the queue of the root transport.
+    fn queued_requests(queues: &ClientRequestQueues) -> Vec<u64> {
+        queues
+            .borrow()
+            .get(&ROOT_TRANSPORT)
+            .map_or_else(Vec::new, |queue| {
+                queue
+                    .requests
+                    .iter()
+                    .filter_map(|queued| {
+                        queued
+                            .message
+                            .try_as_typed::<RequestHeader>()
+                            .ok()
+                            .map(|request| request.header().request)
+                    })
+                    .collect()
+            })
+    }
+
+    /// A fetch that commits, or that starts at a stored offset, takes the lane
+    /// that a poll of each of its partitions takes. A fetch of offsets without
+    /// a commit takes none.
+    #[compio::test]
+    async fn given_a_fetch_when_resolving_progress_should_take_the_lane_of_each_partition_it_can_commit()
+     {
+        let (_bus, shard, _host) = root_host(ServerConfig::default());
+        create_partitions_in(&shard.plane.metadata().mux_stm, FETCH_PARTITIONS);
+        let offset = || WirePollingStrategy::offset(0);
+        let next = WirePollingStrategy::next;
+        let partitions = [2, 0, 1];
+        let poll_lanes = ProgressKeys::Many(
+            partitions
+                .iter()
+                .map(|&partition_id| {
+                    let poll = PollMessagesRequest {
+                        consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+                        stream_id: WireIdentifier::numeric(0),
+                        topic_id: WireIdentifier::numeric(0),
+                        partition_id: Some(partition_id),
+                        strategy: next(),
+                        count: 1,
+                        auto_commit: false,
+                    }
+                    .to_bytes();
+                    let mut message = wire_request(
+                        Operation::NonReplicated,
+                        ROOT_CLIENT,
+                        ROOT_SESSION,
+                        1,
+                        &poll,
+                    );
+                    bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                        &mut message.as_mut_slice()[..size_of::<RequestHeader>()],
+                    )
+                    .reserved[..4]
+                        .copy_from_slice(&POLL_MESSAGES_CODE.to_le_bytes());
+                    progress_key(&shard, &message.into_generic())
+                        .expect("a poll of the next offset takes its lane")
+                })
+                .collect(),
+        );
+        for (strategies, auto_commit, takes_lanes) in [
+            ([offset(), next(), offset()], false, true),
+            ([offset(), offset(), offset()], true, true),
+            ([offset(), offset(), offset()], false, false),
+        ] {
+            let targets: Vec<_> = partitions.into_iter().zip(strategies).collect();
+            assert_eq!(
+                progress_keys(&shard, &root_fetch(1, auto_commit, &targets)),
+                takes_lanes.then(|| poll_lanes.clone()),
+                "{targets:?} with auto-commit {auto_commit}"
+            );
+        }
+        assert_eq!(
+            progress_keys(
+                &shard,
+                &root_fetch(1, true, &[(0, offset()), (u32::MAX, offset())])
+            ),
+            None,
+            "a partition id that no namespace can hold takes no lane"
+        );
+    }
+
+    /// The fetch is first in the queue, so only the lane can let the store
+    /// behind it go first.
+    #[compio::test]
+    async fn given_a_held_store_when_a_committing_fetch_queues_should_wait_while_other_partitions_pass()
+     {
+        const FETCH_REQUEST: u64 = 2;
+        const OTHER_STORE_REQUEST: u64 = 3;
+        let offset = || WirePollingStrategy::offset(0);
+        for store_held in [true, false] {
+            let (bus, shard, host) = root_host(ServerConfig::default());
+            create_partitions_in(&shard.plane.metadata().mux_stm, FETCH_PARTITIONS);
+            bind_root_session(&shard, host.sessions()).await;
+            let config = Arc::new(ServerConfig::default());
+            let drain = Rc::new(ClientDrain::new(&config));
+            let held = store_held.then(|| {
+                drain.admit_progress(
+                    progress_keys(&shard, &root_store(1, 1))
+                        .expect("a store takes a consumer progress lane"),
+                )
+            });
+            let queues = root_queue(
+                &bus,
+                [
+                    root_fetch(FETCH_REQUEST, true, &[(0, offset()), (1, offset())]),
+                    root_store(OTHER_STORE_REQUEST, 2),
+                ],
+            );
+            let running = drain_client_requests(
+                Rc::clone(&shard),
+                Rc::clone(host.sessions()),
+                config,
+                Rc::clone(&queues),
+                &drain,
+                ROOT_TRANSPORT,
+            );
+            futures::pin_mut!(running);
+            let _ = futures::poll!(running.as_mut());
+            let queued = queued_requests(&queues);
+            if store_held {
+                assert_eq!(
+                    queued,
+                    [FETCH_REQUEST],
+                    "a store of one of its partitions holds the fetch, and a store of \
+                     another partition passes it"
+                );
+            } else {
+                assert!(
+                    !queued.contains(&FETCH_REQUEST),
+                    "a fetch with free lanes goes first"
+                );
+            }
+            drop(held);
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_running_fetch_when_stores_queue_should_hold_only_the_stores_of_its_partitions()
+    {
+        const HELD_STORE_REQUEST: u64 = 2;
+        const OTHER_STORE_REQUEST: u64 = 3;
+        let offset = || WirePollingStrategy::offset(0);
+        let (bus, shard, host) = root_host(ServerConfig::default());
+        create_partitions_in(&shard.plane.metadata().mux_stm, FETCH_PARTITIONS);
+        bind_root_session(&shard, host.sessions()).await;
+        let config = Arc::new(ServerConfig::default());
+        let drain = Rc::new(ClientDrain::new(&config));
+        let lanes = progress_keys(
+            &shard,
+            &root_fetch(1, true, &[(0, offset()), (1, offset())]),
+        )
+        .expect("an auto-committing fetch takes the lanes of its partitions");
+        let taken = lanes.as_slice().to_vec();
+        let fetch = drain.admit_progress(lanes);
+        let queues = root_queue(
+            &bus,
+            [
+                root_store(HELD_STORE_REQUEST, 1),
+                root_store(OTHER_STORE_REQUEST, 2),
+            ],
+        );
+        let running = drain_client_requests(
+            Rc::clone(&shard),
+            Rc::clone(host.sessions()),
+            config,
+            Rc::clone(&queues),
+            &drain,
+            ROOT_TRANSPORT,
+        );
+        futures::pin_mut!(running);
+        let _ = futures::poll!(running.as_mut());
+        assert_eq!(queued_requests(&queues), [HELD_STORE_REQUEST]);
+
+        drop(fetch);
+        assert!(
+            taken
+                .iter()
+                .all(|lane| !drain.progress.borrow().contains(lane)),
+            "the end of the fetch frees every lane that it took"
+        );
+    }
+
+    /// A non-replicated frame counts under the code in its header, a
+    /// replicated one under its operation, a login or a logout under its
+    /// command, and a frame that declares no command as unknown. A cancel
+    /// counts too, although the queue answers it before admission.
+    #[compio::test]
+    async fn given_client_frames_when_enqueued_should_count_each_under_its_command() {
+        const UNKNOWN_COMMAND: &str = "unknown";
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        commit_root_session(&shard);
+        let shard_handle = Rc::new(RefCell::new(Some(Rc::downgrade(&shard))));
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        bind_root_session(&shard, &sessions).await;
+        let server_config = Arc::new(ServerConfig::default());
+        let queues: ClientRequestQueues = Rc::default();
+        let active: ActiveClientRequests = Rc::default();
+        let enqueue = |message| {
+            enqueue_client_request(
+                &bus,
+                &shard_handle,
+                &sessions,
+                &server_config,
+                &queues,
+                &active,
+                ROOT_TRANSPORT,
+                message,
+            );
+        };
+        let mut undeclared = root_read(PING_CODE, 5).into_generic();
+        undeclared.as_mut_slice()[offset_of!(RequestHeader, operation)] = UNDECLARED_OPERATION;
+
+        enqueue(root_read(PING_CODE, 1).into_generic());
+        enqueue(root_read(PING_CODE, 2).into_generic());
+        enqueue(root_read(CANCEL_DEFERRED_REQUEST_CODE, 3).into_generic());
+        enqueue(root_store(4, 0));
+        enqueue(undeclared);
+        enqueue(wire_request(Operation::Register, ROOT_CLIENT, 0, 0, &[]).into_generic());
+        enqueue(wire_request(Operation::Logout, ROOT_CLIENT, ROOT_SESSION, 6, &[]).into_generic());
+        settle().await;
+
+        let mut registry = Registry::default();
+        shard.metrics().register(&mut registry);
+        let mut scrape = String::new();
+        encode(&mut scrape, &registry).expect("the scrape encodes");
+        let command = |code| lookup_command(code).expect("a declared command").name;
+        for (command, count) in [
+            (command(PING_CODE), 2),
+            (command(CANCEL_DEFERRED_REQUEST_CODE), 1),
+            (command(STORE_CONSUMER_OFFSET_CODE), 1),
+            (command(LOGIN_REGISTER_CODE), 1),
+            (command(LOGOUT_USER_CODE), 1),
+            (UNKNOWN_COMMAND, 1),
+        ] {
+            let series = format!("client_requests_total{{command=\"{command}\"}} {count}");
+            assert!(
+                scrape.lines().any(|line| line == series),
+                "{series} is not in the scrape:\n{scrape}"
+            );
+        }
+    }
+
     #[compio::test]
     async fn given_queued_progress_when_metadata_changes_should_resolve_once_per_frontier() {
         const CREATED_FRONTIER: u64 = ROOT_SESSION + 1;
@@ -3539,10 +4363,10 @@ mod tests {
         let resolutions = Cell::new(0);
         let resolve = |message: &Message<GenericHeader>| {
             resolutions.set(resolutions.get() + 1);
-            progress_key(&shard, message)
+            progress_keys(&shard, message)
         };
         for _ in 0..3 {
-            assert_eq!(queued.progress_key(ROOT_SESSION, resolve), None);
+            assert_eq!(queued.progress_keys(ROOT_SESSION, resolve), None);
         }
         assert_eq!(
             resolutions.get(),
@@ -3557,8 +4381,12 @@ mod tests {
             .advance(CREATED_FRONTIER);
         for _ in 0..3 {
             assert_eq!(
-                queued.progress_key(shard.plane.metadata().applied_frontier().get(), resolve),
-                Some((namespace.inner(), iggy_binary_protocol::KIND_CONSUMER, 1))
+                queued.progress_keys(shard.plane.metadata().applied_frontier().get(), resolve),
+                Some(&ProgressKeys::One((
+                    namespace.inner(),
+                    iggy_binary_protocol::KIND_CONSUMER,
+                    1
+                )))
             );
         }
         assert_eq!(
@@ -4030,7 +4858,8 @@ mod tests {
             true,
             |_| {},
             prepare,
-        );
+        )
+        .reply;
         assert_eq!(iggy_binary_protocol::result_code(created.body()), Some(0));
         let create = |request, name| {
             let body = WireCreatePersonalAccessTokenRequest {
@@ -4123,7 +4952,8 @@ mod tests {
             true,
             |_| {},
             prepare,
-        );
+        )
+        .reply;
         assert_eq!(iggy_binary_protocol::result_code(created.body()), Some(0));
 
         let resent = submit_client_request_on_owner(&shard, minted)

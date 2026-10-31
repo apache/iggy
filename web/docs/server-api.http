@@ -59,6 +59,22 @@ Content-Type: application/json
 Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJqdGkiOiI5NmJlY2QwNy03ZTYyLTRiYTktYTcyZS02NzgwOThmMjE1MmMiLCJpc3MiOiJpZ2d5LnJzIiwiYXVkIjoiaWdneS5ycyIsInN1YiI6MSwiaWF0IjoxNzAwNTk4NTI5LCJleHAiOjE3MDA2MDIxMjksIm5iZiI6MTcwMDU5ODUyOX0.IYaIwFA1VajunF_P2KLQWOnnEzCYHJT31QuIQa__TS0
 
 
+### Metadata changes from the oldest retained operation (root or manage_servers)
+GET {{url}}/metadata/changes?from=earliest&limit=100
+Authorization: Bearer {{access_token}}
+
+### Metadata changes: a cursor at the newest record, no records
+GET {{url}}/metadata/changes?from=latest&groups=streams,topics
+Authorization: Bearer {{access_token}}
+
+### Metadata changes after a cursor from an earlier page
+GET {{url}}/metadata/changes?after=mc1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&limit=100
+Authorization: Bearer {{access_token}}
+
+### Current state pages, continued with the current_page_token of the previous answer
+GET {{url}}/metadata/changes?from=current&groups=streams,topics&limit=100
+Authorization: Bearer {{access_token}}
+
 ### Create stream
 POST {{url}}/streams
 Content-Type: application/json

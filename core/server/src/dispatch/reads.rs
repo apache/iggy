@@ -35,14 +35,18 @@ use crate::dispatch::failure::{
     ClientOrigin, FrameChannel, send_host_frame, send_non_replicated_bytes,
     send_non_replicated_deny,
 };
-use crate::dispatch::partition::{handle_get_consumer_offset, handle_poll_messages};
+use crate::dispatch::fetch::fetch_messages;
+use crate::dispatch::metadata_changes::metadata_changes_reply;
+use crate::dispatch::partition::{
+    handle_get_consumer_offset, handle_poll_messages, read_deferred_poll, resolve_deferred_poll,
+};
 use crate::namespace::resolve_partition_namespace;
 use crate::reply_frame::{build_empty_reply, current_metadata_commit};
 use crate::responses::{
     build_get_me_response, build_get_personal_access_tokens_response,
     build_non_replicated_response, connected_client_to_response,
 };
-use crate::session_manager::{ConnectionContext, SessionManager};
+use crate::session_manager::{ConnectionContext, FetchReadGuard, SessionManager};
 use crate::shell::{ShellBus, ShellShard};
 use crate::snapshot;
 use crate::wire::request_body;
@@ -50,17 +54,21 @@ use bytes::Bytes;
 use configs::server::ServerConfig;
 use consensus::MetadataHandle;
 use consensus::client_table::SessionAttachment;
-use futures::future::{Either, select};
+use futures::future::{Abortable, Either, select};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
-    BIND_SESSION_CODE, DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
-    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_PARTITION_ROUTE_CODE,
+    BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, DESCRIBE_OPTIONS_CODE, FETCH_MESSAGES_CODE,
+    GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
+    GET_ME_CODE, GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE,
     GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, PING_CODE,
-    POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
+    POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE, SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::dispatch::lookup_command;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
-use iggy_binary_protocol::requests::messages::GetPartitionRouteRequest;
+use iggy_binary_protocol::requests::messages::{
+    DeferredPollMessagesRequest, FetchMessagesRequest, GetPartitionRouteRequest,
+    MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+};
 use iggy_binary_protocol::requests::system::BindSessionRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::system::get_snapshot::GetSnapshotRequest;
@@ -75,13 +83,14 @@ use iggy_binary_protocol::{HEADER_SIZE, RoutedRequestHeader, WireDecode, WireEnc
 use iggy_common::{IggyError, SnapshotCompression, SystemSnapshotType};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
+use message_bus::BusMessage;
 use message_bus::framing::MAX_MESSAGE_SIZE;
 use metadata::AppliedFrontier;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use server_common::Message;
-use shard::{PartitionRead, PartitionReadReply};
-use std::cell::RefCell;
+use shard::{CommitGate, PartitionRead, PartitionReadReply};
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::pin;
@@ -190,9 +199,11 @@ pub fn read_frontier_budget(config: &ServerConfig) -> Duration {
 /// - `GetClusterMetadata` answers from the configured roster plus the
 ///   consensus view, and sits on the SDK's leader-discovery path, where the
 ///   wait would be real.
-/// - `PollMessages` and `GetConsumerOffset` are partition-plane reads: their
-///   answer comes from a partition group's own log, not the metadata STM, and
-///   holding them would put metadata lag on the data path.
+/// - `PollMessages`, `PollMessagesDeferred`,
+///   `FetchMessages` and `GetConsumerOffset` are partition-plane reads: their answer comes from a
+///   partition group's own log, not the metadata STM, and holding them would
+///   put metadata lag on the data path.
+/// - `CancelDeferredRequest` reads nothing and gets no reply.
 /// - `GetSnapshotFile` shells out to system tools off-thread; there is no
 ///   metadata answer to hold.
 /// - A code this build does not know: its only outcome is `InvalidCommand`,
@@ -208,6 +219,9 @@ pub const fn read_needs_metadata_frontier(code: u32) -> bool {
             | DESCRIBE_OPTIONS_CODE
             | GET_CLUSTER_METADATA_CODE
             | POLL_MESSAGES_CODE
+            | POLL_MESSAGES_DEFERRED_CODE
+            | FETCH_MESSAGES_CODE
+            | CANCEL_DEFERRED_REQUEST_CODE
             | GET_CONSUMER_OFFSET_CODE
             | GET_SNAPSHOT_FILE_CODE
     ) && lookup_command(code).is_some()
@@ -390,6 +404,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     let watermark = watermark.max(request.header().minimum_metadata_op);
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
     match code {
+        CANCEL_DEFERRED_REQUEST_CODE => {}
         PING_CODE => {
             // No `record_heartbeat` here: the funnel records one for EVERY
             // frame before classification, so a ping is already covered.
@@ -520,6 +535,36 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
         GET_SNAPSHOT_FILE_CODE => {
             handle_get_snapshot(shard, server_config, origin, &request, user_id, attachment).await;
         }
+        GET_METADATA_CHANGES_CODE => {
+            let authorize = || authorize_uid(shard, user_id, Permissioner::get_metadata_changes);
+            if let Err(error) =
+                authorize_and_hold_read(shard, attachment, code, watermark, &authorize).await
+            {
+                send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
+                return;
+            }
+            // A current state page hops to shard 0, and the session can end
+            // during the hop.
+            let reply = metadata_changes_reply(shard, request_body(&request), user_id)
+                .await
+                .and_then(|bytes| authorize_attached(attachment, authorize).map(|()| bytes));
+            match reply {
+                Ok(bytes) => {
+                    send_non_replicated_bytes(
+                        shard,
+                        &request,
+                        origin,
+                        bytes,
+                        FrameChannel::Reply,
+                        "metadata_changes",
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
+                }
+            }
+        }
         BIND_SESSION_CODE | GET_PARTITION_ROUTE_CODE => {
             let result = if code == BIND_SESSION_CODE {
                 bind_session(shard, sessions, origin, &request).await
@@ -543,13 +588,27 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 }
             }
         }
-        POLL_MESSAGES_CODE => {
+        POLL_MESSAGES_CODE | POLL_MESSAGES_DEFERRED_CODE | FETCH_MESSAGES_CODE => {
             let consumer_client = bound
                 .zip(attachment)
                 .map(|((client_id, _), attachment)| (client_id, attachment))
                 .ok_or(IggyError::Unauthenticated);
             match consumer_client {
                 Ok((consumer_client_id, attachment)) => {
+                    if code != POLL_MESSAGES_CODE {
+                        handle_deferred_request(
+                            shard,
+                            sessions,
+                            origin,
+                            &request,
+                            code,
+                            user_id,
+                            consumer_client_id,
+                            attachment,
+                        )
+                        .await;
+                        return;
+                    }
                     handle_poll_messages(
                         shard,
                         origin,
@@ -595,6 +654,212 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             )
             .await;
         }
+    }
+}
+
+enum DeferredRequest {
+    Poll(DeferredPollMessagesRequest),
+    Fetch(FetchMessagesRequest),
+}
+
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+async fn handle_deferred_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    origin: ClientOrigin,
+    request: &Message<RoutedRequestHeader>,
+    code: u32,
+    user_id: Option<u32>,
+    consumer_client_id: u128,
+    attachment: &SessionAttachment,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let body = request_body(request);
+    let decoded = match code {
+        POLL_MESSAGES_DEFERRED_CODE => {
+            DeferredPollMessagesRequest::decode_from(body).map(DeferredRequest::Poll)
+        }
+        _ => FetchMessagesRequest::decode_from(body).map(DeferredRequest::Fetch),
+    };
+    let Ok(mut wire) = decoded else {
+        send_non_replicated_deny(shard, request, origin, IggyError::InvalidCommand.as_code()).await;
+        return;
+    };
+    let (wait_us, timeout_us) = match &mut wire {
+        DeferredRequest::Poll(poll) => (&mut poll.wait_us, &mut poll.request_timeout_us),
+        DeferredRequest::Fetch(fetch) => (&mut fetch.wait_us, &mut fetch.request_timeout_us),
+    };
+    let elapsed_us = shard
+        .bus
+        .monotonic_micros()
+        .saturating_sub(origin.arrived_us());
+    // A frame that waited in the drain gets only the time its client still waits for it, so a
+    // request that its client gave up on stores nothing.
+    let Some((remaining_wait_us, remaining_timeout_us)) =
+        remaining_timers(*wait_us, *timeout_us, elapsed_us)
+    else {
+        send_non_replicated_deny(
+            shard,
+            request,
+            origin,
+            IggyError::TransientNotAccepted.as_code(),
+        )
+        .await;
+        return;
+    };
+    *wait_us = remaining_wait_us;
+    *timeout_us = remaining_timeout_us;
+    let timeout_us = remaining_timeout_us;
+    let committing = match &wire {
+        DeferredRequest::Poll(poll) => poll.poll.auto_commit,
+        DeferredRequest::Fetch(fetch) => fetch.auto_commit,
+    };
+    let commit_gate = committing.then(CommitGate::default);
+    serve_deferred_request(
+        shard,
+        sessions,
+        (origin, request),
+        (Duration::from_micros(timeout_us), commit_gate.clone()),
+        async {
+            let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
+            if !attachment.is_valid() {
+                return Err(IggyError::StaleClient);
+            }
+            if !shard
+                .plane
+                .metadata()
+                .applied_frontier()
+                .partition_requests_allowed(shard.bus.monotonic_now())
+                || request.header().minimum_metadata_op > current_metadata_commit(shard)
+            {
+                return Err(IggyError::TransientNotAccepted);
+            }
+            match wire {
+                DeferredRequest::Poll(poll) => {
+                    let (namespace, partition_id, mut resolved) = resolve_deferred_poll(
+                        shard,
+                        &poll,
+                        request.header(),
+                        (consumer_client_id, attachment.clone(), user_id),
+                    )?;
+                    resolved.commit_gate = commit_gate;
+                    read_deferred_poll(
+                        shard,
+                        request,
+                        (namespace, partition_id, resolved),
+                        attachment,
+                    )
+                    .await
+                    .map(|reply| (reply, Vec::new()))
+                }
+                DeferredRequest::Fetch(fetch) => {
+                    Box::pin(fetch_messages(
+                        shard,
+                        sessions,
+                        request,
+                        (&fetch, commit_gate),
+                        (consumer_client_id, attachment, user_id),
+                    ))
+                    .await
+                }
+            }
+        },
+    )
+    .await;
+}
+
+#[allow(clippy::future_not_send)]
+async fn serve_deferred_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    (origin, request): (ClientOrigin, &Message<RoutedRequestHeader>),
+    (watchdog, commit_gate): (Duration, Option<CommitGate>),
+    reply: impl Future<Output = Result<(BusMessage, Vec<FetchReadGuard>), IggyError>>,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let (guard, cancellation) = match SessionManager::begin_deferred_request(
+        sessions,
+        origin.id,
+        (request.header().request, commit_gate.clone()),
+        watchdog,
+        shard.bus.monotonic_now(),
+    ) {
+        Ok(active) => active,
+        Err(error) => {
+            send_non_replicated_deny(shard, request, origin, error.as_code()).await;
+            return;
+        }
+    };
+    let response_queued = Cell::new(false);
+    let outcome = {
+        let operation = Abortable::new(
+            async {
+                // The session room of the reads stays held until the reply is written.
+                let (mut reply, _held_reads) = reply.await?;
+                let written = reply.track_write();
+                // A watchdog expiry while the send waits for room drops the reply
+                // unsent, so only a returned send counts as queued.
+                send_host_frame(shard, origin, reply, FrameChannel::Reply, "deferred_reply").await;
+                response_queued.set(true);
+                written
+                    .await
+                    .map_err(|_| IggyError::ShardCommunicationError)
+            },
+            cancellation,
+        );
+        let operation = pin!(operation);
+        let timeout = pin!(shard.bus.sleep(watchdog));
+        match select(operation, timeout).await {
+            Either::Left((Ok(result), _)) => Some(result),
+            // A committing request that its client cancelled before any read
+            // committed answers once, so the client knows nothing was stored.
+            Either::Left((Err(_), _))
+                if commit_gate.as_ref().is_some_and(CommitGate::is_cancelled) =>
+            {
+                Some(Err(IggyError::TransientNotAccepted))
+            }
+            Either::Left((Err(_), _)) => None,
+            Either::Right(_) => Some(Err(IggyError::ShardCommunicationError)),
+        }
+    };
+    if matches!(outcome, Some(Ok(()))) {
+        guard.written(shard.bus.monotonic_now());
+    }
+    drop(guard);
+    // A queued reply can still reach the peer after the write watchdog expires.
+    if let Some(Err(error)) = outcome
+        && !response_queued.get()
+    {
+        send_non_replicated_deny(shard, request, origin, error.as_code()).await;
+    }
+}
+
+/// The wait and the request timeout of a deferred request whose frame arrived
+/// `elapsed_us` ago, or `None` once its timeout passed. The wait keeps the reply
+/// margin before the shortened timeout.
+const fn remaining_timers(wait_us: u64, timeout_us: u64, elapsed_us: u64) -> Option<(u64, u64)> {
+    match timeout_us.checked_sub(elapsed_us) {
+        Some(remaining) if remaining > 0 => {
+            let wait_us = wait_us.saturating_sub(elapsed_us);
+            let room = remaining.saturating_sub(MIN_DEFERRED_POLL_REPLY_MARGIN_US);
+            let wait = if wait_us < room { wait_us } else { room };
+            Some((wait, remaining))
+        }
+        _ => None,
     }
 }
 
@@ -1003,13 +1268,14 @@ async fn handle_sync_consumer_group<B, MJ, S, SB>(
 #[cfg(test)]
 mod tests {
     use super::{
-        FrontierUnreached, FrontierWait, hold_for_frontier, read_frontier_budget,
-        read_needs_metadata_frontier,
+        FrontierUnreached, FrontierWait, MIN_DEFERRED_POLL_REPLY_MARGIN_US, hold_for_frontier,
+        read_frontier_budget, read_needs_metadata_frontier, remaining_timers,
     };
     use configs::server::ServerConfig;
     use iggy_binary_protocol::codes::{
-        DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE,
-        GET_SNAPSHOT_FILE_CODE, GET_STREAM_CODE, PING_CODE, POLL_MESSAGES_CODE,
+        CANCEL_DEFERRED_REQUEST_CODE, DESCRIBE_OPTIONS_CODE, FETCH_MESSAGES_CODE,
+        GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_SNAPSHOT_FILE_CODE,
+        GET_STREAM_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE,
         SYNC_CONSUMER_GROUP_CODE,
     };
     use iggy_common::IggyDuration;
@@ -1130,6 +1396,9 @@ mod tests {
             DESCRIBE_OPTIONS_CODE,
             GET_CLUSTER_METADATA_CODE,
             POLL_MESSAGES_CODE,
+            POLL_MESSAGES_DEFERRED_CODE,
+            FETCH_MESSAGES_CODE,
+            CANCEL_DEFERRED_REQUEST_CODE,
             GET_CONSUMER_OFFSET_CODE,
             GET_SNAPSHOT_FILE_CODE,
         ] {
@@ -1142,6 +1411,45 @@ mod tests {
         assert!(
             !read_needs_metadata_frontier(u32::MAX),
             "an unknown code has no answer to hold, so it must not park"
+        );
+    }
+
+    #[test]
+    fn given_a_queued_deferred_frame_when_timeout_has_room_should_subtract_queue_time_from_wait() {
+        const SECOND: u64 = 1_000_000;
+        assert_eq!(
+            remaining_timers(5 * SECOND, 10 * SECOND, 2 * SECOND),
+            Some((3 * SECOND, 8 * SECOND))
+        );
+        assert_eq!(
+            remaining_timers(5 * SECOND, 10 * SECOND, 6 * SECOND),
+            Some((0, 4 * SECOND))
+        );
+    }
+
+    #[test]
+    fn given_a_queued_deferred_frame_when_timed_should_keep_only_what_its_client_still_waits() {
+        const SECOND: u64 = 1_000_000;
+        let margin = MIN_DEFERRED_POLL_REPLY_MARGIN_US;
+        assert_eq!(
+            remaining_timers(5 * SECOND, 5 * SECOND + margin, 0),
+            Some((5 * SECOND, 5 * SECOND + margin)),
+            "a frame served on arrival keeps its timers"
+        );
+        assert_eq!(
+            remaining_timers(5 * SECOND, 5 * SECOND + margin, 2 * SECOND),
+            Some((3 * SECOND, 3 * SECOND + margin)),
+            "the wait keeps the reply margin before the shortened timeout"
+        );
+        assert_eq!(
+            remaining_timers(0, 10 * SECOND, 4 * SECOND),
+            Some((0, 6 * SECOND)),
+            "a zero wait stays zero"
+        );
+        assert_eq!(
+            remaining_timers(5 * SECOND, 5 * SECOND + margin, 5 * SECOND + margin),
+            None,
+            "a frame that outlived its timeout is not served"
         );
     }
 }

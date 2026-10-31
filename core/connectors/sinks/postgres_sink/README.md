@@ -38,7 +38,6 @@ stream = "user_events"
 topics = ["users", "orders"]
 schema = "json"
 batch_length = 100
-poll_interval = "5ms"
 consumer_group = "postgres_sink"
 
 [plugin_config]
@@ -185,7 +184,6 @@ CREATE INDEX idx_payload_gin ON iggy_messages USING GIN (payload);
 
 - Increase `batch_size` for higher throughput (larger batches = fewer round trips)
 - Adjust `max_connections` based on PostgreSQL's `max_connections` setting
-- Use `poll_interval` to control how often the sink checks for new messages
 - Use `payload_format = "json"` for JSON data to enable native querying
 
 The sink caps each statement at PostgreSQL's 65,535 bind parameters based on
@@ -206,7 +204,6 @@ stream = "events"
 topics = ["user_events"]
 schema = "json"
 batch_length = 100
-poll_interval = "10ms"
 consumer_group = "pg_sink"
 
 [plugin_config]
@@ -225,7 +222,6 @@ stream = "binary_data"
 topics = ["images", "files"]
 schema = "raw"
 batch_length = 50
-poll_interval = "100ms"
 consumer_group = "pg_sink"
 
 [plugin_config]
@@ -244,7 +240,6 @@ stream = "logs"
 topics = ["app_logs"]
 schema = "text"
 batch_length = 1000
-poll_interval = "5ms"
 consumer_group = "pg_sink"
 
 [plugin_config]

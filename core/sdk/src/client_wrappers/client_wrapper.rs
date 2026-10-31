@@ -23,9 +23,10 @@ use crate::tcp::tcp_client::TcpClient;
 use crate::websocket::websocket_client::WebSocketClient;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
-    BinaryOperationLineage, BinarySendPartitioning, BinaryTransport, ClientState, Identifier,
-    IggyError, IggyMessage, MessageClient, SendMessagesResponse, SystemClient,
-    send_binary_messages,
+    AssignmentVersion, BinaryClient, BinaryOperationLineage, BinarySendPartitioning,
+    BinaryTransport, ClientState, Consumer, DeferredPollOptions, FetchedSection, Identifier,
+    IggyError, IggyMessage, MessageClient, PollingStrategy, SendMessagesResponse, SystemClient,
+    fetch_binary_messages, group_cache_key, send_binary_messages, sync_group_assignment,
 };
 
 #[allow(clippy::large_enum_variant)]
@@ -96,7 +97,7 @@ impl ClientWrapper {
     pub(crate) async fn retains_operation(&self, op: u64) -> bool {
         match self {
             Self::Iggy(client) => Box::pin(client.client.read().await.retains_operation(op)).await,
-            Self::Http(_) => false,
+            Self::Http(client) => client.retains_operation(op),
             Self::Tcp(client) => client.retains_operation(op),
             Self::Quic(client) => client.retains_operation(op),
             Self::WebSocket(client) => client.retains_operation(op),
@@ -124,4 +125,157 @@ impl ClientWrapper {
             Self::WebSocket(client) => client.can_recover(),
         }
     }
+
+    pub(crate) async fn deferred_group_state(
+        &self,
+    ) -> Result<std::sync::Arc<iggy_common::ConsumerGroupClientState>, IggyError> {
+        match self {
+            Self::Tcp(client) => Ok(client.consumer_group_state()),
+            Self::Quic(client) => Ok(client.consumer_group_state()),
+            Self::WebSocket(client) => Ok(client.consumer_group_state()),
+            Self::Http(_) => Err(IggyError::FeatureUnavailable),
+            Self::Iggy(client) => Box::pin(client.client.read().await.deferred_group_state()).await,
+        }
+    }
+
+    /// One `FetchMessages` (109) request for the `targets` of one readiness group, with the
+    /// contract of [`fetch_binary_messages`]. The sections of a nested [`IggyClient`] decode
+    /// with its encryptor. HTTP has no fetch and returns `FeatureUnavailable`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn fetch_messages(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        targets: &[(u32, PollingStrategy)],
+        consumer: &Consumer,
+        count: u32,
+        auto_commit: bool,
+        options: DeferredPollOptions,
+    ) -> Result<Vec<FetchedSection>, IggyError> {
+        macro_rules! fetch {
+            ($client:expr) => {
+                fetch_binary_messages(
+                    $client,
+                    stream_id,
+                    topic_id,
+                    targets,
+                    consumer,
+                    count,
+                    auto_commit,
+                    options,
+                )
+                .await
+            };
+        }
+        match self {
+            Self::Tcp(client) => fetch!(client),
+            Self::Quic(client) => fetch!(client),
+            Self::WebSocket(client) => fetch!(client),
+            Self::Http(_) => Err(IggyError::FeatureUnavailable),
+            Self::Iggy(client) => {
+                let sections = Box::pin(client.client.read().await.fetch_messages(
+                    stream_id,
+                    topic_id,
+                    targets,
+                    consumer,
+                    count,
+                    auto_commit,
+                    options,
+                ))
+                .await?;
+                Ok(sections
+                    .into_iter()
+                    .map(|section| section.with_encryptor(client.encryptor.clone()))
+                    .collect())
+            }
+        }
+    }
+
+    /// The partitions grouped by primary endpoint and split to fit one request
+    /// each, so that a consumer can keep one [`fetch_messages`](Self::fetch_messages)
+    /// in flight per group. Each group keeps the order of `partitions`, and the first
+    /// failed route lookup in that order is the error. HTTP has no groups and
+    /// returns `FeatureUnavailable`.
+    pub(crate) async fn readiness_groups(
+        &self,
+        stream: &Identifier,
+        topic: &Identifier,
+        partitions: &[u32],
+    ) -> Result<Vec<Vec<u32>>, IggyError> {
+        match self {
+            Self::Tcp(client) => {
+                client
+                    .driver
+                    .readiness_groups(stream, topic, partitions)
+                    .await
+            }
+            Self::Quic(client) => {
+                client
+                    .driver
+                    .readiness_groups(stream, topic, partitions)
+                    .await
+            }
+            Self::WebSocket(client) => {
+                client
+                    .driver
+                    .readiness_groups(stream, topic, partitions)
+                    .await
+            }
+            Self::Http(_) => Err(IggyError::FeatureUnavailable),
+            Self::Iggy(client) => {
+                Box::pin(
+                    client
+                        .client
+                        .read()
+                        .await
+                        .readiness_groups(stream, topic, partitions),
+                )
+                .await
+            }
+        }
+    }
+
+    pub(crate) async fn deferred_poll_partitions(
+        &self,
+        stream: &Identifier,
+        topic: &Identifier,
+        group: &Identifier,
+    ) -> Result<(AssignmentVersion, Vec<u32>), IggyError> {
+        match self {
+            Self::Tcp(client) => group_assignment(client, stream, topic, group).await,
+            Self::Quic(client) => group_assignment(client, stream, topic, group).await,
+            Self::WebSocket(client) => group_assignment(client, stream, topic, group).await,
+            Self::Http(_) => Err(IggyError::FeatureUnavailable),
+            Self::Iggy(client) => {
+                Box::pin(
+                    client
+                        .client
+                        .read()
+                        .await
+                        .deferred_poll_partitions(stream, topic, group),
+                )
+                .await
+            }
+        }
+    }
+}
+
+/// Syncs the assignment, then reads it.
+async fn group_assignment<B: BinaryClient>(
+    client: &B,
+    stream: &Identifier,
+    topic: &Identifier,
+    group: &Identifier,
+) -> Result<(AssignmentVersion, Vec<u32>), IggyError> {
+    sync_group_assignment(client, stream, topic, group).await?;
+    let state = client.consumer_group_state();
+    let key = group_cache_key(stream, topic, group);
+    if !state.is_registered(&key) {
+        return Err(IggyError::ConsumerGroupMemberNotFound(
+            0,
+            group.clone(),
+            topic.clone(),
+        ));
+    }
+    Ok(state.assignment_snapshot(&key))
 }

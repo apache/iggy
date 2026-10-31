@@ -420,6 +420,89 @@ enum Responses {
         }
     }
 
+    // MARK: Metadata changes
+
+    /// Decodes a `GetMetadataChanges` reply:
+    /// `[status:u8][phase:u8][has_log_id:u8][log_id:u128][oldest_op:u64][retained_since:u64][head_op:u64]`
+    /// `[has_next:u8][cursor:44][has_more:u8][records_count:u32][record]*[items_count:u32][item]*[token_len:u16][token]`.
+    /// A changes page carries only records, a current page only items and a token.
+    static func metadataChanges(_ body: ArraySlice<UInt8>) throws -> MetadataChanges {
+        try decode(body) { reader in
+            let statusCode = try reader.readUInt8()
+            guard let status = MetadataChangeStatus(rawValue: statusCode) else {
+                throw WireError.validation("unknown metadata change status \(statusCode)")
+            }
+            let phaseCode = try reader.readUInt8()
+            guard let phase = MetadataChangePhase(rawValue: phaseCode) else {
+                throw WireError.validation("unknown metadata change phase \(phaseCode)")
+            }
+            var logID: UInt128Value?
+            if try reader.readFlag() {
+                logID = try reader.readUInt128()
+            }
+            let oldestOp = try reader.readUInt64()
+            let retainedSince = try reader.readTimestamp()
+            let headOp = try reader.readUInt64()
+            var next: MetadataChangeCursor?
+            if try reader.readFlag() {
+                next = try MetadataChangeCursor.decode(from: &reader)
+            }
+            let hasMore = try reader.readFlag()
+            let recordsCount = try reader.readCount()
+            var records: [MetadataChangeRecord] = []
+            records.reserveCapacity(min(recordsCount, reader.remaining / metadataChangeRecordMinimumSize))
+            for _ in 0..<recordsCount {
+                records.append(try metadataChangeRecord(from: &reader))
+            }
+            let itemsCount = try reader.readCount()
+            var items: [MetadataCurrentItem] = []
+            items.reserveCapacity(min(itemsCount, reader.remaining / metadataItemMinimumSize))
+            for _ in 0..<itemsCount {
+                items.append(try metadataItem(from: &reader))
+            }
+            let tokenLength = Int(try reader.readUInt16())
+            var currentPageToken: MetadataCurrentPageToken?
+            if tokenLength != 0 {
+                var tokenReader = ByteReader(try reader.readBytes(tokenLength))
+                currentPageToken = try MetadataCurrentPageToken.decode(from: &tokenReader)
+                guard tokenReader.isAtEnd else {
+                    throw WireError.validation("trailing bytes after a page token")
+                }
+            }
+            let holdsOtherContent = phase == .changes ? !items.isEmpty || currentPageToken != nil : !records.isEmpty
+            guard !holdsOtherContent else {
+                throw WireError.validation("a changes page carries only records and a current page only items")
+            }
+            return MetadataChanges(
+                status: status, phase: phase, logID: logID, oldestOp: oldestOp, retainedSince: retainedSince, headOp: headOp, next: next, hasMore: hasMore,
+                records: records, items: items, currentPageToken: currentPageToken)
+        }
+    }
+
+    /// Smallest record envelope: no actor and an empty body.
+    private static let metadataChangeRecordMinimumSize = 8 + 4 + 16 + 8 + 1 + 1 + 1 + 4
+    /// Smallest item envelope: an empty body.
+    private static let metadataItemMinimumSize = 1 + 4
+
+    /// `[op:u64][ordinal:u32][checksum:u128][timestamp:u64][has_actor:u8][actor_user_id:u32][group:u8][kind:u8][body_len:u32][body]`
+    static func metadataChangeRecord(from reader: inout ByteReader) throws -> MetadataChangeRecord {
+        let op = try reader.readUInt64()
+        let ordinal = try reader.readUInt32()
+        let checksum = try reader.readUInt128()
+        let timestamp = try reader.readTimestamp()
+        let actorUserID = try reader.readOptionalUInt32()
+        let group = try reader.readUInt8()
+        let kind = try reader.readUInt8()
+        let change = try MetadataChange.decode(group: group, kind: kind, body: try reader.readPrefixedBytes())
+        return MetadataChangeRecord(op: op, ordinal: ordinal, checksum: checksum, timestamp: timestamp, actorUserID: actorUserID, change: change)
+    }
+
+    /// `[group:u8][body_len:u32][body]`
+    static func metadataItem(from reader: inout ByteReader) throws -> MetadataCurrentItem {
+        let group = try reader.readUInt8()
+        return try MetadataCurrentItem.decode(group: group, body: try reader.readPrefixedBytes())
+    }
+
     // MARK: Routing
 
     static let partitionRouteSize = 25
@@ -480,6 +563,55 @@ enum Responses {
                 throw WireError.validation("send_messages response has \(reader.remaining) trailing bytes")
             }
             return SendMessagesResponse(confirmations: confirmations)
+        }
+    }
+
+    /// `FETCH_SECTION_HEADER_SIZE`: one entry of the section table of a fetch reply.
+    static let fetchSectionHeaderSize = 56
+
+    /// `FetchMessagesResponse::head_size`: the section count and the table
+    /// of `sections` entries, which come before the records.
+    static func fetchHeadSize(_ sections: Int) -> Int {
+        MemoryLayout<UInt32>.size + sections * fetchSectionHeaderSize
+    }
+
+    /// A fetch reply: `[sections_count:4]`, then per section
+    /// `[partition_id:4][status:4][current_offset:8][messages_count:4][context:24][next_offset:8][records_len:4]`,
+    /// then the records of every section in table order. As
+    /// `FetchMessagesResponse::decode` checks, a section with an error holds
+    /// no records, and the records fill the body exactly.
+    static func fetchSections(_ body: ArraySlice<UInt8>) throws -> [FetchSection] {
+        try decode(body) { reader in
+            let count = try reader.readUInt32()
+            // Compared as `UInt32` so a hostile count never traps a 32-bit `Int`.
+            guard count <= UInt32(Requests.maxPartitionsPerRequest), fetchHeadSize(Int(count)) <= body.count else {
+                throw WireError.validation("a fetch reply of \(body.count) bytes cannot hold \(count) sections")
+            }
+            var sections: [FetchSection] = []
+            var lengths: [UInt32] = []
+            sections.reserveCapacity(Int(count))
+            lengths.reserveCapacity(Int(count))
+            for _ in 0..<count {
+                sections.append(
+                    FetchSection(
+                        partitionID: try reader.readUInt32(), status: try reader.readUInt32(), currentOffset: try reader.readUInt64(),
+                        messagesCount: try reader.readUInt32(), context: try PartitionContext.decode(from: &reader), nextOffset: try reader.readUInt64(),
+                        records: []))
+                lengths.append(try reader.readUInt32())
+            }
+            for index in sections.indices {
+                guard sections[index].status == 0 || lengths[index] == 0 else {
+                    throw WireError.validation("the section of partition \(sections[index].partitionID) has an error and records")
+                }
+                guard let length = Int(exactly: lengths[index]), length <= reader.remaining else {
+                    throw WireError.validation("the records of partition \(sections[index].partitionID) run past the fetch reply")
+                }
+                sections[index].records = try reader.readBytes(length)
+            }
+            guard reader.isAtEnd else {
+                throw WireError.validation("a fetch reply has \(reader.remaining) bytes after its records")
+            }
+            return sections
         }
     }
 

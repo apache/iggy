@@ -22,6 +22,7 @@
 //! [`ServerConfig`] formatter and the [`MessageBusConfig`] section
 //! formatter.
 
+use super::external_auth::ExternalAuthConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::partition::PartitionConfig;
@@ -38,7 +39,7 @@ impl Display for ServerConfig {
              heartbeat: {}, path: {}, runtime: {{ path: {} }}, logging: {}, \
              encryption: {}, memory_pool: {:?}, sharding: {:?}, \
              quic: {}, tcp: {}, http: {}, telemetry: {}, \
-             metadata: {}, message_bus: {}, partition: {} }}",
+             metadata: {}, message_bus: {}, partition: {}, external_auth: {} }}",
             self.consumer_group,
             self.data_maintenance,
             self.heartbeat,
@@ -55,6 +56,7 @@ impl Display for ServerConfig {
             self.metadata,
             self.message_bus,
             self.partition,
+            self.external_auth,
         )
     }
 }
@@ -86,11 +88,13 @@ impl Display for MetadataConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ prepare_queue_depth: {}, journal_slots: {}, clients_table_max: {}, partitions_max: {} }}",
+            "{{ prepare_queue_depth: {}, journal_slots: {}, clients_table_max: {}, partitions_max: {}, change_log_resource_capacity: {}, change_log_activity_capacity: {} }}",
             self.prepare_queue_depth,
             self.journal_slots,
             self.clients_table_max,
             self.partitions_max,
+            self.change_log_resource_capacity,
+            self.change_log_activity_capacity,
         )
     }
 }
@@ -167,6 +171,16 @@ impl Display for QuicCertificateConfig {
             f,
             "{{ self_signed: {}, cert_file: {}, key_file: {} }}",
             self.self_signed, self.cert_file, self.key_file
+        )
+    }
+}
+
+impl Display for ExternalAuthConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ enabled: {}, url: [redacted], timeout: {}, max_concurrent_callouts: {} }}",
+            self.enabled, self.timeout, self.max_concurrent_callouts,
         )
     }
 }

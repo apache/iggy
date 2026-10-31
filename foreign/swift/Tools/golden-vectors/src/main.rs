@@ -35,6 +35,10 @@ use iggy_binary_protocol::codes::*;
 use iggy_binary_protocol::consensus::{
     Command, EvictionHeader, EvictionReason, HEADER_SIZE, Operation, ReplyHeader, RequestHeader,
 };
+use iggy_binary_protocol::primitives::metadata_changes::{
+    WireChangeOptions, WireMetadataChange, WireMetadataChangeCursor, WireMetadataChangeGroup,
+    WireMetadataChangePhase, WireMetadataChangeStatus, WireStreamBody, WireStreamKey,
+};
 use iggy_binary_protocol::primitives::options::WireOptions;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::primitives::permissions::{
@@ -44,7 +48,9 @@ use iggy_binary_protocol::primitives::user_headers::encode_user_headers;
 use iggy_binary_protocol::requests::consumer_groups::*;
 use iggy_binary_protocol::requests::consumer_offsets::*;
 use iggy_binary_protocol::requests::messages::{
-    GetPartitionRouteRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
+    DeferredPollMessagesRequest, FetchMessagesRequest, FetchMessagesTarget,
+    GetPartitionRouteRequest, MAX_DEFERRED_POLL_TIMEOUT_US, MAX_DEFERRED_POLL_WAIT_US,
+    MIN_DEFERRED_POLL_MAX_BYTES, PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
@@ -67,6 +73,7 @@ use iggy_binary_protocol::responses::consumer_groups::{
 };
 use iggy_binary_protocol::responses::consumer_offsets::ConsumerOffsetResponse;
 use iggy_binary_protocol::responses::messages::{
+    FetchMessagesResponse, FetchMessagesSection, FetchMessagesSectionHeader,
     PartitionRouteResponse, PollMessagesResponseHeader, SendMessagesConfirmationResponse,
     SendMessagesResponse,
 };
@@ -78,7 +85,8 @@ use iggy_binary_protocol::responses::streams::{
 };
 use iggy_binary_protocol::responses::system::get_stats::{CacheMetricEntry, StatsResponse};
 use iggy_binary_protocol::responses::system::{
-    ClusterMetadataResponse, ClusterNodeResponse, DescribeOptionsResponse, OptionDescriptor,
+    ClusterMetadataResponse, ClusterNodeResponse, DescribeOptionsResponse,
+    GetMetadataChangesResponse, OptionDescriptor, WireMetadataChangeRecord,
 };
 use iggy_binary_protocol::responses::topics::{
     GetTopicResponse, GetTopicsResponse, PartitionResponse,
@@ -91,8 +99,8 @@ use iggy_binary_protocol::{
     WireIdentifier, WireName, WirePartitioning, WirePollingStrategy,
 };
 use iggy_common::{
-    CompressionAlgorithm, Durability, IggyByteSize, IggyDuration, IggyError, IggyExpiry,
-    MaxTopicSize, NO_ASSIGNED_PARTITION, OptionKey, OptionsPatch,
+    CompressionAlgorithm, DeferredPollOptions, Durability, IggyByteSize, IggyDuration, IggyError,
+    IggyExpiry, MaxTopicSize, NO_ASSIGNED_PARTITION, OptionKey, OptionsPatch,
     RESYNC_REQUIRED_PARTITION_SENTINEL, StreamCreateOptions, StreamEncryptionKey,
     StreamUpdateOptions, TopicCreateOptions, TopicUpdateOptions, UserStatus, UserUpdateOptions,
     stream_key_fingerprint,
@@ -136,6 +144,15 @@ fn named(name: &str) -> WireIdentifier {
 
 fn name(value: &str) -> WireName {
     WireName::new(value).expect("valid name")
+}
+
+fn metadata_cursor() -> WireMetadataChangeCursor {
+    WireMetadataChangeCursor {
+        log_id: 0x0d4b_8f2a_6e1c_93d7,
+        op: 4187,
+        checksum: 0xf2a4_c6e8_b0d1_f359,
+        ordinal: 1,
+    }
 }
 
 fn options(entries: &[(u8, &[u8], u8, &[u8])]) -> WireOptions {
@@ -194,7 +211,7 @@ fn version_info() -> ClientVersionInfo {
     ClientVersionInfo {
         protocol_version: IGGY_PROTOCOL_VERSION,
         sdk_name: name("swift-sdk"),
-        sdk_version: name("0.1.1"),
+        sdk_version: name("0.1.5"),
     }
 }
 
@@ -723,6 +740,107 @@ fn main() {
             auto_commit: false,
         },
     );
+    let deferred_poll = PollMessagesRequest {
+        consumer: WireConsumer::consumer_group(numeric(7)),
+        stream_id: numeric(1),
+        topic_id: named("orders"),
+        partition_id: Some(3),
+        strategy: WirePollingStrategy::next(),
+        count: 100,
+        auto_commit: true,
+    };
+    let defaults = DeferredPollOptions::default();
+    add(
+        &mut vectors,
+        "request.poll_messages_deferred",
+        &DeferredPollMessagesRequest {
+            poll: deferred_poll.clone(),
+            wait_us: defaults.max_wait.as_micros(),
+            min_count: defaults.min_count,
+            max_bytes: defaults.max_bytes,
+            request_timeout_us: defaults.request_timeout.as_micros(),
+        },
+    );
+    add(
+        &mut vectors,
+        "request.poll_messages_deferred.limits",
+        &DeferredPollMessagesRequest {
+            poll: deferred_poll.clone(),
+            wait_us: MAX_DEFERRED_POLL_WAIT_US,
+            min_count: deferred_poll.count,
+            max_bytes: MIN_DEFERRED_POLL_MAX_BYTES as u32,
+            request_timeout_us: MAX_DEFERRED_POLL_TIMEOUT_US,
+        },
+    );
+    // The vectors of `wire.md`: an `Offset` and a `Next` target, then a read
+    // section and a `NotPrimary` section.
+    let fetch_target = |partition_id, strategy| FetchMessagesTarget {
+        partition_id,
+        strategy,
+        max_bytes: 524_288,
+        incarnation: 3,
+        owner_generation: 9,
+    };
+    let fetch_request = FetchMessagesRequest {
+        consumer: WireConsumer::consumer_group(numeric(7)),
+        stream_id: numeric(1),
+        topic_id: named("orders"),
+        wait_us: 5_000_000,
+        request_timeout_us: 6_000_000,
+        min_count: 1,
+        count: 100,
+        max_bytes: 1_048_576,
+        auto_commit: true,
+        targets: vec![
+            fetch_target(1, WirePollingStrategy::offset(41)),
+            fetch_target(2, WirePollingStrategy::next()),
+        ],
+    };
+    add(&mut vectors, "request.fetch_messages", &fetch_request);
+    {
+        let record = batch_record(
+            1,
+            41,
+            1_700_000_000_000_100,
+            1_700_000_000_000_000,
+            &[frame(1, 0, 0, b"hello", &[])],
+        );
+        let section = |partition_id, status, records: &[u8]| FetchMessagesSectionHeader {
+            partition_id,
+            status,
+            current_offset: 0,
+            messages_count: 0,
+            context: PartitionContext::default(),
+            next_offset: 0,
+            records_len: u32::try_from(records.len()).expect("fixture records fit a section"),
+        };
+        let response = FetchMessagesResponse {
+            sections: vec![
+                FetchMessagesSection {
+                    header: FetchMessagesSectionHeader {
+                        current_offset: 41,
+                        messages_count: 1,
+                        context: PartitionContext {
+                            incarnation: 3,
+                            owner_generation: 9,
+                            metadata_op: 12,
+                        },
+                        next_offset: 42,
+                        ..section(1, 0, &record)
+                    },
+                    records: &record,
+                },
+                FetchMessagesSection {
+                    header: section(2, IggyError::NotPrimary.as_code(), &[]),
+                    records: &[],
+                },
+            ],
+        };
+        vectors.insert(
+            "response.fetch_messages".to_owned(),
+            hex(&response.to_bytes().expect("the fixture table is valid")),
+        );
+    }
     add(
         &mut vectors,
         "request.get_partition_route",
@@ -907,6 +1025,20 @@ fn main() {
         "request.describe_options",
         &DescribeOptionsRequest { scope: 1 },
     );
+    add(
+        &mut vectors,
+        "request.get_metadata_changes",
+        &GetMetadataChangesRequest {
+            start: WireMetadataChangeStart::After(metadata_cursor()),
+            since: Some(1_760_356_800_000_000),
+            until: None,
+            limit: 500,
+            groups: vec![
+                WireMetadataChangeGroup::Topics.as_u8(),
+                WireMetadataChangeGroup::Streams.as_u8(),
+            ],
+        },
+    );
 
     // Send messages: the full body a producer writes.
     {
@@ -1032,6 +1164,59 @@ fn main() {
             99,
             &[],
         ))),
+    );
+    let deferred_payload = DeferredPollMessagesRequest {
+        poll: deferred_poll,
+        wait_us: defaults.max_wait.as_micros(),
+        min_count: defaults.min_count,
+        max_bytes: defaults.max_bytes,
+        request_timeout_us: defaults.request_timeout.as_micros(),
+    }
+    .to_bytes();
+    let mut deferred_request = request_header(
+        POLL_MESSAGES_DEFERRED_CODE,
+        client_id,
+        6,
+        99,
+        &deferred_payload,
+    );
+    PartitionContext {
+        incarnation: 17,
+        owner_generation: 9,
+        metadata_op: 52,
+    }
+    .stamp(&mut deferred_request);
+    vectors.insert(
+        "vsr.request.poll_messages_deferred".to_owned(),
+        hex(bytemuck::bytes_of(&deferred_request)),
+    );
+    vectors.insert(
+        "vsr.request.cancel_deferred".to_owned(),
+        hex(bytemuck::bytes_of(
+            &deferred_request
+                .deferred_cancellation()
+                .expect("a deferred poll has a cancellation"),
+        )),
+    );
+    // Each target carries its own fence, so the header of a fetch carries none.
+    let fetch_request = request_header(
+        FETCH_MESSAGES_CODE,
+        client_id,
+        7,
+        99,
+        &fetch_request.to_bytes(),
+    );
+    vectors.insert(
+        "vsr.request.fetch_messages".to_owned(),
+        hex(bytemuck::bytes_of(&fetch_request)),
+    );
+    vectors.insert(
+        "vsr.request.cancel_fetch".to_owned(),
+        hex(bytemuck::bytes_of(
+            &fetch_request
+                .deferred_cancellation()
+                .expect("a fetch has a cancellation"),
+        )),
     );
     vectors.insert(
         "vsr.request.unknown_code".to_owned(),
@@ -1467,6 +1652,44 @@ fn main() {
                     status: 3,
                 },
             ],
+        },
+    );
+    let stream_created = WireMetadataChange::StreamCreated(WireStreamBody {
+        key: WireStreamKey {
+            stream_id: 3,
+            stream_created_op: 4121,
+        },
+        created_at: 1_760_356_800_123_456,
+        name: name("telemetry"),
+        options: WireChangeOptions::Readable {
+            explicit: WireOptions::empty(),
+            derived: WireOptions::empty(),
+        },
+    });
+    add(
+        &mut vectors,
+        "response.get_metadata_changes",
+        &GetMetadataChangesResponse {
+            status: WireMetadataChangeStatus::Ok,
+            phase: WireMetadataChangePhase::Changes,
+            log_id: Some(metadata_cursor().log_id),
+            oldest_op: 3871,
+            retained_since: 0,
+            head_op: 4190,
+            next: Some(metadata_cursor()),
+            has_more: false,
+            records: vec![WireMetadataChangeRecord {
+                op: 4121,
+                ordinal: 0,
+                checksum: 0xa5c1_f703_8b9e_3d65,
+                timestamp: 1_760_356_800_004_121,
+                actor_user_id: Some(0),
+                group: stream_created.group().as_u8(),
+                kind: stream_created.kind().as_u8(),
+                body: stream_created.body_bytes(),
+            }],
+            items: Vec::new(),
+            current_page_token: None,
         },
     );
     add(

@@ -25,7 +25,13 @@ const IGGY_URL: &str = "iggy://iggy:iggy@localhost:8090";
 async fn main() -> Result<(), IggyError> {
     println!("Build iggy client & consumer");
     //For customization, use the `new` or `from_stream_topic` constructor
+    // Stores the offset of each polled batch, so a restart continues after it.
     let config = IggyConsumerConfig::default();
+    let poll_options = PollOptions {
+        commit: CommitPolicy::OnRead,
+        ..config.poll_options()
+    };
+    let config = config.with_poll_options(poll_options);
     let (client, mut consumer) =
         IggyStreamConsumer::with_client_from_url(IGGY_URL, &config).await?;
 

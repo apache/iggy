@@ -111,6 +111,8 @@ pub struct ClientOrigin {
     /// The connection's drain took the request from its queue, so a frame
     /// for it waits for room in a full reply queue.
     queued: bool,
+    /// The monotonic time the frame arrived, where its client's timeout runs from.
+    arrived_us: u64,
 }
 
 impl ClientOrigin {
@@ -121,7 +123,12 @@ impl ClientOrigin {
             id,
             instance: bus.client_instance(id),
             queued: false,
+            arrived_us: bus.monotonic_micros(),
         }
+    }
+
+    pub(in crate::dispatch) const fn arrived_us(self) -> u64 {
+        self.arrived_us
     }
 
     /// This origin for a request that the connection's drain runs. The drain

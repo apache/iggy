@@ -248,6 +248,17 @@ fn add_basic_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
     if args.warmup_time().to_string() != DEFAULT_WARMUP_TIME {
         parts.push(format!("--warmup-time \'{}\'", args.warmup_time()));
     }
+
+    let poll_defaults = PollOptions::wait(IggyDuration::ONE_SECOND);
+    if args.max_wait != poll_defaults.max_wait {
+        parts.push(format!("--max-wait \'{}\'", args.max_wait));
+    }
+    if args.min_count != poll_defaults.min_count {
+        parts.push(format!("--min-count {}", args.min_count));
+    }
+    if let Some(max_bytes) = args.max_bytes {
+        parts.push(format!("--max-bytes {max_bytes}"));
+    }
 }
 
 fn add_benchmark_kind_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
@@ -416,6 +427,46 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn reproduced_commands_preserve_poll_options() {
+        let original = IggyBenchArgs::try_parse_from([
+            "iggy-bench",
+            "--max-wait",
+            "1m 30s",
+            "--min-count",
+            "100",
+            "--max-bytes",
+            "65536",
+            "pinned-consumer",
+            "tcp",
+        ])
+        .unwrap();
+        let command = recreate_bench_command(&original);
+        let reproduced = IggyBenchArgs::try_parse_from(shell_words(&command)).unwrap();
+        assert_eq!(
+            reproduced.poll_options(),
+            original.poll_options(),
+            "{command}"
+        );
+    }
+
+    /// Splits on spaces outside single quotes, as a shell does for these commands.
+    fn shell_words(command: &str) -> Vec<String> {
+        let mut words = vec![String::new()];
+        let mut quoted = false;
+        for character in command.chars() {
+            match character {
+                '\'' => quoted = !quoted,
+                ' ' if !quoted => words.push(String::new()),
+                character => words.last_mut().unwrap().push(character),
+            }
+        }
+        words
+            .into_iter()
+            .skip_while(|word| word != "iggy-bench")
+            .collect()
     }
 
     #[test]

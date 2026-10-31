@@ -46,6 +46,7 @@ use metadata::stm::stream::{Partition, Streams};
 use partitions::{IggyPartitions, PartitionsConfig, StreamKeyIdentity};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use shard::builder::IggyShardBuilder;
+use shard::config::DeferredPollConfig;
 use shard::metrics::ShardMetrics;
 use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
 use shard::{
@@ -355,7 +356,6 @@ pub(in crate::boot) async fn build_shard_for_thread(
             Rc::clone(&bus),
         ),
         CoordinatorConfig {
-            skip_shard_zero_for_replicas: config.cluster.coordinator.skip_shard_zero_for_replicas,
             skip_shard_zero_for_clients: config.cluster.coordinator.skip_shard_zero_for_clients,
         },
         metrics,
@@ -365,6 +365,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     .map_err(ServerError::ShardConstruction)?;
 
     let shard = Rc::new(built.shard);
+    shard.set_deferred_poll_config(deferred_poll_config(config));
     // Repair pacing is shared by both planes' repair loops, so it is a
     // per-shard tunable set once here rather than per consensus group.
     shard.set_repair_retry_ticks(repair_retry_ticks(config));
@@ -462,6 +463,17 @@ const _: () = assert!(
 );
 const _: () =
     assert!(configs::metadata::DEFAULT_METADATA_CLIENTS_TABLE_MAX == consensus::CLIENTS_TABLE_MAX);
+const _: () = assert!(
+    configs::metadata::DEFAULT_METADATA_CHANGE_LOG_RESOURCE_CAPACITY
+        == metadata::change_log::DEFAULT_RESOURCE_CAPACITY
+);
+const _: () = assert!(
+    configs::metadata::DEFAULT_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY
+        == metadata::change_log::DEFAULT_ACTIVITY_CAPACITY
+);
+const _: () = assert!(
+    configs::metadata::MAX_METADATA_CHANGE_LOG_CAPACITY == metadata::change_log::MAX_CAPACITY
+);
 const _: () =
     assert!(configs::cluster::DEFAULT_VIEW_PROBE_ATTEMPTS_MAX == consensus::PROBE_ATTEMPTS_MAX);
 const _: () =
@@ -588,6 +600,18 @@ fn refuse_unreadable_topics(streams: &Streams) -> Result<(), ServerError> {
             source: Box::new(source),
         }),
         None => Ok(()),
+    }
+}
+
+/// The `[sharding]` deferred poll limits in the units the shard compares.
+fn deferred_poll_config(config: &ServerConfig) -> DeferredPollConfig {
+    let sharding = &config.sharding;
+    DeferredPollConfig {
+        max_wait_us: sharding.deferred_poll_max_wait.as_micros(),
+        max_pending: sharding.deferred_poll_max_pending,
+        max_pending_per_session: sharding.deferred_poll_max_pending_per_session,
+        max_read_bytes: sharding.deferred_poll_max_read_bytes.as_bytes_usize(),
+        max_inflight_bytes: sharding.deferred_poll_max_inflight_bytes.as_bytes_usize(),
     }
 }
 
@@ -903,6 +927,15 @@ mod tests {
     use metadata::stm::StateMachine as _;
 
     const CONFIG_KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
+
+    #[test]
+    fn given_default_server_config_when_converting_deferred_poll_limits_should_match_shard_defaults()
+     {
+        assert_eq!(
+            deferred_poll_config(&ServerConfig::default()),
+            DeferredPollConfig::default()
+        );
+    }
     const OTHER_CONFIG_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
 
     #[test]

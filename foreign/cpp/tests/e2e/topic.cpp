@@ -1014,7 +1014,7 @@ TEST_F(E2E_Topic, UpdateTopicDoesNotChangeMessages) {
         iggy::ffi::ErrorInfo error_info{};
         const auto polled = message_client->poll_messages(
             make_numeric_identifier(created_stream.Id()), make_string_identifier(updated_topic_name), 0, "consumer",
-            make_numeric_identifier(1), "offset", 0, 10, false, error_info);
+            make_numeric_identifier(1), make_polling_strategy("offset", 0), make_poll_options(10), error_info);
         ASSERT_EQ(polled.count, 1u);
         ASSERT_EQ(polled.messages.size(), 1u);
         const std::string actual(polled.messages[0].payload.begin(), polled.messages[0].payload.end());

@@ -28,7 +28,8 @@ import {
   ResponseFrameDecoder
 } from './client.frame.js';
 import {
-  Command, EvictionReason, peekCommand, readEviction, readStatus, REQUEST_OFFSET, REPLY_OFFSET
+  Command, EvictionReason, deferredCancellation, peekCommand, readEviction, readStatus, REQUEST_OFFSET,
+  REPLY_OFFSET
 } from '../wire/vsr/header.js';
 import {
   ChangeSignal, PermitPool, type FrozenFrame, OPERATION_TIMEOUT_MS, VsrResponseTimeoutError, waitWithin
@@ -97,7 +98,7 @@ export const LINK_WRITE_QUEUE = 32;
 export const MAX_PENDING_PER_LINK = 256;
 const STALE_CLIENT = 30;
 
-/** A connected socket was lost; a later bootstrap can bind it again. */
+/** A connected socket was lost. A later bootstrap can bind it again. */
 export class ConnectionClosedError extends Error {
   constructor(cause?: Error) {
     super(cause?.message ?? 'replica connection closed', { cause });
@@ -194,7 +195,8 @@ export class IggyConnection extends EventEmitter {
     }
   }
 
-  async exchange(frame: () => Buffer, deadline: number, signal: AbortSignal, owner?: FrozenFrame): Promise<LinkAttempt> {
+  async exchange(frame: () => Buffer, deadline: number, signal: AbortSignal, owner?: FrozenFrame,
+    afterSend?: AbortSignal): Promise<LinkAttempt> {
     let release: (() => void) | undefined;
     let pending: Pending | undefined;
     try {
@@ -221,10 +223,33 @@ export class IggyConnection extends EventEmitter {
         this.writes.push(pending);
         void this.writeFrames();
       }
-      return await waitWithin(response, deadline, signal);
+      try {
+        return await waitWithin(response, deadline, signal);
+      } catch (error) {
+        if (afterSend && pending.started && signal.aborted) {
+          // The server answers a cancelled read that commits once: refused when the cancel won, or with what it
+          // stored, so the request keeps its reply slot.
+          const cancellation = pending.done ? undefined : deferredCancellation(pending.frame);
+          if (cancellation && !this.failed) {
+            this.writes.push({ id: pending.id, frame: cancellation, resolve: () => undefined, done: false, started: false });
+            void this.writeFrames();
+          }
+          return await waitWithin(response, deadline, afterSend);
+        }
+        throw error;
+      }
     } catch (error) {
-      if (pending)
+      if (pending) {
+        // A deferred request that reached the socket stays parked on the
+        // server until its wait ends, so the server is told to drop it. A
+        // late reply then finds no pending entry.
+        const cancellation = pending.started && !pending.done ? deferredCancellation(pending.frame) : undefined;
         this.finish(pending, { error, started: pending.started });
+        if (cancellation && !this.failed) {
+          this.writes.push({ id: pending.id, frame: cancellation, resolve: () => undefined, done: false, started: false });
+          void this.writeFrames();
+        }
+      }
       return { error, started: pending?.started ?? false };
     } finally {
       release?.();

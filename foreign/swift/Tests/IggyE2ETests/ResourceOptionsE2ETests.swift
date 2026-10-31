@@ -97,7 +97,7 @@ struct ResourceOptionsE2ETests {
             #expect(fetched.projection == created.projection)
             #expect(fetched.encryptionKeyFingerprint == (try EncryptionKey.fingerprint(key)))
             let polled = try await client.pollMessages(
-                streamID: Identifier(named: renamed), topicID: topicID, partitionID: 0, strategy: .first, count: 1, autoCommit: false)
+                streamID: Identifier(named: renamed), topicID: topicID, partitionID: 0, strategy: .first, options: PollOptions(count: 1))
             #expect(polled.messages.map(\.payloadString) == ["sealed payload"])
 
             // No stream key is resettable and the projections are read-only,

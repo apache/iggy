@@ -24,7 +24,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -33,9 +33,10 @@ use chrono::Local;
 use consensus::MetadataHandle;
 use iggy_binary_protocol::codes::{
     DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CONSUMER_GROUP_CODE,
-    GET_CONSUMER_GROUPS_CODE, GET_CONSUMER_OFFSET_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
-    GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
-    GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE, POLL_MESSAGES_CODE,
+    GET_CONSUMER_GROUPS_CODE, GET_CONSUMER_OFFSET_CODE, GET_METADATA_CHANGES_CODE,
+    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, GET_STREAM_CODE,
+    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+    POLL_MESSAGES_CODE,
 };
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_groups::{
@@ -102,19 +103,23 @@ use iggy_common::wire_conversions::{
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, Consumer, ConsumerGroup, ConsumerGroupDetails,
     ConsumerOffsetInfo, DEFAULT_MAX_TOPIC_SIZE, Identifier, IdentityInfo, IggyError, IggyTimestamp,
-    OptionSpec, OptionStorage, OptionsScope, Partitioning, PersonalAccessTokenInfo, PollMessages,
-    PolledMessages, RawPersonalAccessToken, SendMessages, SendMessagesConfirmations, Stats, Stream,
-    StreamDetails, TokenInfo, Topic, TopicDetails, UserInfo, UserInfoDetails, Validatable,
-    descriptors_for, erase_buffer,
+    MetadataChanges, MetadataChangesQuery, OptionSpec, OptionStorage, OptionsScope, Partitioning,
+    PersonalAccessTokenInfo, PollMessages, PolledMessages, PollingStrategy, RawPersonalAccessToken,
+    SendMessages, SendMessagesConfirmations, Stats, Stream, StreamDetails, TokenInfo, Topic,
+    TopicDetails, UserInfo, UserInfoDetails, Validatable, descriptors_for, erase_buffer,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
-use secrecy::ExposeSecret;
 use secrecy::zeroize::Zeroizing;
+use secrecy::{ExposeSecret, SecretString};
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
-use shard::{PartitionRead, PartitionReadReply};
+use shard::{
+    DeferredPollContext, DeferredPollRequest, PartitionRead, PartitionReadReply, PollQuotaIdentity,
+};
 
+use crate::dispatch::login_error::LoginRegisterError;
+use crate::dispatch::metadata_changes::metadata_changes_page;
 use crate::dispatch::partition::{
     ConsumerOffsetTarget, fence_poll_context, resolve_consumer_offset_request,
     resolve_poll_request, resolve_primary_consumer_offset_request,
@@ -146,8 +151,8 @@ use crate::http::submit::{
     submit_committed, submit_write,
 };
 use crate::http::wire::{
-    consumer_offset_wire_request, delete_offset_wire_request, encode_send_messages,
-    poll_wire_request, store_offset_wire_request,
+    DeferredPollQuery, consumer_offset_wire_request, delete_offset_wire_request,
+    encode_send_messages, poll_wire_request, store_offset_wire_request,
 };
 use crate::reply_frame::{build_polled_messages_body, build_raw_pat_reply};
 use crate::responses::connected_client_to_response;
@@ -183,6 +188,7 @@ pub(in crate::http) async fn ping(State(_state): State<HttpState>) -> &'static s
 
 pub(in crate::http) async fn login_user(
     State(state): State<HttpState>,
+    ConnectInfo(client_addr): ConnectInfo<crate::http::ClientAddr>,
     Json(command): Json<LoginUser>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
     // Credential verification is a consensus-free STM read; hold it while a
@@ -194,13 +200,30 @@ pub(in crate::http) async fn login_user(
     SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard))
         .await
         .map_err(|_| IggyError::TransientNotAccepted)?;
-    let (user_id, created_at) = verify_login_credentials(
+
+    // verify_login_credentials handles not-caught-up (transient), unknown
+    // users (constant-cost dummy hash), and wrong passwords in one call.
+    match verify_login_credentials(
         &state.shard,
         &command.username,
         command.password.expose_secret(),
-    )
-    .map_err(|error| login_error_to_iggy(&error))?;
-    issue_identity(&state, user_id, created_at)
+    ) {
+        Ok((user_id, created_at)) => issue_identity(&state, user_id, created_at),
+        Err(LoginRegisterError::UserNotFound) if state.server_config.external_auth.enabled => {
+            if state.is_normal_primary() {
+                SendWrapper::new(try_external_auth_http_login(
+                    &state,
+                    &command.username,
+                    &command.password,
+                    &client_addr,
+                ))
+                .await
+            } else {
+                Err(IggyError::TransientNotAccepted.into())
+            }
+        }
+        Err(error) => Err(login_error_to_iggy(&error).into()),
+    }
 }
 
 pub(in crate::http) async fn login_with_personal_access_token(
@@ -777,6 +800,37 @@ pub(in crate::http) async fn get_snapshot(
     Ok((headers, Body::from(archive)))
 }
 
+/// `GET /metadata/changes`: one page of this node's metadata change log, or
+/// of the current state. Local like `/snapshot`: committed records are the
+/// same on every replica of one history, so the page is never redirected.
+/// The query is strict: an unknown, repeated or malformed parameter is a 400.
+pub(in crate::http) async fn get_metadata_changes(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<MetadataChanges>, ReadError> {
+    SendWrapper::new(gate_local_read(
+        &state,
+        &identity,
+        Consistency::Serializable,
+        GET_METADATA_CHANGES_CODE,
+        Permissioner::get_metadata_changes,
+    ))
+    .await?;
+    let query = MetadataChangesQuery::from_http_query(
+        pairs
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    )
+    .map_err(ReadError::Rejected)?;
+    let page = SendWrapper::new(metadata_changes_page(&state.shard, query, identity.user_id))
+        .await
+        .map_err(ReadError::Rejected)?;
+    MetadataChanges::try_from(page)
+        .map(Json)
+        .map_err(ReadError::Rejected)
+}
+
 /// `GET /cluster/metadata`: report the live cluster topology as the same
 /// `ClusterMetadata` JSON the legacy server returns.
 ///
@@ -1133,6 +1187,61 @@ pub(in crate::http) async fn delete_segments(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /streams/{stream_id}/topics/{topic_id}/messages/deferred`: the poll of
+/// [`poll_messages`] with [`DeferredPollQuery`] limits. The primary holds it until
+/// `min_count` messages are ready, the reply reaches `max_bytes`, or `wait_us`
+/// expires. Invalid limits are refused before the poll is resolved. A poll that
+/// stores its offset goes through [`poll_messages_committing`].
+pub(in crate::http) async fn poll_messages_deferred(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Query(query): Query<PollMessages>,
+    Query(wait): Query<DeferredPollQuery>,
+    Query(consistency): Query<ConsistencyQuery>,
+    Extension(request): Extension<Arc<PartitionRequest>>,
+) -> Result<Response, ReadError> {
+    refuse_committing_get(&query)?;
+    poll_messages_committing(
+        State(state),
+        identity,
+        Path((stream_id, topic_id)),
+        Query(query),
+        Query(wait),
+        Query(consistency),
+        Extension(request),
+    )
+    .await
+}
+
+/// `POST /streams/{stream_id}/topics/{topic_id}/messages/deferred`: the poll of
+/// [`poll_messages_deferred`], also with `auto_commit`. A poll that stores its
+/// offset changes state, so it must not ride on a GET that clients, proxies and
+/// load balancers may resend (RFC 9110, section 9.2.1).
+pub(in crate::http) async fn poll_messages_committing(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Query(query): Query<PollMessages>,
+    Query(wait): Query<DeferredPollQuery>,
+    Query(consistency): Query<ConsistencyQuery>,
+    Extension(request): Extension<Arc<PartitionRequest>>,
+) -> Result<Response, ReadError> {
+    let options = iggy_common::DeferredPollOptions::from(wait);
+    options.validate(query.count).map_err(ReadError::Rejected)?;
+    poll_messages_impl(
+        state,
+        identity,
+        stream_id,
+        topic_id,
+        query,
+        consistency,
+        request,
+        Some(options),
+    )
+    .await
+}
+
 /// `GET /streams/{stream_id}/topics/{topic_id}/messages`: poll a batch of
 /// messages as the same `PolledMessages` JSON the legacy server returns. The
 /// query is the same flattened `PollMessages` shape the legacy server accepts
@@ -1158,6 +1267,45 @@ pub(in crate::http) async fn poll_messages(
     Query(consistency): Query<ConsistencyQuery>,
     Extension(request): Extension<Arc<PartitionRequest>>,
 ) -> Result<Response, ReadError> {
+    refuse_committing_get(&query)?;
+    poll_messages_impl(
+        state,
+        identity,
+        stream_id,
+        topic_id,
+        query,
+        consistency,
+        request,
+        None,
+    )
+    .await
+}
+
+/// A GET poll that would store its offset is refused: a resent GET would skip
+/// the batch that the first one stored.
+const fn refuse_committing_get(query: &PollMessages) -> Result<(), ReadError> {
+    if query.auto_commit {
+        return Err(ReadError::CommittingGet);
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Immediate and deferred polls share one authorization, fencing and relay path"
+)]
+#[allow(clippy::too_many_arguments)]
+async fn poll_messages_impl(
+    state: HttpState,
+    identity: Identity,
+    stream_id: String,
+    topic_id: String,
+    query: PollMessages,
+    consistency: ConsistencyQuery,
+    request: Arc<PartitionRequest>,
+    options: Option<iggy_common::DeferredPollOptions>,
+) -> Result<Response, ReadError> {
+    let started = std::time::Instant::now();
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
     let (consistency, metadata_floor) = SendWrapper::new(partition_read_consistency(
@@ -1223,7 +1371,7 @@ pub(in crate::http) async fn poll_messages(
     let requested = request
         .route()
         .map(|route| route.context)
-        .or(query.strategy.context)
+        .or_else(|| query.strategy.context())
         .unwrap_or(local);
     let requested = PartitionContext {
         metadata_op: requested.metadata_op.max(metadata_floor),
@@ -1242,24 +1390,52 @@ pub(in crate::http) async fn poll_messages(
         // member and names client 0, the HTTP read client.
         fence_poll_context(requested, local, HTTP_UNREGISTERED_CLIENT_ID, partition_id)
             .map_err(ReadError::Rejected)?;
-        let reply = state
-            .shard
-            .partition_read(
-                namespace,
-                PartitionRead::UnboundPollOnPrimary {
-                    consumer,
-                    args: args.clone(),
+        let read = if let Some(options) = options {
+            let mut options = options
+                .remaining(started.elapsed())
+                .map_err(ReadError::Rejected)?;
+            let remaining = request
+                .deadline
+                .saturating_duration_since(std::time::Instant::now());
+            options.request_timeout = options.request_timeout.get_duration().min(remaining).into();
+            // A binding HTTP deadline shortens the wait, not its reply margin.
+            options.max_wait = options
+                .max_wait
+                .get_duration()
+                .min(options.request_timeout.get_duration().saturating_sub(
+                    std::time::Duration::from_micros(
+                        iggy_common::MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+                    ),
+                ))
+                .into();
+            PartitionRead::DeferredPoll(Box::new(DeferredPollRequest::new(
+                consumer,
+                args.clone(),
+                metadata,
+                DeferredPollContext {
+                    session: None,
                     user_id: identity.user_id,
-                    user_created_at: identity.user_created_at.as_micros(),
-                    metadata,
+                    user_created_at: Some(identity.user_created_at.as_micros()),
+                    quota: PollQuotaIdentity::User(identity.user_id),
+                    primary: true,
                 },
-            )
-            .await;
+                options,
+            )))
+        } else {
+            PartitionRead::UnboundPollOnPrimary {
+                consumer,
+                args: args.clone(),
+                user_id: identity.user_id,
+                user_created_at: identity.user_created_at.as_micros(),
+                metadata,
+            }
+        };
+        let reply = state.shard.partition_read(namespace, read).await;
         // The owner may already have auto-committed. At-most-once polls can
         // lose a batch here, but revoked credentials must never receive it.
         authorize_read(&state, &identity, consistency, rule)?;
         check_partition_incarnation(&state, namespace, local.incarnation)?;
-        polled_messages_reply(&state, partition_id, reply)
+        polled_messages_reply(&state, partition_id, &query.strategy, reply)
     };
     SendWrapper::new(serve_partition(
         &state,
@@ -1273,10 +1449,11 @@ pub(in crate::http) async fn poll_messages(
     .await
 }
 
-/// The HTTP answer to the owner's reply to a poll.
+/// The HTTP answer to the owner's reply to a poll from `strategy`.
 fn polled_messages_reply(
     state: &HttpInner,
     partition_id: u32,
+    strategy: &PollingStrategy,
     reply: Option<PartitionReadReply>,
 ) -> Result<Response, ReadError> {
     match reply {
@@ -1285,6 +1462,7 @@ fn polled_messages_reply(
             fragments,
             current_offset,
             encryptor,
+            ..
         }) => {
             // TCP parity (`build_polled_messages_reply`): the served context
             // carries at least the metadata this node applied, so a later poll
@@ -1304,7 +1482,7 @@ fn polled_messages_reply(
             )
             .map_err(ReadError::Rejected)?;
             Ok(
-                Json(PolledMessages::from_bytes(body).map_err(ReadError::Rejected)?)
+                Json(PolledMessages::from_bytes(body, strategy).map_err(ReadError::Rejected)?)
                     .into_response(),
             )
         }
@@ -2114,6 +2292,65 @@ fn issue_identity(
     }))
 }
 
+/// Try external auth callout for an HTTP password login and, on success,
+/// resolve the returned username to a pre-provisioned Iggy user.
+async fn try_external_auth_http_login(
+    state: &HttpInner,
+    username: &str,
+    password: &SecretString,
+    client_addr: &crate::http::ClientAddr,
+) -> Result<Json<IdentityInfo>, CustomError> {
+    use crate::external_auth::{
+        Credentials, ExternalAuthRequest, HTTP_TRANSPORT, ValidatedDecision, callout_external_auth,
+    };
+
+    let ext_config = &state.server_config.external_auth;
+    let client_address = client_addr.addr.to_string();
+    let connection_id = uuid::Uuid::now_v7().to_string();
+    let ext_request = ExternalAuthRequest {
+        transport: HTTP_TRANSPORT,
+        client_address: &client_address,
+        connection_id: &connection_id,
+        credentials: Credentials::UsernamePassword { username, password },
+    };
+
+    let decision = callout_external_auth(ext_config, ext_request)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "external auth callout failed");
+            if error.is_transient() {
+                IggyError::TransientNotAccepted
+            } else {
+                IggyError::InvalidCredentials
+            }
+        })?;
+
+    match decision {
+        ValidatedDecision::Allow {
+            username: ext_username,
+        } => {
+            let (user_id, created_at) = state
+                .shard
+                .plane
+                .metadata()
+                .mux_stm
+                .users()
+                .read(|users| crate::external_auth::resolve_username(users, &ext_username))
+                .inspect_err(|_| {
+                    tracing::warn!(
+                        ext_username = %ext_username,
+                        "ext-auth user resolution failed"
+                    );
+                })?;
+            issue_identity(state, user_id, created_at)
+        }
+        ValidatedDecision::Deny { reason } => {
+            tracing::warn!(reason = %reason, "external auth denied login");
+            Err(IggyError::InvalidCredentials.into())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2130,6 +2367,41 @@ mod tests {
     use crate::http::reply::classify_partition_reply;
     use crate::http::wire::build_request_message;
     use crate::reply_frame::build_deny_reply;
+
+    #[tokio::test]
+    async fn given_a_committing_poll_when_sent_as_get_should_refuse_it_and_name_the_post_route() {
+        // A GET poll with `auto_commit` stored its offset, and anything that
+        // resent the GET skipped the batch that the first one stored. The bare
+        // refusal then left an older client without a hint where to send it.
+        let parse = |uri: &str| {
+            Query::<PollMessages>::try_from_uri(&uri.parse().unwrap())
+                .unwrap()
+                .0
+        };
+        let committing =
+            parse("/x?consumer_id=1&partition_id=0&kind=offset&value=0&count=1&auto_commit=true");
+        let reading = parse("/x?consumer_id=1&partition_id=0&kind=offset&value=0&count=1");
+
+        let response = refuse_committing_get(&committing)
+            .expect_err("a committing GET is refused")
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the error body reads");
+        let error: Value = serde_json::from_slice(&body).expect("the error body is JSON");
+        assert_eq!(
+            error,
+            serde_json::json!({
+                "id": IggyError::InvalidCommand.as_code(),
+                "code": "invalid_command",
+                "reason": "A poll with auto_commit stores its offset, so send it as POST /streams/{stream_id}/topics/{topic_id}/messages/deferred",
+                "field": "auto_commit",
+            })
+        );
+        assert!(refuse_committing_get(&reading).is_ok());
+    }
 
     /// A create body can carry the stream key, so it zeroes itself on drop and
     /// leaves its options block for the handler to erase.

@@ -20,7 +20,8 @@ use crate::helpers::test_data::create_test_messages;
 use bytes::Bytes;
 use cucumber::{then, when};
 use iggy::prelude::{
-    Consumer, ConsumerKind, Identifier, IggyMessage, MessageClient, Partitioning, PollingStrategy,
+    Consumer, ConsumerKind, Identifier, IggyMessage, MessageClient, Partitioning, PollOptions,
+    PollingStrategy,
 };
 
 #[when(regex = r"^I send (\d+) messages to stream (\d+), topic (\d+), partition (\d+)$")]
@@ -74,11 +75,13 @@ pub async fn when_poll_messages(
         .poll_messages(
             &Identifier::numeric(stream_id).unwrap(),
             &Identifier::numeric(topic_id).unwrap(),
-            Some(partition_id),
+            partition_id,
             &consumer,
             &PollingStrategy::offset(start_offset),
-            100,
-            false,
+            PollOptions {
+                count: 100,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("Should be able to poll messages");

@@ -27,6 +27,7 @@ pub(crate) mod either;
 pub(crate) mod http;
 pub(crate) mod identifier;
 pub(crate) mod message;
+pub(crate) mod metadata_changes;
 pub(crate) mod options;
 pub(crate) mod partition;
 pub(crate) mod permissions;

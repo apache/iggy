@@ -31,6 +31,8 @@ import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.config.TcpConnectionString;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
+import org.apache.iggy.message.DeferredPollOptions;
+import org.apache.iggy.serde.BytesDeserializer;
 
 import java.io.File;
 import java.time.Duration;
@@ -79,6 +81,12 @@ import java.util.function.Function;
  * @see AsyncIggyTcpClient#builder()
  */
 public final class AsyncIggyTcpClientBuilder {
+    /** The smallest frame that holds a fetch reply of the most partitions with one record of the largest size. */
+    static final long MIN_MAX_VSR_FRAME_SIZE = VsrHeaders.HEADER_SIZE
+            + BytesDeserializer.FETCH_SECTIONS_COUNT_BYTES
+            + (long) FetchMessages.MAX_PARTITIONS_PER_REQUEST * BytesDeserializer.FETCH_SECTION_BYTES
+            + DeferredPollOptions.MAX_RECORD_SIZE;
+
     private String host = "localhost";
     private Integer port = 8090;
     private String username;
@@ -423,9 +431,9 @@ public final class AsyncIggyTcpClientBuilder {
     }
 
     private void validateMaxVsrFrameSize() {
-        if (maxVsrFrameSize < VsrHeaders.HEADER_SIZE || maxVsrFrameSize > Integer.MAX_VALUE) {
-            throw new IggyInvalidArgumentException("MaxVsrFrameSize must be between " + VsrHeaders.HEADER_SIZE + " and "
-                    + Integer.MAX_VALUE + " bytes");
+        if (maxVsrFrameSize < MIN_MAX_VSR_FRAME_SIZE || maxVsrFrameSize > Integer.MAX_VALUE) {
+            throw new IggyInvalidArgumentException("MaxVsrFrameSize must be between " + MIN_MAX_VSR_FRAME_SIZE + " and "
+                    + Integer.MAX_VALUE + " bytes, so a reply holds the largest message");
         }
     }
 

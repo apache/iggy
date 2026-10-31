@@ -32,6 +32,7 @@ import java.util.Set;
 public class IggyValidationException extends IggyServerException {
 
     private static final Set<IggyErrorCode> CODES = EnumSet.of(
+            IggyErrorCode.INVALID_CONFIGURATION,
             IggyErrorCode.INVALID_COMMAND,
             IggyErrorCode.INVALID_FORMAT,
             IggyErrorCode.FEATURE_UNAVAILABLE,

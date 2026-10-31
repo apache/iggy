@@ -15,10 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import type { Socket } from 'node:net';
+import type { ConsumerMessage, IggyConsumer } from '../stream/iggy-consumer.js';
+import type { PartitionReader } from '../stream/partition-reader.js';
 import type { Stream } from '../wire/stream/stream.utils.js';
 import type { Topic } from '../wire/topic/topic.utils.js';
-import type { CreateMessage, Message, OptionSpec } from 'src/wire/index.js';
+import type {
+  CreateMessage, Message, MetadataChangeCursor, MetadataChangeGroup, MetadataChangeRecord,
+  MetadataCurrentItem, OptionSpec, PollMessagesResponse
+} from 'src/wire/index.js';
 import type { Client } from '../client/index.js';
+
+/** How a call that a step started in the background ended, and when. */
+export type Outcome<T> = { ended: number } & ({ ok: true, value: T } | { ok: false, error: unknown });
+
+/** A call that a step started in the background, with the controller that cancels it. */
+export type BackgroundCall<T> = { started: number, cancel: AbortController, outcome: Promise<Outcome<T>> };
 
 export interface TestWorld {
   client: Client
@@ -33,5 +45,27 @@ export interface TestWorld {
   updateError?: unknown,
   optionSpecs?: OptionSpec[],
   userId?: number,
-  callError?: Error
+  callError?: Error,
+  /** Groups the metadata change steps read */
+  changeGroups?: MetadataChangeGroup[],
+  /** Cursor the metadata change steps follow from */
+  changeCursor?: MetadataChangeCursor,
+  /** Records of the last stream that the follow step returned */
+  followedChanges?: MetadataChangeRecord[],
+  /** Items of the last current state scan */
+  currentItems?: MetadataCurrentItem[],
+  /** Consumer group that this client joined on the topic */
+  groupName?: string,
+  lastSentPartition?: number,
+  /** Deferred poll that a step started in the background */
+  deferredPoll?: BackgroundCall<PollMessagesResponse>,
+  /** The link that the deferred poll goes out on, its bytes written before the poll and the size of the poll frame */
+  deferredPollLink?: { socket: Socket, written: number, frameBytes: number },
+  /** Operation of a deferred poll whose outcome stayed unknown */
+  uncertainOperation?: bigint,
+  /** Partition reader that a step opened */
+  reader?: PartitionReader,
+  /** Consumer that a step opened, with its message iterator */
+  consumer?: IggyConsumer,
+  consumerMessages?: AsyncIterator<ConsumerMessage>
 };

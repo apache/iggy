@@ -78,6 +78,12 @@ class ConsumerGroupDetails;
 class ConsumerGroupMember;
 class IggyMessagePolled;
 class IggyMessageToSend;
+class MetadataChangeCursor;
+class MetadataChangeRecord;
+class MetadataChanges;
+class MetadataChangesQuery;
+class MetadataCurrentItem;
+class MetadataCurrentPageToken;
 
 namespace detail {
 /** @brief Internal base for string-backed option types. */
@@ -97,6 +103,10 @@ class StringTag {
     std::string value_;
 };
 
+/** @brief Runs a bridge call and rethrows its failure as IggyException with the call's ErrorInfo. */
+template <typename Operation>
+decltype(auto) RethrowAsIggyException(Operation &&operation);
+
 }  // namespace detail
 
 /**
@@ -104,9 +114,13 @@ class StringTag {
  *
  * Code() and Kind() are available only when a call forwards a typed Rust SDK
  * error. IggyBlockingClient documents the covered methods. Other calls and
- * C++ or bridge-local argument errors leave Code() empty and Kind() empty.
- * OperationId() is present only for operation_uncertain, lane_blocked, and
- * operation_not_retained errors and preserves the full unsigned 64-bit ID.
+ * C++ or bridge-local argument errors leave Code() empty and Kind() empty,
+ * except the metadata change calls, which report invalid input with the kind
+ * each one documents.
+ * OperationId() is present only for operation_uncertain, lane_blocked,
+ * operation_not_retained, partition_lane_blocked and fetch_progress_uncertain
+ * errors and preserves the full unsigned 64-bit ID. BlockedPartitionId() is
+ * present only for partition_lane_blocked.
  */
 class IggyException : public std::runtime_error {
   public:
@@ -119,6 +133,7 @@ class IggyException : public std::runtime_error {
         return kind_ ? *kind_ : kNoKind;
     }
     [[nodiscard]] std::optional<std::uint64_t> OperationId() const noexcept { return operation_id_; }
+    [[nodiscard]] std::optional<std::uint32_t> BlockedPartitionId() const noexcept { return blocked_partition_id_; }
 
   private:
     IggyException(const std::string &message, const ffi::ErrorInfo &error) : std::runtime_error(message) {
@@ -129,17 +144,41 @@ class IggyException : public std::runtime_error {
         if (error.has_operation_id) {
             operation_id_ = error.operation_id;
         }
+        if (error.has_blocked_partition_id) {
+            blocked_partition_id_ = error.blocked_partition_id;
+        }
     }
 
-    friend class IggyBlockingClient;
-    friend std::string EncryptionKeyFingerprint(const std::vector<std::uint8_t> &key);
-    friend std::string EncryptionKeyFingerprint(const std::string &key_base64);
+    template <typename Operation>
+    friend decltype(auto) detail::RethrowAsIggyException(Operation &&operation);
+    friend class ReadException;
 
     std::optional<std::uint32_t> code_;
     // Shared, so that copying the exception cannot throw.
     std::shared_ptr<const std::string> kind_;
     std::optional<std::uint64_t> operation_id_;
+    std::optional<std::uint32_t> blocked_partition_id_;
 };
+
+namespace detail {
+
+template <typename Operation>
+decltype(auto) RethrowAsIggyException(Operation &&operation) {
+    ffi::ErrorInfo error_info{};
+    try {
+        if constexpr (std::is_invocable_v<Operation, ffi::ErrorInfo &>) {
+            return std::forward<Operation>(operation)(error_info);
+        } else {
+            return std::forward<Operation>(operation)();
+        }
+    } catch (const IggyException &) {
+        throw;
+    } catch (const std::exception &error) {
+        throw IggyException(error.what(), error_info);
+    }
+}
+
+}  // namespace detail
 
 /**
  * @brief Details returned after a successful login.
@@ -728,6 +767,8 @@ class Permissions final {
 
     friend class IggyBlockingClient;
     friend class UserInfoDetails;
+    friend class MetadataUserChange;
+    friend class MetadataUserPermissionsUpdated;
 
     GlobalPermissions global_;
     std::map<std::uint32_t, StreamPermissions> streams_;
@@ -1093,6 +1134,8 @@ class IggyMessagePolled final {
     static IggyMessagePolled FromFfi(ffi::IggyMessagePolled message);
 
     friend class IggyBlockingClient;
+    friend class PolledMessages;
+    friend class ReceivedMessage;
 
     std::uint64_t checksum_;
     absl::uint128 id_;
@@ -1147,6 +1190,10 @@ class ResourceOptions final {
     friend class StreamDetails;
     friend class UserInfo;
     friend class UserInfoDetails;
+    friend class MetadataStreamChange;
+    friend class MetadataTopicChange;
+    friend class MetadataTopicItem;
+    friend class MetadataUserChange;
 
     std::map<std::string, HeaderField> explicit_;
     std::map<std::string, HeaderField> derived_;
@@ -1407,18 +1454,19 @@ class Topic final {
 };
 
 /**
- * @brief Partition incarnation and consumer-group owner captured by a read or
- *        a poll.
+ * @brief Partition incarnation and consumer-group owner that
+ *        Partition::Context() reports.
  *
- * Store an offset under the context that delivered it with
- * IggyBlockingClient::StoreConsumerPosition(). The store then fails instead of
- * landing on a recreated partition or under a newer consumer-group owner. The
- * server refuses a context whose incarnation is zero.
+ * A checkpoint keeps the context of its batch privately, and
+ * IggyBlockingClient::StoreConsumerPosition() stores under it. The store then
+ * fails instead of landing on a recreated partition or under a newer
+ * consumer-group owner.
  */
 class PartitionContext final {
   public:
     /**
-     * @brief Creates a context from the values a poll or a read returned.
+     * @brief Creates a context from the values that Partition::Context()
+     *        reports.
      * @param incarnation Creation revision of the partition. It changes when a
      *        deleted partition ID is created again.
      * @param owner_generation Consumer-group owner generation, or zero outside
@@ -1447,11 +1495,9 @@ class PartitionContext final {
     [[nodiscard]] std::uint64_t MetadataOp() const noexcept { return metadata_op_; }
 
   private:
-    [[nodiscard]] ffi::PartitionContext ToFfi() const;
     static PartitionContext FromFfi(ffi::PartitionContext context);
 
     friend class Partition;
-    friend class IggyBlockingClient;
 
     std::uint64_t incarnation_;
     std::uint64_t owner_generation_;
@@ -3970,6 +4016,1621 @@ std::string EncryptionKeyFingerprint(const std::vector<std::uint8_t> &key);
 std::string EncryptionKeyFingerprint(const std::string &key_base64);
 
 /**
+ * @brief Family of metadata change records and the unit of filtering.
+ *
+ * The values are the wire codes. A query without groups selects every group.
+ */
+enum class MetadataChangeGroup : std::uint8_t {
+    Streams              = 1,
+    Topics               = 2,
+    Partitions           = 3,
+    ConsumerGroups       = 4,
+    ConsumerGroupMembers = 5,
+    Users                = 6,
+    PersonalAccessTokens = 7,
+    Sessions             = 8,
+};
+
+constexpr std::string_view to_string(const MetadataChangeGroup group) {
+    switch (group) {
+        case MetadataChangeGroup::Streams:
+            return "streams";
+        case MetadataChangeGroup::Topics:
+            return "topics";
+        case MetadataChangeGroup::Partitions:
+            return "partitions";
+        case MetadataChangeGroup::ConsumerGroups:
+            return "consumer_groups";
+        case MetadataChangeGroup::ConsumerGroupMembers:
+            return "consumer_group_members";
+        case MetadataChangeGroup::Users:
+            return "users";
+        case MetadataChangeGroup::PersonalAccessTokens:
+            return "personal_access_tokens";
+        case MetadataChangeGroup::Sessions:
+            return "sessions";
+    }
+    throw std::invalid_argument("Unknown metadata change group");
+}
+
+/**
+ * @brief Kind of a metadata change record. The values are the wire codes.
+ */
+enum class MetadataChangeKind : std::uint8_t {
+    StreamCreated                    = 1,
+    StreamUpdated                    = 2,
+    StreamDeleted                    = 3,
+    TopicCreated                     = 10,
+    TopicUpdated                     = 11,
+    TopicDeleted                     = 12,
+    PartitionsChanged                = 20,
+    ConsumerGroupCreated             = 30,
+    ConsumerGroupDeleted             = 31,
+    ConsumerGroupMemberJoined        = 40,
+    ConsumerGroupMemberLeft          = 41,
+    ConsumerGroupPartitionHandedOver = 42,
+    UserCreated                      = 50,
+    UserUpdated                      = 51,
+    UserDeleted                      = 52,
+    UserPasswordChanged              = 53,
+    UserPermissionsUpdated           = 54,
+    PersonalAccessTokenCreated       = 60,
+    PersonalAccessTokenDeleted       = 61,
+    SessionRegistered                = 70,
+    SessionClosed                    = 71,
+};
+
+constexpr std::string_view to_string(const MetadataChangeKind kind) {
+    switch (kind) {
+        case MetadataChangeKind::StreamCreated:
+            return "stream_created";
+        case MetadataChangeKind::StreamUpdated:
+            return "stream_updated";
+        case MetadataChangeKind::StreamDeleted:
+            return "stream_deleted";
+        case MetadataChangeKind::TopicCreated:
+            return "topic_created";
+        case MetadataChangeKind::TopicUpdated:
+            return "topic_updated";
+        case MetadataChangeKind::TopicDeleted:
+            return "topic_deleted";
+        case MetadataChangeKind::PartitionsChanged:
+            return "partitions_changed";
+        case MetadataChangeKind::ConsumerGroupCreated:
+            return "consumer_group_created";
+        case MetadataChangeKind::ConsumerGroupDeleted:
+            return "consumer_group_deleted";
+        case MetadataChangeKind::ConsumerGroupMemberJoined:
+            return "consumer_group_member_joined";
+        case MetadataChangeKind::ConsumerGroupMemberLeft:
+            return "consumer_group_member_left";
+        case MetadataChangeKind::ConsumerGroupPartitionHandedOver:
+            return "consumer_group_partition_handed_over";
+        case MetadataChangeKind::UserCreated:
+            return "user_created";
+        case MetadataChangeKind::UserUpdated:
+            return "user_updated";
+        case MetadataChangeKind::UserDeleted:
+            return "user_deleted";
+        case MetadataChangeKind::UserPasswordChanged:
+            return "user_password_changed";
+        case MetadataChangeKind::UserPermissionsUpdated:
+            return "user_permissions_updated";
+        case MetadataChangeKind::PersonalAccessTokenCreated:
+            return "personal_access_token_created";
+        case MetadataChangeKind::PersonalAccessTokenDeleted:
+            return "personal_access_token_deleted";
+        case MetadataChangeKind::SessionRegistered:
+            return "session_registered";
+        case MetadataChangeKind::SessionClosed:
+            return "session_closed";
+    }
+    throw std::invalid_argument("Unknown metadata change kind");
+}
+
+/**
+ * @brief Outcome of a metadata change query.
+ */
+enum class MetadataChangeStatus : std::uint8_t {
+    Ok      = 0,  ///< Records or items after the requested position.
+    Behind  = 1,  ///< The answering node has not applied the requested position yet. Retry later.
+    Expired = 2,  ///< The node no longer holds every record after the position. Rebuild from current state.
+    Reset   = 3,  ///< The position belongs to another history. Rebuild from current state.
+};
+
+constexpr std::string_view to_string(const MetadataChangeStatus status) {
+    switch (status) {
+        case MetadataChangeStatus::Ok:
+            return "ok";
+        case MetadataChangeStatus::Behind:
+            return "behind";
+        case MetadataChangeStatus::Expired:
+            return "expired";
+        case MetadataChangeStatus::Reset:
+            return "reset";
+    }
+    throw std::invalid_argument("Unknown metadata change status");
+}
+
+/**
+ * @brief Whether an answer pages change records or current state items.
+ */
+enum class MetadataChangePhase : std::uint8_t {
+    Changes = 0,
+    Current = 1,
+};
+
+constexpr std::string_view to_string(const MetadataChangePhase phase) {
+    switch (phase) {
+        case MetadataChangePhase::Changes:
+            return "changes";
+        case MetadataChangePhase::Current:
+            return "current";
+    }
+    throw std::invalid_argument("Unknown metadata change phase");
+}
+
+/** @brief Why a consumer group member was removed. */
+enum class MetadataMemberLeftReason : std::uint8_t {
+    Left         = 0,
+    SessionEnded = 1,
+};
+
+constexpr std::string_view to_string(const MetadataMemberLeftReason reason) {
+    switch (reason) {
+        case MetadataMemberLeftReason::Left:
+            return "left";
+        case MetadataMemberLeftReason::SessionEnded:
+            return "session_ended";
+    }
+    throw std::invalid_argument("Unknown member left reason");
+}
+
+/** @brief Why a personal access token was removed. */
+enum class MetadataTokenDeletedReason : std::uint8_t {
+    Deleted = 0,
+    Expired = 1,
+};
+
+constexpr std::string_view to_string(const MetadataTokenDeletedReason reason) {
+    switch (reason) {
+        case MetadataTokenDeletedReason::Deleted:
+            return "deleted";
+        case MetadataTokenDeletedReason::Expired:
+            return "expired";
+    }
+    throw std::invalid_argument("Unknown token deleted reason");
+}
+
+/** @brief Why a session was closed. */
+enum class MetadataSessionClosedReason : std::uint8_t {
+    Logout  = 0,
+    Expired = 1,
+    Revoked = 2,  ///< The user was deactivated or deleted.
+};
+
+constexpr std::string_view to_string(const MetadataSessionClosedReason reason) {
+    switch (reason) {
+        case MetadataSessionClosedReason::Logout:
+            return "logout";
+        case MetadataSessionClosedReason::Expired:
+            return "expired";
+        case MetadataSessionClosedReason::Revoked:
+            return "revoked";
+    }
+    throw std::invalid_argument("Unknown session closed reason");
+}
+
+/** @brief Why a user's public permission set changed. */
+enum class MetadataPermissionsUpdatedReason : std::uint8_t {
+    Updated         = 0,  ///< UpdatePermissions() replaced the set.
+    ResourceDeleted = 1,  ///< A stream or topic delete pruned the user's grants on it.
+};
+
+constexpr std::string_view to_string(const MetadataPermissionsUpdatedReason reason) {
+    switch (reason) {
+        case MetadataPermissionsUpdatedReason::Updated:
+            return "updated";
+        case MetadataPermissionsUpdatedReason::ResourceDeleted:
+            return "resource_deleted";
+    }
+    throw std::invalid_argument("Unknown permissions updated reason");
+}
+
+/**
+ * @brief Position of the last metadata change record a caller consumed.
+ *
+ * Persist ToString() and pass the cursor back through
+ * MetadataChangesQuery::After() to read the records after it. Op() zero names
+ * the beginning of the history LogId() identifies.
+ */
+class MetadataChangeCursor final {
+  public:
+    /**
+     * @brief Parses the `mc1_` text form ToString() returns.
+     * @param text Cursor text.
+     * @return Parsed cursor.
+     * @throws IggyException with Kind() invalid_command when @p text is not a
+     *         canonical cursor. The message never contains the text.
+     */
+    static MetadataChangeCursor Parse(const std::string &text);
+
+    /** @brief Returns the prepare checksum of op 1 of this history. */
+    [[nodiscard]] absl::uint128 LogId() const noexcept { return log_id_; }
+
+    /** @brief Returns the metadata operation of the consumed record. */
+    [[nodiscard]] std::uint64_t Op() const noexcept { return op_; }
+
+    /** @brief Returns the prepare checksum of Op(). */
+    [[nodiscard]] absl::uint128 Checksum() const noexcept { return checksum_; }
+
+    /** @brief Returns the position of the consumed record within Op(). */
+    [[nodiscard]] std::uint32_t Ordinal() const noexcept { return ordinal_; }
+
+    /** @brief Returns whether the cursor names the beginning of its history. */
+    [[nodiscard]] bool IsZero() const noexcept { return op_ == 0; }
+
+    /** @brief Returns the `mc1_` text form, `mc1_` and 59 characters of unpadded base64url. */
+    [[nodiscard]] const std::string &ToString() const noexcept { return text_; }
+
+    friend bool operator==(const MetadataChangeCursor &left, const MetadataChangeCursor &right) noexcept {
+        return left.text_ == right.text_;
+    }
+
+    friend bool operator!=(const MetadataChangeCursor &left, const MetadataChangeCursor &right) noexcept {
+        return !(left == right);
+    }
+
+  private:
+    MetadataChangeCursor() = default;
+
+    static MetadataChangeCursor FromFfi(ffi::MetadataChangeCursor cursor);
+
+    friend class MetadataChanges;
+    friend class MetadataCurrentPageToken;
+
+    absl::uint128 log_id_{};
+    std::uint64_t op_{};
+    absl::uint128 checksum_{};
+    std::uint32_t ordinal_{};
+    std::string text_;
+};
+
+/**
+ * @brief Continuation of a current state scan.
+ *
+ * Pass it back unchanged through MetadataChangesQuery::Current() with the
+ * same groups to read the next page.
+ */
+class MetadataCurrentPageToken final {
+  public:
+    /**
+     * @brief Parses the `cs1_` text form ToString() returns.
+     * @param text Page token text.
+     * @return Parsed page token.
+     * @throws IggyException with Kind() invalid_command when @p text is not a
+     *         canonical page token. The message never contains the text.
+     */
+    static MetadataCurrentPageToken Parse(const std::string &text);
+
+    /** @brief Returns the `cs1_` text form. */
+    [[nodiscard]] const std::string &ToString() const noexcept { return text_; }
+
+    /** @brief Returns the position captured before the scan's first page. */
+    [[nodiscard]] const MetadataChangeCursor &Anchor() const noexcept { return anchor_; }
+
+    /** @brief Returns the highest head any page of the scan reported so far. */
+    [[nodiscard]] std::uint64_t RequiredHead() const noexcept { return required_head_; }
+
+    /** @brief Returns the groups the scan was started with, in code order. */
+    [[nodiscard]] std::vector<MetadataChangeGroup> Groups() const {
+        std::vector<MetadataChangeGroup> groups;
+        for (std::uint8_t code = 1; code <= 8; ++code) {
+            if ((groups_mask_ & (1U << (code - 1))) != 0) {
+                groups.push_back(static_cast<MetadataChangeGroup>(code));
+            }
+        }
+        return groups;
+    }
+
+    /** @brief Returns the group of the last item returned. */
+    [[nodiscard]] MetadataChangeGroup LastGroup() const noexcept { return last_group_; }
+
+    /** @brief Returns the key of the last item returned, in the page token key layout. */
+    [[nodiscard]] const std::vector<std::uint8_t> &LastKey() const noexcept { return last_key_; }
+
+  private:
+    MetadataCurrentPageToken() = default;
+
+    static MetadataCurrentPageToken FromFfi(ffi::MetadataCurrentPageToken token);
+
+    friend class MetadataChanges;
+
+    std::string text_;
+    MetadataChangeCursor anchor_;
+    std::uint64_t required_head_{};
+    std::uint8_t groups_mask_{};
+    MetadataChangeGroup last_group_{MetadataChangeGroup::Streams};
+    std::vector<std::uint8_t> last_key_;
+};
+
+/**
+ * @brief One read of the metadata change log or of the current state.
+ *
+ * Start with Earliest(), Latest(), After(), or Current(), then narrow the
+ * read with the setters. IggyBlockingClient::GetMetadataChanges() refuses an
+ * invalid query with Kind() invalid_command before anything is sent.
+ */
+class MetadataChangesQuery final {
+  public:
+    /** @brief Where the read starts. The values are the wire codes. */
+    enum class Start : std::uint8_t {
+        Earliest = 0,  ///< The oldest operation the requested groups still hold completely.
+        Latest   = 1,  ///< No records, only a cursor at the newest retained record.
+        After    = 2,  ///< The records after Cursor().
+        Current  = 3,  ///< Current state pages, continuing after PageToken() when set.
+    };
+
+    static constexpr std::uint32_t kDefaultLimit = 100;
+    static constexpr std::uint32_t kMaxLimit     = 1000;
+
+    /** @brief Reads from the oldest operation the requested groups still hold completely. */
+    static MetadataChangesQuery Earliest() { return MetadataChangesQuery(Start::Earliest); }
+
+    /** @brief Reads no records and returns a cursor at the newest retained record to follow from. */
+    static MetadataChangesQuery Latest() { return MetadataChangesQuery(Start::Latest); }
+
+    /** @brief Reads the records after @p cursor. */
+    static MetadataChangesQuery After(MetadataChangeCursor cursor) {
+        MetadataChangesQuery query(Start::After);
+        query.cursor_ = std::move(cursor);
+        return query;
+    }
+
+    /** @brief Reads the first page of a current state scan. */
+    static MetadataChangesQuery Current() { return MetadataChangesQuery(Start::Current); }
+
+    /** @brief Reads the page of a current state scan after @p token. Keep the scan's groups. */
+    static MetadataChangesQuery Current(MetadataCurrentPageToken token) {
+        MetadataChangesQuery query(Start::Current);
+        query.page_token_ = std::move(token);
+        return query;
+    }
+
+    /** @brief Returns where the read starts. */
+    [[nodiscard]] Start StartMode() const noexcept { return start_; }
+
+    /** @brief Returns the cursor of an After() read. */
+    [[nodiscard]] const std::optional<MetadataChangeCursor> &Cursor() const noexcept { return cursor_; }
+
+    /** @brief Returns the page token of a continued Current() read. */
+    [[nodiscard]] const std::optional<MetadataCurrentPageToken> &PageToken() const noexcept { return page_token_; }
+
+    /** @brief Returns the requested groups. Empty means every group. */
+    [[nodiscard]] const std::vector<MetadataChangeGroup> &Groups() const noexcept { return groups_; }
+
+    /** @brief Returns the inclusive lower bound on record timestamps, in microseconds. */
+    [[nodiscard]] std::optional<std::uint64_t> Since() const noexcept { return since_; }
+
+    /** @brief Returns the inclusive upper bound on record timestamps, in microseconds. */
+    [[nodiscard]] std::optional<std::uint64_t> Until() const noexcept { return until_; }
+
+    /** @brief Returns the most records or items one page returns. */
+    [[nodiscard]] std::uint32_t Limit() const noexcept { return limit_; }
+
+    /**
+     * @brief Selects the groups to read.
+     *
+     * A current state scan must include each selected group's parents, so a
+     * mirror can apply the cascades of their deletes.
+     * @param groups Requested groups. Empty selects every group.
+     * @return Reference to this query.
+     */
+    MetadataChangesQuery &SetGroups(std::vector<MetadataChangeGroup> groups) {
+        groups_ = std::move(groups);
+        return *this;
+    }
+
+    /**
+     * @brief Keeps records with a timestamp at or after @p micros.
+     *
+     * Time bounds apply to Earliest() and After() reads only.
+     * @param micros Microseconds since the Unix epoch.
+     * @return Reference to this query.
+     */
+    MetadataChangesQuery &SetSince(std::uint64_t micros) {
+        since_ = micros;
+        return *this;
+    }
+
+    /**
+     * @brief Keeps records with a timestamp at or before @p micros.
+     *
+     * Time bounds apply to Earliest() and After() reads only.
+     * @param micros Microseconds since the Unix epoch.
+     * @return Reference to this query.
+     */
+    MetadataChangesQuery &SetUntil(std::uint64_t micros) {
+        until_ = micros;
+        return *this;
+    }
+
+    /**
+     * @brief Sets the most records or items one page returns.
+     * @param limit From 1 to kMaxLimit. The default is kDefaultLimit.
+     * @return Reference to this query.
+     */
+    MetadataChangesQuery &SetLimit(std::uint32_t limit) {
+        limit_ = limit;
+        return *this;
+    }
+
+    /**
+     * @brief Applies the checks GetMetadataChanges() runs before sending.
+     * @throws IggyException with Kind() invalid_command when the limit is
+     *         outside 1 to kMaxLimit, Since() is above Until(), a time bound
+     *         accompanies Latest() or Current() or lies past what the
+     *         platform clock holds, a current state scan misses a parent
+     *         group, or the page token was issued for other groups.
+     */
+    void Validate() const;
+
+    /**
+     * @brief Encodes the query as the binary transports send it, without
+     *        validating it.
+     * @return Request payload without framing.
+     * @throws IggyException with Kind() invalid_command for a group this build
+     *         does not know or a time bound past what the platform clock holds.
+     */
+    [[nodiscard]] std::vector<std::uint8_t> ToBytes() const;
+
+  private:
+    explicit MetadataChangesQuery(Start start) : start_(start) {}
+
+    [[nodiscard]] ffi::MetadataChangesQuery ToFfi() const;
+
+    friend class IggyBlockingClient;
+
+    Start start_;
+    std::optional<MetadataChangeCursor> cursor_;
+    std::optional<MetadataCurrentPageToken> page_token_;
+    std::vector<MetadataChangeGroup> groups_;
+    std::optional<std::uint64_t> since_;
+    std::optional<std::uint64_t> until_;
+    std::uint32_t limit_{kDefaultLimit};
+};
+
+/**
+ * @brief A stream after a create or update, and a current state streams item.
+ */
+class MetadataStreamChange final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. A recreated stream with a reused ID has another. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
+
+    /** @brief Returns the stream name after the change. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /**
+     * @brief Returns the public options after the change, as the read routes return them.
+     * @return `std::nullopt` when the server holds option state this build
+     *         cannot read. Keep the previous values then.
+     */
+    [[nodiscard]] const std::optional<ResourceOptions> &Options() const noexcept { return options_; }
+
+  private:
+    MetadataStreamChange() = default;
+
+    static MetadataStreamChange FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+    friend class MetadataCurrentItem;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint64_t created_at_{};
+    std::string name_;
+    std::optional<ResourceOptions> options_;
+};
+
+/**
+ * @brief A removed stream.
+ */
+class MetadataStreamDeleted final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
+
+    /** @brief Returns the stream name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the op of a deferred delete's request, absent for an immediate delete. */
+    [[nodiscard]] std::optional<std::uint64_t> RequestedOp() const noexcept { return requested_op_; }
+
+  private:
+    MetadataStreamDeleted() = default;
+
+    static MetadataStreamDeleted FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint64_t created_at_{};
+    std::string name_;
+    std::optional<std::uint64_t> requested_op_;
+};
+
+/**
+ * @brief A topic after a create or update.
+ */
+class MetadataTopicChange final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
+
+    /** @brief Returns the topic name after the change. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the partition count after the change. */
+    [[nodiscard]] std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
+
+    /** @brief Returns the public options, `std::nullopt` when this build cannot read them. */
+    [[nodiscard]] const std::optional<ResourceOptions> &Options() const noexcept { return options_; }
+
+  private:
+    MetadataTopicChange() = default;
+
+    static MetadataTopicChange FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint64_t created_at_{};
+    std::string name_;
+    std::uint32_t partitions_count_{};
+    std::optional<ResourceOptions> options_;
+};
+
+/**
+ * @brief A current state topics item. Partition counts travel as partitions items.
+ */
+class MetadataTopicItem final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
+
+    /** @brief Returns the topic name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the public options, `std::nullopt` when this build cannot read them. */
+    [[nodiscard]] const std::optional<ResourceOptions> &Options() const noexcept { return options_; }
+
+  private:
+    MetadataTopicItem() = default;
+
+    static MetadataTopicItem FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataCurrentItem;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint64_t created_at_{};
+    std::string name_;
+    std::optional<ResourceOptions> options_;
+};
+
+/**
+ * @brief A removed topic.
+ */
+class MetadataTopicDeleted final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
+
+    /** @brief Returns the topic name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the op of a deferred delete's request, absent for an immediate delete. */
+    [[nodiscard]] std::optional<std::uint64_t> RequestedOp() const noexcept { return requested_op_; }
+
+  private:
+    MetadataTopicDeleted() = default;
+
+    static MetadataTopicDeleted FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint64_t created_at_{};
+    std::string name_;
+    std::optional<std::uint64_t> requested_op_;
+};
+
+/**
+ * @brief A partition count change.
+ */
+class MetadataPartitionsChanged final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the partition count after the change. */
+    [[nodiscard]] std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
+
+    /** @brief Returns the deleted partition IDs in ascending order, empty on create. */
+    [[nodiscard]] const std::vector<std::uint32_t> &RemovedPartitionIds() const noexcept {
+        return removed_partition_ids_;
+    }
+
+    /** @brief Returns the op of a deferred delete's request, absent for an immediate change. */
+    [[nodiscard]] std::optional<std::uint64_t> RequestedOp() const noexcept { return requested_op_; }
+
+  private:
+    MetadataPartitionsChanged() = default;
+
+    static MetadataPartitionsChanged FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t partitions_count_{};
+    std::vector<std::uint32_t> removed_partition_ids_;
+    std::optional<std::uint64_t> requested_op_;
+};
+
+/**
+ * @brief A current state partitions item.
+ */
+class MetadataPartitionsItem final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the partition count. */
+    [[nodiscard]] std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
+
+  private:
+    MetadataPartitionsItem() = default;
+
+    static MetadataPartitionsItem FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataCurrentItem;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t partitions_count_{};
+};
+
+/**
+ * @brief A created consumer group with the topic's resulting group count.
+ */
+class MetadataConsumerGroupCreated final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the consumer group name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the topic's consumer group count after the change. */
+    [[nodiscard]] std::uint32_t ConsumerGroupsCount() const noexcept { return consumer_groups_count_; }
+
+  private:
+    MetadataConsumerGroupCreated() = default;
+
+    static MetadataConsumerGroupCreated FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::string name_;
+    std::uint32_t consumer_groups_count_{};
+};
+
+/**
+ * @brief A removed consumer group with the topic's resulting group count.
+ */
+class MetadataConsumerGroupDeleted final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the consumer group name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the topic's consumer group count after the change. */
+    [[nodiscard]] std::uint32_t ConsumerGroupsCount() const noexcept { return consumer_groups_count_; }
+
+    /** @brief Returns the op of a deferred delete's request, absent for an immediate delete. */
+    [[nodiscard]] std::optional<std::uint64_t> RequestedOp() const noexcept { return requested_op_; }
+
+  private:
+    MetadataConsumerGroupDeleted() = default;
+
+    static MetadataConsumerGroupDeleted FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::string name_;
+    std::uint32_t consumer_groups_count_{};
+    std::optional<std::uint64_t> requested_op_;
+};
+
+/**
+ * @brief A current state consumer groups item.
+ */
+class MetadataConsumerGroupItem final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the consumer group name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+  private:
+    MetadataConsumerGroupItem() = default;
+
+    static MetadataConsumerGroupItem FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataCurrentItem;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::string name_;
+};
+
+/**
+ * @brief A member that joined a consumer group.
+ */
+class MetadataMemberJoined final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the member ID within the group. */
+    [[nodiscard]] std::uint32_t MemberId() const noexcept { return member_id_; }
+
+    /** @brief Returns the session's client ID. */
+    [[nodiscard]] absl::uint128 ClientId() const noexcept { return client_id_; }
+
+    /** @brief Returns the group's member count after the change. */
+    [[nodiscard]] std::uint32_t MembersCount() const noexcept { return members_count_; }
+
+    /** @brief Returns the installed partition IDs, normally empty because a handover installs them. */
+    [[nodiscard]] const std::vector<std::uint32_t> &PartitionIds() const noexcept { return partition_ids_; }
+
+  private:
+    MetadataMemberJoined() = default;
+
+    static MetadataMemberJoined FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::uint32_t member_id_{};
+    absl::uint128 client_id_{};
+    std::uint32_t members_count_{};
+    std::vector<std::uint32_t> partition_ids_;
+};
+
+/**
+ * @brief A member that left a consumer group.
+ */
+class MetadataMemberLeft final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the member ID within the group. */
+    [[nodiscard]] std::uint32_t MemberId() const noexcept { return member_id_; }
+
+    /** @brief Returns the session's client ID. */
+    [[nodiscard]] absl::uint128 ClientId() const noexcept { return client_id_; }
+
+    /** @brief Returns the group's member count after the change. */
+    [[nodiscard]] std::uint32_t MembersCount() const noexcept { return members_count_; }
+
+    /** @brief Returns why the member was removed. */
+    [[nodiscard]] MetadataMemberLeftReason Reason() const noexcept { return reason_; }
+
+  private:
+    MetadataMemberLeft() = default;
+
+    static MetadataMemberLeft FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::uint32_t member_id_{};
+    absl::uint128 client_id_{};
+    std::uint32_t members_count_{};
+    MetadataMemberLeftReason reason_{MetadataMemberLeftReason::Left};
+};
+
+/**
+ * @brief A completed partition handover within a consumer group.
+ */
+class MetadataPartitionHandedOver final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the partition that changed owner. */
+    [[nodiscard]] std::uint32_t PartitionId() const noexcept { return partition_id_; }
+
+    /** @brief Returns the new owner, absent when the last member left. */
+    [[nodiscard]] std::optional<std::uint32_t> MemberId() const noexcept { return member_id_; }
+
+  private:
+    MetadataPartitionHandedOver() = default;
+
+    static MetadataPartitionHandedOver FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::uint32_t partition_id_{};
+    std::optional<std::uint32_t> member_id_;
+};
+
+/**
+ * @brief A current state consumer group members item.
+ */
+class MetadataMemberItem final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the member ID within the group. */
+    [[nodiscard]] std::uint32_t MemberId() const noexcept { return member_id_; }
+
+    /** @brief Returns the session's client ID. */
+    [[nodiscard]] absl::uint128 ClientId() const noexcept { return client_id_; }
+
+    /** @brief Returns the installed partition IDs in ascending order. */
+    [[nodiscard]] const std::vector<std::uint32_t> &PartitionIds() const noexcept { return partition_ids_; }
+
+  private:
+    MetadataMemberItem() = default;
+
+    static MetadataMemberItem FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataCurrentItem;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::uint32_t member_id_{};
+    absl::uint128 client_id_{};
+    std::vector<std::uint32_t> partition_ids_;
+};
+
+/**
+ * @brief A user after a create or update, and a current state users item.
+ */
+class MetadataUserChange final {
+  public:
+    /** @brief Returns the numeric user ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the creation timestamp in microseconds. A recreated user with a reused ID has another. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the username after the change. */
+    [[nodiscard]] const std::string &Username() const noexcept { return username_; }
+
+    /** @brief Returns the user status after the change. */
+    [[nodiscard]] UserStatus Status() const noexcept { return status_; }
+
+    /** @brief Returns the complete public permission set, empty when the user has none. */
+    [[nodiscard]] const std::optional<::iggy::Permissions> &Permissions() const noexcept { return permissions_; }
+
+    /** @brief Returns the public options, `std::nullopt` when this build cannot read them. */
+    [[nodiscard]] const std::optional<ResourceOptions> &Options() const noexcept { return options_; }
+
+  private:
+    MetadataUserChange() = default;
+
+    static MetadataUserChange FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+    friend class MetadataCurrentItem;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    std::string username_;
+    UserStatus status_{UserStatus::Active};
+    std::optional<::iggy::Permissions> permissions_;
+    std::optional<ResourceOptions> options_;
+};
+
+/**
+ * @brief A deleted user, or one whose password changed.
+ */
+class MetadataUserIdentity final {
+  public:
+    /** @brief Returns the numeric user ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the username. */
+    [[nodiscard]] const std::string &Username() const noexcept { return username_; }
+
+  private:
+    MetadataUserIdentity() = default;
+
+    static MetadataUserIdentity FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    std::string username_;
+};
+
+/**
+ * @brief A user's public permission set after a change.
+ */
+class MetadataUserPermissionsUpdated final {
+  public:
+    /** @brief Returns the numeric user ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the username. */
+    [[nodiscard]] const std::string &Username() const noexcept { return username_; }
+
+    /** @brief Returns the complete permission set after the change, empty when the user has none. */
+    [[nodiscard]] const std::optional<::iggy::Permissions> &Permissions() const noexcept { return permissions_; }
+
+    /** @brief Returns why the set changed. */
+    [[nodiscard]] MetadataPermissionsUpdatedReason Reason() const noexcept { return reason_; }
+
+  private:
+    MetadataUserPermissionsUpdated() = default;
+
+    static MetadataUserPermissionsUpdated FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    std::string username_;
+    std::optional<::iggy::Permissions> permissions_;
+    MetadataPermissionsUpdatedReason reason_{MetadataPermissionsUpdatedReason::Updated};
+};
+
+/**
+ * @brief A created personal access token, and a current state personal access tokens item.
+ */
+class MetadataTokenChange final {
+  public:
+    /** @brief Returns the owner's numeric user ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the owner's creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the token name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the expiry in microseconds, absent for a token that never expires. */
+    [[nodiscard]] std::optional<std::uint64_t> Expiry() const noexcept { return expiry_; }
+
+  private:
+    MetadataTokenChange() = default;
+
+    static MetadataTokenChange FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+    friend class MetadataCurrentItem;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    std::string name_;
+    std::optional<std::uint64_t> expiry_;
+};
+
+/**
+ * @brief A removed personal access token.
+ */
+class MetadataTokenDeleted final {
+  public:
+    /** @brief Returns the owner's numeric user ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the owner's creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the token name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns why the token was removed. */
+    [[nodiscard]] MetadataTokenDeletedReason Reason() const noexcept { return reason_; }
+
+  private:
+    MetadataTokenDeleted() = default;
+
+    static MetadataTokenDeleted FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    std::string name_;
+    MetadataTokenDeletedReason reason_{MetadataTokenDeletedReason::Deleted};
+};
+
+/**
+ * @brief A registered session, and a current state sessions item.
+ */
+class MetadataSession final {
+  public:
+    /** @brief Returns the session user's numeric ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the session user's creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the session's client ID. */
+    [[nodiscard]] absl::uint128 ClientId() const noexcept { return client_id_; }
+
+    /** @brief Returns the session epoch. */
+    [[nodiscard]] std::uint64_t Session() const noexcept { return session_; }
+
+  private:
+    MetadataSession() = default;
+
+    static MetadataSession FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+    friend class MetadataCurrentItem;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    absl::uint128 client_id_{};
+    std::uint64_t session_{};
+};
+
+/**
+ * @brief A closed session.
+ */
+class MetadataSessionClosed final {
+  public:
+    /** @brief Returns the session user's numeric ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the session user's creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the session's client ID. */
+    [[nodiscard]] absl::uint128 ClientId() const noexcept { return client_id_; }
+
+    /** @brief Returns the session epoch. */
+    [[nodiscard]] std::uint64_t Session() const noexcept { return session_; }
+
+    /** @brief Returns why the session was closed. */
+    [[nodiscard]] MetadataSessionClosedReason Reason() const noexcept { return reason_; }
+
+  private:
+    MetadataSessionClosed() = default;
+
+    static MetadataSessionClosed FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    absl::uint128 client_id_{};
+    std::uint64_t session_{};
+    MetadataSessionClosedReason reason_{MetadataSessionClosedReason::Logout};
+};
+
+/**
+ * @brief A binary record of a group or kind this build does not know, kept
+ *        with its codes and raw body.
+ */
+class MetadataUnknownChange final {
+  public:
+    /** @brief Returns the group's wire code. */
+    [[nodiscard]] std::uint8_t GroupCode() const noexcept { return group_code_; }
+
+    /** @brief Returns the kind's wire code. */
+    [[nodiscard]] std::uint8_t KindCode() const noexcept { return kind_code_; }
+
+    /** @brief Returns the raw record body. */
+    [[nodiscard]] const std::vector<std::uint8_t> &Body() const noexcept { return body_; }
+
+  private:
+    MetadataUnknownChange() = default;
+
+    friend class MetadataChangeRecord;
+
+    std::uint8_t group_code_{};
+    std::uint8_t kind_code_{};
+    std::vector<std::uint8_t> body_;
+};
+
+/**
+ * @brief A JSON record of a group or kind this build does not know, kept whole.
+ */
+class MetadataUnknownJsonChange final {
+  public:
+    /** @brief Returns the group name the server sent. */
+    [[nodiscard]] const std::string &Group() const noexcept { return group_; }
+
+    /** @brief Returns the kind name the server sent. */
+    [[nodiscard]] const std::string &Kind() const noexcept { return kind_; }
+
+    /** @brief Returns the whole record object as JSON text. */
+    [[nodiscard]] const std::string &Json() const noexcept { return json_; }
+
+  private:
+    MetadataUnknownJsonChange() = default;
+
+    friend class MetadataChangeRecord;
+
+    std::string group_;
+    std::string kind_;
+    std::string json_;
+};
+
+/**
+ * @brief A binary current state item of a group this build does not know.
+ */
+class MetadataUnknownItem final {
+  public:
+    /** @brief Returns the group's wire code. */
+    [[nodiscard]] std::uint8_t GroupCode() const noexcept { return group_code_; }
+
+    /** @brief Returns the raw item body. */
+    [[nodiscard]] const std::vector<std::uint8_t> &Body() const noexcept { return body_; }
+
+  private:
+    MetadataUnknownItem() = default;
+
+    friend class MetadataCurrentItem;
+
+    std::uint8_t group_code_{};
+    std::vector<std::uint8_t> body_;
+};
+
+/**
+ * @brief A JSON current state item of a group this build does not know, kept whole.
+ */
+class MetadataUnknownJsonItem final {
+  public:
+    /** @brief Returns the group name the server sent. */
+    [[nodiscard]] const std::string &Group() const noexcept { return group_; }
+
+    /** @brief Returns the whole item object as JSON text. */
+    [[nodiscard]] const std::string &Json() const noexcept { return json_; }
+
+  private:
+    MetadataUnknownJsonItem() = default;
+
+    friend class MetadataCurrentItem;
+
+    std::string group_;
+    std::string json_;
+};
+
+/**
+ * @brief One metadata change record: the committed operation that produced
+ *        it, its position within that operation, and what is true after it.
+ *
+ * Change() holds the typed body. Kind() tells apart kinds that share a body
+ * type, such as stream_created and stream_updated.
+ */
+class MetadataChangeRecord final {
+  public:
+    /** @brief The typed body of a record. */
+    using Body = std::variant<MetadataStreamChange,
+                              MetadataStreamDeleted,
+                              MetadataTopicChange,
+                              MetadataTopicDeleted,
+                              MetadataPartitionsChanged,
+                              MetadataConsumerGroupCreated,
+                              MetadataConsumerGroupDeleted,
+                              MetadataMemberJoined,
+                              MetadataMemberLeft,
+                              MetadataPartitionHandedOver,
+                              MetadataUserChange,
+                              MetadataUserIdentity,
+                              MetadataUserPermissionsUpdated,
+                              MetadataTokenChange,
+                              MetadataTokenDeleted,
+                              MetadataSession,
+                              MetadataSessionClosed,
+                              MetadataUnknownChange,
+                              MetadataUnknownJsonChange>;
+
+    /**
+     * @brief Decodes one record envelope as a binary response carries it.
+     * @param bytes Record envelope and body.
+     * @return Decoded record. A group or kind this build does not know is
+     *         kept as MetadataUnknownChange.
+     * @throws IggyException with Kind() invalid_format when @p bytes are malformed.
+     */
+    static MetadataChangeRecord FromBytes(const std::vector<std::uint8_t> &bytes);
+
+    /** @brief Returns the metadata operation that produced the record. */
+    [[nodiscard]] std::uint64_t Op() const noexcept { return op_; }
+
+    /** @brief Returns the record's position within Op(). */
+    [[nodiscard]] std::uint32_t Ordinal() const noexcept { return ordinal_; }
+
+    /** @brief Returns the prepare checksum of Op(). */
+    [[nodiscard]] absl::uint128 Checksum() const noexcept { return checksum_; }
+
+    /** @brief Returns the prepare timestamp of Op() in microseconds. */
+    [[nodiscard]] std::uint64_t Timestamp() const noexcept { return timestamp_; }
+
+    /** @brief Returns the acting user, absent for server actions. */
+    [[nodiscard]] std::optional<std::uint32_t> ActorUserId() const noexcept { return actor_user_id_; }
+
+    /** @brief Returns the kind, absent for a record this build does not know. */
+    [[nodiscard]] std::optional<MetadataChangeKind> Kind() const noexcept { return kind_; }
+
+    /** @brief Returns the group, absent for a record this build does not know. */
+    [[nodiscard]] std::optional<MetadataChangeGroup> Group() const noexcept { return group_; }
+
+    /** @brief Returns the typed body. */
+    [[nodiscard]] const Body &Change() const noexcept { return change_; }
+
+  private:
+    MetadataChangeRecord(std::uint64_t op,
+                         std::uint32_t ordinal,
+                         absl::uint128 checksum,
+                         std::uint64_t timestamp,
+                         std::optional<std::uint32_t> actor_user_id,
+                         std::optional<MetadataChangeKind> kind,
+                         std::optional<MetadataChangeGroup> group,
+                         Body change)
+        : op_(op),
+          ordinal_(ordinal),
+          checksum_(checksum),
+          timestamp_(timestamp),
+          actor_user_id_(actor_user_id),
+          kind_(kind),
+          group_(group),
+          change_(std::move(change)) {}
+
+    static MetadataChangeRecord FromFfi(ffi::MetadataChangeRecord record);
+    static Body BodyFromFfi(MetadataChangeKind kind, ffi::MetadataChangeBody &body);
+
+    friend class MetadataChanges;
+
+    std::uint64_t op_;
+    std::uint32_t ordinal_;
+    absl::uint128 checksum_;
+    std::uint64_t timestamp_;
+    std::optional<std::uint32_t> actor_user_id_;
+    std::optional<MetadataChangeKind> kind_;
+    std::optional<MetadataChangeGroup> group_;
+    Body change_;
+};
+
+/**
+ * @brief One current state item: a resource or session as it is now.
+ */
+class MetadataCurrentItem final {
+  public:
+    /** @brief The typed body of an item. Each group has its own type. */
+    using Body = std::variant<MetadataStreamChange,
+                              MetadataTopicItem,
+                              MetadataPartitionsItem,
+                              MetadataConsumerGroupItem,
+                              MetadataMemberItem,
+                              MetadataUserChange,
+                              MetadataTokenChange,
+                              MetadataSession,
+                              MetadataUnknownItem,
+                              MetadataUnknownJsonItem>;
+
+    /**
+     * @brief Decodes one item as a binary response carries it.
+     * @param bytes Item envelope and body.
+     * @return Decoded item. A group this build does not know is kept as
+     *         MetadataUnknownItem.
+     * @throws IggyException with Kind() invalid_format when @p bytes are malformed.
+     */
+    static MetadataCurrentItem FromBytes(const std::vector<std::uint8_t> &bytes);
+
+    /** @brief Returns the group, absent for an item this build does not know. */
+    [[nodiscard]] std::optional<MetadataChangeGroup> Group() const noexcept { return group_; }
+
+    /** @brief Returns the typed body. */
+    [[nodiscard]] const Body &Value() const noexcept { return value_; }
+
+  private:
+    MetadataCurrentItem(std::optional<MetadataChangeGroup> group, Body value)
+        : group_(group), value_(std::move(value)) {}
+
+    static MetadataCurrentItem FromFfi(ffi::MetadataCurrentItem item);
+    static Body BodyFromFfi(MetadataChangeGroup group, ffi::MetadataChangeBody &body);
+
+    friend class MetadataChanges;
+
+    std::optional<MetadataChangeGroup> group_;
+    Body value_;
+};
+
+/**
+ * @brief One page of the metadata change log, or of the current state.
+ *
+ * IggyBlockingClient::GetMetadataChanges() returns this value. On
+ * MetadataChangeStatus::Ok keep Next() and pass it to the following read. On
+ * Behind retry later, on Expired or Reset rebuild from the current state.
+ */
+class MetadataChanges final {
+  public:
+    /**
+     * @brief Decodes a response payload as the binary transports carry it.
+     * @param payload Response payload without framing.
+     * @return Decoded page.
+     * @throws IggyException with Kind() invalid_format when @p payload is malformed.
+     */
+    static MetadataChanges FromBytes(const std::vector<std::uint8_t> &payload);
+
+    /** @brief Returns the outcome of the query. */
+    [[nodiscard]] MetadataChangeStatus Status() const noexcept { return status_; }
+
+    /** @brief Returns whether the page carries records or current state items. */
+    [[nodiscard]] MetadataChangePhase Phase() const noexcept { return phase_; }
+
+    /** @brief Returns the node's log ID, absent before it applied op 1. */
+    [[nodiscard]] std::optional<absl::uint128> LogId() const noexcept { return log_id_; }
+
+    /** @brief Returns the lowest whole operation from which the requested groups are complete. */
+    [[nodiscard]] std::uint64_t OldestOp() const noexcept { return oldest_op_; }
+
+    /**
+     * @brief Returns the timestamp above which the requested groups are complete.
+     * @return Microseconds, zero when nothing was evicted.
+     */
+    [[nodiscard]] std::uint64_t RetainedSince() const noexcept { return retained_since_; }
+
+    /** @brief Returns the highest metadata operation the node applied. */
+    [[nodiscard]] std::uint64_t HeadOp() const noexcept { return head_op_; }
+
+    /**
+     * @brief Returns the cursor to send back.
+     * @return Present on MetadataChangeStatus::Ok, echoed on Behind, absent on
+     *         Expired and Reset. The last current state page carries the
+     *         anchor to follow the change log from.
+     */
+    [[nodiscard]] const std::optional<MetadataChangeCursor> &Next() const noexcept { return next_; }
+
+    /** @brief Returns whether more records remain after Next(), or another state page exists. */
+    [[nodiscard]] bool HasMore() const noexcept { return has_more_; }
+
+    /** @brief Returns the change records of a changes page. */
+    [[nodiscard]] const std::vector<MetadataChangeRecord> &Records() const noexcept { return records_; }
+
+    /** @brief Returns the items of a current state page. */
+    [[nodiscard]] const std::vector<MetadataCurrentItem> &Items() const noexcept { return items_; }
+
+    /** @brief Returns the continuation of a current state scan, absent once it is complete. */
+    [[nodiscard]] const std::optional<MetadataCurrentPageToken> &CurrentPageToken() const noexcept {
+        return current_page_token_;
+    }
+
+  private:
+    MetadataChanges() = default;
+
+    static MetadataChanges FromFfi(ffi::MetadataChanges changes);
+
+    friend class IggyBlockingClient;
+
+    MetadataChangeStatus status_{MetadataChangeStatus::Ok};
+    MetadataChangePhase phase_{MetadataChangePhase::Changes};
+    std::optional<absl::uint128> log_id_;
+    std::uint64_t oldest_op_{};
+    std::uint64_t retained_since_{};
+    std::uint64_t head_op_{};
+    std::optional<MetadataChangeCursor> next_;
+    bool has_more_{};
+    std::vector<MetadataChangeRecord> records_;
+    std::vector<MetadataCurrentItem> items_;
+    std::optional<MetadataCurrentPageToken> current_page_token_;
+};
+
+/**
  * @brief Starting position for polling messages.
  *
  * @note The strategy kind and value are passed across the Rust FFI as a pair.
@@ -4024,6 +5685,635 @@ class PollingStrategy final {
 };
 
 /**
+ * @brief When the offsets of the messages that a read returns are stored.
+ */
+enum class CommitPolicy : std::uint8_t {
+    /** Nothing is stored. The caller commits checkpoints. The default. */
+    Manual = 0,
+    /**
+     * The server stores the offset of the last message of each read as part of the read, in one round trip. While the
+     * primary stays up a message is delivered at most once. A failover before the store replicates can deliver the
+     * last batch again.
+     */
+    OnRead = 1,
+    /** A reader stores the latest counted position, as its AutoCommit says. A one-shot poll refuses it. */
+    Auto = 2,
+};
+
+/**
+ * @brief When a message counts for CommitPolicy::Auto.
+ */
+enum class CommitAfter : std::uint8_t {
+    /** When the caller asks for the next batch or closes the reader. */
+    Processing = 0,
+    /** When the batch is handed over. */
+    Delivery = 1,
+    /** Only when the caller marks its checkpoint with PartitionReader::Mark(). */
+    Marked = 2,
+};
+
+/**
+ * @brief The event on which CommitPolicy::Auto also stores.
+ */
+class CommitEvery final {
+  public:
+    enum class Kind : std::uint8_t {
+        /** Each counted batch of a reader. */
+        Message = 0,
+        /** Count() counted messages of a partition since its last store. */
+        Messages = 1,
+        /** The last message of each batch. */
+        Batch = 2,
+    };
+
+    static CommitEvery Message() { return CommitEvery(Kind::Message, 0); }
+
+    /** @param count Counted messages between two stores. Zero is refused when the options are used. */
+    static CommitEvery Messages(std::uint32_t count) { return CommitEvery(Kind::Messages, count); }
+
+    static CommitEvery Batch() { return CommitEvery(Kind::Batch, 0); }
+
+    [[nodiscard]] Kind GetKind() const noexcept { return kind_; }
+
+    /** @return The count of Kind::Messages, zero otherwise. */
+    [[nodiscard]] std::uint32_t Count() const noexcept { return count_; }
+
+  private:
+    CommitEvery(Kind kind, std::uint32_t count) : kind_(kind), count_(count) {}
+
+    Kind kind_;
+    std::uint32_t count_;
+};
+
+/**
+ * @brief When CommitPolicy::Auto stores.
+ *
+ * A default AutoCommit stores every 10,000 messages or every 5 seconds,
+ * whichever comes first, after processing. It also stores when the reader
+ * closes. It needs an interval or an event, otherwise the options are refused
+ * when they are used.
+ */
+class AutoCommit final {
+  public:
+    AutoCommit();
+
+    /** @return The interval of the stores, or `std::nullopt`. */
+    [[nodiscard]] std::optional<std::chrono::microseconds> Interval() const noexcept { return interval_; }
+
+    /** @param interval Store the latest counted position at this interval, not zero, or never on a timer. */
+    AutoCommit &SetInterval(std::optional<std::chrono::microseconds> interval) noexcept {
+        interval_ = interval;
+        return *this;
+    }
+
+    /** @return The event of the stores, or `std::nullopt`. */
+    [[nodiscard]] const std::optional<CommitEvery> &Every() const noexcept { return every_; }
+
+    /** @param every Also store on this event, or on none. */
+    AutoCommit &SetEvery(std::optional<CommitEvery> every) noexcept {
+        every_ = every;
+        return *this;
+    }
+
+    [[nodiscard]] CommitAfter After() const noexcept { return after_; }
+
+    AutoCommit &SetAfter(CommitAfter after) noexcept {
+        after_ = after;
+        return *this;
+    }
+
+  private:
+    std::optional<std::chrono::microseconds> interval_;
+    std::optional<CommitEvery> every_;
+    CommitAfter after_ = CommitAfter::Processing;
+};
+
+/**
+ * @brief The limits of one read and when its offsets are stored.
+ *
+ * A read is a poll of one partition, or a fetch that a PartitionReader sends for
+ * several partitions of one primary. A fetch applies Count(), MinCount() and
+ * MaxBytes() to all of its partitions together. A reader that commits nothing
+ * runs several fetches at once, each within these limits, for partitions with
+ * more messages waiting.
+ *
+ * A default PollOptions reads up to 1000 messages and 1 MiB, answers at once,
+ * waits for at least one message and stores nothing. A reader or a poll checks
+ * the limits when it uses them and throws IggyException for an invalid one.
+ */
+class PollOptions final {
+  public:
+    PollOptions();
+
+    [[nodiscard]] std::uint32_t Count() const noexcept { return options_.count; }
+
+    /** @param count Most messages in one read, over all partitions of a fetch. */
+    PollOptions &SetCount(std::uint32_t count) noexcept {
+        options_.count = count;
+        return *this;
+    }
+
+    [[nodiscard]] std::chrono::microseconds MaxWait() const noexcept {
+        return std::chrono::microseconds(options_.max_wait_micros);
+    }
+
+    /** @param max_wait How long the server waits for MinCount() messages, at most 600 s. Zero or less answers at once.
+     */
+    PollOptions &SetMaxWait(std::chrono::microseconds max_wait) noexcept {
+        options_.max_wait_micros = max_wait.count() > 0 ? static_cast<std::uint64_t>(max_wait.count()) : 0;
+        return *this;
+    }
+
+    [[nodiscard]] std::uint32_t MinCount() const noexcept { return options_.min_count; }
+
+    /** @param min_count Messages to wait for, from 1 to Count(), over all partitions of a fetch. */
+    PollOptions &SetMinCount(std::uint32_t min_count) noexcept {
+        options_.min_count = min_count;
+        return *this;
+    }
+
+    [[nodiscard]] std::uint32_t MaxBytes() const noexcept { return options_.max_bytes; }
+
+    /** @param max_bytes Most bytes in one read, over all partitions of a fetch. A first message larger than that comes
+     * alone. */
+    PollOptions &SetMaxBytes(std::uint32_t max_bytes) noexcept {
+        options_.max_bytes = max_bytes;
+        return *this;
+    }
+
+    [[nodiscard]] CommitPolicy Commit() const noexcept { return static_cast<CommitPolicy>(options_.commit); }
+
+    /** @param commit When offsets are stored. CommitPolicy::Auto uses the AutoCommit of SetAutoCommit(), the default
+     * one until then. */
+    PollOptions &SetCommit(CommitPolicy commit) noexcept {
+        options_.commit = static_cast<ffi::CommitPolicy>(commit);
+        return *this;
+    }
+
+    /** @return The AutoCommit that CommitPolicy::Auto uses. */
+    [[nodiscard]] AutoCommit AutoCommitSettings() const;
+
+    /** @brief Sets CommitPolicy::Auto with these settings. */
+    PollOptions &SetAutoCommit(const AutoCommit &auto_commit);
+
+  private:
+    friend class IggyBlockingClient;
+    friend class ReaderOptions;
+    friend class ConsumerOptions;
+
+    ffi::PollOptions options_;
+};
+
+/**
+ * @brief The position after one delivered message, bound to its partition and
+ *        to the partition history that delivered it.
+ *
+ * Only a polled batch makes one. A commit of it after the partition was deleted
+ * and created again, or after its consumer group owner changed, is refused
+ * instead of landing on the new partition.
+ */
+class Checkpoint final {
+  public:
+    Checkpoint(const Checkpoint &other) : inner_(other.inner_->copy()) {}
+    Checkpoint(Checkpoint &&) noexcept = default;
+    Checkpoint &operator=(const Checkpoint &other) {
+        if (this != &other) {
+            inner_ = other.inner_->copy();
+        }
+        return *this;
+    }
+    Checkpoint &operator=(Checkpoint &&) noexcept = default;
+    ~Checkpoint()                                 = default;
+
+    [[nodiscard]] std::uint32_t PartitionId() const { return inner_->partition_id(); }
+
+    [[nodiscard]] std::uint64_t Offset() const { return inner_->offset(); }
+
+  private:
+    explicit Checkpoint(rust::Box<ffi::Checkpoint> inner) : inner_(std::move(inner)) {}
+
+    friend class PolledMessages;
+    friend class PartitionReader;
+    friend class ReceivedMessage;
+    friend class IggyConsumer;
+    friend class IggyBlockingClient;
+
+    rust::Box<ffi::Checkpoint> inner_;
+};
+
+/**
+ * @brief Where the next read of one partition starts after a batch.
+ *
+ * It belongs to the partition of its batch, and a read or a seek of another
+ * partition refuses it with InvalidCommand (3).
+ */
+class Continuation final {
+  public:
+    Continuation(const Continuation &other) : inner_(other.inner_->copy()) {}
+    Continuation(Continuation &&) noexcept = default;
+    Continuation &operator=(const Continuation &other) {
+        if (this != &other) {
+            inner_ = other.inner_->copy();
+        }
+        return *this;
+    }
+    Continuation &operator=(Continuation &&) noexcept = default;
+    ~Continuation()                                   = default;
+
+    /** @return The strategy kind: offset, timestamp, first, last or next. */
+    [[nodiscard]] std::string Kind() const { return std::string(inner_->kind()); }
+
+    [[nodiscard]] std::uint64_t Value() const { return inner_->value(); }
+
+  private:
+    explicit Continuation(rust::Box<ffi::Continuation> inner) : inner_(std::move(inner)) {}
+
+    friend class PolledMessages;
+    friend class PartitionReader;
+    friend class IggyConsumer;
+    friend class ReadException;
+    friend class IggyBlockingClient;
+
+    rust::Box<ffi::Continuation> inner_;
+};
+
+/**
+ * @brief One batch of one partition, as a poll or a reader delivered it.
+ *
+ * Its checkpoints name the messages as they were delivered.
+ */
+class PolledMessages final {
+  public:
+    [[nodiscard]] std::uint32_t PartitionId() const noexcept { return partition_id_; }
+
+    [[nodiscard]] std::uint64_t CurrentOffset() const noexcept { return current_offset_; }
+
+    [[nodiscard]] const std::vector<IggyMessagePolled> &Messages() const noexcept { return messages_; }
+
+    /**
+     * @brief The position after the last message, to commit the whole batch.
+     * @throws IggyException for an empty batch.
+     */
+    [[nodiscard]] ::iggy::Checkpoint Checkpoint() const;
+
+    /**
+     * @brief The position after the message at `index`, to commit a processed part of the batch.
+     * @throws IggyException for an index out of range.
+     */
+    [[nodiscard]] ::iggy::Checkpoint CheckpointAt(std::size_t index) const;
+
+    /** @brief The position after the batch, for the next read of its partition. */
+    [[nodiscard]] ::iggy::Continuation Continuation() const;
+
+  private:
+    explicit PolledMessages(ffi::PolledMessages batch);
+
+    friend class PartitionReader;
+    friend class PendingPoll;
+    friend class IggyBlockingClient;
+
+    std::uint32_t partition_id_;
+    std::uint64_t current_offset_;
+    std::vector<IggyMessagePolled> messages_;
+    // Keeps the delivered positions. Its messages were moved into messages_.
+    ffi::PolledMessages batch_;
+};
+
+/**
+ * @brief A failed read of a PartitionReader. The reader stays usable after it
+ *        and retries by itself.
+ */
+class ReadException final : public IggyException {
+  public:
+    /** @return The partition of the error, or `std::nullopt` for an error of the whole reader. */
+    [[nodiscard]] std::optional<std::uint32_t> PartitionId() const noexcept { return partition_id_; }
+
+    /**
+     * @return For a message that does not decode, the continuation after it,
+     *         to pass to PartitionReader::Seek(), otherwise `nullptr`.
+     */
+    [[nodiscard]] const ::iggy::Continuation *Skip() const noexcept { return skip_.get(); }
+
+  private:
+    ReadException(const std::string &message, ffi::ReadErrorInfo &error);
+
+    friend class PartitionReader;
+    friend class IggyConsumer;
+
+    std::optional<std::uint32_t> partition_id_;
+    // Shared, so that copying the exception cannot throw.
+    std::shared_ptr<const ::iggy::Continuation> skip_;
+};
+
+/**
+ * @brief The settings of a PartitionReader. A setting left unset keeps its default.
+ */
+class ReaderOptions final {
+  public:
+    ReaderOptions() = default;
+
+    /** @param partitions The partitions of a standalone consumer, which needs them. A consumer group reads its
+     * assignment. */
+    ReaderOptions &SetPartitions(std::vector<std::uint32_t> partitions) {
+        partitions_ = std::move(partitions);
+        return *this;
+    }
+
+    /** @param start Where a partition without a stored offset starts. Default next. A continuation is refused. */
+    ReaderOptions &SetStart(const PollingStrategy &start) {
+        start_ = start;
+        return *this;
+    }
+
+    /** @param options The options of each request. Default: the poll defaults with a five-second wait. */
+    ReaderOptions &SetPollOptions(const PollOptions &options) {
+        poll_options_ = options;
+        return *this;
+    }
+
+    /** @param prefetch_bytes Encoded bytes of the requests in flight and the queued batches. Default 16 MiB. */
+    ReaderOptions &SetPrefetchBytes(std::uint32_t prefetch_bytes) noexcept {
+        prefetch_bytes_ = prefetch_bytes;
+        return *this;
+    }
+
+    /** @param prefetch_messages Messages in flight and queued. Default: the larger of 16,000 and the count. */
+    ReaderOptions &SetPrefetchMessages(std::uint32_t prefetch_messages) noexcept {
+        prefetch_messages_ = prefetch_messages;
+        return *this;
+    }
+
+  private:
+    [[nodiscard]] ffi::ReaderOptions ToFfi() const;
+
+    friend class IggyBlockingClient;
+
+    std::vector<std::uint32_t> partitions_;
+    std::optional<PollingStrategy> start_;
+    std::optional<PollOptions> poll_options_;
+    std::optional<std::uint32_t> prefetch_bytes_;
+    std::optional<std::uint32_t> prefetch_messages_;
+};
+
+/**
+ * @brief A poll that runs in the background, from
+ *        IggyBlockingClient::StartPollMessages().
+ *
+ * Wait for its batch in steps, or cancel it. Destroying it cancels the poll.
+ */
+class PendingPoll final {
+  public:
+    PendingPoll(PendingPoll &&) noexcept            = default;
+    PendingPoll &operator=(PendingPoll &&) noexcept = default;
+    PendingPoll(const PendingPoll &)                = delete;
+    PendingPoll &operator=(const PendingPoll &)     = delete;
+
+    /**
+     * @brief Waits up to `timeout` for the batch of the poll.
+     * @return The batch, or `std::nullopt` while the poll still runs. The
+     *         batch is empty when a deferred poll found no message in its max wait.
+     * @throws IggyException for a failed poll, and after the batch was
+     *         returned or the poll was cancelled.
+     */
+    std::optional<PolledMessages> Wait(std::chrono::microseconds timeout);
+
+    /**
+     * @brief Drops the request, also while another thread waits for it.
+     *
+     * A parked deferred poll is cancelled on the server. A poll with
+     * CommitPolicy::OnRead that the server had not answered stores nothing. It
+     * returns after the request was dropped and does nothing after the poll ended.
+     */
+    void Cancel();
+
+  private:
+    explicit PendingPoll(rust::Box<ffi::PendingPoll> poll) : poll_(std::move(poll)) {}
+
+    friend class IggyBlockingClient;
+
+    rust::Box<ffi::PendingPoll> poll_;
+};
+
+/**
+ * @brief Reads the partitions of a topic in batches, with routing, prefetch
+ *        and the position of each partition inside.
+ *
+ * IggyBlockingClient::Reader() builds one. Its calls are safe from several
+ * threads and run one at a time. Destroying it stops its work without waiting,
+ * moves no offset back and does not leave a consumer group: call Close().
+ */
+class PartitionReader final {
+  public:
+    PartitionReader(PartitionReader &&) noexcept            = default;
+    PartitionReader &operator=(PartitionReader &&) noexcept = default;
+    PartitionReader(const PartitionReader &)                = delete;
+    PartitionReader &operator=(const PartitionReader &)     = delete;
+
+    /**
+     * @brief Waits up to `timeout` for the next batch of one partition.
+     * @return The batch, or `std::nullopt` when the time ran out. A batch that
+     *         arrives later stays in the reader.
+     * @throws ReadException for a failed read, IggyException after Close().
+     */
+    std::optional<PolledMessages> Next(std::chrono::microseconds timeout);
+
+    /**
+     * @brief Stores the offset of a checkpoint that this reader delivered.
+     * @throws IggyException with CommitPolicy::OnRead, for a checkpoint this
+     *         reader did not deliver, and for a failed store.
+     */
+    void Commit(const Checkpoint &checkpoint);
+
+    /**
+     * @brief Counts a checkpoint that this reader delivered under CommitPolicy::Auto.
+     * @throws IggyException without CommitPolicy::Auto and for a checkpoint this reader did not deliver.
+     */
+    void Mark(const Checkpoint &checkpoint);
+
+    /**
+     * @brief Sets the next read position of a partition and drops its queued batches.
+     *
+     * With CommitPolicy::OnRead, a seek to an offset above 0 first stores the
+     * offset before it, so a restart resumes at the new position. Every other
+     * seek stores nothing.
+     * @throws IggyException for a partition this reader does not read, and for
+     *         a failed store, after which nothing moved.
+     */
+    void Seek(std::uint32_t partition_id, const PollingStrategy &start);
+
+    /** @brief Moves a partition to a continuation of one of its batches, or past a message with ReadException::Skip().
+     */
+    void Seek(std::uint32_t partition_id, const Continuation &continuation);
+
+    /** @return The partitions of a standalone consumer, or the current assignment of a group member. */
+    [[nodiscard]] std::vector<std::uint32_t> Partitions() const;
+
+    /**
+     * @brief Stops the reader. With CommitPolicy::Auto it stores the latest
+     *        counted positions, with CommitPolicy::OnRead it moves the offsets
+     *        back to the last delivered messages, and a group reader then
+     *        leaves its group. A second call does nothing.
+     */
+    void Close();
+
+  private:
+    explicit PartitionReader(rust::Box<ffi::PartitionReader> reader) : reader_(std::move(reader)) {}
+
+    friend class IggyBlockingClient;
+
+    rust::Box<ffi::PartitionReader> reader_;
+};
+
+/**
+ * @brief One message that an IggyConsumer handed over.
+ */
+class ReceivedMessage final {
+  public:
+    [[nodiscard]] std::uint32_t PartitionId() const noexcept { return partition_id_; }
+
+    /** @return The offset of the newest message of the partition when it was polled. */
+    [[nodiscard]] std::uint64_t CurrentOffset() const noexcept { return current_offset_; }
+
+    [[nodiscard]] const IggyMessagePolled &Message() const noexcept { return message_; }
+
+    /** @return The position after the message, to commit or mark it. */
+    [[nodiscard]] const ::iggy::Checkpoint &Checkpoint() const noexcept { return checkpoint_; }
+
+  private:
+    // Copies the checkpoint, since a Box cannot leave a rust::Vec.
+    explicit ReceivedMessage(ffi::ReceivedMessage &received);
+
+    friend class IggyConsumer;
+
+    std::uint32_t partition_id_;
+    std::uint64_t current_offset_;
+    IggyMessagePolled message_;
+    ::iggy::Checkpoint checkpoint_;
+};
+
+/**
+ * @brief The settings of an IggyConsumer. A setting left unset keeps its default.
+ */
+class ConsumerOptions final {
+  public:
+    ConsumerOptions() = default;
+
+    /** @param partitions The partitions of a standalone consumer, which needs them. A group consumer ignores them. */
+    ConsumerOptions &SetPartitions(std::vector<std::uint32_t> partitions) {
+        partitions_ = std::move(partitions);
+        return *this;
+    }
+
+    /** @param start Where a partition without a stored offset starts. Default next. */
+    ConsumerOptions &SetStart(const PollingStrategy &start) {
+        start_ = start;
+        return *this;
+    }
+
+    /** @param options The options of each request and the commit policy. Default: the poll defaults with a five-second
+     * wait. */
+    ConsumerOptions &SetPollOptions(const PollOptions &options) {
+        poll_options_ = options;
+        return *this;
+    }
+
+    /** @param prefetch_bytes Encoded bytes of the requests in flight and the queued batches. Default 16 MiB. */
+    ConsumerOptions &SetPrefetchBytes(std::uint32_t prefetch_bytes) noexcept {
+        prefetch_bytes_ = prefetch_bytes;
+        return *this;
+    }
+
+    /** @param prefetch_messages Messages in flight and queued. Default: the larger of 16,000 and the count. */
+    ConsumerOptions &SetPrefetchMessages(std::uint32_t prefetch_messages) noexcept {
+        prefetch_messages_ = prefetch_messages;
+        return *this;
+    }
+
+    /** @param allow_replay Hand over again the messages that a seek back reads twice. Default false. */
+    ConsumerOptions &SetAllowReplay(bool allow_replay) noexcept {
+        allow_replay_ = allow_replay;
+        return *this;
+    }
+
+  private:
+    [[nodiscard]] ffi::ConsumerOptions ToFfi() const;
+
+    friend class IggyBlockingClient;
+
+    std::vector<std::uint32_t> partitions_;
+    std::optional<PollingStrategy> start_;
+    std::optional<PollOptions> poll_options_;
+    std::optional<std::uint32_t> prefetch_bytes_;
+    std::optional<std::uint32_t> prefetch_messages_;
+    bool allow_replay_ = false;
+};
+
+/**
+ * @brief Hands over the messages of a topic one at a time, through one
+ *        PartitionReader, with the commit policy of its PollOptions.
+ *
+ * IggyBlockingClient::StandaloneConsumer() and GroupConsumer() build one. Its
+ * calls are safe from several threads and run one at a time. Destroying it
+ * stops its work without waiting and stores nothing: call Close().
+ */
+class IggyConsumer final {
+  public:
+    IggyConsumer(IggyConsumer &&) noexcept            = default;
+    IggyConsumer &operator=(IggyConsumer &&) noexcept = default;
+    IggyConsumer(const IggyConsumer &)                = delete;
+    IggyConsumer &operator=(const IggyConsumer &)     = delete;
+
+    /**
+     * @brief Waits up to `timeout` for the next message.
+     *
+     * Under CommitAfter::Processing it counts the message handed over before.
+     *
+     * @return The message, or `std::nullopt` when the time ran out.
+     * @throws ReadException for a failed read, IggyException after Close().
+     */
+    std::optional<ReceivedMessage> Next(std::chrono::microseconds timeout);
+
+    /**
+     * @brief Stores the offset of a checkpoint that this consumer handed over.
+     * @throws IggyException with CommitPolicy::OnRead and for a failed store.
+     */
+    void Commit(const Checkpoint &checkpoint);
+
+    /**
+     * @brief Counts a checkpoint that this consumer handed over under CommitPolicy::Auto.
+     * @throws IggyException without CommitPolicy::Auto and for a checkpoint this consumer did not hand over.
+     */
+    void Mark(const Checkpoint &checkpoint);
+
+    /**
+     * @brief Sets the next read position of a partition.
+     *
+     * With CommitPolicy::OnRead, a seek to an offset above 0 first stores the
+     * offset before it, so a restart resumes at the new position. Every other
+     * seek stores nothing.
+     * @throws IggyException for a partition this consumer does not read, and
+     *         for a failed store, after which nothing moved.
+     */
+    void Seek(std::uint32_t partition_id, const PollingStrategy &start);
+    void Seek(std::uint32_t partition_id, const Continuation &continuation);
+
+    /**
+     * @brief Stops the consumer. With CommitPolicy::Auto it stores the latest
+     *        counted positions, with CommitPolicy::OnRead it moves the offsets
+     *        back to the last handed over messages, and a group consumer then
+     *        leaves its group. A second call does nothing.
+     */
+    void Close();
+
+  private:
+    explicit IggyConsumer(rust::Box<ffi::Consumer> consumer) : consumer_(std::move(consumer)) {}
+
+    friend class IggyBlockingClient;
+
+    rust::Box<ffi::Consumer> consumer_;
+};
+
+/**
  * @brief Owning client connection to an Apache Iggy server.
  *
  * Create instances with Builder or FromConnectionString(). The client owns a
@@ -4047,11 +6337,17 @@ class PollingStrategy final {
  * - CreatePartitions(), DeletePartitions(), and DeleteSegments().
  * - CreateConsumerGroup(), DeleteConsumerGroup(), JoinConsumerGroup(), and
  *   LeaveConsumerGroup().
- * - StoreConsumerOffset(), StoreConsumerPosition(), and DeleteConsumerOffset().
+ * - StoreConsumerOffset(), StoreConsumerPosition(), DeleteConsumerOffset(), and
+ *   DeleteConsumerPosition().
+ * - PollMessages(), Reader(), StandaloneConsumer(), GroupConsumer(),
+ *   PendingPoll::Wait(), and the calls of PartitionReader and IggyConsumer.
+ * - GetMetadataChanges().
  *
  * Other methods report errors through the exception message only. C++ and
  * bridge-local argument validation failures also have no structured error
- * details, even for the methods listed above.
+ * details, even for the methods listed above. GetMetadataChanges() is the
+ * exception: it reports every invalid query as invalid_command, including one
+ * the bridge refuses.
  *
  * @code{.cpp}
  * auto client{iggy::IggyBlockingClient::Builder()
@@ -4217,8 +6513,11 @@ class IggyBlockingClient final {
      * changes the client state to disconnected, but keeps the client reusable.
      * Call Connect() to establish a new connection. Configured automatic login
      * is applied when reconnecting.
-     * For binary transports, disconnect also drops all retained operations
+     * For binary transports, disconnect also drops all retained mutations
      * without settling their outcomes. They cannot be resolved after reconnecting.
+     * A poll with CommitPolicy::OnRead that waits fails with
+     * fetch_progress_uncertain, and its partition stays blocked across the
+     * reconnect until AbandonOperation().
      *
      * @note The disconnect holds until the next Connect(): requests fail and
      *       nothing reconnects the client in the background, even with
@@ -4373,6 +6672,28 @@ class IggyBlockingClient final {
      *         the request fails.
      */
     void UpdateUser(const Identifier &user, const UserUpdateOptions &options);
+
+    /**
+     * @brief Creates a personal access token for the authenticated user.
+     *
+     * The token string is only returned once upon creation and cannot be
+     * retrieved again.
+     *
+     * Token names must contain between 1 and 255 bytes on binary transports
+     * (TCP, QUIC) and between 3 and 30 bytes on HTTP, and must remain unique.
+     *
+     * For personal access tokens, Expiry::ServerDefault() and Expiry::NeverExpire()
+     * both produce a token that never expires. Use Expiry::Duration() to specify
+     * a bounded lifetime.
+     *
+     * @param name Unique token name (1-255 bytes for binary, 3-30 bytes for HTTP).
+     * @param expiry Expiry policy for the token. ServerDefault() and NeverExpire() mean no expiry.
+     * @return The raw token string.
+     * @throws IggyException if the client is unavailable or unauthenticated;
+     *         the name or expiry is invalid; the name is already in use; or the
+     *         request fails.
+     */
+    std::string CreatePersonalAccessToken(std::string name, const Expiry &expiry);
 
     /**
      * @brief Creates a top-level stream in the cluster metadata.
@@ -4751,30 +7072,150 @@ class IggyBlockingClient final {
                              std::uint64_t offset);
 
     /**
-     * @brief Stores an offset under the partition context that delivered it.
+     * @brief Stores the offset of a checkpoint under the partition context
+     *        that delivered it.
      *
-     * Every retry keeps @p context. The store fails instead of landing on a
-     * recreated partition or under a newer consumer-group owner. Otherwise it
-     * behaves as StoreConsumerOffset() with @p partition_id set.
+     * Every retry keeps the context of @p checkpoint. The store fails instead
+     * of landing on a recreated partition or under a newer consumer-group
+     * owner. Otherwise it behaves as StoreConsumerOffset() with the partition
+     * of @p checkpoint.
      *
      * @param consumer Consumer identity that owns the offset.
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Parent topic, addressed by numeric ID or name.
-     * @param partition_id Partition that delivered @p offset.
-     * @param offset Message offset to store.
-     * @param context Context the poll that delivered @p offset returned.
+     * @param checkpoint Position after a delivered message, from a batch
+     *        that PollMessages() or PartitionReader::Next() returned.
      * @throws IggyException if the partition was deleted or recreated after
-     *         @p context was captured (HistoryUnavailable, 87); this client no
-     *         longer owns the partition in the consumer group
-     *         (ConsumerGroupPartitionNotOwned, 5009); or for any reason
+     *         the context of @p checkpoint was captured (HistoryUnavailable,
+     *         87), if this client no longer owns the partition in the consumer
+     *         group (ConsumerGroupPartitionNotOwned, 5009), or for any reason
      *         StoreConsumerOffset() throws.
      */
     void StoreConsumerPosition(const Consumer &consumer,
                                const Identifier &stream,
                                const Identifier &topic,
-                               std::uint32_t partition_id,
-                               std::uint64_t offset,
-                               const PartitionContext &context);
+                               const Checkpoint &checkpoint);
+
+    /**
+     * @brief Deletes the stored offset of the partition of a checkpoint under
+     *        the partition context that delivered it.
+     *
+     * The delete fails instead of removing the offset of a recreated
+     * partition or of a newer consumer-group owner. The offset of
+     * @p checkpoint is not used.
+     *
+     * @param consumer Consumer identity that owns the offset.
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @param checkpoint Position after a delivered message of the partition,
+     *        from a batch that PollMessages() or PartitionReader::Next()
+     *        returned.
+     * @throws IggyException if no offset is stored (ConsumerOffsetNotFound,
+     *         3021), if the partition was deleted or recreated after the
+     *         context of @p checkpoint was captured (HistoryUnavailable, 87),
+     *         or if this client no longer owns the partition in the consumer
+     *         group (ConsumerGroupPartitionNotOwned, 5009).
+     */
+    void DeleteConsumerPosition(const Consumer &consumer,
+                                const Identifier &stream,
+                                const Identifier &topic,
+                                const Checkpoint &checkpoint);
+
+    /**
+     * @brief Reads one partition once.
+     *
+     * A strategy takes the partition context that the cached route reports.
+     * After another client deleted and recreated the partition, one call can
+     * fail with HistoryUnavailable (87), or ConsumerGroupPartitionNotOwned
+     * (5009) for a consumer group. The failed route is dropped and the next
+     * call routes again.
+     *
+     * With CommitPolicy::OnRead, a lost reply fails with
+     * FetchProgressUncertain (14010) and blocks the partition on this client:
+     * later polls of it fail with PartitionLaneBlocked (14009) until
+     * AbandonOperation() of the operation that the error names.
+     *
+     * @param consumer Consumer identity of the read.
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @param partition_id Partition to read.
+     * @param strategy Where the read starts.
+     * @param options Limits of the read and when its offset is stored.
+     * @return The batch, empty when the partition has no message there.
+     * @throws IggyException for CommitPolicy::Auto (invalid_configuration),
+     *         invalid options, or a failed read.
+     */
+    PolledMessages PollMessages(const Consumer &consumer,
+                                const Identifier &stream,
+                                const Identifier &topic,
+                                std::uint32_t partition_id,
+                                const PollingStrategy &strategy,
+                                const PollOptions &options = PollOptions());
+
+    /**
+     * @brief Reads on from the continuation of a batch of the same partition.
+     * @throws IggyException as the strategy overload does, and with
+     *         InvalidCommand (3) for a continuation of another partition.
+     */
+    PolledMessages PollMessages(const Consumer &consumer,
+                                const Identifier &stream,
+                                const Identifier &topic,
+                                std::uint32_t partition_id,
+                                const Continuation &continuation,
+                                const PollOptions &options = PollOptions());
+
+    /**
+     * @brief Builds a reader of the partitions of a topic.
+     *
+     * A consumer group reads the assignment of its member: the reader joins
+     * the group here, joins again after a session loss, and leaves it in
+     * PartitionReader::Close().
+     *
+     * @param consumer Consumer identity of the reader.
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @param options Settings of the reader. A standalone consumer needs its partitions.
+     * @throws IggyException for invalid options or a failed join.
+     */
+    PartitionReader Reader(const Consumer &consumer,
+                           const Identifier &stream,
+                           const Identifier &topic,
+                           const ReaderOptions &options = ReaderOptions());
+
+    /**
+     * @brief Starts a poll in the background, as PollMessages() does, so the
+     *        caller can wait for its batch in steps or cancel it.
+     * @throws IggyException for invalid arguments. A failed poll throws from PendingPoll::Wait().
+     */
+    PendingPoll StartPollMessages(const Consumer &consumer,
+                                  const Identifier &stream,
+                                  const Identifier &topic,
+                                  std::uint32_t partition_id,
+                                  const PollingStrategy &strategy,
+                                  const PollOptions &options = PollOptions());
+
+    /**
+     * @brief Builds and initializes a standalone consumer named `name` that
+     *        reads the partitions of @p options.
+     * @throws IggyException for invalid options or a failed initialization.
+     */
+    IggyConsumer StandaloneConsumer(const std::string &name,
+                                    const Identifier &stream,
+                                    const Identifier &topic,
+                                    const ConsumerOptions &options);
+
+    /**
+     * @brief Builds and initializes a member of the consumer group `name`.
+     *
+     * It creates the group if it does not exist, joins it here, reads the
+     * assignment of its member, and leaves the group in IggyConsumer::Close().
+     *
+     * @throws IggyException for invalid options or a failed join.
+     */
+    IggyConsumer GroupConsumer(const std::string &name,
+                               const Identifier &stream,
+                               const Identifier &topic,
+                               const ConsumerOptions &options = ConsumerOptions());
 
     /**
      * @brief Retrieves the stored offset for a consumer or consumer group.
@@ -4900,6 +7341,25 @@ class IggyBlockingClient final {
     std::vector<OptionSpec> DescribeOptions(OptionsScope scope);
 
     /**
+     * @brief Reads one page of the metadata change log or of the current state.
+     *
+     * The node records one change per public result of a committed metadata
+     * operation, such as a stream created, a topic renamed, a user's
+     * permissions changed, or a session closed. A mirror keeps a cursor, reads
+     * the records after it, and stores the returned MetadataChanges::Next().
+     * Records carry option values as the read routes return them and never
+     * key material.
+     *
+     * @param query Start position, groups, time bounds, and page size.
+     * @return One page of records or current state items.
+     * @throws IggyException with Kind() invalid_command when @p query is
+     *         invalid, before anything is sent; with Kind() unauthorized when
+     *         the caller is neither root nor holds the global manage_servers
+     *         permission; or when the request fails.
+     */
+    MetadataChanges GetMetadataChanges(const MetadataChangesQuery &query);
+
+    /**
      * @brief Retrieves server process, storage, and resource statistics.
      *
      * The returned fields are an observed snapshot and can change immediately.
@@ -4922,7 +7382,7 @@ class IggyBlockingClient final {
      * An operation_uncertain result keeps the original frame and lane for a later
      * resolve. operation_not_retained does not prove that the original command
      * failed or make resending it safe. Disconnect() and session reset drop
-     * retained operations without settling them or allowing later recovery.
+     * retained mutations without settling them or allowing later recovery.
      * The client keeps the proved outcomes of its last max_operations replays,
      * also across a session reset. A later resolve of a proved operation returns
      * the same outcome without a request.
@@ -4940,10 +7400,12 @@ class IggyBlockingClient final {
     /**
      * @brief Releases a retained operation and its local lane.
      *
-     * Abandonment does not undo or determine the server result. HTTP reports
-     * feature_unavailable because it does not retain operations.
+     * Abandonment does not undo or determine the server result. HTTP retains
+     * only the poll operations of fetch_progress_uncertain, so it reports
+     * operation_not_retained for every other operation.
      *
-     * @param operation_id ID carried by operation_uncertain or lane_blocked.
+     * @param operation_id ID carried by operation_uncertain, lane_blocked,
+     *        fetch_progress_uncertain, or partition_lane_blocked.
      * @throws IggyException if the operation is not retained, recovery is
      *         unsupported, or the client handle is unavailable.
      */
@@ -4951,22 +7413,6 @@ class IggyBlockingClient final {
 
   private:
     explicit IggyBlockingClient(ffi::Client *client);
-
-    template <typename Operation>
-    static decltype(auto) RethrowAsIggyException(Operation &&operation) {
-        ffi::ErrorInfo error_info{};
-        try {
-            if constexpr (std::is_invocable_v<Operation, ffi::ErrorInfo &>) {
-                return std::forward<Operation>(operation)(error_info);
-            } else {
-                return std::forward<Operation>(operation)();
-            }
-        } catch (const IggyException &) {
-            throw;
-        } catch (const std::exception &error) {
-            throw IggyException(error.what(), error_info);
-        }
-    }
 
     [[nodiscard]] ffi::Client *Handle() const;
     void Reset() noexcept;

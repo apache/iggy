@@ -101,6 +101,26 @@ public interface IIggySystem
     Task<ClusterMetadata?> GetClusterMetadataAsync(CancellationToken token = default);
 
     /// <summary>
+    ///     Reads one page of the node's metadata change log, or of its current state.
+    /// </summary>
+    /// <remarks>
+    ///     Every committed metadata operation that changes public state leaves records such as a stream created, a
+    ///     topic renamed or a session closed. A mirror keeps a cursor, asks for the records after it and stores the
+    ///     returned <see cref="MetadataChanges.Next" />. On <see cref="MetadataChangeStatus.Expired" /> or
+    ///     <see cref="MetadataChangeStatus.Reset" /> it rebuilds from current state pages and follows the changes
+    ///     after the anchor they return. Requires root or the global manage servers permission. The query is checked
+    ///     before anything is sent. Available over TCP and HTTP.
+    /// </remarks>
+    /// <param name="query">Where to start, which groups, the time range and the page size.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task that represents the asynchronous operation and returns the page.</returns>
+    /// <exception cref="Exceptions.IggyInvalidStatusCodeException">
+    ///     Invalid command (code 3) for a query the rules refuse, unauthorized (code 41) without the manage servers
+    ///     permission.
+    /// </exception>
+    Task<MetadataChanges> GetMetadataChangesAsync(MetadataChangesQuery query, CancellationToken token = default);
+
+    /// <summary>
     ///     Sends a ping request to the server to verify connectivity.
     /// </summary>
     /// <remarks>

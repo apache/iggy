@@ -18,6 +18,7 @@
 use crate::iobuf::{Frozen, Owned};
 use crate::sharding::METADATA_GROUP;
 use aligned_vec::{AVec, ConstAlign};
+use futures::channel::oneshot;
 use iggy_binary_protocol::{
     Command, CommitHeader, ConsensusError, ConsensusHeader, ConsumerSessionHeartbeatHeader,
     DoViewChangeHeader, ForwardCompletionHeader, ForwardLogoutHeader, ForwardLogoutResultHeader,
@@ -29,6 +30,7 @@ use iggy_binary_protocol::{
     frame_checksum_bytes, prepare_identity_checksum_bytes,
 };
 use smallvec::SmallVec;
+use std::sync::{Arc, Mutex};
 use std::{
     marker::PhantomData,
     mem::{offset_of, size_of},
@@ -86,12 +88,41 @@ pub struct RequestBacking {
 #[derive(Debug, Clone)]
 pub struct ResponseBacking {
     fragments: ResponseFragments,
+    write_receipt: Option<WriteReceipt>,
+}
+
+/// Completed by the transport only after the whole frame is written and flushed.
+/// Dropping every copy without completion cancels the observer.
+#[derive(Debug, Clone)]
+pub struct WriteReceipt(Arc<Mutex<Option<oneshot::Sender<()>>>>);
+
+impl WriteReceipt {
+    pub fn complete(self) {
+        if let Some(sender) = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = sender.send(());
+        }
+    }
 }
 
 impl RequestBackingKind for RequestBacking {}
 impl ResponseBackingKind for ResponseBacking {}
 
 impl ResponseBacking {
+    pub fn track_write(&mut self) -> oneshot::Receiver<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.write_receipt = Some(WriteReceipt(Arc::new(Mutex::new(Some(sender)))));
+        receiver
+    }
+
+    pub fn take_write_receipt(&mut self) -> Option<WriteReceipt> {
+        self.write_receipt.take()
+    }
+
     /// The fragment carrying the frame header.
     #[must_use]
     pub fn first(&self) -> &Frozen<MESSAGE_ALIGN> {
@@ -138,6 +169,7 @@ impl From<Frozen<MESSAGE_ALIGN>> for ResponseBacking {
     fn from(frozen: Frozen<MESSAGE_ALIGN>) -> Self {
         Self {
             fragments: smallvec::smallvec![frozen],
+            write_receipt: None,
         }
     }
 }
@@ -607,7 +639,12 @@ where
             });
         }
 
-        Ok(unsafe { Self::from_backing_unchecked(ResponseBacking { fragments }) })
+        Ok(unsafe {
+            Self::from_backing_unchecked(ResponseBacking {
+                fragments,
+                write_receipt: None,
+            })
+        })
     }
 }
 
@@ -655,6 +692,54 @@ pub enum MessageBag {
 }
 
 impl MessageBag {
+    /// Whether [`Self::routing`] sends frames of `command` to the metadata
+    /// group, whatever group their header names.
+    ///
+    /// Any shard can send these frames, so the replica bus cannot pick their
+    /// link from the sending shard. It sends them over the link of the shard
+    /// range that holds the metadata group. The match names every command,
+    /// so a new command must be classified here before it compiles.
+    #[must_use]
+    pub const fn routes_to_metadata(command: Command) -> bool {
+        match command {
+            Command::ForwardRegister
+            | Command::ForwardRegisterResult
+            | Command::ForwardLogout
+            | Command::ForwardLogoutResult
+            | Command::ConsumerSessionHeartbeat
+            | Command::SessionRetirementProgress
+            | Command::ForwardCompletion
+            | Command::PrimaryRebalance
+            | Command::SegmentDelete => true,
+            Command::Reserved
+            | Command::Ping
+            | Command::Pong
+            | Command::PingClient
+            | Command::PongClient
+            | Command::Request
+            | Command::Prepare
+            | Command::PrepareOk
+            | Command::Reply
+            | Command::Commit
+            | Command::StartViewChange
+            | Command::DoViewChange
+            | Command::StartView
+            | Command::Eviction
+            | Command::ReplicaHello
+            | Command::ReplicaChallenge
+            | Command::ReplicaFinish
+            | Command::RequestStartView
+            | Command::RequestPrepares
+            | Command::RepairPrepare
+            | Command::RepairDone
+            | Command::RangeEvicted
+            | Command::RequestStateTransfer
+            | Command::StateTransferTarget
+            | Command::RequestStateChunk
+            | Command::StateChunk => false,
+        }
+    }
+
     /// `(operation, group)`: everything the shard router needs to pick a
     /// target, read off the already-typed header without consuming the bag.
     ///
@@ -1337,6 +1422,17 @@ mod tests {
         assert_eq!(result.command(), Command::ForwardLogoutResult);
         assert_eq!(forward.operation(), Operation::Reserved);
         assert_eq!(result.size(), HEADER_SIZE as u32);
+        for bag in [forward, result] {
+            assert!(MessageBag::routes_to_metadata(bag.command()));
+            assert_eq!(bag.routing().1, METADATA_GROUP);
+        }
+    }
+
+    #[test]
+    fn given_a_group_frame_when_classified_should_not_route_to_metadata_by_command() {
+        let bag = dispatch(Command::Prepare, HEADER_SIZE as u32).expect("dispatch Prepare");
+        assert!(!MessageBag::routes_to_metadata(bag.command()));
+        assert_ne!(bag.routing().1, METADATA_GROUP);
     }
 
     fn primary_rebalance_frame(kind: PrimaryRebalanceKind) -> Message<PrimaryRebalanceHeader> {
@@ -1391,6 +1487,7 @@ mod tests {
             let bag = MessageBag::try_from(frame.into_generic()).unwrap();
             assert!(matches!(bag, MessageBag::PrimaryRebalance(_)));
             assert_eq!(bag.routing(), (Operation::Reserved, METADATA_GROUP));
+            assert!(MessageBag::routes_to_metadata(bag.command()));
             assert_eq!(bag.command(), Command::PrimaryRebalance);
             assert_eq!(bag.operation(), Operation::Reserved);
             assert_eq!(bag.size(), HEADER_SIZE as u32);

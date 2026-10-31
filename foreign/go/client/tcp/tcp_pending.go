@@ -19,6 +19,7 @@ package tcp
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -36,6 +37,15 @@ const (
 type laneKey struct {
 	incarnation uint64
 	partition   uint32
+	// progress names the progress lane of the partition. Progress polls and
+	// offset calls take it, sends do not, so a parked poll does not hold sends.
+	progress bool
+}
+
+// progressLane is the key of the progress lane of the partition of k.
+func (k laneKey) progressLane() laneKey {
+	k.progress = true
+	return k
 }
 
 type mutationLane struct {
@@ -83,6 +93,17 @@ type operationRegistry struct {
 	// The outcomes that replays proved, oldest first and at most maxOperations.
 	// A reset keeps them, because request IDs never repeat within a client.
 	proved []provedOutcome
+	// Fetch recovery survives a session reset and retains only target keys.
+	fetchReservations map[*fetchRecovery]struct{}
+	fetchRetained     map[uint64]*fetchRecovery
+	fetchBlocked      map[laneKey]*fetchRecovery
+	fetchBytes        int
+}
+
+type fetchRecovery struct {
+	id   uint64
+	keys []laneKey
+	size int
 }
 
 // provedOutcome is the committed result of a replayed operation: nil for a
@@ -102,6 +123,10 @@ type operationFrame struct {
 	data        []byte
 	refs        atomic.Int32
 	reservation *frameReservation
+	// uncancellable keeps the link from cancelling the request when its
+	// caller stops waiting: a fetch with auto-commit, because a cancel after
+	// its read drops what it stored.
+	uncancellable bool
 }
 
 func newOperationFrame(data []byte, reservation *frameReservation) *operationFrame {
@@ -134,41 +159,55 @@ type pendingOperation struct {
 	key   laneKey
 	fence uint64
 	frame *operationFrame
+	// replica is the replica the caller chose, nil when the client routes the request.
+	replica *uint8
+	// budget is the budget of a deferred poll or a fetch, nil for
+	// any other request.
+	budget *deferredBudget
 }
 
 type laneTicket struct {
-	owner       *operationRegistry
-	key         laneKey
-	lane        *mutationLane
-	fence       uint64
-	operation   *pendingOperation
-	reservation *frameReservation
-	resumed     bool
-	finished    bool
-	proved      bool
-	outcome     error
+	owner        *operationRegistry
+	key          laneKey
+	lane         *mutationLane
+	fence        uint64
+	operation    *pendingOperation
+	reservation  *frameReservation
+	resumed      bool
+	finished     bool
+	proved       bool
+	outcome      error
+	fetch        *fetchRecovery
+	fetchUnknown []laneKey
+	// held are the other lanes of the call: the progress lane of an offset
+	// store or delete, which also takes the mutation lane, or the progress
+	// lanes of the other partitions of a fetch.
+	held []*laneTicket
 }
 
 func newOperationRegistry(maxOperations, maxBytes int) *operationRegistry {
-	return &operationRegistry{fence: 1, lanes: make(map[laneKey]*mutationLane), retained: make(map[uint64]*pendingOperation), reservations: make(map[*frameReservation]struct{}), maxOperations: maxOperations, maxBytes: maxBytes, resumers: make(map[uint64][]registryWaiter)}
+	return &operationRegistry{fence: 1, lanes: make(map[laneKey]*mutationLane), retained: make(map[uint64]*pendingOperation), reservations: make(map[*frameReservation]struct{}), maxOperations: maxOperations, maxBytes: maxBytes, resumers: make(map[uint64][]registryWaiter), fetchReservations: make(map[*fetchRecovery]struct{}), fetchRetained: make(map[uint64]*fetchRecovery), fetchBlocked: make(map[laneKey]*fetchRecovery)}
 }
 
 // enter waits for the lane of key in arrival order. A reset keeps the queue,
 // so the ticket takes the fence of the session it is granted under.
 func (r *operationRegistry) enter(ctx context.Context, key laneKey) (*laneTicket, error) {
+	return r.enterLane(ctx, key, false)
+}
+
+func (r *operationRegistry) enterLane(ctx context.Context, key laneKey, inspect bool) (*laneTicket, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	lane := r.lanes[key]
-	if lane == nil {
-		lane = &mutationLane{}
-		r.lanes[key] = lane
-	}
+	lane := r.laneLocked(key)
 	var waiter registryWaiter
 	for {
-		if lane.retained != nil {
-			id := lane.retained.id
+		if blocking := r.fetchBlocked[key]; blocking != nil && !inspect {
 			r.leaveLaneLocked(key, lane, waiter)
-			return nil, ierror.LaneBlocked{OperationID: id}
+			return nil, ierror.PartitionLaneBlocked{PartitionID: key.partition, OperationID: blocking.id}
+		}
+		if blocking := r.blockingLocked(key, lane); blocking != nil {
+			r.leaveLaneLocked(key, lane, waiter)
+			return nil, ierror.LaneBlocked{OperationID: blocking.id}
 		}
 		if ctx.Err() != nil {
 			r.leaveLaneLocked(key, lane, waiter)
@@ -188,6 +227,80 @@ func (r *operationRegistry) enter(ctx context.Context, key laneKey) (*laneTicket
 		}
 		r.waitLocked(ctx, waiter)
 	}
+}
+
+// enterProgress enters the progress lane of the partition of key and, for an
+// offset store or delete, then its mutation lane. The progress lane comes
+// first, so a call that waits for a parked poll holds no mutation lane.
+func (r *operationRegistry) enterProgress(ctx context.Context, key laneKey, mutation bool) (*laneTicket, error) {
+	progress, err := r.enter(ctx, key.progressLane())
+	if err != nil || !mutation {
+		return progress, err
+	}
+	ticket, err := r.enter(ctx, key)
+	if err != nil {
+		progress.finish(false)
+		return nil, err
+	}
+	ticket.held = []*laneTicket{progress}
+	return ticket, nil
+}
+
+// enterLanes enters the lanes of keys in their order, and its ticket holds
+// them all. A fetch takes the progress lanes of its partitions this way, in
+// ascending partition order. Every call that waits for a lane while it holds
+// another takes its lanes in ascending partition order, and the progress
+// lane of a partition before its mutation lane, so no two calls wait for each
+// other. Without keys, it holds nothing and returns no ticket.
+func (r *operationRegistry) enterLanes(ctx context.Context, keys []laneKey) (*laneTicket, error) {
+	var ticket *laneTicket
+	for _, key := range keys {
+		entered, err := r.enter(ctx, key)
+		if err != nil {
+			if ticket != nil {
+				ticket.finish(false)
+			}
+			var blocked ierror.LaneBlocked
+			if errors.As(err, &blocked) {
+				return nil, ierror.PartitionLaneBlocked{PartitionID: key.partition, OperationID: blocked.OperationID}
+			}
+			return nil, err
+		}
+		if ticket == nil {
+			ticket = entered
+		} else {
+			ticket.held = append(ticket.held, entered)
+		}
+	}
+	return ticket, nil
+}
+
+func (r *operationRegistry) laneLocked(key laneKey) *mutationLane {
+	lane := r.lanes[key]
+	if lane == nil {
+		lane = &mutationLane{}
+		r.lanes[key] = lane
+	}
+	return lane
+}
+
+// blockingLocked returns the retained operation that blocks the lane of key.
+// A progress lane retains nothing itself. An offset store or delete that the
+// mutation lane of its partition retains blocks it, because a replay can
+// still move the offset.
+func (r *operationRegistry) blockingLocked(key laneKey, lane *mutationLane) *pendingOperation {
+	if !key.progress {
+		return lane.retained
+	}
+	key.progress = false
+	if mutations := r.lanes[key]; mutations != nil && mutations.retained != nil && changesProgress(mutations.retained.code) {
+		return mutations.retained
+	}
+	return nil
+}
+
+func changesProgress(code command.Code) bool {
+	return code == command.StoreOffsetCode || code == command.DeleteConsumerOffsetCode
 }
 
 // waitLocked releases r.mu until waiter wakes or ctx ends.
@@ -326,7 +439,42 @@ func (r *operationRegistry) releaseSlotLocked(reservation *frameReservation) {
 func (t *laneTicket) freeze(code command.Code, query []byte, frame []byte) *pendingOperation {
 	operation := &pendingOperation{id: vsr.StampedRequestID(frame), code: code, query: append([]byte(nil), query...), key: t.key, fence: t.fence, frame: newOperationFrame(frame, t.reservation)}
 	t.operation = operation
+	if t.fetch != nil {
+		t.fetch.id = operation.id
+	}
 	return operation
+}
+
+// reserveFetch bounds local recovery metadata before the request can be sent.
+// It uses the configured limits independently of replayable mutation frames,
+// whose reservations are reset when their session is replaced.
+func (t *laneTicket) reserveFetch() error {
+	const recoveryHeaderBytes = 16
+	const recoveryKeyBytes = 16
+	r := t.owner
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if t.fetch != nil {
+		return nil
+	}
+	size := recoveryHeaderBytes + recoveryKeyBytes*(1+len(t.held))
+	if len(r.fetchReservations) >= r.maxOperations || size > r.maxBytes-r.fetchBytes {
+		return ierror.ErrTransientNotAccepted
+	}
+	keys := make([]laneKey, 0, 1+len(t.held))
+	keys = append(keys, t.key)
+	for _, held := range t.held {
+		keys = append(keys, held.key)
+	}
+	t.fetch = &fetchRecovery{keys: keys, size: size}
+	r.fetchReservations[t.fetch] = struct{}{}
+	r.fetchBytes += size
+	return nil
+}
+
+func (t *laneTicket) retainFetch(keys []laneKey) error {
+	t.fetchUnknown = keys
+	return ierror.FetchProgressUncertain{OperationID: t.operation.id}
 }
 
 // releaseOperation frees the operation of the ticket and keeps its lane, so the
@@ -364,6 +512,18 @@ func (t *laneTicket) finish(retain bool) {
 	}
 	t.finished = true
 	operation := t.operation
+	if recovery := t.fetch; recovery != nil {
+		if len(t.fetchUnknown) > 0 {
+			recovery.keys = t.fetchUnknown
+			r.fetchRetained[recovery.id] = recovery
+			for _, key := range recovery.keys {
+				r.fetchBlocked[key] = recovery
+			}
+		} else {
+			delete(r.fetchReservations, recovery)
+			r.fetchBytes -= recovery.size
+		}
+	}
 	if t.proved && t.resumed {
 		// Recorded with the release under one lock, so a resolve that no longer
 		// finds the operation finds its outcome, also after an abandon.
@@ -393,6 +553,14 @@ func (t *laneTicket) finish(retain bool) {
 	}
 	r.cleanLaneLocked(t.key, t.lane)
 	r.wakeLaneLocked(t.lane)
+	// Released after the retention above and under the same lock, so a
+	// progress waiter sees the store that now blocks it, and a resolver finds
+	// both lanes free.
+	for _, held := range t.held {
+		held.lane.active = false
+		r.cleanLaneLocked(held.key, held.lane)
+		r.wakeLaneLocked(held.lane)
+	}
 	// While the ticket holds the lane, only its own operation can be retained
 	// there, so only the resolvers of that operation wait for the lane.
 	if operation != nil {
@@ -426,6 +594,9 @@ func (f *operationFrame) releaseRegistryLocked(r *operationRegistry) {
 func (r *operationRegistry) resume(ctx context.Context, id uint64) (*laneTicket, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.fetchRetained[id] != nil {
+		return nil, ierror.FetchProgressUncertain{OperationID: id}
+	}
 	var waiter registryWaiter
 	defer func() { r.leaveResumersLocked(id, waiter) }()
 	for {
@@ -437,10 +608,22 @@ func (r *operationRegistry) resume(ctx context.Context, id uint64) (*laneTicket,
 		if ctx.Err() != nil {
 			return nil, ierror.OperationUncertain{OperationID: id}
 		}
-		if !lane.active {
+		// A replay of an offset store or delete holds the progress lane too, as
+		// its first attempt did. While the operation blocks that lane, only its
+		// replays hold it, and their end wakes this call.
+		var progress *mutationLane
+		if changesProgress(operation.code) {
+			progress = r.laneLocked(operation.key.progressLane())
+		}
+		if !lane.active && (progress == nil || !progress.active) {
 			lane.active = true
 			operation.frame.acquire()
-			return &laneTicket{owner: r, key: operation.key, lane: lane, fence: r.fence, operation: operation, reservation: operation.frame.reservation, resumed: true}, nil
+			ticket := &laneTicket{owner: r, key: operation.key, lane: lane, fence: r.fence, operation: operation, reservation: operation.frame.reservation, resumed: true}
+			if progress != nil {
+				progress.active = true
+				ticket.held = []*laneTicket{{owner: r, key: operation.key.progressLane(), lane: progress, fence: r.fence}}
+			}
+			return ticket, nil
 		}
 		if waiter == nil {
 			waiter = newRegistryWaiter()
@@ -466,6 +649,15 @@ func (r *operationRegistry) leaveResumersLocked(id uint64, waiter registryWaiter
 func (r *operationRegistry) abandon(id uint64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if recovery := r.fetchRetained[id]; recovery != nil {
+		delete(r.fetchRetained, id)
+		delete(r.fetchReservations, recovery)
+		r.fetchBytes -= recovery.size
+		for _, key := range recovery.keys {
+			delete(r.fetchBlocked, key)
+		}
+		return nil
+	}
 	operation := r.retained[id]
 	if operation == nil {
 		return ierror.OperationNotRetained{OperationID: id}
@@ -478,6 +670,21 @@ func (r *operationRegistry) abandon(id uint64) error {
 	r.cleanLaneLocked(operation.key, lane)
 	r.wakeResumersLocked(id)
 	r.grantBudgetLocked()
+	return nil
+}
+
+func (r *operationRegistry) unresolvedFetch() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var first uint64
+	for id := range r.fetchRetained {
+		if first == 0 || id < first {
+			first = id
+		}
+	}
+	if first != 0 {
+		return ierror.FetchProgressUncertain{OperationID: first}
+	}
 	return nil
 }
 

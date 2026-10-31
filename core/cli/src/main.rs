@@ -31,6 +31,7 @@ use crate::error::{CmdToolError, IggyCmdError};
 use crate::logging::Logging;
 use args::context::ContextAction;
 use args::message::MessageAction;
+use args::metadata::MetadataAction;
 use args::partition::PartitionAction;
 use args::segment::SegmentAction;
 use args::user::UserAction;
@@ -39,8 +40,8 @@ use clap::Parser;
 use iggy::client_provider::{self, ClientProviderConfig};
 use iggy::clients::client::IggyClient;
 use iggy::prelude::{
-    Aes256GcmEncryptor, ClientError, EncryptorKind, PersonalAccessTokenExpiry, StreamUpdateOptions,
-    TopicUpdateOptions,
+    Aes256GcmEncryptor, ClientError, EncryptorKind, MetadataChangesQuery,
+    PersonalAccessTokenExpiry, StreamUpdateOptions, TopicUpdateOptions,
 };
 use iggy_cli::commands::binary_context::common::{ContextManager, validate_transport};
 use iggy_cli::commands::binary_context::create_context::CreateContextCmd;
@@ -48,6 +49,7 @@ use iggy_cli::commands::binary_context::delete_context::DeleteContextCmd;
 use iggy_cli::commands::binary_context::show_context::ShowContextCmd;
 use iggy_cli::commands::binary_context::use_context::UseContextCmd;
 use iggy_cli::commands::binary_segments::delete_segments::DeleteSegmentsCmd;
+use iggy_cli::commands::binary_system::metadata_changes::GetMetadataChangesCmd;
 use iggy_cli::commands::binary_system::snapshot::GetSnapshotCmd;
 #[cfg(feature = "login-session")]
 use iggy_cli::commands::cli_command::DIAGNOSTIC_TARGET;
@@ -187,6 +189,13 @@ fn get_command(
             args.snapshot_types,
             args.out_dir,
         )),
+        Command::Metadata(command) => match command {
+            MetadataAction::Changes(args) => Box::new(GetMetadataChangesCmd::new(
+                MetadataChangesQuery::from(&args),
+                args.follow,
+                args.interval,
+            )),
+        },
         Command::Pat(command) => match command {
             PersonalAccessTokenAction::Create(pat_create_args) => {
                 Box::new(CreatePersonalAccessTokenCmd::new(
@@ -439,7 +448,11 @@ async fn run() -> Result<(), IggyCmdError> {
     credentials.set_iggy_client(&client);
     credentials.login_user().await?;
 
-    if command.use_tracing() {
+    if command.stdout_is_data() {
+        if !cli_options.quiet {
+            eprintln!("Executing {}", command.explain());
+        }
+    } else if command.use_tracing() {
         event!(target: PRINT_TARGET, Level::INFO, "Executing {}", command.explain());
     } else {
         println!("Executing {}", command.explain());

@@ -113,6 +113,47 @@ struct ResponseVectorTests {
         #expect(assignment == ConsumerGroupAssignment(generation: 7, partitions: [0, 2, 4]))
     }
 
+    @Test func fetchSections() throws {
+        let sections = try Responses.fetchSections(body("response.fetch_messages"))
+        #expect(sections.map(\.partitionID) == [1, 2])
+        let read = sections[0]
+        #expect(read.error == nil)
+        #expect(read.currentOffset == 41)
+        #expect(read.nextOffset == 42)
+        #expect(read.firstOffset == 41)
+        #expect(read.context == PartitionContext(incarnation: 3, ownerGeneration: 9, metadataOp: 12))
+        let polled = try read.decode()
+        #expect(polled.partitionID == 1)
+        #expect(polled.context == read.context)
+        #expect(polled.messages.map(\.offset) == [41])
+        #expect(polled.messages.map(\.payloadString) == ["hello"])
+        let refused = sections[1]
+        #expect(refused.error == IggyError(.notPrimary))
+        #expect(refused.records.isEmpty)
+        #expect(refused.firstOffset == nil)
+        #expect(throws: IggyError(.notPrimary)) { try refused.decode() }
+        #expect(try Responses.fetchSections(FakeVSRServer.fetchedBody([])[...]).isEmpty)
+    }
+
+    /// The decoder refuses each table that `FetchMessagesResponse::decode`
+    /// refuses in Rust.
+    @Test func fetchReplyValidation() throws {
+        let reply = golden.bytes("response.fetch_messages")
+        let statusOfFirst = 8
+        let recordsLengthOfSecond = 4 + Responses.fetchSectionHeaderSize + 52
+        var tooMany = reply
+        tooMany.replaceSubrange(0..<4, with: UInt32(1001).littleEndianBytes)
+        var tableTooLong = reply
+        tableTooLong.replaceSubrange(0..<4, with: UInt32(8).littleEndianBytes)
+        var errorWithRecords = reply
+        errorWithRecords.replaceSubrange(statusOfFirst..<statusOfFirst + 4, with: IggyErrorCode.notPrimary.rawValue.littleEndianBytes)
+        var recordsPastTheBody = reply
+        recordsPastTheBody.replaceSubrange(recordsLengthOfSecond..<recordsLengthOfSecond + 4, with: UInt32(1).littleEndianBytes)
+        for hostile in [[0, 0, 0], tooMany, tableTooLong, errorWithRecords, recordsPastTheBody, Array(reply.dropLast()), reply + [0]] {
+            #expect(throws: IggyError(.invalidCommand)) { try Responses.fetchSections(hostile[...]) }
+        }
+    }
+
     @Test func consumerOffset() throws {
         let offset = try Responses.consumerOffset(body("response.consumer_offset"))
         #expect(offset == ConsumerOffsetInfo(partitionID: 1, currentOffset: 1000, storedOffset: 500))
@@ -241,6 +282,32 @@ struct ResponseVectorTests {
         #expect(specs[1].kind == .string)
         #expect(specs[1].defaultValue == Array("replicated".utf8))
         #expect(specs[1].description.isEmpty)
+    }
+
+    @Test func metadataChanges() throws {
+        let page = try Responses.metadataChanges(body("response.get_metadata_changes"))
+        let cursor = MetadataChangeCursor(
+            logID: UInt128Value(0x0d4b_8f2a_6e1c_93d7), op: 4187, checksum: UInt128Value(0xf2a4_c6e8_b0d1_f359), ordinal: 1)
+        #expect(page.status == .ok)
+        #expect(page.phase == .changes)
+        #expect(page.logID == cursor.logID)
+        #expect(page.oldestOp == 3871)
+        #expect(page.retainedSince == .zero)
+        #expect(page.headOp == 4190)
+        #expect(page.next == cursor)
+        #expect(page.hasMore == false)
+        #expect(page.items.isEmpty)
+        #expect(page.currentPageToken == nil)
+        #expect(
+            page.records == [
+                MetadataChangeRecord(
+                    op: 4121, ordinal: 0, checksum: UInt128Value(0xa5c1_f703_8b9e_3d65), timestamp: IggyTimestamp(microseconds: 1_760_356_800_004_121),
+                    actorUserID: 0,
+                    change: .streamCreated(
+                        MetadataStreamChange(
+                            streamID: 3, streamCreatedOp: 4121, createdAt: IggyTimestamp(microseconds: 1_760_356_800_123_456), name: "telemetry",
+                            options: .readable([:]))))
+            ])
     }
 
     @Test func sendConfirmations() throws {

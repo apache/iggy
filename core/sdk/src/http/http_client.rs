@@ -16,16 +16,21 @@
 // under the License.
 
 use crate::diagnostic_events::diagnostic_event_channel;
+use crate::driver::{DeferredLease, MAX_DEFERRED_REQUESTS, fetch_error_is_uncertain};
 use crate::http::http_transport::HttpTransport;
 use crate::prelude::{Client, HttpClientConfig, IggyError, NonZeroIggyDuration};
 use crate::vsr::LIFECYCLE_RETRY_MAX_INTERVAL;
 use async_broadcast::{Receiver, Sender};
 use async_trait::async_trait;
 use bytes::Bytes;
+use iggy_binary_protocol::{MAX_MESSAGE_PAYLOAD_SIZE, MAX_RECORD_SIZE};
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
+use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
 use iggy_common::{
-    ConnectionString, ConnectionStringUtils, ConsumerGroupClientState, DiagnosticEvent,
-    HttpConnectionStringOptions, HttpMethod, IdentityInfo, TransportProtocol, validate_api_url,
+    ConnectionString, ConnectionStringUtils, ConsumerGroupClientState, DecodeError,
+    DeferredPollOptions, DiagnosticEvent, HttpConnectionStringOptions, HttpMethod, Identifier,
+    IdentityInfo, PartitionContext, PollMessages, PolledMessages, PollingKind, TransportProtocol,
+    UndecodedRecord, validate_api_url,
 };
 use reqwest::{Method, Response, StatusCode, Url};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, RequestBuilder};
@@ -35,17 +40,31 @@ use reqwest_retry::{
 };
 use reqwest_tracing::{SpanBackendWithUrl, TracingMiddleware};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout_at};
 
 /// The first pause before a request refused with [`IggyError::LifecycleBusy`] is sent again.
 const LIFECYCLE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// No retry of a [`IggyError::LifecycleBusy`] refusal starts past this budget, which matches
 /// the time the binary transports wait for one reply.
 const LIFECYCLE_RETRY_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The query key of [`iggy_common::PollMessages::auto_commit`].
+const AUTO_COMMIT_QUERY_KEY: &str = "auto_commit";
+
+/// Bounds the JSON of a poll reply per byte of records, and of its error body.
+const MAX_JSON_EXPANSION: usize = 16;
+/// The JSON of the largest record: a base64 payload, and its headers at the full expansion.
+const MAX_RECORD_JSON_SIZE: usize = MAX_MESSAGE_PAYLOAD_SIZE.div_ceil(3) * 4
+    + (MAX_RECORD_SIZE - MAX_MESSAGE_PAYLOAD_SIZE) * MAX_JSON_EXPANSION;
+
+/// The first local operation id. Binary request ids also start at 1, because request 0
+/// registers the session, so no transport reports operation 0.
+const FIRST_OPERATION_ID: u64 = 1;
 
 const PUBLIC_PATHS: &[&str] = &[
     "/",
@@ -64,9 +83,17 @@ pub struct HttpClient {
     pub(crate) heartbeat_interval: NonZeroIggyDuration,
     client: reqwest::Client,
     retry_policy: ExponentialBackoff,
+    deferred_leases: tokio::sync::Semaphore,
     access_token: IggyRwLock<String>,
     /// The contexts that fence sends to an explicit partition, read from the topic details.
     pub(super) send_contexts: ConsumerGroupClientState,
+    /// The partitions blocked by a poll with `auto_commit` whose outcome is unknown, by the
+    /// local operation id that `abandon_operation` takes.
+    progress_blocks: Mutex<BTreeMap<u64, ProgressKey>>,
+    /// One progress poll of a partition at a time, so a poll checks the block that the poll
+    /// before it left. Each lane is keyed without its incarnation.
+    progress_lanes: Mutex<HashMap<ProgressKey, Arc<tokio::sync::Mutex<()>>>>,
+    next_operation_id: AtomicU64,
     /// HTTP keeps no connection, so no event is ever published here. The
     /// channel exists only because the `Client` trait requires
     /// `subscribe_events`.
@@ -89,6 +116,13 @@ impl Client for HttpClient {
 
     async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
         self.events.1.clone()
+    }
+
+    async fn abandon_operation(&self, op: u64) -> Result<(), IggyError> {
+        self.progress_blocks()
+            .remove(&op)
+            .map(drop)
+            .ok_or(IggyError::OperationNotRetained(op))
     }
 }
 
@@ -114,7 +148,8 @@ impl HttpTransport for HttpClient {
     async fn get(&self, path: &str) -> Result<Response, IggyError> {
         let url = self.get_url(path)?;
         self.fail_if_not_authenticated(path).await?;
-        self.execute(Method::GET, url, |request| request).await
+        self.execute(Method::GET, url, false, |request| request)
+            .await
     }
 
     /// Invoke HTTP GET request to the Iggy API with query parameters.
@@ -125,7 +160,7 @@ impl HttpTransport for HttpClient {
     ) -> Result<Response, IggyError> {
         let url = self.get_url(path)?;
         self.fail_if_not_authenticated(path).await?;
-        self.execute(Method::GET, url, |request| request.query(query))
+        self.execute(Method::GET, url, false, |request| request.query(query))
             .await
     }
 
@@ -137,7 +172,7 @@ impl HttpTransport for HttpClient {
     ) -> Result<Response, IggyError> {
         let url = self.get_url(path)?;
         self.fail_if_not_authenticated(path).await?;
-        self.execute(Method::POST, url, |request| request.json(payload))
+        self.execute(Method::POST, url, true, |request| request.json(payload))
             .await
     }
 
@@ -149,7 +184,7 @@ impl HttpTransport for HttpClient {
     ) -> Result<Response, IggyError> {
         let url = self.get_url(path)?;
         self.fail_if_not_authenticated(path).await?;
-        self.execute(Method::PUT, url, |request| request.json(payload))
+        self.execute(Method::PUT, url, true, |request| request.json(payload))
             .await
     }
 
@@ -157,7 +192,8 @@ impl HttpTransport for HttpClient {
     async fn delete(&self, path: &str) -> Result<Response, IggyError> {
         let url = self.get_url(path)?;
         self.fail_if_not_authenticated(path).await?;
-        self.execute(Method::DELETE, url, |request| request).await
+        self.execute(Method::DELETE, url, true, |request| request)
+            .await
     }
 
     /// Invoke HTTP DELETE request to the Iggy API with query parameters.
@@ -168,7 +204,7 @@ impl HttpTransport for HttpClient {
     ) -> Result<Response, IggyError> {
         let url = self.get_url(path)?;
         self.fail_if_not_authenticated(path).await?;
-        self.execute(Method::DELETE, url, |request| request.query(query))
+        self.execute(Method::DELETE, url, true, |request| request.query(query))
             .await
     }
 
@@ -181,8 +217,13 @@ impl HttpTransport for HttpClient {
         let method = Method::from_bytes(<&str>::from(method).as_bytes())
             .map_err(|_| IggyError::InvalidHttpRequest)?;
         let url = self.get_url(path)?;
+        // A raw poll asks for `auto_commit` in its query, so the query tells whether a GET writes.
+        let may_commit = method != Method::GET
+            || url.query_pairs().any(|(key, value)| {
+                key == AUTO_COMMIT_QUERY_KEY && value.parse::<bool>() == Ok(true)
+            });
         let response = self
-            .execute(method, url, |request| match &body {
+            .execute(method, url, may_commit, |request| match &body {
                 Some(body) => request.body(body.clone()),
                 None => request,
             })
@@ -223,6 +264,256 @@ impl HttpTransport for HttpClient {
 }
 
 impl HttpClient {
+    /// Sends a deferred poll. Only a refusal that admitted nothing is sent again, within the
+    /// request timeout. A progress poll, one with `auto_commit` or from
+    /// [`PollingKind::Next`], fails with [`IggyError::PartitionLaneBlocked`] while its partition
+    /// is blocked, and the progress polls of one partition run one at a time.
+    ///
+    /// The server stores the offset of a poll with `auto_commit` before it answers, and it can
+    /// still store it after the client gives up. So such a poll that may have reached the
+    /// server fails with [`IggyError::FetchProgressUncertain`] unless its answer proves the
+    /// outcome, and a caller that drops it after the send gets the same block: the partition
+    /// stays blocked until `abandon_operation`. A failure after the connect proves the outcome
+    /// only as a 503 or a 404, or as another 4xx whose error id [`fetch_error_is_uncertain`]
+    /// takes as proof, as on binary.
+    pub(super) async fn get_deferred_poll(
+        &self,
+        path: &str,
+        poll: &PollMessages,
+        options: DeferredPollOptions,
+    ) -> Result<PolledMessages, DecodeError> {
+        options
+            .validate(poll.count)
+            .map_err(DecodeError::without_record)?;
+        let key = ProgressKey::new(
+            &poll.stream_id,
+            &poll.topic_id,
+            poll.partition_id.unwrap_or(DEFAULT_PARTITION_ID),
+            poll.strategy.context(),
+        );
+        let progress = poll.auto_commit || poll.strategy.kind == PollingKind::Next;
+        // Before the lease wait, so a client full of waiting polls cannot hide the block
+        // behind `TransientNotAccepted`.
+        if progress {
+            self.fail_if_progress_blocked(&key)
+                .map_err(DecodeError::without_record)?;
+        }
+        let limit = deferred_reply_limit(options.max_bytes);
+        let started = Instant::now();
+        let deadline = started + options.request_timeout.get_duration();
+        let _lane = if progress {
+            Some(
+                self.progress_lane(&key, deadline)
+                    .await
+                    .map_err(DecodeError::without_record)?,
+            )
+        } else {
+            None
+        };
+        let _permit = DeferredLease::acquire(&self.deferred_leases, deadline)
+            .await
+            .map_err(DecodeError::without_record)?;
+        let url = self.get_url(path).map_err(DecodeError::without_record)?;
+        self.fail_if_not_authenticated(path)
+            .await
+            .map_err(DecodeError::without_record)?;
+        let mut retry_interval = LIFECYCLE_RETRY_INTERVAL;
+        loop {
+            // Another call can block the partition during the lane wait or a retry pause.
+            if progress {
+                self.fail_if_progress_blocked(&key)
+                    .map_err(DecodeError::without_record)?;
+            }
+            let request = {
+                let token = self.access_token.read().await;
+                let remaining = options
+                    .remaining(started.elapsed())
+                    .map_err(DecodeError::without_record)?;
+                // Deferred auto-commits cannot replay an ambiguous transport failure. A proxy may
+                // send a GET again, so a poll that stores its offset is a POST.
+                let request = if poll.auto_commit {
+                    self.client.post(url.clone())
+                } else {
+                    self.client.get(url.clone())
+                };
+                request
+                    .bearer_auth(token.as_str())
+                    .query(poll)
+                    .query(&[
+                        ("wait_us", remaining.max_wait.as_micros()),
+                        ("min_count", u64::from(remaining.min_count)),
+                        ("max_bytes", u64::from(remaining.max_bytes)),
+                        ("request_timeout_us", remaining.request_timeout.as_micros()),
+                    ])
+                    .timeout(remaining.request_timeout.get_duration())
+            };
+            // Armed before the send, because HTTP cannot tell when the request leaves.
+            let attempt = self.poll_attempt(&key, poll.auto_commit);
+            let error = match Self::deferred_reply(request, poll, limit, deadline).await {
+                Ok(messages) => {
+                    attempt.settle();
+                    return Ok(messages);
+                }
+                Err(PollFailure::Refused(error)) => {
+                    attempt.settle();
+                    error
+                }
+                Err(PollFailure::Unknown(error)) => {
+                    return Err(DecodeError::without_record(attempt.unknown(error)));
+                }
+                // The body is not a batch, so it goes out as it came for a diagnosis.
+                Err(PollFailure::Undecoded(body)) => {
+                    return Err(DecodeError {
+                        error: attempt.unknown(IggyError::InvalidJsonResponse),
+                        record: Some(Box::new(UndecodedRecord {
+                            offset: None,
+                            bytes: body,
+                        })),
+                    });
+                }
+            };
+            if !matches!(
+                error,
+                IggyError::TransientNotAccepted | IggyError::DeferredPollCapacityExceeded
+            ) {
+                return Err(DecodeError::without_record(error));
+            }
+            if Instant::now() + retry_interval >= deadline {
+                return Err(DecodeError::without_record(error));
+            }
+            sleep(retry_interval).await;
+            retry_interval = (retry_interval * 2).min(LIFECYCLE_RETRY_MAX_INTERVAL);
+        }
+    }
+
+    /// Sends one attempt of a deferred poll and decodes its answer, whose body may take up to
+    /// `limit` bytes. A decoded batch records `poll.strategy` as its request start.
+    async fn deferred_reply(
+        request: reqwest::RequestBuilder,
+        poll: &PollMessages,
+        limit: usize,
+        deadline: Instant,
+    ) -> Result<PolledMessages, PollFailure> {
+        let sent = request
+            .send()
+            .await
+            .map_err(reqwest_middleware::Error::Reqwest);
+        let uncertain = may_have_committed(&sent);
+        let mut response = sent.map_err(|_| {
+            if uncertain {
+                PollFailure::Unknown(IggyError::TransientNotCommitted)
+            } else {
+                PollFailure::Refused(IggyError::InvalidHttpRequest)
+            }
+        })?;
+        let status = response.status();
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit as u64)
+        {
+            return Err(PollFailure::Unknown(IggyError::InvalidSizeBytes));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = timeout_at(deadline, response.chunk())
+            .await
+            .map_err(|_| PollFailure::Unknown(IggyError::TransientNotCommitted))?
+            .map_err(|_| PollFailure::Unknown(IggyError::TransientNotCommitted))?
+        {
+            if chunk.len() > limit.saturating_sub(body.len()) {
+                return Err(PollFailure::Unknown(IggyError::InvalidSizeBytes));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            let reason = String::from_utf8_lossy(&body).into_owned();
+            // A 503 refuses a poll before the server takes it, and the server sends a 404 only
+            // before the read or for a partition that its owner does not have. The server
+            // checks a poll again after the read, so another 4xx proves the outcome only with
+            // an error that binary also takes as proof.
+            let proved = matches!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE | StatusCode::NOT_FOUND
+            ) || (status.is_client_error()
+                && error_id(&reason)
+                    .is_some_and(|id| !fetch_error_is_uncertain(&IggyError::from_code(id))));
+            let error = Self::response_error(status, reason);
+            return Err(if proved {
+                PollFailure::Refused(error)
+            } else {
+                PollFailure::Unknown(error)
+            });
+        }
+        let mut messages: PolledMessages = match serde_json::from_slice(&body) {
+            Ok(messages) => messages,
+            Err(_) => return Err(PollFailure::Undecoded(Bytes::from(body))),
+        };
+        if messages.count > poll.count || messages.messages.len() != messages.count as usize {
+            return Err(PollFailure::Unknown(IggyError::InvalidMessagesCount));
+        }
+        messages.set_request_start(&poll.strategy);
+        Ok(messages)
+    }
+
+    /// Fails with [`IggyError::PartitionLaneBlocked`] while a poll with `auto_commit` of the
+    /// partition of `key` has an unknown outcome. Polls that store the offset or start at it,
+    /// and offset stores and deletes, check it.
+    pub(super) fn fail_if_progress_blocked(&self, key: &ProgressKey) -> Result<(), IggyError> {
+        let blocking = self
+            .progress_blocks()
+            .iter()
+            .find_map(|(&operation_id, blocked)| blocked.covers(key).then_some(operation_id));
+        blocking.map_or(Ok(()), |operation_id| {
+            Err(IggyError::PartitionLaneBlocked(
+                key.partition_id,
+                operation_id,
+            ))
+        })
+    }
+
+    /// Waits until `deadline` for the progress lane of the partition of `key`, which the poll
+    /// holds until it ends, also while its drop arms a block.
+    async fn progress_lane(
+        &self,
+        key: &ProgressKey,
+        deadline: Instant,
+    ) -> Result<ProgressLane<'_>, IggyError> {
+        let key = key.lane();
+        let lane = Arc::clone(self.progress_lanes().entry(key.clone()).or_default());
+        let guard = timeout_at(deadline, lane.lock_owned())
+            .await
+            .map_err(|_| IggyError::TransientNotAccepted)?;
+        Ok(ProgressLane {
+            client: self,
+            key,
+            guard: Some(guard),
+        })
+    }
+
+    /// Whether the poll `op` still blocks its partition.
+    pub(crate) fn retains_operation(&self, op: u64) -> bool {
+        self.progress_blocks().contains_key(&op)
+    }
+
+    fn poll_attempt(&self, key: &ProgressKey, auto_commit: bool) -> PollAttempt<'_> {
+        PollAttempt {
+            client: self,
+            key: key.clone(),
+            commit: auto_commit.then(|| self.next_operation_id.fetch_add(1, Ordering::Relaxed)),
+        }
+    }
+
+    fn progress_blocks(&self) -> MutexGuard<'_, BTreeMap<u64, ProgressKey>> {
+        self.progress_blocks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn progress_lanes(&self) -> MutexGuard<'_, HashMap<ProgressKey, Arc<tokio::sync::Mutex<()>>>> {
+        self.progress_lanes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Create a new HTTP client for interacting with the Iggy API using the provided API URL.
     pub fn new(api_url: &str) -> Result<Self, IggyError> {
         Self::create(Arc::new(HttpClientConfig {
@@ -243,9 +534,13 @@ impl HttpClient {
             api_url,
             client: reqwest::Client::new(),
             retry_policy,
+            deferred_leases: tokio::sync::Semaphore::new(MAX_DEFERRED_REQUESTS),
             heartbeat_interval: config.heartbeat_interval,
             access_token: IggyRwLock::new(access_token),
             send_contexts: ConsumerGroupClientState::new(),
+            progress_blocks: Mutex::default(),
+            progress_lanes: Mutex::default(),
+            next_operation_id: AtomicU64::new(FIRST_OPERATION_ID),
             events: diagnostic_event_channel(),
         })
     }
@@ -304,14 +599,21 @@ impl HttpClient {
     /// Sends one request. Each [`IggyError::LifecycleBusy`] refusal commits, so the request is
     /// sent again as a new one after a pause that doubles up to [`LIFECYCLE_RETRY_MAX_INTERVAL`],
     /// until a retry would start past [`LIFECYCLE_RETRY_DEADLINE`]. A write whose outcome is
-    /// unknown is never sent again and fails with [`IggyError::TransientNotCommitted`].
-    async fn execute<F>(&self, method: Method, url: Url, decorate: F) -> Result<Response, IggyError>
+    /// unknown is never sent again and fails with [`IggyError::TransientNotCommitted`]. The
+    /// caller marks a write with `may_commit`, because a poll with `auto_commit` is a GET that
+    /// writes.
+    async fn execute<F>(
+        &self,
+        method: Method,
+        url: Url,
+        may_commit: bool,
+        decorate: F,
+    ) -> Result<Response, IggyError>
     where
         F: Fn(RequestBuilder) -> RequestBuilder + Send + Sync,
     {
         let outcome_unknown = Arc::new(AtomicBool::new(false));
-        // Reads commit nothing, so only a write can leave an unknown outcome behind.
-        let client = self.retrying_client(method != Method::GET, &outcome_unknown);
+        let client = self.retrying_client(may_commit, &outcome_unknown);
         let deadline = Instant::now() + LIFECYCLE_RETRY_DEADLINE;
         let mut pause = LIFECYCLE_RETRY_INTERVAL;
         loop {
@@ -366,13 +668,7 @@ impl HttpClient {
             true => Ok(response),
             false => {
                 let reason = response.text().await.unwrap_or("error".to_string());
-                match status {
-                    StatusCode::UNAUTHORIZED => Err(IggyError::Unauthenticated),
-                    StatusCode::FORBIDDEN => Err(IggyError::Unauthorized),
-                    StatusCode::NOT_FOUND => Err(IggyError::ResourceNotFound(reason)),
-                    _ => Err(typed_refusal(&reason)
-                        .unwrap_or_else(|| IggyError::HttpResponseError(status.as_u16(), reason))),
-                }
+                Err(Self::response_error(status, reason))
             }
         }
     }
@@ -394,11 +690,128 @@ impl HttpClient {
     async fn disconnect(&self) -> Result<(), IggyError> {
         Ok(())
     }
+
+    fn response_error(status: StatusCode, reason: String) -> IggyError {
+        match status {
+            StatusCode::UNAUTHORIZED => IggyError::Unauthenticated,
+            StatusCode::FORBIDDEN => IggyError::Unauthorized,
+            StatusCode::NOT_FOUND => IggyError::ResourceNotFound(reason),
+            _ => typed_refusal(&reason)
+                .unwrap_or_else(|| IggyError::HttpResponseError(status.as_u16(), reason)),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
 struct RefreshToken {
     token: String,
+}
+
+/// Why an attempt of a deferred poll returned no messages.
+enum PollFailure {
+    /// Nothing was sent, or the answer proves the outcome.
+    Refused(IggyError),
+    /// The attempt may have reached the server, and no answer proves what it did.
+    Unknown(IggyError),
+    /// The answer is not a batch. Its body goes out with the error.
+    Undecoded(Bytes),
+}
+
+/// The partition of a progress call. HTTP has no partition id independent of the spelling of
+/// the stream and the topic, so a key names them as the call spells them, and adds the
+/// incarnation of the partition when the call carries its context. An incarnation names one
+/// partition in every spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct ProgressKey {
+    stream: String,
+    topic: String,
+    partition_id: u32,
+    incarnation: Option<u64>,
+}
+
+/// The progress lane of one partition, held by one progress poll.
+struct ProgressLane<'a> {
+    client: &'a HttpClient,
+    key: ProgressKey,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+/// One attempt of a deferred poll. An attempt with `auto_commit` that its caller drops before
+/// it settles blocks its partition, because the server can still store the offset.
+struct PollAttempt<'a> {
+    client: &'a HttpClient,
+    key: ProgressKey,
+    /// The local operation id of an attempt with `auto_commit`.
+    commit: Option<u64>,
+}
+
+impl ProgressKey {
+    pub(super) fn new(
+        stream: &Identifier,
+        topic: &Identifier,
+        partition_id: u32,
+        context: Option<PartitionContext>,
+    ) -> Self {
+        Self {
+            stream: stream.as_cow_str().into_owned(),
+            topic: topic.as_cow_str().into_owned(),
+            partition_id,
+            // Metadata revisions start at 1, so incarnation 0 is a context that was never read.
+            incarnation: context
+                .map(|context| context.incarnation)
+                .filter(|incarnation| *incarnation != 0),
+        }
+    }
+
+    /// Whether a block of `self` covers a call of `other`.
+    fn covers(&self, other: &Self) -> bool {
+        self.partition_id == other.partition_id
+            && ((self.stream == other.stream && self.topic == other.topic)
+                || (self.incarnation.is_some() && self.incarnation == other.incarnation))
+    }
+
+    fn lane(&self) -> Self {
+        Self {
+            incarnation: None,
+            ..self.clone()
+        }
+    }
+}
+
+impl Drop for ProgressLane<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        let mut lanes = self.client.progress_lanes();
+        if lanes
+            .get(&self.key)
+            .is_some_and(|lane| Arc::strong_count(lane) == 1)
+        {
+            lanes.remove(&self.key);
+        }
+    }
+}
+
+impl PollAttempt<'_> {
+    /// The answer proved the outcome, so the partition stays open.
+    fn settle(mut self) {
+        self.commit = None;
+    }
+
+    /// The error of an attempt with an unknown outcome. With `auto_commit`, it is
+    /// [`IggyError::FetchProgressUncertain`], and the partition stays blocked.
+    fn unknown(self, error: IggyError) -> IggyError {
+        self.commit.map_or(error, IggyError::FetchProgressUncertain)
+    }
+}
+
+impl Drop for PollAttempt<'_> {
+    fn drop(&mut self) {
+        if let Some(operation_id) = self.commit {
+            self.client
+                .progress_blocks()
+                .insert(operation_id, self.key.clone());
+        }
+    }
 }
 
 /// Resends what the default strategy calls transient, but never a write that may have committed.
@@ -433,23 +846,41 @@ fn may_have_committed(result: &Result<Response, reqwest_middleware::Error>) -> b
     }
 }
 
+/// The largest body of a poll reply, which holds up to `max_bytes` of records or one larger
+/// first record.
+fn deferred_reply_limit(max_bytes: u32) -> usize {
+    (max_bytes as usize)
+        .saturating_mul(MAX_JSON_EXPANSION)
+        .max(MAX_RECORD_JSON_SIZE)
+}
+
 /// Decodes the refusals the client acts on: a producer never repeats `RequestTooOld`, a send
-/// refreshes its context once on `HistoryUnavailable`, `LifecycleBusy` is retried, and
-/// `TransientNotAccepted` proves that the last attempt was admitted nowhere.
+/// refreshes its context once on `HistoryUnavailable`, `LifecycleBusy` is retried,
+/// non-admission and capacity refusals permit a retry without risking duplicate progress, and a
+/// poll refused for its byte limit returns `InvalidSizeBytes`.
 fn typed_refusal(body: &str) -> Option<IggyError> {
-    #[derive(Deserialize)]
-    struct ErrorId {
-        id: u32,
-    }
-    let id = serde_json::from_str::<ErrorId>(body).ok()?.id;
+    let id = error_id(body)?;
     [
         IggyError::RequestTooOld,
         IggyError::HistoryUnavailable,
         IggyError::LifecycleBusy,
         IggyError::TransientNotAccepted,
+        IggyError::DeferredPollCapacityExceeded,
+        IggyError::InvalidSizeBytes,
     ]
     .into_iter()
     .find(|error| error.as_code() == id)
+}
+
+/// The id of the error that the server rendered into an error body.
+fn error_id(body: &str) -> Option<u32> {
+    #[derive(Deserialize)]
+    struct ErrorId {
+        id: u32,
+    }
+    serde_json::from_str::<ErrorId>(body)
+        .ok()
+        .map(|error| error.id)
 }
 
 /// Unit tests for HttpClient.
@@ -592,6 +1023,36 @@ mod tests {
         );
     }
 
+    /// A raw poll that asks for `auto_commit` is a write, so only a raw poll without it is sent
+    /// again after a timeout.
+    #[tokio::test(start_paused = true)]
+    async fn given_raw_poll_when_it_times_out_should_resend_it_only_without_auto_commit() {
+        for auto_commit in [true, false] {
+            let server = ScriptedServer::start(vec![Reply::empty(504), Reply::empty(200)]).await;
+
+            let polled = server
+                .client()
+                .send_http_request(
+                    HttpMethod::Get,
+                    &format!("/streams/1/topics/1/messages?auto_commit={auto_commit}"),
+                    None,
+                )
+                .await;
+
+            let requests = server.requests().len();
+            if auto_commit {
+                assert!(
+                    matches!(polled, Err(IggyError::TransientNotCommitted)),
+                    "{polled:?}"
+                );
+                assert_eq!(requests, 1);
+            } else {
+                polled.unwrap();
+                assert_eq!(requests, 2);
+            }
+        }
+    }
+
     #[test]
     fn typed_refusals_survive_http_decoding() {
         for error in [
@@ -599,6 +1060,8 @@ mod tests {
             IggyError::HistoryUnavailable,
             IggyError::LifecycleBusy,
             IggyError::TransientNotAccepted,
+            IggyError::DeferredPollCapacityExceeded,
+            IggyError::InvalidSizeBytes,
         ] {
             let body = format!(r#"{{"id":{},"reason":"unavailable"}}"#, error.as_code());
             assert_eq!(typed_refusal(&body), Some(error));
@@ -606,6 +1069,197 @@ mod tests {
         for body in ["", "unavailable", r#"{"id":500}"#, r#"{"id":"87"}"#] {
             assert_eq!(typed_refusal(body), None);
         }
+    }
+
+    use iggy_common::{Consumer, PollMessages, PollingStrategy};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+
+    #[tokio::test]
+    async fn deferred_poll_retries_only_nonadmission_with_remaining_wait() {
+        let (client, requests) = deferred_response_server(
+            [
+                IggyError::TransientNotAccepted.as_code(),
+                IggyError::DeferredPollCapacityExceeded.as_code(),
+                IggyError::TransientNotCommitted.as_code(),
+            ]
+            .into_iter()
+            .map(|id| (503, format!(r#"{{"id":{id}}}"#)))
+            .collect(),
+        )
+        .await;
+        let result = client
+            .get_deferred_poll(
+                "messages/deferred",
+                &deferred_request(),
+                iggy_common::DeferredPollOptions::default(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(DecodeError { error: IggyError::HttpResponseError(503, body), .. })
+            if serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_u64().unwrap() as u32
+                == IggyError::TransientNotCommitted.as_code())
+        );
+        let waits = requests.await.unwrap();
+        assert_eq!(waits.len(), 3);
+        assert!(waits[0] <= 1_000_000);
+        assert!(
+            waits
+                .windows(2)
+                .all(|pair| pair[1] > 0 && pair[1] < pair[0]),
+            "waits: {waits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_poll_exhausted_retry_budget_does_not_send_zero_wait() {
+        let (client, requests) = deferred_response_server(vec![(
+            503,
+            format!(r#"{{"id":{}}}"#, IggyError::TransientNotAccepted.as_code()),
+        )])
+        .await;
+        let result = client
+            .get_deferred_poll(
+                "messages/deferred",
+                &deferred_request(),
+                iggy_common::DeferredPollOptions {
+                    max_wait: 0.into(),
+                    request_timeout: 50_000.into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(DecodeError {
+                error: IggyError::TransientNotAccepted,
+                ..
+            })
+        ));
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), requests)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// A poll that stores nothing reports the bound itself. With `auto_commit`, a body it cannot
+    /// read leaves the outcome unknown.
+    #[tokio::test]
+    async fn deferred_poll_bounds_success_and_error_bodies() {
+        const MAX_BYTES: u32 = iggy_common::MIN_DEFERRED_POLL_MAX_BYTES as u32;
+        for status in [200, 503] {
+            let (client, requests) = deferred_server(vec![(
+                status,
+                String::new(),
+                deferred_reply_limit(MAX_BYTES) + 1,
+            )])
+            .await;
+            let result = client
+                .get_deferred_poll(
+                    "messages/deferred",
+                    &PollMessages {
+                        auto_commit: false,
+                        ..deferred_request()
+                    },
+                    iggy_common::DeferredPollOptions {
+                        max_bytes: MAX_BYTES,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(DecodeError {
+                        error: IggyError::InvalidSizeBytes,
+                        ..
+                    })
+                ),
+                "status {status}: {result:?}"
+            );
+            assert_eq!(requests.await.unwrap().len(), 1);
+        }
+    }
+
+    fn deferred_request() -> PollMessages {
+        PollMessages {
+            consumer: Consumer::default(),
+            stream_id: Identifier::default(),
+            topic_id: Identifier::default(),
+            partition_id: Some(0),
+            strategy: PollingStrategy::default(),
+            count: 1,
+            auto_commit: true,
+        }
+    }
+
+    async fn deferred_response_server(
+        responses: Vec<(u16, String)>,
+    ) -> (HttpClient, JoinHandle<Vec<u64>>) {
+        deferred_server(
+            responses
+                .into_iter()
+                .map(|(status, body)| {
+                    let length = body.len();
+                    (status, body, length)
+                })
+                .collect(),
+        )
+        .await
+    }
+
+    /// Answers each request with its status and body under a head that declares its length.
+    async fn deferred_server(
+        responses: Vec<(u16, String, usize)>,
+    ) -> (HttpClient, JoinHandle<Vec<u64>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = HttpClient::create(Arc::new(HttpClientConfig {
+            api_url: format!("http://{}", listener.local_addr().unwrap()),
+            jwt: Some("test-token".to_owned()),
+            ..HttpClientConfig::default()
+        }))
+        .unwrap();
+        let requests = tokio::spawn(async move {
+            let mut waits = Vec::new();
+            for (status, body, length) in responses {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                let path = line.split_whitespace().nth(1).unwrap();
+                let url = Url::parse(&format!("http://localhost{path}")).unwrap();
+                let wait = url
+                    .query_pairs()
+                    .find(|(name, _)| name == "wait_us")
+                    .unwrap()
+                    .1
+                    .parse::<u64>()
+                    .unwrap();
+                waits.push(wait);
+                loop {
+                    line.clear();
+                    assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}"
+                );
+                stream
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+            waits
+        });
+        (client, requests)
     }
 
     #[test]

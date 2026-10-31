@@ -34,10 +34,14 @@ import org.apache.iggy.client.async.StreamsClient;
 import org.apache.iggy.client.async.SystemClient;
 import org.apache.iggy.client.async.TopicsClient;
 import org.apache.iggy.client.async.UsersClient;
+import org.apache.iggy.client.async.reader.PartitionReader;
+import org.apache.iggy.client.async.reader.PartitionReaderBuilder;
 import org.apache.iggy.client.async.tcp.AsyncTcpConnection.TcpConnectionPoolConfig;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
+import org.apache.iggy.client.async.tcp.vsr.VsrOperation;
 import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.config.RetryPolicy;
+import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
@@ -45,6 +49,8 @@ import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
+import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
@@ -413,22 +419,40 @@ public class AsyncIggyTcpClient {
      * Sends a command code and payload and returns the raw response payload.
      *
      * <p>Session-control codes complete the returned future with an invalid-command error.
+     * So does CancelDeferredRequest, because a cancel names a pending request by its
+     * id and the server answers no cancel. Neither is sent.
      *
-     * <p>SendMessages, PollMessages, StoreConsumerOffset and DeleteConsumerOffset
-     * carry the partition context the server fences them by, which the client
-     * captures before it sends them. A SendMessages payload must name an explicit
-     * partition id: balanced and messages-key partitioning complete the future
-     * with a feature-unavailable error, because only the typed
+     * <p>SendMessages, PollMessages, deferred polls, StoreConsumerOffset and
+     * DeleteConsumerOffset carry the partition context the server fences them by,
+     * which the client captures before it sends them. A SendMessages payload must
+     * name an explicit partition id: balanced and messages-key partitioning
+     * complete the future with a feature-unavailable error, because only the typed
      * {@link MessagesClient#sendMessages} resolves them to a partition. A payload
-     * of these commands that does not follow their binary layout completes the
-     * future with an {@link org.apache.iggy.exception.IggyInvalidArgumentException}.
-     * Neither failure sends anything.
+     * of these commands that does not follow their binary layout, or a deferred
+     * poll with limits that {@link org.apache.iggy.message.DeferredPollOptions}
+     * refuses, completes the future with an
+     * {@link org.apache.iggy.exception.IggyInvalidArgumentException}. Neither
+     * failure sends anything.
      *
-     * <p>PollMessages takes the routed path of a typed poll, and StoreConsumerOffset
-     * and DeleteConsumerOffset that of a typed offset write. Each uses the context
-     * its route reports, so after another client deleted and recreated the
-     * partition, one call can fail with code 87 (5009 for a consumer group). The
-     * failed route is dropped and the next call routes again.
+     * <p>PollMessages and deferred polls take the routed path of a typed poll, and
+     * StoreConsumerOffset and DeleteConsumerOffset that of a typed offset write.
+     * Each uses the context its route reports, so after another client deleted and
+     * recreated the partition, one call can fail with code 87 (5009 for a consumer
+     * group). The failed route is dropped and the next call routes again. As for a
+     * typed deferred poll, the request timeout in a deferred poll's payload sets
+     * its deadline.
+     *
+     * <p>FetchMessages goes as it is to the primary of its first target, as the fetch of a
+     * {@link #reader} goes, with the fences and byte limits of its
+     * targets. A refusal with NotPrimary (89) and a NotPrimary section make the next
+     * grouping of a reader look up those routes again. The request timeout
+     * in its payload sets its deadline. A payload that the server would refuse to decode
+     * completes the future with an {@link org.apache.iggy.exception.IggyInvalidArgumentException}
+     * and sends nothing.
+     * A committing fetch with uncertain progress retains local partition blocks. Its raw
+     * section statuses and bytes are unchanged: inspect those statuses, then obtain the
+     * recovery ID from a blocked progress call on an affected target. Whole unknown
+     * outcomes return {@code FETCH_PROGRESS_UNCERTAIN} directly. Recovery never replays 109.
      *
      * <p>The future completes on the client event loop, as the callbacks section of this class says.
      *
@@ -448,24 +472,54 @@ public class AsyncIggyTcpClient {
             throw new IggyNotConnectedException();
         }
 
-        return pollRouter.onClientLoop(AsyncTcpConnection.mapResponse(raw.send(code, payload), response -> {
-            try {
-                if (response.readableBytes() <= 1) {
-                    return new byte[0];
-                }
-                byte[] responsePayload = new byte[response.readableBytes()];
-                response.readBytes(responsePayload);
-                return responsePayload;
-            } finally {
-                response.release();
-            }
-        }));
+        return pollRouter.onClientLoop(
+                AsyncTcpConnection.mapResponse(raw.send(code, payload), AsyncIggyTcpClient::responsePayload));
+    }
+
+    /**
+     * Sends a command code and payload to the replica with the given id and returns its raw response payload. The
+     * replica id is the one that cluster metadata names for the node. Every node answers non-replicated commands such
+     * as GetStats from its own state, so this reads the state of the chosen node.
+     *
+     * <p>The request carries the metadata watermark of the session, so the replica answers after it applied the
+     * metadata that this client saw. Replicated commands, PollMessages, deferred polls, FetchMessages,
+     * CancelDeferredRequest, GetConsumerOffset and session-control codes complete the returned future
+     * with an invalid-command error before anything is sent. An id that cluster metadata does not
+     * name after one read of it completes the future with an invalid-identifier error. A replica that cannot be
+     * reached, or that answers with code 58, is asked again until the request timeout, which ends the call with code
+     * 58. Any other refusal, NotPrimary (89) included, completes the future unchanged and is never sent to another
+     * replica.
+     *
+     * <p>The future completes on the client event loop, as the callbacks section of this class says.
+     *
+     * @param code the command code
+     * @param payload the command payload
+     * @param replicaId the replica id that cluster metadata names
+     * @return a future containing the raw response payload
+     * @throws IggyNotConnectedException if {@link #connect()} has not been called
+     */
+    public CompletableFuture<byte[]> sendBinaryRequestToReplica(int code, byte[] payload, int replicaId) {
+        Objects.requireNonNull(payload, "payload cannot be null");
+        if (isSessionControlCode(code)
+                || AsyncTcpConnection.isPartitionCommand(code)
+                || code == CommandCode.Messages.CANCEL_DEFERRED_REQUEST.getValue()
+                || VsrOperation.operationForCode(code) != VsrOperation.NON_REPLICATED) {
+            return CompletableFuture.failedFuture(
+                    IggyServerException.fromTcpResponse(INVALID_COMMAND_ERROR_CODE, new byte[0]));
+        }
+        if (connection.get() == null || rawRequests == null) {
+            throw new IggyNotConnectedException();
+        }
+        return pollRouter.onClientLoop(AsyncTcpConnection.mapResponse(
+                pollRouter.replicaRequest(replicaId, code, payload), AsyncIggyTcpClient::responsePayload));
     }
 
     /**
      * Replays a retained mutation with its original identity, context and bytes. While another resolve of it
      * replays, this one waits for that replay within {@code timeout}. A wait that runs out fails with
      * {@code OPERATION_UNCERTAIN}.
+     * A retained fetch instead fails with {@code FETCH_PROGRESS_UNCERTAIN} without I/O. Its
+     * recovery id is local, survives reconnects, and has no replayable server receipt.
      *
      * <p>The client keeps the proved outcomes of its last {@code count} replays of
      * {@code pendingOperations(count, bytes)}, also across a session reset. A later resolve of the operation
@@ -479,6 +533,10 @@ public class AsyncIggyTcpClient {
         Objects.requireNonNull(timeout, "timeout");
         if (timeout.isZero() || timeout.isNegative()) {
             throw new IggyInvalidArgumentException("Resolution timeout must be positive");
+        }
+        var fetchRecovery = session.fetchRecovery(operationId);
+        if (fetchRecovery != null) {
+            return CompletableFuture.failedFuture(fetchRecovery);
         }
         long timeoutNanos;
         try {
@@ -510,13 +568,12 @@ public class AsyncIggyTcpClient {
      * operation was uncommitted. A replay of the operation that is already running keeps its lane until the replay
      * ends, so a later mutation of that lane waits for it. That replay still keeps the outcome it proves for
      * {@link #resolveOperation}.
+     * A fetch abandon accepts its unknown progress and releases all of its local target blocks.
+     * It does not cancel or fence the original server request.
      */
     public CompletableFuture<Void> abandonOperation(long operationId) {
-        if (connection.get() == null) {
-            throw new IggyNotConnectedException();
-        }
         try {
-            connection.get().sessionOwner().abandon(operationId);
+            session.abandon(operationId);
             return CompletableFuture.completedFuture(null);
         } catch (RuntimeException error) {
             return CompletableFuture.failedFuture(error);
@@ -554,6 +611,22 @@ public class AsyncIggyTcpClient {
             throw new IggyNotConnectedException();
         }
         return messagesClient;
+    }
+
+    /**
+     * Starts a reader of the partitions of {@code topicId}. A standalone consumer names its partitions on the builder,
+     * a consumer group reads the assignment of its member. The reader groups the partitions by their primary and reads
+     * each group with one request.
+     *
+     * @param streamId the stream identifier
+     * @param topicId  the topic identifier
+     * @param consumer the consumer or consumer group whose offsets the reader reads and stores
+     * @return the builder of the reader
+     * @throws IggyNotConnectedException if the client is not connected
+     */
+    public PartitionReaderBuilder reader(StreamId streamId, TopicId topicId, Consumer consumer) {
+        messages();
+        return PartitionReader.builder(new TcpReaderTransport(this, streamId, topicId, consumer));
     }
 
     /**
@@ -648,6 +721,18 @@ public class AsyncIggyTcpClient {
     }
 
     /**
+     * Drops the connections without a sign-out, as a lost network does, and keeps the event loop group. Every pending
+     * request fails. A poll or fetch with {@code autoCommit} fails with {@code FETCH_PROGRESS_UNCERTAIN}, because the
+     * server can still store its offsets, and the progress of its partitions stays blocked on this client until
+     * {@link #abandonOperation(long)}. {@link #connect()} and a sign-in continue the client.
+     *
+     * @return a {@link CompletableFuture} that completes when the connections are closed
+     */
+    public CompletableFuture<Void> disconnect() {
+        return dropConnections();
+    }
+
+    /**
      * Closes the TCP connection and releases the Netty resources that this client owns.
      *
      * <p>If the client created its own event loop group, it shuts that group down gracefully.
@@ -656,9 +741,58 @@ public class AsyncIggyTcpClient {
      * that group down. After you call this method, you cannot reuse the client. If you need
      * a client again, create a new instance.
      *
+     * <p>A close first waits for the reply of every pending poll or fetch with {@code autoCommit}, at
+     * most until its request timeout, because a cancel can lose the messages that the server
+     * committed for it. It cancels every other pending request.
+     * A fetch whose outcome stays unknown does not fail the close. The close logs it, and its recovery
+     * stays until {@link #abandonOperation(long)} releases it, so the close of a blocking client in
+     * try-with-resources does not throw.
+     *
      * @return a {@link CompletableFuture} that completes when all resources are released
      */
     public CompletableFuture<Void> close() {
+        CompletableFuture<Void> committingFetches = pollRouter.committingReadsEnded();
+        if (committingFetches.isDone()) {
+            return closeNow();
+        }
+        // A fetch ends under the monitors of the router, so the close goes on in a task of the client loop.
+        return pollRouter.onClientLoop(committingFetches).thenCompose(ignored -> closeNow());
+    }
+
+    private CompletableFuture<Void> closeNow() {
+        return dropConnections()
+                .thenCompose(ignored -> {
+                    IoEventLoopGroup owned;
+                    synchronized (this) {
+                        owned = sharedEventLoopGroup.isEmpty() ? eventLoopGroup : null;
+                        if (owned != null) {
+                            eventLoopGroup = null;
+                        }
+                    }
+                    if (owned == null) {
+                        return CompletableFuture.completedFuture(null);
+                    }
+                    CompletableFuture<Void> stopped = new CompletableFuture<>();
+                    owned.shutdownGracefully().addListener(done -> {
+                        if (done.isSuccess()) {
+                            stopped.complete(null);
+                        } else {
+                            stopped.completeExceptionally(done.cause());
+                        }
+                    });
+                    return stopped;
+                })
+                .thenRun(() -> {
+                    var unresolved = session.unresolvedFetch();
+                    if (unresolved != null) {
+                        log.warn(
+                                "Closed with fetch {} of unknown progress, which stays retained until it is abandoned",
+                                Long.toUnsignedString(unresolved.getOperationId()));
+                    }
+                });
+    }
+
+    private CompletableFuture<Void> dropConnections() {
         // Closing is caller intent, like a logout: connect() clears `closed`
         // again, and a session the caller ended must not come back with the
         // credentials the earlier sign-in used.
@@ -671,29 +805,7 @@ public class AsyncIggyTcpClient {
         session.endLineage();
         CompletableFuture<Void> dataClosed = pollRouter.clearSession();
         session.reset();
-        CompletableFuture<Void> linksClosed =
-                currentConnection == null ? dataClosed : dataClosed.thenCompose(ignored -> currentConnection.close());
-        return linksClosed.thenCompose(ignored -> {
-            IoEventLoopGroup owned;
-            synchronized (this) {
-                owned = sharedEventLoopGroup.isEmpty() ? eventLoopGroup : null;
-                if (owned != null) {
-                    eventLoopGroup = null;
-                }
-            }
-            if (owned == null) {
-                return CompletableFuture.completedFuture(null);
-            }
-            CompletableFuture<Void> stopped = new CompletableFuture<>();
-            owned.shutdownGracefully().addListener(done -> {
-                if (done.isSuccess()) {
-                    stopped.complete(null);
-                } else {
-                    stopped.completeExceptionally(done.cause());
-                }
-            });
-            return stopped;
-        });
+        return currentConnection == null ? dataClosed : dataClosed.thenCompose(ignored -> currentConnection.close());
     }
 
     /**
@@ -1686,6 +1798,19 @@ public class AsyncIggyTcpClient {
             }
         });
         return CompletableFuture.completedFuture(null);
+    }
+
+    private static byte[] responsePayload(ByteBuf response) {
+        try {
+            if (response.readableBytes() <= 1) {
+                return new byte[0];
+            }
+            byte[] payload = new byte[response.readableBytes()];
+            response.readBytes(payload);
+            return payload;
+        } finally {
+            response.release();
+        }
     }
 
     private static boolean isSessionControlCode(int code) {

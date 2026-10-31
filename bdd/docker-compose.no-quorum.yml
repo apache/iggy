@@ -123,6 +123,9 @@ services:
   cpp-bdd:
     <<: *no-quorum-bdd-deps
 
+  swift-bdd:
+    <<: *no-quorum-bdd-deps
+
 networks:
   iggy-bdd-network:
     driver: bridge

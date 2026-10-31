@@ -19,7 +19,7 @@ use crate::common::global_context::GlobalContext;
 use cucumber::{given, then, when};
 use iggy::prelude::{
     Consumer, HeaderKey, HeaderValue, Identifier, IggyExpiry, IggyMessage, MaxTopicSize,
-    MessageClient, OptionKey, OptionSpec, OptionsScope, Partitioning, PollingStrategy,
+    MessageClient, OptionKey, OptionSpec, OptionsScope, Partitioning, PollOptions, PollingStrategy,
     StreamClient, StreamCreateOptions, StreamDetails, StreamEncryptionKey, StreamEncryptionSource,
     StreamUpdateOptions, SystemClient, TopicClient, TopicCreateOptions, TopicDetails,
     TopicUpdateOptions, UserClient, UserCreateOptions, UserStatus, UserUpdateOptions,
@@ -466,11 +466,13 @@ async fn poll_first(world: &GlobalContext) -> IggyMessage {
         .poll_messages(
             &stream_identifier(world),
             &topic_identifier(world),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll messages");

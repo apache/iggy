@@ -309,12 +309,12 @@ jobs:
           python-version: "3.11"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.87.26
+        uses: taiki-e/install-action@v2.87.28
         with:
           tool: cargo-llvm-cov
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Install dependencies
         run: |
@@ -429,7 +429,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "23"
+          node-version: "24"
           package-manager-cache: false
 
       - name: Pin npm to 11 to match Dependabot lockfile format
@@ -598,7 +598,7 @@ jobs:
     name: Warm macOS cache
     needs: detect
     if: needs.detect.outputs.rust == 'true'
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1

@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod commit_outcome;
+mod deferred_poll_options;
+mod fetched_section;
 mod iggy_message;
 mod index;
 mod index_view;
@@ -28,12 +31,17 @@ mod messages_batch;
 pub mod partitioning;
 pub mod partitioning_kind;
 mod poll_metadata;
+mod poll_options;
 pub mod polled_messages;
 pub mod polling_kind;
 pub mod polling_strategy;
 mod user_headers;
 
 pub const INDEX_SIZE: usize = 16;
+
+pub use commit_outcome::CommitErrorScope;
+pub use deferred_poll_options::{DEFAULT_POLL_MAX_BYTES, DeferredPollOptions};
+pub use fetched_section::FetchedSection;
 
 pub use crate::http::messages::poll_messages::PollMessages;
 pub use crate::http::messages::send_messages::{
@@ -58,7 +66,8 @@ pub use messages_batch::IggyMessagesBatch;
 pub use partitioning::Partitioning;
 pub use partitioning_kind::PartitioningKind;
 pub use poll_metadata::IggyPollMetadata;
-pub use polled_messages::PolledMessages;
+pub use poll_options::{AutoCommit, CommitAfter, CommitEvery, CommitPolicy, PollOptions};
+pub use polled_messages::{DecodeError, PolledMessages, UndecodedRecord, record_at};
 pub use polling_kind::PollingKind;
 pub use polling_strategy::PollingStrategy;
 pub use user_headers::{

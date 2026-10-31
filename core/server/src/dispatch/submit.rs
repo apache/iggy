@@ -132,6 +132,14 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                     .bind_session(vsr_client_id, session, secret.expose_secret());
                 let _ = reply.try_send(attached);
             }
+            shard::MetadataSubmit::MetadataCurrentState {
+                query,
+                user_id,
+                reply,
+            } => {
+                let page = super::metadata_changes::current_state_page(&shard, &query, user_id);
+                let _ = reply.try_send(page);
+            }
             shard::MetadataSubmit::Register {
                 vsr_client_id,
                 user_id,
@@ -291,6 +299,15 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
             }
             shard::MetadataSubmit::ForwardedCompletion(message) => {
                 propose_relayed_completion(&shard, &message).await;
+            }
+            shard::MetadataSubmit::IsMetadataPrimary { reply } => {
+                let primary = shard
+                    .plane
+                    .metadata()
+                    .consensus
+                    .as_ref()
+                    .is_some_and(|c| c.is_normal() && c.is_primary());
+                let _ = reply.try_send(primary);
             }
         }
     });

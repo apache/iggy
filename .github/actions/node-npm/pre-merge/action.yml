@@ -29,7 +29,7 @@ runs:
     - name: Setup Node.js
       uses: actions/setup-node@v6
       with:
-        node-version: "23"
+        node-version: "24"
         registry-url: "https://registry.npmjs.org"
         package-manager-cache: false
 
@@ -148,6 +148,65 @@ runs:
       with:
         pid-file: ${{ steps.iggy-default.outputs.pid_file }}
         log-file: ${{ steps.iggy-default.outputs.log_file }}
+
+    # Both replicas of the roster in `core/server/config.toml`: a two-replica
+    # cluster commits on 2 acks, so a lone node commits nothing. The suite then
+    # reads through the client's partition routing.
+    - name: Start Iggy VSR cluster node 0
+      id: iggy-cluster-0
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-start
+      with:
+        bin: target/debug/iggy-server
+        encryption-enabled: "true"
+        encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
+        replica-id: "0"
+        pid-file: ${{ runner.temp }}/iggy-node-cluster-0.pid
+        log-file: ${{ runner.temp }}/iggy-node-cluster-0.log
+        wait-timeout-seconds: "90"
+      env:
+        IGGY_CLUSTER_ENABLED: "true"
+        IGGY_PATH: ${{ runner.temp }}/iggy-node-cluster-0-data
+
+    - name: Start Iggy VSR cluster node 1
+      id: iggy-cluster-1
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-start
+      with:
+        bin: target/debug/iggy-server
+        encryption-enabled: "true"
+        encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
+        replica-id: "1"
+        tcp_address: 127.0.0.1:8091
+        http_address: 127.0.0.1:3001
+        pid-file: ${{ runner.temp }}/iggy-node-cluster-1.pid
+        log-file: ${{ runner.temp }}/iggy-node-cluster-1.log
+        wait-timeout-seconds: "90"
+      env:
+        IGGY_CLUSTER_ENABLED: "true"
+        IGGY_PATH: ${{ runner.temp }}/iggy-node-cluster-1-data
+
+    - name: E2E tests (cluster)
+      if: inputs.task == 'e2e'
+      run: |
+        cd foreign/node
+        node --import @swc-node/register/esm-register --test --test-force-exit \
+          $(ls src/e2e/*.e2e.ts | grep -v -e tls.system)
+      shell: bash
+
+    - name: Stop Iggy VSR cluster node 1
+      if: always() && inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy-cluster-1.outputs.pid_file }}
+        log-file: ${{ steps.iggy-cluster-1.outputs.log_file }}
+
+    - name: Stop Iggy VSR cluster node 0
+      if: always() && inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy-cluster-0.outputs.pid_file }}
+        log-file: ${{ steps.iggy-cluster-0.outputs.log_file }}
 
     - name: Start Iggy server (TLS)
       id: iggy-tls

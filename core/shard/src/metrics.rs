@@ -40,14 +40,16 @@ use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEn
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
-use iggy_binary_protocol::Command;
+use iggy_binary_protocol::{COMMAND_TABLE, Command, command_index};
 use iggy_common::ConsumerKind;
-use message_bus::ReplicaReadMetrics;
+use message_bus::{ReplicaLinkMetrics, ReplicaReadMetrics};
 
 /// Label for `frame_drops_total`.
 ///
@@ -123,7 +125,7 @@ impl From<Command> for FrameCommandLabel {
 /// target inbox refused. A shed client request is answered with a retriable
 /// status, so the client recovers. A shed *prepare* has nobody to answer and is
 /// not covered by retransmit once its op has reached quorum
-/// (`consensus::retransmit_targets` skips `ok_quorum_received`), so the backup
+/// (`consensus::prepare_timeout_targets` skips `ok_quorum_received`), so the backup
 /// gap-stops; `tick_partitions`' sweep is what repairs it, escalating to
 /// partition state transfer when the primary has evicted the range, and
 /// `partition_prepare_gap_drops_total` is what counts the prepares that reached
@@ -142,6 +144,12 @@ pub mod frame_drop_variant {
     /// dropped; the shard-0 deadline expiry recovers the slot / pending
     /// entry, so this stays informational.
     pub const REPLICA_HANDSHAKE_ACK: &str = "replica_handshake_ack";
+    /// A replica link's close report to shard 0 was dropped; the next
+    /// reconnect sweep finds the link missing and tears its bundle down.
+    pub const REPLICA_LINK_CLOSED: &str = "replica_link_closed";
+    /// Shard 0's request to close a link of a torn down bundle was
+    /// dropped; the next bundle refresh sends it again.
+    pub const REPLICA_LINK_CLOSE: &str = "replica_link_close";
     pub const PARTITION_PERSISTENCE_COMPLETED: &str = "partition_persistence_completed";
     /// A disk poll could not reserve completion capacity or return its result
     /// to the owning shard.
@@ -237,6 +245,75 @@ fn reason_index(s: &str) -> Option<usize> {
     REASONS.iter().position(|r| *r == s)
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct DeferredPollMetrics {
+    pub pending: Gauge,
+    pub inflight_bytes: Gauge,
+    pub rejected: Counter,
+    pub failed: Counter,
+    pub cancelled: Counter,
+    pub expired: Counter,
+    pub filled: Counter,
+    pub late: Counter,
+    pub readiness_pushes: Counter,
+    pub readiness_watches: Gauge,
+}
+
+impl DeferredPollMetrics {
+    fn register(&self, registry: &mut Registry) {
+        registry.register(
+            "deferred_poll_pending",
+            "pending deferred polls",
+            self.pending.clone(),
+        );
+        registry.register(
+            "deferred_poll_inflight_bytes",
+            "reserved bytes for running or queued deferred reads",
+            self.inflight_bytes.clone(),
+        );
+        registry.register(
+            "deferred_poll_rejected",
+            "deferred polls rejected before admission",
+            self.rejected.clone(),
+        );
+        registry.register(
+            "deferred_poll_failed",
+            "admitted deferred polls rejected by a read error, fence, full completion lane or request deadline",
+            self.failed.clone(),
+        );
+        registry.register(
+            "deferred_poll_cancelled",
+            "deferred polls cancelled by their caller",
+            self.cancelled.clone(),
+        );
+        registry.register(
+            "deferred_poll_expired",
+            "deferred polls completed at their deadline",
+            self.expired.clone(),
+        );
+        registry.register(
+            "deferred_poll_filled",
+            "deferred polls answered before their wait deadline",
+            self.filled.clone(),
+        );
+        registry.register(
+            "deferred_poll_late",
+            "deferred read completions discarded after expiry or cancellation",
+            self.late.clone(),
+        );
+        registry.register(
+            "deferred_poll_readiness_pushes",
+            "partition states pushed to the shards that watch them for readiness waits",
+            self.readiness_pushes.clone(),
+        );
+        registry.register(
+            "deferred_poll_readiness_watches",
+            "partitions of this shard that other shards watch for readiness waits",
+            self.readiness_watches.clone(),
+        );
+    }
+}
+
 /// Per-shard metric handles.
 ///
 /// Cheap to clone (`Arc` of a `Family` under the hood). Each shard owns
@@ -265,6 +342,7 @@ pub struct ShardMetrics {
     partition_io_fenced: Counter,
     partition_io_timeouts: Counter,
 
+    pub(crate) deferred_polls: DeferredPollMetrics,
     partition_wal_disk_bytes: Gauge,
     partition_wal_retained_bytes: Gauge,
     partition_wal_queued_bytes: Gauge,
@@ -283,6 +361,8 @@ pub struct ShardMetrics {
     partitions_reconcile_failures_total: Counter,
     partitions_duplicate_builds_discarded_total: Counter,
     partition_transfer_refusals_total: Counter,
+    partition_applied_divergences_total: Counter,
+    partitions_untrusted_log: Gauge,
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
     partition_frames_incarnation_mismatch_total: Family<FrameCommandLabel, Counter>,
@@ -295,10 +375,18 @@ pub struct ShardMetrics {
     client_requests_denied_queue_full_total: Counter,
     replica_socket_reads_total: Counter,
     replica_inbound_frames_total: Counter,
+    replica_outbound_drops_total: Counter,
+    replica_bundle_teardowns_total: Counter,
+    replica_preamble_refusals_total: Counter,
+    replica_handshake_failures_total: Counter,
+    replica_bundles_up: Gauge,
     partition_consumer_offsets_denied_total: Family<ConsumerOffsetKindLabel, Counter>,
     consumer_offset_denied_counters: [Counter; ConsumerKind::COUNT],
     partition_consumer_offsets_stranded: Family<ConsumerOffsetKindLabel, Gauge>,
     consumer_offset_stranded_gauges: [Gauge; ConsumerKind::COUNT],
+    client_requests: ClientRequestMetrics,
+    fetches: FetchMetrics,
+    readiness_push_to_fire: Histogram,
 }
 
 impl ShardMetrics {
@@ -341,6 +429,7 @@ impl ShardMetrics {
             partition_io_quarantined_jobs: Gauge::default(),
             partition_io_fenced: Counter::default(),
             partition_io_timeouts: Counter::default(),
+            deferred_polls: DeferredPollMetrics::default(),
             partition_wal_disk_bytes: Gauge::default(),
             partition_wal_retained_bytes: Gauge::default(),
             partition_wal_queued_bytes: Gauge::default(),
@@ -362,6 +451,8 @@ impl ShardMetrics {
             partitions_reconcile_failures_total: Counter::default(),
             partitions_duplicate_builds_discarded_total: Counter::default(),
             partition_transfer_refusals_total: Counter::default(),
+            partition_applied_divergences_total: Counter::default(),
+            partitions_untrusted_log: Gauge::default(),
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
             partition_frames_incarnation_mismatch_total: Family::default(),
@@ -374,11 +465,34 @@ impl ShardMetrics {
             client_requests_denied_queue_full_total: Counter::default(),
             replica_socket_reads_total: Counter::default(),
             replica_inbound_frames_total: Counter::default(),
+            replica_outbound_drops_total: Counter::default(),
+            replica_bundle_teardowns_total: Counter::default(),
+            replica_preamble_refusals_total: Counter::default(),
+            replica_handshake_failures_total: Counter::default(),
+            replica_bundles_up: Gauge::default(),
             partition_consumer_offsets_denied_total,
             consumer_offset_denied_counters,
             partition_consumer_offsets_stranded,
             consumer_offset_stranded_gauges,
+            client_requests: ClientRequestMetrics::new(),
+            fetches: FetchMetrics::new(),
+            readiness_push_to_fire: latency_histogram(),
         }
+    }
+
+    /// Counts a client request by its command `code`. A code that the
+    /// command table does not hold counts as `unknown`.
+    pub fn record_client_request(&self, code: u32) {
+        self.client_requests.record(code);
+    }
+
+    /// Counts one answered fetch (109).
+    pub fn record_fetch(&self, fetch: &FetchRecord) {
+        self.fetches.record(fetch);
+    }
+
+    pub(crate) fn record_readiness_push_to_fire(&self, elapsed: Duration) {
+        self.readiness_push_to_fire.observe(elapsed.as_secs_f64());
     }
 
     pub fn record_persistence(&self, metrics: &partitions::PersistenceMetrics) {
@@ -411,6 +525,23 @@ impl ShardMetrics {
     pub fn record_replica_reads(&self, metrics: &ReplicaReadMetrics) {
         self.replica_socket_reads_total.inc_by(metrics.reads);
         self.replica_inbound_frames_total.inc_by(metrics.frames);
+    }
+
+    /// Fold one sweep's replica link events in. The counters take deltas,
+    /// as in [`Self::record_replica_reads`]; `bundles_up` is a gauge.
+    /// Bundles, preambles and their refusals live on shard 0 only, so the
+    /// other shards report zero there.
+    pub fn record_replica_link_stats(&self, stats: &ReplicaLinkMetrics) {
+        self.replica_bundle_teardowns_total
+            .inc_by(stats.bundle_teardowns);
+        self.replica_preamble_refusals_total
+            .inc_by(stats.preamble_refusals);
+        self.replica_handshake_failures_total
+            .inc_by(stats.handshake_failures);
+        self.replica_outbound_drops_total
+            .inc_by(stats.outbound_drops);
+        self.replica_bundles_up
+            .set(i64::try_from(stats.bundles_up).unwrap_or(i64::MAX));
     }
 
     fn register_persistence(&self, registry: &mut Registry) {
@@ -649,6 +780,39 @@ impl ShardMetrics {
     #[must_use]
     pub fn partition_transfer_refusals_value(&self) -> u64 {
         self.partition_transfer_refusals_total.get()
+    }
+
+    /// Bumped when a view this replica adopts contradicts a partition op it
+    /// already applied, and the partition is set aside for a resync.
+    ///
+    /// Any non-zero value means committed history diverged between replicas:
+    /// the resync keeps the node serving, but the local copy it quarantined
+    /// into `.fenced.N` holds an op the group did not keep.
+    pub fn record_partition_applied_divergence(&self) {
+        self.partition_applied_divergences_total.inc();
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_applied_divergences_value(&self) -> u64 {
+        self.partition_applied_divergences_total.get()
+    }
+
+    /// Republished by every partition sweep: how many of this shard's
+    /// partitions elected on a log that may lack acknowledged ops and are
+    /// waiting for a trusted quorum or every replica to report before they
+    /// serve again.
+    pub fn set_partitions_untrusted_log(&self, count: usize) {
+        self.partitions_untrusted_log
+            .set(i64::try_from(count).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partitions_untrusted_log_value(&self) -> i64 {
+        self.partitions_untrusted_log.get()
     }
 
     /// Bumped when a parked partition frame is answered instead of served
@@ -915,6 +1079,7 @@ impl ShardMetrics {
     #[allow(clippy::too_many_lines)]
     pub fn register(&self, registry: &mut Registry) {
         self.register_persistence(registry);
+        self.deferred_polls.register(registry);
         registry.register(
             "partition_io_capacity",
             "configured partition file-job slots per shard",
@@ -992,6 +1157,18 @@ impl ShardMetrics {
             self.partition_transfer_refusals_total.clone(),
         );
         registry.register(
+            "partition_applied_divergences",
+            "adopted views that contradicted an applied partition op; non-zero means committed \
+             history diverged",
+            self.partition_applied_divergences_total.clone(),
+        );
+        registry.register(
+            "partitions_untrusted_log",
+            "partitions electing on a log that may lack acknowledged ops; a view starts only \
+             once a trusted quorum or every replica reports",
+            self.partitions_untrusted_log.clone(),
+        );
+        registry.register(
             "partition_frames_rejected_stale",
             "parked frames rejected for a dead incarnation; non-zero is a caught anomaly",
             self.partition_frames_rejected_stale_total.clone(),
@@ -1026,6 +1203,31 @@ impl ShardMetrics {
             "replica_inbound_frames",
             "frames decoded off this shard's plaintext replica links",
             self.replica_inbound_frames_total.clone(),
+        );
+        registry.register(
+            "replica_outbound_drops",
+            "replica frames dropped because a peer send queue was full",
+            self.replica_outbound_drops_total.clone(),
+        );
+        registry.register(
+            "replica_bundle_teardowns",
+            "replica bundles torn down because a link closed or the bundle stayed incomplete",
+            self.replica_bundle_teardowns_total.clone(),
+        );
+        registry.register(
+            "replica_preamble_refusals",
+            "inbound replica connections closed for a missing or refused placement preamble",
+            self.replica_preamble_refusals_total.clone(),
+        );
+        registry.register(
+            "replica_handshake_failures",
+            "delegated replica link handshakes that failed or ran out of handshake_grace",
+            self.replica_handshake_failures_total.clone(),
+        );
+        registry.register(
+            "replica_bundles_up",
+            "peers whose replica links are all installed, so frames flow to them",
+            self.replica_bundles_up.clone(),
         );
         registry.register(
             "metadata_prepare_gap_drops",
@@ -1066,6 +1268,179 @@ impl ShardMetrics {
              against the limit",
             self.partition_consumer_offsets_stranded.clone(),
         );
+        registry.register(
+            "client_requests",
+            "client requests by command",
+            self.client_requests.total.clone(),
+        );
+        self.fetches.register(registry);
+        registry.register(
+            "readiness_push_to_fire_seconds",
+            "time from applying the pushed partition state that made a parked readiness wait \
+             ready to the end of that wait",
+            self.readiness_push_to_fire.clone(),
+        );
+    }
+
+    /// The text scrape of this handle alone, for the assertions on series
+    /// without a value accessor, such as histogram counts.
+    #[cfg(test)]
+    pub(crate) fn scrape(&self) -> String {
+        let mut registry = Registry::default();
+        self.register(&mut registry);
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry)
+            .expect("scrape encoding succeeds");
+        buffer
+    }
+}
+
+/// What one fetch (109) served, for [`ShardMetrics::record_fetch`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FetchRecord {
+    pub sections: u64,
+    /// The record bytes of the sections. A fetch without any is empty.
+    pub bytes: u64,
+    /// Ready targets that the fetch left for a later one, because its byte
+    /// budget or its read cap ran out.
+    pub budget_waits: u64,
+    /// Reads that their owner refused for its deferred poll quota.
+    pub quota_refusals: u64,
+    /// From the end of the readiness wait to the reply.
+    pub fire_to_reply: Duration,
+}
+
+/// Fetch (109) accounting on the shard of the connection.
+#[derive(Clone)]
+struct FetchMetrics {
+    fetches: Counter,
+    sections: Counter,
+    bytes: Counter,
+    empty: Counter,
+    budget_waits: Counter,
+    quota_refusals: Counter,
+    fire_to_reply: Histogram,
+}
+
+impl FetchMetrics {
+    fn new() -> Self {
+        Self {
+            fetches: Counter::default(),
+            sections: Counter::default(),
+            bytes: Counter::default(),
+            empty: Counter::default(),
+            budget_waits: Counter::default(),
+            quota_refusals: Counter::default(),
+            fire_to_reply: latency_histogram(),
+        }
+    }
+
+    fn record(&self, fetch: &FetchRecord) {
+        self.fetches.inc();
+        self.sections.inc_by(fetch.sections);
+        self.bytes.inc_by(fetch.bytes);
+        if fetch.bytes == 0 {
+            self.empty.inc();
+        }
+        self.budget_waits.inc_by(fetch.budget_waits);
+        self.quota_refusals.inc_by(fetch.quota_refusals);
+        self.fire_to_reply
+            .observe(fetch.fire_to_reply.as_secs_f64());
+    }
+
+    fn register(&self, registry: &mut Registry) {
+        registry.register("fetches", "answered fetch requests", self.fetches.clone());
+        registry.register(
+            "fetch_sections",
+            "partition sections of fetch replies",
+            self.sections.clone(),
+        );
+        registry.register(
+            "fetch_bytes",
+            "record bytes of fetch replies",
+            self.bytes.clone(),
+        );
+        registry.register(
+            "fetch_empty",
+            "fetch replies without records",
+            self.empty.clone(),
+        );
+        registry.register(
+            "fetch_budget_waits",
+            "ready fetch targets left for a later fetch by the byte budget or the read cap",
+            self.budget_waits.clone(),
+        );
+        registry.register(
+            "fetch_quota_refusals",
+            "fetch reads refused by the deferred poll quota of their owner",
+            self.quota_refusals.clone(),
+        );
+        registry.register(
+            "fetch_fire_to_reply_seconds",
+            "time from the end of the readiness wait of a fetch to its reply",
+            self.fire_to_reply.clone(),
+        );
+    }
+}
+
+/// Latency buckets from 10 us, doubling up to about 5 s.
+const LATENCY_BUCKET_START_SECONDS: f64 = 0.000_01;
+const LATENCY_BUCKET_FACTOR: f64 = 2.0;
+const LATENCY_BUCKET_COUNT: u16 = 20;
+
+fn latency_histogram() -> Histogram {
+    Histogram::new(exponential_buckets(
+        LATENCY_BUCKET_START_SECONDS,
+        LATENCY_BUCKET_FACTOR,
+        LATENCY_BUCKET_COUNT,
+    ))
+}
+
+/// The `command` of a request whose code the command table does not hold.
+const UNKNOWN_COMMAND: &str = "unknown";
+const COMMAND_COUNT: usize = COMMAND_TABLE.len();
+
+/// Label for `client_requests_total`: the command name of the table.
+#[derive(Clone, Hash, Eq, PartialEq, EncodeLabelSet, Debug)]
+struct ClientCommandLabel {
+    command: &'static str,
+}
+
+/// Client requests by command. As for frame drops, a command enters the
+/// scrape with its first request, and its later requests are an array
+/// index and an increment.
+#[derive(Clone)]
+struct ClientRequestMetrics {
+    total: Family<ClientCommandLabel, Counter>,
+    cached: Arc<[OnceLock<Counter>; COMMAND_COUNT]>,
+}
+
+impl ClientRequestMetrics {
+    fn new() -> Self {
+        Self {
+            total: Family::default(),
+            cached: Arc::new(std::array::from_fn(|_| OnceLock::new())),
+        }
+    }
+
+    fn record(&self, code: u32) {
+        let cached = command_index(code)
+            .and_then(|index| Some((self.cached.get(index)?, COMMAND_TABLE.get(index)?.name)));
+        match cached {
+            Some((counter, command)) => counter
+                .get_or_init(|| {
+                    self.total
+                        .get_or_create(&ClientCommandLabel { command })
+                        .clone()
+                })
+                .inc(),
+            None => self
+                .total
+                .get_or_create(&ClientCommandLabel {
+                    command: UNKNOWN_COMMAND,
+                })
+                .inc(),
+        };
     }
 }
 
@@ -1101,6 +1476,7 @@ impl FrameDropMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_binary_protocol::codes::FETCH_MESSAGES_CODE;
 
     #[test]
     fn frame_drop_counter_increments_per_label_set() {
@@ -1184,6 +1560,38 @@ mod tests {
     }
 
     #[test]
+    fn replica_link_stats_add_up_and_bundles_up_follows_the_last_sweep() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_replica_link_stats(&ReplicaLinkMetrics {
+            bundle_teardowns: 2,
+            preamble_refusals: 1,
+            handshake_failures: 3,
+            outbound_drops: 2,
+            bundles_up: 1,
+        });
+        metrics.record_replica_link_stats(&ReplicaLinkMetrics {
+            bundle_teardowns: 1,
+            outbound_drops: 1,
+            bundles_up: 2,
+            ..ReplicaLinkMetrics::default()
+        });
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry)
+            .expect("scrape encoding succeeds");
+        for line in [
+            "replica_bundle_teardowns_total 3",
+            "replica_preamble_refusals_total 1",
+            "replica_handshake_failures_total 3",
+            "replica_outbound_drops_total 3",
+            "replica_bundles_up 2",
+        ] {
+            assert!(buffer.lines().any(|scraped| scraped == line), "{line}");
+        }
+    }
+
+    #[test]
     fn unproduced_pairs_never_enter_the_scrape() {
         // The lazy fast-path cache must not mint the full variant x reason
         // cross product: a pair no drop site produced would otherwise sit in
@@ -1258,6 +1666,58 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn client_requests_count_by_command_name_and_unknown_codes_together() {
+        let metrics = ShardMetrics::for_shard();
+        let unknown_code = u32::MAX;
+        metrics.record_client_request(FETCH_MESSAGES_CODE);
+        metrics.record_client_request(FETCH_MESSAGES_CODE);
+        metrics.record_client_request(unknown_code);
+        let scrape = metrics.scrape();
+        let mut series: Vec<_> = scrape
+            .lines()
+            .filter(|line| line.starts_with("client_requests_total"))
+            .collect();
+        // A family encodes its series in hash order.
+        series.sort_unstable();
+        assert_eq!(
+            series,
+            [
+                "client_requests_total{command=\"message.fetch\"} 2",
+                "client_requests_total{command=\"unknown\"} 1",
+            ],
+            "a command without requests stays out of the scrape",
+        );
+    }
+
+    #[test]
+    fn fetch_records_add_up_and_count_empty_replies() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_fetch(&FetchRecord {
+            sections: 2,
+            bytes: 300,
+            budget_waits: 1,
+            quota_refusals: 1,
+            fire_to_reply: Duration::from_micros(50),
+        });
+        metrics.record_fetch(&FetchRecord::default());
+        let scrape = metrics.scrape();
+        for series in [
+            "fetches_total 2",
+            "fetch_sections_total 2",
+            "fetch_bytes_total 300",
+            "fetch_empty_total 1",
+            "fetch_budget_waits_total 1",
+            "fetch_quota_refusals_total 1",
+            "fetch_fire_to_reply_seconds_count 2",
+        ] {
+            assert!(
+                scrape.lines().any(|line| line == series),
+                "{series} is not in the scrape:\n{scrape}"
+            );
+        }
     }
 
     #[test]

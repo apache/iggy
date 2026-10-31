@@ -19,16 +19,21 @@ use std::sync::Arc;
 
 use consensus::{LocalPipeline, Sequencer, VsrConsensus, oneshot_channel};
 use futures::FutureExt;
+use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
 use iggy_binary_protocol::requests::partitions::{
     InstallConsumerGroupOwnerRequest, TransitionPartitionHistoryRequest,
 };
-use iggy_binary_protocol::{Command, Operation, RoutedRequestHeader, WireEncode};
+use iggy_binary_protocol::{
+    AckLevel, Command, Operation, RoutedRequestHeader, WireConsumer, WireEncode, WireIdentifier,
+};
 use iggy_common::{IggyByteSize, PartitionStats, variadic};
 use message_bus::MessageBus;
 use metadata::MuxStateMachine;
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
-use partitions::{IggyPartition, Partition, PartitionPathLayout, PartitionsConfig};
+use partitions::{
+    IggyPartition, Partition, PartitionPathLayout, PartitionsConfig, PollingConsumer,
+};
 use server_common::send_messages::{
     IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
 };
@@ -48,6 +53,7 @@ pub(super) fn partitions_config() -> PartitionsConfig {
         path_layout: PartitionPathLayout::default(),
     }
 }
+const SEGMENT_FLOOR: u64 = 1024 * 1024;
 
 /// Commit one batch starting at offset zero and keep it resident. Each call
 /// creates an independent partition history, even for the same namespace.
@@ -70,8 +76,16 @@ pub(super) async fn partition_with_messages_at_revision<B: MessageBus + Clone>(
     let cluster_id = 1;
     let replica_id = 0;
     let replica_count = 3;
-    let config = partitions_config();
-    let segment_size = config.segment_size;
+    // The batch must fit one segment or it never materialises, and it must stay
+    // under the flush threshold or it stops being resident. Doubling the payload
+    // total covers framing; the floor keeps small fixtures where they were.
+    let payload_bytes: u64 = payloads.iter().map(|payload| payload.len() as u64).sum();
+    let segment_size = IggyByteSize::from(SEGMENT_FLOOR.max(payload_bytes.saturating_mul(2)));
+    let config = PartitionsConfig {
+        segment_size,
+        size_of_messages_required_to_save: segment_size,
+        ..partitions_config()
+    };
     let consensus = VsrConsensus::new(
         cluster_id,
         replica_id,
@@ -93,6 +107,24 @@ pub(super) async fn partition_with_messages_at_revision<B: MessageBus + Clone>(
         ..Default::default()
     });
 
+    commit_messages(&mut partition, &config, namespace, payloads, (1, 0)).await;
+    assert_eq!(partition.consensus().commit_min(), 1);
+    assert_eq!(partition.offsets().commit_offset, payloads.len() as u64 - 1);
+
+    (*partition, config)
+}
+
+/// Append `payloads` as one batch from the fixture client and commit it.
+/// `request` numbers the batch among the client's requests, and
+/// `metadata_watermark` must reach the partition's metadata fences.
+#[allow(clippy::future_not_send)]
+pub(super) async fn commit_messages<B: MessageBus + Clone>(
+    partition: &mut IggyPartition<B>,
+    config: &PartitionsConfig,
+    namespace: IggyNamespace,
+    payloads: &[&str],
+    (request, metadata_watermark): (u64, u64),
+) {
     assert!(!payloads.is_empty(), "fixture requires messages");
     let mut messages = IggyMessages::with_capacity(payloads.len());
     for (index, payload) in payloads.iter().enumerate() {
@@ -113,25 +145,105 @@ pub(super) async fn partition_with_messages_at_revision<B: MessageBus + Clone>(
             operation: Operation::SendMessages,
             client: 1,
             session: 1,
-            request: 1,
+            request,
             group: namespace.inner(),
-            partition_incarnation: created_revision,
+            partition_incarnation: partition.created_revision(),
+            metadata_watermark,
             ..Default::default()
         })
         .expect("encode append request");
     let (append_reply, append_result) = oneshot_channel();
+    let op = partition.consensus().sequencer().current_sequence() + 1;
     partition.on_request(append, Some(append_reply)).await;
-    assert_eq!(partition.consensus().sequencer().current_sequence(), 1);
-    partition.consensus().advance_commit_max(1);
-    partition.commit_journal(&config).await;
-    assert_eq!(partition.consensus().commit_min(), 1);
+    assert_eq!(
+        partition.consensus().sequencer().current_sequence(),
+        op,
+        "fixture append was prepared"
+    );
+    partition.consensus().advance_commit_max(op);
+    partition.commit_journal(config).await;
     assert!(
         matches!(append_result.now_or_never(), Some(Ok(_))),
         "fixture append was committed"
     );
-    assert_eq!(partition.offsets().commit_offset, payloads.len() as u64 - 1);
+}
 
-    (*partition, config)
+/// The client of a [`store_consumer_offset`] of a standalone consumer, apart
+/// from the one that appends.
+const STORING_CLIENT: u128 = 2;
+
+/// Stores `offset` for `consumer` as a client store does, through the commit
+/// of the partition with `ack`. `request` numbers the store among the
+/// storing client's requests.
+#[allow(clippy::future_not_send)]
+pub(super) async fn store_consumer_offset<B: MessageBus + Clone>(
+    partition: &mut IggyPartition<B>,
+    config: &PartitionsConfig,
+    namespace: IggyNamespace,
+    (consumer, offset, ack): (PollingConsumer, u64, AckLevel),
+    (request, metadata_watermark): (u64, u64),
+) {
+    // A group offset takes a store only from its installed owner.
+    let (wire_consumer, client, owner_generation) = match consumer {
+        PollingConsumer::Consumer(id, _) => (
+            WireConsumer::consumer(WireIdentifier::numeric(u32::try_from(id).unwrap())),
+            STORING_CLIENT,
+            0,
+        ),
+        PollingConsumer::ConsumerGroup(group, _) => {
+            let owner = partition
+                .consumer_group_owner(group as u64)
+                .expect("the fixture installs the group owner");
+            (
+                WireConsumer::consumer_group(WireIdentifier::numeric(
+                    u32::try_from(group).unwrap(),
+                )),
+                owner.client_id,
+                owner.generation,
+            )
+        }
+    };
+    let body = StoreConsumerOffsetRequest {
+        consumer: wire_consumer,
+        stream_id: WireIdentifier::numeric(u32::try_from(namespace.stream_id()).unwrap()),
+        topic_id: WireIdentifier::numeric(u32::try_from(namespace.topic_id()).unwrap()),
+        partition_id: Some(u32::try_from(namespace.partition_id()).unwrap()),
+        offset,
+        ack,
+    }
+    .to_bytes();
+    let size = size_of::<RoutedRequestHeader>() + body.len();
+    let mut message = server_common::Message::<RoutedRequestHeader>::new(size);
+    message.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
+    let message = message.transmute_header::<RoutedRequestHeader>(|_, header| {
+        *header = RoutedRequestHeader {
+            command: Command::Request,
+            operation: Operation::StoreConsumerOffset,
+            client,
+            session: 1,
+            request,
+            size: u32::try_from(size).unwrap(),
+            group: namespace.inner(),
+            partition_incarnation: partition.created_revision(),
+            owner_generation,
+            metadata_watermark,
+            ..Default::default()
+        };
+    });
+    let (reply, stored) = oneshot_channel();
+    partition.on_request(message, Some(reply)).await;
+    if ack != AckLevel::NoAck {
+        let op = partition.consensus().sequencer().current_sequence();
+        partition.consensus().advance_commit_max(op);
+        partition.commit_journal(config).await;
+    }
+    let stored = stored.now_or_never();
+    assert!(
+        matches!(&stored, Some(Ok(reply)) if reply.header().status == 0),
+        "the fixture store {consumer:?} with {ack:?} was committed: {:?}",
+        stored.map(|reply| reply.map(|reply| reply.header().status))
+    );
+    assert_eq!(partition.get_consumer_offset(consumer), Some(offset));
 }
 
 #[allow(clippy::future_not_send)]

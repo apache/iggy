@@ -22,11 +22,11 @@ use crate::benchmarks::common::create_consumer;
 use crate::utils::ClientFactory;
 use crate::utils::{batch_total_size_bytes, batch_user_size_bytes};
 use iggy::prelude::*;
-use std::collections::HashMap;
-use std::future::ready;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout};
+
+const PARTITION_ID: u32 = 0;
 
 pub struct LowLevelConsumerClient {
     client_factory: Arc<dyn ClientFactory>,
@@ -35,12 +35,11 @@ pub struct LowLevelConsumerClient {
     consumer: Option<Consumer>,
     stream_id: Identifier,
     topic_id: Identifier,
-    partition_id: Option<u32>,
+    /// Where the next poll of a standalone consumer starts.
     polling_strategy: PollingStrategy,
-    auto_commit: bool,
-    /// Where offset polling continues in each partition. A group member polls its partitions
-    /// round-robin, so one shared cursor would skip the start of every partition but the first.
-    next_offsets: HashMap<u32, u64>,
+    commit: CommitPolicy,
+    /// A group member owns no fixed partition, so only a reader follows its assignment.
+    reader: Option<PartitionReader>,
 }
 
 impl LowLevelConsumerClient {
@@ -52,51 +51,50 @@ impl LowLevelConsumerClient {
             consumer: None,
             stream_id: Identifier::default(),
             topic_id: Identifier::default(),
-            partition_id: None,
             polling_strategy: PollingStrategy::next(),
-            auto_commit: true,
-            next_offsets: HashMap::new(),
+            commit: CommitPolicy::OnRead,
+            reader: None,
         }
     }
 }
 
 impl ConsumerClient for LowLevelConsumerClient {
     async fn consume_batch(&mut self) -> Result<Option<BatchMetrics>, IggyError> {
-        let client = self.client.as_ref().expect("client not initialized");
-        let consumer = self.consumer.as_ref().expect("consumer not initialized");
-        let messages_to_receive = self.config.messages_per_batch.get();
-
-        let polling_strategy = self.polling_strategy;
-        let next_offsets = &self.next_offsets;
-        let strategy_for = |partition_id: u32| {
-            next_offsets
-                .get(&partition_id)
-                .map_or(polling_strategy, |offset| PollingStrategy::offset(*offset))
-        };
         let before_poll = Instant::now();
-        let polled = client
-            .poll_messages_with_strategy_for(
-                &self.stream_id,
-                &self.topic_id,
-                self.partition_id,
-                consumer,
-                &strategy_for,
-                messages_to_receive,
-                self.auto_commit,
-            )
-            .await;
+        let polled = if let Some(reader) = self.reader.as_mut() {
+            // `next()` has no time limit, so a member whose partitions are drained would hold up
+            // the end of the run, which waits for every actor.
+            let poll_timeout = self.config.poll_options.request_timeout().get_duration();
+            match timeout(poll_timeout, reader.next()).await {
+                Ok(polled) => polled.map_err(IggyError::from),
+                Err(_) => return Ok(None),
+            }
+        } else {
+            let client = self.client.as_ref().expect("client not initialized");
+            let consumer = self.consumer.as_ref().expect("consumer not initialized");
+            let options = PollOptions {
+                count: self.config.messages_per_batch.get(),
+                commit: self.commit,
+                ..self.config.poll_options
+            };
+            client
+                .poll_messages(
+                    &self.stream_id,
+                    &self.topic_id,
+                    PARTITION_ID,
+                    consumer,
+                    &self.polling_strategy,
+                    options,
+                )
+                .await
+        };
 
         let polled = match polled {
-            Ok(p) => p,
-            Err(e) => {
-                if matches!(
-                    e,
-                    IggyError::TopicIdNotFound(_, _) | IggyError::TransientNotAccepted
-                ) {
-                    return Ok(None);
-                }
-                return Err(e);
+            Ok(polled) => polled,
+            Err(IggyError::TopicIdNotFound(_, _) | IggyError::TransientNotAccepted) => {
+                return Ok(None);
             }
+            Err(error) => return Err(error),
         };
 
         if polled.messages.is_empty() {
@@ -113,11 +111,8 @@ impl ConsumerClient for LowLevelConsumerClient {
         let user_bytes = batch_user_size_bytes(&polled);
         let total_bytes = batch_total_size_bytes(&polled);
 
-        if self.polling_strategy.kind == PollingKind::Offset
-            && let Some(last) = polled.messages.last()
-        {
-            self.next_offsets
-                .insert(polled.partition_id, last.header.offset + 1);
+        if self.reader.is_none() && self.polling_strategy.kind == PollingKind::Offset {
+            self.polling_strategy = polled.continuation();
         }
 
         Ok(Some(BatchMetrics {
@@ -128,27 +123,26 @@ impl ConsumerClient for LowLevelConsumerClient {
         }))
     }
 
-    fn reset_offsets(&mut self) -> impl Future<Output = Result<(), IggyError>> {
-        self.next_offsets.clear();
+    async fn reset_offsets(&mut self) -> Result<(), IggyError> {
         self.polling_strategy = PollingStrategy::offset(0);
-        ready(Ok(()))
+        if let Some(reader) = self.reader.as_mut() {
+            // A partition assigned after this starts at the start of the reader instead.
+            for partition in reader.partitions() {
+                reader.seek(partition, PollingStrategy::offset(0)).await?;
+            }
+        }
+        Ok(())
     }
 }
 
 impl BenchmarkInit for LowLevelConsumerClient {
     async fn setup(&mut self) -> Result<(), IggyError> {
         let topic_id_str = "topic-1";
-        let default_partition_id = 0u32;
 
         let client = self.client_factory.create_authenticated_client().await?;
 
         let stream_id: Identifier = self.config.stream_id.as_str().try_into().unwrap();
         let topic_id = topic_id_str.try_into().unwrap();
-        let partition_id = if self.config.consumer_group_id.is_some() {
-            None
-        } else {
-            Some(default_partition_id)
-        };
 
         let consumer = create_consumer(
             &client,
@@ -158,20 +152,39 @@ impl BenchmarkInit for LowLevelConsumerClient {
             self.config.consumer_id,
         )
         .await;
-        let (polling_strategy, auto_commit) = match self.config.polling_kind {
-            PollingKind::Offset => (PollingStrategy::offset(0), false),
-            PollingKind::Next => (PollingStrategy::next(), true),
+        let (polling_strategy, commit) = match self.config.polling_kind {
+            PollingKind::Offset => (PollingStrategy::offset(0), CommitPolicy::Manual),
+            PollingKind::Next => (PollingStrategy::next(), CommitPolicy::OnRead),
             _ => panic!("Unsupported polling kind: {:?}", self.config.polling_kind),
         };
+        if self.config.consumer_group_id.is_some() {
+            // A reader asks for one count, so a range of batch sizes reads up to the largest.
+            let options = PollOptions {
+                count: self.config.messages_per_batch.max(),
+                commit,
+                ..self.config.poll_options
+            };
+            // Each timed `next()` measures one fetch round trip, so the reader holds one request
+            // and no prefetch queue.
+            self.reader = Some(
+                client
+                    .reader(&stream_id, &topic_id, &consumer)
+                    .start(polling_strategy)
+                    .options(options)
+                    .prefetch_messages(options.count)
+                    .prefetch_bytes(options.max_bytes)
+                    .build()
+                    .await?,
+            );
+        }
 
         self.client = Some(client);
         self.consumer = Some(consumer);
 
         self.stream_id = stream_id;
         self.topic_id = topic_id;
-        self.partition_id = partition_id;
         self.polling_strategy = polling_strategy;
-        self.auto_commit = auto_commit;
+        self.commit = commit;
 
         Ok(())
     }
@@ -185,34 +198,48 @@ impl BenchmarkConsumerClient for LowLevelConsumerClient {}
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchmarkConsumerConfig, ConsumerClient, LowLevelConsumerClient};
+    use super::{BenchmarkConsumerConfig, ConsumerClient, LowLevelConsumerClient, PARTITION_ID};
     use crate::utils::client_factory::TcpClientFactory;
     use bench_report::numeric_parameter::BenchmarkNumericParameter;
     use iggy::prelude::{
-        ClientWrapper, Consumer, Identifier, IggyClient, IggyDuration, PollingStrategy, TcpClient,
-        TcpClientConfig,
+        ClientWrapper, CommitPolicy, Consumer, Identifier, IggyClient, IggyDuration,
+        PartitionContext, PollOptions, PollingKind, PollingStrategy, TcpClient, TcpClientConfig,
     };
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
 
-    const GROUP_ID: u32 = 1;
-    const WARMUP_OFFSETS: [(u32, u64); 2] = [(0, 12), (1, 34)];
+    const CONSUMER_ID: u32 = 1;
+    const WARMUP_OFFSET: u64 = 12;
+    const WARMUP_HISTORY: PartitionContext = PartitionContext {
+        incarnation: 1,
+        owner_generation: 0,
+        metadata_op: 1,
+    };
 
     #[tokio::test]
-    async fn given_disconnected_group_member_when_resetting_should_rewind_without_offset_requests()
-    {
-        for (polling_strategy, auto_commit) in [
-            (PollingStrategy::next(), true),
-            (PollingStrategy::offset(0), false),
+    async fn given_disconnected_standalone_consumer_when_resetting_should_rewind_without_offset_requests()
+     {
+        for (polling_strategy, commit) in [
+            (PollingStrategy::next(), CommitPolicy::OnRead),
+            (
+                PollingStrategy::continuation(
+                    PARTITION_ID,
+                    PollingKind::Offset,
+                    WARMUP_OFFSET,
+                    WARMUP_HISTORY,
+                ),
+                CommitPolicy::Manual,
+            ),
         ] {
             let mut consumer = LowLevelConsumerClient::new(
                 Arc::new(TcpClientFactory::default()),
                 BenchmarkConsumerConfig {
-                    consumer_id: 1,
-                    consumer_group_id: Some(GROUP_ID),
+                    consumer_id: CONSUMER_ID,
+                    consumer_group_id: None,
                     stream_id: "bench-stream-1".to_owned(),
                     messages_per_batch: BenchmarkNumericParameter::Value(1),
                     warmup_time: IggyDuration::default(),
                     polling_kind: polling_strategy.kind,
+                    poll_options: PollOptions::default(),
                     origin_timestamp_latency_calculation: false,
                     pretty: false,
                 },
@@ -220,18 +247,14 @@ mod tests {
             consumer.client = Some(IggyClient::new(ClientWrapper::Tcp(
                 TcpClient::create(Arc::new(TcpClientConfig::default())).unwrap(),
             )));
-            consumer.consumer = Some(Consumer::group(Identifier::numeric(GROUP_ID).unwrap()));
+            consumer.consumer = Some(Consumer::new(Identifier::numeric(CONSUMER_ID).unwrap()));
             consumer.polling_strategy = polling_strategy;
-            consumer.auto_commit = auto_commit;
-            if !auto_commit {
-                consumer.next_offsets = HashMap::from(WARMUP_OFFSETS);
-            }
+            consumer.commit = commit;
 
             consumer.reset_offsets().await.unwrap();
 
             assert_eq!(consumer.polling_strategy, PollingStrategy::offset(0));
-            assert!(consumer.next_offsets.is_empty());
-            assert_eq!(consumer.auto_commit, auto_commit);
+            assert_eq!(consumer.commit, commit);
         }
     }
 }

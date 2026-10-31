@@ -45,6 +45,11 @@ final class PollRouter: Sendable {
     static let rosterReadTimeout: Duration = .seconds(5)
     static let maxCachedRoutes = 4096
     static let maxDataConnections = 256
+    /// `MAX_DEFERRED_REQUESTS` in the Rust SDK: the deferred requests one
+    /// client keeps in flight. The server refuses more than it parks for one
+    /// client with `deferredPollCapacityExceeded`.
+    static let maxDeferredRequests = 64
+    static let maxProgressLanes = maxDeferredRequests * Requests.maxPartitionsPerRequest + maxDataConnections
 
     /// A partition as its caller spelled it. A stream or topic named by
     /// number and the same one named by name are two keys.
@@ -52,6 +57,84 @@ final class PollRouter: Sendable {
         let stream: Identifier
         let topic: Identifier
         let partitionID: UInt32
+    }
+
+    struct ProgressKey: Hashable, Sendable {
+        let partitionID: UInt32
+        let incarnation: UInt64
+    }
+
+    private struct ProgressLane {
+        let semaphore = AsyncSemaphore(permits: 1)
+        var users = 0
+    }
+
+    /// A committing poll or fetch, as a fetch block in the Rust SDK. Once its
+    /// frame may have reached the server, an unknown outcome blocks the
+    /// progress of its partitions under `id` until the caller abandons it.
+    final class FetchAttempt: Sendable {
+        let id: UInt128Value
+        private let possibleSend = NIOLockedValueBox(false)
+
+        init(id: UInt128Value) {
+            self.id = id
+        }
+
+        var mayHaveCommitted: Bool { possibleSend.withLockedValue { $0 } }
+
+        func sent() { possibleSend.withLockedValue { $0 = true } }
+        func refused() { possibleSend.withLockedValue { $0 = false } }
+    }
+
+    private struct FetchRetention {
+        var keys: [ProgressKey]
+        var blocked = false
+    }
+
+    /// What a routed request carries.
+    enum Body: Sendable {
+        case fixed([UInt8])
+        case deferred(Deferred)
+
+        var isDeferred: Bool {
+            if case .deferred = self { true } else { false }
+        }
+
+        var commits: Bool {
+            if case .deferred(let deferred) = self { deferred.commits } else { false }
+        }
+
+        var fetchAttempt: FetchAttempt? {
+            if case .deferred(let deferred) = self { deferred.fetchAttempt } else { nil }
+        }
+
+        /// The body of one attempt. A deferred request carries what is left
+        /// of its wait and its timeout, as `deferred_payload` in the Rust SDK,
+        /// so no attempt waits past the deadline of its call.
+        func payload() throws -> [UInt8] {
+            switch self {
+            case .fixed(let payload):
+                payload
+            case .deferred(let deferred):
+                try deferred.encode(deferred.options.remaining(after: .now - deferred.started))
+            }
+        }
+    }
+
+    /// A deferred poll or fetch: its options, when its call started,
+    /// and its body under the options left for an attempt.
+    struct Deferred: Sendable {
+        let options: DeferredPollOptions
+        let started: ContinuousClock.Instant
+        /// The server stores the offsets of what it reads, so a cancellation
+        /// waits for the one reply that says whether it did.
+        var commits = false
+        var fetchAttempt: FetchAttempt? = nil
+        let encode: @Sendable (DeferredPollOptions) throws -> [UInt8]
+
+        /// The request timeout bounds the whole call, routing and retries
+        /// included, not each attempt.
+        var deadline: ContinuousClock.Instant { started + options.requestTimeout }
     }
 
     private struct Route: Sendable {
@@ -93,10 +176,23 @@ final class PollRouter: Sendable {
         var metadataPrimary: UInt8?
         var routes: [RouteKey: Route] = [:]
         var slots: [String: Slot] = [:]
+        /// The connections of deferred requests by endpoint, one per request
+        /// in flight there, as a parked request holds its connection for its
+        /// whole wait. At most ``PollRouter/maxDeferredRequests`` across all
+        /// endpoints.
+        var deferredSlots: [String: [Slot]] = [:]
+        // A session reset must not release progress still held by an older call.
+        var progressLanes: [ProgressKey: ProgressLane] = [:]
+        /// The committing polls and fetches in flight, and those whose
+        /// outcome is unknown. A session reset keeps both, so a block
+        /// survives a reconnect and a new session.
+        var fetches: [UInt128Value: FetchRetention] = [:]
+        var blockedProgress: [ProgressKey: UInt128Value] = [:]
         var nextHeartbeat: ContinuousClock.Instant?
     }
 
     private let state: NIOLockedValueBox<State>
+    private let deferredLeases = AsyncSemaphore(permits: PollRouter.maxDeferredRequests)
 
     init(fence: UInt128Value) {
         state = NIOLockedValueBox(State(fence: fence))
@@ -129,7 +225,168 @@ final class PollRouter: Sendable {
             state.fence = fence
             state.routes.removeAll()
             state.slots.removeAll()
+            state.deferredSlots.removeAll()
             state.nextHeartbeat = nil
+        }
+    }
+
+    /// Orders progress across connections and aliases of the same partition
+    /// history. Sorted acquisition prevents overlapping fetches from deadlocking.
+    /// Entries exist only while a holder or waiter references them. A
+    /// partition whose committing read has an unknown outcome fails with
+    /// ``IggyErrorCode/partitionLaneBlocked`` until that read is abandoned.
+    func withProgress<Value: Sendable>(
+        _ keys: [ProgressKey], deadline: ContinuousClock.Instant, _ operation: () async throws -> Value
+    ) async throws -> Value {
+        guard !keys.isEmpty else {
+            return try await operation()
+        }
+        let keys = Set(keys).sorted {
+            ($0.partitionID, $0.incarnation) < ($1.partitionID, $1.incarnation)
+        }
+        guard keys.allSatisfy({ $0.incarnation != 0 }) else {
+            throw IggyError(.transientNotAccepted, context: "progress requires a resolved partition incarnation")
+        }
+        let semaphores = try state.withLockedValue { state in
+            if let blocked = Self.blockedProgress(keys, in: state) {
+                throw blocked
+            }
+            let added = keys.reduce(0) { $0 + (state.progressLanes[$1] == nil ? 1 : 0) }
+            guard added <= Self.maxProgressLanes - state.progressLanes.count else {
+                throw IggyError(.transientNotAccepted, context: "the concurrent progress partition limit was reached")
+            }
+            return keys.map { key in
+                var lane = state.progressLanes[key] ?? ProgressLane()
+                lane.users += 1
+                state.progressLanes[key] = lane
+                return lane.semaphore
+            }
+        }
+        var acquired = 0
+        defer {
+            for semaphore in semaphores.prefix(acquired) {
+                semaphore.release(1)
+            }
+            state.withLockedValue { state in
+                for key in keys {
+                    state.progressLanes[key]?.users -= 1
+                    if state.progressLanes[key]?.users == 0 {
+                        state.progressLanes.removeValue(forKey: key)
+                    }
+                }
+            }
+        }
+        for semaphore in semaphores {
+            guard try await semaphore.acquire(1, deadline: deadline) else {
+                throw IggyError(.transientNotAccepted, context: "the request deadline passed waiting for partition progress")
+            }
+            acquired += 1
+        }
+        // The call that held the lane can have left its outcome unknown.
+        if let blocked = state.withLockedValue({ Self.blockedProgress(keys, in: $0) }) {
+            throw blocked
+        }
+        try Task.checkCancellation()
+        guard ContinuousClock.now < deadline else {
+            throw IggyError(.transientNotAccepted, context: "the request deadline passed before partition progress")
+        }
+        return try await operation()
+    }
+
+    /// Registers a committing poll or fetch before it is sent. At most
+    /// ``maxDeferredRequests`` are in flight or blocked at once.
+    func reserveFetch(_ keys: [ProgressKey]) throws -> FetchAttempt {
+        try state.withLockedValue { state in
+            guard state.fetches.count < Self.maxDeferredRequests else {
+                throw IggyError(.transientNotAccepted, context: "\(Self.maxDeferredRequests) committing reads are in flight or blocked")
+            }
+            var id = UInt128Value.random()
+            while state.fetches[id] != nil {
+                id = .random()
+            }
+            state.fetches[id] = FetchRetention(keys: keys)
+            return FetchAttempt(id: id)
+        }
+    }
+
+    /// Forgets an attempt that ended with a known outcome.
+    func releaseFetch(_ attempt: FetchAttempt) {
+        state.withLockedValue { state in
+            if state.fetches[attempt.id]?.blocked == false {
+                state.fetches.removeValue(forKey: attempt.id)
+            }
+        }
+    }
+
+    /// Blocks the progress of `keys` under the attempt and returns
+    /// ``IggyErrorCode/fetchProgressUncertain`` naming it.
+    func retainFetch(_ attempt: FetchAttempt, keys: [ProgressKey], cause: String? = nil) -> IggyError {
+        state.withLockedValue { state in
+            state.fetches[attempt.id] = FetchRetention(keys: keys, blocked: true)
+            for key in keys {
+                state.blockedProgress[key] = attempt.id
+            }
+        }
+        return IggyError(.fetchProgressUncertain, context: cause, operationID: attempt.id)
+    }
+
+    /// Whether the client still blocks progress under `id`.
+    func retainsFetch(_ id: UInt128Value) -> Bool {
+        state.withLockedValue { $0.fetches[id]?.blocked == true }
+    }
+
+    /// Lifts the blocks of an attempt whose outcome stays unknown, or throws
+    /// ``IggyErrorCode/operationNotRetained``.
+    func abandonFetch(_ id: UInt128Value) throws {
+        try state.withLockedValue { state in
+            guard let retained = state.fetches[id], retained.blocked else {
+                throw IggyError(.operationNotRetained, operationID: id)
+            }
+            for key in retained.keys where state.blockedProgress[key] == id {
+                state.blockedProgress.removeValue(forKey: key)
+            }
+            state.fetches.removeValue(forKey: id)
+        }
+    }
+
+    private static func blockedProgress(_ keys: [ProgressKey], in state: State) -> IggyError? {
+        for key in keys {
+            if let operationID = state.blockedProgress[key] {
+                return IggyError(
+                    .partitionLaneBlocked, context: "a committing read of partition \(key.partitionID) has an unknown outcome",
+                    operationID: operationID, partitionID: key.partitionID)
+            }
+        }
+        return nil
+    }
+
+    /// Closes the connections of the deferred requests in flight, so each
+    /// one ends at once instead of waiting on a session the caller ended.
+    func closeDeferredConnections() async {
+        let connections = state.withLockedValue { state in
+            state.deferredSlots.values.joined().compactMap { slot in slot.connection.withLockedValue { $0?.connection } }
+        }
+        for connection in connections {
+            await connection.close()
+        }
+    }
+
+    func progressContext(
+        _ key: RouteKey, context: PartitionContext?, lineage: UInt64, coordinator: ClientCore, deadline: ContinuousClock.Instant
+    ) async throws -> PartitionContext {
+        if let context, context.incarnation != 0 {
+            return context
+        }
+        return try await retryingLookups(lineage: lineage, coordinator: coordinator, deadline: deadline) { clustered in
+            let route = try await route(key, clustered: clustered, lineage: lineage, coordinator: coordinator, deadline: deadline)
+            guard route.context.incarnation != 0 else {
+                throw IggyError(.transientNotAccepted, context: "the route has no partition incarnation")
+            }
+            guard let context else {
+                return route.context
+            }
+            return PartitionContext(
+                incarnation: route.context.incarnation, ownerGeneration: context.ownerGeneration, metadataOp: context.metadataOp)
         }
     }
 
@@ -145,10 +402,28 @@ final class PollRouter: Sendable {
     /// once the caller signed in or out since, the request fails with
     /// `unauthenticated`, as nothing of the call goes out under a session the
     /// caller opened after the call started.
+    ///
+    /// A deferred request goes over a data connection of its own, on a single
+    /// node too, as its wait would hold a lockstep connection. It holds one of
+    /// ``maxDeferredRequests`` leases across its attempts, waited for until
+    /// `deadline`. A cancelled caller sends command 108 after a request that
+    /// is parked, so the server drops it, and the connection stays usable. A
+    /// committing request answers the cancellation once, so its caller waits
+    /// for that reply.
     func send(
-        _ code: CommandCode, payload: [UInt8], key: RouteKey, context: PartitionContext?, lineage: UInt64, coordinator: ClientCore,
+        _ code: CommandCode, body: Body, key: RouteKey, context: PartitionContext?, lineage: UInt64, coordinator: ClientCore,
         deadline: ContinuousClock.Instant
     ) async throws -> [UInt8] {
+        if body.isDeferred {
+            guard try await deferredLeases.acquire(1, deadline: deadline) else {
+                throw IggyError(.transientNotAccepted, context: "\(Self.maxDeferredRequests) deferred requests were in flight until the deadline")
+            }
+        }
+        defer {
+            if body.isDeferred {
+                deferredLeases.release(1)
+            }
+        }
         let clock = ContinuousClock()
         let now = clock.now
         let clustered = try await isClustered(coordinator, lineage: lineage, deadline: deadline)
@@ -157,7 +432,7 @@ final class PollRouter: Sendable {
             // pinged here once per heartbeat interval too.
             _ = try await control(.ping, [], lineage: lineage, coordinator: coordinator, deadline: deadline)
         }
-        let request = Request(code: code, payload: payload, key: key, lineage: lineage, deadline: deadline)
+        let request = Request(code: code, body: body, key: key, lineage: lineage, deadline: deadline)
         var captured = context
         var backoff = Backoff()
         var replay = Replay()
@@ -170,12 +445,16 @@ final class PollRouter: Sendable {
                 if clustered {
                     return try await sendOnPrimary(request, context: &captured, replay: &replay, coordinator: coordinator)
                 }
-                return try await sendOnCoordinator(request, context: &captured, coordinator: coordinator)
+                return try await sendOnCoordinator(request, context: &captured, replay: &replay, coordinator: coordinator)
             } catch let error as IggyError {
+                if body.fetchAttempt?.mayHaveCommitted == true {
+                    // A committing read that may have stored is never sent again.
+                    throw error
+                }
                 let reconnects =
                     replay.outcome.isUncertain && error.isConnectionLoss && error.code != .staleClient
                     && coordinator.configuration.reconnection.enabled
-                guard error.code == .transientNotAccepted || reconnects else {
+                guard error.code == .transientNotAccepted || error.code == .deferredPollCapacityExceeded || reconnects else {
                     throw replay.outcome.observe(error)
                 }
                 refusal = replay.outcome.observe(error)
@@ -220,6 +499,56 @@ final class PollRouter: Sendable {
         }
     }
 
+    /// Sends a non-replicated request to `replica` and returns its answer.
+    /// The request carries the session's metadata watermark. On a single node
+    /// it goes over the coordinator, in a cluster over a data connection to
+    /// the replica, bound to the client's session. A replica the roster does
+    /// not list after one more roster read fails with `invalidIdentifier`. A
+    /// lost connection or a `transientNotAccepted` refusal sends the request
+    /// to the same replica again until `deadline`, which ends the call with
+    /// the last refusal. Any other answer, `notPrimary` included, is the
+    /// caller's, as the caller chose the replica.
+    func sendToReplica(
+        _ replica: UInt8, code: UInt32, payload: [UInt8], lineage: UInt64, coordinator: ClientCore, deadline: ContinuousClock.Instant
+    ) async throws -> [UInt8] {
+        _ = try await isClustered(coordinator, lineage: lineage, deadline: deadline)
+        if state.withLockedValue({ $0.nodes[replica] }) == nil {
+            try await readRoster(coordinator, lineage: lineage, deadline: deadline)
+        }
+        let (listed, clustered) = state.withLockedValue { ($0.nodes[replica] != nil, $0.nodes.count > 1) }
+        guard listed else {
+            throw IggyError(.invalidIdentifier, context: "the cluster roster does not list replica \(replica)")
+        }
+        guard clustered else {
+            return try await coordinator.exchange(code: code, payload: payload, deadline: deadline, lineage: lineage)
+        }
+        let clock = ContinuousClock()
+        var backoff = Backoff()
+        var refusal = IggyError(.transientNotAccepted, context: "the budget ran out before command \(code) reached replica \(replica)")
+        while clock.now < deadline {
+            let watermark = await coordinator.metadataWatermark
+            guard let identity = await coordinator.sessionIdentity(at: watermark) else {
+                throw IggyError(.unauthenticated, context: "no session is bound to send command \(code) to replica \(replica)")
+            }
+            let fence = state.withLockedValue { $0.fence }
+            do {
+                return try await exchange(
+                    onReplica: replica, code: code, payload: payload, context: ClientCore.readContext(watermark), identity: identity,
+                    lineage: lineage, fence: fence, coordinator: coordinator, deadline: deadline,
+                    dialDeadline: min(deadline, .now + ClientCore.failoverDialTimeout))
+            } catch let unsent as UnsentRequest {
+                guard unsent.refusal.code == .transientNotAccepted else {
+                    throw unsent.refusal
+                }
+                refusal = unsent.refusal
+            } catch let error as IggyError where error.code == .transientNotAccepted || error.code == .transientNotCommitted {
+                refusal = error
+            }
+            try await backoff.pause(after: refusal, before: deadline)
+        }
+        throw refusal
+    }
+
     /// The pauses between the refused attempts of one request: from
     /// `retryInterval`, doubling up to `maxRetryInterval`.
     struct Backoff {
@@ -232,6 +561,12 @@ final class PollRouter: Sendable {
                 throw refusal
             }
             try await Task.sleep(for: interval)
+            lengthen()
+        }
+
+        /// Doubles the next pause without waiting, for a caller that hands a
+        /// copy to an attempt that runs beside others.
+        mutating func lengthen() {
             interval = min(interval * 2, PollRouter.maxRetryInterval)
         }
     }
@@ -245,7 +580,7 @@ final class PollRouter: Sendable {
 
     private struct Request {
         let code: CommandCode
-        let payload: [UInt8]
+        let body: Body
         let key: RouteKey
         let lineage: UInt64
         let deadline: ContinuousClock.Instant
@@ -325,27 +660,44 @@ final class PollRouter: Sendable {
         _ code: CommandCode, _ payload: [UInt8], context: PartitionContext = .empty, lineage: UInt64, coordinator: ClientCore,
         deadline: ContinuousClock.Instant
     ) async throws -> [UInt8] {
-        do {
-            return try await coordinator.exchangeOnce(code: code.rawValue, payload: payload, context: context, deadline: deadline, lineage: lineage)
-        } catch let error as IggyError where error.isReconnectable && error.code != .staleClient && ContinuousClock.now < deadline {
-            _ = try await coordinator.exchange(code: CommandCode.ping.rawValue, payload: [], deadline: deadline, lineage: lineage)
-            return try await coordinator.exchangeOnce(code: code.rawValue, payload: payload, context: context, deadline: deadline, lineage: lineage)
-        }
+        // A cancelled exchange aborts the coordinator connection, so a caller
+        // cancelled meanwhile lets the read or the ping finish instead.
+        try await Task {
+            do {
+                return try await coordinator.exchangeOnce(code: code.rawValue, payload: payload, context: context, deadline: deadline, lineage: lineage)
+            } catch let error as IggyError where error.isReconnectable && error.code != .staleClient && ContinuousClock.now < deadline {
+                _ = try await coordinator.exchange(code: CommandCode.ping.rawValue, payload: [], deadline: deadline, lineage: lineage)
+                return try await coordinator.exchangeOnce(code: code.rawValue, payload: payload, context: context, deadline: deadline, lineage: lineage)
+            }
+        }.value
     }
 
     /// The single-node path: the request goes over the coordinator connection
-    /// with the context of its route.
-    private func sendOnCoordinator(_ request: Request, context: inout PartitionContext?, coordinator: ClientCore) async throws -> [UInt8] {
+    /// with the context of its route, a deferred one over a data connection to
+    /// the same node.
+    private func sendOnCoordinator(
+        _ request: Request, context: inout PartitionContext?, replay: inout Replay, coordinator: ClientCore
+    ) async throws -> [UInt8] {
         let route = try await route(request.key, clustered: false, lineage: request.lineage, coordinator: coordinator, deadline: request.deadline)
         let captured = context ?? route.context
         context = captured
         do {
+            if request.body.isDeferred {
+                return try await exchange(
+                    at: await coordinator.serverAddress, code: request.code.rawValue, body: request.body, context: captured,
+                    identity: route.consumerSession, lineage: request.lineage, fence: route.fence, coordinator: coordinator, deadline: request.deadline,
+                    dialDeadline: request.deadline, replay: &replay)
+            }
+            let payload = try request.body.payload()
             if request.code == .pollMessages {
                 return try await coordinator.exchangeOnce(
-                    code: request.code.rawValue, payload: request.payload, context: captured, deadline: request.deadline, lineage: request.lineage)
+                    code: request.code.rawValue, payload: payload, context: captured, deadline: request.deadline, lineage: request.lineage)
             }
             return try await coordinator.exchange(
-                code: request.code.rawValue, payload: request.payload, context: captured, deadline: request.deadline, lineage: request.lineage)
+                code: request.code.rawValue, payload: payload, context: captured, deadline: request.deadline, lineage: request.lineage)
+        } catch let unsent as UnsentRequest {
+            removeRoute(request.key)
+            throw unsent.refusal
         } catch let error as IggyError {
             removeRoute(request.key)
             throw Self.gradedLoss(error, on: "the coordinator")
@@ -362,7 +714,7 @@ final class PollRouter: Sendable {
         context = captured
         do {
             return try await exchange(
-                onReplica: route.primaryReplica, code: request.code.rawValue, payload: request.payload, context: captured,
+                onReplica: route.primaryReplica, code: request.code.rawValue, body: request.body, context: captured,
                 identity: route.consumerSession, lineage: request.lineage, fence: route.fence, coordinator: coordinator, deadline: request.deadline,
                 dialDeadline: request.deadline, replay: &replay)
         } catch let unsent as UnsentRequest {
@@ -370,6 +722,12 @@ final class PollRouter: Sendable {
             throw unsent.refusal
         } catch let error as IggyError {
             if error.code == .notPrimary {
+                // A fetch names several partitions and the refusal
+                // does not name the one that moved, so its caller looks up
+                // every route again.
+                guard request.code != .fetchMessages else {
+                    throw error
+                }
                 markNotPrimary(route, partitionID: request.key.partitionID)
                 throw ClientCore.graded(error)
             }
@@ -393,17 +751,28 @@ final class PollRouter: Sendable {
     ) async throws -> [UInt8] {
         var replay = Replay()
         return try await exchange(
-            onReplica: replica, code: code, payload: payload, context: context, identity: identity, lineage: lineage, fence: fence,
+            onReplica: replica, code: code, body: .fixed(payload), context: context, identity: identity, lineage: lineage, fence: fence,
             coordinator: coordinator, deadline: deadline, dialDeadline: dialDeadline, replay: &replay)
     }
 
     private func exchange(
-        onReplica replica: UInt8, code: UInt32, payload: [UInt8], context: PartitionContext, identity: Responses.SessionIdentity, lineage: UInt64,
+        onReplica replica: UInt8, code: UInt32, body: Body, context: PartitionContext, identity: Responses.SessionIdentity, lineage: UInt64,
         fence: UInt128Value, coordinator: ClientCore, deadline: ContinuousClock.Instant, dialDeadline: ContinuousClock.Instant, replay: inout Replay
     ) async throws -> [UInt8] {
         let endpoint = try await endpoint(of: replica, lineage: lineage, coordinator: coordinator, deadline: deadline)
-        let slot = try slot(fence: fence, at: endpoint)
-        try await slot.lock.lock()
+        return try await exchange(
+            at: endpoint, code: code, body: body, context: context, identity: identity, lineage: lineage, fence: fence, coordinator: coordinator,
+            deadline: deadline, dialDeadline: dialDeadline, replay: &replay)
+    }
+
+    private func exchange(
+        at endpoint: String, code: UInt32, body: Body, context: PartitionContext, identity: Responses.SessionIdentity, lineage: UInt64,
+        fence: UInt128Value, coordinator: ClientCore, deadline: ContinuousClock.Instant, dialDeadline: ContinuousClock.Instant, replay: inout Replay
+    ) async throws -> [UInt8] {
+        let slot = try slot(fence: fence, at: endpoint, deferred: body.isDeferred)
+        if !body.isDeferred {
+            try await slot.lock.lock()
+        }
         defer { slot.lock.unlock() }
 
         var data = slot.connection.withLockedValue { $0 }
@@ -415,7 +784,7 @@ final class PollRouter: Sendable {
             do {
                 dialed = try await coordinator.dial(endpoint, deadline: dialDeadline)
             } catch let error as IggyError where error.isReconnectable {
-                throw IggyError(.transientNotAccepted, context: "cannot reach replica \(replica) at \(endpoint): \(error)")
+                throw IggyError(.transientNotAccepted, context: "cannot reach \(endpoint): \(error)")
             }
             guard let dialed else {
                 throw UnsentRequest(refusal: IggyError(.transientNotAccepted, context: "the budget ran out before \(endpoint) was dialed"))
@@ -445,16 +814,22 @@ final class PollRouter: Sendable {
         }
 
         do {
-            let body = try await exchange(
-                on: data.connection, code: code, payload: payload, context: context, identity: identity, lineage: lineage, coordinator: coordinator,
+            let reply = try await exchange(
+                on: data.connection, code: code, body: body, context: context, identity: identity, lineage: lineage, coordinator: coordinator,
                 deadline: deadline, replay: &replay)
             data.usable = true
             slot.connection.withLockedValue { $0 = data }
-            return body
+            return reply
         } catch let unsent as UnsentRequest {
             data.usable = true
             slot.connection.withLockedValue { $0 = data }
             throw unsent
+        } catch let cancelled as CancellationError where body.isDeferred {
+            // The cancellation followed the request, and the connection drops
+            // a reply that still arrives.
+            data.usable = true
+            slot.connection.withLockedValue { $0 = data }
+            throw cancelled
         } catch let error as IggyError {
             data.usable = !error.isReconnectable
             if error.code == .transientNotAccepted {
@@ -504,7 +879,7 @@ final class PollRouter: Sendable {
             bindSecret: await coordinator.bindSecret)
         var replay = Replay()
         let body = try await exchange(
-            on: connection, code: CommandCode.bindSession.rawValue, payload: payload, context: .empty, identity: identity, lineage: lineage,
+            on: connection, code: CommandCode.bindSession.rawValue, body: .fixed(payload), context: .empty, identity: identity, lineage: lineage,
             coordinator: coordinator, deadline: deadline, replay: &replay)
         let bound = try Responses.loginRegister(body[...])
         if bound.session == 0 {
@@ -524,11 +899,13 @@ final class PollRouter: Sendable {
     /// attempt or `deadline` passes: the server answers the replay from its
     /// reply cache if the write committed. The retained frame also survives a
     /// route refresh or a lost connection, while the same session is bound.
+    /// A deferred request waits until `deadline`, which its own request
+    /// timeout set.
     private func exchange(
-        on connection: any IggyConnection, code: UInt32, payload: [UInt8], context: PartitionContext, identity: Responses.SessionIdentity,
+        on connection: any IggyConnection, code: UInt32, body: Body, context: PartitionContext, identity: Responses.SessionIdentity,
         lineage: UInt64, coordinator: ClientCore, deadline: ContinuousClock.Instant, replay: inout Replay
     ) async throws -> [UInt8] {
-        let replayDeadline = min(deadline, .now + coordinator.configuration.requestTimeout)
+        let replayDeadline = body.isDeferred ? deadline : min(deadline, .now + coordinator.configuration.requestTimeout)
         guard replayDeadline > .now else {
             throw UnsentRequest(refusal: IggyError(.transientNotAccepted, context: "the budget ran out before command \(code) was sent"))
         }
@@ -540,7 +917,7 @@ final class PollRouter: Sendable {
             request = retained
         } else {
             do {
-                request = try await coordinator.stampRequest(code: code, payload: payload, context: context, for: identity, lineage: lineage)
+                request = try await coordinator.stampRequest(code: code, payload: try body.payload(), context: context, for: identity, lineage: lineage)
             } catch let refusal as IggyError where refusal.code == .transientNotAccepted || refusal.code == .unauthenticated {
                 throw UnsentRequest(refusal: refusal)
             }
@@ -552,8 +929,17 @@ final class PollRouter: Sendable {
         while true {
             let raw: RawFrame
             do {
-                raw = try await connection.exchange(request.bytes, timeout: replayDeadline - .now)
-            } catch let lost as IggyError where replay.outcome.isUncertain {
+                body.fetchAttempt?.sent()
+                raw = try await connection.exchange(
+                    request.bytes, timeout: replayDeadline - .now,
+                    cancellation: request.deferredCancellation.map { DeferredCancellation(frame: $0, isAnswered: body.commits) })
+            } catch let lost as IggyError {
+                if lost.code == .notConnected || lost.code == .cannotEstablishConnection {
+                    body.fetchAttempt?.refused()
+                }
+                guard replay.outcome.isUncertain else {
+                    throw lost
+                }
                 // A replay that found the connection closed wrote nothing, but
                 // `notConnected` would route the write again under a new id.
                 throw IggyError(.disconnected, context: "an earlier attempt may have committed, then: \(lost)")
@@ -571,6 +957,15 @@ final class PollRouter: Sendable {
                 }
                 answer = IggyError(.transientNotCommitted, context: "the reply does not prove the earlier attempt committed")
             } catch let refusal as IggyError {
+                if VSRFrame.peekCommand(header) == .reply, VSRFrame.readReplyStatus(header) == refusal.rawCode,
+                    CommitErrorScope.request.provesNothingStored(refusal.code)
+                {
+                    body.fetchAttempt?.refused()
+                }
+                if body.commits, refusal.code == .transientNotAccepted, Task.isCancelled {
+                    // The cancellation won, so the server stored nothing.
+                    throw CancellationError()
+                }
                 if VSRFrame.peekCommand(header) == .eviction, refusal.code == .staleClient {
                     // As on the coordinator, a stale client eviction ends only
                     // the binding of the connection, so the request is lost with
@@ -585,6 +980,11 @@ final class PollRouter: Sendable {
                 }
                 answer = refusal
             }
+            coordinator.logger.debug(
+                "The data connection refused the request",
+                metadata: [
+                    "code": "\(code)", "request_id": "\(request.requestID)", "error": "\(answer)", "metadata_watermark": "\(identity.metadataWatermark)",
+                ])
             if answer.code == .notPrimary, !VSRFrame.hasCommittedResult(header) {
                 throw answer
             }
@@ -817,14 +1217,31 @@ final class PollRouter: Sendable {
         }
     }
 
-    /// The slot of the data connection to `endpoint`. A session replaced
+    /// The slot of the data connection to `endpoint`. A deferred request gets
+    /// a free one of its own, already locked for it. A session replaced
     /// since `fence` throws ``UnsentRequest``, since nothing was written.
-    private func slot(fence: UInt128Value, at endpoint: String) throws -> Slot {
+    private func slot(fence: UInt128Value, at endpoint: String, deferred: Bool) throws -> Slot {
         try state.withLockedValue { state in
             do {
                 try Self.checkFence(fence, in: state)
             } catch let refusal as IggyError {
                 throw UnsentRequest(refusal: refusal)
+            }
+            if deferred {
+                if let free = state.deferredSlots[endpoint]?.first(where: { $0.lock.tryLock() }) {
+                    return free
+                }
+                // The leases keep at most `maxDeferredRequests` in flight, so
+                // full pools hold an idle slot at another endpoint. Dropping
+                // it closes its connection, which keeps the open connections
+                // within the same bound.
+                if state.deferredSlots.values.reduce(0, { $0 + $1.count }) >= Self.maxDeferredRequests {
+                    Self.dropIdleDeferredSlot(in: &state)
+                }
+                let slot = Slot()
+                _ = slot.lock.tryLock()
+                state.deferredSlots[endpoint, default: []].append(slot)
+                return slot
             }
             if let slot = state.slots[endpoint] {
                 return slot
@@ -838,16 +1255,122 @@ final class PollRouter: Sendable {
         }
     }
 
+    private static func dropIdleDeferredSlot(in state: inout State) {
+        for (endpoint, pool) in state.deferredSlots {
+            if let idle = pool.firstIndex(where: { $0.lock.tryLock() }) {
+                state.deferredSlots[endpoint]?.remove(at: idle)
+                return
+            }
+        }
+    }
+
     private func removeRoute(_ key: RouteKey) {
         _ = state.withLockedValue { $0.routes.removeValue(forKey: key) }
     }
 
     private func markNotPrimary(_ route: Route, partitionID: UInt32) {
         state.withLockedValue { state in
-            for key in state.routes.keys where key.partitionID == partitionID && state.routes[key]?.context.incarnation == route.context.incarnation {
+            for key in Self.aliases(of: route, partitionID: partitionID, in: state) {
                 let floor = max(state.routes[key]?.minimumView ?? 0, route.view == .max ? .max : route.view + 1)
                 state.routes[key]?.minimumView = floor
                 state.routes[key]?.askFirst = route.primaryReplica
+            }
+        }
+    }
+
+    /// Drops the routes of `keys`, whose contexts a fetch found out of date,
+    /// so the next request looks each of them up again.
+    func dropRoutes(_ keys: [RouteKey]) {
+        keys.forEach(removeRoute)
+    }
+
+    /// Marks the routes of `keys` stale after a primary answered a wait or a
+    /// fetch that it is not the primary of one of them, as `may_have_moved`
+    /// in the Rust SDK. A refusal of a whole request does not name that
+    /// partition, so every view floor stays, and each next lookup asks the
+    /// primary of its route first.
+    func mayHaveMoved(_ keys: [RouteKey]) {
+        state.withLockedValue { state in
+            for key in keys {
+                guard let route = state.routes[key] else {
+                    continue
+                }
+                for alias in Self.aliases(of: route, partitionID: key.partitionID, in: state) {
+                    state.routes[alias]?.askFirst = route.primaryReplica
+                }
+            }
+        }
+    }
+
+    /// Every spelling of the partition history that `route` belongs to.
+    private static func aliases(of route: Route, partitionID: UInt32, in state: State) -> [RouteKey] {
+        state.routes.keys.filter { $0.partitionID == partitionID && state.routes[$0]?.context.incarnation == route.context.incarnation }
+    }
+
+    /// `partitions` grouped by the replica that is their primary, in replica
+    /// order, as `readiness_groups` in the Rust SDK: each group keeps the
+    /// order of `partitions` and is split into groups of at most the
+    /// partitions one request names. On a single node they form one group.
+    func primaryGroups(
+        stream: Identifier, topic: Identifier, partitions: [UInt32], lineage: UInt64, coordinator: ClientCore, deadline: ContinuousClock.Instant
+    ) async throws -> [[UInt32]] {
+        let groups = try await retryingLookups(lineage: lineage, coordinator: coordinator, deadline: deadline) { clustered in
+            var groups: [UInt8: [UInt32]] = [:]
+            for partition in partitions {
+                let key = RouteKey(stream: stream, topic: topic, partitionID: partition)
+                let route = try await route(key, clustered: clustered, lineage: lineage, coordinator: coordinator, deadline: deadline)
+                groups[route.primaryReplica, default: []].append(partition)
+            }
+            return groups
+        }
+        return groups.sorted { $0.key < $1.key }.flatMap { group in
+            stride(from: 0, to: group.value.count, by: Requests.maxPartitionsPerRequest).map {
+                Array(group.value[$0..<min($0 + Requests.maxPartitionsPerRequest, group.value.count)])
+            }
+        }
+    }
+
+    /// The fence of each fetch target: the context it carries, where one
+    /// without an incarnation takes the incarnation of its route, as
+    /// `fence_targets` in the Rust SDK fills it.
+    func fences(
+        _ targets: [(key: RouteKey, context: PartitionContext?)], lineage: UInt64, coordinator: ClientCore, deadline: ContinuousClock.Instant
+    ) async throws -> [PartitionContext] {
+        try await retryingLookups(lineage: lineage, coordinator: coordinator, deadline: deadline) { clustered in
+            var fences: [PartitionContext] = []
+            fences.reserveCapacity(targets.count)
+            for target in targets {
+                let fence = target.context ?? .empty
+                guard fence.incarnation == 0 else {
+                    fences.append(fence)
+                    continue
+                }
+                let route = try await route(target.key, clustered: clustered, lineage: lineage, coordinator: coordinator, deadline: deadline)
+                guard route.context.incarnation != 0 else {
+                    throw IggyError(.transientNotAccepted, context: "the route has no partition incarnation")
+                }
+                fences.append(PartitionContext(incarnation: route.context.incarnation, ownerGeneration: fence.ownerGeneration, metadataOp: fence.metadataOp))
+            }
+            return fences
+        }
+    }
+
+    /// Runs route lookups, one by one, as the lockstep connections they take
+    /// would queue them anyway. A lookup refused, answered "not primary" or
+    /// lost with its connection runs them again until `deadline`, as
+    /// `retries_lookup` in the Rust SDK allows.
+    private func retryingLookups<Value>(
+        lineage: UInt64, coordinator: ClientCore, deadline: ContinuousClock.Instant, _ lookUps: (_ clustered: Bool) async throws -> Value
+    ) async throws -> Value {
+        let clustered = try await isClustered(coordinator, lineage: lineage, deadline: deadline)
+        var backoff = Backoff()
+        while true {
+            do {
+                return try await lookUps(clustered)
+            } catch let error as IggyError
+                where [.transientNotAccepted, .notPrimary, .disconnected, .emptyResponse, .notConnected].contains(error.code)
+            {
+                try await backoff.pause(after: IggyError(.transientNotAccepted, context: "\(error)"), before: deadline)
             }
         }
     }

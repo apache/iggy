@@ -190,11 +190,13 @@ async fn given_runtime_knobs_when_creating_topic_should_persist_them_per_topic(
         .poll_messages(
             &stream,
             &topic,
-            Some(0),
+            0,
             &Consumer::new(Identifier::numeric(1).unwrap()),
             &PollingStrategy::offset(0),
-            10,
-            false,
+            PollOptions {
+                count: 10,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();

@@ -16,9 +16,8 @@
 // under the License.
 
 using System.Runtime.CompilerServices;
-using System.Threading.Channels;
-using Apache.Iggy.Contracts;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
 using Microsoft.Extensions.Logging;
 
@@ -31,9 +30,6 @@ namespace Apache.Iggy.Consumers;
 /// <typeparam name="T">The type to deserialize message payloads to</typeparam>
 public class IggyConsumer<T> : IggyConsumer
 {
-    private readonly Channel<ReceivedMessage<T>> _deserializedChannel =
-        Channel.CreateUnbounded<ReceivedMessage<T>>();
-
     private readonly IggyConsumerConfig<T> _typedConfig;
     private readonly ILogger<IggyConsumer<T>> _typedLogger;
 
@@ -51,106 +47,50 @@ public class IggyConsumer<T> : IggyConsumer
     }
 
     /// <summary>
-    ///     Receives and deserializes messages via the rented poll path. Each polled batch is deserialized
-    ///     in full before any message is yielded — the rented buffer is returned immediately after
-    ///     deserialization, independently of how fast the caller iterates. The caller does not need to
-    ///     dispose anything. The stream ends once the consumer is disposed.
+    ///     Receives and deserializes messages one at a time, as <see cref="IggyConsumer.ReceiveAsync" /> receives them.
+    ///     A payload that does not deserialize comes with <see cref="MessageStatus.DeserializationFailed" /> and its
+    ///     error.
     /// </summary>
-    /// <param name="ct">Cancellation token.</param>
-    /// <returns>Async enumerable of deserialized messages with status.</returns>
+    /// <param name="ct">Cancellation token to stop receiving messages</param>
+    /// <exception cref="ConsumerNotInitializedException">Thrown when InitAsync has not been called</exception>
     public async IAsyncEnumerable<ReceivedMessage<T>> ReceiveDeserializedAsync(
         [EnumeratorCancellation] CancellationToken ct = default)
     {
-        if (IsDisposed)
+        await foreach (var received in ReceiveAsync(ct))
         {
-            yield break;
-        }
-        if (!IsInitialized)
-        {
-            throw new ConsumerNotInitializedException();
-        }
-
-        do
-        {
-            if (!_deserializedChannel.Reader.TryRead(out ReceivedMessage<T>? message))
-            {
-                await PollRentedMessagesCoreAsync(ct);
-                continue;
-            }
-
-            if (!BeginDelivery(message.Header.Offset, message.PartitionId, message.Context))
-            {
-                yield break;
-            }
-            yield return message;
-
-            if (_typedConfig.AutoCommitMode == AutoCommitMode.AfterReceive)
-            {
-                await CommitDeliveredAsync(message.Header.Offset, message.PartitionId, message.Context, ct);
-            }
-        } while (!ct.IsCancellationRequested && !IsDisposed);
-    }
-
-    private protected override void CompleteReceiveChannels()
-    {
-        base.CompleteReceiveChannels();
-        _deserializedChannel.Writer.TryComplete();
-        while (_deserializedChannel.Reader.TryRead(out _)) { }
-    }
-
-    /// <summary>
-    ///     Overrides the base batch-publishing step: instead of routing rented messages through the base
-    ///     class channel, deserializes the entire batch immediately (releasing all rented buffer refs via
-    ///     <see cref="IDisposable.Dispose" />) and writes the deserialized results to
-    ///     <see cref="_deserializedChannel" />. Auto-commit is also handled here since the base-class
-    ///     yield path is bypassed.
-    /// </summary>
-    protected override async Task PublishRentedAsync(RentedBatchHandle rental, RentedMessageResponse message,
-        uint partitionId, MessageStatus status,
-        Exception? error, CancellationToken ct)
-    {
-        T? data = default;
-        var deserError = status != MessageStatus.Success ? error : null;
-        var msgStatus = status;
-
-        if (status == MessageStatus.Success)
-        {
+            T? data = default;
+            Dictionary<HeaderKey, HeaderValue>? headers = null;
+            var status = MessageStatus.Success;
+            Exception? error = null;
             try
             {
-                data = Deserialize(message.Payload);
+                data = Deserialize(received.Message.Payload);
+                headers = received.Message.UserHeaders;
             }
-            catch (Exception ex)
+            catch (Exception exception)
             {
-                _typedLogger.LogError(ex, "Failed to deserialize message at offset {Offset}",
-                    message.Header.Offset);
-                msgStatus = MessageStatus.DeserializationFailed;
-                deserError = ex;
+                _typedLogger.LogError(exception, "Failed to deserialize message at offset {Offset}",
+                    received.Message.Header.Offset);
+                status = MessageStatus.DeserializationFailed;
+                error = exception;
             }
+
+            yield return new ReceivedMessage<T>
+            {
+                Data = data,
+                Header = received.Message.Header,
+                UserHeaders = headers,
+                CurrentOffset = received.CurrentOffset,
+                PartitionId = received.PartitionId,
+                Context = received.Context,
+                Checkpoint = received.Checkpoint,
+                Status = status,
+                Error = error
+            };
         }
-
-        var deserialized = new ReceivedMessage<T>
-        {
-            Data = data,
-            Header = message.Header,
-            UserHeaders = message.UserHeaders,
-            CurrentOffset = message.Header.Offset,
-            PartitionId = partitionId,
-            Context = rental.Context,
-            Status = msgStatus,
-            Error = deserError
-        };
-
-        await _deserializedChannel.Writer.WriteAsync(deserialized, ct);
-
-        rental.Release();
     }
 
-    /// <summary>
-    ///     Deserializes a message payload from a span using the configured deserializer. Zero-copy when the
-    ///     deserializer overrides the span overload; otherwise falls back to a one-time array copy.
-    /// </summary>
-    /// <param name="payload">The payload memory to deserialize.</param>
-    /// <returns>The deserialized object of type T.</returns>
+    /// <summary>Deserializes a payload with the deserializer of the configuration.</summary>
     public T Deserialize(ReadOnlyMemory<byte> payload)
     {
         return _typedConfig.Deserializer.Deserialize(payload);

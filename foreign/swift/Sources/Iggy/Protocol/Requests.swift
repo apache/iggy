@@ -164,14 +164,61 @@ enum Requests {
 
     // MARK: Messages
 
+    /// `MAX_PARTITIONS_PER_REQUEST`: the most partitions one fetch names.
+    static let maxPartitionsPerRequest = 1000
+
+    /// A poll, and with `options` a deferred poll (command 106): the same
+    /// body followed by its options.
     static func pollMessages(
-        consumer: Consumer, streamID: Identifier, topicID: Identifier, partitionID: UInt32?, strategy: PollingStrategy, count: UInt32, autoCommit: Bool
+        consumer: Consumer, streamID: Identifier, topicID: Identifier, partitionID: UInt32?, strategy: PollingStrategy, count: UInt32, autoCommit: Bool,
+        options: DeferredPollOptions? = nil
     ) throws -> [UInt8] {
         var writer = ByteWriter()
         try consumerTarget(consumer, streamID, topicID, partitionID, into: &writer)
         strategy.encode(into: &writer)
         writer.write(count)
         writer.write(autoCommit)
+        try options?.encode(into: &writer)
+        return writer.bytes
+    }
+
+    /// One target of a fetch: where its read starts, the bytes it may fill,
+    /// and the fence of the partition history it reads.
+    struct FetchTarget: Sendable, Hashable {
+        let partitionID: UInt32
+        let strategy: PollingStrategy
+        let maxBytes: UInt32
+        let fence: PartitionContext
+    }
+
+    /// `[consumer][stream][topic][wait_us:8][request_timeout_us:8][min_count:4][count:4][max_bytes:4][auto_commit:1][targets_count:4]`,
+    /// then per target `[partition_id:4][strategy:9][max_bytes:4][incarnation:8][owner_generation:8]`.
+    static func fetchMessages(
+        consumer: Consumer, streamID: Identifier, topicID: Identifier, targets: [FetchTarget], count: UInt32, autoCommit: Bool,
+        options: DeferredPollOptions
+    ) throws -> [UInt8] {
+        guard let targetsCount = UInt32(exactly: targets.count) else {
+            throw IggyError(.invalidCommand, context: "a fetch cannot name \(targets.count) partitions")
+        }
+        var writer = ByteWriter()
+        try consumer.encode(into: &writer)
+        try streamID.encode(into: &writer)
+        try topicID.encode(into: &writer)
+        let (wait, timeout) = try options.fetchWireBudget()
+        writer.write(wait)
+        writer.write(timeout)
+        writer.write(options.minCount)
+        writer.write(count)
+        writer.write(options.maxBytes)
+        writer.write(autoCommit)
+        writer.write(targetsCount)
+        for target in targets {
+            writer.write(target.partitionID)
+            target.strategy.encode(into: &writer)
+            writer.write(target.maxBytes)
+            writer.write(target.fence.incarnation)
+            writer.write(target.fence.ownerGeneration)
+        }
         return writer.bytes
     }
 
@@ -368,6 +415,42 @@ enum Requests {
 
     static func describeOptions(scope: OptionsScope) -> [UInt8] {
         [scope.rawValue]
+    }
+
+    /// `[start:u8][cursor:44][has_since:u8][since:u64][has_until:u8][until:u64][limit:u32][groups_count:u8][group:u8]*[token_len:u16][token]`.
+    /// The cursor is all zero unless the read starts after it, and groups
+    /// travel in the caller's order, at most 255 of them as in the Rust encoder.
+    static func getMetadataChanges(_ query: MetadataChangesQuery) -> [UInt8] {
+        var groups = query.groups
+        if groups.count > Int(UInt8.max) {
+            var seen = Set<MetadataChangeGroup>()
+            groups = groups.filter { seen.insert($0).inserted }
+        }
+        var token: [UInt8] = []
+        if case .current(let pageToken?) = query.start {
+            token = pageToken.encoded()
+        }
+        var writer = ByteWriter(capacity: 1 + MetadataChangeCursor.encodedSize + 9 + 9 + 4 + 1 + groups.count + 2 + token.count)
+        writer.write(query.start.code)
+        if case .after(let cursor) = query.start {
+            cursor.encode(into: &writer)
+        } else {
+            writer.writeZeros(MetadataChangeCursor.encodedSize)
+        }
+        for bound in [query.since, query.until] {
+            writer.write(bound != nil)
+            if let bound {
+                writer.write(bound.microseconds)
+            }
+        }
+        writer.write(query.limit)
+        writer.write(UInt8(groups.count))
+        for group in groups {
+            writer.write(group.rawValue)
+        }
+        writer.write(UInt16(token.count))
+        writer.write(token)
+        return writer.bytes
     }
 }
 

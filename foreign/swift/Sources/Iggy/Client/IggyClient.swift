@@ -47,8 +47,12 @@ import Logging
 /// replicated write whose outcome is unknown fails with
 /// ``IggyErrorCode/transientNotCommitted``. The other SDKs keep such
 /// a write in a retained-operation registry and fail it with
-/// ``IggyErrorCode/operationUncertain``. This SDK has no such registry, so
-/// it keeps `transientNotCommitted`.
+/// ``IggyErrorCode/operationUncertain``. This SDK does not retain replicated
+/// writes, so it keeps `transientNotCommitted` for them. A read with
+/// ``CommitPolicy/onRead`` that lost its reply fails with
+/// ``IggyErrorCode/fetchProgressUncertain`` and blocks the progress of its
+/// partitions until ``abandonOperation(_:)``. A ``PartitionReader`` repairs
+/// such a read by itself.
 ///
 /// A request that was not sent before its deadline fails with
 /// ``IggyErrorCode/transientNotAccepted``, and a retry can succeed. A call
@@ -179,6 +183,17 @@ public final class IggyClient: Sendable {
         try await core.logout()
     }
 
+    /// Lifts the block that a committing poll or fetch with an unknown
+    /// outcome left on its partitions, and accepts that outcome as unknown.
+    /// It sends nothing and does not read the poll again. Pass the
+    /// `operationID` of ``IggyErrorCode/fetchProgressUncertain`` or
+    /// ``IggyErrorCode/partitionLaneBlocked``. A poll with `next` then reads
+    /// on from whatever the server stored. An operation the client does not
+    /// block under fails with ``IggyErrorCode/operationNotRetained``.
+    public func abandonOperation(_ operationID: UInt128Value) throws {
+        try core.pollRouter.abandonFetch(operationID)
+    }
+
     // MARK: Raw requests
 
     /// Sends a command code with an already-encoded payload and returns the
@@ -193,22 +208,60 @@ public final class IggyClient: Sendable {
     /// `GetConsumerOffset`, `StoreConsumerOffset`, and `DeleteConsumerOffset`
     /// take the route of
     /// ``sendMessages(streamID:topicID:partitioning:messages:)``,
-    /// ``pollMessages(streamID:topicID:partitionID:consumer:strategy:count:autoCommit:)``,
+    /// ``pollMessages(streamID:topicID:partitionID:consumer:strategy:options:)``,
     /// and the offset calls. A raw send with balanced or key partitioning
     /// fails with ``IggyErrorCode/featureUnavailable``. A group poll, a store,
     /// or a delete that names no partition fails with
     /// ``IggyErrorCode/invalidIdentifier``, and a partition payload that does
     /// not decode fails with ``IggyErrorCode/invalidCommand``. Each fails
-    /// before anything is sent.
+    /// before anything is sent. A deferred poll (106) takes the route of a
+    /// poll, and a fetch (109) the route of its first target, with the fences
+    /// and target limits of its payload.
+    /// Options or targets the wire refuses fail with
+    /// ``IggyErrorCode/invalidCommand``, and so does a cancellation (108):
+    /// cancel the task of the deferred request instead.
     public func sendRawRequest(code: UInt32, payload: [UInt8]) async throws -> [UInt8] {
         guard !CommandCode.isSessionControl(code) else {
             throw IggyError(.invalidCommand, context: "code \(code) controls the session; use login and logout")
+        }
+        // A cancellation names a parked request by its id, and the server
+        // answers none, so a raw one could only wait for its deadline.
+        guard code != CommandCode.cancelDeferredRequest.rawValue else {
+            throw IggyError(.invalidCommand, context: "command \(code) cancels a deferred request; cancel the task of that request instead")
         }
         let lineage = await core.lineage
         if let routed = try await sendRawPartitionRequest(code: code, payload: payload, lineage: lineage) {
             return routed
         }
         return try await core.exchange(code: code, payload: payload, lineage: lineage)
+    }
+
+    /// Sends a command code with an already-encoded payload to the replica
+    /// with id `replica`, as the cluster roster names it, and returns its raw
+    /// reply body. Every node answers non-replicated commands such as
+    /// `GetStats` from its own state, so this reads the state of the chosen
+    /// node. The request carries the session's metadata watermark, so the
+    /// replica answers once it applied the metadata this client saw.
+    ///
+    /// Replicated commands, `PollMessages`, `GetConsumerOffset`, the deferred
+    /// commands 106 to 108, and session-control codes fail with
+    /// ``IggyErrorCode/invalidCommand`` before anything is sent. A
+    /// replica the roster does not list after one more roster read fails with
+    /// ``IggyErrorCode/invalidIdentifier``. A replica that cannot be reached,
+    /// or that answers ``IggyErrorCode/transientNotAccepted``, is asked again
+    /// until the request timeout. Any other refusal,
+    /// ``IggyErrorCode/notPrimary`` included, is returned and never sent to
+    /// another replica.
+    public func sendRawRequest(code: UInt32, payload: [UInt8], replica: UInt8) async throws -> [UInt8] {
+        guard !CommandCode.isSessionControl(code), !CommandCode.isDeferred(code), code != CommandCode.cancelDeferredRequest.rawValue,
+            code != CommandCode.pollMessages.rawValue, code != CommandCode.getConsumerOffset.rawValue, ConsensusOperation.forCode(code) == .nonReplicated
+        else {
+            throw IggyError(.invalidCommand, context: "command \(code) cannot be sent to a chosen replica")
+        }
+        let lineage = try await requireAuthenticated()
+        return try await core.pollRouter.sendToReplica(
+            replica, code: code, payload: payload, lineage: lineage, coordinator: core,
+            deadline: ContinuousClock.now + core.configuration.requestTimeout)
     }
 
     // MARK: Internals shared by the domain extensions
@@ -220,14 +273,17 @@ public final class IggyClient: Sendable {
     }
 
     /// Fails unless the client is signed in, and returns the lineage the
-    /// call started under, which every request of the call carries.
-    func requireAuthenticated() async throws -> UInt64 {
-        try await core.requireAuthenticated()
+    /// call started under, which every request of the call carries. A
+    /// reconnect on the way ends by `limit` if it comes before the request
+    /// timeout.
+    func requireAuthenticated(within limit: ContinuousClock.Instant? = nil) async throws -> UInt64 {
+        try await core.requireAuthenticated(within: limit)
     }
 
-    /// As ``requireAuthenticated()`` for a call pinned to `captured`, such as
-    /// a producer send: once the caller signed in or out since, the call is
-    /// refused as unauthenticated before anything of it is written.
+    /// As ``requireAuthenticated(within:)`` for a call pinned to
+    /// `captured`, such as a producer send: once the caller signed in or out
+    /// since, the call is refused as unauthenticated before anything of it is
+    /// written.
     func requireAuthenticated(under captured: UInt64?) async throws -> UInt64 {
         let started = try await requireAuthenticated()
         guard let captured else {
@@ -237,6 +293,11 @@ public final class IggyClient: Sendable {
             throw refusal
         }
         return captured
+    }
+
+    /// Whether the client comes back on its own after an outage.
+    var canRecover: Bool {
+        get async { await core.canRecover }
     }
 
     /// The lineage a call that starts now runs under.
@@ -288,6 +349,23 @@ extension IggyClient {
     public func describeOptions(scope: OptionsScope) async throws -> [OptionSpec] {
         let lineage = try await requireAuthenticated()
         return try Responses.optionSpecs(try await send(.describeOptions, Requests.describeOptions(scope: scope), lineage: lineage)[...])
+    }
+
+    /// Reads one page of the metadata change log or of the current state.
+    ///
+    /// The node records one change per public result of a committed metadata
+    /// operation, such as a stream created, a topic renamed, a user's
+    /// permissions changed, or a session closed. A mirror keeps a cursor,
+    /// reads the records after it, and stores the returned
+    /// ``MetadataChanges/next``. Records carry options as the read routes
+    /// return them and never key material. Needs root or the global
+    /// `manageServers` permission, and fails with
+    /// ``IggyErrorCode/unauthorized`` otherwise. An invalid query fails with
+    /// ``IggyErrorCode/invalidCommand`` before anything is sent.
+    public func getMetadataChanges(_ query: MetadataChangesQuery = MetadataChangesQuery()) async throws -> MetadataChanges {
+        let lineage = try await requireAuthenticated()
+        try query.validate()
+        return try Responses.metadataChanges(try await send(.getMetadataChanges, Requests.getMetadataChanges(query), lineage: lineage)[...])
     }
 
     /// Captures a snapshot archive of the server state.

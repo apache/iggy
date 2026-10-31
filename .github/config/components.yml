@@ -110,6 +110,7 @@ components:
     paths:
       - "core/binary_protocol/**"
       - "core/consensus/**"
+      - ".config/nextest.toml"
     tasks:
       - "miri"
 
@@ -144,7 +145,7 @@ components:
   # existing deployments, which no other check covers. Matching is literal
   # glob with no crate-graph expansion, so every crate has to be spelled out:
   # `core/server/**` does not cover `core/server_common/**`.
-  # `breaking:storage` on the PR skips it (see .github/workflows/_rust.yml).
+  # `breaking:storage` or `breaking:protocol` on the PR skips it (see .github/workflows/_rust.yml).
   rust-storage-compat:
     depends_on:
       - "rust-workspace"
@@ -183,6 +184,16 @@ components:
     paths:
       - "core/simulator/**"
 
+  # Runtime-free Kafka wire layer the gateway consumes. Listed on its own so a
+  # change confined to the crate still starts the Rust jobs and reruns the
+  # gateway, which no gateways/** glob would otherwise catch.
+  rust-kafka-wire:
+    depends_on:
+      - "rust-workspace"
+      - "rust-common" # the record codec maps onto iggy_common message types
+    paths:
+      - "core/kafka_wire/**"
+
   # Main Rust workspace testing
   rust:
     depends_on:
@@ -194,6 +205,7 @@ components:
       - "rust-server"
       - "rust-cluster"
       - "rust-simulator"
+      - "rust-kafka-wire"
       - "rust-tools"
       - "rust-cli"
       - "rust-bench"
@@ -204,7 +216,7 @@ components:
       - "ci-infrastructure"
     paths:
       - "Dockerfile*"
-      - ".config/**" # nextest + cargo-rail config, read only by the test-* tasks
+      - ".config/**" # nextest and cargo-rail configuration
       - "!foreign/**" # Exclude foreign SDKs
       - "!web/**" # Exclude web UI
     tasks:
@@ -391,6 +403,7 @@ components:
     paths:
       - "bdd/php/**"
       - "bdd/scenarios/basic_messaging.feature"
+      - "bdd/scenarios/deferred_polling.feature"
     tasks: ["bdd-php"]
 
   bdd-go:
@@ -455,6 +468,17 @@ components:
       - "bdd/cpp/**"
       - "bdd/scenarios/**"
     tasks: ["bdd-cpp"]
+
+  bdd-swift:
+    depends_on:
+      - "rust-server"
+      - "sdk-swift"
+      - "bdd-infrastructure"
+      - "ci-infrastructure"
+    paths:
+      - "bdd/swift/**"
+      - "bdd/scenarios/deferred_polling.feature"
+    tasks: ["bdd-swift"]
 
   examples-rust:
     depends_on:
@@ -579,6 +603,7 @@ components:
   rust-gateway:
     depends_on:
       - "rust-sdk"
+      - "rust-kafka-wire"
       - "rust-workspace"
       - "ci-infrastructure"
     paths:

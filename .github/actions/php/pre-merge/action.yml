@@ -109,7 +109,7 @@ runs:
           printf '<?php\n'
           awk 'NF { print "// " $0; next } { print "//" }' ASF_LICENSE.txt
           printf '\n'
-          tail -n +2 "$raw_stubs" | sed -E 's/(public readonly \?string \$[A-Za-z_][A-Za-z0-9_]*) = null;/\1;/'
+          tail -n +2 "$raw_stubs" | sed -E 's/(public readonly [^$]*\$[A-Za-z_][A-Za-z0-9_]*) = null;/\1;/'
         } > foreign/php/iggy-php.stubs.php
         rm -f "$raw_stubs"
         git diff --exit-code -- foreign/php/iggy-php.stubs.php

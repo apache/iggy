@@ -72,11 +72,11 @@ use crate::http::handlers::{
     change_password, create_cg, create_partitions, create_pat, create_stream, create_topic,
     create_user, delete_cg, delete_consumer_offset, delete_partitions, delete_pat, delete_segments,
     delete_stream, delete_topic, delete_user, describe_options, get_cg, get_cgs, get_client,
-    get_clients, get_cluster_metadata, get_consumer_offset, get_pats, get_snapshot, get_stats,
-    get_stream, get_streams, get_topic, get_topics, get_user, get_users, login_user,
-    login_with_personal_access_token, logout_user, ping, poll_messages, refresh_token,
-    send_messages, store_consumer_offset, update_permissions, update_stream, update_topic,
-    update_user,
+    get_clients, get_cluster_metadata, get_consumer_offset, get_metadata_changes, get_pats,
+    get_snapshot, get_stats, get_stream, get_streams, get_topic, get_topics, get_user, get_users,
+    login_user, login_with_personal_access_token, logout_user, ping, poll_messages,
+    poll_messages_committing, poll_messages_deferred, refresh_token, send_messages,
+    store_consumer_offset, update_permissions, update_stream, update_topic, update_user,
 };
 use crate::http::jwt::JwtManager;
 use crate::http::session::RegistrationBarrier;
@@ -412,6 +412,7 @@ fn router(
         .route("/stats", get(get_stats))
         .route("/options/{scope}", get(describe_options))
         .route("/snapshot", post(get_snapshot))
+        .route("/metadata/changes", get(get_metadata_changes))
         .route("/cluster/metadata", get(get_cluster_metadata))
         .route(
             forward::METADATA_FLOOR_PATH,
@@ -479,6 +480,10 @@ fn partition_routes(state: HttpState) -> Router<HttpState> {
         .route(
             "/streams/{stream_id}/topics/{topic_id}/messages",
             post(send_messages).get(poll_messages),
+        )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/messages/deferred",
+            get(poll_messages_deferred).post(poll_messages_committing),
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/consumer-offsets",

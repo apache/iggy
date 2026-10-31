@@ -123,6 +123,11 @@ final class ConsumerGroupState: Sendable {
         }
     }
 
+    /// The assigned partitions, or nil when nothing is cached for the group.
+    func assignedPartitions(_ key: GroupKey) -> [UInt32]? {
+        storage.withLockedValue { $0.assignments[key]?.partitions }
+    }
+
     // MARK: Membership
 
     /// Forgets a group after leaving it.

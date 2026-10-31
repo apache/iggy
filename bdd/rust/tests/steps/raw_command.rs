@@ -26,6 +26,16 @@ pub async fn when_send_raw_command(world: &mut GlobalContext, code: u32) {
     world.last_raw_result = Some(client.send_binary_request(code, Bytes::new()).await);
 }
 
+#[when(regex = r"^I send a raw command with code (\d+) and an empty payload to replica (\d+)$")]
+pub async fn when_send_raw_command_to_replica(world: &mut GlobalContext, code: u32, replica: u8) {
+    let client = world.client.as_ref().expect("Client should be available");
+    world.last_raw_result = Some(
+        client
+            .send_binary_request_to_replica(code, Bytes::new(), replica)
+            .await,
+    );
+}
+
 #[then("the raw command should succeed with an empty response")]
 pub async fn then_raw_command_succeeds_with_empty_response(world: &mut GlobalContext) {
     let response = world
@@ -57,4 +67,15 @@ pub async fn then_raw_command_fails_with_invalid_command_error(world: &mut Globa
         .as_ref()
         .expect_err("Raw command should have failed");
     assert_eq!(*error, IggyError::InvalidCommand);
+}
+
+#[then("the raw command should fail with an invalid identifier error")]
+pub async fn then_raw_command_fails_with_invalid_identifier_error(world: &mut GlobalContext) {
+    let error = world
+        .last_raw_result
+        .as_ref()
+        .expect("Should have sent a raw command")
+        .as_ref()
+        .expect_err("Raw command should have failed");
+    assert_eq!(*error, IggyError::InvalidIdentifier);
 }

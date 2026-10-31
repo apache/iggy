@@ -1220,6 +1220,7 @@ mod tests {
             consumer_group_index: ahash::AHashMap::default(),
             next_consumer_group_id: 0,
             consumer_group_catalog_op: 0,
+            created_op: 0,
         });
         streams.items.insert(stream);
 

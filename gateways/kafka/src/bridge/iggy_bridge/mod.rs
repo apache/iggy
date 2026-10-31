@@ -21,16 +21,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use iggy::prelude::{
-    AutoLogin, Client, Credentials, Identifier, IggyClient, IggyClientBuilder, IggyError,
-    UserClient,
+    AutoLogin, Client, ClusterClient, Credentials, Identifier, IggyClient, IggyClientBuilder,
+    IggyError, UserClient,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, MissedTickBehavior, interval, timeout_at};
 use tracing::{debug, info, warn};
 
 use crate::auth::{AuthError, AuthenticatedPrincipal, PrincipalResolver, resolve_principal};
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
+use crate::bridge::nodes::{KnownNodes, is_unreachable};
 use crate::bridge::topic_map::validate_kafka_topic_name;
 
 mod cluster_id;
@@ -43,7 +44,7 @@ mod topics;
 
 pub use cluster_id::{CLUSTER_ID_TOPIC, ClusterIdCall, cluster_id_stream};
 use fetch::{FetchPool, LazyClient};
-pub(crate) use fetch::{FetchSlot, PartitionProbe, TopicProbe};
+pub(crate) use fetch::{FetchSlot, ONE_MESSAGE_MAX_BYTES, PartitionProbe, TopicProbe};
 use group_index::GroupIndex;
 pub use group_index::{OffsetGroups, ScannedGroups};
 use group_offsets::OffsetPool;
@@ -108,6 +109,9 @@ async fn sign_out_and_shut_down(client: &IggyClient) -> Result<(), BridgeError> 
 
 /// How long a call may hold its slot: the SDK read deadline (30 s) plus a reconnect (15 s).
 const SLOT_LIMIT: Duration = Duration::from_secs(45);
+
+/// How often the bridge reads the roster again, so that new clients dial the current nodes.
+const ROSTER_REFRESH: Duration = Duration::from_mins(1);
 
 /// Runs `call` in a task that holds `slot` until `call` ends, then hands both back. `None` once
 /// `deadline` passes.
@@ -199,13 +203,17 @@ impl IggyBridge {
     /// to a wire response, never panic or unwrap, since an unreachable Iggy backend is an
     /// expected runtime condition, not a bug.
     pub async fn connect(config: IggyBridgeConfig) -> Result<Self, BridgeError> {
-        let client = connect_client(&config).await?;
+        let client = Arc::new(connect_client(&config).await?);
         info!("Iggy bridge connected to {}", config.address);
+        if let Err(error) = learn_roster(&client, &config.nodes).await {
+            warn!(%error, "could not read the Iggy roster; new clients dial only {}", config.address);
+        }
+        refresh_roster_in_background(&client, config.nodes.clone());
         let produce_pool = Arc::new(ProducePool::new(config.produce_sessions));
         produce_pool.sweep_in_background();
 
         Ok(Self {
-            client: Arc::new(client),
+            client,
             config,
             produce_pool,
             fetch_pool: Arc::new(FetchPool::new()),
@@ -250,6 +258,13 @@ impl IggyBridge {
     #[must_use]
     pub(crate) fn aliases_an_override(&self, kafka_topic: &str) -> bool {
         self.config.topic_mapping.aliases_an_override(kafka_topic)
+    }
+
+    /// The nodes of the last roster the bridge read. A SASL login dials them after the configured
+    /// address, as each client of the bridge does.
+    #[must_use]
+    pub fn known_nodes(&self) -> KnownNodes {
+        self.config.nodes.clone()
     }
 
     /// Drops the auto topic creation client without signing it out, so [`Self::close`] does not
@@ -389,6 +404,7 @@ impl IggyBridge {
             max_message_size: crate::bridge::DEFAULT_MAX_MESSAGE_SIZE,
             produce_sessions: crate::bridge::ProduceSessionLimits::default(),
             tls: crate::bridge::IggyTls::default(),
+            nodes: KnownNodes::default(),
         };
         let client = Arc::new(client);
         Self {
@@ -409,20 +425,54 @@ impl IggyBridge {
 }
 
 /// A client for `config`, connected and signed in. See [`IggyBridge::connect`].
+///
+/// Dials `config.address` first, then each node of the last roster, until one answers. A node
+/// that answers and refuses the sign-in ends the dial, since every node would refuse it.
 async fn connect_client(config: &IggyBridgeConfig) -> Result<IggyClient, BridgeError> {
     if config.address.trim().is_empty() {
         return Err(BridgeError::InvalidConfig(
             "Iggy address must not be empty".to_string(),
         ));
     }
+    let mut failure = BridgeError::Iggy(IggyError::CannotEstablishConnection);
+    for address in config.nodes.dial_order(&config.address) {
+        match connect_client_to(config, &address).await {
+            Ok(client) => {
+                config.nodes.mark_reachable(&address);
+                return Ok(client);
+            }
+            Err(error) if out_of_reach(&error) => {
+                warn!(%address, %error, "Iggy node out of reach; dialing the next known node");
+                config.nodes.mark_unreachable(&address);
+                failure = error;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(failure)
+}
 
+/// Whether a dial that ended in `error` can still succeed on another node.
+const fn out_of_reach(error: &BridgeError) -> bool {
+    match error {
+        BridgeError::Timeout => true,
+        BridgeError::Iggy(error) => is_unreachable(error),
+        _ => false,
+    }
+}
+
+/// A client for `config` that dials `address`, connected and signed in.
+async fn connect_client_to(
+    config: &IggyBridgeConfig,
+    address: &str,
+) -> Result<IggyClient, BridgeError> {
     let credentials =
         Credentials::UsernamePassword(config.username.clone(), config.password.clone());
     // A send over the SDK's 8 KiB write buffer leaves as two writes, header then payload. With
     // Nagle on, the payload waits for the server's delayed ACK of the header: about 40 ms a send.
     let mut builder = IggyClientBuilder::new()
         .with_tcp()
-        .with_server_address(config.address.clone())
+        .with_server_address(address.to_owned())
         .with_no_delay()
         .with_auto_sign_in(AutoLogin::Enabled(credentials))
         .with_reconnection_max_retries(Some(RECONNECTION_RETRIES));
@@ -438,6 +488,38 @@ async fn connect_client(config: &IggyBridgeConfig) -> Result<IggyClient, BridgeE
     let client = builder.build().map_err(BridgeError::Iggy)?;
     with_request_timeout(client.connect()).await?;
     Ok(client)
+}
+
+/// Reads the roster through `client` into `nodes`.
+async fn learn_roster(client: &IggyClient, nodes: &KnownNodes) -> Result<(), BridgeError> {
+    let roster = with_request_timeout(client.get_cluster_metadata()).await?;
+    nodes.learn(&roster);
+    Ok(())
+}
+
+/// Reads the roster through `client` every [`ROSTER_REFRESH`], until the bridge drops the client
+/// or shuts it down.
+fn refresh_roster_in_background(client: &Arc<IggyClient>, nodes: KnownNodes) {
+    let client = Arc::downgrade(client);
+    tokio::spawn(async move {
+        let mut tick = interval(ROSTER_REFRESH);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // The first tick fires at once, and the connect has just read the roster.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let Some(client) = client.upgrade() else {
+                return;
+            };
+            match learn_roster(&client, &nodes).await {
+                Ok(()) => {}
+                Err(BridgeError::Iggy(IggyError::ClientShutdown)) => return,
+                Err(error) => {
+                    debug!(%error, "could not read the Iggy roster; new clients keep the last one");
+                }
+            }
+        }
+    });
 }
 
 impl std::fmt::Debug for IggyBridge {

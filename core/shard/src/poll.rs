@@ -30,7 +30,7 @@
 //! before any replication wait.
 
 use crate::shards_table::ShardsTable;
-use crate::{IggyShard, PartitionRead, PartitionReadReply, Sender};
+use crate::{ConsumerOffsetRead, IggyShard, PartitionRead, PartitionReadReply, Sender};
 use consensus::client_table::SessionAttachment;
 use consensus::{Consensus, MetadataHandle, PartitionsHandle, is_partition_receipt_operation};
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
@@ -47,6 +47,7 @@ use server_common::sharding::IggyNamespace;
 pub mod completion;
 #[cfg(test)]
 mod completion_tests;
+pub mod deferred;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
@@ -95,12 +96,21 @@ pub struct PollCompleted {
     namespace: IggyNamespace,
     /// Snapshot facts that have not yet been accepted as consumer progress.
     result: PollReadResult,
-    /// Return path for the accepted read or a rejection.
-    reply: Sender<PartitionReadReply>,
-    attachment: Option<PollAttachment>,
+    target: PollTarget,
     /// Inbox enqueue time for disk diagnostics, or `None` for resident completion.
     #[cfg(feature = "poll-diagnostics")]
     queued_at: Option<std::time::Instant>,
+}
+
+pub enum PollTarget {
+    Immediate {
+        reply: Sender<PartitionReadReply>,
+        attachment: Option<PollAttachment>,
+    },
+    Deferred {
+        request_id: u64,
+        _reservation: deferred::ReadReservation,
+    },
 }
 
 impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
@@ -156,6 +166,18 @@ where
         read: PartitionRead,
         reply: Sender<PartitionReadReply>,
     ) {
+        if let PartitionRead::DeferredPoll(request) = read {
+            self.admit_deferred_poll(namespace, *request, &reply);
+            return;
+        }
+        if let PartitionRead::ConsumerOffsetsOnPrimary { reads } = read {
+            let offsets = reads
+                .into_iter()
+                .map(|read| self.consumer_offset_on_primary(read))
+                .collect();
+            let _ = reply.try_send(PartitionReadReply::ConsumerOffsets(offsets));
+            return;
+        }
         let partitions = self.plane.partitions();
         if matches!(read, PartitionRead::SessionRetired { .. }) {
             let failed_revision = partitions.failed_revision(&namespace).or_else(|| {
@@ -171,7 +193,195 @@ where
                 return;
             }
         }
-        let rejection = partitions
+        let rejection = self.partition_read_rejection(namespace, &read);
+        if let Some(error) = rejection {
+            let _ = reply.try_send(PartitionReadReply::Rejected(error));
+            return;
+        }
+        let (read, attachment) = match read {
+            PartitionRead::PollOnPrimary {
+                consumer,
+                args,
+                attachment,
+            } => (
+                PartitionRead::Poll {
+                    consumer,
+                    args,
+                    metadata: None,
+                },
+                Some(PollAttachment::Bound(attachment)),
+            ),
+            PartitionRead::UnboundPollOnPrimary {
+                consumer,
+                args,
+                user_id,
+                user_created_at,
+                metadata,
+            } => (
+                PartitionRead::Poll {
+                    consumer,
+                    args,
+                    metadata: None,
+                },
+                Some(PollAttachment::Unbound {
+                    user_id,
+                    user_created_at,
+                    metadata,
+                }),
+            ),
+            read => (read, None),
+        };
+        let result = match read {
+            PartitionRead::SessionRetired {
+                identity,
+                created_revision,
+            } => partitions
+                .with_partition(&namespace, |partition| {
+                    PartitionReadReply::SessionRetired(
+                        partition.created_revision() == created_revision
+                            && partition.session_retired(identity),
+                    )
+                })
+                .unwrap_or(PartitionReadReply::NotFound),
+            PartitionRead::DeferredPoll(_) => unreachable!("deferred admission handled above"),
+            // Answered above, entry by entry.
+            PartitionRead::ConsumerOffsetsOnPrimary { .. } => {
+                PartitionReadReply::Rejected(IggyError::InvalidCommand)
+            }
+            PartitionRead::Primary => partitions
+                .with_partition(&namespace, |partition| {
+                    let consensus = partition.consensus();
+                    let view = consensus.view();
+                    if consensus.is_normal()
+                        && !consensus.is_transferring()
+                        && !(consensus.has_ceded_primaryship()
+                            && consensus.primary_index(view) == consensus.replica())
+                    {
+                        PartitionReadReply::Primary {
+                            view,
+                            primary: consensus.primary_index(view),
+                        }
+                    } else {
+                        PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+                    }
+                })
+                .unwrap_or(PartitionReadReply::NotFound),
+            PartitionRead::Poll { consumer, args, .. }
+            | PartitionRead::PollOnPrimary { consumer, args, .. }
+            | PartitionRead::UnboundPollOnPrimary { consumer, args, .. } => {
+                match partitions.build_poll_snapshot(&namespace, consumer, &args) {
+                    None => PartitionReadReply::NotFound,
+                    Some(plan) if plan.needs_off_pump_io() => {
+                        let route_failure = self.senders.get(usize::from(self.id)).map_or(
+                            Some(crate::metrics::frame_drop_reason::UNROUTABLE),
+                            |sender| {
+                                sender
+                                    .is_disconnected()
+                                    .then_some(crate::metrics::frame_drop_reason::DISCONNECTED)
+                            },
+                        );
+                        if let Some(reason) = route_failure {
+                            completion::reject(&reply, self.metrics.frame_drop_metrics(), reason);
+                            return;
+                        }
+                        let Some(completion) = self
+                            .poll_completions
+                            .try_reserve(namespace, reply, attachment)
+                        else {
+                            return;
+                        };
+                        #[cfg(feature = "poll-diagnostics")]
+                        tracing::debug!(
+                            target: "iggy.shard.poll_diagnostics",
+                            namespace_raw = namespace.inner(),
+                            phase = "dispatch",
+                            tier = "disk",
+                            "partition poll dispatch"
+                        );
+                        self.bus.spawn(read_poll(namespace, plan, completion));
+                        return;
+                    }
+                    Some(plan) => {
+                        #[cfg(feature = "poll-diagnostics")]
+                        tracing::debug!(
+                            target: "iggy.shard.poll_diagnostics",
+                            namespace_raw = namespace.inner(),
+                            phase = "dispatch",
+                            tier = "resident",
+                            "partition poll dispatch"
+                        );
+                        self.on_poll_completed(PollCompleted {
+                            namespace,
+                            result: plan.execute_resident(),
+                            target: PollTarget::Immediate { reply, attachment },
+                            #[cfg(feature = "poll-diagnostics")]
+                            queued_at: None,
+                        })
+                        .await;
+                        return;
+                    }
+                }
+            }
+            PartitionRead::ConsumerOffset { consumer }
+            | PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: Some(consumer),
+                ..
+            } => partitions
+                .consumer_offset_read(&namespace, consumer)
+                .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
+                    PartitionReadReply::ConsumerOffset {
+                        stored,
+                        current_offset,
+                    }
+                }),
+            PartitionRead::ConsumerOffsetOnPrimary { consumer: None, .. } => {
+                PartitionReadReply::ConsumerOffset {
+                    stored: None,
+                    current_offset: 0,
+                }
+            }
+            PartitionRead::ExternalGroupOffsetOnPrimary { group_id, .. } => partitions
+                .external_group_offset_read(&namespace, group_id)
+                .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
+                    PartitionReadReply::ConsumerOffset {
+                        stored,
+                        current_offset,
+                    }
+                }),
+            PartitionRead::GroupOffsetState { group_id } => partitions
+                .group_offset_state(&namespace, group_id)
+                .map_or(PartitionReadReply::NotFound, |(last_polled, committed)| {
+                    PartitionReadReply::GroupOffsetState {
+                        last_polled,
+                        committed,
+                    }
+                }),
+            PartitionRead::ResolveSegmentDeleteOffset { count } => partitions
+                .segment_delete_resolution(&namespace, count)
+                .map_or(
+                    PartitionReadReply::NotFound,
+                    |(up_to_offset, lagging, created_revision)| {
+                        PartitionReadReply::SegmentDeleteOffset {
+                            up_to_offset,
+                            lagging,
+                            created_revision,
+                        }
+                    },
+                ),
+        };
+        let _ = reply.try_send(result);
+    }
+
+    /// The condition of this shard that refuses `read` of `namespace` before
+    /// it runs, if any.
+    #[allow(clippy::too_many_lines)]
+    fn partition_read_rejection(
+        &self,
+        namespace: IggyNamespace,
+        read: &PartitionRead,
+    ) -> Option<IggyError> {
+        let partitions = self.plane.partitions();
+        partitions
             .with_partition(&namespace, |partition| {
                 if read.requires_primary() {
                     let consensus = partition.consensus();
@@ -265,179 +475,38 @@ where
             .unwrap_or_else(|| {
                 read.requires_primary()
                     .then_some(IggyError::TransientNotAccepted)
-            });
-        if let Some(error) = rejection {
-            let _ = reply.try_send(PartitionReadReply::Rejected(error));
-            return;
+            })
+    }
+
+    /// A [`PartitionRead::ConsumerOffsetOnPrimary`] of a partition that this
+    /// shard owns, run in place.
+    pub(crate) fn consumer_offset_on_primary(
+        &self,
+        ConsumerOffsetRead {
+            namespace,
+            consumer,
+            metadata,
+        }: ConsumerOffsetRead,
+    ) -> PartitionReadReply {
+        let read = PartitionRead::ConsumerOffsetOnPrimary { consumer, metadata };
+        if let Some(error) = self.partition_read_rejection(namespace, &read) {
+            return PartitionReadReply::Rejected(error);
         }
-        let (read, attachment) = match read {
-            PartitionRead::PollOnPrimary {
-                consumer,
-                args,
-                attachment,
-            } => (
-                PartitionRead::Poll {
-                    consumer,
-                    args,
-                    metadata: None,
-                },
-                Some(PollAttachment::Bound(attachment)),
-            ),
-            PartitionRead::UnboundPollOnPrimary {
-                consumer,
-                args,
-                user_id,
-                user_created_at,
-                metadata,
-            } => (
-                PartitionRead::Poll {
-                    consumer,
-                    args,
-                    metadata: None,
-                },
-                Some(PollAttachment::Unbound {
-                    user_id,
-                    user_created_at,
-                    metadata,
-                }),
-            ),
-            read => (read, None),
+        let Some(consumer) = consumer else {
+            return PartitionReadReply::ConsumerOffset {
+                stored: None,
+                current_offset: 0,
+            };
         };
-        let result = match read {
-            PartitionRead::SessionRetired {
-                identity,
-                created_revision,
-            } => partitions
-                .with_partition(&namespace, |partition| {
-                    PartitionReadReply::SessionRetired(
-                        partition.created_revision() == created_revision
-                            && partition.session_retired(identity),
-                    )
-                })
-                .unwrap_or(PartitionReadReply::NotFound),
-            PartitionRead::Primary => partitions
-                .with_partition(&namespace, |partition| {
-                    let consensus = partition.consensus();
-                    let view = consensus.view();
-                    if consensus.is_normal()
-                        && !consensus.is_transferring()
-                        && !(consensus.has_ceded_primaryship()
-                            && consensus.primary_index(view) == consensus.replica())
-                    {
-                        PartitionReadReply::Primary {
-                            view,
-                            primary: consensus.primary_index(view),
-                        }
-                    } else {
-                        PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
-                    }
-                })
-                .unwrap_or(PartitionReadReply::NotFound),
-            PartitionRead::Poll { consumer, args, .. }
-            | PartitionRead::PollOnPrimary { consumer, args, .. }
-            | PartitionRead::UnboundPollOnPrimary { consumer, args, .. } => {
-                match partitions.build_poll_snapshot(&namespace, consumer, &args) {
-                    None => PartitionReadReply::NotFound,
-                    Some(plan) if plan.needs_off_pump_io() => {
-                        let route_failure = self.senders.get(usize::from(self.id)).map_or(
-                            Some(crate::metrics::frame_drop_reason::UNROUTABLE),
-                            |sender| {
-                                sender
-                                    .is_disconnected()
-                                    .then_some(crate::metrics::frame_drop_reason::DISCONNECTED)
-                            },
-                        );
-                        if let Some(reason) = route_failure {
-                            completion::reject(&reply, self.metrics.frame_drop_metrics(), reason);
-                            return;
-                        }
-                        let Some(completion) = self
-                            .poll_completions
-                            .try_reserve(namespace, reply, attachment)
-                        else {
-                            return;
-                        };
-                        #[cfg(feature = "poll-diagnostics")]
-                        tracing::debug!(
-                            target: "iggy.shard.poll_diagnostics",
-                            namespace_raw = namespace.inner(),
-                            phase = "dispatch",
-                            tier = "disk",
-                            "partition poll dispatch"
-                        );
-                        self.bus.spawn(read_poll(namespace, plan, completion));
-                        return;
-                    }
-                    Some(plan) => {
-                        #[cfg(feature = "poll-diagnostics")]
-                        tracing::debug!(
-                            target: "iggy.shard.poll_diagnostics",
-                            namespace_raw = namespace.inner(),
-                            phase = "dispatch",
-                            tier = "resident",
-                            "partition poll dispatch"
-                        );
-                        self.on_poll_completed(PollCompleted {
-                            namespace,
-                            result: plan.execute_resident(),
-                            reply,
-                            attachment,
-                            #[cfg(feature = "poll-diagnostics")]
-                            queued_at: None,
-                        })
-                        .await;
-                        return;
-                    }
-                }
-            }
-            PartitionRead::ConsumerOffset { consumer }
-            | PartitionRead::ConsumerOffsetOnPrimary {
-                consumer: Some(consumer),
-                ..
-            } => partitions
-                .consumer_offset_read(&namespace, consumer)
-                .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
-                    PartitionReadReply::ConsumerOffset {
-                        stored,
-                        current_offset,
-                    }
-                }),
-            PartitionRead::ConsumerOffsetOnPrimary { consumer: None, .. } => {
+        self.plane
+            .partitions()
+            .consumer_offset_read(&namespace, consumer)
+            .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
                 PartitionReadReply::ConsumerOffset {
-                    stored: None,
-                    current_offset: 0,
+                    stored,
+                    current_offset,
                 }
-            }
-            PartitionRead::ExternalGroupOffsetOnPrimary { group_id, .. } => partitions
-                .external_group_offset_read(&namespace, group_id)
-                .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
-                    PartitionReadReply::ConsumerOffset {
-                        stored,
-                        current_offset,
-                    }
-                }),
-            PartitionRead::GroupOffsetState { group_id } => partitions
-                .group_offset_state(&namespace, group_id)
-                .map_or(PartitionReadReply::NotFound, |(last_polled, committed)| {
-                    PartitionReadReply::GroupOffsetState {
-                        last_polled,
-                        committed,
-                    }
-                }),
-            PartitionRead::ResolveSegmentDeleteOffset { count } => partitions
-                .segment_delete_resolution(&namespace, count)
-                .map_or(
-                    PartitionReadReply::NotFound,
-                    |(up_to_offset, lagging, created_revision)| {
-                        PartitionReadReply::SegmentDeleteOffset {
-                            up_to_offset,
-                            lagging,
-                            created_revision,
-                        }
-                    },
-                ),
-        };
-        let _ = reply.try_send(result);
+            })
     }
 
     /// Discard a read if its reply receiver is already disconnected at the check.
@@ -450,8 +519,7 @@ where
         let PollCompleted {
             namespace,
             result,
-            reply,
-            attachment,
+            target,
             #[cfg(feature = "poll-diagnostics")]
             queued_at,
         } = completion;
@@ -466,6 +534,16 @@ where
                 "partition poll completion"
             );
         }
+        let (reply, attachment) = match target {
+            PollTarget::Immediate { reply, attachment } => (reply, attachment),
+            PollTarget::Deferred {
+                request_id,
+                _reservation,
+            } => {
+                self.on_deferred_poll_completed(request_id, result).await;
+                return;
+            }
+        };
         if reply.is_disconnected() {
             return;
         }
@@ -509,6 +587,18 @@ where
                 return;
             }
         }
+        self.accept_poll_result(namespace, result, reply, None)
+            .await;
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn accept_poll_result(
+        &self,
+        namespace: IggyNamespace,
+        result: PollReadResult,
+        reply: Sender<PartitionReadReply>,
+        next_offset: Option<u64>,
+    ) {
         let partitions = self.plane.partitions();
         let consumer_kind = result.consumer_kind();
         match partitions.complete_poll(&namespace, result) {
@@ -527,6 +617,7 @@ where
                     fragments,
                     current_offset,
                     encryptor,
+                    next_offset,
                 });
                 if let Some(replication) = replication {
                     partitions
@@ -547,7 +638,9 @@ where
 /// Serve a group read only to the partition's installed owner. The serving
 /// node's metadata can lag an install the partition already applied, for
 /// example on a new primary after a view change, and the partition commits a
-/// read's progress under the installed owner.
+/// read's progress under the installed owner. `TransientNotAccepted` means
+/// only that the partition has not applied the install yet, and a readiness
+/// mirror reads it as not ready.
 fn group_owner_rejection(
     namespace: IggyNamespace,
     group_id: u64,

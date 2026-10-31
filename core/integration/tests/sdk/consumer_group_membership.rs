@@ -22,8 +22,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use iggy::prelude::locking::IggyRwLockFn;
 use iggy::prelude::*;
-use iggy_common::{BinaryTransport, ConsumerGroupClientState};
-use integration::harness::wait_for_consumer_group_assignment;
+use iggy_common::{BinaryTransport, ConsumerGroupClientState, sync_group_assignment};
+use integration::harness::{fetch_sections, wait_for_consumer_group_assignment};
 use integration::iggy_harness;
 use tokio::time::{sleep, timeout};
 
@@ -108,9 +108,10 @@ async fn given_group_member_holds_no_partitions_when_group_deleted_should_surfac
     let mut consumer = consumer_client
         .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
-        .batch_length(1)
-        .poll_interval(IggyDuration::new(Duration::from_millis(100)))
-        .auto_join_consumer_group()
+        .poll_options(PollOptions {
+            count: 1,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .do_not_create_consumer_group_if_not_exists()
         .build();
     consumer.init().await.unwrap();
@@ -157,7 +158,10 @@ async fn given_group_member_holds_no_partitions_when_group_deleted_should_surfac
         .expect("poll must not hang after the group is deleted")
         .expect("consumer stream should remain open");
     match item {
-        Err(IggyError::ConsumerGroupNameNotFound(..)) => {}
+        Err(ReadError {
+            error: IggyError::ConsumerGroupNameNotFound(..),
+            ..
+        }) => {}
         Err(other) => {
             panic!("expected ConsumerGroupNameNotFound after group deletion, got error {other:?}")
         }
@@ -165,14 +169,14 @@ async fn given_group_member_holds_no_partitions_when_group_deleted_should_surfac
     }
 }
 
-// A member holding zero partitions gets an empty poll reply whose partition id
-// is the `NO_ASSIGNED_PARTITION` sentinel, so a caller can tell it from an
-// empty partition, which echoes its real id.
+// A member holding zero partitions gets `ConsumerGroupPartitionNotOwned` for a
+// poll of the group's partition, so a caller can tell it from an empty
+// partition, whose poll echoes its real id.
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
     server(heartbeat.enabled = true, heartbeat.interval = "60s")
 )]
-async fn given_member_holds_no_partitions_when_polled_should_report_no_assigned_partition(
+async fn given_member_holds_no_partitions_when_polling_a_partition_should_refuse_it_as_not_owned(
     harness: &TestHarness,
 ) {
     let stream_id = Identifier::named(STREAM_NAME).unwrap();
@@ -219,15 +223,18 @@ async fn given_member_holds_no_partitions_when_polled_should_report_no_assigned_
 
     wait_for_assignment(&first_member, 2).await;
     let consumer = Consumer::group(group_id.clone());
+    let options = PollOptions {
+        count: 1,
+        ..PollOptions::default()
+    };
     let owner_poll = first_member
         .poll_messages(
             &stream_id,
             &topic_id,
-            None,
+            0,
             &consumer,
             &PollingStrategy::next(),
-            1,
-            false,
+            options,
         )
         .await
         .unwrap();
@@ -241,28 +248,29 @@ async fn given_member_holds_no_partitions_when_polled_should_report_no_assigned_
         .poll_messages(
             &stream_id,
             &topic_id,
-            None,
+            0,
             &consumer,
             &PollingStrategy::next(),
-            1,
-            false,
+            options,
         )
-        .await
-        .unwrap();
-    assert!(surplus_poll.messages.is_empty());
-    assert_eq!(
-        surplus_poll.partition_id, NO_ASSIGNED_PARTITION,
-        "a member without partitions must report the sentinel"
+        .await;
+    assert!(
+        matches!(
+            surplus_poll,
+            Err(IggyError::ConsumerGroupPartitionNotOwned(..))
+        ),
+        "a member without partitions must be refused the partition, got {surplus_poll:?}"
     );
 }
 
-// A member built with `do_not_auto_join_consumer_group()` relies on the caller for the join, so
-// polling must not wait for a join the consumer itself never performs.
+// The consumer always joins. A join from a session that is already a member is
+// a no-op, so a member joined by the caller must not lose its partition to the
+// consumer's own join.
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
     server(heartbeat.enabled = true, heartbeat.interval = "60s")
 )]
-async fn given_member_that_does_not_auto_join_when_joined_by_the_caller_should_receive_messages(
+async fn given_member_joined_by_the_caller_when_the_consumer_joins_again_should_receive_messages(
     harness: &TestHarness,
 ) {
     let stream_id = Identifier::named(STREAM_NAME).unwrap();
@@ -314,14 +322,16 @@ async fn given_member_that_does_not_auto_join_when_joined_by_the_caller_should_r
     let mut consumer = client
         .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
-        .batch_length(1)
-        .do_not_auto_join_consumer_group()
+        .poll_options(PollOptions {
+            count: 1,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .build();
     consumer.init().await.unwrap();
 
     let received = timeout(RESOLVE_TIMEOUT, consumer.next())
         .await
-        .expect("a member joined by the caller must poll instead of waiting for a join")
+        .expect("a member joined by the caller must poll after the consumer's own join")
         .expect("consumer stream should remain open")
         .expect("the member must receive the message from its assigned partition");
     assert_eq!(received.message.payload, "message");
@@ -472,24 +482,12 @@ async fn given_group_member_when_session_reset_should_forget_membership(harness:
         .unwrap();
 
     let consumer = Consumer::group(group_id.clone());
-    // The first group poll syncs the assignment, which is what registers the
-    // membership in the transport cache.
+    // The sync is what registers the membership in the transport cache.
     wait_for_assignment(&client, 1).await;
-    client
-        .poll_messages(
-            &stream_id,
-            &topic_id,
-            None,
-            &consumer,
-            &PollingStrategy::next(),
-            1,
-            false,
-        )
-        .await
-        .unwrap();
+    sync_assignment(&client).await;
 
     let state = consumer_group_state(&client).await;
-    // The key the join and the group poll build from the same identifiers.
+    // The key the join and the sync build from the same identifiers.
     let key = format!("{stream_id}|{topic_id}|{group_id}");
     assert!(
         state.is_registered(&key),
@@ -517,22 +515,148 @@ async fn given_group_member_when_session_reset_should_forget_membership(harness:
     assert!(!state.is_registered(&key));
     assert!(!state.has_assignment(&key));
 
-    // The new identity never joined, and the poll must say so instead of
-    // running against the old assignment.
+    // The new identity never joined, so the server refuses its poll of the
+    // partition that the old session owned.
     let poll = client
         .poll_messages(
             &stream_id,
             &topic_id,
-            None,
+            0,
             &consumer,
             &PollingStrategy::next(),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await;
     assert!(
-        matches!(poll, Err(IggyError::ConsumerGroupMemberNotFound(..))),
-        "expected ConsumerGroupMemberNotFound for a poll without a rejoin, got {poll:?}"
+        matches!(poll, Err(IggyError::ConsumerGroupPartitionNotOwned(..))),
+        "expected ConsumerGroupPartitionNotOwned for a poll without a rejoin, got {poll:?}"
+    );
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(heartbeat.enabled = true, heartbeat.interval = "60s")
+)]
+async fn given_stale_assignment_when_fetching_should_refuse_then_resync_owned_partitions(
+    harness: &TestHarness,
+) {
+    const PARTITIONS: u32 = 4;
+    const MAX_WAIT: Duration = Duration::from_secs(10);
+    const PROMPT_REPLY: Duration = Duration::from_secs(2);
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+    let topic_id = Identifier::named(TOPIC_NAME).unwrap();
+    let group_id = Identifier::named(CONSUMER_GROUP_NAME).unwrap();
+
+    let mut clients = harness
+        .root_clients(2)
+        .await
+        .expect("Failed to create root clients");
+    let member = clients.remove(0);
+    let other_member = clients.remove(0);
+    member
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    member
+        .create_topic(
+            &stream_id,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    member
+        .create_consumer_group(&stream_id, &topic_id, CONSUMER_GROUP_NAME)
+        .await
+        .unwrap();
+    for client in [&member, &other_member] {
+        client
+            .join_consumer_group(&stream_id, &topic_id, &group_id)
+            .await
+            .unwrap();
+    }
+    wait_for_assignment(&member, 2).await;
+
+    let consumer = Consumer::group(group_id.clone());
+    sync_assignment(&member).await;
+    let state = consumer_group_state(&member).await;
+    let key = format!("{stream_id}|{topic_id}|{group_id}");
+    let (version, mut owned) = state.assignment_snapshot(&key);
+    owned.sort_unstable();
+    assert_eq!(owned.len(), 2, "two members split four partitions");
+    // The member has not synced the rebalance yet.
+    state.set_assignment(key.clone(), version.generation, (0..PARTITIONS).collect());
+
+    let mut messages = vec![IggyMessage::from_str("owned").unwrap()];
+    member
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(owned[0]),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+    let revoked = (0..PARTITIONS)
+        .find(|partition| !owned.contains(partition))
+        .expect("the other member owns a partition");
+    let stale_targets = [(revoked, PollingStrategy::next())];
+    let options = PollOptions {
+        count: 1,
+        ..PollOptions::wait(MAX_WAIT.into())
+    };
+    let refused = timeout(
+        PROMPT_REPLY,
+        fetch_sections(
+            &member,
+            &stream_id,
+            &topic_id,
+            &stale_targets,
+            &consumer,
+            options,
+        ),
+    )
+    .await
+    .expect("a revoked target must answer before waiting");
+    // A target that the member does not own is refused in its own section.
+    let refused = refused.expect("a revoked target does not fail the whole fetch");
+    assert!(
+        matches!(
+            refused.as_slice(),
+            [section] if section.partition_id == revoked
+                && matches!(section.status, Err(IggyError::ConsumerGroupPartitionNotOwned(..)))
+        ),
+        "{refused:?}"
+    );
+    let mut reader = member
+        .reader(&stream_id, &topic_id, &consumer)
+        .start(PollingStrategy::next())
+        .options(options)
+        .build()
+        .await
+        .unwrap();
+    let batch = timeout(PROMPT_REPLY, reader.next())
+        .await
+        .expect("the reader must re-sync and read the owned partition at once")
+        .unwrap();
+    let delivered: Vec<_> = batch
+        .messages
+        .iter()
+        .map(|message| (batch.partition_id, message.header.offset))
+        .collect();
+    assert_eq!(delivered, [(owned[0], 0)]);
+    let mut resynced = state.assignment_snapshot(&key).1;
+    resynced.sort_unstable();
+    assert_eq!(
+        resynced, owned,
+        "the reader must re-sync the cached assignment"
     );
 }
 
@@ -590,22 +714,23 @@ async fn given_weak_offset_durability_when_owner_changes_should_preserve_progres
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &consumer,
             &PollingStrategy::first(),
-            2,
-            false,
+            PollOptions {
+                count: 2,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
     assert_eq!(polled.messages.len(), 2);
-    let position = ConsumerPosition {
-        partition_id: 0,
-        offset: STORED_OFFSET,
-        context: polled.context,
-    };
+    // The batch starts at offset 0, so the index of a message is its offset.
+    let position = polled
+        .checkpoint_at(STORED_OFFSET as usize)
+        .expect("the batch holds the stored offset");
     predecessor
-        .store_consumer_position(&consumer, &stream_id, &topic_id, position)
+        .store_consumer_position(&consumer, &stream_id, &topic_id, &position)
         .await
         .unwrap();
 
@@ -626,21 +751,26 @@ async fn given_weak_offset_durability_when_owner_changes_should_preserve_progres
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &consumer,
             &PollingStrategy::next(),
-            MESSAGE_COUNT,
-            false,
+            PollOptions {
+                count: MESSAGE_COUNT,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
     assert_eq!(resumed.messages.len(), 1);
     assert_eq!(resumed.messages[0].header.offset, STORED_OFFSET + 1);
-    assert!(resumed.context.owner_generation > position.context.owner_generation);
-    assert_eq!(resumed.context.incarnation, position.context.incarnation);
+    assert!(resumed.context().owner_generation > position.context().owner_generation);
+    assert_eq!(
+        resumed.context().incarnation,
+        position.context().incarnation
+    );
     assert!(matches!(
         successor
-            .store_consumer_position(&consumer, &stream_id, &topic_id, position)
+            .store_consumer_position(&consumer, &stream_id, &topic_id, &position)
             .await,
         Err(IggyError::ConsumerGroupPartitionNotOwned(..))
     ));
@@ -680,6 +810,29 @@ async fn wait_for_assignment(client: &IggyClient, members_count: u32) {
         RESOLVE_TIMEOUT,
     )
     .await;
+}
+
+/// Syncs the caller's assignment into the transport cache, which registers the
+/// membership there.
+async fn sync_assignment(client: &IggyClient) {
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+    let topic_id = Identifier::named(TOPIC_NAME).unwrap();
+    let group_id = Identifier::named(CONSUMER_GROUP_NAME).unwrap();
+    match &*client.client().read().await {
+        ClientWrapper::Tcp(client) => {
+            sync_group_assignment(client, &stream_id, &topic_id, &group_id).await
+        }
+        ClientWrapper::Quic(client) => {
+            sync_group_assignment(client, &stream_id, &topic_id, &group_id).await
+        }
+        ClientWrapper::WebSocket(client) => {
+            sync_group_assignment(client, &stream_id, &topic_id, &group_id).await
+        }
+        ClientWrapper::Http(_) | ClientWrapper::Iggy(_) => {
+            panic!("the consumer-group cache is a binary-transport concern")
+        }
+    }
+    .unwrap();
 }
 
 /// The consumer-group cache lives on the transport `IggyClient` wraps.

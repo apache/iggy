@@ -64,6 +64,7 @@ public sealed class ResourceOptionsSteps
     public async Task CreateKeyedStream(string name, int value)
     {
         _streamKey = Enumerable.Repeat((byte)value, 32).ToArray();
+        _context.LastStreamKey = _streamKey;
         _context.CreatedStream = await _context.IggyClient.CreateStreamAsync(name,
             new StreamOptions { EncryptionKey = _streamKey });
         _context.CreatedStream.ShouldNotBeNull();
@@ -169,6 +170,13 @@ public sealed class ResourceOptionsSteps
         var headers = messages[0].UserHeaders;
         headers.ShouldNotBeNull();
         headers![HeaderKey.FromString(name)].ToString().ShouldBe(value);
+    }
+
+    [When("I delete the stream")]
+    public async Task DeleteStream()
+    {
+        await _context.IggyClient.DeleteStreamAsync(StreamId());
+        _streamId = null;
     }
 
     [When("I rename the stream to {string}")]

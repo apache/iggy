@@ -38,7 +38,7 @@ See [Maven Central](https://central.sonatype.com/artifact/org.apache.iggy/iggy) 
 
 ### Snapshot Versions
 
-Development builds of the next release carry the version `0.9.2-SNAPSHOT`. Get them from the ASF snapshot repository:
+Development builds of the next release carry the version `0.9.6-SNAPSHOT`. Get them from the ASF snapshot repository:
 
 **Gradle:**
 
@@ -51,7 +51,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'org.apache.iggy:iggy:0.9.2-SNAPSHOT'
+    implementation 'org.apache.iggy:iggy:0.9.6-SNAPSHOT'
 }
 ```
 
@@ -72,7 +72,7 @@ dependencies {
     <dependency>
         <groupId>org.apache.iggy</groupId>
         <artifactId>iggy</artifactId>
-        <version>0.9.2-SNAPSHOT</version>
+        <version>0.9.6-SNAPSHOT</version>
     </dependency>
 </dependencies>
 ```
@@ -122,6 +122,12 @@ credentials of the automatic sign-in. It also updates the builder credentials
 that `login()` uses when they name that user. This holds for typed calls,
 `sendBinaryRequest` and `resolveOperation`. A rejected change leaves the
 credentials unchanged.
+
+`sendBinaryRequestToReplica(code, payload, replicaId)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
+
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, fetches, deferred-request cancels, consumer-offset reads and session-control codes fail with `INVALID_COMMAND` before anything is sent.
+
+An id that cluster metadata does not name fails with `INVALID_IDENTIFIER`. An unreachable node is retried until the request timeout, and a `NOT_PRIMARY` reply is returned rather than sent to another node. The HTTP client throws `IggyOperationNotSupportedException`.
 
 ## Quick Start
 
@@ -344,13 +350,183 @@ The stream key is 32 random bytes. It travels inside the create request over the
 
 The typed builders refuse an update the server would refuse for its shape before anything is sent, with the server's error code. `raw(key, value)` and `rawReset(key)` reach keys this build has no field for, and the server decides whether they are allowed.
 
+### Metadata Changes
+
+`getMetadataChanges` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manageServers` permission and works on blocking TCP, async TCP and HTTP.
+
+```java
+import org.apache.iggy.system.MetadataChangeGroup;
+import org.apache.iggy.system.MetadataChangeStart;
+import org.apache.iggy.system.MetadataChanges;
+import org.apache.iggy.system.MetadataChangesQuery;
+
+var query = MetadataChangesQuery.builder()
+    .groups(MetadataChangeGroup.STREAMS, MetadataChangeGroup.TOPICS)
+    .build();
+while (true) {
+    MetadataChanges page = client.system().getMetadataChanges(query);
+    switch (page.status()) {
+        case OK -> {
+            page.records().forEach(record ->
+                System.out.println("op " + record.op() + " by " + record.actorUserId() + ": " + record.kind()));
+            if (page.next().isPresent()) {
+                query = query.withStart(MetadataChangeStart.after(page.next().get()));
+            }
+            if (!page.hasMore()) {
+                Thread.sleep(1000);
+            }
+        }
+        case BEHIND -> Thread.sleep(100);
+        default -> query = query.withStart(rebuild(client, query.groups()));
+    }
+}
+
+// Pages the current state, then returns the position to follow from.
+static MetadataChangeStart rebuild(IggyBaseClient client, List<MetadataChangeGroup> groups)
+        throws InterruptedException {
+    var query = MetadataChangesQuery.builder()
+        .start(MetadataChangeStart.current())
+        .groups(groups)
+        .build();
+    while (true) {
+        MetadataChanges page = client.system().getMetadataChanges(query);
+        switch (page.status()) {
+            case OK -> {
+                page.items().forEach(item -> System.out.println(item.group() + ": " + item.body()));
+                if (page.currentPageToken().isPresent()) {
+                    query = query.withStart(MetadataChangeStart.current(page.currentPageToken().get()));
+                } else if (page.next().isPresent()) {
+                    return MetadataChangeStart.after(page.next().get());
+                } else {
+                    query = query.withStart(MetadataChangeStart.current());
+                }
+            }
+            case BEHIND -> Thread.sleep(100);
+            default -> query = query.withStart(MetadataChangeStart.current());
+        }
+    }
+}
+```
+
+`EXPIRED` means the log no longer holds the history after the cursor, and `RESET` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return.
+
+Current pages need the parent groups of every selected group, for example `TOPICS` with `STREAMS`. Keep a rebuilt state private until a change page answers `OK` with `hasMore()` false and a `headOp()` at or above the last current page's.
+
+A cursor's `toString()` is its `mc1_` text, which `MetadataChangeCursor.parse` reads back, so a mirror can store it. A query the rules refuse fails with an `IggyValidationException` for invalid command before anything is sent, and a record of a kind this SDK does not know arrives as `MetadataChangeBody.Unknown` or `MetadataChangeBody.UnknownJson`.
+
+## Polling
+
+The SDK reads messages at three levels: a poll of one partition, a partition reader that reads many partitions in batches, and a consumer that hands over one message at a time. All three take `PollOptions`, whose `CommitPolicy` decides who stores the consumer offsets.
+
+### Poll one partition
+
+`pollMessages` with a partition and `PollOptions` lets the server hold the request until messages arrive. It waits up to `maxWait` for `minCount` messages and returns at most `count` messages and `maxBytes` of records. The request ends after `maxWait` plus 10 s.
+
+```java
+import org.apache.iggy.message.CommitPolicy;
+import org.apache.iggy.message.PollOptions;
+
+// Defaults: 1000 messages, no wait, 1 message, 1 MiB, nothing stored.
+var options = PollOptions.waitFor(Duration.ofSeconds(5))
+    .withCount(100)
+    .withCommit(CommitPolicy.onRead());
+
+PolledMessages polled = client.messages()
+    .pollMessages(streamId, topicId, 0L, Consumer.of(1L), PollingStrategy.next(), options)
+    .get();
+```
+
+`CommitPolicy.manual()` (the default) stores nothing, and the application stores a `Checkpoint` with `storeConsumerPosition`. `CommitPolicy.onRead()` makes the server store the offset of the last message it returns as part of the read, in one round trip. While the primary stays up a message is delivered at most once. A failover before the store replicates can deliver the last batch again.
+
+A poll of one partition refuses `CommitPolicy.auto(...)` with `INVALID_CONFIGURATION` (2), because it has nothing to count. A reader and a consumer accept it.
+
+A first message larger than `maxBytes` comes alone in the reply, up to the largest message size. A `Last` poll of more than one message whose first message is larger than `maxBytes` fails with `INVALID_SIZE_BYTES` (80). Every reply limit of the client holds the largest message, and `maxVsrFrameSize` refuses a frame that cannot.
+
+`PolledMessages.checkpoint()` and `checkpointAt(index)` name the position after a message, with the history of its partition. `continuation()` is the strategy after the last message, bound to its partition, and a poll or a seek of another partition refuses it with `INVALID_COMMAND` (3).
+
+A cancel of a poll with `OnRead` stops it on the server and waits for its reply: the server answers `TRANSIENT_NOT_ACCEPTED` (58) when the cancel won and nothing was stored, or with what it read and stored. Until then the poll blocks its partition: an offset store or another progress poll of the partition fails at once with `PARTITION_LANE_BLOCKED` (14009) naming the poll, and the reply lifts the block. Without a reply by the deadline of the poll, its outcome is unknown, as below.
+
+If the reply of such a poll is lost, or the server refuses it with a status that does not prove that nothing was stored, the server can have stored its offset. The call fails with `FETCH_PROGRESS_UNCERTAIN` (14010), whose `getOperationId()` names the poll.
+
+Every later poll with `OnRead` and every offset store or delete of that partition on this client then fails with `PARTITION_LANE_BLOCKED` (14009) naming the same operation, also after a reconnect and a new sign-in, until `abandonOperation(id)` releases it. The next `Next` poll then starts after what the lost poll stored. A close waits for the reply of each pending poll with `OnRead`, and the blocking client does not stop such a poll on an interrupt.
+
+`disconnect()` drops the connections without waiting, so a poll with `OnRead` that still waits fails with 14010, and `connect()` with a sign-in continues the client.
+
+### Partition reader
+
+A `PartitionReader` reads the partitions of a topic in batches. It groups the partitions by their primary and reads each group with one request, puts the partitions that a read served last at the end of the next one so a busy partition does not starve the others, regroups after a primary moves, keeps a prefetch, and stays usable after an error.
+
+The prefetch slots that the groups leave free spread the partitions whose last read ended before their head over reads of their own, each with the whole `count` and `maxBytes`, while the quiet partitions of a group share the one read that may wait. Under `OnRead` every read stores, so a group holds one read that may wait at a time, and a waiting `next()` fills the free slots with the backlogged partitions, one committing read per partition.
+
+A standalone consumer names its partitions. A consumer group reader joins its group, follows its assignment, and leaves the group on close.
+
+```java
+PartitionReader reader = client.reader(streamId, topicId, Consumer.of(1L))
+    .partitions(List.of(0L, 1L, 2L))
+    .start(PollingStrategy.first())
+    .options(PollOptions.waitFor(Duration.ofSeconds(5)))
+    .build()
+    .get();
+PolledMessages batch = reader.next().get();
+reader.commit(batch.checkpoint().orElseThrow()).get();
+reader.closeAsync().get();
+```
+
+`next()` returns the next batch of one partition, never empty, in offset order within one generation of the partition: from its first read, from each `seek`, and from each new assignment. A cancelled `next()` leaves its batch in the reader. The default wait of a reader is 5 s. The futures of a reader complete on its own thread, so a callback must not block.
+
+- `Manual`: `commit(checkpoint)` stores the offset of a delivered checkpoint, forward only within a generation.
+- `OnRead`: the server stores each read, and the reader reads only for a waiting `next()`. After a read whose reply was lost, the reader abandons it and reads that partition again after its retry interval. That read starts after what the lost read stored, so the reader reads those messages again without a store and delivers them first.
+
+  Only a lost read explains a read that starts past the expected offset: without one, the application or another session stored that offset, and the reader delivers from there. A partition that leaves the assignment still hands over the reads that the server stored for it. `closeAsync()` moves the offset of each partition with undelivered batches, or with a lost or undecoded read, back to its last delivered message.
+
+  `seek` to an offset above 0 stores the offset before it, which moves the server position, and the other strategies store nothing. A seek that waits for a read in flight applies after that read ends, also when `closeAsync()` starts first: its store then runs before the rewind, and a refused store fails the seek, or the close. `commit` and `mark` are refused.
+- `Auto(AutoCommit)`: the reader counts each batch as `CommitAfter` says (`PROCESSING` at the next `next()` or the close, `DELIVERY` when `next()` returns it, `MARKED` on `mark(checkpoint)`), and stores the latest counted position at its `interval`, on its `every` event, before a rebalance takes a partition away, and on close. `AutoCommit.defaults()` stores every 10,000 messages or 5 s after processing.
+
+A `ReadException` names its partition. `HISTORY_UNAVAILABLE` (87) stops a partition until `seek` when its position came from an earlier read of a history that is gone.
+
+A message that does not decode arrives as a `ReadException` whose `skip()` is the continuation after it, after a batch with the messages before it, and the partition stops until a `seek`.
+
+The exception carries the bytes the server served for it: `record()` is the message frame as received (its header, payload and user headers) or, when the framing of the section is malformed, the remaining bytes of the section from where decoding stopped.
+
+`offset()` is the offset of the message when its frame decoded and a later check failed, empty for malformed framing.
+
+A refusal that a retry does not change is retried with a doubling wait and stops its partition after six in a row. A partition that another member owns (`CONSUMER_GROUP_PARTITION_NOT_OWNED`, 5009) drops its position and resolves its start again after the next assignment, and six such refusals in a row are reported once without a stop.
+
+The blocking client builds a blocking reader with `org.apache.iggy.client.blocking.reader.PartitionReader.build(client.reader(...))`, whose `next(Duration)` returns empty at its timeout and keeps the batch for the next call.
+
+### Consumer
+
+An `IggyConsumer` hands over one message at a time from a reader. Under `Auto` with `PROCESSING`, a message counts when the next one is asked for, or after its handler succeeds in `consume`. A handler that fails leaves its message uncounted and ends `consume` with its error.
+
+```java
+IggyConsumer consumer = IggyConsumer.build(client.reader(streamId, topicId, Consumer.group(groupId))
+        .options(PollOptions.waitFor(Duration.ofSeconds(5)).withCommit(CommitPolicy.auto())))
+    .get();
+consumer.consume(message -> process(message.message())).get();
+consumer.shutdown().get();
+```
+
+`shutdown()` stops a running loop after its current handler, counts the last message under `PROCESSING`, stores, moves offsets back under `OnRead`, and leaves the group.
+
+### Transport notes
+
+The TCP client multiplexes deferred polls with other requests on its shared connections and routes them to the partition primary. Up to 64 deferred requests can be in flight per client, and further ones wait for a slot within their request timeout.
+
+A server capacity refusal (`DEFERRED_POLL_CAPACITY_EXCEEDED`) backs off, and if it lasts until the deadline, the call fails with `DEFERRED_POLL_CAPACITY_EXCEEDED` (90). A deferred poll of a consumer group must name its partition, a reader reads the whole assignment.
+
+The HTTP client sends a poll that stores its offset as a `POST` to `.../messages/deferred`, which no proxy or client library resends, and a poll that stores nothing as a `GET`. If the answer of a storing poll is lost after the request went out, or the server refuses it with a status that does not prove that nothing was stored, the call fails with `FETCH_PROGRESS_UNCERTAIN` (14010), whose `getOperationId()` names the poll on this client.
+
+Every later poll that stores its offset or starts at it (`Next`), and every offset store, of that partition on the client then fails with `PARTITION_LANE_BLOCKED` (14009) naming the same operation, until `abandonOperation(id)` releases it. The block covers the stream and topic as the call spells them, and any spelling of a call that carries the context of the same partition incarnation, for every consumer.
+
+A call that spells the stream or topic differently and carries no context does not see it. Such polls of one partition take turns, so a second one waits for the first and then meets its block. A timeout or transport failure before the request can be sent reports `TRANSIENT_NOT_ACCEPTED` (58).
+
+The HTTP client accepts a plain consumer only, because the server refuses a consumer group over HTTP. An interrupt of the calling thread ends a poll that stores nothing, also while it waits for the reply headers.
+
 ## Exception Handling
 
 The SDK's custom exception types inherit from `IggyException`. When you join a failed future, the cause can come back inside a `CompletionException`. The HTTP client's `close()` method declares `IOException`. Handle these two boundaries as well as the specific SDK errors.
 
-The HTTP client treats 503 `relay_refused` through Apache HttpClient's ordinary
-429/503 retry strategy. That behavior does not provide retained-operation
-recovery over HTTP.
+The HTTP client treats 503 `relay_refused` through Apache HttpClient's ordinary 429/503 retry strategy. That behavior does not provide retained-operation recovery over HTTP. A `pollMessages` with auto-commit is the `POST` above, which the client never sends again after the request may have reached the server, and whose unknown outcome fails with `FETCH_PROGRESS_UNCERTAIN` (14010).
 
 On a multi-node cluster, an HTTP call often reaches a node that is not the
 partition primary. For message sends, polls and consumer offset calls, that
@@ -412,11 +588,12 @@ deadline; an oversized frame fails locally. Cancellation removes only the caller
 A mutation already sent may remain retained. The byte limit counts admitted frozen frames and
 writer references; API input snapshots and queued serialization buffers are outside this limit.
 
-Auto-commit and `Next` polls use a temporary partition ordering barrier. Their success
-acknowledges local admission, not replicated offset durability. Code 57, a lost or malformed
-reply, or an eviction ends the call with code 57. Progress is unknown, and the call
-releases the barrier. These polls are never retained or replayed after uncertainty. Explicit non-admission
-(58 or 89) may retry within the same deadline.
+Polls with `OnRead` and `Next` polls use a temporary partition ordering barrier. Their success
+acknowledges local admission, not replicated offset durability. For a `Next` poll that stores nothing, code 57, a lost or
+malformed reply, or an eviction ends the call with code 57. For a poll with `OnRead` they end it with
+`FETCH_PROGRESS_UNCERTAIN` (14010), because the server can have stored its offset. Either way the call releases the
+barrier, and these polls are never retained or replayed after uncertainty. Explicit non-admission (58 or 89) may retry
+within the same deadline.
 
 ## Examples
 

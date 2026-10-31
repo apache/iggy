@@ -15,25 +15,40 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{RUNTIME, ffi, type_conversion::ffi_options_to_raw};
+use crate::{
+    RUNTIME,
+    consumer::Consumer as ConsumerHandle,
+    ffi,
+    messages::{Checkpoint, Continuation},
+    pending_poll::PendingPoll,
+    reader::PartitionReader,
+    type_conversion::{ffi_options_to_raw, parse_message_expiry},
+};
 use bytes::Bytes;
 use iggy::prelude::{
     AutoLogin as RustAutoLogin, Client as IggyConnectionClient, ClusterClient, Consumer,
-    ConsumerGroupClient, ConsumerOffsetClient, ConsumerPosition, Identifier as RustIdentifier,
+    ConsumerGroupClient, ConsumerOffsetClient, Identifier as RustIdentifier,
     IggyClient as RustIggyClient, IggyClientBuilder as RustIggyClientBuilder,
-    IggyDuration as RustIggyDuration, IggyMessage, IggyTimestamp, MessageClient,
+    IggyDuration as RustIggyDuration, IggyMessage, MessageClient,
     NonZeroIggyDuration as RustNonZeroIggyDuration, OptionsScope as RustOptionsScope,
-    PartitionClient, PartitionContext, Partitioning, Permissions as RustPermissions,
-    PollingStrategy, SegmentClient, SnapshotCompression as RustSnapshotCompression, StreamClient,
-    StreamCreateOptions as RustStreamCreateOptions, StreamEncryptionKey,
+    PartitionClient, Partitioning, Permissions as RustPermissions, PersonalAccessTokenClient,
+    PollOptions, PollingStrategy, SegmentClient, SnapshotCompression as RustSnapshotCompression,
+    StreamClient, StreamCreateOptions as RustStreamCreateOptions, StreamEncryptionKey,
     StreamUpdateOptions as RustStreamUpdateOptions, SystemClient as RustSystemClient,
     SystemSnapshotType as RustSystemSnapshotType, TopicClient,
     TopicCreateOptions as RustTopicCreateOptions, TopicUpdateOptions as RustTopicUpdateOptions,
     UserClient, UserCreateOptions as RustUserCreateOptions, UserStatus as RustUserStatus,
     UserUpdateOptions as RustUserUpdateOptions,
 };
+use iggy_binary_protocol::requests::system::GetMetadataChangesRequest;
+use iggy_binary_protocol::responses::system::{
+    GetMetadataChangesResponse, WireMetadataChangeRecord, WireMetadataItem,
+};
+use iggy_binary_protocol::{WireDecode, WireEncode};
 use iggy_common::{
-    Credentials as RustCredentials, IggyError, PendingOperationsConfig, stream_key_fingerprint,
+    Credentials as RustCredentials, IggyError, MetadataChangeCursor, MetadataChangeRecord,
+    MetadataChanges, MetadataChangesQuery, MetadataCurrentItem, MetadataCurrentPageToken,
+    PendingOperationsConfig, stream_key_fingerprint,
 };
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -43,9 +58,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Sentinel value passed from C++ to mean "no partition specified" — the server picks the
-/// partition based on the consumer/strategy. Cxx FFI does not support `Option<u32>`, so we
-/// reserve `u32::MAX` as the sentinel for `partition_id`.
+/// Sentinel value passed from C++ to the consumer offset calls to mean "no partition specified".
+/// Cxx FFI does not support `Option<u32>`, so we reserve `u32::MAX` as the sentinel for
+/// `partition_id`.
 const ANY_PARTITION_ID: u32 = u32::MAX;
 
 fn resolve_consumer(consumer_kind: &str, consumer_id: RustIdentifier) -> Result<Consumer, String> {
@@ -53,6 +68,33 @@ fn resolve_consumer(consumer_kind: &str, consumer_id: RustIdentifier) -> Result<
         "consumer" => Ok(Consumer::new(consumer_id)),
         "consumer_group" => Ok(Consumer::group(consumer_id)),
         _ => Err(format!("invalid consumer kind: {consumer_kind}")),
+    }
+}
+
+/// The resolved parts of a poll request.
+struct PollRequest {
+    stream_id: RustIdentifier,
+    topic_id: RustIdentifier,
+    consumer: Consumer,
+    options: PollOptions,
+}
+
+impl PollRequest {
+    fn new(
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        consumer_kind: &str,
+        consumer_id: ffi::Identifier,
+        options: ffi::PollOptions,
+    ) -> Result<Self, String> {
+        let fail = |error: String| format!("Could not poll messages: {error}");
+        let consumer_id = RustIdentifier::try_from(consumer_id).map_err(fail)?;
+        Ok(Self {
+            stream_id: RustIdentifier::try_from(stream_id).map_err(fail)?,
+            topic_id: RustIdentifier::try_from(topic_id).map_err(fail)?,
+            consumer: resolve_consumer(consumer_kind, consumer_id).map_err(fail)?,
+            options: PollOptions::try_from(options).map_err(fail)?,
+        })
     }
 }
 
@@ -64,25 +106,6 @@ fn opt_partition(partition_id: u32) -> Option<u32> {
     }
 }
 
-fn polling_strategy(
-    kind: &str,
-    value: u64,
-    context: Option<PartitionContext>,
-) -> Result<PollingStrategy, String> {
-    let strategy = match kind {
-        "offset" => PollingStrategy::offset(value),
-        "timestamp" => PollingStrategy::timestamp(IggyTimestamp::from(value)),
-        "first" => PollingStrategy::first(),
-        "last" => PollingStrategy::last(),
-        "next" => PollingStrategy::next(),
-        _ => return Err(format!("invalid polling strategy: {kind}")),
-    };
-    Ok(match context {
-        Some(context) => strategy.with_context(context),
-        None => strategy,
-    })
-}
-
 /// The `id` of the JSON error body an HTTP refusal carries.
 #[derive(Deserialize)]
 struct HttpErrorBody {
@@ -90,7 +113,7 @@ struct HttpErrorBody {
 }
 
 impl ffi::ErrorInfo {
-    fn record(&mut self, error: &IggyError) {
+    pub(crate) fn record(&mut self, error: &IggyError) {
         self.code = error.as_code();
         self.kind = error.as_string().to_owned();
         // HTTP reports an option refusal only in its body, binary transports by the error itself.
@@ -104,6 +127,12 @@ impl ffi::ErrorInfo {
         let operation = error.operation_id();
         self.has_operation_id = operation.is_some();
         self.operation_id = operation.unwrap_or_default();
+        let blocked_partition = match error {
+            IggyError::PartitionLaneBlocked(partition_id, _) => Some(*partition_id),
+            _ => None,
+        };
+        self.has_blocked_partition_id = blocked_partition.is_some();
+        self.blocked_partition_id = blocked_partition.unwrap_or_default();
     }
 }
 
@@ -477,53 +506,46 @@ impl Client {
         partition_id: u32,
         consumer_kind: String,
         consumer_id: ffi::Identifier,
-        polling_strategy_kind: String,
-        polling_strategy_value: u64,
-        count: u32,
-        auto_commit: bool,
+        strategy: ffi::PollingStrategy,
+        options: ffi::PollOptions,
         error_info: &mut ffi::ErrorInfo,
     ) -> Result<ffi::PolledMessages, String> {
+        *error_info = ffi::ErrorInfo::default();
+        let strategy = PollingStrategy::try_from(strategy)
+            .map_err(|error| format!("Could not poll messages: {error}"))?;
         self.poll(
             stream_id,
             topic_id,
             partition_id,
             consumer_kind,
             consumer_id,
-            polling_strategy_kind,
-            polling_strategy_value,
-            count,
-            auto_commit,
-            None,
+            &strategy,
+            options,
             error_info,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn poll_messages_with_context(
+    pub fn poll_messages_from(
         &self,
         stream_id: ffi::Identifier,
         topic_id: ffi::Identifier,
         partition_id: u32,
         consumer_kind: String,
         consumer_id: ffi::Identifier,
-        polling_strategy_kind: String,
-        polling_strategy_value: u64,
-        count: u32,
-        auto_commit: bool,
-        context: ffi::PartitionContext,
+        continuation: &Continuation,
+        options: ffi::PollOptions,
         error_info: &mut ffi::ErrorInfo,
     ) -> Result<ffi::PolledMessages, String> {
+        *error_info = ffi::ErrorInfo::default();
         self.poll(
             stream_id,
             topic_id,
             partition_id,
             consumer_kind,
             consumer_id,
-            polling_strategy_kind,
-            polling_strategy_value,
-            count,
-            auto_commit,
-            Some(context.into()),
+            &continuation.0,
+            options,
             error_info,
         )
     }
@@ -536,42 +558,161 @@ impl Client {
         partition_id: u32,
         consumer_kind: String,
         consumer_id: ffi::Identifier,
-        polling_strategy_kind: String,
-        polling_strategy_value: u64,
-        count: u32,
-        auto_commit: bool,
-        context: Option<PartitionContext>,
+        strategy: &PollingStrategy,
+        options: ffi::PollOptions,
         error_info: &mut ffi::ErrorInfo,
     ) -> Result<ffi::PolledMessages, String> {
-        *error_info = ffi::ErrorInfo::default();
-        let rust_stream_id = RustIdentifier::try_from(stream_id)
-            .map_err(|error| format!("Could not poll messages: {error}"))?;
-        let rust_topic_id = RustIdentifier::try_from(topic_id)
-            .map_err(|error| format!("Could not poll messages: {error}"))?;
-        let rust_consumer_id = RustIdentifier::try_from(consumer_id)
-            .map_err(|error| format!("Could not poll messages: {error}"))?;
-        let consumer = resolve_consumer(&consumer_kind, rust_consumer_id)
-            .map_err(|error| format!("Could not poll messages: {error}"))?;
-        let strategy = polling_strategy(&polling_strategy_kind, polling_strategy_value, context)
-            .map_err(|error| format!("Could not poll messages: {error}"))?;
-
+        let request = PollRequest::new(stream_id, topic_id, &consumer_kind, consumer_id, options)?;
         RUNTIME.block_on(async {
             let polled = self
                 .inner
                 .poll_messages(
-                    &rust_stream_id,
-                    &rust_topic_id,
-                    opt_partition(partition_id),
-                    &consumer,
-                    &strategy,
-                    count,
-                    auto_commit,
+                    &request.stream_id,
+                    &request.topic_id,
+                    partition_id,
+                    &request.consumer,
+                    strategy,
+                    request.options,
                 )
                 .await
                 .inspect_err(|error| error_info.record(error))
                 .map_err(|error| format!("Could not poll messages: {error}"))?;
             Ok(ffi::PolledMessages::from(polled))
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_poll_messages(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        partition_id: u32,
+        consumer_kind: String,
+        consumer_id: ffi::Identifier,
+        strategy: ffi::PollingStrategy,
+        options: ffi::PollOptions,
+    ) -> Result<Box<PendingPoll>, String> {
+        let strategy = PollingStrategy::try_from(strategy)
+            .map_err(|error| format!("Could not poll messages: {error}"))?;
+        let request = PollRequest::new(stream_id, topic_id, &consumer_kind, consumer_id, options)?;
+        let client = Arc::clone(&self.inner);
+        let task = RUNTIME.spawn(async move {
+            client
+                .poll_messages(
+                    &request.stream_id,
+                    &request.topic_id,
+                    partition_id,
+                    &request.consumer,
+                    &strategy,
+                    request.options,
+                )
+                .await
+        });
+        Ok(Box::new(PendingPoll::new(task)))
+    }
+
+    pub fn consumer(
+        &self,
+        name: String,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        group: bool,
+        options: ffi::ConsumerOptions,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<Box<ConsumerHandle>, String> {
+        *error_info = ffi::ErrorInfo::default();
+        let fail = |error: String| format!("Could not build consumer '{name}': {error}");
+        let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(fail)?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id).map_err(fail)?;
+        // The builders take names, so the stream and topic identifiers replace them.
+        let builder = if group {
+            self.inner.consumer_group(&name, &name, &name)
+        } else {
+            self.inner.consumer(&name, &name, &name)
+        };
+        let mut builder = builder
+            .map_err(|error| fail(error.to_string()))?
+            .stream(rust_stream_id)
+            .topic(rust_topic_id);
+        if !group {
+            builder = builder.partitions(options.partitions);
+        }
+        if options.has_start {
+            builder =
+                builder.polling_strategy(PollingStrategy::try_from(options.start).map_err(fail)?);
+        }
+        if options.has_poll_options {
+            builder =
+                builder.poll_options(PollOptions::try_from(options.poll_options).map_err(fail)?);
+        }
+        if options.has_prefetch_bytes {
+            builder = builder.prefetch_bytes(options.prefetch_bytes);
+        }
+        if options.has_prefetch_messages {
+            builder = builder.prefetch_messages(options.prefetch_messages);
+        }
+        if options.allow_replay {
+            builder = builder.allow_replay();
+        }
+        let mut consumer = builder.build();
+        RUNTIME
+            .block_on(consumer.init())
+            .inspect_err(|error| error_info.record(error))
+            .map_err(|error| fail(error.to_string()))?;
+        Ok(Box::new(ConsumerHandle::new(consumer)))
+    }
+
+    pub fn reader(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        consumer_kind: String,
+        consumer_id: ffi::Identifier,
+        options: ffi::ReaderOptions,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<Box<PartitionReader>, String> {
+        *error_info = ffi::ErrorInfo::default();
+        let rust_stream_id = RustIdentifier::try_from(stream_id)
+            .map_err(|error| format!("Could not build reader: {error}"))?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id)
+            .map_err(|error| format!("Could not build reader: {error}"))?;
+        let rust_consumer_id = RustIdentifier::try_from(consumer_id)
+            .map_err(|error| format!("Could not build reader: {error}"))?;
+        let consumer = resolve_consumer(&consumer_kind, rust_consumer_id)
+            .map_err(|error| format!("Could not build reader: {error}"))?;
+
+        let mut builder = self
+            .inner
+            .reader(&rust_stream_id, &rust_topic_id, &consumer);
+        if !options.partitions.is_empty() {
+            builder = builder.partitions(options.partitions);
+        }
+        if options.has_start {
+            let start = PollingStrategy::try_from(options.start)
+                .map_err(|error| format!("Could not build reader: {error}"))?;
+            builder = builder.start(start);
+        }
+        if options.has_poll_options {
+            let poll_options = PollOptions::try_from(options.poll_options)
+                .map_err(|error| format!("Could not build reader: {error}"))?;
+            builder = builder.options(poll_options);
+        }
+        if options.has_prefetch_bytes {
+            builder = builder.prefetch_bytes(options.prefetch_bytes);
+        }
+        if options.has_prefetch_messages {
+            builder = builder.prefetch_messages(options.prefetch_messages);
+        }
+
+        RUNTIME
+            .block_on(builder.build())
+            .map(|reader| Box::new(PartitionReader::new(reader)))
+            .inspect_err(|error| error_info.record(error))
+            .map_err(|error| {
+                format!(
+                    "Could not build reader for stream '{rust_stream_id}', topic '{rust_topic_id}': {error}"
+                )
+            })
     }
 
     pub fn create_topic(
@@ -993,16 +1134,13 @@ impl Client {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn store_consumer_position(
         &self,
         stream_id: ffi::Identifier,
         topic_id: ffi::Identifier,
-        partition_id: u32,
         consumer_kind: String,
         consumer_id: ffi::Identifier,
-        offset: u64,
-        context: ffi::PartitionContext,
+        checkpoint: &Checkpoint,
         error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
         *error_info = ffi::ErrorInfo::default();
@@ -1014,20 +1152,47 @@ impl Client {
             .map_err(|error| format!("Could not store consumer position: {error}"))?;
         let consumer = resolve_consumer(&consumer_kind, rust_consumer_id)
             .map_err(|error| format!("Could not store consumer position: {error}"))?;
-        let position = ConsumerPosition {
-            partition_id,
-            offset,
-            context: context.into(),
-        };
 
         RUNTIME.block_on(async {
             self.inner
-                .store_consumer_position(&consumer, &rust_stream_id, &rust_topic_id, position)
+                .store_consumer_position(&consumer, &rust_stream_id, &rust_topic_id, &checkpoint.0)
                 .await
                 .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not store consumer position for stream '{rust_stream_id}', topic '{rust_topic_id}': {error}"
+                    )
+                })
+        })
+    }
+
+    pub fn delete_consumer_position(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        consumer_kind: String,
+        consumer_id: ffi::Identifier,
+        checkpoint: &Checkpoint,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
+        let rust_stream_id = RustIdentifier::try_from(stream_id)
+            .map_err(|error| format!("Could not delete consumer position: {error}"))?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id)
+            .map_err(|error| format!("Could not delete consumer position: {error}"))?;
+        let rust_consumer_id = RustIdentifier::try_from(consumer_id)
+            .map_err(|error| format!("Could not delete consumer position: {error}"))?;
+        let consumer = resolve_consumer(&consumer_kind, rust_consumer_id)
+            .map_err(|error| format!("Could not delete consumer position: {error}"))?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .delete_consumer_position(&consumer, &rust_stream_id, &rust_topic_id, &checkpoint.0)
+                .await
+                .inspect_err(|error| error_info.record(error))
+                .map_err(|error| {
+                    format!(
+                        "Could not delete consumer position for stream '{rust_stream_id}', topic '{rust_topic_id}': {error}"
                     )
                 })
         })
@@ -1184,6 +1349,31 @@ impl Client {
         })
     }
 
+    /// Reads one page of the metadata change log or of the current state.
+    ///
+    /// The Rust SDK validates the query before anything is sent, so a refused
+    /// query and a refusal by the server both carry their error code.
+    pub fn get_metadata_changes(
+        &self,
+        query: ffi::MetadataChangesQuery,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<ffi::MetadataChanges, String> {
+        *error_info = ffi::ErrorInfo::default();
+        let query = MetadataChangesQuery::try_from(query)
+            .inspect_err(|error| error_info.record(error))
+            .map_err(|error| format!("Could not get metadata changes: {error}"))?;
+
+        RUNTIME.block_on(async {
+            let changes = self
+                .inner
+                .get_metadata_changes(&query)
+                .await
+                .inspect_err(|error| error_info.record(error))
+                .map_err(|error| format!("Could not get metadata changes: {error}"))?;
+            Ok(ffi::MetadataChanges::from(changes))
+        })
+    }
+
     pub fn ping(&self) -> Result<(), String> {
         RUNTIME.block_on(async {
             self.inner
@@ -1284,6 +1474,23 @@ impl Client {
                 .await
                 .map_err(|error| format!("Could not get cluster metadata: {error}"))?;
             Ok(ffi::ClusterMetadata::from(metadata))
+        })
+    }
+
+    pub fn create_personal_access_token(
+        &self,
+        name: String,
+        expiry_kind: String,
+        expiry_value: u64,
+    ) -> Result<String, String> {
+        let expiry = parse_message_expiry(&expiry_kind, expiry_value)?;
+        RUNTIME.block_on(async {
+            let token = self
+                .inner
+                .create_personal_access_token(&name, expiry)
+                .await
+                .map_err(|error| format!("Could not create personal access token: {error}"))?;
+            Ok(token.token)
         })
     }
 
@@ -1463,6 +1670,32 @@ impl Client {
             Ok(Vec::from(response))
         })
     }
+
+    /// Sends a command code and payload to the replica with `replica_id`, as
+    /// cluster metadata names it, and returns its raw response bytes.
+    /// Replicated commands, polls, consumer-offset reads and session-control
+    /// codes return an invalid-command error, and a replica that cluster
+    /// metadata does not name returns an invalid-identifier error.
+    pub fn send_binary_request_to_replica(
+        &self,
+        code: u32,
+        payload: Vec<u8>,
+        replica_id: u8,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<Vec<u8>, String> {
+        *error_info = ffi::ErrorInfo::default();
+        RUNTIME.block_on(async {
+            let response = self
+                .inner
+                .send_binary_request_to_replica(code, Bytes::from(payload), replica_id)
+                .await
+                .inspect_err(|error| error_info.record(error))
+                .map_err(|error| {
+                    format!("Could not send raw command '{code}' to replica {replica_id}: {error}")
+                })?;
+            Ok(Vec::from(response))
+        })
+    }
 }
 
 /// Fingerprint of a 32-byte stream key. Any other length is refused with
@@ -1486,6 +1719,95 @@ pub fn encryption_key_fingerprint_base64(
         .map(|key| key.fingerprint())
         .inspect_err(|error| error_info.record(error))
         .map_err(|error| format!("Could not compute the stream key fingerprint: {error}"))
+}
+
+/// Parses the `mc1_` text form. The error never echoes the text.
+pub fn parse_metadata_change_cursor(
+    text: &[u8],
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<ffi::MetadataChangeCursor, String> {
+    *error_info = ffi::ErrorInfo::default();
+    str::from_utf8(text)
+        .map_err(|_| IggyError::InvalidCommand)
+        .and_then(MetadataChangeCursor::from_str)
+        .map(ffi::MetadataChangeCursor::from)
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not parse the metadata change cursor: {error}"))
+}
+
+/// Parses the `cs1_` text form. The error never echoes the text.
+pub fn parse_metadata_current_page_token(
+    text: &[u8],
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<ffi::MetadataCurrentPageToken, String> {
+    *error_info = ffi::ErrorInfo::default();
+    str::from_utf8(text)
+        .map_err(|_| IggyError::InvalidCommand)
+        .and_then(MetadataCurrentPageToken::from_str)
+        .map(ffi::MetadataCurrentPageToken::from)
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not parse the metadata current page token: {error}"))
+}
+
+pub fn validate_metadata_changes_query(
+    query: ffi::MetadataChangesQuery,
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<(), String> {
+    *error_info = ffi::ErrorInfo::default();
+    MetadataChangesQuery::try_from(query)
+        .and_then(|query| query.validate().map(|_| ()))
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Invalid metadata changes query: {error}"))
+}
+
+pub fn encode_metadata_changes_query(
+    query: ffi::MetadataChangesQuery,
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<Vec<u8>, String> {
+    *error_info = ffi::ErrorInfo::default();
+    MetadataChangesQuery::try_from(query)
+        .map(|query| GetMetadataChangesRequest::from(&query).to_bytes().to_vec())
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not encode the metadata changes query: {error}"))
+}
+
+pub fn decode_metadata_changes(
+    payload: &[u8],
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<ffi::MetadataChanges, String> {
+    *error_info = ffi::ErrorInfo::default();
+    GetMetadataChangesResponse::decode_from(payload)
+        .map_err(|_| IggyError::InvalidFormat)
+        .and_then(MetadataChanges::try_from)
+        .map(ffi::MetadataChanges::from)
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not decode the metadata changes: {error}"))
+}
+
+pub fn decode_metadata_change_record(
+    bytes: &[u8],
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<ffi::MetadataChangeRecord, String> {
+    *error_info = ffi::ErrorInfo::default();
+    WireMetadataChangeRecord::decode_from(bytes)
+        .map_err(|_| IggyError::InvalidFormat)
+        .and_then(MetadataChangeRecord::try_from)
+        .map(ffi::MetadataChangeRecord::from)
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not decode the metadata change record: {error}"))
+}
+
+pub fn decode_metadata_current_item(
+    bytes: &[u8],
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<ffi::MetadataCurrentItem, String> {
+    *error_info = ffi::ErrorInfo::default();
+    WireMetadataItem::decode_from(bytes)
+        .map_err(|_| IggyError::InvalidFormat)
+        .and_then(MetadataCurrentItem::try_from)
+        .map(ffi::MetadataCurrentItem::from)
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not decode the metadata current item: {error}"))
 }
 
 fn is_option_error(error: &IggyError) -> bool {
@@ -1514,14 +1836,16 @@ pub unsafe fn delete_connection(client: *mut Client) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::messages::default_poll_options;
+    use iggy::prelude::{PartitionContext, PollingKind};
     use std::thread;
 
-    const POLLING_STRATEGY_KINDS: [&str; 5] = ["offset", "timestamp", "first", "last", "next"];
     const CONTEXT: PartitionContext = PartitionContext {
         incarnation: 3,
         owner_generation: 5,
         metadata_op: 7,
     };
+    const PARTITION: u32 = 1;
 
     #[test]
     fn should_preserve_each_calls_exact_operation_identity_under_concurrent_recovery() {
@@ -1567,25 +1891,24 @@ mod tests {
     }
 
     #[test]
-    fn should_leave_the_context_unset_on_a_poll_without_one() {
-        for kind in POLLING_STRATEGY_KINDS {
-            assert_eq!(
-                polling_strategy(kind, 9, None).map(|strategy| strategy.context),
-                Ok(None),
-                "{kind}"
-            );
-        }
-    }
+    fn given_a_lost_committing_poll_when_recording_should_keep_its_operation_and_blocked_partition()
+    {
+        let mut info = ffi::ErrorInfo::default();
+        info.record(&IggyError::PartitionLaneBlocked(u32::MAX, u64::MAX));
+        assert_eq!(info.code, IggyError::PartitionLaneBlocked(0, 0).as_code());
+        assert_eq!(info.kind, "partition_lane_blocked");
+        assert!(info.has_operation_id);
+        assert_eq!(info.operation_id, u64::MAX);
+        assert!(info.has_blocked_partition_id);
+        assert_eq!(info.blocked_partition_id, u32::MAX);
 
-    #[test]
-    fn should_carry_the_caller_context_on_a_poll_with_one() {
-        for kind in POLLING_STRATEGY_KINDS {
-            assert_eq!(
-                polling_strategy(kind, 9, Some(CONTEXT)).map(|strategy| strategy.context),
-                Ok(Some(CONTEXT)),
-                "{kind}"
-            );
-        }
+        info.record(&IggyError::FetchProgressUncertain(u64::MAX));
+        assert_eq!(info.code, IggyError::FetchProgressUncertain(0).as_code());
+        assert_eq!(info.kind, "fetch_progress_uncertain");
+        assert!(info.has_operation_id);
+        assert_eq!(info.operation_id, u64::MAX);
+        assert!(!info.has_blocked_partition_id);
+        assert_eq!(info.blocked_partition_id, 0);
     }
 
     #[test]
@@ -1620,61 +1943,111 @@ mod tests {
     }
 
     #[test]
-    fn should_reject_an_unknown_polling_strategy() {
-        assert_eq!(
-            polling_strategy("latest", 0, Some(CONTEXT))
-                .err()
-                .as_deref(),
-            Some("invalid polling strategy: latest")
-        );
-    }
-
-    #[test]
     fn should_clear_the_previous_error_info_when_a_poll_rejects_its_arguments() {
         let client = Client {
             inner: Arc::new(RustIggyClient::default()),
         };
-        let invalid_identifier = || ffi::Identifier {
-            kind: String::new(),
-            length: 0,
-            value: Vec::new(),
-        };
-        for with_context in [false, true] {
+        let continuation = Continuation(PollingStrategy::continuation(
+            PARTITION,
+            PollingKind::Offset,
+            0,
+            CONTEXT,
+        ));
+        for from_continuation in [false, true] {
             let mut info = ffi::ErrorInfo::default();
             info.record(&IggyError::OperationUncertain(u64::MAX));
-            let polled = if with_context {
-                client.poll_messages_with_context(
+            let polled = if from_continuation {
+                client.poll_messages_from(
                     invalid_identifier(),
                     invalid_identifier(),
-                    ANY_PARTITION_ID,
+                    PARTITION,
                     "consumer".to_owned(),
                     invalid_identifier(),
-                    "next".to_owned(),
-                    0,
-                    1,
-                    false,
-                    ffi::PartitionContext::from(CONTEXT),
+                    &continuation,
+                    default_poll_options(),
                     &mut info,
                 )
             } else {
                 client.poll_messages(
                     invalid_identifier(),
                     invalid_identifier(),
-                    ANY_PARTITION_ID,
+                    PARTITION,
                     "consumer".to_owned(),
                     invalid_identifier(),
-                    "next".to_owned(),
-                    0,
-                    1,
-                    false,
+                    ffi::PollingStrategy {
+                        kind: "next".to_owned(),
+                        value: 0,
+                    },
+                    default_poll_options(),
                     &mut info,
                 )
             };
-            assert!(polled.is_err(), "with_context: {with_context}");
-            assert_eq!(info.code, 0, "with_context: {with_context}");
-            assert!(info.kind.is_empty(), "with_context: {with_context}");
-            assert!(!info.has_operation_id, "with_context: {with_context}");
-            assert_eq!(info.operation_id, 0, "with_context: {with_context}");
+            assert!(polled.is_err(), "{from_continuation}");
+            assert_eq!(info.code, 0, "{from_continuation}");
+            assert!(info.kind.is_empty(), "{from_continuation}");
+            assert!(!info.has_operation_id, "{from_continuation}");
+            assert_eq!(info.operation_id, 0, "{from_continuation}");
+        }
+    }
+
+    #[test]
+    fn should_refuse_invalid_reader_settings_before_any_request() {
+        let client = Client {
+            inner: Arc::new(RustIggyClient::default()),
+        };
+        let cases = [
+            (
+                "consumer_group",
+                vec![PARTITION],
+                None,
+                IggyError::InvalidCommand,
+            ),
+            ("consumer", Vec::new(), None, IggyError::InvalidCommand),
+            (
+                "consumer",
+                vec![PARTITION],
+                Some(PollOptions {
+                    count: 0,
+                    ..PollOptions::default()
+                }),
+                IggyError::InvalidMessagesCount,
+            ),
+        ];
+        for (consumer_kind, partitions, poll_options, expected) in cases {
+            let options = ffi::ReaderOptions {
+                partitions,
+                has_start: false,
+                start: ffi::PollingStrategy {
+                    kind: "next".to_owned(),
+                    value: 0,
+                },
+                has_poll_options: poll_options.is_some(),
+                poll_options: poll_options.unwrap_or_default().into(),
+                has_prefetch_bytes: false,
+                prefetch_bytes: 0,
+                has_prefetch_messages: false,
+                prefetch_messages: 0,
+            };
+            let mut info = ffi::ErrorInfo::default();
+            let reader = client.reader(
+                ffi::Identifier::from(RustIdentifier::numeric(1).unwrap()),
+                ffi::Identifier::from(RustIdentifier::numeric(1).unwrap()),
+                consumer_kind.to_owned(),
+                ffi::Identifier::from(RustIdentifier::numeric(1).unwrap()),
+                options,
+                &mut info,
+            );
+            assert!(reader.is_err(), "{expected}");
+            assert_eq!(info.code, expected.as_code(), "{expected}");
+            assert_eq!(info.kind, expected.as_string(), "{expected}");
+        }
+    }
+
+    fn invalid_identifier() -> ffi::Identifier {
+        ffi::Identifier {
+            kind: String::new(),
+            length: 0,
+            value: Vec::new(),
         }
     }
 }

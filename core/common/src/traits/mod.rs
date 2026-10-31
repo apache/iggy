@@ -35,5 +35,8 @@ pub(crate) mod topic_client;
 pub(crate) mod user_client;
 pub(crate) mod validatable;
 
-pub use binary_impls::{BinarySendPartitioning, decode_send_confirmations, send_binary_messages};
+pub use binary_impls::{
+    BinarySendPartitioning, decode_send_confirmations, fetch_binary_messages, send_binary_messages,
+};
 pub use binary_impls::{binary_sign_in, rust_sdk_version_info, sign_in_request};
+pub use binary_impls::{group_cache_key, sync_group_assignment};

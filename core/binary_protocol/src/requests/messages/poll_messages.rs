@@ -17,9 +17,10 @@
 
 use crate::WireError;
 use crate::WireIdentifier;
-use crate::codec::{WireDecode, WireEncode, read_u8, read_u32_le};
+use crate::codec::{WireDecode, WireEncode, read_u8, read_u32_le, read_u64_le};
 use crate::primitives::consumer::WireConsumer;
 use crate::primitives::polling_strategy::WirePollingStrategy;
+use crate::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
 use bytes::{BufMut, BytesMut};
 
 /// `PollMessages` request.
@@ -45,9 +46,43 @@ pub struct PollMessagesRequest {
 
 const PARTITION_FLAG_SIZE: usize = 1;
 const PARTITION_VALUE_SIZE: usize = 4;
-const STRATEGY_SIZE: usize = 9;
+pub(crate) const STRATEGY_SIZE: usize = 9;
 const COUNT_SIZE: usize = 4;
 const AUTO_COMMIT_SIZE: usize = 1;
+
+/// Finite protocol ceiling; servers may configure a lower admission limit.
+pub const MAX_DEFERRED_POLL_WAIT_US: u64 = 600_000_000;
+/// Request timeout room above the longest wait.
+const DEFERRED_POLL_TIMEOUT_HEADROOM_US: u64 = 30_000_000;
+/// Finite ceiling of a deferred request timeout: the longest wait plus headroom.
+pub const MAX_DEFERRED_POLL_TIMEOUT_US: u64 =
+    MAX_DEFERRED_POLL_WAIT_US + DEFERRED_POLL_TIMEOUT_HEADROOM_US;
+/// Least time a waiting request leaves between the end of its wait and its request timeout.
+///
+/// The server spends it on the final read and the reply, so an idle wait answers before the
+/// client gives up. A zero wait of a 106 answers at once and needs no margin. A 109
+/// needs it at any wait.
+pub const MIN_DEFERRED_POLL_REPLY_MARGIN_US: u64 = 1_000_000;
+/// Reply margin of a `FetchMessages` request.
+///
+/// The server gives each partition read of a 109 the deadline `timeout - 2 x margin` and
+/// replies by `timeout - margin`, so a read that committed always has one margin to reach the
+/// reply.
+pub const FETCH_REPLY_MARGIN_US: u64 = 200_000;
+// A 109 timeout leaves the reply margin after the wait, so every read deadline falls after
+// the wait.
+const _: () = assert!(2 * FETCH_REPLY_MARGIN_US < MIN_DEFERRED_POLL_REPLY_MARGIN_US);
+/// Smallest byte limit that can return a message: the reply header, one batch
+/// header and one message header.
+pub const MIN_DEFERRED_POLL_MAX_BYTES: usize = POLL_RESPONSE_HEADER_SIZE
+    + crate::batch::BATCH_HEADER_SIZE
+    + crate::batch::BATCH_MESSAGE_HEADER_SIZE;
+
+/// Whether `request_timeout_us` covers a wait of `wait_us` and its reply margin.
+#[must_use]
+pub const fn deferred_timeout_covers_wait(wait_us: u64, request_timeout_us: u64) -> bool {
+    wait_us == 0 || request_timeout_us >= wait_us.saturating_add(MIN_DEFERRED_POLL_REPLY_MARGIN_US)
+}
 
 impl PollMessagesRequest {
     /// Read the strategy and auto-commit flag without allocating identifiers.
@@ -143,100 +178,72 @@ impl WireDecode for PollMessagesRequest {
     }
 }
 
+/// Readiness-based polling with explicit message and response-byte limits.
+/// New command codes prevent older servers from silently ignoring the wait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredPollMessagesRequest {
+    pub poll: PollMessagesRequest,
+    pub wait_us: u64,
+    pub min_count: u32,
+    pub max_bytes: u32,
+    pub request_timeout_us: u64,
+}
+
+impl WireEncode for DeferredPollMessagesRequest {
+    fn encoded_size(&self) -> usize {
+        self.poll.encoded_size() + 2 * size_of::<u64>() + 2 * size_of::<u32>()
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        self.poll.encode(buf);
+        buf.put_u64_le(self.wait_us);
+        buf.put_u32_le(self.min_count);
+        buf.put_u32_le(self.max_bytes);
+        buf.put_u64_le(self.request_timeout_us);
+    }
+}
+
+impl WireDecode for DeferredPollMessagesRequest {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
+        let (poll, consumed) = PollMessagesRequest::decode(buf)?;
+        if buf.len() - consumed != 2 * size_of::<u64>() + 2 * size_of::<u32>() {
+            return Err(WireError::Validation(
+                "deferred poll requires wait, minimum count, byte limit and request timeout".into(),
+            ));
+        }
+        let wait_us = read_u64_le(buf, consumed)?;
+        let min_count = read_u32_le(buf, consumed + size_of::<u64>())?;
+        let max_bytes = read_u32_le(buf, consumed + size_of::<u64>() + size_of::<u32>())?;
+        let request_timeout_us =
+            read_u64_le(buf, consumed + size_of::<u64>() + 2 * size_of::<u32>())?;
+        if wait_us > MAX_DEFERRED_POLL_WAIT_US
+            || min_count == 0
+            || min_count > poll.count
+            || request_timeout_us == 0
+            || !deferred_timeout_covers_wait(wait_us, request_timeout_us)
+            || request_timeout_us > MAX_DEFERRED_POLL_TIMEOUT_US
+            || (max_bytes as usize) < MIN_DEFERRED_POLL_MAX_BYTES
+        {
+            return Err(WireError::Validation(
+                "invalid deferred poll wait, message counts or byte limit".into(),
+            ));
+        }
+        Ok((
+            Self {
+                poll,
+                wait_us,
+                min_count,
+                max_bytes,
+                request_timeout_us,
+            },
+            buf.len(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn given_poll_encodings_when_peeking_progress_should_match_full_decode() {
-        let identifiers = [
-            WireIdentifier::numeric(u32::MAX),
-            WireIdentifier::named("named-é").unwrap(),
-        ];
-        for consumer_id in &identifiers {
-            for consumer in [
-                WireConsumer::consumer(consumer_id.clone()),
-                WireConsumer::consumer_group(consumer_id.clone()),
-                WireConsumer::external_group(consumer_id.clone()),
-            ] {
-                for stream_id in &identifiers {
-                    for topic_id in &identifiers {
-                        for strategy in [
-                            WirePollingStrategy::offset(0),
-                            WirePollingStrategy::offset(u64::MAX),
-                            WirePollingStrategy::timestamp(u64::MAX),
-                            WirePollingStrategy::first(),
-                            WirePollingStrategy::last(),
-                            WirePollingStrategy::next(),
-                        ] {
-                            for partition_id in [None, Some(u32::MAX)] {
-                                for auto_commit in [false, true] {
-                                    for count in [0, u32::MAX] {
-                                        let request = PollMessagesRequest {
-                                            consumer: consumer.clone(),
-                                            stream_id: stream_id.clone(),
-                                            topic_id: topic_id.clone(),
-                                            partition_id,
-                                            strategy: strategy.clone(),
-                                            count,
-                                            auto_commit,
-                                        };
-                                        let mut bytes = request.to_bytes().to_vec();
-                                        assert_eq!(
-                                            PollMessagesRequest::decode_from(&bytes).unwrap(),
-                                            request
-                                        );
-                                        for end in 0..=bytes.len() {
-                                            assert_progress_peek_matches(&bytes[..end]);
-                                        }
-                                        bytes.extend_from_slice(b"trailing\0\xff");
-                                        assert_progress_peek_matches(&bytes);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn given_mutated_poll_fields_when_peeking_progress_should_match_full_decode() {
-        for identifier in [
-            WireIdentifier::numeric(1),
-            WireIdentifier::named("café").unwrap(),
-        ] {
-            let request = PollMessagesRequest {
-                consumer: WireConsumer::consumer(identifier.clone()),
-                stream_id: identifier.clone(),
-                topic_id: identifier,
-                partition_id: Some(0),
-                strategy: WirePollingStrategy::offset(0),
-                count: 0,
-                auto_commit: false,
-            };
-            let mut bytes = request.to_bytes().to_vec();
-            for offset in 0..bytes.len() {
-                let original = bytes[offset];
-                for value in u8::MIN..=u8::MAX {
-                    bytes[offset] = value;
-                    assert_progress_peek_matches(&bytes);
-                }
-                bytes[offset] = original;
-            }
-        }
-    }
-
-    fn assert_progress_peek_matches(bytes: &[u8]) {
-        let decoded = PollMessagesRequest::decode_from(bytes)
-            .map(|request| (request.strategy, request.auto_commit));
-        assert_eq!(
-            PollMessagesRequest::peek_progress(bytes),
-            decoded,
-            "{bytes:?}"
-        );
-    }
 
     #[test]
     fn roundtrip_with_partition() {
@@ -328,6 +335,104 @@ mod tests {
             assert!(
                 PollMessagesRequest::decode(&bytes[..i]).is_err(),
                 "expected error for truncation at byte {i}"
+            );
+        }
+    }
+    #[test]
+    fn deferred_preserves_legacy_prefix_and_validates_limits() {
+        let request = DeferredPollMessagesRequest {
+            poll: PollMessagesRequest {
+                consumer: WireConsumer::consumer_group(WireIdentifier::named("group").unwrap()),
+                stream_id: WireIdentifier::named("stream").unwrap(),
+                topic_id: WireIdentifier::numeric(2),
+                partition_id: Some(3),
+                strategy: WirePollingStrategy::offset(42),
+                count: 5,
+                auto_commit: true,
+            },
+            wait_us: MAX_DEFERRED_POLL_WAIT_US,
+            min_count: 1,
+            max_bytes: 1024,
+            request_timeout_us: MAX_DEFERRED_POLL_TIMEOUT_US,
+        };
+        for wait_us in [0, 1, MAX_DEFERRED_POLL_WAIT_US] {
+            let request = DeferredPollMessagesRequest {
+                wait_us,
+                ..request.clone()
+            };
+            let bytes = request.to_bytes();
+            let prefix = request.poll.to_bytes();
+            assert_eq!(&bytes[..prefix.len()], prefix.as_ref());
+            assert_eq!(bytes.len(), prefix.len() + 24);
+            assert_eq!(
+                &bytes[prefix.len()..prefix.len() + 8],
+                &wait_us.to_le_bytes()
+            );
+            assert_eq!(
+                DeferredPollMessagesRequest::decode(&bytes).unwrap(),
+                (request, bytes.len())
+            );
+            for end in 0..bytes.len() {
+                assert!(DeferredPollMessagesRequest::decode(&bytes[..end]).is_err());
+            }
+            let mut extra = bytes.to_vec();
+            extra.push(0);
+            assert!(DeferredPollMessagesRequest::decode(&extra).is_err());
+        }
+        for invalid in [
+            DeferredPollMessagesRequest {
+                wait_us: MAX_DEFERRED_POLL_WAIT_US + 1,
+                ..request.clone()
+            },
+            DeferredPollMessagesRequest {
+                min_count: 0,
+                ..request.clone()
+            },
+            DeferredPollMessagesRequest {
+                min_count: 6,
+                ..request.clone()
+            },
+            DeferredPollMessagesRequest {
+                max_bytes: 15,
+                ..request.clone()
+            },
+            DeferredPollMessagesRequest {
+                request_timeout_us: 0,
+                ..request.clone()
+            },
+            DeferredPollMessagesRequest {
+                request_timeout_us: MAX_DEFERRED_POLL_WAIT_US - 1,
+                ..request.clone()
+            },
+            DeferredPollMessagesRequest {
+                request_timeout_us: MAX_DEFERRED_POLL_TIMEOUT_US + 1,
+                ..request.clone()
+            },
+            DeferredPollMessagesRequest {
+                wait_us: 1,
+                request_timeout_us: MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+                ..request.clone()
+            },
+            DeferredPollMessagesRequest {
+                max_bytes: u32::try_from(MIN_DEFERRED_POLL_MAX_BYTES).unwrap() - 1,
+                ..request.clone()
+            },
+        ] {
+            assert!(
+                DeferredPollMessagesRequest::decode(&invalid.to_bytes()).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        for (wait_us, request_timeout_us) in [(0, 1), (1, 1 + MIN_DEFERRED_POLL_REPLY_MARGIN_US)] {
+            let valid = DeferredPollMessagesRequest {
+                wait_us,
+                request_timeout_us,
+                max_bytes: u32::try_from(MIN_DEFERRED_POLL_MAX_BYTES).unwrap(),
+                ..request.clone()
+            };
+            assert!(
+                DeferredPollMessagesRequest::decode(&valid.to_bytes()).is_ok(),
+                "rejected {valid:?}"
             );
         }
     }

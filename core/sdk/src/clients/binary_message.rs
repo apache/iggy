@@ -19,71 +19,93 @@ use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_common::locking::IggyRwLockFn;
-use iggy_common::{BinarySendPartitioning, MessageClient};
+use iggy_common::{BinarySendPartitioning, MessageClient, with_binary_deadline};
 use iggy_common::{
-    Consumer, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages, PollingStrategy,
-    SendMessagesResponse,
+    CommitPolicy, Consumer, DecodeError, Identifier, IggyError, IggyMessage, Partitioning,
+    PollOptions, PolledMessages, PollingStrategy, SendMessagesResponse,
 };
+use tokio::time::Instant;
 
 #[async_trait]
 impl MessageClient for IggyClient {
+    /// The call ends at its own deadline of `max_wait` plus 10 s, so a wait of up to 600 s
+    /// outlives the operation timeout of the other calls.
+    ///
+    /// With an encryptor, `CommitPolicy::OnRead` fails with
+    /// [`IggyError::InvalidConfiguration`] before anything is sent: the server would store the
+    /// offset of a batch before the client decrypts it, so a batch that fails to decrypt would
+    /// be lost.
     async fn poll_messages(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: u32,
         consumer: &Consumer,
         strategy: &PollingStrategy,
-        count: u32,
-        auto_commit: bool,
+        options: PollOptions,
     ) -> Result<PolledMessages, IggyError> {
-        self.poll_messages_with_strategy_for(
+        self.poll_messages_raw(
             stream_id,
             topic_id,
             partition_id,
             consumer,
-            &|_: u32| *strategy,
-            count,
-            auto_commit,
+            strategy,
+            options,
         )
         .await
+        .map_err(|error| error.error)
     }
 
-    async fn poll_messages_with_strategy_for(
+    async fn poll_messages_raw(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: u32,
         consumer: &Consumer,
-        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
-        count: u32,
-        auto_commit: bool,
-    ) -> Result<PolledMessages, IggyError> {
-        if count == 0 {
-            return Err(IggyError::InvalidMessagesCount);
+        strategy: &PollingStrategy,
+        options: PollOptions,
+    ) -> Result<PolledMessages, DecodeError> {
+        if options.commit == CommitPolicy::OnRead && self.encryptor.is_some() {
+            return Err(DecodeError::without_record(IggyError::InvalidConfiguration));
         }
-
-        let mut polled_messages = super::with_client!(self, client => client.poll_messages_with_strategy_for(
-                stream_id,
-                topic_id,
-                partition_id,
-                consumer,
-                strategy_for,
-                count,
-                auto_commit,
-            ).await)?;
+        let deadline = Instant::now()
+            .checked_add(options.request_timeout().get_duration())
+            .ok_or(IggyError::InvalidCommand)
+            .map_err(DecodeError::without_record)?;
+        let mut polled_messages = with_binary_deadline(deadline, async {
+            let client = tokio::time::timeout_at(deadline, self.client.read())
+                .await
+                .map_err(|_| DecodeError::without_record(IggyError::TransientNotAccepted))?;
+            client
+                .poll_messages_raw(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    consumer,
+                    strategy,
+                    options,
+                )
+                .await
+        })
+        .await?;
 
         if let Some(ref encryptor) = self.encryptor {
-            for message in &mut polled_messages.messages {
-                let payload = encryptor.decrypt(&message.payload)?;
-                message.payload = Bytes::from(payload);
-                message.header.payload_length = message.payload.len() as u32;
-
-                if let Some(ref user_headers) = message.user_headers {
-                    let decrypted_headers = encryptor.decrypt(user_headers)?;
-                    message.header.user_headers_length = decrypted_headers.len() as u32;
-                    message.user_headers = Some(Bytes::from(decrypted_headers));
-                }
+            let failed =
+                polled_messages
+                    .messages
+                    .iter_mut()
+                    .enumerate()
+                    .find_map(|(index, message)| {
+                        encryptor
+                            .decrypt_message(message)
+                            .err()
+                            .map(|error| (index, error))
+                    });
+            if let Some((index, error)) = failed {
+                return Err(DecodeError {
+                    error,
+                    record: polled_messages.undecoded_record(index).map(Box::new),
+                });
             }
         }
 
@@ -135,5 +157,142 @@ impl IggyClient {
         }
 
         super::with_client!(self, client => client.send_messages_with_partitioning(stream_id, topic_id, partitioning, messages).await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client_wrappers::client_wrapper::ClientWrapper;
+    use crate::links::OPERATION_TIMEOUT;
+    use crate::links::fake_cluster::{Answer, FakeCluster, connected, endpoint};
+    use crate::tcp::tcp_client::TcpClient;
+    use iggy_binary_protocol::codes::POLL_MESSAGES_DEFERRED_CODE;
+    use iggy_binary_protocol::requests::messages::DeferredPollMessagesRequest;
+    use iggy_binary_protocol::responses::messages::{
+        PartitionRouteResponse, PollMessagesResponseHeader,
+    };
+    use iggy_binary_protocol::{WireDecode, WireEncode};
+    use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyDuration, PartitionContext};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::Notify;
+    use tokio::time::sleep;
+
+    const PARTITION_ID: u32 = 0;
+    const ENCRYPTION_KEY: [u8; 32] = [1; 32];
+
+    /// A cluster of one replica that routes the partition.
+    fn routed_cluster() -> Arc<FakeCluster> {
+        let cluster = FakeCluster::new(1);
+        *cluster.route.lock().unwrap() = Some(PartitionRouteResponse {
+            incarnation: 7,
+            metadata_op: 11,
+            view: 0,
+            partitions_count: 1,
+            primary_replica: 0,
+        });
+        cluster
+    }
+
+    fn empty_reply() -> Vec<u8> {
+        PollMessagesResponseHeader {
+            partition_id: PARTITION_ID,
+            current_offset: 0,
+            messages_count: 0,
+            context: PartitionContext::default(),
+        }
+        .to_bytes()
+        .to_vec()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_wait_past_the_operation_timeout_when_polling_should_wait_for_the_reply() {
+        let reply_after = OPERATION_TIMEOUT * 2;
+        let max_wait = OPERATION_TIMEOUT * 3;
+        let cluster = routed_cluster();
+        let release = Arc::new(Notify::new());
+        cluster.script(
+            &endpoint(0),
+            POLL_MESSAGES_DEFERRED_CODE,
+            [Answer::GatedBody {
+                release: Arc::clone(&release),
+                completed: Arc::new(AtomicBool::new(false)),
+                body: empty_reply(),
+            }],
+        );
+        let client = IggyClient::new(ClientWrapper::Tcp(TcpClient::from_links(
+            connected(&cluster, 1).await,
+        )));
+        let id = Identifier::numeric(1).unwrap();
+        let consumer = Consumer::new(id.clone());
+        let strategy = PollingStrategy::offset(0);
+        let start = Instant::now();
+
+        let (result, ()) = tokio::join!(
+            client.poll_messages(
+                &id,
+                &id,
+                PARTITION_ID,
+                &consumer,
+                &strategy,
+                PollOptions::wait(max_wait.into()),
+            ),
+            async {
+                sleep(reply_after).await;
+                release.notify_one();
+            }
+        );
+
+        let polled = result.expect("the poll must outlive the operation timeout of other calls");
+        assert_eq!(polled.partition_id, PARTITION_ID);
+        assert_eq!(start.elapsed(), reply_after);
+        let request = DeferredPollMessagesRequest::decode_from(
+            &cluster.received(POLL_MESSAGES_DEFERRED_CODE)[0].body,
+        )
+        .unwrap();
+        assert_eq!(request.wait_us, IggyDuration::from(max_wait).as_micros());
+    }
+
+    /// The server would store the offset of an `OnRead` batch before the client decrypts it.
+    #[tokio::test(start_paused = true)]
+    async fn given_an_encryptor_when_polling_with_on_read_should_refuse_it_before_sending() {
+        let cluster = routed_cluster();
+        cluster.script(
+            &endpoint(0),
+            POLL_MESSAGES_DEFERRED_CODE,
+            [Answer::Body(empty_reply())],
+        );
+        let encryptor = EncryptorKind::Aes256Gcm(Aes256GcmEncryptor::new(&ENCRYPTION_KEY).unwrap());
+        let client = IggyClient::create(
+            ClientWrapper::Tcp(TcpClient::from_links(connected(&cluster, 1).await)),
+            None,
+            Some(Arc::new(encryptor)),
+        );
+        let id = Identifier::numeric(1).unwrap();
+        let consumer = Consumer::new(id.clone());
+        let next = PollingStrategy::next();
+        let poll = |commit| {
+            client.poll_messages(
+                &id,
+                &id,
+                PARTITION_ID,
+                &consumer,
+                &next,
+                PollOptions {
+                    commit,
+                    ..PollOptions::default()
+                },
+            )
+        };
+
+        let refused = poll(CommitPolicy::OnRead).await;
+        let sent_after_refusal = cluster.count(POLL_MESSAGES_DEFERRED_CODE);
+        let polled = poll(CommitPolicy::Manual).await;
+
+        assert_eq!(refused.map(drop), Err(IggyError::InvalidConfiguration));
+        assert_eq!(sent_after_refusal, 0);
+        assert_eq!(polled.map(|polled| polled.count), Ok(0));
+        assert_eq!(cluster.count(POLL_MESSAGES_DEFERRED_CODE), 1);
     }
 }

@@ -20,9 +20,11 @@ package command
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
 func TestSerialize_CreateTopic_ServerDefaults(t *testing.T) {
@@ -294,5 +296,25 @@ func TestCreateTopic_NonStringOptionKeyIsRejected(t *testing.T) {
 
 	if _, err := command.MarshalBinary(); err == nil {
 		t.Error("expected an error for a non-string option key, got nil")
+	}
+}
+
+func TestCreateTopic_OutOfByteOptionValueKindIsRejected(t *testing.T) {
+	streamId, err := iggcon.NewIdentifier(uint32(1))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	command := CreateTopic{
+		StreamId: streamId,
+		Name:     "t",
+		Options: iggcon.TopicOptions{Raw: []iggcon.HeaderEntry{{
+			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("future_option")},
+			Value: iggcon.HeaderValue{Kind: 257, Value: []byte("x")},
+		}}},
+	}
+
+	// 257 truncates to 1, which would let a reader decode the value as Raw.
+	if _, err := command.MarshalBinary(); !errors.Is(err, ierror.ErrInvalidOptionValue) {
+		t.Fatalf("got %v, want invalid option value", err)
 	}
 }

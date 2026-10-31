@@ -1,7 +1,7 @@
 # Review execution in Claude Code and Codex
 
-These instructions supply target preparation and client-specific tools for `team-review`, `team-review-slim`, and
-`connector-review`. They replace the tool examples in those skills, without changing their roles, Charters, or rounds.
+These instructions supply target preparation and client-specific tools for `team-review` and `connector-review`.
+They replace the tool examples in those skills, without changing their roles, Charters, or rounds.
 An explicit skill invocation authorizes its reviewers and validators. Workers do not delegate further.
 
 ## Prepare the target
@@ -41,6 +41,21 @@ Follow local RTK instructions for ordinary commands. If RTK is in use, use `rtk 
 Give every worker the resolved start and head, repository path, artifact paths, applicable repository instructions,
 its role and Charter, and the execution instructions for its client.
 
+## CI evidence for team-review
+
+For a PR target, run `gh pr checks <PR> --json name,state,bucket,link,workflow` before starting reviewers. Save the
+complete output as `<DIR>/checks.json`. With RTK, use `rtk proxy gh pr checks` to preserve the JSON. Inspect all checks,
+including tests and builds, rather than only required checks. Failed or pending checks produce a nonzero exit code;
+retain their results. Report failed, pending, skipped, cancelled, missing, or unavailable checks accurately.
+None of those states proves that tests passed.
+
+Recheck the PR's `headRefOid` after the CI query and before the final report. If it differs from the reviewed head,
+report an incomplete review without a verdict. Give every reviewer the CI results and include their status and links
+in the report's `Verification:` line. Passing CI covers those checks without a local rerun.
+
+For branch or ref-range targets, report CI as not checked. If the client cannot query CI, report it as unavailable.
+Do not turn absent CI evidence into an automatic local build or test run.
+
 ## Claude Code tools
 
 Use the tool calls in each skill as written.
@@ -74,7 +89,9 @@ deliverable one follow-up and, if still absent, one replacement worker. If it re
 or validation shard and an incomplete review. Do not issue a completed verdict.
 
 Workers list each test or build command that they need, with its reason, under `Checks to run:` at the end of their
-deliverable. The moderator runs those checks serially after the workers finish. Record actual commands and outcomes
-in the report's `Verification:` line. For `team-review-slim`, `validation: none (manual)` means no independent
+deliverable. For `team-review`, the moderator runs a proposed check only when a concrete concern remains unresolved
+by source tracing and CI evidence. Reject routine reruns of passing CI and generic validation checklists.
+Run accepted checks serially after the workers finish. Record actual commands, justifications, and outcomes
+in the report's `Verification:` line. For `team-review`, `validation: none (manual)` means no independent
 validation rounds; it does not mean that no tests ran.
 Keep reports local unless the user also requests publication.

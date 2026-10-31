@@ -17,10 +17,9 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
-use iggy_common::MessageClient;
 use iggy_common::{
-    Consumer, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages, PollingStrategy,
-    SendMessagesResponse,
+    Consumer, DecodeError, Identifier, IggyError, IggyMessage, MessageClient, Partitioning,
+    PollOptions, PolledMessages, PollingStrategy, SendMessagesResponse,
 };
 
 #[async_trait]
@@ -29,101 +28,46 @@ impl MessageClient for ClientWrapper {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: u32,
         consumer: &Consumer,
         strategy: &PollingStrategy,
-        count: u32,
-        auto_commit: bool,
+        options: PollOptions,
     ) -> Result<PolledMessages, IggyError> {
-        self.poll_messages_with_strategy_for(
-            stream_id,
-            topic_id,
-            partition_id,
-            consumer,
-            &|_: u32| *strategy,
-            count,
-            auto_commit,
+        super::dispatch_client!(
+            self,
+            MessageClient::poll_messages(
+                stream_id,
+                topic_id,
+                partition_id,
+                consumer,
+                strategy,
+                options
+            )
         )
         .await
     }
 
-    async fn poll_messages_with_strategy_for(
+    async fn poll_messages_raw(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: u32,
         consumer: &Consumer,
-        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
-        count: u32,
-        auto_commit: bool,
-    ) -> Result<PolledMessages, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .poll_messages_with_strategy_for(
-                        stream_id,
-                        topic_id,
-                        partition_id,
-                        consumer,
-                        strategy_for,
-                        count,
-                        auto_commit,
-                    )
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .poll_messages_with_strategy_for(
-                        stream_id,
-                        topic_id,
-                        partition_id,
-                        consumer,
-                        strategy_for,
-                        count,
-                        auto_commit,
-                    )
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .poll_messages_with_strategy_for(
-                        stream_id,
-                        topic_id,
-                        partition_id,
-                        consumer,
-                        strategy_for,
-                        count,
-                        auto_commit,
-                    )
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .poll_messages_with_strategy_for(
-                        stream_id,
-                        topic_id,
-                        partition_id,
-                        consumer,
-                        strategy_for,
-                        count,
-                        auto_commit,
-                    )
-                    .await
-            }
-            ClientWrapper::WebSocket(client) => {
-                client
-                    .poll_messages_with_strategy_for(
-                        stream_id,
-                        topic_id,
-                        partition_id,
-                        consumer,
-                        strategy_for,
-                        count,
-                        auto_commit,
-                    )
-                    .await
-            }
-        }
+        strategy: &PollingStrategy,
+        options: PollOptions,
+    ) -> Result<PolledMessages, DecodeError> {
+        super::dispatch_client!(
+            self,
+            MessageClient::poll_messages_raw(
+                stream_id,
+                topic_id,
+                partition_id,
+                consumer,
+                strategy,
+                options
+            )
+        )
+        .await
     }
 
     async fn send_messages(
@@ -133,32 +77,10 @@ impl MessageClient for ClientWrapper {
         partitioning: &Partitioning,
         messages: &mut [IggyMessage],
     ) -> Result<SendMessagesResponse, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .send_messages(stream_id, topic_id, partitioning, messages)
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .send_messages(stream_id, topic_id, partitioning, messages)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .send_messages(stream_id, topic_id, partitioning, messages)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .send_messages(stream_id, topic_id, partitioning, messages)
-                    .await
-            }
-            ClientWrapper::WebSocket(client) => {
-                client
-                    .send_messages(stream_id, topic_id, partitioning, messages)
-                    .await
-            }
-        }
+        super::dispatch_client!(
+            self,
+            MessageClient::send_messages(stream_id, topic_id, partitioning, messages)
+        )
+        .await
     }
 }

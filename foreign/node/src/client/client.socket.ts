@@ -22,21 +22,31 @@ import type {
 } from './client.type.js';
 import { DeserializeError, ResponseError, responseError } from '../wire/error.utils.js';
 import { IggyConnection, endpointKey, type Endpoint } from './client.connection.js';
-import { normalizeClientConfig } from './client.config.js';
+import { DEFAULT_MAX_RESPONSE_FRAME_SIZE, normalizeClientConfig } from './client.config.js';
 import {
-  ChangeSignal, MutationLanes, NotConnectedError, OperationUncertainError, OperationNotRetainedError,
-  OPERATION_TIMEOUT_MS, VsrResponseTimeoutError, pause, waitWithin, type ClientOperation
+  ChangeSignal, FetchProgressUncertainError, MutationLanes, NotConnectedError, OperationUncertainError, OperationNotRetainedError,
+  OPERATION_TIMEOUT_MS, PermitPool, VsrResponseTimeoutError, pause, waitWithin, type ClientOperation
 } from './client.operation.js';
 import { LOGIN, LOGIN_WITH_TOKEN, LOGOUT, PING } from '../wire/index.js';
 import { GET_CLUSTER_METADATA } from '../wire/cluster/get-cluster-metadata.command.js';
 import { deserializePartitionRoute, type PartitionRoute } from '../wire/partition/partition-route.js';
 import { ConsumerKind } from '../wire/offset/offset.utils.js';
 import { COMMAND_CODE } from '../wire/command.code.js';
-import { serializeIdentifier } from '../wire/identifier.utils.js';
+import { serializeIdentifier, type Id } from '../wire/identifier.utils.js';
+import { uint32ToBuf } from '../wire/number.utils.js';
 import { deserializeOptions } from '../wire/options.utils.js';
 import { OptionsScope } from '../wire/system/describe-options.command.js';
 import { PartitionKind } from '../wire/message/partitioning.utils.js';
 import { PollingStrategyKind } from '../wire/message/poll.utils.js';
+import { CommitErrorScope, provesNothingStored } from '../wire/message/commit-outcome.js';
+import {
+  DEFERRED_POLL_OFFSET, DEFERRED_POLL_OPTIONS_SIZE, MAX_PARTITIONS_PER_REQUEST, MIN_DEFERRED_POLL_MAX_BYTES,
+  MIN_DEFERRED_POLL_REPLY_MARGIN_US, US_PER_MS, isDeferredBudget, isFetchBudget
+} from '../wire/message/deferred-poll.utils.js';
+import {
+  FETCH_MESSAGES, FETCH_MESSAGES_FIELD, FETCH_MESSAGES_FIELDS_SIZE, FETCH_SECTION_FIELD, FETCH_SECTION_SIZE, FETCH_TARGET_FIELD,
+  FETCH_TARGET_SIZE, fetchReplyHeadSize
+} from '../wire/message/fetch-messages.command.js';
 import {
   EvictionReason, HEADER_SIZE, REPLY_OFFSET, hasCommittedResult, type PartitionContext,
   EMPTY_PARTITION_CONTEXT, readReplyOperation
@@ -50,8 +60,8 @@ import { validateReplyForRequest } from '../wire/vsr/reply.js';
 import { debug } from './client.debug.js';
 
 export {
-  LaneBlockedError, NotConnectedError, OperationNotRetainedError, OperationUncertainError,
-  VsrResponseTimeoutError
+  FETCH_PROGRESS_UNCERTAIN, FetchProgressUncertainError, LANE_BLOCKED, LaneBlockedError, NotConnectedError,
+  OperationNotRetainedError, OperationUncertainError, PARTITION_LANE_BLOCKED, VsrResponseTimeoutError
 } from './client.operation.js';
 
 const RETRY_INTERVAL_MS = 50;
@@ -69,11 +79,35 @@ const OPERATION_NOT_RETAINED = 85;
 const HISTORY_UNAVAILABLE = 87;
 const LIFECYCLE_BUSY = 88;
 const NOT_PRIMARY = 89;
+const DEFERRED_POLL_CAPACITY_EXCEEDED = 90;
+const GROUP_PARTITION_NOT_OWNED = 5009;
+/** The refusals of a partition after which its route can be stale: it moved, or its history or owner changed. */
+const STALE_ROUTE_CODES = new Set([NOT_PRIMARY, HISTORY_UNAVAILABLE, GROUP_PARTITION_NOT_OWNED]);
 const INVALID_COMMAND = 3;
 const FEATURE_UNAVAILABLE = 5;
+const INVALID_IDENTIFIER = 6;
+const INVALID_SIZE_BYTES = 80;
+// Session control, and the partition reads that need the primary and its incarnation.
+const REPLICA_REFUSED_CODES = new Set<number>([
+  COMMAND_CODE.LoginUser,
+  COMMAND_CODE.LogoutUser,
+  COMMAND_CODE.LoginRegister,
+  COMMAND_CODE.LoginWithAccessToken,
+  COMMAND_CODE.LoginRegisterWithAccessToken,
+  COMMAND_CODE.PollMessages,
+  COMMAND_CODE.PollMessagesDeferred,
+  COMMAND_CODE.FetchMessages,
+  COMMAND_CODE.GetOffset,
+]);
 const INVALID_SESSION_BINDING = 14004;
 const ROUTE_NAMESPACE_MISSING = new Set([1009, 1010, 2010, 2011, 3007]);
 const POLL_OPTIONS_SIZE = 9 + 4 + 1;
+const POLL_COUNT_SIZE = 4;
+const POLL_AUTOCOMMIT_SIZE = 1;
+// Deferred polls and fetches together, as MAX_DEFERRED_REQUESTS
+// in core/sdk/src/driver.rs. The server parks as many per session and shard.
+const MAX_DEFERRED_REQUESTS = 64;
+const MAX_ROUTE_LOOKUPS_IN_FLIGHT = 16;
 const IDENTIFIER_PREFIX_SIZE = 2;
 const SEND_METADATA_LENGTH_SIZE = 4;
 const PARTITION_ID_SIZE = 4;
@@ -88,11 +122,14 @@ const TOPIC_DISCOVERY_RESETS = new Set<number>([
 ]);
 const READ_COMMANDS = new Set<number>([
   COMMAND_CODE.Ping, COMMAND_CODE.GetStats, COMMAND_CODE.GetClusterMetadata,
-  COMMAND_CODE.DescribeOptions, COMMAND_CODE.GetMe, COMMAND_CODE.GetClient,
-  COMMAND_CODE.GetClients, COMMAND_CODE.GetUser, COMMAND_CODE.GetUsers,
+  COMMAND_CODE.DescribeOptions, COMMAND_CODE.GetMetadataChanges, COMMAND_CODE.GetMe,
+  COMMAND_CODE.GetClient, COMMAND_CODE.GetClients, COMMAND_CODE.GetUser, COMMAND_CODE.GetUsers,
   COMMAND_CODE.GetAccessTokens, COMMAND_CODE.GetPartitionRoute, COMMAND_CODE.GetOffset,
   COMMAND_CODE.GetStream, COMMAND_CODE.GetStreams, COMMAND_CODE.GetTopic,
-  COMMAND_CODE.GetTopics, COMMAND_CODE.GetGroup, COMMAND_CODE.GetGroups, COMMAND_CODE.SyncGroup
+  COMMAND_CODE.GetTopics, COMMAND_CODE.GetGroup, COMMAND_CODE.GetGroups, COMMAND_CODE.SyncGroup,
+]);
+const OFFSET_COMMANDS = new Set<number>([
+  COMMAND_CODE.GetOffset, COMMAND_CODE.StoreOffset, COMMAND_CODE.DeleteConsumerOffset
 ]);
 
 type ReplicaSlot = {
@@ -122,6 +159,18 @@ type Attempt = {
   committed: boolean,
   started: boolean
 };
+/**
+ * The wait and the request timeout of a deferred poll or a
+ * fetch, in microseconds, and where its body carries them.
+ */
+type DeferredBudget = {
+  readonly started: number,
+  readonly wait: bigint,
+  readonly timeout: bigint,
+  readonly waitOffset: number,
+  readonly timeoutOffset: number
+};
+type DriveOptions = SendCommandOptions & { budget?: DeferredBudget };
 
 /** A replica link used its retry budget, and nothing restarts it. */
 class ReconnectExhaustedError extends Error {
@@ -139,6 +188,7 @@ export class CommandResponseStream extends EventEmitter {
   private readonly connections = new Set<IggyConnection>();
   private connecting = false;
   private readonly partitionRoutes = new Map<string, CachedRoute>();
+  private readonly deferredRequests = new PermitPool(MAX_DEFERRED_REQUESTS);
   private readonly changed = new ChangeSignal();
   private readonly lifetime = new AbortController();
   private sessionLifetime = new AbortController();
@@ -189,11 +239,23 @@ export class CommandResponseStream extends EventEmitter {
   get busy(): boolean { return this.pendingSubmissions > 0; }
 
   async sendCommand(command: number, payload: Buffer, options: SendCommandOptions = {}): Promise<CommandResponse> {
+    // Only a link cancels a deferred request, the one that it sent.
+    if (command === COMMAND_CODE.CancelDeferredRequest)
+      throw responseError(command, INVALID_COMMAND);
+    if (options.replica !== undefined && !isReplicaCommand(command))
+      throw responseError(command, INVALID_COMMAND);
+    if (options.replica !== undefined && !(Number.isInteger(options.replica) && options.replica >= 0 && options.replica < MAX_REPLICAS))
+      throw responseError(command, INVALID_IDENTIFIER);
     if (isLoginCommand(command)) return this.loginByCaller(command, () => Buffer.from(payload), options);
     const lineage = options.lineage ?? this.lineage;
     payload = Buffer.from(payload);
+    const budget = deferredBudget(command, payload,
+      (this.options.maxResponseFrameSize ?? DEFAULT_MAX_RESPONSE_FRAME_SIZE) - HEADER_SIZE);
     const release = this.hold();
-    const deadline = options.deadline ?? Date.now() + OPERATION_TIMEOUT_MS;
+    // A deferred request gives up at its own request timeout.
+    const deadline = budget
+      ? Math.min(options.deadline ?? Number.POSITIVE_INFINITY, budget.started + Number(budget.timeout / US_PER_MS))
+      : options.deadline ?? Date.now() + OPERATION_TIMEOUT_MS;
     const signal = AbortSignal.any([this.lifetime.signal, ...(options.signal ? [options.signal] : [])]);
     try {
       if (command === LOGOUT.code) {
@@ -213,23 +275,63 @@ export class CommandResponseStream extends EventEmitter {
           }
         });
       }
-      if (lineage !== this.lineage) throw responseError(command, UNAUTHENTICATED);
-      if (!this.isAuthenticated && command !== PING.code) {
-        void this.signIn();
-        await this.nextSession(command, lineage, deadline, signal);
+      await this.ready(command, lineage, deadline, signal);
+      if (!budget) return await this.drive(command, payload, options, deadline, signal, lineage);
+      const lease = await this.deferredLease(command, deadline, signal);
+      try {
+        if (command === COMMAND_CODE.FetchMessages)
+          return await this.fetchMessages(payload, { ...options, budget }, deadline, signal, lineage);
+        return await this.drive(command, payload, { ...options, budget }, deadline, signal, lineage);
+      } finally {
+        lease();
       }
-      if (this.isAuthenticated && this.replicas.size === 0) {
-        const generation = this.routingGeneration;
-        // The call waits for a session lost meanwhile itself.
-        await this.refreshRoster(deadline, signal).catch((error: unknown) => {
-          if (generation !== this.routingGeneration) return;
-          // The call sent nothing yet, so a deadline leaves it not accepted.
-          throw error instanceof VsrResponseTimeoutError ? responseError(command, TRANSIENT_NOT_ACCEPTED) : error;
-        });
-      }
-      return await this.drive(command, payload, options, deadline, signal, lineage);
     } finally {
       release();
+    }
+  }
+
+  /**
+   * The partitions of a topic grouped by their primary, in replica id order,
+   * and split to fit one fetch each. Each group keeps the order of
+   * `partitions`. The routes come from the cache, so only the partitions
+   * without a fresh route are looked up.
+   */
+  async readinessGroups(streamId: Id, topicId: Id, partitions: number[],
+    options: SendCommandOptions = {}): Promise<number[][]> {
+    const command = COMMAND_CODE.GetPartitionRoute;
+    const lineage = options.lineage ?? this.lineage;
+    const release = this.hold();
+    const deadline = options.deadline ?? Date.now() + OPERATION_TIMEOUT_MS;
+    const signal = AbortSignal.any([this.lifetime.signal, ...(options.signal ? [options.signal] : [])]);
+    try {
+      await this.ready(command, lineage, deadline, signal);
+      const topic = Buffer.concat([serializeIdentifier(streamId), serializeIdentifier(topicId)]);
+      const groups = await this.primaryGroups(command, topic, partitions.map(uint32ToBuf), deadline, signal, lineage);
+      return groups.flatMap((group) => Array.from(
+        { length: Math.ceil(group.length / MAX_PARTITIONS_PER_REQUEST) },
+        (_, index) => group.slice(index * MAX_PARTITIONS_PER_REQUEST, (index + 1) * MAX_PARTITIONS_PER_REQUEST)
+          .map((target) => target.readUInt32LE(0))
+      ));
+    } finally {
+      release();
+    }
+  }
+
+  /** Waits for a session of `lineage` and for the roster that routes a call of it. */
+  private async ready(command: number, lineage: number, deadline: number, signal: AbortSignal): Promise<void> {
+    if (lineage !== this.lineage) throw responseError(command, UNAUTHENTICATED);
+    if (!this.isAuthenticated && command !== PING.code) {
+      void this.signIn();
+      await this.nextSession(command, lineage, deadline, signal);
+    }
+    if (this.isAuthenticated && this.replicas.size === 0) {
+      const generation = this.routingGeneration;
+      // The call waits for a session lost meanwhile itself.
+      await this.refreshRoster(deadline, signal).catch((error: unknown) => {
+        if (generation !== this.routingGeneration) return;
+        // The call sent nothing yet, so a deadline leaves it not accepted.
+        throw error instanceof VsrResponseTimeoutError ? responseError(command, TRANSIENT_NOT_ACCEPTED) : error;
+      });
     }
   }
 
@@ -266,15 +368,30 @@ export class CommandResponseStream extends EventEmitter {
     }
   }
 
-  private async drive(command: number, body: Buffer, options: SendCommandOptions,
+  private async drive(command: number, body: Buffer, options: DriveOptions,
     deadline: number, signal: AbortSignal, lineage: number, retained?: ClientOperation): Promise<CommandResponse> {
     /** The session that the frame of the call belongs to. */
     let generation = this.routingGeneration;
     const target = partitionRoute(command, body);
+    const fetch = command === COMMAND_CODE.FetchMessages ? readFetch(body) : undefined;
     const replicated = command !== LOGOUT.code && operationForCode(command) !== Operation.NonReplicated;
-    const progress = command === COMMAND_CODE.PollMessages &&
-      (body[body.length - 1] !== 0 || body[body.length - POLL_OPTIONS_SIZE] === PollingStrategyKind.Next);
-    const safeRead = READ_COMMANDS.has(command) || (command === COMMAND_CODE.PollMessages && !progress);
+    const pollEnd = command === COMMAND_CODE.PollMessagesDeferred ? body.length - DEFERRED_POLL_OPTIONS_SIZE : body.length;
+    const progress = fetch ? fetch.progress : isPoll(command) &&
+      (body[pollEnd - POLL_AUTOCOMMIT_SIZE] !== 0 || body[pollEnd - POLL_OPTIONS_SIZE] === PollingStrategyKind.Next);
+    const safeRead = READ_COMMANDS.has(command) || ((isPoll(command) || fetch !== undefined) && !progress);
+    // A read that stores its offset can store it before a cancel arrives, so once it is sent the caller's abort only
+    // cancels it on the server and the call waits for its one reply.
+    const commits = fetch ? fetch.commits : isPoll(command) && body[pollEnd - POLL_AUTOCOMMIT_SIZE] !== 0;
+    // A progress fetch holds the progress lane of each target, in ascending
+    // partition order, as offset stores take them.
+    const fetchPartitions = fetch?.progress
+      ? new Map(fetch.targets
+        .map((fetchTarget) => [fetchTarget.readUInt32LE(FETCH_TARGET_FIELD.partitionId),
+          fetchTarget.readBigUInt64LE(FETCH_TARGET_FIELD.incarnation)] as const)
+        .sort(([left], [right]) => left - right)
+        .map(([partition, incarnation]) => [progressLaneOf(laneKey(incarnation, partition)), partition]))
+      : undefined;
+    const fetchLanes = fetchPartitions ? [...fetchPartitions.keys()] : [];
     // A replay and a logout belong to their session. Any other call that
     // needs a session waits for the one that replaces a lost one.
     const restartable = !retained && command !== LOGOUT.code && (command !== PING.code || this.isAuthenticated);
@@ -293,6 +410,7 @@ export class CommandResponseStream extends EventEmitter {
     let lastRefusal: ResponseError | undefined;
     let previousLink: IggyConnection | undefined;
     let sent = false;
+    let mayHaveCommitted = false;
     try {
       for (;;) {
         this.ensureLineage(lineage, command);
@@ -334,7 +452,15 @@ export class CommandResponseStream extends EventEmitter {
         }
         context ??= { ...EMPTY_PARTITION_CONTEXT, metadataOp: this.metadataWatermark };
         this.ensureLineage(lineage, command);
-        const lane = target ? groupKey(context, target) : 'metadata';
+        // A caller's zero wire fence must not bypass the resolved history's local recovery block.
+        const laneContext = context.incarnation === 0n && selected ? selected.route.context : context;
+        const mutationLane = target ? groupKey(laneContext, target) : 'metadata';
+        // Offset calls and progress polls keep their order in a progress lane
+        // apart from sends, so a parked poll does not delay a send. An offset
+        // store or delete holds both lanes, as in core/sdk/src/session_owner/lanes.rs.
+        const progressLanes = fetch ? fetchLanes
+          : target && (progress || OFFSET_COMMANDS.has(command)) ? [progressLaneOf(mutationLane)] : [];
+        const lane = replicated ? mutationLane : progressLanes.at(-1);
         if (operation && staleFrame && operation.lane !== lane) {
           // A definitive refusal released the old history. The replacement
           // must enter the lane that orders writes to its current incarnation.
@@ -351,10 +477,14 @@ export class CommandResponseStream extends EventEmitter {
             operation = undefined;
             continue;
           }
-        } else if (!operation && (replicated || progress)) {
+        } else if (!operation && lane) {
           try {
+            // A committing poll keeps a recovery record for its partition, as a committing fetch does for each target.
+            const recovered = fetchPartitions ?? (commits && target
+              ? new Map([[lane, target.query.readUInt32LE(target.query.length - PARTITION_ID_SIZE)]]) : undefined);
             operation = await this.lanes.enter(lane, command, body, context, replicated,
-              this.vsrSession, deadline, signal);
+              this.vsrSession, deadline, signal, replicated ? progressLanes : progressLanes.slice(0, -1), recovered,
+              commits);
             staleFrame = false;
           } catch (error) {
             // A lane can free while no session is bound to encode the frame.
@@ -373,25 +503,59 @@ export class CommandResponseStream extends EventEmitter {
         try {
           if (refresh && target)
             selected = await this.routeFor(target, deadline, attemptSignal, generation, true);
-          else if (refresh)
+          else if (refresh && options.replica === undefined)
             await this.refreshRoster(deadline, attemptSignal);
           refresh = false;
           const link = target
             ? await this.primaryLink(selected!, deadline, attemptSignal)
-            : await this.readyLink(deadline, attemptSignal, safeRead ? previousLink : undefined);
+            : options.replica !== undefined
+              ? await this.replicaLink(command, options.replica, deadline, attemptSignal)
+              : await this.readyLink(deadline, attemptSignal, safeRead ? previousLink : undefined);
           previousLink = link;
           this.ensureGeneration(generation, command);
           attempt = await this.exchange(link, command, () => {
             this.ensureGeneration(generation, command);
             this.ensureLineage(lineage, command);
-            return operation?.frame.buffer ?? (frame ??= this.vsrSession.encode(command, body, context));
-          }, deadline, attemptSignal, operation);
+            const bytes = operation?.frame.buffer ?? (frame ??= this.vsrSession.encode(command, body, context));
+            return options.budget ? deferredFrame(command, bytes, options.budget, deadline) : bytes;
+          }, deadline, attemptSignal, operation, commits
+            ? AbortSignal.any([this.lifetime.signal, this.sessionLifetime.signal,
+              ...(operation ? [operation.lifetime.signal] : [])]) : undefined);
           exchanged = true;
         } catch (error) {
           attempt = { error, committed: false, started: false };
         }
         sent ||= attempt.started;
-        if (generation !== this.routingGeneration && attempt.started && (replicated || progress))
+        // The server refused the read because the cancel won, so it stored nothing.
+        if (commits && attempt.started && options.signal?.aborted && attempt.error instanceof ResponseError &&
+            attempt.error.fromServer && attempt.error.errorCode === TRANSIENT_NOT_ACCEPTED)
+          throw options.signal.reason;
+        if (commits && attempt.started)
+          mayHaveCommitted = !(attempt.error instanceof ResponseError && attempt.error.fromServer &&
+            provesNothingStored(CommitErrorScope.Request, attempt.error.errorCode));
+        if (fetch?.commits && operation && !attempt.error) {
+          const sections = FETCH_MESSAGES.deserialize(attempt.response!);
+          const requested = new Set(fetch.targets.map((target) => target.readUInt32LE(FETCH_TARGET_FIELD.partitionId)));
+          const seen = new Set<number>();
+          for (const section of sections) {
+            if (!requested.has(section.partitionId) || seen.has(section.partitionId))
+              throw new DeserializeError('fetch reply names a duplicate or unrequested partition');
+            seen.add(section.partitionId);
+          }
+          const uncertain = new Set(sections.filter(({ status }) =>
+            status !== 0 && !provesNothingStored(CommitErrorScope.Section, status))
+            .map(({ partitionId }) => partitionId));
+          if (uncertain.size > 0) {
+            this.lanes.retainFetch(operation, uncertain);
+            attempt.response!.fetchProgress = { operationId: operation.id, partitions: uncertain };
+          }
+          mayHaveCommitted = false;
+          this.ensureLineage(lineage, command);
+        } else if (commits && !attempt.error) {
+          mayHaveCommitted = false;
+        }
+        const hasCommittingReply = commits && !attempt.error;
+        if (!hasCommittingReply && generation !== this.routingGeneration && attempt.started && (replicated || progress))
           throw uncertainOutcome(command, operation, attempt.error ?? responseError(command, TRANSIENT_NOT_ACCEPTED));
         // A committed rejection proves the outcome even when it also ends the session.
         if (operation?.uncertain && attempt.committed && attempt.error) {
@@ -412,10 +576,12 @@ export class CommandResponseStream extends EventEmitter {
           if (restartable && exchanged && !attempt.started && generation !== this.routingGeneration) continue;
           throw attempt.error;
         }
-        if (generation !== this.routingGeneration) {
+        if (!hasCommittingReply && generation !== this.routingGeneration) {
           if (restartable && (!attempt.started || safeRead)) continue;
           throw responseError(command, TRANSIENT_NOT_ACCEPTED);
         }
+        if (mayHaveCommitted && attempt.error)
+          throw new FetchProgressUncertainError(operation!.id, attempt.error);
         if (!attempt.error) {
           if (operation?.uncertain && !attempt.committed)
             throw new OperationUncertainError(operation.id, new Error('reply does not prove the retained result'));
@@ -446,6 +612,12 @@ export class CommandResponseStream extends EventEmitter {
         } else if (code === OPERATION_NOT_RETAINED) {
           if (operation?.retainable) operation.uncertain = true;
           throw uncertainOutcome(command, operation, error);
+        } else if (code === NOT_PRIMARY &&
+            (options.replica !== undefined || fetch)) {
+          // The caller chose the replica, so its refusal is the answer. A
+          // fetch does not say which of its partitions moved, so its caller
+          // looks up the route of each one again.
+          throw error;
         } else if (code === NOT_PRIMARY || code === TRANSIENT_NOT_ACCEPTED) {
           if (selected) this.invalidateRoute(selected, code === NOT_PRIMARY);
           refresh = true;
@@ -497,6 +669,9 @@ export class CommandResponseStream extends EventEmitter {
           }
           lastRefusal = responseError(command, TRANSIENT_NOT_ACCEPTED);
           lastRefusal.fromServer = true;
+        } else if (code === DEFERRED_POLL_CAPACITY_EXCEEDED) {
+          // The primary parks no more deferred requests of this session for
+          // now. It still leads the partition, so the call keeps its route.
         } else if (code !== undefined) {
           if (operation?.uncertain)
             throw new OperationUncertainError(operation.id, error);
@@ -517,6 +692,10 @@ export class CommandResponseStream extends EventEmitter {
         retryDelay = Math.min(retryDelay * 2, MAX_RETRY_INTERVAL_MS);
       }
     } catch (error) {
+      if (operation?.fetchProgress && mayHaveCommitted) {
+        this.lanes.retainFetch(operation);
+        throw error instanceof FetchProgressUncertainError ? error : new FetchProgressUncertainError(operation.id, error);
+      }
       // A call that sent nothing and saw no refusal was not accepted either.
       if (error instanceof VsrResponseTimeoutError && (lastRefusal || !sent))
         error = lastRefusal ?? responseError(command, TRANSIENT_NOT_ACCEPTED);
@@ -527,24 +706,125 @@ export class CommandResponseStream extends EventEmitter {
       }
       if (retained && !this.lanes.owns(retained))
         throw error instanceof ResponseError ? error : new OperationNotRetainedError(retained.id);
-      if (error instanceof ResponseError && !(error instanceof VsrEvictionError) && error.commandCode !== command) {
-        const remapped = responseError(command, error.errorCode);
-        remapped.fromServer = error.fromServer;
-        remapped.committed = error.committed;
-        throw remapped;
-      }
-      throw error;
+      throw refusalOf(command, error);
     } finally {
       if (operation && !operation.retained) this.lanes.complete(operation);
       if (operation && frameLease) operation.frame.release();
     }
   }
 
+  /**
+   * A fetch goes to the primary of its targets.
+   * Each target carries its own fence, so the header carries context zero,
+   * and a target without a fence takes the incarnation of its route. A
+   * refusal of the fetch as not the primary, or for a history or an owner
+   * that changed, does not say which partition it is about, so the routes of
+   * all targets go stale. A section refused so names its partition, so only
+   * that route goes stale. The next `readinessGroups` then looks them up.
+   */
+  private async fetchMessages(body: Buffer, options: DriveOptions, deadline: number,
+    signal: AbortSignal, lineage: number): Promise<CommandResponse> {
+    const command = COMMAND_CODE.FetchMessages;
+    const { topic, targets } = readFetch(body);
+    const unfenced = targets.filter((target) => target.readBigUInt64LE(FETCH_TARGET_FIELD.incarnation) === 0n);
+    const routes = await this.routesOf(command, topic, unfenced, deadline, signal, lineage);
+    unfenced.forEach((target, index) => {
+      target.writeBigUInt64LE(routes[index].route.context.incarnation, FETCH_TARGET_FIELD.incarnation);
+      target.writeBigUInt64LE(routes[index].route.context.ownerGeneration, FETCH_TARGET_FIELD.ownerGeneration);
+    });
+    let response: CommandResponse;
+    try {
+      response = await this.drive(command, body, { ...options, context: EMPTY_PARTITION_CONTEXT },
+        deadline, signal, lineage);
+    } catch (error) {
+      if (error instanceof ResponseError && error.fromServer && STALE_ROUTE_CODES.has(error.errorCode))
+        this.staleRoutes(topic, targets);
+      throw error;
+    }
+    const data = options.handleResponse === false
+      ? (response as unknown as Buffer).subarray(HEADER_SIZE) : response.data;
+    this.staleRoutes(topic, fetchSections(data)
+      .filter((section) => STALE_ROUTE_CODES.has(section.readUInt32LE(FETCH_SECTION_FIELD.status))));
+    return response;
+  }
+
+  /** Marks the routes of the partitions that lead `targets` stale. */
+  private staleRoutes(topic: Buffer, targets: Buffer[]): void {
+    for (const target of targets) {
+      const route = this.partitionRoutes.get(readinessTarget(topic, target).key);
+      if (route) this.invalidateRoute(route, false);
+    }
+  }
+
+  /** `targets` grouped by the primary of their partition, in replica id order, each group in the order of `targets`. */
+  private async primaryGroups(command: number, topic: Buffer, targets: Buffer[], deadline: number,
+    signal: AbortSignal, lineage: number): Promise<Buffer[][]> {
+    const routes = await this.routesOf(command, topic, targets, deadline, signal, lineage);
+    const groups = new Map<number, Buffer[]>();
+    targets.forEach((target, index) => {
+      const primary = routes[index].route.primaryReplica;
+      const group = groups.get(primary);
+      if (group) group.push(target);
+      else groups.set(primary, [target]);
+    });
+    return [...groups].sort(([left], [right]) => left - right).map(([, group]) => group);
+  }
+
+  /**
+   * The routes of the partitions that lead `targets`, in their order. At most
+   * MAX_ROUTE_LOOKUPS_IN_FLIGHT routes are looked up at once, as
+   * `readiness_groups` in core/sdk/src/driver.rs does.
+   */
+  private async routesOf(command: number, topic: Buffer, targets: Buffer[], deadline: number,
+    signal: AbortSignal, lineage: number): Promise<CachedRoute[]> {
+    let generation = this.routingGeneration;
+    for (;;) {
+      this.ensureLineage(lineage, command);
+      // As in `drive`, a lookup goes out only under a live session.
+      if (generation !== this.routingGeneration || !this.isAuthenticated) {
+        await this.nextSession(command, lineage, deadline, signal);
+        generation = this.routingGeneration;
+      }
+      const sessionSignal = AbortSignal.any([signal, this.sessionLifetime.signal]);
+      const routes: CachedRoute[] = [];
+      let next = 0;
+      let failed = false;
+      try {
+        await Promise.all(Array.from({ length: Math.min(MAX_ROUTE_LOOKUPS_IN_FLIGHT, targets.length) }, async () => {
+          while (next < targets.length && !failed) {
+            const index = next++;
+            try {
+              routes[index] = await this.routeFor(readinessTarget(topic, targets[index]), deadline, sessionSignal, generation);
+            } catch (error) {
+              failed = true;
+              throw error;
+            }
+          }
+        }));
+      } catch (error) {
+        // A session failure answered a lookup of the call itself.
+        if (generation !== this.routingGeneration && !isSessionFailure(error)) continue;
+        // No request of these targets went out.
+        throw error instanceof VsrResponseTimeoutError ? responseError(command, TRANSIENT_NOT_ACCEPTED) : error;
+      }
+      return routes;
+    }
+  }
+
+  /** A deferred request waits for one of the MAX_DEFERRED_REQUESTS leases within its deadline. */
+  private async deferredLease(command: number, deadline: number, signal: AbortSignal): Promise<() => void> {
+    try {
+      return await this.deferredRequests.acquire(deadline, signal);
+    } catch (error) {
+      throw error instanceof VsrResponseTimeoutError ? responseError(command, TRANSIENT_NOT_ACCEPTED) : error;
+    }
+  }
+
   private async exchange(link: IggyConnection, command: number, frame: () => Buffer,
-    deadline: number, signal: AbortSignal, operation?: ClientOperation): Promise<Attempt> {
+    deadline: number, signal: AbortSignal, operation?: ClientOperation, afterSend?: AbortSignal): Promise<Attempt> {
     const generation = this.routingGeneration;
     let request: Buffer | undefined;
-    const attempt = await link.exchange(() => request = frame(), deadline, signal, operation?.frame);
+    const attempt = await link.exchange(() => request = frame(), deadline, signal, operation?.frame, afterSend);
     if (attempt.error || !attempt.response) {
       const error = this.isAuthenticated && command !== COMMAND_CODE.BindSession &&
         isDetachedFailure(attempt.error)
@@ -734,6 +1014,30 @@ export class CommandResponseStream extends EventEmitter {
       catch (error) {
         if (!(error instanceof VsrResponseTimeoutError)) throw error;
         const refusal = responseError(COMMAND_CODE.GetPartitionRoute, TRANSIENT_NOT_ACCEPTED);
+        refusal.fromServer = true;
+        throw refusal;
+      }
+    }
+  }
+
+  /** The link of the replica the caller chose, waited for while it reconnects. An id the roster does not name is looked up in one fresh roster, then refused. */
+  private async replicaLink(command: number, replica: number, deadline: number, signal: AbortSignal): Promise<IggyConnection> {
+    let rosterRead = false;
+    for (;;) {
+      const slot = this.replicas.get(replica);
+      if (slot?.attached && slot.connection?.connected) return slot.connection;
+      if (slot?.failure instanceof ResponseError) throw slot.failure;
+      if (slot?.failure instanceof TypeError) throw slot.failure;
+      if (!slot) {
+        if (rosterRead) throw responseError(command, INVALID_IDENTIFIER);
+        rosterRead = true;
+        await this.refreshRoster(deadline, signal);
+        continue;
+      }
+      try { await waitWithin(this.changed.promise, deadline, signal); }
+      catch (error) {
+        if (!(error instanceof VsrResponseTimeoutError)) throw error;
+        const refusal = responseError(command, TRANSIENT_NOT_ACCEPTED);
         refusal.fromServer = true;
         throw refusal;
       }
@@ -1207,7 +1511,7 @@ export class CommandResponseStream extends EventEmitter {
     } finally { release(); }
   }
 
-  /** Only SDK recovery shares a sign-in; callers always own a fresh attempt. */
+  /** Only SDK recovery shares a sign-in. Callers always own a fresh attempt. */
   private signIn(): Promise<boolean> {
     if (this.isAuthenticated) return Promise.resolve(true);
     if (!this.authenticationPromise) {
@@ -1327,8 +1631,22 @@ const isSessionFailure = (error: unknown, binding = false): boolean =>
   (error instanceof ResponseError && error.fromServer &&
     ((error.errorCode === UNAUTHENTICATED && (binding || error.committed)) ||
       (error.errorCode === STALE_CLIENT && error.committed)));
+const laneKey = (incarnation: bigint, partitionId: number): string => `${incarnation}:${partitionId}`;
 const groupKey = (context: PartitionContext, target: PartitionTarget): string =>
-  `${context.incarnation}:${target.query.readUInt32LE(target.query.length - PARTITION_ID_SIZE)}`;
+  laneKey(context.incarnation, target.query.readUInt32LE(target.query.length - PARTITION_ID_SIZE));
+const progressLaneOf = (lane: string): string => `progress:${lane}`;
+const isPoll = (command: number): boolean =>
+  command === COMMAND_CODE.PollMessages || command === COMMAND_CODE.PollMessagesDeferred;
+
+/** `error` as the refusal of `command`, also when a step for it failed, such as a route lookup. */
+const refusalOf = (command: number, error: unknown): unknown => {
+  if (!(error instanceof ResponseError) || error instanceof VsrEvictionError || error.commandCode === command)
+    return error;
+  const remapped = responseError(command, error.errorCode);
+  remapped.fromServer = error.fromServer;
+  remapped.committed = error.committed;
+  return remapped;
+};
 
 type PartitionTarget = {
   query: Buffer,
@@ -1340,21 +1658,25 @@ const partitionRoute = (command: number, payload: Buffer): PartitionTarget | und
     const { query } = sendTarget(payload);
     return { query, key: query.toString('hex') };
   }
-  if (command !== COMMAND_CODE.PollMessages && command !== COMMAND_CODE.GetOffset &&
-      command !== COMMAND_CODE.StoreOffset && command !== COMMAND_CODE.DeleteConsumerOffset)
+  if (command === COMMAND_CODE.FetchMessages) {
+    const { topic, targets } = readFetch(payload);
+    return readinessTarget(topic, targets[0]);
+  }
+  if (!isPoll(command) && !OFFSET_COMMANDS.has(command))
     return undefined;
   let position = 1;
   const consumerEnd = identifierEnd(payload, position, command);
   const streamEnd = identifierEnd(payload, consumerEnd, command);
   position = identifierEnd(payload, streamEnd, command);
   const suffix = command === COMMAND_CODE.PollMessages ? POLL_OPTIONS_SIZE
-    : command === COMMAND_CODE.StoreOffset ? STORE_OFFSET_SUFFIX_SIZE
-      : command === COMMAND_CODE.DeleteConsumerOffset ? DELETE_OFFSET_SUFFIX_SIZE : 0;
+    : command === COMMAND_CODE.PollMessagesDeferred ? POLL_OPTIONS_SIZE + DEFERRED_POLL_OPTIONS_SIZE
+      : command === COMMAND_CODE.StoreOffset ? STORE_OFFSET_SUFFIX_SIZE
+        : command === COMMAND_CODE.DeleteConsumerOffset ? DELETE_OFFSET_SUFFIX_SIZE : 0;
   if (payload.length !== position + 1 + PARTITION_ID_SIZE + suffix || payload[position] > 1)
     throw responseError(command, INVALID_COMMAND);
   if (payload[position] === 0) {
     if (command === COMMAND_CODE.StoreOffset || command === COMMAND_CODE.DeleteConsumerOffset ||
-        (command === COMMAND_CODE.PollMessages && payload[0] === ConsumerKind.Group))
+        (isPoll(command) && payload[0] === ConsumerKind.Group))
       throw responseError(command, INVALID_COMMAND);
   }
   const query = Buffer.concat([payload.subarray(consumerEnd, position),
@@ -1362,6 +1684,138 @@ const partitionRoute = (command: number, payload: Buffer): PartitionTarget | und
       : payload.subarray(position + 1, position + 1 + PARTITION_ID_SIZE)]);
   return { query, key: query.toString('hex') };
 };
+
+/** The parts of a fetch body that the client reads. */
+type Fetch = {
+  /** Where the fields after the topic start. */
+  fieldsAt: number,
+  /** The stream and topic identifiers, which lead each route lookup of the fetch. */
+  topic: Buffer,
+  /** One view into the body per target, each led by its partition id. */
+  targets: Buffer[],
+  /** The fetch commits on read, or a target starts at the stored offset. */
+  progress: boolean,
+  commits: boolean
+};
+
+/** Reads a fetch body, after the checks that the server's decoder makes. */
+const readFetch = (payload: Buffer): Fetch => {
+  const command = COMMAND_CODE.FetchMessages;
+  const consumerEnd = identifierEnd(payload, 1, command);
+  const topicEnd = identifierEnd(payload, identifierEnd(payload, consumerEnd, command), command);
+  const targetsAt = topicEnd + FETCH_MESSAGES_FIELDS_SIZE;
+  if (payload.length < targetsAt)
+    throw responseError(command, INVALID_COMMAND);
+  const count = payload.readUInt32LE(topicEnd + FETCH_MESSAGES_FIELD.targetsCount);
+  const minCount = payload.readUInt32LE(topicEnd + FETCH_MESSAGES_FIELD.minCount);
+  const maxBytes = payload.readUInt32LE(topicEnd + FETCH_MESSAGES_FIELD.maxBytes);
+  if (count === 0 || count > MAX_PARTITIONS_PER_REQUEST || payload.length !== targetsAt + count * FETCH_TARGET_SIZE ||
+      !isFetchBudget(payload.readBigUInt64LE(topicEnd + FETCH_MESSAGES_FIELD.wait),
+        payload.readBigUInt64LE(topicEnd + FETCH_MESSAGES_FIELD.requestTimeout)) ||
+      minCount === 0 || minCount > payload.readUInt32LE(topicEnd + FETCH_MESSAGES_FIELD.count) ||
+      maxBytes < MIN_DEFERRED_POLL_MAX_BYTES)
+    throw responseError(command, INVALID_COMMAND);
+  const targets = Array.from({ length: count }, (_, index) =>
+    payload.subarray(targetsAt + index * FETCH_TARGET_SIZE, targetsAt + (index + 1) * FETCH_TARGET_SIZE));
+  const kinds = targets.map((target) => target[FETCH_TARGET_FIELD.kind]);
+  const limits = targets.map((target) => target.readUInt32LE(FETCH_TARGET_FIELD.maxBytes));
+  if (new Set(targets.map((target) => target.readUInt32LE(FETCH_TARGET_FIELD.partitionId))).size !== count ||
+      kinds.some((kind) => kind !== PollingStrategyKind.Offset && kind !== PollingStrategyKind.Next) ||
+      limits.some((limit) => limit < MIN_DEFERRED_POLL_MAX_BYTES || limit > maxBytes))
+    throw responseError(command, INVALID_COMMAND);
+  return {
+    fieldsAt: topicEnd, topic: payload.subarray(consumerEnd, topicEnd), targets,
+    progress: payload[topicEnd + FETCH_MESSAGES_FIELD.autoCommit] !== 0 || kinds.includes(PollingStrategyKind.Next),
+    commits: payload[topicEnd + FETCH_MESSAGES_FIELD.autoCommit] !== 0
+  };
+};
+
+/**
+ * The section headers of a fetch reply, each led by its partition id. A reply
+ * whose table does not fit is left to the decoder of the caller.
+ */
+const fetchSections = (data: Buffer): Buffer[] => {
+  const count = data.length >= POLL_COUNT_SIZE ? data.readUInt32LE(0) : 0;
+  if (data.length < fetchReplyHeadSize(count))
+    return [];
+  return Array.from({ length: count }, (_, index) => data.subarray(
+    POLL_COUNT_SIZE + index * FETCH_SECTION_SIZE, POLL_COUNT_SIZE + (index + 1) * FETCH_SECTION_SIZE));
+};
+
+/** The route lookup of a target partition. */
+const readinessTarget = (topic: Buffer, target: Buffer): PartitionTarget => {
+  const query = Buffer.concat([topic, target.subarray(0, PARTITION_ID_SIZE)]);
+  return { query, key: query.toString('hex') };
+};
+
+/**
+ * The budget of a deferred poll or a fetch, after the checks
+ * that the server's decoder makes, which fail with 3 before anything is sent.
+ * A deferred poll fills at most `replyBodyLimit` bytes, and a fetch that many
+ * with its section table, because a link fails on a larger reply. A fetch
+ * that cannot fit one message then fails with 80. Other commands have no
+ * budget.
+ */
+const deferredBudget = (command: number, payload: Buffer, replyBodyLimit: number): DeferredBudget | undefined => {
+  if (command === COMMAND_CODE.FetchMessages) {
+    const { fieldsAt, targets } = readFetch(payload);
+    if (payload.readBigUInt64LE(fieldsAt + FETCH_MESSAGES_FIELD.requestTimeout) <= MIN_DEFERRED_POLL_REPLY_MARGIN_US)
+      throw responseError(command, INVALID_COMMAND);
+    const maxBytes = Math.min(payload.readUInt32LE(fieldsAt + FETCH_MESSAGES_FIELD.maxBytes),
+      replyBodyLimit - fetchReplyHeadSize(targets.length));
+    if (maxBytes < MIN_DEFERRED_POLL_MAX_BYTES)
+      throw responseError(command, INVALID_SIZE_BYTES);
+    payload.writeUInt32LE(maxBytes, fieldsAt + FETCH_MESSAGES_FIELD.maxBytes);
+    for (const target of targets)
+      target.writeUInt32LE(Math.min(target.readUInt32LE(FETCH_TARGET_FIELD.maxBytes), maxBytes), FETCH_TARGET_FIELD.maxBytes);
+    const waitOffset = fieldsAt + FETCH_MESSAGES_FIELD.wait;
+    const timeoutOffset = fieldsAt + FETCH_MESSAGES_FIELD.requestTimeout;
+    return {
+      started: Date.now(), wait: payload.readBigUInt64LE(waitOffset), timeout: payload.readBigUInt64LE(timeoutOffset),
+      waitOffset, timeoutOffset
+    };
+  }
+  if (command !== COMMAND_CODE.PollMessagesDeferred)
+    return undefined;
+  partitionRoute(command, payload);
+  const pollEnd = payload.length - DEFERRED_POLL_OPTIONS_SIZE;
+  const count = payload.readUInt32LE(pollEnd - POLL_AUTOCOMMIT_SIZE - POLL_COUNT_SIZE);
+  const waitOffset = pollEnd + DEFERRED_POLL_OFFSET.wait;
+  const timeoutOffset = pollEnd + DEFERRED_POLL_OFFSET.requestTimeout;
+  const wait = payload.readBigUInt64LE(waitOffset);
+  const timeout = payload.readBigUInt64LE(timeoutOffset);
+  const minCount = payload.readUInt32LE(pollEnd + DEFERRED_POLL_OFFSET.minCount);
+  const maxBytes = payload.readUInt32LE(pollEnd + DEFERRED_POLL_OFFSET.maxBytes);
+  if (!isDeferredBudget(wait, timeout) || minCount === 0 || minCount > count || maxBytes < MIN_DEFERRED_POLL_MAX_BYTES)
+    throw responseError(command, INVALID_COMMAND);
+  payload.writeUInt32LE(Math.min(maxBytes, replyBodyLimit), pollEnd + DEFERRED_POLL_OFFSET.maxBytes);
+  return { started: Date.now(), wait, timeout, waitOffset, timeoutOffset };
+};
+
+/**
+ * A frame of a deferred request that waits only for what remains of its wait,
+ * and leaves its reply margin before the deadline of the call, as
+ * `Call::deferred_payload` in core/sdk/src/driver.rs does. The frame is a
+ * copy, because a link can still hold the bytes of an earlier attempt.
+ */
+const deferredFrame = (command: number, frame: Buffer, budget: DeferredBudget, deadline: number): Buffer => {
+  const now = Date.now();
+  const elapsed = BigInt(Math.max(0, now - budget.started)) * US_PER_MS;
+  const timeout = smaller(budget.timeout - elapsed, BigInt(Math.floor(deadline - now)) * US_PER_MS);
+  if (timeout <= 0n || (command === COMMAND_CODE.FetchMessages && timeout < MIN_DEFERRED_POLL_REPLY_MARGIN_US))
+    throw responseError(command, TRANSIENT_NOT_ACCEPTED);
+  const wait = smaller(budget.wait - elapsed, timeout - MIN_DEFERRED_POLL_REPLY_MARGIN_US);
+  const bytes = Buffer.from(frame);
+  bytes.writeBigUInt64LE(wait > 0n ? wait : 0n, HEADER_SIZE + budget.waitOffset);
+  bytes.writeBigUInt64LE(timeout, HEADER_SIZE + budget.timeoutOffset);
+  return bytes;
+};
+
+const smaller = (left: bigint, right: bigint): bigint => left < right ? left : right;
+
+/** A command the caller may send to a replica it chooses: non-replicated, not a partition read, not session control. */
+const isReplicaCommand = (command: number): boolean =>
+  !REPLICA_REFUSED_CODES.has(command) && operationForCode(command) === Operation.NonReplicated;
 
 const identifierEnd = (payload: Buffer, position: number, command: number): number => {
   if (position + IDENTIFIER_PREFIX_SIZE > payload.length)

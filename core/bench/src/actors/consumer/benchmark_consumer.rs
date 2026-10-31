@@ -483,6 +483,7 @@ mod tests {
                 messages_per_batch: args.messages_per_batch(),
                 warmup_time: args.warmup_time(),
                 polling_kind: PollingKind::Next,
+                poll_options: args.poll_options(),
                 origin_timestamp_latency_calculation,
                 pretty: false,
             },

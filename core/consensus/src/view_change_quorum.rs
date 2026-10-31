@@ -211,6 +211,22 @@ pub struct StoredDvc {
     /// The sender's uncommitted suffix. Empty from a silent sender, which counts
     /// toward the quorum and `max(commit)` but neither nacks nor offers bodies.
     pub suffix: DvcSuffix,
+    /// The sender's log may lack ops it acknowledged before a restart. See
+    /// `DoViewChangeHeader::flags` and `merge_view_change`.
+    pub untrusted_log: bool,
+}
+
+impl StoredDvc {
+    /// Whether this is the log-less vote a recovering replica barred from
+    /// electing casts. See `VsrAction::is_empty_vote`.
+    #[must_use]
+    pub fn is_empty_vote(&self) -> bool {
+        self.untrusted_log
+            && self.log_view == 0
+            && self.op == 0
+            && self.commit == 0
+            && self.suffix.is_empty()
+    }
 }
 
 /// Array type for storing DVC messages from all replicas.
@@ -224,10 +240,17 @@ pub fn dvc_quorum_array_empty() -> DvcQuorumArray {
 }
 
 /// Record a DVC in the array. Returns true if this is a new entry (not duplicate).
+///
+/// A real vote replaces the same sender's empty vote: the sender has since
+/// recovered a log to vote with, and keeping the empty one would hide it from a
+/// merge still waiting on that log.
 pub fn dvc_record(array: &mut DvcQuorumArray, dvc: StoredDvc) -> bool {
     let slot = &mut array[dvc.replica as usize];
-    if slot.is_some() {
-        return false; // Duplicate
+    if slot
+        .as_ref()
+        .is_some_and(|seated| !seated.is_empty_vote() || dvc.is_empty_vote())
+    {
+        return false;
     }
     *slot = Some(dvc);
     true

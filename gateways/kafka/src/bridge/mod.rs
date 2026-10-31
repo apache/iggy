@@ -25,6 +25,7 @@
 pub mod config;
 pub mod error;
 pub mod iggy_bridge;
+pub mod nodes;
 pub mod topic_map;
 
 pub use config::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, ProduceSessionLimits};
@@ -35,4 +36,5 @@ pub use iggy_bridge::{
     ScannedGroups, StreamTopicCache, TopicCreationOutcome, TopicLoad, TopicTarget,
     cluster_id_stream,
 };
+pub use nodes::KnownNodes;
 pub use topic_map::{TopicMapping, TopicOverride};

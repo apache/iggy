@@ -205,7 +205,8 @@ pub struct ClusterConfig {
     /// (`normal_heartbeat_timeout`). Raise it on oversubscribed hosts where
     /// scheduling stalls fake primary death; sub-`MIN_CLUSTER_HEARTBEAT_TIMEOUT`
     /// values (including the `0` / `disabled` / `unlimited` sentinels, which
-    /// all parse to zero) are rejected at boot.
+    /// all parse to zero) are rejected at boot. On Linux it is also the
+    /// `TCP_USER_TIMEOUT` of every replica link.
     #[serde(default = "default_heartbeat_timeout")]
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
@@ -296,7 +297,7 @@ pub struct ClusterConfig {
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
     pub repair_gap_debounce_interval: IggyDuration,
-    /// Prepares a peer serves per repair round before the requester walks to
+    /// Prepares a peer serves per repair round before the requester asks for
     /// the next chunk. Each frame rides the per-peer message-bus queue, so this
     /// must stay below `message_bus.peer_queue_capacity` or a full round
     /// overruns the queue and silently drops frames (enforced at the top
@@ -343,12 +344,22 @@ pub struct ClusterConfig {
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterCoordinatorConfig {
-    /// When `total_shards > 1`, exclude shard 0 from replica placement.
-    /// Shard 0 already hosts the coordinator, the metadata writer, and both
-    /// listeners; replicas are long-lived steady flows, so offload them to
-    /// peer shards by default.
+    /// Keep replica links off shard 0 while the shard range of link 0 has
+    /// another shard. Shard 0 already hosts the coordinator, the metadata
+    /// writer, and both listeners; replica links are long-lived steady
+    /// flows, so offload them to peer shards by default.
     #[serde(default = "default_skip_shard_zero_for_replicas")]
     pub skip_shard_zero_for_replicas: bool,
+    /// TCP links to each peer replica, at most the shard count. Link `j`
+    /// carries the frames of the shards in range `j`, so more links spread
+    /// replication over more shards. Every node must run the same value:
+    /// the replica handshake refuses a peer that differs. Shard counts may
+    /// differ between nodes. A range with fewer shards than there are peers
+    /// puts links to two peers on one shard. With
+    /// `skip_shard_zero_for_replicas` on, range 0 keeps its links off shard
+    /// 0, so it needs one shard more than there are peers.
+    #[serde(default = "default_replica_connections_per_peer")]
+    pub replica_connections_per_peer: u16,
     /// When `total_shards > 1`, exclude shard 0 from client placement.
     /// Default false: client connections are short-lived and benefit from
     /// shard-0 parallelism more than replicas do.
@@ -360,10 +371,15 @@ fn default_skip_shard_zero_for_replicas() -> bool {
     true
 }
 
+fn default_replica_connections_per_peer() -> u16 {
+    1
+}
+
 impl Default for ClusterCoordinatorConfig {
     fn default() -> Self {
         Self {
             skip_shard_zero_for_replicas: default_skip_shard_zero_for_replicas(),
+            replica_connections_per_peer: default_replica_connections_per_peer(),
             skip_shard_zero_for_clients: false,
         }
     }

@@ -64,8 +64,10 @@ class MessagesHttpClientSendContextTest {
     private static final String GET_TOPIC = "GET /streams/1/topics/2";
     private static final String POST_MESSAGES = "POST /streams/1/topics/2/messages";
     private static final String POLL_MESSAGES = "GET /streams/1/topics/2/messages";
+    private static final String POST_DEFERRED_POLL = "POST /streams/1/topics/2/messages/deferred";
     private static final String DELETE_STREAM = "DELETE /streams/1";
     private static final int TRANSIENT_NOT_COMMITTED = 57;
+    private static final int FETCH_PROGRESS_UNCERTAIN = 14010;
     private static final int HISTORY_UNAVAILABLE = 87;
     private static final int UNAUTHORIZED = 41;
 
@@ -243,6 +245,47 @@ class MessagesHttpClientSendContextTest {
     }
 
     @Test
+    void shouldReportAnUnknownOutcomeWithoutResendingACommittingPollThatLostItsAnswer() throws IOException {
+        try (var server = new FakeServer();
+                var client = new IggyHttpClient(server.url())) {
+            // The server stores the offset when it reads, so a resend from Next would skip the batch.
+            server.scriptedAnswers.add(HttpExchange::close);
+
+            assertThatThrownBy(() -> poll(client, PollingStrategy.next(), true))
+                    .isInstanceOfSatisfying(
+                            IggyServerException.class,
+                            error -> assertThat(error.getRawErrorCode()).isEqualTo(FETCH_PROGRESS_UNCERTAIN));
+            assertThat(server.requests).containsExactly(POST_DEFERRED_POLL);
+        }
+    }
+
+    @Test
+    void shouldResendAPollThatOnlyReadsAfterItLostItsAnswer() throws IOException {
+        try (var server = new FakeServer();
+                var client = new IggyHttpClient(server.url())) {
+            server.scriptedAnswers.add(HttpExchange::close);
+
+            poll(client, PollingStrategy.offset(BigInteger.valueOf(5)), false);
+
+            assertThat(server.requests).containsExactly(POLL_MESSAGES, POLL_MESSAGES);
+        }
+    }
+
+    /** A proxy or a client library may resend a GET, so a poll that stores its offset is a POST. */
+    @Test
+    void shouldPostACommittingPollAndNeverResendIt() throws IOException {
+        try (var server = new FakeServer();
+                var client = new IggyHttpClient(server.url())) {
+            server.scriptedAnswers.add(exchange -> FakeServer.reply(exchange, HttpStatus.SC_SERVICE_UNAVAILABLE, ""));
+
+            assertThatThrownBy(() -> poll(client, PollingStrategy.next(), true));
+            assertThat(server.requests).containsExactly(POST_DEFERRED_POLL);
+            assertThat(queryParameter(server.polls.get(0), "auto_commit")).contains("true");
+            assertThat(queryParameter(server.polls.get(0), "wait_us")).contains("0");
+        }
+    }
+
+    @Test
     void shouldSendTheCallerPollContextAsAQueryParameter() throws IOException {
         try (var server = new FakeServer();
                 var client = new IggyHttpClient(server.url())) {
@@ -263,7 +306,11 @@ class MessagesHttpClientSendContextTest {
     }
 
     private static void poll(IggyHttpClient client, PollingStrategy strategy) {
-        client.messages().pollMessages(1L, 2L, Optional.of(3L), 7L, strategy, 10L, false);
+        poll(client, strategy, false);
+    }
+
+    private static void poll(IggyHttpClient client, PollingStrategy strategy, boolean autoCommit) {
+        client.messages().pollMessages(1L, 2L, Optional.of(3L), 7L, strategy, 10L, autoCommit);
     }
 
     private static Optional<String> queryParameter(String query, String name) {
@@ -344,6 +391,9 @@ class MessagesHttpClientSendContextTest {
                     exchange.getRequestMethod() + " " + exchange.getRequestURI().getPath();
             byte[] body = exchange.getRequestBody().readAllBytes();
             requests.add(request);
+            if (request.equals(POLL_MESSAGES) || request.equals(POST_DEFERRED_POLL)) {
+                polls.add(exchange.getRequestURI().getRawQuery());
+            }
             HttpHandler scripted = scriptedAnswers.poll();
             if (scripted != null) {
                 scripted.handle(exchange);
@@ -377,8 +427,7 @@ class MessagesHttpClientSendContextTest {
                         reply(exchange, 201, "{\"confirmations\": []}");
                     }
                 }
-                case POLL_MESSAGES -> {
-                    polls.add(exchange.getRequestURI().getRawQuery());
+                case POLL_MESSAGES, POST_DEFERRED_POLL -> {
                     reply(exchange, 200, """
                             {"partition_id": 3, "current_offset": 0, "count": 0, "messages": [],
                              "context": {"incarnation": 103, "owner_generation": 0, "metadata_op": 52}}

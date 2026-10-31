@@ -16,12 +16,16 @@
 // under the License.
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::prelude::{AutoCommit, AutoCommitWhen, IggyConsumer};
+use crate::clients::reader_builder::{DEFAULT_MAX_WAIT, DEFAULT_PREFETCH_BYTES};
+use crate::prelude::IggyConsumer;
 use iggy_common::locking::IggyRwLock;
 use iggy_common::{
-    Consumer, EncryptorKind, Identifier, IggyDuration, NonZeroIggyDuration, PollingStrategy,
+    Consumer, EncryptorKind, Identifier, IggyDuration, NonZeroIggyDuration, PollOptions,
+    PollingStrategy,
 };
 use std::sync::Arc;
+
+const DEFAULT_OFFSET_DRAIN_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Debug)]
 pub struct IggyConsumerBuilder {
@@ -30,12 +34,11 @@ pub struct IggyConsumerBuilder {
     consumer: Consumer,
     stream: Identifier,
     topic: Identifier,
-    partition: Option<u32>,
+    partitions: Option<Vec<u32>>,
     polling_strategy: PollingStrategy,
-    polling_interval: Option<IggyDuration>,
-    batch_length: u32,
-    auto_commit: AutoCommit,
-    auto_join_consumer_group: bool,
+    poll_options: PollOptions,
+    prefetch_bytes: u32,
+    prefetch_messages: Option<u32>,
     create_consumer_group_if_not_exists: bool,
     encryptor: Option<Arc<EncryptorKind>>,
     polling_retry_interval: NonZeroIggyDuration,
@@ -46,16 +49,13 @@ pub struct IggyConsumerBuilder {
 }
 
 impl IggyConsumerBuilder {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         client: IggyRwLock<ClientWrapper>,
         consumer_name: String,
         consumer: Consumer,
         stream_id: Identifier,
         topic_id: Identifier,
-        partition_id: Option<u32>,
         encryptor: Option<Arc<EncryptorKind>>,
-        polling_interval: Option<IggyDuration>,
     ) -> Self {
         Self {
             client,
@@ -63,22 +63,18 @@ impl IggyConsumerBuilder {
             consumer,
             stream: stream_id,
             topic: topic_id,
-            partition: partition_id,
+            partitions: None,
             polling_strategy: PollingStrategy::next(),
-            batch_length: 1000,
-            auto_commit: AutoCommit::IntervalOrWhen(
-                NonZeroIggyDuration::ONE_SECOND,
-                AutoCommitWhen::PollingMessages,
-            ),
-            auto_join_consumer_group: true,
+            poll_options: PollOptions::wait(DEFAULT_MAX_WAIT.into()),
+            prefetch_bytes: DEFAULT_PREFETCH_BYTES,
+            prefetch_messages: None,
             create_consumer_group_if_not_exists: true,
             encryptor,
-            polling_interval,
             polling_retry_interval: NonZeroIggyDuration::ONE_SECOND,
             init_retries: None,
             init_retry_interval: NonZeroIggyDuration::ONE_SECOND,
             allow_replay: false,
-            offset_drain_timeout: IggyDuration::new_from_secs(5),
+            offset_drain_timeout: IggyDuration::new_from_secs(DEFAULT_OFFSET_DRAIN_TIMEOUT_SECS),
         }
     }
 
@@ -92,14 +88,18 @@ impl IggyConsumerBuilder {
         Self { topic, ..self }
     }
 
-    /// Sets the partition to read. `None` lets a consumer group read its assigned partitions and
-    /// makes the server read partition `0` for a standalone consumer. `Some(n)` is for standalone
-    /// consumers. A group member ignores it with a warning and reads its assignment.
-    pub fn partition(self, partition: Option<u32>) -> Self {
-        Self { partition, ..self }
+    /// Sets the partitions of a standalone consumer, which requires them. A consumer group reads
+    /// the assignment of its member, so `init()` refuses them for a group.
+    pub fn partitions(self, partitions: impl IntoIterator<Item = u32>) -> Self {
+        Self {
+            partitions: Some(partitions.into_iter().collect()),
+            ..self
+        }
     }
 
-    /// Sets the polling strategy.
+    /// Sets the start of a partition without a position. Defaults to
+    /// [`PollingStrategy::next()`]. `init()` refuses a continuation, because it belongs to one
+    /// partition.
     pub fn polling_strategy(self, polling_strategy: PollingStrategy) -> Self {
         Self {
             polling_strategy,
@@ -107,42 +107,36 @@ impl IggyConsumerBuilder {
         }
     }
 
-    /// Sets how many messages one poll request fetches at most. Defaults to 1000.
-    pub fn batch_length(self, batch_length: u32) -> Self {
+    /// Sets the limits of each request and the [`CommitPolicy`](iggy_common::CommitPolicy) of
+    /// the consumer. Defaults to [`PollOptions::wait`] of five seconds: at most 1000 messages and
+    /// a 1 MiB reply, and the application commits. A message larger than the reply limit comes
+    /// alone in its reply.
+    pub fn poll_options(self, poll_options: PollOptions) -> Self {
         Self {
-            batch_length,
+            poll_options,
             ..self
         }
     }
 
-    /// Sets the auto-commit configuration for storing the offset on the server.
-    pub fn auto_commit(self, auto_commit: AutoCommit) -> Self {
+    /// Caps encoded bytes reserved for in-flight and buffered replies. Default: 16 MiB.
+    pub fn prefetch_bytes(self, prefetch_bytes: u32) -> Self {
         Self {
-            auto_commit,
+            prefetch_bytes,
             ..self
         }
     }
 
-    /// Joins the consumer group during `init()` and again after the membership was lost, for
-    /// example after a reconnect. On by default.
-    pub fn auto_join_consumer_group(self) -> Self {
+    /// Caps messages reserved for in-flight and buffered replies. Default: 16,000, or the
+    /// `count` of the poll options when that is larger.
+    pub fn prefetch_messages(self, prefetch_messages: u32) -> Self {
         Self {
-            auto_join_consumer_group: true,
+            prefetch_messages: Some(prefetch_messages),
             ..self
         }
     }
 
-    /// Leaves joining the consumer group to the caller. The member polls as soon as `init()`
-    /// returns, and a poll without a membership fails with
-    /// [`IggyError::ConsumerGroupMemberNotFound`](iggy_common::IggyError::ConsumerGroupMemberNotFound).
-    pub fn do_not_auto_join_consumer_group(self) -> Self {
-        Self {
-            auto_join_consumer_group: false,
-            ..self
-        }
-    }
-
-    /// Automatically creates the consumer group if it does not exist.
+    /// Automatically creates the consumer group if it does not exist, also when the member
+    /// joins again after a session loss. On by default.
     pub fn create_consumer_group_if_not_exists(self) -> Self {
         Self {
             create_consumer_group_if_not_exists: true,
@@ -154,22 +148,6 @@ impl IggyConsumerBuilder {
     pub fn do_not_create_consumer_group_if_not_exists(self) -> Self {
         Self {
             create_consumer_group_if_not_exists: false,
-            ..self
-        }
-    }
-
-    /// Sets the polling interval for messages.
-    pub fn poll_interval(self, interval: IggyDuration) -> Self {
-        Self {
-            polling_interval: Some(interval),
-            ..self
-        }
-    }
-
-    /// Clears the polling interval for messages.
-    pub fn without_poll_interval(self) -> Self {
-        Self {
-            polling_interval: None,
             ..self
         }
     }
@@ -190,9 +168,8 @@ impl IggyConsumerBuilder {
         }
     }
 
-    /// Sets how long a poll waits before the next attempt while it is blocked: after a
-    /// disconnect, after a failed group join, or while the group member holds no partitions.
-    /// One second by default.
+    /// Sets how long a refused partition waits before the next read: after a transient
+    /// refusal, or a message that does not decode. One second by default.
     pub fn polling_retry_interval(self, interval: NonZeroIggyDuration) -> Self {
         Self {
             polling_retry_interval: interval,
@@ -219,8 +196,8 @@ impl IggyConsumerBuilder {
         }
     }
 
-    /// Sets how long `shutdown()` waits for the background auto-commit tasks to
-    /// drain before leaving the consumer group. 5 seconds by default.
+    /// Sets how long `shutdown()` waits for the stores of `CommitPolicy::Auto` before the reader
+    /// closes. 5 seconds by default.
     pub fn offset_drain_timeout(self, timeout: IggyDuration) -> Self {
         Self {
             offset_drain_timeout: timeout,
@@ -238,12 +215,11 @@ impl IggyConsumerBuilder {
             self.consumer,
             self.stream,
             self.topic,
-            self.partition,
-            self.polling_interval,
+            self.partitions,
             self.polling_strategy,
-            self.batch_length,
-            self.auto_commit,
-            self.auto_join_consumer_group,
+            self.poll_options,
+            self.prefetch_bytes,
+            self.prefetch_messages,
             self.create_consumer_group_if_not_exists,
             self.encryptor,
             self.polling_retry_interval,

@@ -27,7 +27,7 @@ use futures::future::poll_fn;
 use iggy_binary_protocol::{Command, ConsensusError, GenericHeader, Operation, PrepareHeader};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
-use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
+use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn, ReplicaLinkId};
 use partitions::{FatalCommit, PartitionIncarnation};
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, MessageBag};
@@ -324,6 +324,7 @@ where
         SB: 'static,
     {
         let _completion_pump = self.poll_completions.pump_guard();
+        let _deferred_pump = self.deferred_polls.pump_guard(self.id, &self.senders);
         self.plane.partitions().set_io_notifier(
             self.partition_io.notifier(),
             self.partition_io.limits.bytes_max(),
@@ -367,7 +368,32 @@ where
         // backoff on every pump turn while the shutdown channel is empty.
         let mut stop_signal = std::pin::pin!(stop.recv().fuse());
         let mut fatal: Option<FatalCommit> = None;
+        let deadline_timer = |deadline: Option<u64>| {
+            async move {
+                if let Some(deadline) = deadline {
+                    self.bus
+                        .sleep(std::time::Duration::from_micros(
+                            deadline.saturating_sub(self.bus.monotonic_micros()),
+                        ))
+                        .await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }
+            .fuse()
+        };
+        let mut armed_deadline = None;
+        let mut deferred_deadline = std::pin::pin!(deadline_timer(None));
         loop {
+            self.service_deferred_polls().await;
+            // Here and not at the end of the turn: an idle owner would hold
+            // the pushes of this turn until its next event or tick.
+            self.flush_readiness_pushes();
+            let next_deadline = self.deferred_polls.earliest_deadline();
+            if next_deadline != armed_deadline {
+                armed_deadline = next_deadline;
+                deferred_deadline.set(deadline_timer(next_deadline));
+            }
             // `select_biased!`, not `select!`: the unbiased macro draws its
             // arm order from a process-random thread-local PRNG, which the
             // deterministic simulator cannot seed. The listed order is the
@@ -408,8 +434,14 @@ where
                     // a quiet shard until the next inbound frame's tail
                     // drain; parked partition frames then never re-dispatch.
                     self.apply_reconcile_ops();
+                    self.tick_deferred_polls();
+                    self.sweep_readiness_watches();
                     consensus_tick.set(rearm_tick());
                     self.process_loopback(&mut loopback_buf).await;
+                }
+                () = deferred_deadline.as_mut() => {
+                    armed_deadline = None;
+                    deferred_deadline.set(deadline_timer(None));
                 }
                 frame = poll_fn(|_| {
                     self.pop_redispatched_frame().map_or(Poll::Pending, Poll::Ready)
@@ -492,6 +524,7 @@ where
                         Err(_) => break,
                     }
                 }
+                () = poll_fn(|context| self.deferred_polls.poll_ready(context)).fuse() => {}
                 () = poll_fn(|context| {
                     self.plane.partitions().register_loopback_waker(context.waker());
                     self.partition_io.register_waker(context.waker());
@@ -509,6 +542,7 @@ where
         }
 
         self.poll_completions.close();
+        self.deferred_polls.close(self.id, &self.senders);
 
         // A stop can win the select immediately after a frame fenced a
         // partition, before the next tick observes it. Preserve that fault so
@@ -824,52 +858,74 @@ where
         M: RestorableMetadataStm,
     {
         match payload {
-            LifecycleFrame::ReplicaInboundSetup { fd, slot } => {
+            LifecycleFrame::ReplicaInboundSetup {
+                fd,
+                slot,
+                link,
+                deadline,
+            } => {
                 tracing::info!(
                     shard = self.id,
                     slot,
+                    replica_id = link.replica,
+                    link = link.link,
+                    epoch = link.epoch,
                     raw_fd = fd.as_raw_fd(),
-                    "installing blind-delegated inbound replica fd"
+                    "installing delegated inbound replica link fd"
                 );
                 let on_done =
-                    self.replica_handshake_done_fn(ReplicaHandshakeOutcome::ReleaseSlot(slot));
-                self.bus
-                    .install_replica_inbound_fd(fd, self.on_replica_message.clone(), on_done);
-            }
-            LifecycleFrame::ReplicaOutboundSetup { fd, replica_id } => {
-                tracing::info!(
-                    shard = self.id,
-                    replica_id,
-                    raw_fd = fd.as_raw_fd(),
-                    "installing delegated outbound replica fd"
-                );
-                let on_done =
-                    self.replica_handshake_done_fn(ReplicaHandshakeOutcome::ClearDial(replica_id));
-                self.bus.install_replica_outbound_fd(
+                    self.replica_handshake_done_fn(ReplicaHandshakeOutcome::Inbound { slot, link });
+                self.bus.install_replica_inbound_fd(
                     fd,
-                    replica_id,
+                    link,
+                    deadline,
                     self.on_replica_message.clone(),
                     on_done,
                 );
             }
-            LifecycleFrame::ReplicaInboundHandshakeDone { slot } => {
-                // Only shard 0 tracks in-flight handshake slots; a
-                // non-zero owning shard's ack closure addresses senders[0]
-                // (shard 0 itself releases inline, no frame).
+            LifecycleFrame::ReplicaOutboundSetup { fd, link } => {
+                tracing::info!(
+                    shard = self.id,
+                    replica_id = link.replica,
+                    link = link.link,
+                    epoch = link.epoch,
+                    raw_fd = fd.as_raw_fd(),
+                    "installing delegated outbound replica link fd"
+                );
+                let on_done =
+                    self.replica_handshake_done_fn(ReplicaHandshakeOutcome::Outbound(link));
+                self.bus.install_replica_outbound_fd(
+                    fd,
+                    link,
+                    self.on_replica_message.clone(),
+                    on_done,
+                );
+            }
+            LifecycleFrame::ReplicaInboundHandshakeDone { slot, link } => {
+                // Only shard 0 tracks in-flight handshake slots and
+                // bundles; a non-zero owning shard's ack closure addresses
+                // senders[0] (shard 0 itself acks inline, no frame).
                 debug_assert_eq!(
                     self.id, 0,
                     "ReplicaInboundHandshakeDone routed to shard {}",
                     self.id
                 );
-                self.bus.release_replica_handshake_slot(slot);
+                self.bus.replica_inbound_handshake_done(slot, link);
             }
-            LifecycleFrame::ReplicaOutboundHandshakeDone { replica_id } => {
+            LifecycleFrame::ReplicaOutboundHandshakeDone { link } => {
                 debug_assert_eq!(
                     self.id, 0,
                     "ReplicaOutboundHandshakeDone routed to shard {}",
                     self.id
                 );
-                self.bus.clear_replica_dial_pending(replica_id);
+                self.bus.replica_outbound_handshake_done(link);
+            }
+            LifecycleFrame::ReplicaLinkClosed { link } => {
+                debug_assert_eq!(self.id, 0, "ReplicaLinkClosed routed to shard {}", self.id);
+                self.bus.replica_link_closed(link);
+            }
+            LifecycleFrame::ReplicaLinkClose { link } => {
+                self.bus.close_replica_link(link);
             }
             LifecycleFrame::ClientConnectionSetup { fd, meta, permit } => {
                 tracing::info!(
@@ -982,6 +1038,25 @@ where
                 reply,
             } => {
                 self.on_partition_read(namespace, read, reply).await;
+            }
+            LifecycleFrame::ReadinessWait { wait, reply, watch } => {
+                self.admit_readiness_wait(*wait, &reply, watch);
+            }
+            LifecycleFrame::ReadinessCancel { waiter } => {
+                self.cancel_readiness_wait(waiter);
+            }
+            LifecycleFrame::ReadinessUpdate { from, states } => {
+                self.apply_readiness_update(from, states);
+            }
+            LifecycleFrame::ReadinessUnwatch { from, watches } => {
+                self.unwatch_readiness(from, watches);
+            }
+            LifecycleFrame::ReadinessInterest {
+                from,
+                watches,
+                parked,
+            } => {
+                self.set_readiness_interest(from, watches, parked);
             }
             LifecycleFrame::PartitionSubmit {
                 request,
@@ -1115,11 +1190,12 @@ where
 
     /// Build the one-shot ack a delegated replica handshake fires when it
     /// finishes, releasing the in-flight cap slot (inbound) or clearing
-    /// the pending-dial entry (outbound). When this shard IS shard 0 the
-    /// closure releases inline on the local bus (infallible, no frame in
-    /// flight); otherwise it `try_send`s the outcome frame to shard 0,
-    /// where a full or disconnected inbox is log-only: shard 0's
-    /// deadline expiry covers the lost ack.
+    /// the pending-dial entry (outbound) and refreshing the bundle of the
+    /// peer. When this shard IS shard 0 the closure acks inline on the
+    /// local bus (infallible, no frame in flight); otherwise it
+    /// `try_send`s the outcome frame to shard 0, where a full or
+    /// disconnected inbox is log-only: shard 0's deadline expiry and
+    /// reconnect sweep cover the lost ack.
     fn replica_handshake_done_fn(
         &self,
         outcome: ReplicaHandshakeOutcome,
@@ -1127,11 +1203,11 @@ where
         if self.id == 0 {
             let bus = self.bus.clone();
             return Box::new(move || match outcome {
-                ReplicaHandshakeOutcome::ReleaseSlot(slot) => {
-                    bus.release_replica_handshake_slot(slot);
+                ReplicaHandshakeOutcome::Inbound { slot, link } => {
+                    bus.replica_inbound_handshake_done(slot, link);
                 }
-                ReplicaHandshakeOutcome::ClearDial(replica_id) => {
-                    bus.clear_replica_dial_pending(replica_id);
+                ReplicaHandshakeOutcome::Outbound(link) => {
+                    bus.replica_outbound_handshake_done(link);
                 }
             });
         }
@@ -1140,11 +1216,11 @@ where
         let shard = self.id;
         Box::new(move || {
             let frame = match outcome {
-                ReplicaHandshakeOutcome::ReleaseSlot(slot) => {
-                    LifecycleFrame::ReplicaInboundHandshakeDone { slot }
+                ReplicaHandshakeOutcome::Inbound { slot, link } => {
+                    LifecycleFrame::ReplicaInboundHandshakeDone { slot, link }
                 }
-                ReplicaHandshakeOutcome::ClearDial(replica_id) => {
-                    LifecycleFrame::ReplicaOutboundHandshakeDone { replica_id }
+                ReplicaHandshakeOutcome::Outbound(link) => {
+                    LifecycleFrame::ReplicaOutboundHandshakeDone { link }
                 }
             };
             if let Err(e) = to_shard_zero.try_send(ShardFrame::lifecycle(frame)) {
@@ -1163,12 +1239,13 @@ where
 
 /// Outcome a delegated replica handshake reports back to shard 0:
 /// release the in-flight cap slot (inbound) or clear the pending-dial
-/// entry (outbound). Becomes a [`LifecycleFrame`] only on the
-/// cross-shard send leg; shard 0 applies it inline.
+/// entry (outbound), then refresh the bundle of the peer. Becomes a
+/// [`LifecycleFrame`] only on the cross-shard send leg; shard 0 applies
+/// it inline.
 #[derive(Clone, Copy)]
 enum ReplicaHandshakeOutcome {
-    ReleaseSlot(u64),
-    ClearDial(u8),
+    Inbound { slot: u64, link: ReplicaLinkId },
+    Outbound(ReplicaLinkId),
 }
 
 #[cfg(test)]

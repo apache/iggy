@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Enums;
 using Apache.Iggy.Headers;
 
 namespace Apache.Iggy.Contracts;
@@ -37,6 +38,18 @@ internal static class OptionValues
         return Find(explicitOptions, derivedOptions, OptionKeys.Describe(key).Name) is { Kind: HeaderKind.String } value
             ? value.ToString()
             : null;
+    }
+
+    internal static StreamEncryptionSource? EncryptionKeySource(Dictionary<HeaderKey, HeaderValue>? explicitOptions,
+        Dictionary<HeaderKey, HeaderValue>? derivedOptions)
+    {
+        return Text(explicitOptions, derivedOptions, StreamOptionKey.EncryptionKeySource) switch
+        {
+            "none" => StreamEncryptionSource.None,
+            "stream" => StreamEncryptionSource.Stream,
+            "server" => StreamEncryptionSource.Server,
+            _ => null
+        };
     }
 
     /// <summary>A u64 setting, <see cref="ulong.MaxValue" /> when absent: never expire and unlimited.</summary>

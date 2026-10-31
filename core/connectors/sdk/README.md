@@ -174,7 +174,7 @@ The source sends 100 records, then continues polling without new messages. Stdou
 
 The format-conversion transforms define no per-key defaults. Every non-optional key shown above must be present, or the configuration fails to deserialize (`schema_path`, `message_type`, `field_mappings`, and `descriptor_set` are optional).
 
-The two `[[streams]]` shapes differ: a source produces to a single `topic` and can tune batching via `batch_length` and `linger_time`, while a sink consumes from a list of `topics` and can additionally set `batch_length`, `poll_interval`, and `consumer_group`.
+The two `[[streams]]` shapes differ. A source produces to a single `topic` and can tune batching with `batch_length` and `linger_time`. A sink consumes from a list of `topics` and can set `batch_length` and `consumer_group`.
 
 Transforms are keyed by type, so one connector configures at most one `proto_convert`.
 
@@ -189,6 +189,7 @@ These are SDK configuration fields, not Random or Stdout `plugin_config` keys. T
 - **`schema_path`**: Path to the `.proto` file containing message definitions
 - **`message_type`**: Fully qualified name of the protobuf message type to use
 - **`use_any_wrapper`**: Selects the Any fallback when no message descriptor is loaded; a loaded descriptor takes precedence
+- **`field_mappings`**: Maps protobuf field names (keys) to JSON field names (values); JSON field names must be unique
 
 #### Transform Options
 

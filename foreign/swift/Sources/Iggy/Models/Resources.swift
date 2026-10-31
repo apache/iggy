@@ -646,8 +646,10 @@ extension Duration {
     /// Whole microseconds, or nil when the duration is negative or does not
     /// fit a `UInt64`.
     var wholeMicroseconds: UInt64? {
+        // A duration between -1 s and zero has zero seconds and negative
+        // attoseconds.
         let (seconds, attoseconds) = components
-        guard seconds >= 0 else {
+        guard seconds >= 0, attoseconds >= 0 else {
             return nil
         }
         let (scaled, overflow) = UInt64(seconds).multipliedReportingOverflow(by: 1_000_000)

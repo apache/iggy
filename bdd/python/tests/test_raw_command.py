@@ -63,6 +63,26 @@ def send_raw_command(context, code):
     asyncio.run(send())
 
 
+@when(
+    parsers.parse(
+        "I send a raw command with code {code:d} "
+        "and an empty payload to replica {replica:d}"
+    )
+)
+def send_raw_command_to_replica(context, code, replica):
+    async def send():
+        try:
+            context.last_raw_response = (
+                await context.client.send_binary_request_to_replica(code, b"", replica)
+            )
+            context.last_raw_error = None
+        except RuntimeError as error:
+            context.last_raw_response = None
+            context.last_raw_error = error
+
+    asyncio.run(send())
+
+
 @then("the raw command should succeed with an empty response")
 def raw_command_succeeds_with_empty_response(context):
     assert context.last_raw_error is None
@@ -80,3 +100,10 @@ def raw_command_fails_with_invalid_command(context):
     assert context.last_raw_response is None
     assert context.last_raw_error is not None
     assert "invalid command" in str(context.last_raw_error).lower()
+
+
+@then("the raw command should fail with an invalid identifier error")
+def raw_command_fails_with_invalid_identifier(context):
+    assert context.last_raw_response is None
+    assert context.last_raw_error is not None
+    assert "invalid identifier" in str(context.last_raw_error).lower()

@@ -17,36 +17,23 @@
 
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { getIggyAddress } from "../tcp.sm.utils.js";
 import { getTestClient } from "./test-client.utils.js";
 
-// The suite runs against a single-node server (cluster mode off), which
-// reports itself as the sole healthy leader with endpoints derived from
-// its default config.
-const expectedMeta = {
-  name: "single-node",
-  nodes: [
-    {
-      replicaId: 0,
-      name: "iggy-node",
-      ip: "127.0.0.1",
-      endpoints: {
-        tcp: 8090,
-        quic: 8080,
-        http: 3000,
-        websocket: 8092,
-      },
-      role: "Leader",
-      status: "Healthy",
-    },
-  ],
-};
-
+// The suite runs against one node or a cluster on any ports, so it checks
+// the shape of the roster and the node that the client dialed.
 describe("e2e -> system", async () => {
   const c = getTestClient();
 
   it("e2e -> cluster::getClusterMetadata", async () => {
     const meta = await c.cluster.getClusterMetadata();
-    assert.deepEqual(meta, expectedMeta);
+    const [host, port] = getIggyAddress();
+
+    assert.deepEqual(meta.nodes.map(({ replicaId }) => replicaId), meta.nodes.map((_, index) => index));
+    assert.deepEqual(meta.nodes.filter(({ role }) => role === "Leader").length, 1);
+    assert.ok(meta.nodes.every(({ status }) => status === "Healthy"), JSON.stringify(meta.nodes));
+    assert.ok(meta.nodes.some(({ ip, endpoints }) => ip === host && endpoints.tcp === port),
+      `${host}:${port} is not in ${JSON.stringify(meta.nodes)}`);
   });
 
   after(() => {
