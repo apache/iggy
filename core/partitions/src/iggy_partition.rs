@@ -1019,9 +1019,7 @@ where
         if single_replica {
             partition.log.journal().inner.set_repair_retention(false);
         }
-        partition
-            .consensus
-            .set_recovered_log_complete(partition.acknowledges_only_written_prepares());
+        partition.refresh_recovered_log_complete();
         partition
     }
 
@@ -1875,6 +1873,7 @@ where
     }
 
     pub fn ensure_materialization_recovery(&self) {
+        self.refresh_recovered_log_complete();
         if self.materialization_missing
             && (self.consensus.state_transfer_stage() == consensus::StateTransferStage::Idle
                 || self.consensus.status() == consensus::Status::ViewChange)
@@ -3773,8 +3772,16 @@ where
     /// Unset fields keep the shard-wide configured values.
     pub fn set_runtime_options(&mut self, runtime_options: TopicRuntimeOptions) {
         self.runtime_options = runtime_options;
-        self.consensus
-            .set_recovered_log_complete(self.acknowledges_only_written_prepares());
+        self.refresh_recovered_log_complete();
+    }
+
+    /// A replica whose materialization is missing lost the prepares it
+    /// acknowledged, whatever the durability, so it answers view changes with
+    /// the empty vote rather than staying silent until a transfer.
+    pub(crate) fn refresh_recovered_log_complete(&self) {
+        self.consensus.set_recovered_log_complete(
+            self.acknowledges_only_written_prepares() && !self.materialization_missing,
+        );
     }
 
     /// Whether every prepare this replica acknowledges is on stable storage

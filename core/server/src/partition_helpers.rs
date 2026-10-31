@@ -215,15 +215,36 @@ pub async fn load_partition_or_fence(
         Ok(_) => {}
     }
     let initialization_dir = partition_initialization_path(&config.get_system_path(), namespace);
-    match partitions::read_created_revision(&initialization_dir).await {
+    let initialization = partitions::read_created_revision(&initialization_dir).await;
+    let lost_with_storage = matches!(initialization, Ok(None))
+        && predates_storage(
+            storage_epoch(&config.get_system_path()).await?,
+            partition_metadata.created_at.as_micros(),
+        );
+    match initialization {
         Ok(Some(recorded)) if recorded > created_revision => return Ok(None),
-        Ok(None)
-            if replica_count == 1
-                && predates_storage(
-                    storage_epoch(&config.get_system_path()).await?,
-                    partition_metadata.created_at.as_micros(),
-                ) =>
-        {
+        // Boot reaches here before the reconciler for every partition this node
+        // is a member of. A load would take the empty log for a new member's and
+        // let it elect, so a wider group rebuilds as the reconciler would.
+        Ok(None) if lost_with_storage && replica_count > 1 => {
+            return Box::pin(build_partition_fresh(
+                config,
+                partitions.config(),
+                namespace,
+                partition_stats,
+                created_revision,
+                partition_metadata.created_at.as_micros(),
+                topic_runtime,
+                cluster_id,
+                self_replica_id,
+                members,
+                partition_metadata.created_view,
+                bus,
+            ))
+            .await
+            .map(Some);
+        }
+        Ok(None) if lost_with_storage => {
             error!(
                 namespace_raw = namespace.inner(),
                 created_revision,
@@ -1545,16 +1566,17 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_storage_younger_than_an_unrecorded_partition_when_loading_should_refuse_only_a_singleton()
+    async fn given_storage_younger_than_an_unrecorded_partition_when_loading_should_refuse_a_singleton_and_rebuild_a_wider_member_as_lost()
      {
         const REVISION: u64 = 7;
         const EPOCH: u64 = 1_000 * STORAGE_EPOCH_SKEW_MICROS;
         let namespace = IggyNamespace::new(1, 1, 0);
-        for (replica_count, created_at, served) in [
-            (1, EPOCH - 2 * STORAGE_EPOCH_SKEW_MICROS, false),
-            (1, EPOCH - STORAGE_EPOCH_SKEW_MICROS / 2, true),
-            (1, EPOCH + 1, true),
-            (REPLICAS, EPOCH - 2 * STORAGE_EPOCH_SKEW_MICROS, true),
+        for (replica_count, created_at, served, lost) in [
+            (1, EPOCH - 2 * STORAGE_EPOCH_SKEW_MICROS, false, true),
+            (1, EPOCH - STORAGE_EPOCH_SKEW_MICROS / 2, true, false),
+            (1, EPOCH + 1, true, false),
+            (REPLICAS, EPOCH - 2 * STORAGE_EPOCH_SKEW_MICROS, true, true),
+            (REPLICAS, EPOCH + 1, true, false),
         ] {
             let root = tempfile::tempdir().unwrap();
             let config = solo_config(&root);
@@ -1583,17 +1605,24 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(
-                loaded.is_some(),
-                served,
-                "replicas={replica_count} created_at={created_at}"
-            );
-            assert_eq!(partitions.is_tombstoned(&namespace), !served);
+            let context = format!("replicas={replica_count} created_at={created_at}");
+            assert_eq!(loaded.is_some(), served, "{context}");
+            assert_eq!(partitions.is_tombstoned(&namespace), !served, "{context}");
+            if let Some(partition) = loaded
+                && replica_count > 1
+            {
+                assert_eq!(partition.requires_state_transfer(), lost, "{context}");
+                assert_eq!(
+                    partition.consensus().recovery_election_allowed(),
+                    !lost,
+                    "{context}: a lost copy elects nothing on its empty log"
+                );
+            }
         }
     }
 
     /// The reconciler's path: a partition whose directory went with the
-    /// storage reaches the fresh build, never the loader.
+    /// storage reaches the fresh build. Boot's loader sends it there too.
     #[compio::test]
     async fn given_storage_younger_than_an_unrecorded_partition_when_building_fresh_should_refuse_a_singleton_and_keep_a_wider_member_out_of_elections()
      {

@@ -5340,6 +5340,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             // config says nothing about how deep a peer's pipeline is.
             prepare_queue_ceiling: PREPARE_QUEUE_CEILING as u64,
             absence_nacks: true,
+            empty_votes_max: if self.recovered_log_complete.get() {
+                self.quorum_replication() - 1
+            } else {
+                self.replica_count as usize
+            },
         }
     }
 

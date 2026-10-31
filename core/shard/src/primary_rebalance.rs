@@ -43,6 +43,7 @@ use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use metadata::impls::metadata::PartitionPrimaryTransfer;
+use metadata::stm::stream::PartitionReplication;
 use partitions::{IggyPartition, PreparedPrimaryTransfer};
 use server_common::Message;
 use server_common::MessageBag;
@@ -135,9 +136,11 @@ pub struct PrimaryRebalance {
     /// Every peer was heard from in this view, so placement got `eligible`
     /// rather than no evidence.
     readiness_known: bool,
-    /// Partitions too few of whose members are up to commit, with their
-    /// primary down too, as of the last scan. No primary counts them.
-    without_ready_quorum: usize,
+    /// The cluster's partitions short of their factor or of a write quorum,
+    /// as of the last scan.
+    replication: PartitionReplication,
+    /// The nodes the directory last narrowed in-sync reports to.
+    live_nodes: u32,
     next_quorum_scan: Instant,
     stable_since: Instant,
     next_move: Instant,
@@ -189,6 +192,8 @@ struct Peer {
     nonce: Option<u128>,
     sent_at: Option<Instant>,
     ready_at: Option<Instant>,
+    /// When the peer last answered a probe of this view, ready or not.
+    live_at: Option<Instant>,
     answered_at: Option<Instant>,
     /// The peer answered a probe of this view, or one timed out or never left
     /// this node, so `ready_at` reflects the peer rather than the view's start.
@@ -198,6 +203,8 @@ struct Peer {
     replied: bool,
     /// The last partition report sent to this peer.
     status_cursor: Option<u64>,
+    /// The last directory change sent to this peer.
+    changes_sent: u64,
 }
 
 struct PendingMove {
@@ -227,11 +234,11 @@ pub enum LocalRebalance {
 }
 
 impl PrimaryRebalance {
-    /// On the metadata primary's first shard, the partitions no primary is up
-    /// to count as below their write quorum. Zero elsewhere, and until every
+    /// On the metadata primary's first shard, the cluster's partitions short
+    /// of their factor or of a write quorum. Zero elsewhere, and until every
     /// peer was heard from in this view.
-    pub(crate) const fn partitions_without_ready_quorum(&self) -> usize {
-        self.without_ready_quorum
+    pub(crate) const fn partition_replication(&self) -> PartitionReplication {
+        self.replication
     }
 
     /// Whether `header` answers the peer's outstanding probe.
@@ -252,6 +259,7 @@ impl PrimaryRebalance {
         peer.nonce = None;
         peer.answered_at = peer.sent_at;
         peer.ready_at = (header.ready == 1).then_some(now);
+        peer.live_at = Some(now);
         peer.heard = true;
         peer.replied = true;
         true
@@ -353,7 +361,8 @@ impl Default for PrimaryRebalance {
             peers: Vec::new(),
             eligible: Vec::new(),
             readiness_known: false,
-            without_ready_quorum: 0,
+            replication: PartitionReplication::default(),
+            live_nodes: u32::MAX,
             next_quorum_scan: Instant::now(),
             stable_since: Instant::now(),
             next_move: Instant::now(),
@@ -412,7 +421,11 @@ where
             self.retain_partition_directories(self.bus.monotonic_now());
         }
         if self.id != 0 || !consensus.is_primary() || !consensus_ready(consensus) {
-            self.primary_rebalance.borrow_mut().reset_authority();
+            let mut state = self.primary_rebalance.borrow_mut();
+            state.reset_authority();
+            state.live_nodes = u32::MAX;
+            state.replication = PartitionReplication::default();
+            drop(state);
             metadata.observe_replica_readiness(&[]);
             if self.id == 0 {
                 metadata
@@ -492,6 +505,22 @@ where
                 .iter()
                 .enumerate()
                 .all(|(index, peer)| index == usize::from(consensus.replica()) || peer.heard);
+            // Placement readiness drops a node while any of its partitions
+            // repairs, which says nothing about whether it holds the others.
+            // Liveness is whether it answers at all.
+            let live: Vec<bool> = (0..consensus.replica_count())
+                .map(|replica| {
+                    replica == consensus.replica()
+                        || state.peers[usize::from(replica)]
+                            .live_at
+                            .is_some_and(|live| now.duration_since(live) <= PROBE_TIMEOUT)
+                })
+                .collect();
+            let live_nodes = if readiness_known {
+                node_mask(&live)
+            } else {
+                u32::MAX
+            };
             if changed {
                 state.stable_since = now;
                 state.pending = None;
@@ -503,21 +532,17 @@ where
                 } else {
                     &[]
                 });
+            }
+            if live_nodes != state.live_nodes {
+                state.live_nodes = live_nodes;
                 metadata
                     .mux_stm
                     .streams()
-                    .set_partition_directory_ready_nodes(if readiness_known {
-                        node_mask(&state.eligible)
-                    } else {
-                        u32::MAX
-                    });
+                    .set_partition_directory_ready_nodes(live_nodes);
             }
             if readiness_known && now >= state.next_quorum_scan {
                 state.next_quorum_scan = now + PROBE_INTERVAL;
-                state.without_ready_quorum = metadata
-                    .mux_stm
-                    .streams()
-                    .partitions_without_ready_quorum(&state.eligible);
+                state.replication = metadata.mux_stm.streams().partition_replication(&live);
             }
             if let Some(pending) = state.pending.as_ref() {
                 let elapsed = now.duration_since(pending.since);
@@ -560,7 +585,9 @@ where
                 ) else {
                     return false;
                 };
-                if consensus.primary_index(current.view) != target {
+                if self.partition_primary_node(moved.plan.namespace.inner(), current.view)
+                    != Some(target)
+                {
                     backoff.record_failure(now);
                     return false;
                 }
@@ -629,17 +656,22 @@ where
         let Some(cursor) = state.peers.get_mut(usize::from(peer)) else {
             return Vec::new();
         };
-        let (batch, last) = self
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .partition_status_batch(
+        let streams = self.plane.metadata().mux_stm.streams();
+        // Changes first: a new primary reaches every node within a probe, not
+        // once the cycle through every partition comes back to it.
+        let (mut batch, changes_sent) =
+            streams.partition_status_changes(cursor.changes_sent, STATUS_ENTRIES_PER_FRAME);
+        cursor.changes_sent = changes_sent;
+        let room = STATUS_ENTRIES_PER_FRAME - batch.len();
+        if room > 0 {
+            let (cycle, last) = streams.partition_status_batch(
                 cursor.status_cursor,
-                STATUS_ENTRIES_PER_FRAME,
+                room,
                 STATUS_ENTRIES_SCANNED_PER_FRAME,
             );
-        cursor.status_cursor = last;
+            cursor.status_cursor = last;
+            batch.extend(cycle);
+        }
         batch
     }
 

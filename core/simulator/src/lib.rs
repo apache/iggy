@@ -2186,6 +2186,16 @@ fn view_scoped_partition_frame(
         }
         Command::DoViewChange => {
             let header = message.try_as_typed::<DoViewChangeHeader>().ok()?.header();
+            // An empty vote leaves its sender in its own view by design: it
+            // holds no log and the sender acks nothing until a transfer.
+            let empty_vote = header.untrusted_log()
+                && header.log_view == 0
+                && header.op == 0
+                && header.commit == 0
+                && header.size as usize == size_of::<DoViewChangeHeader>();
+            if empty_vote {
+                return None;
+            }
             (header.group, header.partition_incarnation)
         }
         Command::StartView => {
@@ -15958,19 +15968,37 @@ mod metadata_read_frontier_tests {
         };
         assert_eq!(write(&mut sim, b"all members"), 0);
 
+        let filler = sim.replicas[0].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .namespace_from_partition(
+                &iggy_binary_protocol::WireIdentifier::named("freshness").unwrap(),
+                &iggy_binary_protocol::WireIdentifier::named("filler").unwrap(),
+                0,
+            )
+            .expect("the filler topic places the lowest nodes first");
+        let filler_members = partition_members(&sim, filler);
+        // The gauges count every partition, so the crash spares the filler's.
         let backup = *members
             .nodes()
             .iter()
-            .find(|node| **node != primary)
-            .expect("three members");
+            .find(|node| **node != primary && filler_members.member(**node).is_none())
+            .expect("a backup the filler does not store");
         let under_replicated = |sim: &Simulator| {
-            let metrics = sim.replicas[usize::from(primary)]
-                .partition_shard(namespace)
-                .metrics();
-            (
-                metrics.partitions_under_replicated_value(),
-                metrics.partitions_below_write_quorum_value(),
-            )
+            sim.replicas
+                .iter()
+                .enumerate()
+                .filter(|(replica, _)| !sim.is_crashed(u8::try_from(*replica).unwrap()))
+                .flat_map(|(_, replica)| replica.shards.iter())
+                .fold((0, 0), |(under, below), shard| {
+                    let metrics = shard.metrics();
+                    (
+                        under + metrics.partitions_under_replicated_value(),
+                        below + metrics.partitions_below_write_quorum_value(),
+                    )
+                })
         };
         assert_eq!(under_replicated(&sim), (0, 0));
 
@@ -16241,6 +16269,41 @@ mod metadata_read_frontier_tests {
         );
     }
 
+    /// A two-member partition with its backup down cannot commit. Its primary
+    /// hears too few members, steps down and keeps trying to elect, so the
+    /// count must not depend on which node leads it at the moment.
+    #[test]
+    fn given_a_two_member_partition_when_its_backup_is_down_should_count_it_below_write_quorum_once()
+     {
+        const REPLICAS: u8 = 5;
+        const SAMPLES: usize = 200;
+        let (mut sim, client, namespace) = placed_partition_cluster(REPLICAS, 2, 0xF2E5_0070);
+        let members = partition_members(&sim, namespace);
+        let (primary, _) =
+            partition_leader(&sim, namespace, None).expect("one member leads the partition");
+        assert_eq!(
+            write_through(&mut sim, &client, namespace, primary, b"both members"),
+            0
+        );
+        let backup = *members
+            .nodes()
+            .iter()
+            .find(|node| **node != primary)
+            .expect("two members");
+
+        sim.replica_crash(backup);
+        advance_freshness_time(
+            &mut sim,
+            consensus::MEMBER_LAG_MAX + shard::PARTITION_REPORT_INTERVAL,
+        );
+        for _ in 0..SAMPLES {
+            for _ in 0..10 {
+                sim.step();
+            }
+            assert_eq!(cluster_below_write_quorum(&sim, Some(backup)), 1);
+        }
+    }
+
     /// `partitions_below_write_quorum` summed over every shard of every node
     /// but `down`, as an operator sums it over the cluster.
     fn cluster_below_write_quorum(sim: &Simulator, down: Option<u8>) -> i64 {
@@ -16251,6 +16314,89 @@ mod metadata_read_frontier_tests {
             .flat_map(|(_, replica)| replica.shards.iter())
             .map(|shard| shard.metrics().partitions_below_write_quorum_value())
             .sum()
+    }
+
+    /// Either member of a two-member partition can lose its storage, as one
+    /// `--fresh` replica at a time does. Both durabilities are persisted, so
+    /// only that member's empty vote lets the survivor, which holds every
+    /// committed op, lead a view to transfer the history back from. In-memory
+    /// storage does not model the transfer, so this stops at the view.
+    #[test]
+    fn given_a_two_member_partition_when_either_member_returns_without_its_storage_should_lead_on_the_survivor()
+     {
+        const REPLICAS: u8 = 5;
+        for wipe_primary in [true, false] {
+            let (mut sim, client, namespace) =
+                placed_partition_cluster(REPLICAS, 2, 0xF2E5_0060 + u64::from(wipe_primary));
+            let members = partition_members(&sim, namespace);
+            let (primary, _) =
+                partition_leader(&sim, namespace, None).expect("one member leads the partition");
+            let survivor = *members
+                .nodes()
+                .iter()
+                .find(|node| **node != primary)
+                .expect("two members");
+            let (wiped, survivor) = if wipe_primary {
+                (primary, survivor)
+            } else {
+                (survivor, primary)
+            };
+            assert_eq!(
+                write_through(&mut sim, &client, namespace, primary, b"before the wipe"),
+                0
+            );
+            let committed = sim
+                .partition_consensus_state(usize::from(primary), namespace)
+                .expect("the primary hosts the partition")
+                .commit_min;
+
+            sim.replica_crash(wiped);
+            sim.replica_restart_losing_partitions(wiped, &[namespace]);
+            let rebuilt = |sim: &Simulator| {
+                sim.replicas[usize::from(wiped)]
+                    .partition_shard(namespace)
+                    .plane
+                    .partitions()
+                    .contains(&namespace)
+            };
+            assert!(
+                (0..SETUP_TOTAL_STEPS).any(|_| {
+                    sim.step();
+                    rebuilt(&sim)
+                }),
+                "the restarted member rebuilds the partition"
+            );
+            // As the server marks a group whose storage went with the disk.
+            sim.replicas[usize::from(wiped)]
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .get_mut_by_ns(&namespace)
+                .expect("the rebuilt partition is live")
+                .force_requires_state_transfer_for_test();
+            // Nothing commits until the transfer lands, since both members ack.
+            assert!(
+                (0..SETUP_TOTAL_STEPS).any(|_| {
+                    sim.step();
+                    sim.partition_consensus_state(usize::from(survivor), namespace)
+                        .is_some_and(|state| {
+                            state.status == Status::Normal
+                                && state.is_primary
+                                && (!wipe_primary || state.view > 0)
+                        })
+                }),
+                "wipe_primary={wipe_primary}: node {survivor} never led: {:?}",
+                sim.partition_consensus_state(usize::from(survivor), namespace)
+            );
+            let kept =
+                super::tests::retained_prepare(&sim, usize::from(survivor), namespace, committed);
+            assert!(
+                kept.body()
+                    .windows(b"before the wipe".len())
+                    .any(|bytes| bytes == b"before the wipe"),
+                "wipe_primary={wipe_primary}: the view dropped the committed op"
+            );
+        }
     }
 
     fn partition_fresh(sim: &Simulator, replica: u8) -> bool {

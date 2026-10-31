@@ -355,29 +355,37 @@ Metadata is always on every node.
 `GetTopic` lists, for each partition, its `members`, the node ids that store it,
 and its `in_sync_members`, the members its primary last reported in sync, which
 the metadata primary narrows to the nodes answering its probes. A member missing
-from the second list is down or behind, so before restarting a node, check that
-the partitions it is a member of keep a quorum of in-sync members without it.
+from the second list is down or behind. Before restarting a node, check that
+every partition it is a member of keeps, without it, enough in-sync members to
+elect a primary: 2 of 2 or 3, 3 of 4 or 5, 4 of 6, and 5 of 7. A restart of a
+node that leads a partition needs that many, not just a write quorum.
 The in-sync list is empty until a partition's primary first reports, about a
 second after it is created, and while none of its members that are up leads it.
 
 At create the metadata primary picks each partition's nodes: the primary is the
 ready node leading the fewest partitions, and the other members are the nodes
-storing the fewest. A node that is down is picked only when too few are up. The
+storing the fewest, each in a rack the partition does not use yet while one has
+a ready node, like Kafka's `broker.rack`. A node names its rack, or availability
+zone, with `rack` in its `[[cluster.nodes]]` entry, and a node without one
+shares a rack with no other. A node that is down is picked only when too few are
+up. The
 assignment never moves. While a member is down its partitions run with fewer
 copies, and the member catches up from the others when it comes back. A new
 metadata primary refuses creates with `TransientNotAccepted` (58) until every
 node has answered its probe or missed it, so the node whose failure started the
 view is not picked.
 
-Each partition's primary reports in `/metrics`, per shard, how many of the
-partitions it leads have a member out of sync: `partitions_under_replicated`
-counts a member it cannot reach or one that has trailed the commit point for
-30 seconds, Kafka's `replica.lag.time.max.ms` default, and
-`partitions_below_write_quorum` counts partitions with too few members in sync
-to commit. A partition whose primary is down, with too few members up to commit,
-has no primary to count it, so the metadata primary counts it from the nodes that
-answer its probes. Like Kafka's `UnderReplicatedPartitions`, sum the series over
-every node for the cluster's total.
+The metadata primary reports in `/metrics`, on its first shard, the cluster's
+`partitions_under_replicated`, partitions with a member out of sync, and
+`partitions_below_write_quorum`, partitions that cannot commit. For a partition
+whose primary answers its probes, it counts the members of the primary's last
+report that answer too: a member is out of the report while the primary cannot
+reach it or while it has trailed the commit point for 30 seconds, Kafka's
+`replica.lag.time.max.ms` default. For a partition whose primary does not answer,
+it counts the members that answer, which must be enough to elect a primary
+before anything commits. Every other node reports 0, so, like Kafka's
+`UnderReplicatedPartitions`, summing the series over every node gives the
+cluster's total.
 
 A write commits on a quorum of a partition's members: 2 of 3, 3 of 5, and at
 most 3 for wider groups. A factor of 2 keeps two copies but stops accepting
@@ -388,7 +396,8 @@ write before that copy reaches disk; set `durability=persisted` on such a topic
 to acknowledge only written data.
 
 Deleting a topic or stream waits while one of its partitions lacks a quorum of
-its members, and completes once they return, like Kafka's pending deletes.
+its members, and completes once they return, like Kafka's pending deletes, or
+once enough of them came back without their copy that the rest cannot commit.
 
 Logins keep working while a partition lacks a quorum of its members. A session
 that ends then cannot be retired on that partition, so the partition owes the
@@ -401,18 +410,25 @@ for that reason, and `retirement_debts_paid`, the payments a node made.
 
 A node that comes back with empty storage refuses to serve a factor-1
 partition created before it, because that data was only on this node and
-serving it again would reuse its offsets. A member of a wider partition waits
-instead for a member that kept the partition's data and copies it, and takes no
-part in electing a primary before then, so a 3-member partition with one member
-down and another back on empty storage waits for the one that is down. If every
-member lost its storage, none of them serves the partition rather than restart
-it at offset 0. Delete and recreate the topic to accept the loss.
+serving it again would reuse its offsets. A member of a wider partition copies
+the data from a member that kept it instead. Until then it never leads, and it
+votes in an election only to let every member report, which elects a member that
+kept the data once fewer than a write quorum of members lost theirs. So a
+2-member partition elects its other member when one member comes back empty, as
+replacing one disk at a time with `--fresh` does, and a 3-member partition with
+one member down and another back on empty storage waits for the one that is
+down. If a write quorum of members lost their storage, none of them serves the
+partition rather than restart it at offset 0 or without ops that only they
+held. Delete and recreate the topic to accept the loss: the delete completes once
+the members that lost their copy leave too few to commit, and frees the name.
 
 A node that does not store a partition answers its route lookups from what the
 partition's primary last reported, or from the partition's initial primary
 before any report, and it refuses sends and polls for it with `NotPrimary`, so
-clients go to the primary. Its topic and stream counters
-follow those reports too, so they trail the members.
+clients go to the primary. The metadata primary relays a report that names a
+new primary or changes the in-sync members in its next probe, about a second
+after it hears it, and cycles through the others 512 per probe. Its topic and
+stream counters follow those reports too, so they trail the members.
 
 Topics created before replication factors keep every partition on every node.
 

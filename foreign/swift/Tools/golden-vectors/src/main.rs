@@ -110,6 +110,11 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use twox_hash::{XxHash3_64, XxHash32};
 
+/// The SDK sends `sdkVersion` in every login handshake, so the handshake
+/// vectors take it from the Swift source instead of a copy that a version
+/// bump would leave behind.
+const IGGY_SWIFT_SOURCE: &str = include_str!("../../../Sources/Iggy/Iggy.swift");
+
 /// Hash and error tables are maps keyed by length and code, so each entry is
 /// one line of the pretty-printed fixture and the file stays reviewable.
 #[derive(Serialize)]
@@ -211,8 +216,19 @@ fn version_info() -> ClientVersionInfo {
     ClientVersionInfo {
         protocol_version: IGGY_PROTOCOL_VERSION,
         sdk_name: name("swift-sdk"),
-        sdk_version: name("0.1.5"),
+        sdk_version: name(swift_sdk_version()),
     }
+}
+
+fn swift_sdk_version() -> &'static str {
+    IGGY_SWIFT_SOURCE
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("public static let sdkVersion = \"")?
+                .strip_suffix('"')
+        })
+        .expect("Iggy.swift declares sdkVersion")
 }
 
 fn sample_permissions() -> WirePermissions {

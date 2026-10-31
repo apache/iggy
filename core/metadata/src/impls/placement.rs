@@ -45,6 +45,9 @@ pub(super) struct PlacementState {
     /// A readiness coordinator has reported. A metadata plane without one has
     /// no evidence to wait for and counts every node as ready.
     readiness_reported: bool,
+    /// Per node, the failure domain it sits in, `None` for a node that named
+    /// none and so shares a domain with no other.
+    racks: Vec<Option<u32>>,
 }
 
 /// Per node: partitions it is primary of, and partitions it stores.
@@ -124,6 +127,10 @@ struct ScanInputs {
 }
 
 impl PlacementState {
+    pub(super) fn set_racks(&mut self, racks: Vec<Option<u32>>) {
+        self.racks = racks;
+    }
+
     pub(super) fn observe_replicas(&mut self, view: u32, eligible: &[bool]) {
         self.readiness_reported = true;
         self.eligible = (!eligible.is_empty()).then(|| (view, eligible.to_vec()));
@@ -287,13 +294,27 @@ impl PlacementState {
             counts.record(None, u32::from(primary));
             return Ok((Vec::new(), u32::from(primary)));
         };
-        let mut followers: Vec<u8> = (0..nodes).filter(|node| *node != primary).collect();
-        followers.sort_by_key(|&node| {
-            let (primaries, replicas) = load(node);
-            (!ready(node), replicas, primaries, node)
-        });
-        let mut members = followers[..usize::from(factor) - 1].to_vec();
-        members.push(primary);
+        // A copy in a rack the partition already uses does not survive that
+        // rack's loss, so each follower goes to an unused rack while one holds
+        // a ready node.
+        let rack = |node: u8| self.racks.get(usize::from(node)).copied().flatten();
+        let mut members = vec![primary];
+        let mut used_racks: Vec<u32> = rack(primary).into_iter().collect();
+        let mut candidates: Vec<u8> = (0..nodes).filter(|node| *node != primary).collect();
+        for _ in 1..factor {
+            let (index, &follower) = candidates
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, &node)| {
+                    let (primaries, replicas) = load(node);
+                    let shares_rack = rack(node).is_some_and(|rack| used_racks.contains(&rack));
+                    (!ready(node), shares_rack, replicas, primaries, node)
+                })
+                .ok_or(IggyError::InvalidReplicationFactor)?;
+            candidates.swap_remove(index);
+            used_racks.extend(rack(follower));
+            members.push(follower);
+        }
         members.sort_unstable();
         let created_view = members
             .iter()
@@ -1048,6 +1069,33 @@ mod tests {
             .unwrap();
         assert_eq!(transfer.namespace, IggyNamespace::new(0, 1, 0));
         assert_eq!(transfer.target, 2);
+    }
+
+    /// Nodes numbered rack by rack would put the first partitions' copies in
+    /// one rack each, so losing a rack would lose them all.
+    #[test]
+    fn given_nodes_in_racks_when_placing_should_spread_each_partition_over_racks() {
+        const NODES: u8 = 9;
+        const PARTITIONS: usize = 30;
+        let rack_of = |node: u8| u32::from(node / 3);
+        let mut placement = PlacementState::default();
+        placement.set_racks((0..NODES).map(|node| Some(rack_of(node))).collect());
+        let mut counts = PlacementCounts::new(NODES);
+        for _ in 0..PARTITIONS {
+            let (members, _) = placement.select(&mut counts, 0, Some(3)).unwrap();
+            let mut racks: Vec<u32> = members.iter().map(|&node| rack_of(node)).collect();
+            racks.sort_unstable();
+            racks.dedup();
+            assert_eq!(racks.len(), 3, "members {members:?} share a rack");
+        }
+        assert!(
+            counts
+                .replicas
+                .iter()
+                .all(|copies| copies.abs_diff(10) <= 1),
+            "copies stay within one of the mean: {:?}",
+            counts.replicas
+        );
     }
 
     #[test]

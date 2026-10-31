@@ -17,7 +17,7 @@
 
 use iggy_binary_protocol::primitives::partition_status::PartitionStatusEntry;
 use server_common::sharding::IggyNamespace;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -35,6 +35,34 @@ pub struct PartitionDirectory {
     /// nodes narrowed to these, so a primary that died does not keep claiming
     /// its members in sync with its last report.
     ready_nodes: AtomicU32,
+    /// Locked after `entries` whenever both are held.
+    changes: Mutex<Changes>,
+}
+
+/// The order in which reports last changed what a route or an in-sync list
+/// reads, so a node hears a new primary first rather than after a whole
+/// cycle through every partition.
+#[derive(Debug, Default)]
+struct Changes {
+    last: u64,
+    by_seq: BTreeMap<u64, u64>,
+    by_namespace: HashMap<u64, u64>,
+}
+
+impl Changes {
+    fn mark(&mut self, namespace: u64) {
+        self.last += 1;
+        if let Some(previous) = self.by_namespace.insert(namespace, self.last) {
+            self.by_seq.remove(&previous);
+        }
+        self.by_seq.insert(self.last, namespace);
+    }
+
+    fn forget(&mut self, namespace: u64) {
+        if let Some(seq) = self.by_namespace.remove(&namespace) {
+            self.by_seq.remove(&seq);
+        }
+    }
 }
 
 impl Default for PartitionDirectory {
@@ -42,6 +70,7 @@ impl Default for PartitionDirectory {
         Self {
             entries: Mutex::default(),
             ready_nodes: AtomicU32::new(u32::MAX),
+            changes: Mutex::default(),
         }
     }
 }
@@ -67,19 +96,57 @@ impl PartitionDirectory {
         reports: impl IntoIterator<Item = PartitionStatusEntry>,
     ) -> Vec<PartitionStatusEntry> {
         let mut entries = self.lock();
+        let mut changes = self.changes();
         let mut accepted = Vec::new();
         for report in reports {
-            let replace = entries.get(&report.namespace).is_none_or(|known| {
+            let known = entries.get(&report.namespace);
+            let replace = known.is_none_or(|known| {
                 (report.created_revision, report.view, report.commit)
                     >= (known.created_revision, known.view, known.commit)
             });
             if replace {
+                let moved = known.is_none_or(|known| {
+                    (known.created_revision, known.view, known.in_sync_nodes)
+                        != (report.created_revision, report.view, report.in_sync_nodes)
+                });
                 entries.insert(report.namespace, report);
+                if moved {
+                    changes.mark(report.namespace);
+                }
                 accepted.push(report);
             }
         }
+        drop(changes);
         drop(entries);
         accepted
+    }
+
+    /// Up to `limit` reports whose incarnation, view or in-sync nodes changed
+    /// after change `after`, oldest change first, with the last change they
+    /// reach, the next call's `after`.
+    #[must_use]
+    pub fn changed_after(
+        &self,
+        after: u64,
+        limit: usize,
+        mut include: impl FnMut(&PartitionStatusEntry) -> bool,
+    ) -> (Vec<PartitionStatusEntry>, u64) {
+        let entries = self.lock();
+        let changes = self.changes();
+        let mut last = after;
+        let mut batch = Vec::new();
+        for (&seq, namespace) in changes.by_seq.range(after.saturating_add(1)..) {
+            if batch.len() == limit {
+                break;
+            }
+            last = seq;
+            if let Some(entry) = entries.get(namespace).filter(|entry| include(entry)) {
+                batch.push(self.narrowed(entry));
+            }
+        }
+        drop(changes);
+        drop(entries);
+        (batch, last)
     }
 
     /// The latest report of `namespace`'s `created_revision` incarnation.
@@ -155,15 +222,24 @@ impl PartitionDirectory {
                 rejected.push(*namespace);
             }
         }
+        let mut changes = self.changes();
         for namespace in rejected {
             entries.remove(&namespace);
+            changes.forget(namespace);
         }
+        drop(changes);
         drop(entries);
         (visited == limit).then_some(last).flatten()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, PartitionStatusEntry>> {
         self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn changes(&self) -> std::sync::MutexGuard<'_, Changes> {
+        self.changes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -185,6 +261,44 @@ mod tests {
             segments_count: 1,
             in_sync_nodes: 0,
         }
+    }
+
+    #[test]
+    fn given_reports_when_their_view_or_in_sync_nodes_change_should_list_them_in_change_order() {
+        let directory = PartitionDirectory::default();
+        directory.record([report(1, 1, 0), report(2, 1, 0), report(3, 1, 0)]);
+        let (all, seen) = directory.changed_after(0, 8, |_| true);
+        assert_eq!(all.len(), 3);
+
+        let mut counters_only = report(1, 1, 0);
+        counters_only.messages_count = 5;
+        counters_only.commit = 2;
+        directory.record([report(3, 1, 1), counters_only]);
+        let mut in_sync = report(2, 1, 0);
+        in_sync.in_sync_nodes = 0b11;
+        directory.record([in_sync]);
+        let (changed, last) = directory.changed_after(seen, 8, |_| true);
+        assert_eq!(
+            changed
+                .iter()
+                .map(|entry| entry.namespace)
+                .collect::<Vec<_>>(),
+            [3, 2],
+            "a new view or in-sync set is a change, new counters are not"
+        );
+        assert_eq!(directory.changed_after(last, 8, |_| true).0, []);
+
+        directory.retain_chunk(None, 8, |entry| entry.namespace != 3);
+        assert_eq!(
+            directory
+                .changed_after(0, 8, |_| true)
+                .0
+                .iter()
+                .map(|entry| entry.namespace)
+                .collect::<Vec<_>>(),
+            [1, 2],
+            "a retired report leaves the change log"
+        );
     }
 
     #[test]

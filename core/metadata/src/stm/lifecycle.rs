@@ -64,6 +64,10 @@ pub struct LifecyclePartition {
     pub partition_id: u32,
     pub fence: LifecycleFence,
     pub partition_op: Option<u64>,
+    /// Bit per node that retired its lost copy of a deleted partition. See
+    /// [`retired_member_op`].
+    #[serde(default)]
+    pub retired_members: u32,
 }
 
 /// Retained until every affected partition durably installs its exact fence.
@@ -117,6 +121,27 @@ impl LifecycleIntent {
 /// can install its fence, so a durable retirement fence that keeps the
 /// incarnation offline completes it instead.
 pub const RETIRED_PARTITION_OP: u64 = u64::MAX;
+
+/// The `partition_op` with which `node` reports retiring its lost copy of a
+/// partition that a delete removes.
+///
+/// It only records the member. Once too few members remain to commit, a member
+/// completes the target with [`RETIRED_PARTITION_OP`], since then no log can
+/// install its fence either.
+#[must_use]
+pub const fn retired_member_op(node: u8) -> u64 {
+    RETIRED_PARTITION_OP - 1 - node as u64
+}
+
+/// The node a [`retired_member_op`] names.
+#[must_use]
+pub const fn retiring_member(partition_op: u64) -> Option<u8> {
+    match (RETIRED_PARTITION_OP - 1).checked_sub(partition_op) {
+        #[allow(clippy::cast_possible_truncation)]
+        Some(node) if node < u32::BITS as u64 => Some(node as u8),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LifecycleCompletion {
@@ -421,6 +446,7 @@ impl StreamsInner {
                     partition_id,
                     fence,
                     partition_op: None,
+                    retired_members: 0,
                 });
             }
         }
@@ -460,6 +486,7 @@ impl StateHandler for CompleteLifecycleRequest {
         // A batch applies whole or not at all, so nothing is recorded until
         // every completion passes.
         let mut recorded = Vec::with_capacity(self.completions.len());
+        let mut retirements = Vec::new();
         for completion in &self.completions {
             let Some(&index) = intent
                 .partition_index
@@ -467,14 +494,28 @@ impl StateHandler for CompleteLifecycleRequest {
             else {
                 return ApplyReply::err(IggyError::InvalidCommand.as_code());
             };
-            match intent
-                .partitions
-                .get(index)
-                .map(|partition| partition.partition_op)
-            {
-                Some(None) => recorded.push((index, completion.partition_op)),
-                Some(Some(op)) if op == completion.partition_op => {}
-                _ => return ApplyReply::err(IggyError::InvalidCommand.as_code()),
+            let Some(partition) = intent.partitions.get(index) else {
+                return ApplyReply::err(IggyError::InvalidCommand.as_code());
+            };
+            if let Some(node) = retiring_member(completion.partition_op) {
+                // Only a delete may lose a copy for good.
+                if !matches!(partition.fence, LifecycleFence::History(_)) {
+                    return ApplyReply::err(IggyError::InvalidCommand.as_code());
+                }
+                if partition.partition_op.is_none() {
+                    retirements.push((index, node));
+                }
+                continue;
+            }
+            match partition.partition_op {
+                None => recorded.push((index, completion.partition_op)),
+                Some(op) if op == completion.partition_op => {}
+                Some(_) => return ApplyReply::err(IggyError::InvalidCommand.as_code()),
+            }
+        }
+        for &(index, node) in &retirements {
+            if let Some(partition) = intent.partitions.get_mut(index) {
+                partition.retired_members |= 1 << node;
             }
         }
         for &(index, partition_op) in &recorded {
@@ -1679,6 +1720,80 @@ mod tests {
             crate::stm::snapshot::MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
         let restored = Streams::from_snapshot(decoded.streams.unwrap()).unwrap();
         assert_eq!(catalog(&restored), (REMOVAL_OP, 2, vec![1]));
+    }
+
+    #[test]
+    fn given_a_member_retirement_when_completing_should_record_it_and_leave_the_target_pending() {
+        assert_eq!(retiring_member(retired_member_op(5)), Some(5));
+        assert_eq!(retiring_member(RETIRED_PARTITION_OP), None);
+        assert_eq!(retiring_member(12), None);
+        let streams = streams();
+        let reply = apply(
+            &streams,
+            Operation::DeleteTopic,
+            &DeleteTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+            },
+            context(),
+        );
+        assert_eq!(reply.code, 0);
+        let retire = |streams: &Streams, metadata_op| {
+            complete_batch(
+                streams,
+                vec![completion(0, retired_member_op(2))],
+                metadata_op,
+            )
+            .code
+        };
+        assert_eq!(retire(&streams, INTENT_OP + 1), 0);
+        assert_eq!(
+            retire(&streams, INTENT_OP + 2),
+            0,
+            "a repeated report changes nothing"
+        );
+        let retired =
+            |streams: &Streams| streams.pending_lifecycles()[0].partitions[0].retired_members;
+        assert_eq!(retired(&streams), 1 << 2);
+        assert!(
+            streams.lifecycle_pending(INTENT_OP),
+            "a retirement completes no target"
+        );
+
+        let mut snapshot = crate::stm::snapshot::MetadataSnapshot::new(INTENT_OP + 2);
+        snapshot.streams = Some(streams.to_snapshot());
+        let decoded =
+            crate::stm::snapshot::MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
+        let restored = Streams::from_snapshot(decoded.streams.unwrap()).unwrap();
+        assert_eq!(retired(&restored), 1 << 2);
+
+        for (partition_id, partition_op, metadata_op) in [
+            (0, RETIRED_PARTITION_OP, INTENT_OP + 3),
+            (1, 7, INTENT_OP + 4),
+        ] {
+            let reply = complete_batch(
+                &streams,
+                vec![completion(partition_id, partition_op)],
+                metadata_op,
+            );
+            assert_eq!(reply.code, 0);
+        }
+        assert!(!streams.lifecycle_pending(INTENT_OP));
+    }
+
+    #[test]
+    fn given_a_group_deletion_when_a_member_reports_retiring_its_copy_should_refuse() {
+        let streams = pending_owned_group_deletion(INTENT_OP - 1);
+        let reply = complete_batch(
+            &streams,
+            vec![completion(0, retired_member_op(1))],
+            INTENT_OP + 1,
+        );
+        assert_eq!(reply.code, IggyError::InvalidCommand.as_code());
+        assert_eq!(
+            streams.pending_lifecycles()[0].partitions[0].retired_members,
+            0
+        );
     }
 
     #[test]

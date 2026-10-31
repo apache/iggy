@@ -508,6 +508,63 @@ fn given_failed_moves_to_a_target_when_backing_off_should_double_each_wait_once_
     }
 }
 
+/// The partition's own members decide who leads a view, not the metadata
+/// group's: members [0, 2] of three nodes lead view 7 on node 2, while view 7
+/// modulo three names node 1. A move that held must still reset the target.
+#[compio::test]
+async fn given_a_move_inside_a_subset_group_when_the_target_holds_should_reset_its_backoff() {
+    const TARGET_VIEW: u32 = 7;
+    let (shard, _inbox) = owner();
+    let metadata = shard.plane.metadata();
+    let namespace = IggyNamespace::new(1, 1, 0);
+    let streams = metadata.mux_stm.streams();
+    streams.seed_namespace_on(
+        namespace,
+        namespace.inner(),
+        PARTITION_VIEW,
+        iggy_common::Durability::Persisted,
+        &[0, TARGET],
+    );
+    assert_ne!(
+        metadata
+            .consensus
+            .as_ref()
+            .unwrap()
+            .primary_index(TARGET_VIEW),
+        TARGET
+    );
+    arm(&shard, MovePhase::Transfer);
+    let created_revision = streams.created_revision_for_namespace(namespace).unwrap();
+    let observe = |view| {
+        metadata.observe_partition_views(&[PartitionPlacementView {
+            namespace,
+            created_revision,
+            view,
+        }]);
+    };
+    observe(PARTITION_VIEW);
+    let moved_at = shard.bus.monotonic_now();
+    {
+        let mut state = shard.primary_rebalance.borrow_mut();
+        let pending = state.pending.as_mut().unwrap();
+        pending.plan.created_revision = created_revision;
+        pending.since = moved_at;
+        state.backoffs[usize::from(TARGET)] = TargetBackoff {
+            until: Some(moved_at),
+            wait: MOVE_HOLD_INTERVAL,
+        };
+    }
+
+    observe(TARGET_VIEW);
+    tick_with_ready_peers(&shard, moved_at).await;
+    tick_with_ready_peers(&shard, moved_at + MOVE_HOLD_INTERVAL).await;
+
+    assert_eq!(
+        shard.primary_rebalance.borrow().backoffs[usize::from(TARGET)].wait,
+        Duration::ZERO
+    );
+}
+
 #[compio::test]
 async fn given_a_backed_off_target_when_its_probe_move_is_lost_or_held_should_double_or_reset_the_wait()
  {
@@ -815,10 +872,12 @@ fn given_health_challenge_when_reply_is_overdue_or_replayed_should_not_extend_re
             nonce: Some(NONCE),
             sent_at: Some(Instant::now()),
             ready_at: Some(previous),
+            live_at: Some(previous),
             answered_at: None,
             heard: false,
             replied: false,
             status_cursor: None,
+            changes_sent: 0,
         };
         let mut invalid = reply;
         match changed {
@@ -1395,4 +1454,48 @@ fn given_outbox_reports_when_a_partition_stops_being_refreshed_should_evict_only
     outbox.record(&[status(3)], start + OUTBOX_REPORT_MAX_AGE);
     assert_eq!(outbox.next_batch(1), [status(3)]);
     assert_eq!(outbox.next_batch(1), [status(2)], "the cursor wraps");
+}
+
+/// A peer that does not store a partition routes from what the metadata
+/// primary relays, so a new primary must go out in the next probe rather than
+/// once the cycle through every partition reaches it again.
+#[compio::test]
+async fn given_more_reports_than_a_probe_carries_when_a_primary_changes_should_send_it_first() {
+    const PARTITIONS: usize = STATUS_ENTRIES_PER_FRAME + STATUS_ENTRIES_PER_FRAME / 2;
+    const PEER: u8 = 1;
+    const MOVED: usize = PARTITIONS / 2;
+    let (shard, _inbox) = owner();
+    let streams = shard.plane.metadata().mux_stm.streams();
+    let namespace = |id: usize| IggyNamespace::new(1, 1, id);
+    streams.seed_namespace(namespace(PARTITIONS - 1), 1, 0);
+    let status = |id: usize, view: u32| PartitionStatusEntry {
+        namespace: namespace(id).inner(),
+        created_revision: streams
+            .created_revision_for_namespace(namespace(id))
+            .unwrap(),
+        view,
+        commit: 0,
+        current_offset: 0,
+        messages_count: 0,
+        size_bytes: 0,
+        segments_count: 1,
+        in_sync_nodes: 0,
+    };
+    let reports: Vec<_> = (0..PARTITIONS).map(|id| status(id, 0)).collect();
+    streams.record_partition_statuses(&reports, 0, REPLICAS);
+    shard.primary_rebalance.borrow_mut().peers = vec![Peer::default(); usize::from(REPLICAS)];
+    let sent: usize = (0..2).map(|_| shard.next_status_batch(PEER).len()).sum();
+    assert!(sent > PARTITIONS, "every first report went out once");
+
+    streams.record_partition_statuses(&[status(MOVED, 1)], 0, REPLICAS);
+    let batch = shard.next_status_batch(PEER);
+    assert_eq!(
+        batch.len(),
+        STATUS_ENTRIES_PER_FRAME,
+        "the cycle fills the rest"
+    );
+    assert_eq!(
+        (batch[0].namespace, batch[0].view),
+        (namespace(MOVED).inner(), 1)
+    );
 }

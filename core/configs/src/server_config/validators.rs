@@ -1212,6 +1212,7 @@ mod tests {
 
     fn cluster_node(replica_id: u8, http: Option<u16>) -> ClusterNodeConfig {
         ClusterNodeConfig {
+            rack: None,
             name: format!("node-{replica_id}"),
             ip: "127.0.0.1".to_string(),
             advertised_address: None,

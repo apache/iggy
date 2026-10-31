@@ -9405,11 +9405,9 @@ where
         let mut repair_ring_entries = 0usize;
         let mut repair_ring_bytes = 0u64;
         let mut untrusted_logs = 0usize;
-        let mut under_replicated = 0usize;
-        let mut below_write_quorum = 0usize;
         let mut owing_retirement = 0usize;
         // The replication gauges are scraped, not driven: once per report
-        // interval keeps the per-member clock reads off every tick.
+        // interval is enough.
         let replication_due =
             u128::from(self.ticks.get()).is_multiple_of(PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS);
         for namespace in namespace_scratch.iter() {
@@ -9424,13 +9422,6 @@ where
                 untrusted_logs += usize::from(consensus.has_untrusted_log());
                 owing_retirement +=
                     usize::from(replication_due && partition.owes_session_retirement());
-                if replication_due
-                    && let Some(in_sync) = consensus.in_sync_members(consensus::MEMBER_LAG_MAX)
-                {
-                    under_replicated += usize::from(in_sync < consensus.replica_count());
-                    below_write_quorum +=
-                        usize::from(usize::from(in_sync) < consensus.quorum_replication());
-                }
                 let (entries, bytes) = partition.repair_ring_occupancy();
                 repair_ring_entries += entries;
                 repair_ring_bytes += bytes;
@@ -9459,12 +9450,13 @@ where
             .set_repair_ring(repair_ring_entries, repair_ring_bytes);
         self.metrics.set_partitions_untrusted_log(untrusted_logs);
         if replication_due {
-            below_write_quorum += self
-                .primary_rebalance
-                .borrow()
-                .partitions_without_ready_quorum();
-            self.metrics
-                .set_partition_replication(under_replicated, below_write_quorum);
+            // Counted once for the cluster, so a partition whose primary is down
+            // or stepped down is not left to a node that no longer leads it.
+            let replication = self.primary_rebalance.borrow().partition_replication();
+            self.metrics.set_partition_replication(
+                replication.under_replicated,
+                replication.below_write_quorum,
+            );
             self.metrics
                 .set_partitions_owing_retirement(owing_retirement);
         }
@@ -14960,10 +14952,15 @@ async fn dispatch_partition_wire_actions<B, P, J, SB>(
 }
 
 /// Wire actions a partition awaiting a state transfer may still send: its
-/// probe, and the empty vote that vouches for no history but lets a group
-/// whose every log is untrusted start a view.
+/// probe, the empty vote that vouches for no history but lets a group whose
+/// every log is untrusted start a view, and the reply to a primary's heartbeat
+/// in the view it adopted. Without that reply a two-member primary loses its
+/// heartbeat quorum and steps down before it can serve the transfer.
 fn sendable_while_awaiting_transfer(action: &VsrAction) -> bool {
-    matches!(action, VsrAction::SendRequestStartView { .. }) || action.is_empty_vote()
+    matches!(
+        action,
+        VsrAction::SendRequestStartView { .. } | VsrAction::SendCommitReply { .. }
+    ) || action.is_empty_vote()
 }
 
 #[allow(

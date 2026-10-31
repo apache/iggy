@@ -4686,6 +4686,7 @@ where
                 InstallFilePhase::FinishBackup => InstallPhase::ClearMissing,
                 InstallFilePhase::ClearMissing => {
                     self.materialization_missing = false;
+                    self.refresh_recovered_log_complete();
                     InstallPhase::Done
                 }
                 _ => unreachable!("transfer file result matches captured phase"),

@@ -508,6 +508,11 @@ pub struct ClusterNodeConfig {
     /// `nodes.len()`. Validated by [`ClusterConfig::validate`].
     pub replica_id: u8,
     pub ports: TransportPorts,
+    /// Failure domain, such as a rack or an availability zone. Placement puts
+    /// a partition's copies in as many as it can. A node without one shares a
+    /// domain with no other node.
+    #[serde(default)]
+    pub rack: Option<String>,
 }
 
 /// One client-network-scoped advertised address: clients whose IP falls
@@ -1885,6 +1890,7 @@ mod advertised_for_tests {
 
     fn node_with_selectors(selectors: Vec<AdvertisedAddressSelector>) -> ClusterNodeConfig {
         ClusterNodeConfig {
+            rack: None,
             name: "node-0".to_owned(),
             ip: "10.0.1.5".to_owned(),
             advertised_address: Some("203.0.113.10".to_owned()),
@@ -2075,6 +2081,7 @@ mod cluster_validate_tests {
 
     fn node(name: &str, id: u8) -> ClusterNodeConfig {
         ClusterNodeConfig {
+            rack: None,
             name: name.to_string(),
             ip: "127.0.0.1".to_string(),
             advertised_address: None,

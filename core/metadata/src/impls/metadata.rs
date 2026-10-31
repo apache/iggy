@@ -1668,6 +1668,30 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
         self.default_replication_factor.set(factor);
     }
 
+    /// The failure domain of each node, indexed by node id, from `[cluster]
+    /// nodes`. Placement spreads a partition's members over as many as it can.
+    /// Only the primary reads it, when it admits a create, so every node needs
+    /// the same list.
+    pub fn set_node_racks(&self, racks: &[Option<String>]) {
+        let mut names: Vec<&str> = Vec::new();
+        let domains = racks
+            .iter()
+            .map(|rack| {
+                rack.as_deref().map(|rack| {
+                    let index = names
+                        .iter()
+                        .position(|known| *known == rack)
+                        .unwrap_or_else(|| {
+                            names.push(rack);
+                            names.len() - 1
+                        });
+                    u32::try_from(index).unwrap_or(u32::MAX)
+                })
+            })
+            .collect();
+        self.placement.borrow_mut().set_racks(domains);
+    }
+
     /// The replication factor a topic created without one gets in a cluster
     /// of `nodes` nodes: the configured number lowered to `nodes`, or every
     /// node.

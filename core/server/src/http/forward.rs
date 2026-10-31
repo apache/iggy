@@ -2312,6 +2312,7 @@ mod tests {
         roster.enabled = true;
         roster.nodes.push(
             ResolvedClusterNode::try_from(ClusterNodeConfig {
+                rack: None,
                 name: "primary".to_owned(),
                 ip: address.ip().to_string(),
                 advertised_address: None,

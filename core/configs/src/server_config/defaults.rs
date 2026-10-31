@@ -133,6 +133,7 @@ impl Default for ClusterConfig {
                 .nodes
                 .iter()
                 .map(|node| ClusterNodeConfig {
+                    rack: None,
                     name: node.name.parse().unwrap(),
                     ip: node.ip.parse().unwrap(),
                     advertised_address: None,

@@ -2109,6 +2109,40 @@ namespace Iggy {
     }
 
     /**
+     * One partition of a topic.
+     */
+    class Partition {
+        public readonly int $current_offset;
+
+        public readonly int $id;
+
+        /**
+         * Node ids among `members` that the partition's primary last reported in sync and that
+         * are up. Empty until the primary first reports, and while no member that is up can
+         * lead it.
+         *
+         * @var array
+         */
+        public readonly array $in_sync_members;
+
+        /**
+         * Node ids that store the partition, in member order. While one is down, a write still
+         * commits if a quorum of the others is in sync.
+         *
+         * @var array
+         */
+        public readonly array $members;
+
+        public readonly int $messages_count;
+
+        public readonly int $segments_count;
+
+        public readonly int $size_bytes;
+
+        public function __construct() {}
+    }
+
+    /**
      * Reads the partitions of a topic in batches, with routing, prefetch and the position of each
      * partition inside. Build one with Client::reader() or Client::groupReader().
      *
@@ -2642,6 +2676,16 @@ namespace Iggy {
          * @var array
          */
         public readonly array $options;
+
+        /**
+         * One `Iggy\Partition` per partition of the topic.
+         *
+         * The partitions are rebuilt on each getter call; cache the result in PHP if they will
+         * be read repeatedly.
+         *
+         * @var array
+         */
+        public readonly array $partitions;
 
         public readonly int $partitions_count;
 

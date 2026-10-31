@@ -190,6 +190,25 @@ impl Partition {
     }
 }
 
+/// Whether `status` reports the committed incarnation of its partition.
+fn committed_report(inner: &StreamsInner, status: &PartitionStatusEntry) -> bool {
+    let namespace = IggyNamespace::from_raw(status.namespace);
+    inner
+        .items
+        .get(namespace.stream_id())
+        .and_then(|stream| stream.topics.get(namespace.topic_id()))
+        .and_then(|topic| find_partition(&topic.partitions, namespace.partition_id()))
+        .is_some_and(|partition| partition.created_revision == status.created_revision)
+}
+
+/// Partitions short of their factor and partitions that cannot commit, as
+/// [`Streams::partition_replication`] counts them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PartitionReplication {
+    pub under_replicated: usize,
+    pub below_write_quorum: usize,
+}
+
 /// Node id of the primary `view` assigns among `members`, or among nodes
 /// `0..nodes` when there is no member list.
 #[must_use]
@@ -2319,6 +2338,23 @@ impl Streams {
         });
     }
 
+    /// Up to `limit` directory reports that still name a committed incarnation
+    /// and changed their incarnation, view or in-sync nodes after change
+    /// `after`, with the last change they reach as the next call's `after`.
+    #[must_use]
+    pub fn partition_status_changes(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> (Vec<PartitionStatusEntry>, u64) {
+        self.inner.read(|inner| {
+            inner
+                .stats_registry
+                .directory()
+                .changed_after(after, limit, |status| committed_report(inner, status))
+        })
+    }
+
     /// Up to `limit` directory reports after `after` that still name a
     /// committed incarnation. A peer storing a partition reads its counters
     /// locally but still takes its report, for the in-sync nodes. Visits at
@@ -2336,17 +2372,7 @@ impl Streams {
                 .stats_registry
                 .directory()
                 .scan(after, limit, scan_max, |status| {
-                    let namespace = IggyNamespace::from_raw(status.namespace);
-                    inner
-                        .items
-                        .get(namespace.stream_id())
-                        .and_then(|stream| stream.topics.get(namespace.topic_id()))
-                        .and_then(|topic| {
-                            find_partition(&topic.partitions, namespace.partition_id())
-                        })
-                        .is_some_and(|partition| {
-                            partition.created_revision == status.created_revision
-                        })
+                    committed_report(inner, status)
                 })
         })
     }
@@ -2547,41 +2573,58 @@ impl Streams {
         })
     }
 
-    /// Partitions with fewer than a write quorum of their members `ready`
-    /// whose primary, as last reported or created before any report, is not
-    /// ready either. No primary is up to count them as below their quorum.
+    /// How many committed partitions run short of their factor, and how many
+    /// cannot commit, counted once for the whole cluster. A partition whose
+    /// primary, as last reported or created before any report, is `live`
+    /// counts the members of its last report that are live too. One whose
+    /// primary is not live counts its live members, which must elect a primary
+    /// before anything commits. A live primary yet to report is not counted.
     #[must_use]
-    pub fn partitions_without_ready_quorum(&self, ready: &[bool]) -> usize {
-        let nodes = u8::try_from(ready.len()).unwrap_or(u8::MAX);
-        let is_ready = |node: u8| ready.get(usize::from(node)).copied().unwrap_or(false);
+    pub fn partition_replication(&self, live: &[bool]) -> PartitionReplication {
+        let nodes = u8::try_from(live.len()).unwrap_or(u8::MAX);
+        let is_live = |node: u8| live.get(usize::from(node)).copied().unwrap_or(false);
         self.inner.read(|inner| {
             let directory = inner.stats_registry.directory();
-            let mut count = 0;
+            let mut counts = PartitionReplication::default();
             for (stream_id, stream) in &inner.items {
                 for (topic_id, topic) in &stream.topics {
                     for partition in &topic.partitions {
                         let members = partition.replica_set(nodes);
-                        let ready_members = members
-                            .nodes()
-                            .iter()
-                            .filter(|&&node| is_ready(node))
-                            .count();
-                        if ready_members >= consensus::quorum_replication(members.len()) {
-                            continue;
-                        }
-                        let view = directory
-                            .get(
-                                IggyNamespace::new(stream_id, topic_id, partition.id),
-                                partition.created_revision,
-                            )
-                            .map_or(partition.created_view, |status| status.view);
-                        if !partition.primary_node(view, nodes).is_some_and(is_ready) {
-                            count += 1;
-                        }
+                        let report = directory.get(
+                            IggyNamespace::new(stream_id, topic_id, partition.id),
+                            partition.created_revision,
+                        );
+                        let view = report.map_or(partition.created_view, |status| status.view);
+                        let (holding, quorum) =
+                            if partition.primary_node(view, nodes).is_some_and(is_live) {
+                                let Some(report) = report else {
+                                    continue;
+                                };
+                                let in_sync = members
+                                    .nodes()
+                                    .iter()
+                                    .filter(|&&node| {
+                                        1_u32
+                                            .checked_shl(u32::from(node))
+                                            .is_some_and(|bit| report.in_sync_nodes & bit != 0)
+                                    })
+                                    .count();
+                                (in_sync, consensus::quorum_replication(members.len()))
+                            } else {
+                                let live_members = members
+                                    .nodes()
+                                    .iter()
+                                    .filter(|&&node| is_live(node))
+                                    .count();
+                                (live_members, consensus::quorum_view_change(members.len()))
+                            };
+                        counts.under_replicated +=
+                            usize::from(holding < usize::from(members.len()));
+                        counts.below_write_quorum += usize::from(holding < quorum);
                     }
                 }
             }
-            count
+            counts
         })
     }
 
@@ -7132,17 +7175,55 @@ mod tests {
                 messages_count: 0,
                 size_bytes: 0,
                 segments_count: 1,
-                in_sync_nodes: 0,
+                in_sync_nodes: 0b011,
             }],
             2,
             3,
         );
         assert_eq!(
-            streams.partitions_without_ready_quorum(&[false, true, true]),
+            streams
+                .partition_replication(&[false, true, true])
+                .below_write_quorum,
             2,
             "only the pair led by the down node and the single copy on it"
         );
-        assert_eq!(streams.partitions_without_ready_quorum(&[true; 3]), 0);
+        assert_eq!(
+            streams.partition_replication(&[true; 3]).below_write_quorum,
+            0
+        );
+    }
+
+    /// A partition without its primary needs a view-change quorum to elect,
+    /// three of four, while a replication quorum is only two.
+    #[test]
+    fn given_four_members_without_their_primary_when_two_remain_should_count_them_as_unable_to_elect()
+     {
+        let streams: Streams = StreamsInner::new().into();
+        streams.seed_namespace_on(
+            IggyNamespace::new(0, 0, 0),
+            1,
+            0,
+            iggy_common::Durability::Persisted,
+            &[0, 1, 2, 3],
+        );
+        let counts = |live: &[bool]| streams.partition_replication(live);
+        assert_eq!(
+            counts(&[false, false, true, true]),
+            PartitionReplication {
+                under_replicated: 1,
+                below_write_quorum: 1,
+            }
+        );
+        assert_eq!(
+            counts(&[false, true, true, true]).below_write_quorum,
+            0,
+            "three members elect a new primary"
+        );
+        assert_eq!(
+            counts(&[true, false, false, true]),
+            PartitionReplication::default(),
+            "a live primary that has not reported yet is not counted"
+        );
     }
 
     #[test]

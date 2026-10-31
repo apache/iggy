@@ -597,3 +597,178 @@ async fn given_a_configured_default_factor_when_a_member_goes_down_should_report
     })
     .await;
 }
+
+/// Past the clock skew a node allows between a partition's creation and the
+/// start of its own storage, so a node that comes back empty knows it lost
+/// the partition rather than never having had it.
+const STORAGE_EPOCH_SKEW: Duration = Duration::from_secs(11);
+/// Rejoining on empty storage takes a metadata catch-up, an election and a
+/// partition state transfer before a write commits again.
+const REJOIN_BUDGET: Duration = Duration::from_secs(120);
+
+async fn create_factor_two_topic(client: &TcpClient, durability: Durability) {
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                replication_factor: Some(2),
+                durability,
+                consumer_offset_durability: durability,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// Replacing one member's disk at a time with `--fresh` is the documented
+/// procedure. On a factor-2 topic whose writes wait for the disk, the member
+/// that kept its data must still elect and copy the history back.
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "2"))]
+async fn given_a_factor_of_two_when_its_primary_returns_on_empty_storage_should_serve_again(
+    harness: &mut TestHarness,
+) {
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    let admin = root_client(harness, 0).await;
+    create_factor_two_topic(&admin, Durability::Persisted).await;
+    let primary = usize::from(
+        partition_route(&admin, &stream, &topic, 0)
+            .await
+            .primary_replica,
+    );
+    send_within_budget(&admin, &stream, &topic, 0, "before-wipe").await;
+    drop(admin);
+    sleep(STORAGE_EPOCH_SKEW).await;
+
+    harness.restart_node_from_clean_slate(primary).unwrap();
+    let survivor = (0..3).find(|node| *node != primary).unwrap();
+    let client = login_within_budget(harness, survivor).await;
+    let polled = timeout(REJOIN_BUDGET, async {
+        let mut sent = false;
+        loop {
+            if !sent {
+                let mut messages = vec![IggyMessage::from_str("after-wipe").unwrap()];
+                sent = client
+                    .send_messages(
+                        &stream,
+                        &topic,
+                        &Partitioning::partition_id(0),
+                        &mut messages,
+                    )
+                    .await
+                    .is_ok();
+            }
+            if sent
+                && let Ok(polled) = client
+                    .poll_messages(
+                        &stream,
+                        &topic,
+                        0,
+                        &Consumer::default(),
+                        &PollingStrategy::offset(0),
+                        PollOptions {
+                            count: 2,
+                            ..PollOptions::default()
+                        },
+                    )
+                    .await
+                && polled.messages.len() == 2
+            {
+                break polled;
+            }
+            sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the member that kept its data elects and the partition serves again");
+    let payloads: Vec<_> = polled
+        .messages
+        .iter()
+        .map(|message| message.payload.as_ref().to_vec())
+        .collect();
+    assert_eq!(payloads, [b"before-wipe".to_vec(), b"after-wipe".to_vec()]);
+}
+
+/// Both members of a partition come back on empty storage. Neither serves
+/// it, since that would restart it at offset 0, and deleting the topic, the
+/// way to accept the loss, must complete and free its name.
+#[iggy_harness(cluster_nodes = 5, server(sharding.cpu_allocation = "2"))]
+async fn given_a_factor_of_two_when_both_members_return_on_empty_storage_should_let_its_topic_be_deleted_and_recreated(
+    harness: &mut TestHarness,
+) {
+    const NODES: usize = 5;
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    let creator = root_client(harness, 0).await;
+    create_factor_two_topic(&creator, Durability::Replicated).await;
+    let members = creator
+        .get_topic(&stream, &topic)
+        .await
+        .unwrap()
+        .unwrap()
+        .partitions[0]
+        .members
+        .clone();
+    assert_eq!(members.len(), 2);
+    send_within_budget(&creator, &stream, &topic, 0, "lost").await;
+    drop(creator);
+    let outsider = (0..NODES)
+        .find(|node| !members.contains(&u8::try_from(*node).unwrap()))
+        .unwrap();
+    let admin = root_client(harness, outsider).await;
+    sleep(STORAGE_EPOCH_SKEW).await;
+
+    for &member in &members {
+        harness.stop_node(usize::from(member)).unwrap();
+    }
+    for &member in &members {
+        harness
+            .restart_node_from_clean_slate(usize::from(member))
+            .unwrap();
+    }
+
+    timeout(REJOIN_BUDGET, async {
+        loop {
+            let _ = admin.delete_topic(&stream, &topic).await;
+            if matches!(admin.get_topic(&stream, &topic).await, Ok(None)) {
+                break;
+            }
+            sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the delete completes once both members retired their lost copies");
+    create_factor_two_topic_in_stream(&admin).await;
+    send_within_budget(&admin, &stream, &topic, 0, "recreated").await;
+}
+
+async fn create_factor_two_topic_in_stream(client: &TcpClient) {
+    timeout(POLL_BUDGET, async {
+        loop {
+            let created = client
+                .create_topic(
+                    &Identifier::named(STREAM_NAME).unwrap(),
+                    TOPIC_NAME,
+                    &TopicCreateOptions {
+                        partitions_count: Some(1),
+                        replication_factor: Some(2),
+                        ..TopicCreateOptions::default()
+                    },
+                )
+                .await;
+            if created.is_ok() {
+                break;
+            }
+            sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the freed name takes a new topic");
+}

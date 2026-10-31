@@ -68,8 +68,9 @@ use crate::stm::user::UsersSnapshot;
 /// Version 14: `TopicSnapshot` gained `created_op`, the identity of a topic
 /// incarnation, and the snapshot carries the metadata change log.
 ///
-/// Version 15: `PartitionSnapshot` gained `members` and `retirement_debt_op` as
-/// trailing, defaulted fields.
+/// Version 15: `PartitionSnapshot` gained `members` and `retirement_debt_op`,
+/// and each pending lifecycle target `retired_members`, as trailing, defaulted
+/// fields.
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 15;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
