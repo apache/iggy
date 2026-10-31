@@ -22,6 +22,7 @@ use std::collections::HashMap;
 
 mod container;
 mod publisher;
+mod sink;
 
 use container::{
     DEFAULT_IGGY_TOPIC, DEFAULT_TEST_STREAM, ENV_SOURCE_BATCH_SIZE, ENV_SOURCE_BATCH_TIMEOUT,
@@ -29,6 +30,13 @@ use container::{
     ENV_SOURCE_PATH, ENV_SOURCE_PROTOCOL, ENV_SOURCE_QOS, ENV_SOURCE_SCHEMA, ENV_SOURCE_STREAM,
     ENV_SOURCE_TOPIC, ENV_SOURCE_USERNAME, INVALID_MQTT_PASSWORD, MQTT_PASSWORD, MQTT_USERNAME,
     MqttBrokerContainer,
+};
+
+pub use sink::{
+    Mqtt311SinkQosOneFixture, Mqtt311SinkQosTwoFixture, Mqtt311SinkQosZeroFixture,
+    MqttSinkDynamicTopicFixture, MqttSinkEnvelopeFixture, MqttSinkFixture, MqttSinkIdleFixture,
+    MqttSinkInvalidCredentialsFixture, MqttSinkPipelinedFixture, MqttSinkQosTwoFixture,
+    MqttSinkQosZeroFixture, MqttSinkRawSchemaFixture, MqttSinkTemplateTopicFixture,
 };
 
 const SOURCE_CLIENT_ID: &str = "iggy-mqtt-integration-source";

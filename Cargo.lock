@@ -7683,6 +7683,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_mqtt_sink"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "bytes",
+ "humantime",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "rumqttc-v4-next",
+ "rumqttc-v5-next",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "simd-json",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "iggy_connector_mqtt_source"
 version = "0.5.0"
 dependencies = [
