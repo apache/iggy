@@ -979,23 +979,36 @@ pub async fn build_partition_fresh(
     let partition_id = namespace.partition_id();
     let first_initialization =
         partition_needs_initialization(config, namespace, created_revision).await?;
-    // The initialization record went with the storage, so a sole member cannot
-    // tell this build from a first one and would restart the log at offset 0.
-    if replica_count == 1
-        && first_initialization
+    // The initialization record went with the storage, so this build cannot be
+    // told from a first one. A sole member would restart the log at offset 0.
+    let lost_with_storage = first_initialization
         && predates_storage(
             storage_epoch(&config.get_system_path()).await?,
             created_at_micros,
-        )
-    {
+        );
+    if replica_count == 1 && lost_with_storage {
         return Err(ServerError::PartitionLostWithStorage {
             namespace_raw: namespace.inner(),
             created_revision,
         });
     }
+    // A wider group's members joining at the creation view with empty logs
+    // would form a quorum and restart it the same way if they all lost their
+    // storage. Joining as a prior participant leaves this member out of every
+    // election until a member that kept the history transfers it.
+    if lost_with_storage {
+        warn!(
+            stream_id,
+            topic_id,
+            partition_id,
+            created_revision,
+            "this node's storage began after the partition was created without any record \
+             of it: waiting for a member that kept its history"
+        );
+    }
 
     let partition_dir = config.get_partition_path(stream_id, topic_id, partition_id);
-    let restarted = replica_count > 1 && !first_initialization;
+    let restarted = replica_count > 1 && (!first_initialization || lost_with_storage);
     if replica_count == 1 && !first_initialization {
         let directory = Path::new(&partition_dir).join(format!("prepares-{created_revision}"));
         if !journal::PartitionPrepareJournal::has_published_frontier(&directory)
@@ -1099,7 +1112,7 @@ pub async fn build_partition_fresh(
     let mut partition = IggyPartition::new(stats, consensus);
     partition
         .consensus()
-        .set_recovery_election_allowed(first_initialization);
+        .set_recovery_election_allowed(first_initialization && !lost_with_storage);
     partition.set_runtime_options(runtime_options);
     partition.set_superblock(superblock, recovered_state.as_ref());
     // Surface the evicted-ring ceilings from config onto the fresh journal.
@@ -1582,15 +1595,16 @@ mod tests {
     /// The reconciler's path: a partition whose directory went with the
     /// storage reaches the fresh build, never the loader.
     #[compio::test]
-    async fn given_storage_younger_than_an_unrecorded_partition_when_building_fresh_should_refuse_only_a_singleton()
+    async fn given_storage_younger_than_an_unrecorded_partition_when_building_fresh_should_refuse_a_singleton_and_keep_a_wider_member_out_of_elections()
      {
         const REVISION: u64 = 7;
         const EPOCH: u64 = 1_000 * STORAGE_EPOCH_SKEW_MICROS;
         let namespace = IggyNamespace::new(1, 1, 0);
-        for (replica_count, created_at, built) in [
-            (1, EPOCH - 2 * STORAGE_EPOCH_SKEW_MICROS, false),
-            (1, EPOCH + 1, true),
-            (REPLICAS, EPOCH - 2 * STORAGE_EPOCH_SKEW_MICROS, true),
+        for (replica_count, created_at, built, lost) in [
+            (1, EPOCH - 2 * STORAGE_EPOCH_SKEW_MICROS, false, true),
+            (1, EPOCH + 1, true, false),
+            (REPLICAS, EPOCH - 2 * STORAGE_EPOCH_SKEW_MICROS, true, true),
+            (REPLICAS, EPOCH + 1, true, false),
         ] {
             let root = tempfile::tempdir().unwrap();
             let config = solo_config(&root);
@@ -1613,16 +1627,24 @@ mod tests {
                 Rc::new(IggyMessageBus::new(0)),
             )
             .await;
-            assert_eq!(
-                result.is_ok(),
-                built,
-                "replicas={replica_count} created_at={created_at}"
-            );
-            if !built {
-                assert!(matches!(
-                    result,
-                    Err(ServerError::PartitionLostWithStorage { .. })
-                ));
+            let context = format!("replicas={replica_count} created_at={created_at}");
+            match result {
+                Ok(partition) => {
+                    assert!(built, "{context}");
+                    assert_eq!(partition.requires_state_transfer(), lost, "{context}");
+                    assert_eq!(
+                        partition.consensus().recovery_election_allowed(),
+                        !lost,
+                        "{context}"
+                    );
+                }
+                Err(error) => {
+                    assert!(!built, "{context}");
+                    assert!(
+                        matches!(error, ServerError::PartitionLostWithStorage { .. }),
+                        "{context}"
+                    );
+                }
             }
         }
     }

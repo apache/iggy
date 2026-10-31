@@ -42,6 +42,9 @@ pub(super) struct PlacementState {
     last_scan: Option<(ScanInputs, Option<PartitionPrimaryTransfer>)>,
     reservations: AHashMap<(u64, u128), PlacementCounts>,
     eligible: Option<(u32, Vec<bool>)>,
+    /// A readiness coordinator has reported. A metadata plane without one has
+    /// no evidence to wait for and counts every node as ready.
+    readiness_reported: bool,
 }
 
 /// Per node: partitions it is primary of, and partitions it stores.
@@ -122,6 +125,7 @@ struct ScanInputs {
 
 impl PlacementState {
     pub(super) fn observe_replicas(&mut self, view: u32, eligible: &[bool]) {
+        self.readiness_reported = true;
         self.eligible = (!eligible.is_empty()).then(|| (view, eligible.to_vec()));
     }
 
@@ -248,7 +252,8 @@ impl PlacementState {
     ///
     /// # Errors
     /// `InvalidReplicationFactor` for a factor of zero or above the node count,
-    /// `TransientNotAccepted` when no node is ready to lead.
+    /// `TransientNotAccepted` when no node is ready to lead or, once a
+    /// coordinator reports, while it has no readiness for this view.
     pub(super) fn select(
         &self,
         counts: &mut PlacementCounts,
@@ -262,6 +267,11 @@ impl PlacementState {
         let eligible = self.eligible.as_ref().filter(|(observed_view, eligible)| {
             *observed_view == view && eligible.len() == usize::from(nodes)
         });
+        // The assignment never moves, so guessing would leave a failed node
+        // holding the partition until it returns.
+        if self.readiness_reported && eligible.is_none() {
+            return Err(IggyError::TransientNotAccepted);
+        }
         let ready = |node: u8| eligible.is_none_or(|(_, eligible)| eligible[usize::from(node)]);
         let load = |node: u8| {
             (
@@ -1194,21 +1204,30 @@ mod tests {
     }
 
     #[test]
-    fn given_readiness_from_another_view_when_placing_should_ignore_stale_evidence() {
-        let mut placement = PlacementState::default();
-        placement.observe_replicas(1, &[false, true, true]);
+    fn given_readiness_absent_or_from_another_view_when_placing_should_refuse_until_this_view_reports()
+     {
         let counts = || PlacementCounts {
             primaries: vec![0, 5, 5],
             replicas: vec![0; 3],
         };
+        let mut placement = PlacementState::default();
+        assert_eq!(
+            placement.select(&mut counts(), 1, Some(2)),
+            Ok((vec![0, 1], 0)),
+            "without a coordinator every node counts as ready"
+        );
+        placement.observe_replicas(1, &[false, true, true]);
         assert_eq!(
             placement.select(&mut counts(), 1, None),
             Ok((Vec::new(), 1))
         );
-        assert_eq!(
-            placement.select(&mut counts(), 2, None),
-            Ok((Vec::new(), 0))
-        );
+        for factor in [None, Some(1), Some(2)] {
+            assert_eq!(
+                placement.select(&mut counts(), 2, factor),
+                Err(IggyError::TransientNotAccepted),
+                "evidence from an older view must not place factor {factor:?}"
+            );
+        }
         placement.observe_replicas(2, &[false; 3]);
         assert_eq!(
             placement.select(&mut counts(), 2, None),
@@ -1216,8 +1235,14 @@ mod tests {
         );
         placement.observe_replicas(2, &[]);
         assert_eq!(
-            placement.select(&mut counts(), 2, None),
-            Ok((Vec::new(), 0))
+            placement.select(&mut counts(), 2, Some(1)),
+            Err(IggyError::TransientNotAccepted),
+            "cleared evidence must not presume every node ready"
+        );
+        placement.observe_replicas(2, &[true, false, true]);
+        assert_eq!(
+            placement.select(&mut counts(), 2, Some(2)),
+            Ok((vec![0, 2], 0))
         );
     }
 

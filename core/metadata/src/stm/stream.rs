@@ -2536,6 +2536,44 @@ impl Streams {
         })
     }
 
+    /// Partitions with fewer than a write quorum of their members `ready`
+    /// whose primary, as last reported or created before any report, is not
+    /// ready either. No primary is up to count them as below their quorum.
+    #[must_use]
+    pub fn partitions_without_ready_quorum(&self, ready: &[bool]) -> usize {
+        let nodes = u8::try_from(ready.len()).unwrap_or(u8::MAX);
+        let is_ready = |node: u8| ready.get(usize::from(node)).copied().unwrap_or(false);
+        self.inner.read(|inner| {
+            let directory = inner.stats_registry.directory();
+            let mut count = 0;
+            for (stream_id, stream) in &inner.items {
+                for (topic_id, topic) in &stream.topics {
+                    for partition in &topic.partitions {
+                        let members = partition.replica_set(nodes);
+                        let ready_members = members
+                            .nodes()
+                            .iter()
+                            .filter(|&&node| is_ready(node))
+                            .count();
+                        if ready_members >= consensus::quorum_replication(members.len()) {
+                            continue;
+                        }
+                        let view = directory
+                            .get(
+                                IggyNamespace::new(stream_id, topic_id, partition.id),
+                                partition.created_revision,
+                            )
+                            .map_or(partition.created_view, |status| status.view);
+                        if !partition.primary_node(view, nodes).is_some_and(is_ready) {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            count
+        })
+    }
+
     /// The committed partition's member list, `Some(None)` when every node
     /// stores it.
     #[must_use]
@@ -7022,6 +7060,49 @@ mod tests {
             [status(stored_by_peer)],
             "the stale incarnation's report is gone once the sweep reached it"
         );
+    }
+
+    #[test]
+    fn given_members_down_when_counting_partitions_without_a_ready_quorum_should_leave_those_with_a_ready_primary()
+     {
+        let streams = Streams::default();
+        let seed = |stream: usize, view: u32, members: &[u8]| {
+            let namespace = IggyNamespace::new(stream, 0, 0);
+            streams.seed_namespace_on(
+                namespace,
+                u64::try_from(stream + 1).unwrap(),
+                view,
+                iggy_common::Durability::Persisted,
+                members,
+            );
+            namespace
+        };
+        seed(0, 0, &[0, 1]);
+        seed(1, 1, &[0, 1]);
+        seed(2, 0, &[0, 1, 2]);
+        seed(3, 0, &[0]);
+        let moved = seed(4, 0, &[0, 1]);
+        seed(5, 0, &[]);
+        streams.record_partition_statuses(
+            &[PartitionStatusEntry {
+                namespace: moved.inner(),
+                created_revision: streams.created_revision_for_namespace(moved).unwrap(),
+                view: 1,
+                commit: 0,
+                current_offset: 0,
+                messages_count: 0,
+                size_bytes: 0,
+                segments_count: 1,
+            }],
+            2,
+            3,
+        );
+        assert_eq!(
+            streams.partitions_without_ready_quorum(&[false, true, true]),
+            2,
+            "only the pair led by the down node and the single copy on it"
+        );
+        assert_eq!(streams.partitions_without_ready_quorum(&[true; 3]), 0);
     }
 
     #[test]

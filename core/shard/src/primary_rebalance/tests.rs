@@ -644,16 +644,19 @@ fn given_pending_move_when_unrelated_or_current_traffic_arrives_should_preserve_
 }
 
 #[compio::test]
-async fn given_a_new_authority_when_peers_have_not_answered_should_keep_them_eligible_until_their_first_probe_times_out()
+async fn given_a_new_authority_when_peers_have_not_answered_should_withhold_readiness_until_each_is_heard()
  {
     let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 0, REPLICAS, 0);
     let epoch = shard.bus.monotonic_now();
-    let eligible = || shard.primary_rebalance.borrow().eligible.clone();
+    let readiness = || {
+        let state = shard.primary_rebalance.borrow();
+        (state.readiness_known, state.eligible.clone())
+    };
     shard.tick_primary_rebalance().await;
     assert_eq!(
-        eligible(),
-        [true; 3],
-        "placement must not narrow to the coordinator before any peer answers"
+        readiness(),
+        (false, vec![true, false, false]),
+        "no peer counts as ready before it answers"
     );
 
     let (replica, mut not_ready) = shard.bus.sent.borrow()[0];
@@ -661,21 +664,52 @@ async fn given_a_new_authority_when_peers_have_not_answered_should_keep_them_eli
     not_ready.kind = PrimaryRebalanceKind::MetadataReply;
     shard.on_primary_rebalance(not_ready, Vec::new()).await;
     shard.tick_primary_rebalance().await;
-    assert_eq!(eligible(), [true, false, true]);
+    assert_eq!(
+        readiness(),
+        (false, vec![true, false, false]),
+        "placement waits while a peer is unheard"
+    );
 
     shard.bus.now.set(Some(epoch + PROBE_TIMEOUT));
     shard.tick_primary_rebalance().await;
-    assert_eq!(eligible(), [true, false, true]);
+    assert!(!readiness().0);
     shard
         .bus
         .now
         .set(Some(epoch + PROBE_TIMEOUT + Duration::from_nanos(1)));
     shard.tick_primary_rebalance().await;
     assert_eq!(
-        eligible(),
-        [true, false, false],
-        "an unanswered first probe ends the presumption at its timeout"
+        readiness(),
+        (true, vec![true, false, false]),
+        "an unanswered probe settles its peer as not ready at its timeout"
     );
+
+    let (replica, mut ready) = *shard
+        .bus
+        .sent
+        .borrow()
+        .iter()
+        .rfind(|(replica, _)| *replica == 2)
+        .unwrap();
+    ready.replica = replica;
+    ready.kind = PrimaryRebalanceKind::MetadataReply;
+    ready.ready = 1;
+    shard.on_primary_rebalance(ready, Vec::new()).await;
+    shard.tick_primary_rebalance().await;
+    assert_eq!(readiness(), (true, vec![true, false, true]));
+}
+
+#[compio::test]
+async fn given_refused_probes_when_the_coordinator_ticks_again_should_settle_their_peers_as_not_ready()
+ {
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 0, REPLICAS, 0);
+    shard.bus.disconnected.set(true);
+    shard.tick_primary_rebalance().await;
+    assert!(!shard.primary_rebalance.borrow().readiness_known);
+    shard.tick_primary_rebalance().await;
+    let state = shard.primary_rebalance.borrow();
+    assert!(state.readiness_known);
+    assert_eq!(state.eligible, [true, false, false]);
 }
 
 #[test]
@@ -700,6 +734,7 @@ fn given_health_challenge_when_reply_is_overdue_or_replayed_should_not_extend_re
             sent_at: Some(Instant::now()),
             ready_at: Some(previous),
             answered_at: None,
+            heard: false,
             replied: false,
             status_cursor: None,
         };

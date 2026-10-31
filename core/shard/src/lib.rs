@@ -8912,6 +8912,10 @@ where
             .set_repair_ring(repair_ring_entries, repair_ring_bytes);
         self.metrics.set_partitions_untrusted_log(untrusted_logs);
         if replication_due {
+            below_write_quorum += self
+                .primary_rebalance
+                .borrow()
+                .partitions_without_ready_quorum();
             self.metrics
                 .set_partition_replication(under_replicated, below_write_quorum);
             self.metrics

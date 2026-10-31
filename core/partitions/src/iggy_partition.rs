@@ -4470,6 +4470,12 @@ where
         {
             return Err(IggyError::TransientNotAccepted);
         }
+        // A payment starts only from an empty pipeline. A consumer committing
+        // on every read would otherwise keep a prepare queued at each pay read
+        // and hold the partition's sessions off until it drained its backlog.
+        if self.owes_session_retirement() {
+            return Err(IggyError::TransientNotAccepted);
+        }
         if self.pending_owner_install.get().is_some_and(|pending| {
             kind == ConsumerKind::ConsumerGroup && pending.group_id == u64::from(consumer_id)
         }) || self.pending_history_transition.get().is_some()
@@ -27594,6 +27600,32 @@ mod tests {
             ));
             assert_eq!(partition.group_offset_state(7), (None, None));
             assert_eq!(partition.consensus.pipeline_len(), 0);
+        }
+    }
+
+    /// A retirement debt is paid only from an empty pipeline, so an automatic
+    /// commit waits for the payment like a session request does.
+    #[test]
+    fn given_retirement_debt_when_auto_commit_poll_completes_should_reject_without_progress() {
+        const DEBT_OP: u64 = 40;
+        for owed in [false, true] {
+            let (mut partition, _) = recording_partition_at(0, 3);
+            let consumer = PollingConsumer::Consumer(7, 0);
+            if owed {
+                assert!(matches!(
+                    partition.observe_retirement_debt(DEBT_OP),
+                    RetirementDebtStatus::Unpaid(Some(_))
+                ));
+            }
+            let read_result = poll_read_result(&partition, consumer, true, Some(9));
+            let completion = partition.complete_poll(read_result);
+            if owed {
+                assert!(matches!(completion, Err(IggyError::TransientNotAccepted)));
+                assert_eq!(partition.get_consumer_offset(consumer), None);
+                assert_eq!(partition.consensus.pipeline_len(), 0);
+            } else {
+                assert!(completion.unwrap().replication.is_some());
+            }
         }
     }
 

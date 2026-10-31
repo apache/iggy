@@ -825,7 +825,8 @@ impl ShardMetrics {
 
     /// Republished by every partition sweep, over the partitions this shard
     /// leads: those with a member out of sync, and those with too few members
-    /// in sync to commit.
+    /// in sync to commit. The metadata primary's first shard adds the
+    /// partitions whose primary is down among too many members to commit.
     pub fn set_partition_replication(&self, under_replicated: usize, below_write_quorum: usize) {
         self.partitions_under_replicated
             .set(i64::try_from(under_replicated).unwrap_or(i64::MAX));
@@ -1219,7 +1220,9 @@ impl ShardMetrics {
         );
         registry.register(
             "partitions_below_write_quorum",
-            "partitions this shard leads with too few members in sync to commit a write",
+            "partitions this shard leads with too few members in sync to commit a write; \
+             on the metadata primary's first shard also partitions with too few members up \
+             whose primary is down",
             self.partitions_below_write_quorum.clone(),
         );
         registry.register(

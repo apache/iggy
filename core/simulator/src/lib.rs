@@ -11904,10 +11904,12 @@ mod view_change_data_loss_tests {
 
     /// The metadata primary admits a create that both backups journal, then
     /// crashes before any ack reaches it, so its client has no reply. The
-    /// survivors elect a primary that inherits the create uncommitted. A create
-    /// that primary admits meanwhile must count the inherited partitions once,
-    /// and the inherited create must commit once, with the assignments the
-    /// crashed primary persisted.
+    /// survivors elect a primary that inherits the create uncommitted. Until it
+    /// commits, that primary has not applied its view and has no readiness for
+    /// it, so it refuses another create rather than presume the crashed node
+    /// ready. The inherited create must commit once, with the assignments the
+    /// crashed primary persisted, and the other create must lead only on the
+    /// survivors.
     #[test]
     #[allow(clippy::too_many_lines)]
     fn given_an_inherited_create_when_the_new_primary_admits_another_should_count_and_commit_it_once()
@@ -11922,10 +11924,8 @@ mod view_change_data_loss_tests {
         const ADMITTED_PARTITIONS: u32 = 3;
         // Nothing is placed before the inherited create, so it takes replica 0.
         const INHERITED_VIEWS: [u32; 1] = [0];
-        // Counting the inherited partition once fills replicas 1 and 2 first.
-        // Dropping it starts again at replica 0 ([0, 1, 2]), and counting it
-        // twice repeats replica 1 ([1, 2, 1]).
-        const ADMITTED_VIEWS: [u32; 3] = [1, 2, 0];
+        // Replica 0 crashed, so only the survivors lead, alternating.
+        const ADMITTED_VIEWS: [u32; 3] = [1, 2, 1];
         const PREPARE_STEPS: usize = 200;
         const ELECTION_STEPS: usize = 5_000;
         const ADMISSION_STEPS: usize = 2_000;
@@ -12026,7 +12026,31 @@ mod view_change_data_loss_tests {
 
         let admitted_create = admitter.create_topic(STREAM, ADMITTED_TOPIC, ADMITTED_PARTITIONS);
         let admitted_request = admitted_create.header().request;
-        let (admitted_op, admitted_assignments) = (0..ADMISSION_STEPS)
+        sim.submit_request(ADMITTER, leader, admitted_create.deep_copy().into_generic());
+        let refused = (0..ADMISSION_STEPS)
+            .find_map(|_| {
+                sim.step()
+                    .into_iter()
+                    .find(|reply| reply.header().client == ADMITTER)
+            })
+            .expect("the new primary must answer the second create");
+        assert!(
+            setup_reply_is_transient(&refused),
+            "the new primary must refuse a create while it has no readiness for its view"
+        );
+        assert!(
+            journaled_creates(&sim, leader, ADMITTER, admitted_request).is_empty(),
+            "the refused create must not be prepared"
+        );
+        assert!(
+            metadata_progress(&sim, leader).1 < inherited_op,
+            "the inherited create must still be pending when the second one is refused"
+        );
+
+        for (from, to) in [(1, 2), (2, 1)] {
+            set_prepare_ok_delivery(&mut sim, from, to, true);
+        }
+        let reply = (0..COMMIT_STEPS)
             .find_map(|step| {
                 if step % RESUBMIT_STEPS == 0 {
                     sim.submit_request(
@@ -12035,33 +12059,6 @@ mod view_change_data_loss_tests {
                         admitted_create.deep_copy().into_generic(),
                     );
                 }
-                for reply in sim.step() {
-                    assert!(
-                        reply.header().client == ADMITTER && setup_reply_is_transient(&reply),
-                        "only a transient refusal of the second create may be answered \
-                         before the survivors ack"
-                    );
-                }
-                journaled_creates(&sim, leader, ADMITTER, admitted_request)
-                    .into_iter()
-                    .next()
-            })
-            .expect("the new primary must admit a create while it holds the inherited one");
-        assert!(
-            metadata_progress(&sim, leader).1 < inherited_op,
-            "the inherited create must still be pending when the second one is admitted"
-        );
-        assert_eq!(
-            views(&admitted_assignments),
-            ADMITTED_VIEWS,
-            "the second create must count the inherited partition exactly once"
-        );
-
-        for (from, to) in [(1, 2), (2, 1)] {
-            set_prepare_ok_delivery(&mut sim, from, to, true);
-        }
-        let reply = (0..COMMIT_STEPS)
-            .find_map(|_| {
                 sim.step().into_iter().find(|reply| {
                     reply.header().client == ADMITTER
                         && reply.header().request == admitted_request
@@ -12069,12 +12066,20 @@ mod view_change_data_loss_tests {
                 })
             })
             .expect("the second create must commit once the survivors ack");
+        assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        let admitted_op = reply.header().op;
+        assert!(
+            admitted_op > inherited_op,
+            "the second create must be admitted after the inherited one commits"
+        );
+        let [(journaled_op, admitted_assignments)] =
+            <[_; 1]>::try_from(journaled_creates(&sim, leader, ADMITTER, admitted_request))
+                .expect("the leader must journal the second create once");
+        assert_eq!(journaled_op, admitted_op);
         assert_eq!(
-            (
-                reply.header().op,
-                iggy_binary_protocol::result_code(reply.body())
-            ),
-            (admitted_op, Some(0))
+            views(&admitted_assignments),
+            ADMITTED_VIEWS,
+            "the crashed primary must lead none of the second create's partitions"
         );
 
         // Commits are ordered, so the inherited create committed before the
@@ -15947,6 +15952,11 @@ mod metadata_read_frontier_tests {
             sim.step();
             assert_eq!(partition_leader(&sim, namespace, Some(primary)), None);
         }
+        assert_eq!(
+            cluster_below_write_quorum(&sim, Some(primary)),
+            1,
+            "the metadata primary counts the pair that no primary is up to count"
+        );
 
         sim.replica_restart(primary);
         let (leader, _) = (0..SETUP_TOTAL_STEPS)
@@ -15961,6 +15971,25 @@ mod metadata_read_frontier_tests {
             write_through(&mut sim, &client, namespace, leader, b"pair again"),
             0
         );
+        assert!(
+            (0..SETUP_TOTAL_STEPS).any(|_| {
+                sim.step();
+                cluster_below_write_quorum(&sim, None) == 0
+            }),
+            "no node counts the pair once both members are back"
+        );
+    }
+
+    /// `partitions_below_write_quorum` summed over every shard of every node
+    /// but `down`, as an operator sums it over the cluster.
+    fn cluster_below_write_quorum(sim: &Simulator, down: Option<u8>) -> i64 {
+        sim.replicas
+            .iter()
+            .enumerate()
+            .filter(|(replica, _)| down.is_none_or(|down| *replica != usize::from(down)))
+            .flat_map(|(_, replica)| replica.shards.iter())
+            .map(|shard| shard.metrics().partitions_below_write_quorum_value())
+            .sum()
     }
 
     fn partition_fresh(sim: &Simulator, replica: u8) -> bool {
@@ -16337,13 +16366,22 @@ mod metadata_read_frontier_tests {
         request: Message<RoutedRequestHeader>,
     ) -> u64 {
         let request_id = request.header().request;
-        sim.submit_request(client_id, target, request.into_generic());
+        let request = request.into_generic();
+        sim.submit_request(client_id, target, request.deep_copy());
         for _ in 0..SETUP_TOTAL_STEPS {
             if let Some(reply) = sim
                 .step()
                 .into_iter()
                 .find(|reply| reply.header().request == request_id)
             {
+                // Placement refuses a create until the primary has heard from
+                // every node in its view, and a client retries that refusal.
+                if iggy_binary_protocol::result_code(reply.body())
+                    == Some(iggy_common::IggyError::TransientNotAccepted.as_code())
+                {
+                    sim.submit_request(client_id, target, request.deep_copy());
+                    continue;
+                }
                 assert_eq!(
                     reply.header().status,
                     0,

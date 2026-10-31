@@ -117,6 +117,29 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
     }
 
     @Test
+    void givenReplicationFactorWhenCreatingTopicShouldEchoItAndRefuseZero() {
+        // when
+        var created = topicsClient.createTopic(
+                STREAM_NAME,
+                "replicated-topic",
+                1L,
+                TopicOptions.builder().replicationFactor(1).build());
+
+        // then
+        var topic = topicsClient.getTopic(STREAM_NAME, TopicId.of(created.id())).orElseThrow();
+        assertThat(topic.options().get("replication_factor")).isEqualTo(HeaderValue.fromUint32(1));
+        assertThatThrownBy(() -> topicsClient.createTopic(
+                        STREAM_NAME,
+                        "unreplicated-topic",
+                        1L,
+                        TopicOptions.builder().replicationFactor(0).build()))
+                .isInstanceOfSatisfying(
+                        IggyValidationException.class,
+                        refusal ->
+                                assertThat(refusal.getErrorCode()).isEqualTo(IggyErrorCode.INVALID_REPLICATION_FACTOR));
+    }
+
+    @Test
     void givenTopicResetWhenUpdatingShouldPreserveUnmentionedValues() {
         // given
         var created = topicsClient.createTopic(

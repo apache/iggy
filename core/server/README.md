@@ -66,6 +66,12 @@ example two consecutive `:edge` images. Stop every node and start them all on th
 new build. Their `IGGY-METADATA-CHANGE-LOG-1` data directories are kept: older
 metadata snapshots and journal entries read with every partition on every node,
 and older builds refuse the newer snapshot format instead of misreading it.
+Topics created without `replication_factor` get 3 copies, or one on every node
+in clusters of up to three nodes. On four or more nodes a client that omits the
+key, which includes every SDK, connector, benchmark and MCP release before the
+option, no longer stores a new topic on every node, and each partition then
+tolerates the failures of a 3-member group. Set `replication_factor` to the node
+count to keep the old layout.
 No in-place upgrade, storage conversion tool or retained-data migration is
 provided. Use an offline cutover with logical re-ingestion:
 
@@ -347,15 +353,20 @@ At create the metadata primary picks each partition's nodes: the primary is the
 ready node leading the fewest partitions, and the other members are the nodes
 storing the fewest. A node that is down is picked only when too few are up. The
 assignment never moves. While a member is down its partitions run with fewer
-copies, and the member catches up from the others when it comes back.
+copies, and the member catches up from the others when it comes back. A new
+metadata primary refuses creates with `TransientNotAccepted` (58) until every
+node has answered its probe or missed it, so the node whose failure started the
+view is not picked.
 
 Each partition's primary reports in `/metrics`, per shard, how many of the
 partitions it leads have a member out of sync: `partitions_under_replicated`
 counts a member it cannot reach or one that has trailed the commit point for
 30 seconds, Kafka's `replica.lag.time.max.ms` default, and
 `partitions_below_write_quorum` counts partitions with too few members in sync
-to commit. Like Kafka's `UnderReplicatedPartitions`, sum the series over every
-node for the cluster's total.
+to commit. A partition whose primary is down, with too few members up to commit,
+has no primary to count it, so the metadata primary counts it from the nodes that
+answer its probes. Like Kafka's `UnderReplicatedPartitions`, sum the series over
+every node for the cluster's total.
 
 A write commits on a quorum of a partition's members: 2 of 3, 3 of 5, and at
 most 3 for wider groups. A factor of 2 keeps two copies but stops accepting
@@ -372,14 +383,19 @@ Logins keep working while a partition lacks a quorum of its members. A session
 that ends then cannot be retired on that partition, so the partition owes the
 retirement instead of holding the session's slot in the client table. The
 partition's next primary pays it before serving sessions again, and refuses
-their requests with `TransientNotAccepted` (58) until it has. `/metrics`
+their requests and polls that commit their offset on read with
+`TransientNotAccepted` (58) until it has. `/metrics`
 reports `partitions_owing_retirement`, the partitions still refusing sessions
 for that reason, and `retirement_debts_paid`, the payments a node made.
 
 A node that comes back with empty storage refuses to serve a factor-1
 partition created before it, because that data was only on this node and
-serving it again would reuse its offsets. Delete and recreate the topic to
-accept the loss.
+serving it again would reuse its offsets. A member of a wider partition waits
+instead for a member that kept the partition's data and copies it, and takes no
+part in electing a primary before then, so a 3-member partition with one member
+down and another back on empty storage waits for the one that is down. If every
+member lost its storage, none of them serves the partition rather than restart
+it at offset 0. Delete and recreate the topic to accept the loss.
 
 A node that does not store a partition answers its route lookups from what the
 partition's primary last reported, or from the partition's initial primary

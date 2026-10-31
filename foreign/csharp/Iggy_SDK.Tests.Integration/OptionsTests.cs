@@ -38,6 +38,7 @@ public class OptionsTests
     private const int ReadOnlyOption = 4105;
     private const int UnsupportedOptionKey = 4041;
     private const int InvalidTopicName = 2014;
+    private const int InvalidReplicationFactor = 2018;
 
     private static readonly string[] TopicCatalogKeys =
     [
@@ -232,6 +233,27 @@ public class OptionsTests
         fetched.DerivedOptions!.Keys.Select(key => key.AsString()).ShouldContain("segment_size");
         fetched.DerivedOptions!.Single(kv => kv.Key.AsString() == "segment_size").Value.Kind
             .ShouldBe(HeaderKind.Uint64);
+    }
+
+    [Test]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task given_replication_factor_when_creating_topic_should_echo_it_and_refuse_zero(Protocol protocol)
+    {
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var streamName = $"replicated-{Guid.NewGuid():N}";
+        await client.CreateStreamAsync(streamName);
+        var streamId = Identifier.String(streamName);
+
+        await client.CreateTopicAsync(streamId, "replicated", 1, new TopicOptions { ReplicationFactor = 1 });
+
+        var fetched = await client.GetTopicByIdAsync(streamId, Identifier.String("replicated"));
+        fetched.ShouldNotBeNull();
+        var factor = fetched.Options!.Single(kv => kv.Key.AsString() == "replication_factor").Value;
+        factor.Kind.ShouldBe(HeaderKind.Uint32);
+        factor.ToUInt32().ShouldBe(1u);
+        var refused = await Should.ThrowAsync<IggyInvalidStatusCodeException>(client.CreateTopicAsync(streamId,
+            "unreplicated", 1, new TopicOptions { ReplicationFactor = 0 }));
+        refused.StatusCode.ShouldBe(InvalidReplicationFactor);
     }
 
     [Test]

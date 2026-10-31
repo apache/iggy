@@ -124,6 +124,13 @@ pub struct PrimaryRebalance {
     view: Option<u32>,
     peers: Vec<Peer>,
     eligible: Vec<bool>,
+    /// Every peer was heard from in this view, so placement got `eligible`
+    /// rather than no evidence.
+    readiness_known: bool,
+    /// Partitions too few of whose members are up to commit, with their
+    /// primary down too, as of the last scan. No primary counts them.
+    without_ready_quorum: usize,
+    next_quorum_scan: Instant,
     stable_since: Instant,
     next_move: Instant,
     cursor: Option<IggyNamespace>,
@@ -141,6 +148,9 @@ struct Peer {
     sent_at: Option<Instant>,
     ready_at: Option<Instant>,
     answered_at: Option<Instant>,
+    /// The peer answered a probe of this view, or one timed out or never left
+    /// this node, so `ready_at` reflects the peer rather than the view's start.
+    heard: bool,
     /// The peer answered the newest probe that left this node, so it accepts no
     /// older probe after the next one.
     replied: bool,
@@ -175,6 +185,13 @@ pub enum LocalRebalance {
 }
 
 impl PrimaryRebalance {
+    /// On the metadata primary's first shard, the partitions no primary is up
+    /// to count as below their write quorum. Zero elsewhere, and until every
+    /// peer was heard from in this view.
+    pub(crate) const fn partitions_without_ready_quorum(&self) -> usize {
+        self.without_ready_quorum
+    }
+
     /// Whether `header` answers the peer's outstanding probe.
     fn observe_peer(&mut self, header: &PrimaryRebalanceHeader, now: Instant) -> bool {
         if self.view != Some(header.view) {
@@ -193,6 +210,7 @@ impl PrimaryRebalance {
         peer.nonce = None;
         peer.answered_at = peer.sent_at;
         peer.ready_at = (header.ready == 1).then_some(now);
+        peer.heard = true;
         peer.replied = true;
         true
     }
@@ -204,6 +222,7 @@ impl PrimaryRebalance {
             && peer.nonce == Some(nonce)
         {
             peer.nonce = None;
+            peer.heard = true;
         }
     }
 
@@ -291,6 +310,9 @@ impl Default for PrimaryRebalance {
             view: None,
             peers: Vec::new(),
             eligible: Vec::new(),
+            readiness_known: false,
+            without_ready_quorum: 0,
+            next_quorum_scan: Instant::now(),
             stable_since: Instant::now(),
             next_move: Instant::now(),
             cursor: None,
@@ -359,16 +381,12 @@ where
             if state.view != Some(consensus.view()) {
                 *state = PrimaryRebalance {
                     view: Some(consensus.view()),
-                    // Placement keeps a peer eligible until it answers not
-                    // ready or its first probe times out.
-                    peers: vec![
-                        Peer {
-                            ready_at: Some(now),
-                            ..Peer::default()
-                        };
-                        replicas
-                    ],
+                    // A partition's members never move, so placement waits to
+                    // hear from every peer rather than presume the node whose
+                    // failure started this view is ready.
+                    peers: vec![Peer::default(); replicas],
                     eligible: vec![false; replicas],
+                    next_quorum_scan: now,
                     stable_since: now,
                     next_move: now,
                     received_probe: state.received_probe,
@@ -394,6 +412,9 @@ where
                 let elapsed = peer.sent_at.map_or(PROBE_TIMEOUT + PROBE_INTERVAL, |sent| {
                     now.duration_since(sent)
                 });
+                if peer.nonce.is_some() && elapsed > PROBE_TIMEOUT {
+                    peer.heard = true;
+                }
                 // A backup that answered a probe sent before admission opened
                 // would otherwise wait a full interval for its own credit. The
                 // re-probe is stamped at or after the opening, so it runs once.
@@ -412,10 +433,29 @@ where
                 peer.sent_at = Some(now);
                 outgoing.push((replica, probe_header(consensus, nonce)));
             }
+            let readiness_known = state
+                .peers
+                .iter()
+                .enumerate()
+                .all(|(index, peer)| index == usize::from(consensus.replica()) || peer.heard);
             if changed {
                 state.stable_since = now;
                 state.pending = None;
-                metadata.observe_replica_readiness(&state.eligible);
+            }
+            if changed || readiness_known != state.readiness_known {
+                state.readiness_known = readiness_known;
+                metadata.observe_replica_readiness(if readiness_known {
+                    &state.eligible
+                } else {
+                    &[]
+                });
+            }
+            if readiness_known && now >= state.next_quorum_scan {
+                state.next_quorum_scan = now + PROBE_INTERVAL;
+                state.without_ready_quorum = metadata
+                    .mux_stm
+                    .streams()
+                    .partitions_without_ready_quorum(&state.eligible);
             }
             if let Some(pending) = state.pending.as_ref() {
                 let elapsed = now.duration_since(pending.since);

@@ -70,8 +70,13 @@ const BULKY_PAYLOAD_LEN: usize = 256 * 1024;
 /// time and the kill must land within the pull, so the ordinary 200ms
 /// cadence is too coarse here.
 const KILL_GATE_POLL: Duration = Duration::from_millis(10);
+/// Cluster size and replication factor of the dead-transfer-peer spec.
+const TRANSFER_PEER_DIES_NODES: u32 = 5;
 
 const CONVERSION_MARKER: &str = "partition repair floor unreachable; converting to state transfer";
+/// A wiped member whose storage began more than the storage-epoch skew after
+/// the partition was created joins awaiting a transfer instead of repairing.
+const LOST_STORAGE_MARKER: &str = "waiting for a member that kept its history";
 const INSTALL_MARKER: &str = "partition state transfer installed";
 const INSTALL_FAILED_MARKER: &str = "partition state transfer install failed";
 /// The `StaleTransfer` reason, logged inside an [`INSTALL_FAILED_MARKER`] line.
@@ -157,13 +162,21 @@ async fn given_evicted_ring_when_fresh_node_joins_late_should_state_transfer_par
     // this spec isolates the PARTITION plane.
     let _seed_client = client;
 
-    // Wipe node 2 and rejoin: no local history at all, so repair cannot
-    // connect any floor and the refusal converts to a transfer.
+    // Wipe node 2 and rejoin with no local history at all. Inside the
+    // storage-epoch skew of the create it joins fresh, repair cannot connect
+    // any floor and the refusal converts to a transfer. Past it, the node
+    // knows it lost the partition and awaits the transfer from the start.
+    // Which one runs depends on how long the seeding took.
     harness
         .restart_node_from_clean_slate(2)
         .expect("clean-slate restart of node 2");
 
-    await_marker(harness, 2, CONVERSION_MARKER).await;
+    await_new_marker_any(
+        harness,
+        2,
+        &[(CONVERSION_MARKER, 0), (LOST_STORAGE_MARKER, 0)],
+    )
+    .await;
     await_marker(harness, 2, INSTALL_MARKER).await;
 
     // Disk proof on the rejoined node: transferred segment bytes and a
@@ -267,12 +280,16 @@ async fn given_evicted_ring_wider_than_repair_chunk_when_node_restarts_with_data
 }
 
 #[iggy_harness(
-    cluster_nodes = 3,
+    cluster_nodes = 5,
     server(
         sharding.cpu_allocation = "0..1",
         partition.evicted_ring_capacity = "64"
     )
 )]
+// Five members, so the three left once node 0 dies and node 2 is wiped still
+// form a quorum that can elect past node 0. A wiped member never votes before
+// its transfer: three members could not elect with one down and one wiped.
+//
 // The topic's 8 MiB segment cap makes the 64 MiB bulky seed span several sealed
 // segments, so unlike the other specs (single-segment under the default 1 GiB
 // cap) this one installs from a MULTI-ARTIFACT manifest, one spill per artifact.
@@ -287,7 +304,12 @@ async fn given_transfer_peer_dies_when_stalled_should_leave_dead_peer_and_recove
         .root_client_for_node(0)
         .await
         .expect("connect a root client to the node");
-    seed_topic(&client, Some(SEGMENT_SIZE_MULTI_ARTIFACT)).await;
+    seed_topic(
+        &client,
+        Some(SEGMENT_SIZE_MULTI_ARTIFACT),
+        Some(TRANSFER_PEER_DIES_NODES),
+    )
+    .await;
     // Bulky payloads so the pull spans many 256 KiB chunks: the kill below
     // must land while the transfer is provably in flight, and a small
     // partition finishes inside the marker-poll latency, leaving the
@@ -296,26 +318,29 @@ async fn given_transfer_peer_dies_when_stalled_should_leave_dead_peer_and_recove
     sleep(Duration::from_secs(1)).await;
     let _seed_client = client;
 
-    // Wipe node 2, wait until its rejoin CONVERTED to a transfer, then kill
-    // the serving peer (the view-0 primary, node 0) mid-pull. Node 2 must not
+    // Wipe node 2, wait until its rejoin armed a transfer at the view-0
+    // primary, node 0, then kill that peer mid-pull. Node 2 must not
     // retry into the corpse forever: it re-arms against the next peer -- via
     // the stall budget, or via the StartView it adopts once the survivors
-    // elect past node 0 -- and the transfer re-runs against the new primary
-    // (node 1).
+    // elect past node 0 -- and the transfer re-runs against the new primary.
     harness
         .restart_node_from_clean_slate(2)
         .expect("clean-slate restart of node 2");
-    // Kill node 0 the moment node 2 CONVERTED: the transfer is then armed
-    // at node 0 but the 64 MiB pull cannot possibly finish inside the kill
-    // latency, so node 2 deterministically ends up parked against a dead
-    // peer, whether the descriptor made it out or not. (Gating on the serving
-    // marker instead raced the pull itself: a release-build pull finishes in
-    // a few hundred ms.)
+    // Kill node 0 the moment node 2 armed the transfer there: by converting
+    // its refused repair floor when it rejoined inside the storage-epoch skew
+    // of the create, or, past it, by requesting one on adopting node 0's view.
+    // The 64 MiB pull cannot possibly finish inside the kill latency, so node
+    // 2 deterministically ends up parked against a dead peer, whether the
+    // descriptor made it out or not. (Gating on the serving marker instead
+    // raced the pull itself: a release-build pull finishes in a few hundred
+    // ms.)
     let deadline = Instant::now() + TRANSFER_BUDGET;
-    while !harness.node(2).stdout_contains(CONVERSION_MARKER) {
+    while !(harness.node(2).stdout_contains(CONVERSION_MARKER)
+        || harness.node(2).stdout_contains(REARM_ON_VIEW_MARKER))
+    {
         assert!(
             Instant::now() < deadline,
-            "node 2 never converted its refused repair floor to a transfer"
+            "node 2 never armed a transfer at node 0"
         );
         sleep(KILL_GATE_POLL).await;
     }
@@ -324,7 +349,13 @@ async fn given_transfer_peer_dies_when_stalled_should_leave_dead_peer_and_recove
     // have installed and node 1 can have fully served an earlier attempt while
     // node 0 was still up, and a `contains` would call those the recovery.
     let installs_before_kill = harness.node(2).stdout_occurrences(INSTALL_MARKER);
-    let served_before_kill = harness.node(1).stdout_occurrences(FULLY_SERVED_MARKER);
+    let served_by_survivors = |harness: &TestHarness| -> usize {
+        [1, 3, 4]
+            .into_iter()
+            .map(|node| harness.node(node).stdout_occurrences(FULLY_SERVED_MARKER))
+            .sum()
+    };
+    let served_before_kill = served_by_survivors(harness);
     let abandons_before_kill = harness.node(2).stdout_occurrences(ABANDON_MARKER);
     let rearms_before_kill = harness.node(2).stdout_occurrences(REARM_ON_VIEW_MARKER);
     harness
@@ -344,14 +375,21 @@ async fn given_transfer_peer_dies_when_stalled_should_leave_dead_peer_and_recove
     .await;
 
     // Recovery: the scheduled re-arm targets the surviving primary. No
-    // follow-up commit is asserted -- the cluster is quorum-marginal with
-    // one node down, and an unanswered read mid-election is not a verdict.
+    // follow-up commit is asserted -- an unanswered read mid-election is not
+    // a verdict.
     //
-    // Node 1 is named explicitly, not "any survivor": with node 0 dead it is
-    // the only replica left that can serve, so a marker from it is proof the
-    // re-arm found a new peer rather than proof of the pre-kill attempt.
+    // Only the survivors are counted, not node 0: with node 0 dead, a marker
+    // from one of them is proof the re-arm found a new peer rather than proof
+    // of the pre-kill attempt.
     await_new_marker(harness, 2, INSTALL_MARKER, installs_before_kill).await;
-    await_new_marker(harness, 1, FULLY_SERVED_MARKER, served_before_kill).await;
+    let deadline = Instant::now() + TRANSFER_BUDGET;
+    while served_by_survivors(harness) <= served_before_kill {
+        assert!(
+            Instant::now() < deadline,
+            "no survivor fully served node 2 a transfer within {TRANSFER_BUDGET:?}"
+        );
+        sleep(MARKER_POLL).await;
+    }
 
     // The manifest the install consumed carried one artifact per sealed
     // segment, and each was spilled and renamed separately: the seeded 64 MiB
@@ -391,7 +429,7 @@ async fn given_sustained_writes_when_a_node_falls_past_the_evicted_ring_should_r
         .root_client_for_node(0)
         .await
         .expect("connect a root client to the node");
-    seed_topic(&client, None).await;
+    seed_topic(&client, None, None).await;
 
     harness
         .isolate_node(LAGGING_NODE)
@@ -477,7 +515,7 @@ async fn restart_lagging_node_and_await_install(harness: &mut TestHarness) {
         .root_client_for_node(0)
         .await
         .expect("connect a root client to the node");
-    seed_topic(&client, None).await;
+    seed_topic(&client, None, None).await;
     produce(&client, 40).await;
     sleep(Duration::from_secs(1)).await;
     harness.stop_node(2).expect("stop node 2");
@@ -607,10 +645,15 @@ async fn connect_any(harness: &TestHarness, nodes: &[usize]) -> Option<IggyClien
 
 /// `segment_size` is `None` for the specs that only need the default cap; the
 /// multi-artifact spec passes one small enough that its bulky seed spans
-/// several sealed segments. `messages_required_to_save = 1` is the forcing
+/// several sealed segments, and stores the partition on all five of its nodes.
+/// `messages_required_to_save = 1` is the forcing
 /// function every spec here shares: each commit flushes and ring-evicts, which
 /// is what marches `repair_retained_from` forward.
-async fn seed_topic(client: &IggyClient, segment_size: Option<u64>) {
+async fn seed_topic(
+    client: &IggyClient,
+    segment_size: Option<u64>,
+    replication_factor: Option<u32>,
+) {
     client
         .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
@@ -626,6 +669,7 @@ async fn seed_topic(client: &IggyClient, segment_size: Option<u64>) {
                 segment_size: segment_size.map(IggyByteSize::from),
                 durability: Durability::Persisted,
                 consumer_offset_durability: Durability::Persisted,
+                replication_factor,
                 ..TopicCreateOptions::default()
             },
         )
@@ -670,7 +714,7 @@ async fn produce_bulky(client: &IggyClient, count: u32, payload_len: usize) {
 }
 
 async fn seed_partition(client: &IggyClient) {
-    seed_topic(client, None).await;
+    seed_topic(client, None, None).await;
     produce(client, MESSAGES_COUNT).await;
     assert_eq!(
         poll_count(client, MESSAGES_COUNT).await,
