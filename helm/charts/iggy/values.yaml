@@ -104,27 +104,26 @@ server:
     size: 8Gi
 
   # -- Server-side encryption of message data at rest, using AES-256-GCM.
-  # Server builds using the `flat` layout give every encrypted stream its own
-  # key, stored wrapped under a key derived from this one. Every node of a
-  # cluster must hold the identical key, or it cannot read data another node
-  # wrote.
+  # Server builds from 0.9.1-edge.2 give every encrypted stream its own key,
+  # stored wrapped under a key derived from this one. Every node of a cluster
+  # must hold the identical key, or it cannot read data another node wrote.
   encryption:
-    # -- Enable encryption at rest. With the `flat` layout, streams created
-    # without their own key get a generated one, and a key set while this is
-    # false still accepts streams created with their own key.
+    # -- Enable encryption at rest. On server builds with per-stream keys,
+    # streams created without their own key get a generated one, and a key set
+    # while this is false still accepts streams created with their own key.
     enabled: false
     # -- Encryption config layout: `auto` selects `legacy` for released image
-    # versions through 0.9.0-edge.7. Set `flat` for newer server builds, or
-    # `legacy` for custom builds that still use `[system.encryption]`.
+    # versions through 0.9.0-edge.7 and `flat` for later ones. Set `flat` or
+    # `legacy` explicitly for custom tags.
     configVersion: auto
     # -- 32-byte key, base64 encoded. Ignored when `existingSecret.name` is set.
     # Prefer `existingSecret` outside development: a value here is stored in the
     # Helm release and readable by anyone who can read it.
     key: ""
     # -- Retiring keys, at most two, base64 encoded, that still unwrap stream
-    # keys while a rotation is in flight. Needs the `flat` layout. Stored in the
-    # generated Secret. Ignored when `existingSecret.name` is set. Leave empty
-    # outside a rotation.
+    # keys while a rotation is in flight. Needs a server build from 0.9.1-edge.2
+    # and the `flat` layout. Stored in the generated Secret. Ignored when
+    # `existingSecret.name` is set. Leave empty outside a rotation.
     previousKeys: []
     existingSecret:
       # -- Name of an existing Secret holding the encryption key
@@ -218,7 +217,9 @@ server:
 
   # -- Deployment update strategy. Empty lets the chart choose: `Recreate` when
   # `hostNetwork` is set, because a rolling update would wait forever for a
-  # replacement pod that cannot bind host ports the outgoing pod still holds,
+  # replacement pod that cannot bind host ports the outgoing pod still holds;
+  # `Recreate` when persistence is enabled, because a rolling update starts the
+  # replacement server while the outgoing one is still running on the volume;
   # and the Kubernetes default otherwise.
   strategy: {}
 

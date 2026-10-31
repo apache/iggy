@@ -2,7 +2,7 @@
 
 A Helm chart for Apache Iggy server and web-ui
 
-![Version: 0.7.0](https://img.shields.io/badge/Version-0.7.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.9.0-edge.6](https://img.shields.io/badge/AppVersion-0.9.0--edge.6-informational?style=flat-square)
+![Version: 0.7.0](https://img.shields.io/badge/Version-0.7.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.9.0](https://img.shields.io/badge/AppVersion-0.9.0-informational?style=flat-square)
 
 ## Prerequisites
 
@@ -72,6 +72,13 @@ helm install iggy ./helm/charts/iggy \
   --set server.persistence.enabled=true \
   --set server.persistence.size=50Gi
 ```
+
+With persistence on, the chart uses the `Recreate` strategy. A rolling update
+starts the replacement server while the outgoing one is still running on the
+same volume, which loses messages. Charts before 0.7.0 used a rolling update
+here, so an existing release moves from `RollingUpdate` to `Recreate` on its
+first upgrade. On Helm 4, run that one upgrade with
+`helm upgrade --server-side=false`, as described under [Upgrades](#upgrades).
 
 ### With Custom Values File
 
@@ -196,7 +203,33 @@ stored values.
   authenticated handshake or be rejected. The key is at least 32 bytes of
   CSPRNG output. Turning it on or off is a coordinated restart of the whole
   cluster: a node that authenticates cannot talk to one that does not.
-* **`server.encryption`** encrypts data at rest with AES-256-GCM under a 32-byte base64 key that every node must hold. A node holding a different key cannot read what its peers wrote. The pinned image uses the legacy `[system.encryption]` layout, encrypts message payloads and state commands under that key, and leaves data unencrypted with `enabled` false. Server builds using `[encryption]`, selected with `server.encryption.configVersion=flat`, give every encrypted stream its own key, stored wrapped under a key derived from the configured one. With `enabled` true, streams created without their own key get a generated one. With `enabled` false and a key set, only streams created with their own key are encrypted. A stream created unencrypted stays unencrypted. A standalone node that cannot open a stored stream key refuses to boot, while a cluster node starts and serves that stream once a wrap it can open has committed. To rotate the server key on such a build, set the new key, put the retiring ones in `server.encryption.previousKeys` (or under `existingSecret.previousKeysKey` in the existing Secret), and follow the procedure in the [server README](https://github.com/apache/iggy/blob/master/core/server/README.md#stream-encryption). The retiring keys reach the server through the Secret, like the key itself. Phase 2 empties `previousKeys` and sets `IGGY_ENCRYPTION_RETIRED_KEK_FINGERPRINTS` to the old key's fingerprint as a JSON array through `server.env`. Once every stream has dropped the old wrap, clear `IGGY_ENCRYPTION_RETIRED_KEK_FINGERPRINTS` from `server.env` on every node. A stream holds at most three wraps, so retire an old fingerprint before adding a fourth key. Fingerprints are not secret, so that entry is a plain value. The chart selects the legacy layout for released images through `0.9.0-edge.7`, including its pinned image. Other image tags require an explicit `flat` or `legacy` layout.
+* **`server.encryption`** encrypts data at rest with AES-256-GCM under a
+  32-byte base64 key that every node must hold. A node holding a different key
+  cannot read what its peers wrote. The chart selects the legacy
+  `[system.encryption]` configuration for versioned images through
+  `0.9.0-edge.7`, and the flat `[encryption]` configuration for later ones,
+  including its pinned image. Custom tags require an explicit `flat` or
+  `legacy` layout. Both layouts encrypt message payloads and state commands
+  under that key and leave data unencrypted with `enabled` false. Server
+  builds from `0.9.1-edge.2`, with the flat layout, give every encrypted
+  stream its own key, stored wrapped under a key derived from the configured
+  one. With `enabled` true, streams created without their own key get a
+  generated one. With `enabled` false and a key set, only streams created with
+  their own key are encrypted. A stream created unencrypted stays unencrypted.
+  A standalone node that cannot open a stored stream key refuses to boot, while
+  a cluster node starts and serves that stream once a wrap it can open has
+  committed. To rotate the server key on such a build, set the new key, put
+  the retiring ones in `server.encryption.previousKeys` (or under
+  `existingSecret.previousKeysKey` in the existing Secret), and follow the
+  procedure in the [server README](https://github.com/apache/iggy/blob/master/core/server/README.md#stream-encryption).
+  The retiring keys reach the server through the Secret, like the key itself.
+  Phase 2 empties `previousKeys` and sets
+  `IGGY_ENCRYPTION_RETIRED_KEK_FINGERPRINTS` to the old key's fingerprint as a
+  JSON array through `server.env`. Once every stream has dropped the old wrap,
+  clear `IGGY_ENCRYPTION_RETIRED_KEK_FINGERPRINTS` from `server.env` on every
+  node. A stream holds at most three wraps, so retire an old fingerprint before
+  adding a fourth key. Fingerprints are not secret, so that entry is a plain
+  value.
 * **`server.jwt`** makes HTTP bearer tokens valid on every node and survive a
   restart. With `cluster.auth` enabled the server already derives a cluster-wide
   key from the replica PSK, so setting the JWT secrets is an alternative to that
@@ -366,13 +399,10 @@ Ensure the server binds to `0.0.0.0` instead of `127.0.0.1`. This is configured 
 
 A wildcard bind says which interfaces accept connections, not where clients
 reach the pod, so the server also needs the address to publish in cluster
-metadata. Server builds that carry the setting refuse to start without it.
-`0.9.0-edge.6`, the image this chart pins, predates it:
-that build logs `IGGY_NODE_ADVERTISED_ADDRESS` as an unknown variable and
-publishes the bind address, so the chart's default stays inert until the pinned
-image moves past it. Either way the chart sets `IGGY_NODE_ADVERTISED_ADDRESS` to
-the in-cluster Service DNS name; override it with `server.advertisedAddress`
-when clients arrive through a LoadBalancer or an Ingress.
+metadata, and refuses to start without it. The chart sets
+`IGGY_NODE_ADVERTISED_ADDRESS` to the in-cluster Service DNS name; override it
+with `server.advertisedAddress` when clients arrive through a LoadBalancer or an
+Ingress.
 
 In cluster mode the server ignores the variable altogether and publishes each
 node's roster `ip`, or its `advertisedAddress` when the entry carries one, so
@@ -501,14 +531,14 @@ pre-commit install
 | server.cluster.requireHostNetwork | bool | `true` | Refuse to render a cluster node without `server.hostNetwork`. The replica listener binds the roster `ip` verbatim, which no pod owns on the cluster network, so the pod would die at boot with `CannotBindToSocket`. Set this to false only when the roster `ip` is an address the pod itself holds. |
 | server.cluster.selfReplicaId | int | `0` | Which `nodes` entry this release runs, matched against `replicaId`. |
 | server.enabled | bool | `true` | Enable the Iggy server deployment |
-| server.encryption | object | `{"configVersion":"auto","enabled":false,"existingSecret":{"key":"encryptionKey","name":"","previousKeysKey":"encryptionPreviousKeys"},"key":"","previousKeys":[]}` | Server-side encryption of message data at rest, using AES-256-GCM. Server builds using the `flat` layout give every encrypted stream its own key, stored wrapped under a key derived from this one. Every node of a cluster must hold the identical key, or it cannot read data another node wrote. |
-| server.encryption.configVersion | string | `"auto"` | Encryption config layout: `auto` selects `legacy` for released image versions through 0.9.0-edge.7. Set `flat` for newer server builds, or `legacy` for custom builds that still use `[system.encryption]`. |
-| server.encryption.enabled | bool | `false` | Enable encryption at rest. With the `flat` layout, streams created without their own key get a generated one, and a key set while this is false still accepts streams created with their own key. |
+| server.encryption | object | `{"configVersion":"auto","enabled":false,"existingSecret":{"key":"encryptionKey","name":"","previousKeysKey":"encryptionPreviousKeys"},"key":"","previousKeys":[]}` | Server-side encryption of message data at rest, using AES-256-GCM. Server builds from 0.9.1-edge.2 give every encrypted stream its own key, stored wrapped under a key derived from this one. Every node of a cluster must hold the identical key, or it cannot read data another node wrote. |
+| server.encryption.configVersion | string | `"auto"` | Encryption config layout: `auto` selects `legacy` for released image versions through 0.9.0-edge.7 and `flat` for later ones. Set `flat` or `legacy` explicitly for custom tags. |
+| server.encryption.enabled | bool | `false` | Enable encryption at rest. On server builds with per-stream keys, streams created without their own key get a generated one, and a key set while this is false still accepts streams created with their own key. |
 | server.encryption.existingSecret.key | string | `"encryptionKey"` | Key inside that Secret |
 | server.encryption.existingSecret.name | string | `""` | Name of an existing Secret holding the encryption key |
 | server.encryption.existingSecret.previousKeysKey | string | `"encryptionPreviousKeys"` | Optional key inside that Secret holding the retiring keys, one bare key or a JSON array of at most two. Read with the `flat` layout only. |
 | server.encryption.key | string | `""` | 32-byte key, base64 encoded. Ignored when `existingSecret.name` is set. Prefer `existingSecret` outside development: a value here is stored in the Helm release and readable by anyone who can read it. |
-| server.encryption.previousKeys | list | `[]` | Retiring keys, at most two, base64 encoded, that still unwrap stream keys while a rotation is in flight. Needs the `flat` layout. Stored in the generated Secret. Ignored when `existingSecret.name` is set. Leave empty outside a rotation. |
+| server.encryption.previousKeys | list | `[]` | Retiring keys, at most two, base64 encoded, that still unwrap stream keys while a rotation is in flight. Needs a server build from 0.9.1-edge.2 and the `flat` layout. Stored in the generated Secret. Ignored when `existingSecret.name` is set. Leave empty outside a rotation. |
 | server.env | list | `[{"name":"RUST_LOG","value":"info"},{"name":"IGGY_HTTP_ADDRESS","value":"0.0.0.0:3000"},{"name":"IGGY_TCP_ADDRESS","value":"0.0.0.0:8090"},{"name":"IGGY_QUIC_ADDRESS","value":"0.0.0.0:8080"},{"name":"IGGY_WEBSOCKET_ADDRESS","value":"0.0.0.0:8092"}]` | Environment variables for the server container |
 | server.extraArgs | list | `[]` | Extra command-line arguments appended to the server entrypoint, e.g. `["--with-default-root-credentials"]` for a throwaway development install. `--replica-id` is not one of them: the chart passes it already whenever `cluster.enabled` is set. |
 | server.hostNetwork | bool | `false` | Run the server pod in the host network namespace. Required for cluster mode, where the replica listener binds the roster IP verbatim. |
@@ -548,7 +578,7 @@ pre-commit install
 | server.serviceMonitor.namespace | string | `""` | Namespace to deploy the ServiceMonitor |
 | server.serviceMonitor.path | string | `"/metrics"` | Path to scrape metrics from |
 | server.serviceMonitor.scrapeTimeout | string | `"10s"` | Timeout for scrape metrics request |
-| server.strategy | object | `{}` | Deployment update strategy. Empty lets the chart choose: `Recreate` when `hostNetwork` is set, because a rolling update would wait forever for a replacement pod that cannot bind host ports the outgoing pod still holds, and the Kubernetes default otherwise. |
+| server.strategy | object | `{}` | Deployment update strategy. Empty lets the chart choose: `Recreate` when `hostNetwork` is set, because a rolling update would wait forever for a replacement pod that cannot bind host ports the outgoing pod still holds; `Recreate` when persistence is enabled, because a rolling update starts the replacement server while the outgoing one is still running on the volume; and the Kubernetes default otherwise. |
 | server.tolerations | list | `[]` | Tolerations for server pods |
 | server.users.root.createSecret | bool | `true` | Create a secret for the root user credentials |
 | server.users.root.existingSecret.name | string | `""` | Name of existing secret for root credentials |

@@ -91,6 +91,13 @@ helm install iggy ./helm/charts/iggy \
   --set server.persistence.size=50Gi
 ```
 
+With persistence on, the chart uses the `Recreate` strategy. A rolling update
+starts the replacement server while the outgoing one is still running on the
+same volume, which loses messages. Charts before 0.7.0 used a rolling update
+here, so an existing release moves from `RollingUpdate` to `Recreate` on its
+first upgrade. On Helm 4, run that one upgrade with
+`helm upgrade --server-side=false`, as described under [Upgrades](#upgrades).
+
 ### With Custom Values File
 
 ```bash
@@ -214,7 +221,33 @@ stored values.
   authenticated handshake or be rejected. The key is at least 32 bytes of
   CSPRNG output. Turning it on or off is a coordinated restart of the whole
   cluster: a node that authenticates cannot talk to one that does not.
-* **`server.encryption`** encrypts data at rest with AES-256-GCM under a 32-byte base64 key that every node must hold. A node holding a different key cannot read what its peers wrote. The pinned image uses the legacy `[system.encryption]` layout, encrypts message payloads and state commands under that key, and leaves data unencrypted with `enabled` false. Server builds using `[encryption]`, selected with `server.encryption.configVersion=flat`, give every encrypted stream its own key, stored wrapped under a key derived from the configured one. With `enabled` true, streams created without their own key get a generated one. With `enabled` false and a key set, only streams created with their own key are encrypted. A stream created unencrypted stays unencrypted. A standalone node that cannot open a stored stream key refuses to boot, while a cluster node starts and serves that stream once a wrap it can open has committed. To rotate the server key on such a build, set the new key, put the retiring ones in `server.encryption.previousKeys` (or under `existingSecret.previousKeysKey` in the existing Secret), and follow the procedure in the [server README](https://github.com/apache/iggy/blob/master/core/server/README.md#stream-encryption). The retiring keys reach the server through the Secret, like the key itself. Phase 2 empties `previousKeys` and sets `IGGY_ENCRYPTION_RETIRED_KEK_FINGERPRINTS` to the old key's fingerprint as a JSON array through `server.env`. Once every stream has dropped the old wrap, clear `IGGY_ENCRYPTION_RETIRED_KEK_FINGERPRINTS` from `server.env` on every node. A stream holds at most three wraps, so retire an old fingerprint before adding a fourth key. Fingerprints are not secret, so that entry is a plain value. The chart selects the legacy layout for released images through `0.9.0-edge.7`, including its pinned image. Other image tags require an explicit `flat` or `legacy` layout.
+* **`server.encryption`** encrypts data at rest with AES-256-GCM under a
+  32-byte base64 key that every node must hold. A node holding a different key
+  cannot read what its peers wrote. The chart selects the legacy
+  `[system.encryption]` configuration for versioned images through
+  `0.9.0-edge.7`, and the flat `[encryption]` configuration for later ones,
+  including its pinned image. Custom tags require an explicit `flat` or
+  `legacy` layout. Both layouts encrypt message payloads and state commands
+  under that key and leave data unencrypted with `enabled` false. Server
+  builds from `0.9.1-edge.2`, with the flat layout, give every encrypted
+  stream its own key, stored wrapped under a key derived from the configured
+  one. With `enabled` true, streams created without their own key get a
+  generated one. With `enabled` false and a key set, only streams created with
+  their own key are encrypted. A stream created unencrypted stays unencrypted.
+  A standalone node that cannot open a stored stream key refuses to boot, while
+  a cluster node starts and serves that stream once a wrap it can open has
+  committed. To rotate the server key on such a build, set the new key, put
+  the retiring ones in `server.encryption.previousKeys` (or under
+  `existingSecret.previousKeysKey` in the existing Secret), and follow the
+  procedure in the [server README](https://github.com/apache/iggy/blob/master/core/server/README.md#stream-encryption).
+  The retiring keys reach the server through the Secret, like the key itself.
+  Phase 2 empties `previousKeys` and sets
+  `IGGY_ENCRYPTION_RETIRED_KEK_FINGERPRINTS` to the old key's fingerprint as a
+  JSON array through `server.env`. Once every stream has dropped the old wrap,
+  clear `IGGY_ENCRYPTION_RETIRED_KEK_FINGERPRINTS` from `server.env` on every
+  node. A stream holds at most three wraps, so retire an old fingerprint before
+  adding a fourth key. Fingerprints are not secret, so that entry is a plain
+  value.
 * **`server.jwt`** makes HTTP bearer tokens valid on every node and survive a
   restart. With `cluster.auth` enabled the server already derives a cluster-wide
   key from the replica PSK, so setting the JWT secrets is an alternative to that
@@ -384,13 +417,10 @@ Ensure the server binds to `0.0.0.0` instead of `127.0.0.1`. This is configured 
 
 A wildcard bind says which interfaces accept connections, not where clients
 reach the pod, so the server also needs the address to publish in cluster
-metadata. Server builds that carry the setting refuse to start without it.
-`{{ template "chart.appVersion" . }}`, the image this chart pins, predates it:
-that build logs `IGGY_NODE_ADVERTISED_ADDRESS` as an unknown variable and
-publishes the bind address, so the chart's default stays inert until the pinned
-image moves past it. Either way the chart sets `IGGY_NODE_ADVERTISED_ADDRESS` to
-the in-cluster Service DNS name; override it with `server.advertisedAddress`
-when clients arrive through a LoadBalancer or an Ingress.
+metadata, and refuses to start without it. The chart sets
+`IGGY_NODE_ADVERTISED_ADDRESS` to the in-cluster Service DNS name; override it
+with `server.advertisedAddress` when clients arrive through a LoadBalancer or an
+Ingress.
 
 In cluster mode the server ignores the variable altogether and publishes each
 node's roster `ip`, or its `advertisedAddress` when the entry carries one, so
