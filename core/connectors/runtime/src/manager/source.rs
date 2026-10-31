@@ -254,6 +254,9 @@ impl SourceManager {
                 },
                 other => RuntimeError::ConnectorSdkError(other),
             })?;
+        // An exactly-once source keeps its producer around the plugin's bytes.
+        let state =
+            crate::exactly_once::plugin_state(state).map_err(RuntimeError::ConnectorSdkError)?;
 
         source::init_source(
             &container,

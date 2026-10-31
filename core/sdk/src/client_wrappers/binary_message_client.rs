@@ -18,8 +18,8 @@
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
 use iggy_common::{
-    Consumer, DecodeError, Identifier, IggyError, IggyMessage, MessageClient, Partitioning,
-    PollOptions, PolledMessages, PollingStrategy, SendMessagesResponse,
+    BatchProducer, Consumer, DecodeError, Identifier, IggyError, IggyMessage, MessageClient,
+    Partitioning, PollOptions, PolledMessages, PollingStrategy, SendMessagesResponse,
 };
 
 #[async_trait]
@@ -82,5 +82,30 @@ impl MessageClient for ClientWrapper {
             MessageClient::send_messages(stream_id, topic_id, partitioning, messages)
         )
         .await
+    }
+
+    async fn send_producer_messages(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: u32,
+        producer: BatchProducer,
+        messages: &mut [IggyMessage],
+    ) -> Result<SendMessagesResponse, IggyError> {
+        super::dispatch_client!(
+            self,
+            MessageClient::send_producer_messages(
+                stream_id,
+                topic_id,
+                partition_id,
+                producer,
+                messages
+            )
+        )
+        .await
+    }
+
+    async fn next_producer_id(&self) -> Result<u64, IggyError> {
+        super::dispatch_client!(self, MessageClient::next_producer_id()).await
     }
 }

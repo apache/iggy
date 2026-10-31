@@ -19,11 +19,11 @@ use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_common::locking::IggyRwLockFn;
-use iggy_common::{BinarySendPartitioning, MessageClient, with_binary_deadline};
 use iggy_common::{
-    CommitPolicy, Consumer, DecodeError, Identifier, IggyError, IggyMessage, Partitioning,
-    PollOptions, PolledMessages, PollingStrategy, SendMessagesResponse,
+    BatchProducer, CommitPolicy, Consumer, DecodeError, Identifier, IggyError, IggyMessage,
+    Partitioning, PollOptions, PolledMessages, PollingStrategy, SendMessagesResponse,
 };
+use iggy_common::{BinarySendPartitioning, MessageClient, with_binary_deadline};
 use tokio::time::Instant;
 
 #[async_trait]
@@ -126,6 +126,28 @@ impl MessageClient for IggyClient {
             messages,
         )
         .await
+    }
+
+    async fn send_producer_messages(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: u32,
+        producer: BatchProducer,
+        messages: &mut [IggyMessage],
+    ) -> Result<SendMessagesResponse, IggyError> {
+        self.send_messages_with_partitioning(
+            stream_id,
+            topic_id,
+            &mut BinarySendPartitioning::new(&Partitioning::partition_id(partition_id))
+                .with_producer(producer),
+            messages,
+        )
+        .await
+    }
+
+    async fn next_producer_id(&self) -> Result<u64, IggyError> {
+        super::with_client!(self, client => client.next_producer_id().await)
     }
 }
 

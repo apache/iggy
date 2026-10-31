@@ -67,7 +67,7 @@ it knows the server supports flexible encoding.
 | 14 | SyncGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Relays the leader's assignment blobs; flexible encoding at v4+ |
 | 15 | DescribeGroups | 0 | 6 | 0, 1, 2, 3, 4, 5, 6 | Members, assignment and state of groups on this coordinator. A group that is not there but holds offsets in Iggy is `Empty`. Any other missing group is `Dead`, and v6 also returns `GROUP_ID_NOT_FOUND` (69). Flexible encoding at v5+ |
 | 16 | ListGroups | 0 | 5 | 0, 1, 2, 3, 4, 5 | Groups on this coordinator, plus the groups that hold offsets in Iggy as `Empty` (see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)). v4+ state filter and v5 type filter. Flexible encoding at v3+ |
-| 22 | InitProducerId | 0 | 5 | 0, 1, 2, 3, 4, 5 | Allocate a producer id (epoch 0); a `transactional_id` gets `UNSUPPORTED_VERSION` (35); flexible encoding at v2+ |
+| 22 | InitProducerId | 0 | 5 | 0, 1, 2, 3, 4, 5 | A producer id at epoch 0, from Iggy with a bridge. A `transactional_id` gets `UNSUPPORTED_VERSION` (35). Flexible encoding at v2+ |
 | 32 | DescribeConfigs | 1 | 4 | 1, 2, 3, 4 | Topic resources only. Returns `retention.ms` and leaves out `cleanup.policy`. Flexible encoding at v4. See [`CONFIGS.md`](CONFIGS.md) |
 | 33 | AlterConfigs | 0 | 2 | 0, 1, 2 | Persists `retention.ms` only. Flexible encoding at v2. See [`CONFIGS.md`](CONFIGS.md) |
 | 42 | DeleteGroups | 0 | 2 | 0, 1, 2 | With a bridge: deletes a group without members, with its offsets in Iggy. While it has members: `NON_EMPTY_GROUP` (68). When it does not exist: `GROUP_ID_NOT_FOUND` (69). Flexible encoding at v2. v3 adds an error message that `kafka-protocol` cannot encode yet |
@@ -527,7 +527,8 @@ InitProducerId and idempotent producers
 
 - [x] InitProducerId (22) allocates a producer id so a stock idempotent producer starts; a
       transactional request is refused
-- [ ] Deduplicate an idempotent producer's retries. Delivery stays at-least-once until then
+- [x] Write each batch of an idempotent producer once, with `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`
+      ([#4513](https://github.com/apache/iggy/issues/4513)). Iggy partitions keep the producer state
 
 Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
 [`AUTHENTICATION.md`](AUTHENTICATION.md).

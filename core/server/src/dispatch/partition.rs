@@ -1732,6 +1732,7 @@ mod tests {
     use consensus::PartitionsHandle;
     #[cfg(target_os = "linux")]
     use consensus::Sequencer;
+    use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BATCH_PRODUCER_OFFSET};
     use iggy_binary_protocol::codes::PING_CODE;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
@@ -2703,6 +2704,24 @@ mod tests {
             ),
             IggyError::InvalidIdentifier,
         ));
+        for partitioning in [
+            WirePartitioning::Balanced,
+            WirePartitioning::MessagesKey(b"key".to_vec()),
+        ] {
+            let mut body = send_body(
+                WireIdentifier::Numeric(0),
+                WireIdentifier::Numeric(0),
+                partitioning,
+            );
+            let mut batch = [0; BATCH_HEADER_SIZE];
+            batch[BATCH_PRODUCER_OFFSET] = 1;
+            body.extend_from_slice(&batch);
+            cases.push((
+                Operation::SendMessages,
+                body,
+                IggyError::ProducerPartitionRequired,
+            ));
+        }
         cases.push((
             Operation::DeleteSegments,
             DeleteSegmentsRequest {

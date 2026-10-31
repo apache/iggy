@@ -19,8 +19,11 @@
 //!
 //! A Java producer sets `enable.idempotence=true` without being asked (KIP-679, default since
 //! Kafka 3.0) and sends this before its first record, so answering it is what lets a stock
-//! producer start against this gateway at all. Produce uses the id only to pick the producer's
-//! Iggy session: delivery stays at-least-once, and no retry is deduplicated. See
+//! producer start against this gateway at all.
+//!
+//! With a bridge, the id comes from Iggy, which makes it unique across the cluster, and the
+//! partitions write each batch of the producer once. Without one, the gateway's own allocator
+//! gives the id, and Produce uses it only to pick the producer's Iggy session. See
 //! `docs/IDEMPOTENCE.md`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,12 +34,12 @@ use kafka_protocol::messages::{InitProducerIdRequest, InitProducerIdResponse, Pr
 
 use crate::error::Result;
 use crate::protocol::api::{
-    API_KEY_INIT_PRODUCER_ID, ApiVersionRange, ERROR_NONE, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
+    API_KEY_INIT_PRODUCER_ID, ApiVersionRange, ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_NONE,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_init_producer_id_shape;
 use crate::protocol::handlers::{
-    decode_guarded, encode_message, handle_versioned_request, is_transactional,
+    decode_guarded, decode_request, encode_message, is_transactional, respond_or_close,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -51,8 +54,8 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 const COUNTER_BITS: u32 = 47;
 const MAX_COUNTER: u64 = (1 << COUNTER_BITS) - 1;
 
-/// The epoch every allocated id carries. Epochs only advance when a producer is fenced, which
-/// needs the transactional state this gateway does not keep.
+/// The epoch every new id starts at. An idempotent Java producer moves to the next epoch by
+/// itself, and a new epoch starts its sequences at 0, which the partitions accept.
 const PRODUCER_EPOCH: i16 = 0;
 
 /// Hands out producer ids that are unique across gateway instances sharing one Iggy cluster.
@@ -109,20 +112,37 @@ impl ProducerIdAllocator {
     }
 }
 
-#[expect(
-    clippy::unused_async,
-    reason = "the shared handler signature, kept until a handler awaits the bridge"
-)]
+/// Answers with a new producer id at epoch 0.
+///
+/// A request that names its current id and epoch (KIP-360) also gets a new id: Kafka does the
+/// same for a producer without a transactional id.
 pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
-    handle_versioned_request(
+    let req = match decode_request(
         API_KEY_INIT_PRODUCER_ID,
         api_version,
         body,
         |v, b| decode_guarded::<InitProducerIdRequest>(v, b, validate_init_producer_id_shape),
-        |v, req| encode_response(v, req, &state.producer_ids),
         encode_error_response,
         "InitProducerId",
-    )
+    ) {
+        Ok(req) => req,
+        Err(outcome) => return outcome,
+    };
+    let encoded = match &state.bridge {
+        Some(bridge) if !is_transactional(req.transactional_id.as_ref()) => {
+            match bridge.next_producer_id().await {
+                Ok(producer_id) => encode_inner(api_version, ERROR_NONE, producer_id),
+                // Retriable, so the producer asks again. Not 15 or 16: those send a Java
+                // producer to look for a transaction coordinator, which this gateway has none of.
+                Err(error) => {
+                    tracing::warn!(%error, "could not get a producer id from Iggy");
+                    encode_error_response(api_version, ERROR_COORDINATOR_LOAD_IN_PROGRESS)
+                }
+            }
+        }
+        _ => encode_response(api_version, &req, &state.producer_ids),
+    };
+    respond_or_close(encoded, "InitProducerId")
 }
 
 /// `InitProducerId` response carrying `error_code` and no usable producer id.

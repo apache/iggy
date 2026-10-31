@@ -24,6 +24,7 @@ mod crash_offset_reuse;
 mod crash_recovery_corruption;
 mod failover_client_continuity;
 mod fast_primary_rejoin;
+mod idempotent_producer;
 mod metadata_changes;
 mod metadata_checkpoint_restart;
 mod metadata_state_transfer;

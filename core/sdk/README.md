@@ -573,6 +573,53 @@ batch. Report names record them with the derived request timeout. `--request-tim
 because the timeout is always `max_wait` plus 10 s. Intentional batching waits count in the measured
 latency.
 
+## Idempotent producers
+
+An idempotent producer writes each batch once. If it sends a batch again, the partition does not write the batch a second time. This holds after a lost reply, a reconnect or a lost session. If a restarted client stored its producer state, it holds after the restart too.
+
+The client puts the producer id, the epoch and the sequence of the first message in the batch header. The epoch is a counter that fences an older copy of the same producer. `BatchProducer::new` returns `None` for an id above `i64::MAX`, an epoch above `i16::MAX` or a sequence above `i32::MAX`. Each limit fits a signed integer, so SDKs in languages without unsigned integers read the fields as they are.
+
+`next_producer_id` returns a producer id that no other client of the cluster gets. It sends no request, because the id holds the session number of the client and a local index. One session hands out 2^20 ids. After that, the call fails with `ProducerIdsExhausted` (91), and a new sign-in starts a new range. An id stays unique after its session ends, so a producer can store its id and use it again after a restart.
+
+`send_producer_messages` sends one batch with its producer to the partition that you name, because each partition counts the sequence of a producer separately. The partition keeps the last five batches of each producer and answers as follows:
+
+- If the partition holds the batch, it does not write the batch again. The reply holds the offset of the first write.
+- If an uncommitted write holds the batch, the answer is `TransientNotCommitted` (57). The outcome stays unknown, so the client sends the batch again and gets the offset of the first write.
+- If the batch does not follow the last batch of its producer, the answer is `ProducerSequenceOutOfOrder` (92).
+- If the epoch is older than the newest epoch of the producer, the answer is `ProducerEpochFenced` (93).
+- If the partition does not hold the producer and the batch does not start at sequence 0, the answer is `ProducerUnknown` (94). The producer starts the next epoch at sequence 0.
+
+A new epoch starts at sequence 0. To fence an older copy of itself, for example after a restart, a producer moves to the next epoch. A restarted producer can resend its last batch. It sends that batch first, with the old epoch and the old sequence. After that, it moves to the next epoch.
+
+```rust
+use iggy::prelude::*;
+
+async fn produce(
+    client: &IggyClient,
+    stream: &Identifier,
+    topic: &Identifier,
+    batches: &mut [Vec<IggyMessage>],
+) -> Result<(), IggyError> {
+    let producer_id = client.next_producer_id().await?;
+    let mut producer = BatchProducer::new(producer_id, 0, 0).ok_or(IggyError::InvalidCommand)?;
+    for batch in batches.iter_mut() {
+        // A retry of this batch sends the same producer and sequence.
+        client
+            .send_producer_messages(stream, topic, 0, producer, batch)
+            .await?;
+        let count = u32::try_from(batch.len()).map_err(|_| IggyError::InvalidCommand)?;
+        producer = producer.next(count);
+    }
+    Ok(())
+}
+```
+
+`IggyProducer` has an idempotent mode, which `idempotent()` on its builder turns on. The producer then gets its id from `next_producer_id`, picks the partition of each chunk as a plain send does and numbers the chunks of each partition. After an unknown outcome, it sends a chunk again with the same producer section. The mode is off by default, because released consumers cannot poll the batches that it writes.
+
+A partition keeps 4096 producers. Past that limit, it drops the producer that was idle the longest. It also drops a producer after 24 hours without a batch. The producer state stays through restarts, checkpoints and state transfer between replicas. HTTP clients get `FeatureUnavailable` from `next_producer_id` and `send_producer_messages`. A client with an encryptor encrypts the messages of `send_producer_messages` in place, so pass the plaintext messages again to resend a batch.
+
+Released builds of the Rust SDK refuse a binary poll that returns a batch with a producer. They require zero bytes in that part of the header. The same holds for every client that embeds the Rust SDK: the Python, C++ and PHP SDKs, the CLI, the Kafka gateway and the connectors runtime. Released Swift SDKs refuse the batch too. The Go, Java, C# and Node.js SDKs do not read that part of the header. Upgrade every consumer of a topic before a producer writes such batches to it.
+
 ## Metadata changes
 
 `get_metadata_changes` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manage_servers` permission.

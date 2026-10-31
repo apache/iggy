@@ -197,6 +197,29 @@ pub enum IggyError {
     /// No poll progress was applied. Back off without invalidating the partition route.
     #[error("Deferred poll capacity exceeded; retry after backoff on the same replica")]
     DeferredPollCapacityExceeded = 90,
+    /// This client handed out every producer id of its session. Another
+    /// client, or this one after it signs in again, gets new ids.
+    #[error("This client has no producer ids left in its session")]
+    ProducerIdsExhausted = 91,
+    /// The batch does not follow the last batch that the partition holds for
+    /// its producer. Nothing was written.
+    #[error("The producer batch does not follow the last batch of its producer")]
+    ProducerSequenceOutOfOrder = 92,
+    /// A newer epoch of the producer wrote to the partition. Nothing was
+    /// written.
+    #[error("A newer epoch of the producer fenced this batch")]
+    ProducerEpochFenced = 93,
+    /// The partition holds no state for the producer, and the batch does not
+    /// start at sequence 0. Nothing was written. The producer starts a new
+    /// epoch at sequence 0.
+    #[error(
+        "The partition does not know this producer, and the batch does not start at sequence 0"
+    )]
+    ProducerUnknown = 94,
+    /// A batch of an idempotent producer names no partition. Its sequence
+    /// counts per partition, so `Balanced` and a messages key cannot pick one.
+    #[error("A producer batch must name its partition")]
+    ProducerPartitionRequired = 95,
     #[error("Client with ID: {0} was not found.")]
     ClientNotFound(u32) = 100,
     #[error("Invalid client ID")]

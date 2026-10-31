@@ -33,6 +33,7 @@ pub mod offset_storage;
 mod partition_storage;
 mod persistence;
 mod poll_plan;
+pub mod producer_state;
 pub use persistence::FileSyncBarrier;
 pub(crate) use persistence::PersistenceDrain;
 pub use persistence::{
@@ -153,6 +154,7 @@ pub struct RetainedPartitionState {
     pub(crate) history_transition: Option<iggy_partition::InstalledPartitionHistory>,
     pub(crate) owner_retirement:
         Option<iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest>,
+    pub(crate) producers: producer_state::ProducerTable,
 }
 
 /// Partition-level data plane operations.

@@ -899,6 +899,25 @@ pub fn producer_id(blob: &[u8]) -> Option<i64> {
     (id != NO_PRODUCER_ID).then_some(id)
 }
 
+/// The idempotent producer of a record batch, as its header names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProducerFields {
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+    pub base_sequence: i32,
+}
+
+/// The producer of the first batch in `blob`: its id, bytes 43 to 50, its epoch, bytes 51 and
+/// 52, and the sequence of its first record, bytes 53 to 56. `None` when it has no producer id.
+#[must_use]
+pub fn batch_producer(blob: &[u8]) -> Option<ProducerFields> {
+    Some(ProducerFields {
+        producer_id: producer_id(blob)?,
+        producer_epoch: i16::from_be_bytes(blob.get(51..53)?.try_into().ok()?),
+        base_sequence: i32::from_be_bytes(blob.get(53..57)?.try_into().ok()?),
+    })
+}
+
 /// The record count the first batch in `blob` declares, bytes 57 to 60. `None` when it has none.
 #[must_use]
 pub fn declared_records(blob: &[u8]) -> Option<usize> {
@@ -971,8 +990,7 @@ pub fn decode_batch(
 /// - The decoder reserves from `record_count` (`kafka-protocol-0.18.0/src/records.rs:517`), so
 ///   the count must fit the blob, plus the partition cap when compressed.
 /// - Control and transactional batches are refused: a stored message cannot carry their flags.
-///   An idempotent batch passes, its producer id, epoch and sequence ignored, because a stock
-///   Java producer is idempotent. `IDEMPOTENCE.md` has why a retry is then not deduplicated.
+///   An idempotent batch passes. Produce reads its producer with [`batch_producer`].
 fn preflight(buf: &Bytes, budget: &DecompressionBudget, zstd: Zstd) -> Result<()> {
     let mut rest = buf.clone();
     let infos = RecordBatchDecoder::decode_batch_info(&mut rest)
@@ -2517,6 +2535,26 @@ mod tests {
         );
         let unowned = encode_with(&[record_at_offset(0, b"v")], Compression::None);
         assert_eq!(producer_id(&unowned), None);
+    }
+
+    #[test]
+    fn given_an_idempotent_batch_when_its_producer_is_read_should_return_the_first_sequence() {
+        let mut records = vec![record_at_offset(0, b"a"), record_at_offset(1, b"b")];
+        for (sequence, record) in (17..).zip(records.iter_mut()) {
+            record.producer_id = 42;
+            record.producer_epoch = 3;
+            record.sequence = sequence;
+        }
+        assert_eq!(
+            batch_producer(&encode_with(&records, Compression::None)),
+            Some(ProducerFields {
+                producer_id: 42,
+                producer_epoch: 3,
+                base_sequence: 17,
+            })
+        );
+        let unowned = encode_with(&[record_at_offset(0, b"v")], Compression::None);
+        assert_eq!(batch_producer(&unowned), None);
     }
 
     #[test]

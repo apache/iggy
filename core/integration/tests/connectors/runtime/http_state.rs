@@ -30,10 +30,16 @@
 //!   * `503` burst mid-stream -> saves Nack, then recover once the store is
 //!     healthy again,
 //!   * API-driven restart -> the source reloads the served state and resumes
-//!     the ETag chain.
+//!     the ETag chain,
+//!   * exactly-once source whose save after a send fails -> the batch that the
+//!     plugin produces again lands once,
+//!   * exactly-once source restarted before its first save after a send -> the
+//!     batch lands once, and new batches use the next epoch.
 
 use assert_cmd::prelude::CommandCargoExt;
 use async_trait::async_trait;
+use iggy::prelude::IggyClient;
+use iggy_common::{Consumer, Identifier, MessageClient, PollOptions, PollingStrategy};
 use iggy_connector_sdk::api::{ConnectorRuntimeStats, ConnectorStatus, SourceInfoResponse};
 use integration::harness::config::TestServerConfig;
 use integration::harness::{TestBinaryError, TestFixture, TestHarness, seeds};
@@ -57,6 +63,20 @@ const WAIT_DEADLINE: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const IDEMPOTENCY_KEY_HEADER: HeaderName = HeaderName::from_static("idempotency-key");
 const STATE_URL_QUERY_SECRET: &str = "state-query-secret-not-for-logs";
+const EXACTLY_ONCE_KEY: &str = "random_exactly_once";
+const EXACTLY_ONCE_RESOURCE_PATH: &str = "/source_random_exactly_once";
+/// Starts the state of an exactly-once source.
+const EXACTLY_ONCE_MAGIC: &[u8] = b"\0IGGYEO\x01";
+/// The next sequence, after the magic, producer id, epoch and partition id.
+const EXACTLY_ONCE_NEXT_SEQUENCE_AT: usize = 22;
+/// The `messages_range` and `max_count` of the exactly-once source.
+const EXACTLY_ONCE_BATCH: usize = 3;
+const EXACTLY_ONCE_MESSAGES: usize = 60;
+/// Both attempts of one save at `max_attempts = 1`.
+const PUTS_PER_FAILED_SAVE: u64 = 2;
+/// Time for a batch that a source writes twice to reach the topic.
+const SETTLE_TIME: Duration = Duration::from_millis(500);
+const POLL_BATCH: u32 = 1_000;
 
 /// In-memory state server backing the wiremock responder. Enforces the
 /// conditional-write contract and exposes counters plus injectable failure
@@ -68,6 +88,9 @@ struct SharedStore {
     committed_requests: StdMutex<HashMap<String, (Vec<u8>, String)>>,
     conflict_mode: AtomicBool,
     fail_next_puts: AtomicU64,
+    /// Fails writes of an exactly-once state past the first batch, which the runtime saves after a
+    /// send.
+    fail_next_settled_puts: AtomicU64,
     get_count: AtomicU64,
     put_count: AtomicU64,
 }
@@ -120,6 +143,16 @@ impl Respond for StateStoreResponder {
                 return ResponseTemplate::new(409);
             }
             return ResponseTemplate::new(200).insert_header(ETAG, etag.as_str());
+        }
+        if stored_next_sequence(&request.body).is_some_and(|sequence| sequence > 0)
+            && store
+                .fail_next_settled_puts
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            return ResponseTemplate::new(503);
         }
         if store
             .fail_next_puts
@@ -175,21 +208,70 @@ pub struct HttpStateStoreFixture {
 #[async_trait]
 impl TestFixture for HttpStateStoreFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
-        let server = MockServer::start().await;
-        let store = Arc::new(SharedStore::default());
-        Mock::given(path(RESOURCE_PATH))
-            .respond_with(StateStoreResponder(store.clone()))
-            .mount(&server)
-            .await;
+        let (server, store) = start_state_server(RESOURCE_PATH, SharedStore::default()).await;
         Ok(Self { server, store })
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        HashMap::from([(
-            "IGGY_CONNECTORS_STATE_HTTP_URL".to_string(),
-            self.server.uri(),
-        )])
+        state_server_envs(&self.server)
     }
+}
+
+/// The state server of the exactly-once source. Its first `FAILED_SETTLED_PUTS` writes of a
+/// state past the first batch answer `503`, so the save after a send fails and the runtime Nacks a
+/// batch that Iggy holds.
+pub struct ExactlyOnceStateStore<const FAILED_SETTLED_PUTS: u64> {
+    server: MockServer,
+    store: Arc<SharedStore>,
+}
+
+#[async_trait]
+impl<const FAILED_SETTLED_PUTS: u64> TestFixture for ExactlyOnceStateStore<FAILED_SETTLED_PUTS> {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let store = SharedStore {
+            fail_next_settled_puts: AtomicU64::new(FAILED_SETTLED_PUTS),
+            ..SharedStore::default()
+        };
+        let (server, store) = start_state_server(EXACTLY_ONCE_RESOURCE_PATH, store).await;
+        Ok(Self { server, store })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        state_server_envs(&self.server)
+    }
+}
+
+/// The save after the first send fails.
+type LostSaveFixture = ExactlyOnceStateStore<PUTS_PER_FAILED_SAVE>;
+/// Every save after a send fails until the test clears the count.
+type FailingSavesFixture = ExactlyOnceStateStore<{ u64::MAX }>;
+
+async fn start_state_server(
+    resource_path: &str,
+    store: SharedStore,
+) -> (MockServer, Arc<SharedStore>) {
+    let server = MockServer::start().await;
+    let store = Arc::new(store);
+    Mock::given(path(resource_path))
+        .respond_with(StateStoreResponder(store.clone()))
+        .mount(&server)
+        .await;
+    (server, store)
+}
+
+fn state_server_envs(server: &MockServer) -> HashMap<String, String> {
+    HashMap::from([("IGGY_CONNECTORS_STATE_HTTP_URL".to_string(), server.uri())])
+}
+
+/// The first sequence of the next batch that the state of an exactly-once source names. `None`
+/// for any other state.
+fn stored_next_sequence(body: &[u8]) -> Option<u32> {
+    if !body.starts_with(EXACTLY_ONCE_MAGIC) {
+        return None;
+    }
+    body.get(EXACTLY_ONCE_NEXT_SEQUENCE_AT..EXACTLY_ONCE_NEXT_SEQUENCE_AT + 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_le_bytes)
 }
 
 async fn wait_until<F: Fn() -> bool>(what: &str, condition: F) {
@@ -202,7 +284,7 @@ async fn wait_until<F: Fn() -> bool>(what: &str, condition: F) {
     }
 }
 
-async fn fetch_source(harness: &TestHarness) -> SourceInfoResponse {
+async fn fetch_source(harness: &TestHarness, key: &str) -> SourceInfoResponse {
     let api_url = harness
         .connectors_runtime()
         .expect("connectors runtime handle should be available")
@@ -217,14 +299,14 @@ async fn fetch_source(harness: &TestHarness) -> SourceInfoResponse {
         .expect("Failed to parse sources");
     sources
         .into_iter()
-        .find(|source| source.key == SOURCE_KEY)
+        .find(|source| source.key == key)
         .expect("HTTP-state source should be reported")
 }
 
-async fn wait_for_status(harness: &TestHarness, expected: ConnectorStatus) {
+async fn wait_for_status(harness: &TestHarness, key: &str, expected: ConnectorStatus) {
     let deadline = Instant::now() + WAIT_DEADLINE;
     loop {
-        let source = fetch_source(harness).await;
+        let source = fetch_source(harness, key).await;
         if source.status == expected {
             return;
         }
@@ -232,6 +314,87 @@ async fn wait_for_status(harness: &TestHarness, expected: ConnectorStatus) {
             panic!(
                 "timed out after {WAIT_DEADLINE:?} waiting for source status {expected:?}, last seen {:?} ({:?})",
                 source.status, source.last_error
+            );
+        }
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+async fn wait_for_last_error(harness: &TestHarness, key: &str, expected: &str) {
+    let deadline = Instant::now() + WAIT_DEADLINE;
+    loop {
+        let source = fetch_source(harness, key).await;
+        if source
+            .last_error
+            .as_ref()
+            .is_some_and(|error| error.message.contains(expected))
+        {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out after {WAIT_DEADLINE:?} waiting for source error {expected:?}, last seen {:?}",
+                source.last_error
+            );
+        }
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+async fn restart_source(harness: &TestHarness, key: &str) {
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connectors runtime handle should be available")
+        .http_url();
+    let response = Client::new()
+        .post(format!("{api_url}/sources/{key}/restart"))
+        .send()
+        .await
+        .expect("restart request should be sent");
+    assert!(
+        response.status().is_success(),
+        "restart should succeed, got {}",
+        response.status()
+    );
+}
+
+/// The messages that partition 0 of the seeded topic holds.
+async fn stored_messages(client: &IggyClient) -> usize {
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let mut stored = 0;
+    loop {
+        let polled = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                0,
+                &Consumer::default(),
+                &PollingStrategy::offset(stored as u64),
+                PollOptions {
+                    count: POLL_BATCH,
+                    ..PollOptions::default()
+                },
+            )
+            .await
+            .expect("poll the source topic");
+        if polled.messages.is_empty() {
+            return stored;
+        }
+        stored += polled.messages.len();
+    }
+}
+
+async fn wait_for_messages(client: &IggyClient, expected: usize) {
+    let deadline = Instant::now() + WAIT_DEADLINE;
+    loop {
+        let stored = stored_messages(client).await;
+        if stored >= expected {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out after {WAIT_DEADLINE:?} waiting for {expected} messages, the topic holds {stored}"
             );
         }
         sleep(POLL_INTERVAL).await;
@@ -307,7 +470,7 @@ async fn given_empty_state_store_when_booted_should_run_and_checkpoint(
     fixture: HttpStateStoreFixture,
 ) {
     crate::connectors::random_source_liveness::assert_produces_messages(harness).await;
-    wait_for_status(harness, ConnectorStatus::Running).await;
+    wait_for_status(harness, SOURCE_KEY, ConnectorStatus::Running).await;
     wait_until("the first checkpoint PUT to reach the state server", || {
         fixture.store.version.load(Ordering::SeqCst) > 0
     })
@@ -332,7 +495,7 @@ async fn given_conflict_mid_stream_should_nack_and_latch(
     .await;
 
     fixture.store.conflict_mode.store(true, Ordering::SeqCst);
-    wait_for_status(harness, ConnectorStatus::Error).await;
+    wait_for_status(harness, SOURCE_KEY, ConnectorStatus::Error).await;
 
     let version_after_conflict = fixture.store.version.load(Ordering::SeqCst);
     let puts_after_conflict = fixture.store.put_count.load(Ordering::SeqCst);
@@ -350,7 +513,7 @@ async fn given_conflict_mid_stream_should_nack_and_latch(
 
     let deadline = Instant::now() + WAIT_DEADLINE;
     loop {
-        let source = fetch_source(harness).await;
+        let source = fetch_source(harness, SOURCE_KEY).await;
         if source
             .last_error
             .as_ref()
@@ -458,5 +621,81 @@ async fn given_restart_when_state_exists_should_resume_from_served_state(
     assert!(
         logs.contains("Restored state for Random source"),
         "the plugin should restore the served state on restart"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(
+        config_path = "tests/connectors/runtime/http_state_exactly_once.toml"
+    )),
+    seed = seeds::connector_stream
+)]
+async fn given_a_failed_save_after_a_send_when_the_source_sends_again_should_write_the_batch_once(
+    harness: &TestHarness,
+    fixture: LostSaveFixture,
+) {
+    let client = harness.root_client().await.expect("root client");
+
+    wait_for_messages(&client, EXACTLY_ONCE_MESSAGES).await;
+    sleep(SETTLE_TIME).await;
+
+    assert_eq!(
+        fixture.store.fail_next_settled_puts.load(Ordering::SeqCst),
+        0,
+        "the save after the first send must fail"
+    );
+    assert_eq!(
+        stored_messages(&client).await,
+        EXACTLY_ONCE_MESSAGES,
+        "the Nacked batch went out again and must land once"
+    );
+    assert_eq!(
+        stored_next_sequence(&fixture.store.body.lock().expect("store lock")),
+        u32::try_from(EXACTLY_ONCE_MESSAGES).ok(),
+        "the last save must settle the last batch"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(
+        config_path = "tests/connectors/runtime/http_state_exactly_once.toml"
+    )),
+    seed = seeds::connector_stream
+)]
+async fn given_an_unsaved_batch_when_the_source_restarts_should_write_the_batch_once(
+    harness: &TestHarness,
+    fixture: FailingSavesFixture,
+) {
+    // No save after a send lands, so the stored state names the first batch until the source
+    // stops at its Nack limit.
+    wait_for_last_error(harness, EXACTLY_ONCE_KEY, "consecutive NACK limit reached").await;
+    let client = harness.root_client().await.expect("root client");
+    assert_eq!(stored_messages(&client).await, EXACTLY_ONCE_BATCH);
+    assert_eq!(
+        stored_next_sequence(&fixture.store.body.lock().expect("store lock")),
+        Some(0),
+        "the stored state must name the first batch"
+    );
+    fixture
+        .store
+        .fail_next_settled_puts
+        .store(0, Ordering::SeqCst);
+
+    restart_source(harness, EXACTLY_ONCE_KEY).await;
+    wait_for_messages(&client, EXACTLY_ONCE_MESSAGES).await;
+    sleep(SETTLE_TIME).await;
+
+    assert_eq!(
+        stored_messages(&client).await,
+        EXACTLY_ONCE_MESSAGES,
+        "the unsaved batch went out again after the restart and must land once"
+    );
+    let (stdout, stderr) = harness
+        .connectors_runtime()
+        .expect("connectors runtime handle should be available")
+        .collect_logs();
+    assert!(
+        format!("{stdout}\n{stderr}").contains("at epoch 1 to partition 0"),
+        "the restarted source must write at the next epoch"
     );
 }

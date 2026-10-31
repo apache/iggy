@@ -203,22 +203,21 @@ builds one, so the answer does not depend on allocating a payload already known 
 
 ## Batch-level fields
 
-Per-record storage drops what the Kafka record batch header carries: producer id, producer
-epoch, base sequence, the transactional flag, compression and the batch CRC. Fetch synthesizes
-a batch with producer id `-1`, epoch `-1`, base sequence `-1`, no compression, `CreateTime`
+Per-record storage drops the transactional flag, the compression and the batch CRC of the Kafka
+record batch header. With `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, the producer id, the epoch and
+the base sequence of an idempotent batch go to the Iggy batch header, and the partition keeps them
+as producer state. Otherwise the gateway drops them. Fetch synthesizes a
+batch with producer id `-1`, epoch `-1`, base sequence `-1`, no compression, `CreateTime`
 timestamps, and a recomputed CRC32C.
 
 Two consequences worth stating before they surprise someone:
 
-- Idempotent-producer deduplication cannot be reconstructed from stored data later. If
-  [#3545](https://github.com/apache/iggy/issues/3545) ever grows past a stub, producer id,
-  epoch and sequence need their own tracking.
+- The partition writes each batch of an idempotent producer once, from the producer state that
+  it keeps. See [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 - The bytes a consumer receives are not the bytes the producer sent, so anything comparing
   batches byte for byte across the gateway will differ.
 
-Whether producer id `-1` is what Fetch actually sends depends on the InitProducerId decision in
-[`IDEMPOTENCE.md`](IDEMPOTENCE.md). Allocating producer ids does not change what is stored, only
-what Produce accepts, so this section holds under either answer.
+Fetch sends producer id `-1` whatever producer wrote the batch. A consumer does not need it.
 
 Produce refuses a control batch and a transactional batch. A stored message carries neither flag.
 A control record admitted here therefore reaches consumers as ordinary application data, and a

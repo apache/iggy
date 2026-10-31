@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::{
-    Consumer, DecodeError, Identifier, IggyError, IggyMessage, Partitioning, PollOptions,
-    PolledMessages, PollingStrategy, SendMessagesResponse,
+    BatchProducer, Consumer, DecodeError, Identifier, IggyError, IggyMessage, Partitioning,
+    PollOptions, PolledMessages, PollingStrategy, SendMessagesResponse,
 };
 use async_trait::async_trait;
 
@@ -151,4 +151,39 @@ pub trait MessageClient {
         partitioning: &Partitioning,
         messages: &mut [IggyMessage],
     ) -> Result<SendMessagesResponse, IggyError>;
+
+    /// [`Self::send_messages`] for one batch of an idempotent producer, to
+    /// the partition `partition_id`. The producer counts its sequence per
+    /// partition, so the caller names the partition.
+    ///
+    /// The partition keeps the last batches of each producer. A batch it
+    /// already holds is not written again: the reply names the offset of its
+    /// first write. Only binary clients send a producer, and HTTP returns
+    /// [`IggyError::FeatureUnavailable`].
+    ///
+    /// A client with an encryptor encrypts `messages` in place. To resend a
+    /// batch, pass its plaintext messages again.
+    async fn send_producer_messages(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: u32,
+        producer: BatchProducer,
+        messages: &mut [IggyMessage],
+    ) -> Result<SendMessagesResponse, IggyError> {
+        let _ = (stream_id, topic_id, partition_id, producer, messages);
+        Err(IggyError::FeatureUnavailable)
+    }
+
+    /// A producer id that no other client of the cluster gets. It is built
+    /// from this client's session number, the op of its `Register`, so no
+    /// request goes to the server. The ids of a session stay unique after the
+    /// session ends, so a producer can store its id and use it again.
+    ///
+    /// Fails with [`IggyError::ProducerIdsExhausted`] after 2^20 ids from one
+    /// session, and with [`IggyError::Unauthenticated`] before a sign-in.
+    /// HTTP returns [`IggyError::FeatureUnavailable`].
+    async fn next_producer_id(&self) -> Result<u64, IggyError> {
+        Err(IggyError::FeatureUnavailable)
+    }
 }

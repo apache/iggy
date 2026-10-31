@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::BinaryClient;
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::{
     consumer_to_wire, identifier_to_wire, partitioning_to_wire, polling_strategy_to_wire,
 };
 use crate::{
-    CommitPolicy, Consumer, DecodeError, DeferredPollOptions, FetchedSection, Identifier,
-    IggyError, IggyMessage, MessageClient, Partitioning, PollOptions, PolledMessages,
+    BatchProducer, CommitPolicy, Consumer, DecodeError, DeferredPollOptions, FetchedSection,
+    Identifier, IggyError, IggyMessage, MessageClient, Partitioning, PollOptions, PolledMessages,
     PollingStrategy, SendMessagesResponse,
 };
+use crate::{BinaryClient, VsrSessionControl};
 use crate::{
     PartitioningKind, TopicClient, binary_operation_deadline, calculate_32, with_binary_deadline,
     with_binary_lineage,
@@ -142,11 +142,13 @@ async fn fresh_topic_partition_count<B: BinaryClient>(
 
 /// A chunk keeps its selected partition while an earlier lane blocker resolves.
 /// Only a definitive missing-partition result permits one fresh selection.
+/// An idempotent producer rides along, so every send of the chunk carries it.
 #[doc(hidden)]
 pub struct BinarySendPartitioning<'a> {
     original: &'a Partitioning,
     selected: Option<Cow<'a, Partitioning>>,
     refreshed: bool,
+    producer: Option<BatchProducer>,
 }
 
 impl<'a> BinarySendPartitioning<'a> {
@@ -155,11 +157,25 @@ impl<'a> BinarySendPartitioning<'a> {
             original,
             selected: None,
             refreshed: false,
+            producer: None,
         }
+    }
+
+    /// The producer counts its sequence per partition, so `original` must
+    /// name the partition.
+    #[must_use]
+    pub const fn with_producer(mut self, producer: BatchProducer) -> Self {
+        debug_assert!(matches!(self.original.kind, PartitioningKind::PartitionId));
+        self.producer = Some(producer);
+        self
     }
 
     pub fn original(&self) -> &Partitioning {
         self.original
+    }
+
+    pub const fn producer(&self) -> Option<BatchProducer> {
+        self.producer
     }
 
     pub fn is_resolved(&self) -> bool {
@@ -184,13 +200,13 @@ pub async fn send_binary_messages<B: BinaryClient>(
                     PartitioningKind::PartitionId => Cow::Borrowed(partitioning.original),
                     _ => {
                         let count = topic_partition_count(client, stream_id, topic_id).await?;
-                        Cow::Owned(select_partition(
+                        Cow::Owned(Partitioning::partition_id(select_partition(
                             client,
                             stream_id,
                             topic_id,
                             partitioning.original,
                             count,
-                        )?)
+                        )?))
                     }
                 });
             }
@@ -199,7 +215,13 @@ pub async fn send_binary_messages<B: BinaryClient>(
                     .selected
                     .as_deref()
                     .ok_or(IggyError::InvalidCommand)?;
-                let payload = encode_messages(stream_id, topic_id, selected, messages)?;
+                let payload = encode_messages(
+                    stream_id,
+                    topic_id,
+                    selected,
+                    partitioning.producer,
+                    messages,
+                )?;
                 match client
                     .send_raw_with_context(
                         SEND_MESSAGES_CODE,
@@ -215,13 +237,14 @@ pub async fn send_binary_messages<B: BinaryClient>(
                         partitioning.refreshed = true;
                         let count =
                             fresh_topic_partition_count(client, stream_id, topic_id).await?;
-                        partitioning.selected = Some(Cow::Owned(select_partition(
-                            client,
-                            stream_id,
-                            topic_id,
-                            partitioning.original,
-                            count,
-                        )?));
+                        partitioning.selected =
+                            Some(Cow::Owned(Partitioning::partition_id(select_partition(
+                                client,
+                                stream_id,
+                                topic_id,
+                                partitioning.original,
+                                count,
+                            )?)));
                     }
                     result => {
                         return result.map(|response| committed_send_confirmations(&response));
@@ -233,13 +256,40 @@ pub async fn send_binary_messages<B: BinaryClient>(
     .await
 }
 
+/// The partition that a send with `partitioning` goes to, picked as
+/// [`send_binary_messages`] picks it. With `fresh`, the partition count comes
+/// from the topic details instead of a cached route.
+#[doc(hidden)]
+pub async fn select_send_partition<B: BinaryClient>(
+    client: &B,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    partitioning: &Partitioning,
+    fresh: bool,
+) -> Result<u32, IggyError> {
+    if partitioning.kind == PartitioningKind::PartitionId {
+        return partitioning
+            .value
+            .get(..4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_le_bytes)
+            .ok_or(IggyError::InvalidCommand);
+    }
+    let count = if fresh {
+        fresh_topic_partition_count(client, stream_id, topic_id).await?
+    } else {
+        topic_partition_count(client, stream_id, topic_id).await?
+    };
+    select_partition(client, stream_id, topic_id, partitioning, count)
+}
+
 fn select_partition<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,
     topic_id: &Identifier,
     partitioning: &Partitioning,
     count: u32,
-) -> Result<Partitioning, IggyError> {
+) -> Result<u32, IggyError> {
     if count == 0 {
         return Err(IggyError::TopicIdNotFound(
             topic_id.clone(),
@@ -253,7 +303,7 @@ fn select_partition<B: BinaryClient>(
         PartitioningKind::MessagesKey => calculate_32(&partitioning.value) % count,
         PartitioningKind::PartitionId => return Err(IggyError::InvalidCommand),
     };
-    Ok(Partitioning::partition_id(partition))
+    Ok(partition)
 }
 
 /// Read up to `count` messages from several partitions in one request to their primary, and
@@ -495,12 +545,36 @@ impl<B: BinaryClient> MessageClient for B {
         )
         .await
     }
+
+    async fn send_producer_messages(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: u32,
+        producer: BatchProducer,
+        messages: &mut [IggyMessage],
+    ) -> Result<SendMessagesResponse, IggyError> {
+        send_binary_messages(
+            self,
+            stream_id,
+            topic_id,
+            &mut BinarySendPartitioning::new(&Partitioning::partition_id(partition_id))
+                .with_producer(producer),
+            messages,
+        )
+        .await
+    }
+
+    async fn next_producer_id(&self) -> Result<u64, IggyError> {
+        VsrSessionControl::next_producer_id(self)
+    }
 }
 
 fn encode_messages(
     stream_id: &Identifier,
     topic_id: &Identifier,
     partitioning: &Partitioning,
+    producer: Option<BatchProducer>,
     messages: &mut [IggyMessage],
 ) -> Result<Bytes, IggyError> {
     let wire_stream_id = identifier_to_wire(stream_id)?;
@@ -530,11 +604,12 @@ fn encode_messages(
         &raw_messages,
     );
     let mut buf = BytesMut::with_capacity(size);
-    SendMessagesEncoder::encode(
+    SendMessagesEncoder::encode_with_producer(
         &mut buf,
         &wire_stream_id,
         &wire_topic_id,
         &wire_partitioning,
+        producer,
         &raw_messages,
     )
     .map_err(|error| match error {

@@ -31,6 +31,7 @@ use crate::poll_plan::{
     DiskReadPlan, DiskSegment, PartitionDirResolution, PollContext, PollPlan, PollReadResult,
     PollTier, ResidentTailSnapshot,
 };
+use crate::producer_state::{ProducerAdmission, ProducerEntry, ProducerTable, StampedBatch};
 use crate::segment::Segment;
 use crate::state_transfer::{
     PartitionTransferSession, PartitionTransferUnavailable, PendingTransferRearm, TransferPlanSlot,
@@ -56,6 +57,7 @@ use consensus::{
     replicate_preflight, restamp_prepare_view, send_prepare_ok as send_prepare_ok_common,
     verify_prepare_integrity,
 };
+use iggy_binary_protocol::batch::BatchProducer;
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::consumer_offsets::{
@@ -140,6 +142,10 @@ where
     /// group, where preallocating the cap would reserve hundreds of KiB per
     /// partition before a client connects).
     dedup: ClientTable,
+    /// Committed state of idempotent producers. Every replica records a
+    /// committed batch in op order. The primary checks a producer's batch
+    /// against it and the uncommitted prepares before the batch gets offsets.
+    producers: ProducerTable,
     pub log: SegmentedLog<PartitionJournal<PartitionJournalMemStorage>>,
     /// Highest durably persisted offset.
     pub offset: Arc<AtomicU64>,
@@ -880,6 +886,7 @@ where
                 consensus::PARTITION_DEDUP_CLIENTS_MAX,
                 ClientTableMode::PartitionSlice,
             ),
+            producers: ProducerTable::default(),
             log: SegmentedLog::default(),
             offset: Arc::new(AtomicU64::new(0)),
             dirty_offset: AtomicU64::new(0),
@@ -1407,6 +1414,21 @@ where
     #[must_use]
     pub const fn consensus(&self) -> &VsrConsensus<B> {
         &self.consensus
+    }
+
+    /// The committed producer table, ascending by producer id, as a
+    /// checkpoint or a transfer offer carries it.
+    pub(crate) fn producer_entries(&self) -> Vec<(u64, ProducerEntry)> {
+        self.producers
+            .entries()
+            .map(|(producer_id, entry)| (producer_id, *entry))
+            .collect()
+    }
+
+    /// Replace the committed producer table with the one a checkpoint or a
+    /// transfer carried.
+    pub(crate) fn restore_producers(&mut self, entries: Vec<(u64, ProducerEntry)>) {
+        self.producers = ProducerTable::from_entries(entries);
     }
 
     /// This group's dedup slice. Read at admission to classify a request,
@@ -2991,6 +3013,7 @@ where
             consumer_group_owners: std::mem::take(&mut self.consumer_group_owners),
             history_transition: self.history_transition,
             owner_retirement: self.owner_retirement.take(),
+            producers: std::mem::take(&mut self.producers),
             durable_offset: self.offset.load(Ordering::Acquire),
             write_offset: self.dirty_offset.load(Ordering::Relaxed),
             offset_space: self.offset_space,
@@ -3030,11 +3053,13 @@ where
             consumer_group_owners,
             history_transition,
             owner_retirement,
+            producers,
         } = state;
         self.log = log;
         self.consumer_group_owners = consumer_group_owners;
         self.history_transition = history_transition;
         self.owner_retirement = owner_retirement;
+        self.producers = producers;
         if let Some(capacity) = retry_capacity {
             self.dedup
                 .install_watermarks(capacity, retry_protection)
@@ -4561,6 +4586,117 @@ where
                 .set(self.local_request_order.get().max(order.0.get()));
         }
         prepare
+    }
+
+    /// Checks the batch of an idempotent producer right before the request
+    /// becomes a prepare and its batch gets offsets. Answers a batch that the
+    /// partition does not write, and returns whether the request goes on.
+    async fn admit_producer_batch(
+        &self,
+        message: &Message<RoutedRequestHeader>,
+        reply: &mut Option<consensus::Sender<Message<ReplyHeader>>>,
+    ) -> bool {
+        let header = message.header();
+        let refusal = match self.check_producer_batch(message) {
+            Ok(ProducerAdmission::Append) => return true,
+            Ok(ProducerAdmission::Duplicate { base_offset }) => {
+                // The batch committed, so the answer is a committed result,
+                // which also settles a send the client holds as uncertain.
+                let duplicate = build_reply_from_request(
+                    &self.consensus,
+                    header,
+                    send_confirmation_body(header.group, base_offset),
+                )
+                .transmute_header(|mut duplicate, output: &mut ReplyHeader| {
+                    duplicate.reserved[0] = ReplyHeader::COMMITTED_RESULT;
+                    duplicate.partition_incarnation = header.partition_incarnation;
+                    *output = duplicate;
+                });
+                Self::deliver_reply_or_log(
+                    &self.consensus,
+                    header,
+                    CachedReply::from(duplicate),
+                    reply.take(),
+                    "producer duplicate reply send failed",
+                )
+                .await;
+                return false;
+            }
+            // The first copy can still commit, so the outcome of this send
+            // stays unknown, as for a request that is still pending.
+            Ok(ProducerAdmission::DuplicateInFlight) => IggyError::TransientNotCommitted,
+            Ok(ProducerAdmission::OutOfOrder) => IggyError::ProducerSequenceOutOfOrder,
+            Ok(ProducerAdmission::Unknown) => IggyError::ProducerUnknown,
+            Ok(ProducerAdmission::StaleEpoch) => IggyError::ProducerEpochFenced,
+            Err(error) => error,
+        };
+        Self::send_partition_deny_or_log(
+            &self.consensus,
+            header,
+            refusal.as_code(),
+            "producer batch refusal reply failed",
+            reply.take(),
+        )
+        .await;
+        false
+    }
+
+    fn check_producer_batch(
+        &self,
+        message: &Message<RoutedRequestHeader>,
+    ) -> Result<ProducerAdmission, IggyError> {
+        if message.header().operation != Operation::SendMessages {
+            return Ok(ProducerAdmission::Append);
+        }
+        let batch = message
+            .as_slice()
+            .get(std::mem::size_of::<RoutedRequestHeader>()..)
+            .and_then(|body| BatchHeader::decode(body).ok())
+            .ok_or(IggyError::InvalidCommand)?;
+        let Some(producer) = batch.producer else {
+            return Ok(ProducerAdmission::Append);
+        };
+        let in_flight = self.in_flight_producer_batches(producer.producer_id())?;
+        Ok(self
+            .producers
+            .admit(producer, batch.message_count, &in_flight))
+    }
+
+    /// The batches of `producer_id` in the uncommitted prepares, in op order.
+    /// A prepare this replica cannot read leaves the answer unknown, so the
+    /// sender is told to retry.
+    fn in_flight_producer_batches(&self, producer_id: u64) -> Result<Vec<StampedBatch>, IggyError> {
+        let head = self.consensus.sequencer().current_sequence();
+        let mut batches = Vec::new();
+        for op in self.consensus.commit_min().saturating_add(1)..=head {
+            let entry = self
+                .log
+                .journal()
+                .inner
+                .repair_entry(op)
+                .filter(|entry| !entry.is_empty())
+                .ok_or(IggyError::TransientNotAccepted)?;
+            if peek_operation(&entry) != Operation::SendMessages {
+                continue;
+            }
+            let batch = entry
+                .as_slice()
+                .get(std::mem::size_of::<PrepareHeader>()..)
+                .and_then(|body| BatchHeader::decode(body).ok())
+                .ok_or(IggyError::TransientNotAccepted)?;
+            if let Some(producer) = batch
+                .producer
+                .filter(|producer| producer.producer_id() == producer_id)
+            {
+                batches.push(StampedBatch {
+                    producer,
+                    message_count: batch.message_count,
+                    base_offset: batch.base_offset,
+                    timestamp: batch.base_timestamp,
+                });
+            }
+        }
+        Ok(batches)
     }
 
     fn local_request_must_queue(&self) -> bool {
@@ -7920,6 +8056,9 @@ where
                         .await;
                     return;
                 }
+                if !self.admit_producer_batch(&message, &mut reply).await {
+                    return;
+                }
                 if let Some((kind, consumer_id, Some(_), _)) = consumer_offset
                     && !self
                         .admit_consumer_offset_key(message.header(), kind, consumer_id, &mut reply)
@@ -8192,6 +8331,15 @@ where
                     }
                     continue;
                 }
+            }
+            if !self
+                .admit_producer_batch(&request.message, &mut reply_sender)
+                .await
+            {
+                if Self::record_promotion_denial(&mut consecutive_denials) {
+                    break;
+                }
+                continue;
             }
             consecutive_denials = 0;
             if queued_install.is_some() {
@@ -11450,6 +11598,14 @@ where
     }
 
     fn publish_committed_batch_stats(&mut self, batch_stats: CommittedBatchStats) {
+        if let Some(producer) = batch_stats.producer {
+            self.producers.record(&StampedBatch {
+                producer,
+                message_count: batch_stats.message_count,
+                base_offset: batch_stats.base_offset,
+                timestamp: batch_stats.timestamp,
+            });
+        }
         self.widest_batch_bytes
             .set(self.widest_batch_bytes.get().max(batch_stats.size_bytes));
         let end_offset = batch_stats.end_offset();
@@ -11524,6 +11680,8 @@ where
             base_offset: batch.header.base_offset,
             message_count,
             size_bytes: batch.header.total_size() as u64,
+            producer: batch.header.producer,
+            timestamp: batch.header.base_timestamp,
         }))
     }
 
@@ -13378,14 +13536,18 @@ const _: () = assert!(!Operation::SendMessages.is_result_framed());
 /// it reads the legacy server's empty body. That is also why absence must stay
 /// absent - a placeholder entry would carry a valid stream/topic/partition/
 /// offset tuple and be indistinguishable from a real commit at offset 0.
-#[allow(clippy::cast_possible_truncation)]
 fn send_messages_reply_body(
     namespace: u64,
     batch_stats: Option<CommittedBatchStats>,
 ) -> bytes::Bytes {
-    let Some(stats) = batch_stats else {
-        return bytes::Bytes::from_static(&[0, 0, 0, 0]);
-    };
+    batch_stats.map_or_else(
+        || bytes::Bytes::from_static(&[0, 0, 0, 0]),
+        |stats| send_confirmation_body(namespace, stats.base_offset),
+    )
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn send_confirmation_body(namespace: u64, base_offset: u64) -> bytes::Bytes {
     let namespace = IggyNamespace::from_raw(namespace);
     SendMessagesResponse {
         confirmations: vec![SendMessagesConfirmationResponse {
@@ -13394,7 +13556,7 @@ fn send_messages_reply_body(
             stream_id: namespace.stream_id() as u32,
             topic_id: namespace.topic_id() as u32,
             partition_id: namespace.partition_id() as u32,
-            base_offset: stats.base_offset,
+            base_offset,
         }],
     }
     .to_bytes()
@@ -13409,6 +13571,8 @@ struct CommittedBatchStats {
     base_offset: u64,
     message_count: u32,
     size_bytes: u64,
+    producer: Option<BatchProducer>,
+    timestamp: u64,
 }
 
 struct JournaledMessages {
@@ -14244,6 +14408,7 @@ mod tests {
                     groups: Vec::new(),
                     external_groups: Vec::new(),
                     dedup: Vec::new(),
+                    producers: Vec::new(),
                 };
                 partition
                     .install_state_transfer(&repair_config(), 1, staged, &offsets.encode())
@@ -14315,6 +14480,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         partition
             .install_state_transfer(&repair_config(), 3, staged, &offsets.encode())
@@ -14365,6 +14531,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         assert!(matches!(
             partition
@@ -14591,6 +14758,7 @@ mod tests {
             owners: Vec::new(),
             history_transition: None,
             owner_retirement: None,
+            producers: Vec::new(),
         };
 
         let result = partition
@@ -17569,6 +17737,7 @@ mod tests {
             owners: Vec::new(),
             history_transition: None,
             owner_retirement: None,
+            producers: Vec::new(),
         };
         let installed = backup
             .install_state_transfer(&repair_config(), 1, vec![staged], &offsets.encode())
@@ -18353,6 +18522,7 @@ mod tests {
                     dedup: partition.dedup.watermarks_sorted(),
                     owners: Vec::new(),
                     history_transition: None,
+                    producers: Vec::new(),
                 };
                 partition
                     .install_state_transfer(&config, 2, vec![staged], &offsets.encode())
@@ -21955,6 +22125,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         let outcome = partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &offer.encode())
@@ -23070,6 +23241,7 @@ mod tests {
             groups: vec![(9, 3)],
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &wire.encode())
@@ -23309,6 +23481,8 @@ mod tests {
                             base_offset: 0,
                             message_count: 1,
                             size_bytes: 0,
+                            producer: None,
+                            timestamp: 0,
                         }),
                     ),
                 );
@@ -24821,6 +24995,7 @@ mod tests {
             groups: vec![(8, 5)],
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         partition
             .install_state_transfer(&repair_config(), 1, Vec::new(), &wire.encode())
@@ -28367,6 +28542,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         let installed_commit_operation = 12;
         partition
@@ -28550,6 +28726,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         let offered_commit_operation = 12;
         let install_error = partition
@@ -33710,6 +33887,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         let refused = partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &behind.encode())
@@ -33765,6 +33943,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            producers: Vec::new(),
         };
         let refused = partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &stale.encode())
@@ -33843,6 +34022,39 @@ mod tests {
 
         assert_holds_message_less_state(&receiver, &origin, &transition);
         assert_eq!(receiver.created_revision(), incarnation);
+    }
+
+    /// The offer carries the committed producer table, so a replica that
+    /// catches up by transfer answers a resent batch as its donor does.
+    #[compio::test]
+    async fn given_a_producer_table_when_a_replica_transfers_should_hold_it() {
+        let (_origin_directory, mut origin, _) = message_less_origin().await;
+        origin.producers.record(&StampedBatch {
+            producer: BatchProducer::new(7, 2, 0).unwrap(),
+            message_count: 3,
+            base_offset: 0,
+            timestamp: 1,
+        });
+
+        let offer = origin.state_transfer_offer(&repair_config()).await.unwrap();
+        let (_receiver_directory, mut receiver) = transfer_receiver();
+        receiver
+            .install_state_transfer(
+                &repair_config(),
+                offer.commit_op,
+                Vec::new(),
+                &offer.offsets.1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(receiver.producer_entries(), origin.producer_entries());
+        assert_eq!(
+            receiver
+                .producers
+                .admit(BatchProducer::new(7, 2, 0).unwrap(), 3, &[]),
+            ProducerAdmission::Duplicate { base_offset: 0 }
+        );
     }
 
     /// A replica that never took a message and lags past every op its peers
@@ -34077,6 +34289,8 @@ mod tests {
             base_offset,
             message_count,
             size_bytes: 128,
+            producer: None,
+            timestamp: 0,
         }
     }
 
@@ -34937,6 +35151,7 @@ mod tests {
             owners: Vec::new(),
             history_transition: None,
             owner_retirement: None,
+            producers: Vec::new(),
         };
         partition
             .install_state_transfer(&repair_config(), INSTALLED_OPS, staged, &offsets.encode())

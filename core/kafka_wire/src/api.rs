@@ -57,8 +57,8 @@ pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = ResponseError::UnknownTopicOrP
 /// Retriable, nothing written. The Produce stub, and a partition refused because the request
 /// budget ran out.
 pub const ERROR_NOT_LEADER_OR_FOLLOWER: i16 = ResponseError::NotLeaderOrFollower.code();
-/// Outcome unknown: the write may have landed. Retriable, so a retry can duplicate it.
-/// Idempotent produce (#3545) closes that.
+/// Outcome unknown: the write may have landed. Retriable. A retry of an idempotent batch writes
+/// nothing new, and a retry of any other batch can write it twice.
 pub const ERROR_REQUEST_TIMED_OUT: i16 = ResponseError::RequestTimedOut.code();
 /// Produce: a record, send or partition too large, even alone. Not retried as-is. Java splits a
 /// multi-record batch and sends the halves.
@@ -176,6 +176,16 @@ pub const ERROR_GROUP_MAX_SIZE_REACHED: i16 = 81;
 /// The member id does not hold the `group_instance_id` it named, or a static member that
 /// returned has since replaced it.
 pub const ERROR_FENCED_INSTANCE_ID: i16 = 82;
+/// Produce: the batch does not follow the last batch of its producer.
+///
+/// A batch older than the batches that the partition keeps gets it too. The Java producer retries
+/// it, and moves to a new epoch when the gap is real.
+pub const ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = ResponseError::OutOfOrderSequenceNumber.code();
+/// Produce: a newer epoch of the producer wrote to the partition.
+pub const ERROR_INVALID_PRODUCER_EPOCH: i16 = ResponseError::InvalidProducerEpoch.code();
+/// Produce: the partition no longer holds the producer, and the batch does not start at
+/// sequence 0. The Java producer moves to a new epoch and sends the batch again from 0.
+pub const ERROR_UNKNOWN_PRODUCER_ID: i16 = ResponseError::UnknownProducerId.code();
 /// Produce: a record or batch this gateway cannot map.
 ///
 /// Not `CORRUPT_MESSAGE` (2), whose text fits but which `kafka-protocol`'s table marks
