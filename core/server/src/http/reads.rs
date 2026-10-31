@@ -978,6 +978,7 @@ pub(in crate::http) mod tests {
                                 fragments: Vec::new().into(),
                                 current_offset: 0,
                                 encryptor: None,
+                                next_offset: None,
                             }
                         }
                         PartitionRead::ConsumerOffsetOnPrimary { .. } => {
@@ -1203,6 +1204,7 @@ pub(in crate::http) mod tests {
                 fragments: Vec::new().into(),
                 current_offset: 0,
                 encryptor: None,
+                next_offset: None,
             },
             PartitionRead::ConsumerOffsetOnPrimary { .. } => PartitionReadReply::ConsumerOffset {
                 stored: Some(0),

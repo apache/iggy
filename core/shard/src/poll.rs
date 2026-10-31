@@ -30,7 +30,7 @@
 //! before any replication wait.
 
 use crate::shards_table::ShardsTable;
-use crate::{IggyShard, PartitionRead, PartitionReadReply, Sender};
+use crate::{ConsumerOffsetRead, IggyShard, PartitionRead, PartitionReadReply, Sender};
 use consensus::client_table::SessionAttachment;
 use consensus::{Consensus, MetadataHandle, PartitionsHandle, is_partition_receipt_operation};
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
@@ -170,6 +170,14 @@ where
             self.admit_deferred_poll(namespace, *request, &reply);
             return;
         }
+        if let PartitionRead::ConsumerOffsetsOnPrimary { reads } = read {
+            let offsets = reads
+                .into_iter()
+                .map(|read| self.consumer_offset_on_primary(read))
+                .collect();
+            let _ = reply.try_send(PartitionReadReply::ConsumerOffsets(offsets));
+            return;
+        }
         let partitions = self.plane.partitions();
         if matches!(read, PartitionRead::SessionRetired { .. }) {
             let failed_revision = partitions.failed_revision(&namespace).or_else(|| {
@@ -185,101 +193,7 @@ where
                 return;
             }
         }
-        let rejection = partitions
-            .with_partition(&namespace, |partition| {
-                if read.requires_primary() {
-                    let consensus = partition.consensus();
-                    if consensus.is_normal_backup() {
-                        return Some(IggyError::NotPrimary);
-                    }
-                    if !consensus.is_primary()
-                        || !consensus.is_normal()
-                        || consensus.is_transferring()
-                    {
-                        return Some(IggyError::TransientNotAccepted);
-                    }
-                }
-                if partition.requires_state_transfer() || partition.read_history_is_changing() {
-                    return Some(IggyError::TransientNotAccepted);
-                }
-                // The merged log of a new view can hold a message append or an
-                // offset store that the old view acknowledged. The new primary
-                // applies it only after the view starts, so until then a poll
-                // can miss acknowledged messages and a stored offset can be
-                // older. The head is current only on the primary that started
-                // the view.
-                if read.reads_messages_or_offset()
-                    && partition.consensus().is_primary()
-                    && !partition.consensus().applied_view_start()
-                {
-                    return Some(IggyError::TransientNotAccepted);
-                }
-                if let PartitionRead::ConsumerOffsetOnPrimary { metadata, .. }
-                | PartitionRead::ExternalGroupOffsetOnPrimary { metadata, .. } = &read
-                {
-                    if !metadata
-                        .is_valid_for_offset(self.plane.metadata().mux_stm.streams(), namespace)
-                        || !metadata.matches_partition(self.shards_table.epoch_for(namespace))
-                    {
-                        return Some(IggyError::TransientNotAccepted);
-                    }
-                    if partition.history_deleted() {
-                        return Some(IggyError::HistoryUnavailable);
-                    }
-                }
-                if let PartitionRead::PollOnPrimary {
-                    consumer,
-                    attachment,
-                    ..
-                } = &read
-                {
-                    let consensus = partition.consensus();
-                    if !consensus.is_primary()
-                        || !consensus.is_normal()
-                        || consensus.is_transferring()
-                        || !attachment
-                            .metadata
-                            .matches_partition(self.shards_table.epoch_for(namespace))
-                    {
-                        return Some(IggyError::TransientNotAccepted);
-                    }
-                    // This node's metadata can lag a delete fence the partition
-                    // already applied, so it still authorizes the old incarnation.
-                    if partition.history_deleted() {
-                        return Some(IggyError::HistoryUnavailable);
-                    }
-                    // The plan captures this owner in the same turn, and
-                    // completion refuses an owner that changed since.
-                    return match *consumer {
-                        PollingConsumer::ConsumerGroup(group_id, _) => group_owner_rejection(
-                            namespace,
-                            group_id as u64,
-                            partition.consumer_group_owner(group_id as u64),
-                            &attachment.metadata,
-                        ),
-                        PollingConsumer::Consumer(..) => None,
-                    };
-                }
-                if let PartitionRead::Poll {
-                    metadata: Some(metadata),
-                    ..
-                }
-                | PartitionRead::UnboundPollOnPrimary { metadata, .. } = &read
-                    && (!metadata.is_valid(self.plane.metadata().mux_stm.streams(), namespace)
-                        || !metadata.matches_partition(self.shards_table.epoch_for(namespace)))
-                {
-                    return Some(IggyError::TransientNotAccepted);
-                }
-                (matches!(
-                    read,
-                    PartitionRead::Poll { .. } | PartitionRead::UnboundPollOnPrimary { .. }
-                ) && partition.history_deleted())
-                .then_some(IggyError::HistoryUnavailable)
-            })
-            .unwrap_or_else(|| {
-                read.requires_primary()
-                    .then_some(IggyError::TransientNotAccepted)
-            });
+        let rejection = self.partition_read_rejection(namespace, &read);
         if let Some(error) = rejection {
             let _ = reply.try_send(PartitionReadReply::Rejected(error));
             return;
@@ -330,6 +244,10 @@ where
                 })
                 .unwrap_or(PartitionReadReply::NotFound),
             PartitionRead::DeferredPoll(_) => unreachable!("deferred admission handled above"),
+            // Answered above, entry by entry.
+            PartitionRead::ConsumerOffsetsOnPrimary { .. } => {
+                PartitionReadReply::Rejected(IggyError::InvalidCommand)
+            }
             PartitionRead::Primary => partitions
                 .with_partition(&namespace, |partition| {
                     let consensus = partition.consensus();
@@ -454,6 +372,143 @@ where
         let _ = reply.try_send(result);
     }
 
+    /// The condition of this shard that refuses `read` of `namespace` before
+    /// it runs, if any.
+    #[allow(clippy::too_many_lines)]
+    fn partition_read_rejection(
+        &self,
+        namespace: IggyNamespace,
+        read: &PartitionRead,
+    ) -> Option<IggyError> {
+        let partitions = self.plane.partitions();
+        partitions
+            .with_partition(&namespace, |partition| {
+                if read.requires_primary() {
+                    let consensus = partition.consensus();
+                    if consensus.is_normal_backup() {
+                        return Some(IggyError::NotPrimary);
+                    }
+                    if !consensus.is_primary()
+                        || !consensus.is_normal()
+                        || consensus.is_transferring()
+                    {
+                        return Some(IggyError::TransientNotAccepted);
+                    }
+                }
+                if partition.requires_state_transfer() || partition.read_history_is_changing() {
+                    return Some(IggyError::TransientNotAccepted);
+                }
+                // The merged log of a new view can hold a message append or an
+                // offset store that the old view acknowledged. The new primary
+                // applies it only after the view starts, so until then a poll
+                // can miss acknowledged messages and a stored offset can be
+                // older. The head is current only on the primary that started
+                // the view.
+                if read.reads_messages_or_offset()
+                    && partition.consensus().is_primary()
+                    && !partition.consensus().applied_view_start()
+                {
+                    return Some(IggyError::TransientNotAccepted);
+                }
+                if let PartitionRead::ConsumerOffsetOnPrimary { metadata, .. }
+                | PartitionRead::ExternalGroupOffsetOnPrimary { metadata, .. } = &read
+                {
+                    if !metadata
+                        .is_valid_for_offset(self.plane.metadata().mux_stm.streams(), namespace)
+                        || !metadata.matches_partition(self.shards_table.epoch_for(namespace))
+                    {
+                        return Some(IggyError::TransientNotAccepted);
+                    }
+                    if partition.history_deleted() {
+                        return Some(IggyError::HistoryUnavailable);
+                    }
+                }
+                if let PartitionRead::PollOnPrimary {
+                    consumer,
+                    attachment,
+                    ..
+                } = &read
+                {
+                    let consensus = partition.consensus();
+                    if !consensus.is_primary()
+                        || !consensus.is_normal()
+                        || consensus.is_transferring()
+                        || !attachment
+                            .metadata
+                            .matches_partition(self.shards_table.epoch_for(namespace))
+                    {
+                        return Some(IggyError::TransientNotAccepted);
+                    }
+                    // This node's metadata can lag a delete fence the partition
+                    // already applied, so it still authorizes the old incarnation.
+                    if partition.history_deleted() {
+                        return Some(IggyError::HistoryUnavailable);
+                    }
+                    // The plan captures this owner in the same turn, and
+                    // completion refuses an owner that changed since.
+                    return match *consumer {
+                        PollingConsumer::ConsumerGroup(group_id, _) => group_owner_rejection(
+                            namespace,
+                            group_id as u64,
+                            partition.consumer_group_owner(group_id as u64),
+                            &attachment.metadata,
+                        ),
+                        PollingConsumer::Consumer(..) => None,
+                    };
+                }
+                if let PartitionRead::Poll {
+                    metadata: Some(metadata),
+                    ..
+                }
+                | PartitionRead::UnboundPollOnPrimary { metadata, .. } = &read
+                    && (!metadata.is_valid(self.plane.metadata().mux_stm.streams(), namespace)
+                        || !metadata.matches_partition(self.shards_table.epoch_for(namespace)))
+                {
+                    return Some(IggyError::TransientNotAccepted);
+                }
+                (matches!(
+                    read,
+                    PartitionRead::Poll { .. } | PartitionRead::UnboundPollOnPrimary { .. }
+                ) && partition.history_deleted())
+                .then_some(IggyError::HistoryUnavailable)
+            })
+            .unwrap_or_else(|| {
+                read.requires_primary()
+                    .then_some(IggyError::TransientNotAccepted)
+            })
+    }
+
+    /// A [`PartitionRead::ConsumerOffsetOnPrimary`] of a partition that this
+    /// shard owns, run in place.
+    pub(crate) fn consumer_offset_on_primary(
+        &self,
+        ConsumerOffsetRead {
+            namespace,
+            consumer,
+            metadata,
+        }: ConsumerOffsetRead,
+    ) -> PartitionReadReply {
+        let read = PartitionRead::ConsumerOffsetOnPrimary { consumer, metadata };
+        if let Some(error) = self.partition_read_rejection(namespace, &read) {
+            return PartitionReadReply::Rejected(error);
+        }
+        let Some(consumer) = consumer else {
+            return PartitionReadReply::ConsumerOffset {
+                stored: None,
+                current_offset: 0,
+            };
+        };
+        self.plane
+            .partitions()
+            .consumer_offset_read(&namespace, consumer)
+            .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
+                PartitionReadReply::ConsumerOffset {
+                    stored,
+                    current_offset,
+                }
+            })
+    }
+
     /// Discard a read if its reply receiver is already disconnected at the check.
     /// Otherwise accept it on the owner's pump and attempt the reply before
     /// replication, which may suspend. Another shard can disconnect after the
@@ -532,7 +587,8 @@ where
                 return;
             }
         }
-        self.accept_poll_result(namespace, result, reply).await;
+        self.accept_poll_result(namespace, result, reply, None)
+            .await;
     }
 
     #[allow(clippy::future_not_send)]
@@ -541,6 +597,7 @@ where
         namespace: IggyNamespace,
         result: PollReadResult,
         reply: Sender<PartitionReadReply>,
+        next_offset: Option<u64>,
     ) {
         let partitions = self.plane.partitions();
         let consumer_kind = result.consumer_kind();
@@ -560,6 +617,7 @@ where
                     fragments,
                     current_offset,
                     encryptor,
+                    next_offset,
                 });
                 if let Some(replication) = replication {
                     partitions
@@ -580,7 +638,9 @@ where
 /// Serve a group read only to the partition's installed owner. The serving
 /// node's metadata can lag an install the partition already applied, for
 /// example on a new primary after a view change, and the partition commits a
-/// read's progress under the installed owner.
+/// read's progress under the installed owner. `TransientNotAccepted` means
+/// only that the partition has not applied the install yet, and a readiness
+/// mirror reads it as not ready.
 fn group_owner_rejection(
     namespace: IggyNamespace,
     group_id: u64,

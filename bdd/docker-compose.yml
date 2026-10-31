@@ -39,6 +39,7 @@ services:
       - ./scenarios/stream_options.feature:/app/features/stream_options.feature
       - ./scenarios/resource_options_patch.feature:/app/features/resource_options_patch.feature
       - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
+      - ./scenarios/deferred_polling.feature:/app/features/deferred_polling.feature
     command:
       - sh
       - -c
@@ -52,6 +53,7 @@ services:
           stream_options)     cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test stream_options ;;
           resource_options_patch) cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test resource_options_patch ;;
           metadata_changes)   cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test metadata_changes ;;
+          deferred_polling)   cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test deferred_polling ;;
           *)                  cargo test -p bdd --features "$$BDD_RUST_FEATURES" ;;
         esac
     networks:
@@ -73,6 +75,7 @@ services:
       - ./scenarios/resource_options_patch.feature:/app/features/resource_options_patch.feature
       - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
       - ./scenarios/session_contract.feature:/app/features/session_contract.feature
+      - ./scenarios/deferred_polling.feature:/app/features/deferred_polling.feature
     working_dir: /app
     command:
       - sh
@@ -85,6 +88,7 @@ services:
           stream_options)         TEST_PATH='tests/test_stream_options.py' ;;
           resource_options_patch) TEST_PATH='tests/test_resource_options_patch.py' ;;
           metadata_changes)       TEST_PATH='tests/test_metadata_changes.py' ;;
+          deferred_polling)       TEST_PATH='tests/test_deferred_polling.py' ;;
           *)                      TEST_PATH='tests/' ;;
         esac
         uv run --project /workspace/bdd/python pytest $$TEST_PATH -v
@@ -105,6 +109,7 @@ services:
       - ./scenarios/stream_options.feature:/app/features/stream_options.feature
       - ./scenarios/session_contract.feature:/app/features/session_contract.feature
       - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
+      - ./scenarios/deferred_polling.feature:/app/features/deferred_polling.feature
     command:
       - sh
       - -c
@@ -115,6 +120,7 @@ services:
           session_contract) GROUP='--group session-contract' ;;
           stream_options)   GROUP='--group stream-options' ;;
           metadata_changes) GROUP='--group metadata-changes' ;;
+          deferred_polling) GROUP='--group deferred-polling' ;;
           *)                GROUP='' ;;
         esac
         ./scripts/test.sh --configuration /workspace/bdd/php/phpunit.xml.dist $$GROUP
@@ -155,6 +161,7 @@ services:
           stream_options)         TAGS='--tags @stream-options' ;;
           resource_options_patch) TAGS='--tags @resource-options-patch' ;;
           metadata_changes)       TAGS='--tags @metadata-changes' ;;
+          deferred_polling)       TAGS='--tags @deferred-polling' ;;
           *)                      TAGS='' ;;
         esac
         npm run test:bdd -- $$TAGS
@@ -182,6 +189,7 @@ services:
           stream_options)     FILTER='--filter-trait Category=stream-options' ;;
           resource_options_patch) FILTER='--filter-trait Category=resource-options-patch' ;;
           metadata_changes)   FILTER='--filter-trait Category=metadata-changes' ;;
+          deferred_polling)   FILTER='--filter-trait Category=deferred-polling' ;;
           session_contract)   FILTER='--filter-trait Category=session-contract' ;;
         esac
         dotnet test $$FILTER
@@ -206,6 +214,7 @@ services:
       - ./scenarios/stream_options.feature:/app/features/stream_options.feature
       - ./scenarios/resource_options_patch.feature:/app/features/resource_options_patch.feature
       - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
+      - ./scenarios/deferred_polling.feature:/app/features/deferred_polling.feature
     command:
       - sh
       - -c
@@ -219,6 +228,7 @@ services:
           stream_options)     export CUCUMBER_FILTER_TAGS='@stream-options' ;;
           resource_options_patch) export CUCUMBER_FILTER_TAGS='@resource-options-patch' ;;
           metadata_changes)   export CUCUMBER_FILTER_TAGS='@metadata-changes' ;;
+          deferred_polling)   export CUCUMBER_FILTER_TAGS='@deferred-polling' ;;
         esac
         gradle --no-daemon test
     networks:
@@ -240,6 +250,22 @@ services:
       - ./scenarios/resource_options_patch.feature:/app/features/resource_options_patch.feature
       - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
       - ./scenarios/session_contract.feature:/app/features/session_contract.feature
+      - ./scenarios/deferred_polling.feature:/app/features/deferred_polling.feature
+    networks:
+      - iggy-bdd-network
+
+  # Runs only the deferred polling feature.
+  swift-bdd:
+    image: iggy-bdd-swift
+    build:
+      context: ..
+      dockerfile: bdd/swift/Dockerfile
+    environment:
+      - IGGY_ROOT_USERNAME=iggy
+      - IGGY_ROOT_PASSWORD=iggy
+      - BDD_FEATURE=${BDD_FEATURE:-all}
+    volumes:
+      - ./scenarios/deferred_polling.feature:/app/features/deferred_polling.feature
     networks:
       - iggy-bdd-network
 

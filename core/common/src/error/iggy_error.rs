@@ -639,6 +639,17 @@ pub enum IggyError {
     LaneBlocked(u64) = 14007,
     #[error("Operation {0} is not retained")]
     OperationNotRetained(u64) = 14008,
+    /// Names the blocked partition of a multi-target request, or of any progress
+    /// call prevented by the retained unknown outcome of a committing read: a
+    /// fetch or a poll with `CommitPolicy::OnRead`.
+    /// Field order: `(partition_id, operation_id)`.
+    #[error("Lane of partition {0} blocked by operation {1} with an unknown outcome")]
+    PartitionLaneBlocked(u32, u64) = 14009,
+    /// A committing read, a fetch or a poll with `CommitPolicy::OnRead`,
+    /// has no replayable receipt. Its local recovery ID survives session
+    /// replacement. Only explicit abandonment frees progress.
+    #[error("Read {0} has unknown progress, explicit abandonment is required")]
+    FetchProgressUncertain(u64) = 14010,
 }
 
 impl IggyError {
@@ -652,13 +663,16 @@ impl IggyError {
         self.into()
     }
 
-    /// The retained operation that an `OperationUncertain`, `LaneBlocked` or
-    /// `OperationNotRetained` error names, to resolve or abandon it.
+    /// The retained operation that an `OperationUncertain`, `LaneBlocked`,
+    /// `OperationNotRetained`, `PartitionLaneBlocked` or `FetchProgressUncertain`
+    /// error names. A fetch identity supports abandonment only, never replay.
     pub fn operation_id(&self) -> Option<u64> {
         match self {
             IggyError::OperationUncertain(operation_id)
             | IggyError::LaneBlocked(operation_id)
-            | IggyError::OperationNotRetained(operation_id) => Some(*operation_id),
+            | IggyError::OperationNotRetained(operation_id)
+            | IggyError::FetchProgressUncertain(operation_id)
+            | IggyError::PartitionLaneBlocked(_, operation_id) => Some(*operation_id),
             _ => None,
         }
     }
@@ -686,6 +700,7 @@ mod tests {
 
     const GROUP_NAME_ERROR_CODE: u32 = 5005;
     const RETAINED_OPERATION: u64 = 7;
+    const BLOCKED_PARTITION: u32 = 3;
 
     #[cfg(target_arch = "x86_64")]
     #[test]
@@ -790,6 +805,16 @@ mod tests {
                 14008,
                 "operation_not_retained",
             ),
+            (
+                IggyError::PartitionLaneBlocked(BLOCKED_PARTITION, RETAINED_OPERATION),
+                14009,
+                "partition_lane_blocked",
+            ),
+            (
+                IggyError::FetchProgressUncertain(RETAINED_OPERATION),
+                14010,
+                "fetch_progress_uncertain",
+            ),
         ];
         for (error, code, name) in cases {
             assert_eq!(error.as_code(), code);
@@ -815,6 +840,14 @@ mod tests {
             IggyError::from_code(14008),
             IggyError::OperationNotRetained(0)
         ));
+        assert!(matches!(
+            IggyError::from_code(14009),
+            IggyError::PartitionLaneBlocked(0, 0)
+        ));
+        assert!(matches!(
+            IggyError::from_code(14010),
+            IggyError::FetchProgressUncertain(0)
+        ));
     }
 
     #[test]
@@ -826,11 +859,33 @@ mod tests {
             ),
             (IggyError::LaneBlocked(u64::MAX), Some(u64::MAX)),
             (IggyError::OperationNotRetained(0), Some(0)),
+            (
+                IggyError::FetchProgressUncertain(RETAINED_OPERATION),
+                Some(RETAINED_OPERATION),
+            ),
+            (
+                IggyError::PartitionLaneBlocked(BLOCKED_PARTITION, RETAINED_OPERATION),
+                Some(RETAINED_OPERATION),
+            ),
             (IggyError::NotPrimary, None),
         ];
         for (error, operation_id) in cases {
             assert_eq!(error.operation_id(), operation_id, "{error}");
         }
+    }
+
+    #[test]
+    fn given_a_blocked_partition_lane_when_displayed_should_name_the_partition_and_the_operation() {
+        let message =
+            IggyError::PartitionLaneBlocked(BLOCKED_PARTITION, RETAINED_OPERATION).to_string();
+        assert!(
+            message.contains(&format!("partition {BLOCKED_PARTITION}")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("operation {RETAINED_OPERATION}")),
+            "{message}"
+        );
     }
 
     #[test]

@@ -104,11 +104,13 @@ async fn poll_payloads(
         .poll_messages(
             stream,
             topic,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            16,
-            false,
+            PollOptions {
+                count: 16,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap_or_else(|error| panic!("poll_messages: {error}"))

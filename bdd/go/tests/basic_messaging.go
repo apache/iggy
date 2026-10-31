@@ -134,15 +134,16 @@ func (s basicMessagingSteps) whenPollMessages(
 	streamIdentifier, _ := iggcon.NewIdentifier(streamID)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicID)
 	uint32PartitionID := partitionID
+	options := iggcon.DefaultPollOptions()
+	options.Count = 100
 	polledMessages, err := c.client.PollMessages(
 		ctx,
 		streamIdentifier,
 		topicIdentifier,
+		uint32PartitionID,
 		consumer,
 		iggcon.OffsetPollingStrategy(startOffset),
-		100,
-		false,
-		&uint32PartitionID,
+		options,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to poll messages: %w", err)

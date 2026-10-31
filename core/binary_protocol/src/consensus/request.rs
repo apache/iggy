@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::codes::{
-    CANCEL_DEFERRED_REQUEST_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
-    LOGOUT_USER_CODE, POLL_MESSAGES_DEFERRED_CODE, WAIT_FOR_MESSAGES_CODE,
+    CANCEL_DEFERRED_REQUEST_CODE, FETCH_MESSAGES_CODE, LOGIN_REGISTER_CODE,
+    LOGIN_REGISTER_WITH_PAT_CODE, LOGOUT_USER_CODE, POLL_MESSAGES_DEFERRED_CODE,
 };
 use crate::consensus::{Command, HEADER_SIZE, Operation, RequestHeader};
 use crate::error::WireError;
@@ -53,7 +53,7 @@ impl RequestHeader {
         if self.operation != Operation::NonReplicated
             || !matches!(
                 u32::from_le_bytes(self.reserved),
-                POLL_MESSAGES_DEFERRED_CODE | WAIT_FOR_MESSAGES_CODE
+                POLL_MESSAGES_DEFERRED_CODE | FETCH_MESSAGES_CODE
             )
         {
             return None;
@@ -172,6 +172,25 @@ mod tests {
             u128::from(XxHash3_64::oneshot(&payload))
         );
         assert_eq!(header.reserved, [0; 4]);
+    }
+
+    #[test]
+    fn only_deferred_requests_get_a_cancellation() {
+        for code in [POLL_MESSAGES_DEFERRED_CODE, FETCH_MESSAGES_CODE] {
+            let request = RequestHeader::for_request(code, 1, 2, 3, &[7; 8]).unwrap();
+            let cancel = request.deferred_cancellation().unwrap();
+            assert_eq!(cancel.operation, Operation::NonReplicated);
+            assert_eq!(
+                cancel.reserved[NON_REPLICATED_CODE_RANGE],
+                CANCEL_DEFERRED_REQUEST_CODE.to_le_bytes()
+            );
+            assert_eq!((cancel.client, cancel.request, cancel.session), (1, 2, 3));
+            assert_eq!(cancel.size as usize, HEADER_SIZE);
+        }
+        for code in [PING_CODE, CANCEL_DEFERRED_REQUEST_CODE, SEND_MESSAGES_CODE] {
+            let request = RequestHeader::for_request(code, 1, 2, 3, &[]).unwrap();
+            assert!(request.deferred_cancellation().is_none(), "code {code}");
+        }
     }
 
     #[test]

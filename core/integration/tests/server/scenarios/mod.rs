@@ -71,6 +71,9 @@ const PARTITION_ID: u32 = 0;
 // expectation holds, then make the terminal assertion for a real mismatch.
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+// The server cap of one poll reply (`sharding.deferred_poll_max_read_bytes`).
+// A poll that must return more than the 1 MiB default in one reply asks for it.
+const POLL_REPLY_MAX_BYTES: u32 = 16 * 1024 * 1024;
 const STREAM_NAME: &str = "test-stream";
 const TOPIC_NAME: &str = "test-topic";
 const PARTITIONS_COUNT: u32 = 3;
@@ -200,8 +203,8 @@ async fn validate_system_stats(
     );
 }
 
-/// Poll until the partition serves `expected_count` messages or
-/// [`CONVERGENCE_TIMEOUT`] expires, returning the last poll result.
+/// Poll from `strategy` until the partition serves `expected_count` messages
+/// or [`CONVERGENCE_TIMEOUT`] expires, returning every message read.
 ///
 /// `send_messages` acks at consensus commit while the owning shard applies
 /// the batch asynchronously (see the materialisation race note at the top
@@ -209,32 +212,43 @@ async fn validate_system_stats(
 /// send burst can observe fewer messages than were acked. Retrying absorbs
 /// that convergence window without weakening the caller's assertion: real
 /// message loss still returns short and fails it once the deadline expires.
+/// One reply holds at most `max_bytes`, so a large read takes several polls.
 async fn poll_until_expected_count(
     client: &IggyClient,
     stream_name: &str,
     topic_name: &str,
     strategy: &PollingStrategy,
     expected_count: u32,
-) -> PolledMessages {
+) -> Vec<IggyMessage> {
+    let stream = Identifier::named(stream_name).unwrap();
+    let topic = Identifier::named(topic_name).unwrap();
     let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
+    let mut messages = Vec::with_capacity(expected_count as usize);
+    let mut next = *strategy;
+    while messages.len() < expected_count as usize && Instant::now() < deadline {
         let polled = client
             .poll_messages(
-                &Identifier::named(stream_name).unwrap(),
-                &Identifier::named(topic_name).unwrap(),
-                Some(PARTITION_ID),
+                &stream,
+                &topic,
+                PARTITION_ID,
                 &Consumer::default(),
-                strategy,
-                expected_count,
-                false,
+                &next,
+                PollOptions {
+                    count: expected_count - messages.len() as u32,
+                    max_bytes: POLL_REPLY_MAX_BYTES,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
-        if polled.messages.len() as u32 == expected_count || Instant::now() >= deadline {
-            return polled;
+        if polled.messages.is_empty() {
+            sleep(RETRY_INTERVAL).await;
+            continue;
         }
-        sleep(RETRY_INTERVAL).await;
+        next = polled.continuation();
+        messages.extend(polled.messages);
     }
+    messages
 }
 
 async fn create_client(harness: &TestHarness) -> IggyClient {

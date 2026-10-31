@@ -16,11 +16,15 @@
 // under the License.
 
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using Apache.Iggy.Contracts;
+using Apache.Iggy.Contracts.Tcp;
+using Apache.Iggy.Enums;
 using Apache.Iggy.Mappers;
+using Apache.Iggy.Tests.ContractsTests;
 using Apache.Iggy.Utils;
 using Apache.Iggy.Vsr;
 using static Apache.Iggy.Tests.VsrTests.MockFrames;
@@ -51,6 +55,29 @@ internal static class MockFrames
     internal const int BIND_SESSION_CODE = 15;
     internal const int PING_CODE = 1;
     internal const uint TRANSIENT_NOT_ACCEPTED = 58;
+
+    /// <summary>A target prefix: the partition id, then the strategy kind and value.</summary>
+    private const int PartitionStrategySize = sizeof(uint) + 1 + sizeof(ulong);
+
+    /// <summary>What a PollMessages body carries after its partition id: the strategy, the count, the commit flag.</summary>
+    private const int PollTailAfterPartition = 1 + sizeof(ulong) + sizeof(uint) + 1;
+
+    /// <summary>A FetchMessages target: the partition id, the strategy, the byte limit and the fence.</summary>
+    private const int FetchTargetSize = PartitionStrategySize + sizeof(uint) + 2 * sizeof(ulong);
+
+    /// <summary>The wire numbers the polling kinds from 1, in the order of <see cref="MessagePolling" />.</summary>
+    private const int FirstWireKind = 1;
+
+    /// <summary>A poll reply body starts with the partition, the current offset, the count and the context.</summary>
+    private const int PollContextPosition = sizeof(uint) + sizeof(ulong) + sizeof(uint);
+
+    private const int PollHeaderSize = PollContextPosition + PartitionContext.ENCODED_SIZE;
+
+    /// <summary>The base offset of the golden batch, counted from the start of its records.</summary>
+    private const int RecordsBaseOffsetPosition = sizeof(ulong);
+
+    /// <summary>How many messages the golden batch holds.</summary>
+    internal const uint GOLDEN_BATCH_MESSAGES = 2;
 
     /// <summary>A reply for anything the roster read does not claim: a register, or an empty read.</summary>
     internal static byte[] Answer(MockRequest request)
@@ -140,6 +167,151 @@ internal static class MockFrames
         return body;
     }
 
+    /// <summary>A FetchMessages request as the node read it.</summary>
+    internal static FetchRequest ReadFetch(MockRequest request)
+    {
+        var body = request.Body.AsSpan();
+        var position = 1;
+        for (var identifier = 0; identifier < 3; identifier++)
+        {
+            position += 2 + body[position + 1];
+        }
+
+        var waitUs = BinaryPrimitives.ReadUInt64LittleEndian(body[position..]);
+        var requestTimeoutUs = BinaryPrimitives.ReadUInt64LittleEndian(body[(position + sizeof(ulong))..]);
+        position += 2 * sizeof(ulong);
+        var minCount = BinaryPrimitives.ReadUInt32LittleEndian(body[position..]);
+        var count = BinaryPrimitives.ReadUInt32LittleEndian(body[(position + sizeof(uint))..]);
+        var maxBytes = BinaryPrimitives.ReadUInt32LittleEndian(body[(position + 2 * sizeof(uint))..]);
+        position += 3 * sizeof(uint);
+        var autoCommit = body[position++] == 1;
+        var targets = new FetchTarget[BinaryPrimitives.ReadUInt32LittleEndian(body[position..])];
+        position += sizeof(uint);
+        for (var index = 0; index < targets.Length; index++)
+        {
+            var target = body[(position + index * FetchTargetSize)..];
+            targets[index] = new FetchTarget(BinaryPrimitives.ReadUInt32LittleEndian(target),
+                (MessagePolling)(target[sizeof(uint)] - FirstWireKind),
+                BinaryPrimitives.ReadUInt64LittleEndian(target[(sizeof(uint) + 1)..]),
+                BinaryPrimitives.ReadUInt32LittleEndian(target[PartitionStrategySize..]),
+                BinaryPrimitives.ReadUInt64LittleEndian(target[(PartitionStrategySize + sizeof(uint))..]),
+                BinaryPrimitives.ReadUInt64LittleEndian(target[(PartitionStrategySize + sizeof(uint) + sizeof(ulong))..]));
+        }
+
+        return new FetchRequest(waitUs, requestTimeoutUs, minCount, count, maxBytes, autoCommit, targets);
+    }
+
+    /// <summary>A FetchMessages reply body: the section count, the section table, then the records.</summary>
+    internal static byte[] FetchBody(params FetchSection[] sections)
+    {
+        var body = new byte[FetchedMessages.HeadSize(sections.Length) + sections.Sum(section => section.Records.Length)];
+        BinaryPrimitives.WriteUInt32LittleEndian(body, (uint)sections.Length);
+        var records = FetchedMessages.HeadSize(sections.Length);
+        for (var index = 0; index < sections.Length; index++)
+        {
+            var section = sections[index];
+            var header = body.AsSpan(FetchedMessages.HeadSize(index));
+            BinaryPrimitives.WriteUInt32LittleEndian(header, section.PartitionId);
+            BinaryPrimitives.WriteUInt32LittleEndian(header[4..], section.Status);
+            BinaryPrimitives.WriteUInt64LittleEndian(header[8..], section.CurrentOffset);
+            BinaryPrimitives.WriteUInt32LittleEndian(header[16..], section.MessagesCount);
+            BinaryPrimitives.WriteUInt64LittleEndian(header[20..], section.Context.Incarnation);
+            BinaryPrimitives.WriteUInt64LittleEndian(header[28..], section.Context.OwnerGeneration);
+            BinaryPrimitives.WriteUInt64LittleEndian(header[36..], section.Context.MetadataOp);
+            BinaryPrimitives.WriteUInt64LittleEndian(header[44..], section.NextOffset);
+            BinaryPrimitives.WriteUInt32LittleEndian(header[52..], (uint)section.Records.Length);
+            section.Records.CopyTo(body.AsSpan(records));
+            records += section.Records.Length;
+        }
+
+        return body;
+    }
+
+    /// <summary>
+    ///     A section that serves the golden batch from <paramref name="firstOffset" />, so it holds that offset and
+    ///     the next one.
+    /// </summary>
+    internal static FetchSection GoldenSection(uint partitionId, ulong firstOffset, PartitionContext context)
+    {
+        var records = GoldenPollBody(partitionId, firstOffset, context)[PollHeaderSize..];
+        return new FetchSection(partitionId, 0, firstOffset + GOLDEN_BATCH_MESSAGES - 1, GOLDEN_BATCH_MESSAGES,
+            context, firstOffset + GOLDEN_BATCH_MESSAGES, records);
+    }
+
+    /// <summary>The golden poll body moved to another partition, first offset and context.</summary>
+    internal static byte[] GoldenPollBody(uint partitionId, ulong firstOffset, PartitionContext context)
+    {
+        var body = Convert.FromHexString(MessageBatchGoldenVectorTests.POLL_BODY);
+        BinaryPrimitives.WriteUInt32LittleEndian(body, partitionId);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(PollContextPosition), context.Incarnation);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(PollContextPosition + sizeof(ulong)),
+            context.OwnerGeneration);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(PollContextPosition + 2 * sizeof(ulong)),
+            context.MetadataOp);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(PollHeaderSize + RecordsBaseOffsetPosition), firstOffset);
+
+        return body;
+    }
+
+    /// <summary>A section that read nothing: an empty read without a status, or a refusal with one.</summary>
+    internal static FetchSection EmptySection(uint partitionId, ulong nextOffset, PartitionContext context,
+        uint status = 0)
+    {
+        return status == 0
+            ? new FetchSection(partitionId, 0, nextOffset, 0, context, nextOffset, [])
+            : new FetchSection(partitionId, status, 0, 0, default, 0, []);
+    }
+
+    /// <summary>The PollMessages part of a poll request: a deferred poll appends its wait options to it.</summary>
+    internal static ReadOnlySpan<byte> PollBody(MockRequest request)
+    {
+        var tail = request.Code == CommandCodes.POLL_MESSAGES_DEFERRED_CODE ? TcpContracts.DEFERRED_POLL_TAIL_SIZE : 0;
+        return request.Body.AsSpan(0, request.Body.Length - tail);
+    }
+
+    /// <summary>The partition a PollMessages or PollMessagesDeferred request reads.</summary>
+    internal static uint PolledPartition(MockRequest request)
+    {
+        return BinaryPrimitives.ReadUInt32LittleEndian(PollBody(request)[^(PollTailAfterPartition + sizeof(uint))..]);
+    }
+
+    /// <summary>The partition, the strategy and the count of a PollMessages or PollMessagesDeferred request.</summary>
+    internal static (uint PartitionId, MessagePolling Kind, ulong Value, uint Count) ReadPoll(MockRequest request)
+    {
+        var tail = PollBody(request)[^PollTailAfterPartition..];
+        return (PolledPartition(request), (MessagePolling)(tail[0] - FirstWireKind),
+            BinaryPrimitives.ReadUInt64LittleEndian(tail[1..]),
+            BinaryPrimitives.ReadUInt32LittleEndian(tail[(1 + sizeof(ulong))..]));
+    }
+
+    /// <summary>A FetchMessages target as the client sent it, with its fence.</summary>
+    internal readonly record struct FetchTarget(
+        uint PartitionId,
+        MessagePolling Kind,
+        ulong Value,
+        uint MaxBytes,
+        ulong Incarnation,
+        ulong OwnerGeneration);
+
+    internal readonly record struct FetchRequest(
+        ulong WaitUs,
+        ulong RequestTimeoutUs,
+        uint MinCount,
+        uint Count,
+        uint MaxBytes,
+        bool AutoCommit,
+        FetchTarget[] Targets);
+
+    /// <summary>One section of a FetchMessages reply. The records are those a poll reply carries after its header.</summary>
+    internal readonly record struct FetchSection(
+        uint PartitionId,
+        uint Status,
+        ulong CurrentOffset,
+        uint MessagesCount,
+        PartitionContext Context,
+        ulong NextOffset,
+        byte[] Records);
+
     internal static void WriteNode(List<byte> body, ushort port, bool leader, byte replicaId = 0)
     {
         body.Add(replicaId);
@@ -197,6 +369,7 @@ internal sealed class MockNode : IDisposable
     private volatile bool _killed;
     private int _connections;
     private readonly List<MockRequest> _recorded = [];
+    private readonly ConcurrentDictionary<(UInt128 Client, ulong Request), Func<byte[], Task>> _parked = new();
     private int _pings;
     private int _registrations;
 
@@ -248,9 +421,12 @@ internal sealed class MockNode : IDisposable
         }
     }
 
-    /// <param name="handler">Answers each request.</param>
+    /// <param name="handler">
+    ///     Answers each request, or returns null to leave it unanswered, the way the server holds a parked deferred
+    ///     request and never answers its cancel.
+    /// </param>
     /// <param name="beforeSend">Runs before each reply goes out. The reply waits until its task ends.</param>
-    public void Serve(Func<MockRequest, byte[]> handler, Func<MockRequest, byte[], Task>? beforeSend = null)
+    public void Serve(Func<MockRequest, byte[]?> handler, Func<MockRequest, byte[], Task>? beforeSend = null)
     {
         _ = Task.Run(async () =>
         {
@@ -277,6 +453,18 @@ internal sealed class MockNode : IDisposable
         });
     }
 
+    /// <summary>Sends the reply of a request that the handler left unanswered, on the link that carried it.</summary>
+    public Task AnswerParkedAsync(MockRequest request, byte[] reply)
+    {
+        if (!_parked.TryRemove((request.ClientId, request.RequestId), out var send))
+        {
+            throw new InvalidOperationException($"Request {request.RequestId} is not parked.");
+        }
+
+        CorrelateReply(request, reply);
+        return send(reply);
+    }
+
     public void Kill()
     {
         _killed = true;
@@ -298,12 +486,27 @@ internal sealed class MockNode : IDisposable
         Kill();
     }
 
-    private async Task Exchange(TcpClient connection, Func<MockRequest, byte[]> handler,
+    private async Task Exchange(TcpClient connection, Func<MockRequest, byte[]?> handler,
         Func<MockRequest, byte[], Task>? beforeSend)
     {
         try
         {
             await using var stream = connection.GetStream();
+            using var writes = new SemaphoreSlim(1, 1);
+            async Task SendAsync(byte[] frame)
+            {
+                await writes.WaitAsync();
+                try
+                {
+                    await stream.WriteAsync(frame);
+                    await stream.FlushAsync();
+                }
+                finally
+                {
+                    writes.Release();
+                }
+            }
+
             var header = new byte[HEADER_SIZE];
             while (!_killed)
             {
@@ -336,14 +539,17 @@ internal sealed class MockNode : IDisposable
                     Interlocked.Increment(ref _pings);
                 }
 
-                var reply = handler(request);
+                if (handler(request) is not { } reply)
+                {
+                    _parked[(request.ClientId, request.RequestId)] = SendAsync;
+                    continue;
+                }
                 CorrelateReply(request, reply);
                 if (beforeSend is not null)
                 {
                     await beforeSend(request, reply);
                 }
-                await stream.WriteAsync(reply);
-                await stream.FlushAsync();
+                await SendAsync(reply);
             }
         }
         catch (Exception)

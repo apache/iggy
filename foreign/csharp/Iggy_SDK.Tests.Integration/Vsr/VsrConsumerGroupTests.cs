@@ -15,8 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Diagnostics;
 using System.Text;
+using Apache.Iggy.Consumers;
 using Apache.Iggy.Contracts;
+using Apache.Iggy.Extensions;
+using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
@@ -52,7 +56,7 @@ public class VsrConsumerGroupTests
             await SendAsync(client, streamName, partitionId);
         }
 
-        // One poll per assigned partition drains it; the sole member owns them all, so the round-robin has to
+        // One poll per assigned partition drains it. The sole member owns them all, so the round-robin has to
         // hand out every partition exactly once before it wraps.
         var polled = await DrainGroupAsync(client, streamName, groupName, PartitionsCount);
 
@@ -163,11 +167,92 @@ public class VsrConsumerGroupTests
         }
 
         // The first member still holds the pre-rebalance assignment, so its polls fence until they re-sync.
-        // Between them the two members have to see every partition; a lost one means a fence was swallowed.
+        // Between them the two members have to see every partition. A lost one means a fence was swallowed.
         var drained = await DrainGroupAsync(first, streamName, groupName, PartitionsCount);
         drained += await DrainGroupAsync(second, streamName, groupName, PartitionsCount);
 
         drained.ShouldBe((int)PartitionsCount);
+    }
+
+    /// <summary>
+    ///     A group reader waits on every assigned partition, one read per primary, and returns the one that holds
+    ///     messages. The partitions get messages in descending order, so a reader that waited on one partition alone
+    ///     would park in at least one round. It runs alone, because the load of the other tests stretches a reply past
+    ///     the bound.
+    /// </summary>
+    [Test]
+    [NotInParallel]
+    public async Task GroupReader_Should_Read_ThePartitionThatHoldsMessages()
+    {
+        var promptReply = TimeSpan.FromSeconds(2);
+        var (client, streamName, groupName) = await CreateGroup();
+        await using var reader = await client.Reader(Identifier.String(streamName), Identifier.String(TopicName),
+                Consumer.Group(groupName))
+            .WithOptions(new PollOptions { Count = 10, MaxWait = TimeSpan.FromSeconds(10) })
+            .BuildAsync();
+        await WaitForAssignmentAsync(reader, (int)PartitionsCount);
+
+        for (var partition = (int)PartitionsCount - 1; partition >= 0; partition--)
+        {
+            await SendAsync(client, streamName, (uint)partition);
+            var started = Stopwatch.StartNew();
+            var batch = await reader.NextAsync();
+
+            started.Elapsed.ShouldBeLessThan(promptReply);
+            batch.PartitionId.ShouldBe((uint)partition);
+            batch.Messages.Count.ShouldBe(1);
+        }
+    }
+
+    /// <summary>
+    ///     A partition with a backlog does not hide a partition of the same primary that holds a message too: the
+    ///     reader gives the partition that the backlog left out a fetch of its own beside the next read of the
+    ///     backlog. One partition more than nodes puts two partitions on one primary.
+    /// </summary>
+    [Test]
+    public async Task GroupReader_With_ABacklog_Should_Serve_AnotherPartitionOfItsPrimary()
+    {
+        const int BacklogMessages = 20;
+        var client = await Fixture.CreateAuthenticatedClient(Protocol.Tcp);
+        var metadata = (await client.GetClusterMetadataAsync()).ShouldNotBeNull();
+        var partitionsCount = (uint)metadata.Nodes.Length + 1;
+        var (streamName, groupName) = await CreateGroup(client, partitionsCount);
+        var assigned = Enumerable.Range(0, (int)partitionsCount).Select(partitionId => (uint)partitionId).ToList();
+        var shared = (await ((TcpMessageStream)client).ReadinessGroupsAsync(Identifier.String(streamName),
+            Identifier.String(TopicName), assigned)).FirstOrDefault(group => group.Count > 1).ShouldNotBeNull();
+        for (var message = 0; message < BacklogMessages; message++)
+        {
+            await SendAsync(client, streamName, shared[0]);
+        }
+
+        await SendAsync(client, streamName, shared[^1]);
+        await using var reader = await client.Reader(Identifier.String(streamName), Identifier.String(TopicName),
+                Consumer.Group(groupName))
+            .WithStart(PollingStrategy.Offset(0))
+            .WithOptions(new PollOptions { Count = 10, MaxWait = TimeSpan.FromSeconds(10) })
+            .BuildAsync();
+        await WaitForAssignmentAsync(reader, (int)partitionsCount);
+
+        // A fetch from an offset fills its count from the backlog in request order, so the first reply may hold the
+        // backlog alone. The other partition then gets a fetch of its own beside the next backlog fetch, whose replies
+        // land in either order, so it shows by the third batch, and one more backlog reply may overtake its reply.
+        List<uint> read = [];
+        while (read.Count < 4 && !read.Contains(shared[^1]))
+        {
+            read.Add((await reader.NextAsync()).PartitionId);
+        }
+
+        read.ShouldContain(shared[^1], $"read {string.Join(", ", read)} before {shared[^1]}");
+    }
+
+    private static async Task WaitForAssignmentAsync(PartitionReader reader, int partitions)
+    {
+        var deadline = Stopwatch.StartNew();
+        while (reader.Partitions.Count < partitions)
+        {
+            deadline.Elapsed.ShouldBeLessThan(TimeSpan.FromSeconds(10), "the member never owned every partition");
+            await Task.Delay(100);
+        }
     }
 
     /// <summary>Joins, then waits until the members own every partition, so the next group poll syncs them.</summary>
@@ -183,14 +268,22 @@ public class VsrConsumerGroupTests
     private async Task<(IIggyClient Client, string StreamName, string GroupName)> CreateGroup()
     {
         var client = await Fixture.CreateAuthenticatedClient(Protocol.Tcp);
+        var (streamName, groupName) = await CreateGroup(client, PartitionsCount);
+
+        return (client, streamName, groupName);
+    }
+
+    private static async Task<(string StreamName, string GroupName)> CreateGroup(IIggyClient client,
+        uint partitionsCount)
+    {
         var streamName = $"vsr-group-{Guid.NewGuid():N}";
         var groupName = $"vsr-group-name-{Guid.NewGuid():N}";
 
         await client.CreateStreamAsync(streamName);
-        await client.CreateTopicAsync(Identifier.String(streamName), TopicName, PartitionsCount);
+        await client.CreateTopicAsync(Identifier.String(streamName), TopicName, partitionsCount);
         await client.CreateConsumerGroupAsync(Identifier.String(streamName), Identifier.String(TopicName), groupName);
 
-        return (client, streamName, groupName);
+        return (streamName, groupName);
     }
 
     private static Task SendAsync(IIggyClient client, string streamName, uint partitionId)

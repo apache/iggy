@@ -26,6 +26,7 @@ import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.message.PollOptions;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
@@ -55,6 +56,19 @@ final class MessagesTcpClient implements MessagesClient {
     }
 
     @Override
+    public PolledMessages pollMessages(
+            StreamId streamId,
+            TopicId topicId,
+            long partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            PollOptions options) {
+        var polled = delegate.pollMessages(streamId, topicId, partitionId, consumer, strategy, options);
+        // A cancel of a committing poll can lose what the server committed, so only its reply ends the wait.
+        return options.commitsOnRead() ? FutureUtil.resolve(polled) : FutureUtil.resolveInterruptibly(polled);
+    }
+
+    @Override
     @SuppressWarnings("checkstyle:ParameterNumber")
     public PolledMessages pollMessagesDeferred(
             StreamId streamId,
@@ -65,8 +79,10 @@ final class MessagesTcpClient implements MessagesClient {
             Long count,
             boolean autoCommit,
             DeferredPollOptions options) {
-        return FutureUtil.resolveInterruptibly(delegate.pollMessagesDeferred(
-                streamId, topicId, partitionId, consumer, strategy, count, autoCommit, options));
+        var polled = delegate.pollMessagesDeferred(
+                streamId, topicId, partitionId, consumer, strategy, count, autoCommit, options);
+        // A cancel of a committing poll can lose what the server committed, so only its reply ends the wait.
+        return autoCommit ? FutureUtil.resolve(polled) : FutureUtil.resolveInterruptibly(polled);
     }
 
     @Override

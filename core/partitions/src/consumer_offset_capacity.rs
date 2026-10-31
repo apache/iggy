@@ -166,6 +166,44 @@ impl DurableConsumerOffsets {
     }
 }
 
+/// When a client last stored or deleted each consumer offset, on the bus
+/// clock. A parked read compares stamps, because a store can leave the value
+/// as it was.
+#[derive(Debug, Default)]
+pub struct ExplicitOffsetStores {
+    stored_at: RefCell<HashMap<(ConsumerKind, u32), u64>>,
+    /// The last delete of any offset, which an offset without a stamp reads.
+    deleted_at: Cell<Option<u64>>,
+}
+
+impl ExplicitOffsetStores {
+    pub(crate) fn record_store(&self, kind: ConsumerKind, id: u32, now: u64) {
+        self.stored_at.borrow_mut().insert((kind, id), now);
+    }
+
+    pub(crate) fn record_delete(&self, kind: ConsumerKind, id: u32, now: u64) {
+        self.stored_at.borrow_mut().remove(&(kind, id));
+        self.deleted_at.set(Some(now));
+    }
+
+    /// Forgets every stamp, as a delete of every offset at `now`.
+    pub(crate) fn clear(&self, now: u64) {
+        self.stored_at.borrow_mut().clear();
+        self.deleted_at.set(Some(now));
+    }
+
+    /// Whether a client stored or deleted the offset at or after `since`. An
+    /// offset without a stamp counts the last delete of any offset.
+    pub(crate) fn since(&self, kind: ConsumerKind, id: u32, since: u64) -> bool {
+        self.stored_at
+            .borrow()
+            .get(&(kind, id))
+            .copied()
+            .or_else(|| self.deleted_at.get())
+            .is_some_and(|at| at >= since)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsumerOffsetCapacityError {
     pub kind: ConsumerKind,
@@ -468,6 +506,36 @@ impl ConsumerOffsetCapacity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_a_store_of_the_same_value_when_checking_since_admission_should_report_it() {
+        let stores = ExplicitOffsetStores::default();
+        stores.record_store(ConsumerKind::Consumer, 1, 5);
+        assert!(!stores.since(ConsumerKind::Consumer, 1, 6));
+        stores.record_store(ConsumerKind::Consumer, 1, 6);
+        assert!(stores.since(ConsumerKind::Consumer, 1, 6));
+        assert!(
+            !stores.since(ConsumerKind::ConsumerGroup, 1, 6),
+            "a store of another kind leaves the offset alone"
+        );
+        assert!(!stores.since(ConsumerKind::Consumer, 2, 6));
+    }
+
+    #[test]
+    fn given_a_deleted_offset_when_checking_since_admission_should_count_the_last_delete() {
+        let stores = ExplicitOffsetStores::default();
+        stores.record_store(ConsumerKind::Consumer, 1, 2);
+        stores.record_store(ConsumerKind::Consumer, 2, 2);
+        stores.record_delete(ConsumerKind::Consumer, 1, 7);
+        assert!(stores.since(ConsumerKind::Consumer, 1, 7));
+        assert!(
+            !stores.since(ConsumerKind::Consumer, 2, 7),
+            "an offset with its own stamp ignores deletes of others"
+        );
+        assert!(stores.since(ConsumerKind::Consumer, 3, 7));
+        stores.clear(9);
+        assert!(stores.since(ConsumerKind::Consumer, 2, 9));
+    }
 
     #[test]
     fn given_cached_inactive_tokens_when_admitting_should_count_only_active_keys() {

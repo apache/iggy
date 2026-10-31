@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-php"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 authors = ["Iggy Committers <dev@iggy.apache.org>"]
 license = "Apache-2.0"
@@ -30,8 +30,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 bytes = "1.12.1"
-futures = "0.3.34"
 ext-php-rs = "=0.16.3"
+futures = "0.3.34"
 iggy = { path = "../../core/sdk" }
 iggy_binary_protocol = { path = "../../core/binary_protocol" }
 libc = "0.2.191"
