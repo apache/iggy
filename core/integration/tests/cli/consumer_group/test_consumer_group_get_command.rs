@@ -25,8 +25,11 @@ use iggy::prelude::Client;
 use iggy::prelude::IggyExpiry;
 use iggy::prelude::StreamCreateOptions;
 use iggy::prelude::TopicCreateOptions;
+use iggy::prelude::{Consumer, IggyMessage, Partitioning};
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
+use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 struct TestConsumerGroupGetCmd {
     stream_id: u32,
@@ -184,6 +187,308 @@ impl IggyCmdTestCase for TestConsumerGroupGetCmd {
             .await;
         assert!(stream.is_ok());
     }
+}
+
+struct TestConsumerGroupGetLagWithoutStoredOffsetCmd {
+    stream_name: String,
+    topic_name: String,
+    group_name: String,
+    messages_count: u32,
+    stream_id: u32,
+    topic_id: u32,
+    group_id: u32,
+}
+
+impl TestConsumerGroupGetLagWithoutStoredOffsetCmd {
+    fn new() -> Self {
+        Self {
+            stream_name: String::from("cg-get-lag-no-offset-stream"),
+            topic_name: String::from("cg-get-lag-no-offset-topic"),
+            group_name: String::from("cg-get-lag-no-offset-group"),
+            messages_count: 10,
+            stream_id: 0,
+            topic_id: 0,
+            group_id: 0,
+        }
+    }
+}
+
+#[async_trait]
+impl IggyCmdTestCase for TestConsumerGroupGetLagWithoutStoredOffsetCmd {
+    async fn prepare_server_state(&mut self, client: &dyn Client) {
+        let stream = client.create_stream(&self.stream_name).await.unwrap();
+        self.stream_id = stream.id;
+
+        let topic = client
+            .create_topic(
+                &self.stream_id.try_into().unwrap(),
+                &self.topic_name,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        self.topic_id = topic.id;
+
+        let consumer_group = client
+            .create_consumer_group(
+                &self.stream_id.try_into().unwrap(),
+                &self.topic_id.try_into().unwrap(),
+                &self.group_name,
+            )
+            .await
+            .unwrap();
+        self.group_id = consumer_group.id;
+
+        let mut messages = (1..=self.messages_count)
+            .filter_map(|id| IggyMessage::from_str(format!("Test message {id}").as_str()).ok())
+            .collect::<Vec<_>>();
+        client
+            .send_messages(
+                &self.stream_id.try_into().unwrap(),
+                &self.topic_id.try_into().unwrap(),
+                &Partitioning::partition_id(0),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+    }
+
+    fn get_command(&self) -> IggyCmdCommand {
+        IggyCmdCommand::new()
+            .arg("consumer-group")
+            .arg("get")
+            .arg(self.stream_name.clone())
+            .arg(self.topic_name.clone())
+            .arg(self.group_name.clone())
+            .with_env_credentials()
+    }
+
+    fn verify_command(&self, command_state: Assert) {
+        let current_offset = self.messages_count - 1;
+        command_state
+            .success()
+            .stdout(contains("Stored offset"))
+            .stdout(contains(format!(
+                "{current_offset}              | -             | {}",
+                self.messages_count
+            )));
+    }
+
+    async fn verify_server_state(&self, client: &dyn Client) {
+        client
+            .delete_consumer_group(
+                &self.stream_id.try_into().unwrap(),
+                &self.topic_id.try_into().unwrap(),
+                &self.group_name.clone().try_into().unwrap(),
+            )
+            .await
+            .unwrap();
+        client
+            .delete_topic(
+                &self.stream_id.try_into().unwrap(),
+                &self.topic_id.try_into().unwrap(),
+            )
+            .await
+            .unwrap();
+        client
+            .delete_stream(&self.stream_id.try_into().unwrap())
+            .await
+            .unwrap();
+    }
+}
+
+struct TestConsumerGroupGetLagWithStoredOffsetCmd {
+    stream_name: String,
+    topic_name: String,
+    group_name: String,
+    messages_count: u32,
+    stored_offset: u64,
+    stream_id: u32,
+    topic_id: u32,
+    group_id: u32,
+}
+
+impl TestConsumerGroupGetLagWithStoredOffsetCmd {
+    fn new() -> Self {
+        Self {
+            stream_name: String::from("cg-get-lag-stored-stream"),
+            topic_name: String::from("cg-get-lag-stored-topic"),
+            group_name: String::from("cg-get-lag-stored-group"),
+            messages_count: 10,
+            stored_offset: 3,
+            stream_id: 0,
+            topic_id: 0,
+            group_id: 0,
+        }
+    }
+}
+
+#[async_trait]
+impl IggyCmdTestCase for TestConsumerGroupGetLagWithStoredOffsetCmd {
+    async fn prepare_server_state(&mut self, client: &dyn Client) {
+        let stream = client.create_stream(&self.stream_name).await.unwrap();
+        self.stream_id = stream.id;
+
+        let topic = client
+            .create_topic(
+                &self.stream_id.try_into().unwrap(),
+                &self.topic_name,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        self.topic_id = topic.id;
+
+        let consumer_group = client
+            .create_consumer_group(
+                &self.stream_id.try_into().unwrap(),
+                &self.topic_id.try_into().unwrap(),
+                &self.group_name,
+            )
+            .await
+            .unwrap();
+        self.group_id = consumer_group.id;
+
+        let join_result = client
+            .join_consumer_group(
+                &self.stream_id.try_into().unwrap(),
+                &self.topic_id.try_into().unwrap(),
+                &self.group_name.clone().try_into().unwrap(),
+            )
+            .await;
+        assert!(
+            join_result.is_ok(),
+            "join_consumer_group failed: {:?}",
+            join_result.err()
+        );
+
+        // The server fences a group offset write to the calling connection's
+        // membership. Join returns before that assignment is visible.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stream_id = self.stream_id.try_into().unwrap();
+        let topic_id = self.topic_id.try_into().unwrap();
+        let group_id = self.group_id.try_into().unwrap();
+        loop {
+            let group = client
+                .get_consumer_group(&stream_id, &topic_id, &group_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let owns_partition = group
+                .members
+                .iter()
+                .any(|member| member.partitions.contains(&0));
+            if group.members_count == 1 && owns_partition {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "partition 0 was not assigned: {group:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let mut messages = (1..=self.messages_count)
+            .filter_map(|id| IggyMessage::from_str(format!("Test message {id}").as_str()).ok())
+            .collect::<Vec<_>>();
+        client
+            .send_messages(
+                &self.stream_id.try_into().unwrap(),
+                &self.topic_id.try_into().unwrap(),
+                &Partitioning::partition_id(0),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+
+        let group_consumer = Consumer::group(self.group_name.clone().try_into().unwrap());
+        client
+            .store_consumer_offset(
+                &group_consumer,
+                &self.stream_id.try_into().unwrap(),
+                &self.topic_id.try_into().unwrap(),
+                Some(0),
+                self.stored_offset,
+            )
+            .await
+            .unwrap();
+    }
+
+    fn get_command(&self) -> IggyCmdCommand {
+        IggyCmdCommand::new()
+            .arg("consumer-group")
+            .arg("get")
+            .arg(self.stream_name.clone())
+            .arg(self.topic_name.clone())
+            .arg(self.group_name.clone())
+            .with_env_credentials()
+    }
+
+    fn verify_command(&self, command_state: Assert) {
+        let current_offset = self.messages_count - 1;
+        let lag = current_offset as u64 - self.stored_offset;
+        command_state.success().stdout(contains(format!(
+            "{current_offset}              | {}             | {lag}",
+            self.stored_offset
+        )));
+    }
+
+    async fn verify_server_state(&self, client: &dyn Client) {
+        let _ = client
+            .leave_consumer_group(
+                &self.stream_id.try_into().unwrap(),
+                &self.topic_id.try_into().unwrap(),
+                &self.group_name.clone().try_into().unwrap(),
+            )
+            .await;
+        client
+            .delete_consumer_group(
+                &self.stream_id.try_into().unwrap(),
+                &self.topic_id.try_into().unwrap(),
+                &self.group_name.clone().try_into().unwrap(),
+            )
+            .await
+            .unwrap();
+        client
+            .delete_topic(
+                &self.stream_id.try_into().unwrap(),
+                &self.topic_id.try_into().unwrap(),
+            )
+            .await
+            .unwrap();
+        client
+            .delete_stream(&self.stream_id.try_into().unwrap())
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+#[parallel]
+pub async fn should_show_lag_without_stored_offset() {
+    let mut iggy_cmd_test = IggyCmdTest::default();
+    iggy_cmd_test.setup().await;
+    iggy_cmd_test
+        .execute_test(TestConsumerGroupGetLagWithoutStoredOffsetCmd::new())
+        .await;
+}
+
+#[tokio::test]
+#[parallel]
+pub async fn should_show_lag_with_stored_offset() {
+    let mut iggy_cmd_test = IggyCmdTest::default();
+    iggy_cmd_test.setup().await;
+    iggy_cmd_test
+        .execute_test(TestConsumerGroupGetLagWithStoredOffsetCmd::new())
+        .await;
 }
 
 #[tokio::test]

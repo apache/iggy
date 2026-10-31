@@ -92,6 +92,7 @@ windows-native-keyring-store = { workspace = true, optional = true }
 cfg_aliases = { workspace = true }
 
 [dev-dependencies]
+async-broadcast = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 
