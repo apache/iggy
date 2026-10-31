@@ -236,11 +236,13 @@ async fn poll_all(client: &IggyClient) -> Result<u32, IggyError> {
         .poll_messages(
             &Identifier::named(STREAM_NAME).expect("stream identifier"),
             &Identifier::named(TOPIC_NAME).expect("topic identifier"),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            MESSAGES_COUNT,
-            false,
+            PollOptions {
+                count: MESSAGES_COUNT,
+                ..PollOptions::default()
+            },
         )
         .await?;
     Ok(polled.messages.len() as u32)

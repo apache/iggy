@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use iggy::prelude::{Identifier, IggyMessage, MessageClient, Partitioning};
+use iggy::prelude::{DEFAULT_POLL_MAX_BYTES, Identifier, IggyMessage, MessageClient, Partitioning};
 use serial_test::serial;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
@@ -420,6 +420,26 @@ async fn max_timestamp_resolves_to_the_last_record_at_any_version() {
             "v{version}: got {timestamp}, the last batch came after {between}"
         );
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn a_record_past_the_default_poll_cap_resolves_by_time_and_as_the_last_record() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    seed.ensure_stream_and_topic("orders", 1)
+        .await
+        .expect("seed the topic");
+    let before = now_millis() - 60_000;
+    let cap = usize::try_from(DEFAULT_POLL_MAX_BYTES).expect("a u32 fits a usize");
+    produce_batch(&server, &["x".repeat(2 * cap).as_str()]).await;
+
+    let (error_code, _, offset) = send_at(&state, REQUEST_VERSION, "orders", 0, before).await;
+    assert_eq!((error_code, offset), (ERROR_NONE, 0), "by time");
+    let (error_code, _, offset) =
+        send_at(&state, MAX_TIMESTAMP_VERSION, "orders", 0, MAX_TIMESTAMP).await;
+    assert_eq!((error_code, offset), (ERROR_NONE, 0), "as the last record");
 }
 
 /// A TCP relay to `server` that leaves the next connections [`Self::stall_next`] counts

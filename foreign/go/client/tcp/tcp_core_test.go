@@ -528,7 +528,7 @@ func TestExchange_LostLinkKeepsTheSessionAndTheSentWrite(t *testing.T) {
 	}
 }
 
-func TestExchange_EvictedPollThatMovesItsConsumerEndsNotCommitted(t *testing.T) {
+func TestExchange_EvictedPollThatMovesItsConsumerEndsWithItsUnknownOutcome(t *testing.T) {
 	for _, test := range []struct {
 		name       string
 		reason     vsr.EvictionReason
@@ -536,10 +536,10 @@ func TestExchange_EvictedPollThatMovesItsConsumerEndsNotCommitted(t *testing.T) 
 		autoCommit bool
 		want       error
 	}{
-		{"no_session/auto_commit", vsr.EvictionNoSession, iggcon.FirstPollingStrategy(), true, ierror.ErrTransientNotCommitted},
+		{"no_session/auto_commit", vsr.EvictionNoSession, iggcon.FirstPollingStrategy(), true, ierror.FetchProgressUncertain{}},
 		{"no_session/next", vsr.EvictionNoSession, iggcon.NextPollingStrategy(), false, ierror.ErrTransientNotCommitted},
 		{"no_session/read_only", vsr.EvictionNoSession, iggcon.FirstPollingStrategy(), false, ierror.ErrTransientNotCommitted},
-		{"stale_client/next", vsr.EvictionStaleClient, iggcon.NextPollingStrategy(), true, ierror.ErrTransientNotCommitted},
+		{"stale_client/auto_commit", vsr.EvictionStaleClient, iggcon.NextPollingStrategy(), true, ierror.FetchProgressUncertain{}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client, serverConn := newOfflinePipeClient(t)
@@ -548,7 +548,7 @@ func TestExchange_EvictedPollThatMovesItsConsumerEndsNotCommitted(t *testing.T) 
 			})
 			partition := uint32(0)
 
-			_, err := client.PollMessages(context.Background(), numericIdentifier(t, 1), numericIdentifier(t, 2),
+			_, err := client.pollMessages(context.Background(), numericIdentifier(t, 1), numericIdentifier(t, 2),
 				iggcon.NewSingleConsumer(numericIdentifier(t, 3)), test.strategy, 1, test.autoCommit, &partition)
 
 			require.ErrorIs(t, err, test.want)

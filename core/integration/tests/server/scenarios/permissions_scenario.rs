@@ -226,11 +226,13 @@ async fn test_no_permissions(harness: &TestHarness, root_client: &IggyClient) {
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await,
         "poll_messages",
@@ -733,11 +735,13 @@ async fn test_message_permissions(harness: &TestHarness, root_client: &IggyClien
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll_messages: poll_messages should work");
@@ -801,11 +805,13 @@ async fn test_message_permissions(harness: &TestHarness, root_client: &IggyClien
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await,
         "send_messages: poll_messages",
@@ -846,11 +852,13 @@ async fn test_message_permissions(harness: &TestHarness, root_client: &IggyClien
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("both: poll_messages should work");
@@ -928,11 +936,13 @@ async fn test_stream_specific_permissions(harness: &TestHarness, root_client: &I
         .poll_messages(
             &stream1_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("stream-specific: poll_messages 1 should work");
@@ -968,11 +978,13 @@ async fn test_stream_specific_permissions(harness: &TestHarness, root_client: &I
             .poll_messages(
                 &stream2_id,
                 &topic_id,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await,
         "stream-specific: poll_messages 2",
@@ -1061,11 +1073,13 @@ async fn test_topic_specific_permissions(harness: &TestHarness, root_client: &Ig
         .poll_messages(
             &stream_id,
             &topic1_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("topic-specific: poll_messages 1 should work");
@@ -1093,11 +1107,13 @@ async fn test_topic_specific_permissions(harness: &TestHarness, root_client: &Ig
             .poll_messages(
                 &stream_id,
                 &topic2_id,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await,
         "topic-specific: poll_messages 2",
@@ -1156,11 +1172,13 @@ async fn test_global_permission_inheritance(harness: &TestHarness, root_client: 
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("read_streams → poll_messages");
@@ -1270,11 +1288,13 @@ async fn test_global_permission_inheritance(harness: &TestHarness, root_client: 
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("manage_streams → poll_messages");
@@ -1334,11 +1354,13 @@ async fn test_global_permission_inheritance(harness: &TestHarness, root_client: 
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("manage_topics → poll_messages");
@@ -1390,11 +1412,13 @@ async fn test_global_permission_inheritance(harness: &TestHarness, root_client: 
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("read_topics → poll_messages");
@@ -1528,11 +1552,13 @@ async fn test_stream_permission_inheritance(harness: &TestHarness, root_client: 
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("stream.read_stream → poll_messages");
@@ -1650,11 +1676,13 @@ async fn test_stream_permission_inheritance(harness: &TestHarness, root_client: 
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("stream.manage_stream → poll_messages");
@@ -1731,11 +1759,13 @@ async fn test_stream_permission_inheritance(harness: &TestHarness, root_client: 
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("stream.manage_topics implies poll_messages: poll_messages should work");
@@ -1814,11 +1844,13 @@ async fn test_topic_permission_inheritance(harness: &TestHarness, root_client: &
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("topic.read_topic implies poll_messages: poll_messages should work");
@@ -1883,11 +1915,13 @@ async fn test_topic_permission_inheritance(harness: &TestHarness, root_client: &
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("topic.manage_topic implies poll_messages: poll_messages should work");
@@ -1933,11 +1967,13 @@ async fn test_consumer_group_operations(harness: &TestHarness, root_client: &Igg
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll_messages: poll should work");
@@ -2287,11 +2323,13 @@ async fn test_union_semantics(harness: &TestHarness, root_client: &IggyClient) {
         .poll_messages(
             &stream1_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("additive: poll topic 1 should work");
@@ -2301,11 +2339,13 @@ async fn test_union_semantics(harness: &TestHarness, root_client: &IggyClient) {
         .poll_messages(
             &stream1_id,
             &topic2_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("additive: poll topic 2 should work (via stream.read_stream)");
@@ -2388,11 +2428,13 @@ async fn test_missing_resource_behavior(harness: &TestHarness, root_client: &Igg
             .poll_messages(
                 &nonexistent_stream,
                 &nonexistent_topic,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await,
         "authorized: poll from non-existent stream/topic",
@@ -2440,11 +2482,13 @@ async fn test_missing_resource_behavior(harness: &TestHarness, root_client: &Igg
             .poll_messages(
                 &nonexistent_stream,
                 &nonexistent_topic,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await,
         "unauthorized: poll from non-existent",
@@ -2660,11 +2704,13 @@ async fn test_live_permission_revocation(harness: &TestHarness, root_client: &Ig
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll must still work (poll grant retained)");

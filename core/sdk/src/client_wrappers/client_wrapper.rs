@@ -24,9 +24,9 @@ use crate::websocket::websocket_client::WebSocketClient;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
     AssignmentVersion, BinaryClient, BinaryOperationLineage, BinarySendPartitioning,
-    BinaryTransport, ClientState, Identifier, IggyError, IggyMessage, MessageClient,
-    SendMessagesResponse, SystemClient, group_cache_key, send_binary_messages,
-    sync_group_assignment,
+    BinaryTransport, ClientState, Consumer, DeferredPollOptions, FetchedSection, Identifier,
+    IggyError, IggyMessage, MessageClient, PollingStrategy, SendMessagesResponse, SystemClient,
+    fetch_binary_messages, group_cache_key, send_binary_messages, sync_group_assignment,
 };
 
 #[allow(clippy::large_enum_variant)]
@@ -97,7 +97,7 @@ impl ClientWrapper {
     pub(crate) async fn retains_operation(&self, op: u64) -> bool {
         match self {
             Self::Iggy(client) => Box::pin(client.client.read().await.retains_operation(op)).await,
-            Self::Http(_) => false,
+            Self::Http(client) => client.retains_operation(op),
             Self::Tcp(client) => client.retains_operation(op),
             Self::Quic(client) => client.retains_operation(op),
             Self::WebSocket(client) => client.retains_operation(op),
@@ -138,9 +138,64 @@ impl ClientWrapper {
         }
     }
 
-    /// The partitions grouped by primary endpoint and split to fit one wait
-    /// request each, so that a consumer can keep one readiness wait in flight
-    /// per group.
+    /// One `FetchMessages` (109) request for the `targets` of one readiness group, with the
+    /// contract of [`fetch_binary_messages`]. The sections of a nested [`IggyClient`] decode
+    /// with its encryptor. HTTP has no fetch and returns `FeatureUnavailable`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn fetch_messages(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        targets: &[(u32, PollingStrategy)],
+        consumer: &Consumer,
+        count: u32,
+        auto_commit: bool,
+        options: DeferredPollOptions,
+    ) -> Result<Vec<FetchedSection>, IggyError> {
+        macro_rules! fetch {
+            ($client:expr) => {
+                fetch_binary_messages(
+                    $client,
+                    stream_id,
+                    topic_id,
+                    targets,
+                    consumer,
+                    count,
+                    auto_commit,
+                    options,
+                )
+                .await
+            };
+        }
+        match self {
+            Self::Tcp(client) => fetch!(client),
+            Self::Quic(client) => fetch!(client),
+            Self::WebSocket(client) => fetch!(client),
+            Self::Http(_) => Err(IggyError::FeatureUnavailable),
+            Self::Iggy(client) => {
+                let sections = Box::pin(client.client.read().await.fetch_messages(
+                    stream_id,
+                    topic_id,
+                    targets,
+                    consumer,
+                    count,
+                    auto_commit,
+                    options,
+                ))
+                .await?;
+                Ok(sections
+                    .into_iter()
+                    .map(|section| section.with_encryptor(client.encryptor.clone()))
+                    .collect())
+            }
+        }
+    }
+
+    /// The partitions grouped by primary endpoint and split to fit one request
+    /// each, so that a consumer can keep one [`fetch_messages`](Self::fetch_messages)
+    /// in flight per group. Each group keeps the order of `partitions`, and the first
+    /// failed route lookup in that order is the error. HTTP has no groups and
+    /// returns `FeatureUnavailable`.
     pub(crate) async fn readiness_groups(
         &self,
         stream: &Identifier,

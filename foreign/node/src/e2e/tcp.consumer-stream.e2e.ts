@@ -17,7 +17,7 @@
 
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import type { Readable } from 'node:stream';
+import { once } from 'node:events';
 import { Client } from '../client/client.js';
 import { groupConsumerStream } from '../stream/consumer-stream.js';
 import {
@@ -54,6 +54,12 @@ describe('e2e -> consumer-stream', async () => {
 
   const ct = 1000;
 
+  after(async () => {
+    assert.ok(await c.stream.delete({ streamId: streamName }));
+    assert.ok(await c.session.logout());
+    c.destroy();
+  });
+
   it('e2e -> consumer-stream::send-messages', async () => {
     for (let i = 0; i < ct; i += 100) {
       await sendSomeMessages(c.clientProvider)(
@@ -71,47 +77,37 @@ describe('e2e -> consumer-stream', async () => {
       streamId: streamName,
       topicId: topicName,
       pollingStrategy: PollingStrategy.Next,
-      count: 100,
-      interval: 500
+      count: 100
     };
 
     const pollStream = groupConsumerStream(opt);
     const s = await pollStream(pollReq);
     const s2 = await pollStream(pollReq);
-    let recv = 0;
-    const dataCb = (str: Readable) => (d: PollMessagesResponse) => {
-      recv += d.messages.length;
-      assert.equal(d.messages.length, d.count);
-      if (recv === ct) {
-        str.destroy();
-      }
-    };
-
-    s.on('data', dataCb(s));
-    s2.on('data', dataCb(s2));
-
-    // promise prevent test from finishing before end is handled
-    await new Promise((resolve, reject) => {
-      s.on('error', (err) => {
-        console.error('=>>Stream ERROR::', err)
-        s.destroy(err);
-        reject(err);
+    const received = new Set<string>();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        for (const stream of [s, s2]) {
+          stream.once('error', reject);
+          stream.on('data', ({ partitionId, messages, count }: PollMessagesResponse) => {
+            try {
+              assert.equal(messages.length, count);
+              for (const { headers: { offset } } of messages) {
+                const key = `${partitionId}:${offset}`;
+                assert.ok(!received.has(key), `message ${key} was delivered twice`);
+                received.add(key);
+              }
+              if (received.size === ct) resolve();
+            } catch (error) { reject(error); }
+          });
+        }
       });
-
-      s.on('end', async () => {
-        resolve(assert.equal(ct, recv));
-      });
-    });
-
-    after(async () => {
-      // The member that did not get the last batch can still be polling,
-      // and a poll that fails after the delete has no error listener.
-      s.destroy();
-      s2.destroy();
-      assert.ok(await c.stream.delete({ streamId: streamName }));
-      assert.ok(await c.session.logout());
-      await c.destroy();
-    });
-
+      assert.equal(received.size, ct);
+    } finally {
+      await Promise.all([s, s2].map(async (stream) => {
+        const closed = once(stream, 'close');
+        stream.destroy();
+        await closed;
+      }));
+    }
   });
 });

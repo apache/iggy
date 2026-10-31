@@ -64,6 +64,7 @@ class VsrOperationTest {
         }
         assertThat(VsrLoginCodec.PROTOCOL_VERSION)
                 .isEqualTo(constants.get("protocol_version").get("packed").asInt())
-                .isEqualTo(constants.get("protocol_version_min").get("packed").asInt());
+                .isGreaterThanOrEqualTo(
+                        constants.get("protocol_version_min").get("packed").asInt());
     }
 }

@@ -54,6 +54,8 @@ pub(crate) struct SessionOwner {
     lanes: Mutex<Lanes>,
     proved: Mutex<ProvedOutcomes>,
     pending: Arc<PendingOperations>,
+    /// Fetch blocks outlive sessions, unlike replayable mutation reservations.
+    pending_fetches: Arc<PendingOperations>,
     consumer_group_state: Arc<ConsumerGroupClientState>,
     /// The highest metadata commit a reply showed. A reset keeps it.
     metadata_watermark: AtomicU64,
@@ -119,6 +121,7 @@ impl SessionOwner {
             lanes: Mutex::default(),
             proved: Mutex::new(ProvedOutcomes::new(pending_operations.max_operations)),
             pending: Arc::new(PendingOperations::new(pending_operations)),
+            pending_fetches: Arc::new(PendingOperations::new(pending_operations)),
             consumer_group_state: Arc::default(),
             metadata_watermark: AtomicU64::new(0),
             sign_in: Mutex::default(),
@@ -177,8 +180,9 @@ impl SessionOwner {
         Ok(first_bind)
     }
 
-    /// Replaces the session, raises the fence and drops every retained
-    /// operation. The request counter, the proved outcomes, the watermark and
+    /// Replaces the session, raises the fence and drops replayable retained
+    /// mutations. Local fetch progress blocks survive. The request counter,
+    /// the proved outcomes, the watermark and
     /// the sign-in stay. The caller ended the session, so no sign-in is owed,
     /// and the lineage ends.
     pub(crate) fn reset(&self) -> Result<(), IggyError> {

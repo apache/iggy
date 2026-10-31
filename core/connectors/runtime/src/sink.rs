@@ -29,8 +29,8 @@ use crate::{
 use dlopen2::wrapper::Container;
 use futures::{Stream, StreamExt};
 use iggy::prelude::{
-    AutoCommit, AutoCommitWhen, Client, DeferredPollOptions, IggyClient, IggyConsumer, IggyError,
-    IggyMessage, NonZeroIggyDuration, PollingStrategy, UserClient,
+    Client, CommitPolicy, IggyClient, IggyConsumer, IggyDuration, IggyError, IggyMessage,
+    NonZeroIggyDuration, PollOptions, PollingStrategy, ReadError, UserClient,
 };
 use iggy_connector_sdk::decoders::avro::{AvroConfig, AvroStreamDecoder};
 use iggy_connector_sdk::{
@@ -39,13 +39,17 @@ use iggy_connector_sdk::{
 };
 use std::{
     collections::HashMap,
+    pin::Pin,
     str::FromStr,
     sync::{Arc, atomic::Ordering},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
+
+const DEFAULT_BATCH_LENGTH: u32 = 1000;
 
 /// Initializes all enabled sink connectors.
 ///
@@ -309,7 +313,10 @@ pub(crate) fn spawn_consume_tasks(
                 callback,
                 transforms,
                 topic_metadata,
-                &mut consumer,
+                &mut ConsumerMessages {
+                    consumer: &mut consumer,
+                    client: &client,
+                },
                 verbose,
                 benchmark,
                 &plugin_key,
@@ -360,6 +367,15 @@ pub(crate) async fn release_sink_client(client: Arc<IggyClient>, plugin_id: u32)
     }
 }
 
+/// The reads of a sink task, and the calls that resume a partition that its reader stopped.
+pub(crate) trait SinkMessages:
+    Stream<Item = Result<iggy::prelude::ReceivedMessage, ReadError>> + Unpin
+{
+    async fn abandon_operation(&mut self, operation: u64) -> Result<(), IggyError>;
+
+    async fn seek(&mut self, partition_id: u32, start: PollingStrategy) -> Result<(), IggyError>;
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn consume_messages(
     plugin_id: u32,
@@ -368,7 +384,7 @@ pub(crate) async fn consume_messages(
     consume: ConsumeCallback,
     transforms: Vec<Arc<dyn Transform>>,
     topic_metadata: TopicMetadata,
-    mut messages: impl Stream<Item = Result<iggy::prelude::ReceivedMessage, IggyError>> + Unpin,
+    messages: &mut impl SinkMessages,
     verbose: bool,
     benchmark: bool,
     plugin_key: &str,
@@ -397,12 +413,9 @@ pub(crate) async fn consume_messages(
                 };
                 match message {
                     Some(Ok(message)) => Some(message),
-                    Some(Err(_)) => {
-                        error!(
-                            "Failed to receive message for sink connector with ID: {plugin_id} from stream: {}, topic: {}",
-                            topic_metadata.stream, topic_metadata.topic
-                        );
+                    Some(Err(error)) => {
                         metrics.inc_errors_with_labels(&labels.counter);
+                        handle_read_error(messages, error, plugin_id, &topic_metadata).await;
                         continue;
                     }
                     None => None,
@@ -527,6 +540,91 @@ pub(crate) async fn consume_messages(
     Ok(())
 }
 
+/// The reader stops a partition after a read with an unknown outcome, a message that does not
+/// decode, or a new partition history. Each would wait for a restart, so the sink resumes the
+/// partition. After an unknown outcome it resumes after the stored offset. The abandoned request
+/// can still store its offset later, so the sink can skip the messages of that request. The
+/// reader retries any other error by itself.
+async fn handle_read_error(
+    messages: &mut impl SinkMessages,
+    error: ReadError,
+    plugin_id: u32,
+    topic_metadata: &TopicMetadata,
+) {
+    let TopicMetadata { stream, topic } = topic_metadata;
+    let (partition_id, start) = match (error.partition_id, &error.error, error.skip) {
+        (
+            Some(partition_id),
+            IggyError::FetchProgressUncertain(operation)
+            | IggyError::PartitionLaneBlocked(_, operation),
+            _,
+        ) => {
+            warn!(
+                "Abandoning operation: {operation} with an unknown outcome, which blocks partition: {partition_id} of sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic}. The partition resumes after its stored offset. {}",
+                error.error
+            );
+            match messages.abandon_operation(*operation).await {
+                // The reader reports a lost fetch for each of its partitions, and the first
+                // abandon frees the operation for all of them.
+                Ok(()) | Err(IggyError::OperationNotRetained(_)) => {}
+                Err(abandon_error) => warn!(
+                    "Failed to abandon operation: {operation} of sink connector with ID: {plugin_id}: {abandon_error}"
+                ),
+            }
+            (partition_id, PollingStrategy::next())
+        }
+        (Some(partition_id), _, Some(skip)) => {
+            warn!(
+                "Skipping a message that does not decode in partition: {partition_id} of sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic}. {}",
+                error.error
+            );
+            (partition_id, skip)
+        }
+        (Some(partition_id), IggyError::HistoryUnavailable, None) => {
+            warn!(
+                "Partition: {partition_id} of sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic} has a new history. It resumes after its stored offset. {}",
+                error.error
+            );
+            (partition_id, PollingStrategy::next())
+        }
+        _ => {
+            error!(
+                "Failed to receive message for sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic}"
+            );
+            return;
+        }
+    };
+    if let Err(seek_error) = messages.seek(partition_id, start).await {
+        error!(
+            "Failed to resume partition: {partition_id} of sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic}: {seek_error}"
+        );
+    }
+}
+
+/// A sink consumer with the client that holds the operations of its reads.
+struct ConsumerMessages<'a> {
+    consumer: &'a mut IggyConsumer,
+    client: &'a IggyClient,
+}
+
+impl Stream for ConsumerMessages<'_> {
+    type Item = Result<iggy::prelude::ReceivedMessage, ReadError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.consumer.poll_next_unpin(cx)
+    }
+}
+
+impl SinkMessages for ConsumerMessages<'_> {
+    async fn abandon_operation(&mut self, operation: u64) -> Result<(), IggyError> {
+        self.client.abandon_operation(operation).await
+    }
+
+    async fn seek(&mut self, partition_id: u32, start: PollingStrategy) -> Result<(), IggyError> {
+        self.consumer.seek(partition_id, start).await
+    }
+}
+
 fn get_plugin_version(container: &Container<SinkApi>) -> String {
     unsafe {
         let version_ptr = (container.iggy_sink_version)();
@@ -590,15 +688,11 @@ pub(crate) async fn setup_sink_consumers(
             .consumer_group
             .as_deref()
             .unwrap_or(&default_consumer_group);
-        let batch_length = stream.batch_length.unwrap_or(1000);
         for topic in stream.topics.iter() {
             let mut consumer = iggy_client
                 .consumer_group(consumer_group, &stream.stream, topic)?
-                .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
                 .create_consumer_group_if_not_exists()
-                .auto_join_consumer_group()
                 .polling_strategy(PollingStrategy::next())
-                .batch_length(batch_length)
                 .poll_options(poll_options)
                 .build();
             consumer.init().await?;
@@ -618,26 +712,30 @@ pub(crate) async fn setup_sink_consumers(
                 }
                 other => other.decoder(),
             };
-            consumers.push((consumer, decoder, batch_length, transforms.clone()));
+            consumers.push((consumer, decoder, poll_options.count, transforms.clone()));
         }
     }
     Ok(consumers)
 }
 
-/// A configured wait extends the default request timeout by its length, so the
-/// final read and the reply keep the default time after the wait.
-fn poll_options(stream: &StreamConsumerConfig) -> Result<DeferredPollOptions, RuntimeError> {
+/// The server stores the offset of each reply as part of the read. While the
+/// primary stays up the plugin gets each message at most once, and a failover
+/// before the store replicates can deliver the last batch again. A stream
+/// without `max_wait` waits one second.
+fn poll_options(stream: &StreamConsumerConfig) -> Result<PollOptions, RuntimeError> {
     if stream.poll_interval.is_some() {
         return Err(RuntimeError::UnsupportedPollInterval(stream.stream.clone()));
     }
-    let mut options = DeferredPollOptions::default();
+    let mut options = PollOptions {
+        count: stream.batch_length.unwrap_or(DEFAULT_BATCH_LENGTH),
+        commit: CommitPolicy::OnRead,
+        ..PollOptions::wait(IggyDuration::ONE_SECOND)
+    };
     if let Some(max_wait) = stream.max_wait.as_deref() {
         // A zero wait answers at once, so an idle topic would be polled constantly.
         let max_wait = NonZeroIggyDuration::from_str(max_wait).map_err(|error| {
             RuntimeError::InvalidConfiguration(format!("Invalid max wait: {error}"))
         })?;
-        options.request_timeout =
-            (options.request_timeout.get_duration() + max_wait.get_duration()).into();
         options.max_wait = max_wait.into();
     }
     if let Some(min_count) = stream.min_count {
@@ -941,7 +1039,11 @@ mod tests {
     use iggy_connector_sdk::{Error, Payload};
     use prost::Message as _;
     use std::sync::LazyLock;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, AtomicUsize};
+    use tracing::{Level, Subscriber};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt};
+    use tracing_subscriber::registry::Registry;
 
     /// One entry per FFI call the stub sink received, keyed by plugin id so
     /// tests sharing the binary do not read each other's batches.
@@ -1210,6 +1312,106 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// A recovery call of the sink loop.
+    #[derive(Debug, PartialEq)]
+    enum Recovery {
+        Abandon(u64),
+        Seek(u32, PollingStrategy),
+    }
+
+    /// Counts the warnings logged under its subscriber.
+    struct Warnings(Arc<AtomicUsize>);
+
+    impl<S: Subscriber> Layer<S> for Warnings {
+        fn on_event(&self, event: &tracing::Event<'_>, _: LayerContext<'_, S>) {
+            if *event.metadata().level() == Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Hands reads to the sink loop and records its recovery calls in order.
+    struct FakeMessages<S> {
+        reads: S,
+        abandon: Result<(), IggyError>,
+        calls: Vec<Recovery>,
+    }
+
+    impl<S> FakeMessages<S> {
+        fn new(reads: S) -> Self {
+            Self {
+                reads,
+                abandon: Ok(()),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl<S> Stream for FakeMessages<S>
+    where
+        S: Stream<Item = Result<iggy::prelude::ReceivedMessage, ReadError>> + Unpin,
+    {
+        type Item = S::Item;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.reads.poll_next_unpin(cx)
+        }
+    }
+
+    impl<S> SinkMessages for FakeMessages<S>
+    where
+        S: Stream<Item = Result<iggy::prelude::ReceivedMessage, ReadError>> + Unpin,
+    {
+        /// As the client does, the first abandon frees `operation`.
+        async fn abandon_operation(&mut self, operation: u64) -> Result<(), IggyError> {
+            let abandoned = self.calls.contains(&Recovery::Abandon(operation));
+            self.calls.push(Recovery::Abandon(operation));
+            if abandoned {
+                return Err(IggyError::OperationNotRetained(operation));
+            }
+            self.abandon.clone()
+        }
+
+        async fn seek(
+            &mut self,
+            partition_id: u32,
+            start: PollingStrategy,
+        ) -> Result<(), IggyError> {
+            self.calls.push(Recovery::Seek(partition_id, start));
+            Ok(())
+        }
+    }
+
+    /// Runs the sink loop until `messages` end, into the capturing stub sink.
+    async fn consume_reads(
+        plugin_id: u32,
+        messages: &mut impl SinkMessages,
+        metrics: &Arc<Metrics>,
+    ) {
+        const BATCH_SIZE: u32 = 16;
+        let (_shutdown, shutdown_rx) = watch::channel(());
+        consume_messages(
+            plugin_id,
+            Schema::Json.decoder(),
+            BATCH_SIZE,
+            capturing_consume,
+            Vec::new(),
+            TopicMetadata {
+                stream: "test_stream".to_owned(),
+                topic: "test_topic".to_owned(),
+            },
+            messages,
+            false,
+            false,
+            "test_sink",
+            metrics,
+            &SinkLabels::new("test_sink"),
+            shutdown_rx,
+        )
+        .await
+        .expect("consuming the stream should succeed");
+    }
+
     #[tokio::test]
     async fn given_an_avro_stream_when_batch_is_tagged_should_use_the_decoded_payload_schema() {
         let plugin_id = next_plugin_id();
@@ -1266,12 +1468,12 @@ mod tests {
         const BATCH_SIZE: u32 = 16;
         let plugin_id = next_plugin_id();
         let received = |partition_id, offset, current_offset| {
-            Ok(iggy::prelude::ReceivedMessage {
-                context: iggy::prelude::PartitionContext::default(),
-                message: test_message(offset, br#"{"id":1}"#.to_vec()),
+            iggy::prelude::ReceivedMessage::new(
+                test_message(offset, br#"{"id":1}"#.to_vec()),
                 current_offset,
                 partition_id,
-            })
+                iggy::prelude::PartitionContext::default(),
+            )
         };
         // Byte-limited replies stop each partition short of its head.
         let messages = futures::stream::iter([
@@ -1280,7 +1482,8 @@ mod tests {
             received(2, 0, 1),
             received(1, 2, 2),
             received(2, 1, 1),
-        ]);
+        ])
+        .map(Ok);
         let (_shutdown, shutdown_rx) = watch::channel(());
 
         consume_messages(
@@ -1293,7 +1496,7 @@ mod tests {
                 stream: "test_stream".to_owned(),
                 topic: "test_topic".to_owned(),
             },
-            messages,
+            &mut FakeMessages::new(messages),
             false,
             false,
             "test_sink",
@@ -1318,26 +1521,29 @@ mod tests {
     async fn given_a_batch_short_of_the_partition_head_when_shutdown_arrives_should_still_send_it()
     {
         const BATCH_SIZE: u32 = 16;
+        const PARTITION_ID: u32 = 1;
         let plugin_id = next_plugin_id();
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         let received = |offset| {
-            Ok(iggy::prelude::ReceivedMessage {
-                context: iggy::prelude::PartitionContext::default(),
-                message: test_message(offset, br#"{"id":1}"#.to_vec()),
-                current_offset: TEST_CURRENT_OFFSET,
-                partition_id: 1,
-            })
+            iggy::prelude::ReceivedMessage::new(
+                test_message(offset, br#"{"id":1}"#.to_vec()),
+                TEST_CURRENT_OFFSET,
+                PARTITION_ID,
+                iggy::prelude::PartitionContext::default(),
+            )
         };
         // A byte-limited reply ends short of the head, so the loop asks for
         // more. That poll parks, and the shutdown arrives while it waits.
-        let messages = Box::pin(futures::stream::iter([received(0), received(1)]).chain(
-            futures::stream::once(async move {
-                shutdown_tx
-                    .send(())
-                    .expect("the sink loop should still listen for shutdown");
-                std::future::pending().await
-            }),
-        ));
+        let messages = Box::pin(
+            futures::stream::iter([received(0), received(1)])
+                .map(Ok)
+                .chain(futures::stream::once(async move {
+                    shutdown_tx
+                        .send(())
+                        .expect("the sink loop should still listen for shutdown");
+                    std::future::pending().await
+                })),
+        );
 
         consume_messages(
             plugin_id,
@@ -1349,7 +1555,7 @@ mod tests {
                 stream: "test_stream".to_owned(),
                 topic: "test_topic".to_owned(),
             },
-            messages,
+            &mut FakeMessages::new(messages),
             false,
             false,
             "test_sink",
@@ -1366,8 +1572,158 @@ mod tests {
             .collect();
         assert_eq!(
             batches,
-            [(1, vec![0, 1])],
+            [(PARTITION_ID, vec![0, 1])],
             "the poll committed this batch, so a shutdown must not drop it"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_reads_that_stop_a_partition_when_consumed_should_resume_each_partition() {
+        const UNCERTAIN_OPERATION: u64 = 7;
+        const BLOCKING_OPERATION: u64 = 8;
+        const UNDECODED_OFFSET: u64 = 5;
+        let plugin_id = next_plugin_id();
+        let metrics = Arc::new(Metrics::init());
+        let skip = PollingStrategy::offset(UNDECODED_OFFSET + 1);
+        let stopped = |partition_id, error, skip| ReadError {
+            partition_id: Some(partition_id),
+            error,
+            skip,
+            offset: None,
+            record: None,
+        };
+        let mut messages = FakeMessages::new(futures::stream::iter([
+            Err(stopped(
+                1,
+                IggyError::FetchProgressUncertain(UNCERTAIN_OPERATION),
+                None,
+            )),
+            Err(stopped(
+                2,
+                IggyError::PartitionLaneBlocked(2, BLOCKING_OPERATION),
+                None,
+            )),
+            Err(stopped(3, IggyError::CannotDecryptData, Some(skip))),
+            Err(stopped(4, IggyError::HistoryUnavailable, None)),
+            Ok(iggy::prelude::ReceivedMessage::new(
+                test_message(0, br#"{"id":1}"#.to_vec()),
+                0,
+                1,
+                iggy::prelude::PartitionContext::default(),
+            )),
+        ]));
+
+        consume_reads(plugin_id, &mut messages, &metrics).await;
+
+        assert_eq!(
+            messages.calls,
+            [
+                Recovery::Abandon(UNCERTAIN_OPERATION),
+                Recovery::Seek(1, PollingStrategy::next()),
+                Recovery::Abandon(BLOCKING_OPERATION),
+                Recovery::Seek(2, PollingStrategy::next()),
+                Recovery::Seek(3, skip),
+                Recovery::Seek(4, PollingStrategy::next()),
+            ]
+        );
+        assert_eq!(metrics.get_errors("test_sink", ConnectorType::Sink), 4);
+        let batches: Vec<_> = captured(plugin_id)
+            .into_iter()
+            .map(|batch| (batch.partition_id, batch.offsets))
+            .collect();
+        assert_eq!(
+            batches,
+            [(1, vec![0])],
+            "the loop reads on after it resumes a partition"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_read_error_that_the_reader_retries_when_consumed_should_only_count_it() {
+        let plugin_id = next_plugin_id();
+        let metrics = Arc::new(Metrics::init());
+        let mut messages = FakeMessages::new(futures::stream::iter([
+            Err(ReadError {
+                partition_id: None,
+                error: IggyError::Disconnected,
+                skip: None,
+                offset: None,
+                record: None,
+            }),
+            Err(ReadError {
+                partition_id: Some(1),
+                error: IggyError::TransientNotAccepted,
+                skip: None,
+                offset: None,
+                record: None,
+            }),
+        ]));
+
+        consume_reads(plugin_id, &mut messages, &metrics).await;
+
+        assert_eq!(messages.calls, []);
+        assert_eq!(metrics.get_errors("test_sink", ConnectorType::Sink), 2);
+    }
+
+    #[tokio::test]
+    async fn given_an_abandon_that_fails_when_resuming_should_still_seek_the_partition() {
+        const OPERATION: u64 = 7;
+        let plugin_id = next_plugin_id();
+        let mut messages = FakeMessages {
+            abandon: Err(IggyError::FeatureUnavailable),
+            ..FakeMessages::new(futures::stream::iter([Err(ReadError {
+                partition_id: Some(1),
+                error: IggyError::FetchProgressUncertain(OPERATION),
+                skip: None,
+                offset: None,
+                record: None,
+            })]))
+        };
+
+        consume_reads(plugin_id, &mut messages, &Arc::new(Metrics::init())).await;
+
+        assert_eq!(
+            messages.calls,
+            [
+                Recovery::Abandon(OPERATION),
+                Recovery::Seek(1, PollingStrategy::next())
+            ],
+            "the seek still tries to resume the partition"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_lost_fetch_of_two_partitions_when_resuming_should_warn_once_per_partition() {
+        const OPERATION: u64 = 7;
+        let plugin_id = next_plugin_id();
+        let lost = |partition_id| ReadError {
+            partition_id: Some(partition_id),
+            error: IggyError::FetchProgressUncertain(OPERATION),
+            skip: None,
+            offset: None,
+            record: None,
+        };
+        let mut messages = FakeMessages::new(futures::stream::iter([Err(lost(1)), Err(lost(2))]));
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let _subscriber = tracing::subscriber::set_default(
+            Registry::default().with(Warnings(Arc::clone(&warnings))),
+        );
+
+        consume_reads(plugin_id, &mut messages, &Arc::new(Metrics::init())).await;
+
+        assert_eq!(
+            messages.calls,
+            [
+                Recovery::Abandon(OPERATION),
+                Recovery::Seek(1, PollingStrategy::next()),
+                Recovery::Abandon(OPERATION),
+                Recovery::Seek(2, PollingStrategy::next()),
+            ]
+        );
+        assert_eq!(
+            warnings.load(Ordering::Relaxed),
+            2,
+            "the second abandon finds the operation freed by the first, which is no failure"
         );
     }
 
@@ -1565,24 +1921,29 @@ mod tests {
 
     #[test]
     fn given_max_wait_and_min_count_when_building_poll_options_should_wait_for_a_batch() {
-        let default = DeferredPollOptions::default();
         let unset = poll_options(&StreamConsumerConfig::default()).expect("defaults are valid");
-        assert_eq!(unset, default);
+        assert_eq!(
+            unset,
+            PollOptions {
+                count: DEFAULT_BATCH_LENGTH,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::wait(IggyDuration::ONE_SECOND)
+            }
+        );
 
         let stream = StreamConsumerConfig {
+            batch_length: Some(2000),
             max_wait: Some("30s".to_owned()),
             min_count: Some(500),
             ..StreamConsumerConfig::default()
         };
         let options = poll_options(&stream).expect("a 30 s wait is valid");
 
+        assert_eq!(options.count, 2000);
         assert_eq!(options.max_wait.get_duration(), Duration::from_secs(30));
         assert_eq!(options.min_count, 500);
-        assert_eq!(
-            options.request_timeout.get_duration(),
-            default.request_timeout.get_duration() + Duration::from_secs(30)
-        );
-        assert_eq!(options.validate(1000), Ok(()));
+        assert_eq!(options.commit, CommitPolicy::OnRead);
+        assert_eq!(options.validate(), Ok(()));
     }
 
     #[test]

@@ -65,9 +65,9 @@ fn given_live_wire_constants_when_comparing_fixture_should_match_codes_and_versi
     );
     assert_eq!(
         constants.protocol_version.packed,
-        pack_protocol_version(0, 12, 0)
+        pack_protocol_version(0, 12, 1)
     );
-    assert_eq!(constants.protocol_version.text, "0.12.0");
+    assert_eq!(constants.protocol_version.text, "0.12.1");
     assert_eq!(
         constants.command_codes["update_resource"],
         CommandCode {

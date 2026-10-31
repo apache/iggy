@@ -19,6 +19,7 @@ import { deserializePartitionContext, PARTITION_CONTEXT_SIZE, type PartitionCont
 import { type Id } from "../identifier.utils.js";
 import { type ValueOf, reverseRecord } from "../../type.utils.js";
 import { toDate } from "../serialize.utils.js";
+import { DeserializeError } from "../error.utils.js";
 import { serializeGetOffset, type Consumer } from "../offset/offset.utils.js";
 import { deserializeHeaders, type ParsedHeaderEntry } from "./header.utils.js";
 import { Transform, type TransformCallback } from "node:stream";
@@ -260,6 +261,8 @@ export type BatchMessage = {
   payload: Buffer;
   /** Raw user header bytes */
   userHeaders: Buffer;
+  /** The frame as received: its header, payload and user headers */
+  frame: Buffer;
 };
 
 /**
@@ -271,7 +274,8 @@ export type BatchMessage = {
  * @param b - Buffer containing serialized batch records
  * @param pos - Starting position in the buffer
  * @returns Array of decoded message frames
- * @throws Error if a record or frame is malformed
+ * @throws DeserializeError if a record or frame is malformed, with the
+ * remaining bytes from where decoding stopped as its `record`
  */
 export const deserializeBatchMessages = (
   b: Buffer,
@@ -280,27 +284,24 @@ export const deserializeBatchMessages = (
   const messages: BatchMessage[] = [];
   const len = b.length;
   while (pos < len) {
+    const malformed = (message: string) => new DeserializeError(message, { record: b.subarray(pos) });
     if (pos + BATCH_HEADER_SIZE > len)
-      throw new Error("truncated batch header in poll response");
+      throw malformed("truncated batch header in poll response");
     const batch = deserializeBatchHeader(b, pos);
     const recordEnd = pos + Number(batch.batchLength);
     if (Number(batch.batchLength) < BATCH_HEADER_SIZE || recordEnd > len)
-      throw new Error(
-        `invalid batch length ${batch.batchLength} in poll response`,
-      );
+      throw malformed(`invalid batch length ${batch.batchLength} in poll response`);
     pos += BATCH_HEADER_SIZE;
     while (pos < recordEnd) {
       if (pos + FRAME_HEADER_SIZE > recordEnd)
-        throw new Error("truncated message frame in poll response");
+        throw malformed("truncated message frame in poll response");
       const frame = deserializeFrameHeader(b, pos);
       if (frame.reserved !== 0n)
-        throw new Error(
-          `non-zero reserved field ${frame.reserved} in message frame`,
-        );
+        throw malformed(`non-zero reserved field ${frame.reserved} in message frame`);
       const payloadEnd = pos + FRAME_HEADER_SIZE + frame.payloadLength;
       const frameEnd = payloadEnd + frame.userHeadersLength;
       if (frameEnd > recordEnd)
-        throw new Error("truncated message frame in poll response");
+        throw malformed("truncated message frame in poll response");
       messages.push({
         checksum: frame.checksum,
         id: frame.id,
@@ -310,6 +311,7 @@ export const deserializeBatchMessages = (
           batch.originTimestamp + BigInt(frame.timestampDelta),
         payload: b.subarray(pos + FRAME_HEADER_SIZE, payloadEnd),
         userHeaders: b.subarray(payloadEnd, frameEnd),
+        frame: b.subarray(pos, frameEnd),
       });
       pos = frameEnd;
     }
@@ -323,6 +325,9 @@ export const deserializeBatchMessages = (
  * @param b - Buffer containing serialized batch records
  * @param pos - Starting position in the buffer
  * @returns Array of deserialized messages
+ * @throws DeserializeError if a record or frame is malformed, or the user
+ * headers of a message do not decode, then with the offset and the frame of
+ * that message as its `offset` and `record`
  */
 export const deserializeMessages = (b: Buffer, pos = 0): Message[] =>
   deserializeBatchMessages(b, pos).map((message) => ({
@@ -337,11 +342,23 @@ export const deserializeMessages = (b: Buffer, pos = 0): Message[] =>
       reserved: 0n,
     },
     payload: message.payload,
-    userHeaders:
-      message.userHeaders.length > 0
-        ? deserializeHeaders(message.userHeaders)
-        : ([] as ParsedHeaderEntry[]),
+    userHeaders: deserializeUserHeaders(message),
   }));
+
+const deserializeUserHeaders = (message: BatchMessage): ParsedHeaderEntry[] => {
+  if (message.userHeaders.length === 0) return [];
+  try {
+    return deserializeHeaders(message.userHeaders);
+  } catch (cause) {
+    throw new DeserializeError(
+      `user headers of the message at offset ${message.offset} do not decode`,
+      { cause, offset: message.offset, record: message.frame },
+    );
+  }
+};
+
+/** The partition, current offset, count and context before the records of a poll response. */
+const POLL_RESPONSE_HEADER_SIZE = 4 + 8 + 4 + PARTITION_CONTEXT_SIZE;
 
 /**
  * Deserializes a poll messages response from a buffer.
@@ -351,12 +368,16 @@ export const deserializeMessages = (b: Buffer, pos = 0): Message[] =>
  * @returns Parsed PollMessagesResponse
  */
 export const deserializePollMessages = (r: Buffer, pos = 0) => {
+  if (r.length < pos + POLL_RESPONSE_HEADER_SIZE)
+    throw new DeserializeError("truncated poll response header", { record: r.subarray(pos) });
   const partitionId = r.readUInt32LE(pos);
   const currentOffset = r.readBigUInt64LE(pos + 4);
   const count = r.readUInt32LE(pos + 12);
   const context = deserializePartitionContext(r, pos + 16);
-  const messages = deserializeMessages(r, pos + 16 + PARTITION_CONTEXT_SIZE);
-  if (messages.length !== count) throw new Error("poll response count does not match its messages");
+  const records = r.subarray(pos + POLL_RESPONSE_HEADER_SIZE);
+  const messages = deserializeMessages(records);
+  if (messages.length !== count)
+    throw new DeserializeError("poll response count does not match its messages", { record: records });
 
   return {
     partitionId,

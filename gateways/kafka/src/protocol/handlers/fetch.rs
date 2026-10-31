@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use iggy::prelude::{
-    IGGY_MESSAGE_HEADER_SIZE, IggyError, IggyMessage, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE,
+    DEFAULT_POLL_MAX_BYTES, IGGY_MESSAGE_HEADER_SIZE, IggyError, IggyMessage, PollOptions,
     PolledMessages,
 };
 use kafka_protocol::indexmap::IndexSet;
@@ -36,7 +36,7 @@ use kafka_protocol::records::Record;
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
 
-use crate::bridge::iggy_bridge::{FetchSlot, PartitionProbe, TopicProbe};
+use crate::bridge::iggy_bridge::{FetchSlot, ONE_MESSAGE_MAX_BYTES, PartitionProbe, TopicProbe};
 use crate::bridge::topic_map::validate_kafka_topic_name;
 use crate::bridge::{BridgeError, IggyBridge};
 use crate::error::Result;
@@ -81,15 +81,6 @@ const LAST_GOOD_TTL: Duration = Duration::from_secs(30);
 
 /// Most messages one partition read takes from Iggy, over all its polls.
 const MAX_POLL_COUNT: u32 = 1000;
-/// Most messages one poll asks for. Iggy caps a poll by count, not by bytes, so this caps what one
-/// poll can load: about 1 GB of the largest messages. A byte cap in Iggy would lift it.
-const MAX_PAGE_COUNT: u32 = 16;
-/// The largest message Iggy stores, header included.
-const LARGEST_MESSAGE_BYTES: u64 =
-    MAX_PAYLOAD_SIZE as u64 + MAX_USER_HEADERS_SIZE as u64 + IGGY_MESSAGE_HEADER_SIZE as u64;
-// The server answers an empty poll when the reply passes its u32 frame size. The consumer would
-// then stall.
-const _: () = assert!(MAX_PAGE_COUNT as u64 * LARGEST_MESSAGE_BYTES < u32::MAX as u64);
 
 /// First version with sessions and a top-level error code.
 const SESSION_MIN_VERSION: i16 = 7;
@@ -851,7 +842,11 @@ impl<'a> Reader<'a> {
         if worth_polling(self.owes_first_record, budget, probe.average_size) {
             while let Some(count) = next_page(&polled, budget, probe.average_size) {
                 let asked = Instant::now();
-                let Some(page) = self.poll(want.topic, at.index, polled.next, count).await else {
+                let left = budget.saturating_sub(polled.bytes);
+                let Some(page) = self
+                    .poll(want.topic, at.index, polled.next, count, left)
+                    .await
+                else {
                     break;
                 };
                 match page {
@@ -864,7 +859,7 @@ impl<'a> Reader<'a> {
                             asked,
                         });
                     }
-                    Ok(page) => polled.add(page, count),
+                    Ok(page) => polled.add(page),
                     Err(error) if polled.messages.is_empty() => {
                         return Read::Done(self.refuse(want, at, offset, &error));
                     }
@@ -929,14 +924,14 @@ impl<'a> Reader<'a> {
         if !worth_polling(self.owes_first_record, budget, probe.average_size) {
             return Read::Done(unread);
         }
-        let count = poll_count(budget, probe.average_size, u64::from(MAX_PAGE_COUNT));
+        let count = poll_count(budget, probe.average_size, u64::from(MAX_POLL_COUNT));
         let asked = Instant::now();
-        match self.poll(want.topic, at.index, offset, count).await {
+        match self.poll(want.topic, at.index, offset, count, budget).await {
             None => Read::Done(unread),
             Some(Err(error)) => Read::Done(self.refuse(want, at, offset, &error)),
             Some(Ok(page)) if !page.messages.is_empty() => {
                 let mut polled = Polled::new(offset, probe.high_watermark);
-                polled.add(page, count);
+                polled.add(page);
                 self.read(want, at, offset, probe, polled).await
             }
             Some(Ok(page)) if caught_up(offset, page.current_offset) => {
@@ -1044,18 +1039,25 @@ impl<'a> Reader<'a> {
         refused(want.partition, code)
     }
 
-    /// Polls one page, in the read slot. `None` once `give_up_at` passes.
+    /// Polls one page of at most `count` messages and [`page_max_bytes`] bytes, in the read slot.
+    /// `None` once `give_up_at` passes.
     async fn poll(
         &mut self,
         topic: &str,
         index: u32,
         offset: u64,
         count: u32,
+        budget: usize,
     ) -> Option<core::result::Result<PolledMessages, BridgeError>> {
         let give_up_at = self.fetch.give_up_at;
         if Instant::now() >= give_up_at {
             return None;
         }
+        let options = PollOptions {
+            count,
+            max_bytes: page_max_bytes(count, budget),
+            ..PollOptions::default()
+        };
         let bridge = self.fetch.bridge;
         let (page, slot) = bridge
             .poll(
@@ -1063,7 +1065,7 @@ impl<'a> Reader<'a> {
                 topic,
                 index,
                 offset,
-                count,
+                options,
                 give_up_at,
             )
             .await?;
@@ -1553,11 +1555,13 @@ impl Polled {
         }
     }
 
-    fn add(&mut self, page: PolledMessages, count: u32) {
-        self.done = page.messages.len() < usize::try_from(count).unwrap_or(usize::MAX);
+    fn add(&mut self, page: PolledMessages) {
         let Some(last) = page.messages.last() else {
+            self.done = true;
             return;
         };
+        // A page can come back short for bytes, so only the end of the partition ends the read.
+        self.done = last.header.offset >= page.current_offset;
         self.next = last.header.offset.saturating_add(1);
         self.high_watermark = self
             .high_watermark
@@ -1585,13 +1589,10 @@ fn next_page(polled: &Polled, budget: usize, average_size: u64) -> Option<u32> {
         return None;
     }
     if polled.messages.is_empty() {
-        return Some(poll_count(budget, average_size, waiting).min(MAX_PAGE_COUNT));
+        return Some(poll_count(budget, average_size, waiting));
     }
     let fits = budget.saturating_sub(polled.bytes) / polled.largest.max(1);
-    let count = u32::try_from(fits)
-        .unwrap_or(u32::MAX)
-        .min(MAX_PAGE_COUNT)
-        .min(room);
+    let count = u32::try_from(fits).unwrap_or(u32::MAX).min(room);
     (count > 0).then_some(count)
 }
 
@@ -1610,6 +1611,19 @@ fn poll_count(budget: usize, average_size: u64, waiting: u64) -> u32 {
     let fits = u64::try_from(budget).unwrap_or(u64::MAX) / average_size.max(1);
     let count = fits.min(waiting).clamp(1, u64::from(MAX_POLL_COUNT));
     u32::try_from(count).unwrap_or(MAX_POLL_COUNT)
+}
+
+/// The byte cap of a poll of `count` messages with `budget` bytes left.
+///
+/// The budget, but never below Iggy's default cap, since the encoder trims the page to the
+/// budget anyway. One message gets [`ONE_MESSAGE_MAX_BYTES`].
+fn page_max_bytes(count: u32, budget: usize) -> u32 {
+    if count == 1 {
+        return ONE_MESSAGE_MAX_BYTES;
+    }
+    u32::try_from(budget)
+        .unwrap_or(u32::MAX)
+        .max(DEFAULT_POLL_MAX_BYTES)
 }
 
 /// Bytes Iggy stores for `message`, header included, as the probe's average counts them.
@@ -1904,6 +1918,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn given_a_budget_when_capping_a_page_should_send_it_but_never_below_the_default_cap() {
+        let budget = 4 * 1024 * 1024;
+        assert_eq!(
+            page_max_bytes(MAX_POLL_COUNT, budget),
+            u32::try_from(budget).unwrap()
+        );
+        assert_eq!(
+            page_max_bytes(MAX_POLL_COUNT, 10),
+            DEFAULT_POLL_MAX_BYTES,
+            "a small budget still reads a default page"
+        );
+        assert_eq!(page_max_bytes(2, usize::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn given_one_message_when_capping_the_page_should_send_the_smallest_cap() {
+        // No cap made the owner reserve its whole read budget for one message.
+        for budget in [0, 10, 4 * 1024 * 1024, usize::MAX] {
+            assert_eq!(
+                page_max_bytes(1, budget),
+                ONE_MESSAGE_MAX_BYTES,
+                "the first message comes whatever its size"
+            );
+        }
+    }
+
     /// A page of messages from `first` on, one per payload size.
     fn page(first: u64, sizes: &[usize], current_offset: u64) -> PolledMessages {
         let messages: Vec<IggyMessage> = sizes
@@ -1918,19 +1959,22 @@ mod tests {
                 message
             })
             .collect();
-        PolledMessages {
-            partition_id: 0,
+        PolledMessages::new(
+            iggy::prelude::PartitionContext::default(),
+            0,
             current_offset,
-            count: u32::try_from(messages.len()).unwrap(),
+            u32::try_from(messages.len()).unwrap(),
             messages,
-            context: iggy::prelude::PartitionContext::default(),
-        }
+        )
     }
 
     #[test]
     fn given_a_new_read_when_sizing_the_first_page_should_use_the_average_up_to_the_cap() {
         let mib = 1024 * 1024;
-        assert_eq!(next_page(&Polled::new(0, 10_000), mib, 100), Some(16));
+        assert_eq!(
+            next_page(&Polled::new(0, 10_000), mib, 100),
+            Some(MAX_POLL_COUNT)
+        );
         assert_eq!(next_page(&Polled::new(0, 3), mib, 100), Some(3));
         assert_eq!(
             next_page(&Polled::new(0, 100), 10, 100),
@@ -1943,31 +1987,51 @@ mod tests {
     #[test]
     fn given_small_messages_when_sizing_later_pages_should_grow_to_the_cap() {
         let mut polled = Polled::new(0, 10_000);
-        polled.add(page(0, &[100; 16], 15), 16);
+        polled.add(page(0, &[100; 16], 9_999));
         assert_eq!(polled.next, 16);
-        assert_eq!(next_page(&polled, 1024 * 1024, 100), Some(MAX_PAGE_COUNT));
+        assert_eq!(
+            next_page(&polled, 1024 * 1024, 100),
+            Some(MAX_POLL_COUNT - 16)
+        );
     }
 
     #[test]
     fn given_a_large_message_when_sizing_the_next_page_should_ask_for_what_fits() {
         let mut polled = Polled::new(0, 10_000);
-        polled.add(page(0, &[100, 100, 400_000], 2), 3);
+        polled.add(page(0, &[100, 100, 400_000], 9_999));
         assert_eq!(next_page(&polled, 1024 * 1024, 100), Some(1));
         assert_eq!(next_page(&polled, 500_000, 100), None, "no room left");
     }
 
     #[test]
-    fn given_a_short_page_when_sizing_the_next_page_should_stop() {
+    fn given_a_page_short_for_bytes_when_more_waits_should_read_on() {
         let mut polled = Polled::new(0, 10_000);
-        polled.add(page(0, &[100; 3], 20_000), 16);
+        polled.add(page(0, &[100; 3], 20_000));
         assert_eq!(polled.high_watermark, 20_001, "the reply moves it up");
+        assert_eq!(
+            next_page(&polled, 1024 * 1024, 100),
+            Some(MAX_POLL_COUNT - 3)
+        );
+    }
+
+    #[test]
+    fn given_a_page_at_the_end_of_the_partition_when_sizing_the_next_page_should_stop() {
+        let mut polled = Polled::new(0, 10_000);
+        polled.add(page(0, &[100; 3], 2));
         assert_eq!(next_page(&polled, 1024 * 1024, 100), None);
+        let mut polled = Polled::new(0, 10_000);
+        polled.add(page(0, &[], 2));
+        assert_eq!(
+            next_page(&polled, 1024 * 1024, 100),
+            None,
+            "an empty page ends the read"
+        );
     }
 
     #[test]
     fn given_the_count_cap_when_sizing_the_next_page_should_not_pass_it() {
         let mut polled = Polled::new(0, 10_000);
-        polled.add(page(0, &[1; 990], 989), 990);
+        polled.add(page(0, &[1; 990], 9_999));
         assert_eq!(next_page(&polled, usize::MAX, 1), Some(10));
     }
 

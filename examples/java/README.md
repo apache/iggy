@@ -50,6 +50,15 @@ A good introduction for newcomers to Iggy:
 ./gradlew runGettingStartedConsumer
 ```
 
+### Reader Consumer
+
+Reads the messages of the getting started producer as a member of a consumer group, through a partition reader that waits on the server for new messages and stores the offset of each message once it is processed:
+
+```bash
+./gradlew runGettingStartedProducer
+./gradlew runReaderConsumer
+```
+
 ### Message Headers
 
 Shows metadata management using custom headers:

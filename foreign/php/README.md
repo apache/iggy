@@ -112,6 +112,7 @@ $client->loginUser('iggy', 'iggy');
 $stream = 'php-stream';
 $topic = 'php-topic';
 $partitionId = 0;
+$consumerId = 1;
 
 $client->createStream($stream);
 $client->createTopic($stream, $topic, 1, null, null, null, null);
@@ -121,24 +122,25 @@ $client->sendMessages($stream, $topic, $partitionId, [
     new \Iggy\SendMessage('hello from PHP 2'),
 ]);
 
-$messages = $client->pollMessages(
+$polled = $client->pollMessages(
     $stream,
     $topic,
     $partitionId,
+    $consumerId,
     \Iggy\PollingStrategy::first(),
-    10,
-    true,
+    new \Iggy\PollOptions(count: 10),
 );
 
-foreach ($messages as $message) {
+foreach ($polled->messages as $message) {
     echo $message->payload(), PHP_EOL;
 }
+
+$next = $client->pollMessages($stream, $topic, $partitionId, $consumerId, $polled->continuation());
 ```
 
-Consumer group callbacks require a finite message limit. The partition id
-argument is ignored for a consumer group, since the member reads the partitions
-the server assigns to it. After the example above, each loop below consumes one
-of its two messages:
+Consumer group callbacks require a finite message limit. The member reads the
+partitions that the server assigns to it. After the example above, each loop
+below consumes one of its two messages:
 
 ```php
 <?php
@@ -147,32 +149,43 @@ $consumer = $client->consumerGroup(
     'php-consumer',
     $stream,
     $topic,
-    null,
     \Iggy\PollingStrategy::next(),
-    10,
-    \Iggy\AutoCommit::disabled(),
-    true,
-    true,
-    null,
-    null,
-    null,
-    null,
-    false,
 );
 
 $consumer->consumeMessages(
     function (\Iggy\ReceiveMessage $message) use ($consumer): void {
         echo $message->payload(), PHP_EOL;
-        $consumer->storePosition($message->position());
+        $consumer->commit($message->checkpoint());
     },
     1,
 );
 
 foreach ($consumer->iterMessages() as $message) {
     echo $message->payload(), PHP_EOL;
-    $consumer->storePosition($message->position());
+    $consumer->commit($message->checkpoint());
 
     break;
+}
+
+$consumer->shutdown();
+```
+
+A reader returns whole batches of one partition, and it reads ahead in the
+background:
+
+```php
+<?php
+
+$reader = $client->reader($stream, $topic, 'php-reader', [$partitionId], \Iggy\PollingStrategy::first());
+
+try {
+    $batch = $reader->next();
+    foreach ($batch->messages as $message) {
+        echo $message->payload(), PHP_EOL;
+    }
+    $reader->commit($batch->checkpoint());
+} finally {
+    $reader->close();
 }
 ```
 
@@ -322,7 +335,10 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   `max_pending_operation_bytes`, for example
   `iggy+quic://iggy:iggy@localhost:8080?max_pending_operations=256&max_pending_operation_bytes=67108864`.
 - `Iggy\Exception\PendingOperationException` preserves the read-only `operation_id`
-  decimal string and `kind` (`uncertain`, `lane_blocked`, or `not_retained`).
+  decimal string and `kind` (`uncertain`, `lane_blocked`, `fetch_progress_uncertain`,
+  or `not_retained`).
+  Its read-only `partition_id` names the blocked partition of a fetch, or is
+  `null` for other pending operations.
   `getCode()` returns the SDK error code. Keep IDs as strings: PHP integers cannot
   represent the full unsigned 64-bit range. `lane_blocked` identifies an earlier
   operation, and the blocked call was not sent. `not_retained` does not prove
@@ -334,9 +350,14 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   `abandonOperation(string $operation_id)` releases it without proving whether it
   committed. Both methods reject malformed or overflowing IDs. HTTP does not support
   retained-operation recovery. A session reset, disconnect or shutdown discards
-  retained operations. The client keeps the proved outcomes of its last
+  replayable retained mutations. The client keeps the proved outcomes of its last
   `max_pending_operations` replays, also across a session reset. A later
   `resolveOperation()` of a proved operation returns the same outcome without a request.
+- Unknown committing fetch progress raises code 14010 with kind `fetch_progress_uncertain`. Its local recovery ID and affected progress blocks survive reconnect and session replacement.
+
+  `resolveOperation()` returns that error without I/O. `abandonOperation()` explicitly releases all its local blocks while accepting the unknown outcome. Abandonment does not stop the old request.
+
+  GetOffset and stateless reads remain available for inspection. Raw partial replies keep wire statuses. A later affected progress call raises code 14009 with the partition and recovery ID. Fetch retention uses a separate bounded pool with the configured operation/byte limits and stores target metadata only.
 - Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
   An unresolved operation cannot recover its receipt after its original session
   ends, even after a new login or account reactivation. A fresh send can duplicate it.
@@ -354,32 +375,76 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   current consumer partition, and is rejected until at least one message has been
   polled. Pass an explicit partition id before the first poll.
 - `consumeMessages()` requires an explicit finite limit. It does not run forever
-  by default.
+  by default. An exception of the callback ends the run, and `consumeMessages()`
+  throws it. In the callback, `commit()`, `storeOffset()`, `deleteOffset()` and the
+  getters work. `seek()`, `shutdown()`, `iterMessages()` and `consumeMessages()` throw
+  there.
 - `iterMessages()` returns a PHP `Iterator` and can be used with `foreach`.
   Break out of the loop when the caller's processing limit or shutdown signal is reached.
-- Without an `AutoCommit` argument, the consumer stores no offset, as with
-  `AutoCommit::disabled()`. Store positions after processing, or each restart
-  reads the same messages again.
-- `AutoCommit::when()` may queue an offset commit before the PHP callback runs.
-  If callback success must control commits, use `AutoCommit::disabled()` and call
-  `storePosition($message->position())` after the callback work succeeds.
-- Every received message keeps the partition context of the poll that delivered it:
+  A new `foreach` over the same iterator reads on after the last message it yielded.
+- `pollMessages()` returns an `Iggy\PolledMessages` batch with `partition_id`,
+  `current_offset`, `count` and `messages`. `Iggy\PollOptions` sets `count`,
+  `max_wait_micros`, `min_count`, `max_bytes` and `commit`, and refuses
+  invalid limits before anything is sent.
+- `commit` takes an `Iggy\CommitPolicy`: `CommitPolicy::manual()`, the default, stores
+  nothing, `CommitPolicy::onRead()` makes the server store the offset of each reply, and
+  `CommitPolicy::auto(new AutoCommit(...))` makes a reader or a consumer store the latest
+  counted position every `interval_micros` or on a `CommitEvery` event, and on close or
+  shutdown. A message counts as its `CommitAfter` says: after processing (the default),
+  at delivery, or when `mark($checkpoint)` marks it. `AutoCommit::default()` stores every
+  10,000 messages or 5 seconds after processing. `pollMessages()` refuses `auto()`.
+- With `CommitPolicy::onRead()`, the server stores the offset of each reply. A lost reply, also to a `disconnect()` while the poll waits, then throws `FetchProgressUncertain` (14010), and the partition stays blocked until `abandonOperation()`. `disconnect()` closes the connection until the next `connect()`, after which `loginUser()` signs in again.
+- `consumerGroup()` builds a member of a consumer group, and creates a missing group
+  by default. `reader()` builds a batch reader of chosen partitions as a standalone
+  consumer, and `groupReader()` a batch reader of an existing consumer group.
+- `PartitionReader::next()` waits until a batch arrives. Give `timeout_micros` to
+  limit the wait. At the timeout, `next()` returns `null`, and the script gets control
+  back. A batch that arrives later stays in the reader for the next call.
+- `startPollMessages()` runs the poll of `pollMessages()` in the background and
+  returns a `PendingPoll` at once. `wait($timeout_micros)` returns its batch, or
+  `null` while the poll still runs, and `cancel()` drops the request, which cancels
+  a parked deferred poll on the server. A parked poll holds its connection, so start
+  it on a client that sends nothing else meanwhile.
+- The default options of a reader or a consumer wait 5 seconds for up to 1000
+  messages. A wait of 0 polls an idle topic in a busy loop. `prefetch_bytes`
+  (16 MiB) and `prefetch_messages` bound the requests in flight and the queued
+  batches.
+- With `CommitPolicy::manual()`, the consumer stores no offset. Commit checkpoints
+  after processing, or each restart reads the same messages again.
+- Under `CommitPolicy::auto()`, `consumeMessages()` counts a message after its callback
+  returns with `CommitAfter::Processing`, and before it with `CommitAfter::Delivery`. An
+  exception of the callback ends the run, and under `CommitAfter::Processing` its message
+  stays uncounted, so the next run reads it again.
+- Every received message has a `checkpoint()`: the position after the message, with
   the partition incarnation, which changes when the partition is deleted and recreated,
-  and the consumer group owner generation. `Iggy\Consumer::storePosition()` commits a
-  message's `position()` under that context, so a commit after a recreation or an owner
-  change is refused instead of landing on the newer partition. `storeOffset()` commits
-  under the context of the latest message consumed from that partition.
-- `Iggy\PollingStrategy::withContext()` continues a poll at an offset under the context
-  that produced it, for example
-  `PollingStrategy::offset($message->offset() + 1)->withContext($message->context())`.
-  A stale context fails the poll. To continue in another process, save the context's
-  `incarnation`, `owner_generation` and `metadata_op` with the offset and rebuild it with
-  `new Iggy\PartitionContext(...)`.
-- A poll or offset write without a caller context uses the context of its route. It can
-  fail once with `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009)
-  for a consumer group, after another client deleted and recreated the partition. The
-  failed route is dropped, and the next call routes again. Both errors surface as
-  `Iggy\Exception\IggyException`.
+  and the consumer group owner generation. Commit it with `Iggy\Consumer::commit()` or
+  `Iggy\PartitionReader::commit()`, on the consumer or the reader that delivered it. A
+  commit after a recreation or an owner change is refused instead of landing on the newer
+  partition. `storeOffset()` commits under the context of the latest message consumed
+  from that partition. `PolledMessages::checkpoint()` covers the whole batch.
+- `PolledMessages::continuation()` continues a poll after the batch, under the
+  partition context of the batch. A read after a recreation fails with
+  `HistoryUnavailable` (87). A continuation cannot move to another process: store a
+  checkpoint there, and start the other process with `PollingStrategy::next()`.
+- `Client::deleteConsumerPosition()` deletes the offset stored for the partition of a
+  checkpoint, under the partition history that delivered it.
+- A failed read of a reader or of `iterMessages()` throws `Iggy\Exception\ReadException`.
+  `consumeMessages()` throws it only for an error that ends its run, such as
+  `HistoryUnavailable` (87), and the consumer retries the other failed reads.
+  `getCode()` is the error code, `getPrevious()` the typed exception that a direct call
+  would throw, `partition_id` the partition or `null`, and `skip` the continuation after
+  a message that does not decode. The reader retries by itself. `HistoryUnavailable`
+  (87) stops the partition until `seek()`.
+- Call `close()` on a reader and `shutdown()` on a consumer before the script ends.
+  Under `CommitPolicy::auto()`, they store the latest counted position first. Under
+  `CommitPolicy::onRead()`, they move the offset back to the last delivered
+  message, so the next run reads the prefetched messages again. Destroying the object
+  without them skips those messages.
+- A poll with a fresh strategy, or an offset write without a checkpoint, uses the
+  context of its route. It can fail once with `HistoryUnavailable` (87), or
+  `ConsumerGroupPartitionNotOwned` (5009) for a consumer group, after another client
+  deleted and recreated the partition. The failed route is dropped, and the next call
+  routes again. Both errors surface as `Iggy\Exception\IggyException`.
 - `Iggy\PollingStrategy::timestamp()` and `Iggy\PollingStrategy::timestampMicros()`
   expect microseconds since the Unix epoch. Use
   `Iggy\PollingStrategy::timestampSeconds()` for PHP `time()` values.

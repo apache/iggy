@@ -31,10 +31,12 @@ import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -65,20 +67,17 @@ class VsrResponseHandlerTest {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void shouldCancelOnlyAfterTheDeferredFrameHasBeenSent(boolean cancelBeforeWrite) {
+    @CsvSource({"false, POLL_DEFERRED", "true, POLL_DEFERRED", "false, FETCH_MESSAGES", "true, FETCH_MESSAGES"})
+    void shouldCancelOnlyAfterTheDeferredFrameHasBeenSent(boolean cancelBeforeWrite, CommandCode.Messages deferred) {
         long requestId = 7;
         long sessionId = 9;
+        int command = deferred.getValue();
         CompletableFuture<ByteBuf> future = new CompletableFuture<>();
         ByteBuf request = requestFrame(VsrOperation.NON_REPLICATED, requestId);
         request.setLongLE(VsrHeaders.REQUEST_SESSION_OFFSET, sessionId);
-        request.setIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET, CommandCode.Messages.POLL_DEFERRED.getValue());
+        request.setIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET, command);
         var pending = handler.registerRequest(
-                channel,
-                request,
-                future,
-                System.nanoTime() + TimeUnit.MINUTES.toNanos(1),
-                CommandCode.Messages.POLL_DEFERRED.getValue());
+                channel, request, future, System.nanoTime() + TimeUnit.MINUTES.toNanos(1), command);
         try {
             if (cancelBeforeWrite) {
                 future.cancel(false);
@@ -92,10 +91,11 @@ class VsrResponseHandlerTest {
             channel.runPendingTasks();
             ByteBuf original = channel.readOutbound();
             assertThat(original.getIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET))
-                    .isEqualTo(CommandCode.Messages.POLL_DEFERRED.getValue());
+                    .isEqualTo(command);
             original.release();
             ByteBuf cancellation = channel.readOutbound();
             assertThat(cancellation.readableBytes()).isEqualTo(VsrHeaders.HEADER_SIZE);
+            assertThat(cancellation.getIntLE(VsrHeaders.SIZE_OFFSET)).isEqualTo(VsrHeaders.HEADER_SIZE);
             assertThat(cancellation.getIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET))
                     .isEqualTo(CommandCode.Messages.CANCEL_DEFERRED_REQUEST.getValue());
             assertThat(VsrHeaders.readRequestId(cancellation)).isEqualTo(requestId);
@@ -103,6 +103,15 @@ class VsrResponseHandlerTest {
                     .isEqualTo(sessionId);
             cancellation.release();
             assertThat((Object) channel.readOutbound()).isNull();
+
+            ByteBuf lateReply = replyFrame(
+                    VsrOperation.NON_REPLICATED, requestId, Unpooled.buffer().writeIntLE(0));
+            channel.writeInbound(lateReply);
+            assertThat(lateReply.refCnt())
+                    .as("a reply after the cancel is dropped")
+                    .isZero();
+            assertThat((Object) channel.readOutbound()).isNull();
+            assertThat(evictions.get()).isZero();
             assertThat(channel.isActive()).isTrue();
         } finally {
             request.release();
@@ -231,7 +240,11 @@ class VsrResponseHandlerTest {
     void shouldBindSessionOnRegisterReply() throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         var ticket = session.acquire(
-                        ConsensusSession.LaneKey.METADATA, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                        List.of(ConsensusSession.LaneKey.METADATA),
+                        true,
+                        VsrHeaders.HEADER_SIZE,
+                        deadline,
+                        channel.eventLoop())
                 .join();
         var heldMonitor = new AtomicBoolean();
         var waiting = ticket.awaitSession(session.lineage(), deadline, channel.eventLoop())
@@ -276,10 +289,18 @@ class VsrResponseHandlerTest {
         session.bind(42);
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         var first = session.acquire(
-                        ConsensusSession.LaneKey.METADATA, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                        List.of(ConsensusSession.LaneKey.METADATA),
+                        true,
+                        VsrHeaders.HEADER_SIZE,
+                        deadline,
+                        channel.eventLoop())
                 .join();
         var waiting = session.acquire(
-                ConsensusSession.LaneKey.METADATA, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+                List.of(ConsensusSession.LaneKey.METADATA),
+                true,
+                VsrHeaders.HEADER_SIZE,
+                deadline,
+                channel.eventLoop());
         var heldMonitor = new AtomicBoolean();
         var continued = waiting.whenComplete((ticket, error) -> heldMonitor.set(Thread.holdsLock(session)));
         var logout = enqueue(VsrOperation.LOGOUT, 7);

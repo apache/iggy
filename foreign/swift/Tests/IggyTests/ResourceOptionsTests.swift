@@ -86,7 +86,9 @@ struct ResourceOptionsTests {
         let constants = fixture.constants
         #expect(ProtocolVersion.current.packed == constants.protocolVersion.packed)
         #expect(ProtocolVersion.current.description == constants.protocolVersion.text)
-        #expect(constants.protocolVersionMin.packed == constants.protocolVersion.packed)
+        // The minimum stays behind while released clients still send the
+        // commands of the older patch.
+        #expect(constants.protocolVersionMin.packed <= constants.protocolVersion.packed)
 
         // Command and operation mirrors.
         for (name, entry) in constants.commandCodes {

@@ -249,7 +249,7 @@ fn add_basic_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
         parts.push(format!("--warmup-time \'{}\'", args.warmup_time()));
     }
 
-    let poll_defaults = DeferredPollOptions::default();
+    let poll_defaults = PollOptions::wait(IggyDuration::ONE_SECOND);
     if args.max_wait != poll_defaults.max_wait {
         parts.push(format!("--max-wait \'{}\'", args.max_wait));
     }
@@ -258,9 +258,6 @@ fn add_basic_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
     }
     if let Some(max_bytes) = args.max_bytes {
         parts.push(format!("--max-bytes {max_bytes}"));
-    }
-    if args.request_timeout != poll_defaults.request_timeout {
-        parts.push(format!("--request-timeout \'{}\'", args.request_timeout));
     }
 }
 
@@ -442,8 +439,6 @@ mod tests {
             "100",
             "--max-bytes",
             "65536",
-            "--request-timeout",
-            "2m",
             "pinned-consumer",
             "tcp",
         ])

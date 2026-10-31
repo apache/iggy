@@ -29,8 +29,8 @@ const PARTITION_ID: u32 = 0;
 const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 const OFFSET_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-// `AutoCommit::Disabled` leaves every commit to the caller, so the final flush of `shutdown()`
-// must not run either: it would commit a message whose handler failed.
+// The default `CommitPolicy::Manual` leaves every commit to the caller, so the final flush of
+// `shutdown()` must not run either: it would commit a message whose handler failed.
 #[iggy_harness]
 async fn given_disabled_auto_commit_when_shutdown_should_not_store_the_reading_position(
     harness: &TestHarness,
@@ -69,13 +69,10 @@ async fn given_disabled_auto_commit_when_shutdown_should_not_store_the_reading_p
         .await
         .unwrap();
 
-    // Both messages must come in one batch: with nothing committed, `next()` serves the same
-    // batch again and the consumer's own filter drops it, so a second poll would stall.
     let mut consumer = client
-        .consumer(CONSUMER_NAME, STREAM_NAME, TOPIC_NAME, PARTITION_ID)
+        .consumer(CONSUMER_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
-        .auto_commit(AutoCommit::Disabled)
-        .batch_length(2)
+        .partitions([PARTITION_ID])
         .offset_drain_timeout(IggyDuration::from(OFFSET_DRAIN_TIMEOUT))
         .build();
     consumer.init().await.unwrap();
@@ -110,6 +107,6 @@ async fn given_disabled_auto_commit_when_shutdown_should_not_store_the_reading_p
         .unwrap();
     assert!(
         stored_offset.is_none(),
-        "nothing must be stored under AutoCommit::Disabled, got {stored_offset:?}"
+        "nothing must be stored under the default client commit policy, got {stored_offset:?}"
     );
 }

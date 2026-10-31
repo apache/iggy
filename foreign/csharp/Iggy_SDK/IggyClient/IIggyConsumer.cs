@@ -28,6 +28,58 @@ namespace Apache.Iggy.IggyClient;
 public interface IIggyConsumer
 {
     /// <summary>
+    ///     Reads one batch of one partition: waits until <see cref="PollOptions.MinCount" /> messages are readable or
+    ///     <see cref="PollOptions.MaxWait" /> passes, and returns up to <see cref="PollOptions.Count" /> messages.
+    /// </summary>
+    /// <remarks>
+    ///     <para>
+    ///         <see cref="PollOptions.Commit" /> decides who stores the offset. With
+    ///         <see cref="CommitPolicy.Manual" /> nothing is stored: commit <see cref="PolledMessages.Checkpoint" />
+    ///         with <see cref="IIggyOffset.StoreConsumerPositionAsync" />.
+    ///         With <see cref="CommitPolicy.OnRead" /> the server stores the offset of the last message as part of the
+    ///         read. A one-shot poll has nothing to count, so it refuses <see cref="CommitPolicy.Auto" />.
+    ///     </para>
+    ///     <para>
+    ///         Continue the partition with <see cref="PolledMessages.Continuation" />, which a poll of another
+    ///         partition refuses. A poll that can move an offset (<see cref="CommitPolicy.OnRead" /> or
+    ///         <see cref="PollingStrategy.Next" />) is not sent again after a lost reply. A canceled poll is also
+    ///         canceled on the server. With <see cref="CommitPolicy.OnRead" /> the call then waits for the one answer
+    ///         of the server: it ends as canceled when nothing was stored, or returns the messages that the read
+    ///         stored before the cancel arrived.
+    ///     </para>
+    ///     <para>
+    ///         The default implementation throws <see cref="FeatureUnavailableException" />: a client must opt in, so
+    ///         a wait never turns into an immediate poll without notice.
+    ///     </para>
+    /// </remarks>
+    /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
+    /// <param name="topicId">The identifier of the topic to consume from (numeric ID or name).</param>
+    /// <param name="partitionId">The partition to read.</param>
+    /// <param name="consumer">The consumer whose position <see cref="PollingStrategy.Next" /> means.</param>
+    /// <param name="strategy">Where the read starts, such as the continuation of the previous batch.</param>
+    /// <param name="options">The limits of the read and the commit policy.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <exception cref="IggyInvalidStatusCodeException">
+    ///     Status 4009, 3, 80 or 2 when <paramref name="options" /> break their rules, 2 for
+    ///     <see cref="CommitPolicy.Auto" />, and 3 for a continuation of another partition. Nothing is sent then.
+    /// </exception>
+    Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint partitionId,
+        Consumer consumer, PollingStrategy strategy, PollOptions options, CancellationToken token = default)
+    {
+        return Task.FromException<PolledMessages>(new FeatureUnavailableException());
+    }
+
+    /// <summary>
+    ///     <see cref="PollMessagesAsync(Identifier, Identifier, uint, Consumer, PollingStrategy, PollOptions, CancellationToken)" />
+    ///     with the payload buffers rented from a shared pool. The caller disposes the rental.
+    /// </summary>
+    Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId, uint partitionId,
+        Consumer consumer, PollingStrategy strategy, PollOptions options, CancellationToken token = default)
+    {
+        return Task.FromException<PolledMessagesRental>(new FeatureUnavailableException());
+    }
+
+    /// <summary>
     ///     Polls messages from a specified topic and partition with a given polling strategy.
     /// </summary>
     /// <remarks>
@@ -52,7 +104,7 @@ public interface IIggyConsumer
     /// <returns>
     ///     A task that represents the asynchronous operation and returns the polled messages. A consumer-group
     ///     poll whose member currently owns no partition returns an empty batch whose
-    ///     <see cref="PolledMessages.PartitionId" /> is <see cref="PolledMessages.NoAssignedPartition" />; do
+    ///     <see cref="PolledMessages.PartitionId" /> is <see cref="PolledMessages.NoAssignedPartition" />. Do
     ///     not key offsets on it, back off and poll again.
     /// </returns>
     Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,

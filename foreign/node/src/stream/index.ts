@@ -16,3 +16,5 @@
 // under the License.
 
 export * from './consumer-stream.js';
+export * from './partition-reader.js';
+export * from './iggy-consumer.js';
