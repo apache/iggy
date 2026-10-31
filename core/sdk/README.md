@@ -53,7 +53,7 @@ in the configured directory. See the [server recovery guide](../server/README.md
 Mixed versions and rolling upgrades are unsupported. Binary clients share one
 logical session across replica links using BindSession (15) and discover
 partition primaries with GetPartitionRoute (105). The minimum binary protocol
-version is 0.12.1. Commands 14, 103, 104, 107, 123 and 124 are retired. HTTP clients
+version is 0.12.2. Commands 14, 103, 104, 107, 123 and 124 are retired. HTTP clients
 use server-side forwarding.
 
 ```bash
