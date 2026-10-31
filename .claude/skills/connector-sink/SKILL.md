@@ -34,7 +34,8 @@ for getting them to the external system reliably and efficiently.
 
 ## Quick reference
 
-- Skeleton: [TEMPLATE.md](TEMPLATE.md) (load on demand when authoring).
+- Skeleton: [TEMPLATE.md](TEMPLATE.md) (fill-in-the-blank kit — implement only `TODO(ConnectorDeveloper)`).
+- PR pre-flight: [connector-pr-review](../connector-pr-review/SKILL.md).
 - Exemplars: `stdout_sink` (minimal), `postgres_sink` (DB + transient detection), `http_sink` (validation, batch modes, retry middleware), `mongodb_sink` (atomic counters), `elasticsearch_sink` / `iceberg_sink` (backend-specific idioms).
 
 ## Hard rules

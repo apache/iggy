@@ -100,17 +100,23 @@ fn test_config() -> RandomSourceConfig {
 
 ### Async testing pattern
 
-The trait methods are `async`. For unit tests, build a runtime locally - don't add `#[tokio::test]` in `src/lib.rs` (it pulls test macros into prod build):
+The trait methods are `async`. Prefer `#[tokio::test]` directly on the test fn - `#[cfg(test)]`
+gates the whole module out of a plain `cargo build`, and this workspace's resolver (`resolver = "3"`
+in the root `Cargo.toml`, tied to the edition-2024 crates here) keeps `tokio`'s `test-util`/`macros`
+dev-dependency features out of that build too, so there's no prod-build leak to avoid. This is also
+the dominant pattern in-tree
+(`postgres_source::tests` uses `#[tokio::test]` throughout, no manual runtime):
 
 ```rust
-#[test]
-fn given_X_should_Y() {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    runtime.block_on(async {
-        // await calls here
-    });
+#[tokio::test]
+async fn given_x_should_y() {
+    // await calls directly, no manual Runtime::new()
 }
 ```
+
+A manual `tokio::runtime::Runtime::new().unwrap().block_on(...)` inside a plain `#[test]` still
+works and you'll see it in some older plugin tests (`random_source`), but don't ask for it in
+review - it's equivalent, not a correctness requirement.
 
 ### Mandatory: four canonical source state tests
 

@@ -129,6 +129,10 @@ Please refer to the **[Source documentation](https://github.com/apache/iggy/tree
 
 New connector can be built simply by implementing either `Sink` or `Source` trait. Please check the **[sink](https://github.com/apache/iggy/tree/master/core/connectors/sinks)** or **[source](https://github.com/apache/iggy/tree/master/core/connectors/sources)** documentation, as well as the existing examples under `core/connectors/sinks` and `core/connectors/sources`.
 
+Starting from a blank crate re-solves the same framework plumbing (config validation, `SecretString` secrets, retry + circuit breaker, ACK/NACK cursor staging) every time.
+Copy `core/connectors/sinks/sink_template` or `core/connectors/sources/source_template` instead - compiling, tested starting points with only the backend-specific calls marked `TODO(ConnectorDeveloper)`.
+See [`core/connectors/docs/authoring-sinks-and-sources.md`](docs/authoring-sinks-and-sources.md) for the full authoring guide and the review checklist it's built from.
+
 ## Transformations
 
 Field transformations (depending on the supported payload formats) can be applied to the messages either before they are sent to the specified topic (e.g. when produced by the source connectors), or before consumed by the sink connectors. To add a transformation, implement the `Transform` trait in the SDK, add its `TransformType` variant and extend `transforms::from_config`. Each transform may have its own, custom configuration.
