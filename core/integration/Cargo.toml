@@ -79,9 +79,17 @@ lapin = { workspace = true }
 lazy_static = { workspace = true }
 libc = { workspace = true }
 mongodb = { workspace = true }
+# Builds the OTLP requests the OTLP sink tests produce, and reads back the
+# OTLP/JSON that the collector exported.
+opentelemetry-proto = { workspace = true, features = [
+    "gen-tonic-messages",
+    "logs",
+    "with-serde",
+] }
 parquet = { workspace = true }
 pgwire = { workspace = true }
 predicates = { workspace = true }
+prost = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
 reqwest = { workspace = true, features = ["http2", "json"] }
