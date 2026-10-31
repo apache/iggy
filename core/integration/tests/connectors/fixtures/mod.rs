@@ -107,7 +107,7 @@ pub use quickwit::{
 pub use rabbitmq::{
     RabbitMqOps, RabbitMqSinkDirectFixture, RabbitMqSinkFanoutFixture, RabbitMqSinkFixture,
     RabbitMqSinkHeadersFixture, RabbitMqSinkRawSchemaFixture, RabbitMqSinkUnroutableFixture,
-    RabbitMqSinkWithoutMetadataFixture,
+    RabbitMqSinkWithoutMetadataFixture, RabbitMqSourceFixture, RabbitMqSourceMetadataFixture,
 };
 pub use redshift::{
     RedshiftSinkFixture, RedshiftSinkJsonFixture, RedshiftSinkNoArchiveFixture,

@@ -16,3 +16,4 @@
 // under the License.
 
 mod rabbitmq_sink;
+mod rabbitmq_source;

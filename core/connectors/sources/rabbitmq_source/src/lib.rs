@@ -241,7 +241,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     batch::PendingBatch, config::RabbitMqSourceConfig, driver::RabbitMqDriver,
-    message::prepare_delivery, tls,
+    message::prepare_delivery,
 };
 
 source_connector!(RabbitMqSource);

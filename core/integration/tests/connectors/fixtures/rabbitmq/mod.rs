@@ -17,6 +17,7 @@
 
 mod container;
 mod sink;
+mod source;
 
 pub use container::RabbitMqOps;
 pub use sink::{
@@ -24,3 +25,4 @@ pub use sink::{
     RabbitMqSinkHeadersFixture, RabbitMqSinkRawSchemaFixture, RabbitMqSinkUnroutableFixture,
     RabbitMqSinkWithoutMetadataFixture,
 };
+pub use source::{RabbitMqSourceFixture, RabbitMqSourceMetadataFixture};

@@ -34,6 +34,7 @@ use uuid::Uuid;
 const RABBITMQ_IMAGE: &str = "docker.io/rabbitmq";
 const RABBITMQ_TAG: &str = "4.0-management";
 const RABBITMQ_PORT: u16 = 5672;
+const RABBITMQ_MANAGEMENT_PORT: u16 = 15672;
 const RABBITMQ_READY_MSG: &str = "Time to start RabbitMQ:";
 const RABBITMQ_BOOT_ATTEMPTS: usize = 60;
 const RABBITMQ_BOOT_INTERVAL_MS: u64 = 1000;
@@ -71,16 +72,40 @@ pub struct RabbitMqContainer {
     #[allow(dead_code)]
     container: ContainerAsync<GenericImage>,
     pub(super) amqp_url: String,
+    pub(super) management_url: String,
     pub(super) queue_names: Vec<String>,
     pub(super) exchange_setup: RabbitMqExchangeSetup,
 }
 
 impl RabbitMqContainer {
-    async fn start_container() -> Result<(ContainerAsync<GenericImage>, String), TestBinaryError> {
+    pub(super) async fn pause(&self) -> Result<(), TestBinaryError> {
+        self.container
+            .pause()
+            .await
+            .map_err(|error| TestBinaryError::InvalidState {
+                message: format!("Failed to pause RabbitMQ container: {error}"),
+            })
+    }
+
+    pub(super) async fn resume(&self) -> Result<(), TestBinaryError> {
+        self.container
+            .unpause()
+            .await
+            .map_err(|error| TestBinaryError::InvalidState {
+                message: format!("Failed to resume RabbitMQ container: {error}"),
+            })
+    }
+
+    async fn start_container()
+    -> Result<(ContainerAsync<GenericImage>, String, String), TestBinaryError> {
         let container = GenericImage::new(RABBITMQ_IMAGE, RABBITMQ_TAG)
-            .with_exposed_port(RABBITMQ_PORT.tcp())
             .with_wait_for(WaitFor::message_on_stdout(RABBITMQ_READY_MSG))
+            .with_exposed_port(RABBITMQ_PORT.tcp())
+            .with_exposed_port(RABBITMQ_MANAGEMENT_PORT.tcp())
+            .with_env_var("RABBITMQ_DEFAULT_USER", "iggy_test")
+            .with_env_var("RABBITMQ_DEFAULT_PASS", "iggy_test_password")
             .with_mapped_port(0, RABBITMQ_PORT.tcp())
+            .with_mapped_port(0, RABBITMQ_MANAGEMENT_PORT.tcp())
             .with_container_name(fixtures::unique_container_name("rabbitmq"))
             .start()
             .await
@@ -101,15 +126,28 @@ impl RabbitMqContainer {
                 fixture_type: "RabbitMqContainer".to_string(),
                 message: "No mapping for RabbitMQ port".to_string(),
             })?;
-        let amqp_url = format!("amqp://guest:guest@127.0.0.1:{mapped_port}");
-        Ok((container, amqp_url))
+        let amqp_url = format!("amqp://iggy_test:iggy_test_password@127.0.0.1:{mapped_port}");
+        let management_port = container
+            .ports()
+            .await
+            .map_err(|e| TestBinaryError::FixtureSetup {
+                fixture_type: "RabbitMqContainer".to_string(),
+                message: format!("Failed to get management port: {e}"),
+            })?
+            .map_to_host_port_ipv4(RABBITMQ_MANAGEMENT_PORT)
+            .ok_or_else(|| TestBinaryError::FixtureSetup {
+                fixture_type: "RabbitMqContainer".to_string(),
+                message: "No mapping for RabbitMQ management port".to_string(),
+            })?;
+        let management_url = format!("http://127.0.0.1:{management_port}");
+        Ok((container, amqp_url, management_url))
     }
 
     async fn start_with(
         exchange_setup: RabbitMqExchangeSetup,
         queue_count: usize,
     ) -> Result<Self, TestBinaryError> {
-        let (container, amqp_url) = Self::start_container().await?;
+        let (container, amqp_url, management_url) = Self::start_container().await?;
         let queue_names = (0..queue_count)
             .map(|index| format!("test_queue_{}_{}", Uuid::new_v4().simple(), index))
             .collect();
@@ -117,6 +155,7 @@ impl RabbitMqContainer {
         let instance = Self {
             container,
             amqp_url,
+            management_url,
             exchange_setup,
             queue_names,
         };
@@ -206,7 +245,8 @@ impl RabbitMqContainer {
                 .queue_declare(
                     queue_name.as_str().into(),
                     QueueDeclareOptions {
-                        auto_delete: true,
+                        durable: true,
+                        auto_delete: false,
                         ..Default::default()
                     },
                     FieldTable::default(),
