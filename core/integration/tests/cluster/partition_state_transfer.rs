@@ -27,7 +27,8 @@
 //! `RangeEvicted`, the repaired window cannot connect to recovered state,
 //! and `complete_repair` returns the `FloorRefused` conversion trigger.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -74,8 +75,9 @@ const KILL_GATE_POLL: Duration = Duration::from_millis(10);
 const CONVERSION_MARKER: &str = "partition repair floor unreachable; converting to state transfer";
 const INSTALL_MARKER: &str = "partition state transfer installed";
 const INSTALL_FAILED_MARKER: &str = "partition state transfer install failed";
-/// The `StaleTransfer` reason, logged inside an [`INSTALL_FAILED_MARKER`] line.
-const STALE_INSTALL_MARKER: &str = "is below the local commit frontier";
+/// The `OfferErasesHeldOps` reason, logged inside an [`INSTALL_FAILED_MARKER`]
+/// line.
+const HELD_OPS_INSTALL_MARKER: &str = "would erase held ops";
 /// Logged once per transfer, at the last byte of the last artifact. The
 /// descriptor-time "serving" line only proves a request ARRIVED; this proves the
 /// pull ran.
@@ -102,6 +104,32 @@ const ISOLATED_SENDS: u32 = 100;
 const WRITE_INTERVAL: Duration = Duration::from_secs(1);
 /// How long node 2 must go without another conversion once it installed.
 const CAUGHT_UP_WINDOW: Duration = Duration::from_secs(10);
+/// Logged by a receiver that links segments it already holds into a
+/// transfer. Its `reused_len` field counts the bytes that it did not pull.
+const REUSE_MARKER: &str = "reused segments that this node already holds";
+/// Repeated-install specs must exhaust snapshot-tail retention as well as the
+/// ring; otherwise the next gap can correctly heal without another snapshot.
+const SNAPSHOT_ONLY_REPAIR_MEMORY_BYTES_MAX: &str = "1 B";
+/// Logged by a receiver that adopts the staged copies of an earlier attempt.
+/// Its `adopted_len` field counts the bytes that it did not pull.
+const ADOPTED_MARKER: &str = "adopted staged segments from an earlier transfer attempt";
+/// Logged by a receiver that fills an artifact with the bytes of its own
+/// segment. Its `seeded_len` field counts them.
+const SEED_MARKER: &str = "seeded a partition transfer artifact from the local segment";
+/// Logged by a receiver whose seeded artifact failed the manifest checksum.
+const PREFIX_MISMATCH_MARKER: &str = "the local segment prefix does not match the offered artifact";
+/// Logged once per session before the install. Its `pulled_len` field counts
+/// the chunk bytes that crossed the network.
+const PULLED_MARKER: &str = "partition transfer pulled every artifact";
+/// Logged by a requester that schedules another transfer attempt, for
+/// example after a refusal.
+const REARM_MARKER: &str = "partition transfer did not land; scheduling a re-arm";
+/// Bulky sends per round of the reuse spec: 10 MiB, more than one
+/// [`SEGMENT_SIZE_MULTI_ARTIFACT`], so each round seals at least one segment.
+const BULKY_SENDS_PER_ROUND: u32 = 40;
+/// Transfers in the reuse spec. The second one must reuse a sealed segment
+/// that the first one pulled.
+const REUSE_ROUNDS: usize = 2;
 
 /// Transfer end-to-end: adoption, repair round-trip, conversion, chunk pull,
 /// install, tail repair. CI runners are slow; bound without hanging the suite.
@@ -382,7 +410,6 @@ async fn given_transfer_peer_dies_when_stalled_should_leave_dead_peer_and_recove
 /// needed: the pull itself is a few KiB.
 #[tokio::test(flavor = "multi_thread")]
 #[parallel]
-#[ignore = "known bug: under sustained writes the backup refuses every transfer as stale (transfer frontier below the local commit frontier); run with --run-ignored only"]
 async fn given_sustained_writes_when_a_node_falls_past_the_evicted_ring_should_rejoin_through_one_transfer()
  {
     let mut harness = relayed_cluster();
@@ -408,12 +435,10 @@ async fn given_sustained_writes_when_a_node_falls_past_the_evicted_ring_should_r
         .expect("restore node 2's peer links");
     await_marker(&harness, LAGGING_NODE, CONVERSION_MARKER).await;
 
-    // Today every install is refused with "transfer frontier X is below the
-    // local commit frontier X+1". The first request only pins the offer at the
-    // primary's commit point (the build answers "flush is pending"), and the
-    // pull runs on the next request, one `repair_retry_interval` later. Node 2
-    // journals the op committed in between, and the install refuses an offer
-    // below an op it holds.
+    // The first request only pins the offer at the primary's commit point (the
+    // build answers "flush is pending"), and the pull runs on the next request,
+    // one `repair_retry_interval` later. Node 2 journals the ops committed in
+    // between, so it holds ops above the offer it installs.
     let deadline = Instant::now() + TRANSFER_BUDGET;
     while harness
         .node(LAGGING_NODE)
@@ -424,15 +449,15 @@ async fn given_sustained_writes_when_a_node_falls_past_the_evicted_ring_should_r
             Instant::now() < deadline,
             "node 2 fell past the evicted ring and never installed a state transfer within \
              {TRANSFER_BUDGET:?} while one message per second was written: the peers fully \
-             served {} pull(s) and node 2 failed {} install(s), {} of them as stale, so a \
-             backup cannot rejoin under sustained writes",
+             served {} pull(s) and node 2 failed {} install(s), {} of them for held ops, so \
+             a backup cannot rejoin under sustained writes",
             fully_served_count(&harness),
             harness
                 .node(LAGGING_NODE)
                 .stdout_occurrences(INSTALL_FAILED_MARKER),
             harness
                 .node(LAGGING_NODE)
-                .stdout_occurrences(STALE_INSTALL_MARKER),
+                .stdout_occurrences(HELD_OPS_INSTALL_MARKER),
         );
         sleep(MARKER_POLL).await;
     }
@@ -466,6 +491,298 @@ async fn given_sustained_writes_when_a_node_falls_past_the_evicted_ring_should_r
     assert!(
         acked > acked_at_install,
         "the steady writer must keep committing through the caught-up window"
+    );
+}
+
+/// A node that falls past the evicted ring must link the sealed segments it
+/// already holds into each transfer and pull only the rest.
+///
+/// Node 2 holds sealed segments that it wrote itself, then falls behind twice.
+/// Each segment that node 2 held sealed at the cut must keep its inode through
+/// the install: the install renamed a link to it, and none of its bytes
+/// crossed the network. A pulled segment always lands in a new file, because
+/// the old one still exists when the pull writes it. The second round must
+/// also keep a segment that the first round pulled, which proves that the
+/// install stamps the segments it installs. The reuse line must count exactly
+/// the bytes of the kept segments.
+#[tokio::test(flavor = "multi_thread")]
+#[parallel]
+async fn given_sealed_segments_on_a_lagging_node_when_it_transfers_twice_should_pull_only_the_rest()
+{
+    let mut harness =
+        relayed_cluster_with_repair_budget(Some(SNAPSHOT_ONLY_REPAIR_MEMORY_BYTES_MAX));
+    harness.start().await.expect("start the cluster");
+    let client = harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect a root client to the node");
+    seed_topic(&client, Some(SEGMENT_SIZE_MULTI_ARTIFACT)).await;
+    produce_bulky(&client, 2 * BULKY_SENDS_PER_ROUND, BULKY_PAYLOAD_LEN).await;
+    let mut expected: Vec<String> = (0..2 * BULKY_SENDS_PER_ROUND)
+        .map(bulky_payload_prefix)
+        .collect();
+    let data_path = harness.node(LAGGING_NODE).data_path();
+    let mut kept_before = BTreeSet::new();
+
+    for round in 1..=REUSE_ROUNDS {
+        // Node 2 must hold every committed payload, so the segments that it
+        // holds sealed are final before the cut.
+        await_installed_payloads(&harness, LAGGING_NODE, &expected).await;
+        let held = segment_files(&data_path);
+        let sealed: Vec<u64> = held.keys().rev().skip(1).copied().collect();
+        assert!(
+            !sealed.is_empty(),
+            "round {round}: node 2 must hold a sealed segment before the cut"
+        );
+        if round > 1 {
+            assert!(
+                sealed.iter().any(|start| !kept_before.contains(start)),
+                "round {round}: node 2 must hold a sealed segment that the last transfer \
+                 pulled, or this round cannot prove that the install stamps it"
+            );
+        }
+        let installs = harness
+            .node(LAGGING_NODE)
+            .stdout_occurrences(INSTALL_MARKER);
+        let reuses = harness.node(LAGGING_NODE).stdout_occurrences(REUSE_MARKER);
+
+        harness
+            .isolate_node(LAGGING_NODE)
+            .expect("cut node 2 off from its peers");
+        produce_bulky(&client, BULKY_SENDS_PER_ROUND, BULKY_PAYLOAD_LEN).await;
+        produce(&client, ISOLATED_SENDS).await;
+        harness
+            .heal_node(LAGGING_NODE)
+            .expect("restore node 2's peer links");
+        await_new_marker(&harness, LAGGING_NODE, INSTALL_MARKER, installs).await;
+        expected.extend((0..BULKY_SENDS_PER_ROUND).map(bulky_payload_prefix));
+        expected.extend((0..ISOLATED_SENDS).map(|sequence| format!("message-{sequence}")));
+        await_installed_payloads(&harness, LAGGING_NODE, &expected).await;
+
+        let installed = segment_files(&data_path);
+        let kept: BTreeMap<u64, u64> = held
+            .iter()
+            .filter(|(start, file)| installed.get(start) == Some(file))
+            .map(|(start, (_, len))| (*start, *len))
+            .collect();
+        for start in &sealed {
+            assert!(
+                kept.contains_key(start),
+                "round {round}: node 2 held segment {start} sealed, but the install replaced \
+                 its file, so the transfer copied bytes that node 2 already had"
+            );
+        }
+        assert_eq!(
+            reused_len_after(&harness, LAGGING_NODE, reuses),
+            kept.values().sum::<u64>(),
+            "round {round}: the reuse line must count exactly the bytes of the kept segments"
+        );
+        kept_before = kept.into_keys().collect();
+    }
+}
+
+/// A node that falls past the evicted ring while the primary keeps writing
+/// the segment that the node holds a prefix of must pull only the rest.
+///
+/// Each round, node 2 holds the leading bytes of the segment that the
+/// primary writes on during the cut. The transfer must seed that artifact
+/// with them, so the pulled bytes are the manifest minus the reused and the
+/// held bytes. Between the rounds, node 2 fills and seals the segment that the
+/// transfer installed as active. The next transfer must keep that segment like
+/// any other sealed one, which proves that its checksum memo grew with it.
+#[tokio::test(flavor = "multi_thread")]
+#[parallel]
+async fn given_a_segment_prefix_on_a_lagging_node_when_it_transfers_should_pull_only_the_suffix() {
+    let mut harness =
+        relayed_cluster_with_repair_budget(Some(SNAPSHOT_ONLY_REPAIR_MEMORY_BYTES_MAX));
+    harness.start().await.expect("start the cluster");
+    let client = harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect a root client to the node");
+    seed_topic(&client, Some(SEGMENT_SIZE_MULTI_ARTIFACT)).await;
+    produce_bulky(&client, 2 * BULKY_SENDS_PER_ROUND, BULKY_PAYLOAD_LEN).await;
+    let mut expected: Vec<String> = (0..2 * BULKY_SENDS_PER_ROUND)
+        .map(bulky_payload_prefix)
+        .collect();
+    let data_path = harness.node(LAGGING_NODE).data_path();
+    let mut installed_active: Option<u64> = None;
+
+    for round in 1..=REUSE_ROUNDS {
+        await_installed_payloads(&harness, LAGGING_NODE, &expected).await;
+        let held = segment_files(&data_path);
+        let (active_start, active_len) = held_prefix(&held, round);
+        if let Some(installed) = installed_active {
+            assert!(
+                installed < active_start,
+                "round {round}: the segment that the last transfer installed as active must \
+                 seal on node 2 before the cut"
+            );
+        }
+        let installs = harness
+            .node(LAGGING_NODE)
+            .stdout_occurrences(INSTALL_MARKER);
+
+        harness
+            .isolate_node(LAGGING_NODE)
+            .expect("cut node 2 off from its peers");
+        produce_bulky(&client, BULKY_SENDS_PER_ROUND, BULKY_PAYLOAD_LEN).await;
+        produce(&client, ISOLATED_SENDS).await;
+        harness
+            .heal_node(LAGGING_NODE)
+            .expect("restore node 2's peer links");
+        await_new_marker(&harness, LAGGING_NODE, INSTALL_MARKER, installs).await;
+        expected.extend((0..BULKY_SENDS_PER_ROUND).map(bulky_payload_prefix));
+        expected.extend((0..ISOLATED_SENDS).map(|sequence| format!("message-{sequence}")));
+        await_installed_payloads(&harness, LAGGING_NODE, &expected).await;
+
+        let session = installed_session(&harness, LAGGING_NODE);
+        // Node 2 can persist bytes of its active segment after the files were
+        // listed, so the seed holds at least what the listing saw.
+        let (seeded_len, _) = session.seed.unwrap_or_else(|| {
+            panic!(
+                "round {round}: node 2 held {active_len} bytes of segment {active_start}, \
+                 but it did not seed them"
+            )
+        });
+        assert!(
+            seeded_len >= active_len,
+            "round {round}: the seed must hold the {active_len} bytes that node 2 held, \
+             got {seeded_len}"
+        );
+        assert_eq!(
+            session.pulled_len,
+            session.total_len - session.reused_len - seeded_len,
+            "round {round}: node 2 seeded {seeded_len} bytes of segment {active_start}, so the \
+             transfer must pull the manifest minus those and the reused bytes"
+        );
+        let installed = segment_files(&data_path);
+        if let Some(sealed) = installed_active {
+            assert_eq!(
+                installed.get(&sealed).map(|(inode, _)| inode),
+                held.get(&sealed).map(|(inode, _)| inode),
+                "round {round}: node 2 sealed segment {sealed} after the last transfer \
+                 installed it as active, but this install replaced its file, so the transfer \
+                 pulled bytes that node 2 already had"
+            );
+        }
+        installed_active = installed.keys().next_back().copied();
+        // With node 2 connected: fill and seal the segment that this transfer
+        // installed as active. The small sends leave bytes in the segment
+        // after it, which the next round seeds.
+        produce_bulky(&client, BULKY_SENDS_PER_ROUND, BULKY_PAYLOAD_LEN).await;
+        produce(&client, ISOLATED_SENDS).await;
+        expected.extend((0..BULKY_SENDS_PER_ROUND).map(bulky_payload_prefix));
+        expected.extend((0..ISOLATED_SENDS).map(|sequence| format!("message-{sequence}")));
+    }
+}
+
+/// A held prefix with other bytes than the offered segment must not reach the
+/// install. The checksum of the seeded artifact fails, and the transfer pulls
+/// that artifact whole in the same session.
+#[tokio::test(flavor = "multi_thread")]
+#[parallel]
+async fn given_a_damaged_segment_prefix_when_it_transfers_should_pull_the_whole_artifact() {
+    let mut harness = relayed_cluster();
+    harness.start().await.expect("start the cluster");
+    let client = harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect a root client to the node");
+    seed_topic(&client, Some(SEGMENT_SIZE_MULTI_ARTIFACT)).await;
+    produce_bulky(&client, 2 * BULKY_SENDS_PER_ROUND, BULKY_PAYLOAD_LEN).await;
+    let mut expected: Vec<String> = (0..2 * BULKY_SENDS_PER_ROUND)
+        .map(bulky_payload_prefix)
+        .collect();
+    let data_path = harness.node(LAGGING_NODE).data_path();
+    await_installed_payloads(&harness, LAGGING_NODE, &expected).await;
+    let held = segment_files(&data_path);
+    let (active_start, active_len) = held_prefix(&held, 1);
+    let installs = harness
+        .node(LAGGING_NODE)
+        .stdout_occurrences(INSTALL_MARKER);
+    let mismatches = harness
+        .node(LAGGING_NODE)
+        .stdout_occurrences(PREFIX_MISMATCH_MARKER);
+
+    harness
+        .isolate_node(LAGGING_NODE)
+        .expect("cut node 2 off from its peers");
+    flip_segment_byte(&data_path, active_start, active_len / 2);
+    produce_bulky(&client, BULKY_SENDS_PER_ROUND, BULKY_PAYLOAD_LEN).await;
+    produce(&client, ISOLATED_SENDS).await;
+    harness
+        .heal_node(LAGGING_NODE)
+        .expect("restore node 2's peer links");
+    await_new_marker(&harness, LAGGING_NODE, INSTALL_MARKER, installs).await;
+    expected.extend((0..BULKY_SENDS_PER_ROUND).map(bulky_payload_prefix));
+    expected.extend((0..ISOLATED_SENDS).map(|sequence| format!("message-{sequence}")));
+    await_installed_payloads(&harness, LAGGING_NODE, &expected).await;
+
+    assert_eq!(
+        harness
+            .node(LAGGING_NODE)
+            .stdout_occurrences(PREFIX_MISMATCH_MARKER),
+        mismatches + 1,
+        "the seeded artifact must fail its checksum once, and the whole pull must pass"
+    );
+    let session = installed_session(&harness, LAGGING_NODE);
+    let (seeded_len, artifact_len) = session
+        .seed
+        .expect("node 2 must seed the artifact before its checksum fails");
+    assert!(
+        seeded_len >= active_len,
+        "the seed must hold the {active_len} bytes that node 2 held, got {seeded_len}"
+    );
+    assert_eq!(
+        session.pulled_len,
+        session.total_len - session.reused_len + artifact_len - seeded_len,
+        "the transfer must pull the suffix, then the whole artifact once the checksum failed"
+    );
+}
+
+/// The first request of a transfer finds the plan of the primary unpinned,
+/// because the pin waits for the next I/O turn of the partition. The primary
+/// must keep that request and answer it once the plan is pinned. A refusal
+/// makes the requester wait out a whole re-arm interval for nothing.
+#[tokio::test(flavor = "multi_thread")]
+#[parallel]
+async fn given_an_unpinned_plan_when_a_transfer_is_requested_should_answer_without_a_re_arm() {
+    let mut harness = relayed_cluster();
+    harness.start().await.expect("start the cluster");
+    let client = harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect a root client to the node");
+    seed_topic(&client, Some(SEGMENT_SIZE_MULTI_ARTIFACT)).await;
+    produce_bulky(&client, BULKY_SENDS_PER_ROUND, BULKY_PAYLOAD_LEN).await;
+    let mut expected: Vec<String> = (0..BULKY_SENDS_PER_ROUND)
+        .map(bulky_payload_prefix)
+        .collect();
+    await_installed_payloads(&harness, LAGGING_NODE, &expected).await;
+    let installs = harness
+        .node(LAGGING_NODE)
+        .stdout_occurrences(INSTALL_MARKER);
+    let rearms = harness.node(LAGGING_NODE).stdout_occurrences(REARM_MARKER);
+
+    harness
+        .isolate_node(LAGGING_NODE)
+        .expect("cut node 2 off from its peers");
+    produce_bulky(&client, BULKY_SENDS_PER_ROUND, BULKY_PAYLOAD_LEN).await;
+    produce(&client, ISOLATED_SENDS).await;
+    harness
+        .heal_node(LAGGING_NODE)
+        .expect("restore node 2's peer links");
+    await_new_marker(&harness, LAGGING_NODE, INSTALL_MARKER, installs).await;
+    expected.extend((0..BULKY_SENDS_PER_ROUND).map(bulky_payload_prefix));
+    expected.extend((0..ISOLATED_SENDS).map(|sequence| format!("message-{sequence}")));
+    await_installed_payloads(&harness, LAGGING_NODE, &expected).await;
+
+    assert_eq!(
+        harness.node(LAGGING_NODE).stdout_occurrences(REARM_MARKER),
+        rearms,
+        "the primary must answer the first transfer request of node 2 with an offer, \
+         so node 2 must not schedule a re-arm before the install"
     );
 }
 
@@ -515,13 +832,23 @@ async fn restart_lagging_node_and_await_install(harness: &mut TestHarness) {
 /// links, so the one that cuts a node off builds its cluster here with the same
 /// server settings.
 fn relayed_cluster() -> TestHarness {
-    let overrides = HashMap::from([
+    relayed_cluster_with_repair_budget(None)
+}
+
+fn relayed_cluster_with_repair_budget(repair_memory_bytes_max: Option<&str>) -> TestHarness {
+    let mut overrides = HashMap::from([
         ("sharding.cpu_allocation".to_owned(), "0..1".to_owned()),
         (
             "partition.evicted_ring_capacity".to_owned(),
             "64".to_owned(),
         ),
     ]);
+    if let Some(bytes_max) = repair_memory_bytes_max {
+        overrides.insert(
+            "partition.repair_memory_bytes_max".to_owned(),
+            bytes_max.to_owned(),
+        );
+    }
     let extra_envs = resolve_config_paths(&overrides).expect("valid server config paths");
     TestHarness::builder()
         .server(TestServerConfig::builder().extra_envs(extra_envs).build())
@@ -594,6 +921,123 @@ fn fully_served_count(harness: &TestHarness) -> usize {
         .sum()
 }
 
+/// `reused_len` of the first reuse line that `node` logged after `baseline`
+/// earlier ones.
+fn reused_len_after(harness: &TestHarness, node: usize, baseline: usize) -> u64 {
+    let log = harness.node(node).stdout_plain();
+    let line = log
+        .lines()
+        .filter(|line| line.contains(REUSE_MARKER))
+        .nth(baseline)
+        .unwrap_or_else(|| panic!("node {node} logged no {REUSE_MARKER:?} line for the transfer"));
+    logged_number(line, "reused_len")
+}
+
+/// What the last session that `node` pulled to the end logged.
+struct PulledSession {
+    total_len: u64,
+    /// The bytes that it staged without a pull: `reused_len` of its reuse
+    /// line plus `adopted_len` of the adopted line before it.
+    reused_len: u64,
+    /// `seeded_len` and `artifact_len` of its seed line.
+    seed: Option<(u64, u64)>,
+    pulled_len: u64,
+}
+
+/// The lines of one session come in order: adopted and reuse when its reuse
+/// scan lands, the seed when the pull reaches that artifact, the pulled line
+/// before the install.
+fn installed_session(harness: &TestHarness, node: usize) -> PulledSession {
+    let log = harness.node(node).stdout_plain();
+    let mut adopted = None;
+    let mut reuse = None;
+    let mut seed = None;
+    let mut session = None;
+    for line in log.lines() {
+        if line.contains(ADOPTED_MARKER) {
+            adopted = Some(line);
+        } else if line.contains(REUSE_MARKER) {
+            reuse = Some((line, adopted.take()));
+            seed = None;
+        } else if line.contains(SEED_MARKER) {
+            seed = Some(line);
+        } else if line.contains(PULLED_MARKER) {
+            session = Some((reuse, seed, line));
+        }
+    }
+    let (reuse, seed, pulled) =
+        session.unwrap_or_else(|| panic!("node {node} logged no {PULLED_MARKER:?} line"));
+    let (reuse, adopted) =
+        reuse.unwrap_or_else(|| panic!("node {node} logged no {REUSE_MARKER:?} line"));
+    PulledSession {
+        total_len: logged_number(reuse, "total_len"),
+        reused_len: logged_number(reuse, "reused_len")
+            + adopted.map_or(0, |line| logged_number(line, "adopted_len")),
+        seed: seed.map(|line| {
+            (
+                logged_number(line, "seeded_len"),
+                logged_number(line, "artifact_len"),
+            )
+        }),
+        pulled_len: logged_number(pulled, "pulled_len"),
+    }
+}
+
+fn logged_number(line: &str, field: &str) -> u64 {
+    let label = format!(" {field}=");
+    let start = line
+        .find(&label)
+        .unwrap_or_else(|| panic!("the line has no {label:?} field: {line}"))
+        + label.len();
+    line[start..]
+        .split(|character: char| !character.is_ascii_digit())
+        .next()
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or_else(|| panic!("the line has no number in {label:?}: {line}"))
+}
+
+/// The active segment of `held` and its length. Sealed segments must exist,
+/// so the transfer logs a reuse line, and the active one must hold bytes, so
+/// it can seed an artifact.
+fn held_prefix(held: &BTreeMap<u64, (u64, u64)>, round: usize) -> (u64, u64) {
+    assert!(
+        held.len() > 1,
+        "round {round}: node 2 must hold a sealed segment before the cut"
+    );
+    let (&start, &(_, len)) = held
+        .last_key_value()
+        .expect("node 2 holds a segment before the cut");
+    assert!(
+        len > 0,
+        "round {round}: node 2's active segment must hold bytes before the cut"
+    );
+    (start, len)
+}
+
+/// Invert one byte of the segment log at `start_offset`.
+fn flip_segment_byte(root: &Path, start_offset: u64, position: u64) {
+    let path = walk(root, &mut |path| {
+        is_segment_log(path)
+            && path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<u64>().ok())
+                == Some(start_offset)
+    })
+    .unwrap_or_else(|| panic!("no segment log starts at offset {start_offset}"));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("open the segment log");
+    let mut byte = [0_u8; 1];
+    file.read_exact_at(&mut byte, position)
+        .expect("read the segment byte");
+    byte[0] = !byte[0];
+    file.write_all_at(&byte, position)
+        .expect("write the segment byte");
+}
+
 async fn connect_any(harness: &TestHarness, nodes: &[usize]) -> Option<IggyClient> {
     for &node in nodes {
         if let Ok(builder) = harness.node(node).tcp_client()
@@ -655,7 +1099,11 @@ async fn produce(client: &IggyClient, count: u32) {
 /// `payload_len` filler bytes so the on-disk segment grows fast.
 async fn produce_bulky(client: &IggyClient, count: u32, payload_len: usize) {
     for sequence in 0..count {
-        let payload = format!("bulky-{sequence}-{}", "x".repeat(payload_len));
+        let payload = format!(
+            "{}{}",
+            bulky_payload_prefix(sequence),
+            "x".repeat(payload_len)
+        );
         let mut messages = vec![IggyMessage::from_str(&payload).expect("message")];
         client
             .send_messages(
@@ -667,6 +1115,12 @@ async fn produce_bulky(client: &IggyClient, count: u32, payload_len: usize) {
             .await
             .expect("send bulky message");
     }
+}
+
+/// The leading bytes of the payload that [`produce_bulky`] sends as its
+/// `sequence`-th message.
+fn bulky_payload_prefix(sequence: u32) -> String {
+    format!("bulky-{sequence}-")
 }
 
 async fn seed_partition(client: &IggyClient) {
@@ -854,6 +1308,25 @@ fn segment_log_count(root: &Path) -> usize {
         false
     });
     count
+}
+
+/// Inode and length of each segment log under `root`, by base offset. A
+/// segment that keeps its inode through an install was linked, not copied.
+fn segment_files(root: &Path) -> BTreeMap<u64, (u64, u64)> {
+    let mut files = BTreeMap::new();
+    let _ = walk(root, &mut |path| {
+        if is_segment_log(path)
+            && let Some(start_offset) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse().ok())
+            && let Ok(metadata) = std::fs::metadata(path)
+        {
+            files.insert(start_offset, (metadata.ino(), metadata.len()));
+        }
+        false
+    });
+    files
 }
 
 /// A segment `.log`, named for its 20-digit zero-padded base offset (see

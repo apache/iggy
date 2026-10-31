@@ -646,7 +646,8 @@ mod tests {
     use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
     use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
     use iggy_binary_protocol::{
-        ForwardCompletionHeader, GenericHeader, Operation, WireEncode, WireIdentifier, WireName,
+        Command, ConsensusHeader, ForwardCompletionHeader, GenericHeader, HEADER_SIZE, Operation,
+        StartViewChangeHeader, WireEncode, WireIdentifier, WireName,
     };
     use iggy_common::{IggyDuration, IggyError};
     use journal::prepare_journal::PrepareJournal;
@@ -1115,9 +1116,21 @@ mod tests {
         for _ in 0..TimeoutManager::NORMAL_HEARTBEAT_TICKS {
             consensus.tick(PlaneKind::Metadata);
         }
+        let vote = Message::<StartViewChangeHeader>::new(HEADER_SIZE).transmute_header(
+            |_, header: &mut StartViewChangeHeader| {
+                header.command = Command::StartViewChange;
+                header.cluster = consensus.cluster();
+                header.group = consensus.group();
+                header.view = 1;
+                header.replica = PRIMARY;
+                header.size = u32::try_from(HEADER_SIZE).unwrap();
+                header.seal();
+            },
+        );
+        consensus.handle_start_view_change(PlaneKind::Metadata, vote.header());
         assert!(
             !consensus.is_normal(),
-            "a silent primary starts a view change"
+            "a quorum of votes starts a view change"
         );
         assert_eq!(
             metadata

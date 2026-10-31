@@ -53,6 +53,14 @@ const STABLE_INTERVAL: Duration = Duration::from_secs(5);
 const GRANT_TIMEOUT: Duration = Duration::from_secs(1);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBES_PER_TICK: usize = 8;
+/// A moved primary that keeps its partition this long counts as held. A backup
+/// that cannot follow the target loses the view inside it: one view-change
+/// status timeout to give up on the view, one more to escalate past it. Sized
+/// for the default 5 s timeouts. Also the first wait after a failed move.
+const MOVE_HOLD_INTERVAL: Duration = Duration::from_secs(30);
+/// Caps the wait after repeated failed moves, so a target that recovered gets
+/// primaries back within minutes.
+const TARGET_BACKOFF_MAX: Duration = Duration::from_secs(240);
 
 #[cfg(test)]
 mod tests;
@@ -70,6 +78,40 @@ pub struct PrimaryRebalance {
     /// When this node's partition admission last opened under this authority.
     /// A probe sent before then carried no fresh quorum evidence.
     admission_opened: Option<Instant>,
+    /// Moves a source carried out, watched until the target holds the
+    /// partition for `MOVE_HOLD_INTERVAL` or loses it to a view change.
+    moves: Vec<MovedPrimary>,
+    /// Per replica. A target ready for a move can still be one that a backup
+    /// cannot hear in time, and only a lost view shows it. Moving to it again
+    /// at once would repeat the view changes forever.
+    backoffs: Vec<TargetBackoff>,
+}
+
+struct MovedPrimary {
+    plan: PartitionPrimaryTransfer,
+    since: Instant,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TargetBackoff {
+    until: Option<Instant>,
+    wait: Duration,
+}
+
+impl TargetBackoff {
+    fn blocks(self, now: Instant) -> bool {
+        self.until.is_some_and(|until| now < until)
+    }
+
+    /// Moves watched together often fail together, for example when the target
+    /// restarts, so a failure inside a running wait counts once.
+    fn record_failure(&mut self, now: Instant) {
+        if self.blocks(now) {
+            return;
+        }
+        self.wait = (self.wait * 2).clamp(MOVE_HOLD_INTERVAL, TARGET_BACKOFF_MAX);
+        self.until = Some(now + self.wait);
+    }
 }
 
 #[derive(Clone, Default)]
@@ -230,6 +272,8 @@ impl Default for PrimaryRebalance {
             pending: None,
             received_probe: None,
             admission_opened: None,
+            moves: Vec::new(),
+            backoffs: Vec::new(),
         }
     }
 }
@@ -299,6 +343,7 @@ where
                         replicas
                     ],
                     eligible: vec![false; replicas],
+                    backoffs: vec![TargetBackoff::default(); replicas],
                     stable_since: now,
                     next_move: now,
                     received_probe: state.received_probe,
@@ -309,10 +354,13 @@ where
             let admission_opened = state.admission_opened;
             for replica in 0..consensus.replica_count() {
                 let index = usize::from(replica);
-                let ready = replica == consensus.replica()
-                    || state.peers[index]
+                let ready = if replica == consensus.replica() {
+                    !metadata.applied_frontier().has_partition_recovery()
+                } else {
+                    state.peers[index]
                         .ready_at
-                        .is_some_and(|ready| now.duration_since(ready) <= PROBE_TIMEOUT);
+                        .is_some_and(|ready| now.duration_since(ready) <= PROBE_TIMEOUT)
+                };
                 if state.eligible[index] != ready {
                     state.eligible[index] = ready;
                     changed = true;
@@ -363,16 +411,61 @@ where
                         MovePhase::Transfer => TRANSFER_TIMEOUT,
                     };
                 if invalid || expired {
+                    // The planned view ended after the grant, so watch whether
+                    // the target keeps the partition.
+                    let moved =
+                        (invalid && current.is_some() && pending.phase == MovePhase::Transfer)
+                            .then_some(pending.plan);
                     state.pending = None;
+                    if let Some(plan) = moved {
+                        state.moves.push(MovedPrimary { plan, since: now });
+                    }
                 }
             }
+            let PrimaryRebalance {
+                moves, backoffs, ..
+            } = &mut *state;
+            moves.retain(|moved| {
+                let target = moved.plan.target;
+                let (Some(current), Some(backoff)) = (
+                    metadata.partition_placement_view(
+                        moved.plan.namespace,
+                        moved.plan.created_revision,
+                    ),
+                    backoffs.get_mut(usize::from(target)),
+                ) else {
+                    return false;
+                };
+                if consensus.primary_index(current.view) != target {
+                    backoff.record_failure(now);
+                    return false;
+                }
+                if now.duration_since(moved.since) >= MOVE_HOLD_INTERVAL {
+                    *backoff = TargetBackoff::default();
+                    return false;
+                }
+                true
+            });
             if state.pending.is_none()
                 && now >= state.next_move
                 && now.duration_since(state.stable_since) >= STABLE_INTERVAL
             {
                 state.next_move = now + PROBE_INTERVAL;
-                if let Some(plan) =
-                    metadata.primary_rebalance_candidate(&state.eligible, state.cursor)
+                // After its wait, a backed-off target gets one move at a time
+                // until one holds. It also sits out as a source: it lost the
+                // primaries moved to it, so it rarely has any to give.
+                let mut candidates = state.eligible.clone();
+                for ((replica, eligible), backoff) in
+                    candidates.iter_mut().enumerate().zip(&state.backoffs)
+                {
+                    let probing = backoff.wait > Duration::ZERO
+                        && state
+                            .moves
+                            .iter()
+                            .any(|moved| usize::from(moved.plan.target) == replica);
+                    *eligible &= !backoff.blocks(now) && !probing;
+                }
+                if let Some(plan) = metadata.primary_rebalance_candidate(&candidates, state.cursor)
                 {
                     let mut probe =
                         probe_header(consensus, self.next_forward_nonce(consensus.replica()));
@@ -452,7 +545,12 @@ where
                 };
                 reply.ready = u8::from(
                     header.kind == PrimaryRebalanceKind::MetadataProbe
-                        && consensus_ready(consensus),
+                        && consensus_ready(consensus)
+                        && !self
+                            .plane
+                            .metadata()
+                            .applied_frontier()
+                            .has_partition_recovery(),
                 );
                 self.send_rebalance(header.replica, reply).await;
             }
@@ -570,6 +668,11 @@ where
                                 && partition.consensus().is_primary()
                         } else {
                             partition_ready(partition, &header)
+                                && !self
+                                    .plane
+                                    .metadata()
+                                    .applied_frontier()
+                                    .has_partition_recovery()
                         }
                 }));
                 if let Some(partition) = partition {
@@ -796,6 +899,7 @@ fn partition_ready<B: MessageBus, SB: SuperblockStore>(
     probe: &PrimaryRebalanceHeader,
 ) -> bool {
     partition_history_ready(partition, probe)
+        && partition.repair.is_none()
         && partition.consensus().commit_min() >= probe.commit
         && partition.consensus().commit_min() == partition.consensus().commit_max()
         && !partition.history_is_busy()

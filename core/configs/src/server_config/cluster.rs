@@ -200,9 +200,9 @@ fn default_superblock_wedged_fatal_timeout() -> IggyDuration {
 pub struct ClusterConfig {
     pub enabled: bool,
     pub name: String,
-    /// Backup-side liveness window for a plane's primary. A replica that
-    /// sees no primary traffic for this long starts a view change
-    /// (`normal_heartbeat_timeout`). Raise it on oversubscribed hosts where
+    /// Liveness window for the primary and its replication quorum. Backups
+    /// vote after primary silence; a primary without heartbeat replies from
+    /// a quorum relinquishes leadership. Raise it on oversubscribed hosts where
     /// scheduling stalls fake primary death; sub-`MIN_CLUSTER_HEARTBEAT_TIMEOUT`
     /// values (including the `0` / `disabled` / `unlimited` sentinels, which
     /// all parse to zero) are rejected at boot. On Linux it is also the

@@ -189,6 +189,7 @@ fn arm<SB: SuperblockStore>(shard: &TestShard<SB>, phase: MovePhase) -> PrimaryR
         view: Some(METADATA_VIEW),
         peers: vec![Peer::default(); usize::from(REPLICAS)],
         eligible: vec![true; usize::from(REPLICAS)],
+        backoffs: vec![TargetBackoff::default(); usize::from(REPLICAS)],
         pending: Some(PendingMove {
             plan: PartitionPrimaryTransfer {
                 namespace,
@@ -480,6 +481,87 @@ async fn given_a_sent_grant_when_the_new_view_is_unseen_should_hold_the_move_unt
     }
 }
 
+#[test]
+fn given_failed_moves_to_a_target_when_backing_off_should_double_each_wait_once_up_to_the_cap() {
+    let mut now = Instant::now();
+    let mut backoff = TargetBackoff::default();
+    for wait in [
+        MOVE_HOLD_INTERVAL,
+        MOVE_HOLD_INTERVAL * 2,
+        MOVE_HOLD_INTERVAL * 4,
+        TARGET_BACKOFF_MAX,
+        TARGET_BACKOFF_MAX,
+    ] {
+        backoff.record_failure(now);
+        // Another watched move fails inside the same wait.
+        backoff.record_failure(now + wait / 2);
+        assert_eq!(backoff.wait, wait);
+        assert!(backoff.blocks(now + wait / 2));
+        now += wait;
+        assert!(!backoff.blocks(now));
+    }
+}
+
+#[compio::test]
+async fn given_a_backed_off_target_when_its_probe_move_is_lost_or_held_should_double_or_reset_the_wait()
+ {
+    let target_view = PARTITION_VIEW + 1;
+    for held in [false, true] {
+        let (shard, _inbox) = owner();
+        arm(&shard, MovePhase::Transfer);
+        let metadata = shard.plane.metadata();
+        assert_eq!(
+            metadata
+                .consensus
+                .as_ref()
+                .unwrap()
+                .primary_index(target_view),
+            TARGET
+        );
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let streams = metadata.mux_stm.streams();
+        streams.seed_namespace(namespace, namespace.inner(), PARTITION_VIEW);
+        let created_revision = streams.created_revision_for_namespace(namespace).unwrap();
+        let observe = |view| {
+            metadata.observe_partition_views(&[PartitionPlacementView {
+                namespace,
+                created_revision,
+                view,
+            }]);
+        };
+        observe(PARTITION_VIEW);
+        let moved_at = shard.bus.monotonic_now();
+        {
+            let mut state = shard.primary_rebalance.borrow_mut();
+            let pending = state.pending.as_mut().unwrap();
+            pending.plan.created_revision = created_revision;
+            pending.since = moved_at;
+            // The wait after one failed move ran out, so this move probes the target.
+            state.backoffs[usize::from(TARGET)] = TargetBackoff {
+                until: Some(moved_at),
+                wait: MOVE_HOLD_INTERVAL,
+            };
+        }
+
+        observe(target_view);
+        tick_with_ready_peers(&shard, moved_at).await;
+        if held {
+            tick_with_ready_peers(&shard, moved_at + MOVE_HOLD_INTERVAL).await;
+        } else {
+            observe(target_view + 1);
+            tick_with_ready_peers(&shard, moved_at + PROBE_INTERVAL).await;
+        }
+
+        let wait = shard.primary_rebalance.borrow().backoffs[usize::from(TARGET)].wait;
+        let expected = if held {
+            Duration::ZERO
+        } else {
+            MOVE_HOLD_INTERVAL * 2
+        };
+        assert_eq!(wait, expected, "held={held}");
+    }
+}
+
 #[compio::test]
 async fn given_an_unsent_grant_when_the_coordinator_ticks_should_plan_again_before_the_transfer_timeout()
  {
@@ -762,6 +844,7 @@ fn given_partition_probe_when_local_history_is_not_ready_should_refuse() {
         "recovering",
         "unproved",
         "transfer",
+        "repair",
         "ceded",
         "recovery barrier",
         "transition",
@@ -782,6 +865,20 @@ fn given_partition_probe_when_local_history_is_not_ready_should_refuse() {
             "transfer" => partition
                 .consensus()
                 .set_state_transfer_stage(StateTransferStage::AwaitingTarget),
+            "repair" => {
+                partition.repair = Some(partitions::RepairSession {
+                    nonce: NONCE,
+                    view: PARTITION_VIEW,
+                    from_op: COMMITTED + 1,
+                    commit_to_op: COMMITTED + 1,
+                    fetch_to_op: COMMITTED + 1,
+                    floor: None,
+                    peer: SOURCE,
+                    idle_ticks: 0,
+                    floor_pulled_from: 0,
+                    requested_from: None,
+                });
+            }
             "ceded" => partition.consensus().init_as_backup(),
             "recovery barrier" => partition.consensus().set_recovery_barrier(COMMITTED + 1),
             "transition" => {
@@ -810,6 +907,45 @@ fn given_busy_source_history_when_capturing_frontier_should_allow_drain_but_not_
     assert!(partition.history_is_busy());
     assert!(partition_history_ready(&partition, &probe));
     assert!(!partition_ready(&partition, &probe));
+}
+
+#[compio::test]
+async fn given_another_shard_recovering_when_metadata_is_probed_should_refuse_primary_moves_without_blocking_admission()
+ {
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 1, 3, 0);
+    let consensus = shard.plane.metadata().consensus.as_ref().unwrap();
+    let frontier = shard.plane.metadata().applied_frontier();
+    let other_shard = frontier.track_partition_recovery();
+    other_shard.set_active(true);
+    let mut probe = probe_header(consensus, NONCE);
+    probe.replica = 0;
+    probe.quorum_age_ns = 0;
+    shard.on_primary_rebalance(probe).await;
+    probe.nonce += 1;
+    shard.on_primary_rebalance(probe).await;
+    assert_eq!(shard.bus.sent.borrow().last().unwrap().1.ready, 0);
+    assert!(frontier.partition_requests_allowed(shard.bus.monotonic_now()));
+    drop(other_shard);
+    probe.nonce += 1;
+    shard.on_primary_rebalance(probe).await;
+    assert_eq!(shard.bus.sent.borrow().last().unwrap().1.ready, 1);
+}
+
+#[compio::test]
+async fn given_local_partition_recovery_when_the_coordinator_probes_should_exclude_itself_until_recovery_finishes()
+ {
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 0, 3, 0);
+    let recovery = shard
+        .plane
+        .metadata()
+        .applied_frontier()
+        .track_partition_recovery();
+    recovery.set_active(true);
+    shard.tick_primary_rebalance().await;
+    assert!(!shard.primary_rebalance.borrow().eligible[0]);
+    recovery.set_active(false);
+    shard.tick_primary_rebalance().await;
+    assert!(shard.primary_rebalance.borrow().eligible[0]);
 }
 
 #[compio::test]
