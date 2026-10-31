@@ -1332,6 +1332,8 @@ fn main() {
             current_offset: 99,
             size_bytes: 1024,
             messages_count: 100,
+            members: vec![0, 1, 2],
+            in_sync_members: vec![0, 1],
         },
         PartitionResponse {
             context: Default::default(),
@@ -1341,6 +1343,8 @@ fn main() {
             current_offset: 0,
             size_bytes: 0,
             messages_count: 0,
+            members: vec![1, 2, 0],
+            in_sync_members: vec![],
         },
         PartitionResponse {
             context: Default::default(),
@@ -1350,6 +1354,8 @@ fn main() {
             current_offset: 7,
             size_bytes: 512,
             messages_count: 8,
+            members: vec![2, 0, 1],
+            in_sync_members: vec![2],
         },
     ];
     add(

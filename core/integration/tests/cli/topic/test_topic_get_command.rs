@@ -217,7 +217,7 @@ impl IggyCmdTestCase for TestTopicGetCmd {
         let mut assertion = assertion
             .stdout(contains("Partition id | Created"))
             .stdout(contains("Segments count | Current offset | Size"))
-            .stdout(contains("Messages count"))
+            .stdout(contains("Messages count | Members | In sync"))
             .stdout(contains("Option                            | Value"))
             .stdout(contains("Source"))
             .stdout(contains(
@@ -262,7 +262,7 @@ impl IggyCmdTestCase for TestTopicGetCmd {
             if self.populate_partitions {
                 assert!(row.contains(&format!("| 1 | {index} |")), "{row}");
                 assert!(row.contains(" B |") && !row.contains("| 0 B |"), "{row}");
-                assert!(row.ends_with(&format!("| {} |", index + 1)), "{row}");
+                assert!(row.contains(&format!(" B | {} |", index + 1)), "{row}");
             } else {
                 assert!(row.contains("| 1 | 0 | 0 B | 0 |"), "{row}");
             }

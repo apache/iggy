@@ -20,18 +20,46 @@ use server_common::sharding::IggyNamespace;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// What each partition's primary last reported, as this node heard it.
 ///
 /// Node-local and never replicated: the metadata primary collects it from the
 /// other nodes' metadata replies and hands it back out in its probes, so a
 /// node answers for partitions it does not store.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PartitionDirectory {
     entries: Mutex<BTreeMap<u64, PartitionStatusEntry>>,
+    /// Nodes the metadata primary hears from, bit `n` for node `n`, or every
+    /// bit without that evidence. Reports leave the reads with their in-sync
+    /// nodes narrowed to these, so a primary that died does not keep claiming
+    /// its members in sync with its last report.
+    ready_nodes: AtomicU32,
+}
+
+impl Default for PartitionDirectory {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::default(),
+            ready_nodes: AtomicU32::new(u32::MAX),
+        }
+    }
 }
 
 impl PartitionDirectory {
+    /// Narrow the in-sync nodes of every report read from here on to
+    /// `ready_nodes`, or stop narrowing them with `u32::MAX`.
+    pub fn set_ready_nodes(&self, ready_nodes: u32) {
+        self.ready_nodes.store(ready_nodes, Ordering::Relaxed);
+    }
+
+    fn narrowed(&self, entry: &PartitionStatusEntry) -> PartitionStatusEntry {
+        PartitionStatusEntry {
+            in_sync_nodes: entry.in_sync_nodes & self.ready_nodes.load(Ordering::Relaxed),
+            ..*entry
+        }
+    }
+
     /// Keep the newest report of each partition, ordered by incarnation, then
     /// view, then the primary's commit. Returns the reports it kept.
     pub fn record(
@@ -64,7 +92,7 @@ impl PartitionDirectory {
         self.lock()
             .get(&namespace.inner())
             .filter(|entry| entry.created_revision == created_revision)
-            .copied()
+            .map(|entry| self.narrowed(entry))
     }
 
     /// Up to `limit` reports in namespace order after `after`, wrapping to the
@@ -99,7 +127,7 @@ impl PartitionDirectory {
             }
             last = Some(*namespace);
             if include(entry) {
-                batch.push(*entry);
+                batch.push(self.narrowed(entry));
             }
         }
         drop(entries);
@@ -155,6 +183,7 @@ mod tests {
             messages_count: 0,
             size_bytes: 0,
             segments_count: 1,
+            in_sync_nodes: 0,
         }
     }
 

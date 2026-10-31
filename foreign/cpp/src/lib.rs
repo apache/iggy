@@ -104,6 +104,11 @@ mod ffi {
         /// The owner generation is zero: topic details belong to no consumer
         /// group.
         context: PartitionContext,
+        /// Node ids that store the partition, in member order.
+        members: Vec<u8>,
+        /// Members the partition's primary last reported in sync and that are
+        /// up. Empty until the primary first reports.
+        in_sync_members: Vec<u8>,
     }
 
     struct TopicDetails {

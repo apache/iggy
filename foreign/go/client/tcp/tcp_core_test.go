@@ -874,3 +874,14 @@ func topicDetailsBody(t *testing.T, partitionsCount uint32) []byte {
 	copy(body[nameLenOffset+1:], name)
 	return body
 }
+
+// partitionDetailsBody is one GetTopic/CreateTopic partition entry: zeroed
+// counters and context, then the two u8-counted node lists.
+func partitionDetailsBody(id uint32, members, inSyncMembers []uint8) []byte {
+	body := binary.LittleEndian.AppendUint32(nil, id)
+	body = append(body, make([]byte, 8+4+8+8+8+iggcon.PartitionContextSize)...)
+	body = append(body, uint8(len(members)))
+	body = append(body, members...)
+	body = append(body, uint8(len(inSyncMembers)))
+	return append(body, inSyncMembers...)
+}

@@ -274,7 +274,9 @@ PartitionContext PartitionContext::FromFfi(ffi::PartitionContext context) {
 
 Partition Partition::FromFfi(ffi::Partition partition) {
     return Partition(partition.id, partition.created_at, partition.segments_count, partition.current_offset,
-                     partition.size_bytes, partition.messages_count, PartitionContext::FromFfi(partition.context));
+                     partition.size_bytes, partition.messages_count, PartitionContext::FromFfi(partition.context),
+                     std::vector<std::uint8_t>(partition.members.begin(), partition.members.end()),
+                     std::vector<std::uint8_t>(partition.in_sync_members.begin(), partition.in_sync_members.end()));
 }
 
 TopicDetails TopicDetails::FromFfi(ffi::TopicDetails topic) {

@@ -76,6 +76,11 @@ type PartitionContract struct {
 	SegmentsCount uint32           `json:"segmentsCount"`
 	CurrentOffset uint64           `json:"currentOffset"`
 	SizeBytes     uint64           `json:"sizeBytes"`
+	// Members are the node ids that store the partition, in member order.
+	Members []uint8 `json:"members"`
+	// InSyncMembers are the members the partition's primary last reported in
+	// sync and that are up. Empty until the primary first reports.
+	InSyncMembers []uint8 `json:"inSyncMembers"`
 }
 
 type PartitioningKind int

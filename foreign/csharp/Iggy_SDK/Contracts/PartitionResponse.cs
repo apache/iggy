@@ -59,4 +59,15 @@ public sealed class PartitionResponse
     /// </summary>
     [JsonConverter(typeof(SizeConverter))]
     public required ulong Size { get; init; }
+
+    /// <summary>
+    ///     Node ids that store the partition, in member order.
+    /// </summary>
+    public IReadOnlyList<byte> Members { get; init; } = [];
+
+    /// <summary>
+    ///     Node ids among <see cref="Members" /> that the partition's primary last reported in sync and that are up.
+    ///     Empty until the primary first reports.
+    /// </summary>
+    public IReadOnlyList<byte> InSyncMembers { get; init; } = [];
 }

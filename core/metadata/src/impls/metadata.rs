@@ -77,11 +77,11 @@ use iggy_common::calculate_checksum;
 use iggy_common::variadic;
 use iggy_common::wire_conversions::{resource_options_from_wire, resource_options_to_wire};
 use iggy_common::{
-    DEFAULT_REPLICATION_FACTOR, HeaderKey, HeaderValue, IggyError, MetadataChangeStart,
-    MetadataChangesQuery, OptionAdmissionContext, OptionKey, OptionOperation, OptionValue,
-    OptionVisibility, OptionsProvenance, OptionsScope, ResourceOptions, ServerKeyContext,
-    TopicCreateOptions, TopicResolvedOptions, UserId, admit, critical_keys_marker,
-    derived_defaults, stream_wrap_set, topic_option_keys, validate_topic_segment_size,
+    HeaderKey, HeaderValue, IggyError, MetadataChangeStart, MetadataChangesQuery,
+    OptionAdmissionContext, OptionKey, OptionOperation, OptionValue, OptionVisibility,
+    OptionsProvenance, OptionsScope, ResourceOptions, ServerKeyContext, TopicCreateOptions,
+    TopicResolvedOptions, UserId, admit, critical_keys_marker, derived_defaults, stream_wrap_set,
+    topic_option_keys, validate_topic_segment_size,
 };
 use journal::local_gate::LocalGate;
 use journal::superblock::{
@@ -1289,6 +1289,9 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// `[personal_access_token] max_tokens_per_user`, zero for no cap. See
     /// [`Self::admit_personal_access_token`].
     max_tokens_per_user: Cell<u32>,
+    /// `[cluster] default_replication_factor`, `None` for every node. See
+    /// [`Self::default_replication_factor`].
+    default_replication_factor: Cell<Option<u8>>,
     /// Highest metadata op whose apply has been PUBLISHED on this node, plus
     /// the reads parked on it. Shared by every shard; see
     /// [`AppliedFrontier`] for the ordering and the wake contract.
@@ -1365,6 +1368,7 @@ where
             prepare_gap_drops: Cell::new(0),
             partitions_max: Cell::new(0),
             max_tokens_per_user: Cell::new(0),
+            default_replication_factor: Cell::new(None),
             applied_frontier: Arc::default(),
             stream_key_context: Arc::default(),
             change_log: Rc::new(MetadataChangeLog::new(ChangeLogCapacities::default())),
@@ -1654,6 +1658,24 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     /// `CreatePartitions`, so every node needs the same value.
     pub fn set_partitions_max(&self, partitions_max: u32) {
         self.partitions_max.set(partitions_max);
+    }
+
+    /// Give a topic created without a replication factor `factor` nodes, or
+    /// every node for `None`, from `[cluster] default_replication_factor`. Only
+    /// the primary reads it, when it admits a `CreateTopic`, and the topic
+    /// stores the factor it resolved, so every node needs the same value.
+    pub fn set_default_replication_factor(&self, factor: Option<u8>) {
+        self.default_replication_factor.set(factor);
+    }
+
+    /// The replication factor a topic created without one gets in a cluster
+    /// of `nodes` nodes: the configured number lowered to `nodes`, or every
+    /// node.
+    #[must_use]
+    pub fn default_replication_factor(&self, nodes: u8) -> u8 {
+        self.default_replication_factor
+            .get()
+            .map_or(nodes, |factor| factor.min(nodes))
     }
 
     /// Cap the personal access tokens of each user at `[personal_access_token]
@@ -4981,6 +5003,7 @@ where
                 let replication_factor = resolve_replication_factor(
                     TopicCreateOptions::from_resource_options(&admitted.explicit)
                         .replication_factor,
+                    self.default_replication_factor(consensus.replica_count()),
                     consensus.replica_count(),
                     &mut derived,
                 )?;
@@ -5520,15 +5543,16 @@ pub fn build_truncate_partition_client_message_with_identifiers(
 }
 
 /// A new topic's replication factor: the explicit value, which must fit the
-/// cluster's `nodes`, or the catalog default lowered to `nodes`. The default is
-/// written back into `derived`, so the topic stores what placement used.
+/// cluster's `nodes`, or this node's `default`. The default is written back
+/// into `derived`, so the topic stores what placement used.
 fn resolve_replication_factor(
     explicit: Option<u32>,
+    default: u8,
     nodes: u8,
     derived: &mut ResourceOptions,
 ) -> Result<u8, IggyError> {
     let factor = explicit.unwrap_or_else(|| {
-        let factor = DEFAULT_REPLICATION_FACTOR.min(u32::from(nodes));
+        let factor = u32::from(default);
         derived.insert(
             HeaderKey::from(OptionKey::ReplicationFactor),
             OptionValue::derived(HeaderValue::from(factor)),
@@ -7145,6 +7169,27 @@ mod tests {
             .into_iter()
             .map(|partition| partition.initial_view)
             .collect()
+    }
+
+    #[test]
+    fn given_a_configured_default_factor_when_admitting_a_create_without_one_should_place_that_many_members()
+     {
+        for (configured, expected) in [(None, 3), (Some(2), 2), (Some(5), 3)] {
+            let metadata = placement_metadata();
+            metadata.set_default_replication_factor(configured);
+            assert_eq!(metadata.default_replication_factor(3), expected);
+            let prepare = metadata
+                .prepare_request(placement_request(1, "topic", 2))
+                .unwrap();
+            let request = PersistedCreateTopicRequest::decode_from(prepare.body()).unwrap();
+            assert!(
+                request
+                    .partitions
+                    .iter()
+                    .all(|partition| partition.members.len() == usize::from(expected)),
+                "configured {configured:?}"
+            );
+        }
     }
 
     #[test]

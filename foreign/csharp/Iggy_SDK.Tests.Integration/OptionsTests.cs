@@ -115,7 +115,7 @@ public class OptionsTests
         specs["preallocate_segments"].DefaultValue.ShouldBe([0]);
 
         specs["replication_factor"].Kind.ShouldBe(HeaderKind.Uint32);
-        BitConverter.ToUInt32(specs["replication_factor"].DefaultValue).ShouldBe(3u);
+        BitConverter.ToUInt32(specs["replication_factor"].DefaultValue).ShouldBe((uint)Fixture.ClusterNodeCount);
 
         specs["message_expiry"].Updatable.ShouldBeTrue();
         specs["message_expiry"].Resettable.ShouldBeTrue();

@@ -167,7 +167,8 @@ public final class TopicOptions {
 
         /**
          * Number of nodes that store each partition, 1 to 32 and at most the cluster's node count. Left unset,
-         * the server uses 3, lowered to the node count when the cluster is smaller.
+         * the server's {@code [cluster] default_replication_factor} applies: every node unless an operator set a
+         * number.
          *
          * <p>Two replicas keep two copies but stop accepting writes while either node is down, like Kafka with
          * {@code min.insync.replicas=2}. The server refuses an out-of-range value with

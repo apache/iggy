@@ -114,6 +114,12 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     protected virtual ResourceMapping[] ResourceMappings => [];
 
     /// <summary>
+    ///     The cluster size, which is what a server on the default settings reports as the default replication
+    ///     factor.
+    /// </summary>
+    public int ClusterNodeCount => NodeCount;
+
+    /// <summary>
     ///     Cluster size, mirroring the Rust integration harness knob of the same name: the
     ///     IGGY_TEST_CLUSTER_NODES environment variable decides (default 1, a standalone node with
     ///     clustering disabled; 2 or more, a replicated cluster). A subclass can pin its own size

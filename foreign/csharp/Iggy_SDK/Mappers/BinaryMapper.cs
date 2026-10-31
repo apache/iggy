@@ -40,6 +40,8 @@ internal static partial class BinaryMapper
     private const int CACHE_METRICS_ENTRY_SIZE = 32;
     private const int OPEN_FILES_FIELDS_SIZE = 8 + 8;
     private const int MIN_TOPIC_SIZE = 33 + 4 + 4;
+    private const int PARTITION_COUNTERS_SIZE = 40 + PartitionContext.ENCODED_SIZE;
+    private const int MIN_PARTITION_SIZE = PARTITION_COUNTERS_SIZE + 1 + 1;
     private const int MIN_OPTION_SPEC_SIZE = 1 + 1 + 1 + 4 + 4;
     private const int CLUSTER_NODE_TAIL_SIZE = 4 * 2 + 1 + 1;
     private const int MIN_CLUSTER_NODE_SIZE = 1 + 4 + 4 + CLUSTER_NODE_TAIL_SIZE;
@@ -1001,10 +1003,11 @@ internal static partial class BinaryMapper
     internal static TopicResponse MapTopic(ReadOnlySpan<byte> payload)
     {
         var (topic, position) = MapToTopic(payload, 0);
-        List<PartitionResponse> partitions = new();
-        var length = payload.Length;
+        var partitionsCount = ValidatedCollectionSize(topic.PartitionsCount, payload.Length - position,
+            MIN_PARTITION_SIZE, "Partitions count");
+        List<PartitionResponse> partitions = new(partitionsCount);
 
-        while (position < length)
+        for (var i = 0; i < partitionsCount; i++)
         {
             var (partition, readBytes) = MapToPartition(payload, position);
             partitions.Add(partition);
@@ -1057,25 +1060,56 @@ internal static partial class BinaryMapper
     private static (PartitionResponse partition, int readBytes) MapToPartition(ReadOnlySpan<byte>
         payload, int position)
     {
+        if (payload.Length - position < MIN_PARTITION_SIZE)
+        {
+            throw new MalformedResponseException($"Partition at byte {position} is truncated.");
+        }
+
         var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         var createdAt = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 4)..(position + 12)]);
         var segmentsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 12)..(position + 16)]);
         var currentOffset = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 16)..(position + 24)]);
         var sizeBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 24)..(position + 32)]);
         var messagesCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 32)..(position + 40)]);
-        var readBytes = 40 + PartitionContext.ENCODED_SIZE;
+        var context = MapPartitionContext(payload[(position + 40)..]);
+        var end = position + PARTITION_COUNTERS_SIZE;
+        var members = ReadNodeIds(payload, ref end, "Partition members");
+        var inSyncMembers = ReadNodeIds(payload, ref end, "Partition in-sync members");
 
         return (
             new PartitionResponse
             {
-                Context = MapPartitionContext(payload[(position + 40)..]),
+                Context = context,
                 Id = id,
                 SegmentsCount = segmentsCount,
                 CurrentOffset = currentOffset,
                 Size = sizeBytes,
                 CreatedAt = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(createdAt).LocalDateTime,
-                MessagesCount = messagesCount
-            }, readBytes);
+                MessagesCount = messagesCount,
+                Members = members,
+                InSyncMembers = inSyncMembers
+            }, end - position);
+    }
+
+    private static byte[] ReadNodeIds(ReadOnlySpan<byte> payload, ref int position, string field)
+    {
+        if (position >= payload.Length)
+        {
+            throw new MalformedResponseException($"{field} count at byte {position} is missing.");
+        }
+
+        var count = payload[position];
+        position += 1;
+        var remaining = payload.Length - position;
+        if (count > remaining)
+        {
+            throw new MalformedResponseException(
+                $"{field} count {count} exceeds remaining payload of {remaining} bytes.");
+        }
+
+        var nodeIds = payload.Slice(position, count).ToArray();
+        position += count;
+        return nodeIds;
     }
 
     internal static List<ConsumerGroupResponse> MapConsumerGroups(ReadOnlySpan<byte> payload)

@@ -406,14 +406,13 @@ final class ResourceOptionsTest extends TestCase
         assert_same($explicit, self::sorted($defaults->options));
         $expected = [];
         foreach (self::catalogRows('topic') as $key => $row) {
-            if ($row['storage'] === 'map' && !array_key_exists($key, $explicit)) {
+            if ($row['storage'] === 'map' && $row['default'] !== null && !array_key_exists($key, $explicit)) {
                 $expected[$key] = self::phpScalar($row['default'], $row['kind']);
             }
         }
-        // The server lowers an omitted replication factor to its node count.
-        if (array_key_exists('replication_factor', $expected)) {
-            $expected['replication_factor'] = min($expected['replication_factor'], self::SERVER_NODES);
-        }
+        // The catalog has no replication factor default: the server's
+        // default_replication_factor applies, which is every node unless configured.
+        $expected['replication_factor'] = self::SERVER_NODES;
         ksort($expected);
         $derived = $defaults->derived_options;
         ksort($derived);

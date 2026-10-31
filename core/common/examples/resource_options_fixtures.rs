@@ -147,7 +147,7 @@ fn describe_options_vectors() -> GeneratorResult<Vec<DescribeOptionsVector>> {
     SCOPES
         .into_iter()
         .map(|scope| {
-            let bytes = describe_options_response(scope)?.to_bytes();
+            let bytes = describe_options_response(scope, &[])?.to_bytes();
             let entries = DescribeOptionsResponse::decode_from(&bytes)?
                 .entries
                 .iter()

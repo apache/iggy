@@ -499,6 +499,8 @@ pub(crate) fn topic_body(partitions_count: u32) -> Vec<u8> {
                     owner_generation: 0,
                     metadata_op: 11,
                 },
+                members: vec![0],
+                in_sync_members: vec![0],
             })
             .collect(),
     }

@@ -19,11 +19,11 @@ use super::codec::{OptionValueCodec, invalid};
 use super::key::OptionKey;
 use super::{
     DEFAULT_MAX_TOPIC_SIZE, DEFAULT_MESSAGE_EXPIRY, DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
-    DEFAULT_PREALLOCATE_SEGMENTS, DEFAULT_REPLICATION_FACTOR, DEFAULT_SEGMENT_SIZE,
-    DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, Durability, MAX_MESSAGES_REQUIRED_TO_SAVE,
-    MAX_PREALLOCATED_TOPIC_BYTES, MAX_REPLICATION_FACTOR, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
-    MAX_TOPIC_SEGMENT_SIZE, MIN_TOPIC_SEGMENT_SIZE, OptionValue, OptionsScope,
-    PartitionResizePolicy, ResourceOptions, erase_options,
+    DEFAULT_PREALLOCATE_SEGMENTS, DEFAULT_SEGMENT_SIZE, DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+    Durability, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_PREALLOCATED_TOPIC_BYTES,
+    MAX_REPLICATION_FACTOR, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, MAX_TOPIC_SEGMENT_SIZE,
+    MIN_TOPIC_SEGMENT_SIZE, OptionValue, OptionsScope, PartitionResizePolicy, ResourceOptions,
+    erase_options,
 };
 use crate::http::users::defaults::{MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
@@ -285,16 +285,18 @@ pub static CATALOG: [OptionDescriptor; 20] = [
         kind: HeaderKind::Uint32,
         storage: OptionStorage::Map,
         mutability: OptionMutability::CreateOnly,
-        default: OptionDefault::Const(|| Ok(HeaderValue::from(DEFAULT_REPLICATION_FACTOR))),
+        // A server setting, so the server reports it rather than the catalog.
+        default: OptionDefault::None,
         visibility: OptionVisibility::Public,
         critical: false,
         description: || {
             format!(
                 "Nodes that store each partition, 1..={MAX_REPLICATION_FACTOR} and at most the \
-                 cluster's node count. Omitted, it is {DEFAULT_REPLICATION_FACTOR} or the node \
-                 count when smaller. A write commits on a quorum of these nodes, so 2 keeps two \
-                 copies but stops writing while either is down, and 1 keeps one copy that \
-                 replicated durability acknowledges before it reaches disk"
+                 cluster's node count. Omitted, the server's [cluster] \
+                 default_replication_factor applies: every node unless an operator set a \
+                 number. A write commits on a quorum of these nodes, so 2 keeps two copies but \
+                 stops writing while either is down, and 1 keeps one copy that replicated \
+                 durability acknowledges before it reaches disk"
             )
         },
     },

@@ -454,3 +454,146 @@ async fn given_an_rf1_node_down_when_sessions_churn_should_keep_admitting_logins
     .await
     .expect("no partition keeps refusing sessions once its debt is paid");
 }
+
+/// The partitions of the topic, once every one of them lists all its members
+/// in sync, read through `node`.
+async fn await_in_sync(
+    client: &TcpClient,
+    stream: &Identifier,
+    topic: &Identifier,
+    expected: impl Fn(&Partition) -> Vec<u8>,
+) -> Vec<Partition> {
+    timeout(POLL_BUDGET, async {
+        loop {
+            let partitions = client
+                .get_topic(stream, topic)
+                .await
+                .unwrap()
+                .unwrap()
+                .partitions;
+            if partitions
+                .iter()
+                .all(|partition| partition.in_sync_members == expected(partition))
+            {
+                return partitions;
+            }
+            sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("in-sync members never reached the expected lists"))
+}
+
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "2"))]
+async fn given_no_factor_when_creating_on_the_default_setting_should_store_every_partition_on_every_node(
+    harness: &mut TestHarness,
+) {
+    let client = root_client(harness, 0).await;
+    let specs = client.describe_options(OptionsScope::Topic).await.unwrap();
+    let replication_factor = specs
+        .iter()
+        .find(|spec| spec.key == "replication_factor")
+        .unwrap();
+    assert_eq!(replication_factor.default_value, 3_u32.to_le_bytes());
+
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    client
+        .create_topic(
+            &stream,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let partitions = await_in_sync(&client, &stream, &topic, |partition| {
+        partition.members.clone()
+    })
+    .await;
+    for partition in &partitions {
+        let mut members = partition.members.clone();
+        members.sort_unstable();
+        assert_eq!(members, [0, 1, 2], "partition {}", partition.id);
+    }
+}
+
+#[iggy_harness(
+    cluster_nodes = 3,
+    server(
+        cluster.default_replication_factor = "2",
+        sharding.cpu_allocation = "2"
+    )
+)]
+async fn given_a_configured_default_factor_when_a_member_goes_down_should_report_it_out_of_sync(
+    harness: &mut TestHarness,
+) {
+    const DOWN: u8 = 2;
+    let client = root_client(harness, 0).await;
+    let specs = client.describe_options(OptionsScope::Topic).await.unwrap();
+    let replication_factor = specs
+        .iter()
+        .find(|spec| spec.key == "replication_factor")
+        .unwrap();
+    assert_eq!(replication_factor.default_value, 2_u32.to_le_bytes());
+
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    client
+        .create_topic(
+            &stream,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let details = client.get_topic(&stream, &topic).await.unwrap().unwrap();
+    let factor = details
+        .options
+        .get(&HeaderKey::from_str(topic_option_keys::REPLICATION_FACTOR).unwrap())
+        .expect("the topic stores the factor it was given");
+    assert_eq!(factor.value, HeaderValue::from(2_u32));
+
+    let partitions = await_in_sync(&client, &stream, &topic, |partition| {
+        partition.members.clone()
+    })
+    .await;
+    let distinct: BTreeSet<u8> = partitions
+        .iter()
+        .flat_map(|partition| partition.members.iter().copied())
+        .collect();
+    assert!(distinct.len() > 1, "the members spread over the nodes");
+    for partition in &partitions {
+        assert_eq!(partition.members.len(), 2, "partition {}", partition.id);
+    }
+    assert!(
+        partitions
+            .iter()
+            .any(|partition| partition.members.contains(&DOWN)),
+        "three partitions of two members each use every node of three"
+    );
+
+    harness.kill_node(usize::from(DOWN)).unwrap();
+    await_in_sync(&client, &stream, &topic, |partition| {
+        partition
+            .members
+            .iter()
+            .copied()
+            .filter(|member| *member != DOWN)
+            .collect()
+    })
+    .await;
+}

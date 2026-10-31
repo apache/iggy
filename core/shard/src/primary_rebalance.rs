@@ -61,8 +61,8 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBES_PER_TICK: usize = 8;
 /// Partition reports one metadata probe or reply carries.
 const STATUS_ENTRIES_PER_FRAME: usize = 512;
-/// Directory reports one probe batch visits while skipping those its peer
-/// stores itself.
+/// Directory reports one probe batch visits while skipping those of deleted
+/// incarnations.
 const STATUS_ENTRIES_SCANNED_PER_FRAME: usize = 4 * STATUS_ENTRIES_PER_FRAME;
 /// Directory reports one retain pass checks under the directory lock.
 const DIRECTORY_RETAIN_CHUNK: usize = 1024;
@@ -370,6 +370,12 @@ where
         if self.id != 0 || !consensus.is_primary() || !consensus_ready(consensus) {
             self.primary_rebalance.borrow_mut().reset_authority();
             metadata.observe_replica_readiness(&[]);
+            if self.id == 0 {
+                metadata
+                    .mux_stm
+                    .streams()
+                    .set_partition_directory_ready_nodes(u32::MAX);
+            }
             return;
         }
         let mut outgoing = Vec::new();
@@ -449,6 +455,14 @@ where
                 } else {
                     &[]
                 });
+                metadata
+                    .mux_stm
+                    .streams()
+                    .set_partition_directory_ready_nodes(if readiness_known {
+                        node_mask(&state.eligible)
+                    } else {
+                        u32::MAX
+                    });
             }
             if readiness_known && now >= state.next_quorum_scan {
                 state.next_quorum_scan = now + PROBE_INTERVAL;
@@ -517,17 +531,7 @@ where
     }
 
     /// The next run of directory reports for `peer`, advancing its cursor.
-    /// Partitions the peer stores are skipped: it reads those locally.
     fn next_status_batch(&self, peer: u8) -> Vec<PartitionStatusEntry> {
-        let Some(nodes) = self
-            .plane
-            .metadata()
-            .consensus
-            .as_ref()
-            .map(VsrConsensus::replica_count)
-        else {
-            return Vec::new();
-        };
         let mut state = self.primary_rebalance.borrow_mut();
         let Some(cursor) = state.peers.get_mut(usize::from(peer)) else {
             return Vec::new();
@@ -541,8 +545,6 @@ where
                 cursor.status_cursor,
                 STATUS_ENTRIES_PER_FRAME,
                 STATUS_ENTRIES_SCANNED_PER_FRAME,
-                peer,
-                nodes,
             );
         cursor.status_cursor = last;
         batch
@@ -1031,6 +1033,17 @@ where
         self.partition_status_outbox
             .next_batch(STATUS_ENTRIES_PER_FRAME)
     }
+}
+
+/// `eligible` as a mask of node ids, bit `n` for node `n`.
+fn node_mask(eligible: &[bool]) -> u32 {
+    eligible
+        .iter()
+        .enumerate()
+        .filter(|(_, ready)| **ready)
+        .filter_map(|(node, _)| u32::try_from(node).ok())
+        .filter_map(|node| 1_u32.checked_shl(node))
+        .fold(0, |mask, bit| mask | bit)
 }
 
 pub fn consensus_ready<B: MessageBus>(consensus: &VsrConsensus<B>) -> bool {

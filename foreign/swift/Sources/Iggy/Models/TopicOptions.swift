@@ -82,8 +82,9 @@ public struct TopicCreateOptions: Sendable, Hashable {
     public var sizeOfMessagesRequiredToSaveBytes: UInt64?
     public var preallocateSegments: Bool?
     /// Number of nodes that store each partition, 1 to 32 and at most the
-    /// cluster's node count. Nil lets the server use 3, lowered to the node
-    /// count when the cluster is smaller. Create-only.
+    /// cluster's node count. Nil lets the server's
+    /// `[cluster] default_replication_factor` apply: every node unless an
+    /// operator set a number. Create-only.
     ///
     /// Two replicas keep two copies but stop accepting writes while either
     /// node is down, like Kafka with `min.insync.replicas=2`. The server

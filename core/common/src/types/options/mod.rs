@@ -368,8 +368,6 @@ pub const DEFAULT_MESSAGES_REQUIRED_TO_SAVE: u32 = 1024;
 pub const DEFAULT_PREALLOCATE_SEGMENTS: bool = false;
 /// 1 MiB (was `[partition] size_of_messages_required_to_save`).
 pub const DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE: u64 = 1024 * 1024;
-/// Lowered to the cluster's node count at admission when that is smaller.
-pub const DEFAULT_REPLICATION_FACTOR: u32 = 3;
 
 /// Largest partition group consensus supports.
 pub const MAX_REPLICATION_FACTOR: u32 = 32;
@@ -561,8 +559,9 @@ pub struct OptionSpec {
     #[serde(default)]
     pub critical: bool,
     /// The key's default in `kind`'s encoding; empty when the key has no
-    /// default. A build constant rather than a per-node value: these defaults
-    /// stopped being config-derived when the `[system.*]` keys became options.
+    /// default. A build constant for every key but `replication_factor`, which
+    /// reports what the answering node's `[cluster] default_replication_factor`
+    /// resolves to.
     #[serde(default)]
     pub default_value: Vec<u8>,
     /// Human-readable description.
@@ -1202,8 +1201,9 @@ pub struct TopicCreateOptions {
     /// Whether this topic's segments reserve their bytes on open; `None`
     /// resolves against [`DEFAULT_PREALLOCATE_SEGMENTS`].
     pub preallocate_segments: Option<bool>,
-    /// Nodes that store each partition; `None` resolves at admission to
-    /// [`DEFAULT_REPLICATION_FACTOR`], lowered to the cluster's node count.
+    /// Nodes that store each partition; `None` resolves at admission to the
+    /// server's `[cluster] default_replication_factor`, every node unless an
+    /// operator set a number.
     pub replication_factor: Option<u32>,
     /// String-valued keys with no typed field above, parsed server-side
     /// through each key's `FromStr`. Lets a client reach a key added to the
@@ -1670,10 +1670,13 @@ mod tests {
                 && descriptor.visibility == OptionVisibility::Public
         }) {
             let key = HeaderKey::from(descriptor.key);
-            let default = descriptor
-                .default_value()
-                .expect("default encodes")
-                .expect("every topic map key has a default");
+            // A server setting decides the replication factor's default, so the
+            // catalog derives none and admission stores the resolved value.
+            let Some(default) = descriptor.default_value().expect("default encodes") else {
+                assert_eq!(descriptor.key, OptionKey::ReplicationFactor);
+                assert!(!derived.contains_key(&key));
+                continue;
+            };
             let stored =
                 ResourceOptions::from([(key.clone(), OptionValue::explicit(default.clone()))]);
             let block =

@@ -1243,6 +1243,7 @@ fn given_outbox_reports_when_a_partition_stops_being_refreshed_should_evict_only
         messages_count: 0,
         size_bytes: 0,
         segments_count: 1,
+        in_sync_nodes: 0,
     };
     let outbox = PartitionStatusOutbox::default();
     let start = Instant::now();

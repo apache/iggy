@@ -74,7 +74,8 @@ use iggy_binary_protocol::{
 };
 use iggy_common::wire_conversions::{describe_options_response, resource_options_to_wire_split};
 use iggy_common::{
-    IggyError, IggyTimestamp, OptionsScope, ResourceOptions, UserStatus, public_options,
+    HeaderValue, IggyError, IggyTimestamp, OptionKey, OptionsScope, ResourceOptions, UserStatus,
+    public_options,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -82,6 +83,7 @@ use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::{Stream, StreamsInner, Topic};
 use metadata::stm::user::User;
 use server_common::Message;
+use server_common::sharding::IggyNamespace;
 use shard::ConnectedClientInfo;
 use std::cell::RefCell;
 use std::net::IpAddr;
@@ -329,7 +331,14 @@ where
 {
     match code {
         DESCRIBE_OPTIONS_CODE => Ok(NonReplicatedResponse::Bytes(
-            build_describe_options_response(body)?.to_bytes(),
+            build_describe_options_response(
+                body,
+                shard
+                    .plane
+                    .metadata()
+                    .default_replication_factor(shard.replica_topology().replica_count),
+            )?
+            .to_bytes(),
         )),
         GET_CLUSTER_METADATA_CODE => Ok(NonReplicatedResponse::Bytes(
             build_cluster_metadata_response(roster, shard, client_ip).to_bytes(),
@@ -747,8 +756,12 @@ fn servable<T>(
     }
 }
 
-/// Serve the option catalog for one resource scope.
-fn build_describe_options_response(body: &[u8]) -> Result<DescribeOptionsResponse, IggyError> {
+/// Serve the option catalog for one resource scope, with the replication
+/// factor this node gives a topic created without one.
+fn build_describe_options_response(
+    body: &[u8],
+    default_replication_factor: u8,
+) -> Result<DescribeOptionsResponse, IggyError> {
     let request =
         DescribeOptionsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
     let scope = match request.scope {
@@ -757,7 +770,13 @@ fn build_describe_options_response(body: &[u8]) -> Result<DescribeOptionsRespons
         }
         _ => return Err(IggyError::InvalidCommand),
     };
-    describe_options_response(scope)
+    describe_options_response(
+        scope,
+        &[(
+            OptionKey::ReplicationFactor,
+            HeaderValue::from(u32::from(default_replication_factor)),
+        )],
+    )
 }
 
 /// The explicit and derived blocks a read returns for `stored`.
@@ -896,6 +915,7 @@ where
                     .topics
                     .get(topic_id)
                     .ok_or(IggyError::InvalidIdentifier)?;
+                let nodes = shard.replica_topology().replica_count;
                 let partitions = topic
                     .partitions
                     .iter()
@@ -906,6 +926,7 @@ where
                             topic_id,
                             partition,
                             shard.plane.metadata().applied_frontier().get(),
+                            nodes,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -1011,6 +1032,7 @@ fn partition_response(
     topic_id: usize,
     partition: &metadata::stm::stream::Partition,
     metadata_op: u64,
+    nodes: u8,
 ) -> Result<PartitionResponse, IggyError> {
     // Per-partition counters live in the shared stats registry (one `Arc`
     // across all shards and both left-right buffers).
@@ -1042,6 +1064,26 @@ fn partition_response(
             stats.messages_count_inconsistent(),
         )
     });
+    let members = partition.replica_set(nodes).nodes().to_vec();
+    // The primary's last report, narrowed on the metadata primary to the nodes
+    // it hears from. No report yet leaves nobody known in sync.
+    let in_sync_nodes = streams
+        .stats_registry
+        .directory()
+        .get(
+            IggyNamespace::new(stream_id, topic_id, partition.id),
+            partition.created_revision,
+        )
+        .map_or(0, |status| status.in_sync_nodes);
+    let in_sync_members = members
+        .iter()
+        .copied()
+        .filter(|node| {
+            1_u32
+                .checked_shl(u32::from(*node))
+                .is_some_and(|bit| in_sync_nodes & bit != 0)
+        })
+        .collect();
     Ok(PartitionResponse {
         id: usize_to_u32(partition.id)?,
         created_at: partition.created_at.as_micros(),
@@ -1054,6 +1096,8 @@ fn partition_response(
             owner_generation: 0,
             metadata_op,
         },
+        members,
+        in_sync_members,
     })
 }
 
@@ -1082,7 +1126,7 @@ impl NonReplicatedResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_common::{HeaderKey, HeaderValue, OptionKey, OptionValue};
+    use iggy_common::{HeaderKey, OptionValue};
     use std::str::FromStr;
 
     #[test]
@@ -1168,7 +1212,8 @@ mod tests {
         let partition = Partition::new(0, 1, IggyTimestamp::from(1u64), 0, 0);
 
         // Registry miss: the owning shard has not started building.
-        let predicted = partition_response(&streams, 0, 0, &partition, 0).expect("response builds");
+        let predicted =
+            partition_response(&streams, 0, 0, &partition, 0, 1).expect("response builds");
         assert_eq!(predicted.segments_count, 1);
         assert_eq!(predicted.messages_count, 0);
 
@@ -1179,17 +1224,72 @@ mod tests {
         let stats = streams
             .stats_registry
             .partition(0, 0, &partition, topic_stats);
-        let mid_build = partition_response(&streams, 0, 0, &partition, 0).expect("response builds");
+        let mid_build =
+            partition_response(&streams, 0, 0, &partition, 0, 1).expect("response builds");
         assert_eq!(mid_build.segments_count, 1);
 
         // Materialized: the real counters answer from here on.
         stats.increment_segments_count(1);
         stats.increment_messages_count(7);
         stats.increment_size_bytes(64);
-        let live = partition_response(&streams, 0, 0, &partition, 0).expect("response builds");
+        let live = partition_response(&streams, 0, 0, &partition, 0, 1).expect("response builds");
         assert_eq!(live.segments_count, 1);
         assert_eq!(live.messages_count, 7);
         assert_eq!(live.size_bytes, 64);
+    }
+
+    #[test]
+    fn partition_response_lists_members_and_the_reported_ones_in_sync() {
+        use iggy_binary_protocol::primitives::partition_status::PartitionStatusEntry;
+        use metadata::stm::stream::{Partition, StreamsInner};
+
+        let streams = StreamsInner::new();
+        let legacy = Partition::new(0, 1, IggyTimestamp::from(1u64), 0, 0);
+        let unreported = partition_response(&streams, 0, 0, &legacy, 0, 3).unwrap();
+        assert_eq!(
+            unreported.members,
+            [0, 1, 2],
+            "no member list is every node"
+        );
+        assert_eq!(unreported.in_sync_members, Vec::<u8>::new());
+
+        let report = |in_sync_nodes| PartitionStatusEntry {
+            namespace: IggyNamespace::new(0, 0, 0).inner(),
+            created_revision: 0,
+            view: 0,
+            commit: 0,
+            current_offset: 0,
+            messages_count: 0,
+            size_bytes: 0,
+            segments_count: 1,
+            in_sync_nodes,
+        };
+        streams.stats_registry.directory().record([report(0b101)]);
+        let reported = partition_response(&streams, 0, 0, &legacy, 0, 3).unwrap();
+        assert_eq!(reported.in_sync_members, [0, 2]);
+
+        streams.stats_registry.directory().set_ready_nodes(0b011);
+        let narrowed = partition_response(&streams, 0, 0, &legacy, 0, 3).unwrap();
+        assert_eq!(
+            narrowed.in_sync_members,
+            [0],
+            "a member the metadata primary cannot hear is not in sync"
+        );
+    }
+
+    #[test]
+    fn describe_options_reports_this_nodes_default_replication_factor() {
+        let body = DescribeOptionsRequest {
+            scope: OPTIONS_SCOPE_TOPIC,
+        }
+        .to_bytes();
+        let response = build_describe_options_response(&body, 2).unwrap();
+        let entry = response
+            .entries
+            .iter()
+            .find(|entry| entry.key.as_str() == "replication_factor")
+            .unwrap();
+        assert_eq!(entry.default_value.as_ref(), 2_u32.to_le_bytes());
     }
 
     #[test]

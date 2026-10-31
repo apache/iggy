@@ -18,6 +18,7 @@
 package binaryserialization
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -495,10 +496,11 @@ func DeserializeTopic(payload []byte) (*iggcon.TopicDetails, error) {
 		return &iggcon.TopicDetails{}, err
 	}
 
-	partitions := make([]iggcon.PartitionContract, 0)
-	length := len(payload)
-
-	for position < length {
+	// The header's count delimits the entries, so a body short of it is
+	// refused rather than read as fewer partitions.
+	partitions := make([]iggcon.PartitionContract, 0,
+		boundedCapacity(topic.PartitionsCount, len(payload)-position, partitionMinimumSize))
+	for i := uint32(0); i < topic.PartitionsCount; i++ {
 		partition, readBytes, err := DeserializePartition(payload, position)
 		if err != nil {
 			return nil, err
@@ -615,13 +617,20 @@ func topicUint64Option(topic iggcon.Topic, key iggcon.TopicOptionKey, fallback u
 	return binary.LittleEndian.Uint64(value.Value)
 }
 
+// partitionCountersSize covers id + created_at + segments_count +
+// current_offset + size_bytes + messages_count + context.
+const partitionCountersSize = 4 + 8 + 4 + 8 + 8 + 8 + iggcon.PartitionContextSize // 64 bytes
+
+// partitionMinimumSize is a partition whose members and in-sync node lists
+// are both empty: the counters and one u8 count per list.
+const partitionMinimumSize = partitionCountersSize + 1 + 1 // 66 bytes
+
 func DeserializePartition(payload []byte, position int) (iggcon.PartitionContract, int, error) {
-	const partitionSize = 40 + iggcon.PartitionContextSize
-	if position < 0 || position > len(payload) || len(payload)-position < partitionSize {
+	if position < 0 || position > len(payload) || len(payload)-position < partitionMinimumSize {
 		return iggcon.PartitionContract{}, 0, fmt.Errorf("truncated partition response")
 	}
 	var partitionContext iggcon.PartitionContext
-	if err := partitionContext.UnmarshalBinary(payload[position+40 : position+partitionSize]); err != nil {
+	if err := partitionContext.UnmarshalBinary(payload[position+40 : position+partitionCountersSize]); err != nil {
 		return iggcon.PartitionContract{}, 0, err
 	}
 	id := binary.LittleEndian.Uint32(payload[position : position+4])
@@ -630,7 +639,14 @@ func DeserializePartition(payload []byte, position int) (iggcon.PartitionContrac
 	currentOffset := binary.LittleEndian.Uint64(payload[position+16 : position+24])
 	sizeBytes := binary.LittleEndian.Uint64(payload[position+24 : position+32])
 	messagesCount := binary.LittleEndian.Uint64(payload[position+32 : position+40])
-	readBytes := partitionSize
+	members, membersEnd, err := deserializeNodeIds(payload, position+partitionCountersSize, "partition members")
+	if err != nil {
+		return iggcon.PartitionContract{}, 0, err
+	}
+	inSyncMembers, end, err := deserializeNodeIds(payload, membersEnd, "partition in-sync members")
+	if err != nil {
+		return iggcon.PartitionContract{}, 0, err
+	}
 
 	partition := iggcon.PartitionContract{
 		Context:       partitionContext,
@@ -640,9 +656,26 @@ func DeserializePartition(payload []byte, position int) (iggcon.PartitionContrac
 		CurrentOffset: currentOffset,
 		SizeBytes:     sizeBytes,
 		MessagesCount: messagesCount,
+		Members:       members,
+		InSyncMembers: inSyncMembers,
 	}
 
-	return partition, readBytes, nil
+	return partition, end - position, nil
+}
+
+// deserializeNodeIds reads a u8 count followed by that many u8 node ids and
+// returns the position past the list.
+func deserializeNodeIds(payload []byte, position int, field string) ([]uint8, int, error) {
+	if position >= len(payload) {
+		return nil, 0, fmt.Errorf("truncated %s count at offset %d", field, position)
+	}
+	count := int(payload[position])
+	start := position + 1
+	if len(payload)-start < count {
+		return nil, 0, fmt.Errorf("truncated %s at offset %d: need %d bytes, got %d",
+			field, start, count, len(payload)-start)
+	}
+	return bytes.Clone(payload[start : start+count]), start + count, nil
 }
 
 func DeserializeConsumerGroups(payload []byte) []iggcon.ConsumerGroup {

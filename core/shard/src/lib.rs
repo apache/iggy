@@ -9619,6 +9619,9 @@ where
                         messages_count: stats.messages_count_inconsistent(),
                         size_bytes: stats.size_bytes_inconsistent(),
                         segments_count: stats.segments_count_inconsistent(),
+                        in_sync_nodes: consensus
+                            .in_sync_nodes(consensus::MEMBER_LAG_MAX)
+                            .unwrap_or(0),
                     });
                 }
             }

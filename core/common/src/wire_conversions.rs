@@ -27,10 +27,10 @@ use crate::{
     ConsumerGroupInfo, ConsumerGroupMember, ConsumerOffsetInfo, GlobalPermissions, HeaderKey,
     HeaderKind, HeaderValue, IdKind, Identifier, IdentityInfo, IggyByteSize, IggyError,
     OPTION_FLAG_CRITICAL, OPTION_FLAG_READ_ONLY, OPTION_FLAG_RESETTABLE, OPTION_FLAG_SECRET,
-    OPTION_FLAG_UPDATABLE, OptionSpec, OptionValue, OptionsProvenance, OptionsScope, Partition,
-    Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken, ResourceOptions, Stats, Stream,
-    StreamDetails, StreamPermissions, Topic, TopicDetails, TopicPermissions, TransportEndpoints,
-    UserInfo, UserInfoDetails, UserStatus, descriptors_for,
+    OPTION_FLAG_UPDATABLE, OptionKey, OptionSpec, OptionValue, OptionsProvenance, OptionsScope,
+    Partition, Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken, ResourceOptions,
+    Stats, Stream, StreamDetails, StreamPermissions, Topic, TopicDetails, TopicPermissions,
+    TransportEndpoints, UserInfo, UserInfoDetails, UserStatus, descriptors_for,
 };
 use bytes::{BufMut, BytesMut};
 use iggy_binary_protocol::primitives::options::{MAX_OPTIONS, MAX_OPTIONS_BYTES, WireOptions};
@@ -157,6 +157,8 @@ impl From<PartitionResponse> for Partition {
             size: IggyByteSize::from(w.size_bytes),
             messages_count: w.messages_count,
             context: w.context,
+            members: w.members,
+            in_sync_members: w.in_sync_members,
         }
     }
 }
@@ -871,7 +873,8 @@ fn headers_from_validated_slice(
 
 /// The `DescribeOptions` response for `scope`: every catalog entry a client
 /// may see, with its kind, flags, default and description. Internal keys stay
-/// out.
+/// out. `server_defaults` fills in the defaults a server setting decides,
+/// such as `replication_factor`.
 ///
 /// # Errors
 ///
@@ -879,17 +882,22 @@ fn headers_from_validated_slice(
 /// catalog tests rule out.
 pub fn describe_options_response(
     scope: OptionsScope,
+    server_defaults: &[(OptionKey, HeaderValue)],
 ) -> Result<iggy_binary_protocol::responses::system::DescribeOptionsResponse, IggyError> {
     let entries = descriptors_for(scope)
         .filter(|descriptor| descriptor.is_described())
         .map(|descriptor| {
+            let server_default = server_defaults
+                .iter()
+                .find(|(key, _)| *key == descriptor.key)
+                .map(|(_, value)| value.clone());
             Ok(iggy_binary_protocol::responses::system::OptionDescriptor {
                 key: iggy_binary_protocol::WireName::new(descriptor.key.to_string())
                     .map_err(|_| IggyError::InvalidFormat)?,
                 kind: descriptor.kind.as_code(),
                 flags: descriptor.flags(),
-                default_value: descriptor
-                    .default_value()?
+                default_value: server_default
+                    .map_or_else(|| descriptor.default_value(), |value| Ok(Some(value)))?
                     .map(|value| bytes::Bytes::copy_from_slice(value.as_bytes()))
                     .unwrap_or_default(),
                 description: (descriptor.description)(),

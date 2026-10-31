@@ -511,6 +511,8 @@ impl From<RustPartition> for ffi::Partition {
             size_bytes: partition.size.as_bytes_u64(),
             messages_count: partition.messages_count,
             context: partition.context.into(),
+            members: partition.members,
+            in_sync_members: partition.in_sync_members,
         }
     }
 }
@@ -1921,6 +1923,20 @@ mod tests {
         )
     }
 
+    fn topic_partition(members: Vec<u8>, in_sync_members: Vec<u8>) -> RustPartition {
+        RustPartition {
+            id: 1,
+            created_at: IggyTimestamp::from(11),
+            segments_count: 1,
+            current_offset: 2,
+            size: RustIggyByteSize::from(13),
+            messages_count: 3,
+            context: CONTEXT,
+            members,
+            in_sync_members,
+        }
+    }
+
     #[test]
     fn given_optional_bridge_fields_when_converting_should_preserve_presence() {
         let unnamed = RustStreamUpdateOptions::try_from(ffi::StreamUpdateOptions {
@@ -2127,17 +2143,19 @@ mod tests {
 
     #[test]
     fn should_keep_the_partition_context_of_a_topic_partition() {
-        let partition = RustPartition {
-            id: 1,
-            created_at: IggyTimestamp::from(11),
-            segments_count: 1,
-            current_offset: 2,
-            size: RustIggyByteSize::from(13),
-            messages_count: 3,
-            context: CONTEXT,
-        };
+        let partition = topic_partition(Vec::new(), Vec::new());
 
         assert_eq!(fields(&ffi::Partition::from(partition).context), (3, 5, 7));
+    }
+
+    #[test]
+    fn given_topic_partition_with_members_when_bridged_should_keep_members_and_in_sync_members() {
+        let partition = topic_partition(vec![1, 3, 4], vec![1, 4]);
+
+        let bridged = ffi::Partition::from(partition);
+
+        assert_eq!(bridged.members, [1, 3, 4]);
+        assert_eq!(bridged.in_sync_members, [1, 4]);
     }
 
     #[test]

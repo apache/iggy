@@ -3815,6 +3815,19 @@ class Partition:
         The partition incarnation and the metadata operation the details were read at.
         The owner generation is `0` because the details belong to no consumer group.
         """
+    @property
+    def members(self) -> builtins.list[builtins.int]:
+        r"""
+        Node ids that store the partition, in member order. While one is down, a write
+        still commits if a quorum of the others is in sync.
+        """
+    @property
+    def in_sync_members(self) -> builtins.list[builtins.int]:
+        r"""
+        Node ids among `members` that the partition's primary last reported in sync and
+        that are up. Empty until the primary first reports, and while no member that is
+        up can lead it.
+        """
 
 @typing.final
 class PartitionContext:
@@ -5357,11 +5370,12 @@ class TopicOptions:
             preallocate_segments: Reserve segment bytes on open as `bool | None`.
             replication_factor: Nodes that store each partition as
                 `int | None`, 1 to 32 and at most the cluster's node count.
-                `None` resolves to 3, lowered to the node count when smaller.
-                A write commits on a quorum of these nodes, so 2 keeps two
-                copies but stops accepting writes while either node is down.
-                The server rejects an out-of-range value with an `OptionError`
-                of kind `invalid_replication_factor`.
+                `None` applies the server's `[cluster] default_replication_factor`,
+                every node unless an operator set a number. A write commits on
+                a quorum of these nodes, so 2 keeps two copies but stops
+                accepting writes while either node is down. The server rejects
+                an out-of-range value with an `OptionError` of kind
+                `invalid_replication_factor`.
             raw: Additional option keys as `dict[str, str]`, sent as string
                 values so a key newer than this build can be set. A typed field
                 wins on collision.

@@ -2320,6 +2320,24 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// `None` unless this replica is the acting primary.
     #[must_use]
     pub fn in_sync_members(&self, lag_max: Duration) -> Option<u8> {
+        self.in_sync_member_mask(lag_max)
+            .and_then(|mask| u8::try_from(mask.count_ones()).ok())
+    }
+
+    /// [`Self::in_sync_members`] as a mask of node ids, bit `n` for node `n`.
+    #[must_use]
+    pub fn in_sync_nodes(&self, lag_max: Duration) -> Option<u32> {
+        self.in_sync_member_mask(lag_max).map(|mask| {
+            (0..self.replica_count)
+                .filter(|member| mask & (1 << member) != 0)
+                .filter_map(|member| self.members.node(member))
+                .filter_map(|node| 1_u32.checked_shl(u32::from(node)))
+                .fold(0, |nodes, bit| nodes | bit)
+        })
+    }
+
+    /// The in-sync members as a mask of member indices.
+    fn in_sync_member_mask(&self, lag_max: Duration) -> Option<u32> {
         if !self.is_acting_primary() {
             return None;
         }
@@ -2327,14 +2345,15 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         let lag_max = u64::try_from(lag_max.as_micros()).unwrap_or(u64::MAX);
         let unreachable = self.member_unreachable.get();
         let announcements = self.commit_announcements.borrow();
-        let in_sync = (0..self.replica_count)
+        let mask = (0..self.replica_count)
             .filter(|member| {
                 *member == self.replica
                     || !(unreachable & (1 << member) != 0
                         || announcements.lagging(*member, now, lag_max))
             })
-            .count();
-        u8::try_from(in_sync).ok()
+            .fold(0, |mask, member| mask | (1 << member));
+        drop(announcements);
+        Some(mask)
     }
 
     /// Restore local commit progress from already-applied state during bootstrap.

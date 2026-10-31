@@ -89,7 +89,8 @@ public sealed class TopicOptions
 
     /// <summary>
     ///     Number of nodes that store each partition, 1 to 32 and at most the cluster's node count. Null lets the
-    ///     server use 3, lowered to the node count when the cluster is smaller. Fixed at creation.
+    ///     server's <c>[cluster] default_replication_factor</c> apply: every node, unless an operator set a number,
+    ///     which is lowered to the node count when the cluster is smaller. Fixed at creation.
     /// </summary>
     /// <remarks>
     ///     Two replicas keep two copies but stop accepting writes while either node is down, like Kafka with

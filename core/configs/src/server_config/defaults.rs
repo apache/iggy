@@ -112,6 +112,11 @@ impl Default for ClusterConfig {
                 .parse()
                 .unwrap(),
             view_probe_attempts_max: SERVER_CONFIG.cluster.view_probe_attempts_max as u32,
+            default_replication_factor: SERVER_CONFIG
+                .cluster
+                .default_replication_factor
+                .parse()
+                .unwrap(),
             repair_retry_interval: SERVER_CONFIG
                 .cluster
                 .repair_retry_interval

@@ -2319,17 +2319,17 @@ impl Streams {
         });
     }
 
-    /// Up to `limit` directory reports after `after` that `peer` needs: it
-    /// stores the others itself. Visits at most `scan_max` reports and returns
-    /// the last one visited as the next cursor.
+    /// Up to `limit` directory reports after `after` that still name a
+    /// committed incarnation. A peer storing a partition reads its counters
+    /// locally but still takes its report, for the in-sync nodes. Visits at
+    /// most `scan_max` reports and returns the last one visited as the next
+    /// cursor.
     #[must_use]
     pub fn partition_status_batch(
         &self,
         after: Option<u64>,
         limit: usize,
         scan_max: usize,
-        peer: u8,
-        nodes: u8,
     ) -> (Vec<PartitionStatusEntry>, Option<u64>) {
         self.inner.read(|inner| {
             inner
@@ -2346,10 +2346,21 @@ impl Streams {
                         })
                         .is_some_and(|partition| {
                             partition.created_revision == status.created_revision
-                                && partition.replica_set(nodes).member(peer).is_none()
                         })
                 })
         })
+    }
+
+    /// Narrow the in-sync nodes the directory's reports carry to
+    /// `ready_nodes`, the nodes the metadata primary hears from, or stop
+    /// narrowing them with `u32::MAX`.
+    pub fn set_partition_directory_ready_nodes(&self, ready_nodes: u32) {
+        self.inner.read(|inner| {
+            inner
+                .stats_registry
+                .directory()
+                .set_ready_nodes(ready_nodes);
+        });
     }
 
     /// The directory's latest report of `namespace`, if it still names the
@@ -3319,6 +3330,13 @@ fn encode_create_topic_reply(
                     owner_generation: 0,
                     metadata_op,
                 },
+                // A new topic always lists its members. Nothing is in sync
+                // before the partition's primary first reports.
+                members: p
+                    .members
+                    .map(|members| members.nodes().to_vec())
+                    .unwrap_or_default(),
+                in_sync_members: Vec::new(),
             })
         })
         .collect::<Result<Vec<PartitionResponse>, _>>()
@@ -7007,7 +7025,7 @@ mod tests {
     }
 
     #[test]
-    fn given_directory_reports_when_batching_for_a_peer_should_skip_what_it_stores_and_retain_in_chunks()
+    fn given_directory_reports_when_batching_for_a_peer_should_relay_committed_ones_narrowed_and_retain_in_chunks()
      {
         let streams = Streams::default();
         let stored_by_peer = IggyNamespace::new(0, 0, 0);
@@ -7029,11 +7047,32 @@ mod tests {
             messages_count: 0,
             size_bytes: 0,
             segments_count: 1,
+            in_sync_nodes: 0,
         };
         streams.record_partition_statuses(&[status(stored_by_peer), status(elsewhere)], 0, 3);
-        let (batch, cursor) = streams.partition_status_batch(None, 4, 4, 1, 3);
-        assert_eq!(batch, [status(elsewhere)]);
+        let (batch, cursor) = streams.partition_status_batch(None, 4, 4);
+        assert_eq!(
+            batch,
+            [status(stored_by_peer), status(elsewhere)],
+            "a peer storing a partition still takes its report, for the in-sync nodes"
+        );
         assert_eq!(cursor, Some(elsewhere.inner()));
+        streams.record_partition_statuses(
+            &[PartitionStatusEntry {
+                commit: 1,
+                in_sync_nodes: 0b111,
+                ..status(elsewhere)
+            }],
+            0,
+            3,
+        );
+        streams.set_partition_directory_ready_nodes(0b011);
+        assert_eq!(
+            streams.partition_status(elsewhere).unwrap().in_sync_nodes,
+            0b011,
+            "a node the metadata primary cannot hear is not in sync"
+        );
+        streams.set_partition_directory_ready_nodes(u32::MAX);
 
         streams.record_partition_statuses(
             &[PartitionStatusEntry {
@@ -7056,7 +7095,7 @@ mod tests {
             None
         );
         assert_eq!(
-            streams.partition_status_batch(None, 4, 4, 2, 3).0,
+            streams.partition_status_batch(None, 4, 4).0,
             [status(stored_by_peer)],
             "the stale incarnation's report is gone once the sweep reached it"
         );
@@ -7093,6 +7132,7 @@ mod tests {
                 messages_count: 0,
                 size_bytes: 0,
                 segments_count: 1,
+                in_sync_nodes: 0,
             }],
             2,
             3,

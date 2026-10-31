@@ -373,6 +373,8 @@ mod tests {
                 size: Default::default(),
                 messages_count: 0,
                 context: PartitionContext::default(),
+                members: Vec::new(),
+                in_sync_members: Vec::new(),
             })
             .collect()
     }

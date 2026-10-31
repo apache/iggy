@@ -66,12 +66,12 @@ example two consecutive `:edge` images. Stop every node and start them all on th
 new build. Their `IGGY-METADATA-CHANGE-LOG-1` data directories are kept: older
 metadata snapshots and journal entries read with every partition on every node,
 and older builds refuse the newer snapshot format instead of misreading it.
-Topics created without `replication_factor` get 3 copies, or one on every node
-in clusters of up to three nodes. On four or more nodes a client that omits the
-key, which includes every SDK, connector, benchmark and MCP release before the
-option, no longer stores a new topic on every node, and each partition then
-tolerates the failures of a 3-member group. Set `replication_factor` to the node
-count to keep the old layout.
+Topics created without `replication_factor` still go on every node, so clients
+that never send the key, which includes every SDK, connector, benchmark and MCP
+release before the option, keep the old layout. Set `[cluster]
+default_replication_factor` to a number to give those topics fewer copies.
+Topic responses carry each partition's member list and in-sync members, a client
+wire change that SDKs from before this release cannot decode.
 No in-place upgrade, storage conversion tool or retained-data migration is
 provided. Use an offline cutover with logical re-ingestion:
 
@@ -343,11 +343,22 @@ A topic's create-only `replication_factor` is the number of nodes that store
 each of its partitions. It applies to every partition of the topic, including
 ones added later, and takes 1 to 32 but no more than the cluster's node count.
 Any other number is refused with `InvalidReplicationFactor` (2018), and a value
-that is not a number with `InvalidOptionValue` (4042). Omitted, it is 3, or the
-node count when the cluster is smaller, so clusters of up to three nodes store
-every partition on every node. `DescribeOptions` lists the default as 3; a
-topic created without the key stores the lowered value as derived. Metadata is
-always on every node.
+that is not a number with `InvalidOptionValue` (4042). Omitted, it is the
+server's `[cluster] default_replication_factor`: `"all"` by default, which stores
+each partition on every node, or a number from 1 to 32, lowered to the node count
+when larger, so `"3"` keeps three copies on clusters of any size, like Kafka's
+`default.replication.factor`. The metadata primary resolves it when it admits the
+create, so set the same value on every node. `DescribeOptions` reports the value
+that node resolves to, and a topic created without the key stores it as derived.
+Metadata is always on every node.
+
+`GetTopic` lists, for each partition, its `members`, the node ids that store it,
+and its `in_sync_members`, the members its primary last reported in sync, which
+the metadata primary narrows to the nodes answering its probes. A member missing
+from the second list is down or behind, so before restarting a node, check that
+the partitions it is a member of keep a quorum of in-sync members without it.
+The in-sync list is empty until a partition's primary first reports, about a
+second after it is created, and while none of its members that are up leads it.
 
 At create the metadata primary picks each partition's nodes: the primary is the
 ready node leading the fewest partitions, and the other members are the nodes

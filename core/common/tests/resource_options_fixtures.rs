@@ -189,7 +189,7 @@ fn given_describe_options_vectors_when_decoding_should_match_catalog_flags() {
             .expect("entries decode");
         assert_eq!(entries, vector.entries, "{}", vector.scope);
 
-        let rebuilt = describe_options_response(vector.scope).expect("server response builds");
+        let rebuilt = describe_options_response(vector.scope, &[]).expect("server response builds");
         assert_eq!(
             rebuilt.to_bytes().as_ref(),
             bytes.as_slice(),

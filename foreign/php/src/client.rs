@@ -306,10 +306,10 @@ impl IggyClient {
     /// `#[\SensitiveParameter]`, because an unknown key may hold a secret.
     ///
     /// `replication_factor` is how many nodes store each partition, 1 to 32 and at most the
-    /// cluster's node count. Null resolves to 3, lowered to the node count when smaller. A write
-    /// commits on a quorum of these nodes, so 2 keeps two copies but stops accepting writes while
-    /// either node is down. The server rejects an out-of-range value with
-    /// `InvalidReplicationFactor`.
+    /// cluster's node count. Null lets the server's `[cluster] default_replication_factor` apply:
+    /// every node unless an operator set a number. A write commits on a quorum of these nodes, so
+    /// 2 keeps two copies but stops accepting writes while either node is down. The server
+    /// rejects an out-of-range value with `InvalidReplicationFactor`.
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,

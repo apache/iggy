@@ -32,10 +32,12 @@ pub struct PartitionStatusEntry {
     pub messages_count: u64,
     pub size_bytes: u64,
     pub segments_count: u32,
+    /// Nodes the primary counts in sync, bit `n` for node `n`, itself included.
+    pub in_sync_nodes: u32,
 }
 
 impl PartitionStatusEntry {
-    pub const ENCODED_SIZE: usize = 56;
+    pub const ENCODED_SIZE: usize = 60;
 }
 
 impl WireEncode for PartitionStatusEntry {
@@ -52,6 +54,7 @@ impl WireEncode for PartitionStatusEntry {
         buf.put_u64_le(self.messages_count);
         buf.put_u64_le(self.size_bytes);
         buf.put_u32_le(self.segments_count);
+        buf.put_u32_le(self.in_sync_nodes);
     }
 }
 
@@ -74,6 +77,7 @@ impl WireDecode for PartitionStatusEntry {
                 messages_count: read_u64_le(buf, 36)?,
                 size_bytes: read_u64_le(buf, 44)?,
                 segments_count: read_u32_le(buf, 52)?,
+                in_sync_nodes: read_u32_le(buf, 56)?,
             },
             Self::ENCODED_SIZE,
         ))
@@ -126,6 +130,7 @@ mod tests {
                 messages_count: 12,
                 size_bytes: 13,
                 segments_count: 14,
+                in_sync_nodes: 0b101,
             },
             PartitionStatusEntry {
                 namespace: 1,
@@ -136,6 +141,7 @@ mod tests {
                 messages_count: 0,
                 size_bytes: 0,
                 segments_count: u32::MAX,
+                in_sync_nodes: u32::MAX,
             },
         ];
         let body = encode_status_entries(&entries);

@@ -1557,6 +1557,26 @@ class Partition final {
      */
     [[nodiscard]] PartitionContext Context() const noexcept { return context_; }
 
+    /**
+     * @brief Returns the nodes that store the partition.
+     *
+     * While one member is down, a write still commits if a quorum of the
+     * others is in sync.
+     * @return Node IDs in member order, owned by this value. The reference
+     *         remains valid while this Partition remains alive.
+     */
+    [[nodiscard]] const std::vector<std::uint8_t> &Members() const noexcept { return members_; }
+
+    /**
+     * @brief Returns the members the partition's primary last reported in
+     *        sync and that are up.
+     * @return Node IDs among Members(), owned by this value. Empty until the
+     *         primary first reports, and while no member that is up can lead
+     *         the partition. The reference remains valid while this Partition
+     *         remains alive.
+     */
+    [[nodiscard]] const std::vector<std::uint8_t> &InSyncMembers() const noexcept { return in_sync_members_; }
+
   private:
     Partition(std::uint32_t id,
               std::uint64_t created_at,
@@ -1564,14 +1584,18 @@ class Partition final {
               std::uint64_t current_offset,
               std::uint64_t size_bytes,
               std::uint64_t messages_count,
-              PartitionContext context)
+              PartitionContext context,
+              std::vector<std::uint8_t> members,
+              std::vector<std::uint8_t> in_sync_members)
         : id_(id),
           created_at_(created_at),
           segments_count_(segments_count),
           current_offset_(current_offset),
           size_bytes_(size_bytes),
           messages_count_(messages_count),
-          context_(context) {}
+          context_(context),
+          members_(std::move(members)),
+          in_sync_members_(std::move(in_sync_members)) {}
 
     static Partition FromFfi(ffi::Partition partition);
 
@@ -1584,6 +1608,8 @@ class Partition final {
     std::uint64_t size_bytes_;
     std::uint64_t messages_count_;
     PartitionContext context_;
+    std::vector<std::uint8_t> members_;
+    std::vector<std::uint8_t> in_sync_members_;
 };
 
 /**
@@ -3280,9 +3306,9 @@ class TopicCreateOptions final {
 
     /**
      * @brief Returns the number of nodes that store each partition.
-     * @return Configured replication factor, or `std::nullopt` to use the
-     *         server default of 3, lowered to the cluster's node count when
-     *         that is smaller.
+     * @return Configured replication factor, or `std::nullopt` to apply the
+     *         server's `[cluster] default_replication_factor`: every node
+     *         unless an operator set a number.
      */
     [[nodiscard]] std::optional<std::uint32_t> ReplicationFactor() const noexcept { return replication_factor_; }
 

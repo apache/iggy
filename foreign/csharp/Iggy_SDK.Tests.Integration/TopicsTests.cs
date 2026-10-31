@@ -92,6 +92,7 @@ public class TopicsTests
         response.Name.ShouldBe("Get Topic");
         response.CompressionAlgorithm.ShouldBe(CompressionAlgorithm.Gzip);
         response.Partitions!.Count().ShouldBe(2);
+        response.Partitions!.ShouldAllBe(partition => partition.Members.Count > 0);
         response.MessageExpiry.ShouldBe(TimeSpan.FromMinutes(10));
         response.Size.ShouldBe(0u);
         response.PartitionsCount.ShouldBe(2u);
