@@ -63,8 +63,16 @@ use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
 #[path = "common/certs.rs"]
 mod certs;
+#[path = "common/codec.rs"]
+mod codec;
+#[path = "common/gateways.rs"]
+mod gateways;
 #[path = "common/server.rs"]
 mod server;
+#[path = "common/tcp.rs"]
+mod tcp;
+#[path = "common/wire.rs"]
+mod wire;
 
 use certs::{Issued, TestPki};
 use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
@@ -85,6 +93,10 @@ const GROUP_TOPIC: &str = "payments";
 const GROUP_TOPIC_PARTITIONS: u32 = 2;
 /// The topic the producer writes while one of two gateways stops.
 const FAILOVER_TOPIC: &str = "failover";
+/// The topic of the consumer group that moves to another gateway.
+const GROUP_FAILOVER_TOPIC: &str = "group-failover";
+/// Records of each batch that the moving group reads.
+const GROUP_FAILOVER_BATCH: usize = 100;
 /// Records the producer writes there, at [`FAILOVER_RATE`] a second.
 const FAILOVER_RECORDS: u32 = 600;
 const FAILOVER_RATE: u32 = 60;
@@ -358,8 +370,11 @@ async fn start_bridged_gateway_with(
 }
 
 /// Two bridged gateways that list each other in `IGGY_KAFKA_BROKERS`, as nodes 1 and 2. A short
-/// drain lets a stop take effect at once.
-async fn start_listed_gateways(server: &TestServer) -> (BridgedGateway, BridgedGateway) {
+/// drain lets a stop take effect at once. With `coordinator_log`, they share their groups.
+async fn start_listed_gateways(
+    server: &TestServer,
+    coordinator_log: bool,
+) -> (BridgedGateway, BridgedGateway) {
     let sockets = [
         bind_listener("127.0.0.1:0").expect("bind ephemeral port"),
         bind_listener("127.0.0.1:0").expect("bind ephemeral port"),
@@ -375,6 +390,7 @@ async fn start_listed_gateways(server: &TestServer) -> (BridgedGateway, BridgedG
             node_id,
             brokers: brokers.clone(),
             shutdown_drain_timeout: Duration::from_secs(1),
+            coordinator_log,
             ..GatewayConfig::default()
         };
         let listener = BoundListener::new(
@@ -2606,7 +2622,7 @@ async fn given_two_listed_gateways_when_the_first_stops_should_keep_producing_th
         .ensure_stream_and_topic(FAILOVER_TOPIC, 1)
         .await
         .expect("create the topic");
-    let (first, second) = start_listed_gateways(&server).await;
+    let (first, second) = start_listed_gateways(&server, false).await;
     let (first_addr, second_addr) = (first.addr.to_string(), second.addr.to_string());
 
     let listing = run_client(KCAT_IMAGE, &["-b", &first_addr, "-L"], &[]).expect_ran("kcat -L");
@@ -2680,4 +2696,111 @@ async fn given_two_listed_gateways_when_the_first_stops_should_keep_producing_th
         stored >= FAILOVER_RECORDS as usize,
         "{stored} of {FAILOVER_RECORDS} records stored"
     );
+}
+
+/// A Java consumer group reads through two gateways that share their groups through the
+/// coordinator log. The gateway that coordinates the group stops between two batches. The
+/// consumer finds the group at the other gateway and reads every record of the second batch,
+/// with no record read twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_two_gateways_with_the_coordinator_log_when_the_coordinator_stops_should_keep_the_group_reading()
+ {
+    const GROUP: &str = "e2e-moving";
+    let Some(server) = ready_server() else {
+        return;
+    };
+    root_bridge(&server)
+        .await
+        .ensure_stream_and_topic(GROUP_FAILOVER_TOPIC, 2)
+        .await
+        .expect("create the topic");
+    let (first, second) = start_listed_gateways(&server, true).await;
+    let bootstrap = format!("{},{}", first.addr, second.addr);
+    let coordinator = gateways::eventually(gateways::SETTLE, "a coordinator", || async {
+        let named = gateways::coordinators(first.addr, &[GROUP.to_string()]).await?;
+        Some(named[0])
+    })
+    .await;
+
+    produce_batch(&bootstrap);
+    let total = (2 * GROUP_FAILOVER_BATCH).to_string();
+    let mut consumer = RunningClient::start(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            &bootstrap,
+            "--topic",
+            GROUP_FAILOVER_TOPIC,
+            "--group",
+            GROUP,
+            "--from-beginning",
+            "--max-messages",
+            &total,
+            "--timeout-ms",
+            "60000",
+            "--property",
+            "print.partition=true",
+            "--property",
+            "print.offset=true",
+        ],
+    );
+    let mut read = 0;
+    consumer.wait_for("the first batch", |line| {
+        read += usize::from(line.starts_with("Partition:"));
+        (read == GROUP_FAILOVER_BATCH).then_some(())
+    });
+
+    let (stopped, survivor) = if coordinator == 1 {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    stopped.stop().await;
+    produce_batch(&survivor.addr.to_string());
+
+    let output = consumer.wait_exit("the consumer reads the second batch");
+    let records: Vec<&String> = output
+        .iter()
+        .filter(|line| line.starts_with("Partition:"))
+        .collect();
+    let distinct: std::collections::BTreeSet<(&str, &str)> = records
+        .iter()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            Some((fields.next()?, fields.next()?))
+        })
+        .collect();
+    assert_eq!(
+        distinct.len(),
+        2 * GROUP_FAILOVER_BATCH,
+        "every record must be read once through the moved group: {output:#?}"
+    );
+    survivor.stop().await;
+}
+
+/// Writes one batch of `GROUP_FAILOVER_BATCH` records to `GROUP_FAILOVER_TOPIC` through
+/// `bootstrap`.
+fn produce_batch(bootstrap: &str) {
+    let records = GROUP_FAILOVER_BATCH.to_string();
+    let servers = format!("bootstrap.servers={bootstrap}");
+    run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-producer-perf-test.sh",
+            "--topic",
+            GROUP_FAILOVER_TOPIC,
+            "--num-records",
+            &records,
+            "--throughput",
+            "-1",
+            "--record-size",
+            "16",
+            "--producer-props",
+            &servers,
+            "acks=all",
+        ],
+        &[],
+    )
+    .expect_ran("the batch is produced");
 }

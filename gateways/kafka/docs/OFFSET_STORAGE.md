@@ -45,7 +45,8 @@ leaves it behind.
   an empty id is refused in OffsetCommit and OffsetFetch too.
 - Negative offset: delete the key. A missing key or group counts as success. Kafka consumers read any
   negative offset as none.
-- Metadata string and leader epoch: dropped. OffsetFetch returns `""` and -1.
+- Metadata string and leader epoch: dropped here. OffsetFetch returns `""` and -1. The coordinator
+  log keeps both, up to 4,096 bytes of metadata as in Kafka (see "More than one gateway").
 - No key, unknown group or unknown topic: OffsetFetch returns -1 and no error.
 - Any other failed read fails the whole group in OffsetFetch. A lost read never goes back as -1,
   because the consumer then resets its position. A read that its owning shard does not answer in
@@ -105,11 +106,39 @@ consumer still uses a group, and Iggy keeps no commit time.
 
 ## More than one gateway
 
-Offsets are shared, since the key depends only on the Kafka group id. Membership is not
-([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)). With `IGGY_KAFKA_BROKERS`, `FindCoordinator` names
-one gateway for every group, so consumers and admin tools commit through that gateway. The cases
-below remain for gateways without that list, and for a client that sends group requests to
-another gateway.
+With the coordinator log ([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md#more-than-one-gateway)), the
+log decides each offset:
+
+- The coordinator of the group stores each commit in Iggy as above, then appends it to the log
+  with its metadata, its leader epoch and the commit time. The commit counts only once the log
+  holds it, and answers `COORDINATOR_LOAD_IN_PROGRESS` (14) when the log does not confirm it in
+  the request's time. The Iggy copy goes first, because that write checks the topic and the
+  partition.
+- A coordinator that lost the group's log partition can append, but its record does not count,
+  and the commit answers `NOT_COORDINATOR` (16). Its Iggy copy can still land, so the copy can
+  hold an older offset than the log. The log answers `OffsetFetch`.
+- `OffsetFetch` answers each partition the log holds an offset or a deletion for from the log,
+  with the commit metadata. Iggy answers the other partitions, which hold offsets from before the
+  log. After `DeleteGroups`, the log holds every offset of the group, so Iggy answers none.
+- `DeleteGroups` and `OffsetDelete` delete in Iggy and in the log, while the group's commits wait.
+- When Iggy deletes a topic, each owner removes its offsets from the log, so a new topic of that
+  name starts with none, as in Kafka. The gateway learns of it from Iggy's change log, which needs
+  `manage_servers` on the bridge's Iggy user. Without it, a new topic of the name starts at the
+  old offsets.
+- Only the coordinator answers offset requests for a group, so a commit made through another
+  gateway answers `NOT_COORDINATOR`, and the client asks the coordinator.
+
+Without the coordinator log, offsets are shared, since the key depends only on the Kafka group id.
+Membership is not. With `IGGY_KAFKA_BROKERS`, `FindCoordinator` names one gateway for every group,
+so consumers and admin tools commit through that gateway. The cases below remain for gateways
+without the log and without that list, and for a client that sends group requests to another
+gateway.
+
+- Each gateway learns from Iggy's metadata change log which groups hold offsets. A group that one
+  gateway creates lists on the others within about a second
+  ([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md#groups-that-only-hold-offsets)). That needs root or
+  the global `manage_servers` permission on the bridge's Iggy user. Without it, each gateway scans
+  every Kafka topic for the groups, and a scan answers for 10 s.
 
 - A gateway with no members in a group accepts a commit with no generation, as admin tools and
   `assign()` consumers send, even when another gateway has live members in it. That commit

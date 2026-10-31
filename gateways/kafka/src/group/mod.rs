@@ -23,8 +23,10 @@
 //! wire messages into the request types here, and `state` holds the synchronous state machine
 //! those requests drive.
 //!
-//! Membership is process memory, not Iggy state. Two gateway instances fronting one Iggy cluster
-//! therefore coordinate two independent groups under one name; see `docs/CONSUMER_GROUPS.md`.
+//! Membership is process memory. With several gateways, a [`GroupHome`] decides which gateway
+//! coordinates each group, and keeps the state of each completed generation in the coordinator
+//! log, so another gateway can take a group over with its members. See
+//! `docs/CONSUMER_GROUPS.md`.
 
 mod offset_work;
 mod state;
@@ -33,9 +35,10 @@ pub use offset_work::{RunningCommit, RunningDeletion};
 pub use state::{MAX_CLIENT_ID_BYTES, MAX_GROUP_ID_BYTES, is_valid_group_id};
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use kafka_protocol::messages::{
     HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest, OffsetCommitRequest, SyncGroupRequest,
@@ -46,7 +49,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::group::offset_work::OffsetWork;
-use crate::group::state::{GroupState, Step};
+use crate::group::state::{GroupState, Step, SyncStep};
 use crate::protocol::api::{
     ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_NONE, ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_MEMBER_ID,
 };
@@ -147,6 +150,52 @@ impl Default for GroupCoordinatorConfig {
             deletion_hold: DEFAULT_DELETION_HOLD,
         }
     }
+}
+
+/// A group as the coordinator log keeps it: the state of a generation that completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupSnapshot {
+    pub generation_id: i32,
+    pub protocol_type: String,
+    pub protocol_name: Option<String>,
+    pub leader: Option<String>,
+    pub members: Vec<MemberSnapshot>,
+}
+
+/// One member of a [`GroupSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberSnapshot {
+    pub member_id: String,
+    pub group_instance_id: Option<String>,
+    /// The `client_id` and `client_host` of the member's last join, as `DescribeGroups` reports
+    /// them.
+    pub client_id: String,
+    pub client_host: String,
+    pub session_timeout_ms: u32,
+    pub rebalance_timeout_ms: u32,
+    /// The member's subscription for the selected protocol.
+    pub metadata: Bytes,
+    pub assignment: Bytes,
+}
+
+/// Where the groups live when several gateways share them.
+#[async_trait]
+pub trait GroupHome: Send + Sync {
+    /// `Ok` when this gateway coordinates `group_id` now. Else the Kafka code that sends the
+    /// client to look again: `NOT_COORDINATOR`, or `COORDINATOR_LOAD_IN_PROGRESS` while this
+    /// gateway loads the group.
+    ///
+    /// # Errors
+    ///
+    /// The Kafka code above.
+    fn serves(&self, group_id: &str) -> Result<(), i16>;
+
+    /// Keeps the state of a completed generation, before any member learns its assignment.
+    ///
+    /// # Errors
+    ///
+    /// The Kafka code that refuses the store, which the leader gets.
+    async fn store(&self, group_id: &str, snapshot: GroupSnapshot) -> Result<(), i16>;
 }
 
 /// One `JoinGroup` request, normalized across wire versions.
@@ -551,9 +600,14 @@ impl From<&HeartbeatRequest> for GroupMember {
 /// There is no timer task. A request that touches a group first expires whatever is overdue in
 /// it, and a parked `JoinGroup`/`SyncGroup` waiter sleeps until that group's next deadline, so
 /// the coroutine waiting on a barrier is also the timer that fires it.
+///
+/// A clone shares the groups, so the coordinator log can restore and evict them.
+#[derive(Clone)]
 pub struct GroupCoordinator {
     config: GroupCoordinatorConfig,
-    groups: Mutex<HashMap<StrBytes, GroupState>>,
+    groups: Arc<Mutex<HashMap<StrBytes, GroupState>>>,
+    /// Set once when several gateways share the groups. See [`Self::set_home`].
+    home: Arc<OnceLock<Arc<dyn GroupHome>>>,
     /// The commits and the offset deletions that run for each group. Changed under `groups`, so
     /// a check of a group and its deletion's start are one step.
     offset_work: Arc<OffsetWork>,
@@ -567,10 +621,55 @@ impl GroupCoordinator {
     pub fn new(config: GroupCoordinatorConfig, shutdown: CancellationToken) -> Self {
         Self {
             config,
-            groups: Mutex::new(HashMap::new()),
+            groups: Arc::new(Mutex::new(HashMap::new())),
+            home: Arc::new(OnceLock::new()),
             offset_work: Arc::new(OffsetWork::new()),
             shutdown,
         }
+    }
+
+    /// Shares the groups with other gateways through `home`. Without it, this gateway
+    /// coordinates every group and keeps them in memory alone. Set once: a later call changes
+    /// nothing.
+    pub fn set_home(&self, home: Arc<dyn GroupHome>) {
+        let _ = self.home.set(home);
+    }
+
+    /// `Ok` when this gateway coordinates `group_id` now.
+    ///
+    /// # Errors
+    ///
+    /// `NOT_COORDINATOR` or `COORDINATOR_LOAD_IN_PROGRESS` from the [`GroupHome`].
+    pub fn serves(&self, group_id: &str) -> Result<(), i16> {
+        self.home.get().map_or(Ok(()), |home| home.serves(group_id))
+    }
+
+    /// Restores the groups a coordinator log kept. A group already here keeps its own state.
+    pub async fn restore(&self, snapshots: &[(String, GroupSnapshot)]) {
+        let mut groups = self.groups.lock().await;
+        state::restore_groups(&mut groups, &self.config, snapshots, Instant::now());
+    }
+
+    /// Drops every group that `leaves` names. Their parked members get `NOT_COORDINATOR` and
+    /// look for the new coordinator. Returns how many groups went.
+    pub async fn evict(&self, leaves: impl Fn(&str) -> bool) -> usize {
+        let mut groups = self.groups.lock().await;
+        state::evict(&mut groups, leaves)
+    }
+
+    /// Expires what is overdue in every group and drops the ones that emptied.
+    pub async fn sweep(&self) {
+        let mut groups = self.groups.lock().await;
+        state::sweep(&mut groups, Instant::now());
+    }
+
+    /// The ids among `group_ids` that name no group here now.
+    pub async fn absent(&self, group_ids: Vec<String>) -> Vec<String> {
+        let groups = self.groups.lock().await;
+        group_ids
+            .into_iter()
+            .filter(|group_id| !groups.contains_key(group_id.as_bytes()))
+            .collect()
     }
 
     /// Joins `request`'s member, parking until the group's join barrier completes.
@@ -581,6 +680,10 @@ impl GroupCoordinator {
     pub async fn join(&self, request: &JoinRequest) -> JoinResult {
         let mut parked: Option<StrBytes> = None;
         loop {
+            if let Err(error) = self.serves(&request.group_id) {
+                let member_id = parked.unwrap_or_else(|| request.member_id.clone());
+                return JoinResult::error(error, member_id);
+            }
             let outcome = {
                 let mut groups = self.groups.lock().await;
                 let now = Instant::now();
@@ -621,6 +724,9 @@ impl GroupCoordinator {
     pub async fn sync(&self, mut request: SyncRequest) -> SyncResult {
         let mut parked = false;
         loop {
+            if let Err(error) = self.serves(&request.group_id) {
+                return SyncResult::error(error);
+            }
             let outcome = {
                 let mut groups = self.groups.lock().await;
                 let now = Instant::now();
@@ -634,7 +740,20 @@ impl GroupCoordinator {
                         now,
                     )
                 } else {
-                    state::sync_step(&mut groups, &self.config, &request, now)
+                    let store_first = self.home.get().is_some();
+                    match state::sync_or_store_step(
+                        &mut groups,
+                        &self.config,
+                        &request,
+                        now,
+                        store_first,
+                    ) {
+                        SyncStep::Step(step) => step,
+                        SyncStep::Store(snapshot) => {
+                            drop(groups);
+                            return self.store_then_sync(&request, snapshot).await;
+                        }
+                    }
                 };
                 let outcome = park_outcome(&groups, &request.group_id, step, |_| {
                     SyncResult::error(ERROR_UNKNOWN_MEMBER_ID)
@@ -655,6 +774,31 @@ impl GroupCoordinator {
         }
     }
 
+    /// Stores the generation the leader's `request` completes, then answers the leader. The
+    /// followers parked on the group get their assignments once it turns `Stable`.
+    async fn store_then_sync(&self, request: &SyncRequest, snapshot: GroupSnapshot) -> SyncResult {
+        let stored = match self.home.get() {
+            Some(home) => home.store(&request.group_id, snapshot).await,
+            None => Ok(()),
+        };
+        let mut groups = self.groups.lock().await;
+        // A release drops the group after this gateway stops serving it. The leader then looks
+        // for the new coordinator, which restores a stored generation, and keeps its member id.
+        let gone = self
+            .serves(&request.group_id)
+            .err()
+            .unwrap_or(ERROR_UNKNOWN_MEMBER_ID);
+        state::finish_store(
+            &mut groups,
+            &request.group_id,
+            &request.member_id,
+            request.generation_id,
+            stored,
+            gone,
+            Instant::now(),
+        )
+    }
+
     /// Refreshes a member's session and reports whether it must rejoin. Never parks.
     pub async fn heartbeat(
         &self,
@@ -663,6 +807,9 @@ impl GroupCoordinator {
         member_id: &StrBytes,
         group_instance_id: Option<&StrBytes>,
     ) -> i16 {
+        if let Err(error) = self.serves(group_id) {
+            return error;
+        }
         let mut groups = self.groups.lock().await;
         state::heartbeat_step(
             &mut groups,
@@ -676,6 +823,9 @@ impl GroupCoordinator {
 
     /// Removes `request`'s members and releases whoever is parked on the group. Never parks.
     pub async fn leave(&self, request: &LeaveRequest) -> LeaveResult {
+        if let Err(error) = self.serves(&request.group_id) {
+            return LeaveResult::error(error);
+        }
         let mut groups = self.groups.lock().await;
         state::leave_step(&mut groups, request, Instant::now())
     }
@@ -711,6 +861,7 @@ impl GroupCoordinator {
     /// The Kafka code that refuses the commit. `COORDINATOR_LOAD_IN_PROGRESS` while a deletion of
     /// the group's offsets runs, which clients retry.
     pub async fn validate_commit(&self, request: &CommitRequest) -> Result<RunningCommit, i16> {
+        self.serves(&request.group_id)?;
         let mut groups = self.groups.lock().await;
         match state::commit_step(&mut groups, request, Instant::now()) {
             ERROR_NONE => self
@@ -1054,6 +1205,71 @@ mod tests {
             ..standalone_commit("orders")
         };
         assert!(coordinator.validate_commit(&commit).await.is_ok());
+    }
+
+    /// A home whose partition moves away during a store, as a release does.
+    struct MovingHome {
+        groups: GroupCoordinator,
+        served: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl GroupHome for MovingHome {
+        fn serves(&self, _group_id: &str) -> Result<(), i16> {
+            if self.served.load(std::sync::atomic::Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(ERROR_NOT_COORDINATOR)
+            }
+        }
+
+        async fn store(&self, _group_id: &str, _snapshot: GroupSnapshot) -> Result<(), i16> {
+            self.served
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.groups.evict(|_| true).await;
+            Ok(())
+        }
+    }
+
+    /// `UNKNOWN_MEMBER_ID` would make the leader drop its id and rejoin, and the new coordinator
+    /// would then wait a session timeout for the old id.
+    #[tokio::test]
+    async fn given_a_release_during_the_store_should_send_the_leader_to_the_new_coordinator() {
+        let coordinator = coordinator();
+        coordinator.set_home(Arc::new(MovingHome {
+            groups: coordinator.clone(),
+            served: std::sync::atomic::AtomicBool::new(true),
+        }));
+        let joined = coordinator.join(&join_request("orders")).await;
+        assert_eq!(joined.error, ERROR_NONE);
+
+        let synced = coordinator
+            .sync(SyncRequest {
+                group_id: id("orders"),
+                generation_id: joined.generation_id,
+                member_id: joined.member_id.clone(),
+                group_instance_id: None,
+                protocol_type: None,
+                protocol_name: None,
+                assignments: vec![(joined.member_id, Bytes::new())],
+            })
+            .await;
+        assert_eq!(synced.error, ERROR_NOT_COORDINATOR);
+    }
+
+    #[tokio::test]
+    async fn given_group_ids_should_name_those_without_a_group_here() {
+        let coordinator = coordinator();
+        assert_eq!(
+            coordinator.join(&join_request("orders")).await.error,
+            ERROR_NONE
+        );
+        assert_eq!(
+            coordinator
+                .absent(vec!["orders".to_string(), "payments".to_string()])
+                .await,
+            ["payments"]
+        );
     }
 
     /// The first join of a member that must claim its id first. The answer carries that id.

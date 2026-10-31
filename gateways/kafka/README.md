@@ -76,6 +76,7 @@ Default bind: a `PLAINTEXT` listener on `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_INSTANCE_ID` | `IGGY_KAFKA_NODE_ID`, else `0` | This gateway's number among the gateways fronting one Iggy cluster. It is the high half of every producer id `InitProducerId` hands out, and Kafka requires those to be cluster-unique, so give every gateway its own value. Unset, it follows `IGGY_KAFKA_NODE_ID`. A single gateway can leave both unset. |
 | `IGGY_KAFKA_NODE_ID` | `1` | This gateway's broker id in Metadata, 0 to 65535. Beside each Iggy node, use that node's replica id. Required with `IGGY_KAFKA_BROKERS` |
 | `IGGY_KAFKA_BROKERS` | unset | Every gateway in front of the Iggy cluster, this one included, as `id@host:port` entries separated by commas. With several listeners, one `id@PROTOCOL://host:port` entry per gateway and listener. Give every gateway the same list. See [Several gateways](#several-gateways-4515) |
+| `IGGY_KAFKA_COORDINATOR_LOG` | `true` with `IGGY_KAFKA_BROKERS` and the bridge, else `false` | Share the consumer groups through the coordinator log in Iggy (`true` or `false`). Needs the bridge. See [Several gateways](#several-gateways-4515) |
 | `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. If Iggy does not answer, startup tries again 1 s after each failed connect, for up to 60 s, and then the gateway stops. A wrong password or a missing permission stops it at once. It never falls back to stubs. |
 | `IGGY_KAFKA_SASL_ENABLED` | `false` | Single-listener form: require SASL/PLAIN before serving any other API (`true` or `false`, nothing else). With `IGGY_KAFKA_LISTENERS`, a `SASL_PLAINTEXT` or `SASL_SSL` listener says the same |
 | `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` | `15` | Seconds an unauthenticated connection may sit between frames. Waiting for an authentication slot and the verification itself each get this budget, the verification's starting once it holds a slot. Separate from the 10-minute idle timeout that applies once authenticated |
@@ -287,9 +288,9 @@ member that leaves hands its partition to the other at its commit.
 
 Limits:
 
-- Group membership is gateway memory. With several gateways, the one with the lowest node id
-  coordinates every group, and while it is down the groups wait for it
-  ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)).
+- Group membership is gateway memory. With the coordinator log, the gateway also stores each
+  completed generation in Iggy, so another gateway or a restarted one takes the group over with
+  its members ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md#more-than-one-gateway)).
 - Classic protocol only. A consumer with `group.protocol=consumer` (KIP-848) fails.
 - Offsets never expire. `kafka-consumer-groups.sh --delete` and `--delete-offsets` delete them
   ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md#deleting-groups-and-offsets)).
@@ -297,8 +298,25 @@ Limits:
   `manage_topics` or `manage_streams`, look in the gateway log for `the bridge user may not list
   the Iggy groups of these Kafka topics, so DeleteGroups deletes nothing`. The bridge's Iggy user,
   not the principal, lacks the permission to read the topics that the line names. `--list` still
-  shows the group as `Empty`, because its scan leaves those topics out.
+  shows the group as `Empty`. Iggy's change log shows the groups of every topic, and a scan leaves
+  those topics out rather than failing.
 - Delivery is at-least-once. A consumer that stops before it commits reads those records again.
+
+`--list` and `--describe` report a group that holds offsets in Iggy and has no members here as
+`Empty`. The gateway learns these groups from Iggy's metadata change log. A group that another
+gateway commits for shows within about a second. The change log needs root or the global
+`manage_servers` permission on the bridge's Iggy user (`IGGY_KAFKA_IGGY_USERNAME`). Without it, the
+gateway logs this warning once:
+
+```text
+the bridge's Iggy user lacks the manage_servers permission, so the gateway cannot read Iggy's
+metadata change log
+```
+
+It then finds the groups with a scan that costs one Iggy call per Kafka topic. The groups of a scan
+answer for 10 s, and a group that another gateway commits for shows with the next scan. Grant
+`manage_servers` to the bridge user to avoid the scans
+([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md#groups-that-only-hold-offsets)).
 
 ## Several gateways ([#4515](https://github.com/apache/iggy/issues/4515))
 
@@ -314,12 +332,44 @@ IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 \
 cargo run -p iggy-gateway-kafka
 ```
 
-- Metadata lists every gateway and names the one that answers as the leader of every partition.
-  Any gateway can serve any partition, because the Iggy SDK sends each partition request to its
-  primary. A client of a stopped gateway goes on through the others.
-- `FindCoordinator` names the gateway with the lowest node id for every consumer group, so a
-  group never splits over two gateways. While that gateway is down, the groups wait for it.
-  Committed offsets stay in Iggy.
+- The coordinator log decides which gateway coordinates each group. Each group belongs to one of
+  16 log partitions, by a hash of its id. An Iggy consumer group spreads the 16 partitions over
+  the gateways. The gateway that Iggy gives a partition claims it in the log, and coordinates its
+  groups. It stores each completed generation, each offset commit with its metadata, and each
+  deletion there. [docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md#more-than-one-gateway)
+  describes the log.
+- When a gateway stops, Iggy gives its partitions to the others, and they take its groups over
+  with their members and offsets. A member that keeps its heartbeat goes on without a rebalance.
+  A stop on SIGTERM hands the partitions over at once. After a crash, the takeover waits for the
+  Iggy session timeout, 1.2 times `heartbeat.interval`, 36 s by default (not tested).
+- Metadata lists each gateway that owns a log partition, and this gateway. It names a leader for
+  each partition by a hash of the topic and the partition index, so the clients spread over the
+  gateways. Any gateway can serve any partition, because the Iggy SDK sends each partition
+  request to its primary. A client of a stopped gateway goes on through the others.
+- The owner of log partition 0 is the controller. Only the controller creates and deletes topics
+  and adds partitions. The others answer `NOT_CONTROLLER` (41), and Kafka admin clients retry at
+  the controller.
+- The bridge's Iggy user creates the topics `coordinators` and `coordinator_owners` and the Iggy
+  consumer group `kafka-gateways` in the stream `<default stream>.meta`, where the cluster id
+  lives. It needs `manage_topics` there, or an operator creates the topics first and grants it
+  `read_topics`, `poll_messages` and `send_messages`. `read_topics` also covers the group.
+- With `IGGY_KAFKA_COORDINATOR_LOG=false`, the gateway with the lowest node id coordinates every
+  group, and while it is down the groups wait for it.
+- Gateways with and without the log name different coordinators for a group. To upgrade from a
+  build without the log, set `IGGY_KAFKA_COORDINATOR_LOG=false` until every gateway runs this
+  build, then turn it on with every gateway stopped. Turned on one gateway at a time, a group
+  can have two coordinators until the last restart, and its records can be read twice.
+- To add a gateway, restart the others with an `IGGY_KAFKA_BROKERS` that lists it, then start
+  it. A gateway that owns log partitions but is missing from a list leaves their groups without
+  a coordinator there: `FindCoordinator` answers `COORDINATOR_NOT_AVAILABLE` (15), and the
+  gateway log names it.
+- To lower the takeover time after a crash, lower Iggy's `heartbeat.interval`. It must stay above
+  (3 times `consumer_group.heartbeat_interval` + 6.2 s) / 1.2. With
+  `consumer_group.heartbeat_interval = "1s"`, that is about 7.7 s, so a takeover after about 9 s
+  (not tested). See `core/server/config.toml`.
+- Each gateway holds the Iggy sessions that "Concurrency ceiling" counts, up to 256 producer
+  sessions and about 30 others. N gateways times their sessions must stay below Iggy's
+  cluster-wide clients table, 8192 sessions. Three gateways at the default limits hold about 860.
 - A new Iggy client dials `IGGY_KAFKA_IGGY_ADDR` first, then the other nodes of the roster that
   the bridge read. Beside a stopped node, new producers and SASL logins go on through the other
   nodes. The bridge itself needs that address at startup. To start while that node is down,
@@ -361,9 +411,11 @@ The certificate's subject alternative names must cover every host in
 `IGGY_KAFKA_ADVERTISED_LISTENERS`: a client verifies the name of each broker address Metadata
 hands it, so a host missing from the certificate fails the client's next connection, not the
 first. Client certificates are checked against the CA only; there is no CRL or OCSP revocation
-checking, so revoke access by deleting or deactivating the Iggy user a certificate maps to. That
-applies to new connections only: an open connection keeps the principal its handshake resolved,
-and the permissions that came with it, until it closes.
+checking, so revoke access by deleting or deactivating the Iggy user a certificate maps to. An open
+connection of that user closes within about a second, once the bridge reads the change in Iggy's
+metadata change log. Without `manage_servers` on the bridge's Iggy user, that applies to new
+connections only: an open connection keeps the principal its handshake resolved, and the
+permissions that came with it, until it closes.
 
 ```bash
 kcat -b kafka.example.com:9094 -X security.protocol=SSL -X ssl.ca.location=ca.pem -L
@@ -475,10 +527,12 @@ are not implemented and not advertised.
 `--list` here is a snapshot of the caller's own grants, not the broker-wide dump it is against a
 Kafka cluster. A principal sees its own permissions and nobody else's, because the gateway holds no
 administrative credentials, so filtering on another `User:` returns an empty listing whatever that
-user holds, and root's listing is root's grants rather than a catalog of every binding. Only global permissions are rendered, as wildcard bindings, and the view is a snapshot
-taken when the connection authenticated, so a permission changed afterwards is invisible until the
-client reconnects. [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) has the mapping table and what is
-deliberately left out.
+user holds, and root's listing is root's grants rather than a catalog of every binding. Only global permissions are rendered, as wildcard bindings. The view starts as a snapshot
+taken when the connection authenticated. A permission changed afterwards shows within about a
+second, once the bridge reads the change in Iggy's metadata change log. A connection whose user is
+deleted or deactivated closes. Without `manage_servers` on the bridge's Iggy user, a permission
+changed afterwards is invisible until the client reconnects.
+[docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) has the mapping table and what is deliberately left out.
 
 Full reasoning, including what was rejected and why, is in
 [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md).
@@ -790,7 +844,11 @@ With auto-creation off, the default, nothing changes: a missing topic is answere
   more, one per read slot, and a `ListOffsets` lookup by time borrows one of those slots for its
   request. Topic probes use 1
   more. With auto topic creation on, creations use 1 more, opened at the first one.
-  Offset calls use 8 more: a commit client and a read client per offset slot.
+  Offset calls use 8 more: a commit client and a read client per offset slot. Reading Iggy's
+  metadata change log uses 1 more, opened at startup. It reads the log every 250 ms. The listing of
+  `DeleteGroups` uses 1 more, opened at the first one. Without `manage_servers`, the scan for the
+  groups that hold offsets shares that client. The coordinator log uses 6 more, opened at
+  startup: the lease client, a read client and 4 append clients.
 - CreateTopics, DeleteTopics and CreatePartitions writes also take one gateway-wide lock, so a
   CreatePartitions can read a topic's count and add to it with nothing in between. A
   CreatePartitions whose write outcome is unknown keeps the lock while it re-reads the topic, for

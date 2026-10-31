@@ -18,7 +18,7 @@
 use iggy::prelude::IggyError;
 use thiserror::Error;
 
-use crate::bridge::iggy_bridge::ClusterIdCall;
+use crate::bridge::iggy_bridge::{ClusterIdCall, CoordinatorLogCall};
 use crate::cluster_id::InvalidClusterId;
 use crate::protocol::api::{
     ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_INVALID_PARTITIONS, ERROR_INVALID_REQUEST,
@@ -116,6 +116,17 @@ pub enum BridgeError {
         topic: &'static str,
         source: Box<Self>,
     },
+    /// A call to Iggy that prepares the coordinator log failed. Made only at startup.
+    #[error(
+        "cannot {call} '{stream}/{topic}' for the coordinator log: {source}{}",
+        call.permission_hint(source, stream)
+    )]
+    CoordinatorLogCall {
+        call: CoordinatorLogCall,
+        stream: String,
+        topic: &'static str,
+        source: Box<Self>,
+    },
 }
 
 impl BridgeError {
@@ -146,9 +157,10 @@ impl BridgeError {
             // is reachable only if a future caller starts constructing configs at request time.
             // `UNKNOWN_SERVER_ERROR` at least doesn't claim a specific, wrong cause the way
             // `UNSUPPORTED_VERSION` (misleadingly implies a Kafka API version mismatch) would.
-            Self::InvalidConfig(_) | Self::InvalidClusterId { .. } | Self::ClusterIdCall { .. } => {
-                ERROR_UNKNOWN_SERVER_ERROR
-            }
+            Self::InvalidConfig(_)
+            | Self::InvalidClusterId { .. }
+            | Self::ClusterIdCall { .. }
+            | Self::CoordinatorLogCall { .. } => ERROR_UNKNOWN_SERVER_ERROR,
         }
     }
 
@@ -217,7 +229,9 @@ impl BridgeError {
     #[must_use]
     pub fn is_retriable(&self) -> bool {
         match self {
-            Self::ClusterIdCall { source, .. } => source.is_retriable(),
+            Self::ClusterIdCall { source, .. } | Self::CoordinatorLogCall { source, .. } => {
+                source.is_retriable()
+            }
             _ => matches!(
                 self.to_kafka_error_code(),
                 ERROR_NOT_LEADER_OR_FOLLOWER | ERROR_REQUEST_TIMED_OUT

@@ -39,9 +39,9 @@ use crate::group::{
     CONSUMER_PROTOCOL_TYPE, CommitRequest, DESCRIBE_RESPONSE_TOO_LARGE,
     GROUP_STATE_COMPLETING_REBALANCE, GROUP_STATE_EMPTY, GROUP_STATE_PREPARING_REBALANCE,
     GROUP_STATE_STABLE, GroupCoordinatorConfig, GroupDescription, GroupListing, GroupMember,
-    GroupRemoval, JoinRequest, JoinResult, JoinedMember, LeaveRequest, LeaveResult, LeavingMember,
-    LeftMember, MemberDescription, OFFSETS_ONLY_PROTOCOL_TYPE, OffsetDeletion, Subscribed,
-    SyncRequest, SyncResult, owned_str,
+    GroupRemoval, GroupSnapshot, JoinRequest, JoinResult, JoinedMember, LeaveRequest, LeaveResult,
+    LeavingMember, LeftMember, MemberDescription, MemberSnapshot, OFFSETS_ONLY_PROTOCOL_TYPE,
+    OffsetDeletion, Subscribed, SyncRequest, SyncResult, owned_str,
 };
 use crate::protocol::api::{
     API_KEY_DESCRIBE_GROUPS, ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_FENCED_INSTANCE_ID,
@@ -130,6 +130,15 @@ pub enum Step<T> {
         member_id: StrBytes,
         wake_at: Instant,
     },
+}
+
+/// Outcome of one `SyncGroup` step when the coordinator log keeps the groups.
+pub enum SyncStep {
+    Step(Step<SyncResult>),
+    /// The leader's sync completes the generation. Store this state, then call
+    /// [`finish_store`]. Until then the group stays `CompletingRebalance`, so no member learns its
+    /// assignment before the state is stored.
+    Store(GroupSnapshot),
 }
 
 /// What one `LeaveGroup` removed, which decides how the group reacts afterwards.
@@ -299,6 +308,8 @@ pub struct GroupState {
     /// The member id holding each instance id. An entry is dropped with its holder, so the map
     /// never outgrows `members`.
     static_members: HashMap<StrBytes, StrBytes>,
+    /// The leader's assignments while the coordinator log stores the generation they complete.
+    storing: Option<Vec<(StrBytes, Bytes)>>,
     changed: watch::Sender<u64>,
 }
 
@@ -321,7 +332,86 @@ impl GroupState {
             rebalance_started: now,
             initial: true,
             static_members: HashMap::new(),
+            storing: None,
             changed: watch::channel(0).0,
+        }
+    }
+
+    /// The group a coordinator log kept, `Stable` in the generation it stored. Each member's
+    /// session starts again at `now`, as Kafka's coordinator does when it loads a group. `None`
+    /// for a snapshot with no members.
+    pub(super) fn restore(
+        snapshot: &GroupSnapshot,
+        now: Instant,
+        max_rebalance_timeout: Duration,
+    ) -> Option<Self> {
+        if snapshot.members.is_empty() {
+            return None;
+        }
+        let protocol_name = snapshot.protocol_name.as_deref().map(str_bytes);
+        let mut group = Self::new(str_bytes(&snapshot.protocol_type), now);
+        group.phase = Phase::Stable;
+        group.generation_id = snapshot.generation_id;
+        group.protocol_name.clone_from(&protocol_name);
+        group.leader = snapshot.leader.as_deref().map(str_bytes);
+        group.initial = false;
+        for stored in &snapshot.members {
+            let session_timeout = Duration::from_millis(u64::from(stored.session_timeout_ms));
+            let member = Member {
+                group_instance_id: stored.group_instance_id.as_deref().map(str_bytes),
+                client_id: str_bytes(&stored.client_id),
+                client_host: str_bytes(&stored.client_host),
+                session_timeout,
+                rebalance_timeout: Duration::from_millis(u64::from(stored.rebalance_timeout_ms))
+                    .min(max_rebalance_timeout),
+                protocols: protocol_name
+                    .iter()
+                    .map(|name| (name.clone(), stored.metadata.clone()))
+                    .collect(),
+                assignment: stored.assignment.clone(),
+                session_deadline: now + session_timeout,
+                rejoined: false,
+                synced: true,
+                join_response: None,
+            };
+            group.insert_member(str_bytes(&stored.member_id), member);
+        }
+        if group
+            .leader
+            .as_ref()
+            .is_none_or(|leader| !group.members.contains_key(leader))
+        {
+            group.leader = group.members.keys().next().cloned();
+        }
+        Some(group)
+    }
+
+    /// This group as the coordinator log keeps it, with `assignments` as the leader's sync gave
+    /// them. A member the leader left out keeps empty bytes, as [`Self::apply_assignments`] does.
+    fn snapshot_with(&self, assignments: &[(StrBytes, Bytes)]) -> GroupSnapshot {
+        let selected = self.protocol_name.clone().unwrap_or_default();
+        GroupSnapshot {
+            generation_id: self.generation_id,
+            protocol_type: self.protocol_type.to_string(),
+            protocol_name: self.protocol_name.as_ref().map(ToString::to_string),
+            leader: self.leader.as_ref().map(ToString::to_string),
+            members: self
+                .members
+                .iter()
+                .map(|(member_id, member)| MemberSnapshot {
+                    member_id: member_id.to_string(),
+                    group_instance_id: member.group_instance_id.as_ref().map(ToString::to_string),
+                    client_id: member.client_id.to_string(),
+                    client_host: member.client_host.to_string(),
+                    session_timeout_ms: duration_millis(member.session_timeout),
+                    rebalance_timeout_ms: duration_millis(member.rebalance_timeout),
+                    metadata: member.metadata_for(&selected),
+                    assignment: assignments
+                        .iter()
+                        .find(|(target, _)| target == member_id)
+                        .map_or_else(Bytes::new, |(_, blob)| Bytes::copy_from_slice(blob)),
+                })
+                .collect(),
         }
     }
 
@@ -603,6 +693,7 @@ impl GroupState {
 
     fn prepare_rebalance(&mut self, now: Instant, trigger: Option<&StrBytes>) {
         self.phase = Phase::PreparingRebalance;
+        self.storing = None;
         self.initial = false;
         self.rebalance_started = now;
         self.sync_deadline = None;
@@ -948,6 +1039,56 @@ impl GroupState {
         }
         Subscribed::Topics(topics)
     }
+}
+
+/// A `StrBytes` that owns a copy of `value`.
+fn str_bytes(value: &str) -> StrBytes {
+    StrBytes::from_string(value.to_owned())
+}
+
+/// Kafka sends timeouts as milliseconds in an `i32`, so every one fits.
+fn duration_millis(value: Duration) -> u32 {
+    u32::try_from(value.as_millis()).unwrap_or(u32::MAX)
+}
+
+/// Restores the groups a coordinator log kept. A group already here keeps its own state: its
+/// members joined after the snapshot was stored.
+pub fn restore_groups(
+    groups: &mut Groups,
+    config: &GroupCoordinatorConfig,
+    snapshots: &[(String, GroupSnapshot)],
+    now: Instant,
+) {
+    for (group_id, snapshot) in snapshots {
+        let group_id = str_bytes(group_id);
+        if groups.contains_key(&group_id) {
+            continue;
+        }
+        if let Some(group) = GroupState::restore(snapshot, now, config.max_rebalance_timeout) {
+            groups.insert(group_id, group);
+        }
+    }
+}
+
+/// Ticks every group and drops the ones that emptied.
+pub fn sweep(groups: &mut Groups, now: Instant) {
+    groups.retain(|_, group| {
+        group.tick(now);
+        !group.is_empty()
+    });
+}
+
+/// Removes every group that `leaves` names, and wakes its parked members so they ask again.
+pub fn evict(groups: &mut Groups, leaves: impl Fn(&str) -> bool) -> usize {
+    let before = groups.len();
+    groups.retain(|group_id, group| {
+        if leaves(group_id) {
+            group.bump();
+            return false;
+        }
+        true
+    });
+    before - groups.len()
 }
 
 /// Tick every group and drop the ones that emptied, returning how many were reclaimed.
@@ -1372,14 +1513,31 @@ pub fn heartbeat_step(
     }
 }
 
+#[cfg(test)]
 pub fn sync_step(
     groups: &mut Groups,
     config: &GroupCoordinatorConfig,
     request: &SyncRequest,
     now: Instant,
 ) -> Step<SyncResult> {
+    match sync_or_store_step(groups, config, request, now, false) {
+        SyncStep::Step(step) => step,
+        // Asked for no store, so never reached.
+        SyncStep::Store(_) => Step::Respond(SyncResult::error(ERROR_UNKNOWN_SERVER_ERROR)),
+    }
+}
+
+/// [`sync_step`], except that with `store_first` the leader's sync completing a generation asks
+/// for that state to be stored before the group turns `Stable`.
+pub fn sync_or_store_step(
+    groups: &mut Groups,
+    config: &GroupCoordinatorConfig,
+    request: &SyncRequest,
+    now: Instant,
+    store_first: bool,
+) -> SyncStep {
     if !tick_group(groups, &request.group_id, now) {
-        return Step::Respond(SyncResult::error(ERROR_UNKNOWN_MEMBER_ID));
+        return SyncStep::Step(Step::Respond(SyncResult::error(ERROR_UNKNOWN_MEMBER_ID)));
     }
     let oversized = request
         .assignments
@@ -1387,15 +1545,15 @@ pub fn sync_step(
         .any(|(_, blob)| blob.len() > config.max_member_blob_bytes);
 
     let Some(group) = groups.get_mut(&request.group_id) else {
-        return Step::Respond(SyncResult::error(ERROR_UNKNOWN_MEMBER_ID));
+        return SyncStep::Step(Step::Respond(SyncResult::error(ERROR_UNKNOWN_MEMBER_ID)));
     };
     if let Err(error) =
         group.validate_member(&request.member_id, request.group_instance_id.as_ref())
     {
-        return Step::Respond(SyncResult::error(error));
+        return SyncStep::Step(Step::Respond(SyncResult::error(error)));
     }
     if request.generation_id != group.generation_id {
-        return Step::Respond(SyncResult::error(ERROR_ILLEGAL_GENERATION));
+        return SyncStep::Step(Step::Respond(SyncResult::error(ERROR_ILLEGAL_GENERATION)));
     }
     let protocol_mismatch = request
         .protocol_type
@@ -1406,13 +1564,15 @@ pub fn sync_step(
             .as_ref()
             .is_some_and(|name| Some(name) != group.protocol_name.as_ref());
     if protocol_mismatch {
-        return Step::Respond(SyncResult::error(ERROR_INCONSISTENT_GROUP_PROTOCOL));
+        return SyncStep::Step(Step::Respond(SyncResult::error(
+            ERROR_INCONSISTENT_GROUP_PROTOCOL,
+        )));
     }
     if oversized {
-        return Step::Respond(SyncResult::error(ERROR_INVALID_REQUEST));
+        return SyncStep::Step(Step::Respond(SyncResult::error(ERROR_INVALID_REQUEST)));
     }
 
-    match group.phase {
+    let step = match group.phase {
         Phase::PreparingRebalance => Step::Respond(SyncResult::error(ERROR_REBALANCE_IN_PROGRESS)),
         Phase::Stable => {
             group.mark_synced(&request.member_id);
@@ -1421,11 +1581,29 @@ pub fn sync_step(
             }
             Step::Respond(group.sync_result(&request.member_id))
         }
-        Phase::CompletingRebalance => {
-            if group.leader.as_ref() == Some(&request.member_id) {
-                group.apply_assignments(&request.assignments, now);
-                return Step::Respond(group.sync_result(&request.member_id));
+        // A leader that syncs again while its first sync is stored waits like a follower.
+        Phase::CompletingRebalance
+            if group.leader.as_ref() == Some(&request.member_id) && group.storing.is_none() =>
+        {
+            if store_first {
+                let snapshot = group.snapshot_with(&request.assignments);
+                group.storing = Some(
+                    request
+                        .assignments
+                        .iter()
+                        .map(|(member_id, blob)| (owned_str(member_id), blob.clone()))
+                        .collect(),
+                );
+                group.mark_synced(&request.member_id);
+                if let Some(member) = group.members.get_mut(&request.member_id) {
+                    member.session_deadline = now + member.session_timeout;
+                }
+                return SyncStep::Store(snapshot);
             }
+            group.apply_assignments(&request.assignments, now);
+            Step::Respond(group.sync_result(&request.member_id))
+        }
+        Phase::CompletingRebalance => {
             group.mark_synced(&request.member_id);
             if let Some(member) = group.members.get_mut(&request.member_id) {
                 member.session_deadline = now + member.session_timeout;
@@ -1434,6 +1612,42 @@ pub fn sync_step(
                 member_id: request.member_id.clone(),
                 wake_at: group.wake_at(now),
             }
+        }
+    };
+    SyncStep::Step(step)
+}
+
+/// Ends the store that [`sync_or_store_step`] asked for, and answers the leader. Once stored, the
+/// group turns `Stable` and its parked members get their assignments. A refused store opens a
+/// rebalance, and the leader gets `refusal`. A group that moved on during the store, because a
+/// member left or a session ended, answers `REBALANCE_IN_PROGRESS`. A group that is gone answers
+/// the refusal of the store, else `gone`.
+pub fn finish_store(
+    groups: &mut Groups,
+    group_id: &StrBytes,
+    member_id: &StrBytes,
+    generation_id: i32,
+    stored: Result<(), i16>,
+    gone: i16,
+    now: Instant,
+) -> SyncResult {
+    let Some(group) = groups.get_mut(group_id) else {
+        return SyncResult::error(stored.err().unwrap_or(gone));
+    };
+    if group.phase != Phase::CompletingRebalance || group.generation_id != generation_id {
+        return SyncResult::error(ERROR_REBALANCE_IN_PROGRESS);
+    }
+    let Some(assignments) = group.storing.take() else {
+        return SyncResult::error(ERROR_REBALANCE_IN_PROGRESS);
+    };
+    match stored {
+        Ok(()) => {
+            group.apply_assignments(&assignments, now);
+            group.sync_result(member_id)
+        }
+        Err(refusal) => {
+            group.prepare_rebalance(now, None);
+            SyncResult::error(refusal)
         }
     }
 }

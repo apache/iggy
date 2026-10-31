@@ -154,13 +154,23 @@ a surprise.
 
 ## Staleness
 
-The permissions a connection reports are the ones its principal had when it authenticated. A
-permission changed afterwards is not visible until the client reconnects.
+A connection starts with the permissions its principal had when it authenticated. The bridge then
+follows Iggy's metadata change log ([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md#groups-that-only-hold-offsets)),
+which records each change of a user's permissions with the new set. Before each request, a
+connection takes the last set that the log showed for its user. So a change reaches open
+connections within about a second. A connection whose user is deleted or deactivated closes before
+its next request, as Iggy ends the sessions of such a user, also when the user comes back before
+the connection looks. `ANONYMOUS` names no Iggy user, so no change applies to it.
 
-This is deliberate. The alternative is either holding an Iggy session open per connection, which
-the authentication design rejects on cost, or keeping the password to log in again, which it
-rejects outright. It also matches what Iggy already does on its own data plane, where a revocation
-becomes visible only once the owning shard applies it.
+The log needs root or the global `manage_servers` permission on the bridge's Iggy user. Without
+it, a connection keeps the permissions it authenticated with until the client reconnects. The
+gateway holds no Iggy session per connection and keeps no password, so it has no other way to read
+them again.
+
+A change follows the Iggy user, by its id and creation time, not its name. So a connection keeps
+following its user after a rename, and never takes the permissions of a new user of the same name.
+A connection whose login could not read its user takes no change, and closes when a user of its
+name is revoked or renamed.
 
 Say so in the README rather than leaving an operator to discover that an ACL view can lag.
 

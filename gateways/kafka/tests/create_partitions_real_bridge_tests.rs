@@ -39,9 +39,9 @@ use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::acl::PrincipalPermissions;
 use iggy_gateway_kafka::protocol::api::{
-    ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REQUEST, ERROR_NONE,
-    ERROR_POLICY_VIOLATION, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-    GatewayState,
+    ConnectionState, ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICA_ASSIGNMENT,
+    ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_POLICY_VIOLATION, ERROR_TOPIC_AUTHORIZATION_FAILED,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::create_partitions;
 
@@ -131,7 +131,14 @@ async fn send(
     validate_only: bool,
 ) -> Vec<(String, i16, Option<String>)> {
     let body = build_request(topics, validate_only);
-    let outcome = create_partitions::handle(state, principal, REQUEST_VERSION, body).await;
+    let outcome = create_partitions::handle(
+        state,
+        &ConnectionState::default(),
+        principal,
+        REQUEST_VERSION,
+        body,
+    )
+    .await;
     decode_results(outcome.expect_response("CreatePartitions request always answers"))
 }
 
@@ -189,6 +196,7 @@ async fn iggy_partition_ids(server: &TestServer, name: &str) -> Vec<u32> {
 fn principal(manage_topics: bool) -> AuthenticatedPrincipal {
     AuthenticatedPrincipal {
         username: "alice".to_string(),
+        user: None,
         permissions: PrincipalPermissions {
             manage_topics,
             ..PrincipalPermissions::default()
@@ -664,7 +672,9 @@ async fn create_partitions_at_the_legacy_versions_grows_and_refuses_like_v3() {
 
     for (version, count) in [(0, 2), (1, 3)] {
         let body = build_legacy_request("orders", count);
-        let outcome = create_partitions::handle(&state, None, version, body).await;
+        let outcome =
+            create_partitions::handle(&state, &ConnectionState::default(), None, version, body)
+                .await;
         let results = decode_legacy_results(outcome.expect_response("answers"));
         assert_eq!(
             results,
@@ -674,8 +684,14 @@ async fn create_partitions_at_the_legacy_versions_grows_and_refuses_like_v3() {
     }
     assert_eq!(iggy_partition_ids(&server, "orders").await, vec![0, 1, 2]);
 
-    let outcome =
-        create_partitions::handle(&state, None, 0, build_legacy_request("orders", 3)).await;
+    let outcome = create_partitions::handle(
+        &state,
+        &ConnectionState::default(),
+        None,
+        0,
+        build_legacy_request("orders", 3),
+    )
+    .await;
     assert_eq!(
         decode_legacy_results(outcome.expect_response("answers")),
         vec![(

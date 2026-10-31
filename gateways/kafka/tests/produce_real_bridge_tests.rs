@@ -945,8 +945,8 @@ async fn given_two_producers_when_they_send_at_once_should_keep_the_order_of_eac
         send_each(bridge, Producer::Connection(1), "a", 20),
         send_each(bridge, Producer::Connection(2), "b", 20),
     );
-    // This client, the bridge's shared one, and one for each producer.
-    assert_eq!(connected_clients(&raw_client(&server).await).await, 4);
+    // This client, the bridge's shared one, its change log client, and one for each producer.
+    assert_eq!(connected_clients(&raw_client(&server).await).await, 5);
 
     let payloads: Vec<String> = stored(&server, 0, 100)
         .await
@@ -976,11 +976,11 @@ async fn given_open_produce_sessions_when_a_connection_or_the_bridge_ends_should
 
     send_each(bridge, Producer::Connection(1), "a", 1).await;
     send_each(bridge, Producer::Connection(2), "b", 1).await;
-    // This client, the bridge's shared one, and one for each producer.
-    wait_for_clients(&raw, 4).await;
+    // This client, the bridge's shared one, its change log client, and one for each producer.
+    wait_for_clients(&raw, 5).await;
 
     bridge.end_connection(1);
-    wait_for_clients(&raw, 3).await;
+    wait_for_clients(&raw, 4).await;
 
     bridge.close().await.expect("the bridge closes");
     wait_for_clients(&raw, 1).await;

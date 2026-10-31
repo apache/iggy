@@ -79,7 +79,7 @@ use crate::bridge::iggy_bridge::in_slot;
 use crate::bridge::{BridgeError, IggyBridge, MAX_TOPIC_PARTITIONS};
 use crate::error::Result;
 use crate::protocol::api::{
-    API_KEY_CREATE_PARTITIONS, ApiVersionRange, ERROR_INVALID_PARTITIONS,
+    API_KEY_CREATE_PARTITIONS, ApiVersionRange, ConnectionState, ERROR_INVALID_PARTITIONS,
     ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_NOT_CONTROLLER,
     ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_AUTHORIZATION_FAILED,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome,
@@ -89,7 +89,7 @@ use crate::protocol::handlers::topic_config::{
     exceeds_topic_cap, find_duplicate_names, topic_cap_message,
 };
 use crate::protocol::handlers::{
-    MAX_REQUEST_TIMEOUT, clamp_request_timeout, decode_guarded, encode_message,
+    MAX_REQUEST_TIMEOUT, another_controller, clamp_request_timeout, decode_guarded, encode_message,
     handle_versioned_request, is_supported_version, respond_or_close, unsupported_version_response,
 };
 
@@ -132,6 +132,7 @@ type Verdict = (i16, Option<StrBytes>);
 
 pub async fn handle(
     state: &GatewayState,
+    connection: &ConnectionState,
     principal: Option<&AuthenticatedPrincipal>,
     api_version: i16,
     body: Bytes,
@@ -171,6 +172,12 @@ pub async fn handle(
             );
         }
     };
+    if another_controller(state, &connection.brokers) {
+        return respond_or_close(
+            encode_inner(api_version, &req.topics, ERROR_NOT_CONTROLLER),
+            "CreatePartitions",
+        );
+    }
 
     // Kafka's `ControllerApis.createPartitions` order: duplicates are answered first, once per
     // name, before authorization looks at the rest.
@@ -1040,6 +1047,7 @@ mod tests {
     fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
         AuthenticatedPrincipal {
             username: "alice".to_string(),
+            user: None,
             permissions: PrincipalPermissions {
                 manage_topics,
                 ..PrincipalPermissions::default()

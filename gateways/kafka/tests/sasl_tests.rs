@@ -84,6 +84,7 @@ impl SaslAuthenticator for FixedCredentialAuthenticator {
         if matches {
             Ok(AuthenticatedPrincipal {
                 username: credentials.username.clone(),
+                user: None,
                 permissions: self.permissions,
                 permissions_known: true,
             })
@@ -1035,6 +1036,7 @@ impl SaslAuthenticator for StallingAuthenticator {
         let _held = self.release.acquire().await;
         Ok(AuthenticatedPrincipal {
             username: credentials.username.clone(),
+            user: None,
             permissions: PrincipalPermissions::default(),
             permissions_known: true,
         })
@@ -1101,6 +1103,7 @@ impl SaslAuthenticator for ConcurrencyRecordingAuthenticator {
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         Ok(AuthenticatedPrincipal {
             username: credentials.username.clone(),
+            user: None,
             permissions: PrincipalPermissions::default(),
             permissions_known: true,
         })
@@ -1499,6 +1502,7 @@ impl SaslAuthenticator for UnreadPermissionsAuthenticator {
     ) -> Result<AuthenticatedPrincipal, AuthError> {
         Ok(AuthenticatedPrincipal {
             username: credentials.username.clone(),
+            user: None,
             permissions: PrincipalPermissions::default(),
             permissions_known: false,
         })

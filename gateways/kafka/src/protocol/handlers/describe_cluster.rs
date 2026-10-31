@@ -31,6 +31,7 @@ use kafka_protocol::messages::{BrokerId, DescribeClusterRequest, DescribeCluster
 use kafka_protocol::protocol::StrBytes;
 
 use crate::cluster_id::ClusterId;
+use crate::coordinator::Placement;
 use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_DESCRIBE_CLUSTER, ApiVersionRange, BrokerAdvertise, Brokers, ConnectionState,
@@ -97,6 +98,7 @@ pub async fn handle(
             &state.cluster_id,
             &connection.broker,
             &connection.brokers,
+            &state.placement(),
         ),
         "DescribeCluster",
     )
@@ -111,6 +113,7 @@ pub fn encode_response(
     cluster_id: &ClusterId,
     broker: &BrokerAdvertise,
     brokers: &Brokers,
+    placement: &Placement,
 ) -> Result<Bytes> {
     // Kafka's `AuthHelper.computeDescribeClusterResponse`, whose refusals leave the endpoint
     // type at its default. v0 has no endpoint type field, so it decodes as the broker default
@@ -133,7 +136,7 @@ pub fn encode_response(
         return encode_message(&response, version, 128);
     }
     let entries = brokers
-        .listed(broker)
+        .live(broker, placement)
         .into_iter()
         .map(|(node, endpoint)| {
             DescribeClusterBroker::default()
@@ -145,7 +148,7 @@ pub fn encode_response(
     let response = DescribeClusterResponse::default()
         .with_endpoint_type(ENDPOINT_TYPE_BROKER)
         .with_cluster_id(StrBytes::from_string(cluster_id.to_string()))
-        .with_controller_id(BrokerId(brokers.node_id))
+        .with_controller_id(BrokerId(brokers.listed_or_own(placement.controller())))
         .with_brokers(entries);
     encode_message(&response, version, 128)
 }
@@ -186,6 +189,7 @@ mod tests {
                 &cluster_id,
                 &broker(),
                 &Brokers::default(),
+                &Placement::alone(1),
             )
             .expect("encode");
             let response = decode(version, body);
@@ -219,6 +223,7 @@ mod tests {
             &ClusterId::random(),
             &broker(),
             &brokers,
+            &Placement::alone(2),
         )
         .expect("encode");
         let response = decode(0, body);
@@ -242,6 +247,7 @@ mod tests {
                 &ClusterId::random(),
                 &broker(),
                 &Brokers::default(),
+                &Placement::alone(1),
             )
             .expect("encode");
             let response = decode(version, body);
@@ -269,6 +275,7 @@ mod tests {
                 &ClusterId::random(),
                 &broker(),
                 &Brokers::default(),
+                &Placement::alone(1),
             )
             .expect("encode");
             let response = decode(1, body);

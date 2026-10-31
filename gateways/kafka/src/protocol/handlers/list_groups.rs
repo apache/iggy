@@ -30,8 +30,9 @@
 //! `COORDINATOR_LOAD_IN_PROGRESS` (14), which clients retry. When no scan could find the groups,
 //! the answer has only the groups this coordinator holds, as before the gateway knew of them.
 //!
-//! With several gateways, only the one that `FindCoordinator` names lists groups. The others
-//! answer with an empty list.
+//! With the coordinator log, each gateway lists the groups it coordinates, and the admin client
+//! asks every broker. Without it, only the gateway that `FindCoordinator` names lists groups, and
+//! the others answer with an empty list.
 
 use std::collections::HashSet;
 
@@ -40,7 +41,7 @@ use kafka_protocol::messages::list_groups_response::ListedGroup;
 use kafka_protocol::messages::{GroupId, ListGroupsRequest, ListGroupsResponse};
 use kafka_protocol::protocol::StrBytes;
 
-use crate::bridge::{OffsetGroups, ScannedGroups};
+use crate::bridge::ScannedGroups;
 use crate::error::Result;
 use crate::group::{GROUP_STATE_EMPTY, GroupListing};
 use crate::protocol::api::{
@@ -89,8 +90,8 @@ pub async fn handle(
         }
     };
     // The admin client asks every broker and keeps one answer per group. Only the coordinator's
-    // answer is current, so the other gateways list nothing.
-    if !connection.brokers.coordinates_groups() {
+    // answer is current, so each gateway lists the groups it coordinates.
+    if state.coordination.is_none() && !connection.brokers.coordinates_groups() {
         return respond_or_close(encode_response(api_version, Vec::new()), "ListGroups");
     }
 
@@ -100,7 +101,12 @@ pub async fn handle(
     if lists_offsets_only && let Some(bridge) = &state.bridge {
         let deadline = offset_deadline(state, connection).await;
         match bridge.offset_groups(deadline).await {
-            ScannedGroups::Found(offset_groups) => add_offsets_only(&mut listings, &offset_groups),
+            ScannedGroups::Found(offset_groups) => add_offsets_only(
+                &mut listings,
+                offset_groups
+                    .iter()
+                    .filter(|group_id| state.groups.serves(group_id).is_ok()),
+            ),
             ScannedGroups::Pending => {
                 tracing::debug!(
                     "ListGroups waits for the first scan of the groups that hold offsets"
@@ -112,6 +118,10 @@ pub async fn handle(
             }
             // The scan logged why. The groups this coordinator holds still answer.
             ScannedGroups::Failed => {}
+        }
+        if let Some(coordination) = &state.coordination {
+            let logged = coordination.logged_groups().await;
+            add_offsets_only(&mut listings, logged.iter().map(String::as_str));
         }
     }
     let listings: Vec<GroupListing> = listings
@@ -137,16 +147,18 @@ fn selected(filter: &[StrBytes], value: &str) -> bool {
             .any(|wanted| wanted.as_str().trim().eq_ignore_ascii_case(value))
 }
 
-/// Adds each group of `offset_groups` that is not live here, as `Empty`. Keeps the list in group
+/// Adds each group of `offset_groups` that is not listed yet, as `Empty`. Keeps the list in group
 /// id order.
-fn add_offsets_only(listings: &mut Vec<GroupListing>, offset_groups: &OffsetGroups) {
-    let live: HashSet<&str> = listings
+fn add_offsets_only<'a>(
+    listings: &mut Vec<GroupListing>,
+    offset_groups: impl Iterator<Item = &'a str>,
+) {
+    let live: HashSet<String> = listings
         .iter()
-        .map(|group| group.group_id.as_str())
+        .map(|group| group.group_id.to_string())
         .collect();
     let offsets_only: Vec<GroupListing> = offset_groups
-        .iter()
-        .filter(|group_id| !live.contains(group_id))
+        .filter(|group_id| !live.contains(*group_id))
         .map(|group_id| GroupListing::offsets_only(StrBytes::from_string(group_id.to_owned())))
         .collect();
     listings.extend(offsets_only);

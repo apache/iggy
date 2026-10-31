@@ -800,6 +800,247 @@ async fn given_weak_offset_durability_when_owner_changes_should_preserve_progres
     .expect("the installed owner's committed offset must survive whole-cluster crash");
 }
 
+// A member reads its own share of a group. The partition that moves to a new member leaves the
+// old member's answer when the handoff starts, and reaches the new member's answer only when the
+// old member has committed what it polled, so the two answers never name one partition twice.
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(
+        heartbeat.enabled = true,
+        heartbeat.interval = "60s",
+        consumer_group.rebalancing_timeout = "60s"
+    )
+)]
+async fn given_a_handoff_when_members_read_their_assignment_should_drop_the_partition_before_it_moves(
+    harness: &TestHarness,
+) {
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+    let topic_id = Identifier::named(TOPIC_NAME).unwrap();
+    let group_id = Identifier::named(CONSUMER_GROUP_NAME).unwrap();
+    let consumer = Consumer::group(group_id.clone());
+
+    let mut clients = harness
+        .root_clients(3)
+        .await
+        .expect("Failed to create root clients");
+    let source = clients.remove(0);
+    let target = clients.remove(0);
+    let outsider = clients.remove(0);
+
+    source
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    source
+        .create_topic(
+            &stream_id,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(2),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    source
+        .create_consumer_group(&stream_id, &topic_id, CONSUMER_GROUP_NAME)
+        .await
+        .unwrap();
+    for partition in 0..2 {
+        let mut messages = vec![IggyMessage::from_str("record").unwrap()];
+        source
+            .send_messages(
+                &stream_id,
+                &topic_id,
+                &Partitioning::partition_id(partition),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        outsider
+            .get_consumer_group_assignment(&stream_id, &topic_id, &group_id)
+            .await
+            .unwrap(),
+        None,
+        "a client that never joined has no assignment"
+    );
+
+    source
+        .join_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap();
+    wait_for_assignment(&source, 1).await;
+    let whole = source
+        .get_consumer_group_assignment(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap()
+        .expect("a member has an assignment");
+    assert_eq!(whole.partitions, [0, 1]);
+
+    // Polled and not committed, so neither partition drains until the source commits it.
+    let mut polled = std::collections::BTreeMap::new();
+    for &partition in &whole.partitions {
+        let messages = source
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                partition,
+                &consumer,
+                &PollingStrategy::offset(0),
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(messages.messages.len(), 1);
+        polled.insert(partition, messages.messages[0].header.offset);
+    }
+
+    target
+        .join_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap();
+    let kept = timeout(RESOLVE_TIMEOUT, async {
+        loop {
+            let assignment = source
+                .get_consumer_group_assignment(&stream_id, &topic_id, &group_id)
+                .await
+                .unwrap()
+                .expect("the source stays a member");
+            if assignment.partitions.len() == 1 {
+                return assignment;
+            }
+            sleep(ASSIGNMENT_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the source must give up one partition when the target joins");
+    assert!(
+        kept.generation > whole.generation,
+        "a handoff advances the generation"
+    );
+    let moving = 1 - kept.partitions[0];
+    let target_share = target
+        .get_consumer_group_assignment(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap()
+        .expect("the target is a member");
+    assert!(
+        target_share.partitions.is_empty(),
+        "the target must not get partition {moving} while the source still owns it, got {target_share:?}"
+    );
+
+    source
+        .store_consumer_offset(
+            &consumer,
+            &stream_id,
+            &topic_id,
+            Some(moving),
+            polled[&moving],
+        )
+        .await
+        .unwrap();
+    let received = timeout(RESOLVE_TIMEOUT, async {
+        loop {
+            let assignment = target
+                .get_consumer_group_assignment(&stream_id, &topic_id, &group_id)
+                .await
+                .unwrap()
+                .expect("the target stays a member");
+            if !assignment.partitions.is_empty() {
+                return assignment;
+            }
+            sleep(ASSIGNMENT_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the handoff must complete once the source commits what it polled");
+    assert_eq!(received.partitions, [moving]);
+}
+
+// A member that never polls through the group has nothing to drain, so a partition it hands over
+// reaches the new member at once, long before the rebalancing timeout forces it.
+#[iggy_harness(
+    test_client_transport = [Tcp],
+    server(
+        heartbeat.enabled = true,
+        heartbeat.interval = "60s",
+        consumer_group.rebalancing_timeout = "60s"
+    )
+)]
+async fn given_a_member_that_never_polled_when_a_member_joins_should_hand_over_at_once(
+    harness: &TestHarness,
+) {
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+    let topic_id = Identifier::named(TOPIC_NAME).unwrap();
+    let group_id = Identifier::named(CONSUMER_GROUP_NAME).unwrap();
+
+    let mut clients = harness
+        .root_clients(2)
+        .await
+        .expect("Failed to create root clients");
+    let source = clients.remove(0);
+    let target = clients.remove(0);
+
+    source
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    source
+        .create_topic(
+            &stream_id,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(2),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    source
+        .create_consumer_group(&stream_id, &topic_id, CONSUMER_GROUP_NAME)
+        .await
+        .unwrap();
+    source
+        .join_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap();
+    wait_for_assignment(&source, 1).await;
+
+    target
+        .join_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap();
+    let shares = timeout(RESOLVE_TIMEOUT, async {
+        loop {
+            let source_share = source
+                .get_consumer_group_assignment(&stream_id, &topic_id, &group_id)
+                .await
+                .unwrap()
+                .expect("the source stays a member");
+            let target_share = target
+                .get_consumer_group_assignment(&stream_id, &topic_id, &group_id)
+                .await
+                .unwrap()
+                .expect("the target is a member");
+            if source_share.partitions.len() == 1 && target_share.partitions.len() == 1 {
+                return (source_share, target_share);
+            }
+            sleep(ASSIGNMENT_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("a partition that was never polled must move without waiting for the timeout");
+    assert_ne!(shares.0.partitions, shares.1.partitions);
+}
+
 async fn wait_for_assignment(client: &IggyClient, members_count: u32) {
     wait_for_consumer_group_assignment(
         client,

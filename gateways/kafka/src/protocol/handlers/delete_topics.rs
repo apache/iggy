@@ -42,14 +42,14 @@ use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::{BridgeError, IggyBridge};
 use crate::error::Result;
 use crate::protocol::api::{
-    API_KEY_DELETE_TOPICS, ApiVersionRange, ERROR_INVALID_REQUEST, ERROR_NONE,
+    API_KEY_DELETE_TOPICS, ApiVersionRange, ConnectionState, ERROR_INVALID_REQUEST, ERROR_NONE,
     ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
     ERROR_TOPIC_AUTHORIZATION_FAILED, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_delete_topics_shape;
 use crate::protocol::handlers::{
-    clamp_request_timeout, decode_guarded, encode_message, handle_versioned_request,
-    is_supported_version, respond_or_close, unsupported_version_response,
+    another_controller, clamp_request_timeout, decode_guarded, encode_message,
+    handle_versioned_request, is_supported_version, respond_or_close, unsupported_version_response,
 };
 
 /// This bridge never advertises v6 (the `topics: Vec<DeleteTopicState>`, topic-id-based shape).
@@ -72,6 +72,7 @@ const MAX_BRIDGE_BACKED_TOPICS: usize = 100;
 
 pub async fn handle(
     state: &GatewayState,
+    connection: &ConnectionState,
     principal: Option<&AuthenticatedPrincipal>,
     api_version: i16,
     body: Bytes,
@@ -111,6 +112,12 @@ pub async fn handle(
             );
         }
     };
+    if another_controller(state, &connection.brokers) {
+        return respond_or_close(
+            encode_inner(api_version, &req.topic_names, ERROR_NOT_CONTROLLER),
+            "DeleteTopics",
+        );
+    }
 
     if let Some(results) = authorize(principal, &req.topic_names) {
         let resp = DeleteTopicsResponse::default().with_responses(results);
