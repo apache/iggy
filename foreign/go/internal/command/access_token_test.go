@@ -25,25 +25,129 @@ import (
 )
 
 func TestCreatePersonalAccessTokenMarshalBinary(t *testing.T) {
-	tests := []struct {
-		name   string
-		expiry iggcon.Duration
-		want   []byte
+	for _, test := range []struct {
+		name    string
+		request *CreatePersonalAccessToken
+		code    Code
+		want    []byte
 	}{
-		{"server default", iggcon.IggyExpiryServerDefault, []byte{5, 't', 'o', 'k', 'e', 'n', 0, 0, 0, 0, 0, 0, 0, 0}},
-		{"little endian", 0x01020304, []byte{5, 't', 'o', 'k', 'e', 'n', 4, 3, 2, 1, 0, 0, 0, 0}},
-		{"past 32 bits", 0x0102030405060708, []byte{5, 't', 'o', 'k', 'e', 'n', 8, 7, 6, 5, 4, 3, 2, 1}},
-		{"never expire", iggcon.IggyExpiryNeverExpire, []byte{5, 't', 'o', 'k', 'e', 'n', 255, 255, 255, 255, 255, 255, 255, 255}},
-	}
-
-	for _, test := range tests {
+		{
+			name:    "server default expiry",
+			request: &CreatePersonalAccessToken{Name: "token", Expiry: iggcon.IggyExpiryServerDefault},
+			code:    42,
+			want:    []byte{5, 't', 'o', 'k', 'e', 'n', 0, 0, 0, 0, 0, 0, 0, 0},
+		},
+		{
+			name:    "little endian expiry",
+			request: &CreatePersonalAccessToken{Name: "token", Expiry: 0x01020304},
+			code:    42,
+			want:    []byte{5, 't', 'o', 'k', 'e', 'n', 4, 3, 2, 1, 0, 0, 0, 0},
+		},
+		{
+			name:    "expiry past 32 bits",
+			request: &CreatePersonalAccessToken{Name: "token", Expiry: 0x0102030405060708},
+			code:    42,
+			want:    []byte{5, 't', 'o', 'k', 'e', 'n', 8, 7, 6, 5, 4, 3, 2, 1},
+		},
+		{
+			name:    "never expire",
+			request: &CreatePersonalAccessToken{Name: "token", Expiry: iggcon.IggyExpiryNeverExpire},
+			code:    42,
+			want:    []byte{5, 't', 'o', 'k', 'e', 'n', 255, 255, 255, 255, 255, 255, 255, 255},
+		},
+		{
+			name:    "empty name",
+			request: &CreatePersonalAccessToken{Name: "", Expiry: 0x01020304},
+			code:    42,
+			want:    []byte{0, 4, 3, 2, 1, 0, 0, 0, 0},
+		},
+		{
+			name:    "longer name",
+			request: &CreatePersonalAccessToken{Name: "my-access-token", Expiry: iggcon.IggyExpiryServerDefault},
+			code:    42,
+			want:    []byte{15, 'm', 'y', '-', 'a', 'c', 'c', 'e', 's', 's', '-', 't', 'o', 'k', 'e', 'n', 0, 0, 0, 0, 0, 0, 0, 0},
+		},
+	} {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := (&CreatePersonalAccessToken{Name: "token", Expiry: test.expiry}).MarshalBinary()
+			if got := test.request.Code(); got != test.code {
+				t.Fatalf("CreatePersonalAccessToken code = %d, want %d", got, test.code)
+			}
+			got, err := test.request.MarshalBinary()
 			if err != nil {
 				t.Fatal(err)
 			}
 			if !bytes.Equal(got, test.want) {
-				t.Fatalf("CreatePersonalAccessToken body = % x, want % x", got, test.want)
+				t.Fatalf("CreatePersonalAccessToken body = %x, want %x", got, test.want)
+			}
+		})
+	}
+}
+
+func TestGetPersonalAccessTokensMarshalBinary(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		request *GetPersonalAccessTokens
+		code    Code
+		want    []byte
+	}{
+		{
+			name:    "empty body",
+			request: &GetPersonalAccessTokens{},
+			code:    41,
+			want:    []byte{},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.request.Code(); got != test.code {
+				t.Fatalf("GetPersonalAccessTokens code = %d, want %d", got, test.code)
+			}
+			got, err := test.request.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, test.want) {
+				t.Fatalf("GetPersonalAccessTokens body = %x, want %x", got, test.want)
+			}
+		})
+	}
+}
+
+func TestDeletePersonalAccessTokenMarshalBinary(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		request *DeletePersonalAccessToken
+		code    Code
+		want    []byte
+	}{
+		{
+			name:    "short name",
+			request: &DeletePersonalAccessToken{Name: "token"},
+			code:    43,
+			want:    []byte{5, 't', 'o', 'k', 'e', 'n'},
+		},
+		{
+			name:    "empty name",
+			request: &DeletePersonalAccessToken{Name: ""},
+			code:    43,
+			want:    []byte{0},
+		},
+		{
+			name:    "longer name",
+			request: &DeletePersonalAccessToken{Name: "my-access-token"},
+			code:    43,
+			want:    []byte{15, 'm', 'y', '-', 'a', 'c', 'c', 'e', 's', 's', '-', 't', 'o', 'k', 'e', 'n'},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.request.Code(); got != test.code {
+				t.Fatalf("DeletePersonalAccessToken code = %d, want %d", got, test.code)
+			}
+			got, err := test.request.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, test.want) {
+				t.Fatalf("DeletePersonalAccessToken body = %x, want %x", got, test.want)
 			}
 		})
 	}
