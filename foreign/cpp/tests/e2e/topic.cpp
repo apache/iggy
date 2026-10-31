@@ -294,7 +294,8 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
         .SetDurability(iggy::Durability::Persisted)
         .SetMessagesRequiredToSave(messages_required_to_save)
         .SetSizeOfMessagesRequiredToSave(size_of_messages_required_to_save)
-        .SetPreallocateSegments(false);
+        .SetPreallocateSegments(false)
+        .SetReplicationFactor(1);
 
     ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, options));
 
@@ -308,6 +309,7 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
     EXPECT_EQ(explicit_options.count("messages_required_to_save"), 1u);
     EXPECT_EQ(explicit_options.count("size_of_messages_required_to_save"), 1u);
     EXPECT_EQ(explicit_options.count("preallocate_segments"), 1u);
+    EXPECT_EQ(explicit_options.count("replication_factor"), 1u);
 
     auto check_kind = [&](const std::string &key, iggy::HeaderKind expected) {
         auto it = explicit_options.find(key);
@@ -320,6 +322,7 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
     check_kind("messages_required_to_save", iggy::HeaderKind::Uint32);
     check_kind("size_of_messages_required_to_save", iggy::HeaderKind::Uint64);
     check_kind("preallocate_segments", iggy::HeaderKind::Bool);
+    check_kind("replication_factor", iggy::HeaderKind::Uint32);
 
     EXPECT_EQ(explicit_options.at("segment_size").Value(),
               (std::vector<std::uint8_t>{0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00}));
@@ -328,8 +331,9 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
     EXPECT_EQ(explicit_options.at("size_of_messages_required_to_save").Value(),
               (std::vector<std::uint8_t>{0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00}));
     EXPECT_EQ(explicit_options.at("preallocate_segments").Value(), (std::vector<std::uint8_t>{0x00}));
+    EXPECT_EQ(explicit_options.at("replication_factor").Value(), (std::vector<std::uint8_t>{0x01, 0x00, 0x00, 0x00}));
 
-    EXPECT_EQ(explicit_options.size(), 6u);
+    EXPECT_EQ(explicit_options.size(), 7u);
     EXPECT_EQ(topic_details.Options().Derived().count("segment_size"), 0u)
         << "segment_size was set explicitly, so it cannot be derived";
 }

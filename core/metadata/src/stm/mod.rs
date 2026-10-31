@@ -20,6 +20,7 @@ pub mod consumer_group;
 pub mod id_slab;
 pub mod lifecycle;
 pub mod mux;
+pub mod partition_directory;
 pub mod result;
 pub mod snapshot;
 pub mod stream;

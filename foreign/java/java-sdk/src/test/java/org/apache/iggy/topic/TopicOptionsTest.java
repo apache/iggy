@@ -54,6 +54,7 @@ class TopicOptionsTest {
                 .messagesRequiredToSave(1024)
                 .sizeOfMessagesRequiredToSave(BigInteger.valueOf(1_048_576))
                 .preallocateSegments(true)
+                .replicationFactor(3)
                 .build()
                 .entries();
 
@@ -64,11 +65,14 @@ class TopicOptionsTest {
                         "consumer_offset_durability",
                         "messages_required_to_save",
                         "size_of_messages_required_to_save",
-                        "preallocate_segments");
+                        "preallocate_segments",
+                        "replication_factor");
         assertThat(options.get("segment_size").kind()).isEqualTo(HeaderKind.Uint64);
         assertThat(options.get("messages_required_to_save").kind()).isEqualTo(HeaderKind.Uint32);
         assertThat(options.get("size_of_messages_required_to_save").kind()).isEqualTo(HeaderKind.Uint64);
         assertThat(options.get("preallocate_segments").kind()).isEqualTo(HeaderKind.Bool);
+        assertThat(options.get("replication_factor").kind()).isEqualTo(HeaderKind.Uint32);
+        assertThat(options.get("replication_factor").value()).containsExactly(3, 0, 0, 0);
         // Little-endian, so the low byte of 128 MiB leads and the high bytes are zero.
         assertThat(options.get("segment_size").value()).containsExactly(0, 0, 0, 8, 0, 0, 0, 0);
     }

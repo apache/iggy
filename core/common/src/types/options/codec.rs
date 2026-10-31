@@ -17,8 +17,8 @@
 
 use super::key::OptionKey;
 use super::{
-    Durability, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
-    PartitionResizePolicy,
+    Durability, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_REPLICATION_FACTOR,
+    MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, PartitionResizePolicy,
 };
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
 use crate::types::message::{HeaderKind, HeaderValue};
@@ -217,6 +217,14 @@ impl OptionValueCodec for u32 {
             && (value == 0 || value > MAX_MESSAGES_REQUIRED_TO_SAVE)
         {
             return Err(invalid(key));
+        }
+        if key == OptionKey::ReplicationFactor && !(1..=MAX_REPLICATION_FACTOR).contains(&value) {
+            tracing::debug!(
+                replication_factor = value,
+                max = MAX_REPLICATION_FACTOR,
+                "refusing a replication factor outside the supported range"
+            );
+            return Err(IggyError::InvalidReplicationFactor);
         }
         Ok(value)
     }

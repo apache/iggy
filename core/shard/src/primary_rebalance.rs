@@ -32,6 +32,9 @@ use crate::{
 use consensus::{
     Consensus, MetadataHandle, PartitionsHandle, QUORUM_REPLICATION_MAX, VsrConsensus,
 };
+use iggy_binary_protocol::primitives::partition_status::{
+    PartitionStatusEntry, encode_status_entries,
+};
 use iggy_binary_protocol::{
     Command, ConsensusHeader, HEADER_SIZE, PrepareHeader, PrimaryRebalanceHeader,
     PrimaryRebalanceKind,
@@ -45,6 +48,9 @@ use server_common::Message;
 use server_common::MessageBag;
 use server_common::sharding::IggyNamespace;
 use server_common::sharding::METADATA_GROUP;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::time::{Duration, Instant};
 
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(1);
@@ -53,6 +59,63 @@ const STABLE_INTERVAL: Duration = Duration::from_secs(5);
 const GRANT_TIMEOUT: Duration = Duration::from_secs(1);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBES_PER_TICK: usize = 8;
+/// Partition reports one metadata probe or reply carries.
+const STATUS_ENTRIES_PER_FRAME: usize = 512;
+/// Directory reports one probe batch visits while skipping those its peer
+/// stores itself.
+const STATUS_ENTRIES_SCANNED_PER_FRAME: usize = 4 * STATUS_ENTRIES_PER_FRAME;
+/// Directory reports one retain pass checks under the directory lock.
+const DIRECTORY_RETAIN_CHUNK: usize = 1024;
+/// An outbox report not refreshed for this long names a partition this node
+/// no longer leads. Each led partition is reported once per probe interval.
+const OUTBOX_REPORT_MAX_AGE: Duration = Duration::from_secs(2 * PROBE_INTERVAL.as_secs());
+
+/// Shard 0: this node's own partition reports awaiting metadata replies, with
+/// when each was last refreshed.
+#[derive(Debug, Default)]
+pub struct PartitionStatusOutbox {
+    entries: RefCell<BTreeMap<u64, (PartitionStatusEntry, Instant)>>,
+    cursor: Cell<Option<u64>>,
+}
+
+impl PartitionStatusOutbox {
+    pub fn record(&self, statuses: &[PartitionStatusEntry], now: Instant) {
+        let mut entries = self.entries.borrow_mut();
+        for status in statuses {
+            entries.insert(status.namespace, (*status, now));
+        }
+    }
+
+    /// Drop reports no publish refreshed within [`OUTBOX_REPORT_MAX_AGE`].
+    pub fn evict_stale(&self, now: Instant) {
+        self.entries.borrow_mut().retain(|_, (_, refreshed)| {
+            now.saturating_duration_since(*refreshed) < OUTBOX_REPORT_MAX_AGE
+        });
+    }
+
+    /// Up to `limit` reports after the cursor, wrapping, advancing it.
+    pub fn next_batch(&self, limit: usize) -> Vec<PartitionStatusEntry> {
+        let entries = self.entries.borrow();
+        let after = self.cursor.get();
+        let start = after.map_or(Bound::Unbounded, Bound::Excluded);
+        let end = after.map_or(Bound::Excluded(0), Bound::Included);
+        let batch: Vec<_> = entries
+            .range((start, Bound::Unbounded))
+            .chain(entries.range((Bound::Unbounded, end)))
+            .take(limit.min(entries.len()))
+            .map(|(_, (status, _))| *status)
+            .collect();
+        if let Some(last) = batch.last() {
+            self.cursor.set(Some(last.namespace));
+        }
+        batch
+    }
+
+    #[cfg(test)]
+    pub fn namespaces(&self) -> Vec<u64> {
+        self.entries.borrow().keys().copied().collect()
+    }
+}
 
 #[cfg(test)]
 mod tests;
@@ -81,6 +144,8 @@ struct Peer {
     /// The peer answered the newest probe that left this node, so it accepts no
     /// older probe after the next one.
     replied: bool,
+    /// The last partition report sent to this peer.
+    status_cursor: Option<u64>,
 }
 
 struct PendingMove {
@@ -110,24 +175,26 @@ pub enum LocalRebalance {
 }
 
 impl PrimaryRebalance {
-    fn observe_peer(&mut self, header: &PrimaryRebalanceHeader, now: Instant) {
+    /// Whether `header` answers the peer's outstanding probe.
+    fn observe_peer(&mut self, header: &PrimaryRebalanceHeader, now: Instant) -> bool {
         if self.view != Some(header.view) {
-            return;
+            return false;
         }
         let Some(peer) = self.peers.get_mut(usize::from(header.replica)) else {
-            return;
+            return false;
         };
         if peer.nonce != Some(header.nonce)
             || peer
                 .sent_at
                 .is_none_or(|sent| now.duration_since(sent) > PROBE_TIMEOUT)
         {
-            return;
+            return false;
         }
         peer.nonce = None;
         peer.answered_at = peer.sent_at;
         peer.ready_at = (header.ready == 1).then_some(now);
         peer.replied = true;
+        true
     }
 
     /// A probe the bus refused never left this node, so nothing can answer it.
@@ -275,6 +342,9 @@ where
         let Some(consensus) = metadata.consensus.as_ref() else {
             return;
         };
+        if self.id == 0 {
+            self.retain_partition_directories(self.bus.monotonic_now());
+        }
         if self.id != 0 || !consensus.is_primary() || !consensus_ready(consensus) {
             self.primary_rebalance.borrow_mut().reset_authority();
             metadata.observe_replica_readiness(&[]);
@@ -391,12 +461,14 @@ where
                 }
             }
         }
-        if let Some(probe) = capture {
-            self.send_rebalance(consensus.primary_index(probe.partition_view), probe)
-                .await;
+        if let Some(probe) = capture
+            && let Some(source) = self.partition_primary_node(probe.namespace, probe.partition_view)
+        {
+            self.send_rebalance(source, probe, &[]).await;
         }
         for (replica, probe) in outgoing {
-            if !self.send_rebalance(replica, probe).await {
+            let statuses = self.next_status_batch(replica);
+            if !self.send_rebalance(replica, probe, &statuses).await {
                 self.primary_rebalance
                     .borrow_mut()
                     .forget_unsent(replica, probe.nonce);
@@ -404,8 +476,97 @@ where
         }
     }
 
+    /// The next run of directory reports for `peer`, advancing its cursor.
+    /// Partitions the peer stores are skipped: it reads those locally.
+    fn next_status_batch(&self, peer: u8) -> Vec<PartitionStatusEntry> {
+        let Some(nodes) = self
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .map(VsrConsensus::replica_count)
+        else {
+            return Vec::new();
+        };
+        let mut state = self.primary_rebalance.borrow_mut();
+        let Some(cursor) = state.peers.get_mut(usize::from(peer)) else {
+            return Vec::new();
+        };
+        let (batch, last) = self
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .partition_status_batch(
+                cursor.status_cursor,
+                STATUS_ENTRIES_PER_FRAME,
+                STATUS_ENTRIES_SCANNED_PER_FRAME,
+                peer,
+                nodes,
+            );
+        cursor.status_cursor = last;
+        batch
+    }
+
+    /// Node id of the primary `view` assigns in the committed partition behind
+    /// `namespace`.
+    fn partition_primary_node(&self, namespace: u64, view: u32) -> Option<u8> {
+        let nodes = self.plane.metadata().consensus.as_ref()?.replica_count();
+        let members = self
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .members_for_namespace(IggyNamespace::from_raw(namespace))?;
+        metadata::stm::stream::primary_of(members, view, nodes)
+    }
+
+    /// Once per probe interval, drop the reports this node no longer leads,
+    /// and check one chunk of the directory for deleted partitions. The cross
+    /// shard directory lock is held for one chunk only.
+    fn retain_partition_directories(&self, now: Instant) {
+        if self
+            .partition_directory_retained_at
+            .get()
+            .is_some_and(|retained| now.duration_since(retained) < PROBE_INTERVAL)
+        {
+            return;
+        }
+        self.partition_directory_retained_at.set(Some(now));
+        let next = self
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .retain_partition_directory(
+                self.partition_directory_retain_cursor.get(),
+                DIRECTORY_RETAIN_CHUNK,
+            );
+        self.partition_directory_retain_cursor.set(next);
+        self.partition_status_outbox.evict_stale(now);
+    }
+
+    /// Take in partition reports, this node's own or a peer's.
+    pub(crate) fn record_partition_statuses(&self, statuses: &[PartitionStatusEntry]) {
+        let Some(consensus) = self.plane.metadata().consensus.as_ref() else {
+            return;
+        };
+        if statuses.is_empty() {
+            return;
+        }
+        self.plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .record_partition_statuses(statuses, consensus.node_id(), consensus.replica_count());
+    }
+
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
-    pub(crate) async fn on_primary_rebalance(&self, header: PrimaryRebalanceHeader) {
+    pub(crate) async fn on_primary_rebalance(
+        &self,
+        header: PrimaryRebalanceHeader,
+        statuses: Vec<PartitionStatusEntry>,
+    ) {
         let Some(consensus) = self.plane.metadata().consensus.as_ref() else {
             return;
         };
@@ -438,6 +599,7 @@ where
                 }
                 if header.kind == PrimaryRebalanceKind::MetadataProbe {
                     self.credit_backup_freshness(consensus, &header, now);
+                    self.record_partition_statuses(&statuses);
                 }
                 let mut reply = header;
                 if header.kind == PrimaryRebalanceKind::MetadataProbe {
@@ -454,15 +616,37 @@ where
                     header.kind == PrimaryRebalanceKind::MetadataProbe
                         && consensus_ready(consensus),
                 );
-                self.send_rebalance(header.replica, reply).await;
+                let statuses = if header.kind == PrimaryRebalanceKind::MetadataProbe {
+                    self.next_reported_statuses()
+                } else {
+                    Vec::new()
+                };
+                self.send_rebalance(header.replica, reply, &statuses).await;
             }
             PrimaryRebalanceKind::MetadataReply => {
                 if consensus.is_primary() && consensus_ready(consensus) {
-                    let evidence = {
+                    let (answered, evidence) = {
                         let mut state = self.primary_rebalance.borrow_mut();
-                        state.observe_peer(&header, now);
-                        state.quorum_evidence(consensus.quorum_replication())
+                        let answered = state.observe_peer(&header, now);
+                        (
+                            answered,
+                            state.quorum_evidence(consensus.quorum_replication()),
+                        )
                     };
+                    // Only a reply to the outstanding probe carries reports
+                    // newer than what the directory already holds.
+                    if answered {
+                        self.record_partition_statuses(&statuses);
+                        let views: Vec<_> = statuses
+                            .iter()
+                            .map(|status| metadata::impls::metadata::PartitionPlacementView {
+                                namespace: IggyNamespace::from_raw(status.namespace),
+                                created_revision: status.created_revision,
+                                view: status.view,
+                            })
+                            .collect();
+                        self.plane.metadata().observe_partition_views(&views);
+                    }
                     if let Some(sent) = evidence
                         && self.credit_partition_admission(
                             consensus,
@@ -481,7 +665,8 @@ where
                 let outgoing = {
                     let mut state = self.primary_rebalance.borrow_mut();
                     if !state.matches_pending(&header, MovePhase::Capture, now)
-                        || header.replica != consensus.primary_index(header.partition_view)
+                        || Some(header.replica)
+                            != self.partition_primary_node(header.namespace, header.partition_view)
                     {
                         return;
                     }
@@ -498,7 +683,7 @@ where
                     pending.since = now;
                     (pending.plan.target, pending.probe)
                 };
-                self.send_rebalance(outgoing.0, outgoing.1).await;
+                self.send_rebalance(outgoing.0, outgoing.1, &[]).await;
             }
             PrimaryRebalanceKind::PartitionReply => {
                 if !consensus.is_primary() || !consensus_ready(consensus) {
@@ -525,9 +710,15 @@ where
                     pending.probe.target = pending.plan.target;
                     pending.phase = MovePhase::Transfer;
                     pending.since = now;
-                    (consensus.primary_index(pending.plan.view), pending.probe)
+                    (
+                        self.partition_primary_node(pending.probe.namespace, pending.plan.view),
+                        pending.probe,
+                    )
                 };
-                if !self.send_rebalance(outgoing.0, outgoing.1).await {
+                let Some(source) = outgoing.0 else {
+                    return;
+                };
+                if !self.send_rebalance(source, outgoing.1, &[]).await {
                     self.primary_rebalance
                         .borrow_mut()
                         .forget_unsent_grant(outgoing.1.nonce);
@@ -558,7 +749,7 @@ where
     #[allow(clippy::future_not_send)]
     pub(crate) async fn on_local_rebalance(&self, frame: LocalRebalance) {
         match frame {
-            LocalRebalance::Wire(header) => self.on_primary_rebalance(header).await,
+            LocalRebalance::Wire(header) => self.on_primary_rebalance(header, Vec::new()).await,
             LocalRebalance::Capture(mut header) | LocalRebalance::Probe(mut header) => {
                 let capture = matches!(frame, LocalRebalance::Capture(_));
                 let namespace = IggyNamespace::from_raw(header.namespace);
@@ -574,14 +765,14 @@ where
                 }));
                 if let Some(partition) = partition {
                     let coordinator = header.replica;
-                    header.replica = partition.consensus().replica();
+                    header.replica = partition.consensus().node_id();
                     header.kind = if capture {
                         header.commit = partition.consensus().commit_max();
                         PrimaryRebalanceKind::SourceReply
                     } else {
                         PrimaryRebalanceKind::PartitionReply
                     };
-                    self.send_rebalance(coordinator, header).await;
+                    self.send_rebalance(coordinator, header, &[]).await;
                 }
             }
             LocalRebalance::Transfer { namespace, request } => {
@@ -734,9 +925,15 @@ where
         opened
     }
 
-    /// Returns false when the frame did not leave this node.
+    /// Returns false when the frame did not leave this node. `statuses` rides
+    /// only on a metadata probe or reply.
     #[allow(clippy::future_not_send)]
-    async fn send_rebalance(&self, target: u8, mut header: PrimaryRebalanceHeader) -> bool {
+    async fn send_rebalance(
+        &self,
+        target: u8,
+        mut header: PrimaryRebalanceHeader,
+        statuses: &[PartitionStatusEntry],
+    ) -> bool {
         if header.kind == PrimaryRebalanceKind::MetadataProbe {
             let Some(consensus) = self.plane.metadata().consensus.as_ref() else {
                 return false;
@@ -771,13 +968,28 @@ where
             self.send_local_rebalance(0, LocalRebalance::Wire(header));
             return true;
         }
+        let body = encode_status_entries(statuses);
+        let size = HEADER_SIZE + body.len();
+        header.size = u32::try_from(size).unwrap_or(u32::MAX);
+        header.checksum_body = if body.is_empty() {
+            0
+        } else {
+            u128::from(iggy_common::calculate_checksum(&body))
+        };
         header.seal();
-        let message = Message::<PrimaryRebalanceHeader>::new(HEADER_SIZE)
+        let mut message = Message::<PrimaryRebalanceHeader>::new(size)
             .transmute_header(|_, output: &mut PrimaryRebalanceHeader| *output = header);
+        message.as_mut_slice()[HEADER_SIZE..size].copy_from_slice(&body);
         self.bus
             .send_to_replica(target, message.into_generic().into_frozen())
             .await
             .is_ok()
+    }
+
+    /// The next run of this node's own partition reports for a metadata reply.
+    fn next_reported_statuses(&self) -> Vec<PartitionStatusEntry> {
+        self.partition_status_outbox
+            .next_batch(STATUS_ENTRIES_PER_FRAME)
     }
 }
 

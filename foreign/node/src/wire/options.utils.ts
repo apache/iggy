@@ -67,7 +67,8 @@ export const TopicOptionKey = {
   PartitionResizePolicy: 'partition_resize_policy',
   MessagesRequiredToSave: 'messages_required_to_save',
   SizeOfMessagesRequiredToSave: 'size_of_messages_required_to_save',
-  PreallocateSegments: 'preallocate_segments'
+  PreallocateSegments: 'preallocate_segments',
+  ReplicationFactor: 'replication_factor'
 } as const;
 
 export type TopicOptionKey = typeof TopicOptionKey[keyof typeof TopicOptionKey];
@@ -107,6 +108,7 @@ export const OPTION_CATALOG: ReadonlyMap<string, OptionDescriptor> = new Map([
   ['messages_required_to_save', { scopes: [Topic], flags: 0, internal: false }],
   ['size_of_messages_required_to_save', { scopes: [Topic], flags: 0, internal: false }],
   ['preallocate_segments', { scopes: [Topic], flags: 0, internal: false }],
+  ['replication_factor', { scopes: [Topic], flags: 0, internal: false }],
   ['encryption_key', { scopes: [Stream], flags: Secret | Critical, internal: false }],
   ['encryption_key_wrapped', { scopes: [Stream], flags: Critical, internal: true }],
   ['encryption_key_source', { scopes: [Stream], flags: ReadOnly, internal: false }],

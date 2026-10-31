@@ -449,6 +449,21 @@ impl SimClient {
         name: &str,
         partitions_count: u32,
     ) -> Message<RoutedRequestHeader> {
+        self.create_topic_with_factor(stream, name, partitions_count, None)
+    }
+
+    /// [`Self::create_topic`] with an explicit replication factor; `None`
+    /// leaves it to the server default.
+    ///
+    /// # Panics
+    /// As [`Self::create_topic`].
+    pub fn create_topic_with_factor(
+        &self,
+        stream: &str,
+        name: &str,
+        partitions_count: u32,
+        replication_factor: Option<u32>,
+    ) -> Message<RoutedRequestHeader> {
         let wire = CreateTopicRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             partitions_count,
@@ -456,6 +471,7 @@ impl SimClient {
             options: iggy_common::TopicCreateOptions {
                 durability: iggy_common::Durability::Persisted,
                 consumer_offset_durability: iggy_common::Durability::Persisted,
+                replication_factor,
                 ..Default::default()
             }
             .to_wire()

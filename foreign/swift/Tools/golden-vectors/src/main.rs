@@ -1817,6 +1817,7 @@ fn main() {
         messages_required_to_save: Some(7),
         size_of_messages_required_to_save: Some(IggyByteSize::from(4096)),
         preallocate_segments: Some(false),
+        replication_factor: Some(2),
         raw: BTreeMap::new(),
     };
     add(

@@ -506,6 +506,7 @@ mod tests {
                     partition_id: 0,
                     consensus_group_id: partition_group,
                     initial_view: 0,
+                    members: Vec::new(),
                 }],
             };
             assert_eq!(StateHandler::apply(&request, &mut streams, now).code, 0);

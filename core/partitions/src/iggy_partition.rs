@@ -312,6 +312,12 @@ where
     #[cfg(test)]
     offset_dir_sync_count: Cell<usize>,
     pub(crate) required_metadata_frontier: u64,
+    /// Newest metadata `FinalizeSession` op whose retirement debt a committed
+    /// payment covers. Replicated with the receipts it protects.
+    pub(crate) retirement_paid_through: u64,
+    /// Newest retirement debt op this replica learned from local metadata.
+    /// While it exceeds `retirement_paid_through`, session requests wait.
+    retirement_debt: Cell<u64>,
     /// Durable superblock for this partition's consensus group, recording
     /// `(view, log_view)` across a crash so this replica can never
     /// re-participate in a view older than one it advertised. `None` for
@@ -955,6 +961,8 @@ where
             #[cfg(test)]
             offset_dir_sync_count: Cell::new(0),
             required_metadata_frontier: 0,
+            retirement_paid_through: 0,
+            retirement_debt: Cell::new(0),
             superblock: None,
             superblock_lock: Rc::new(LocalGate::new()),
             superblock_intent: Cell::new(None),
@@ -991,6 +999,9 @@ where
 
     /// Record the metadata incarnation this partition was built for.
     pub fn set_created_revision(&mut self, created_revision: u64) {
+        if created_revision != self.created_revision() {
+            self.retirement_debt.set(0);
+        }
         self.consensus.set_partition_incarnation(created_revision);
     }
 
@@ -1016,6 +1027,38 @@ where
                 .is_some_and(|history| history.partition_op <= self.consensus.commit_min())
                 || (self.required_metadata_frontier >= identity.metadata_watermark
                     && self.dedup.get_epoch(identity.client_id) != Some(identity.session)))
+    }
+
+    /// Arms the session gate for `debt_op`. Only a normal primary with an
+    /// empty pipeline lists its retry slice: the gate then keeps every session
+    /// request out until the payment built from that list commits.
+    #[must_use]
+    pub fn observe_retirement_debt(&self, debt_op: u64) -> RetirementDebtStatus {
+        self.retirement_debt
+            .set(self.retirement_debt.get().max(debt_op));
+        if self.retirement_paid_through >= debt_op {
+            return RetirementDebtStatus::Paid;
+        }
+        let consensus = &self.consensus;
+        let can_pay = self.fatal.is_none()
+            && !self.requires_state_transfer()
+            && consensus.is_primary()
+            && consensus.is_normal()
+            && !consensus.is_transferring()
+            && consensus.commit_min() == consensus.commit_max()
+            && consensus.pipeline_is_empty();
+        RetirementDebtStatus::Unpaid(can_pay.then(|| {
+            self.dedup
+                .active_sessions()
+                .map(|(client_id, _, session)| (client_id, session))
+                .collect()
+        }))
+    }
+
+    /// Whether session requests must wait for a retirement debt payment.
+    #[must_use]
+    pub const fn owes_session_retirement(&self) -> bool {
+        self.retirement_debt.get() > self.retirement_paid_through
     }
 
     fn pending_session_retirement(&self, client_id: u128, session: u64) -> bool {
@@ -2984,6 +3027,7 @@ where
                 .then_some(self.dedup.capacity()),
             retry_protection: self.dedup.watermarks_sorted(),
             required_metadata_frontier: self.required_metadata_frontier,
+            retirement_paid_through: self.retirement_paid_through,
             consumer_offsets: self.retained_consumer_offsets(ConsumerKind::Consumer),
             consumer_group_offsets: self.retained_consumer_offsets(ConsumerKind::ConsumerGroup),
             external_group_offsets: self.retained_consumer_offsets(ConsumerKind::ExternalGroup),
@@ -3020,6 +3064,7 @@ where
             retry_capacity,
             retry_protection,
             required_metadata_frontier,
+            retirement_paid_through,
             durable_offset,
             write_offset,
             offset_space,
@@ -3046,6 +3091,7 @@ where
             );
         }
         self.required_metadata_frontier = required_metadata_frontier;
+        self.retirement_paid_through = retirement_paid_through;
         for (consumer_id, offset) in consumer_offsets {
             self.consumer_offsets.pin().insert(
                 consumer_id as usize,
@@ -5909,8 +5955,11 @@ where
             // A fenced backup refuses prepares while the primary keeps
             // committing, so its drain stalls until the grant expires.
             && self.consensus.is_primary()
-            && request.target < self.consensus.replica_count()
-            && request.target != self.consensus.primary_index(self.consensus.view())
+            && self
+                .consensus
+                .members()
+                .member(request.target)
+                .is_some_and(|target| target != self.consensus.primary_index(self.consensus.view()))
             && self.consensus.is_normal()
             && !self.consensus.has_ceded_primaryship()
             && !self.consensus.is_transferring()
@@ -7490,6 +7539,19 @@ where
                 } else {
                     None
                 };
+            // Checked before dedup: a finalized session's cached receipt must
+            // not be served either until the debt is paid.
+            if !is_auto_commit_client(client_id) && self.owes_session_retirement() {
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::TransientNotAccepted.as_code(),
+                    "partition owes session retirement",
+                    reply.take(),
+                )
+                .await;
+                return;
+            }
             if !is_auto_commit_client(client_id)
                 && message.header().metadata_watermark < self.required_metadata_frontier
             {
@@ -11144,6 +11206,12 @@ where
                         .required_metadata_frontier
                         .max(identity.metadata_watermark);
                 }
+                // A finalized session absent from the slice still must not
+                // start writing here, so the frontier covers the whole debt.
+                self.retirement_paid_through =
+                    self.retirement_paid_through.max(retirement.paid_through);
+                self.required_metadata_frontier =
+                    self.required_metadata_frontier.max(retirement.paid_through);
             }
             let reply = match self.commit_receipt(
                 &entry,
@@ -13473,6 +13541,15 @@ const SEGMENT_REMOVAL_BUDGET_PER_PASS: usize = 16;
 /// each with an awaited reply send.
 const PROMOTION_DENIALS_MAX: usize = 4;
 
+/// Answer of [`IggyPartition::observe_retirement_debt`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetirementDebtStatus {
+    /// A committed payment covers the debt.
+    Paid,
+    /// The retry slice as `(client_id, session)` when this replica can pay now.
+    Unpaid(Option<Vec<(u128, u64)>>),
+}
+
 /// What one call to [`IggyPartition::remove_sealed_segments_up_to`] reclaimed.
 ///
 /// `budget_spent` reports that the pass stopped on
@@ -14244,6 +14321,7 @@ mod tests {
                     groups: Vec::new(),
                     external_groups: Vec::new(),
                     dedup: Vec::new(),
+                    retirement_paid_through: 0,
                 };
                 partition
                     .install_state_transfer(&repair_config(), 1, staged, &offsets.encode())
@@ -14315,6 +14393,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            retirement_paid_through: 0,
         };
         partition
             .install_state_transfer(&repair_config(), 3, staged, &offsets.encode())
@@ -14365,6 +14444,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            retirement_paid_through: 0,
         };
         assert!(matches!(
             partition
@@ -14591,6 +14671,7 @@ mod tests {
             owners: Vec::new(),
             history_transition: None,
             owner_retirement: None,
+            retirement_paid_through: 0,
         };
 
         let result = partition
@@ -16839,6 +16920,122 @@ mod tests {
         }
     }
 
+    fn retirement_payment_request(
+        namespace: IggyNamespace,
+        identities: Vec<SessionIdentity>,
+        paid_through: u64,
+    ) -> Message<RoutedRequestHeader> {
+        let body = RetireSessionsRequest {
+            identities,
+            paid_through,
+        }
+        .to_bytes();
+        let size = size_of::<RoutedRequestHeader>() + body.len();
+        let mut request = Message::<RoutedRequestHeader>::new(size).transmute_header(
+            |_, header: &mut RoutedRequestHeader| {
+                header.command = Command::Request;
+                header.operation = Operation::RetireSession;
+                header.cluster = TEST_CLUSTER;
+                header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+                header.session = 1;
+                header.request = paid_through;
+                header.metadata_watermark = paid_through;
+                header.group = namespace.inner();
+                header.size = u32::try_from(size).unwrap();
+            },
+        );
+        request.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
+        request
+    }
+
+    #[compio::test]
+    async fn given_retirement_debt_when_session_requests_arrive_should_refuse_them_until_the_payment_commits()
+     {
+        const DEBT_OP: u64 = 40;
+        const FINALIZED_CLIENT: u128 = 1;
+        const NEW_CLIENT: u128 = 2;
+        let (mut partition, _replies) = recording_partition_at(0, 3);
+        let namespace = partition.namespace();
+        let send = |client_id: u128, metadata_watermark: u64| {
+            let mut send = checksumless_send_request(namespace, 1).transmute_header(
+                |header, next: &mut RoutedRequestHeader| {
+                    *next = header;
+                    next.client = client_id;
+                    next.metadata_watermark = metadata_watermark;
+                },
+            );
+            send.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+                .copy_from_slice(&build_segment_record(namespace, 0));
+            send
+        };
+        partition.on_request(send(FINALIZED_CLIENT, 0), None).await;
+        partition.consensus.advance_commit_max(1);
+        partition.commit_journal(&repair_config()).await;
+
+        assert_eq!(
+            partition.observe_retirement_debt(DEBT_OP),
+            RetirementDebtStatus::Unpaid(Some(vec![(FINALIZED_CLIENT, 1)]))
+        );
+        // The first request is the committed one's retry, a cached hit.
+        for request in [send(FINALIZED_CLIENT, 0), send(NEW_CLIENT, DEBT_OP)] {
+            let (sender, receiver) = consensus::oneshot_channel();
+            partition.on_request(request, Some(sender)).await;
+            assert_eq!(
+                receiver.await.unwrap().header().status,
+                IggyError::TransientNotAccepted.as_code()
+            );
+        }
+        assert_eq!(partition.consensus.sequencer().current_sequence(), 1);
+
+        partition
+            .on_request(
+                retirement_payment_request(
+                    namespace,
+                    vec![SessionIdentity {
+                        client_id: FINALIZED_CLIENT,
+                        session: 1,
+                        metadata_watermark: DEBT_OP,
+                    }],
+                    DEBT_OP,
+                ),
+                None,
+            )
+            .await;
+        assert!(partition.owes_session_retirement(), "prepared is not paid");
+        partition.consensus.advance_commit_max(2);
+        partition.commit_journal(&repair_config()).await;
+        assert!(partition.fatal.is_none(), "{:?}", partition.fatal);
+        assert!(!partition.owes_session_retirement());
+        assert_eq!(
+            partition.observe_retirement_debt(DEBT_OP),
+            RetirementDebtStatus::Paid
+        );
+        assert!(!partition.dedup.contains(FINALIZED_CLIENT));
+        assert_eq!(partition.required_metadata_frontier, DEBT_OP);
+
+        let (sender, receiver) = consensus::oneshot_channel();
+        partition
+            .on_request(send(FINALIZED_CLIENT, 0), Some(sender))
+            .await;
+        assert_eq!(
+            receiver.await.unwrap().header().status,
+            IggyError::TransientNotAccepted.as_code(),
+            "the paid frontier keeps a finalized session's stale request out"
+        );
+        partition.on_request(send(NEW_CLIENT, DEBT_OP), None).await;
+        assert_eq!(partition.consensus.sequencer().current_sequence(), 3);
+
+        let wire = crate::state_transfer::ConsumerOffsetsWire::decode(
+            &crate::state_transfer::ConsumerOffsetsWire {
+                retirement_paid_through: partition.retirement_paid_through,
+                ..Default::default()
+            }
+            .encode(),
+        )
+        .unwrap();
+        assert_eq!(wire.retirement_paid_through, DEBT_OP);
+    }
+
     /// Pins the barrier count of a burst of ended sessions: the sweep sends the
     /// oldest `MAX_SESSIONS_PER_RETIREMENT` identities in one barrier, so one
     /// partition commits `ceil(K / MAX_SESSIONS_PER_RETIREMENT)` barriers for K
@@ -17569,6 +17766,7 @@ mod tests {
             owners: Vec::new(),
             history_transition: None,
             owner_retirement: None,
+            retirement_paid_through: 0,
         };
         let installed = backup
             .install_state_transfer(&repair_config(), 1, vec![staged], &offsets.encode())
@@ -18353,6 +18551,7 @@ mod tests {
                     dedup: partition.dedup.watermarks_sorted(),
                     owners: Vec::new(),
                     history_transition: None,
+                    retirement_paid_through: 0,
                 };
                 partition
                     .install_state_transfer(&config, 2, vec![staged], &offsets.encode())
@@ -21955,6 +22154,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            retirement_paid_through: 0,
         };
         let outcome = partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &offer.encode())
@@ -23070,6 +23270,7 @@ mod tests {
             groups: vec![(9, 3)],
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            retirement_paid_through: 0,
         };
         partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &wire.encode())
@@ -24821,6 +25022,7 @@ mod tests {
             groups: vec![(8, 5)],
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            retirement_paid_through: 0,
         };
         partition
             .install_state_transfer(&repair_config(), 1, Vec::new(), &wire.encode())
@@ -28367,6 +28569,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            retirement_paid_through: 0,
         };
         let installed_commit_operation = 12;
         partition
@@ -28550,6 +28753,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            retirement_paid_through: 0,
         };
         let offered_commit_operation = 12;
         let install_error = partition
@@ -33710,6 +33914,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            retirement_paid_through: 0,
         };
         let refused = partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &behind.encode())
@@ -33765,6 +33970,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            retirement_paid_through: 0,
         };
         let refused = partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &stale.encode())
@@ -34937,6 +35143,7 @@ mod tests {
             owners: Vec::new(),
             history_transition: None,
             owner_retirement: None,
+            retirement_paid_through: 0,
         };
         partition
             .install_state_transfer(&repair_config(), INSTALLED_OPS, staged, &offsets.encode())

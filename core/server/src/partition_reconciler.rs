@@ -158,7 +158,7 @@ use crate::shell::{ServerShard, ShellBus, ShellShard};
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
 use consensus::Consensus;
-use consensus::{MetadataHandle, PartitionsHandle};
+use consensus::{MetadataHandle, PartitionsHandle, ReplicaSet};
 use futures::FutureExt;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_offsets::DeleteConsumerOffsetRequest;
@@ -923,7 +923,7 @@ async fn reconcile_additions(
                 topic_runtime,
                 ctx.cluster_id,
                 ctx.self_replica_id,
-                ctx.replica_count,
+                partition_metadata.replica_set(ctx.replica_count),
                 Rc::clone(&ctx.shard.bus),
                 partitions,
             )
@@ -935,10 +935,11 @@ async fn reconcile_additions(
                 ns,
                 partition_stats,
                 created_revision,
+                partition_metadata.created_at.as_micros(),
                 topic_runtime,
                 ctx.cluster_id,
                 ctx.self_replica_id,
-                ctx.replica_count,
+                partition_metadata.replica_set(ctx.replica_count),
                 created_view,
                 Rc::clone(&ctx.shard.bus),
             )
@@ -962,6 +963,17 @@ async fn reconcile_additions(
             // knows: nothing is counted, so the pass may fast-skip, and the
             // commit that moves metadata on bumps the revision and retries it.
             Ok(None) => {}
+            // Retrying cannot bring the history back; the tombstone keeps every
+            // later pass from rebuilding it empty.
+            Err(err @ crate::server_error::ServerError::PartitionLostWithStorage { .. }) => {
+                error!(
+                    shard = shard_id,
+                    ns_raw = ns.inner(),
+                    error = %err,
+                    "refusing to rebuild a partition lost with this node's storage"
+                );
+                partitions.fence(ns, created_revision);
+            }
             Err(err) => {
                 ctx.record_failure(ns, FailureCause::Add, now);
                 ctx.shard.metrics().record_partition_reconcile_failure();
@@ -1602,6 +1614,15 @@ fn snapshot_target_namespaces(ctx: &ReconcilerCtx) -> Vec<TargetPartition> {
         for (_, stream) in &inner.items {
             for (topic_id, topic) in &stream.topics {
                 for partition in &topic.partitions {
+                    // A partition this node does not store is no target: it
+                    // gets neither a build nor a routing row here.
+                    if partition
+                        .replica_set(ctx.replica_count)
+                        .member(ctx.self_replica_id)
+                        .is_none()
+                    {
+                        continue;
+                    }
                     entries.push(TargetPartition {
                         ns: IggyNamespace::new(stream.id, topic_id, partition.id),
                         epoch: partition.created_revision,
@@ -1837,13 +1858,13 @@ pub fn reconcile_partition_lifecycles<B, MJ, S, SB>(
     }
 }
 
-/// On a single-replica node, recovery fences a partition it cannot load, and
-/// then no log can install a lifecycle fence. Without this, a delete of the
-/// topic, the operator's exit from that fence, would wait forever. The durable
-/// retirement fence keeps the incarnation offline, which is what the lifecycle
-/// fence would have proven.
+/// On a partition this node alone stores, recovery fences an incarnation it
+/// cannot load, and then no log can install a lifecycle fence. Without this, a
+/// delete of the topic, the operator's exit from that fence, would wait
+/// forever. The durable retirement fence keeps the incarnation offline, which
+/// is what the lifecycle fence would have proven.
 async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) {
-    if ctx.replica_count != 1 || ctx.lifecycle_reports.batch_in_flight.get() {
+    if ctx.lifecycle_reports.batch_in_flight.get() {
         return;
     }
     let partitions = ctx.shard.plane.partitions();
@@ -1884,7 +1905,9 @@ async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) {
         for (topic_id, partition_id, namespace, incarnation) in targets {
             // Other tasks run during the awaits, so each target is checked
             // again right before its durable write.
-            if partitions.failed_revision(&namespace) != Some(incarnation) {
+            if partitions.failed_revision(&namespace) != Some(incarnation)
+                || !stored_only_here(ctx, namespace)
+            {
                 continue;
             }
             if let Err(error) =
@@ -1910,6 +1933,21 @@ async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) {
             return;
         }
     }
+}
+
+/// Whether the committed partition's only member is this node, so no other
+/// replica's log can complete its lifecycle.
+fn stored_only_here(ctx: &ReconcilerCtx, namespace: IggyNamespace) -> bool {
+    ctx.shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .members_for_namespace(namespace)
+        .is_some_and(|members| {
+            let members = members.unwrap_or_else(|| ReplicaSet::all(ctx.replica_count));
+            members.len() == 1 && members.member(ctx.self_replica_id).is_some()
+        })
 }
 
 /// The ready completions of the intent at `metadata_op` in batch order, at
@@ -2226,6 +2264,7 @@ mod tests {
             initial_view: 0,
             partition_id,
             consensus_group_id,
+            members: Vec::new(),
         }
     }
 
@@ -3327,10 +3366,11 @@ mod tests {
             ns,
             Arc::clone(&stats),
             LIVE_EPOCH,
+            0,
             iggy_common::TopicRuntimeOptions::default(),
             CLUSTER_ID,
             0,
-            1,
+            consensus::ReplicaSet::all(1),
             created_view(&ctx, ns),
             Rc::clone(&ctx.shard.bus),
         )
@@ -3358,10 +3398,11 @@ mod tests {
             ns,
             Arc::clone(&stats),
             LIVE_EPOCH + 1,
+            0,
             iggy_common::TopicRuntimeOptions::default(),
             CLUSTER_ID,
             0,
-            1,
+            consensus::ReplicaSet::all(1),
             created_view(&ctx, ns),
             Rc::clone(&ctx.shard.bus),
         )
@@ -4001,7 +4042,15 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-repair-ceiling", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        // The repair peer must be a member of the group it repairs from.
+        let ctx = Rc::new(ReconcilerCtx::new(
+            Rc::clone(&shard),
+            1,
+            Rc::new(config),
+            CLUSTER_ID,
+            0,
+            2,
+        ));
         reconcile_pass(&ctx).await;
 
         let ns = IggyNamespace::new(0, 0, 0);
@@ -4402,6 +4451,66 @@ mod tests {
             "a recreate of the recycled ids must not inherit the lifted fence"
         );
         assert!(!partitions.is_tombstoned(&ns));
+    }
+
+    #[compio::test]
+    async fn given_a_fenced_partition_only_this_node_stores_in_a_larger_cluster_when_deleted_should_complete_the_delete()
+     {
+        const NODES: u8 = 3;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        let solo = IggyNamespace::new(0, 0, 0);
+        let shared = IggyNamespace::new(1, 0, 0);
+        mux.streams()
+            .seed_namespace_on(solo, 1, 0, iggy_common::Durability::Persisted, &[0]);
+        mux.streams()
+            .seed_namespace_on(shared, 2, 0, iggy_common::Durability::Persisted, &[0, 1]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = Rc::new(ReconcilerCtx::new(
+            Rc::clone(&shard),
+            1,
+            Rc::new(config),
+            CLUSTER_ID,
+            0,
+            NODES,
+        ));
+        let stm = &shard.plane.metadata().mux_stm;
+        for namespace in [solo, shared] {
+            let revision = stm
+                .streams()
+                .created_revision_for_namespace(namespace)
+                .unwrap();
+            shard.plane.partitions().fence(namespace, revision);
+        }
+        for (op, stream_id) in [(10, 0), (11, 1)] {
+            stm.update(build_prepare(
+                op,
+                Operation::DeleteTopic,
+                &DeleteTopicRequest {
+                    stream_id: WireIdentifier::numeric(stream_id),
+                    topic_id: WireIdentifier::numeric(0),
+                },
+            ))
+            .expect("DeleteTopic apply succeeds");
+        }
+
+        reconcile_retired_lifecycles(&ctx).await;
+
+        let (_, batches) = drain_lifecycle_reports(&lanes);
+        let completed: Vec<_> = batches
+            .iter()
+            .map(|(request, _)| request.completions().to_vec())
+            .collect();
+        assert_eq!(
+            completed,
+            [vec![LifecycleCompletion {
+                topic_id: 0,
+                partition_id: 0,
+                partition_op: metadata::stm::lifecycle::RETIRED_PARTITION_OP,
+            }]],
+            "only the partition no other node stores may complete through its fence"
+        );
     }
 
     #[compio::test]

@@ -29,8 +29,8 @@ use crate::shell::{
 };
 use configs::server::ServerConfig;
 use consensus::{
-    ClientTable, HistoryRecovery, JoinMode, LocalPipeline, PipelineEntry, Sequencer, VsrConsensus,
-    VsrRestore, VsrState,
+    ClientTable, HistoryRecovery, JoinMode, LocalPipeline, PipelineEntry, ReplicaSet, Sequencer,
+    VsrConsensus, VsrRestore, VsrState,
 };
 use iggy_common::{
     EncryptorKind, IggyByteSize, IggyError, PartitionStats, ServerKeyContext, StreamEncryption,
@@ -206,6 +206,13 @@ pub(in crate::boot) async fn build_shard_for_thread(
             let mut encryption = None;
             for (topic_id, topic) in &stream.topics {
                 for partition in &topic.partitions {
+                    if partition
+                        .replica_set(topology.replica_count)
+                        .member(topology.self_replica_id)
+                        .is_none()
+                    {
+                        continue;
+                    }
                     let namespace = IggyNamespace::new(stream.id, topic_id, partition.id);
                     let owning_shard =
                         calculate_shard_assignment(&namespace, u32::from(total_shards));
@@ -283,7 +290,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
             topic_runtime,
             topology.cluster_id,
             topology.self_replica_id,
-            topology.replica_count,
+            partition_metadata.replica_set(topology.replica_count),
             Rc::clone(&bus),
             &partitions,
         )
@@ -780,7 +787,7 @@ pub(in crate::boot) fn restore_metadata_consensus(
     let consensus = VsrConsensus::restored(
         topology.cluster_id,
         topology.self_replica_id,
-        replica_count,
+        ReplicaSet::all(replica_count),
         server_common::sharding::METADATA_GROUP,
         bus,
         // Request queue keeps the stock 2x ratio over the prepare queue
@@ -979,6 +986,7 @@ mod tests {
                         partition_id: 0,
                         consensus_group_id: 1,
                         initial_view: 0,
+                        members: Vec::new(),
                     }],
                 }
                 .to_bytes(),

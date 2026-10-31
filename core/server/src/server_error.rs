@@ -231,6 +231,15 @@ pub enum ServerError {
         namespace_raw: u64,
         created_revision: u64,
     },
+    #[error(
+        "partition {namespace_raw} incarnation {created_revision} is stored only on this node, \
+         and this node's storage began after it was created without any record of it: \
+         refusing to serve it from offset 0; delete and recreate the topic to accept the loss"
+    )]
+    PartitionLostWithStorage {
+        namespace_raw: u64,
+        created_revision: u64,
+    },
     // Quarantines the one partition rather than treating the group as fresh or
     // reading through to a superseded view: mirrors the metadata plane's
     // `RecoveryError::SuperblockUnreadable` policy, minus the boot refusal,
@@ -333,6 +342,15 @@ pub enum ServerError {
     ClusterReplicaCountTooLarge { count: usize },
     #[error("cluster mode requires --replica-id to identify the current node")]
     MissingReplicaId,
+    #[error(
+        "committed metadata places partition {namespace_raw} on node {node}, but the cluster \
+         has {nodes} nodes; adding or removing nodes is not supported"
+    )]
+    PartitionMemberOutsideCluster {
+        namespace_raw: u64,
+        node: u8,
+        nodes: u8,
+    },
     #[error(
         "--replica-id {supplied} was passed with cluster.enabled=false; the WAL would commit \
          under replica {default} which permanently fixes this node's identity. Either set \

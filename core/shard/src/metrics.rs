@@ -363,6 +363,10 @@ pub struct ShardMetrics {
     partition_transfer_refusals_total: Counter,
     partition_applied_divergences_total: Counter,
     partitions_untrusted_log: Gauge,
+    partitions_under_replicated: Gauge,
+    partitions_below_write_quorum: Gauge,
+    partitions_owing_retirement: Gauge,
+    retirement_debts_paid_total: Counter,
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
     partition_frames_incarnation_mismatch_total: Family<FrameCommandLabel, Counter>,
@@ -453,6 +457,10 @@ impl ShardMetrics {
             partition_transfer_refusals_total: Counter::default(),
             partition_applied_divergences_total: Counter::default(),
             partitions_untrusted_log: Gauge::default(),
+            partitions_under_replicated: Gauge::default(),
+            partitions_below_write_quorum: Gauge::default(),
+            partitions_owing_retirement: Gauge::default(),
+            retirement_debts_paid_total: Counter::default(),
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
             partition_frames_incarnation_mismatch_total: Family::default(),
@@ -815,6 +823,41 @@ impl ShardMetrics {
         self.partitions_untrusted_log.get()
     }
 
+    /// Republished by every partition sweep, over the partitions this shard
+    /// leads: those with a member out of sync, and those with too few members
+    /// in sync to commit.
+    pub fn set_partition_replication(&self, under_replicated: usize, below_write_quorum: usize) {
+        self.partitions_under_replicated
+            .set(i64::try_from(under_replicated).unwrap_or(i64::MAX));
+        self.partitions_below_write_quorum
+            .set(i64::try_from(below_write_quorum).unwrap_or(i64::MAX));
+    }
+
+    /// Republished with the replication gauges: partitions on this shard that
+    /// refuse sessions until a retirement debt payment commits.
+    pub fn set_partitions_owing_retirement(&self, owing: usize) {
+        self.partitions_owing_retirement
+            .set(i64::try_from(owing).unwrap_or(i64::MAX));
+    }
+
+    pub fn record_retirement_debt_paid(&self) {
+        self.retirement_debts_paid_total.inc();
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partitions_under_replicated_value(&self) -> i64 {
+        self.partitions_under_replicated.get()
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partitions_below_write_quorum_value(&self) -> i64 {
+        self.partitions_below_write_quorum.get()
+    }
+
     /// Bumped when a parked partition frame is answered instead of served
     /// because it was addressed to an incarnation this shard no longer holds
     /// (delete + recreate recycled the namespace's slab keys). Serving it would
@@ -1167,6 +1210,28 @@ impl ShardMetrics {
             "partitions electing on a log that may lack acknowledged ops; a view starts only \
              once a trusted quorum or every replica reports",
             self.partitions_untrusted_log.clone(),
+        );
+        registry.register(
+            "partitions_under_replicated",
+            "partitions this shard leads with a member it cannot reach or that has trailed \
+             the commit point for longer than the lag window",
+            self.partitions_under_replicated.clone(),
+        );
+        registry.register(
+            "partitions_below_write_quorum",
+            "partitions this shard leads with too few members in sync to commit a write",
+            self.partitions_below_write_quorum.clone(),
+        );
+        registry.register(
+            "partitions_owing_retirement",
+            "partitions on this shard refusing sessions until they retire sessions that \
+             finalized while the partition lacked a quorum of its members",
+            self.partitions_owing_retirement.clone(),
+        );
+        registry.register(
+            "retirement_debts_paid",
+            "retirement debts this node paid as a partition primary",
+            self.retirement_debts_paid_total.clone(),
         );
         registry.register(
             "partition_frames_rejected_stale",

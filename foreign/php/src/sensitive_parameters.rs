@@ -57,7 +57,7 @@ const SENSITIVE_PARAMETERS: &[(&str, &str, u32)] = &[
     ("Iggy\\Client", "createStream", 1),
     ("Iggy\\Client", "createStream", 2),
     ("Iggy\\Client", "updateStream", 3),
-    ("Iggy\\Client", "createTopic", 13),
+    ("Iggy\\Client", "createTopic", 14),
     ("Iggy\\Client", "updateTopic", 6),
     ("Iggy\\Client", "encryptionKeyFingerprint", 0),
 ];

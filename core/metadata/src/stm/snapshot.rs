@@ -67,13 +67,18 @@ use crate::stm::user::UsersSnapshot;
 ///
 /// Version 14: `TopicSnapshot` gained `created_op`, the identity of a topic
 /// incarnation, and the snapshot carries the metadata change log.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 14;
+///
+/// Version 15: `PartitionSnapshot` gained `members` and `retirement_debt_op` as
+/// trailing, defaulted fields.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 15;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
-/// Session protection is mandatory and its nested layout changed. Older
-/// snapshots cannot prove the current retry contract and are refused.
-pub const MIN_READABLE_SNAPSHOT_FORMAT_VERSION: u32 = SNAPSHOT_FORMAT_VERSION;
+/// Session protection is mandatory and its nested layout changed in version
+/// 14, so older snapshots cannot prove the current retry contract and are
+/// refused. Version 14 reads with every partition on every node and no
+/// retirement debt.
+pub const MIN_READABLE_SNAPSHOT_FORMAT_VERSION: u32 = 14;
 
 /// The release that wrote a snapshot: the packed `iggy_binary_protocol` semver of
 /// this build. [`iggy_binary_protocol::ProtocolVersion`] documents the packing and
@@ -371,6 +376,7 @@ impl MetadataSnapshot {
     pub(crate) fn validate(&self) -> Result<(), SnapshotError> {
         if let Some(streams) = &self.streams {
             streams.validate_ownership_history(self.sequence_number)?;
+            streams.validate_partition_members()?;
         }
         self.change_log.validate(self.sequence_number)
     }
@@ -652,7 +658,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 8;
-        const PINNED_VERSION: u32 = 14;
+        const PINNED_VERSION: u32 = 15;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -668,6 +674,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn nested_snapshot_shapes_are_pinned_too() {
         // The top-level count above is blind to everything under it, which is how
         // `TopicSnapshot` once swapped a removed field for an added one and kept
@@ -684,7 +691,8 @@ mod tests {
         const CLIENT_TABLE_FIELD_COUNT: u32 = 2;
         // Version 5 appended `created_view` the same way. Version 10 dropped
         // `purge_generation` from the middle, which no default can cover.
-        const PARTITION_FIELD_COUNT: u32 = 6;
+        // `members` and `retirement_debt_op` are appended with defaults.
+        const PARTITION_FIELD_COUNT: u32 = 8;
 
         let client_table = consensus::ClientTableSnapshot {
             slots: Vec::new(),
@@ -728,6 +736,8 @@ mod tests {
             created_revision: 0,
             deleted_up_to_offset: 0,
             created_view: 0,
+            members: Vec::new(),
+            retirement_debt_op: 0,
         };
         let encoded = rmp_serde::to_vec(&partition).unwrap();
         assert_eq!(
@@ -851,7 +861,7 @@ mod tests {
 
     #[test]
     fn decode_refuses_snapshots_without_durable_session_protection() {
-        for version in 0..SNAPSHOT_FORMAT_VERSION {
+        for version in 0..MIN_READABLE_SNAPSHOT_FORMAT_VERSION {
             let mut snapshot = MetadataSnapshot::new(9);
             snapshot.version = version;
             let bytes = snapshot.encode().unwrap();
@@ -871,6 +881,36 @@ mod tests {
             Err(SnapshotError::UnsupportedFormatVersion { found, expected })
                 if found == INDEPENDENT_OWNER_GENERATION_FORMAT && expected == SNAPSHOT_FORMAT_VERSION
         ));
+    }
+
+    #[test]
+    fn given_format_fourteen_partition_when_decoding_should_default_members_and_debt() {
+        #[derive(Serialize)]
+        struct FormatFourteenPartition {
+            id: usize,
+            consensus_group_id: u64,
+            created_at: IggyTimestamp,
+            created_revision: u64,
+            deleted_up_to_offset: u64,
+            created_view: u32,
+        }
+        let mut snapshot = MetadataSnapshot::new(9);
+        snapshot.version = MIN_READABLE_SNAPSHOT_FORMAT_VERSION;
+        assert!(MetadataSnapshot::decode(&snapshot.encode().unwrap()).is_ok());
+
+        let encoded = rmp_serde::to_vec(&FormatFourteenPartition {
+            id: 2,
+            consensus_group_id: 3,
+            created_at: IggyTimestamp::from(4),
+            created_revision: 5,
+            deleted_up_to_offset: 6,
+            created_view: 7,
+        })
+        .unwrap();
+        let decoded: PartitionSnapshot = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!((decoded.id, decoded.created_view), (2, 7));
+        assert!(decoded.members.is_empty(), "stored on every node");
+        assert_eq!(decoded.retirement_debt_op, 0);
     }
 
     #[test]
@@ -1006,6 +1046,8 @@ mod tests {
                                 created_revision: 0,
                                 deleted_up_to_offset: 0,
                                 created_view: 0,
+                                members: vec![2, 0, 1],
+                                retirement_debt_op: 9,
                             }],
                             consumer_groups: Vec::new(),
                             // Nonzero and distinct from every id above so the
@@ -1043,6 +1085,7 @@ mod tests {
         let (_, topic) = &stream.topics[0];
         assert_eq!(topic.partitions.len(), 1);
         assert_eq!(topic.partitions[0].consensus_group_id, 33);
+        assert_eq!(topic.partitions[0].retirement_debt_op, 9);
         // Never-reuse counter: `#[serde(default)]` would silently restore 0 if
         // the field were dropped from the wire format, so pin its survival.
         assert_eq!(topic.next_consumer_group_id, 5);

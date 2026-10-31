@@ -31,10 +31,11 @@ public sealed class TopicOptionsTests
             Durability = Apache.Iggy.Enums.Durability.Persisted,
             MessagesRequiredToSave = 1024,
             SizeOfMessagesRequiredToSave = 1048576,
-            PreallocateSegments = false
+            PreallocateSegments = false,
+            ReplicationFactor = 3
         }.ToDictionary();
 
-        Assert.Equal(6, options.Count);
+        Assert.Equal(7, options.Count);
 
         Assert.Equal(HeaderKind.Uint64, options["segment_size"].Kind);
         Assert.Equal(134217728UL, options["segment_size"].ToUInt64());
@@ -50,6 +51,9 @@ public sealed class TopicOptionsTests
 
         Assert.Equal(HeaderKind.Bool, options["preallocate_segments"].Kind);
         Assert.False(options["preallocate_segments"].ToBool());
+
+        Assert.Equal(HeaderKind.Uint32, options["replication_factor"].Kind);
+        Assert.Equal(3U, options["replication_factor"].ToUInt32());
     }
 
     [Fact]

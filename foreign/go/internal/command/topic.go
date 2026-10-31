@@ -135,6 +135,9 @@ func (t *CreateTopic) typedOptions() ([]iggcon.HeaderEntry, error) {
 	if options.PreallocateSegments != nil {
 		typed = append(typed, iggcon.PreallocateSegmentsOption(*options.PreallocateSegments))
 	}
+	if options.ReplicationFactor != nil {
+		typed = append(typed, iggcon.ReplicationFactorOption(*options.ReplicationFactor))
+	}
 	return typed, nil
 }
 

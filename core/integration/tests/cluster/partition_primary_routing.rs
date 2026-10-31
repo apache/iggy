@@ -748,9 +748,11 @@ async fn given_balanced_primaries_when_a_replica_fails_and_returns_should_rebala
         .await
         .unwrap();
     let stream = Identifier::named(STREAM_NAME).unwrap();
+    // Every node stores every partition, so any node can take a primary.
     let options = TopicCreateOptions {
         partitions_count: Some(1),
         durability: Durability::Persisted,
+        replication_factor: Some(5),
         message_expiry: Some(IggyExpiry::NeverExpire),
         ..TopicCreateOptions::default()
     };

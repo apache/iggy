@@ -37,6 +37,8 @@ pub use poll::deferred::{
     ServedState, WatchedState,
 };
 pub use poll::{ConsumerAttachment, PollCompleted};
+/// How often the replication gauges and partition reports refresh.
+pub use primary_rebalance::PROBE_INTERVAL as PARTITION_REPORT_INTERVAL;
 pub use router::CONSENSUS_TICK_INTERVAL;
 
 #[cfg(feature = "simulator")]
@@ -44,7 +46,7 @@ use consensus::LocalPipeline;
 use consensus::{
     AdoptedView, ChunkProgress, CommitOutcome, Consensus, ConsensusClock, DVC_HEADERS_MAX,
     DvcHeaderKind, DvcSuffix, FatalReason, MergedLog, MetadataHandle, MuxPlane, PartitionsHandle,
-    Pipeline, Plane, PlaneKind, RepairEvidence, STATE_TRANSFER_MAX_DECODE_RETRIES,
+    Pipeline, Plane, PlaneKind, RepairEvidence, ReplicaSet, STATE_TRANSFER_MAX_DECODE_RETRIES,
     STATE_TRANSFER_MAX_STALL_RETRIES, Sequencer, StartViewRefusal, Status, VsrAction, VsrConsensus,
     build_deny_reply_from_request_header, dvc_blank, dvc_header_kind, encode_prepare_headers,
     fatal, repaired_frontier_update, repaired_prepare_evidence, restamp_prepare_view,
@@ -53,6 +55,9 @@ use consensus::{
 #[cfg(any(test, feature = "simulator"))]
 use crossfire::AsyncRxTrait;
 use futures::FutureExt;
+use iggy_binary_protocol::primitives::partition_status::{
+    PartitionStatusEntry, decode_status_entries,
+};
 use iggy_binary_protocol::responses::system::GetMetadataChangesResponse;
 use iggy_binary_protocol::{
     CHECKSUM_UNSEALED, Command, CommitHeader, ConsensusHeader, ConsumerSession,
@@ -140,6 +145,8 @@ pub struct PartitionMaterialisation {
     created_view: u32,
     first_initialization: bool,
     consumer_offsets_max: usize,
+    /// `None` when every node stores the partition.
+    members: Option<ReplicaSet>,
 }
 
 #[cfg(feature = "simulator")]
@@ -151,12 +158,19 @@ impl PartitionMaterialisation {
             created_view,
             first_initialization,
             consumer_offsets_max: partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
+            members: None,
         }
     }
 
     #[must_use]
     pub const fn with_consumer_offsets_max(mut self, consumer_offsets_max: usize) -> Self {
         self.consumer_offsets_max = consumer_offsets_max;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_members(mut self, members: Option<ReplicaSet>) -> Self {
+        self.members = members;
         self
     }
 }
@@ -418,6 +432,12 @@ pub enum PartitionRead {
         identity: iggy_binary_protocol::requests::system::SessionIdentity,
         created_revision: u64,
     },
+    /// Arm the incarnation's session gate for `debt_op` and report whether it
+    /// is paid; see [`partitions::IggyPartition::observe_retirement_debt`].
+    RetirementDebt {
+        created_revision: u64,
+        debt_op: u64,
+    },
     /// A bound poll. A group read is served only to the partition's installed
     /// owner.
     PollOnPrimary {
@@ -500,6 +520,7 @@ impl PartitionRead {
             | Self::Poll { .. } => true,
             Self::Primary
             | Self::SessionRetired { .. }
+            | Self::RetirementDebt { .. }
             | Self::GroupOffsetState { .. }
             | Self::ResolveSegmentDeleteOffset { .. } => false,
         }
@@ -519,12 +540,14 @@ pub struct ConsumerOffsetRead {
 /// Reply to a [`PartitionRead`].
 #[derive(Debug)]
 pub enum PartitionReadReply {
-    /// The partition group's view on this replica and the primary of that view.
+    /// The partition group's view on this replica and the node id of that
+    /// view's primary.
     Primary {
         view: u32,
         primary: u8,
     },
     SessionRetired(bool),
+    RetirementDebt(partitions::RetirementDebtStatus),
     /// Permanent failure of this incarnation. It is not a retirement proof
     /// until the caller durably fences the incarnation against future serving.
     SessionRetirementFailed {
@@ -1081,8 +1104,9 @@ pub enum LifecycleFrame {
     /// the per-shard reconciler. No payload: reconciler re-reads target
     /// state. Drops covered by the periodic safety tick.
     MetadataCommitTick,
-    /// Last-known serving views, retried by a bounded sweep on each owning shard.
-    PartitionPlacementViews(Vec<PartitionPlacementView>),
+    /// Last-known serving views, retried by a bounded sweep on each owning shard,
+    /// with the counters of the partitions this node leads.
+    PartitionPlacementViews(Vec<PartitionPlacementView>, Vec<PartitionStatusEntry>),
     PrimaryRebalance(Box<primary_rebalance::LocalRebalance>),
     PartitionPersistenceCompleted(partitions::PersistenceCompletion),
     /// Wake marker for the reconciler-to-pump funnel. Pump drains the
@@ -1893,6 +1917,12 @@ where
     /// Namespaces still owed a placement report in the current interval.
     partition_placement_owed: Cell<usize>,
     primary_rebalance: RefCell<primary_rebalance::PrimaryRebalance>,
+    /// Shard 0: reports of the partitions this node leads, for metadata replies.
+    partition_status_outbox: primary_rebalance::PartitionStatusOutbox,
+    /// Shard 0: when stale directory reports were last dropped.
+    partition_directory_retained_at: Cell<Option<Instant>>,
+    /// Shard 0: where the next chunk of the directory sweep starts.
+    partition_directory_retain_cursor: Cell<Option<u64>>,
 
     /// Consecutive metadata superblock write failures tolerated before the
     /// process fail-stops. Defaults to 0 (disabled) so the simulator and tests
@@ -2152,6 +2182,9 @@ where
             partition_placement_cursor: Cell::new(None),
             partition_placement_owed: Cell::new(0),
             primary_rebalance: RefCell::default(),
+            partition_status_outbox: primary_rebalance::PartitionStatusOutbox::default(),
+            partition_directory_retained_at: Cell::new(None),
+            partition_directory_retain_cursor: Cell::new(None),
             superblock_wedged_fatal_failures: Cell::new(0),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
             metadata_transfer_attempts: Cell::new(0),
@@ -2436,6 +2469,15 @@ where
             );
         }
         (gathered, received == shard_count)
+    }
+
+    /// This node's id and the cluster's node count.
+    #[must_use]
+    pub const fn replica_topology(&self) -> ReplicaTopology {
+        ReplicaTopology::new(
+            self.partition_consensus.self_replica_id,
+            self.partition_consensus.replica_count,
+        )
     }
 
     /// Run a partition read on the shard owning `namespace` and await the reply.
@@ -3042,6 +3084,9 @@ where
             partition_placement_cursor: Cell::new(None),
             partition_placement_owed: Cell::new(0),
             primary_rebalance: RefCell::default(),
+            partition_status_outbox: primary_rebalance::PartitionStatusOutbox::default(),
+            partition_directory_retained_at: Cell::new(None),
+            partition_directory_retain_cursor: Cell::new(None),
             superblock_wedged_fatal_failures: Cell::new(0),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
             metadata_transfer_attempts: Cell::new(0),
@@ -3933,9 +3978,18 @@ where
         T: ShardsTable,
     {
         self.fence_rebalance_authority(&message);
+        if !self.partition_frame_source_is_member(&message) {
+            return;
+        }
         match message {
             MessageBag::PrimaryRebalance(message) => {
-                self.on_primary_rebalance(*message.header()).await;
+                let Some(statuses) =
+                    control_suffix_body_verified(&message, message.header().checksum_body)
+                        .and_then(|body| decode_status_entries(body).ok())
+                else {
+                    return;
+                };
+                self.on_primary_rebalance(*message.header(), statuses).await;
             }
             MessageBag::Request(request) => {
                 // One header read for the pair; `header()` casts on every call.
@@ -5173,16 +5227,19 @@ where
             created_view,
             first_initialization,
             consumer_offsets_max,
+            members,
         } = materialisation;
         let partitions = self.plane.partitions();
         if partitions.contains(&namespace) {
             return;
         }
 
-        let mut consensus = VsrConsensus::with_clock(
+        let members =
+            members.unwrap_or_else(|| ReplicaSet::all(self.partition_consensus.replica_count));
+        let mut consensus = VsrConsensus::with_members(
             self.partition_consensus.cluster_id,
             self.partition_consensus.self_replica_id,
-            self.partition_consensus.replica_count,
+            members,
             namespace.inner(),
             self.partition_consensus.bus.clone(),
             LocalPipeline::new(),
@@ -5193,8 +5250,7 @@ where
         // Recovered metadata can precede the group's first materialization;
         // missing retained history alone cannot distinguish that from data loss.
         consensus.set_recovery_election_allowed(first_initialization || retained.is_some());
-        let restarted = (retained.is_some() || !first_initialization)
-            && self.partition_consensus.replica_count > 1;
+        let restarted = (retained.is_some() || !first_initialization) && members.len() > 1;
         let consensus::FreshGroupStart {
             join,
             view_fallback,
@@ -5266,7 +5322,7 @@ where
         // Match production's solo reservation handling. A replicated WAL may
         // retain a suffix the next view discards; anchoring at its dirty offset
         // would prevent truncation from restoring the earlier append point.
-        if self.partition_consensus.replica_count == 1 && !partition.durability().is_persisted() {
+        if members.len() == 1 && !partition.durability().is_persisted() {
             partition.reanchor_in_memory_to_mint_frontier(partitions.config().segment_size);
         }
         partitions.insert(namespace, partition);
@@ -5774,7 +5830,7 @@ where
                 peer,
                 "adopted a live view while awaiting transfer; requesting partition state transfer"
             );
-            if self.peer_is_known(peer, "StartView") {
+            if self.member_is_known(partition.consensus().replica_count(), peer, "StartView") {
                 let _ = self
                     .arm_partition_transfer(partition, peer, transfers_inflight)
                     .await;
@@ -5981,7 +6037,6 @@ where
         M: StreamsFrontend,
     {
         let header = *msg.header();
-        let target = header.replica;
         // Snapshot the config-overridable chunk ceiling once; both plane
         // branches below serve the same per-round window.
         let repair_chunk_max = self.repair_chunk_max.get();
@@ -5989,6 +6044,9 @@ where
         if let Some(ref consensus) = planes.0.consensus
             && consensus.group() == header.group
         {
+            let Some(target) = consensus.members().node(header.replica) else {
+                return;
+            };
             // A primary-elect can need bodies held only by ViewChange peers.
             // Other requesters may receive only those peers' committed prefix.
             if consensus.is_transferring() {
@@ -6116,6 +6174,9 @@ where
         {
             return;
         }
+        let Some(target) = partition.consensus().members().node(header.replica) else {
+            return;
+        };
         let cluster = partition.consensus().cluster();
         let self_id = partition.consensus().replica();
         // The frontier bounds the serve, not `commit_max` alone, mirroring the
@@ -6788,7 +6849,11 @@ where
                         );
                         // Same reason as the StartView arm: this id becomes
                         // `session.peer` and later reaches the peer rotation.
-                        if self.peer_is_known(header.replica, "RepairRangeReply") {
+                        if self.member_is_known(
+                            partition.consensus().replica_count(),
+                            header.replica,
+                            "RepairRangeReply",
+                        ) {
                             partition.consensus().begin_state_transfer_await();
                             let _ = self
                                 .arm_partition_transfer(
@@ -6911,9 +6976,8 @@ where
                 h.size = size_of::<RequestPreparesHeader>() as u32;
                 h.seal();
             });
-        if self
-            .bus
-            .send_to_replica(target, msg.into_generic().into_frozen())
+        if consensus
+            .send_to_member(target, msg.into_generic().into_frozen())
             .await
             .is_err()
         {
@@ -6940,7 +7004,7 @@ where
     /// served-through watermark past a failed send, or the terminating
     /// `RepairDone` reports ops that were never delivered.
     #[allow(clippy::future_not_send)]
-    async fn send_repair_prepare(&self, target: u8, entry: Frozen<MESSAGE_ALIGN>) -> bool
+    async fn send_repair_prepare(&self, node: u8, entry: Frozen<MESSAGE_ALIGN>) -> bool
     where
         B: MessageBus,
     {
@@ -6956,7 +7020,7 @@ where
             return false;
         };
         self.bus
-            .send_to_replica(target, message.into_frozen())
+            .send_to_replica(node, message.into_frozen())
             .await
             .is_ok()
     }
@@ -6967,7 +7031,7 @@ where
         &self,
         cluster: u128,
         self_id: u8,
-        target: u8,
+        node: u8,
         command: Command,
         nonce: u128,
         op: u64,
@@ -6990,7 +7054,7 @@ where
             });
         let _ = self
             .bus
-            .send_to_replica(target, msg.into_generic().into_frozen())
+            .send_to_replica(node, msg.into_generic().into_frozen())
             .await;
     }
 
@@ -7684,9 +7748,8 @@ where
                     h.size = size_of::<RequestStateTransferHeader>() as u32;
                     h.seal();
                 });
-        let _ = self
-            .bus
-            .send_to_replica(target, msg.into_generic().into_frozen())
+        let _ = consensus
+            .send_to_member(target, msg.into_generic().into_frozen())
             .await;
     }
 
@@ -7703,6 +7766,7 @@ where
         &self,
         cluster: u128,
         self_id: u8,
+        members: ReplicaSet,
         target: u8,
         nonce: u128,
         namespace: u64,
@@ -7740,9 +7804,12 @@ where
             }
             h.seal();
         });
+        let Some(node) = members.node(target) else {
+            return;
+        };
         let _ = self
             .bus
-            .send_to_replica(target, msg.into_generic().into_frozen())
+            .send_to_replica(node, msg.into_generic().into_frozen())
             .await;
     }
 
@@ -7755,6 +7822,7 @@ where
         &self,
         cluster: u128,
         self_id: u8,
+        members: ReplicaSet,
         target: u8,
         nonce: u128,
         namespace: u64,
@@ -7779,9 +7847,12 @@ where
                 h.size = size_of::<RequestStateChunkHeader>() as u32;
                 h.seal();
             });
+        let Some(node) = members.node(target) else {
+            return;
+        };
         let _ = self
             .bus
-            .send_to_replica(target, msg.into_generic().into_frozen())
+            .send_to_replica(node, msg.into_generic().into_frozen())
             .await;
     }
 
@@ -7844,6 +7915,7 @@ where
             self.send_state_transfer_target(
                 cluster,
                 self_id,
+                *consensus.members(),
                 header.replica,
                 header.nonce,
                 header.group,
@@ -7873,6 +7945,7 @@ where
                 self.send_state_transfer_target(
                     cluster,
                     self_id,
+                    *consensus.members(),
                     header.replica,
                     header.nonce,
                     header.group,
@@ -7909,6 +7982,7 @@ where
                 self.send_state_transfer_target(
                     cluster,
                     self_id,
+                    *consensus.members(),
                     header.replica,
                     header.nonce,
                     header.group,
@@ -8152,6 +8226,7 @@ where
             self.send_request_state_chunk(
                 consensus.cluster(),
                 consensus.replica(),
+                *consensus.members(),
                 peer,
                 nonce,
                 consensus.group(),
@@ -8342,6 +8417,7 @@ where
         };
         let cluster = consensus.cluster();
         let self_id = consensus.replica();
+        let members = *consensus.members();
 
         // Never serve a frame the receiving transport will reject: anything past
         // `max_message_size` tears down the whole replica connection, which reads
@@ -8418,10 +8494,12 @@ where
         };
         match reply {
             Some(ChunkReply::Chunk(chunk)) => {
-                let _ = self
-                    .bus
-                    .send_to_replica(header.replica, chunk.into_generic().into_frozen())
-                    .await;
+                if let Some(node) = members.node(header.replica) {
+                    let _ = self
+                        .bus
+                        .send_to_replica(node, chunk.into_generic().into_frozen())
+                        .await;
+                }
             }
             Some(ChunkReply::Unavailable { transient }) => {
                 tracing::info!(
@@ -8433,6 +8511,7 @@ where
                 self.send_state_transfer_target(
                     cluster,
                     self_id,
+                    *consensus.members(),
                     header.replica,
                     header.nonce,
                     header.group,
@@ -8785,10 +8864,27 @@ where
         let mut repair_ring_entries = 0usize;
         let mut repair_ring_bytes = 0u64;
         let mut untrusted_logs = 0usize;
+        let mut under_replicated = 0usize;
+        let mut below_write_quorum = 0usize;
+        let mut owing_retirement = 0usize;
+        // The replication gauges are scraped, not driven: once per report
+        // interval keeps the per-member clock reads off every tick.
+        let replication_due =
+            u128::from(self.ticks.get()).is_multiple_of(PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS);
         for namespace in namespace_scratch.iter() {
             if let Some(partition) = partitions.get_mut_by_ns(namespace) {
                 partition.drive_persistence().await;
-                untrusted_logs += usize::from(partition.consensus().has_untrusted_log());
+                let consensus = partition.consensus();
+                untrusted_logs += usize::from(consensus.has_untrusted_log());
+                owing_retirement +=
+                    usize::from(replication_due && partition.owes_session_retirement());
+                if replication_due
+                    && let Some(in_sync) = consensus.in_sync_members(consensus::MEMBER_LAG_MAX)
+                {
+                    under_replicated += usize::from(in_sync < consensus.replica_count());
+                    below_write_quorum +=
+                        usize::from(usize::from(in_sync) < consensus.quorum_replication());
+                }
                 let (entries, bytes) = partition.repair_ring_occupancy();
                 repair_ring_entries += entries;
                 repair_ring_bytes += bytes;
@@ -8815,6 +8911,12 @@ where
         self.metrics
             .set_repair_ring(repair_ring_entries, repair_ring_bytes);
         self.metrics.set_partitions_untrusted_log(untrusted_logs);
+        if replication_due {
+            self.metrics
+                .set_partition_replication(under_replicated, below_write_quorum);
+            self.metrics
+                .set_partitions_owing_retirement(owing_retirement);
+        }
 
         // Counted at most ONCE per sweep and only if a re-arm actually fires,
         // then tracked locally as arms land. Counting per namespace is a full
@@ -9480,6 +9582,7 @@ where
         let visited = owed.min(namespaces.len()).min(batch);
         let partitions = self.plane.partitions();
         let mut reports = Vec::with_capacity(visited);
+        let mut statuses = Vec::new();
         for namespace in namespaces[start..]
             .iter()
             .chain(&namespaces[..start])
@@ -9501,11 +9604,24 @@ where
                     created_revision: partition.created_revision(),
                     view,
                 });
+                if consensus.is_primary() {
+                    let stats = &partition.stats;
+                    statuses.push(PartitionStatusEntry {
+                        namespace: namespace.inner(),
+                        created_revision: partition.created_revision(),
+                        view,
+                        commit: consensus.commit_min(),
+                        current_offset: stats.current_offset(),
+                        messages_count: stats.messages_count_inconsistent(),
+                        size_bytes: stats.size_bytes_inconsistent(),
+                        segments_count: stats.segments_count_inconsistent(),
+                    });
+                }
             }
         }
         if !reports.is_empty()
             && let Err(error) = sender.try_send(ShardFrame::lifecycle(
-                LifecycleFrame::PartitionPlacementViews(reports),
+                LifecycleFrame::PartitionPlacementViews(reports, statuses),
             ))
         {
             self.metrics.record_frame_drop(
@@ -9603,12 +9719,6 @@ where
         B: MessageBus,
     {
         let header = *msg.header();
-        // Before anything keyed by the requester: the offer map's documented
-        // bound is the replica count, and an unvalidated id makes it 256 entries
-        // per served group, each pinning an offer for its full expiry.
-        if !self.peer_is_known(header.replica, "RequestStateTransfer") {
-            return;
-        }
         let planes = self.plane.inner();
         let config = planes.1.0.config().clone();
         let Some(partition) = planes
@@ -9622,6 +9732,16 @@ where
             partition,
             header.partition_incarnation,
             Command::RequestStateTransfer,
+        ) {
+            return;
+        }
+        // Before anything keyed by the requester: an unvalidated id makes the
+        // offer map 256 entries per served group, each pinning an offer for its
+        // full expiry.
+        if !self.member_is_known(
+            partition.consensus().replica_count(),
+            header.replica,
+            "RequestStateTransfer",
         ) {
             return;
         }
@@ -9681,6 +9801,7 @@ where
                 self.send_state_transfer_target(
                     cluster,
                     self_id,
+                    *partition.consensus().members(),
                     header.replica,
                     header.nonce,
                     header.group,
@@ -9752,6 +9873,7 @@ where
                         self.send_state_transfer_target(
                             cluster,
                             self_id,
+                            *partition.consensus().members(),
                             header.replica,
                             header.nonce,
                             header.group,
@@ -9777,6 +9899,7 @@ where
         self.send_state_transfer_target(
             cluster,
             self_id,
+            *partition.consensus().members(),
             header.replica,
             header.nonce,
             header.group,
@@ -9816,10 +9939,6 @@ where
         }
 
         let header = *msg.header();
-        // The requester id keys the offer map, whose bound is the replica count.
-        if !self.peer_is_known(header.replica, "RequestStateChunk") {
-            return;
-        }
         let planes = self.plane.inner();
         let Some(partition) = planes.1.0.get_by_ns(&IggyNamespace::from_raw(header.group)) else {
             return;
@@ -9831,8 +9950,17 @@ where
         ) {
             return;
         }
+        // The requester id keys the offer map, whose bound is the group size.
+        if !self.member_is_known(
+            partition.consensus().replica_count(),
+            header.replica,
+            "RequestStateChunk",
+        ) {
+            return;
+        }
         let cluster = partition.consensus().cluster();
         let self_id = partition.consensus().replica();
+        let members = *partition.consensus().members();
         let serving_view = partition.consensus().view();
         let serving_commit_max = partition.consensus().commit_max();
         let chunk_len_max = self.state_chunk_len_max();
@@ -9981,10 +10109,12 @@ where
         };
         match reply {
             Some(ChunkReply::Chunk(chunk)) => {
-                let _ = self
-                    .bus
-                    .send_to_replica(header.replica, chunk.into_generic().into_frozen())
-                    .await;
+                if let Some(node) = members.node(header.replica) {
+                    let _ = self
+                        .bus
+                        .send_to_replica(node, chunk.into_generic().into_frozen())
+                        .await;
+                }
             }
             Some(ChunkReply::Unavailable { transient }) => {
                 tracing::info!(
@@ -9997,6 +10127,7 @@ where
                 self.send_state_transfer_target(
                     cluster,
                     self_id,
+                    *partition.consensus().members(),
                     header.replica,
                     header.nonce,
                     header.group,
@@ -10116,15 +10247,8 @@ where
             .evict_namespace(namespace);
     }
 
-    /// Whether a peer-supplied source replica id names a replica of this
-    /// cluster.
-    ///
-    /// `header.replica` arrives unvalidated on every frame, and the partition
-    /// transfer paths turn it into ring arithmetic ([`next_transfer_peer`], where
-    /// id 255 panics in debug and wraps to replica 0 in release -- a silent
-    /// retarget) and into the served-offer map key, whose documented bound is the
-    /// replica count rather than 256 entries per served group. One check at the
-    /// frame's ingress closes both.
+    /// Whether a peer-supplied source node id names a node of this cluster.
+    /// Partition frames carry member indices instead; see [`Self::member_is_known`].
     fn peer_is_known(&self, replica: u8, frame: &'static str) -> bool {
         let replica_count = self.partition_consensus.replica_count;
         if replica < replica_count {
@@ -10135,7 +10259,46 @@ where
             frame,
             replica,
             replica_count,
-            "dropping a partition frame whose source replica is outside this cluster"
+            "dropping a frame whose source replica is outside this cluster"
+        );
+        false
+    }
+
+    /// Whether a partition-group frame names a sender inside its group, as far
+    /// as this shard knows the group. Every consensus handler indexes per-member
+    /// state by that field.
+    fn partition_frame_source_is_member(&self, message: &MessageBag) -> bool {
+        let Some(replica) = message.partition_source_replica() else {
+            return true;
+        };
+        let (_, group) = message.routing();
+        let Some(group_size) = self
+            .plane
+            .partitions()
+            .get_by_ns(&IggyNamespace::from_raw(group))
+            .map(|partition| partition.consensus().replica_count())
+        else {
+            return true;
+        };
+        self.member_is_known(group_size, replica, "partition consensus frame")
+    }
+
+    /// Whether a peer-supplied member index names a replica of a partition
+    /// group of `group_size` members.
+    ///
+    /// `header.replica` arrives unvalidated, and the transfer paths turn it into
+    /// ring arithmetic ([`next_transfer_peer`]) and into the served-offer map
+    /// key, whose bound is the group size.
+    fn member_is_known(&self, group_size: u8, replica: u8, frame: &'static str) -> bool {
+        if replica < group_size {
+            return true;
+        }
+        tracing::warn!(
+            shard = self.id,
+            frame,
+            replica,
+            group_size,
+            "dropping a partition frame whose source replica is outside its group"
         );
         false
     }
@@ -10644,11 +10807,6 @@ where
         M: StreamsFrontend,
     {
         let header = *msg.header();
-        // The peer id reaches `next_transfer_peer`'s ring arithmetic through the
-        // re-arm below, so it is validated before anything uses it.
-        if !self.peer_is_known(header.replica, "StateTransferTarget") {
-            return;
-        }
         let planes = self.plane.inner();
         let Some(partition) = planes
             .1
@@ -10661,6 +10819,15 @@ where
             partition,
             header.partition_incarnation,
             Command::StateTransferTarget,
+        ) {
+            return;
+        }
+        // The peer id reaches `next_transfer_peer`'s ring arithmetic through the
+        // re-arm below, so it is validated before anything uses it.
+        if !self.member_is_known(
+            partition.consensus().replica_count(),
+            header.replica,
+            "StateTransferTarget",
         ) {
             return;
         }
@@ -11385,12 +11552,17 @@ where
         });
         let consensus_ids = {
             let consensus = partition.consensus();
-            (consensus.cluster(), consensus.replica())
+            (
+                consensus.cluster(),
+                consensus.replica(),
+                *consensus.members(),
+            )
         };
         if let Some((nonce, peer, artifact, offset, len)) = request {
             self.send_request_state_chunk(
                 consensus_ids.0,
                 consensus_ids.1,
+                consensus_ids.2,
                 peer,
                 nonce,
                 namespace,
@@ -13529,13 +13701,12 @@ async fn dispatch_vsr_actions<B, P, J>(
 {
     use std::mem::size_of;
 
-    let bus = consensus.message_bus();
     let self_id = consensus.replica();
     let cluster = consensus.cluster();
     let replica_count = consensus.replica_count();
 
     let send = |target: u8, msg: Frozen<MESSAGE_ALIGN>| async move {
-        if let Err(e) = bus.send_to_replica(target, msg).await {
+        if let Err(e) = consensus.send_to_member(target, msg).await {
             tracing::debug!(replica = self_id, target, "bus send failed: {e}");
         }
     };
@@ -13860,12 +14031,11 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
     P: Pipeline<Entry = consensus::PipelineEntry>,
     SB: SuperblockStore,
 {
-    let bus = consensus.message_bus();
     let self_id = consensus.replica();
     let journal = &partition.log.journal().inner;
 
     let send = |target: u8, msg: Frozen<MESSAGE_ALIGN>| async move {
-        if let Err(e) = bus.send_to_replica(target, msg).await {
+        if let Err(e) = consensus.send_to_member(target, msg).await {
             tracing::debug!(replica = self_id, target, "bus send failed: {e}");
         }
     };
@@ -17093,7 +17263,7 @@ mod partition_placement_tests {
     }
 
     fn receive(inbox: &Receiver<ShardFrame>) -> Vec<PartitionPlacementView> {
-        let ShardFrame::Lifecycle(LifecycleFrame::PartitionPlacementViews(reports)) =
+        let ShardFrame::Lifecycle(LifecycleFrame::PartitionPlacementViews(reports, _)) =
             inbox.try_recv().expect("placement report queued")
         else {
             panic!("expected partition placement observations");

@@ -174,6 +174,12 @@ fn owner_at<SB: SuperblockStore>(
 
 fn arm<SB: SuperblockStore>(shard: &TestShard<SB>, phase: MovePhase) -> PrimaryRebalanceHeader {
     let namespace = IggyNamespace::new(1, 1, 0);
+    // The coordinator names the source and target from the committed members.
+    shard.plane.metadata().mux_stm.streams().seed_namespace(
+        namespace,
+        namespace.inner(),
+        PARTITION_VIEW,
+    );
     let consensus = shard.plane.metadata().consensus.as_ref().unwrap();
     let mut probe = probe_header(consensus, NONCE);
     probe.namespace = namespace.inner();
@@ -253,7 +259,7 @@ async fn given_pending_target_probe_when_reply_is_stale_or_mismatched_should_not
             }
             _ => unreachable!(),
         }
-        shard.on_primary_rebalance(reply).await;
+        shard.on_primary_rebalance(reply, Vec::new()).await;
         assert!(
             inbox.try_recv().is_err(),
             "{changed} reply granted a transfer"
@@ -277,11 +283,11 @@ async fn given_primary_frontier_when_target_confirms_it_should_grant_the_source_
     source.commit = COMMITTED + 1;
     let mut wrong_source = source;
     wrong_source.replica = TARGET;
-    shard.on_primary_rebalance(wrong_source).await;
+    shard.on_primary_rebalance(wrong_source, Vec::new()).await;
     assert!(shard.bus.sent.borrow().is_empty());
     assert!(inbox.try_recv().is_err());
 
-    shard.on_primary_rebalance(source).await;
+    shard.on_primary_rebalance(source, Vec::new()).await;
     let (target, probe) = shard.bus.sent.borrow()[0];
     assert_eq!(target, TARGET);
     assert_eq!(probe.kind, PrimaryRebalanceKind::PartitionProbe);
@@ -289,14 +295,14 @@ async fn given_primary_frontier_when_target_confirms_it_should_grant_the_source_
     assert_eq!(probe.nonce, source.nonce);
     assert_eq!(probe.replica, 0);
     assert!(inbox.try_recv().is_err());
-    shard.on_primary_rebalance(source).await;
+    shard.on_primary_rebalance(source, Vec::new()).await;
     assert_eq!(shard.bus.sent.borrow().len(), 1);
 
     let mut reply = probe;
     reply.kind = PrimaryRebalanceKind::PartitionReply;
     reply.replica = TARGET;
     reply.ready = 1;
-    shard.on_primary_rebalance(reply).await;
+    shard.on_primary_rebalance(reply, Vec::new()).await;
     assert!(
         inbox.try_recv().is_err(),
         "the coordinator must not grant its own replica of the partition"
@@ -311,7 +317,7 @@ async fn given_primary_frontier_when_target_confirms_it_should_grant_the_source_
     assert_eq!(grant.created_revision, CREATED_REVISION);
     assert_eq!(grant.partition_view, PARTITION_VIEW);
     assert_eq!(grant.target, TARGET);
-    shard.on_primary_rebalance(reply).await;
+    shard.on_primary_rebalance(reply, Vec::new()).await;
     assert_eq!(
         shard.bus.sent.borrow().len(),
         2,
@@ -321,7 +327,7 @@ async fn given_primary_frontier_when_target_confirms_it_should_grant_the_source_
     let (source_node, source_inbox) =
         owner_at::<PingPongSuperblock>(None, source_replica, REPLICAS, METADATA_VIEW);
     let received_at = source_node.bus.monotonic_now();
-    source_node.on_primary_rebalance(grant).await;
+    source_node.on_primary_rebalance(grant, Vec::new()).await;
     let ShardFrame::Lifecycle(LifecycleFrame::PrimaryRebalance(frame)) =
         source_inbox.try_recv().unwrap()
     else {
@@ -362,7 +368,7 @@ async fn given_a_grant_frame_when_its_sender_is_not_the_ready_metadata_primary_s
             "not ready" => consensus.begin_view_probe(),
             _ => unreachable!(),
         }
-        source_node.on_primary_rebalance(grant).await;
+        source_node.on_primary_rebalance(grant, Vec::new()).await;
         assert_eq!(inbox.try_recv().is_ok(), changed == "none", "{changed}");
     }
 }
@@ -383,7 +389,7 @@ async fn given_the_coordinator_leads_the_partition_when_target_confirms_it_shoul
         pending.probe.partition_view = led_view;
     }
     reply.partition_view = led_view;
-    shard.on_primary_rebalance(reply).await;
+    shard.on_primary_rebalance(reply, Vec::new()).await;
     assert!(
         shard.bus.sent.borrow().is_empty(),
         "a local grant must not leave the node"
@@ -415,10 +421,10 @@ async fn given_target_rejection_when_reply_is_correlated_should_drop_the_move_an
     let (shard, inbox) = owner();
     let mut reply = arm(&shard, MovePhase::Probe);
     reply.ready = 0;
-    shard.on_primary_rebalance(reply).await;
+    shard.on_primary_rebalance(reply, Vec::new()).await;
     assert!(shard.primary_rebalance.borrow().pending.is_none());
     reply.ready = 1;
-    shard.on_primary_rebalance(reply).await;
+    shard.on_primary_rebalance(reply, Vec::new()).await;
     assert!(inbox.try_recv().is_err());
     assert!(shard.bus.sent.borrow().is_empty());
 }
@@ -512,7 +518,7 @@ async fn given_an_unsent_grant_when_the_coordinator_ticks_should_plan_again_befo
         .created_revision = views[0].created_revision;
 
     shard.bus.disconnected.set(true);
-    shard.on_primary_rebalance(reply).await;
+    shard.on_primary_rebalance(reply, Vec::new()).await;
     shard.bus.disconnected.set(false);
     assert!(shard.bus.sent.borrow().is_empty());
 
@@ -556,7 +562,7 @@ async fn given_pending_target_probe_when_metadata_authority_changes_should_not_g
         pin!(shard.dispatch_message(suspect_primary(METADATA_GROUP, METADATA_VIEW + 1), None));
     assert_eq!(futures::poll!(&mut dispatch), Poll::Pending);
     assert!(superblock.entered.get());
-    shard.on_primary_rebalance(reply).await;
+    shard.on_primary_rebalance(reply, Vec::new()).await;
     assert!(
         shard.bus.sent.borrow().is_empty(),
         "a reply handled during the suspension granted a move"
@@ -653,7 +659,7 @@ async fn given_a_new_authority_when_peers_have_not_answered_should_keep_them_eli
     let (replica, mut not_ready) = shard.bus.sent.borrow()[0];
     not_ready.replica = replica;
     not_ready.kind = PrimaryRebalanceKind::MetadataReply;
-    shard.on_primary_rebalance(not_ready).await;
+    shard.on_primary_rebalance(not_ready, Vec::new()).await;
     shard.tick_primary_rebalance().await;
     assert_eq!(eligible(), [true, false, true]);
 
@@ -695,6 +701,7 @@ fn given_health_challenge_when_reply_is_overdue_or_replayed_should_not_extend_re
             ready_at: Some(previous),
             answered_at: None,
             replied: false,
+            status_cursor: None,
         };
         let mut invalid = reply;
         match changed {
@@ -843,7 +850,7 @@ async fn given_three_or_five_replicas_when_a_quorum_answers_not_ready_should_cre
                 shard.primary_rebalance.borrow_mut().peers[usize::from(peer)].sent_at =
                     Some(epoch + Duration::from_secs(2));
             }
-            shard.on_primary_rebalance(reply).await;
+            shard.on_primary_rebalance(reply, Vec::new()).await;
             assert_eq!(
                 frontier.partition_requests_allowed(shard.bus.monotonic_now()),
                 replicas == 3 || peer == 2
@@ -918,7 +925,7 @@ async fn given_admission_opening_when_peers_answered_earlier_probes_should_repro
 
     primary.tick_primary_rebalance().await;
     advance(10);
-    primary.on_primary_rebalance(answer(0)).await;
+    primary.on_primary_rebalance(answer(0), Vec::new()).await;
     assert!(
         primary
             .plane
@@ -941,13 +948,13 @@ async fn given_admission_opening_when_peers_answered_earlier_probes_should_repro
     );
 
     let backup_frontier = backup.plane.metadata().applied_frontier();
-    backup.on_primary_rebalance(sent(0).1).await;
+    backup.on_primary_rebalance(sent(0).1, Vec::new()).await;
     assert!(!backup_frontier.partition_requests_allowed(backup.bus.monotonic_now()));
-    backup.on_primary_rebalance(reprobe).await;
+    backup.on_primary_rebalance(reprobe, Vec::new()).await;
     assert!(backup_frontier.partition_requests_allowed(backup.bus.monotonic_now()));
 
     advance(30);
-    primary.on_primary_rebalance(answer(1)).await;
+    primary.on_primary_rebalance(answer(1), Vec::new()).await;
     advance(40);
     primary.tick_primary_rebalance().await;
     assert_eq!(primary.bus.sent.borrow().len(), 4);
@@ -959,8 +966,8 @@ async fn given_admission_opening_when_peers_answered_earlier_probes_should_repro
     );
 
     advance(50);
-    primary.on_primary_rebalance(answer(2)).await;
-    primary.on_primary_rebalance(answer(3)).await;
+    primary.on_primary_rebalance(answer(2), Vec::new()).await;
+    primary.on_primary_rebalance(answer(3), Vec::new()).await;
     advance(60);
     primary.tick_primary_rebalance().await;
     assert_eq!(
@@ -982,8 +989,8 @@ async fn given_backup_credit_when_probes_are_stale_replayed_or_lack_evidence_sho
     probe.quorum_age_ns = 0;
     let mut previous = probe;
     previous.nonce -= 1;
-    shard.on_primary_rebalance(previous).await;
-    shard.on_primary_rebalance(probe).await;
+    shard.on_primary_rebalance(previous, Vec::new()).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
     assert!(frontier.partition_requests_allowed(epoch));
     shard.bus.now.set(Some(epoch + Duration::from_secs(1)));
     for altered in ["replay", "reordered", "view", "cluster", "primary"] {
@@ -996,38 +1003,38 @@ async fn given_backup_credit_when_probes_are_stale_replayed_or_lack_evidence_sho
             "primary" => invalid.replica = 2,
             _ => unreachable!(),
         }
-        shard.on_primary_rebalance(invalid).await;
+        shard.on_primary_rebalance(invalid, Vec::new()).await;
         assert!(
             !frontier.partition_requests_allowed(epoch + Duration::from_secs(8)),
             "{altered}"
         );
     }
     shard.primary_rebalance.borrow_mut().reset_authority();
-    shard.on_primary_rebalance(probe).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
     assert!(!frontier.partition_requests_allowed(epoch + Duration::from_secs(8)));
     probe.nonce += 1;
     probe.quorum_age_ns = PrimaryRebalanceHeader::NO_QUORUM_EVIDENCE;
-    shard.on_primary_rebalance(probe).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
     probe.quorum_age_ns = 0;
-    shard.on_primary_rebalance(probe).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
     assert!(
         !frontier.partition_requests_allowed(epoch + Duration::from_secs(8)),
         "an absent-evidence probe is consumed too"
     );
     probe.nonce += 1;
     probe.quorum_age_ns = u64::try_from(Duration::from_secs(8).as_nanos()).unwrap();
-    shard.on_primary_rebalance(probe).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
     assert!(!frontier.partition_requests_allowed(epoch + Duration::from_secs(8)));
     probe.nonce += 1;
     probe.quorum_age_ns = u64::try_from(Duration::from_secs(1).as_nanos()).unwrap();
-    shard.on_primary_rebalance(probe).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
     assert!(
         !frontier.partition_requests_allowed(epoch + Duration::from_secs(8)),
         "receipt must not hide the advertised evidence age"
     );
     probe.nonce += 1;
     probe.quorum_age_ns = 0;
-    shard.on_primary_rebalance(probe).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
     assert!(frontier.partition_requests_allowed(epoch + Duration::from_secs(8)));
     assert!(!frontier.partition_requests_allowed(epoch + Duration::from_secs(9)));
 }
@@ -1067,20 +1074,20 @@ async fn given_an_adopted_view_when_its_head_is_not_applied_and_advertised_shoul
     probe.quorum_age_ns = 0;
     probe.commit = COMMITTED - 1;
     frontier.advance(COMMITTED - 1);
-    shard.on_primary_rebalance(probe).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
     assert!(!frontier.partition_requests_allowed(epoch));
     probe.nonce += 1;
     probe.commit = COMMITTED;
-    shard.on_primary_rebalance(probe).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
     assert!(!frontier.partition_requests_allowed(epoch));
     frontier.advance(COMMITTED);
-    shard.on_primary_rebalance(probe).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
     assert!(
         !frontier.partition_requests_allowed(epoch),
         "an earlier discarded packet cannot become fresh by replay"
     );
     probe.nonce += 1;
-    shard.on_primary_rebalance(probe).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
     assert!(frontier.partition_requests_allowed(epoch));
 }
 
@@ -1127,7 +1134,7 @@ async fn given_a_delayed_probe_when_crediting_a_backup_should_age_its_evidence_f
     let mut probe = probe_header(consensus, NONCE);
     probe.replica = 0;
     probe.quorum_age_ns = 0;
-    shard.on_primary_rebalance(probe).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
     assert!(
         !frontier.partition_requests_allowed(epoch),
         "nothing bounds when the first probe of a view left the primary"
@@ -1135,7 +1142,7 @@ async fn given_a_delayed_probe_when_crediting_a_backup_should_age_its_evidence_f
     let transit = Duration::from_secs(3);
     shard.bus.now.set(Some(epoch + transit));
     probe.nonce += 1;
-    shard.on_primary_rebalance(probe).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
     assert!(
         frontier.partition_requests_allowed(
             (epoch + window)
@@ -1172,7 +1179,7 @@ async fn given_an_overdue_probe_when_probing_again_should_withhold_evidence_unti
 
     shard.tick_primary_rebalance().await;
     advance(10);
-    shard.on_primary_rebalance(answer(0)).await;
+    shard.on_primary_rebalance(answer(0), Vec::new()).await;
     advance(3_100);
     shard.tick_primary_rebalance().await;
     assert_eq!(sent(2).0, 1);
@@ -1183,9 +1190,37 @@ async fn given_an_overdue_probe_when_probing_again_should_withhold_evidence_unti
         "the overdue probe can still reach the peer after this one"
     );
     advance(3_200);
-    shard.on_primary_rebalance(answer(3)).await;
+    shard.on_primary_rebalance(answer(3), Vec::new()).await;
     advance(4_200);
     shard.tick_primary_rebalance().await;
     assert_eq!(sent(4).0, 2);
     assert!(carries_evidence(4), "the reply restores the evidence");
+}
+
+#[test]
+fn given_outbox_reports_when_a_partition_stops_being_refreshed_should_evict_only_it() {
+    let status = |namespace| PartitionStatusEntry {
+        namespace,
+        created_revision: 1,
+        view: 0,
+        commit: 0,
+        current_offset: 0,
+        messages_count: 0,
+        size_bytes: 0,
+        segments_count: 1,
+    };
+    let outbox = PartitionStatusOutbox::default();
+    let start = Instant::now();
+    outbox.record(&[status(1), status(2)], start);
+    outbox.record(&[status(2)], start + PROBE_INTERVAL);
+    outbox.evict_stale(start + OUTBOX_REPORT_MAX_AGE);
+    assert_eq!(
+        outbox.namespaces(),
+        [2],
+        "a report no publish refreshed names a partition this node stopped leading"
+    );
+    assert_eq!(outbox.next_batch(4), [status(2)]);
+    outbox.record(&[status(3)], start + OUTBOX_REPORT_MAX_AGE);
+    assert_eq!(outbox.next_batch(1), [status(3)]);
+    assert_eq!(outbox.next_batch(1), [status(2)], "the cursor wraps");
 }

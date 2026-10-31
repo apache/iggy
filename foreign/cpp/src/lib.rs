@@ -690,6 +690,8 @@ mod ffi {
         size_of_messages_required_to_save: u64,
         has_preallocate_segments: bool,
         preallocate_segments: bool,
+        has_replication_factor: bool,
+        replication_factor: u32,
         has_partition_resize_policy: bool,
         partition_resize_policy: String,
         raw_options: Vec<HeaderEntry>,

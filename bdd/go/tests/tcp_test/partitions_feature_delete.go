@@ -51,7 +51,7 @@ var _ = ginkgo.Describe("DELETE PARTITION:", func() {
 			client := createAuthorizedConnection()
 			err := client.DeletePartitions(
 				context.Background(),
-				randomU32Identifier(),
+				nonExistingStreamIdentifier(client),
 				randomU32Identifier(),
 				10,
 			)

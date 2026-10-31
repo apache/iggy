@@ -21,7 +21,7 @@ use crate::change_log::{
     AppliedChange, ChangeLogCapacities, ChangeLogSnapshot, CurrentState, MetadataChangeLog,
     change_actor, change_page, current_page, session_closed, session_registered, session_revoked,
 };
-use crate::impls::placement::PlacementState;
+use crate::impls::placement::{PlacementCounts, PlacementState};
 use crate::stm::authz::{
     PartitionsCreate, admits_partitions_create, gated_apply, reject_stale_session,
 };
@@ -60,7 +60,7 @@ use iggy_binary_protocol::requests::streams::{
     UpdateStreamResolvedRequest,
 };
 use iggy_binary_protocol::requests::system::{
-    FinalizeSessionRequest, ResourceTarget, SessionIdentity, UpdateResourceRequest,
+    FinalizeSessionRequest, ResourceTarget, RetirementDebt, SessionIdentity, UpdateResourceRequest,
 };
 use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopicRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
@@ -77,11 +77,11 @@ use iggy_common::calculate_checksum;
 use iggy_common::variadic;
 use iggy_common::wire_conversions::{resource_options_from_wire, resource_options_to_wire};
 use iggy_common::{
-    HeaderKey, IggyError, MetadataChangeStart, MetadataChangesQuery, OptionAdmissionContext,
-    OptionKey, OptionOperation, OptionValue, OptionVisibility, OptionsProvenance, OptionsScope,
-    ResourceOptions, ServerKeyContext, TopicCreateOptions, TopicResolvedOptions, UserId, admit,
-    critical_keys_marker, derived_defaults, stream_wrap_set, topic_option_keys,
-    validate_topic_segment_size,
+    DEFAULT_REPLICATION_FACTOR, HeaderKey, HeaderValue, IggyError, MetadataChangeStart,
+    MetadataChangesQuery, OptionAdmissionContext, OptionKey, OptionOperation, OptionValue,
+    OptionVisibility, OptionsProvenance, OptionsScope, ResourceOptions, ServerKeyContext,
+    TopicCreateOptions, TopicResolvedOptions, UserId, admit, critical_keys_marker,
+    derived_defaults, stream_wrap_set, topic_option_keys, validate_topic_segment_size,
 };
 use journal::local_gate::LocalGate;
 use journal::superblock::{
@@ -902,8 +902,9 @@ pub struct CommittedApply {
 /// The backup commit walk's per-op logic, shared so the simulator's WAL
 /// reconstruction reaches identical state from the same log through one apply path.
 /// Register creates an identity or resolves its matching retry. Logout ends the
-/// exact session and rebalances its memberships; `FinalizeSession` removes it after
-/// partition retirement. Every other op applies to the state
+/// exact session and rebalances its memberships; `FinalizeSession` removes it once
+/// every partition group retired it or records that group's retirement debt. Every
+/// other op applies to the state
 /// machine and caches the reply for at-most-once dedup. `fire_notifier` runs the
 /// post-commit hook (a no-op during reconstruction, before it is wired). Returns
 /// the committed reply without advancing `commit_min`; the caller owns that counter.
@@ -1058,11 +1059,13 @@ where
                 "invalid session finalization",
             )
         });
-        if table_mutations_allowed
-            && mux_stm.streams().read(|inner| inner.namespace_revision)
-                == request.namespace_revision
-        {
-            client_table.borrow_mut().finalize_session(request.identity);
+        if mux_stm.streams().read(|inner| inner.namespace_revision) == request.namespace_revision {
+            if table_mutations_allowed {
+                client_table.borrow_mut().finalize_session(request.identity);
+            }
+            mux_stm
+                .streams()
+                .record_retirement_debt(&request.debt, header.op);
         }
         return CommittedApply {
             reply: build_reply_message(&header, &bytes::Bytes::new()),
@@ -3240,8 +3243,9 @@ where
             .map_err(|Canceled| MetadataSubmitError::Canceled)
     }
 
-    /// Finalize only after the caller proves a quorum has retired this exact
-    /// ended session in every currently allocated partition group.
+    /// Finalize once every currently allocated partition group either proved
+    /// this exact ended session retired on a quorum of its members or is
+    /// listed in `debt`, which its next primary pays before serving sessions.
     ///
     /// # Errors
     /// Returns an admission or consensus error before finalization commits.
@@ -3250,6 +3254,7 @@ where
         &self,
         identity: SessionIdentity,
         namespace_revision: u64,
+        debt: Vec<RetirementDebt>,
     ) -> Result<Option<u64>, MetadataSubmitError> {
         let consensus = self
             .consensus
@@ -3293,6 +3298,7 @@ where
                 &FinalizeSessionRequest {
                     identity,
                     namespace_revision,
+                    debt,
                 }
                 .to_bytes(),
             ),
@@ -4802,7 +4808,7 @@ where
         Ok(())
     }
 
-    fn placement_counts(&self) -> Result<Vec<u64>, IggyError> {
+    fn placement_counts(&self) -> Result<PlacementCounts, IggyError> {
         let headers = self.pending_placement_headers()?;
         let consensus = self.consensus.as_ref().unwrap();
         let mut placement = self.placement.borrow_mut();
@@ -4812,6 +4818,38 @@ where
             placement.add_reservation(&header, &mut counts)?;
         }
         Ok(counts)
+    }
+
+    /// The committed topic's replication factor. `None` for a topic created
+    /// before replication factors, or one that does not exist. A topic not
+    /// committed yet refuses transiently while a create waits in the pipeline:
+    /// that create may be the one named, and its factor is unknown until it
+    /// commits.
+    fn committed_replication_factor(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+    ) -> Result<Option<u8>, IggyError> {
+        let committed = self.mux_stm.streams().read(|inner| {
+            let stream = inner.resolve_stream_id(stream_id)?;
+            let topic = inner.resolve_topic_id(stream, topic_id)?;
+            let topic = inner.items.get(stream)?.topics.get(topic)?;
+            Some(TopicCreateOptions::from_resource_options(&topic.options).replication_factor)
+        });
+        let Some(factor) = committed else {
+            let creating_topic = self
+                .pending_placement_headers()?
+                .iter()
+                .any(|header| header.operation == Operation::CreateTopicWithAssignments);
+            return if creating_topic {
+                Err(IggyError::TransientNotAccepted)
+            } else {
+                Ok(None)
+            };
+        };
+        factor
+            .map(|factor| u8::try_from(factor).map_err(|_| IggyError::InvalidReplicationFactor))
+            .transpose()
     }
 
     /// Partitions the creates in the prepare pipeline add when they commit.
@@ -4939,7 +4977,13 @@ where
                 // canonicalizes kinds (a `"128MiB"` string becomes `Uint64`).
                 request.options =
                     resource_options_to_wire(&admitted.explicit, OptionsProvenance::All)?;
-                let derived = derived_defaults(OptionsScope::Topic, &admitted.explicit)?;
+                let mut derived = derived_defaults(OptionsScope::Topic, &admitted.explicit)?;
+                let replication_factor = resolve_replication_factor(
+                    TopicCreateOptions::from_resource_options(&admitted.explicit)
+                        .replication_factor,
+                    consensus.replica_count(),
+                    &mut derived,
+                )?;
                 let mut stored = derived.clone();
                 stored.extend(admitted.explicit.clone());
                 let resolved = TopicResolvedOptions::from(&stored);
@@ -4968,14 +5012,17 @@ where
                     .into_iter()
                     .enumerate()
                     .map(|(partition_id, consensus_group_id)| {
+                        let (members, initial_view) = self.placement.borrow().select(
+                            &mut counts,
+                            consensus.view(),
+                            Some(replication_factor),
+                        )?;
                         Ok(CreatedPartitionAssignment {
                             partition_id: u32::try_from(partition_id)
                                 .map_err(|_| IggyError::InvalidCommand)?,
                             consensus_group_id,
-                            initial_view: self
-                                .placement
-                                .borrow()
-                                .select(&mut counts, consensus.view())?,
+                            initial_view,
+                            members,
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -4999,7 +5046,11 @@ where
                 // `CreatePartitionsResult::{Stream,Topic}NotFound`. A preflight
                 // read here would decide against possibly-uncommitted state and
                 // drop without a reply (TOCTOU + wedge). See the metadata
-                // validation design doc.
+                // validation design doc. The replication factor comes from the
+                // committed topic: a missing topic gets no member list, and
+                // apply answers it with `TopicNotFound`.
+                let replication_factor =
+                    self.committed_replication_factor(&request.stream_id, &request.topic_id)?;
                 let mut counts = self.placement_counts()?;
                 let partitions = self
                     .allocator
@@ -5007,14 +5058,17 @@ where
                     .into_iter()
                     .enumerate()
                     .map(|(offset, consensus_group_id)| {
+                        let (members, initial_view) = self.placement.borrow().select(
+                            &mut counts,
+                            consensus.view(),
+                            replication_factor,
+                        )?;
                         Ok(CreatedPartitionAssignment {
                             partition_id: u32::try_from(offset)
                                 .map_err(|_| IggyError::InvalidCommand)?,
                             consensus_group_id,
-                            initial_view: self
-                                .placement
-                                .borrow()
-                                .select(&mut counts, consensus.view())?,
+                            initial_view,
+                            members,
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -5463,6 +5517,34 @@ pub fn build_truncate_partition_client_message_with_identifiers(
             expected_history: None,
         },
     )
+}
+
+/// A new topic's replication factor: the explicit value, which must fit the
+/// cluster's `nodes`, or the catalog default lowered to `nodes`. The default is
+/// written back into `derived`, so the topic stores what placement used.
+fn resolve_replication_factor(
+    explicit: Option<u32>,
+    nodes: u8,
+    derived: &mut ResourceOptions,
+) -> Result<u8, IggyError> {
+    let factor = explicit.unwrap_or_else(|| {
+        let factor = DEFAULT_REPLICATION_FACTOR.min(u32::from(nodes));
+        derived.insert(
+            HeaderKey::from(OptionKey::ReplicationFactor),
+            OptionValue::derived(HeaderValue::from(factor)),
+        );
+        factor
+    });
+    match u8::try_from(factor) {
+        Ok(factor) if factor >= 1 && factor <= nodes => Ok(factor),
+        _ => {
+            debug!(
+                replication_factor = factor,
+                nodes, "refusing a topic whose replication factor the cluster cannot hold"
+            );
+            Err(IggyError::InvalidReplicationFactor)
+        }
+    }
 }
 
 /// Rewrite a generic patch into the resolved operation of its scope: the
@@ -7110,6 +7192,38 @@ mod tests {
     }
 
     #[test]
+    fn given_a_pending_create_topic_when_admitting_create_partitions_should_refuse_transiently() {
+        let add_partitions = || {
+            let body = WireCreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::named("pending").unwrap(),
+                partitions_count: 1,
+            }
+            .to_bytes();
+            pat_request(2, 1, Operation::CreatePartitions, &body)
+        };
+        let metadata = placement_metadata();
+        assert!(
+            metadata.prepare_request(add_partitions()).is_ok(),
+            "a topic nobody is creating is apply's TopicNotFound"
+        );
+
+        let metadata = placement_metadata();
+        let create = metadata
+            .prepare_request(placement_request(1, "pending", 2))
+            .unwrap();
+        metadata
+            .consensus
+            .as_ref()
+            .unwrap()
+            .pipeline_message(PlaneKind::Metadata, &create);
+        assert!(matches!(
+            metadata.prepare_request(add_partitions()),
+            Err(IggyError::TransientNotAccepted)
+        ));
+    }
+
+    #[test]
     fn given_rolled_back_placement_when_admitting_another_batch_should_release_reservations() {
         let metadata = placement_metadata();
         let consensus = metadata.consensus.as_ref().unwrap();
@@ -7656,7 +7770,19 @@ mod tests {
             }
         }
         assert!(!expected.is_empty(), "the topic catalog has defaulted rows");
+        // The factor default is lowered to this single-node cluster.
+        expected.insert(
+            HeaderKey::from(OptionKey::ReplicationFactor),
+            OptionValue::derived(HeaderValue::from(1u32)),
+        );
         assert_eq!(derived, expected);
+        assert!(
+            persisted
+                .partitions
+                .iter()
+                .all(|partition| partition.members == [0]),
+            "every partition lists the one node"
+        );
     }
 
     #[test]
@@ -8824,6 +8950,7 @@ mod tests {
                     partition_id: 0,
                     consensus_group_id: 1,
                     initial_view: view,
+                    members: Vec::new(),
                 }],
             },
             inner,
@@ -10435,7 +10562,7 @@ mod tests {
 
         assert!(
             metadata
-                .submit_session_finalization(identity, namespace_revision)
+                .submit_session_finalization(identity, namespace_revision, Vec::new())
                 .await
                 .unwrap()
                 .is_some(),
@@ -10480,6 +10607,7 @@ mod tests {
                     partition_id: 1,
                     consensus_group_id: 2,
                     initial_view: 0,
+                    members: Vec::new(),
                 }],
             }
             .to_bytes(),
@@ -10492,7 +10620,7 @@ mod tests {
         assert_ne!(current_revision, revision);
         assert_eq!(
             metadata
-                .submit_session_finalization(identity, revision)
+                .submit_session_finalization(identity, revision, Vec::new())
                 .await
                 .unwrap(),
             None
@@ -10509,6 +10637,7 @@ mod tests {
                     &FinalizeSessionRequest {
                         identity,
                         namespace_revision: reported_revision,
+                        debt: Vec::new(),
                     }
                     .to_bytes(),
                 ),
@@ -10527,6 +10656,107 @@ mod tests {
                 "finalization must use the namespace revision at ordered apply"
             );
         }
+    }
+
+    #[compio::test]
+    async fn given_finalization_with_debt_when_applied_should_record_it_for_the_named_incarnation_only()
+     {
+        const CLIENT: u128 = 1;
+        let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
+        let session = metadata.client_table.borrow().get_epoch(CLIENT).unwrap();
+        metadata
+            .submit_logout_in_process(CLIENT, session, 1)
+            .await
+            .unwrap();
+        let identity = metadata
+            .client_table
+            .borrow()
+            .ended_sessions()
+            .next()
+            .unwrap();
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let created_revision = metadata
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(
+                consensus,
+                &RoutedRequestHeader::default(),
+                Operation::FinalizeSession,
+                &FinalizeSessionRequest {
+                    identity,
+                    namespace_revision: metadata.mux_stm.namespace_revision(),
+                    debt: vec![
+                        RetirementDebt {
+                            namespace: namespace.inner(),
+                            created_revision,
+                        },
+                        RetirementDebt {
+                            namespace: namespace.inner(),
+                            created_revision: created_revision + 1,
+                        },
+                    ],
+                }
+                .to_bytes(),
+            ),
+            metadata.client_table_capacity(),
+        );
+        let finalize_op = prepare.header().op;
+        apply_committed_prepare(
+            metadata.mux_stm.as_ref(),
+            &metadata.client_table,
+            true,
+            |_| {},
+            prepare,
+        );
+        assert_eq!(metadata.client_table.borrow().ended_sessions().next(), None);
+        let streams = metadata.mux_stm.streams();
+        assert_eq!(
+            streams.retirement_debt_for(namespace, created_revision),
+            Some(finalize_op)
+        );
+        assert_eq!(
+            streams.retirement_debt_for(namespace, created_revision + 1),
+            None
+        );
+        assert_eq!(
+            streams.retirement_debts_stored_by(0, 1),
+            (
+                vec![(namespace, created_revision, finalize_op)],
+                finalize_op
+            )
+        );
+        assert_eq!(
+            streams.retirement_debts_since(0, 0, 1),
+            Some((
+                vec![(namespace, created_revision, finalize_op)],
+                finalize_op
+            ))
+        );
+        assert_eq!(
+            streams.retirement_debts_since(finalize_op, 0, 1),
+            Some((Vec::new(), finalize_op))
+        );
+        let restored = <Streams as crate::stm::snapshot::Snapshotable>::from_snapshot(
+            crate::stm::snapshot::Snapshotable::to_snapshot(streams),
+        )
+        .expect("snapshot restores");
+        assert_eq!(
+            restored.retirement_debt_for(namespace, created_revision),
+            Some(finalize_op)
+        );
+        assert_eq!(
+            restored.read(|inner| inner.retirement_debt_revision),
+            finalize_op
+        );
+        assert_eq!(
+            restored.retirement_debts_since(0, 0, 1),
+            None,
+            "a restored reader must rescan"
+        );
     }
 
     #[compio::test]
@@ -10746,6 +10976,7 @@ mod tests {
                             &FinalizeSessionRequest {
                                 identity: ended[0],
                                 namespace_revision: metadata.mux_stm.namespace_revision(),
+                                debt: Vec::new(),
                             }
                             .to_bytes(),
                         ),
@@ -11208,6 +11439,7 @@ mod tests {
                     partition_id: 0,
                     consensus_group_id: 1,
                     initial_view: 0,
+                    members: Vec::new(),
                 }],
             },
             &mut inner,

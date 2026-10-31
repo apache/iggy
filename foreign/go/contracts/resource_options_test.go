@@ -486,6 +486,7 @@ func checkCatalog(t *testing.T, catalog []catalogRow) {
 			string(iggcon.TopicOptionMessagesRequiredToSave),
 			string(iggcon.TopicOptionSizeOfMessagesRequiredToSave),
 			string(iggcon.TopicOptionPreallocateSegments),
+			string(iggcon.TopicOptionReplicationFactor),
 		},
 		"user": {
 			string(iggcon.UserOptionUsername),
@@ -561,6 +562,7 @@ func checkTypedSurface(t *testing.T, catalog []catalogRow) {
 			"messages_required_to_save":         {create: "MessagesRequiredToSave"},
 			"size_of_messages_required_to_save": {create: "SizeOfMessagesRequiredToSave"},
 			"preallocate_segments":              {create: "PreallocateSegments"},
+			"replication_factor":                {create: "ReplicationFactor"},
 		},
 		"user": {
 			"username": {update: "Username"},

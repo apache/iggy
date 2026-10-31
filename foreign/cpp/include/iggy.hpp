@@ -2994,6 +2994,7 @@ enum class TopicOptionKey : std::uint8_t {
     MessagesRequiredToSave,
     SizeOfMessagesRequiredToSave,
     PreallocateSegments,
+    ReplicationFactor,
 };
 
 constexpr std::string_view to_string(const TopicOptionKey key) {
@@ -3020,6 +3021,8 @@ constexpr std::string_view to_string(const TopicOptionKey key) {
             return "size_of_messages_required_to_save";
         case TopicOptionKey::PreallocateSegments:
             return "preallocate_segments";
+        case TopicOptionKey::ReplicationFactor:
+            return "replication_factor";
     }
     throw std::invalid_argument("Unknown topic option key");
 }
@@ -3276,6 +3279,30 @@ class TopicCreateOptions final {
     }
 
     /**
+     * @brief Returns the number of nodes that store each partition.
+     * @return Configured replication factor, or `std::nullopt` to use the
+     *         server default of 3, lowered to the cluster's node count when
+     *         that is smaller.
+     */
+    [[nodiscard]] std::optional<std::uint32_t> ReplicationFactor() const noexcept { return replication_factor_; }
+
+    /**
+     * @brief Sets the number of nodes that store each partition.
+     *
+     * A write commits on a quorum of these nodes, so 2 keeps two copies but
+     * stops accepting writes while either node is down.
+     * @param replication_factor Number of nodes, from 1 to 32 inclusive and at
+     *        most the cluster's node count.
+     * @return Reference to this options object.
+     * @note The server rejects an out-of-range value with
+     *       InvalidReplicationFactor (2018).
+     */
+    TopicCreateOptions &SetReplicationFactor(std::uint32_t replication_factor) noexcept {
+        replication_factor_ = replication_factor;
+        return *this;
+    }
+
+    /**
      * @brief Returns additional topic settings as key-value pairs.
      *
      * Use this for supported settings that do not have a dedicated setter.
@@ -3326,6 +3353,7 @@ class TopicCreateOptions final {
     std::optional<std::uint32_t> messages_required_to_save_;
     std::optional<std::uint64_t> size_of_messages_required_to_save_;
     std::optional<bool> preallocate_segments_;
+    std::optional<std::uint32_t> replication_factor_;
     std::map<std::string, std::string> raw_;
 
     friend class IggyBlockingClient;

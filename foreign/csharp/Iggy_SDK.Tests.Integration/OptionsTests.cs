@@ -51,7 +51,8 @@ public class OptionsTests
         "partition_resize_policy",
         "messages_required_to_save",
         "size_of_messages_required_to_save",
-        "preallocate_segments"
+        "preallocate_segments",
+        "replication_factor"
     ];
 
     private static readonly string[] NeverReturnedKeys = ["encryption_key", "encryption_key_wrapped", "critical_keys"];
@@ -111,6 +112,9 @@ public class OptionsTests
 
         specs["preallocate_segments"].Kind.ShouldBe(HeaderKind.Bool);
         specs["preallocate_segments"].DefaultValue.ShouldBe([0]);
+
+        specs["replication_factor"].Kind.ShouldBe(HeaderKind.Uint32);
+        BitConverter.ToUInt32(specs["replication_factor"].DefaultValue).ShouldBe(3u);
 
         specs["message_expiry"].Updatable.ShouldBeTrue();
         specs["message_expiry"].Resettable.ShouldBeTrue();
@@ -177,7 +181,8 @@ public class OptionsTests
             PartitionResizePolicy = PartitionResizePolicy.Fixed,
             MessagesRequiredToSave = 1,
             SizeOfMessagesRequiredToSave = 1,
-            PreallocateSegments = true
+            PreallocateSegments = true,
+            ReplicationFactor = 1
         }.ToDictionary().Keys;
 
         typedKeys.ShouldAllBe(key => catalogKeys.Contains(key));

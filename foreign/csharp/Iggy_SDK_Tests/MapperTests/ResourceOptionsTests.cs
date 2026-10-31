@@ -509,7 +509,8 @@ public sealed class ResourceOptionsTests
                     PartitionResizePolicy = PartitionResizePolicy.Fixed,
                     MessagesRequiredToSave = 64,
                     SizeOfMessagesRequiredToSave = 4096,
-                    PreallocateSegments = true
+                    PreallocateSegments = true,
+                    ReplicationFactor = 3
                 }.ToDictionary().Keys.ToHashSet());
                 Assert.Equal(updateKeys, new TopicUpdate
                 {

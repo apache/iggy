@@ -253,6 +253,11 @@ where
             return PartitionAdmission::Denied;
         }
     };
+    // No routing row is coming for a partition this node does not store.
+    if !crate::namespace::stores_partition(shard, IggyNamespace::from_raw(namespace)) {
+        send_deny_reply(shard, origin, &header, IggyError::NotPrimary.as_code()).await;
+        return PartitionAdmission::Denied;
+    }
     // Convergence wait: a CreateTopic commit returns to the client before the
     // per-shard reconcilers seed routing rows and materialise the partition
     // (next wake/periodic tick). An op arriving inside that window is not lost
@@ -923,6 +928,9 @@ where
         partition_id,
     )
     .map_err(ReadPolledMessagesError::Rejected)?;
+    if !crate::namespace::stores_partition(shard, namespace) {
+        return Err(ReadPolledMessagesError::Rejected(IggyError::NotPrimary));
+    }
     let read = PartitionRead::PollOnPrimary {
         consumer,
         args,
@@ -2209,11 +2217,13 @@ mod tests {
                             initial_view: 0,
                             partition_id: 0,
                             consensus_group_id: 1,
+                            members: Vec::new(),
                         },
                         CreatedPartitionAssignment {
                             initial_view: 0,
                             partition_id: 1,
                             consensus_group_id: 2,
+                            members: Vec::new(),
                         },
                     ],
                 }
@@ -2538,6 +2548,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         md.mux_stm
@@ -4081,6 +4092,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         md.mux_stm
@@ -4467,6 +4479,7 @@ mod tests {
                     initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 1,
+                    members: Vec::new(),
                 }],
             }
             .to_bytes(),

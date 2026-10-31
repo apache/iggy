@@ -37,7 +37,8 @@ use crate::shell::consensus_timers;
 use compio::fs::create_dir_all;
 use configs::server::ServerConfig;
 use consensus::{
-    FreshGroupStart, JoinMode, LocalPipeline, VsrConsensus, VsrRestore, VsrState, fresh_group_start,
+    FreshGroupStart, JoinMode, LocalPipeline, ReplicaSet, VsrConsensus, VsrRestore, VsrState,
+    fresh_group_start,
 };
 use iggy_common::{IggyByteSize, IggyError, IggyTimestamp, PartitionStats, TopicRuntimeOptions};
 use journal::durable_storage::{DiskStorage, DurableStorage};
@@ -63,6 +64,11 @@ use tracing::{error, warn};
 
 const PARTITION_INITIALIZATION_DIR: &str = "partition-initialization";
 const RETIREMENT_FENCE_FILE: &str = "retirement.fence";
+/// Creation time, in micros, of the oldest data this node's storage can hold.
+const STORAGE_EPOCH_FILE: &str = "storage.epoch";
+/// Clock skew tolerated between this node and the metadata primary that
+/// stamped a partition's creation time.
+const STORAGE_EPOCH_SKEW_MICROS: u64 = 10_000_000;
 
 /// Open the durable superblock for one partition's consensus group and read
 /// back the last recorded VSR state.
@@ -182,10 +188,11 @@ pub async fn load_partition_or_fence(
     topic_runtime: TopicRuntimeOptions,
     cluster_id: u128,
     self_replica_id: u8,
-    replica_count: u8,
+    members: ReplicaSet,
     bus: Rc<IggyMessageBus>,
     partitions: &IggyPartitions<Rc<IggyMessageBus>, PingPongSuperblock>,
 ) -> Result<Option<IggyPartition<Rc<IggyMessageBus>>>, ServerError> {
+    let replica_count = members.len();
     let created_revision = partition_metadata.created_revision;
     match partition_retirement_fence(&config.get_system_path(), namespace).await {
         Ok(Some(recorded)) if recorded > created_revision => return Ok(None),
@@ -210,6 +217,23 @@ pub async fn load_partition_or_fence(
     let initialization_dir = partition_initialization_path(&config.get_system_path(), namespace);
     match partitions::read_created_revision(&initialization_dir).await {
         Ok(Some(recorded)) if recorded > created_revision => return Ok(None),
+        Ok(None)
+            if replica_count == 1
+                && predates_storage(
+                    storage_epoch(&config.get_system_path()).await?,
+                    partition_metadata.created_at.as_micros(),
+                ) =>
+        {
+            error!(
+                namespace_raw = namespace.inner(),
+                created_revision,
+                "this node alone stores the partition, and its storage began after the \
+                 partition was created without any record of it: refusing to serve it from \
+                 offset 0; delete and recreate the topic to accept the loss"
+            );
+            partitions.fence(namespace, created_revision);
+            return Ok(None);
+        }
         Err(source) if source.kind() == std::io::ErrorKind::InvalidData => {
             error!(%source, namespace_raw = namespace.inner(), "unreadable initialization record; refusing partition");
             partitions.fence(namespace, created_revision);
@@ -348,7 +372,7 @@ pub async fn load_partition_or_fence(
         topic_runtime,
         cluster_id,
         self_replica_id,
-        replica_count,
+        members,
         Rc::clone(&bus),
     ))
     .await
@@ -492,10 +516,11 @@ pub async fn load_partition_or_fence(
                 namespace,
                 Arc::clone(&partition_stats),
                 partition_metadata.created_revision,
+                partition_metadata.created_at.as_micros(),
                 topic_runtime,
                 cluster_id,
                 self_replica_id,
-                replica_count,
+                members,
                 partition_metadata.created_view,
                 Rc::clone(&bus),
             ))
@@ -556,9 +581,10 @@ async fn load_partition(
     runtime_options: TopicRuntimeOptions,
     cluster_id: u128,
     self_replica_id: u8,
-    replica_count: u8,
+    members: ReplicaSet,
     bus: Rc<IggyMessageBus>,
 ) -> Result<IggyPartition<Rc<IggyMessageBus>>, ServerError> {
+    let replica_count = members.len();
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
@@ -612,7 +638,7 @@ async fn load_partition(
     let consensus = VsrConsensus::restored(
         cluster_id,
         self_replica_id,
-        replica_count,
+        members,
         namespace.inner(),
         bus,
         LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
@@ -930,13 +956,15 @@ pub async fn build_partition_fresh(
     namespace: IggyNamespace,
     stats: Arc<PartitionStats>,
     created_revision: u64,
+    created_at_micros: u64,
     runtime_options: TopicRuntimeOptions,
     cluster_id: u128,
     self_replica_id: u8,
-    replica_count: u8,
+    members: ReplicaSet,
     created_view: u32,
     bus: Rc<IggyMessageBus>,
 ) -> Result<IggyPartition<Rc<IggyMessageBus>>, ServerError> {
+    let replica_count = members.len();
     if partition_retirement_fence(&config.get_system_path(), namespace)
         .await?
         .is_some_and(|recorded| recorded >= created_revision)
@@ -951,6 +979,20 @@ pub async fn build_partition_fresh(
     let partition_id = namespace.partition_id();
     let first_initialization =
         partition_needs_initialization(config, namespace, created_revision).await?;
+    // The initialization record went with the storage, so a sole member cannot
+    // tell this build from a first one and would restart the log at offset 0.
+    if replica_count == 1
+        && first_initialization
+        && predates_storage(
+            storage_epoch(&config.get_system_path()).await?,
+            created_at_micros,
+        )
+    {
+        return Err(ServerError::PartitionLostWithStorage {
+            namespace_raw: namespace.inner(),
+            created_revision,
+        });
+    }
 
     let partition_dir = config.get_partition_path(stream_id, topic_id, partition_id);
     let restarted = replica_count > 1 && !first_initialization;
@@ -1036,7 +1078,7 @@ pub async fn build_partition_fresh(
     let consensus = VsrConsensus::restored(
         cluster_id,
         self_replica_id,
-        replica_count,
+        members,
         namespace.inner(),
         bus,
         LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
@@ -1207,6 +1249,38 @@ pub async fn record_partition_retirement_fence(
             dir: PathBuf::from(directory),
             source,
         })
+}
+
+/// Record that this node's storage holds nothing older than `now_micros`.
+/// Boot calls it when it finds no metadata state in a multi-node cluster.
+///
+/// # Errors
+/// The record could not be written durably.
+pub async fn record_storage_epoch(system_path: &str, now_micros: u64) -> Result<(), ServerError> {
+    partitions::write_revision_record(system_path, STORAGE_EPOCH_FILE, now_micros)
+        .await
+        .map_err(|source| ServerError::PartitionCreatedRevisionIo {
+            dir: PathBuf::from(system_path),
+            source,
+        })
+}
+
+async fn storage_epoch(system_path: &str) -> Result<Option<u64>, ServerError> {
+    partitions::read_revision_record(system_path, STORAGE_EPOCH_FILE)
+        .await
+        .map_err(|source| ServerError::PartitionCreatedRevisionIo {
+            dir: PathBuf::from(system_path),
+            source,
+        })
+}
+
+/// Whether a partition created at `created_at_micros` existed before this
+/// node's storage began, so a missing initialization record means lost data.
+const fn predates_storage(storage_epoch: Option<u64>, created_at_micros: u64) -> bool {
+    match storage_epoch {
+        Some(epoch) => created_at_micros.saturating_add(STORAGE_EPOCH_SKEW_MICROS) < epoch,
+        None => false,
+    }
 }
 
 async fn partition_needs_initialization(
@@ -1385,7 +1459,7 @@ mod tests {
                 TopicRuntimeOptions::default(),
                 CLUSTER,
                 0,
-                replica_count,
+                ReplicaSet::all(replica_count),
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
             )
@@ -1420,10 +1494,11 @@ mod tests {
                 namespace,
                 Arc::new(PartitionStats::default()),
                 REVISION,
+                0,
                 TopicRuntimeOptions::default(),
                 CLUSTER,
                 0,
-                replica_count,
+                ReplicaSet::all(replica_count),
                 0,
                 Rc::new(IggyMessageBus::new(0)),
             )
@@ -1439,7 +1514,7 @@ mod tests {
                 TopicRuntimeOptions::default(),
                 CLUSTER,
                 0,
-                replica_count,
+                ReplicaSet::all(replica_count),
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
             )
@@ -1452,6 +1527,102 @@ mod tests {
                 );
             } else {
                 assert!(recovered.unwrap().requires_state_transfer());
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn given_storage_younger_than_an_unrecorded_partition_when_loading_should_refuse_only_a_singleton()
+     {
+        const REVISION: u64 = 7;
+        const EPOCH: u64 = 1_000 * STORAGE_EPOCH_SKEW_MICROS;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        for (replica_count, created_at, served) in [
+            (1, EPOCH - 2 * STORAGE_EPOCH_SKEW_MICROS, false),
+            (1, EPOCH - STORAGE_EPOCH_SKEW_MICROS / 2, true),
+            (1, EPOCH + 1, true),
+            (REPLICAS, EPOCH - 2 * STORAGE_EPOCH_SKEW_MICROS, true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let config = solo_config(&root);
+            let partitions = solo_partitions(&config);
+            std::fs::create_dir_all(config.get_system_path()).unwrap();
+            record_storage_epoch(&config.get_system_path(), EPOCH)
+                .await
+                .unwrap();
+            let loaded = load_partition_or_fence(
+                &config,
+                namespace,
+                Arc::new(PartitionStats::default()),
+                &Partition::new(
+                    0,
+                    namespace.inner(),
+                    IggyTimestamp::from(created_at),
+                    REVISION,
+                    0,
+                ),
+                TopicRuntimeOptions::default(),
+                CLUSTER,
+                0,
+                ReplicaSet::all(replica_count),
+                Rc::new(IggyMessageBus::new(0)),
+                &partitions,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                loaded.is_some(),
+                served,
+                "replicas={replica_count} created_at={created_at}"
+            );
+            assert_eq!(partitions.is_tombstoned(&namespace), !served);
+        }
+    }
+
+    /// The reconciler's path: a partition whose directory went with the
+    /// storage reaches the fresh build, never the loader.
+    #[compio::test]
+    async fn given_storage_younger_than_an_unrecorded_partition_when_building_fresh_should_refuse_only_a_singleton()
+     {
+        const REVISION: u64 = 7;
+        const EPOCH: u64 = 1_000 * STORAGE_EPOCH_SKEW_MICROS;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        for (replica_count, created_at, built) in [
+            (1, EPOCH - 2 * STORAGE_EPOCH_SKEW_MICROS, false),
+            (1, EPOCH + 1, true),
+            (REPLICAS, EPOCH - 2 * STORAGE_EPOCH_SKEW_MICROS, true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let config = solo_config(&root);
+            std::fs::create_dir_all(config.get_system_path()).unwrap();
+            record_storage_epoch(&config.get_system_path(), EPOCH)
+                .await
+                .unwrap();
+            let result = build_partition_fresh(
+                &config,
+                &solo_partitions_config(&config),
+                namespace,
+                Arc::new(PartitionStats::default()),
+                REVISION,
+                created_at,
+                TopicRuntimeOptions::default(),
+                CLUSTER,
+                0,
+                ReplicaSet::all(replica_count),
+                0,
+                Rc::new(IggyMessageBus::new(0)),
+            )
+            .await;
+            assert_eq!(
+                result.is_ok(),
+                built,
+                "replicas={replica_count} created_at={created_at}"
+            );
+            if !built {
+                assert!(matches!(
+                    result,
+                    Err(ServerError::PartitionLostWithStorage { .. })
+                ));
             }
         }
     }
@@ -1488,10 +1659,11 @@ mod tests {
                 namespace,
                 Arc::new(PartitionStats::default()),
                 0,
+                0,
                 TopicRuntimeOptions::default(),
                 CLUSTER,
                 REPLICA,
-                REPLICAS,
+                ReplicaSet::all(REPLICAS),
                 CREATED_VIEW,
                 Rc::new(IggyMessageBus::new(0)),
             )
@@ -1524,7 +1696,7 @@ mod tests {
                     TopicRuntimeOptions::default(),
                     CLUSTER,
                     REPLICA,
-                    REPLICAS,
+                    ReplicaSet::all(REPLICAS),
                     Rc::new(IggyMessageBus::new(0)),
                 ))
                 .await
@@ -1535,10 +1707,11 @@ mod tests {
                     namespace,
                     Arc::new(PartitionStats::default()),
                     0,
+                    0,
                     TopicRuntimeOptions::default(),
                     CLUSTER,
                     REPLICA,
-                    REPLICAS,
+                    ReplicaSet::all(REPLICAS),
                     CREATED_VIEW,
                     Rc::new(IggyMessageBus::new(0)),
                 )
@@ -1591,7 +1764,7 @@ mod tests {
                 TopicRuntimeOptions::default(),
                 CLUSTER,
                 REPLICA,
-                REPLICAS,
+                ReplicaSet::all(REPLICAS),
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
             )
@@ -1615,10 +1788,11 @@ mod tests {
                     namespace,
                     Arc::new(PartitionStats::default()),
                     0,
+                    0,
                     TopicRuntimeOptions::default(),
                     CLUSTER,
                     REPLICA,
-                    REPLICAS,
+                    ReplicaSet::all(REPLICAS),
                     CREATED_VIEW,
                     Rc::new(IggyMessageBus::new(0)),
                 )
@@ -1659,7 +1833,7 @@ mod tests {
             runtime,
             CLUSTER,
             REPLICA,
-            REPLICAS,
+            ReplicaSet::all(REPLICAS),
             Rc::new(IggyMessageBus::new(0)),
         ))
         .await;
@@ -1679,7 +1853,7 @@ mod tests {
             runtime,
             CLUSTER,
             REPLICA,
-            REPLICAS,
+            ReplicaSet::all(REPLICAS),
             Rc::new(IggyMessageBus::new(0)),
             &partitions,
         )
@@ -1805,10 +1979,11 @@ mod tests {
                     namespace,
                     Arc::new(PartitionStats::default()),
                     REVISION,
+                    0,
                     TopicRuntimeOptions::default(),
                     CLUSTER,
                     REPLICA,
-                    REPLICAS,
+                    ReplicaSet::all(REPLICAS),
                     0,
                     Rc::new(IggyMessageBus::new(0)),
                 )
@@ -1957,10 +2132,11 @@ mod tests {
                 namespace,
                 Arc::new(PartitionStats::default()),
                 0,
+                0,
                 runtime,
                 CLUSTER,
                 REPLICA,
-                REPLICAS,
+                ReplicaSet::all(REPLICAS),
                 CREATED_VIEW,
                 Rc::new(IggyMessageBus::new(0)),
             )
@@ -2024,7 +2200,7 @@ mod tests {
                 runtime,
                 CLUSTER,
                 REPLICA,
-                REPLICAS,
+                ReplicaSet::all(REPLICAS),
                 Rc::new(IggyMessageBus::new(0)),
             ))
             .await
@@ -2102,7 +2278,7 @@ mod tests {
                 TopicRuntimeOptions::default(),
                 CLUSTER,
                 0,
-                1,
+                ReplicaSet::all(1),
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
             )
@@ -2153,7 +2329,7 @@ mod tests {
                 TopicRuntimeOptions::default(),
                 CLUSTER,
                 0,
-                1,
+                ReplicaSet::all(1),
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
             )
@@ -2195,10 +2371,11 @@ mod tests {
                 namespace,
                 Arc::new(PartitionStats::default()),
                 0,
+                0,
                 runtime,
                 CLUSTER,
                 REPLICA,
-                REPLICAS,
+                ReplicaSet::all(REPLICAS),
                 0,
                 Rc::new(IggyMessageBus::new(0)),
             )
@@ -2280,7 +2457,7 @@ mod tests {
             runtime,
             CLUSTER,
             REPLICA,
-            REPLICAS,
+            ReplicaSet::all(REPLICAS),
             Rc::new(IggyMessageBus::new(0)),
         ))
         .await
@@ -2320,10 +2497,11 @@ mod tests {
                 namespace,
                 Arc::new(PartitionStats::default()),
                 0,
+                0,
                 runtime,
                 CLUSTER,
                 REPLICA,
-                REPLICAS,
+                ReplicaSet::all(REPLICAS),
                 0,
                 Rc::new(IggyMessageBus::new(0)),
             )
@@ -2358,7 +2536,7 @@ mod tests {
                 runtime,
                 CLUSTER,
                 REPLICA,
-                REPLICAS,
+                ReplicaSet::all(REPLICAS),
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
             )
@@ -2444,10 +2622,11 @@ mod tests {
             IggyNamespace::new(1, 1, 0),
             Arc::new(PartitionStats::default()),
             0,
+            0,
             TopicRuntimeOptions::default(),
             CLUSTER,
             0,
-            1,
+            ReplicaSet::all(1),
             0,
             Rc::new(IggyMessageBus::new(0)),
         )
@@ -2488,10 +2667,11 @@ mod tests {
             IggyNamespace::new(1, 1, 0),
             Arc::new(PartitionStats::default()),
             created_revision,
+            0,
             TopicRuntimeOptions::default(),
             CLUSTER,
             REPLICA,
-            REPLICAS,
+            ReplicaSet::all(REPLICAS),
             created_view,
             Rc::new(IggyMessageBus::new(0)),
         )
@@ -2537,7 +2717,7 @@ mod tests {
             },
             CLUSTER,
             REPLICA,
-            REPLICAS,
+            ReplicaSet::all(REPLICAS),
             Rc::new(IggyMessageBus::new(0)),
             partitions,
         )
@@ -2681,7 +2861,7 @@ mod tests {
             TopicRuntimeOptions::default(),
             CLUSTER,
             0,
-            1,
+            ReplicaSet::all(1),
             Rc::new(IggyMessageBus::new(0)),
             &partitions,
         ));

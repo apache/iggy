@@ -182,7 +182,7 @@ var _ = ginkgo.Describe("GET CONSUMER OFFSET:", func() {
 			_, err := client.GetConsumerOffset(
 				context.Background(),
 				consumer,
-				randomU32Identifier(),
+				nonExistingStreamIdentifier(client),
 				randomU32Identifier(),
 				&partitionId,
 			)

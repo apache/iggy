@@ -52,6 +52,7 @@ pub enum OptionKey {
     MessagesRequiredToSave,
     SizeOfMessagesRequiredToSave,
     PreallocateSegments,
+    ReplicationFactor,
     EncryptionKey,
     EncryptionKeyWrapped,
     EncryptionKeySource,

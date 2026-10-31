@@ -304,6 +304,12 @@ impl IggyClient {
     /// (18446744073709551615) can be sent. `raw` sends string-valued keys this build does not
     /// know, and the server decides whether to accept them. It is marked
     /// `#[\SensitiveParameter]`, because an unknown key may hold a secret.
+    ///
+    /// `replication_factor` is how many nodes store each partition, 1 to 32 and at most the
+    /// cluster's node count. Null resolves to 3, lowered to the node count when smaller. A write
+    /// commits on a quorum of these nodes, so 2 keeps two copies but stops accepting writes while
+    /// either node is down. The server rejects an out-of-range value with
+    /// `InvalidReplicationFactor`.
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,
@@ -320,6 +326,7 @@ impl IggyClient {
         size_of_messages_required_to_save: Option<&Zval>,
         preallocate_segments: Option<bool>,
         partition_resize_policy: Option<String>,
+        replication_factor: Option<&Zval>,
         raw: Option<BTreeMap<String, String>>,
     ) -> PhpResult {
         let message_expiry_micros = optional_u64(message_expiry_micros, "message_expiry_micros")?;
@@ -331,6 +338,8 @@ impl IggyClient {
             size_of_messages_required_to_save,
             "size_of_messages_required_to_save",
         )?;
+        let replication_factor =
+            optional_unsigned::<u32>(replication_factor, "replication_factor")?;
         let compression_algorithm = match compression_algorithm {
             Some(value) => CompressionAlgorithm::from_str(&value).map_err(to_php_exception)?,
             None => CompressionAlgorithm::default(),
@@ -363,6 +372,7 @@ impl IggyClient {
             size_of_messages_required_to_save: size_of_messages_required_to_save
                 .map(IggyByteSize::from),
             preallocate_segments,
+            replication_factor,
             raw: raw.unwrap_or_default(),
         };
 

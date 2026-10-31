@@ -183,6 +183,8 @@ std::map<std::string, ScopeSurface> TypedSurface() {
                }},
               {"preallocate_segments",
                [] { return TopicCreateOptions().SetPreallocateSegments(true).PreallocateSegments().has_value(); }},
+              {"replication_factor",
+               [] { return TopicCreateOptions().SetReplicationFactor(1).ReplicationFactor().has_value(); }},
           },
           {
               {"name", [] { return TopicUpdateOptions().SetName("renamed").Name().has_value(); }},

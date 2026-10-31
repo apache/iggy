@@ -156,7 +156,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER OFFSET:", func() {
 			err := client.DeleteConsumerOffset(
 				context.Background(),
 				consumer,
-				randomU32Identifier(),
+				nonExistingStreamIdentifier(client),
 				randomU32Identifier(),
 				&partitionId)
 			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)

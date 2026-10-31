@@ -33,7 +33,7 @@ pub use bind_session::{BindSessionRequest, SessionIdentity};
 pub use describe_options::{
     DescribeOptionsRequest, OPTIONS_SCOPE_STREAM, OPTIONS_SCOPE_TOPIC, OPTIONS_SCOPE_USER,
 };
-pub use finalize_session::FinalizeSessionRequest;
+pub use finalize_session::{FinalizeSessionRequest, RetirementDebt};
 pub use get_client::GetClientRequest;
 pub use get_clients::GetClientsRequest;
 pub use get_cluster_metadata::GetClusterMetadataRequest;

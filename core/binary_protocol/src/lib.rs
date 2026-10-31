@@ -109,7 +109,7 @@ pub use primitives::user_headers::{
 };
 pub use version::{
     ClientVersionInfo, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN, ProtocolVersion,
-    is_protocol_compatible,
+    REPLICA_WIRE_REVISION, is_protocol_compatible,
 };
 
 /// Maximum number of partitions allowed in a single create/delete request.

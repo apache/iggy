@@ -743,6 +743,11 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
             } else {
                 None
             },
+            replication_factor: if options.has_replication_factor {
+                Some(options.replication_factor)
+            } else {
+                None
+            },
             raw,
         })
     }

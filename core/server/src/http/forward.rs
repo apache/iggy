@@ -111,7 +111,7 @@ use rustls::{CertificateError, DigitallySignedStruct, SignatureScheme};
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use server_common::sharding::IggyNamespace;
-use shard::{PartitionRead, PartitionReadReply};
+use shard::PartitionReadReply;
 use tracing::{debug, warn};
 
 use crate::dispatch::reads::hold_for_frontier;
@@ -1525,11 +1525,7 @@ async fn partition_primary(
     namespace: IggyNamespace,
 ) -> Option<PartitionPrimary> {
     state.metrics.partition_primary_probes.inc();
-    match state
-        .shard
-        .partition_read(namespace, PartitionRead::Primary)
-        .await?
-    {
+    match crate::namespace::partition_primary(&state.shard, namespace).await? {
         PartitionReadReply::Primary { view, primary } => Some(PartitionPrimary {
             view,
             replica: primary,
@@ -2419,7 +2415,7 @@ mod tests {
             "the poll waits for its partition"
         );
         let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
-            read: PartitionRead::UnboundPollOnPrimary { metadata, .. },
+            read: shard::PartitionRead::UnboundPollOnPrimary { metadata, .. },
             reply,
             ..
         })) = shard_inbox.try_recv()

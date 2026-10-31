@@ -165,6 +165,18 @@ public final class TopicOptions {
             return set(TopicOptionKey.PREALLOCATE_SEGMENTS, HeaderValue.fromBool(enabled));
         }
 
+        /**
+         * Number of nodes that store each partition, 1 to 32 and at most the cluster's node count. Left unset,
+         * the server uses 3, lowered to the node count when the cluster is smaller.
+         *
+         * <p>Two replicas keep two copies but stop accepting writes while either node is down, like Kafka with
+         * {@code min.insync.replicas=2}. The server refuses an out-of-range value with
+         * {@code INVALID_REPLICATION_FACTOR}.
+         */
+        public Builder replicationFactor(long replicas) {
+            return set(TopicOptionKey.REPLICATION_FACTOR, HeaderValue.fromUint32(replicas));
+        }
+
         /** An option this build has no setter for. A typed setter wins on collision. */
         public Builder raw(String key, HeaderValue value) {
             raw.put(key, value);

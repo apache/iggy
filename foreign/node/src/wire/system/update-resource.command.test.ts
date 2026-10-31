@@ -342,7 +342,8 @@ describe('given shared vectors when encoding should match server contract', () =
           topicBlock({ partitionResizePolicy: PartitionResizePolicy.Fixed }),
         messages_required_to_save: () => topicBlock({ messagesRequiredToSave: 1 }),
         size_of_messages_required_to_save: () => topicBlock({ sizeOfMessagesRequiredToSave: 1n }),
-        preallocate_segments: () => topicBlock({ preallocateSegments: true })
+        preallocate_segments: () => topicBlock({ preallocateSegments: true }),
+        replication_factor: () => topicBlock({ replicationFactor: 1 })
       },
       user: {}
     };

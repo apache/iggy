@@ -113,6 +113,15 @@ const PATCH_MASK: u32 = COMPONENT_MAX;
 /// incompatible release needs a new minor version for those servers to reject it.
 pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 12, 1);
 
+/// Revision of what replicas send each other, which clients never see.
+///
+/// Peers refuse each other at the replica handshake unless it matches, so bump
+/// it whenever a build stops decoding what another build sends. Revision 1 adds
+/// partition member lists, partition status bodies on metadata probes and
+/// replies, retirement debt on session finalization and the paid-through mark
+/// on session retirement.
+pub const REPLICA_WIRE_REVISION: u32 = 1;
+
 /// Oldest protocol version this build accepts at login.
 ///
 /// Version 0.11.0 has no session-binding secret, and 0.11.1 still sends the
