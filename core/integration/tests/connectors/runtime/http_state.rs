@@ -39,7 +39,7 @@
 use assert_cmd::prelude::CommandCargoExt;
 use async_trait::async_trait;
 use iggy::prelude::IggyClient;
-use iggy_common::{Consumer, Identifier, MessageClient, PollingStrategy};
+use iggy_common::{Consumer, Identifier, MessageClient, PollOptions, PollingStrategy};
 use iggy_connector_sdk::api::{ConnectorRuntimeStats, ConnectorStatus, SourceInfoResponse};
 use integration::harness::config::TestServerConfig;
 use integration::harness::{TestBinaryError, TestFixture, TestHarness, seeds};
@@ -368,11 +368,13 @@ async fn stored_messages(client: &IggyClient) -> usize {
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(stored as u64),
-                POLL_BATCH,
-                false,
+                PollOptions {
+                    count: POLL_BATCH,
+                    ..PollOptions::default()
+                },
             )
             .await
             .expect("poll the source topic");

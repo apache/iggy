@@ -32,6 +32,9 @@ use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::responses::messages::poll_messages::{
     POLL_RESPONSE_HEADER_SIZE, PollMessagesResponseHeader,
 };
+use iggy_binary_protocol::responses::messages::{
+    FetchMessagesResponse, FetchMessagesSectionHeader,
+};
 use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
@@ -513,6 +516,97 @@ pub fn build_polled_messages_body(
     fragments: PollFragments,
     encryptor: Option<&EncryptorKind>,
 ) -> Result<Bytes, IggyError> {
+    // The head is written after the walk, which is what counts the messages.
+    let records_len: usize = fragments.iter().map(Fragment::len).sum();
+    let mut body: Vec<u8> = Vec::with_capacity(POLL_RESPONSE_HEADER_SIZE + records_len);
+    body.resize(POLL_RESPONSE_HEADER_SIZE, 0);
+    let count = walk_polled_records(fragments, encryptor, |record| {
+        body.extend_from_slice(record);
+    })?;
+    body[..POLL_RESPONSE_HEADER_SIZE].copy_from_slice(
+        &PollMessagesResponseHeader {
+            partition_id,
+            current_offset,
+            messages_count: count,
+            context,
+        }
+        .to_le_bytes(),
+    );
+    Ok(Bytes::from(body))
+}
+
+/// The records of one read section of a `FetchMessages` reply, as frames that
+/// follow the reply head, and their message count. Records go out as stored,
+/// except at-rest decryption, which copies them as a poll reply does.
+pub fn fetch_section_records(
+    fragments: PollFragments,
+    encryptor: Option<&EncryptorKind>,
+) -> Result<(Vec<Frozen<MESSAGE_ALIGN>>, u32), IggyError> {
+    let Some(encryptor) = encryptor else {
+        let frames: Vec<_> = fragments.into_iter().map(Fragment::into_frozen).collect();
+        let count = polled_message_count(&frames)?;
+        return Ok((frames, count));
+    };
+    let mut records =
+        Owned::<MESSAGE_ALIGN>::with_capacity(fragments.iter().map(Fragment::len).sum());
+    let count = walk_polled_records(fragments, Some(encryptor), |record| {
+        records.extend_from_slice(record);
+    })?;
+    Ok((vec![records.into()], count))
+}
+
+/// Build the `FetchMessages` reply as a vectored frame: one buffer holding
+/// the reply header, the section count and the table, then the records of
+/// each section in table order. `sections` pairs each table entry with its
+/// records.
+pub fn build_fetch_messages_reply(
+    request_header: &RoutedRequestHeader,
+    commit: u64,
+    sections: Vec<(FetchMessagesSectionHeader, Vec<Frozen<MESSAGE_ALIGN>>)>,
+) -> Result<BusMessage, IggyError> {
+    let headers: Vec<_> = sections.iter().map(|(header, _)| *header).collect();
+    let head_len = FetchMessagesResponse::head_size(headers.len());
+    let records_len: usize = sections
+        .iter()
+        .flat_map(|(_, records)| records)
+        .map(Frozen::len)
+        .sum();
+    let header_len = std::mem::size_of::<ReplyHeader>();
+    let size = u32::try_from(header_len + head_len + records_len)
+        .map_err(|_| IggyError::InvalidCommand)?;
+    let header = reply_header(
+        request_header,
+        request_header.client,
+        request_header.session,
+        commit,
+        size,
+    );
+    let mut head = Owned::<MESSAGE_ALIGN>::zeroed(header_len + head_len);
+    let (header_bytes, body_head) = head.as_mut_slice().split_at_mut(header_len);
+    header_bytes.copy_from_slice(bytemuck::bytes_of(&header));
+    FetchMessagesResponse::write_head(&headers, body_head)
+        .map_err(|_| IggyError::InvalidCommand)?;
+    let mut frames = ResponseFragments::with_capacity(
+        1 + sections
+            .iter()
+            .map(|(_, records)| records.len())
+            .sum::<usize>(),
+    );
+    frames.push(head.into());
+    frames.extend(sections.into_iter().flat_map(|(_, records)| records));
+    // Re-checks the header and that the frames cover `size`.
+    Message::<ReplyHeader, ResponseBacking>::try_from(frames)
+        .map(Message::into_inner)
+        .map_err(|_| IggyError::InvalidCommand)
+}
+
+/// Hands each batch record that spans `fragments` to `sink`, decrypted when
+/// `encryptor` is set, and returns the messages of all batches.
+fn walk_polled_records(
+    fragments: PollFragments,
+    encryptor: Option<&EncryptorKind>,
+    mut sink: impl FnMut(&[u8]),
+) -> Result<u32, IggyError> {
     // Batches may arrive split across fragments (rewritten batch header +
     // sliced blob); concatenate into one stream before walking records.
     let mut stream: Vec<u8> = Vec::new();
@@ -521,9 +615,6 @@ pub fn build_polled_messages_body(
         stream.extend_from_slice(frozen.as_slice());
     }
 
-    // The head is written after the walk, which is what counts the messages.
-    let mut body: Vec<u8> = Vec::with_capacity(POLL_RESPONSE_HEADER_SIZE + stream.len());
-    body.resize(POLL_RESPONSE_HEADER_SIZE, 0);
     let mut count: u32 = 0;
     let mut position = 0usize;
     while position < stream.len() {
@@ -537,27 +628,16 @@ pub fn build_polled_messages_body(
         }
         let record = &stream[position..batch_end];
         if let Some(encryptor) = encryptor {
-            let decrypted = send_messages::decrypt_batch_record(record, encryptor)?;
-            body.extend_from_slice(&decrypted);
+            sink(&send_messages::decrypt_batch_record(record, encryptor)?);
         } else {
-            body.extend_from_slice(record);
+            sink(record);
         }
         count = count
             .checked_add(batch.message_count)
             .ok_or(IggyError::InvalidCommand)?;
         position = batch_end;
     }
-
-    body[..POLL_RESPONSE_HEADER_SIZE].copy_from_slice(
-        &PollMessagesResponseHeader {
-            partition_id,
-            current_offset,
-            messages_count: count,
-            context,
-        }
-        .to_le_bytes(),
-    );
-    Ok(Bytes::from(body))
+    Ok(count)
 }
 
 /// Build the `ConsumerOffsetResponse` reply body:

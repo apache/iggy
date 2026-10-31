@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
 // EncodeRequest returns the complete request frame for a command code and its
@@ -97,4 +98,29 @@ func StampRequestHeader(session *Session, code uint32, frame []byte) error {
 		}
 	}
 	return nil
+}
+
+// DeferredCancellation returns the frame that cancels the deferred poll or fetch in frame: a header without a body that names the
+// same client, session and request. It must follow that request on the same
+// connection. It returns false for any other request.
+func DeferredCancellation(frame []byte) ([]byte, bool) {
+	code := binary.LittleEndian.Uint32(frame[requestOffsetReserved:])
+	if Operation(frame[requestOffsetOperation]) != OperationNonReplicated ||
+		code != uint32(command.PollMessagesDeferredCode) &&
+			code != uint32(command.FetchMessagesCode) {
+		return nil, false
+	}
+	cancellation := make([]byte, HeaderSize)
+	EncodeRequestHeader((*[HeaderSize]byte)(cancellation), RequestFields{
+		Size: HeaderSize,
+		Client: ClientID{
+			Lo: binary.LittleEndian.Uint64(frame[requestOffsetClient:]),
+			Hi: binary.LittleEndian.Uint64(frame[requestOffsetClient+8:]),
+		},
+		Request:           StampedRequestID(frame),
+		Operation:         OperationNonReplicated,
+		Session:           binary.LittleEndian.Uint64(frame[requestOffsetSession:]),
+		NonReplicatedCode: uint32(command.CancelDeferredRequestCode),
+	})
+	return cancellation, true
 }

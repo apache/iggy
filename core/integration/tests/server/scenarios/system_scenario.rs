@@ -263,11 +263,13 @@ pub async fn run(harness: &TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::offset(0),
-            MESSAGES_COUNT,
-            false,
+            PollOptions {
+                count: MESSAGES_COUNT,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -287,11 +289,13 @@ pub async fn run(harness: &TestHarness) {
             .poll_messages(
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &consumer,
                 &PollingStrategy::offset(start_offset),
-                batch_length,
-                false,
+                PollOptions {
+                    count: batch_length,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -329,11 +333,13 @@ pub async fn run(harness: &TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(PARTITION_ID + 1),
+            PARTITION_ID + 1,
             &consumer,
             &PollingStrategy::offset(0),
-            MESSAGES_COUNT,
-            false,
+            PollOptions {
+                count: MESSAGES_COUNT,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -420,11 +426,14 @@ pub async fn run(harness: &TestHarness) {
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::next(),
-            messages_count,
-            true,
+            PollOptions {
+                count: messages_count,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();

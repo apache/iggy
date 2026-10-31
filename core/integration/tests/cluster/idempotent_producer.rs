@@ -449,11 +449,13 @@ pub(crate) async fn poll_payloads(client: &IggyClient) -> Vec<String> {
         .poll_messages(
             &stream_id(),
             &topic_id(),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            100,
-            false,
+            PollOptions {
+                count: 100,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll the partition")

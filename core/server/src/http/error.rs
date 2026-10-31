@@ -507,6 +507,10 @@ pub(in crate::http) enum ReadError {
     /// authorization denial) graded through the legacy `IggyError -> status`
     /// map so SDK error bodies stay byte-identical.
     Rejected(IggyError),
+    /// A GET poll with `auto_commit`, rendered as `InvalidCommand` with the
+    /// member named in `field` and the route to use in `reason`, because REST
+    /// has no version handshake to tell an older client why it is refused.
+    CommittingGet,
     /// Requested entity is absent -> 404 with the legacy not-found body.
     NotFound,
     /// A linearizable read reached a follower and the primary's HTTP address was
@@ -542,6 +546,15 @@ impl IntoResponse for ReadError {
     fn into_response(self) -> Response {
         match self {
             Self::Rejected(error) => CustomError::from(error).into_response(),
+            Self::CommittingGet => (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    reason: "A poll with auto_commit stores its offset, so send it as POST /streams/{stream_id}/topics/{topic_id}/messages/deferred".to_owned(),
+                    field: Some("auto_commit".to_owned()),
+                    ..ErrorResponse::from_error(&IggyError::InvalidCommand)
+                }),
+            )
+                .into_response(),
             // Reuse the legacy 404 body so a missing stream renders exactly as
             // the legacy server's `CustomError::ResourceNotFound` does.
             Self::NotFound => CustomError::ResourceNotFound.into_response(),

@@ -289,6 +289,8 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case operationUncertain = 14006
     case laneBlocked = 14007
     case operationNotRetained = 14008
+    case partitionLaneBlocked = 14009
+    case fetchProgressUncertain = 14010
 }
 
 extension IggyErrorCode {
@@ -560,6 +562,8 @@ extension IggyErrorCode {
         case .operationUncertain: "operation_uncertain"
         case .laneBlocked: "lane_blocked"
         case .operationNotRetained: "operation_not_retained"
+        case .partitionLaneBlocked: "partition_lane_blocked"
+        case .fetchProgressUncertain: "fetch_progress_uncertain"
         }
     }
 }

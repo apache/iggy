@@ -47,15 +47,17 @@ func createDefaultMessages() []iggcon.IggyMessage {
 func itShouldSuccessfullyPublishMessages(streamId uint32, topicId uint32, messages []iggcon.IggyMessage, client iggcon.Client) {
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+	options := iggcon.DefaultPollOptions()
+	options.Count = uint32(len(messages))
+	options.Commit = iggcon.OnReadCommit()
 	result, err := client.PollMessages(
 		context.Background(),
 		streamIdentifier,
 		topicIdentifier,
+		0,
 		iggcon.NewSingleConsumer(randomU32Identifier()),
 		iggcon.FirstPollingStrategy(),
-		uint32(len(messages)),
-		true,
-		nil)
+		options)
 
 	ginkgo.It("It should not be nil", func() {
 		gomega.Expect(result).NotTo(gomega.BeNil())

@@ -394,11 +394,13 @@ async fn given_a_stored_consumer_position_when_polling_across_a_reservation_hole
         .poll_messages(
             &stream,
             &topic,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::next(),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll forward from the stored position");

@@ -64,6 +64,22 @@ inline rust::Vec<std::uint8_t> partition_id_bytes(std::uint32_t id) {
     return v;
 }
 
+inline iggy::ffi::PollingStrategy make_polling_strategy(const std::string &kind, const std::uint64_t value) {
+    iggy::ffi::PollingStrategy strategy{};
+    strategy.kind  = kind;
+    strategy.value = value;
+    return strategy;
+}
+
+inline iggy::ffi::PollOptions make_poll_options(
+    const std::uint32_t count,
+    const iggy::ffi::CommitPolicy commit = iggy::ffi::CommitPolicy::Manual) {
+    iggy::ffi::PollOptions options = iggy::ffi::default_poll_options();
+    options.count                  = count;
+    options.commit                 = commit;
+    return options;
+}
+
 inline rust::Vec<rust::String> make_snapshot_types(std::initializer_list<const char *> values) {
     rust::Vec<rust::String> snapshot_types;
     for (const auto *const value : values) {

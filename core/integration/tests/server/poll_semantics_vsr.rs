@@ -26,8 +26,11 @@
 
 use futures::StreamExt;
 use iggy::prelude::*;
-use integration::harness::wait_for_consumer_group_assignment;
+use integration::harness::{fetch_sections, partition_primary, wait_for_consumer_group_assignment};
 use integration::iggy_harness;
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
@@ -62,11 +65,13 @@ async fn given_missing_partition_when_polling_should_reject_partition_not_found(
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(7),
+            7,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await;
 
@@ -81,11 +86,13 @@ async fn given_missing_partition_when_polling_should_reject_partition_not_found(
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll on the existing partition still succeeds");
@@ -104,11 +111,13 @@ async fn given_missing_stream_when_polling_should_reject_stream_not_found(harnes
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await;
 
@@ -135,11 +144,13 @@ async fn given_missing_topic_when_polling_should_reject_topic_not_found(harness:
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await;
 
@@ -323,11 +334,13 @@ async fn given_message_at_polled_timestamp_when_polling_should_include_it(harnes
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            10,
-            false,
+            PollOptions {
+                count: 10,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll all");
@@ -344,11 +357,13 @@ async fn given_message_at_polled_timestamp_when_polling_should_include_it(harnes
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::timestamp(second_timestamp.into()),
-            10,
-            false,
+            PollOptions {
+                count: 10,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll by timestamp");
@@ -387,18 +402,17 @@ async fn given_deferred_poll_when_messages_arrive_should_fill_count_and_keep_con
     let topic = Identifier::from_str_value("deferred-topic").unwrap();
     let consumer = Consumer::default();
     let strategy = PollingStrategy::first();
-    let mut poll = Box::pin(client.poll_messages_deferred(
+    let mut poll = Box::pin(client.poll_messages(
         &stream,
         &topic,
-        Some(0),
+        0,
         &consumer,
         &strategy,
-        2,
-        false,
-        DeferredPollOptions {
-            max_wait: 2_000_000.into(),
+        PollOptions {
+            count: 2,
             min_count: 2,
-            ..Default::default()
+            // Far above the run time, so a slow runner cannot end the wait before the second send.
+            ..PollOptions::wait(30_000_000.into())
         },
     ));
     tokio::select! {
@@ -447,18 +461,16 @@ async fn given_deferred_poll_when_messages_arrive_should_fill_count_and_keep_con
     );
     let started = tokio::time::Instant::now();
     let partial = client
-        .poll_messages_deferred(
+        .poll_messages(
             &stream,
             &topic,
-            Some(0),
+            0,
             &consumer,
             &strategy,
-            3,
-            false,
-            DeferredPollOptions {
-                max_wait: 200_000.into(),
+            PollOptions {
+                count: 3,
                 min_count: 3,
-                ..Default::default()
+                ..PollOptions::wait(200_000.into())
             },
         )
         .await
@@ -469,36 +481,31 @@ async fn given_deferred_poll_when_messages_arrive_should_fill_count_and_keep_con
         "partial result returned before deadline"
     );
     let empty = client
-        .poll_messages_deferred(
+        .poll_messages(
             &stream,
             &topic,
-            Some(0),
+            0,
             &consumer,
             &PollingStrategy::offset(2),
-            1,
-            false,
-            DeferredPollOptions {
-                max_wait: 50_000.into(),
-                min_count: 1,
-                ..Default::default()
+            PollOptions {
+                count: 1,
+                ..PollOptions::wait(50_000.into())
             },
         )
         .await
         .unwrap();
     assert!(empty.messages.is_empty());
     let immediate = client
-        .poll_messages_deferred(
+        .poll_messages(
             &stream,
             &topic,
-            Some(0),
+            0,
             &consumer,
             &strategy,
-            3,
-            false,
-            DeferredPollOptions {
-                max_wait: 0.into(),
+            PollOptions {
+                count: 3,
                 min_count: 3,
-                ..Default::default()
+                ..PollOptions::default()
             },
         )
         .await
@@ -514,10 +521,11 @@ async fn given_deferred_poll_when_messages_arrive_should_fill_count_and_keep_con
         http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
     )
 )]
-async fn given_deferred_auto_commit_when_cancelled_should_preserve_unseen_messages(
+async fn given_committing_poll_when_dropped_should_settle_through_its_one_reply(
     harness: &TestHarness,
 ) {
-    let client = if harness.transport().unwrap() == TransportProtocol::Http {
+    let http = harness.transport().unwrap() == TransportProtocol::Http;
+    let client = if http {
         harness
             .node(1)
             .http_client()
@@ -563,81 +571,118 @@ async fn given_deferred_auto_commit_when_cancelled_should_preserve_unseen_messag
         )
         .await
         .unwrap();
-    let mut cancelled = Box::pin(client.poll_messages_deferred(
+    // Over HTTP the server reads after the wait, so the poll ends before the next steps.
+    let max_wait = if http {
+        Duration::from_millis(200)
+    } else {
+        Duration::from_secs(10)
+    };
+    let mut dropped = Box::pin(client.poll_messages(
         &stream,
         &topic,
-        Some(0),
+        0,
         &consumer,
         &strategy,
-        2,
-        true,
-        DeferredPollOptions {
-            max_wait: 200_000.into(),
+        PollOptions {
+            count: 2,
             min_count: 2,
-            ..Default::default()
+            commit: CommitPolicy::OnRead,
+            ..PollOptions::wait(max_wait.into())
         },
     ));
     tokio::select! {
-        result = &mut cancelled => panic!("partial result completed before cancellation: {result:?}"),
+        result = &mut dropped => panic!("partial result completed before the drop: {result:?}"),
         () = sleep(Duration::from_millis(50)) => {}
     }
-    drop(cancelled);
+    drop(dropped);
+    if !http {
+        // The poll waits for a second message, so the cancel wins before any store. The server
+        // answers it once with nothing stored, and that answer opens the partition.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let polled = loop {
+            let polled = client
+                .poll_messages(
+                    &stream,
+                    &topic,
+                    0,
+                    &consumer,
+                    &strategy,
+                    PollOptions {
+                        count: 1,
+                        ..PollOptions::default()
+                    },
+                )
+                .await;
+            match polled {
+                Err(IggyError::PartitionLaneBlocked(0, _))
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    sleep(Duration::from_millis(50)).await;
+                }
+                polled => break polled,
+            }
+        };
+        let polled = polled.expect("the answer to the cancel opens the partition");
+        assert_eq!(
+            polled
+                .messages
+                .iter()
+                .map(|message| message.header.offset)
+                .collect::<Vec<_>>(),
+            [0],
+            "a cancelled poll stores nothing"
+        );
+        return;
+    }
+    // HTTP has no cancel, so the server can still store the offset after the drop.
     sleep(Duration::from_millis(250)).await;
-    let next = client
-        .poll_messages_deferred(
+    let blocked = client
+        .poll_messages(
             &stream,
             &topic,
-            Some(0),
+            0,
             &consumer,
             &strategy,
-            1,
-            false,
-            DeferredPollOptions {
-                max_wait: 200_000.into(),
-                min_count: 1,
-                ..Default::default()
+            PollOptions {
+                count: 1,
+                ..PollOptions::wait(200_000.into())
             },
         )
-        .await
-        .unwrap();
-    assert_eq!(
-        next.messages.len(),
-        1,
-        "cancelled poll must not accept its partial result"
-    );
-    assert_eq!(next.messages[0].header.offset, 0);
+        .await;
+    let operation = match blocked {
+        Err(IggyError::PartitionLaneBlocked(0, operation)) => operation,
+        other => panic!("a dropped committing poll must block its partition, got {other:?}"),
+    };
+    client.abandon_operation(operation).await.unwrap();
 
+    // The server may have stored offset 0 for the dropped poll, so read from an explicit offset.
     let committed = client
-        .poll_messages_deferred(
+        .poll_messages(
             &stream,
             &topic,
-            Some(0),
+            0,
             &consumer,
-            &strategy,
-            1,
-            true,
-            DeferredPollOptions {
-                max_wait: 500_000.into(),
-                min_count: 1,
-                ..Default::default()
+            &PollingStrategy::offset(0),
+            PollOptions {
+                count: 1,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::wait(500_000.into())
             },
         )
         .await
-        .unwrap();
+        .expect("an abandoned operation must release its partition");
     assert_eq!(committed.messages[0].header.offset, 0);
     let next = client
-        .poll_messages_deferred(
+        .poll_messages(
             &stream,
             &topic,
-            Some(0),
+            0,
             &consumer,
             &strategy,
-            1,
-            true,
-            DeferredPollOptions {
-                max_wait: 200_000.into(),
-                min_count: 1,
-                ..Default::default()
+            PollOptions {
+                count: 1,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::wait(200_000.into())
             },
         )
         .await
@@ -674,13 +719,10 @@ async fn given_deferred_group_when_one_partition_is_empty_should_deliver_other_p
         .consumer_group("deferred-group", "group-stream", "group-topic")
         .unwrap()
         .create_consumer_group_if_not_exists()
-        .auto_join_consumer_group()
-        .auto_commit(AutoCommit::Disabled)
         .polling_strategy(PollingStrategy::first())
-        .batch_length(1)
-        .poll_options(DeferredPollOptions {
-            max_wait: Duration::from_secs(2).into(),
-            ..Default::default()
+        .poll_options(PollOptions {
+            count: 1,
+            ..PollOptions::wait(Duration::from_secs(2).into())
         })
         .build();
     consumer.init().await.unwrap();
@@ -708,117 +750,299 @@ async fn given_deferred_group_when_one_partition_is_empty_should_deliver_other_p
     consumer.shutdown().await.unwrap();
 }
 
-#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
-async fn given_readiness_wait_when_a_message_arrives_should_name_its_partition_without_reading_it(
+#[iggy_harness(cluster_nodes = 1, test_client_transport = [Tcp, WebSocket, Quic])]
+async fn given_group_fetch_when_one_partition_holds_messages_should_not_wait_on_idle_ones(
     harness: &TestHarness,
 ) {
+    const MAX_WAIT: Duration = Duration::from_secs(10);
+    const PROMPT_REPLY: Duration = Duration::from_secs(2);
+    const PARTITIONS: u32 = 3;
+    const FETCHES: u64 = 3;
+    const READY_PARTITION: u32 = 1;
     let client = harness.root_client().await.unwrap();
-    client
-        .create_stream("readiness-stream", &StreamCreateOptions::default())
-        .await
-        .unwrap();
-    let stream = Identifier::from_str_value("readiness-stream").unwrap();
-    client
-        .create_topic(
-            &stream,
-            "readiness-topic",
-            &TopicCreateOptions {
-                partitions_count: Some(2),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    let topic = Identifier::from_str_value("readiness-topic").unwrap();
-    let consumer = Consumer::default();
-    let next = [(0, PollingStrategy::next()), (1, PollingStrategy::next())];
-    let options = DeferredPollOptions {
-        max_wait: Duration::from_secs(2).into(),
-        ..Default::default()
+    let (stream, topic, group) =
+        create_sole_group_member(&client, "ready-stream", PARTITIONS).await;
+    let consumer = Consumer::group(group);
+    let targets: Vec<_> = (0..PARTITIONS)
+        .map(|partition| (partition, PollingStrategy::next()))
+        .collect();
+    let options = PollOptions {
+        count: 1,
+        commit: CommitPolicy::OnRead,
+        ..PollOptions::wait(MAX_WAIT.into())
     };
-    let mut wait = Box::pin(client.wait_for_messages(&stream, &topic, &next, &consumer, options));
-    tokio::select! {
-        result = &mut wait => panic!("wait on empty partitions completed early: {result:?}"),
-        () = sleep(Duration::from_millis(50)) => {}
-    }
-    let mut messages = vec![
-        IggyMessage::builder()
-            .payload("ready".into())
-            .build()
-            .unwrap(),
-    ];
-    client
-        .send_messages(
-            &stream,
-            &topic,
-            &Partitioning::partition_id(1),
-            &mut messages,
+    for offset in 0..FETCHES {
+        send_to_partition(&client, &stream, &topic, READY_PARTITION, 1).await;
+        let sections = tokio::time::timeout(
+            PROMPT_REPLY,
+            fetch_sections(&client, &stream, &topic, &targets, &consumer, options),
         )
         .await
+        .expect("an idle partition must not hold the fetch for max_wait")
         .unwrap();
-    let ready = tokio::time::timeout(Duration::from_secs(3), wait)
+        assert_eq!(
+            sections.len(),
+            PARTITIONS as usize,
+            "every Next target resolves"
+        );
+        let delivered: Vec<_> = sections
+            .iter()
+            .flat_map(|section| {
+                section
+                    .decode()
+                    .unwrap()
+                    .messages
+                    .into_iter()
+                    .map(|message| (section.partition_id, message.header.offset))
+            })
+            .collect();
+        assert_eq!(delivered, [(READY_PARTITION, offset)]);
+        assert_eq!(
+            client
+                .get_consumer_offset(&consumer, &stream, &topic, Some(READY_PARTITION))
+                .await
+                .unwrap()
+                .unwrap()
+                .stored_offset,
+            offset,
+        );
+    }
+}
+
+#[iggy_harness(cluster_nodes = 1, test_client_transport = [Tcp, WebSocket, Quic])]
+async fn given_group_fetch_when_every_partition_is_idle_should_resolve_next_after_max_wait(
+    harness: &TestHarness,
+) {
+    const MAX_WAIT: Duration = Duration::from_secs(2);
+    const EARLY_TOLERANCE: Duration = Duration::from_millis(100);
+    const LATE_TOLERANCE: Duration = Duration::from_secs(1);
+    const PARTITIONS: u32 = 3;
+    let client = harness.root_client().await.unwrap();
+    let (stream, topic, group) = create_sole_group_member(&client, "idle-stream", PARTITIONS).await;
+    let targets: Vec<_> = (0..PARTITIONS)
+        .map(|partition| (partition, PollingStrategy::next()))
+        .collect();
+    let started = tokio::time::Instant::now();
+    let sections = fetch_sections(
+        &client,
+        &stream,
+        &topic,
+        &targets,
+        &Consumer::group(group),
+        PollOptions {
+            count: 1,
+            commit: CommitPolicy::OnRead,
+            ..PollOptions::wait(MAX_WAIT.into())
+        },
+    )
+    .await
+    .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(sections.len(), PARTITIONS as usize);
+    for (partition, section) in sections.iter().enumerate() {
+        assert_eq!(section.partition_id, partition as u32);
+        assert_eq!(section.next_offset, 0);
+        assert!(section.decode().unwrap().messages.is_empty());
+    }
+    assert!(
+        elapsed >= MAX_WAIT - EARLY_TOLERANCE && elapsed < MAX_WAIT + LATE_TOLERANCE,
+        "an empty fetch returned after {elapsed:?}, expected about {MAX_WAIT:?}"
+    );
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
+async fn given_group_fetch_when_one_partition_keeps_a_backlog_should_read_another_within_max_wait(
+    harness: &TestHarness,
+) {
+    const MAX_WAIT: Duration = Duration::from_secs(2);
+    const LATE_TOLERANCE: Duration = Duration::from_secs(1);
+    const PARTITIONS: u32 = 2;
+    const BACKLOG_PARTITION: u32 = 0;
+    const LATE_PARTITION: u32 = 1;
+    const BACKLOG_BATCH: usize = 2;
+    let client = harness.root_client().await.unwrap();
+    let (stream, topic, _) = create_sole_group_member(&client, "backlog-stream", PARTITIONS).await;
+    let mut consumer = client
+        .consumer_group(GROUP, "backlog-stream", TOPIC)
+        .unwrap()
+        .polling_strategy(PollingStrategy::next())
+        .poll_options(PollOptions {
+            count: 1,
+            commit: CommitPolicy::OnRead,
+            ..PollOptions::wait(MAX_WAIT.into())
+        })
+        .build();
+    consumer.init().await.unwrap();
+    send_to_partition(&client, &stream, &topic, BACKLOG_PARTITION, BACKLOG_BATCH).await;
+    let first = tokio::time::timeout(MAX_WAIT + LATE_TOLERANCE, consumer.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.partition_id, BACKLOG_PARTITION);
+    send_to_partition(&client, &stream, &topic, LATE_PARTITION, 1).await;
+    let late = tokio::time::timeout(MAX_WAIT + LATE_TOLERANCE, async {
+        loop {
+            send_to_partition(&client, &stream, &topic, BACKLOG_PARTITION, BACKLOG_BATCH).await;
+            let delivered = consumer.next().await.unwrap().unwrap();
+            if delivered.partition_id == LATE_PARTITION {
+                return delivered;
+            }
+            assert_eq!(delivered.partition_id, BACKLOG_PARTITION);
+        }
+    })
+    .await
+    .expect("a backlog on one partition must not hide another for longer than max_wait");
+    assert_eq!(late.message.header.offset, 0);
+    consumer.shutdown().await.unwrap();
+}
+
+#[iggy_harness(cluster_nodes = 1, test_client_transport = [Tcp, WebSocket, Quic])]
+async fn given_fetch_when_a_message_arrives_should_return_its_section_without_committing(
+    harness: &TestHarness,
+) {
+    const READY_PARTITION: u32 = 1;
+    const PARK_TIME: Duration = Duration::from_millis(50);
+    const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
+    let client = harness.root_client().await.unwrap();
+    let (stream, topic, _) = create_sole_group_member(&client, "fetch-stream", 2).await;
+    let consumer = Consumer::default();
+    let targets = [
+        (0, PollingStrategy::next()),
+        (READY_PARTITION, PollingStrategy::next()),
+    ];
+    let options = PollOptions {
+        count: 1,
+        ..PollOptions::wait(Duration::from_secs(2).into())
+    };
+    let mut fetch = Box::pin(fetch_sections(
+        &client, &stream, &topic, &targets, &consumer, options,
+    ));
+    tokio::select! {
+        result = &mut fetch => panic!("fetch on empty partitions completed early: {result:?}"),
+        () = sleep(PARK_TIME) => {}
+    }
+    send_to_partition(&client, &stream, &topic, READY_PARTITION, 1).await;
+    let sections = tokio::time::timeout(REPLY_TIMEOUT, fetch)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(ready, [1]);
+    assert_eq!(
+        sections.len(),
+        targets.len(),
+        "every Next target has a resolved start"
+    );
+    let idle = &sections[0];
+    assert_eq!(
+        (idle.partition_id, idle.next_offset, idle.messages_count),
+        (0, 0, 0)
+    );
+    let ready = &sections[1];
+    assert_eq!(
+        (ready.partition_id, ready.next_offset, ready.messages_count),
+        (READY_PARTITION, 1, 1)
+    );
+    assert_eq!(ready.decode().unwrap().messages[0].header.offset, 0);
     assert!(
         client
-            .get_consumer_offset(&consumer, &stream, &topic, Some(1))
+            .get_consumer_offset(&consumer, &stream, &topic, Some(READY_PARTITION))
             .await
             .unwrap()
             .is_none(),
-        "a wait stores no offset"
+        "a non-committing fetch stores no offset"
     );
 
-    let now = DeferredPollOptions {
-        max_wait: 0.into(),
-        ..Default::default()
+    let immediate = PollOptions {
+        count: 1,
+        ..PollOptions::default()
     };
-    let offsets = [
-        (0, PollingStrategy::offset(0)),
-        (1, PollingStrategy::offset(0)),
-    ];
-    assert_eq!(
-        client
-            .wait_for_messages(&stream, &topic, &offsets, &consumer, now)
-            .await
-            .unwrap(),
-        [1],
-        "a zero wait reports what is ready now"
-    );
-    let past_head = [(1, PollingStrategy::offset(1))];
+    let continued: Vec<_> = sections
+        .iter()
+        .map(|section| {
+            (
+                section.partition_id,
+                PollingStrategy::continuation(
+                    section.partition_id,
+                    PollingKind::Offset,
+                    section.next_offset,
+                    section.context,
+                ),
+            )
+        })
+        .collect();
     assert!(
-        client
-            .wait_for_messages(&stream, &topic, &past_head, &consumer, now)
+        fetch_sections(&client, &stream, &topic, &continued, &consumer, immediate)
             .await
             .unwrap()
-            .is_empty()
+            .is_empty(),
+        "continuing from the section table must not replay records"
     );
-    let polled = client
-        .poll_messages(
+    let replayed = fetch_sections(
+        &client,
+        &stream,
+        &topic,
+        &[(READY_PARTITION, PollingStrategy::next())],
+        &consumer,
+        immediate,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replayed[0].decode().unwrap().messages[0].header.offset, 0);
+    assert!(matches!(
+        fetch_sections(
+            &client,
             &stream,
             &topic,
-            Some(1),
+            &[(READY_PARTITION, PollingStrategy::first())],
             &consumer,
-            &PollingStrategy::next(),
-            1,
-            false,
+            immediate
         )
-        .await
-        .unwrap();
-    assert_eq!(polled.messages[0].header.offset, 0);
-    assert!(matches!(
-        client
-            .wait_for_messages(
-                &stream,
-                &topic,
-                &[(1, PollingStrategy::first())],
-                &consumer,
-                now
-            )
-            .await,
+        .await,
         Err(IggyError::InvalidCommand)
     ));
+}
+
+#[iggy_harness(cluster_nodes = 1, test_client_transport = [Tcp, WebSocket, Quic])]
+async fn given_repeated_fetches_when_each_partition_receives_a_message_should_return_it(
+    harness: &TestHarness,
+) {
+    const PARTITIONS: u32 = 8;
+    const PARK_TIME: Duration = Duration::from_millis(50);
+    const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
+    let client = harness.root_client().await.unwrap();
+    let (stream, topic, _) = create_sole_group_member(&client, "watch-stream", PARTITIONS).await;
+    let consumer = Consumer::default();
+    let options = PollOptions {
+        count: 1,
+        ..PollOptions::wait(Duration::from_secs(2).into())
+    };
+    let mut targets: Vec<_> = (0..PARTITIONS)
+        .map(|partition| (partition, PollingStrategy::offset(0)))
+        .collect();
+    for partition in 0..PARTITIONS {
+        let mut fetch = Box::pin(fetch_sections(
+            &client, &stream, &topic, &targets, &consumer, options,
+        ));
+        tokio::select! {
+            result = &mut fetch => panic!("fetch completed before its message: {result:?}"),
+            () = sleep(PARK_TIME) => {}
+        }
+        send_to_partition(&client, &stream, &topic, partition, 1).await;
+        let sections = tokio::time::timeout(REPLY_TIMEOUT, fetch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sections.len(), 1);
+        let section = &sections[0];
+        assert_eq!((section.partition_id, section.next_offset), (partition, 1));
+        assert_eq!(section.decode().unwrap().messages[0].header.offset, 0);
+        targets[partition as usize].1 = PollingStrategy::continuation(
+            section.partition_id,
+            PollingKind::Offset,
+            section.next_offset,
+            section.context,
+        );
+    }
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
@@ -849,13 +1073,11 @@ async fn given_commit_on_poll_group_when_the_application_pauses_should_commit_on
         .consumer_group("on-demand-group", "on-demand-stream", "on-demand-topic")
         .unwrap()
         .create_consumer_group_if_not_exists()
-        .auto_join_consumer_group()
-        .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
         .polling_strategy(PollingStrategy::next())
-        .batch_length(1)
-        .poll_options(DeferredPollOptions {
-            max_wait: Duration::from_secs(2).into(),
-            ..Default::default()
+        .poll_options(PollOptions {
+            count: 1,
+            commit: CommitPolicy::OnRead,
+            ..PollOptions::wait(Duration::from_secs(2).into())
         })
         .build();
     consumer.init().await.unwrap();
@@ -948,9 +1170,11 @@ async fn given_commit_on_poll_group_when_shut_down_mid_batch_should_store_the_la
         .consumer_group("shutdown-group", "shutdown-stream", TOPIC)
         .unwrap()
         .create_consumer_group_if_not_exists()
-        .auto_join_consumer_group()
-        .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
-        .batch_length(SENT)
+        .poll_options(PollOptions {
+            count: SENT,
+            commit: CommitPolicy::OnRead,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .build();
     consumer.init().await.unwrap();
     read_offsets(&mut consumer, READ).await;
@@ -963,28 +1187,29 @@ async fn given_commit_on_poll_group_when_shut_down_mid_batch_should_store_the_la
 }
 
 #[iggy_harness(test_client_transport = [Tcp])]
-async fn given_interval_and_poll_commits_when_the_application_pauses_should_store_the_last_delivered_offset(
+async fn given_commit_on_poll_consumer_when_shut_down_mid_batch_should_store_the_last_delivered_offset(
     harness: &TestHarness,
 ) {
     const SENT: u32 = 10;
     const READ: u64 = 3;
     let client = harness.root_client().await.unwrap();
-    let (stream, topic) = create_partition_with_messages(&client, "interval-stream", SENT).await;
+    let (stream, topic) = create_partition_with_messages(&client, "on-read-stream", SENT).await;
     let mut consumer = client
-        .consumer("interval-reader", "interval-stream", TOPIC, 0)
+        .consumer("on-read-reader", "on-read-stream", TOPIC)
         .unwrap()
-        .auto_commit(AutoCommit::IntervalOrWhen(
-            NonZeroIggyDuration::new(Duration::from_millis(50)).unwrap(),
-            AutoCommitWhen::PollingMessages,
-        ))
-        .batch_length(SENT)
+        .partitions([0])
+        .poll_options(PollOptions {
+            count: SENT,
+            commit: CommitPolicy::OnRead,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .build();
     consumer.init().await.unwrap();
 
     read_offsets(&mut consumer, READ).await;
 
-    let reader = Consumer::new(Identifier::named("interval-reader").unwrap());
-    wait_for_stored_offset(&client, &reader, &stream, &topic, READ - 1).await;
+    let reader = Consumer::new(Identifier::named("on-read-reader").unwrap());
+    wait_for_stored_offset(&client, &reader, &stream, &topic, u64::from(SENT) - 1).await;
     consumer.shutdown().await.unwrap();
     wait_for_stored_offset(&client, &reader, &stream, &topic, READ - 1).await;
 }
@@ -1040,18 +1265,15 @@ async fn given_deferred_poll_when_wait_exceeds_heartbeat_window_should_keep_sess
 
     let started = tokio::time::Instant::now();
     let result = client
-        .poll_messages_deferred(
+        .poll_messages(
             &stream,
             &topic,
-            None,
+            0,
             &Consumer::group(group.clone()),
             &PollingStrategy::first(),
-            1,
-            false,
-            DeferredPollOptions {
-                max_wait: 10_000_000.into(),
-                min_count: 1,
-                ..Default::default()
+            PollOptions {
+                count: 1,
+                ..PollOptions::wait(10_000_000.into())
             },
         )
         .await
@@ -1096,17 +1318,15 @@ async fn given_large_batch_cap_when_one_message_arrives_should_return_without_wa
     let topic = Identifier::named("topic").unwrap();
     let consumer = Consumer::default();
     let strategy = PollingStrategy::offset(0);
-    let mut poll = Box::pin(client.poll_messages_deferred(
+    let mut poll = Box::pin(client.poll_messages(
         &stream,
         &topic,
-        Some(0),
+        0,
         &consumer,
         &strategy,
-        100,
-        false,
-        DeferredPollOptions {
-            max_wait: Duration::from_secs(5).into(),
-            ..Default::default()
+        PollOptions {
+            count: 100,
+            ..PollOptions::wait(Duration::from_secs(5).into())
         },
     ));
     tokio::select! {
@@ -1170,23 +1390,25 @@ async fn given_byte_limit_when_batch_is_larger_should_return_prefix_without_skip
             + iggy_binary_protocol::batch::BATCH_HEADER_SIZE
             + iggy_binary_protocol::batch::BATCH_MESSAGE_HEADER_SIZE
             + PAYLOAD.len()) as u32;
-    let options = DeferredPollOptions {
+    let options = PollOptions {
+        count: 3,
         min_count: 3,
         max_bytes,
-        ..Default::default()
+        ..PollOptions::wait(IggyDuration::ONE_SECOND)
     };
     for offset in 0..3 {
         let polled = tokio::time::timeout(
             Duration::from_millis(700),
-            client.poll_messages_deferred(
+            client.poll_messages(
                 &stream,
                 &topic,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::next(),
-                3,
-                true,
-                options,
+                PollOptions {
+                    commit: CommitPolicy::OnRead,
+                    ..options
+                },
             ),
         )
         .await
@@ -1195,43 +1417,62 @@ async fn given_byte_limit_when_batch_is_larger_should_return_prefix_without_skip
         assert_eq!(polled.messages.len(), 1);
         assert_eq!(polled.messages[0].header.offset, offset);
     }
+    // The server returns a first record larger than `max_bytes` alone, in the one reply of the
+    // request.
     let oversized = client
-        .poll_messages_deferred(
+        .poll_messages(
             &stream,
             &topic,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            3,
-            false,
-            DeferredPollOptions {
+            PollOptions {
                 max_bytes: max_bytes - 1,
                 ..options
             },
         )
-        .await;
-    let error = oversized.expect_err("an oversized first record must fail, never disappear");
-    let code = if let IggyError::HttpResponseError(_, body) = &error {
-        serde_json::from_str::<serde_json::Value>(body).unwrap()["id"]
-            .as_u64()
-            .unwrap()
-    } else {
-        u64::from(error.as_code())
-    };
+        .await
+        .expect("an oversized first record must come alone, never fail or disappear");
     assert_eq!(
-        code,
-        u64::from(IggyError::InvalidSizeBytes.as_code()),
-        "{error:?}"
+        oversized
+            .messages
+            .iter()
+            .map(|message| message.header.offset)
+            .collect::<Vec<_>>(),
+        [0]
     );
-    let replay = client
-        .poll_messages_deferred(
+    // A `Last` start counts back from the end of the partition, and its first record comes alone
+    // in the same way.
+    let last = client
+        .poll_messages(
             &stream,
             &topic,
-            Some(0),
+            0,
+            &Consumer::default(),
+            &PollingStrategy::last(),
+            PollOptions {
+                count: 2,
+                min_count: 1,
+                max_bytes: max_bytes - 1,
+                ..options
+            },
+        )
+        .await
+        .expect("an oversized first record of a `Last` start must come alone");
+    assert_eq!(
+        last.messages
+            .iter()
+            .map(|message| message.header.offset)
+            .collect::<Vec<_>>(),
+        [1]
+    );
+    let replay = client
+        .poll_messages(
+            &stream,
+            &topic,
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            3,
-            false,
             options,
         )
         .await
@@ -1274,9 +1515,13 @@ async fn given_default_consumer_when_restarted_before_commit_should_replay_unpro
         .await
         .unwrap();
     let mut consumer = client
-        .consumer("safe-reader", "safe-stream", "topic", 0)
+        .consumer("safe-reader", "safe-stream", "topic")
         .unwrap()
-        .batch_length(2)
+        .partitions([0])
+        .poll_options(PollOptions {
+            count: 2,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .prefetch_messages(4)
         .build();
     consumer.init().await.unwrap();
@@ -1298,9 +1543,13 @@ async fn given_default_consumer_when_restarted_before_commit_should_replay_unpro
             .is_none()
     );
     let mut restarted = client
-        .consumer("safe-reader", "safe-stream", "topic", 0)
+        .consumer("safe-reader", "safe-stream", "topic")
         .unwrap()
-        .batch_length(2)
+        .partitions([0])
+        .poll_options(PollOptions {
+            count: 2,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .build();
     restarted.init().await.unwrap();
     let first = tokio::time::timeout(Duration::from_secs(2), restarted.next())
@@ -1312,8 +1561,9 @@ async fn given_default_consumer_when_restarted_before_commit_should_replay_unpro
     restarted.store_offset(0, Some(0)).await.unwrap();
     drop(restarted);
     let mut committed = client
-        .consumer("safe-reader", "safe-stream", "topic", 0)
+        .consumer("safe-reader", "safe-stream", "topic")
         .unwrap()
+        .partitions([0])
         .build();
     committed.init().await.unwrap();
     let next = tokio::time::timeout(Duration::from_secs(2), committed.next())
@@ -1352,10 +1602,6 @@ async fn given_buffered_group_batch_when_membership_is_revoked_should_discard_qu
         .create_consumer_group(&stream, &topic, "readers")
         .await
         .unwrap();
-    client
-        .join_consumer_group(&stream, &topic, &group)
-        .await
-        .unwrap();
     let mut messages = (0..10)
         .map(|_| IggyMessage::from_str("buffered").unwrap())
         .collect::<Vec<_>>();
@@ -1371,8 +1617,10 @@ async fn given_buffered_group_batch_when_membership_is_revoked_should_discard_qu
     let mut consumer = client
         .consumer_group("readers", "revoke-stream", "topic")
         .unwrap()
-        .do_not_auto_join_consumer_group()
-        .batch_length(10)
+        .poll_options(PollOptions {
+            count: 10,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .prefetch_messages(10)
         .build();
     consumer.init().await.unwrap();
@@ -1392,19 +1640,246 @@ async fn given_buffered_group_batch_when_membership_is_revoked_should_discard_qu
         .await
         .unwrap();
     sleep(Duration::from_millis(1200)).await;
-    let received = tokio::time::timeout(Duration::from_secs(2), consumer.next())
+    // The reader joins again at an assignment refresh and reads the group position after a retry
+    // interval, so the next message comes from a new read.
+    let received = tokio::time::timeout(REJOIN_READ_TIMEOUT, consumer.next())
         .await
         .unwrap()
-        .unwrap();
-    assert!(
-        received.is_err(),
+        .unwrap()
+        .expect("the member joins again and reads on");
+    assert_eq!(
+        received.message.header.offset, 0,
         "revoked prefetched messages must never reach the application"
     );
     consumer.shutdown().await.unwrap();
 }
 
+#[iggy_harness(cluster_nodes = 1, test_client_transport = [Tcp, WebSocket, Quic])]
+async fn given_one_prefetch_slot_when_a_fetch_has_many_sections_should_deliver_every_section(
+    harness: &TestHarness,
+) {
+    const PARTITIONS: u32 = 3;
+    const PARK_TIME: Duration = Duration::from_millis(100);
+    const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
+    let client = harness.root_client().await.unwrap();
+    let (stream, topic, _) = create_sole_group_member(&client, "prefetch-stream", PARTITIONS).await;
+    let options = PollOptions {
+        count: PARTITIONS,
+        min_count: PARTITIONS,
+        ..PollOptions::wait(Duration::from_secs(2).into())
+    };
+    let mut consumer = client
+        .consumer_group(GROUP, "prefetch-stream", TOPIC)
+        .unwrap()
+        .polling_strategy(PollingStrategy::offset(0))
+        .prefetch_messages(PARTITIONS)
+        .prefetch_bytes(options.max_bytes)
+        .poll_options(options)
+        .build();
+    consumer.init().await.unwrap();
+    let mut first = Box::pin(consumer.next());
+    tokio::select! {
+        result = &mut first => panic!("consumer completed before its messages: {result:?}"),
+        () = sleep(PARK_TIME) => {}
+    }
+    for partition in 0..PARTITIONS {
+        send_to_partition(&client, &stream, &topic, partition, 1).await;
+    }
+    let first = tokio::time::timeout(REPLY_TIMEOUT, first)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let mut delivered = vec![(first.partition_id, first.message.header.offset)];
+    for _ in 1..PARTITIONS {
+        let message = tokio::time::timeout(REPLY_TIMEOUT, consumer.next())
+            .await
+            .expect("the remaining sections must survive one-slot backpressure")
+            .unwrap()
+            .unwrap();
+        delivered.push((message.partition_id, message.message.header.offset));
+    }
+    delivered.sort_unstable();
+    assert_eq!(delivered, [(0, 0), (1, 0), (2, 0)]);
+    consumer.shutdown().await.unwrap();
+}
+
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_seeded_fetches_when_replies_are_lost_or_cancelled_should_preserve_partition_progress(
+    harness: &TestHarness,
+) {
+    const SEED: u64 = 109;
+    const PARTITIONS: u32 = 6;
+    const ROUNDS: usize = 12;
+    const MAX_BATCH: usize = 3;
+    const MAX_FETCHES: usize = ROUNDS * MAX_BATCH;
+    const FETCH_BYTES: u32 = 512;
+    const CANCEL_EVERY: usize = 3;
+    const DROP_EVERY: usize = 2;
+    const PARK_TIME: Duration = Duration::from_millis(50);
+    let client = harness.tcp_root_client().await.unwrap();
+    let (stream, topic, _) =
+        create_sole_group_member(&client, "fetch-model-stream", PARTITIONS).await;
+    let consumer = Consumer::default();
+    let mut primaries = BTreeMap::<u8, Vec<u32>>::new();
+    for partition in 0..PARTITIONS {
+        let primary = partition_primary(&client, &stream, &topic, partition)
+            .await
+            .unwrap();
+        primaries.entry(primary).or_default().push(partition);
+    }
+    let groups: Vec<_> = primaries.into_values().collect();
+    assert!(
+        groups.len() > 1,
+        "the sequence must exercise more than one primary"
+    );
+    let mut rng = StdRng::seed_from_u64(SEED);
+    let mut produced = [0_u64; PARTITIONS as usize];
+    let mut positions = [(0_u64, None); PARTITIONS as usize];
+    let mut dropped_replies = 0;
+    let options = PollOptions {
+        max_bytes: FETCH_BYTES,
+        ..PollOptions::default()
+    };
+    for round in 0..ROUNDS {
+        let partition = rng.random_range(0..PARTITIONS);
+        if round % CANCEL_EVERY == 0 {
+            let targets = [(
+                partition,
+                PollingStrategy::offset(produced[partition as usize]),
+            )];
+            let mut parked = Box::pin(fetch_sections(
+                &client,
+                &stream,
+                &topic,
+                &targets,
+                &consumer,
+                PollOptions {
+                    count: 1,
+                    max_wait: Duration::from_secs(2).into(),
+                    ..options
+                },
+            ));
+            tokio::select! {
+                result = &mut parked => panic!("seed {SEED}, round {round}: empty fetch did not park: {result:?}"),
+                () = sleep(PARK_TIME) => {}
+            }
+            drop(parked);
+        }
+        let batch = rng.random_range(1..=MAX_BATCH);
+        send_to_partition(&client, &stream, &topic, partition, batch).await;
+        produced[partition as usize] += batch as u64;
+        let mut caught_up = false;
+        for fetch_round in 0..MAX_FETCHES {
+            for group in &groups {
+                let mut targets: Vec<_> = group
+                    .iter()
+                    .map(|&partition| {
+                        let (offset, context) = positions[partition as usize];
+                        let strategy = match context {
+                            Some(context) => PollingStrategy::continuation(
+                                partition,
+                                PollingKind::Offset,
+                                offset,
+                                context,
+                            ),
+                            None => PollingStrategy::offset(offset),
+                        };
+                        (partition, strategy)
+                    })
+                    .collect();
+                let rotation = rng.random_range(0..targets.len());
+                targets.rotate_left(rotation);
+                let count = rng.random_range(1..=MAX_BATCH as u32);
+                let fetch_options = PollOptions { count, ..options };
+                let mut sections =
+                    fetch_sections(&client, &stream, &topic, &targets, &consumer, fetch_options)
+                        .await
+                        .unwrap();
+                if round % DROP_EVERY == 0 && fetch_round == 0 && !sections.is_empty() {
+                    let lost: Vec<_> = sections
+                        .iter()
+                        .map(|section| {
+                            (
+                                section.partition_id,
+                                section.next_offset,
+                                section.records.clone(),
+                            )
+                        })
+                        .collect();
+                    sections = fetch_sections(
+                        &client,
+                        &stream,
+                        &topic,
+                        &targets,
+                        &consumer,
+                        fetch_options,
+                    )
+                    .await
+                    .unwrap();
+                    let replayed: Vec<_> = sections
+                        .iter()
+                        .map(|section| {
+                            (
+                                section.partition_id,
+                                section.next_offset,
+                                section.records.clone(),
+                            )
+                        })
+                        .collect();
+                    assert_eq!(
+                        replayed, lost,
+                        "seed {SEED}, round {round}: a lost non-committing reply must replay"
+                    );
+                    dropped_replies += 1;
+                }
+                assert!(
+                    sections
+                        .iter()
+                        .map(|section| section.messages_count)
+                        .sum::<u32>()
+                        <= count
+                );
+                assert!(
+                    sections
+                        .iter()
+                        .map(|section| section.records.len())
+                        .sum::<usize>()
+                        <= FETCH_BYTES as usize
+                );
+                for section in sections {
+                    let polled = section.decode().unwrap();
+                    let position = &mut positions[section.partition_id as usize];
+                    for message in polled.messages {
+                        assert_eq!(
+                            message.header.offset, position.0,
+                            "seed {SEED}, round {round}, partition {}: no gap or unrequested duplicate",
+                            section.partition_id
+                        );
+                        position.0 += 1;
+                    }
+                    assert_eq!(section.next_offset, position.0);
+                    position.1 = Some(section.context);
+                }
+            }
+            if positions.iter().map(|position| position.0).eq(produced) {
+                caught_up = true;
+                break;
+            }
+        }
+        assert!(
+            caught_up,
+            "seed {SEED}, round {round}: positions {positions:?}, produced {produced:?}"
+        );
+    }
+    assert!(dropped_replies > 0, "the seed must cover discarded replies");
+}
+
 const TOPIC: &str = "topic";
+const GROUP: &str = "group";
+const ASSIGNMENT_TIMEOUT: Duration = Duration::from_secs(5);
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(3);
+const REJOIN_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const STORED_OFFSET_TIMEOUT: Duration = Duration::from_secs(3);
 const STORED_OFFSET_RECHECK: Duration = Duration::from_millis(20);
 
@@ -1444,6 +1919,66 @@ async fn create_partition_with_messages(
         .await
         .unwrap();
     (stream, topic)
+}
+
+/// Creates `stream_name` with a topic of `partitions` partitions and a group
+/// that the client joins as its only member.
+async fn create_sole_group_member(
+    client: &IggyClient,
+    stream_name: &str,
+    partitions: u32,
+) -> (Identifier, Identifier, Identifier) {
+    client
+        .create_stream(stream_name, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream = Identifier::named(stream_name).unwrap();
+    client
+        .create_topic(
+            &stream,
+            TOPIC,
+            &TopicCreateOptions {
+                partitions_count: Some(partitions),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let topic = Identifier::named(TOPIC).unwrap();
+    client
+        .create_consumer_group(&stream, &topic, GROUP)
+        .await
+        .unwrap();
+    let group = Identifier::named(GROUP).unwrap();
+    client
+        .join_consumer_group(&stream, &topic, &group)
+        .await
+        .unwrap();
+    wait_for_consumer_group_assignment(client, &stream, &topic, &group, 1, ASSIGNMENT_TIMEOUT)
+        .await;
+    (stream, topic, group)
+}
+
+/// Sends `count` messages to `partition`.
+async fn send_to_partition(
+    client: &IggyClient,
+    stream: &Identifier,
+    topic: &Identifier,
+    partition: u32,
+    count: usize,
+) {
+    let mut messages = (0..count)
+        .map(|index| IggyMessage::from_str(&format!("message-{index}")).unwrap())
+        .collect::<Vec<_>>();
+    client
+        .send_messages(
+            stream,
+            topic,
+            &Partitioning::partition_id(partition),
+            &mut messages,
+        )
+        .await
+        .unwrap();
 }
 
 /// Reads offsets `0..count` of partition 0, in order.

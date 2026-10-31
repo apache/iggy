@@ -24,10 +24,12 @@ use ext_php_rs::{
     exception::PhpException,
     ffi::zend_call_known_function,
     php_class, php_impl,
-    types::Zval,
-    zend::{ExecutorGlobals, ce},
+    types::{ZendObject, Zval},
+    zend::{ClassEntry, ExecutorGlobals, ce},
 };
-use iggy::prelude::IggyError;
+use iggy::prelude::{IggyError, ReadError};
+
+use crate::receive_message::PollingStrategy;
 
 #[php_class]
 #[php(name = "Iggy\\Exception\\IggyException")]
@@ -66,6 +68,7 @@ pub struct TransientException;
 pub struct PendingOperationException {
     operation_id: String,
     kind: String,
+    partition_id: Option<u32>,
 }
 #[php_impl]
 impl PendingOperationException {
@@ -79,33 +82,62 @@ impl PendingOperationException {
     pub fn kind(&self) -> &str {
         &self.kind
     }
+
+    #[php(getter, change_case = "snake_case")]
+    pub fn partition_id(&self) -> Option<u32> {
+        self.partition_id
+    }
 }
 
 impl PendingOperationException {
-    fn into_exception_object(self, message: &str, code: i32) -> Result<Zval, Error> {
-        let mut object = self.into_zval(false)?;
-        let mut arguments = [message.into_zval(false)?, code.into_zval(false)?];
-        let mut result = Zval::new();
-        let receiver = object.object_mut().ok_or(Error::Object)?;
+    fn from_error(error: &IggyError) -> Option<Self> {
+        let (operation_id, kind, partition_id) = match error {
+            IggyError::OperationUncertain(operation_id) => (*operation_id, "uncertain", None),
+            IggyError::FetchProgressUncertain(operation_id) => {
+                (*operation_id, "fetch_progress_uncertain", None)
+            }
+            IggyError::LaneBlocked(operation_id) => (*operation_id, "lane_blocked", None),
+            IggyError::PartitionLaneBlocked(partition_id, operation_id) => {
+                (*operation_id, "lane_blocked", Some(*partition_id))
+            }
+            IggyError::OperationNotRetained(operation_id) => (*operation_id, "not_retained", None),
+            _ => return None,
+        };
+        Some(Self {
+            operation_id: operation_id.to_string(),
+            kind: kind.to_owned(),
+            partition_id,
+        })
+    }
+}
 
-        // SAFETY: The initialized object extends Exception, and the argument and result
-        // zvals remain live for the call. Its native constructor initializes inherited
-        // fields that the generated Rust constructor leaves untouched.
-        unsafe {
-            zend_call_known_function(
-                ce::exception().constructor,
-                receiver,
-                receiver.ce,
-                &raw mut result,
-                arguments.len().try_into()?,
-                arguments.as_mut_ptr(),
-                ptr::null_mut(),
-            );
-        }
-        if let Some(class) = ExecutorGlobals::pending_exception_class() {
-            return Err(Error::ExceptionPending { class });
-        }
-        Ok(object)
+/// A failed read of a PartitionReader or a Consumer. The reader stays usable and retries by
+/// itself.
+///
+/// The code is the code of the error, and the previous exception is the error itself, typed as
+/// any other call would throw it, for example a PendingOperationException.
+#[php_class]
+#[php(name = "Iggy\\Exception\\ReadException")]
+#[php(extends(IggyException))]
+#[derive(Default)]
+pub struct ReadException {
+    partition_id: Option<u32>,
+    skip: Option<PollingStrategy>,
+}
+
+#[php_impl]
+impl ReadException {
+    /// The partition of the error, or null for an error of the whole reader.
+    #[php(getter, change_case = "snake_case")]
+    pub fn partition_id(&self) -> Option<u32> {
+        self.partition_id
+    }
+
+    /// For a message that does not decode: the continuation after it. The reader reads the
+    /// message again until a seek of its partition to this continuation skips it.
+    #[php(getter)]
+    pub fn skip(&self) -> Option<PollingStrategy> {
+        self.skip.clone()
     }
 }
 
@@ -120,32 +152,28 @@ pub(crate) fn to_php_exception(error: impl IntoPhpException) -> PhpException {
 impl IntoPhpException for IggyError {
     fn into_php_exception(self) -> PhpException {
         let message = self.to_string();
+        let code = self.as_code() as i32;
 
-        let pending = match &self {
-            IggyError::OperationUncertain(operation_id) => Some((*operation_id, "uncertain")),
-            IggyError::LaneBlocked(operation_id) => Some((*operation_id, "lane_blocked")),
-            IggyError::OperationNotRetained(operation_id) => Some((*operation_id, "not_retained")),
-            _ => None,
-        };
-        if let Some((operation_id, kind)) = pending {
-            let exception = PendingOperationException {
-                operation_id: operation_id.to_string(),
-                kind: kind.to_owned(),
-            };
-            return match exception.into_exception_object(&message, self.as_code() as i32) {
-                Ok(object) => PhpException::from_message(String::new()).with_object(object),
-                Err(error) => error.into_php_exception(),
-            };
+        match PendingOperationException::from_error(&self) {
+            Some(exception) => thrown(exception_object(exception, &message, code, None)),
+            None => PhpException::new(message, code, exception_class(&self)),
         }
+    }
+}
 
-        let class = match PhpExceptionKind::from(&self) {
-            PhpExceptionKind::Connection => ConnectionException::get_metadata().ce(),
-            PhpExceptionKind::Authentication => AuthenticationException::get_metadata().ce(),
-            PhpExceptionKind::NotFound => NotFoundException::get_metadata().ce(),
-            PhpExceptionKind::Transient => TransientException::get_metadata().ce(),
-            PhpExceptionKind::Base => IggyException::get_metadata().ce(),
+impl IntoPhpException for ReadError {
+    fn into_php_exception(self) -> PhpException {
+        let message = self.to_string();
+        let code = self.error.as_code() as i32;
+        let exception = ReadException {
+            partition_id: self.partition_id,
+            skip: self.skip.map(PollingStrategy::from),
         };
-        PhpException::new(message, self.as_code() as i32, class)
+
+        thrown(
+            error_object(&self.error)
+                .and_then(|error| exception_object(exception, &message, code, Some(error))),
+        )
     }
 }
 
@@ -166,6 +194,73 @@ impl IntoPhpException for String {
 impl IntoPhpException for &str {
     fn into_php_exception(self) -> PhpException {
         PhpException::from_class::<IggyException>(self.to_string())
+    }
+}
+
+fn thrown(object: Result<Zval, Error>) -> PhpException {
+    match object {
+        Ok(object) => PhpException::from_message(String::new()).with_object(object),
+        Err(error) => error.into_php_exception(),
+    }
+}
+
+/// An exception object that carries Rust fields or a previous exception, which the generated
+/// constructor of its class cannot set.
+fn exception_object(
+    exception: impl IntoZval,
+    message: &str,
+    code: i32,
+    previous: Option<Zval>,
+) -> Result<Zval, Error> {
+    let mut object = exception.into_zval(false)?;
+    let mut arguments = vec![message.into_zval(false)?, code.into_zval(false)?];
+    arguments.extend(previous);
+    let mut result = Zval::new();
+    let receiver = object.object_mut().ok_or(Error::Object)?;
+
+    // SAFETY: The initialized object extends Exception, and the argument and result
+    // zvals remain live for the call. Its native constructor initializes inherited
+    // fields that the generated Rust constructor leaves untouched.
+    unsafe {
+        zend_call_known_function(
+            ce::exception().constructor,
+            receiver,
+            receiver.ce,
+            &raw mut result,
+            arguments.len().try_into()?,
+            arguments.as_mut_ptr(),
+            ptr::null_mut(),
+        );
+    }
+    if let Some(class) = ExecutorGlobals::pending_exception_class() {
+        return Err(Error::ExceptionPending { class });
+    }
+    Ok(object)
+}
+
+/// The exception object that a call failing with `error` throws.
+fn error_object(error: &IggyError) -> Result<Zval, Error> {
+    let message = error.to_string();
+    let code = error.as_code() as i32;
+
+    match PendingOperationException::from_error(error) {
+        Some(exception) => exception_object(exception, &message, code, None),
+        None => exception_object(
+            ZendObject::new(exception_class(error)),
+            &message,
+            code,
+            None,
+        ),
+    }
+}
+
+fn exception_class(error: &IggyError) -> &'static ClassEntry {
+    match PhpExceptionKind::from(error) {
+        PhpExceptionKind::Connection => ConnectionException::get_metadata().ce(),
+        PhpExceptionKind::Authentication => AuthenticationException::get_metadata().ce(),
+        PhpExceptionKind::NotFound => NotFoundException::get_metadata().ce(),
+        PhpExceptionKind::Transient => TransientException::get_metadata().ce(),
+        PhpExceptionKind::Base => IggyException::get_metadata().ce(),
     }
 }
 
@@ -250,5 +345,45 @@ impl From<&IggyError> for PhpExceptionKind {
             | IggyError::ShardCommunicationError => Self::Transient,
             _ => Self::Base,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_operation_errors_preserve_exact_identity_and_kind() {
+        for operation_id in [(1u64 << 53) + 17, u64::MAX] {
+            for (error, kind, partition_id) in [
+                (
+                    IggyError::OperationUncertain(operation_id),
+                    "uncertain",
+                    None,
+                ),
+                (IggyError::LaneBlocked(operation_id), "lane_blocked", None),
+                (
+                    IggyError::FetchProgressUncertain(operation_id),
+                    "fetch_progress_uncertain",
+                    None,
+                ),
+                (
+                    IggyError::PartitionLaneBlocked(u32::MAX, operation_id),
+                    "lane_blocked",
+                    Some(u32::MAX),
+                ),
+                (
+                    IggyError::OperationNotRetained(operation_id),
+                    "not_retained",
+                    None,
+                ),
+            ] {
+                let exception = PendingOperationException::from_error(&error).unwrap();
+                assert_eq!(exception.operation_id(), operation_id.to_string());
+                assert_eq!(exception.kind(), kind);
+                assert_eq!(exception.partition_id(), partition_id);
+            }
+        }
+        assert!(PendingOperationException::from_error(&IggyError::InvalidCommand).is_none());
     }
 }

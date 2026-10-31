@@ -72,6 +72,16 @@ func expectCode(_ codes: IggyErrorCode..., sourceLocation: SourceLocation = #_so
     }
 }
 
+func reportedError(_ operation: () async throws -> Void) async throws -> IggyError {
+    var reported: IggyError?
+    do {
+        try await operation()
+    } catch let error as IggyError {
+        reported = error
+    }
+    return try #require(reported)
+}
+
 extension IggyClient {
     /// ``sendMessages(streamID:topicID:partitioning:messages:)`` for a batch
     /// the test does not read back, so the call can take a literal.

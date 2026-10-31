@@ -150,6 +150,12 @@ public enum Partitioning: Sendable, Hashable {
 }
 
 /// Where a poll starts reading a partition.
+///
+/// A continuation, from ``PolledMessages/continuation``, also carries the
+/// partition and the partition history it was read from: a poll of another
+/// partition refuses it, and a poll after the partition was recreated fails
+/// with ``IggyErrorCode/historyUnavailable`` instead of reading the offset in
+/// another history.
 public struct PollingStrategy: Sendable, Hashable, CustomStringConvertible {
     public enum Kind: UInt8, Sendable, Hashable {
         case offset = 1
@@ -161,28 +167,36 @@ public struct PollingStrategy: Sendable, Hashable, CustomStringConvertible {
 
     public var kind: Kind
     public var value: UInt64
-    /// The partition incarnation and owner a continuation offset was read
-    /// under. A poll that carries one is refused once the partition was
-    /// recreated, instead of reading the offset in another incarnation.
-    public var context: PartitionContext?
+    /// The partition incarnation and owner a continuation was read under.
+    var context: PartitionContext?
+    /// The partition a continuation belongs to.
+    var partitionID: UInt32?
 
-    public init(kind: Kind, value: UInt64, context: PartitionContext? = nil) {
+    public init(kind: Kind, value: UInt64) {
+        self.kind = kind
+        self.value = value
+    }
+
+    init(kind: Kind, value: UInt64, context: PartitionContext?, partitionID: UInt32? = nil) {
         self.kind = kind
         self.value = value
         self.context = context
+        self.partitionID = partitionID
     }
 
-    /// Resume from a specific offset. Pass the ``PolledMessages/context`` of
-    /// the poll the offset came from to have the poll refused once the
-    /// partition was recreated.
-    public static func offset(_ offset: UInt64, context: PartitionContext? = nil) -> PollingStrategy {
-        PollingStrategy(kind: .offset, value: offset, context: context)
+    /// Start at a specific offset.
+    public static func offset(_ offset: UInt64) -> PollingStrategy {
+        PollingStrategy(kind: .offset, value: offset)
     }
 
-    /// Resume from the first message at or after a timestamp, under
-    /// `context` as for ``offset(_:context:)``.
-    public static func timestamp(_ timestamp: IggyTimestamp, context: PartitionContext? = nil) -> PollingStrategy {
-        PollingStrategy(kind: .timestamp, value: timestamp.microseconds, context: context)
+    /// Start at the first message at or after a timestamp.
+    public static func timestamp(_ timestamp: IggyTimestamp) -> PollingStrategy {
+        PollingStrategy(kind: .timestamp, value: timestamp.microseconds)
+    }
+
+    /// A start bound to `partitionID` and the history of `context`.
+    static func continuation(partitionID: UInt32, kind: Kind, value: UInt64, context: PartitionContext) -> PollingStrategy {
+        PollingStrategy(kind: kind, value: value, context: context, partitionID: partitionID)
     }
 
     /// Start from the beginning of the partition.
@@ -191,6 +205,13 @@ public struct PollingStrategy: Sendable, Hashable, CustomStringConvertible {
     public static let last = PollingStrategy(kind: .last, value: 0)
     /// Continue after the consumer's stored offset.
     public static let next = PollingStrategy(kind: .next, value: 0)
+
+    /// Refuses a continuation of another partition.
+    func validate(partitionID: UInt32) throws {
+        if let bound = self.partitionID, bound != partitionID {
+            throw IggyError(.invalidCommand, context: "a continuation of partition \(bound) cannot read partition \(partitionID)")
+        }
+    }
 
     public var description: String {
         switch kind {
@@ -209,18 +230,130 @@ public struct PollingStrategy: Sendable, Hashable, CustomStringConvertible {
     }
 }
 
-/// A checkpoint to commit: the inclusive offset of the last consumed
-/// message, with the partition incarnation and owner of the poll that
-/// delivered it, so a delayed commit cannot land on a recreated partition.
-public struct ConsumerPosition: Sendable, Hashable {
-    public var partitionID: UInt32
-    public var offset: UInt64
-    public var context: PartitionContext
+/// The limits of a deferred poll, as `DeferredPollOptions` in the Rust SDK.
+///
+/// The server answers once `minCount` messages are readable, the next
+/// message would pass `maxBytes`, or `maxWait` ran out. At the end of the
+/// wait it reads what there is, so a reply can hold fewer messages, or none.
+/// `requestTimeout` bounds the whole call: a reconnect and a sync of the
+/// group assignment on the way, routing, admission, the wait, the reply and
+/// every retry. A request that waits must leave one second between its wait
+/// and its timeout for the final read and the reply.
+///
+/// `maxBytes` covers the whole reply body, the poll metadata and the batch
+/// framing included. A first message larger than that comes alone in its
+/// own reply.
+struct DeferredPollOptions: Sendable, Hashable {
+    /// `MAX_DEFERRED_POLL_WAIT_US`, the longest wait the protocol carries.
+    static let maxWaitMicroseconds: UInt64 = 600_000_000
+    /// `MAX_DEFERRED_POLL_TIMEOUT_US`: the longest wait and 30 seconds more.
+    static let maxRequestTimeoutMicroseconds: UInt64 = 630_000_000
+    /// `MIN_DEFERRED_POLL_REPLY_MARGIN_US`: the server spends it on the final
+    /// read and the reply, so an idle wait answers before the client gives up.
+    static let replyMarginMicroseconds: UInt64 = 1_000_000
+    /// `MIN_DEFERRED_POLL_MAX_BYTES`, the smallest limit that can return a
+    /// message: the poll reply header, one batch header and one message header.
+    static let minMaxBytes: UInt32 = 344
+    static let maxReplyBytes = UInt32(VSRFrame.maxFrameSize - VSRFrame.headerSize)
 
-    public init(partitionID: UInt32, offset: UInt64, context: PartitionContext) {
-        self.partitionID = partitionID
-        self.offset = offset
-        self.context = context
+    var maxWait: Duration
+    var minCount: UInt32
+    var maxBytes: UInt32
+    var requestTimeout: Duration
+
+    /// One message, a 1 MiB reply, a one-second wait and an eleven-second
+    /// request timeout by default.
+    init(maxWait: Duration = .seconds(1), minCount: UInt32 = 1, maxBytes: UInt32 = 1_048_576, requestTimeout: Duration = .seconds(11)) {
+        self.maxWait = maxWait
+        self.minCount = minCount
+        self.maxBytes = maxBytes
+        self.requestTimeout = requestTimeout
+    }
+
+    /// Refuses, before anything is sent, what the server refuses, as
+    /// `DeferredPollOptions::validate` in the Rust SDK.
+    func validate(count: UInt32) throws {
+        guard minCount >= 1, minCount <= count else {
+            throw IggyError(.invalidMessagesCount, context: "minCount \(minCount) must be between 1 and the count \(count)")
+        }
+        try validateBudget()
+        guard maxBytes >= Self.minMaxBytes else {
+            throw IggyError(.invalidSizeBytes, context: "maxBytes \(maxBytes) must be at least \(Self.minMaxBytes)")
+        }
+    }
+
+    /// A new fetch leaves time for local setup before its final read and
+    /// reply, even without a wait. Check at the wire's microsecond precision.
+    func validateFetch(count: UInt32) throws {
+        try validate(count: count)
+        let (wait, timeout) = try budgetMicroseconds()
+        guard timeout > Self.replyMarginMicroseconds, timeout >= wait + Self.replyMarginMicroseconds else {
+            throw IggyError(
+                .invalidCommand,
+                context: "a fetch needs requestTimeout \(requestTimeout) above one second and at least one second past maxWait \(maxWait)")
+        }
+    }
+
+    func validateBudget() throws {
+        let (wait, timeout) = try budgetMicroseconds()
+        guard wait <= Self.maxWaitMicroseconds, timeout >= 1, timeout <= Self.maxRequestTimeoutMicroseconds,
+            wait == 0 || timeout >= wait + Self.replyMarginMicroseconds
+        else {
+            throw IggyError(.invalidCommand, context: "maxWait \(maxWait) or requestTimeout \(requestTimeout) is out of range")
+        }
+    }
+
+    /// The options of an attempt `elapsed` into its call, as
+    /// `DeferredPollOptions::remaining` in the Rust SDK. The wait and the
+    /// timeout shrink together, so a wait keeps its reply margin. A spent
+    /// timeout is refused as not accepted: the attempt never left the client.
+    func remaining(after elapsed: Duration) throws -> DeferredPollOptions {
+        var options = self
+        options.requestTimeout = requestTimeout - elapsed
+        guard let timeout = options.requestTimeout.wholeMicroseconds, timeout > 0 else {
+            throw IggyError(.transientNotAccepted, context: "the request timeout of \(requestTimeout) ran out before the request was sent")
+        }
+        options.maxWait = max(.zero, maxWait - elapsed)
+        return options
+    }
+
+    /// The wait and the timeout in whole microseconds, as the wire carries them.
+    func budgetMicroseconds() throws -> (wait: UInt64, timeout: UInt64) {
+        guard let wait = maxWait.wholeMicroseconds, let timeout = requestTimeout.wholeMicroseconds else {
+            throw IggyError(.invalidCommand, context: "maxWait \(maxWait) and requestTimeout \(requestTimeout) must not be negative")
+        }
+        return (wait, timeout)
+    }
+
+    /// The wait and the timeout as an attempt sends them. Whole microseconds
+    /// of a shrunk budget can lose a part of the reply margin, so the wait
+    /// gives way, as in `deferred_payload` of the Rust SDK.
+    func wireBudget() throws -> (wait: UInt64, timeout: UInt64) {
+        let (wait, timeout) = try budgetMicroseconds()
+        let room = timeout > Self.replyMarginMicroseconds ? timeout - Self.replyMarginMicroseconds : 0
+        return (min(wait, room), timeout)
+    }
+
+    /// ``wireBudget()`` of a fetch attempt. A timeout shrunk below the reply
+    /// margin is one the server refuses, so the attempt is refused as not
+    /// accepted: it never left the client.
+    func fetchWireBudget() throws -> (wait: UInt64, timeout: UInt64) {
+        let (wait, timeout) = try budgetMicroseconds()
+        guard timeout >= Self.replyMarginMicroseconds else {
+            throw IggyError(.transientNotAccepted, context: "the request timeout left for the fetch, \(requestTimeout), is below the reply margin")
+        }
+        return (min(wait, timeout - Self.replyMarginMicroseconds), timeout)
+    }
+
+    /// `[wait_us:8][min_count:4][max_bytes:4][request_timeout_us:8]`, which
+    /// turns a poll into a deferred one. A reply larger than a frame fails the
+    /// connection that reads it, so the server must not fill more.
+    func encode(into writer: inout ByteWriter) throws {
+        let (wait, timeout) = try wireBudget()
+        writer.write(wait)
+        writer.write(minCount)
+        writer.write(min(maxBytes, Self.maxReplyBytes))
+        writer.write(timeout)
     }
 }
 

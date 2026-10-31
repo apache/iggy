@@ -18,10 +18,14 @@
 
 declare(strict_types=1);
 
+use Iggy\AutoCommit;
 use Iggy\Client;
+use Iggy\CommitEvery;
+use Iggy\CommitPolicy;
 use Iggy\Exception\IggyException;
 use Iggy\Exception\PendingOperationException;
 use Iggy\PendingOperationsConfig;
+use Iggy\PollOptions;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\TestDox;
 use PHPUnit\Framework\TestCase;
@@ -34,6 +38,10 @@ final class RawCommandTest extends TestCase
     private const CREATE_STREAM_CODE = 202;
     private const SERVER_REPLICA_ID = 0;
     private const UNKNOWN_REPLICA_ID = 9;
+    private const INVALID_COMMAND_CODE = 3;
+    private const INVALID_SIZE_BYTES_CODE = 80;
+    private const INVALID_MESSAGES_COUNT_CODE = 4009;
+    private const MAX_POLL_WAIT_MICROS = 600_000_000;
 
     #[TestDox('A raw ping command returns an empty successful response')]
     public function testRawPingReturnsEmptyResponse(): void
@@ -217,13 +225,23 @@ final class RawCommandTest extends TestCase
                     'messages_required_to_save', 'size_of_messages_required_to_save'],
             ],
             'consumerGroup' => [
-                ['name' => 'g', 'stream' => 's', 'topic' => 't', 'partition_id' => null,
-                    'polling_strategy' => null, 'batch_length' => null, 'auto_commit' => null,
-                    'create_consumer_group_if_not_exists' => false, 'auto_join_consumer_group' => false,
-                    'poll_interval_micros' => null, 'polling_retry_interval_micros' => null,
-                    'init_retries' => null, 'init_retry_interval_micros' => null, 'allow_replay' => false],
-                ['partition_id', 'batch_length', 'poll_interval_micros',
-                    'polling_retry_interval_micros', 'init_retries', 'init_retry_interval_micros'],
+                ['name' => 'g', 'stream' => 's', 'topic' => 't', 'polling_strategy' => null,
+                    'poll_options' => null, 'prefetch_bytes' => null,
+                    'prefetch_messages' => null, 'create_consumer_group_if_not_exists' => false,
+                    'polling_retry_interval_micros' => null, 'init_retries' => null,
+                    'init_retry_interval_micros' => null, 'allow_replay' => false],
+                ['prefetch_bytes', 'prefetch_messages', 'polling_retry_interval_micros',
+                    'init_retries', 'init_retry_interval_micros'],
+            ],
+            'reader' => [
+                ['stream' => 's', 'topic' => 't', 'consumer' => 'c', 'partitions' => [0], 'start' => null,
+                    'options' => null, 'prefetch_bytes' => null, 'prefetch_messages' => null],
+                ['prefetch_bytes', 'prefetch_messages'],
+            ],
+            'groupReader' => [
+                ['stream' => 's', 'topic' => 't', 'group' => 'g', 'start' => null, 'options' => null,
+                    'prefetch_bytes' => null, 'prefetch_messages' => null],
+                ['prefetch_bytes', 'prefetch_messages'],
             ],
         ];
         foreach ($methods as $method => [$required, $fields]) {
@@ -234,14 +252,81 @@ final class RawCommandTest extends TestCase
                 }
             }
         }
-        foreach (['partition_id', 'batch_length', 'init_retries'] as $field) {
-            $arguments = array_replace($methods['consumerGroup'][0], [$field => 4294967296]);
-            assert_throws(static fn () => $client->consumerGroup(...$arguments), $field);
+        $u32Fields = [
+            'consumerGroup' => ['prefetch_bytes', 'prefetch_messages', 'init_retries'],
+            'reader' => ['prefetch_bytes', 'prefetch_messages'],
+            'groupReader' => ['prefetch_bytes', 'prefetch_messages'],
+        ];
+        foreach ($u32Fields as $method => $fields) {
+            foreach ($fields as $field) {
+                $arguments = array_replace($methods[$method][0], [$field => 4294967296]);
+                assert_throws(static fn () => $client->$method(...$arguments), $field);
+            }
         }
-        $arguments = array_replace($methods['consumerGroup'][0], ['poll_interval_micros' => 1_000]);
-        assert_throws(static fn () => $client->consumerGroup(...$arguments), 'poll_interval_micros');
         $arguments = array_replace($methods['createTopic'][0], ['messages_required_to_save' => 4294967296]);
         assert_throws(static fn () => $client->createTopic(...$arguments), 'messages_required_to_save');
+    }
+
+    public function testPollOptionsKeepDefaultsAndRefuseInvalidLimits(): void
+    {
+        $defaults = new PollOptions();
+        assert_same(1000, $defaults->count);
+        assert_same(0, $defaults->max_wait_micros);
+        assert_same(1, $defaults->min_count);
+        assert_same(1024 * 1024, $defaults->max_bytes);
+        assert_same('manual', $defaults->commit->kind);
+
+        $options = new PollOptions(10, 5_000, 2, 65_536, CommitPolicy::onRead());
+        assert_same(10, $options->count);
+        assert_same(5_000, $options->max_wait_micros);
+        assert_same(2, $options->min_count);
+        assert_same(65_536, $options->max_bytes);
+        assert_same('on_read', $options->commit->kind);
+        assert_same('auto', (new PollOptions(commit: CommitPolicy::auto(AutoCommit::default())))->commit->kind);
+
+        foreach (['count', 'max_wait_micros', 'min_count', 'max_bytes'] as $field) {
+            foreach ([-1, 1.5, true, '18446744073709551616'] as $invalid) {
+                assert_throws(static fn () => new PollOptions(...[$field => $invalid]), $field);
+            }
+        }
+        foreach (['count', 'min_count', 'max_bytes'] as $field) {
+            assert_throws(static fn () => new PollOptions(...[$field => 4294967296]), $field);
+        }
+        assert_same(
+            self::INVALID_MESSAGES_COUNT_CODE,
+            assert_throws(static fn () => new PollOptions(count: 2, min_count: 3))->getCode(),
+        );
+        assert_same(
+            self::INVALID_MESSAGES_COUNT_CODE,
+            assert_throws(static fn () => new PollOptions(min_count: 0))->getCode(),
+        );
+        assert_same(
+            self::INVALID_COMMAND_CODE,
+            assert_throws(static fn () => new PollOptions(max_wait_micros: self::MAX_POLL_WAIT_MICROS + 1))->getCode(),
+        );
+        assert_same(
+            self::INVALID_SIZE_BYTES_CODE,
+            assert_throws(static fn () => new PollOptions(max_bytes: 1))->getCode(),
+        );
+    }
+
+    public function testAutoCommitRefusesSettingsThatNeverStore(): void
+    {
+        foreach ([0, -1, 1.5, true, '18446744073709551616'] as $invalid) {
+            assert_throws(static fn () => new AutoCommit($invalid), 'interval_micros');
+        }
+        assert_throws(static fn () => new AutoCommit(), "'interval_micros' or an 'every'");
+        assert_throws(static fn () => CommitEvery::messages(0), 'must not be zero');
+    }
+
+    public function testReaderRefusesAnEmptyPartitionListBeforeConnecting(): void
+    {
+        $client = new Client('127.0.0.1:1');
+
+        assert_same(
+            self::INVALID_COMMAND_CODE,
+            assert_throws(static fn () => $client->reader('s', 't', 'c', []))->getCode(),
+        );
     }
 
     public function testConnectionStringBudgetsReachEveryBinaryTransport(): void

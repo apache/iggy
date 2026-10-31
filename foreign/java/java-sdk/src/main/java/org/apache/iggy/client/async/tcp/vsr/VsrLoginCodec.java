@@ -45,7 +45,7 @@ final class VsrLoginCodec {
      * protocol version through its current version, including patch components.
      * Versions outside this range, including newer patches, are rejected.
      */
-    static final int PROTOCOL_VERSION = 12 << 10; // 0.12.0
+    static final int PROTOCOL_VERSION = 12 << 10 | 1; // 0.12.1
 
     static final String SDK_NAME = "java-sdk";
 

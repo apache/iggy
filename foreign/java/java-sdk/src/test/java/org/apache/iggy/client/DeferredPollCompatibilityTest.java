@@ -26,6 +26,7 @@ import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.message.PollOptions;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
@@ -65,6 +66,14 @@ class DeferredPollCompatibilityTest {
                         false,
                         DeferredPollOptions.defaults()))
                 .isInstanceOf(IggyOperationNotSupportedException.class);
+        assertThatThrownBy(() -> client.pollMessages(
+                        StreamId.of(1L),
+                        TopicId.of(1L),
+                        0L,
+                        Consumer.of(0L),
+                        PollingStrategy.next(),
+                        PollOptions.defaults()))
+                .isInstanceOf(IggyOperationNotSupportedException.class);
         assertThat(client.immediatePolls).isZero();
     }
 
@@ -81,6 +90,16 @@ class DeferredPollCompatibilityTest {
                                 10L,
                                 false,
                                 DeferredPollOptions.defaults())
+                        .get())
+                .isInstanceOf(ExecutionException.class)
+                .hasCauseInstanceOf(IggyOperationNotSupportedException.class);
+        assertThatThrownBy(() -> client.pollMessages(
+                                StreamId.of(1L),
+                                TopicId.of(1L),
+                                0L,
+                                Consumer.of(0L),
+                                PollingStrategy.next(),
+                                PollOptions.defaults())
                         .get())
                 .isInstanceOf(ExecutionException.class)
                 .hasCauseInstanceOf(IggyOperationNotSupportedException.class);

@@ -258,8 +258,8 @@ use futures::{FutureExt, StreamExt};
 use iggy::prelude::*;
 use integration::harness::handle::common::SIGTERM_TIMEOUT;
 use integration::harness::{
-    ServerHandle, StopOutcome, TestBinary, TestBinaryError, TestHarness, TestServerConfig, disk,
-    resolve_config_paths,
+    GroupPoller, ServerHandle, StopOutcome, TestBinary, TestBinaryError, TestHarness,
+    TestServerConfig, disk, resolve_config_paths,
 };
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -1604,13 +1604,9 @@ impl Workload {
         }
         let client = dialer.connect().await;
         let builder = client
-            .consumer(
-                STANDALONE_ICONSUMER_NAME,
-                STREAM_NAME,
-                TOPIC_NAME,
-                STANDALONE_ICONSUMER_PARTITION,
-            )
-            .expect("standalone IggyConsumer builder");
+            .consumer(STANDALONE_ICONSUMER_NAME, STREAM_NAME, TOPIC_NAME)
+            .expect("standalone IggyConsumer builder")
+            .partitions([STANDALONE_ICONSUMER_PARTITION]);
         let reader = Reader::new(
             format!("consumer {STANDALONE_ICONSUMER_NAME}"),
             Consumer::new(Identifier::named(STANDALONE_ICONSUMER_NAME).expect("valid name")),
@@ -1707,11 +1703,6 @@ impl Workload {
         };
 
         println!("{} drain over, readers stop", stamp(started));
-        // The group's `IggyConsumer` stops before the members leave. Its
-        // shutdown flush stores the last offset it consumed in every partition
-        // it ever held, unless it stored that offset already. A leave can move
-        // such a partition back to it, and the fence then admits the old
-        // offset, so the group offset moves back.
         group_iconsumer_phase.send_replace(ConsumerPhase::Stop);
         let mut consumer_outcomes = Vec::with_capacity(consumers.len() + 1);
         consumer_outcomes.push(group_iconsumer.await.expect("consumer task panicked"));
@@ -2314,24 +2305,38 @@ impl ConsumerOutcome {
     }
 }
 
-/// Polls the reader's next batch and stores its last offset.
+/// Polls the reader's next batch and stores its last offset. The group
+/// reader polls through the member's `GroupPoller`.
 async fn poll_and_commit(
     client: &IggyClient,
     reader: &Reader,
+    group_poller: Option<&mut GroupPoller>,
     outcome: &mut ConsumerOutcome,
     context: &TaskContext,
 ) -> Result<(), Failure> {
     let target = &context.target;
-    let polled = call(client.poll_messages(
-        &target.stream,
-        &target.topic,
-        reader.partition,
-        &reader.consumer,
-        &PollingStrategy::next(),
-        POLL_BATCH,
-        false,
-    ))
-    .await?;
+    let strategy = PollingStrategy::next();
+    let options = PollOptions {
+        count: POLL_BATCH,
+        ..PollOptions::default()
+    };
+    let polled = match reader.partition {
+        Some(partition) => {
+            call(client.poll_messages(
+                &target.stream,
+                &target.topic,
+                partition,
+                &reader.consumer,
+                &strategy,
+                options,
+            ))
+            .await?
+        }
+        None => {
+            let poller = group_poller.expect("a group member polls through its GroupPoller");
+            call(poller.poll(client, &target.stream, &target.topic, &strategy, options)).await?
+        }
+    };
     outcome.errors.succeeded();
     let Some(last) = polled.messages.last().map(|message| message.header.offset) else {
         sleep(POLL_PAUSE).await;
@@ -2377,6 +2382,7 @@ async fn run_member(
             continue;
         }
         churn.joins += 1;
+        let mut poller = GroupPoller::new(target.group.clone());
         let session_end =
             Instant::now() + Duration::from_millis(rng.random_range(MEMBER_SESSION_MS));
         loop {
@@ -2386,7 +2392,9 @@ async fn run_member(
             {
                 break;
             }
-            if let Err(failure) = poll_and_commit(&client, &group, &mut outcome, &context).await {
+            if let Err(failure) =
+                poll_and_commit(&client, &group, Some(&mut poller), &mut outcome, &context).await
+            {
                 let lost_membership = matches!(
                     failure,
                     Failure::Iggy(IggyError::ConsumerGroupMemberNotFound(..))
@@ -2421,7 +2429,8 @@ async fn run_consumer(
 ) -> ConsumerOutcome {
     let mut outcome = ConsumerOutcome::new(reader.name.clone(), context.started);
     while *phase.borrow() != ConsumerPhase::Stop {
-        if let Err(failure) = poll_and_commit(&client, &reader, &mut outcome, &context).await {
+        if let Err(failure) = poll_and_commit(&client, &reader, None, &mut outcome, &context).await
+        {
             outcome.errors.record(&failure);
             sleep(RETRY_PAUSE).await;
         }
@@ -2433,17 +2442,17 @@ async fn start_iggy_consumer(builder: IggyConsumerBuilder) -> IggyConsumer {
     let commit_interval =
         NonZeroIggyDuration::new(ICONSUMER_COMMIT_INTERVAL).expect("non-zero commit interval");
     let mut consumer = builder
-        // Commits only what was handed over. The default commits with the
-        // poll and can skip a batch whose reply was lost, which would break
-        // the no-loss check.
-        .auto_commit(AutoCommit::IntervalOrWhen(
-            commit_interval,
-            AutoCommitWhen::ConsumingAllMessages,
-        ))
-        .batch_length(POLL_BATCH)
-        .poll_options(DeferredPollOptions {
-            max_wait: IggyDuration::from(POLL_PAUSE),
-            ..Default::default()
+        // Commits only what was handed over. `OnRead` commits with the read
+        // and can skip a batch whose reply was lost, which would break the
+        // no-loss check.
+        .poll_options(PollOptions {
+            count: POLL_BATCH,
+            commit: CommitPolicy::Auto(AutoCommit {
+                interval: Some(commit_interval),
+                every: Some(CommitEvery::Batch),
+                after: CommitAfter::Delivery,
+            }),
+            ..PollOptions::wait(IggyDuration::from(POLL_PAUSE))
         })
         .build();
     consumer.init().await.expect("init the IggyConsumer");
@@ -2479,7 +2488,7 @@ async fn run_iggy_consumer(
                         &context,
                     );
                 }
-                Some(Err(error)) => outcome.errors.record(&Failure::Iggy(error)),
+                Some(Err(error)) => outcome.errors.record(&Failure::Iggy(error.into())),
                 None => break,
             },
         }
@@ -3452,11 +3461,13 @@ async fn read_log(
             let polled = call(client.poll_messages(
                 &target.stream,
                 &target.topic,
-                Some(partition),
+                partition,
                 &consumer,
                 &PollingStrategy::offset(next),
-                VERIFY_BATCH,
-                false,
+                PollOptions {
+                    count: VERIFY_BATCH,
+                    ..PollOptions::default()
+                },
             ))
             .await?;
             if polled.messages.is_empty() {

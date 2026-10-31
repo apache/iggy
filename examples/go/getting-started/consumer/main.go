@@ -88,16 +88,17 @@ func consumeMessages(ctx context.Context, client iggcon.Client) error {
 
 		streamIdentifier, _ := iggcon.NewIdentifier(StreamID)
 		topicIdentifier, _ := iggcon.NewIdentifier(TopicID)
+		options := iggcon.DefaultPollOptions()
+		options.Count = messagePerBatch
 		pollMessages, err := client.
 			PollMessages(
 				ctx,
 				streamIdentifier,
 				topicIdentifier,
+				PartitionID,
 				consumer,
 				iggcon.OffsetPollingStrategy(offset),
-				messagePerBatch,
-				false,
-				&PartitionID,
+				options,
 			)
 		if err != nil {
 			return err

@@ -23,10 +23,13 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.CommitPolicy;
 import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.message.PollOptions;
 import org.apache.iggy.message.PolledMessages;
+import org.apache.iggy.message.PollingKind;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
 
@@ -72,6 +75,50 @@ import java.util.concurrent.CompletableFuture;
  * @see org.apache.iggy.client.async.tcp.AsyncIggyTcpClient#messages()
  */
 public interface MessagesClient {
+
+    /**
+     * Polls one partition with the limits and the commit policy of {@code options}.
+     *
+     * <p>The server waits up to {@link PollOptions#maxWait()} for {@link PollOptions#minCount()} messages and returns
+     * at most {@link PollOptions#count()} messages and {@link PollOptions#maxBytes()} of records. A first message
+     * larger than {@code maxBytes} comes alone in the reply. A {@link PollingKind#Last} poll of more than one message
+     * whose first message is larger than {@code maxBytes} fails with
+     * {@link org.apache.iggy.exception.IggyErrorCode#INVALID_SIZE_BYTES}. The request ends after
+     * {@link PollOptions#requestTimeout()}.
+     *
+     * <p>With {@link CommitPolicy#onRead()} the server stores the offset of the last message it returns as part of the
+     * read. A cancel of such a poll stops it on the server and waits for its reply, which shows whether it stored.
+     * Until then the poll blocks its partition, so an offset store or another progress poll of it fails at once with
+     * {@link org.apache.iggy.exception.IggyErrorCode#PARTITION_LANE_BLOCKED}. A
+     * reply that the connection loses, or a refusal that does not prove that nothing was stored, fails with
+     * {@link org.apache.iggy.exception.IggyErrorCode#FETCH_PROGRESS_UNCERTAIN} naming the operation: the server can
+     * have stored the offset. Every later committing poll and offset store or delete of the partition on this client
+     * then fails with {@link org.apache.iggy.exception.IggyErrorCode#PARTITION_LANE_BLOCKED} naming that operation,
+     * also after a reconnect, until {@code abandonOperation} releases it. {@link CommitPolicy.Auto} is refused with
+     * {@link org.apache.iggy.exception.IggyErrorCode#INVALID_CONFIGURATION}: a one-shot poll has nothing to count. A
+     * {@link org.apache.iggy.client.async.reader.PartitionReader} counts and stores it.
+     *
+     * <p>Continue a partition with {@link PolledMessages#continuation()}, which a poll of another partition refuses
+     * with {@link org.apache.iggy.exception.IggyErrorCode#INVALID_COMMAND}.
+     *
+     * @param streamId    the stream identifier
+     * @param topicId     the topic identifier
+     * @param partitionId the partition, 0 to 4294967295
+     * @param consumer    the consumer or consumer group whose offset {@code Next} reads and a commit stores
+     * @param strategy    where the poll starts
+     * @param options     the limits and the commit policy
+     * @return a {@link CompletableFuture} that completes with the messages of the partition
+     */
+    default CompletableFuture<PolledMessages> pollMessages(
+            StreamId streamId,
+            TopicId topicId,
+            long partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            PollOptions options) {
+        return CompletableFuture.failedFuture(new IggyOperationNotSupportedException(
+                "pollMessages", getClass().getSimpleName()));
+    }
 
     /**
      * Polls messages from a topic partition asynchronously.
@@ -169,11 +216,13 @@ public interface MessagesClient {
      * operator wait limit below the requested wait and a request this client encoded wrongly.
      * Never retry it and never infer the cause from the code alone.
      *
+     * <p>A group poll must name its partition. Without one, the TCP client fails with
+     * {@link org.apache.iggy.exception.IggyErrorCode#INVALID_COMMAND} before it sends anything.
+     * A {@link org.apache.iggy.client.async.reader.PartitionReader} reads the whole assignment of a group.
+     *
      * @param streamId    the stream identifier (numeric or string-based)
      * @param topicId     the topic identifier (numeric or string-based)
-     * @param partitionId optional partition ID to poll from; when empty and polling with a
-     *                    group consumer, the client selects the partition round-robin from
-     *                    the member's synced group assignment
+     * @param partitionId the partition ID to poll from, which only a plain consumer can leave empty
      * @param consumer    the consumer identity, either individual or group
      * @param strategy    the polling strategy controlling where to start reading
      * @param count       the maximum number of messages to return

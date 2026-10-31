@@ -42,10 +42,10 @@ pub use consumer_group_client_state::{AssignmentVersion, ConsumerGroupClientStat
 pub const RESYNC_REQUIRED_PARTITION_SENTINEL: u32 = u32::MAX;
 
 /// Client-side `partition_id` of an empty poll reply for a consumer-group
-/// member that currently holds no partitions. The server never sends it: the
-/// transport fills it in when the synced assignment is empty, so a caller can
-/// tell "nothing assigned" from a genuine empty poll, which echoes the real
-/// partition id. Same value as the Go and Node SDKs use for that case.
+/// member that currently holds no partitions, as the Go and Swift SDKs fill it
+/// in. The server never sends it, and the Rust SDK never fills it in, because
+/// its polls always name a partition. It stays as the source of the Swift
+/// golden vectors.
 pub const NO_ASSIGNED_PARTITION: u32 = u32::MAX - 1;
 
 /// Frozen ceiling on the widest batch record any admission path can persist.
@@ -108,9 +108,10 @@ pub use traits::system_client::SystemClient;
 pub use traits::topic_client::TopicClient;
 pub use traits::user_client::UserClient;
 pub use traits::validatable::Validatable;
-pub use traits::wait_for_messages_request;
 #[doc(hidden)]
-pub use traits::{BinarySendPartitioning, select_send_partition, send_binary_messages};
+pub use traits::{
+    BinarySendPartitioning, fetch_binary_messages, select_send_partition, send_binary_messages,
+};
 pub use traits::{binary_sign_in, rust_sdk_version_info, sign_in_request};
 pub use traits::{decode_send_confirmations, group_cache_key, sync_group_assignment};
 pub use types::args::*;

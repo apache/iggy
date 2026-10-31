@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use iggy::prelude::{
-    Consumer, HeaderKey, Identifier, IggyClient, IggyMessage, MessageClient, PollingStrategy,
-    SystemClient, TopicClient,
+    Consumer, HeaderKey, Identifier, IggyClient, IggyMessage, MessageClient, PollOptions,
+    PollingStrategy, SystemClient, TopicClient,
 };
 use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::protocol::StrBytes;
@@ -271,11 +271,13 @@ async fn stored(server: &TestServer, partition: u32, count: u32) -> Vec<IggyMess
         .poll_messages(
             &Identifier::named(STREAM).expect("stream name"),
             &Identifier::named(TOPIC).expect("topic name"),
-            Some(partition),
+            partition,
             &Consumer::new(Identifier::named("reader").expect("consumer name")),
             &PollingStrategy::offset(0),
-            count,
-            false,
+            PollOptions {
+                count,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll the partition back")

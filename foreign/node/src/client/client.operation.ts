@@ -18,10 +18,14 @@
 import { HEADER_SIZE, REQUEST_OFFSET, type PartitionContext } from '../wire/vsr/header.js';
 import type { VsrSession } from '../wire/vsr/index.js';
 import { responseError } from '../wire/error.utils.js';
+import { COMMAND_CODE } from '../wire/command.code.js';
 
 const INVALID_MESSAGE_LENGTH = 80;
 const TRANSIENT_NOT_ACCEPTED = 58;
 export const OPERATION_TIMEOUT_MS = 30_000;
+export const LANE_BLOCKED = 14007;
+export const PARTITION_LANE_BLOCKED = 14009;
+export const FETCH_PROGRESS_UNCERTAIN = 14010;
 
 export class OperationUncertainError extends Error {
   constructor(readonly operationId: bigint | undefined, cause: unknown) {
@@ -30,10 +34,25 @@ export class OperationUncertainError extends Error {
   }
 }
 
+/** A local recovery key, never a replayable server receipt. */
+export class FetchProgressUncertainError extends OperationUncertainError {
+  readonly errorCode = FETCH_PROGRESS_UNCERTAIN;
+  constructor(operationId: bigint, cause?: unknown) {
+    super(operationId, cause);
+    this.name = 'FetchProgressUncertainError';
+    this.message = `Read ${operationId} has unknown progress and requires explicit abandonment.`;
+  }
+}
+
 export class LaneBlockedError extends Error {
-  constructor(readonly operationId: bigint) {
-    super('A retained operation blocks this mutation lane.');
+  /** `PARTITION_LANE_BLOCKED` for a partition that an uncertain committing fetch blocks, else `LANE_BLOCKED`. */
+  readonly errorCode: number;
+  constructor(readonly operationId: bigint, readonly partitionId?: number, readonly requiresExplicitRecovery = false) {
+    super(requiresExplicitRecovery
+      ? `Lane of partition ${partitionId} blocked by operation ${operationId} with an unknown outcome.`
+      : `Lane blocked by operation ${operationId} with an unknown outcome.`);
     this.name = 'LaneBlockedError';
+    this.errorCode = requiresExplicitRecovery ? PARTITION_LANE_BLOCKED : LANE_BLOCKED;
   }
 }
 
@@ -189,6 +208,8 @@ export class FrozenFrame {
 
 export type ClientOperation = {
   readonly lane: string,
+  /** The progress lanes that an offset store or delete, or a progress fetch, holds as well. */
+  readonly heldLanes: readonly string[],
   readonly command: number,
   context: PartitionContext,
   frame: FrozenFrame,
@@ -199,7 +220,16 @@ export type ClientOperation = {
   retained: boolean,
   uncertain: boolean,
   /** An abandon frees the slot of a running replay before the replay ends. */
-  holdsSlot: boolean
+  holdsSlot: boolean,
+  readonly fetchProgress?: FetchProgress
+};
+
+/** Only identities and budget remain after an uncertain fetch. No transport or frame survives with them. */
+type FetchProgress = {
+  id: bigint,
+  readonly targets: ReadonlyMap<string, number>,
+  readonly size: number,
+  retained: boolean
 };
 
 type AdmissionWaiter = {
@@ -208,9 +238,16 @@ type AdmissionWaiter = {
 };
 type LaneWaiters = { head?: AdmissionWaiter, tail?: AdmissionWaiter };
 
+const lanesOf = (operation: ClientOperation): string[] => [operation.lane, ...operation.heldLanes];
+
 export class MutationLanes {
   private readonly lanes = new Map<string, ClientOperation>();
+  /** The progress lanes that calls hold while they wait for their next lane. */
+  private readonly held = new Set<string>();
   private readonly operations = new Map<bigint, ClientOperation>();
+  private readonly fetchProgress = new Map<bigint, FetchProgress>();
+  private readonly blockedProgress = new Map<string, FetchProgress>();
+  private fetchBytes = 0;
   /**
    * The outcomes that replays proved, oldest first: the committed rejection,
    * or `undefined` for a committed success. A reset keeps them, because
@@ -225,31 +262,54 @@ export class MutationLanes {
 
   constructor(private readonly maxOperations: number, private readonly maxBytes: number) {}
 
+  /**
+   * Admits a call to `lane` in arrival order. It takes `heldLanes` first, in
+   * their order, and keeps each one while it waits for the next. An offset
+   * store or delete holds its progress lane, so a send can pass it while it
+   * waits behind a parked poll. A progress fetch holds the progress lane of
+   * each target, in ascending partition order, so two fetches never wait for
+   * each other.
+   */
   async enter(lane: string, command: number, body: Buffer, context: PartitionContext,
     retainable: boolean, session: VsrSession, deadline: number,
-    signal: AbortSignal): Promise<ClientOperation> {
+    signal: AbortSignal, heldLanes: readonly string[] = [], partitions?: ReadonlyMap<string, number>,
+    commits = false): Promise<ClientOperation> {
     const size = retainable ? HEADER_SIZE + body.length : 0;
-    if (!Number.isSafeInteger(size) || size > this.maxBytes)
+    const fetchSize = commits ? HEADER_SIZE + body.length : 0;
+    if (!Number.isSafeInteger(size) || size > this.maxBytes || fetchSize > this.maxBytes)
       throw responseError(command, INVALID_MESSAGE_LENGTH, 'request exceeds the mutation byte limit');
-    const waiting: AdmissionWaiter = { size, retainable, changed: new ChangeSignal() };
-    let queue = this.waiting.get(lane);
-    if (!queue) {
-      queue = {};
-      this.waiting.set(lane, queue);
-    }
-    waiting.previous = queue.tail;
-    if (queue.tail) queue.tail.next = waiting;
-    else queue.head = waiting;
-    queue.tail = waiting;
+    const admission: AdmissionWaiter = { size, retainable, changed: new ChangeSignal() };
+    // A held lane needs no capacity, so its waiter asks for none and wakes when the lane frees.
+    const waiterFor = (step: number): AdmissionWaiter =>
+      step < heldLanes.length ? { size: 0, retainable: false, changed: new ChangeSignal() } : admission;
+    let step = 0;
+    let waiting = waiterFor(step);
+    let current = heldLanes[step] ?? lane;
+    let queue = this.join(current, waiting);
+    // Only the call that took a held lane frees it. A call that waits for a
+    // lane holds nothing, so its end must not free the lane.
+    const taken: string[] = [];
     try {
       for (;;) {
         signal.throwIfAborted();
         if (Date.now() >= deadline)
           throw responseError(command, TRANSIENT_NOT_ACCEPTED);
-        this.throwIfRetained(lane);
-        const head = !this.lanes.has(lane) && queue.head === waiting;
+        this.throwIfRetained(current, partitions?.get(current), command === COMMAND_CODE.GetOffset);
+        const head = !this.busy(current) && queue.head === waiting;
+        if (head && step < heldLanes.length) {
+          this.held.add(current);
+          taken.push(current);
+          this.leave(current, queue, waiting);
+          step += 1;
+          current = heldLanes[step] ?? lane;
+          waiting = waiterFor(step);
+          queue = this.join(current, waiting);
+          continue;
+        }
         if (head &&
             (!retainable || this.count < this.maxOperations) && size <= this.maxBytes - this.bytes) {
+          if (commits && (this.fetchProgress.size >= this.maxOperations || fetchSize > this.maxBytes - this.fetchBytes))
+            throw responseError(command, TRANSIENT_NOT_ACCEPTED, 'committing fetch recovery capacity is full');
           if (retainable) this.count += 1;
           this.bytes += size;
           let bytes: Buffer;
@@ -261,13 +321,24 @@ export class MutationLanes {
             throw error;
           }
           const operation: ClientOperation = {
-            lane, command, context, retainable,
+            lane, heldLanes: [...taken], command, context, retainable,
             id: bytes.readBigUInt64LE(REQUEST_OFFSET.request),
             frame: this.freeze(bytes, size),
             lifetime: new AbortController(), resolving: false, retained: false, uncertain: false,
-            holdsSlot: retainable
+            holdsSlot: retainable,
+            fetchProgress: commits ? {
+              id: bytes.readBigUInt64LE(REQUEST_OFFSET.request), targets: new Map(partitions), size: fetchSize, retained: false
+            } : undefined
           };
+          if (operation.fetchProgress) {
+            this.fetchProgress.set(operation.id, operation.fetchProgress);
+            this.fetchBytes += fetchSize;
+          }
           this.lanes.set(lane, operation);
+          for (const held of taken.splice(0)) {
+            this.held.delete(held);
+            this.lanes.set(held, operation);
+          }
           this.operations.set(operation.id, operation);
           return operation;
         }
@@ -279,14 +350,11 @@ export class MutationLanes {
         throw responseError(command, TRANSIENT_NOT_ACCEPTED);
       throw error;
     } finally {
-      if (waiting.previous) waiting.previous.next = waiting.next;
-      else queue.head = waiting.next;
-      if (waiting.next) waiting.next.previous = waiting.previous;
-      else queue.tail = waiting.previous;
-      this.capacityWaiting.delete(waiting);
-      if (!queue.head) this.waiting.delete(lane);
-      this.wakeLane(lane);
-      this.wakeWaiting();
+      for (const held of taken) {
+        this.held.delete(held);
+        this.wakeLane(held);
+      }
+      this.leave(current, queue, waiting);
     }
   }
 
@@ -304,6 +372,12 @@ export class MutationLanes {
     const bytes = session.encode(operation.command, body, context);
     this.bytes += size;
     this.operations.delete(operation.id);
+    if (operation.fetchProgress) {
+      this.releaseFetch(operation.fetchProgress);
+      operation.fetchProgress.id = bytes.readBigUInt64LE(REQUEST_OFFSET.request);
+      this.fetchProgress.set(operation.fetchProgress.id, operation.fetchProgress);
+      this.fetchBytes += operation.fetchProgress.size;
+    }
     operation.id = bytes.readBigUInt64LE(REQUEST_OFFSET.request);
     operation.context = context;
     operation.frame = this.freeze(bytes, size);
@@ -318,13 +392,16 @@ export class MutationLanes {
     });
   }
 
-  throwIfRetained(lane: string): void {
+  throwIfRetained(lane: string, partitionId?: number, inspection = false): void {
+    const fetch = inspection ? undefined : this.blockedProgress.get(lane);
+    if (fetch) throw new LaneBlockedError(fetch.id, fetch.targets.get(lane), true);
     const operation = this.lanes.get(lane);
     if (operation?.retained)
-      throw new LaneBlockedError(operation.id);
+      throw new LaneBlockedError(operation.id, partitionId);
   }
 
   retained(id: bigint): ClientOperation {
+    if (this.fetchProgress.get(id)?.retained) throw new FetchProgressUncertainError(id);
     const operation = this.operations.get(id);
     if (!operation?.retained)
       throw new OperationNotRetainedError(id);
@@ -339,10 +416,22 @@ export class MutationLanes {
     // A replay keeps the state it has, which an abandon can have dropped.
     if (operation.retainable && this.owns(operation) && !operation.resolving) {
       operation.retained = true;
-      for (let waiter = this.waiting.get(operation.lane)?.head; waiter; waiter = waiter.next)
-        waiter.changed.pulse();
+      for (const lane of lanesOf(operation))
+        for (let waiter = this.waiting.get(lane)?.head; waiter; waiter = waiter.next)
+          waiter.changed.pulse();
       this.changed.pulse();
     }
+  }
+
+  retainFetch(operation: ClientOperation, partitions?: ReadonlySet<number>): void {
+    const fetch = operation.fetchProgress;
+    if (!fetch || this.fetchProgress.get(fetch.id) !== fetch) return;
+    fetch.retained = true;
+    for (const [lane, partition] of fetch.targets)
+      if (!partitions || partitions.has(partition)) {
+        this.blockedProgress.set(lane, fetch);
+        for (let waiter = this.waiting.get(lane)?.head; waiter; waiter = waiter.next) waiter.changed.pulse();
+      }
   }
 
   /** Completes a call that proved its outcome. A replay keeps the outcome for a later resolve. */
@@ -370,6 +459,11 @@ export class MutationLanes {
    * FIFO.
    */
   abandon(id: bigint): void {
+    const fetch = this.fetchProgress.get(id);
+    if (fetch?.retained) {
+      this.releaseFetch(fetch);
+      return;
+    }
     const operation = this.retained(id);
     operation.retained = false;
     if (!operation.resolving) {
@@ -384,11 +478,12 @@ export class MutationLanes {
     if (!this.owns(operation))
       return;
     this.operations.delete(operation.id);
-    this.lanes.delete(operation.lane);
+    for (const lane of lanesOf(operation)) this.lanes.delete(lane);
     this.releaseSlot(operation);
+    if (operation.fetchProgress && !operation.fetchProgress.retained) this.releaseFetch(operation.fetchProgress);
     operation.lifetime.abort(new OperationNotRetainedError(operation.id));
     operation.frame.releaseOwner();
-    this.wakeLane(operation.lane);
+    for (const lane of lanesOf(operation)) this.wakeLane(lane);
     this.wakeWaiting();
     this.changed.pulse();
   }
@@ -403,6 +498,13 @@ export class MutationLanes {
       if (operation.retained || operation.resolving) this.complete(operation);
   }
 
+  private releaseFetch(fetch: FetchProgress): void {
+    if (!this.fetchProgress.delete(fetch.id)) return;
+    this.fetchBytes -= fetch.size;
+    for (const lane of fetch.targets.keys())
+      if (this.blockedProgress.get(lane) === fetch) this.blockedProgress.delete(lane);
+  }
+
   private releaseSlot(operation: ClientOperation): void {
     if (!operation.holdsSlot)
       return;
@@ -410,9 +512,37 @@ export class MutationLanes {
     this.count -= 1;
   }
 
+  private join(lane: string, waiting: AdmissionWaiter): LaneWaiters {
+    let queue = this.waiting.get(lane);
+    if (!queue) {
+      queue = {};
+      this.waiting.set(lane, queue);
+    }
+    waiting.previous = queue.tail;
+    if (queue.tail) queue.tail.next = waiting;
+    else queue.head = waiting;
+    queue.tail = waiting;
+    return queue;
+  }
+
+  private leave(lane: string, queue: LaneWaiters, waiting: AdmissionWaiter): void {
+    if (waiting.previous) waiting.previous.next = waiting.next;
+    else queue.head = waiting.next;
+    if (waiting.next) waiting.next.previous = waiting.previous;
+    else queue.tail = waiting.previous;
+    this.capacityWaiting.delete(waiting);
+    if (!queue.head) this.waiting.delete(lane);
+    this.wakeLane(lane);
+    this.wakeWaiting();
+  }
+
+  private busy(lane: string): boolean {
+    return this.lanes.has(lane) || this.held.has(lane);
+  }
+
   private wakeLane(lane: string): void {
     const head = this.waiting.get(lane)?.head;
-    if (head && !this.lanes.has(lane)) this.capacityWaiting.add(head);
+    if (head && !this.busy(lane)) this.capacityWaiting.add(head);
   }
 
   private wakeWaiting(): void {
