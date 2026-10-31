@@ -71,6 +71,7 @@ class GlobalPermissions;
 class Permissions;
 class StreamPermissions;
 class TopicPermissions;
+class PersonalAccessTokenInfo;
 class UserInfo;
 class UserInfoDetails;
 class ConsumerGroup;
@@ -1322,6 +1323,40 @@ class UserInfoDetails final {
     std::string username_;
     std::optional<::iggy::Permissions> permissions_;
     ResourceOptions options_;
+};
+
+/**
+ * @brief Snapshot of one personal access token's metadata.
+ *
+ * GetPersonalAccessTokens() returns one value for each token owned by the
+ * caller. The secret token string is never included. Expiry() is expressed
+ * in microseconds since the Unix epoch and is empty when the token never
+ * expires.
+ */
+class PersonalAccessTokenInfo final {
+  public:
+    /**
+     * @brief Returns the token name.
+     * @return The name the token was created with.
+     */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /**
+     * @brief Returns the expiry timestamp.
+     * @return Timestamp in microseconds since the Unix epoch, or empty when the token never expires.
+     */
+    [[nodiscard]] std::optional<std::uint64_t> Expiry() const noexcept { return expires_at_; }
+
+  private:
+    PersonalAccessTokenInfo(std::string name, std::optional<std::uint64_t> expires_at)
+        : name_(std::move(name)), expires_at_(expires_at) {}
+
+    static PersonalAccessTokenInfo FromFfi(ffi::PersonalAccessTokenInfo token);
+
+    friend class IggyBlockingClient;
+
+    std::string name_;
+    std::optional<std::uint64_t> expires_at_;
 };
 
 /**
@@ -5693,6 +5728,7 @@ class PollingStrategy final {
  *
  * - Login(), Logout(), ResolveOperation(), and AbandonOperation().
  * - CreateUser(), UpdateUser(), and DeleteUser().
+ * - DeletePersonalAccessToken().
  * - EncryptionKeyFingerprint() and invalid keys passed to CreateStream().
  * - CreateStream(), UpdateStream(), and DeleteStream().
  * - CreateTopic(), UpdateTopic(), and DeleteTopic().
@@ -5959,6 +5995,31 @@ class IggyBlockingClient final {
      *         request fails.
      */
     std::vector<UserInfo> GetUsers();
+
+    /**
+     * @brief Lists the personal access tokens owned by the authenticated caller.
+     *
+     * The result carries token names and expiry only. The server shows a
+     * secret token string only when the token is created.
+     *
+     * @return One entry per token, empty when the caller has none.
+     * @throws IggyException if the client is unavailable or unauthenticated, or
+     *         the request fails.
+     */
+    std::vector<PersonalAccessTokenInfo> GetPersonalAccessTokens();
+
+    /**
+     * @brief Deletes one of the caller's personal access tokens.
+     *
+     * A failed or unknown transport outcome can leave the deletion committed;
+     * list the tokens before retrying.
+     *
+     * @param name Name of the token to delete.
+     * @throws IggyException if @p name is empty or exceeds 255 bytes; the
+     *         client is unavailable or unauthenticated; the token does not
+     *         exist; or the request fails.
+     */
+    void DeletePersonalAccessToken(std::string name);
 
     /**
      * @brief Creates a user account.

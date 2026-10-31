@@ -1214,6 +1214,82 @@ TEST_F(E2E_Client, GetUsersBeforeLoginThrows) {
     ASSERT_THROW(client.GetUsers(), std::exception);
 }
 
+TEST_F(E2E_Client, GetPersonalAccessTokensBeforeLoginThrows) {
+    RecordProperty("description", "Rejects listing personal access tokens without an active authenticated session.");
+    auto client = GetLoggedOutHighLevelClient();
+
+    ASSERT_THROW(client.GetPersonalAccessTokens(), std::exception);
+    ASSERT_NO_THROW(client.Connect());
+    ASSERT_THROW(client.GetPersonalAccessTokens(), std::exception);
+    ASSERT_NO_THROW(client.Login("iggy", "iggy"));
+    ASSERT_NO_THROW(client.Logout());
+    ASSERT_THROW(client.GetPersonalAccessTokens(), std::exception);
+    ASSERT_NO_THROW(client.Login("iggy", "iggy"));
+    ASSERT_NO_THROW(client.Disconnect());
+    ASSERT_THROW(client.GetPersonalAccessTokens(), std::exception);
+}
+
+TEST_F(E2E_Client, DeletePersonalAccessTokenBeforeLoginThrows) {
+    RecordProperty("description", "Rejects deleting a personal access token without an active authenticated session.");
+    auto client                  = GetLoggedOutHighLevelClient();
+    const std::string token_name = GetRandomName(50);
+
+    ASSERT_THROW(client.DeletePersonalAccessToken(token_name), std::exception);
+    ASSERT_NO_THROW(client.Connect());
+    ASSERT_THROW(client.DeletePersonalAccessToken(token_name), std::exception);
+    ASSERT_NO_THROW(client.Login("iggy", "iggy"));
+    ASSERT_NO_THROW(client.Logout());
+    ASSERT_THROW(client.DeletePersonalAccessToken(token_name), std::exception);
+    ASSERT_NO_THROW(client.Login("iggy", "iggy"));
+    ASSERT_NO_THROW(client.Disconnect());
+    ASSERT_THROW(client.DeletePersonalAccessToken(token_name), std::exception);
+}
+
+TEST_F(E2E_Client, GetPersonalAccessTokensAfterLoginSucceeds) {
+    RecordProperty("description", "Lists personal access tokens for an authenticated session.");
+    auto client = GetLoggedInHighLevelClient();
+
+    ASSERT_NO_THROW(client.GetPersonalAccessTokens());
+}
+
+TEST_F(E2E_Client, PersonalAccessTokenCanBeListedAndDeleted) {
+    RecordProperty("description",
+                   "Lists a created personal access token with its expiry, deletes it, and lists again.");
+    auto client                  = GetLoggedInHighLevelClient();
+    const std::string token_name = GetRandomName(50);
+
+    ASSERT_NO_THROW((void)client.CreatePersonalAccessToken(token_name, iggy::Expiry::Duration(3'600'000'000)));
+
+    const auto tokens = client.GetPersonalAccessTokens();
+    const auto found =
+        std::find_if(tokens.begin(), tokens.end(), [&](const auto &token) { return token.Name() == token_name; });
+    EXPECT_NE(found, tokens.end());
+    if (found != tokens.end()) {
+        EXPECT_TRUE(found->Expiry().has_value());
+    }
+
+    ASSERT_NO_THROW(client.DeletePersonalAccessToken(token_name));
+    const auto remaining = client.GetPersonalAccessTokens();
+    EXPECT_EQ(std::count_if(remaining.begin(), remaining.end(),
+                            [&](const auto &token) { return token.Name() == token_name; }),
+              0);
+}
+
+TEST_F(E2E_Client, DeleteUnknownPersonalAccessTokenThrows) {
+    RecordProperty("description", "Rejects deleting a personal access token that does not exist.");
+    auto client = GetLoggedInHighLevelClient();
+
+    try {
+        client.DeletePersonalAccessToken(GetRandomName(50));
+        FAIL() << "Deleting an unknown personal access token must be rejected";
+    } catch (const iggy::IggyException &error) {
+        constexpr std::uint32_t resource_not_found_code = 20;
+        EXPECT_EQ(error.Code(), resource_not_found_code);
+        EXPECT_EQ(error.Kind(), "resource_not_found");
+        EXPECT_FALSE(error.OperationId().has_value());
+    }
+}
+
 TEST_F(E2E_Client, GetUserAllowsSelfLookupWithoutReadUsersPermission) {
     RecordProperty("description", "Allows a user without read_users permission to read its own details.");
     auto root_client           = GetLoggedInHighLevelClient();

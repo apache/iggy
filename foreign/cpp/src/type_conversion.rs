@@ -60,7 +60,8 @@ use iggy_common::{
     MetadataPartitionsItem, MetadataSession, MetadataSessionClosed, MetadataStreamChange,
     MetadataStreamDeleted, MetadataTokenChange, MetadataTokenDeleted, MetadataTopicChange,
     MetadataTopicDeleted, MetadataTopicItem, MetadataUserChange, MetadataUserIdentity,
-    MetadataUserPermissionsUpdated, Permissions as RustPermissions, Stats as RustStats,
+    MetadataUserPermissionsUpdated, Permissions as RustPermissions,
+    PersonalAccessTokenInfo as RustPersonalAccessTokenInfo, Stats as RustStats,
     StreamPermissions as RustStreamPermissions, TopicPermissions as RustTopicPermissions,
     TransportEndpoints as RustTransportEndpoints, UserInfo as RustUserInfo,
     UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
@@ -198,6 +199,17 @@ impl From<RustUserInfoDetails> for ffi::UserInfoDetails {
             permissions: ffi::Permissions::from(user.permissions.unwrap_or_default()),
             options: resource_options_to_ffi(&user.options, true),
             derived_options: resource_options_to_ffi(&user.options, false),
+        }
+    }
+}
+
+impl From<RustPersonalAccessTokenInfo> for ffi::PersonalAccessTokenInfo {
+    fn from(token: RustPersonalAccessTokenInfo) -> Self {
+        let has_expiry = token.expiry_at.is_some();
+        ffi::PersonalAccessTokenInfo {
+            name: token.name,
+            has_expiry,
+            expiry: token.expiry_at.map_or(0, |expiry_at| expiry_at.as_micros()),
         }
     }
 }
@@ -2100,5 +2112,23 @@ mod tests {
             MetadataChangesQuery::try_from(query(ffi::MetadataChangeStart::After, Vec::new())),
             Err(IggyError::InvalidCommand)
         );
+    }
+
+    #[test]
+    fn given_token_with_and_without_expiry_when_converting_should_preserve_presence() {
+        let expiring = ffi::PersonalAccessTokenInfo::from(RustPersonalAccessTokenInfo {
+            name: "ci-bot".to_owned(),
+            expiry_at: Some(IggyTimestamp::from(1_700_000_000_000_000)),
+        });
+        assert_eq!(expiring.name, "ci-bot");
+        assert!(expiring.has_expiry);
+        assert_eq!(expiring.expiry, 1_700_000_000_000_000);
+
+        let permanent = ffi::PersonalAccessTokenInfo::from(RustPersonalAccessTokenInfo {
+            name: "laptop".to_owned(),
+            expiry_at: None,
+        });
+        assert!(!permanent.has_expiry);
+        assert_eq!(permanent.expiry, 0);
     }
 }
