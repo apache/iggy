@@ -90,6 +90,20 @@ export type SendCommandOptions = {
 };
 
 /**
+ * Connection lifecycle events of a `Client`, with their listener arguments.
+ */
+export type ClientEventMap = {
+  /** Dialing starts; retries share one event until a connection succeeds */
+  connecting: [],
+  /** The dialed socket is ready: TCP connected, or TLS handshake done */
+  connected: [],
+  /** The connection reported an error, such as a failed dial */
+  error: [error: Error],
+  /** `destroy()` closed the connection. No event follows this one */
+  end: []
+};
+
+/**
  * Low-level client interface for communicating with the Iggy server.
  * Provides direct access to command sending and event handling.
  */
@@ -130,7 +144,7 @@ export type RawClient = {
    */
   readinessGroups?: (streamId: Id, topicId: Id, partitions: number[], options?: SendCommandOptions) =>
     Promise<number[][]>,
-  /** Destroys the client connection */
+  /** Destroys the connection. Socket closure is reported through `end`. */
   destroy: () => void,
   /** Tracks one facade operation across multiple command submissions. */
   hold?: () => () => void,

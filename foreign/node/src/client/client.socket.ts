@@ -185,6 +185,8 @@ export class CommandResponseStream extends EventEmitter {
   private readonly vsrSession = new VsrSession();
   private readonly lanes: MutationLanes;
   private readonly replicas = new Map<number, ReplicaSlot>();
+  private readonly connections = new Set<IggyConnection>();
+  private connecting = false;
   private readonly partitionRoutes = new Map<string, CachedRoute>();
   private readonly deferredRequests = new PermitPool(MAX_DEFERRED_REQUESTS);
   private readonly changed = new ChangeSignal();
@@ -1208,7 +1210,32 @@ export class CommandResponseStream extends EventEmitter {
   }
 
   private connectionFor(endpoint: Endpoint): IggyConnection {
+    this.lifetime.signal.throwIfAborted();
     const connection = new IggyConnection({ ...this.options, options: { ...this.options.options, ...endpoint } });
+    this.connections.add(connection);
+    void connection.socketClosed.then(() => this.connections.delete(connection));
+    connection.on('connecting', () => {
+      if (!this.lifetime.signal.aborted && !this.connecting) {
+        this.connecting = true;
+        this.emit('connecting');
+      }
+    });
+    connection.on('connect', () => {
+      if (!this.lifetime.signal.aborted) {
+        this.connecting = false;
+        // Listener exceptions must not enter the dial's transport retry path.
+        process.nextTick(() => {
+          if (!this.lifetime.signal.aborted)
+            this.emit('connected');
+        });
+      }
+    });
+    connection.on('error', (error: Error) => {
+      // Keep diagnostic link errors separate from EventEmitter's special
+      // 'error' event: internal events.once waits must survive link recovery.
+      if (!connection.ending && !this.lifetime.signal.aborted && this.listenerCount('connectionError') > 0)
+        this.emit('connectionError', error);
+    });
     connection.on('eviction', (error) => this.emit('eviction', error));
     return connection;
   }
@@ -1561,6 +1588,12 @@ export class CommandResponseStream extends EventEmitter {
   }
 
   destroy(): void {
+    if (this.lifetime.signal.aborted) return;
+    const closed = [...this.connections].map((connection) => connection.socketClosed);
+    void Promise.allSettled(closed).then(() => {
+      // Listener exceptions follow EventEmitter semantics, outside a promise chain.
+      process.nextTick(() => this.emit('end'));
+    });
     this.signInCredentials = undefined;
     this.lifetime.abort(new Error('client destroyed'));
     this.resetSession();

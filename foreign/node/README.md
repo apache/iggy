@@ -533,6 +533,41 @@ const client = new Client({
 const stats = await client.system.getStats();
 ```
 
+### Connection events
+
+`Client` and `SingleClient` report their connection lifecycle through Node.js-style `on`, `once`,
+`off` and `removeListener` methods. Each method returns the client, so calls
+can be chained. Listeners receive the client as `this`. These four methods do not implement the
+full Node.js `EventEmitter` interface. `SimpleClient` wraps an arbitrary raw client and does not expose these methods.
+The `getClient()` factory returns a `SimpleClient`, so it does not expose them either.
+
+```ts
+client
+  .on("connecting", () => console.log("dialing the server"))
+  .once("connected", () => console.log("connected"))
+  .on("error", (error) => console.error("connection error", error))
+  .on("end", () => console.log("client destroyed"));
+```
+
+- `connecting` fires when dialing starts. Failed retries share that event
+  until a connection succeeds, including retries from later commands.
+  A subsequent dial starts a new phase. All links share this state and the
+  client's listeners; an event does not identify a replica. The client
+  dials lazily on its first command and announces the phase on the next tick.
+  Attach listeners before issuing commands or awaiting them to receive it.
+- `connected` fires when each socket is ready: TCP connected, or the TLS
+  handshake done. It fires before the client logs in.
+- `error` receives each error the connection reports, for example a refused
+  dial. Failed commands reject separately and can wrap the connection error
+  in `cause`, for example a refused login. Without an `error` listener,
+  the diagnostic event does not throw.
+- `end` fires once, after `destroy()` closes every link, and no lifecycle event
+  follows it. Destruction cancels requests immediately; `await client.destroy()`
+  resolves after `end`. Repeated calls share that completion.
+
+The low-level `getRawClient()` keeps a synchronous `destroy()` method.
+Listen for its `end` event to wait for socket closure.
+
 ### Connection strings
 
 Every client constructor (except `SimpleClient` see note) also accepts a
