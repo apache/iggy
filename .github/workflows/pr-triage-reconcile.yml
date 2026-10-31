@@ -1,0 +1,219 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: PR Triage Reconcile
+
+# Scheduled catch-up for the PR lifecycle labels. pr-triage-apply.yml and
+# stale-prs-unmark-on-activity.yml are fed by pr-triage-collect.yml, whose
+# pull_request leg GitHub does not run while a PR has a merge conflict. A
+# conflicted PR that is opened, closed, converted to a draft, marked ready
+# or pushed to therefore never reaches them. This workflow runs from the
+# default branch with a write token and applies the same rules from the
+# PRs' live state:
+#   closed or draft with an S-* label      -> remove both S-* labels
+#   open, non-draft, no S-* label          -> add S-waiting-on-review
+#   open with S-stale and a push, reopen or ready_for_review after the
+#   label was added                        -> remove S-stale
+# Comments and reviews fire issue_comment / pull_request_review whatever
+# the merge state, so those paths need no catch-up. The welcome comment is
+# not reconciled: it cannot tell a conflicted first open from a PR that
+# never qualified.
+#
+# Everything here is idempotent, so overlapping with an apply run is
+# harmless: both converge on the same live state. Note that this makes
+# "every open non-draft PR carries an S-* label" an enforced invariant:
+# removing both by hand lasts until the next run.
+#
+# SECURITY: schedule and workflow_dispatch only, no actions/checkout, no
+# PR content is executed. The workflow only calls the GitHub REST API via
+# actions/github-script.
+
+on:
+  schedule:
+    - cron: "41 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  pull-requests: write
+  issues: write
+  contents: read
+
+concurrency:
+  group: pr-triage-reconcile
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    steps:
+      - name: Reconcile lifecycle labels
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const LABEL_REVIEW = 'S-waiting-on-review';
+            const LABEL_AUTHOR = 'S-waiting-on-author';
+            const LABEL_STALE = 'S-stale';
+            const { owner, repo } = context.repo;
+
+            // Same retry policy as pr-triage-apply.yml: 5xx, 429 and
+            // network errors are retried, anything else surfaces at once.
+            const withRetry = async (fn, label) => {
+              const delays = [500, 1500, 4000];
+              for (let attempt = 0; ; attempt++) {
+                try {
+                  return await fn();
+                } catch (e) {
+                  const s = e.status;
+                  const transient = s === undefined || s === 429
+                                 || (s >= 500 && s < 600);
+                  if (!transient || attempt >= delays.length) throw e;
+                  core.warning(`${label}: transient failure ` +
+                    `(${s ?? e.code ?? 'network'}), retry ` +
+                    `${attempt + 1}/${delays.length} in ${delays[attempt]}ms`);
+                  await new Promise(r => setTimeout(r, delays[attempt]));
+                }
+              }
+            };
+
+            // Search only picks candidates; the index lags, so every
+            // decision below is taken on the PR's live state. Search stops
+            // at 1000 results, so pagination is capped before GitHub
+            // rejects page 11.
+            const search = async (q) => {
+              let pages = 0;
+              const items = await withRetry(() => github.paginate(
+                github.rest.search.issuesAndPullRequests,
+                {
+                  q: `repo:${owner}/${repo} is:pr ${q}`,
+                  per_page: 100,
+                  advanced_search: 'true',
+                },
+                (response, done) => {
+                  pages += 1;
+                  if (pages >= 10) done();
+                  return response.data;
+                },
+              ), `search ${q}`);
+              return items.map(i => i.number);
+            };
+
+            const livePr = async (n) => {
+              try {
+                const { data } = await withRetry(() => github.rest.pulls.get({
+                  owner, repo, pull_number: n,
+                }), `pulls.get #${n}`);
+                return data;
+              } catch (e) {
+                if (e.status === 404) return null;
+                throw e;
+              }
+            };
+
+            // Paginated so a PR with more than 100 labels is read whole;
+            // setLabels below is a replace-all PUT.
+            const labelsOf = async (n) => (await withRetry(() => github.paginate(
+              github.rest.issues.listLabelsOnIssue,
+              { owner, repo, issue_number: n, per_page: 100 },
+            ), `listLabelsOnIssue #${n}`)).map(l => l.name);
+
+            // The S-* rule pr-triage-apply.yml applies at the start of
+            // every run.
+            const convergeState = async (n) => {
+              const pr = await livePr(n);
+              if (!pr) return;
+              const names = await labelsOf(n);
+              const hasState = names.includes(LABEL_REVIEW) || names.includes(LABEL_AUTHOR);
+              if (pr.state === 'closed' || pr.draft) {
+                if (!hasState) return;
+                await withRetry(() => github.rest.issues.setLabels({
+                  owner, repo, issue_number: n,
+                  labels: names.filter(x => x !== LABEL_REVIEW && x !== LABEL_AUTHOR),
+                }), `setLabels #${n}`);
+                core.info(`#${n}: cleared S-* labels (${pr.state === 'closed' ? 'closed' : 'draft'})`);
+                return;
+              }
+              if (hasState) return;
+              await withRetry(() => github.rest.issues.addLabels({
+                owner, repo, issue_number: n, labels: [LABEL_REVIEW],
+              }), `addLabels #${n}`);
+              core.info(`#${n}: added ${LABEL_REVIEW}`);
+            };
+
+            // Activity after the last S-stale labelling that the collector
+            // could not have seen. reopened, ready_for_review and
+            // head_ref_force_pushed carry timestamps on the timeline. A
+            // plain push does not: its committed entries carry git dates,
+            // so the head commit's committer date stands in for it, and a
+            // rebase or a new commit moves that forward.
+            const ACTIVITY = new Set(['reopened', 'ready_for_review', 'head_ref_force_pushed']);
+            const unmarkStale = async (n) => {
+              const pr = await livePr(n);
+              if (!pr || pr.state !== 'open') return;
+              const names = await labelsOf(n);
+              if (!names.includes(LABEL_STALE)) return;
+              const timeline = await withRetry(() => github.paginate(
+                github.rest.issues.listEventsForTimeline,
+                { owner, repo, issue_number: n, per_page: 100 },
+              ), `timeline #${n}`);
+              let markedAt = null;
+              for (const ev of timeline) {
+                if (ev.event === 'labeled' && ev.label && ev.label.name === LABEL_STALE) {
+                  markedAt = Date.parse(ev.created_at);
+                }
+              }
+              if (markedAt === null) {
+                core.info(`#${n}: ${LABEL_STALE} present without a labeled event, leaving it`);
+                return;
+              }
+              let why = null;
+              for (const ev of timeline) {
+                if (ACTIVITY.has(ev.event) && ev.created_at && Date.parse(ev.created_at) > markedAt) {
+                  why = ev.event;
+                  break;
+                }
+              }
+              if (!why) {
+                const { data: head } = await withRetry(() => github.rest.repos.getCommit({
+                  owner, repo, ref: pr.head.sha,
+                }), `getCommit #${n}`);
+                const committed = head.commit && head.commit.committer && head.commit.committer.date;
+                if (committed && Date.parse(committed) > markedAt) why = 'push';
+              }
+              if (!why) return;
+              try {
+                await withRetry(() => github.rest.issues.removeLabel({
+                  owner, repo, issue_number: n, name: LABEL_STALE,
+                }), `removeLabel #${n}`);
+              } catch (e) {
+                // Already gone: the unmark workflow got there first.
+                if (e.status !== 404) throw e;
+              }
+              core.info(`#${n}: removed ${LABEL_STALE} (${why})`);
+            };
+
+            // A comma in label: is OR; advanced search allows the grouped OR.
+            const stateCandidates = [
+              ...await search(`(is:closed OR draft:true) label:${LABEL_REVIEW},${LABEL_AUTHOR}`),
+              ...await search(`is:open draft:false -label:${LABEL_REVIEW} -label:${LABEL_AUTHOR}`),
+            ];
+            core.info(`S-* candidates: ${stateCandidates.length}`);
+            for (const n of stateCandidates) await convergeState(n);
+
+            const staleCandidates = await search(`is:open label:${LABEL_STALE}`);
+            core.info(`${LABEL_STALE} candidates: ${staleCandidates.length}`);
+            for (const n of staleCandidates) await unmarkStale(n);
