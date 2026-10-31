@@ -16,13 +16,13 @@
 // under the License.
 
 import Logging
-import NIOConcurrencyHelpers
 
 /// Reads the partitions of one topic and hands their messages over one at a
-/// time, a port of `IggyConsumer` in the Rust SDK.
+/// time, a port of `IggyConsumer` in the Rust SDK, on one
+/// ``PartitionReader``.
 ///
-/// Build a standalone consumer of one partition with
-/// ``IggyClient/consumer(name:streamID:topicID:partitionID:configuration:)``,
+/// Build a standalone consumer of chosen partitions with
+/// ``IggyClient/consumer(name:streamID:topicID:partitions:configuration:)``,
 /// or a member of a consumer group with
 /// ``IggyClient/consumerGroup(name:streamID:topicID:configuration:)``, whose
 /// partitions the server assigns. Call ``initialize()`` once, then read with
@@ -36,21 +36,19 @@ import NIOConcurrencyHelpers
 /// }
 /// ```
 ///
-/// Messages come from a buffer that a poll refills once it runs empty. A
-/// failed poll is thrown after ``ConsumerConfiguration/pollingRetryInterval``
-/// and leaves the consumer usable, so a caller of ``next()`` can call it again;
-/// a `for try await` loop ends at the first error instead. ``next()`` returns
-/// nil only after ``shutdown()``. One reader consumes a consumer, as in the
-/// Rust SDK: two loops over the same consumer split its messages between them.
+/// The ``CommitPolicy`` of ``ConsumerConfiguration/pollOptions`` decides
+/// who stores offsets: the application with ``commit(_:)`` under `manual`,
+/// the server with each read under `onRead`, the consumer under `auto`,
+/// which counts a message when it is handed over (``CommitAfter/delivery``),
+/// once the application asked for the next one or its handler returned
+/// (``CommitAfter/processing``), or once it is marked
+/// (``CommitAfter/marked``). ``shutdown()`` stores the counted positions,
+/// moves an `onRead` offset back to the last message handed over, and
+/// leaves the group.
 ///
-/// The consumer remembers the last message handed over from each partition.
-/// Without ``ConsumerConfiguration/allowReplay`` a message at or below it is
-/// not handed over again, and ``ConsumerConfiguration/autoCommit`` decides
-/// when the reading position is stored on the server.
-///
-/// Unlike the Rust consumer, this one has no encryptor, since the Swift
-/// client has none, and does not resolve a group create or join whose outcome
-/// was lost: the Swift client has no operation lanes to resolve them through.
+/// A failed read is thrown as a ``ReadError`` and the consumer can be read
+/// on. ``next()`` returns nil only after ``shutdown()``. One reader consumes
+/// a consumer: two loops over the same consumer split its messages.
 public actor IggyConsumer: AsyncSequence {
     public typealias Element = ReceivedMessage
 
@@ -58,77 +56,42 @@ public actor IggyConsumer: AsyncSequence {
     public nonisolated let streamID: Identifier
     public nonisolated let topicID: Identifier
     public nonisolated let consumer: Consumer
-    /// The partition a standalone consumer reads; nil for a group member.
-    public nonisolated let partitionID: UInt32?
-    /// The partition of the last batch handed over. Before the first one it
-    /// is the partition of a standalone consumer and zero for a group member.
-    public private(set) var currentPartitionID: UInt32
+    /// The partitions a standalone consumer reads, nil for a group member.
+    public nonisolated let partitions: [UInt32]?
+    /// The partition of the last message handed over, zero before the first.
+    public private(set) var currentPartitionID: UInt32 = 0
 
     private let client: IggyClient
     private let configuration: ConsumerConfiguration
     private let logger: Logger
-    private let isConsumerGroup: Bool
-    /// One poll at a time: a reader that finds the buffer empty waits here
-    /// while another one polls.
     private let reading = AsyncMutex()
-    /// Held by a join and by the final leave, so a join in flight ends
-    /// before the leave and none starts after it.
-    private let membership = AsyncMutex()
-    /// Held by every store and delete, so a coverage check, its request, and
-    /// the cache update see no other store in between.
-    private let offsetWrites = AsyncMutex()
-    private let commitWakeups: AsyncStream<Void>
-    private let commitWakeup: AsyncStream<Void>.Continuation
-
-    private var isInitialized = false
-    /// Shared by concurrent calls of ``initialize()``.
+    private(set) var reader: PartitionReader?
     private var initialization: Task<Void, any Error>?
     private var isShutDown = false
     private var shutdownTask: Task<Void, Never>?
-    /// Follows the client's events: polling waits while the client is signed
-    /// out and can come back on its own.
-    private var canPoll = true
-    private var joinedGroup = false
-    private var buffer: [IggyMessage] = []
+    private var buffer: PolledMessages?
     private var bufferIndex = 0
-    private var bufferedContext = PartitionContext.empty
-    private var bufferedCurrentOffset: UInt64 = 0
-    private var lastPolledAt: ContinuousClock.Instant?
-    /// Where each partition continues after its last message handed over,
-    /// unless a `next` poll commits, which leaves that to the offset it stores.
-    private var nextPositions: [UInt32: ConsumerPosition] = [:]
-    private var lastConsumed: [UInt32: ConsumerPosition] = [:]
-    private var lastStored: [UInt32: ConsumerPosition] = [:]
-    /// Commits queued by the message triggers, the latest per partition.
-    private var pendingCommits: [UInt32: ConsumerPosition] = [:]
-    private var eventsTask: Task<Void, Never>?
-    private var intervalTask: Task<Void, Never>?
-    private var intervalIsStoring = false
-    private var commitTask: Task<Void, Never>?
+    /// With ``CommitAfter/processing``: the message ``next()`` handed over
+    /// last, which counts once the next one is asked for.
+    private var unprocessed: (checkpoint: Checkpoint, endsBatch: Bool)?
+    /// The last message handed over from each partition, which the replay
+    /// filter skips up to.
+    private var lastConsumed: [UInt32: Checkpoint] = [:]
 
     init(
-        client: IggyClient, name: String, consumer: Consumer, streamID: Identifier, topicID: Identifier, partitionID: UInt32?,
+        client: IggyClient, name: String, consumer: Consumer, streamID: Identifier, topicID: Identifier, partitions: [UInt32]?,
         configuration: ConsumerConfiguration
     ) throws {
         try configuration.validate()
+        try configuration.reader(partitions: partitions).validate(group: consumer.kind == .consumerGroup)
         self.client = client
         self.name = name
         self.consumer = consumer
         self.streamID = streamID
         self.topicID = topicID
-        self.partitionID = partitionID
-        currentPartitionID = partitionID ?? 0
+        self.partitions = partitions
         self.configuration = configuration
         logger = client.logger
-        isConsumerGroup = consumer.kind == .consumerGroup
-        (commitWakeups, commitWakeup) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
-    }
-
-    deinit {
-        eventsTask?.cancel()
-        intervalTask?.cancel()
-        commitTask?.cancel()
-        commitWakeup.finish()
     }
 
     public nonisolated func makeAsyncIterator() -> AsyncIterator {
@@ -160,12 +123,12 @@ public actor IggyConsumer: AsyncSequence {
     // MARK: Lifecycle
 
     /// Looks the stream and topic up, retrying a missing one as
-    /// ``ConsumerConfiguration/initRetries`` says, joins the group of a member
-    /// that joins on its own, and starts the commit tasks. Concurrent calls
-    /// share one run, and calling it again after it succeeded, or after
+    /// ``ConsumerConfiguration/initRetries`` says, and builds the reader,
+    /// which joins the group of a member that joins on its own. Concurrent
+    /// calls share one run, and calling it again after it succeeded, or after
     /// ``shutdown()``, does nothing.
     public func initialize() async throws {
-        if isInitialized || isShutDown {
+        if reader != nil || isShutDown {
             return
         }
         if let initialization {
@@ -180,50 +143,22 @@ public actor IggyConsumer: AsyncSequence {
     private func start() async throws {
         logger.info("Initializing the consumer", metadata: metadata)
         try await waitForStreamAndTopic()
-        let events = await client.events
-        // A retried initialize after a failed join replaces the subscription
-        // with nothing suspending in between, so none is left behind.
-        eventsTask?.cancel()
-        eventsTask = Task { [weak self] in
-            for await event in events {
-                guard let self, await self.observe(event) else {
-                    return
-                }
-            }
-        }
-        if isConsumerGroup, configuration.autoJoinConsumerGroup {
-            try await joinGroup()
-        }
+        let built = try await client.reader(
+            streamID: streamID, topicID: topicID, consumer: consumer, configuration: configuration.reader(partitions: partitions))
         guard !isShutDown else {
-            // A shutdown came in meanwhile and already stopped what it found.
-            eventsTask?.cancel()
-            eventsTask = nil
+            try? await built.close()
             return
         }
-        if let interval = configuration.autoCommit.interval {
-            intervalTask = Task { [weak self] in
-                while (try? await Task.sleep(for: interval)) != nil {
-                    guard let self, await self.storeOnTick() else {
-                        return
-                    }
-                }
-            }
-        }
-        commitTask = Task { [weak self, commitWakeups] in
-            for await _ in commitWakeups {
-                guard let self, await self.sendPendingCommits() else {
-                    return
-                }
-            }
-        }
-        isInitialized = true
+        reader = built
         logger.info("The consumer has been initialized", metadata: metadata)
     }
 
-    /// Stops reading, sends the queued commits, stores the reading position
-    /// of every partition read unless auto-commit is disabled, and leaves the
-    /// group. Every caller waits for the same shutdown. Failures are logged:
-    /// nothing is left for the caller to undo.
+    /// Stops reading, counts the last message under
+    /// ``CommitAfter/processing``, and closes the reader, which stores the
+    /// counted positions, moves an `onRead` offset back to the last message
+    /// handed over, and leaves the group, within
+    /// ``ConsumerConfiguration/offsetDrainTimeout``. Every caller waits for
+    /// the same shutdown. Failures are logged.
     public func shutdown() async {
         if let shutdownTask {
             await shutdownTask.value
@@ -237,159 +172,116 @@ public actor IggyConsumer: AsyncSequence {
 
     private func drain() async {
         logger.info("Shutting down the consumer", metadata: metadata)
-        let timeout = configuration.offsetDrainTimeout
-        if let intervalTask {
-            // A sleeping tick is cancelled. One that is storing ends after its
-            // store.
-            if intervalIsStoring {
-                await Self.wait(for: intervalTask, upTo: timeout)
-            } else {
-                intervalTask.cancel()
+        if let initialization {
+            _ = try? await initialization.value
+        }
+        guard let reader else {
+            return
+        }
+        await countUnprocessed()
+        do {
+            let closed = try await withDeadline(.now + configuration.offsetDrainTimeout) {
+                try await reader.close()
+                return true
             }
-        }
-        if let commitTask {
-            commitWakeup.yield()
-            await Self.wait(for: commitTask, upTo: timeout)
-        }
-        if configuration.autoCommit != .disabled {
-            let positions = Array(lastConsumed.values)
-            // One deadline for every final store, as in the Rust SDK.
-            _ = try? await withDeadline(.now + client.configuration.requestTimeout) {
-                await self.storeFinalPositions(positions)
+            if closed == nil {
+                logger.warning("The reader did not close within the offset drain timeout", metadata: metadata)
             }
+        } catch {
+            logger.warning("The reader closed with an error", metadata: metadata.merging(["error": "\(error)"]) { $1 })
         }
-        // Every join checks the shutdown under this lock, so none comes after
-        // the leave.
-        if isConsumerGroup, (try? await membership.lock()) != nil {
-            defer { membership.unlock() }
-            if joinedGroup {
-                joinedGroup = false
-                do {
-                    try await client.leaveConsumerGroup(streamID: streamID, topicID: topicID, groupID: consumer.id)
-                } catch {
-                    // Expected after an explicit leave or a deleted group.
-                    logger.debug("Failed to leave the consumer group", metadata: metadata.merging(["error": "\(error)"]) { $1 })
-                }
-            }
-        }
-        eventsTask?.cancel()
-        eventsTask = nil
         logger.info("The consumer has been shut down", metadata: metadata)
     }
 
     // MARK: Reading
 
-    /// The next message: from the buffer, or from a poll once it is empty.
-    /// Throws what a poll or join ran into, after the retry interval, and can
-    /// be called again after it threw. Nil once the consumer is shut down.
+    /// The next message, or nil once the consumer is shut down. Throws a
+    /// ``ReadError`` and can be called again after it threw.
     public func next() async throws -> ReceivedMessage? {
-        if isShutDown {
+        await countUnprocessed()
+        guard let received = try await take() else {
             return nil
         }
-        // Nothing suspends between the check and the handover, so a
-        // buffered message needs no lock.
-        if bufferIndex < buffer.count {
-            return handOverBuffered()
+        if configuration.pollOptions.autoCommit?.after == .processing {
+            unprocessed = (received.checkpoint, isLastOfBatch)
         }
-        try await reading.lock()
-        defer { reading.unlock() }
-        while !isShutDown {
-            // The poll this reader waited for can have refilled the buffer.
-            if bufferIndex < buffer.count {
-                return handOverBuffered()
-            }
-            try Task.checkCancellation()
-            let polled = try await poll()
-            if !polled.messages.isEmpty, !isShutDown {
-                return handOverPolled(polled)
-            }
-        }
-        return nil
+        return received
     }
 
     /// Hands every message to `handler` until the consumer shuts down, the
-    /// task is cancelled, or an error ends the reading: a client that is shut
-    /// down or cannot come back without the caller, or an invalid address.
-    /// Other errors are logged and reading goes on, and a handler that throws
-    /// is logged too. The ``AutoCommitAfter`` triggers fire here, after the
-    /// handler returned or threw.
+    /// task is cancelled, or a read error ends the reading: a client that is
+    /// shut down or cannot come back without the caller, or an invalid
+    /// address. Other read errors are logged and reading goes on. Under
+    /// ``CommitAfter/processing`` a message counts once its handler returned,
+    /// and a handler that throws leaves its message uncounted and ends the
+    /// reading with its error. Under any other policy a handler that throws
+    /// is logged.
     public func consumeMessages(_ handler: @Sendable (ReceivedMessage) async throws -> Void) async throws {
-        let after = configuration.autoCommit.afterTrigger
+        await countUnprocessed()
+        let processing = configuration.pollOptions.autoCommit?.after == .processing
         while true {
             let received: ReceivedMessage
             do {
-                guard let next = try await next() else {
+                guard let next = try await take() else {
                     return
                 }
                 received = next
-            } catch let error as IggyError {
-                let ends = Self.endsConsumption(error) ? true : !(await client.canRecover)
-                if ends {
+            } catch let error as ReadError {
+                let recovers = await client.canRecover
+                if Self.endsConsumption(error.error) || !recovers {
                     logger.error("Reading stopped", metadata: metadata.merging(["error": "\(error)"]) { $1 })
                     throw error
                 }
                 logger.error("Failed to read a message", metadata: metadata.merging(["error": "\(error)"]) { $1 })
                 continue
             }
+            let endsBatch = isLastOfBatch
             do {
                 try await handler(received)
             } catch {
                 logger.error(
                     "The handler failed", metadata: metadata.merging(["offset": "\(received.message.offset)", "error": "\(error)"]) { $1 })
+                if processing {
+                    throw error
+                }
+                continue
             }
-            switch after {
-            case .consumingEachMessage?:
-                queueCommit(received.position)
-            case .consumingEveryNthMessage(let n)?:
-                if received.message.offset % UInt64(n) == 0 {
-                    queueCommit(received.position)
-                }
-            case .consumingAllMessages?:
-                if received.message.offset == received.currentOffset {
-                    queueCommit(received.position)
-                }
-            case nil:
-                break
+            if processing, let reader {
+                await reader.count(received.checkpoint, messages: 1, endsBatch: endsBatch)
             }
         }
     }
 
     // MARK: Offsets
 
-    /// Stores `offset` for a partition, the current one when nil, under the
-    /// context of the last message handed over from it. Before any was, it
-    /// is stored without a context.
-    public func storeOffset(_ offset: UInt64, partitionID: UInt32? = nil) async throws {
-        let partition = partitionID ?? currentPartitionID
-        if let last = lastConsumed[partition] {
-            try await storePosition(ConsumerPosition(partitionID: partition, offset: offset, context: last.context))
-            return
+    /// Stores the offset of a checkpoint the consumer handed over, now. A
+    /// checkpoint of an older generation of its partition stores nothing.
+    /// Throws ``IggyErrorCode/invalidCommand`` under ``CommitPolicy/onRead``.
+    public func commit(_ checkpoint: Checkpoint) async throws {
+        try await requireReader().commit(checkpoint)
+    }
+
+    /// Counts a checkpoint the consumer handed over, under
+    /// ``CommitPolicy/auto(_:)``, for messages processed concurrently with
+    /// ``CommitAfter/marked``. Throws ``IggyErrorCode/invalidCommand``
+    /// without `auto`.
+    public func mark(_ checkpoint: Checkpoint) async throws {
+        try await requireReader().mark(checkpoint)
+    }
+
+    /// Sets where `partitionID` reads next, as
+    /// ``PartitionReader/seek(partitionID:to:)`` does, and drops its messages
+    /// not handed over yet. A seek back hands the messages over again.
+    public func seek(partitionID: UInt32, to start: PollingStrategy) async throws {
+        try await requireReader().seek(partitionID: partitionID, to: start)
+        if buffer?.partitionID == partitionID {
+            buffer = nil
+            bufferIndex = 0
         }
-        try await offsetWrites.lock()
-        defer { offsetWrites.unlock() }
-        try await client.storeConsumerOffset(consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partition, offset: offset)
-        lastStored[partition] = ConsumerPosition(partitionID: partition, offset: offset, context: .empty)
-    }
-
-    /// Stores the exact position delivered, as
-    /// ``ReceivedMessage/position`` gives it, even after later polls. Without
-    /// ``ConsumerConfiguration/allowReplay`` a position at or below the one
-    /// already stored in the same partition history is not sent.
-    public func storePosition(_ position: ConsumerPosition) async throws {
-        try await store(position, allowReplay: configuration.allowReplay)
-    }
-
-    /// Deletes the stored offset of a partition, the current one when nil.
-    /// Unlike the Rust consumer, a group member's nil is not left to the
-    /// server, since the Swift client routes the request by its partition.
-    public func deleteOffset(partitionID: UInt32? = nil) async throws {
-        let partition = partitionID ?? currentPartitionID
-        try await offsetWrites.lock()
-        defer { offsetWrites.unlock() }
-        // A cancelled delete can still have committed, so a later store must
-        // not be skipped as covered.
-        lastStored[partition] = nil
-        try await client.deleteConsumerOffset(consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partition)
+        lastConsumed[partitionID] = nil
+        if unprocessed?.checkpoint.partitionID == partitionID {
+            unprocessed = nil
+        }
     }
 
     /// The offset of the last message handed over from the partition.
@@ -397,15 +289,90 @@ public actor IggyConsumer: AsyncSequence {
         lastConsumed[partitionID]?.offset
     }
 
-    /// The offset this consumer last stored for the partition.
-    public func lastStoredOffset(partitionID: UInt32) -> UInt64? {
-        lastStored[partitionID]?.offset
-    }
-
     // MARK: Internals
 
     private var metadata: Logger.Metadata {
         ["consumer": "\(name)", "stream": "\(streamID)", "topic": "\(topicID)"]
+    }
+
+    private var isLastOfBatch: Bool {
+        guard let buffer else {
+            return true
+        }
+        return bufferIndex >= buffer.messages.count
+    }
+
+    private func requireReader() throws -> PartitionReader {
+        guard let reader else {
+            throw IggyError(.invalidCommand, context: "the consumer is not initialized")
+        }
+        return reader
+    }
+
+    /// The next message from the buffer, or from the next batch of the
+    /// reader once it is empty, without those that replay skips.
+    private func take() async throws -> ReceivedMessage? {
+        try await reading.lock()
+        defer { reading.unlock() }
+        while !isShutDown {
+            if let buffered = buffer, bufferIndex < buffered.messages.count {
+                // A seek of its partition can have replaced its generation since
+                // the batch was taken, as `yield_current` checks in the Rust SDK.
+                if let reader, await !reader.holds(buffered) {
+                    buffer = nil
+                    continue
+                }
+                return await handOver(buffered)
+            }
+            buffer = nil
+            guard let reader else {
+                throw IggyError(.invalidCommand, context: "the consumer is not initialized")
+            }
+            guard var batch = try await reader.nextBatch(), !isShutDown else {
+                return nil
+            }
+            skipReplayed(&batch)
+            buffer = batch
+            bufferIndex = 0
+        }
+        return nil
+    }
+
+    private func handOver(_ batch: PolledMessages) async -> ReceivedMessage {
+        let index = bufferIndex
+        bufferIndex += 1
+        let message = batch.messages[index]
+        let checkpoint = batch.checkpoint(at: index) ?? Checkpoint(partitionID: batch.partitionID, offset: message.offset, context: batch.context)
+        currentPartitionID = batch.partitionID
+        lastConsumed[batch.partitionID] = checkpoint
+        let endsBatch = bufferIndex == batch.messages.count
+        if let reader {
+            await reader.deliver(checkpoint)
+            if configuration.pollOptions.autoCommit?.after == .delivery {
+                await reader.count(checkpoint, messages: 1, endsBatch: endsBatch)
+            }
+        }
+        return ReceivedMessage(message: message, currentOffset: batch.currentOffset, partitionID: batch.partitionID, checkpoint: checkpoint)
+    }
+
+    private func countUnprocessed() async {
+        guard let (checkpoint, endsBatch) = unprocessed, let reader else {
+            return
+        }
+        unprocessed = nil
+        await reader.count(checkpoint, messages: 1, endsBatch: endsBatch)
+    }
+
+    /// Drops the messages at or below the last one handed over from the same
+    /// partition history, unless replay is allowed.
+    private func skipReplayed(_ batch: inout PolledMessages) {
+        guard !configuration.allowReplay, let consumed = lastConsumed[batch.partitionID],
+            PartitionReader.sameHistory(consumed.context, batch.context)
+        else {
+            return
+        }
+        batch.messages.removeAll { $0.offset <= consumed.offset }
+        batch.count = UInt32(batch.messages.count)
     }
 
     private func waitForStreamAndTopic() async throws {
@@ -442,294 +409,36 @@ public actor IggyConsumer: AsyncSequence {
         }
     }
 
-    private func joinGroup() async throws {
-        try await membership.lock()
-        defer { membership.unlock() }
-        // The final leave of a shutdown may have gone already.
-        if joinedGroup || isShutDown {
-            return
-        }
-        if try await client.getConsumerGroup(streamID: streamID, topicID: topicID, groupID: consumer.id) == nil {
-            guard configuration.createConsumerGroupIfNotExists else {
-                throw IggyError(.consumerGroupNameNotFound, context: "consumer group \(name) does not exist and auto-creation is disabled")
-            }
-            logger.info("Creating the consumer group", metadata: metadata)
-            do {
-                _ = try await client.createConsumerGroup(streamID: streamID, topicID: topicID, name: name)
-            } catch let error as IggyError where error.code == .consumerGroupNameAlreadyExists {
-                // Another member created it first.
-            }
-        }
-        logger.info("Joining the consumer group", metadata: metadata)
-        try await client.joinConsumerGroup(streamID: streamID, topicID: topicID, groupID: consumer.id)
-        joinedGroup = true
-    }
-
-    /// Returns false once the client shut down, which ends the subscription.
-    private func observe(_ event: DiagnosticEvent) async -> Bool {
-        switch event {
-        case .shutdown:
-            logger.warning("The client has been shut down", metadata: metadata)
-            joinedGroup = false
-            canPoll = false
-            return false
-        case .connected, .disconnected, .signedOut:
-            joinedGroup = false
-        case .signedIn:
-            break
-        }
-        // Events can arrive after one that reports a later state, so the
-        // state of the client decides.
-        canPoll = await client.state == .authenticated
-        return true
-    }
-
-    /// One poll, as the Rust consumer's poll future: the interval wait, the
-    /// sign-in wait, a join when the membership was lost, and the request.
-    /// An empty result is not an error.
-    private func poll() async throws -> PolledMessages {
-        if let pollInterval = configuration.pollInterval, let lastPolledAt {
-            try await Task.sleep(until: lastPolledAt + pollInterval, clock: .continuous)
-        }
-        let retryInterval = configuration.pollingRetryInterval
-        // A client that only the caller brings back never recovers, so the
-        // poll goes on and fails with the reason instead of waiting for good.
-        // Without a heartbeat or a commit to send, nothing else signs the
-        // client in again, so the wait does.
-        while !canPoll, !isShutDown, await client.canRecover {
-            if (try? await client.requireAuthenticated()) != nil {
-                break
-            }
-            try await Task.sleep(for: retryInterval)
-        }
-        if isConsumerGroup, configuration.autoJoinConsumerGroup, !joinedGroup {
-            do {
-                try await joinGroup()
-            } catch {
-                logger.error("Failed to join the consumer group", metadata: metadata.merging(["error": "\(error)"]) { $1 })
-                try await Task.sleep(for: retryInterval)
-                throw error
-            }
-        }
-        // A shutdown may have sent its final commits and leave already.
-        if isShutDown {
-            return .empty
-        }
-        lastPolledAt = .now
-        let continuations = nextPositions
-        let strategy = configuration.pollingStrategy
-        // A refusal does not name its partition, and it answers the last one
-        // the strategy was asked for.
-        let polledPartition = NIOLockedValueBox(PolledMessages.noAssignedPartition)
-        do {
-            var polled = try await client.pollMessages(
-                streamID: streamID, topicID: topicID, partitionID: partitionID, consumer: consumer, count: configuration.batchLength,
-                autoCommit: configuration.autoCommit.whenTrigger == .pollingMessages
-            ) { partition in
-                polledPartition.withLockedValue { $0 = partition }
-                return continuations[partition].map { .offset($0.offset, context: $0.context) } ?? strategy
-            }
-            if polled.partitionID == PolledMessages.noAssignedPartition {
-                nextPositions.removeAll()
-                try await Task.sleep(for: retryInterval)
-                return polled
-            }
-            if !configuration.allowReplay, let consumed = lastConsumed[polled.partitionID], Self.sameHistory(consumed.context, polled.context) {
-                polled.messages.removeAll { $0.offset <= consumed.offset }
-                polled.count = UInt32(polled.messages.count)
-            }
-            return polled
-        } catch let error as IggyError {
-            if error.code == .historyUnavailable || error.code == .consumerGroupPartitionNotOwned {
-                nextPositions[polledPartition.withLockedValue { $0 }] = nil
-            }
-            logger.error("Failed to poll messages", metadata: metadata.merging(["error": "\(error)"]) { $1 })
-            if isConsumerGroup, configuration.autoJoinConsumerGroup, error.code == .consumerGroupMemberNotFound {
-                // The membership was revoked; the next poll joins again.
-                joinedGroup = false
-                return PolledMessages(partitionID: PolledMessages.noAssignedPartition, currentOffset: 0, count: 0, messages: [])
-            }
-            if isConsumerGroup, [.disconnected, .unauthenticated, .staleClient].contains(error.code) {
-                joinedGroup = false
-            }
-            try await Task.sleep(for: retryInterval)
-            throw error
-        }
-    }
-
-    private func handOverPolled(_ polled: PolledMessages) -> ReceivedMessage {
-        let partition = polled.partitionID
-        currentPartitionID = partition
-        buffer = polled.messages
-        bufferIndex = 0
-        bufferedContext = polled.context
-        bufferedCurrentOffset = polled.currentOffset
-        return handOverBuffered()
-    }
-
-    private func handOverBuffered() -> ReceivedMessage {
-        let partition = currentPartitionID
-        let message = buffer[bufferIndex]
-        bufferIndex += 1
-        let position = ConsumerPosition(partitionID: partition, offset: message.offset, context: bufferedContext)
-        lastConsumed[partition] = position
-        let drained = bufferIndex == buffer.count
-        switch configuration.autoCommit.whenTrigger {
-        case .consumingEachMessage?:
-            queueCommit(position)
-        case .consumingEveryNthMessage(let n)?:
-            if message.offset % UInt64(n) == 0 {
-                queueCommit(position)
-            }
-        case .consumingAllMessages?:
-            if drained {
-                queueCommit(position)
-            }
-        case .pollingMessages?, nil:
-            break
-        }
-        let received = ReceivedMessage(message: message, currentOffset: bufferedCurrentOffset, partitionID: partition, context: bufferedContext)
-        if drained {
-            // The strategy only says where a partition starts; the next poll
-            // of it continues after the last message handed over. A `next`
-            // poll that commits starts after the offset it stored instead.
-            if configuration.pollingStrategy.kind != .next || configuration.autoCommit.whenTrigger != .pollingMessages {
-                nextPositions[partition] = ConsumerPosition(partitionID: partition, offset: message.offset + 1, context: bufferedContext)
-            }
-            buffer.removeAll(keepingCapacity: true)
-            bufferIndex = 0
-        }
-        return received
-    }
-
-    /// Queues a commit for the commit task. A later one for the same
-    /// partition replaces a queued one not sent yet.
-    private func queueCommit(_ position: ConsumerPosition) {
-        guard isInitialized, !isShutDown else {
-            logger.error("The commit was not queued because the consumer is not running", metadata: metadata)
-            return
-        }
-        pendingCommits[position.partitionID] = position
-        commitWakeup.yield()
-    }
-
-    /// Sends the queued commits. Returns false once the consumer is shut
-    /// down and nothing is left, which ends the commit task.
-    private func sendPendingCommits() async -> Bool {
-        while let partition = pendingCommits.keys.first, let position = pendingCommits.removeValue(forKey: partition) {
-            await storeInBackground(position)
-        }
-        return !isShutDown
-    }
-
-    /// Returns false once the consumer is shut down, which ends the interval
-    /// task before it stores anything more, or right after the store that a
-    /// shutdown waits for.
-    private func storeOnTick() async -> Bool {
-        guard !isShutDown else {
-            return false
-        }
-        intervalIsStoring = true
-        defer { intervalIsStoring = false }
-        for position in lastConsumed.values {
-            await storeInBackground(position)
-        }
-        return !isShutDown
-    }
-
-    private func storeFinalPositions(_ positions: [ConsumerPosition]) async {
-        for position in positions {
-            do {
-                try await store(position, allowReplay: false)
-            } catch {
-                logger.warning(
-                    "The final checkpoint was not acknowledged",
-                    metadata: metadata.merging(["partition": "\(position.partitionID)", "offset": "\(position.offset)", "error": "\(error)"]) { $1 })
-            }
-        }
-    }
-
-    /// Background commits have no caller to report to, so a failure is
-    /// logged. They never move a stored offset back: replay governs reading.
-    private func storeInBackground(_ position: ConsumerPosition) async {
-        do {
-            try await store(position, allowReplay: false)
-        } catch {
-            logger.error(
-                "Failed to store the offset",
-                metadata: metadata.merging(["partition": "\(position.partitionID)", "offset": "\(position.offset)", "error": "\(error)"]) { $1 })
-        }
-    }
-
-    private func store(_ position: ConsumerPosition, allowReplay: Bool) async throws {
-        try await offsetWrites.lock()
-        defer { offsetWrites.unlock() }
-        if !allowReplay, storedPositionCovers(position) {
-            return
-        }
-        try await client.storeConsumerPosition(consumer: consumer, streamID: streamID, topicID: topicID, position: position)
-        lastStored[position.partitionID] = position
-    }
-
-    /// A store without a context proves nothing about a partition history.
-    private func storedPositionCovers(_ position: ConsumerPosition) -> Bool {
-        guard let stored = lastStored[position.partitionID], stored.context.incarnation != 0, position.context.incarnation != 0 else {
-            return false
-        }
-        return Self.sameHistory(stored.context, position.context) && position.offset <= stored.offset
-    }
-
-    /// Offsets compare only within one incarnation and owner. The metadata
-    /// frontier is left out: another group's change can move it between two
-    /// polls of the same partition.
-    static func sameHistory(_ left: PartitionContext, _ right: PartitionContext) -> Bool {
-        left.incarnation == right.incarnation && left.ownerGeneration == right.ownerGeneration
-    }
-
     static func endsConsumption(_ error: IggyError) -> Bool {
         switch error.code {
         case .invalidServerAddress, .invalidClientAddress, .clientShutdown: true
         default: false
         }
     }
-
-    /// Waits for `task` up to `timeout`, then cancels it and waits for it to
-    /// end: a waiter that gives up does not cancel what it waits for.
-    private static func wait(for task: Task<Void, Never>, upTo timeout: Duration) async {
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { await task.value }
-            group.addTask {
-                if (try? await Task.sleep(for: timeout)) != nil {
-                    task.cancel()
-                }
-            }
-            _ = await group.next()
-            group.cancelAll()
-        }
-    }
 }
 
 extension IggyClient {
-    /// A standalone consumer of one partition, identified by `name`. Building
-    /// it never talks to the server; ``IggyConsumer/initialize()`` does.
+    /// A standalone consumer of `partitions`, identified by `name`. Building
+    /// it never talks to the server, ``IggyConsumer/initialize()`` does.
     /// Throws ``IggyErrorCode/invalidConfiguration`` for an option out of
-    /// range.
+    /// range or partitions that are not 1 to 1000 distinct ids.
     public func consumer(
-        name: String, streamID: Identifier, topicID: Identifier, partitionID: UInt32, configuration: ConsumerConfiguration = ConsumerConfiguration()
+        name: String, streamID: Identifier, topicID: Identifier, partitions: [UInt32], configuration: ConsumerConfiguration = ConsumerConfiguration()
     ) throws -> IggyConsumer {
         try IggyConsumer(
-            client: self, name: name, consumer: .consumer(try Identifier(named: name)), streamID: streamID, topicID: topicID, partitionID: partitionID,
+            client: self, name: name, consumer: .consumer(try Identifier(named: name)), streamID: streamID, topicID: topicID, partitions: partitions,
             configuration: configuration)
     }
 
     /// A member of the consumer group `name`, which reads the partitions the
-    /// server assigns to it. Building it never talks to the server;
-    /// ``IggyConsumer/initialize()`` does.
+    /// server assigns to it. Building it never talks to the server,
+    /// ``IggyConsumer/initialize()`` does. Throws what building a standalone
+    /// consumer throws.
     public func consumerGroup(
         name: String, streamID: Identifier, topicID: Identifier, configuration: ConsumerConfiguration = ConsumerConfiguration()
     ) throws -> IggyConsumer {
         try IggyConsumer(
-            client: self, name: name, consumer: .group(try Identifier(named: name)), streamID: streamID, topicID: topicID, partitionID: nil,
+            client: self, name: name, consumer: .group(try Identifier(named: name)), streamID: streamID, topicID: topicID, partitions: nil,
             configuration: configuration)
     }
 }

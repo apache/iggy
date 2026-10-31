@@ -935,6 +935,7 @@ async fn reconcile_additions(
                 ns,
                 partition_stats,
                 created_revision,
+                partition_metadata.created_at.as_micros(),
                 topic_runtime,
                 ctx.cluster_id,
                 ctx.self_replica_id,
@@ -962,6 +963,17 @@ async fn reconcile_additions(
             // knows: nothing is counted, so the pass may fast-skip, and the
             // commit that moves metadata on bumps the revision and retries it.
             Ok(None) => {}
+            // Retrying cannot bring the history back; the tombstone keeps every
+            // later pass from rebuilding it empty.
+            Err(err @ crate::server_error::ServerError::PartitionLostWithStorage { .. }) => {
+                error!(
+                    shard = shard_id,
+                    ns_raw = ns.inner(),
+                    error = %err,
+                    "refusing to rebuild a partition lost with this node's storage"
+                );
+                partitions.fence(ns, created_revision);
+            }
             Err(err) => {
                 ctx.record_failure(ns, FailureCause::Add, now);
                 ctx.shard.metrics().record_partition_reconcile_failure();
@@ -3354,6 +3366,7 @@ mod tests {
             ns,
             Arc::clone(&stats),
             LIVE_EPOCH,
+            0,
             iggy_common::TopicRuntimeOptions::default(),
             CLUSTER_ID,
             0,
@@ -3385,6 +3398,7 @@ mod tests {
             ns,
             Arc::clone(&stats),
             LIVE_EPOCH + 1,
+            0,
             iggy_common::TopicRuntimeOptions::default(),
             CLUSTER_ID,
             0,

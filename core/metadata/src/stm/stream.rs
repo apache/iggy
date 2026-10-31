@@ -1410,6 +1410,24 @@ impl PollMetadata {
     }
 }
 
+/// What one partition of [`Streams::poll_targets`] resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollTarget {
+    Pollable {
+        namespace: IggyNamespace,
+        metadata: PollMetadata,
+    },
+    /// The group does not hold the partition pollable for the client, as
+    /// [`Streams::consumer_group_fence`] decides. A group poll also gets this
+    /// when its stream, topic, group or member is gone.
+    NotOwned,
+    /// No such stream, topic or partition.
+    NotFound,
+    /// [`Streams::poll_metadata`] refuses the poll: a lifecycle intent blocks
+    /// it, or the installed owner is not the client in this incarnation.
+    Unavailable,
+}
+
 impl Streams {
     #[must_use]
     pub fn poll_metadata(
@@ -1481,6 +1499,106 @@ impl Streams {
                 group,
                 client_id,
             })
+        })
+    }
+
+    /// The poll target of each of `partition_ids` in one topic for
+    /// `client_id`, in order, and the id of the group that `group_id` names.
+    ///
+    /// One read guard resolves the stream, the topic, the group and its member
+    /// once. Each partition then runs the checks of
+    /// [`Self::consumer_group_fence`] (group polls only),
+    /// [`Self::namespace_from_partition`] and [`Self::poll_metadata`], in that
+    /// order, so a poll of many partitions resolves as one poll per partition
+    /// would.
+    #[must_use]
+    pub fn poll_targets(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+        group_id: Option<&WireIdentifier>,
+        client_id: u128,
+        partition_ids: &[u32],
+    ) -> (Option<u64>, Vec<PollTarget>) {
+        self.read(|inner| {
+            let missing = if group_id.is_some() {
+                PollTarget::NotOwned
+            } else {
+                PollTarget::NotFound
+            };
+            let Some((stream_id, topic_id, topic)) =
+                inner.resolve_stream_id(stream_id).and_then(|stream_id| {
+                    let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
+                    let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
+                    Some((stream_id, topic_id, topic))
+                })
+            else {
+                return (None, vec![missing; partition_ids.len()]);
+            };
+            let group = match group_id {
+                Some(group_id) => {
+                    let group = topic
+                        .resolve_group_id(group_id)
+                        .and_then(|id| topic.consumer_groups.get(&id));
+                    let member = group.and_then(|group| {
+                        group
+                            .members
+                            .iter()
+                            .find(|(_, member)| member.client_id == client_id)
+                    });
+                    let (Some(group), Some((_, member))) = (group, member) else {
+                        return (
+                            group.map(|group| group.id),
+                            vec![missing; partition_ids.len()],
+                        );
+                    };
+                    Some((group, member))
+                }
+                None => None,
+            };
+            let group_id = group.map(|(group, _)| group.id);
+            let blocked = inner.lifecycle_blocks_consumer(stream_id, topic_id, group_id);
+            let targets = partition_ids
+                .iter()
+                .map(|&partition_id| {
+                    let partition_id = partition_id as usize;
+                    if group.is_some_and(|(_, member)| !member.is_pollable(partition_id)) {
+                        return PollTarget::NotOwned;
+                    }
+                    let Some(partition) = find_partition(&topic.partitions, partition_id) else {
+                        return PollTarget::NotFound;
+                    };
+                    if blocked {
+                        return PollTarget::Unavailable;
+                    }
+                    let owner = match group {
+                        Some((group, _)) => {
+                            let Some(owner) = group
+                                .assignments
+                                .get(&partition_id)
+                                .filter(|assignment| {
+                                    assignment.incarnation == partition.created_revision
+                                })
+                                .and_then(|assignment| assignment.owner)
+                                .filter(|owner| owner.client_id == client_id)
+                            else {
+                                return PollTarget::Unavailable;
+                            };
+                            Some((group.id, owner.generation))
+                        }
+                        None => None,
+                    };
+                    PollTarget::Pollable {
+                        namespace: IggyNamespace::new(stream_id, topic_id, partition_id),
+                        metadata: PollMetadata {
+                            created_revision: partition.created_revision,
+                            group: owner,
+                            client_id,
+                        },
+                    }
+                })
+                .collect();
+            (group_id, targets)
         })
     }
 
@@ -3966,6 +4084,7 @@ impl_fill_restore!(Streams, streams);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stm::consumer_group::{ConsumerGroupAssignment, ConsumerGroupMember};
     use crate::stm::snapshot::MetadataSnapshot;
     use iggy_binary_protocol::WireName;
     use iggy_binary_protocol::codec::WireDecode;
@@ -6169,6 +6288,116 @@ mod tests {
         assert!(find_partition(&sparse, 0).is_none());
         assert!(find_partition(&sparse, 1).is_none());
         assert!(find_partition(&dense, 2).is_none());
+    }
+
+    /// A fetch resolves its stream, topic and group once, so each of its
+    /// partitions must still get the answer of the three calls that a poll of
+    /// that partition alone runs: the group fence, the namespace and the poll
+    /// metadata.
+    #[test]
+    fn given_a_group_poll_of_many_partitions_when_resolving_once_should_match_one_poll_each() {
+        const CLIENT: u128 = 7;
+        const OTHER_CLIENT: u128 = 8;
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "alpha");
+        let create_topic = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, 4, "logs"),
+            derived_options: WireOptions::empty(),
+            partitions: (0..4)
+                .map(|partition_id| CreatedPartitionAssignment {
+                    initial_view: 0,
+                    partition_id,
+                    consensus_group_id: u64::from(partition_id) + 1,
+                    members: Vec::new(),
+                })
+                .collect(),
+        };
+        let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+        let topic = &mut inner.items[0].topics[0];
+        let incarnation = topic.partitions[0].created_revision;
+        let owner = |client_id, incarnation| ConsumerGroupAssignment {
+            incarnation,
+            owner: Some(ConsumerGroupOwner {
+                client_id,
+                session: 1,
+                generation: 5,
+            }),
+            pending: None,
+        };
+        let mut group = ConsumerGroup::new(3, Arc::from("readers"));
+        group.members.insert(ConsumerGroupMember {
+            partitions: vec![0, 1, 2, 3],
+            pending_revocations: vec![1],
+            ..ConsumerGroupMember::new(0, CLIENT)
+        });
+        // Partition 0 serves the client, 1 drains a handoff, 2 is owned by
+        // another client, 3 belongs to an older incarnation and 4 is missing.
+        group.assignments.insert(0, owner(CLIENT, incarnation));
+        group.assignments.insert(1, owner(CLIENT, incarnation));
+        group
+            .assignments
+            .insert(2, owner(OTHER_CLIENT, incarnation));
+        group.assignments.insert(3, owner(CLIENT, incarnation + 1));
+        topic.consumer_groups.insert(group.id, group);
+        topic.consumer_group_index.insert(Arc::from("readers"), 3);
+        let streams = Streams::from(inner);
+        let stream_id = WireIdentifier::numeric(0);
+        let topic_id = WireIdentifier::numeric(0);
+        let partitions = [0, 1, 2, 3, 4];
+
+        for (group_id, client_id) in [
+            (WireIdentifier::named("readers").unwrap(), CLIENT),
+            (WireIdentifier::named("readers").unwrap(), OTHER_CLIENT),
+            (WireIdentifier::numeric(9), CLIENT),
+        ] {
+            let (resolved_group, targets) = streams.poll_targets(
+                &stream_id,
+                &topic_id,
+                Some(&group_id),
+                client_id,
+                &partitions,
+            );
+            for (&partition_id, target) in partitions.iter().zip(targets) {
+                let one_poll = streams
+                    .consumer_group_fence(
+                        &stream_id,
+                        &topic_id,
+                        &group_id,
+                        client_id,
+                        partition_id,
+                        true,
+                    )
+                    .map_or(PollTarget::NotOwned, |group| {
+                        assert_eq!(resolved_group, Some(group));
+                        streams
+                            .namespace_from_partition(&stream_id, &topic_id, partition_id)
+                            .map_or(PollTarget::NotFound, |namespace| {
+                                streams
+                                    .poll_metadata(namespace, Some(group), client_id)
+                                    .map_or(PollTarget::Unavailable, |metadata| {
+                                        PollTarget::Pollable {
+                                            namespace,
+                                            metadata,
+                                        }
+                                    })
+                            })
+                    });
+                assert_eq!(target, one_poll, "partition {partition_id} of {group_id}");
+            }
+        }
+        let (group, targets) =
+            streams.poll_targets(&stream_id, &topic_id, None, CLIENT, &partitions);
+        assert_eq!(group, None);
+        assert!(matches!(targets[0], PollTarget::Pollable { .. }));
+        assert_eq!(targets[4], PollTarget::NotFound);
+        let (_, targets) = streams.poll_targets(
+            &WireIdentifier::numeric(5),
+            &topic_id,
+            None,
+            CLIENT,
+            &partitions,
+        );
+        assert_eq!(targets, vec![PollTarget::NotFound; partitions.len()]);
     }
 
     /// A checkpoint reads a stream's total and each of its topics' as separate

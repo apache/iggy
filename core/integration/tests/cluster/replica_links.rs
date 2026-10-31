@@ -299,11 +299,13 @@ async fn replicate_every_partition(client: &IggyClient, topic: &str) {
             .poll_messages(
                 &stream,
                 &topic,
-                Some(partition),
+                partition,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                MESSAGES_PER_PARTITION,
-                false,
+                PollOptions {
+                    count: MESSAGES_PER_PARTITION,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap_or_else(|error| panic!("poll partition {partition}: {error}"));

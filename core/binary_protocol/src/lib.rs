@@ -85,7 +85,9 @@ pub use consensus::{
     prepare_identity_checksum_bytes, read_size_field, result_code, result_section_len,
     write_rejection_section,
 };
-pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
+pub use dispatch::{
+    COMMAND_TABLE, CommandMeta, command_index, lookup_by_operation, lookup_command,
+};
 pub use error::WireError;
 pub use framing::{RequestFrame, ResponseFrame, STATUS_OK};
 pub use primitives::ack_level::AckLevel;
@@ -107,8 +109,24 @@ pub use primitives::user_headers::{
 };
 pub use version::{
     ClientVersionInfo, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN, ProtocolVersion,
-    is_protocol_compatible,
+    REPLICA_WIRE_REVISION, is_protocol_compatible,
 };
 
 /// Maximum number of partitions allowed in a single create/delete request.
 pub const MAX_PARTITIONS_PER_REQUEST: u32 = 1000;
+/// The largest payload of one message.
+pub const MAX_MESSAGE_PAYLOAD_SIZE: usize = 64 * 1000 * 1000;
+/// The largest user headers of one message.
+pub const MAX_MESSAGE_USER_HEADERS_SIZE: usize = 100 * 1000;
+/// The largest record of one message in a read reply, with its batch and message headers. A
+/// read returns a first record up to this size even above its `max_bytes`, so every client
+/// reply cap holds it.
+pub const MAX_RECORD_SIZE: usize = batch::BATCH_HEADER_SIZE
+    + batch::BATCH_MESSAGE_HEADER_SIZE
+    + MAX_MESSAGE_PAYLOAD_SIZE
+    + MAX_MESSAGE_USER_HEADERS_SIZE;
+/// The largest frame of a read reply that holds one record of [`MAX_RECORD_SIZE`]: the frame
+/// header, the largest fetch table and the record. A poll reply has a smaller head.
+pub const MAX_RECORD_REPLY_SIZE: usize = consensus::HEADER_SIZE
+    + responses::messages::FetchMessagesResponse::head_size(MAX_PARTITIONS_PER_REQUEST as usize)
+    + MAX_RECORD_SIZE;

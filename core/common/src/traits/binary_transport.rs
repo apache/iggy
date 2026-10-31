@@ -26,7 +26,7 @@ use iggy_binary_protocol::WireEncode;
 use iggy_binary_protocol::codes::{
     DELETE_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
-use iggy_binary_protocol::requests::messages::{PollMessagesRequest, WaitForMessagesRequest};
+use iggy_binary_protocol::requests::messages::{FetchMessagesRequest, PollMessagesRequest};
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
@@ -218,13 +218,29 @@ pub trait BinaryTransport {
         }
     }
 
-    /// A readiness wait shares a multiplexed connection, like a positive poll wait.
-    /// A client runs at most `MAX_DEFERRED_REQUESTS` deferred requests at once.
-    async fn send_wait_with_response(
+    /// A fetch is a deferred request to the primary of its targets. A target
+    /// with incarnation zero takes the incarnation of its route, because the
+    /// server refuses that incarnation.
+    /// A raw partial reply preserves wire statuses. If a committing section's
+    /// progress is unknown, a later progress call on that target returns
+    /// `PartitionLaneBlocked` with the local ID to abandon. Typed callers use
+    /// [`Self::send_fetch_sections`] to receive that ID in the section error.
+    #[doc(hidden)]
+    async fn send_fetch_with_response(
         &self,
-        _request: &WaitForMessagesRequest,
+        _request: &FetchMessagesRequest,
     ) -> Result<Bytes, IggyError> {
         Err(IggyError::FeatureUnavailable)
+    }
+
+    /// Typed fetch sections retain local recovery identities for unknown
+    /// committing progress. Raw callers retain the original wire statuses.
+    #[doc(hidden)]
+    async fn send_fetch_sections(
+        &self,
+        request: &FetchMessagesRequest,
+    ) -> Result<Vec<crate::FetchedSection>, IggyError> {
+        crate::FetchedSection::from_reply(&self.send_fetch_with_response(request).await?)
     }
 
     fn get_heartbeat_interval(&self) -> NonZeroIggyDuration;
@@ -387,18 +403,27 @@ pub fn decode_session_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Client, Consumer, ConsumerGroupClientState, MessageClient, PollingStrategy};
+    use crate::{
+        AutoCommit, Client, CommitPolicy, Consumer, ConsumerGroupClientState, DeferredPollOptions,
+        MIN_DEFERRED_POLL_REPLY_MARGIN_US, MessageClient, PollOptions, PollingKind,
+        PollingStrategy, fetch_binary_messages, sync_group_assignment,
+    };
     use bytes::BytesMut;
     use iggy_binary_protocol::codes::SYNC_CONSUMER_GROUP_CODE;
     use iggy_binary_protocol::codes::{GET_PARTITION_ROUTE_CODE, PING_CODE, SEND_MESSAGES_CODE};
     use iggy_binary_protocol::requests::consumer_offsets::{
         DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
     };
-    use iggy_binary_protocol::requests::messages::{RawMessage, SendMessagesEncoder};
+    use iggy_binary_protocol::requests::messages::{
+        FetchMessagesTarget, RawMessage, SendMessagesEncoder,
+    };
     use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
-    use iggy_binary_protocol::responses::messages::PollMessagesResponseHeader;
+    use iggy_binary_protocol::responses::messages::{
+        FetchMessagesResponse, FetchMessagesSection, FetchMessagesSectionHeader,
+        PollMessagesResponseHeader,
+    };
     use iggy_binary_protocol::{
-        AckLevel, WireConsumer, WireIdentifier, WirePartitioning, WirePollingStrategy,
+        AckLevel, STATUS_OK, WireConsumer, WireIdentifier, WirePartitioning, WirePollingStrategy,
     };
     use std::sync::Mutex;
 
@@ -410,7 +435,13 @@ mod tests {
     enum Call {
         Raw(u32, Bytes, PartitionContext),
         Poll(PollMessagesRequest, Option<PartitionContext>),
+        DeferredPoll(
+            PollMessagesRequest,
+            Option<PartitionContext>,
+            DeferredPollOptions,
+        ),
         OffsetWrite(u32, Bytes, Option<PartitionContext>),
+        Fetch(FetchMessagesRequest),
     }
 
     /// Keeps the provided `send_raw_with_response`, the behavior under test.
@@ -460,7 +491,7 @@ mod tests {
                 let scenario = scenario.as_mut().unwrap();
                 if scenario.replaced {
                     assert!(self.state.is_registered("1|orders|3"));
-                    assert_eq!(self.state.next_group_partition("1|orders|3"), Some(7));
+                    assert_eq!(self.state.assignment_snapshot("1|orders|3").1, [7]);
                     if scenario.caller_changed {
                         return Err(IggyError::Unauthenticated);
                     }
@@ -511,16 +542,57 @@ mod tests {
             context: Option<PartitionContext>,
         ) -> Result<Bytes, IggyError> {
             self.record(Call::Poll(request.clone(), context));
-            if self.sync.lock().unwrap().is_some() {
-                return Ok(PollMessagesResponseHeader {
-                    partition_id: request.partition_id.unwrap(),
-                    current_offset: 0,
-                    messages_count: 0,
-                    context: Default::default(),
-                }
-                .to_bytes());
-            }
             Ok(Bytes::from_static(RECEIPT))
+        }
+
+        /// Answers a deferred poll with an empty reply of its partition.
+        async fn send_poll_with_response_and_options(
+            &self,
+            request: &PollMessagesRequest,
+            context: Option<PartitionContext>,
+            options: Option<DeferredPollOptions>,
+        ) -> Result<Bytes, IggyError> {
+            let Some(options) = options else {
+                return self.send_poll_with_response(request, context).await;
+            };
+            self.record(Call::DeferredPoll(request.clone(), context, options));
+            Ok(PollMessagesResponseHeader {
+                partition_id: request.partition_id.unwrap(),
+                current_offset: 0,
+                messages_count: 0,
+                context: Default::default(),
+            }
+            .to_bytes())
+        }
+
+        /// Serves an empty section of `PARTITION` and refuses the other
+        /// targets as moved.
+        async fn send_fetch_with_response(
+            &self,
+            request: &FetchMessagesRequest,
+        ) -> Result<Bytes, IggyError> {
+            self.record(Call::Fetch(request.clone()));
+            let sections = request
+                .targets
+                .iter()
+                .map(|target| FetchMessagesSection {
+                    header: FetchMessagesSectionHeader {
+                        partition_id: target.partition_id,
+                        status: if target.partition_id == PARTITION {
+                            STATUS_OK
+                        } else {
+                            IggyError::NotPrimary.as_code()
+                        },
+                        current_offset: 0,
+                        messages_count: 0,
+                        context: PartitionContext::default(),
+                        next_offset: 0,
+                        records_len: 0,
+                    },
+                    records: &[],
+                })
+                .collect();
+            Ok(FetchMessagesResponse { sections }.to_bytes().unwrap())
         }
 
         fn get_heartbeat_interval(&self) -> NonZeroIggyDuration {
@@ -582,17 +654,13 @@ mod tests {
             })),
             ..Default::default()
         };
-        let result = transport
-            .poll_messages(
-                &Identifier::numeric(STREAM).unwrap(),
-                &Identifier::named(TOPIC).unwrap(),
-                None,
-                &Consumer::group(Identifier::numeric(3).unwrap()),
-                &PollingStrategy::offset(0),
-                1,
-                false,
-            )
-            .await;
+        let result = sync_group_assignment(
+            &transport,
+            &Identifier::numeric(STREAM).unwrap(),
+            &Identifier::named(TOPIC).unwrap(),
+            &Identifier::numeric(3).unwrap(),
+        )
+        .await;
         if caller_changed {
             assert_eq!(result.unwrap_err(), IggyError::Unauthenticated);
         } else {
@@ -602,21 +670,14 @@ mod tests {
             );
         }
         assert!(transport.state.is_registered("1|orders|3"));
-        assert_eq!(transport.state.next_group_partition("1|orders|3"), Some(7));
+        assert_eq!(transport.state.assignment_snapshot("1|orders|3").1, [7]);
         let calls = transport.take_calls();
-        assert_eq!(
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(
             calls
                 .iter()
-                .filter(|call| matches!(call, Call::Raw(SYNC_CONSUMER_GROUP_CODE, ..)))
-                .count(),
-            2
-        );
-        assert_eq!(
-            calls
-                .iter()
-                .filter(|call| matches!(call, Call::Poll(..)))
-                .count(),
-            usize::from(!caller_changed)
+                .all(|call| matches!(call, Call::Raw(SYNC_CONSUMER_GROUP_CODE, ..))),
+            "{calls:?}"
         );
     }
 
@@ -681,6 +742,281 @@ mod tests {
         )
         .unwrap();
         payload.freeze()
+    }
+
+    #[tokio::test]
+    async fn given_a_fetch_when_sent_should_encode_every_target_and_return_a_section_of_each() {
+        const MOVED: u32 = 5;
+        const COUNT: u32 = 10;
+        const OFFSET: u64 = 7;
+        let fence = PartitionContext {
+            incarnation: 4,
+            owner_generation: 2,
+            metadata_op: 9,
+        };
+        let options = DeferredPollOptions::default();
+        let transport = Recorder::default();
+
+        let sections = fetch_binary_messages(
+            &transport,
+            &Identifier::numeric(STREAM).unwrap(),
+            &Identifier::named(TOPIC).unwrap(),
+            &[
+                (PARTITION, PollingStrategy::next()),
+                (
+                    MOVED,
+                    PollingStrategy::continuation(MOVED, PollingKind::Offset, OFFSET, fence),
+                ),
+            ],
+            &Consumer::new(Identifier::numeric(1).unwrap()),
+            COUNT,
+            true,
+            options,
+        )
+        .await
+        .unwrap();
+
+        let calls = transport.take_calls();
+        let [Call::Fetch(request)] = calls.as_slice() else {
+            panic!("expected one fetch: {calls:?}");
+        };
+        assert_eq!(
+            (&request.consumer, &request.stream_id, &request.topic_id),
+            (&consumer(), &WireIdentifier::numeric(STREAM), &wire_topic())
+        );
+        assert_eq!(
+            (
+                request.wait_us,
+                request.request_timeout_us,
+                request.min_count,
+                request.count,
+                request.max_bytes,
+                request.auto_commit
+            ),
+            (
+                options.max_wait.as_micros(),
+                options.request_timeout.as_micros(),
+                options.min_count,
+                COUNT,
+                options.max_bytes,
+                true
+            )
+        );
+        assert_eq!(
+            request.targets,
+            [
+                FetchMessagesTarget {
+                    partition_id: PARTITION,
+                    strategy: WirePollingStrategy::next(),
+                    max_bytes: options.max_bytes,
+                    incarnation: 0,
+                    owner_generation: 0,
+                },
+                FetchMessagesTarget {
+                    partition_id: MOVED,
+                    strategy: WirePollingStrategy::offset(OFFSET),
+                    max_bytes: options.max_bytes,
+                    incarnation: fence.incarnation,
+                    owner_generation: fence.owner_generation,
+                },
+            ]
+        );
+        let statuses: Vec<_> = sections
+            .iter()
+            .map(|section| (section.partition_id, section.status.clone()))
+            .collect();
+        assert_eq!(
+            statuses,
+            [(PARTITION, Ok(())), (MOVED, Err(IggyError::NotPrimary))]
+        );
+    }
+
+    #[tokio::test]
+    async fn given_an_invalid_fetch_when_sent_should_fail_before_the_transport() {
+        let transport = Recorder::default();
+        let next = (PARTITION, PollingStrategy::next());
+        let other_partition = (
+            PARTITION,
+            PollingStrategy::continuation(
+                PARTITION + 1,
+                PollingKind::Offset,
+                0,
+                PartitionContext::default(),
+            ),
+        );
+        let options = DeferredPollOptions::default();
+        // Unlike a deferred poll, a fetch needs the reply margin also
+        // without a wait.
+        let no_margin = DeferredPollOptions {
+            max_wait: Duration::ZERO.into(),
+            request_timeout: Duration::from_micros(MIN_DEFERRED_POLL_REPLY_MARGIN_US - 1).into(),
+            ..options
+        };
+        let cases = [
+            (vec![], 1, options, IggyError::InvalidCommand),
+            (vec![next, next], 1, options, IggyError::InvalidCommand),
+            (
+                vec![(PARTITION, PollingStrategy::first())],
+                1,
+                options,
+                IggyError::InvalidCommand,
+            ),
+            (vec![other_partition], 1, options, IggyError::InvalidCommand),
+            (vec![next], 0, options, IggyError::InvalidMessagesCount),
+            (vec![next], 1, no_margin, IggyError::InvalidCommand),
+            (
+                vec![next],
+                1,
+                DeferredPollOptions {
+                    request_timeout: Duration::from_micros(MIN_DEFERRED_POLL_REPLY_MARGIN_US)
+                        .into(),
+                    ..no_margin
+                },
+                IggyError::InvalidCommand,
+            ),
+            (
+                vec![next],
+                1,
+                DeferredPollOptions {
+                    request_timeout: (Duration::from_micros(MIN_DEFERRED_POLL_REPLY_MARGIN_US)
+                        + Duration::from_nanos(999))
+                    .into(),
+                    ..no_margin
+                },
+                IggyError::InvalidCommand,
+            ),
+        ];
+
+        for (targets, count, options, error) in cases {
+            let fetched = fetch_binary_messages(
+                &transport,
+                &Identifier::numeric(STREAM).unwrap(),
+                &Identifier::named(TOPIC).unwrap(),
+                &targets,
+                &Consumer::new(Identifier::numeric(1).unwrap()),
+                count,
+                false,
+                options,
+            )
+            .await;
+            assert_eq!(fetched.unwrap_err(), error, "{targets:?}");
+        }
+        assert!(transport.take_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_auto_commit_when_polling_once_should_refuse_it_before_sending() {
+        let transport = Recorder::default();
+        let options = PollOptions {
+            commit: CommitPolicy::Auto(AutoCommit::default()),
+            ..PollOptions::default()
+        };
+
+        let polled = transport
+            .poll_messages(
+                &Identifier::numeric(STREAM).unwrap(),
+                &Identifier::named(TOPIC).unwrap(),
+                PARTITION,
+                &Consumer::new(Identifier::numeric(1).unwrap()),
+                &PollingStrategy::next(),
+                options,
+            )
+            .await;
+
+        assert_eq!(polled.map(|_| ()), Err(IggyError::InvalidConfiguration));
+        assert!(transport.take_calls().is_empty(), "nothing is sent");
+    }
+
+    #[tokio::test]
+    async fn given_a_poll_when_sent_should_send_one_deferred_poll_of_its_partition() {
+        const COUNT: u32 = 5;
+        const OFFSET: u64 = 7;
+        let context = PartitionContext {
+            incarnation: 4,
+            owner_generation: 2,
+            metadata_op: 9,
+        };
+        let options = PollOptions {
+            count: COUNT,
+            commit: CommitPolicy::OnRead,
+            ..PollOptions::default()
+        };
+        let transport = Recorder::default();
+
+        let polled = transport
+            .poll_messages(
+                &Identifier::numeric(STREAM).unwrap(),
+                &Identifier::named(TOPIC).unwrap(),
+                PARTITION,
+                &Consumer::new(Identifier::numeric(1).unwrap()),
+                &PollingStrategy::continuation(PARTITION, PollingKind::Offset, OFFSET, context),
+                options,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            transport.take_calls(),
+            vec![Call::DeferredPoll(
+                PollMessagesRequest {
+                    consumer: consumer(),
+                    stream_id: WireIdentifier::numeric(STREAM),
+                    topic_id: wire_topic(),
+                    partition_id: Some(PARTITION),
+                    strategy: WirePollingStrategy::offset(OFFSET),
+                    count: COUNT,
+                    auto_commit: true,
+                },
+                Some(context),
+                DeferredPollOptions::from(options),
+            )]
+        );
+        assert_eq!(
+            polled.continuation(),
+            PollingStrategy::continuation(PARTITION, PollingKind::Offset, OFFSET, context),
+            "an empty reply keeps the start of its request"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_an_invalid_poll_when_sent_should_fail_before_the_transport() {
+        let transport = Recorder::default();
+        let other_partition = PollingStrategy::continuation(
+            PARTITION + 1,
+            PollingKind::Offset,
+            0,
+            PartitionContext::default(),
+        );
+        let cases = [
+            (
+                PollingStrategy::next(),
+                PollOptions {
+                    count: 0,
+                    ..PollOptions::default()
+                },
+                IggyError::InvalidMessagesCount,
+            ),
+            (
+                other_partition,
+                PollOptions::default(),
+                IggyError::InvalidCommand,
+            ),
+        ];
+
+        for (strategy, options, error) in cases {
+            let polled = transport
+                .poll_messages(
+                    &Identifier::numeric(STREAM).unwrap(),
+                    &Identifier::named(TOPIC).unwrap(),
+                    PARTITION,
+                    &Consumer::new(Identifier::numeric(1).unwrap()),
+                    &strategy,
+                    options,
+                )
+                .await;
+            assert_eq!(polled.unwrap_err(), error, "{strategy:?}");
+        }
+        assert!(transport.take_calls().is_empty());
     }
 
     #[tokio::test]

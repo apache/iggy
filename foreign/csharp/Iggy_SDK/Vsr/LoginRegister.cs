@@ -35,7 +35,7 @@ internal static class LoginRegister
     internal const int PROTOCOL_VERSION_MAJOR = 0;
 
     internal const int PROTOCOL_VERSION_MINOR = 12;
-    internal const int PROTOCOL_VERSION_PATCH = 0;
+    internal const int PROTOCOL_VERSION_PATCH = 1;
 
     /// <summary>Packed protocol version: <c>major &lt;&lt; 20 | minor &lt;&lt; 10 | patch</c>, 10 bits each.</summary>
     internal const uint PROTOCOL_VERSION =

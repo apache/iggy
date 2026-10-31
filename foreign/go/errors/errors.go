@@ -22,3 +22,9 @@ package ierror
 import "errors"
 
 var ErrNilContext = errors.New("nil context")
+
+// Unwrap preserves generic lane-blocked recovery while a fetch also names
+// the partition whose retained operation must be resolved or abandoned.
+func (e PartitionLaneBlocked) Unwrap() error {
+	return LaneBlocked{OperationID: e.OperationID}
+}

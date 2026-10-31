@@ -63,8 +63,8 @@ func TestE2E_SendAndPollRoundTrip(t *testing.T) {
 	}
 
 	partitionId := uint32(0)
-	polled, err := connected.PollMessages(ctx, streamId, topicId,
-		iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), 12, false, &partitionId)
+	polled, err := connected.PollMessages(ctx, streamId, topicId, partitionId,
+		iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), countOptions(12, false))
 	require.NoError(t, err)
 	assert.Len(t, polled.Messages, 12)
 	assert.Equal(t, uint32(0), polled.PartitionId)
@@ -167,14 +167,13 @@ func TestE2E_ConsumerGroupFlow(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// A group poll without an explicit partition round-robins the partitions
-	// the member owns, so polling once per partition covers every one of them.
+	// The member polls each partition that it owns, and the server stores what it reads.
 	polledPartitions := make(map[uint32]bool)
-	for range len(assignment.Partitions) {
-		polled, err := connected.PollMessages(ctx, streamId, topicId,
-			iggcon.NewGroupConsumer(groupId), iggcon.NextPollingStrategy(), 2, true, nil)
+	for _, partitionId := range assignment.Partitions {
+		polled, err := connected.PollMessages(ctx, streamId, topicId, partitionId,
+			iggcon.NewGroupConsumer(groupId), iggcon.NextPollingStrategy(), countOptions(2, true))
 		require.NoError(t, err)
-		require.NotEqual(t, iggcon.NoAssignedPartition, polled.PartitionId)
+		require.Len(t, polled.Messages, 2)
 		polledPartitions[polled.PartitionId] = true
 	}
 	assert.Len(t, polledPartitions, len(assignment.Partitions),
@@ -221,8 +220,9 @@ func TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint32(1), beforeClient.ConsumerGroupsCount)
 	counts := make(map[uint32]int)
-	for range int(details.PartitionsCount) * messagesPerPartition {
-		polled, err := connected.PollMessages(ctx, stream, topic, consumer, iggcon.NextPollingStrategy(), 1, true, nil)
+	for index := range int(details.PartitionsCount) * messagesPerPartition {
+		partition := uint32(index) % details.PartitionsCount
+		polled, err := connected.PollMessages(ctx, stream, topic, partition, consumer, iggcon.NextPollingStrategy(), countOptions(1, true))
 		require.NoError(t, err)
 		require.Len(t, polled.Messages, 1)
 		counts[polled.PartitionId]++
@@ -234,10 +234,10 @@ func TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership(t *testing.T) {
 			return err == nil && offset != nil && offset.StoredOffset == uint64(messagesPerPartition-1)
 		}, 5*time.Second, 50*time.Millisecond,
 			"partition %d auto-commit must replicate to the coordinator's backup", partition)
-		polled, err := connected.PollMessages(ctx, stream, topic, consumer, iggcon.NextPollingStrategy(), 1, true, &partition)
+		polled, err := connected.PollMessages(ctx, stream, topic, partition, consumer, iggcon.NextPollingStrategy(), countOptions(1, true))
 		require.NoError(t, err)
 		assert.Empty(t, polled.Messages, "the group auto-commit advanced on the primary")
-		polled, err = connected.PollMessages(ctx, stream, topic, iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), 1, true, &partition)
+		polled, err = connected.PollMessages(ctx, stream, topic, partition, iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), countOptions(1, true))
 		require.NoError(t, err)
 		require.Len(t, polled.Messages, 1)
 	}
@@ -449,8 +449,8 @@ func TestE2E_TLSRoundTrip(t *testing.T) {
 	require.NotEmpty(t, response.Confirmations)
 
 	partitionId := uint32(0)
-	polled, err := connected.PollMessages(ctx, streamId, topicId,
-		iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), 3, false, &partitionId)
+	polled, err := connected.PollMessages(ctx, streamId, topicId, partitionId,
+		iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), countOptions(3, false))
 	require.NoError(t, err)
 	assert.Len(t, polled.Messages, 3)
 }

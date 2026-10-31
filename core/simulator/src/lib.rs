@@ -2236,6 +2236,8 @@ fn stamp_metadata_watermark(
 }
 
 #[cfg(test)]
+mod deferred_commit_tests;
+#[cfg(test)]
 mod slow_replica_tests;
 
 #[cfg(test)]
@@ -15801,6 +15803,164 @@ mod metadata_read_frontier_tests {
                 "node {replica} counts the remote partition"
             );
         }
+    }
+
+    /// The normal primary of `namespace` and its view, ignoring `skip`.
+    fn partition_leader(
+        sim: &Simulator,
+        namespace: IggyNamespace,
+        skip: Option<u8>,
+    ) -> Option<(u8, u32)> {
+        (0..u8::try_from(sim.replicas.len()).unwrap())
+            .filter(|replica| Some(*replica) != skip)
+            .find_map(|replica| {
+                sim.partition_consensus_state(usize::from(replica), namespace)
+                    .filter(|state| state.is_primary && state.status == consensus::Status::Normal)
+                    .map(|state| (replica, state.view))
+            })
+    }
+
+    /// A write's final status, retrying transient refusals as clients do.
+    fn write_through(
+        sim: &mut Simulator,
+        client: &SimClient,
+        namespace: IggyNamespace,
+        target: u8,
+        payload: &'static [u8],
+    ) -> u32 {
+        const TRANSIENT_RETRIES: usize = 64;
+        const RETRY_STEPS: usize = 10;
+        let mut status = IggyError::TransientNotAccepted.as_code();
+        for _ in 0..TRANSIENT_RETRIES {
+            status = super::tests::submit_and_wait_for_reply(
+                sim,
+                1,
+                target,
+                client.send_messages(namespace, &[bytes::Bytes::from_static(payload)]),
+            )
+            .header()
+            .status;
+            if status != IggyError::TransientNotAccepted.as_code() {
+                break;
+            }
+            for _ in 0..RETRY_STEPS {
+                sim.step();
+            }
+        }
+        status
+    }
+
+    #[test]
+    fn given_a_three_member_partition_on_five_nodes_when_its_primary_fails_should_elect_among_members()
+     {
+        const REPLICAS: u8 = 5;
+        let (mut sim, client, namespace) = placed_partition_cluster(REPLICAS, 3, 0xF2E5_0040);
+        let members = partition_members(&sim, namespace);
+        let (primary, view) =
+            partition_leader(&sim, namespace, None).expect("one member leads the partition");
+        assert!(members.member(primary).is_some());
+        assert_eq!(
+            write_through(&mut sim, &client, namespace, primary, b"first primary"),
+            0
+        );
+
+        sim.replica_crash(primary);
+        let (elected, elected_view) = (0..SETUP_TOTAL_STEPS)
+            .find_map(|_| {
+                sim.step();
+                partition_leader(&sim, namespace, Some(primary))
+                    .filter(|(_, elected_view)| *elected_view > view)
+            })
+            .expect("the surviving members elect a new primary");
+        assert!(
+            members.member(elected).is_some(),
+            "node {elected} leads a partition it does not store"
+        );
+        assert_eq!(
+            write_through(&mut sim, &client, namespace, elected, b"second primary"),
+            0,
+            "two of three members still commit"
+        );
+        let committed = sim
+            .partition_consensus_state(usize::from(elected), namespace)
+            .expect("the elected primary hosts the partition")
+            .commit_min;
+
+        advance_freshness_time(&mut sim, std::time::Duration::from_secs(5));
+        for replica in (0..REPLICAS).filter(|replica| members.member(*replica).is_none()) {
+            assert!(
+                sim.partition_consensus_state(usize::from(replica), namespace)
+                    .is_none(),
+                "node {replica} took part in a view change of a partition it does not store"
+            );
+            let status = sim.replicas[usize::from(replica)].shards[0]
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .partition_status(namespace)
+                .unwrap_or_else(|| panic!("node {replica} heard from the elected primary"));
+            assert!(
+                status.view >= elected_view,
+                "node {replica} still routes to view {}",
+                status.view
+            );
+        }
+
+        sim.replica_restart(primary);
+        assert!(
+            (0..SETUP_TOTAL_STEPS).any(|_| {
+                sim.step();
+                sim.partition_consensus_state(usize::from(primary), namespace)
+                    .is_some_and(|state| {
+                        state.status == consensus::Status::Normal
+                            && state.view >= elected_view
+                            && state.commit_min >= committed
+                    })
+            }),
+            "the old primary rejoins the new view and catches up"
+        );
+        let (leader, _) = partition_leader(&sim, namespace, None).expect("a member leads");
+        assert_eq!(
+            write_through(&mut sim, &client, namespace, leader, b"all members again"),
+            0
+        );
+    }
+
+    #[test]
+    fn given_a_two_member_partition_when_its_primary_fails_should_wait_for_it_without_electing() {
+        const REPLICAS: u8 = 5;
+        const OUTAGE_STEPS: u32 = 2_000;
+        let (mut sim, client, namespace) = placed_partition_cluster(REPLICAS, 2, 0xF2E5_0050);
+        let members = partition_members(&sim, namespace);
+        let (primary, view) =
+            partition_leader(&sim, namespace, None).expect("one member leads the partition");
+        assert!(members.member(primary).is_some());
+        assert_eq!(
+            write_through(&mut sim, &client, namespace, primary, b"both members"),
+            0
+        );
+
+        // Two members need both for a view change, so the survivor never leads.
+        sim.replica_crash(primary);
+        for _ in 0..OUTAGE_STEPS {
+            sim.step();
+            assert_eq!(partition_leader(&sim, namespace, Some(primary)), None);
+        }
+
+        sim.replica_restart(primary);
+        let (leader, _) = (0..SETUP_TOTAL_STEPS)
+            .find_map(|_| {
+                sim.step();
+                partition_leader(&sim, namespace, None)
+                    .filter(|(_, leader_view)| *leader_view >= view)
+            })
+            .expect("the pair resumes once both members are back");
+        assert!(members.member(leader).is_some());
+        assert_eq!(
+            write_through(&mut sim, &client, namespace, leader, b"pair again"),
+            0
+        );
     }
 
     fn partition_fresh(sim: &Simulator, replica: u8) -> bool {

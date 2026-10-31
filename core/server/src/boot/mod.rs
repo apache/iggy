@@ -296,6 +296,7 @@ pub fn bootstrap(
     install_default_crypto_provider();
     let mut root_credentials = resolve_root_credentials(&config)?;
     warm_dummy_password_hash();
+    crate::external_auth::preflight(&config.external_auth)?;
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());

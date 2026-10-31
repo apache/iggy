@@ -20,6 +20,7 @@
 //! builders below assemble minimal shards and wire frames.
 
 use bytes::Bytes;
+use consensus::client_table::SessionAttachment;
 use consensus::{LocalPipeline, MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -33,6 +34,7 @@ use iggy_binary_protocol::{
     Command, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader, WireEncode,
     WireGlobalPermissions, WireIdentifier, WireName, WireOptions, WirePermissions,
 };
+use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{EncryptorKind, ServerKeyContext, UserStatus, variadic};
 use journal::prepare_journal::PrepareJournal;
 use message_bus::client_listener::RequestHandler;
@@ -57,15 +59,15 @@ use server_common::send_messages::{
     COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, PREPARE_SPLIT_POINT,
     SendMessagesOwned, encrypt_batch_request,
 };
-use server_common::sharding::{IggyNamespace, ShardId};
+use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use server_common::{MESSAGE_ALIGN, Message};
-use shard::shards_table::PapayaShardsTable;
+use shard::shards_table::{PapayaShardsTable, ShardsTable};
 use shard::{IggyShard, PartitionConsensusConfig, ReplicaTopology, ShardIdentity};
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::mem::size_of;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 pub type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
@@ -104,6 +106,8 @@ pub struct SpyBus {
     pub sleeps: Rc<RefCell<Vec<std::time::Duration>>>,
     /// Pins [`MessageBus::realtime_micros`]. `None` reads the system clock.
     pub realtime: Rc<Cell<Option<u64>>>,
+    /// Pins the monotonic clock when a test also controls the bus timers.
+    pub monotonic: Rc<Cell<Option<u64>>>,
     /// One installation per client connection, as the production registry
     /// keeps them. [`ConnectionInstaller::client_instance`] opens one on
     /// first sight, so every client is connected until
@@ -183,6 +187,13 @@ impl MessageBus for SpyBus {
         self.realtime
             .get()
             .unwrap_or_else(|| iggy_common::IggyTimestamp::now().as_micros())
+    }
+    fn monotonic_micros(&self) -> u64 {
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        self.monotonic.get().unwrap_or_else(|| {
+            u64::try_from(ORIGIN.get_or_init(Instant::now).elapsed().as_micros())
+                .unwrap_or(u64::MAX)
+        })
     }
     fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
     fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
@@ -505,6 +516,10 @@ pub fn prepare_message(
 /// The client that issues the setup operations below.
 const VSR_CLIENT_ID: u128 = 1;
 
+/// The consensus group of partition 0. Each later partition takes the next
+/// group.
+const FIRST_PARTITION_GROUP: u64 = 1;
+
 /// Creates one stream with one single-partition topic, and returns the
 /// namespace of its partition. No route names the partition yet.
 pub fn create_one_partition(shard: &TestShard) -> IggyNamespace {
@@ -513,6 +528,12 @@ pub fn create_one_partition(shard: &TestShard) -> IggyNamespace {
 
 /// [`create_one_partition`] on the metadata state machine of any shard.
 pub fn create_one_partition_in(mux_stm: &TestMux) -> IggyNamespace {
+    create_partitions_in(mux_stm, 1)[0]
+}
+
+/// Creates one stream with one topic of `count` partitions, and returns the
+/// namespaces of its partitions in partition order. No route names them yet.
+pub fn create_partitions_in(mux_stm: &TestMux, count: u32) -> Vec<IggyNamespace> {
     mux_stm.users().ensure_root_user("iggy", "hash");
     mux_stm
         .update(prepare_message(
@@ -534,24 +555,74 @@ pub fn create_one_partition_in(mux_stm: &TestMux) -> IggyNamespace {
             &CreateTopicWithAssignmentsRequest {
                 request: CreateTopicRequest {
                     stream_id: WireIdentifier::numeric(0),
-                    partitions_count: 1,
+                    partitions_count: count,
                     name: WireName::new("topic").unwrap(),
                     options: WireOptions::empty(),
                 },
                 derived_options: WireOptions::empty(),
-                partitions: vec![CreatedPartitionAssignment {
-                    initial_view: 0,
-                    partition_id: 0,
-                    consensus_group_id: 1,
-                    members: Vec::new(),
-                }],
+                partitions: (0..count)
+                    .map(|partition_id| CreatedPartitionAssignment {
+                        initial_view: 0,
+                        partition_id,
+                        consensus_group_id: FIRST_PARTITION_GROUP + u64::from(partition_id),
+                        members: Vec::new(),
+                    })
+                    .collect(),
             }
             .to_bytes(),
         ))
         .unwrap();
-    mux_stm
-        .streams()
-        .namespace_from_partition(&WireIdentifier::numeric(0), &WireIdentifier::numeric(0), 0)
+    (0..count)
+        .map(|partition_id| {
+            mux_stm
+                .streams()
+                .namespace_from_partition(
+                    &WireIdentifier::numeric(0),
+                    &WireIdentifier::numeric(0),
+                    partition_id,
+                )
+                .unwrap()
+        })
+        .collect()
+}
+
+/// [`create_one_partition`] with the partition routed to shard 0, so
+/// authorization and resolution let a read reach the owner inbox.
+pub fn route_one_partition(shard: &TestShard) -> IggyNamespace {
+    route_partitions(shard, 1)[0]
+}
+
+/// [`create_partitions_in`] on `shard`, with every partition routed to
+/// shard 0.
+pub fn route_partitions(shard: &TestShard, count: u32) -> Vec<IggyNamespace> {
+    route_partitions_to(shard, count, 0)
+}
+
+/// [`route_partitions`] to the shard `owner`.
+pub fn route_partitions_to(shard: &TestShard, count: u32, owner: u16) -> Vec<IggyNamespace> {
+    let namespaces = create_partitions_in(&shard.plane.metadata().mux_stm, count);
+    for namespace in &namespaces {
+        shard
+            .shards_table()
+            .insert(*namespace, PartitionLocation::new(ShardId::new(owner), 0));
+    }
+    namespaces
+}
+
+/// Registers `client_id` as the root user and attaches `session`, the
+/// state of a bound TCP connection.
+pub fn attach_root_session(shard: &TestShard, client_id: u128, session: u64) -> SessionAttachment {
+    let mut table = shard.plane.metadata().client_table.borrow_mut();
+    table
+        .commit_register(
+            client_id,
+            DEFAULT_ROOT_USER_ID,
+            [0x5a; 32],
+            register_reply(client_id, session),
+        )
+        .unwrap();
+    table
+        .attach_session(client_id, session, DEFAULT_ROOT_USER_ID)
         .unwrap()
 }
 

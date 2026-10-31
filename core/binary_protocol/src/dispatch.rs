@@ -191,17 +191,27 @@ pub const COMMAND_TABLE: &[CommandMeta] = &[
     CommandMeta::non_replicated(GET_METADATA_CHANGES_CODE, "metadata.changes"),
     // Deferred messages
     CommandMeta::non_replicated(POLL_MESSAGES_DEFERRED_CODE, "message.poll_deferred"),
-    CommandMeta::non_replicated(WAIT_FOR_MESSAGES_CODE, "message.wait"),
     CommandMeta::non_replicated(CANCEL_DEFERRED_REQUEST_CODE, "message.cancel_deferred"),
+    CommandMeta::non_replicated(FETCH_MESSAGES_CODE, "message.fetch"),
 ];
 
 /// Lookup command metadata by command code.
 ///
-/// Uses a `match` (compiled to a jump table / binary search) for O(1) lookup
-/// instead of linear scan. The match maps code -> table index, keeping
-/// `COMMAND_TABLE` as the single source of truth for all metadata.
+/// Uses the `match` of [`command_index`] (compiled to a jump table / binary
+/// search) for O(1) lookup instead of linear scan, keeping `COMMAND_TABLE`
+/// as the single source of truth for all metadata.
 #[must_use]
 pub const fn lookup_command(code: u32) -> Option<&'static CommandMeta> {
+    match command_index(code) {
+        Some(idx) => Some(&COMMAND_TABLE[idx]),
+        None => None,
+    }
+}
+
+/// The index of command `code` in `COMMAND_TABLE`, for per-command arrays in
+/// table order.
+#[must_use]
+pub const fn command_index(code: u32) -> Option<usize> {
     // Indices must match the order of entries in COMMAND_TABLE above.
     let idx = match code {
         PING_CODE => 0,
@@ -254,11 +264,11 @@ pub const fn lookup_command(code: u32) -> Option<&'static CommandMeta> {
         UPDATE_RESOURCE_CODE => 47,
         GET_METADATA_CHANGES_CODE => 48,
         POLL_MESSAGES_DEFERRED_CODE => 49,
-        WAIT_FOR_MESSAGES_CODE => 50,
-        CANCEL_DEFERRED_REQUEST_CODE => 51,
+        CANCEL_DEFERRED_REQUEST_CODE => 50,
+        FETCH_MESSAGES_CODE => 51,
         _ => return None,
     };
-    Some(&COMMAND_TABLE[idx])
+    Some(idx)
 }
 
 /// Lookup command metadata by VSR operation.
@@ -362,12 +372,13 @@ mod tests {
         }
     }
 
-    /// Verify that the match indices in `lookup_command` point to entries
+    /// Verify that the match indices in `command_index` point to entries
     /// whose `.code` field actually matches the looked-up code.
     /// Catches table reordering that would silently break the match.
     #[test]
     fn lookup_command_indices_match_table_codes() {
         for (i, entry) in COMMAND_TABLE.iter().enumerate() {
+            assert_eq!(command_index(entry.code), Some(i), "{}", entry.name);
             let looked_up = lookup_command(entry.code)
                 .unwrap_or_else(|| panic!("lookup_command({}) returned None", entry.code));
             assert_eq!(

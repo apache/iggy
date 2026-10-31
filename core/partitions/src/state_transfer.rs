@@ -4204,6 +4204,8 @@ where
         self.last_polled_offsets.pin().clear();
         self.durable_consumer_offsets.clear();
         self.durable_consumer_offsets.set_emptied_at(emptied_at);
+        self.explicit_offset_stores
+            .clear(self.consensus().message_bus().monotonic_micros());
         self.pending_consumer_offset_commits.clear();
         for kind in ConsumerKind::ALL {
             self.consumer_offset_capacity_for(kind)

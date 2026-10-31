@@ -67,13 +67,18 @@ use crate::stm::user::UsersSnapshot;
 ///
 /// Version 14: `TopicSnapshot` gained `created_op`, the identity of a topic
 /// incarnation, and the snapshot carries the metadata change log.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 14;
+///
+/// Version 15: `PartitionSnapshot` gained `members` and `retirement_debt_op` as
+/// trailing, defaulted fields.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 15;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
-/// Session protection is mandatory and its nested layout changed. Older
-/// snapshots cannot prove the current retry contract and are refused.
-pub const MIN_READABLE_SNAPSHOT_FORMAT_VERSION: u32 = SNAPSHOT_FORMAT_VERSION;
+/// Session protection is mandatory and its nested layout changed in version
+/// 14, so older snapshots cannot prove the current retry contract and are
+/// refused. Version 14 reads with every partition on every node and no
+/// retirement debt.
+pub const MIN_READABLE_SNAPSHOT_FORMAT_VERSION: u32 = 14;
 
 /// The release that wrote a snapshot: the packed `iggy_binary_protocol` semver of
 /// this build. [`iggy_binary_protocol::ProtocolVersion`] documents the packing and
@@ -653,7 +658,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 8;
-        const PINNED_VERSION: u32 = 14;
+        const PINNED_VERSION: u32 = 15;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -856,7 +861,7 @@ mod tests {
 
     #[test]
     fn decode_refuses_snapshots_without_durable_session_protection() {
-        for version in 0..SNAPSHOT_FORMAT_VERSION {
+        for version in 0..MIN_READABLE_SNAPSHOT_FORMAT_VERSION {
             let mut snapshot = MetadataSnapshot::new(9);
             snapshot.version = version;
             let bytes = snapshot.encode().unwrap();
@@ -876,6 +881,36 @@ mod tests {
             Err(SnapshotError::UnsupportedFormatVersion { found, expected })
                 if found == INDEPENDENT_OWNER_GENERATION_FORMAT && expected == SNAPSHOT_FORMAT_VERSION
         ));
+    }
+
+    #[test]
+    fn given_format_fourteen_partition_when_decoding_should_default_members_and_debt() {
+        #[derive(Serialize)]
+        struct FormatFourteenPartition {
+            id: usize,
+            consensus_group_id: u64,
+            created_at: IggyTimestamp,
+            created_revision: u64,
+            deleted_up_to_offset: u64,
+            created_view: u32,
+        }
+        let mut snapshot = MetadataSnapshot::new(9);
+        snapshot.version = MIN_READABLE_SNAPSHOT_FORMAT_VERSION;
+        assert!(MetadataSnapshot::decode(&snapshot.encode().unwrap()).is_ok());
+
+        let encoded = rmp_serde::to_vec(&FormatFourteenPartition {
+            id: 2,
+            consensus_group_id: 3,
+            created_at: IggyTimestamp::from(4),
+            created_revision: 5,
+            deleted_up_to_offset: 6,
+            created_view: 7,
+        })
+        .unwrap();
+        let decoded: PartitionSnapshot = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!((decoded.id, decoded.created_view), (2, 7));
+        assert!(decoded.members.is_empty(), "stored on every node");
+        assert_eq!(decoded.retirement_debt_op, 0);
     }
 
     #[test]

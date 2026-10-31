@@ -111,11 +111,13 @@ async fn given_a_factor_of_one_when_writing_through_any_node_should_store_each_p
                     .poll_messages(
                         &stream,
                         &topic,
-                        Some(partition_id),
+                        partition_id,
                         &Consumer::default(),
                         &PollingStrategy::offset(0),
-                        1,
-                        false,
+                        PollOptions {
+                            count: 1,
+                            ..PollOptions::default()
+                        },
                     )
                     .await
                     .unwrap();
@@ -299,6 +301,64 @@ async fn send_within_budget(
     .unwrap_or_else(|_| panic!("partition {partition_id} never accepted {payload}"));
 }
 
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "2"))]
+async fn given_a_factor_of_one_when_one_reader_fetches_every_partition_should_return_each_message(
+    harness: &mut TestHarness,
+) {
+    let writer = root_client(harness, 0).await;
+    writer
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    writer
+        .create_topic(
+            &stream,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS),
+                replication_factor: Some(1),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut expected = BTreeSet::new();
+    for partition_id in 0..PARTITIONS {
+        partition_route(&writer, &stream, &topic, partition_id).await;
+        let payload = format!("partition-{partition_id}");
+        send_within_budget(&writer, &stream, &topic, partition_id, &payload).await;
+        expected.insert(payload);
+    }
+
+    // One fetch names partitions that live on three different nodes.
+    let client = IggyClient::new(ClientWrapper::Tcp(root_client(harness, 0).await));
+    let mut reader = client
+        .reader(
+            &stream,
+            &topic,
+            &Consumer::new(Identifier::named("every-partition").unwrap()),
+        )
+        .partitions(0..PARTITIONS)
+        .start(PollingStrategy::first())
+        .build()
+        .await
+        .unwrap();
+    let mut read = BTreeSet::new();
+    timeout(POLL_BUDGET, async {
+        while read.len() < expected.len() {
+            let batch = reader.next().await.unwrap();
+            for message in batch.messages {
+                read.insert(String::from_utf8(message.payload.to_vec()).unwrap());
+            }
+        }
+    })
+    .await
+    .expect("the reader reaches every partition");
+    assert_eq!(read, expected);
+}
+
 #[iggy_harness(
     cluster_nodes = 3,
     server(metadata.clients_table_max = "8", sharding.cpu_allocation = "2")
@@ -367,11 +427,13 @@ async fn given_an_rf1_node_down_when_sessions_churn_should_keep_admitting_logins
                 .poll_messages(
                     &stream,
                     &topic,
-                    Some(stranded),
+                    stranded,
                     &Consumer::default(),
                     &PollingStrategy::offset(0),
-                    2,
-                    false,
+                    PollOptions {
+                        count: 2,
+                        ..PollOptions::default()
+                    },
                 )
                 .await
                 && polled.messages.len() == 2

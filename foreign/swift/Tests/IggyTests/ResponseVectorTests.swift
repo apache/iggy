@@ -113,6 +113,47 @@ struct ResponseVectorTests {
         #expect(assignment == ConsumerGroupAssignment(generation: 7, partitions: [0, 2, 4]))
     }
 
+    @Test func fetchSections() throws {
+        let sections = try Responses.fetchSections(body("response.fetch_messages"))
+        #expect(sections.map(\.partitionID) == [1, 2])
+        let read = sections[0]
+        #expect(read.error == nil)
+        #expect(read.currentOffset == 41)
+        #expect(read.nextOffset == 42)
+        #expect(read.firstOffset == 41)
+        #expect(read.context == PartitionContext(incarnation: 3, ownerGeneration: 9, metadataOp: 12))
+        let polled = try read.decode()
+        #expect(polled.partitionID == 1)
+        #expect(polled.context == read.context)
+        #expect(polled.messages.map(\.offset) == [41])
+        #expect(polled.messages.map(\.payloadString) == ["hello"])
+        let refused = sections[1]
+        #expect(refused.error == IggyError(.notPrimary))
+        #expect(refused.records.isEmpty)
+        #expect(refused.firstOffset == nil)
+        #expect(throws: IggyError(.notPrimary)) { try refused.decode() }
+        #expect(try Responses.fetchSections(FakeVSRServer.fetchedBody([])[...]).isEmpty)
+    }
+
+    /// The decoder refuses each table that `FetchMessagesResponse::decode`
+    /// refuses in Rust.
+    @Test func fetchReplyValidation() throws {
+        let reply = golden.bytes("response.fetch_messages")
+        let statusOfFirst = 8
+        let recordsLengthOfSecond = 4 + Responses.fetchSectionHeaderSize + 52
+        var tooMany = reply
+        tooMany.replaceSubrange(0..<4, with: UInt32(1001).littleEndianBytes)
+        var tableTooLong = reply
+        tableTooLong.replaceSubrange(0..<4, with: UInt32(8).littleEndianBytes)
+        var errorWithRecords = reply
+        errorWithRecords.replaceSubrange(statusOfFirst..<statusOfFirst + 4, with: IggyErrorCode.notPrimary.rawValue.littleEndianBytes)
+        var recordsPastTheBody = reply
+        recordsPastTheBody.replaceSubrange(recordsLengthOfSecond..<recordsLengthOfSecond + 4, with: UInt32(1).littleEndianBytes)
+        for hostile in [[0, 0, 0], tooMany, tableTooLong, errorWithRecords, recordsPastTheBody, Array(reply.dropLast()), reply + [0]] {
+            #expect(throws: IggyError(.invalidCommand)) { try Responses.fetchSections(hostile[...]) }
+        }
+    }
+
     @Test func consumerOffset() throws {
         let offset = try Responses.consumerOffset(body("response.consumer_offset"))
         #expect(offset == ConsumerOffsetInfo(partitionID: 1, currentOffset: 1000, storedOffset: 500))

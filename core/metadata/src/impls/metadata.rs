@@ -4821,20 +4821,33 @@ where
     }
 
     /// The committed topic's replication factor. `None` for a topic created
-    /// before replication factors, or one this node cannot see yet.
+    /// before replication factors, or one that does not exist. A topic not
+    /// committed yet refuses transiently while a create waits in the pipeline:
+    /// that create may be the one named, and its factor is unknown until it
+    /// commits.
     fn committed_replication_factor(
         &self,
         stream_id: &WireIdentifier,
         topic_id: &WireIdentifier,
     ) -> Result<Option<u8>, IggyError> {
-        self.mux_stm
-            .streams()
-            .read(|inner| {
-                let stream = inner.resolve_stream_id(stream_id)?;
-                let topic = inner.resolve_topic_id(stream, topic_id)?;
-                let topic = inner.items.get(stream)?.topics.get(topic)?;
-                TopicCreateOptions::from_resource_options(&topic.options).replication_factor
-            })
+        let committed = self.mux_stm.streams().read(|inner| {
+            let stream = inner.resolve_stream_id(stream_id)?;
+            let topic = inner.resolve_topic_id(stream, topic_id)?;
+            let topic = inner.items.get(stream)?.topics.get(topic)?;
+            Some(TopicCreateOptions::from_resource_options(&topic.options).replication_factor)
+        });
+        let Some(factor) = committed else {
+            let creating_topic = self
+                .pending_placement_headers()?
+                .iter()
+                .any(|header| header.operation == Operation::CreateTopicWithAssignments);
+            return if creating_topic {
+                Err(IggyError::TransientNotAccepted)
+            } else {
+                Ok(None)
+            };
+        };
+        factor
             .map(|factor| u8::try_from(factor).map_err(|_| IggyError::InvalidReplicationFactor))
             .transpose()
     }
@@ -5033,9 +5046,9 @@ where
                 // `CreatePartitionsResult::{Stream,Topic}NotFound`. A preflight
                 // read here would decide against possibly-uncommitted state and
                 // drop without a reply (TOCTOU + wedge). See the metadata
-                // validation design doc. The replication factor is read the
-                // same way: a topic this node cannot see yet gets no member
-                // list, and apply refuses it if the committed topic has one.
+                // validation design doc. The replication factor comes from the
+                // committed topic: a missing topic gets no member list, and
+                // apply answers it with `TopicNotFound`.
                 let replication_factor =
                     self.committed_replication_factor(&request.stream_id, &request.topic_id)?;
                 let mut counts = self.placement_counts()?;
@@ -7176,6 +7189,38 @@ mod tests {
             "admitted assignments reserve load before append can yield"
         );
         assert!(metadata.journal.is_none());
+    }
+
+    #[test]
+    fn given_a_pending_create_topic_when_admitting_create_partitions_should_refuse_transiently() {
+        let add_partitions = || {
+            let body = WireCreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::named("pending").unwrap(),
+                partitions_count: 1,
+            }
+            .to_bytes();
+            pat_request(2, 1, Operation::CreatePartitions, &body)
+        };
+        let metadata = placement_metadata();
+        assert!(
+            metadata.prepare_request(add_partitions()).is_ok(),
+            "a topic nobody is creating is apply's TopicNotFound"
+        );
+
+        let metadata = placement_metadata();
+        let create = metadata
+            .prepare_request(placement_request(1, "pending", 2))
+            .unwrap();
+        metadata
+            .consensus
+            .as_ref()
+            .unwrap()
+            .pipeline_message(PlaneKind::Metadata, &create);
+        assert!(matches!(
+            metadata.prepare_request(add_partitions()),
+            Err(IggyError::TransientNotAccepted)
+        ));
     }
 
     #[test]

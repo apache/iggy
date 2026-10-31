@@ -143,6 +143,37 @@ func TestPendingRegistryAbandonKeepsTheLaneOfARunningReplayUntilItFinishes(t *te
 	require.Zero(t, registry.bytes)
 }
 
+func TestPendingRegistryReplayOfAnOffsetWriteHoldsItsProgressLane(t *testing.T) {
+	registry := newOperationRegistry(DefaultMaxPendingOperations, DefaultMaxPendingOperationBytes)
+	key := laneKey{incarnation: 1, partition: 1}
+	ticket, err := registry.enterProgress(context.Background(), key, true)
+	require.NoError(t, err)
+	require.NoError(t, ticket.reserve(context.Background(), vsr.HeaderSize))
+	data := make([]byte, vsr.HeaderSize)
+	binary.LittleEndian.PutUint64(data[frameOffsetRequest:], uint64(1)<<63)
+	operation := ticket.freeze(command.StoreOffsetCode, nil, data)
+	ticket.finish(true)
+	_, err = registry.enter(context.Background(), key.progressLane())
+	var blocked ierror.LaneBlocked
+	require.ErrorAs(t, err, &blocked, "the retained store blocks progress")
+	require.Equal(t, operation.id, blocked.OperationID)
+	replay, err := registry.resume(context.Background(), operation.id)
+	require.NoError(t, err)
+	require.NoError(t, registry.abandon(operation.id))
+	busy, cancelBusy := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancelBusy()
+	_, err = registry.enter(busy, key.progressLane())
+	require.ErrorIs(t, err, ierror.ErrTransientNotAccepted, "the replay holds the progress lane")
+	replay.finish(true)
+	free, cancelFree := context.WithTimeout(context.Background(), time.Second)
+	defer cancelFree()
+	progress, err := registry.enter(free, key.progressLane())
+	require.NoError(t, err)
+	progress.finish(false)
+	require.Empty(t, registry.lanes)
+	require.Zero(t, registry.bytes)
+}
+
 func TestPendingRegistryResetKeepsPhysicalBytesUntilOldWriterFinishes(t *testing.T) {
 	registry := newOperationRegistry(1, vsr.HeaderSize)
 	ticket, err := registry.enter(context.Background(), laneKey{})

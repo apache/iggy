@@ -60,6 +60,7 @@ pub(crate) mod error;
 mod log;
 mod manager;
 pub(crate) mod metrics;
+mod plugin_instance;
 mod sink;
 mod source;
 mod state;

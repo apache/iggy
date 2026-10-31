@@ -100,8 +100,8 @@ public interface CommandCode {
         // 103 and 104 are retired and must never be reused.
         GET_PARTITION_ROUTE(105),
         POLL_DEFERRED(106),
-        WAIT_FOR_MESSAGES(107),
-        CANCEL_DEFERRED_REQUEST(108);
+        CANCEL_DEFERRED_REQUEST(108),
+        FETCH_MESSAGES(109);
 
         private final int value;
 

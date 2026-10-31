@@ -16,6 +16,7 @@
 // under the License.
 
 using Apache.Iggy.Contracts;
+using Apache.Iggy.Exceptions;
 using Apache.Iggy.Kinds;
 
 namespace Apache.Iggy.IggyClient;
@@ -65,6 +66,24 @@ public interface IIggyOffset
         PartitionContext context, CancellationToken token = default);
 
     /// <summary>
+    ///     Commits a checkpoint: stores its offset under the partition history that delivered its message. The server
+    ///     refuses the store with status 87 when the partition was deleted and recreated since, and with status 5009
+    ///     when the partition moved to another member of the consumer group.
+    /// </summary>
+    /// <param name="consumer">The consumer identifier (group ID or member ID).</param>
+    /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
+    /// <param name="topicId">The identifier of the topic (numeric ID or name).</param>
+    /// <param name="checkpoint">The checkpoint of a read, such as <see cref="PolledMessages.Checkpoint" />.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    Task StoreConsumerPositionAsync(Consumer consumer, Identifier streamId, Identifier topicId,
+        Checkpoint checkpoint, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(checkpoint);
+        return StoreOffsetAsync(consumer, streamId, topicId, checkpoint.Offset, checkpoint.PartitionId,
+            checkpoint.Context, token);
+    }
+
+    /// <summary>
     ///     Retrieves the current offset for a consumer in a specified topic.
     /// </summary>
     /// <param name="consumer">The consumer identifier (group ID or member ID).</param>
@@ -99,4 +118,39 @@ public interface IIggyOffset
     /// <returns>A task representing the asynchronous operation.</returns>
     Task DeleteOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, uint? partitionId,
         CancellationToken token = default);
+
+    /// <summary>
+    ///     Deletes a stored offset under the context of the poll that delivered the partition. The server refuses the
+    ///     delete with status 87 when the partition was deleted and recreated since that poll, and with status 5009
+    ///     when the partition moved to another member of the consumer group. The default implementation is for
+    ///     clients without this fence, such as HTTP: it throws <see cref="FeatureUnavailableException" />.
+    /// </summary>
+    /// <param name="consumer">The consumer identifier (group ID or member ID).</param>
+    /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
+    /// <param name="topicId">The identifier of the topic (numeric ID or name).</param>
+    /// <param name="partitionId">The partition that delivered the offset.</param>
+    /// <param name="context">The <see cref="PolledMessages.Context" /> of the poll that delivered the partition.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    Task DeleteOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, uint partitionId,
+        PartitionContext context, CancellationToken token = default)
+    {
+        return Task.FromException(new FeatureUnavailableException());
+    }
+
+    /// <summary>
+    ///     Deletes the stored offset of the partition of a checkpoint under the partition history that delivered its
+    ///     message. The offset of the checkpoint is not used.
+    /// </summary>
+    /// <param name="consumer">The consumer identifier (group ID or member ID).</param>
+    /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
+    /// <param name="topicId">The identifier of the topic (numeric ID or name).</param>
+    /// <param name="checkpoint">A checkpoint of the partition.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    Task DeleteConsumerPositionAsync(Consumer consumer, Identifier streamId, Identifier topicId,
+        Checkpoint checkpoint, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(checkpoint);
+        return DeleteOffsetAsync(consumer, streamId, topicId, checkpoint.PartitionId, checkpoint.Context, token);
+    }
 }

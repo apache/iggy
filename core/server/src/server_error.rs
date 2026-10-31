@@ -231,6 +231,15 @@ pub enum ServerError {
         namespace_raw: u64,
         created_revision: u64,
     },
+    #[error(
+        "partition {namespace_raw} incarnation {created_revision} is stored only on this node, \
+         and this node's storage began after it was created without any record of it: \
+         refusing to serve it from offset 0; delete and recreate the topic to accept the loss"
+    )]
+    PartitionLostWithStorage {
+        namespace_raw: u64,
+        created_revision: u64,
+    },
     // Quarantines the one partition rather than treating the group as fresh or
     // reading through to a superseded view: mirrors the metadata plane's
     // `RecoveryError::SuperblockUnreadable` policy, minus the boot refusal,
@@ -423,6 +432,8 @@ pub enum ServerError {
     Panicked { description: String },
     #[error("Failed to list config environment variables")]
     ListConfigEnvVars(#[source] std::io::Error),
+    #[error("failed to build the external auth HTTP client: {reason}")]
+    ExternalAuthClient { reason: String },
 }
 
 /// Per-shard outcome captured by [`crate::boot::ShardHandles::join_all`]

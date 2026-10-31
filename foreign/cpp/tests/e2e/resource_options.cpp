@@ -273,9 +273,9 @@ class E2E_ResourceOptionsTransport : public E2ETestFixture,
             return payloads;
         }
         iggy::ffi::ErrorInfo error_info{};
-        const auto polled =
-            client->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
-                                  make_numeric_identifier(1), "offset", 0, 10, false, error_info);
+        const auto polled = client->poll_messages(
+            make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
+            make_numeric_identifier(1), make_polling_strategy("offset", 0), make_poll_options(10), error_info);
         for (const auto &message : polled.messages) {
             payloads.emplace_back(message.payload.begin(), message.payload.end());
         }

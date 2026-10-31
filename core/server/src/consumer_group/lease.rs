@@ -140,6 +140,9 @@ pub struct ConsumerGroupLiveness {
     /// Namespaces the last completed sweep could not prove: the next sweep
     /// gives each of them one attempt instead of the full wait.
     pub(super) retirement_suspects: BTreeSet<IggyNamespace>,
+    /// When each suspect last got a retirement barrier. Without one a suspect
+    /// that regained its quorum never proves a session again.
+    pub(super) retirement_suspect_barriers: BTreeMap<IggyNamespace, Instant>,
     pub(super) retirement_groups: Option<(u64, Rc<RetirementGroups>)>,
     /// Nodes missing from the reports of the last finalization, which the
     /// next one does not wait for before recording debt.

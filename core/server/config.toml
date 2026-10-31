@@ -1270,6 +1270,61 @@ handshake_grace = "10 s"
 # or with ulimit -Hn.
 #connections_max = 10000
 
+# External authentication callout. When enabled, login attempts for usernames
+# not found in the local user store are forwarded to an external HTTP service.
+# The service maps the caller to a pre-provisioned Iggy username or denies the
+# login. Local users authenticate through the built-in path and never hit the
+# callout.
+#
+# ── Callout contract ────────────────────────────────────────────────────
+#
+# The server POSTs JSON to 'url' with a timeout of 'timeout':
+#
+#   {
+#     "transport":     "<transport>",
+#     "client_address": "<ip:port>",
+#     "connection_id":  "<uuid>",
+#     "credentials": {
+#       "type":     "username_password",
+#       "username": "<login name>",
+#       "password": "<cleartext>"
+#     }
+#   }
+#
+# transport is one of: tcp, tcp_tls, ws, wss, quic, http.
+#
+# connection_id on TCP/QUIC/WS is the client's persistent connection id
+# (stable across reconnect retries). On HTTP it is a fresh UUIDv7 per
+# login request because each REST call is stateless.
+#
+# The service must return 2xx JSON. Any non-2xx status is treated as an
+# error (5xx and 429 are retryable; other 4xx are terminal). A 2xx body
+# must carry a "decision" tag:
+#
+#   Allow -- map the caller to a pre-provisioned Iggy user:
+#     {"decision": "allow", "username": "<iggy username>"}
+#
+#   Deny -- reject the login:
+#     {"decision": "deny", "reason": "<optional reason>"}
+#
+# The mapped username must exist as an active, non-root user. The
+# credential (password) is forwarded so the external service can verify
+# the requester; use TLS ('url' starting with https://) to protect it.
+#
+# Callouts fire only on the normal-status primary. Backup nodes and
+# nodes in a view change return a retryable error so the SDK reconnects
+# to the primary. The SDK replays logins after transient failures, so
+# the external service must be idempotent. One-time passwords will not
+# survive a replay.
+#[external_auth]
+#enabled = false
+#url = "https://auth.example.com/iggy/verify"
+#timeout = "5 s"
+# Per-shard cap on concurrent callouts. Each shard thread gets its own
+# counter, so the external service can see up to shards * this value
+# requests in flight.
+#max_concurrent_callouts = 64
+
 # This node's own client-facing identity, used when 'cluster.enabled' is false.
 [node]
 # A literal IP or a DNS hostname, without a port. Named to match its roster

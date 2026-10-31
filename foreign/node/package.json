@@ -1,7 +1,7 @@
 {
   "name": "apache-iggy",
   "type": "module",
-  "version": "0.10.1-edge.5",
+  "version": "0.10.1-edge.6",
   "description": "Official Apache Iggy NodeJS SDK",
   "keywords": [
     "iggy",
@@ -55,8 +55,8 @@
     "uuidv7": "1.2.1"
   },
   "devDependencies": {
-    "@commitlint/cli": "21.2.3",
-    "@commitlint/config-conventional": "21.2.3",
+    "@commitlint/cli": "21.2.4",
+    "@commitlint/config-conventional": "21.2.4",
     "@cucumber/cucumber": "13.3.0",
     "@swc-node/register": "1.12.1",
     "@types/debug": "4.1.13",

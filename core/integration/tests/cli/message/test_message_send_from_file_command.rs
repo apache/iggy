@@ -211,11 +211,14 @@ impl IggyCmdTestCase for TestMessageSendFromFileCmd<'_> {
                 .poll_messages(
                     &stream_id.try_into().unwrap(),
                     &topic_id.try_into().unwrap(),
-                    Some(0),
+                    0,
                     &Consumer::new(Identifier::default()),
                     &PollingStrategy::offset(0),
-                    self.message_count as u32 * 2,
-                    true,
+                    PollOptions {
+                        count: self.message_count as u32 * 2,
+                        commit: CommitPolicy::OnRead,
+                        ..PollOptions::default()
+                    },
                 )
                 .await;
             assert!(messages.is_ok());

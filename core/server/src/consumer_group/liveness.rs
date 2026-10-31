@@ -66,6 +66,10 @@ const RETIREMENT_ATTEMPTS_IN_FLIGHT: usize = 8;
 /// How long a stored partition may stay unproven, after its retry, before
 /// this node reports it unprovable.
 const UNPROVABLE_AFTER: Duration = Duration::from_secs(2);
+/// How often a suspect namespace gets a retirement barrier it does not wait
+/// for. Only a barrier moves a partition's metadata frontier past sessions
+/// that ended after its last debt payment.
+const SUSPECT_BARRIER_INTERVAL: Duration = Duration::from_secs(1);
 /// How long the metadata primary waits for an expected reporter before it
 /// finalizes with retirement debt.
 const RETIREMENT_DEBT_GRACE: Duration = Duration::from_secs(2);
@@ -777,14 +781,27 @@ where
         let Some(progress) = &tracker.retirement else {
             return false;
         };
-        let suspect = |namespace: &IggyNamespace| tracker.retirement_suspects.contains(namespace);
-        let attempts: Vec<(IggyNamespace, u64, bool)> = if progress.cursor < namespaces.len() {
+        let now = shard.bus.monotonic_now();
+        let barrier = |namespace: &IggyNamespace| {
+            if !tracker.retirement_suspects.contains(namespace) {
+                Barrier::Await
+            } else if tracker
+                .retirement_suspect_barriers
+                .get(namespace)
+                .is_none_or(|sent| now.saturating_duration_since(*sent) >= SUSPECT_BARRIER_INTERVAL)
+            {
+                Barrier::Send
+            } else {
+                Barrier::Skip
+            }
+        };
+        let attempts: Vec<(IggyNamespace, u64, Barrier)> = if progress.cursor < namespaces.len() {
             namespaces
                 .iter()
                 .skip(progress.cursor)
                 .take(MAX_RETIREMENTS_PER_PASS)
                 .map(|&(namespace, created_revision)| {
-                    (namespace, created_revision, suspect(&namespace))
+                    (namespace, created_revision, barrier(&namespace))
                 })
                 .collect()
         } else {
@@ -793,12 +810,21 @@ where
                 .iter()
                 .take(MAX_RETIREMENTS_PER_PASS)
                 .map(|(namespace, (created_revision, _, _))| {
-                    (*namespace, *created_revision, suspect(namespace))
+                    (*namespace, *created_revision, barrier(namespace))
                 })
                 .collect()
         };
         (progress.cursor, attempts)
     };
+    {
+        let now = shard.bus.monotonic_now();
+        let mut tracker = liveness.borrow_mut();
+        for (namespace, _, barrier) in &attempts {
+            if *barrier == Barrier::Send {
+                tracker.retirement_suspect_barriers.insert(*namespace, now);
+            }
+        }
+    }
     if stop.try_recv().is_ok()
         || shutdown.is_triggered()
         || consensus.view() != view
@@ -809,14 +835,14 @@ where
     // A group without a live member quorum stalls only its own attempt: the
     // pass deadline settles every attempt that answered in time.
     let mut running = futures::stream::iter(attempts.iter().map(
-        |&(namespace, created_revision, suspect)| {
-            let body = (!suspect).then_some(&body[..]);
+        |&(namespace, created_revision, barrier)| {
+            let body = &body[..];
             async move {
                 let retired = prove_retired(
                     shard,
                     liveness,
                     identity,
-                    body,
+                    (barrier, body),
                     namespace,
                     created_revision,
                     system_path,
@@ -847,6 +873,7 @@ where
     let ConsumerGroupLiveness {
         retirement,
         retirement_suspects,
+        retirement_suspect_barriers,
         ..
     } = &mut *tracker;
     let Some(progress) = retirement else {
@@ -899,6 +926,7 @@ where
         .iter()
         .map(|debt| IggyNamespace::from_raw(debt.namespace))
         .collect();
+    retirement_suspect_barriers.retain(|namespace, _| retirement_suspects.contains(namespace));
     if !progress.unprovable.is_empty() {
         debug!(
             client_id = identity.client_id,
@@ -932,6 +960,7 @@ where
     }
     tracker.retirement_fences.clear();
     tracker.retirement_suspects.clear();
+    tracker.retirement_suspect_barriers.clear();
     let (node, nodes) = metadata.consensus.as_ref().map_or((0, 1), |consensus| {
         (consensus.replica(), consensus.replica_count())
     });
@@ -958,13 +987,13 @@ where
 }
 
 /// Whether this node's copy of `namespace` holds `identity` retired: an
-/// applied barrier, or a durable fence over a failed incarnation. Without a
-/// `body` it only reads, so a group that cannot commit never holds a slot.
+/// applied barrier, or a durable fence over a failed incarnation. A suspect
+/// never waits on its barrier, so a group that cannot commit never holds a slot.
 async fn prove_retired<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     liveness: &RefCell<ConsumerGroupLiveness>,
     identity: SessionIdentity,
-    body: Option<&[u8]>,
+    (barrier, body): (Barrier, &[u8]),
     namespace: IggyNamespace,
     created_revision: u64,
     system_path: &str,
@@ -1016,9 +1045,12 @@ where
         }
         _ => {}
     }
-    let (Some(body), Some(consensus)) = (body, shard.plane.metadata().consensus.as_ref()) else {
+    let Some(consensus) = shard.plane.metadata().consensus.as_ref() else {
         return false;
     };
+    if barrier == Barrier::Skip {
+        return false;
+    }
     let request = retire_sessions_frame(
         consensus.cluster(),
         namespace,
@@ -1026,13 +1058,29 @@ where
         consensus.commit_min(),
         body,
     );
-    if let Ok(ticket) = shard.partition_submit(namespace, request) {
-        let _ = shard.await_partition_submit(ticket).await;
+    let Ok(ticket) = shard.partition_submit(namespace, request) else {
+        return false;
+    };
+    if barrier == Barrier::Send {
+        // The retry's read proves it once the barrier commits.
+        return false;
     }
+    let _ = shard.await_partition_submit(ticket).await;
     matches!(
         read().await,
         Some(shard::PartitionReadReply::SessionRetired(true))
     )
+}
+
+/// How a sweep attempt treats a namespace the plain read cannot prove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Barrier {
+    /// Submit a retirement and wait for it before reading again.
+    Await,
+    /// A suspect due for a retirement it does not wait for.
+    Send,
+    /// A suspect that got one recently: read only.
+    Skip,
 }
 
 /// A server-originated `RetireSession` request for `namespace`.
@@ -2774,35 +2822,7 @@ mod tests {
         let (_directory, shard) = shard_with_members(1).await;
         let metadata = shard.plane.metadata();
         let namespace = IggyNamespace::new(0, 0, 0);
-        let created_revision = metadata
-            .mux_stm
-            .streams()
-            .created_revision_for_namespace(namespace)
-            .unwrap();
-        let consensus = VsrConsensus::new(
-            1,
-            0,
-            1,
-            namespace.inner(),
-            shard.bus.clone(),
-            LocalPipeline::new(),
-        );
-        consensus.init();
-        let mut partition = partitions::IggyPartition::with_in_memory_storage(
-            std::sync::Arc::new(iggy_common::PartitionStats::default()),
-            consensus,
-            shard.plane.partitions().config().segment_size,
-        );
-        partition.set_created_revision(created_revision);
-        shard.plane.partitions().insert(namespace, partition);
-        shard::shards_table::ShardsTable::insert(
-            shard.shards_table(),
-            namespace,
-            server_common::sharding::PartitionLocation::new(
-                server_common::sharding::ShardId::new(0),
-                created_revision,
-            ),
-        );
+        let created_revision = insert_in_memory_partition(&shard, namespace);
         let mut messages = server_common::send_messages::IggyMessages::with_capacity(1);
         messages.push(server_common::send_messages::IggyMessage {
             header: server_common::send_messages::IggyMessageHeader::default(),
@@ -2894,6 +2914,89 @@ mod tests {
             tracker.retirement_debts.paid.get(&namespace),
             Some(&(created_revision, DEBT_OP))
         );
+    }
+
+    #[compio::test]
+    async fn given_a_suspect_partition_that_commits_when_sweeping_should_prove_without_debt() {
+        const PASSES_MAX: usize = 16;
+        let (directory, shard) = shard_with_members(1).await;
+        let metadata = shard.plane.metadata();
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let created_revision = insert_in_memory_partition(&shard, namespace);
+        assert!(
+            metadata
+                .client_table
+                .borrow_mut()
+                .end_session(CLIENT, 0, SESSION, SESSION)
+        );
+        let revision = metadata
+            .mux_stm
+            .streams()
+            .read(|inner| inner.namespace_revision);
+        let tracker = RefCell::new(ConsumerGroupLiveness::default());
+        // An earlier sweep found the partition without its member quorum.
+        stored_namespaces(&shard, &tracker, revision);
+        tracker.borrow_mut().retirement_suspects.insert(namespace);
+        let (_stop, receiver) = shard::channel(1);
+        let (_signal, shutdown) = Shutdown::new();
+        let system_path = directory.path().to_str().unwrap();
+        for _ in 0..PASSES_MAX {
+            if metadata.client_table.borrow().count() == 0 {
+                break;
+            }
+            super::super::tests::run_with_partition_message_pump(
+                &shard,
+                retire_sessions(&shard, &tracker, &receiver, &shutdown, TIMEOUT, system_path),
+            )
+            .await;
+        }
+
+        assert_eq!(metadata.client_table.borrow().count(), 0);
+        assert_eq!(
+            metadata
+                .mux_stm
+                .streams()
+                .retirement_debt_for(namespace, created_revision),
+            Some(0),
+            "a suspect that commits again proves the session instead of owing it"
+        );
+        assert!(!tracker.borrow().retirement_suspects.contains(&namespace));
+    }
+
+    /// A single-replica in-memory partition at `namespace`, routed to shard 0.
+    fn insert_in_memory_partition(shard: &TestShard, namespace: IggyNamespace) -> u64 {
+        let created_revision = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            namespace.inner(),
+            shard.bus.clone(),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let mut partition = partitions::IggyPartition::with_in_memory_storage(
+            std::sync::Arc::new(iggy_common::PartitionStats::default()),
+            consensus,
+            shard.plane.partitions().config().segment_size,
+        );
+        partition.set_created_revision(created_revision);
+        shard.plane.partitions().insert(namespace, partition);
+        shard::shards_table::ShardsTable::insert(
+            shard.shards_table(),
+            namespace,
+            server_common::sharding::PartitionLocation::new(
+                server_common::sharding::ShardId::new(0),
+                created_revision,
+            ),
+        );
+        created_revision
     }
 
     #[test]

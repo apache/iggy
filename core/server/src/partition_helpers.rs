@@ -516,6 +516,7 @@ pub async fn load_partition_or_fence(
                 namespace,
                 Arc::clone(&partition_stats),
                 partition_metadata.created_revision,
+                partition_metadata.created_at.as_micros(),
                 topic_runtime,
                 cluster_id,
                 self_replica_id,
@@ -955,6 +956,7 @@ pub async fn build_partition_fresh(
     namespace: IggyNamespace,
     stats: Arc<PartitionStats>,
     created_revision: u64,
+    created_at_micros: u64,
     runtime_options: TopicRuntimeOptions,
     cluster_id: u128,
     self_replica_id: u8,
@@ -977,6 +979,20 @@ pub async fn build_partition_fresh(
     let partition_id = namespace.partition_id();
     let first_initialization =
         partition_needs_initialization(config, namespace, created_revision).await?;
+    // The initialization record went with the storage, so a sole member cannot
+    // tell this build from a first one and would restart the log at offset 0.
+    if replica_count == 1
+        && first_initialization
+        && predates_storage(
+            storage_epoch(&config.get_system_path()).await?,
+            created_at_micros,
+        )
+    {
+        return Err(ServerError::PartitionLostWithStorage {
+            namespace_raw: namespace.inner(),
+            created_revision,
+        });
+    }
 
     let partition_dir = config.get_partition_path(stream_id, topic_id, partition_id);
     let restarted = replica_count > 1 && !first_initialization;
@@ -1478,6 +1494,7 @@ mod tests {
                 namespace,
                 Arc::new(PartitionStats::default()),
                 REVISION,
+                0,
                 TopicRuntimeOptions::default(),
                 CLUSTER,
                 0,
@@ -1562,6 +1579,54 @@ mod tests {
         }
     }
 
+    /// The reconciler's path: a partition whose directory went with the
+    /// storage reaches the fresh build, never the loader.
+    #[compio::test]
+    async fn given_storage_younger_than_an_unrecorded_partition_when_building_fresh_should_refuse_only_a_singleton()
+     {
+        const REVISION: u64 = 7;
+        const EPOCH: u64 = 1_000 * STORAGE_EPOCH_SKEW_MICROS;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        for (replica_count, created_at, built) in [
+            (1, EPOCH - 2 * STORAGE_EPOCH_SKEW_MICROS, false),
+            (1, EPOCH + 1, true),
+            (REPLICAS, EPOCH - 2 * STORAGE_EPOCH_SKEW_MICROS, true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let config = solo_config(&root);
+            std::fs::create_dir_all(config.get_system_path()).unwrap();
+            record_storage_epoch(&config.get_system_path(), EPOCH)
+                .await
+                .unwrap();
+            let result = build_partition_fresh(
+                &config,
+                &solo_partitions_config(&config),
+                namespace,
+                Arc::new(PartitionStats::default()),
+                REVISION,
+                created_at,
+                TopicRuntimeOptions::default(),
+                CLUSTER,
+                0,
+                ReplicaSet::all(replica_count),
+                0,
+                Rc::new(IggyMessageBus::new(0)),
+            )
+            .await;
+            assert_eq!(
+                result.is_ok(),
+                built,
+                "replicas={replica_count} created_at={created_at}"
+            );
+            if !built {
+                assert!(matches!(
+                    result,
+                    Err(ServerError::PartitionLostWithStorage { .. })
+                ));
+            }
+        }
+    }
+
     #[compio::test]
     async fn given_initialized_singleton_when_rebuilding_lost_directory_should_refuse() {
         let root = tempfile::tempdir().unwrap();
@@ -1593,6 +1658,7 @@ mod tests {
                 &partitions_config,
                 namespace,
                 Arc::new(PartitionStats::default()),
+                0,
                 0,
                 TopicRuntimeOptions::default(),
                 CLUSTER,
@@ -1640,6 +1706,7 @@ mod tests {
                     &partitions_config,
                     namespace,
                     Arc::new(PartitionStats::default()),
+                    0,
                     0,
                     TopicRuntimeOptions::default(),
                     CLUSTER,
@@ -1720,6 +1787,7 @@ mod tests {
                     partitions.config(),
                     namespace,
                     Arc::new(PartitionStats::default()),
+                    0,
                     0,
                     TopicRuntimeOptions::default(),
                     CLUSTER,
@@ -1911,6 +1979,7 @@ mod tests {
                     namespace,
                     Arc::new(PartitionStats::default()),
                     REVISION,
+                    0,
                     TopicRuntimeOptions::default(),
                     CLUSTER,
                     REPLICA,
@@ -2062,6 +2131,7 @@ mod tests {
                 &partitions_config,
                 namespace,
                 Arc::new(PartitionStats::default()),
+                0,
                 0,
                 runtime,
                 CLUSTER,
@@ -2301,6 +2371,7 @@ mod tests {
                 namespace,
                 Arc::new(PartitionStats::default()),
                 0,
+                0,
                 runtime,
                 CLUSTER,
                 REPLICA,
@@ -2426,6 +2497,7 @@ mod tests {
                 namespace,
                 Arc::new(PartitionStats::default()),
                 0,
+                0,
                 runtime,
                 CLUSTER,
                 REPLICA,
@@ -2550,6 +2622,7 @@ mod tests {
             IggyNamespace::new(1, 1, 0),
             Arc::new(PartitionStats::default()),
             0,
+            0,
             TopicRuntimeOptions::default(),
             CLUSTER,
             0,
@@ -2594,6 +2667,7 @@ mod tests {
             IggyNamespace::new(1, 1, 0),
             Arc::new(PartitionStats::default()),
             created_revision,
+            0,
             TopicRuntimeOptions::default(),
             CLUSTER,
             REPLICA,

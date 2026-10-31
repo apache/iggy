@@ -139,11 +139,14 @@ pub async fn consume_messages(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                Some(args.partition_id),
+                args.partition_id,
                 &consumer,
                 &PollingStrategy::next(),
-                args.messages_per_batch,
-                true,
+                PollOptions {
+                    count: args.messages_per_batch,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await?;
         if polled_messages.messages.is_empty() {

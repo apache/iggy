@@ -17,14 +17,17 @@
 
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Net.Sockets;
 using System.Runtime.ExceptionServices;
 using System.Text;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
+using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Kinds;
 using Apache.Iggy.Mappers;
 using Apache.Iggy.Utils;
 using Apache.Iggy.Vsr;
@@ -43,6 +46,10 @@ public sealed partial class TcpMessageStream
     private const byte ConsumerGroupWireKind = 2;
     private const byte StringKind = 2;
 
+    private const int MaxRouteLookupsInFlight = 16;
+
+    private readonly SemaphoreSlim _deferredRequests =
+        new(DeferredPollOptions.MAX_PARKED_REQUESTS, DeferredPollOptions.MAX_PARKED_REQUESTS);
     private readonly object _pollRoutingGate = new();
     private readonly Dictionary<PartitionRouteKey, CachedRoute> _partitionRoutes = [];
     private readonly Dictionary<byte, string> _replicaEndpoints = [];
@@ -56,6 +63,71 @@ public sealed partial class TcpMessageStream
         bool Stale, long Sequence);
     private long _routeSequence;
     private readonly record struct SendTarget(PartitionRouteKey Key, byte[] Query);
+
+    /// <summary>
+    ///     Where the wait and the request timeout of a deferred request sit in its body, and the values the caller
+    ///     encoded there. Every attempt sends what is left of both: a non-replicated read has no replay receipt,
+    ///     so its budget shrinks without a new request identity. A fetch keeps the reply margin also without a wait.
+    /// </summary>
+    private readonly record struct DeferredBudget(int WaitOffset, int TimeoutOffset, ulong WaitUs, ulong TimeoutUs,
+        bool KeepsMargin)
+    {
+        internal static DeferredBudget? Read(int code, ReadOnlySpan<byte> body)
+        {
+            int waitOffset;
+            int timeoutOffset;
+            if (code == CommandCodes.POLL_MESSAGES_DEFERRED_CODE)
+            {
+                waitOffset = body.Length - TcpContracts.DEFERRED_POLL_TAIL_SIZE;
+                timeoutOffset = body.Length - sizeof(ulong);
+            }
+            else if (code == CommandCodes.FETCH_MESSAGES_CODE)
+            {
+                waitOffset = 1;
+                _ = ReadIdentifier(body, ref waitOffset);
+                _ = ReadIdentifier(body, ref waitOffset);
+                _ = ReadIdentifier(body, ref waitOffset);
+                timeoutOffset = waitOffset + sizeof(ulong);
+            }
+            else
+            {
+                return null;
+            }
+
+            if (waitOffset < 0 || timeoutOffset + sizeof(ulong) > body.Length)
+            {
+                throw VsrError.Exception(VsrError.INVALID_COMMAND, "The deferred request body is truncated.");
+            }
+
+            return new DeferredBudget(waitOffset, timeoutOffset,
+                BinaryPrimitives.ReadUInt64LittleEndian(body[waitOffset..]),
+                BinaryPrimitives.ReadUInt64LittleEndian(body[timeoutOffset..]),
+                code == CommandCodes.FETCH_MESSAGES_CODE);
+        }
+
+        /// <summary>
+        ///     Writes into <paramref name="body" /> what is left after <paramref name="spent" />, measured with a
+        ///     stopwatch as for <see cref="DeferredPollOptions.Remaining" />. The timeout also ends within
+        ///     <paramref name="budget" />, the time this client gives the call. The wait keeps its reply margin, so an
+        ///     idle wait still answers before the client gives up.
+        /// </summary>
+        /// <exception cref="IggyInvalidStatusCodeException">Status 58 once nothing is left to send.</exception>
+        internal void Spend(Span<byte> body, TimeSpan budget, TimeSpan spent)
+        {
+            var spentUs = DeferredPollOptions.Micros(spent);
+            var timeoutUs = Math.Min(TimeoutUs > spentUs ? TimeoutUs - spentUs : 0,
+                DeferredPollOptions.Micros(budget - spent));
+            if (timeoutUs == 0 || KeepsMargin && timeoutUs < DeferredPollOptions.REPLY_MARGIN_US)
+            {
+                throw PollNotAccepted();
+            }
+
+            var waitUs = Math.Min(WaitUs > spentUs ? WaitUs - spentUs : 0,
+                timeoutUs > DeferredPollOptions.REPLY_MARGIN_US ? timeoutUs - DeferredPollOptions.REPLY_MARGIN_US : 0);
+            BinaryPrimitives.WriteUInt64LittleEndian(body[WaitOffset..], waitUs);
+            BinaryPrimitives.WriteUInt64LittleEndian(body[TimeoutOffset..], timeoutUs);
+        }
+    }
 
     internal bool RetainsOperation(ulong operationId)
     {
@@ -151,7 +223,7 @@ public sealed partial class TcpMessageStream
         }
         var present = body[position++] != 0;
         if (!present && (code is CommandCodes.STORE_CONSUMER_OFFSET_CODE or CommandCodes.DELETE_CONSUMER_OFFSET_CODE
-            || code == CommandCodes.POLL_MESSAGES_CODE && group))
+            || code is CommandCodes.POLL_MESSAGES_CODE or CommandCodes.POLL_MESSAGES_DEFERRED_CODE && group))
         {
             throw VsrError.Exception(VsrError.INVALID_COMMAND, "This partition request requires an explicit partition id.");
         }
@@ -185,6 +257,7 @@ public sealed partial class TcpMessageStream
         {
             throw new ArgumentOutOfRangeException(nameof(timeout));
         }
+        var started = Stopwatch.GetTimestamp();
         cancellation.CancelAfter(budget);
         var deadline = Environment.TickCount64 + (long)budget.TotalMilliseconds;
         var captured = retained?.Context ?? context;
@@ -195,6 +268,18 @@ public sealed partial class TcpMessageStream
         var generation = retained?.Generation ?? startedUnder ?? _consensusSession.Generation;
         var retainable = VsrOperations.ForCode(code) is not (VsrOperation.NonReplicated or VsrOperation.Register or VsrOperation.Logout);
         var progress = IsProgressPoll(code, payload.Span);
+        var fetchLanes = progress && code == CommandCodes.FETCH_MESSAGES_CODE ? FetchProgressLanes(payload.Span) : null;
+        var commits = code == CommandCodes.FETCH_MESSAGES_CODE && TcpContracts.FetchAutoCommits(payload.Span);
+        var committing = TcpContracts.ReadAutoCommits(code, payload.Span);
+        var deferred = DeferredBudget.Read(code, payload.Span);
+        // A progress poll spends its budget in the frame of its lane. Any other deferred call spends it in a copy,
+        // so the caller's buffer keeps what the caller encoded.
+        var deferredBody = deferred is not null && !progress ? payload.ToArray() : null;
+        if (deferredBody is not null)
+        {
+            payload = deferredBody;
+        }
+        var leased = false;
         var refreshHistory = code == CommandCodes.SEND_MESSAGES_CODE && context is null && retained is null;
         var retryDelay = LifecycleRetryIntervalMs;
         var routingRetries = 0;
@@ -203,12 +288,18 @@ public sealed partial class TcpMessageStream
         var rosterRead = false;
         var terminal = false;
         var frameAcquired = false;
+        var mayHaveCommitted = false;
         var startOver = false;
         IggyInvalidStatusCodeException? refusal = null;
         IggyInvalidStatusCodeException? rejection = null;
         CancellationTokenRegistration operationCancellation = default;
         try
         {
+            if (deferred is not null)
+            {
+                await _deferredRequests.WaitAsync(cancellation.Token);
+                leased = true;
+            }
             while (true)
             {
                 CachedRoute? route = null;
@@ -251,7 +342,7 @@ public sealed partial class TcpMessageStream
                     }
                     if (target is { } partition)
                     {
-                        if (operation is null && (retainable || progress))
+                        if (operation is null && fetchLanes is null && (retainable || progress))
                         {
                             PartitionContext? known = captured;
                             lock (_pollRoutingGate)
@@ -264,7 +355,8 @@ public sealed partial class TcpMessageStream
                             }
                             if (known is { } knownContext)
                             {
-                                _mutations.ThrowIfRetained(new MutationLane(knownContext.Incarnation, partition.Key.PartitionId));
+                                _mutations.ThrowIfRetained(new MutationLane(knownContext.Incarnation,
+                                    partition.Key.PartitionId, progress));
                             }
                         }
                         route = await GetPartitionRouteAsync(partition.Key, partition.Query, deadline, cancellation.Token,
@@ -279,10 +371,17 @@ public sealed partial class TcpMessageStream
                     EnsureOperationSession(code, generation);
                     if (operation is null && (retainable || progress))
                     {
+                        // A caller's zero wire fence must not bypass the resolved history's local recovery block.
+                        var laneContext = captured.Value.Incarnation == 0 && route is not null
+                            ? route.Route.Context : captured.Value;
                         var lane = target is { } selected
-                            ? new MutationLane(captured.Value.Incarnation, selected.Key.PartitionId) : MutationLane.Metadata;
-                        operation = await _mutations.EnterAsync(lane, code, payload, captured.Value, retainable, generation,
-                            cancellation.Token);
+                            ? new MutationLane(laneContext.Incarnation, selected.Key.PartitionId, progress)
+                            : MutationLane.Metadata;
+                        operation = await (fetchLanes is null
+                            ? _mutations.EnterAsync(lane, code, payload, captured.Value, retainable, generation,
+                                cancellation.Token)
+                            : _mutations.EnterAsync(fetchLanes, code, payload, captured.Value, retainable, generation,
+                                cancellation.Token));
                         _mutations.Acquire(operation);
                         frameAcquired = true;
                         operationCancellation = operation.Lifetime.Token.Register(cancellation.Cancel);
@@ -354,11 +453,47 @@ public sealed partial class TcpMessageStream
                         ExceptionDispatchInfo.Throw(refusal);
                     }
                     refusal = null;
+                    if (deferred is { } deferredBudget)
+                    {
+                        deferredBudget.Spend(
+                            operation is null ? deferredBody : operation.Frame.Bytes.AsSpan(VsrHeader.HEADER_SIZE),
+                            budget, Stopwatch.GetElapsedTime(started));
+                    }
                     sending = true;
+                    // A read that commits can store its offset before a cancel reaches the server, so once it goes
+                    // out the caller's cancel only asks the server to cancel it. Its reply, its deadline, or the end
+                    // of the client or the lane ends the call.
+                    using var unattended = committing && operation is not null
+                        ? CancellationTokenSource.CreateLinkedTokenSource(_clientLifetime.Token,
+                            operation.Lifetime.Token)
+                        : null;
                     var attempt = operation is null
                         ? await connection.SendAttemptAsync(code, payload, deadline, deadline, HasSensitiveReply(code),
                             cancellation.Token, retryTransient: false, context: captured.Value, retainedFrame: frame)
-                        : await connection.SendFrameAsync(operation, deadline, HasSensitiveReply(code), cancellation.Token);
+                        : await connection.SendFrameAsync(operation, deadline, HasSensitiveReply(code),
+                            unattended?.Token ?? cancellation.Token, unattended is null ? default : token);
+                    if (unattended is not null && token.IsCancellationRequested
+                        && attempt.Error is IggyInvalidStatusCodeException
+                        {
+                            FromServer: true, StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED
+                        })
+                    {
+                        // The cancel won before the read stored anything.
+                        throw new OperationCanceledException(token);
+                    }
+                    if (committing && attempt.RequestStarted)
+                    {
+                        mayHaveCommitted = attempt.Error is not IggyInvalidStatusCodeException { FromServer: true } refusalStatus
+                            || !CommitErrorScope.Request.ProvesNothingStored(refusalStatus.StatusCode);
+                    }
+                    if (mayHaveCommitted && attempt.Error is not null)
+                    {
+                        if (IsSessionFailure(attempt.Error))
+                        {
+                            ScheduleSessionRecovery(generation);
+                        }
+                        throw new VsrFetchProgressUncertainException(operation!.Identity.RequestId, attempt.Error);
+                    }
                     if (attempt.Error is null)
                     {
                         if (operation is { Uncertain: true } && !attempt.Committed)
@@ -368,9 +503,40 @@ public sealed partial class TcpMessageStream
                                 VsrError.Exception(VsrError.TRANSIENT_NOT_COMMITTED, "The reply does not prove commit."),
                                 operation.Identity.RequestId);
                         }
+                        var response = attempt.Response!;
+                        if (commits && operation is not null)
+                        {
+                            try
+                            {
+                                var sections = BinaryMapper.ReadFetchSections(response.Memory.Span);
+                                var requested = fetchLanes!.Select(lane => lane.PartitionId).ToHashSet();
+                                if (sections.Any(section => !requested.Contains(section.PartitionId)))
+                                {
+                                    throw new MalformedResponseException("Fetch reply names an unrequested partition.");
+                                }
+                                var uncertain = sections.Where(section => section.Status != 0
+                                    && !CommitErrorScope.Section.ProvesNothingStored((int)section.Status)).Select(section => section.PartitionId).ToHashSet();
+                                if (uncertain.Count > 0)
+                                {
+                                    _mutations.RetainFetch(operation, uncertain);
+                                    response = new FetchProgressReply(response, operation.Identity.RequestId, uncertain);
+                                }
+                                mayHaveCommitted = false;
+                                if (_consensusSession.Ended(generation) is { } replySessionEnded)
+                                {
+                                    ExceptionDispatchInfo.Throw(replySessionEnded);
+                                }
+                            }
+                            catch
+                            {
+                                response.Dispose();
+                                throw;
+                            }
+                        }
+                        mayHaveCommitted = false;
                         terminal = true;
                         RefreshCommittedCredentials(code, (operation?.Body ?? payload).Span, generation);
-                        return attempt.Response!;
+                        return response;
                     }
                     if (IsSessionFailure(attempt.Error))
                     {
@@ -410,7 +576,8 @@ public sealed partial class TcpMessageStream
                             terminal = true;
                             rejection = status;
                         }
-                        if (status.StatusCode == VsrError.HISTORY_UNAVAILABLE && target is { } staleHistory)
+                        if (status.StatusCode is VsrError.HISTORY_UNAVAILABLE or VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED
+                            && target is { } staleHistory)
                         {
                             RemovePartitionRoute(staleHistory.Key);
                         }
@@ -449,9 +616,13 @@ public sealed partial class TcpMessageStream
                     lastWasNotPrimary = false;
                     await Task.Delay(PollRoutingRetryDelay(routingRetries++, Random.Shared.NextDouble()), cancellation.Token);
                 }
+                // A fetch names several partitions and its refusal as not primary does not say
+                // which one moved, so the caller looks up every route of the call again.
                 catch (IggyInvalidStatusCodeException error) when (error.StatusCode is
                     VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.TRANSIENT_NOT_COMMITTED
-                    || error.StatusCode == VsrError.NOT_PRIMARY && replica is null)
+                    or VsrError.DEFERRED_POLL_CAPACITY_EXCEEDED
+                    || error.StatusCode == VsrError.NOT_PRIMARY && replica is null
+                    && code != CommandCodes.FETCH_MESSAGES_CODE)
                 {
                     if (generation != _consensusSession.Generation && retained is null
                         && operation is not { Uncertain: true } && ResumesUnderNewSession(generation))
@@ -486,7 +657,8 @@ public sealed partial class TcpMessageStream
                         }
                         throw;
                     }
-                    if (target is { } failed)
+                    // A full server refuses a deferred request on the right route, so the route is kept.
+                    if (target is { } failed && error.StatusCode != VsrError.DEFERRED_POLL_CAPACITY_EXCEEDED)
                     {
                         RemovePartitionRoute(failed.Key, error.StatusCode == VsrError.NOT_PRIMARY ? route : null);
                     }
@@ -563,6 +735,12 @@ public sealed partial class TcpMessageStream
                 }
             }
         }
+        catch (Exception error) when (operation?.FetchProgress is not null && mayHaveCommitted)
+        {
+            _mutations.RetainFetch(operation);
+            throw error is VsrFetchProgressUncertainException ? error
+                : new VsrFetchProgressUncertainException(operation.Identity.RequestId, error);
+        }
         catch (Exception error) when (operation is { Retainable: true, Uncertain: true }
             && error is not IggyInvalidStatusCodeException { Committed: true })
         {
@@ -590,6 +768,10 @@ public sealed partial class TcpMessageStream
         }
         finally
         {
+            if (leased)
+            {
+                _deferredRequests.Release();
+            }
             operationCancellation.Dispose();
             if (terminal && retained is not null)
             {
@@ -689,8 +871,152 @@ public sealed partial class TcpMessageStream
     {
         const int PollTailSize = 14;
         const byte NextStrategy = 5;
-        return code == CommandCodes.POLL_MESSAGES_CODE && body.Length >= PollTailSize
-            && (body[^1] != 0 || body[^PollTailSize] == NextStrategy);
+        if (code == CommandCodes.FETCH_MESSAGES_CODE)
+        {
+            return TcpContracts.FetchMovesConsumer(body);
+        }
+
+        if (code == CommandCodes.POLL_MESSAGES_DEFERRED_CODE && body.Length >= TcpContracts.DEFERRED_POLL_TAIL_SIZE)
+        {
+            body = body[..^TcpContracts.DEFERRED_POLL_TAIL_SIZE];
+        }
+        else if (code != CommandCodes.POLL_MESSAGES_CODE)
+        {
+            return false;
+        }
+
+        return body.Length >= PollTailSize && (body[^1] != 0 || body[^PollTailSize] == NextStrategy);
+    }
+
+    // Two fetches that share partitions take their lanes in the same order, so neither waits for the other in a
+    // cycle.
+    private static MutationLane[] FetchProgressLanes(ReadOnlySpan<byte> body) =>
+    [
+        .. TcpContracts.FetchTargetFences(body).OrderBy(target => target.PartitionId)
+            .Select(target => new MutationLane(target.Incarnation, target.PartitionId, Progress: true))
+    ];
+
+    /// <summary>
+    ///     Sends one fetch to the primary of the first target. A target without a fence, or with incarnation zero as
+    ///     the Rust SDK reads it, takes the context of its route, and each target gets the whole byte limit. A
+    ///     section or a refusal as not primary, or with a lost history, marks the routes of its partitions stale, so
+    ///     the next grouping looks them up again. So does a refusal as not owned, whose route names an old owner
+    ///     generation. A refusal of the whole fetch does not name its partition, so it marks all of them.
+    /// </summary>
+    private async Task<FetchedMessages> FetchMessagesCoreAsync(Identifier streamId, Identifier topicId,
+        IReadOnlyList<(uint PartitionId, PollingStrategy Strategy)> targets, Consumer consumer, uint count,
+        bool autoCommit, DeferredPollOptions options, CancellationToken token, ulong generation)
+    {
+        var started = Stopwatch.GetTimestamp();
+        var deadline = Environment.TickCount64 + (long)options.RequestTimeout.TotalMilliseconds;
+        // A link drops a reply wider than it reads, so the records get what the frame leaves after the table.
+        var records = _configuration.MaxResponseFrameSize - VsrHeader.HEADER_SIZE - FetchedMessages.HeadSize(targets.Count);
+        if (records < DeferredPollOptions.MIN_MAX_BYTES)
+        {
+            throw VsrError.Exception(VsrError.INVALID_SIZE_BYTES,
+                $"A reply frame of {_configuration.MaxResponseFrameSize} bytes cannot hold a fetch of {targets.Count} partitions.");
+        }
+
+        var fenced = new (uint PartitionId, PollingStrategy Strategy)[targets.Count];
+        for (var index = 0; index < fenced.Length; index++)
+        {
+            var (partitionId, strategy) = targets[index];
+            if (strategy.Context is not { Incarnation: not 0 })
+            {
+                var key = new PartitionRouteKey(streamId, topicId, partitionId);
+                var route = await GetPartitionRouteAsync(key, RouteQuery(key), deadline, token);
+                strategy = strategy.WithContext(route.Route.Context);
+            }
+
+            fenced[index] = (partitionId, strategy);
+        }
+
+        var left = options.Remaining(Stopwatch.GetElapsedTime(started)) with
+        {
+            MaxBytes = Math.Min(options.MaxBytes, (uint)records)
+        };
+        var first = new PartitionRouteKey(streamId, topicId, targets[0].PartitionId);
+        IMemoryOwner<byte> reply;
+        try
+        {
+            reply = await SendRoutedAsync(CommandCodes.FETCH_MESSAGES_CODE, new SendTarget(first, RouteQuery(first)),
+                TcpContracts.FetchMessages(consumer, streamId, topicId, left, count, autoCommit, left.MaxBytes, fenced),
+                default(PartitionContext), token, left.RequestTimeout, generation);
+        }
+        catch (IggyInvalidStatusCodeException error) when (error.StatusCode is VsrError.NOT_PRIMARY
+                                                               or VsrError.HISTORY_UNAVAILABLE
+                                                               or VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED)
+        {
+            foreach (var (partitionId, _) in targets)
+            {
+                RemovePartitionRoute(new PartitionRouteKey(streamId, topicId, partitionId));
+            }
+
+            throw;
+        }
+
+        FetchedMessages fetched;
+        try
+        {
+            fetched = BinaryMapper.MapFetchedMessages(reply, _configuration.MessageEncryptor);
+        }
+        catch
+        {
+            reply.Dispose();
+            throw;
+        }
+
+        foreach (var section in fetched.Sections)
+        {
+            if (section.Status is (uint)VsrError.NOT_PRIMARY or (uint)VsrError.HISTORY_UNAVAILABLE
+                or (uint)VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED)
+            {
+                RemovePartitionRoute(new PartitionRouteKey(streamId, topicId, section.PartitionId));
+            }
+        }
+
+        return fetched;
+    }
+
+    /// <summary>
+    ///     <paramref name="targets" /> grouped by the primary of <paramref name="partitionOf" /> and split to fit one
+    ///     fetch each, keeping their order. A lookup that no replica answers is retried until
+    ///     <paramref name="deadline" />.
+    /// </summary>
+    private async Task<List<T[]>> ReadinessGroupsAsync<T>(Identifier streamId, Identifier topicId,
+        IReadOnlyList<T> targets, Func<T, uint> partitionOf, long deadline, CancellationToken token)
+    {
+        var primaries = new byte[targets.Count];
+        var lookups = new ParallelOptions { MaxDegreeOfParallelism = MaxRouteLookupsInFlight, CancellationToken = token };
+        for (var retries = 0; ; retries++)
+        {
+            try
+            {
+                await Parallel.ForEachAsync(Enumerable.Range(0, targets.Count), lookups, async (index, lookup) =>
+                {
+                    var key = new PartitionRouteKey(streamId, topicId, partitionOf(targets[index]));
+                    var route = await GetPartitionRouteAsync(key, RouteQuery(key), deadline, lookup);
+                    primaries[index] = route.Route.PrimaryReplica;
+                });
+                return
+                [
+                    .. targets.Select((target, index) => (Primary: primaries[index], Target: target))
+                        .GroupBy(entry => entry.Primary, entry => entry.Target)
+                        .OrderBy(group => group.Key)
+                        .SelectMany(group => group.Chunk(TcpContracts.MAX_PARTITIONS_PER_REQUEST))
+                ];
+            }
+            catch (Exception error) when (VsrConnection.IsConnectionException(error)
+                || error is IggyInvalidStatusCodeException { StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY })
+            {
+                var pause = PollRoutingRetryDelay(retries, Random.Shared.NextDouble());
+                if (Environment.TickCount64 + (long)pause.TotalMilliseconds >= deadline)
+                {
+                    throw PollNotAccepted();
+                }
+                await Task.Delay(pause, token);
+            }
+        }
     }
 
     private async Task<CachedRoute> GetPartitionRouteAsync(PartitionRouteKey key, ReadOnlyMemory<byte> query,

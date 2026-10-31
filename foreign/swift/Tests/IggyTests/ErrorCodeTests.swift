@@ -61,5 +61,7 @@ struct ErrorCodeTests {
         #expect(IggyError(.invalidFormat) != IggyError(.invalidCommand))
         #expect(IggyError(wireCode: 65_535) != IggyError(.error))
         #expect(IggyError(.invalidFormat, context: "x").hashValue == IggyError(.invalidFormat).hashValue)
+        #expect(IggyError(.partitionLaneBlocked, operationID: 1, partitionID: 2) != IggyError(.partitionLaneBlocked, operationID: 3, partitionID: 2))
+        #expect(IggyError(.partitionLaneBlocked, operationID: 1, partitionID: 2) != IggyError(.partitionLaneBlocked, operationID: 1, partitionID: 3))
     }
 }

@@ -32,14 +32,14 @@ pub use crate::client_wrappers::client_wrapper::ClientWrapper;
 pub use crate::client_wrappers::connection_info::ConnectionInfo;
 pub use crate::clients::client::IggyClient;
 pub use crate::clients::client_builder::IggyClientBuilder;
-pub use crate::clients::consumer::{
-    AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer, IggyConsumerState, ReceivedMessage,
-};
+pub use crate::clients::consumer::{IggyConsumer, IggyConsumerState, ReceivedMessage};
 pub use crate::clients::consumer_builder::IggyConsumerBuilder;
 pub use crate::clients::producer::IggyProducer;
 pub use crate::clients::producer_builder::IggyProducerBuilder;
 pub use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
 pub use crate::clients::producer_sharding::{BalancedSharding, OrderedSharding, Sharding};
+pub use crate::clients::reader::{PartitionReader, ReadError};
+pub use crate::clients::reader_builder::ReaderBuilder;
 pub use crate::consumer_ext::IggyConsumerMessageExt;
 pub use crate::http::http_client::HttpClient;
 pub use crate::quic::quic_client::QuicClient;
@@ -50,27 +50,28 @@ pub use crate::stream_builder::{IggyStream, IggyStreamConfig};
 pub use crate::tcp::tcp_client::TcpClient;
 pub use crate::websocket::websocket_client::WebSocketClient;
 pub use iggy_common::{
-    Aes256GcmEncryptor, Args, ArgsOptional, AutoLogin, CacheMetrics, CacheMetricsKey, ClientError,
-    ClientInfoDetails, ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus,
-    CompressionAlgorithm, Consumer, ConsumerGroup, ConsumerGroupDetails, ConsumerGroupMember,
-    ConsumerKind, ConsumerPosition, Credentials, DeferredPollOptions, Durability, EncryptorKind,
-    GlobalPermissions, HeaderField, HeaderKey, HeaderKind, HeaderValue, HttpClientConfig,
-    HttpClientConfigBuilder, HttpMethod, IdKind, Identifier, IdentityInfo, IggyByteSize,
-    IggyDuration, IggyError, IggyExpiry, IggyIndexView, IggyMessage, IggyMessageHeader,
-    IggyMessageHeaderView, IggyMessageView, IggyMessageViewIterator, IggyTimestamp, MaxTopicSize,
-    NonZeroDurationError, NonZeroIggyDuration, OptionKey, OptionSpec, OptionValue, OptionsScope,
-    Partition, PartitionContext, PartitionResizePolicy, Partitioner, Partitioning,
-    PendingOperationsConfig, Permissions, PersonalAccessTokenExpiry, PollMessages, PolledMessages,
-    PollingKind, PollingStrategy, QuicClientConfig, QuicClientConfigBuilder,
-    QuicClientReconnectionConfig, ResourceOptions, SendMessages, SendMessagesConfirmationResponse,
-    SendMessagesResponse, Sizeable, SnapshotCompression, Stats, Stream, StreamCreateOptions,
-    StreamDetails, StreamEncryptionKey, StreamEncryptionSource, StreamPermissions,
-    StreamUpdateOptions, SystemSnapshotType, TcpClientConfig, TcpClientConfigBuilder,
-    TcpClientReconnectionConfig, Topic, TopicCreateOptions, TopicDetails, TopicPermissions,
-    TopicResolvedOptions, TopicUpdateOptions, TransportEndpoints, TransportProtocol,
-    UserCreateOptions, UserId, UserInfo, UserInfoDetails, UserStatus, UserUpdateOptions,
-    Validatable, WebSocketClientConfig, WebSocketClientConfigBuilder,
-    WebSocketClientReconnectionConfig, WebSocketConfig, defaults, locking, topic_option_keys,
+    Aes256GcmEncryptor, Args, ArgsOptional, AutoCommit, AutoLogin, CacheMetrics, CacheMetricsKey,
+    Checkpoint, ClientError, ClientInfoDetails, ClusterMetadata, ClusterNode, ClusterNodeRole,
+    ClusterNodeStatus, CommitAfter, CommitEvery, CommitPolicy, CompressionAlgorithm, Consumer,
+    ConsumerGroup, ConsumerGroupDetails, ConsumerGroupMember, ConsumerKind, Credentials,
+    Durability, EncryptorKind, GlobalPermissions, HeaderField, HeaderKey, HeaderKind, HeaderValue,
+    HttpClientConfig, HttpClientConfigBuilder, HttpMethod, IdKind, Identifier, IdentityInfo,
+    IggyByteSize, IggyDuration, IggyError, IggyExpiry, IggyIndexView, IggyMessage,
+    IggyMessageHeader, IggyMessageHeaderView, IggyMessageView, IggyMessageViewIterator,
+    IggyTimestamp, MaxTopicSize, NonZeroDurationError, NonZeroIggyDuration, OptionKey, OptionSpec,
+    OptionValue, OptionsScope, Partition, PartitionContext, PartitionResizePolicy, Partitioner,
+    Partitioning, PendingOperationsConfig, Permissions, PersonalAccessTokenExpiry, PollMessages,
+    PollOptions, PolledMessages, PollingKind, PollingStrategy, QuicClientConfig,
+    QuicClientConfigBuilder, QuicClientReconnectionConfig, ResourceOptions, SendMessages,
+    SendMessagesConfirmationResponse, SendMessagesResponse, Sizeable, SnapshotCompression, Stats,
+    Stream, StreamCreateOptions, StreamDetails, StreamEncryptionKey, StreamEncryptionSource,
+    StreamPermissions, StreamUpdateOptions, SystemSnapshotType, TcpClientConfig,
+    TcpClientConfigBuilder, TcpClientReconnectionConfig, Topic, TopicCreateOptions, TopicDetails,
+    TopicPermissions, TopicResolvedOptions, TopicUpdateOptions, TransportEndpoints,
+    TransportProtocol, UndecodedRecord, UserCreateOptions, UserId, UserInfo, UserInfoDetails,
+    UserStatus, UserUpdateOptions, Validatable, WebSocketClientConfig,
+    WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig, WebSocketConfig, defaults,
+    locking, topic_option_keys,
 };
 pub use iggy_common::{
     Client, ClusterClient, ConsumerGroupClient, ConsumerOffsetClient, MessageClient,
@@ -82,8 +83,8 @@ pub use iggy_common::{
     IGGY_MESSAGE_HEADERS_LENGTH_OFFSET_RANGE, IGGY_MESSAGE_ID_OFFSET_RANGE,
     IGGY_MESSAGE_OFFSET_OFFSET_RANGE, IGGY_MESSAGE_ORIGIN_TIMESTAMP_OFFSET_RANGE,
     IGGY_MESSAGE_PAYLOAD_LENGTH_OFFSET_RANGE, IGGY_MESSAGE_TIMESTAMP_OFFSET_RANGE, INDEX_SIZE,
-    MAX_DEFERRED_POLL_WAIT_US, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, NO_ASSIGNED_PARTITION,
-    RESYNC_REQUIRED_PARTITION_SENTINEL, SEC_IN_MICRO,
+    MAX_DEFERRED_POLL_WAIT_US, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE,
+    MIN_DEFERRED_POLL_MAX_BYTES, RESYNC_REQUIRED_PARTITION_SENTINEL, SEC_IN_MICRO,
     defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USER_ID, DEFAULT_ROOT_USERNAME},
 };
 pub use iggy_common::{

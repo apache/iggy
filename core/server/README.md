@@ -57,6 +57,15 @@ replacing the 12-byte assignments and single request-wide view in older metadata
 WAL entries. This boundary also rejects `IGGY-BOUND-GRANTS-4` and
 `IGGY-BOUND-GRANTS-5` directories from upstream and earlier development builds,
 unchanged before replay.
+Replication factors change what replicas send each other: partition member
+lists, partition status on metadata probes and replies, retirement debt on session
+finalization and the paid-through mark on session retirement. Peers compare a
+replica wire revision at the handshake, so a build from before that change and a
+build after it refuse each other even when both report the same version, for
+example two consecutive `:edge` images. Stop every node and start them all on the
+new build. Their `IGGY-METADATA-CHANGE-LOG-1` data directories are kept: older
+metadata snapshots and journal entries read with every partition on every node,
+and older builds refuse the newer snapshot format instead of misreading it.
 No in-place upgrade, storage conversion tool or retained-data migration is
 provided. Use an offline cutover with logical re-ingestion:
 
@@ -448,7 +457,8 @@ Each ring also keeps at most 128 MiB of record bodies and evicts its oldest reco
 
 This release changes protocol and storage formats. Servers and compatible
 clients deploy together; mixed versions and rolling upgrades are unsupported.
-Peers verify protocol, release and storage-format identity before admission.
+Peers verify protocol, replica wire, release and storage-format identity before
+admission.
 Executable packaging does not affect that identity, so stripping or rebuilding
 the same compatible release does not by itself prevent a replica from joining.
 
@@ -456,7 +466,7 @@ This checkout uses protocol 0.12.0, and 0.12.0 is also its minimum. It is a brea
 
 REST has no version handshake, so a 0.11 HTTP client is not refused at login. A create body that sends an option beside `options`, such as a top-level `message_expiry`, and an update body with a nested member, such as the `{"name": ..., "options": {}}` stream update older SDKs send, are refused with `InvalidCommand` (3), and the error's `field` names the member.
 
-Metadata snapshot format 13 is both the current and the oldest readable format. A data directory holding an older snapshot is refused, and journals written by older builds hold operations this build no longer knows. Start this release from fresh storage on every replica.
+Metadata snapshot format 15 is the current format and 14 the oldest readable one. A data directory holding an older snapshot is refused, and journals written by older builds hold operations this build no longer knows. Start this release from fresh storage on every replica.
 
 The protocol number is independent of server and SDK package versions. Its
 current and minimum values are maintained manually for stable releases. The

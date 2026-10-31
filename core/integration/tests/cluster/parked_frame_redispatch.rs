@@ -238,11 +238,13 @@ async fn poll_payloads(
         .poll_messages(
             stream,
             topic,
-            Some(TARGET_PARTITION),
+            TARGET_PARTITION,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            TOTAL_MESSAGES as u32,
-            false,
+            PollOptions {
+                count: TOTAL_MESSAGES as u32,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap_or_else(|error| panic!("poll_messages: {error}"));
