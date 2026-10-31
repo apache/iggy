@@ -2356,6 +2356,17 @@ impl Streams {
             .read(|inner| inner.stats_registry.directory().last_change())
     }
 
+    /// Count the reports of `namespaces` as changed after every earlier
+    /// change, so a cursor that already passed them sends them again.
+    pub fn mark_partition_statuses_changed(&self, namespaces: &[u64]) {
+        self.inner.read(|inner| {
+            inner
+                .stats_registry
+                .directory()
+                .mark_changed(namespaces.iter().copied());
+        });
+    }
+
     /// How many partition reports this node holds.
     #[must_use]
     pub fn partition_status_count(&self) -> usize {

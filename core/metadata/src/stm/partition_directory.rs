@@ -159,6 +159,19 @@ impl PartitionDirectory {
         self.changes().last
     }
 
+    /// Count the held reports of `namespaces` as the newest changes.
+    pub fn mark_changed(&self, namespaces: impl IntoIterator<Item = u64>) {
+        let entries = self.lock();
+        let mut changes = self.changes();
+        for namespace in namespaces {
+            if entries.contains_key(&namespace) {
+                changes.mark(namespace);
+            }
+        }
+        drop(changes);
+        drop(entries);
+    }
+
     /// How many reports this node holds, of every incarnation not yet swept.
     #[must_use]
     pub fn report_count(&self) -> usize {
@@ -361,6 +374,19 @@ mod tests {
         );
         assert_eq!(directory.changed_after(last, 8, |_| true).0, []);
 
+        directory.mark_changed([1, 99]);
+        assert_eq!(
+            directory
+                .changed_after(last, 8, |_| true)
+                .0
+                .iter()
+                .map(|entry| entry.namespace)
+                .collect::<Vec<_>>(),
+            [1],
+            "a marked report goes out again, a namespace without one is no change"
+        );
+        assert_eq!(directory.last_change(), last + 1);
+
         directory.retain_chunk(None, 8, |entry| entry.namespace != 3);
         assert_eq!(
             directory
@@ -369,7 +395,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.namespace)
                 .collect::<Vec<_>>(),
-            [1, 2],
+            [2, 1],
             "a retired report leaves the change log"
         );
     }

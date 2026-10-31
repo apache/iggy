@@ -120,7 +120,7 @@ impl PartitionStatusOutbox {
         batch
     }
 
-    #[cfg(test)]
+    /// The partitions this node leads, as its shards last reported them.
     pub fn namespaces(&self) -> Vec<u64> {
         self.entries.borrow().keys().copied().collect()
     }
@@ -457,6 +457,13 @@ where
             let mut state = self.primary_rebalance.borrow_mut();
             let replicas = usize::from(consensus.replica_count());
             if state.view != Some(consensus.view()) {
+                let streams = metadata.mux_stm.streams();
+                let changes_sent = streams.partition_status_last_change();
+                // The failover that made this node metadata primary can also
+                // have given it partitions, and its shards may have reported
+                // them before this view started. No metadata primary relayed
+                // those, so this node's own reports count as changed after it.
+                streams.mark_partition_statuses_changed(&self.partition_status_outbox.namespaces());
                 *state = PrimaryRebalance {
                     view: Some(consensus.view()),
                     // A partition's members never move, so placement waits to
@@ -467,7 +474,7 @@ where
                     // a failover makes come after it, so they go first.
                     peers: vec![
                         Peer {
-                            changes_sent: metadata.mux_stm.streams().partition_status_last_change(),
+                            changes_sent,
                             ..Peer::default()
                         };
                         replicas

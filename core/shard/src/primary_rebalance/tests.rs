@@ -1546,6 +1546,52 @@ async fn given_a_new_metadata_view_when_a_primary_changes_should_send_it_before_
     );
 }
 
+/// The failover that makes a node metadata primary can also give it
+/// partitions, which its shards may report before its metadata view starts.
+/// No metadata primary relayed those reports, so they go before older changes.
+#[compio::test]
+async fn given_own_reports_from_before_the_metadata_view_when_it_starts_should_send_them_first() {
+    const PARTITIONS: usize = STATUS_ENTRIES_PER_FRAME * 2;
+    const PEER: u8 = 1;
+    const TAKEN_OVER: usize = PARTITIONS - 1;
+    let (shard, _inbox) = owner();
+    let streams = shard.plane.metadata().mux_stm.streams();
+    let namespace = |id: usize| IggyNamespace::new(1, 1, id);
+    streams.seed_namespace(namespace(PARTITIONS - 1), 1, 0);
+    let status = |id: usize, view: u32| PartitionStatusEntry {
+        namespace: namespace(id).inner(),
+        created_revision: streams
+            .created_revision_for_namespace(namespace(id))
+            .unwrap(),
+        view,
+        commit: 0,
+        current_offset: 0,
+        messages_count: 0,
+        size_bytes: 0,
+        segments_count: 1,
+        in_sync_nodes: 0,
+    };
+    let now = shard.bus.monotonic_now();
+    let reports: Vec<_> = (0..PARTITIONS).map(|id| status(id, 0)).collect();
+    streams.record_partition_statuses(&reports, 0, REPLICAS, now);
+    // As the router takes in this node's own report while it is a backup.
+    let taken_over = [status(TAKEN_OVER, 1)];
+    shard.partition_status_outbox.record(&taken_over, now);
+    streams.record_partition_statuses(&taken_over, 0, REPLICAS, now);
+    shard.primary_rebalance.borrow_mut().view = None;
+    // The probes this tick sends fail, so the cursors stay where the view
+    // started them.
+    shard.bus.disconnected.set(true);
+    shard.tick_primary_rebalance().await;
+    shard.bus.disconnected.set(false);
+
+    let (batch, _) = shard.next_status_batch(PEER);
+    assert_eq!(
+        (batch[0].namespace, batch[0].view),
+        (namespace(TAKEN_OVER).inner(), 1)
+    );
+}
+
 /// The bus refused the probe, so the peer never got its reports.
 #[compio::test]
 async fn given_an_unsent_probe_when_probing_again_should_carry_its_reports() {

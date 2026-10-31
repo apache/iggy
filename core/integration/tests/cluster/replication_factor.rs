@@ -18,7 +18,7 @@
 //! A topic's replication factor bounds the nodes that store each partition,
 //! while a client connected to any node still reaches every partition.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -27,8 +27,9 @@ use super::register_forwarding::connect_without_login;
 use crate::server::http_client::{HttpClient, node_url};
 use iggy::prelude::*;
 use iggy_common::{HeaderKey, HeaderValue, topic_option_keys};
-use integration::harness::TestHarness;
+use integration::harness::{TestHarness, TestServerConfig, resolve_config_paths};
 use integration::iggy_harness;
+use serial_test::parallel;
 use tokio::time::{sleep, timeout};
 
 const STREAM_NAME: &str = "replication-factor-stream";
@@ -280,7 +281,18 @@ async fn send_within_budget(
     partition_id: u32,
     payload: &str,
 ) {
-    timeout(POLL_BUDGET, async {
+    send_within(client, stream, topic, partition_id, payload, POLL_BUDGET).await;
+}
+
+async fn send_within(
+    client: &TcpClient,
+    stream: &Identifier,
+    topic: &Identifier,
+    partition_id: u32,
+    payload: &str,
+    budget: Duration,
+) {
+    timeout(budget, async {
         loop {
             let mut messages = vec![IggyMessage::from_str(payload).unwrap()];
             if client
@@ -744,6 +756,102 @@ async fn given_a_factor_of_two_when_its_primary_returns_on_empty_storage_should_
         .map(|message| message.payload.as_ref().to_vec())
         .collect();
     assert_eq!(payloads, [b"before-wipe".to_vec(), b"after-wipe".to_vec()]);
+}
+
+/// Cut off long enough that a primary hearing no member steps down: past the
+/// 5 second `heartbeat_timeout`.
+const STEP_DOWN_ISOLATION: Duration = Duration::from_secs(8);
+/// Views the pair goes through before the rebuilt member must have led one.
+const STEP_DOWN_ROUNDS: usize = 6;
+
+/// A member rebuilt by a state transfer after it came back on empty storage
+/// must elect like any other. Restarting the other member moves the pair to
+/// new views until the rebuilt member leads one. It is then cut off from its
+/// peers until it steps down, and the pair must elect again after the heal.
+#[tokio::test(flavor = "multi_thread")]
+#[parallel]
+async fn given_a_member_rebuilt_by_state_transfer_when_each_leader_steps_down_should_elect_again() {
+    let mut harness = relayed_cluster();
+    harness.start().await.expect("start the cluster");
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    let admin = root_client(&harness, 0).await;
+    create_factor_two_topic(&admin, Durability::Persisted).await;
+    let route = partition_route(&admin, &stream, &topic, 0).await;
+    let rebuilt = route.primary_replica;
+    let members = admin
+        .get_topic(&stream, &topic)
+        .await
+        .unwrap()
+        .unwrap()
+        .partitions[0]
+        .members
+        .clone();
+    let outsider = (0..3)
+        .find(|node| !members.contains(node))
+        .expect("a factor of two leaves one of three nodes out");
+    send_within_budget(&admin, &stream, &topic, 0, "before-wipe").await;
+    drop(admin);
+    sleep(STORAGE_EPOCH_SKEW).await;
+
+    harness
+        .restart_node_from_clean_slate(usize::from(rebuilt))
+        .unwrap();
+    let client = login_within_budget(&harness, usize::from(outsider)).await;
+    // Both members ack every write, so this commits only once the transfer
+    // gave the rebuilt member the history.
+    send_within(&client, &stream, &topic, 0, "after-wipe", REJOIN_BUDGET).await;
+
+    let mut view = route.view;
+    let mut rebuilt_led = false;
+    for round in 0..STEP_DOWN_ROUNDS {
+        let route = timeout(REJOIN_BUDGET, async {
+            loop {
+                let route = partition_route(&client, &stream, &topic, 0).await;
+                if route.view > view {
+                    break route;
+                }
+                sleep(POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("the pair's new view reaches the outsider");
+        view = route.view;
+        let primary = usize::from(route.primary_replica);
+        if route.primary_replica == rebuilt {
+            harness.isolate_node(primary).unwrap();
+            sleep(STEP_DOWN_ISOLATION).await;
+            harness.heal_node(primary).unwrap();
+            send_within(&client, &stream, &topic, 0, "stepped-down", REJOIN_BUDGET).await;
+            rebuilt_led = true;
+            break;
+        }
+        harness.restart_node(primary).unwrap();
+        send_within(
+            &client,
+            &stream,
+            &topic,
+            0,
+            &format!("round-{round}"),
+            REJOIN_BUDGET,
+        )
+        .await;
+    }
+    assert!(rebuilt_led, "node {rebuilt} never led the pair");
+}
+
+fn relayed_cluster() -> TestHarness {
+    let overrides = HashMap::from([("sharding.cpu_allocation".to_owned(), "2".to_owned())]);
+    TestHarness::builder()
+        .server(
+            TestServerConfig::builder()
+                .extra_envs(resolve_config_paths(&overrides).expect("valid server config paths"))
+                .build(),
+        )
+        .cluster_nodes(3)
+        .peer_relays()
+        .build()
+        .expect("build the harness")
 }
 
 /// Both members of a partition come back on empty storage. Neither serves

@@ -491,14 +491,14 @@ impl StreamsInner {
                 });
             }
         }
+        if !partitions.is_empty() && self.apply_context.metadata_op == 0 {
+            return Some(ApplyReply::err(IggyError::InvalidCommand.as_code()));
+        }
         if deletes {
             self.take_over_group_deletions(stream_id, topic_id);
         }
         if partitions.is_empty() {
             return None;
-        }
-        if self.apply_context.metadata_op == 0 {
-            return Some(ApplyReply::err(IggyError::InvalidCommand.as_code()));
         }
         let mut intent = LifecycleIntent {
             context: self.apply_context,
@@ -1791,6 +1791,21 @@ mod tests {
                 &create_partitions.to_bytes()
             ),
             "only a delete of the scope takes a group deletion over"
+        );
+
+        let refused = apply(
+            &streams,
+            Operation::DeleteTopic,
+            &delete,
+            ApplyContext {
+                metadata_op: 0,
+                ..context()
+            },
+        );
+        assert_eq!(refused.code, IggyError::InvalidCommand.as_code());
+        assert!(
+            streams.lifecycle_pending(INTENT_OP),
+            "a refused delete leaves the group deletion in place"
         );
 
         let reply = apply(
