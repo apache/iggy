@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use iggy::prelude::*;
+use iggy_common::BINARY_OPERATION_TIMEOUT;
 use integration::harness::ext_auth_server::{
     EXT_AUTH_IGGY_USERNAME, EXT_AUTH_PASSWORD, EXT_AUTH_USERNAME, EXT_DENIED_PASSWORD,
     EXT_DENIED_USERNAME, ExtAuthServer,
@@ -359,7 +360,9 @@ mod serialized {
 
     #[tokio::test]
     async fn given_ext_auth_when_callout_cap_saturated_should_return_retryable_error() {
-        let ext_server = ExtAuthServer::start_slow(Duration::from_secs(30)).await;
+        // The overflow login retries until its operation timeout, so a callout
+        // that ends before it frees a slot and lets a retry reach the service.
+        let ext_server = ExtAuthServer::start_slow(BINARY_OPERATION_TIMEOUT * 2).await;
         let mut envs = ext_auth_envs(&ext_server.url());
         envs.insert("IGGY_EXTERNAL_AUTH_TIMEOUT".to_owned(), "60 s".to_owned());
         envs.insert(
