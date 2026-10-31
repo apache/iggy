@@ -76,6 +76,7 @@ pub(crate) mod sysinfo_printer;
 
 // support: shared plumbing.
 pub(crate) mod cluster_meta;
+pub(crate) mod external_auth;
 pub(crate) mod partition_helpers;
 pub mod server_error;
 pub(crate) mod sysinfo_probe;

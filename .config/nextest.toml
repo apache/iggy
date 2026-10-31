@@ -75,6 +75,21 @@ max-threads = 1
 filter = 'binary_id(iggy-gateway-kafka::kafka_client_e2e_tests)'
 test-group = "kafka_client_e2e"
 
+# Each ext-auth test spawns its own iggy-server + mock HTTP server. Each server opens io_uring
+# rings and listener sockets, so running all 24 at once wastes descriptors for no coverage gain.
+[test-groups.ext-auth]
+max-threads = 4
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(/external_auth/)'
+test-group = "ext-auth"
+
+# external_auth::serialized contains timing-dependent tests (fixed sleeps, exact request
+# counts). Adding a test to that module picks up this override automatically.
+[[profile.default.overrides]]
+filter = 'package(integration) and test(/external_auth::serialized/)'
+threads-required = "num-cpus"
+
 # The chaos monkey runs a five-node cluster for minutes (IGGY_TEST_CHAOS_DURATION_SECS, 120 by
 # default), then drains and verifies. It needs the whole box, so its kill and restart timing is
 # not distorted by other tests, and a timeout above the default 300 s. The cap is one hour.
