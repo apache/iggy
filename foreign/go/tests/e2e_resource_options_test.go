@@ -120,8 +120,8 @@ func TestE2E_StreamRename(t *testing.T) {
 		assert.Equal(t, created.EncryptionKekFingerprints(), renamed.EncryptionKekFingerprints())
 
 		partitionId := uint32(0)
-		polled, err := connected.PollMessages(ctx, streamId, topicId,
-			iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), 1, false, &partitionId)
+		polled, err := connected.PollMessages(ctx, streamId, topicId, partitionId,
+			iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), countOptions(1, false))
 		require.NoError(t, err)
 		require.Len(t, polled.Messages, 1)
 		assert.Equal(t, payload, polled.Messages[0].Payload)

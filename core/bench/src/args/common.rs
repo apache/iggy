@@ -30,13 +30,12 @@ use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use iggy::prelude::{
-    DEFAULT_POLL_MAX_BYTES, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, DeferredPollOptions,
-    IggyByteSize, IggyDuration, IggyError, IggyExpiry, TransportProtocol,
+    DEFAULT_POLL_MAX_BYTES, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyByteSize,
+    IggyDuration, IggyError, IggyExpiry, PollOptions, TransportProtocol,
 };
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE};
 use iggy_binary_protocol::requests::messages::{
-    MAX_DEFERRED_POLL_TIMEOUT_US, MAX_DEFERRED_POLL_WAIT_US, MIN_DEFERRED_POLL_MAX_BYTES,
-    MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+    MAX_DEFERRED_POLL_WAIT_US, MIN_DEFERRED_POLL_MAX_BYTES,
 };
 use iggy_binary_protocol::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
 use std::num::NonZeroU32;
@@ -71,10 +70,6 @@ pub struct IggyBenchArgs {
     /// Defaults to 1 MiB, or to one full batch when that is larger.
     #[arg(long)]
     pub max_bytes: Option<u32>,
-
-    /// Overall budget for routing, readiness, I/O and response handling.
-    #[arg(long, default_value_t = DeferredPollOptions::default().request_timeout)]
-    pub request_timeout: IggyDuration,
 
     /// Number of message batches per actor (producer / consumer / producing consumer).
     /// This argument is mutually exclusive with `total_messages_size`.
@@ -142,14 +137,17 @@ pub struct IggyBenchArgs {
 }
 
 impl IggyBenchArgs {
-    pub fn poll_options(&self) -> DeferredPollOptions {
-        DeferredPollOptions {
+    /// Each actor sets its own `count` and `commit`. The `count` here is the smallest
+    /// batch, which `--min-count` must fit.
+    pub fn poll_options(&self) -> PollOptions {
+        PollOptions {
+            count: self.messages_per_batch.min(),
             max_wait: self.max_wait,
             min_count: self.min_count,
             max_bytes: self
                 .max_bytes
                 .unwrap_or_else(|| self.batch_reply_bytes().max(DEFAULT_POLL_MAX_BYTES)),
-            request_timeout: self.request_timeout,
+            ..PollOptions::default()
         }
     }
 
@@ -173,12 +171,9 @@ impl IggyBenchArgs {
                 self.messages_per_batch.min()
             ),
             IggyError::InvalidCommand => format!(
-                "--max-wait {} must be at most {}, and --request-timeout {} must be at least --max-wait plus {} and at most {}",
+                "--max-wait {} must be at most {}",
                 self.max_wait,
-                duration(MAX_DEFERRED_POLL_WAIT_US),
-                self.request_timeout,
-                duration(MIN_DEFERRED_POLL_REPLY_MARGIN_US),
-                duration(MAX_DEFERRED_POLL_TIMEOUT_US)
+                duration(MAX_DEFERRED_POLL_WAIT_US)
             ),
             IggyError::InvalidSizeBytes => format!(
                 "--max-bytes {} must be at least {MIN_DEFERRED_POLL_MAX_BYTES}",
@@ -194,6 +189,12 @@ impl IggyBenchArgs {
             self.benchmark_kind,
             BenchmarkKindCommand::PinnedProducer(_) | BenchmarkKindCommand::BalancedProducer(_)
         )
+    }
+
+    /// The request timeout that the SDK derives from `--max-wait`. Result names keep it, so
+    /// they stay comparable with older results.
+    fn request_timeout(&self) -> IggyDuration {
+        self.poll_options().request_timeout()
     }
 
     pub fn transport_command(&self) -> &BenchmarkTransportCommand {
@@ -216,7 +217,7 @@ impl IggyBenchArgs {
     }
 
     pub fn validate(&mut self) {
-        if let Err(error) = self.poll_options().validate(self.messages_per_batch.min()) {
+        if let Err(error) = self.poll_options().validate() {
             Self::command()
                 .error(ErrorKind::ValueValidation, self.poll_options_error(&error))
                 .exit();
@@ -508,7 +509,7 @@ impl IggyBenchArgs {
                 self.max_wait,
                 self.min_count,
                 self.poll_options().max_bytes,
-                self.request_timeout
+                self.request_timeout()
             ));
         }
 
@@ -569,7 +570,7 @@ impl IggyBenchArgs {
                 self.max_wait,
                 self.min_count,
                 self.poll_options().max_bytes,
-                self.request_timeout
+                self.request_timeout()
             );
         }
 
@@ -598,10 +599,7 @@ mod tests {
 
     fn poll_error(arguments: &[&str]) -> String {
         let args = parse(arguments);
-        let error = args
-            .poll_options()
-            .validate(args.messages_per_batch.min())
-            .unwrap_err();
+        let error = args.poll_options().validate().unwrap_err();
         args.poll_options_error(&error)
     }
 
@@ -621,9 +619,9 @@ mod tests {
     #[test]
     fn poll_option_errors_should_name_the_flag() {
         assert!(poll_error(&["-P", "10", "--min-count", "11"]).starts_with("--min-count 11 "));
-        assert!(
-            poll_error(&["--max-wait", "5s", "--request-timeout", "5s"])
-                .contains("--request-timeout 5s must be at least --max-wait plus 1s")
+        assert_eq!(
+            poll_error(&["--max-wait", "11m"]),
+            "--max-wait 11m must be at most 10m"
         );
         assert!(poll_error(&["--max-bytes", "1"]).starts_with("--max-bytes 1 "));
     }
@@ -636,10 +634,12 @@ mod tests {
 
         let consumer = parse(&["-b", "10"]);
         assert!(consumer.generate_dir_name().contains("_wait1s_min1_"));
+        assert!(consumer.generate_dir_name().contains("_timeout11s"));
         assert!(
             consumer
                 .generate_pretty_name()
                 .contains(", wait 1s, min 1,")
         );
+        assert!(consumer.generate_pretty_name().contains(", timeout 11s"));
     }
 }

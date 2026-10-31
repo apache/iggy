@@ -16,241 +16,58 @@
 // under the License.
 
 using System.Runtime.CompilerServices;
-using Apache.Iggy.Contracts;
-using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
-using Apache.Iggy.Kinds;
-using Microsoft.Extensions.Logging;
+using Apache.Iggy.Mappers;
 
 namespace Apache.Iggy.Consumers;
 
 public partial class IggyConsumer
 {
     /// <summary>
-    ///     Receives messages asynchronously as an async stream of rented messages. Each yielded
-    ///     <see cref="ReceivedRentedMessage" /> shares its underlying pooled buffer with the other messages from the
-    ///     same poll and MUST be disposed by the caller when processing is complete. The buffer is returned to the
-    ///     pool once every message of its batch has been disposed. The stream ends once the consumer is disposed.
+    ///     Receives messages as <see cref="ReceiveAsync" /> does, each a <see cref="ReceivedRentedMessage" /> that shares
+    ///     the pooled buffer of its batch and MUST be disposed by the caller when processing is complete. The buffer
+    ///     returns to the pool once every message of its batch has been disposed. The stream ends once the consumer
+    ///     shuts down.
     /// </summary>
     /// <param name="ct">Cancellation token to stop receiving messages.</param>
-    /// <returns>An async enumerable of rented messages.</returns>
     /// <exception cref="ConsumerNotInitializedException">Thrown when <see cref="InitAsync" /> has not been called.</exception>
     public async IAsyncEnumerable<ReceivedRentedMessage> ReceiveRentedAsync(
         [EnumeratorCancellation] CancellationToken ct = default)
     {
-        if (IsDisposed)
+        ThrowIfNotReading();
+        while (await NextBatchAsync(ct) is { } batch)
         {
-            yield break;
-        }
-        if (!_isInitialized)
-        {
-            throw new ConsumerNotInitializedException();
-        }
-
-        do
-        {
-            if (!_rentedChannel.Reader.TryRead(out var message))
+            var checkpoints = Enumerable.Range(0, batch.Messages.Count).Select(batch.CheckpointAt).ToArray();
+            var handle = new RentedBatchHandle(BinaryMapper.ToRentedMessages(batch));
+            try
             {
-                await PollRentedMessagesCoreAsync(ct);
-                continue;
-            }
-
-            if (!BeginDelivery(message.CurrentOffset, message.PartitionId, message.Context))
-            {
-                message.Dispose();
-                yield break;
-            }
-            yield return message;
-
-            if (_config.AutoCommitMode == AutoCommitMode.AfterReceive)
-            {
-                await CommitDeliveredAsync(message.CurrentOffset, message.PartitionId, message.Context, ct);
-            }
-        } while (!ct.IsCancellationRequested && !IsDisposed);
-    }
-
-    /// <summary>
-    ///     Publishes a single rented message from a polled batch to the consumer channel. Called once per
-    ///     message during <see cref="PollRentedMessagesAsync" />. The caller acquires a reference on
-    ///     <paramref name="rental" /> before invocation; the channel reader is expected to release that
-    ///     reference by disposing the produced <see cref="ReceivedRentedMessage" />. Override to redirect
-    ///     rented batches to a different sink (e.g. typed deserialization) — overrides must ensure the
-    ///     acquired reference is released exactly once on every path.
-    /// </summary>
-    /// <param name="rental">Reference-counted handle around the polled batch. Caller has already acquired one reference.</param>
-    /// <param name="message">
-    ///     The rented message to publish. Payload and raw headers are slices of pooled memory tied to
-    ///     <paramref name="rental" />.
-    /// </param>
-    /// <param name="partitionId">Partition the message was polled from.</param>
-    /// <param name="status">Outcome of any prior processing (e.g. decryption).</param>
-    /// <param name="error">Exception captured if <paramref name="status" /> is non-success; otherwise null.</param>
-    /// <param name="ct">Cancellation token.</param>
-    protected virtual async Task PublishRentedAsync(RentedBatchHandle rental,
-        RentedMessageResponse message,
-        uint partitionId,
-        MessageStatus status,
-        Exception? error,
-        CancellationToken ct)
-    {
-        await _rentedChannel.Writer.WriteAsync(new ReceivedRentedMessage
-        {
-            Handle = rental,
-            Message = message,
-            CurrentOffset = message.Header.Offset,
-            PartitionId = partitionId,
-            Context = rental.Context,
-            Status = status,
-            Error = error
-        }, ct);
-    }
-
-    /// <summary>
-    ///     Polls a rented batch from the server and publishes it via <see cref="PublishRentedAsync" />.
-    ///     Handles offset tracking and auto-commit logic. Rental lifetime is managed via
-    ///     <see cref="RentedBatchHandle" /> shared by every produced message.
-    /// </summary>
-    /// <exception cref="ObjectDisposedException">The consumer is disposed.</exception>
-    protected async Task PollRentedMessagesAsync(CancellationToken ct)
-    {
-        ObjectDisposedException.ThrowIf(IsDisposed, this);
-        await PollRentedMessagesCoreAsync(ct);
-    }
-
-    /// <summary>
-    ///     The poll of the built-in receive loops. Once the consumer is disposed it returns without polling, and the
-    ///     loop ends instead of failing.
-    /// </summary>
-    private protected async Task PollRentedMessagesCoreAsync(CancellationToken ct)
-    {
-        if (IsDisposed)
-        {
-            return;
-        }
-
-        if (!_joinedConsumerGroup || !IsGroupMembershipCurrent())
-        {
-            LogConsumerGroupNotJoinedYetSkippingPolling();
-            await TryRecoverGroupMembershipAsync(ct);
-            return;
-        }
-
-        ThrowIfAutoCommitWithEncryptor();
-
-        await _pollingSemaphore.WaitAsync(ct);
-
-        PolledMessagesRental? rental = null;
-        RentedBatchHandle? batchHandle = null;
-        var polledPartition = PolledMessages.NoAssignedPartition;
-        try
-        {
-            if (_config.PollingIntervalMs > 0)
-            {
-                await WaitBeforePollingAsync(ct);
-            }
-
-            rental = await _client.PollMessagesRentedAsync(_config.StreamId, _config.TopicId,
-                _config.PartitionId, _config.Consumer, partitionId =>
+                var rental = handle.Rental;
+                for (var index = 0; index < rental.Messages.Count; index++)
                 {
-                    polledPartition = partitionId;
-                    return PollingStrategyFor(partitionId);
-                }, _config.BatchSize, _config.AutoCommit, ct);
-
-            if (rental.Messages.Count == 0)
-            {
-                if (rental.PartitionId == PolledMessages.NoAssignedPartition)
-                {
-                    // Partitions come back under a new owner generation, which refuses a kept continuation.
-                    _nextPollingStrategies.Clear();
-                    LogNoPartitionAssignedBackingOff(NoAssignedPartitionBackoffMs);
-                    await Task.Delay(NoAssignedPartitionBackoffMs, ct);
-                    return;
-                }
-
-                if (_logger.IsEnabled(LogLevel.Debug))
-                {
-                    _logger.LogDebug("No messages received from poll for partition {PartitionId}", rental.PartitionId);
-                }
-
-                return;
-            }
-
-            RememberPolledContext(rental.PartitionId, rental.Context);
-            var hasLastOffset = _lastPolledOffset.TryGetValue(rental.PartitionId, out var lastPolledPartitionOffset);
-
-            var currentOffset = 0ul;
-
-            batchHandle = new RentedBatchHandle(rental);
-            var anyNewMessages = false;
-            foreach (var message in rental.Messages)
-            {
-                if (hasLastOffset && message.Header.Offset <= lastPolledPartitionOffset)
-                {
-                    continue;
-                }
-
-                currentOffset = message.Header.Offset;
-                batchHandle.Acquire();
-                try
-                {
-                    await PublishRentedAsync(batchHandle, message, rental.PartitionId, MessageStatus.Success, null, ct);
-                }
-                catch
-                {
-                    batchHandle.Release();
-                    throw;
-                }
-
-                anyNewMessages = true;
-            }
-
-            if (!anyNewMessages)
-            {
-                if (_config.AutoCommitMode != AutoCommitMode.Disabled)
-                {
-                    if (_logger.IsEnabled(LogLevel.Debug))
+                    if (ct.IsCancellationRequested || IsDisposed)
                     {
-                        _logger.LogDebug(
-                            "No new messages found, committing offset {Offset} for partition {PartitionId}",
-                            lastPolledPartitionOffset, rental.PartitionId);
+                        yield break;
                     }
 
-                    await StoreOffsetAsync(lastPolledPartitionOffset, rental.PartitionId, rental.Context, ct);
+                    var message = rental.Messages[index];
+                    Hand(checkpoints[index]!, index == rental.Messages.Count - 1);
+                    handle.Acquire();
+                    yield return new ReceivedRentedMessage
+                    {
+                        Handle = handle,
+                        Message = message,
+                        CurrentOffset = message.Header.Offset,
+                        PartitionId = batch.PartitionId,
+                        Context = batch.Context,
+                        Checkpoint = checkpoints[index]
+                    };
+                    CountProcessed();
                 }
-
-                return;
             }
-
-            _lastPolledOffset[rental.PartitionId] = currentOffset;
-            RememberNextPollingStrategy(rental.PartitionId, currentOffset, rental.Context);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (MessageDecryptionException ex)
-        {
-            LogFailedToDecryptMessage(ex, ex.Offset, ex.PartitionId);
-            throw;
-        }
-        // Without an operation id nothing is retained to resolve, so the next poll can run.
-        catch (Exception ex) when (ex is not (MalformedResponseException
-            or VsrRequestOutcomeUnknownException { OperationId: not null } or VsrLaneBlockedException))
-        {
-            await ReportPollFailureAsync(ex, polledPartition, ct);
-        }
-        finally
-        {
-            if (batchHandle is not null)
+            finally
             {
-                batchHandle.Release();
+                handle.Release();
             }
-            else
-            {
-                rental?.Dispose();
-            }
-
-            _pollingSemaphore.Release();
         }
     }
 }

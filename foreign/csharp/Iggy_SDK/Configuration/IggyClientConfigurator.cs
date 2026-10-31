@@ -50,6 +50,11 @@ public sealed class IggyClientConfigurator
     ///     The largest response frame accepted over <see cref="Enums.Protocol.Tcp" />, in bytes.
     ///     Default is 64 MiB, minimum is the 256-byte header.
     /// </summary>
+    /// <remarks>
+    ///     A read returns its first message even when the message is larger than the byte limit of the read, and a
+    ///     message can take up to 64,000,000 bytes of payload and 100,000 bytes of user headers. The default holds
+    ///     such a reply with its headers (64,156,564 bytes). A lower limit fails the read of a larger message.
+    /// </remarks>
     public int MaxResponseFrameSize { get; set; } = 64 * 1024 * 1024;
 
     /// <summary>
@@ -60,7 +65,7 @@ public sealed class IggyClientConfigurator
 
     /// <summary>
     ///     Maximum bytes of frozen mutation headers and bodies across active and retained operations.
-    ///     A replay shares its original reservation. Default is 64 MiB; minimum is one 256-byte header.
+    ///     A replay shares its original reservation. Default is 64 MiB. Minimum is one 256-byte header.
     /// </summary>
     public long MaxPendingOperationBytes { get; init; } = DEFAULT_MAX_PENDING_OPERATION_BYTES;
 
@@ -83,7 +88,7 @@ public sealed class IggyClientConfigurator
     ///     connected, so an idle session survives the server's heartbeat verification and consumer-group
     ///     assignments stay fresh. Each heartbeat also restarts the replica links that used up their
     ///     <see cref="ReconnectionSettings.MaxRetries" />, with a fresh budget, so a signed-in client recovers
-    ///     from an outage longer than one reconnect burst. Default is 5 seconds; must be between 1 millisecond
+    ///     from an outage longer than one reconnect burst. Default is 5 seconds. Must be between 1 millisecond
     ///     and about 49 days. Init-only: the client validates the interval once and hands it to a timer that
     ///     would fault on an out-of-range value.
     /// </summary>

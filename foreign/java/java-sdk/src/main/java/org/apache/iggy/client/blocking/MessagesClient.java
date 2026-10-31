@@ -23,9 +23,11 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.CommitPolicy;
 import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.message.PollOptions;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
@@ -34,6 +36,31 @@ import java.util.List;
 import java.util.Optional;
 
 public interface MessagesClient {
+
+    /**
+     * Polls one partition with the limits and the commit policy of {@code options}, as
+     * {@link org.apache.iggy.client.async.MessagesClient#pollMessages(StreamId, TopicId, long, Consumer,
+     * PollingStrategy, PollOptions)} describes. Over HTTP a poll with {@link CommitPolicy#onRead()} is a POST, which no
+     * proxy or client library resends, and a consumer group cannot poll. A poll that stores its offset waits for its
+     * reply also when the calling thread is interrupted, because a cancel can lose what the server stored.
+     *
+     * @param streamId    the stream identifier
+     * @param topicId     the topic identifier
+     * @param partitionId the partition, 0 to 4294967295
+     * @param consumer    the consumer whose offset {@code Next} reads and a commit stores
+     * @param strategy    where the poll starts
+     * @param options     the limits and the commit policy
+     * @return the messages of the partition
+     */
+    default PolledMessages pollMessages(
+            StreamId streamId,
+            TopicId topicId,
+            long partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            PollOptions options) {
+        throw new IggyOperationNotSupportedException("pollMessages", getClass().getSimpleName());
+    }
 
     default PolledMessages pollMessages(
             Long streamId,
@@ -129,9 +156,13 @@ public interface MessagesClient {
      * consumer over HTTP: without a persistent connection the client cannot follow the group's
      * partition assignment. A group consumer is rejected before any request is sent.
      *
+     * <p>A group poll must name its partition. Without one, the TCP client fails with
+     * {@link org.apache.iggy.exception.IggyErrorCode#INVALID_COMMAND} before it sends anything.
+     * A {@link org.apache.iggy.client.blocking.reader.PartitionReader} reads the whole assignment of a group.
+     *
      * @param streamId    the stream identifier (numeric or string-based)
      * @param topicId     the topic identifier (numeric or string-based)
-     * @param partitionId optional partition ID to poll from
+     * @param partitionId the partition ID to poll from, which only a plain consumer can leave empty
      * @param consumer    the consumer identity
      * @param strategy    the polling strategy controlling where to start reading
      * @param count       the maximum number of messages to return

@@ -20,6 +20,7 @@
 package org.apache.iggy.serde;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.cluster.ClusterNode;
@@ -34,6 +35,8 @@ import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyMalformedResponseException;
 import org.apache.iggy.message.BytesMessageId;
+import org.apache.iggy.message.DecodeFailure;
+import org.apache.iggy.message.FetchedMessages;
 import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.message.HeaderValue;
@@ -85,8 +88,16 @@ import java.util.function.Supplier;
  */
 public final class BytesDeserializer {
 
+    /** The section count that opens a fetch reply. */
+    public static final int FETCH_SECTIONS_COUNT_BYTES = Integer.BYTES;
+    /** A fetch section: partition id, status, current offset, message count, context, next offset, records length. */
+    public static final int FETCH_SECTION_BYTES = 4 * Integer.BYTES + 2 * Long.BYTES + PartitionContext.ENCODED_SIZE;
+
     private static final int CONSUMER_GROUP_ASSIGNMENT_ENTRY_BYTES = Integer.BYTES;
+    private static final int READY_PARTITION_BYTES = Integer.BYTES;
     private static final int SEND_CONFIRMATION_BYTES = 3 * Integer.BYTES + Long.BYTES;
+    // A fetch names at most this many partitions, MAX_PARTITIONS_PER_REQUEST in core/binary_protocol/src/lib.rs.
+    private static final int MAX_FETCH_SECTIONS = 1000;
     private static final int MIN_CLUSTER_NODE_BYTES = 19;
     // A one-character key (length byte plus a byte of name), kind and flags
     // bytes, and empty length-prefixed default and description.
@@ -256,14 +267,103 @@ public final class BytesDeserializer {
         var currentOffset = readU64AsBigInteger(response);
         var messagesCount = response.readUnsignedIntLE();
         var context = readPartitionContext(response);
+        return new PolledMessages(
+                partitionId, currentOffset, messagesCount, readMessages(response, messagesCount), context);
+    }
+
+    /** Reads the batch records of a poll reply or of a fetch section, which must hold {@code count} messages. */
+    public static List<Message> readMessages(ByteBuf records, long count) {
         var messages = new ArrayList<Message>();
-        while (response.isReadable()) {
-            readBatchRecord(response, messages);
+        while (records.isReadable()) {
+            readBatchRecord(records, messages);
         }
-        if (messages.size() != messagesCount) {
+        if (messages.size() != count) {
             throw new IggyMalformedResponseException("Poll count does not match its messages");
         }
-        return new PolledMessages(partitionId, currentOffset, messagesCount, messages, context);
+        return messages;
+    }
+
+    /**
+     * Reads the batch records of a poll reply or of a fetch section into {@code messages} up to the first message that
+     * does not decode, and returns its failure with the bytes received from it on. The messages before it stay in
+     * {@code messages}. Every failure of this decoder is malformed framing, no check runs after a frame header, so the
+     * failure never names an offset.
+     */
+    public static Optional<DecodeFailure> readMessagesUntilMalformed(ByteBuf records, List<Message> messages) {
+        while (records.isReadable()) {
+            int batchStart = records.readerIndex();
+            BatchHeader batch;
+            try {
+                batch = readBatchHeader(records);
+            } catch (RuntimeException malformed) {
+                return Optional.of(framingFailure(malformed, records, batchStart));
+            }
+            int blobStart = records.readerIndex();
+            ByteBuf blob = records.readSlice(batch.blobLength());
+            while (blob.isReadable()) {
+                int frameStart = blobStart + blob.readerIndex();
+                try {
+                    messages.add(readBatchMessage(blob, batch));
+                } catch (RuntimeException malformed) {
+                    return Optional.of(framingFailure(malformed, records, frameStart));
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static DecodeFailure framingFailure(RuntimeException malformed, ByteBuf records, int position) {
+        return new DecodeFailure(
+                malformed, Optional.empty(), ByteBufUtil.getBytes(records, position, records.writerIndex() - position));
+    }
+
+    /**
+     * Reads a fetch reply: the section table, then the records of each section in table order. The
+     * records of each section stay undecoded until {@link FetchedMessages#decode()}.
+     */
+    public static List<FetchedMessages> readFetchedMessages(ByteBuf response) {
+        if (response.readableBytes() < FETCH_SECTIONS_COUNT_BYTES) {
+            throw new IggyMalformedResponseException(
+                    "fetch reply has " + response.readableBytes() + " bytes, too few for its count");
+        }
+        long sectionsCount = response.readUnsignedIntLE();
+        if (sectionsCount > MAX_FETCH_SECTIONS) {
+            throw new IggyMalformedResponseException(
+                    "fetch reply has " + sectionsCount + " sections, more than a request has targets");
+        }
+        int tableBytes = (int) sectionsCount * FETCH_SECTION_BYTES;
+        if (response.readableBytes() < tableBytes) {
+            throw new IggyMalformedResponseException("fetch reply ends inside its section table");
+        }
+        ByteBuf records = response.duplicate().skipBytes(tableBytes);
+        List<FetchedMessages> sections = new ArrayList<>((int) sectionsCount);
+        for (long section = 0; section < sectionsCount; section++) {
+            var partitionId = response.readUnsignedIntLE();
+            var status = response.readUnsignedIntLE();
+            var currentOffset = readU64AsBigInteger(response);
+            var messagesCount = response.readUnsignedIntLE();
+            var context = readPartitionContext(response);
+            var nextOffset = readU64AsBigInteger(response);
+            var recordsLength = response.readUnsignedIntLE();
+            if (status != FetchedMessages.STATUS_OK && recordsLength != 0) {
+                throw new IggyMalformedResponseException(
+                        "fetch section of partition " + partitionId + " has status " + status + " and records");
+            }
+            if (recordsLength > records.readableBytes()) {
+                throw new IggyMalformedResponseException(
+                        "fetch section records of partition " + partitionId + " run past the reply");
+            }
+            byte[] sectionRecords = new byte[(int) recordsLength];
+            records.readBytes(sectionRecords);
+            sections.add(new FetchedMessages(
+                    partitionId, status, currentOffset, messagesCount, context, nextOffset, sectionRecords));
+        }
+        if (records.isReadable()) {
+            throw new IggyMalformedResponseException(
+                    "fetch reply has " + records.readableBytes() + " bytes past its sections");
+        }
+        response.skipBytes(response.readableBytes());
+        return sections;
     }
 
     /**
@@ -272,6 +372,14 @@ public final class BytesDeserializer {
      * first frame's offset delta is not necessarily zero.
      */
     private static void readBatchRecord(ByteBuf response, List<Message> messages) {
+        BatchHeader batch = readBatchHeader(response);
+        ByteBuf blob = response.readSlice(batch.blobLength());
+        while (blob.isReadable()) {
+            messages.add(readBatchMessage(blob, batch));
+        }
+    }
+
+    private static BatchHeader readBatchHeader(ByteBuf response) {
         if (response.readableBytes() < BytesSerializer.BATCH_HEADER_SIZE) {
             throw new IggyMalformedResponseException(
                     "Truncated batch header: " + response.readableBytes() + " bytes left");
@@ -289,14 +397,10 @@ public final class BytesDeserializer {
             throw new IggyMalformedResponseException("Batch length " + batchLength + " exceeds remaining payload of "
                     + response.readableBytes() + " bytes");
         }
-        ByteBuf blob = response.readSlice(blobLength.intValueExact());
-        while (blob.isReadable()) {
-            messages.add(readBatchMessage(blob, baseOffset, baseTimestamp, batchOriginTimestamp));
-        }
+        return new BatchHeader(baseOffset, baseTimestamp, batchOriginTimestamp, blobLength.intValueExact());
     }
 
-    private static Message readBatchMessage(
-            ByteBuf blob, BigInteger baseOffset, BigInteger baseTimestamp, BigInteger batchOriginTimestamp) {
+    private static Message readBatchMessage(ByteBuf blob, BatchHeader batch) {
         if (blob.readableBytes() < MessageHeader.SIZE) {
             throw new IggyMalformedResponseException(
                     "Truncated message frame header: " + blob.readableBytes() + " bytes left");
@@ -318,9 +422,9 @@ public final class BytesDeserializer {
         var header = new MessageHeader(
                 checksum,
                 id,
-                baseOffset.add(BigInteger.valueOf(offsetDelta)),
-                baseTimestamp,
-                batchOriginTimestamp.add(BigInteger.valueOf(timestampDelta)),
+                batch.baseOffset().add(BigInteger.valueOf(offsetDelta)),
+                batch.baseTimestamp(),
+                batch.originTimestamp().add(BigInteger.valueOf(timestampDelta)),
                 userHeadersLength,
                 payloadLength,
                 BigInteger.ZERO);
@@ -823,6 +927,9 @@ public final class BytesDeserializer {
     private static byte[] newByteArray(Long size) {
         return new byte[size.intValue()];
     }
+
+    private record BatchHeader(
+            BigInteger baseOffset, BigInteger baseTimestamp, BigInteger originTimestamp, int blobLength) {}
 
     private record UserHeaderField(HeaderKind kind, byte[] value) {}
 }

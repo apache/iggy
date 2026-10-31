@@ -24,6 +24,7 @@ use Iggy\Exception\IggyException;
 use Iggy\OptionSpec;
 use Iggy\OptionsScope;
 use Iggy\PollingStrategy;
+use Iggy\PollOptions;
 use Iggy\SendMessage;
 use Iggy\StreamDetails;
 use Iggy\StreamOptionKey;
@@ -37,6 +38,7 @@ use PHPUnit\Framework\TestCase;
 final class ResourceOptionsTest extends TestCase
 {
     private const FINGERPRINT_PATTERN = '/^[0-9a-f]{16}$/';
+    private const CONSUMER_ID = 1;
     private const CATEGORY_MESSAGES = [
         'invalid_command' => 'Invalid command',
         'invalid_encryption_key' => 'Invalid encryption key',
@@ -125,7 +127,7 @@ final class ResourceOptionsTest extends TestCase
         assert_same($created->encryption_kek_fingerprint, $stream->encryption_kek_fingerprint);
         assert_same(
             ['before-rename'],
-            collect_payloads($client->pollMessages($created->id, 'events', 0, PollingStrategy::offset(0), 10, false)),
+            collect_payloads($client->pollMessages($created->id, 'events', 0, self::CONSUMER_ID, PollingStrategy::offset(0), new PollOptions(count: 10))->messages),
         );
     }
 

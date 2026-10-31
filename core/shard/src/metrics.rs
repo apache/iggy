@@ -40,12 +40,14 @@ use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEn
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
-use iggy_binary_protocol::Command;
+use iggy_binary_protocol::{COMMAND_TABLE, Command, command_index};
 use iggy_common::ConsumerKind;
 use message_bus::{ReplicaLinkMetrics, ReplicaReadMetrics};
 
@@ -253,6 +255,8 @@ pub(crate) struct DeferredPollMetrics {
     pub expired: Counter,
     pub filled: Counter,
     pub late: Counter,
+    pub readiness_pushes: Counter,
+    pub readiness_watches: Gauge,
 }
 
 impl DeferredPollMetrics {
@@ -274,7 +278,7 @@ impl DeferredPollMetrics {
         );
         registry.register(
             "deferred_poll_failed",
-            "admitted deferred polls rejected by a read error, fence, read budget refusal or request deadline",
+            "admitted deferred polls rejected by a read error, fence, full completion lane or request deadline",
             self.failed.clone(),
         );
         registry.register(
@@ -296,6 +300,16 @@ impl DeferredPollMetrics {
             "deferred_poll_late",
             "deferred read completions discarded after expiry or cancellation",
             self.late.clone(),
+        );
+        registry.register(
+            "deferred_poll_readiness_pushes",
+            "partition states pushed to the shards that watch them for readiness waits",
+            self.readiness_pushes.clone(),
+        );
+        registry.register(
+            "deferred_poll_readiness_watches",
+            "partitions of this shard that other shards watch for readiness waits",
+            self.readiness_watches.clone(),
         );
     }
 }
@@ -370,6 +384,9 @@ pub struct ShardMetrics {
     consumer_offset_denied_counters: [Counter; ConsumerKind::COUNT],
     partition_consumer_offsets_stranded: Family<ConsumerOffsetKindLabel, Gauge>,
     consumer_offset_stranded_gauges: [Gauge; ConsumerKind::COUNT],
+    client_requests: ClientRequestMetrics,
+    fetches: FetchMetrics,
+    readiness_push_to_fire: Histogram,
 }
 
 impl ShardMetrics {
@@ -457,7 +474,25 @@ impl ShardMetrics {
             consumer_offset_denied_counters,
             partition_consumer_offsets_stranded,
             consumer_offset_stranded_gauges,
+            client_requests: ClientRequestMetrics::new(),
+            fetches: FetchMetrics::new(),
+            readiness_push_to_fire: latency_histogram(),
         }
+    }
+
+    /// Counts a client request by its command `code`. A code that the
+    /// command table does not hold counts as `unknown`.
+    pub fn record_client_request(&self, code: u32) {
+        self.client_requests.record(code);
+    }
+
+    /// Counts one answered fetch (109).
+    pub fn record_fetch(&self, fetch: &FetchRecord) {
+        self.fetches.record(fetch);
+    }
+
+    pub(crate) fn record_readiness_push_to_fire(&self, elapsed: Duration) {
+        self.readiness_push_to_fire.observe(elapsed.as_secs_f64());
     }
 
     pub fn record_persistence(&self, metrics: &partitions::PersistenceMetrics) {
@@ -1233,6 +1268,179 @@ impl ShardMetrics {
              against the limit",
             self.partition_consumer_offsets_stranded.clone(),
         );
+        registry.register(
+            "client_requests",
+            "client requests by command",
+            self.client_requests.total.clone(),
+        );
+        self.fetches.register(registry);
+        registry.register(
+            "readiness_push_to_fire_seconds",
+            "time from applying the pushed partition state that made a parked readiness wait \
+             ready to the end of that wait",
+            self.readiness_push_to_fire.clone(),
+        );
+    }
+
+    /// The text scrape of this handle alone, for the assertions on series
+    /// without a value accessor, such as histogram counts.
+    #[cfg(test)]
+    pub(crate) fn scrape(&self) -> String {
+        let mut registry = Registry::default();
+        self.register(&mut registry);
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry)
+            .expect("scrape encoding succeeds");
+        buffer
+    }
+}
+
+/// What one fetch (109) served, for [`ShardMetrics::record_fetch`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FetchRecord {
+    pub sections: u64,
+    /// The record bytes of the sections. A fetch without any is empty.
+    pub bytes: u64,
+    /// Ready targets that the fetch left for a later one, because its byte
+    /// budget or its read cap ran out.
+    pub budget_waits: u64,
+    /// Reads that their owner refused for its deferred poll quota.
+    pub quota_refusals: u64,
+    /// From the end of the readiness wait to the reply.
+    pub fire_to_reply: Duration,
+}
+
+/// Fetch (109) accounting on the shard of the connection.
+#[derive(Clone)]
+struct FetchMetrics {
+    fetches: Counter,
+    sections: Counter,
+    bytes: Counter,
+    empty: Counter,
+    budget_waits: Counter,
+    quota_refusals: Counter,
+    fire_to_reply: Histogram,
+}
+
+impl FetchMetrics {
+    fn new() -> Self {
+        Self {
+            fetches: Counter::default(),
+            sections: Counter::default(),
+            bytes: Counter::default(),
+            empty: Counter::default(),
+            budget_waits: Counter::default(),
+            quota_refusals: Counter::default(),
+            fire_to_reply: latency_histogram(),
+        }
+    }
+
+    fn record(&self, fetch: &FetchRecord) {
+        self.fetches.inc();
+        self.sections.inc_by(fetch.sections);
+        self.bytes.inc_by(fetch.bytes);
+        if fetch.bytes == 0 {
+            self.empty.inc();
+        }
+        self.budget_waits.inc_by(fetch.budget_waits);
+        self.quota_refusals.inc_by(fetch.quota_refusals);
+        self.fire_to_reply
+            .observe(fetch.fire_to_reply.as_secs_f64());
+    }
+
+    fn register(&self, registry: &mut Registry) {
+        registry.register("fetches", "answered fetch requests", self.fetches.clone());
+        registry.register(
+            "fetch_sections",
+            "partition sections of fetch replies",
+            self.sections.clone(),
+        );
+        registry.register(
+            "fetch_bytes",
+            "record bytes of fetch replies",
+            self.bytes.clone(),
+        );
+        registry.register(
+            "fetch_empty",
+            "fetch replies without records",
+            self.empty.clone(),
+        );
+        registry.register(
+            "fetch_budget_waits",
+            "ready fetch targets left for a later fetch by the byte budget or the read cap",
+            self.budget_waits.clone(),
+        );
+        registry.register(
+            "fetch_quota_refusals",
+            "fetch reads refused by the deferred poll quota of their owner",
+            self.quota_refusals.clone(),
+        );
+        registry.register(
+            "fetch_fire_to_reply_seconds",
+            "time from the end of the readiness wait of a fetch to its reply",
+            self.fire_to_reply.clone(),
+        );
+    }
+}
+
+/// Latency buckets from 10 us, doubling up to about 5 s.
+const LATENCY_BUCKET_START_SECONDS: f64 = 0.000_01;
+const LATENCY_BUCKET_FACTOR: f64 = 2.0;
+const LATENCY_BUCKET_COUNT: u16 = 20;
+
+fn latency_histogram() -> Histogram {
+    Histogram::new(exponential_buckets(
+        LATENCY_BUCKET_START_SECONDS,
+        LATENCY_BUCKET_FACTOR,
+        LATENCY_BUCKET_COUNT,
+    ))
+}
+
+/// The `command` of a request whose code the command table does not hold.
+const UNKNOWN_COMMAND: &str = "unknown";
+const COMMAND_COUNT: usize = COMMAND_TABLE.len();
+
+/// Label for `client_requests_total`: the command name of the table.
+#[derive(Clone, Hash, Eq, PartialEq, EncodeLabelSet, Debug)]
+struct ClientCommandLabel {
+    command: &'static str,
+}
+
+/// Client requests by command. As for frame drops, a command enters the
+/// scrape with its first request, and its later requests are an array
+/// index and an increment.
+#[derive(Clone)]
+struct ClientRequestMetrics {
+    total: Family<ClientCommandLabel, Counter>,
+    cached: Arc<[OnceLock<Counter>; COMMAND_COUNT]>,
+}
+
+impl ClientRequestMetrics {
+    fn new() -> Self {
+        Self {
+            total: Family::default(),
+            cached: Arc::new(std::array::from_fn(|_| OnceLock::new())),
+        }
+    }
+
+    fn record(&self, code: u32) {
+        let cached = command_index(code)
+            .and_then(|index| Some((self.cached.get(index)?, COMMAND_TABLE.get(index)?.name)));
+        match cached {
+            Some((counter, command)) => counter
+                .get_or_init(|| {
+                    self.total
+                        .get_or_create(&ClientCommandLabel { command })
+                        .clone()
+                })
+                .inc(),
+            None => self
+                .total
+                .get_or_create(&ClientCommandLabel {
+                    command: UNKNOWN_COMMAND,
+                })
+                .inc(),
+        };
     }
 }
 
@@ -1268,6 +1476,7 @@ impl FrameDropMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_binary_protocol::codes::FETCH_MESSAGES_CODE;
 
     #[test]
     fn frame_drop_counter_increments_per_label_set() {
@@ -1457,6 +1666,58 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn client_requests_count_by_command_name_and_unknown_codes_together() {
+        let metrics = ShardMetrics::for_shard();
+        let unknown_code = u32::MAX;
+        metrics.record_client_request(FETCH_MESSAGES_CODE);
+        metrics.record_client_request(FETCH_MESSAGES_CODE);
+        metrics.record_client_request(unknown_code);
+        let scrape = metrics.scrape();
+        let mut series: Vec<_> = scrape
+            .lines()
+            .filter(|line| line.starts_with("client_requests_total"))
+            .collect();
+        // A family encodes its series in hash order.
+        series.sort_unstable();
+        assert_eq!(
+            series,
+            [
+                "client_requests_total{command=\"message.fetch\"} 2",
+                "client_requests_total{command=\"unknown\"} 1",
+            ],
+            "a command without requests stays out of the scrape",
+        );
+    }
+
+    #[test]
+    fn fetch_records_add_up_and_count_empty_replies() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_fetch(&FetchRecord {
+            sections: 2,
+            bytes: 300,
+            budget_waits: 1,
+            quota_refusals: 1,
+            fire_to_reply: Duration::from_micros(50),
+        });
+        metrics.record_fetch(&FetchRecord::default());
+        let scrape = metrics.scrape();
+        for series in [
+            "fetches_total 2",
+            "fetch_sections_total 2",
+            "fetch_bytes_total 300",
+            "fetch_empty_total 1",
+            "fetch_budget_waits_total 1",
+            "fetch_quota_refusals_total 1",
+            "fetch_fire_to_reply_seconds_count 2",
+        ] {
+            assert!(
+                scrape.lines().any(|line| line == series),
+                "{series} is not in the scrape:\n{scrape}"
+            );
+        }
     }
 
     #[test]

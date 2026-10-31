@@ -133,7 +133,8 @@ Per `[[streams]]` entry per sink:
 
 1. Build / ensure consumer group `iggy-connect-sink-{key}` (`connect` matches the docker image name `apache/iggy-connect` - see `runtime/src/sink.rs::default_consumer_group`). Overridable via the stream config's `consumer_group`.
 2. Spawn one task per topic (`spawn_consume_tasks`).
-3. Poll Iggy → batch messages (default `batch_length = 1000`). A `consumer.next()` `Err` (transport/decode at the Iggy client boundary) bumps `errors` and `continue`s. A rejected poll committed nothing, so the consumer retries the same offset. Polls commit via `AutoCommit::When(AutoCommitWhen::PollingMessages)`, so only a reply lost after the server committed can skip its batch.
+3. Poll Iggy → batch messages (default `batch_length = 1000`, the poll `count`). Polls use `CommitPolicy::OnRead`: the server stores the offset of each reply, so a reply lost after that store skips its batch. A `consumer.next()` `Err` (a `ReadError`) bumps `errors` and `continue`s.
+   The reader retries most errors by itself. For a partition that it stops, `handle_read_error` seeks: after a read with an unknown outcome (`FetchProgressUncertain`, `PartitionLaneBlocked`) it first calls `abandon_operation` and then seeks `Next` (after the stored offset). It seeks the `skip` of a message that does not decode, and `Next` after `HistoryUnavailable`.
 4. Decode via `Schema::decoder()`. Decode failure logs + bumps `errors`. `messages_filtered` is reserved for the transform filter contract (`Ok(None)`).
 5. Apply transforms (chain). A transform `Err` is logged, bumps `errors`, and drops only that message (drop-and-continue, mirroring the source) - one bad payload never kills the batch. `Ok(None)` filters the message - bumps `messages_filtered{connector_type="sink"}`.
 6. Postcard-encode batch as `RawMessages`. Headers as a separate postcard blob. Per-message failures (missing field, payload conversion, header serialization) bump `errors` + skip. Batch-level failures (postcard serialization of metadata / `RawMessages`) propagate `Err` -> `spawn_consume_tasks` wrapper bumps `errors` + `set_error`. The total histogram and benchmark emit still fire for the failed batch before the `Err` propagates.
@@ -147,7 +148,7 @@ Stages (both labels snake_case): `decode` (schema decode loop), `prepare` (trans
 Gotchas:
 
 - Batch flushes when a message is the last one in its partition (`message_offset == current_offset`), when the batch is full, OR before a message of another partition, because the plugin gets one partition id per batch. `max_wait` and `min_count` on the stream make the server collect larger replies.
-- Auto-commit happens on poll, so sink delivery is at-most-once: a crash after the poll and before the plugin write loses that batch.
+- The server stores the offset on read (`OnRead`), so sink delivery is at-most-once while the primary stays up: a crash after the poll and before the plugin write loses that batch. A failover before the store replicates can deliver the last batch again.
 - A stop still flushes the batch the loop holds, and the task then awaits `IggyConsumer::shutdown`, which rewinds over the batches the consumer holds. Without either step, the next run skips messages that the polls committed.
 
 ## Logging format

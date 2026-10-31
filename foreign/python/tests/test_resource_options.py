@@ -49,6 +49,7 @@ from apache_iggy import (
     PartitionResizePolicy,
     Permissions,
     PollingStrategy,
+    PollOptions,
     QuicConfig,
     QuicReconnectionConfig,
     Stream,
@@ -186,15 +187,14 @@ class TestStreamOptions:
             renamed.encryption_kek_fingerprints == created.encryption_kek_fingerprints
         )
         polled = await transport_client.poll_messages(
-            stream=new_name,
-            topic=topic_name,
+            new_name,
+            topic_name,
             consumer=Consumer.Single("stream-rename"),
             partition_id=0,
             polling_strategy=PollingStrategy.First(),
-            count=1,
-            auto_commit=False,
+            options=PollOptions(count=1),
         )
-        assert [message.payload().decode() for message in polled] == [payload]
+        assert [message.payload().decode() for message in polled.messages] == [payload]
 
     @pytest.mark.asyncio
     async def test_given_stream_key_reset_when_updating_should_reject_without_changing_state(  # noqa: E501

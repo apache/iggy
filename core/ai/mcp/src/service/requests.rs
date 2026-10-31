@@ -206,7 +206,9 @@ pub struct PollMessages {
     #[schemars(description = "timestamp to start from (optional, microseconds from Unix Epoch)")]
     pub timestamp: Option<u64>,
 
-    #[schemars(description = "count (optional, must be greater than 0)")]
+    #[schemars(
+        description = "count (optional, must be greater than 0); one reply stops at 1 MiB of messages, so it can return fewer than count"
+    )]
     pub count: Option<u32>,
 
     #[schemars(description = "auto commit (optional, boolean)")]

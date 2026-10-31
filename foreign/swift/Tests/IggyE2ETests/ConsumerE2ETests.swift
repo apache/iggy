@@ -45,29 +45,34 @@ private func read(_ consumer: IggyConsumer, _ count: Int, timeout: Duration = .s
 
 @Suite("Consumer", requiresServer)
 struct ConsumerE2ETests {
-    /// The default auto-commit stores with every poll, so a second consumer
-    /// of the same name resumes after what the first one read.
-    @Test func aConsumerResumesAfterTheOffsetItStored() async throws {
+    /// Each policy stores the position after the last message handed over
+    /// by the shutdown: the server with the read and the shutdown moving it
+    /// back over what was not handed over, or the consumer flushing what it
+    /// counted. A second consumer of the same name resumes after it.
+    @Test(arguments: [CommitPolicy.onRead, .auto(.default), .auto(AutoCommit(interval: .seconds(60), after: .delivery))])
+    func aConsumerResumesAfterTheLastMessageHandedOver(commit: CommitPolicy) async throws {
         try await E2EEnvironment.withSession { session in
             let client = session.client
             let scratch = try await session.scratchTopic(partitions: 1)
             let name = E2EEnvironment.uniqueName("swift-e2e-reader")
             var batch = try E2EEnvironment.messages(5)
             try await client.sendMessages(streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(0), messages: &batch)
+            let configuration = ConsumerConfiguration(pollOptions: PollOptions(count: 5, maxWait: .seconds(1), commit: commit))
 
-            let first = try client.consumer(name: name, streamID: scratch.stream, topicID: scratch.topic, partitionID: 0)
+            let first = try client.consumer(name: name, streamID: scratch.stream, topicID: scratch.topic, partitions: [0], configuration: configuration)
             try await first.initialize()
-            let received = try await read(first, 5)
-            #expect(received.map(\.message.payloadString) == (0..<5).map { "message \($0)" })
-            #expect(received.map(\.partitionID) == Array(repeating: 0, count: 5))
+            let received = try await read(first, 3)
+            #expect(received.map(\.message.payloadString) == (0..<3).map { "message \($0)" })
+            #expect(received.map(\.partitionID) == Array(repeating: 0, count: 3))
             #expect(received.last?.currentOffset == 4)
             await first.shutdown()
+            let stored = try await client.getConsumerOffset(
+                consumer: .consumer(try Identifier(named: name)), streamID: scratch.stream, topicID: scratch.topic, partitionID: 0)
+            #expect(stored?.storedOffset == 2, "\(commit)")
 
-            var more = try E2EEnvironment.messages(2, prefix: "more")
-            try await client.sendMessages(streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(0), messages: &more)
-            let second = try client.consumer(name: name, streamID: scratch.stream, topicID: scratch.topic, partitionID: 0)
+            let second = try client.consumer(name: name, streamID: scratch.stream, topicID: scratch.topic, partitions: [0], configuration: configuration)
             try await second.initialize()
-            #expect(try await read(second, 2).map(\.message.offset) == [5, 6])
+            #expect(try await read(second, 2).map(\.message.offset) == [3, 4], "\(commit)")
             await second.shutdown()
         }
     }
@@ -83,7 +88,8 @@ struct ConsumerE2ETests {
                 try await client.sendMessages(streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(partition), messages: &batch)
             }
             let name = E2EEnvironment.uniqueName("swift-e2e-group")
-            let member = try client.consumerGroup(name: name, streamID: scratch.stream, topicID: scratch.topic)
+            let member = try client.consumerGroup(
+                name: name, streamID: scratch.stream, topicID: scratch.topic, configuration: ConsumerConfiguration(pollOptions: .wait(.seconds(1))))
             try await member.initialize()
             let received = try await read(member, 4)
             #expect(Set(received.map(\.partitionID)) == [0, 1])

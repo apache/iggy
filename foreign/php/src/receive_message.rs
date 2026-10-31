@@ -17,9 +17,8 @@
 
 use ext_php_rs::{binary::Binary, exception::PhpResult, php_class, php_impl};
 use iggy::prelude::{
-    ConsumerPosition as RustConsumerPosition, IggyMessage as RustReceiveMessage, IggyMessageHeader,
-    PartitionContext as RustPartitionContext, PollingStrategy as RustPollingStrategy,
-    ReceivedMessage,
+    Checkpoint as RustCheckpoint, IggyMessage as RustReceiveMessage, IggyMessageHeader,
+    PolledMessages as RustPolledMessages, PollingStrategy as RustPollingStrategy, ReceivedMessage,
 };
 
 use crate::error::to_php_exception;
@@ -31,16 +30,14 @@ use crate::error::to_php_exception;
 #[php(name = "Iggy\\ReceiveMessage")]
 pub struct ReceiveMessage {
     pub(crate) inner: RustReceiveMessage,
-    pub(crate) partition_id: u32,
-    pub(crate) context: RustPartitionContext,
+    pub(crate) checkpoint: RustCheckpoint,
 }
 
 impl From<ReceivedMessage> for ReceiveMessage {
     fn from(message: ReceivedMessage) -> Self {
         Self {
+            checkpoint: message.checkpoint(),
             inner: message.message,
-            partition_id: message.partition_id,
-            context: message.context,
         }
     }
 }
@@ -48,22 +45,8 @@ impl From<ReceivedMessage> for ReceiveMessage {
 impl Clone for ReceiveMessage {
     fn clone(&self) -> Self {
         Self {
-            inner: RustReceiveMessage {
-                header: IggyMessageHeader {
-                    checksum: self.inner.header.checksum,
-                    id: self.inner.header.id,
-                    offset: self.inner.header.offset,
-                    timestamp: self.inner.header.timestamp,
-                    origin_timestamp: self.inner.header.origin_timestamp,
-                    user_headers_length: self.inner.header.user_headers_length,
-                    payload_length: self.inner.header.payload_length,
-                    reserved: self.inner.header.reserved,
-                },
-                payload: self.inner.payload.clone(),
-                user_headers: self.inner.user_headers.clone(),
-            },
-            partition_id: self.partition_id,
-            context: self.context,
+            inner: copy_message(&self.inner),
+            checkpoint: self.checkpoint,
         }
     }
 }
@@ -116,125 +99,121 @@ impl ReceiveMessage {
 
     /// Retrieves the partition this message belongs to.
     pub fn partition_id(&self) -> u32 {
-        self.partition_id
+        self.checkpoint.partition_id()
     }
 
-    /// Retrieves the partition incarnation and owner captured by the poll that delivered
-    /// this message.
-    pub fn context(&self) -> PartitionContext {
-        self.context.into()
-    }
-
-    /// Retrieves the position to commit for this message with Consumer::storePosition().
+    /// Retrieves the position after this message, which commits it and every earlier message
+    /// of its partition.
     ///
     /// It keeps the partition incarnation and owner that delivered the message, so a commit
     /// after the partition was recreated or changed owner is refused instead of landing on
-    /// the newer partition.
-    pub fn position(&self) -> ConsumerPosition {
-        RustConsumerPosition {
-            partition_id: self.partition_id,
-            offset: self.inner.header.offset,
-            context: self.context,
-        }
-        .into()
+    /// the newer partition. Only the reader or the consumer that delivered the message accepts
+    /// it in commit().
+    pub fn checkpoint(&self) -> Checkpoint {
+        self.checkpoint.into()
     }
 }
 
-/// A PHP class representing the partition incarnation and owner that a poll captured.
+/// A PHP class representing the position after one delivered message.
 ///
-/// Keep it with an offset that is continued or committed later. The server then refuses the
-/// request after the partition was deleted and recreated, or after its consumer group owner
-/// changed.
+/// A commit stores its offset, so it covers every earlier message of the partition.
 #[php_class]
-#[php(name = "Iggy\\PartitionContext")]
+#[php(name = "Iggy\\Checkpoint")]
 #[derive(Clone, Copy)]
-pub struct PartitionContext {
-    pub(crate) inner: RustPartitionContext,
+pub struct Checkpoint {
+    pub(crate) inner: RustCheckpoint,
 }
 
-impl From<RustPartitionContext> for PartitionContext {
-    fn from(inner: RustPartitionContext) -> Self {
+impl From<RustCheckpoint> for Checkpoint {
+    fn from(inner: RustCheckpoint) -> Self {
         Self { inner }
     }
 }
 
 #[php_impl]
-impl PartitionContext {
-    /// Rebuilds a context from values saved with an offset, for example by another process.
-    #[php(constructor)]
-    pub fn __construct(incarnation: u64, owner_generation: u64, metadata_op: u64) -> Self {
-        Self {
-            inner: RustPartitionContext {
-                incarnation,
-                owner_generation,
-                metadata_op,
-            },
-        }
+impl Checkpoint {
+    #[php(getter, change_case = "snake_case")]
+    pub fn partition_id(&self) -> u32 {
+        self.inner.partition_id()
     }
 
-    /// The partition's creation revision. It changes when the partition is deleted and
-    /// recreated.
+    /// The offset of the delivered message, which a commit stores.
     #[php(getter)]
-    pub fn incarnation(&self) -> u64 {
-        self.inner.incarnation
-    }
-
-    /// The consumer group owner generation, or 0 for a poll without a consumer group.
-    #[php(getter, change_case = "snake_case")]
-    pub fn owner_generation(&self) -> u64 {
-        self.inner.owner_generation
-    }
-
-    /// The metadata operation the server must have applied before it serves the request.
-    #[php(getter, change_case = "snake_case")]
-    pub fn metadata_op(&self) -> u64 {
-        self.inner.metadata_op
+    pub fn offset(&self) -> u64 {
+        self.inner.offset()
     }
 }
 
-/// A PHP class representing a consumed position to commit with Consumer::storePosition().
+/// A PHP class representing one batch of one partition.
 #[php_class]
-#[php(name = "Iggy\\ConsumerPosition")]
-#[derive(Clone, Copy)]
-pub struct ConsumerPosition {
-    pub(crate) inner: RustConsumerPosition,
+#[php(name = "Iggy\\PolledMessages")]
+pub struct PolledMessages {
+    inner: RustPolledMessages,
 }
 
-impl From<RustConsumerPosition> for ConsumerPosition {
-    fn from(inner: RustConsumerPosition) -> Self {
+impl From<RustPolledMessages> for PolledMessages {
+    fn from(inner: RustPolledMessages) -> Self {
         Self { inner }
     }
 }
 
 #[php_impl]
-impl ConsumerPosition {
-    /// Rebuilds a position from values saved with a processed message.
-    #[php(constructor)]
-    pub fn __construct(partition_id: u32, offset: u64, context: &PartitionContext) -> Self {
-        Self {
-            inner: RustConsumerPosition {
-                partition_id,
-                offset,
-                context: context.inner,
-            },
-        }
-    }
-
+impl PolledMessages {
     #[php(getter, change_case = "snake_case")]
     pub fn partition_id(&self) -> u32 {
         self.inner.partition_id
     }
 
-    /// The inclusive message offset to commit.
-    #[php(getter)]
-    pub fn offset(&self) -> u64 {
-        self.inner.offset
+    /// The offset of the newest message in the partition when the batch was read.
+    #[php(getter, change_case = "snake_case")]
+    pub fn current_offset(&self) -> u64 {
+        self.inner.current_offset
     }
 
-    /// The partition incarnation and owner captured by the poll that delivered the message.
     #[php(getter)]
-    pub fn context(&self) -> PartitionContext {
-        self.inner.context.into()
+    pub fn count(&self) -> u32 {
+        self.inner.count
+    }
+
+    /// The messages of the batch, in offset order.
+    ///
+    /// Each read of this property copies the messages, so keep the result in a variable to
+    /// read them more than once.
+    #[php(getter)]
+    pub fn messages(&self) -> Vec<ReceiveMessage> {
+        let checkpoints = (0..).map_while(|index| self.inner.checkpoint_at(index));
+        self.inner
+            .messages
+            .iter()
+            .zip(checkpoints)
+            .map(|(message, checkpoint)| ReceiveMessage {
+                inner: copy_message(message),
+                checkpoint,
+            })
+            .collect()
+    }
+
+    /// The position after the last message, to commit the whole batch. Null for an empty
+    /// batch.
+    pub fn checkpoint(&self) -> Option<Checkpoint> {
+        self.inner.checkpoint().map(Checkpoint::from)
+    }
+
+    /// The position after the message at `index`, to commit a processed part of the batch.
+    /// Null for an index out of range.
+    pub fn checkpoint_at(&self, index: usize) -> Option<Checkpoint> {
+        self.inner.checkpoint_at(index).map(Checkpoint::from)
+    }
+
+    /// The position after the batch, for the next read of its partition.
+    ///
+    /// After the last message it is the next offset. An empty batch keeps the start of its
+    /// request, except that first() becomes offset 0, so a start can take more than one read.
+    /// The continuation belongs to the partition of the batch, and a read of another partition
+    /// refuses it with InvalidCommand (3). It keeps the partition history of the batch, so a
+    /// read after the partition was recreated fails with HistoryUnavailable (87).
+    pub fn continuation(&self) -> PollingStrategy {
+        self.inner.continuation().into()
     }
 }
 
@@ -248,6 +227,12 @@ pub struct PollingStrategy {
 impl From<&PollingStrategy> for RustPollingStrategy {
     fn from(value: &PollingStrategy) -> Self {
         value.inner
+    }
+}
+
+impl From<RustPollingStrategy> for PollingStrategy {
+    fn from(inner: RustPollingStrategy) -> Self {
+        Self { inner }
     }
 }
 
@@ -297,70 +282,103 @@ impl PollingStrategy {
             inner: RustPollingStrategy::next(),
         }
     }
+}
 
-    /// Continues at an offset under the partition incarnation and owner that produced it.
-    ///
-    /// A stale context fails the poll instead of reading that offset from a recreated
-    /// partition. Without a context, the poll uses the context of its route.
-    pub fn with_context(&self, context: &PartitionContext) -> Self {
-        Self {
-            inner: self.inner.with_context(context.inner),
-        }
+// The SDK message has no Clone. Its payload and headers are reference counted.
+fn copy_message(message: &RustReceiveMessage) -> RustReceiveMessage {
+    RustReceiveMessage {
+        header: IggyMessageHeader {
+            checksum: message.header.checksum,
+            id: message.header.id,
+            offset: message.header.offset,
+            timestamp: message.header.timestamp,
+            origin_timestamp: message.header.origin_timestamp,
+            user_headers_length: message.header.user_headers_length,
+            payload_length: message.header.payload_length,
+            reserved: message.header.reserved,
+        },
+        payload: message.payload.clone(),
+        user_headers: message.user_headers.clone(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use iggy::prelude::PollingKind;
+    use bytes::Bytes;
+    use iggy::prelude::{PartitionContext, PollingKind};
 
     use super::*;
 
-    const CONTEXT: RustPartitionContext = RustPartitionContext {
+    const PARTITION_ID: u32 = 2;
+    const CONTEXT: PartitionContext = PartitionContext {
         incarnation: 7,
         owner_generation: 3,
         metadata_op: 11,
     };
 
-    #[test]
-    fn given_consumed_message_when_converted_should_keep_its_context_and_position() {
+    fn message(offset: u64) -> RustReceiveMessage {
         let mut message = RustReceiveMessage::default();
-        message.header.offset = 42;
-        let received = ReceivedMessage::new(message, 50, 2, CONTEXT);
-        let expected = received.position();
+        message.header.offset = offset;
+        message.payload = Bytes::from(offset.to_string());
+        message
+    }
+
+    fn batch(offsets: &[u64]) -> PolledMessages {
+        let messages: Vec<_> = offsets.iter().copied().map(message).collect();
+        let count = u32::try_from(messages.len()).unwrap();
+        RustPolledMessages::new(CONTEXT, PARTITION_ID, 50, count, messages).into()
+    }
+
+    #[test]
+    fn given_consumed_message_when_converted_should_keep_its_checkpoint() {
+        let received = ReceivedMessage::new(message(42), 50, PARTITION_ID, CONTEXT);
+        let expected = received.checkpoint();
 
         let message = ReceiveMessage::from(received);
 
-        assert_eq!(message.context().inner, CONTEXT);
-        assert_eq!(message.position().inner, expected);
+        assert_eq!(message.checkpoint().inner, expected);
+        assert_eq!(message.partition_id(), PARTITION_ID);
+        assert_eq!(message.offset(), 42);
     }
 
     #[test]
-    fn given_offset_strategy_when_given_context_should_stamp_it_into_the_poll() {
-        let strategy = PollingStrategy::offset(42).with_context(&PartitionContext::from(CONTEXT));
+    fn given_batch_when_listing_messages_should_give_each_message_its_own_checkpoint() {
+        let polled = batch(&[4, 5, 6]);
 
+        let messages = polled.messages();
+
+        let offsets: Vec<_> = messages.iter().map(ReceiveMessage::offset).collect();
+        assert_eq!(offsets, [4, 5, 6]);
+        for (index, message) in messages.iter().enumerate() {
+            assert_eq!(
+                Some(message.checkpoint().inner),
+                polled.inner.checkpoint_at(index)
+            );
+        }
+        assert_eq!(messages[1].payload().as_slice(), b"5");
         assert_eq!(
-            strategy.inner,
-            RustPollingStrategy {
-                kind: PollingKind::Offset,
-                value: 42,
-                context: Some(CONTEXT),
-            }
+            polled.checkpoint().map(|checkpoint| checkpoint.inner),
+            polled.inner.checkpoint()
         );
+        assert!(polled.checkpoint_at(3).is_none());
     }
 
     #[test]
-    fn given_saved_checkpoint_when_rebuilt_should_match_the_rust_position() {
-        let context = PartitionContext::__construct(7, 3, 11);
+    fn given_batch_when_continuing_should_read_after_its_last_message_of_the_same_partition() {
+        let continuation = batch(&[4, 5]).continuation().inner;
 
-        let position = ConsumerPosition::__construct(2, 42, &context);
+        assert_eq!(continuation.kind, PollingKind::Offset);
+        assert_eq!(continuation.value, 6);
+        assert_eq!(continuation.partition_id(), Some(PARTITION_ID));
+        assert!(continuation.validate_partition(PARTITION_ID + 1).is_err());
+    }
 
-        assert_eq!(
-            position.inner,
-            RustConsumerPosition {
-                partition_id: 2,
-                offset: 42,
-                context: CONTEXT,
-            }
-        );
+    #[test]
+    fn given_empty_batch_when_inspected_should_have_no_checkpoint() {
+        let polled = batch(&[]);
+
+        assert!(polled.messages().is_empty());
+        assert!(polled.checkpoint().is_none());
+        assert!(polled.checkpoint_at(0).is_none());
     }
 }

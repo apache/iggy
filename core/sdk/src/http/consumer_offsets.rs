@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::http::http_client::HttpClient;
+use crate::http::http_client::{HttpClient, ProgressKey};
 use crate::http::http_transport::HttpTransport;
 use crate::http::path::encode_segment;
 use crate::prelude::Identifier;
@@ -24,8 +24,9 @@ use async_trait::async_trait;
 use iggy_common::ConsumerOffsetClient;
 use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
+use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
-use iggy_common::{Consumer, ConsumerOffsetInfo, ConsumerPosition};
+use iggy_common::{Checkpoint, Consumer, ConsumerOffsetInfo};
 
 #[async_trait]
 impl ConsumerOffsetClient for HttpClient {
@@ -34,15 +35,21 @@ impl ConsumerOffsetClient for HttpClient {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        position: ConsumerPosition,
+        checkpoint: &Checkpoint,
     ) -> Result<(), IggyError> {
+        self.fail_if_progress_blocked(&ProgressKey::new(
+            stream_id,
+            topic_id,
+            checkpoint.partition_id(),
+            Some(checkpoint.context()),
+        ))?;
         self.put(
             &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
             &StoreConsumerOffset {
                 consumer: consumer.clone(),
-                partition_id: Some(position.partition_id),
-                offset: position.offset,
-                context: Some(position.context),
+                partition_id: Some(checkpoint.partition_id()),
+                offset: checkpoint.offset(),
+                context: Some(checkpoint.context()),
             },
         )
         .await?;
@@ -57,6 +64,12 @@ impl ConsumerOffsetClient for HttpClient {
         partition_id: Option<u32>,
         offset: u64,
     ) -> Result<(), IggyError> {
+        self.fail_if_progress_blocked(&ProgressKey::new(
+            stream_id,
+            topic_id,
+            partition_id.unwrap_or(DEFAULT_PARTITION_ID),
+            None,
+        ))?;
         self.put(
             &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
             &StoreConsumerOffset {
@@ -108,6 +121,12 @@ impl ConsumerOffsetClient for HttpClient {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
+        self.fail_if_progress_blocked(&ProgressKey::new(
+            stream_id,
+            topic_id,
+            partition_id.unwrap_or(DEFAULT_PARTITION_ID),
+            None,
+        ))?;
         let path = format!(
             "{}/{}",
             get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
@@ -122,6 +141,29 @@ impl ConsumerOffsetClient for HttpClient {
         )
         .await?;
         Ok(())
+    }
+
+    /// The HTTP delete has no field for a context.
+    async fn delete_consumer_position(
+        &self,
+        consumer: &Consumer,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        checkpoint: &Checkpoint,
+    ) -> Result<(), IggyError> {
+        self.fail_if_progress_blocked(&ProgressKey::new(
+            stream_id,
+            topic_id,
+            checkpoint.partition_id(),
+            Some(checkpoint.context()),
+        ))?;
+        self.delete_consumer_offset(
+            consumer,
+            stream_id,
+            topic_id,
+            Some(checkpoint.partition_id()),
+        )
+        .await
     }
 }
 

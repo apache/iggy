@@ -134,7 +134,7 @@ runs:
       run: cargo fmt --all -- --check
       shell: bash
 
-    # clippy-macos-aarch64 runs the same lint on macos-14. Code behind
+    # clippy-macos-aarch64 runs the same lint on macos-15. Code behind
     # cfg(target_os) splits is dead to the Linux leg, so its warnings would
     # otherwise reach master unseen.
     - name: Cargo clippy

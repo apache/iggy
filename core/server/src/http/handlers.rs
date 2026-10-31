@@ -104,9 +104,9 @@ use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, Consumer, ConsumerGroup, ConsumerGroupDetails,
     ConsumerOffsetInfo, DEFAULT_MAX_TOPIC_SIZE, Identifier, IdentityInfo, IggyError, IggyTimestamp,
     MetadataChanges, MetadataChangesQuery, OptionSpec, OptionStorage, OptionsScope, Partitioning,
-    PersonalAccessTokenInfo, PollMessages, PolledMessages, RawPersonalAccessToken, SendMessages,
-    SendMessagesConfirmations, Stats, Stream, StreamDetails, TokenInfo, Topic, TopicDetails,
-    UserInfo, UserInfoDetails, Validatable, descriptors_for, erase_buffer,
+    PersonalAccessTokenInfo, PollMessages, PolledMessages, PollingStrategy, RawPersonalAccessToken,
+    SendMessages, SendMessagesConfirmations, Stats, Stream, StreamDetails, TokenInfo, Topic,
+    TopicDetails, UserInfo, UserInfoDetails, Validatable, descriptors_for, erase_buffer,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
@@ -1190,8 +1190,35 @@ pub(in crate::http) async fn delete_segments(
 /// `GET /streams/{stream_id}/topics/{topic_id}/messages/deferred`: the poll of
 /// [`poll_messages`] with [`DeferredPollQuery`] limits. The primary holds it until
 /// `min_count` messages are ready, the reply reaches `max_bytes`, or `wait_us`
-/// expires. Invalid limits are refused before the poll is resolved.
+/// expires. Invalid limits are refused before the poll is resolved. A poll that
+/// stores its offset goes through [`poll_messages_committing`].
 pub(in crate::http) async fn poll_messages_deferred(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Query(query): Query<PollMessages>,
+    Query(wait): Query<DeferredPollQuery>,
+    Query(consistency): Query<ConsistencyQuery>,
+    Extension(request): Extension<Arc<PartitionRequest>>,
+) -> Result<Response, ReadError> {
+    refuse_committing_get(&query)?;
+    poll_messages_committing(
+        State(state),
+        identity,
+        Path((stream_id, topic_id)),
+        Query(query),
+        Query(wait),
+        Query(consistency),
+        Extension(request),
+    )
+    .await
+}
+
+/// `POST /streams/{stream_id}/topics/{topic_id}/messages/deferred`: the poll of
+/// [`poll_messages_deferred`], also with `auto_commit`. A poll that stores its
+/// offset changes state, so it must not ride on a GET that clients, proxies and
+/// load balancers may resend (RFC 9110, section 9.2.1).
+pub(in crate::http) async fn poll_messages_committing(
     State(state): State<HttpState>,
     identity: Identity,
     Path((stream_id, topic_id)): Path<(String, String)>,
@@ -1240,6 +1267,7 @@ pub(in crate::http) async fn poll_messages(
     Query(consistency): Query<ConsistencyQuery>,
     Extension(request): Extension<Arc<PartitionRequest>>,
 ) -> Result<Response, ReadError> {
+    refuse_committing_get(&query)?;
     poll_messages_impl(
         state,
         identity,
@@ -1251,6 +1279,15 @@ pub(in crate::http) async fn poll_messages(
         None,
     )
     .await
+}
+
+/// A GET poll that would store its offset is refused: a resent GET would skip
+/// the batch that the first one stored.
+const fn refuse_committing_get(query: &PollMessages) -> Result<(), ReadError> {
+    if query.auto_commit {
+        return Err(ReadError::CommittingGet);
+    }
+    Ok(())
 }
 
 #[expect(
@@ -1334,7 +1371,7 @@ async fn poll_messages_impl(
     let requested = request
         .route()
         .map(|route| route.context)
-        .or(query.strategy.context)
+        .or_else(|| query.strategy.context())
         .unwrap_or(local);
     let requested = PartitionContext {
         metadata_op: requested.metadata_op.max(metadata_floor),
@@ -1398,7 +1435,7 @@ async fn poll_messages_impl(
         // lose a batch here, but revoked credentials must never receive it.
         authorize_read(&state, &identity, consistency, rule)?;
         check_partition_incarnation(&state, namespace, local.incarnation)?;
-        polled_messages_reply(&state, partition_id, reply)
+        polled_messages_reply(&state, partition_id, &query.strategy, reply)
     };
     SendWrapper::new(serve_partition(
         &state,
@@ -1412,10 +1449,11 @@ async fn poll_messages_impl(
     .await
 }
 
-/// The HTTP answer to the owner's reply to a poll.
+/// The HTTP answer to the owner's reply to a poll from `strategy`.
 fn polled_messages_reply(
     state: &HttpInner,
     partition_id: u32,
+    strategy: &PollingStrategy,
     reply: Option<PartitionReadReply>,
 ) -> Result<Response, ReadError> {
     match reply {
@@ -1424,6 +1462,7 @@ fn polled_messages_reply(
             fragments,
             current_offset,
             encryptor,
+            ..
         }) => {
             // TCP parity (`build_polled_messages_reply`): the served context
             // carries at least the metadata this node applied, so a later poll
@@ -1443,7 +1482,7 @@ fn polled_messages_reply(
             )
             .map_err(ReadError::Rejected)?;
             Ok(
-                Json(PolledMessages::from_bytes(body).map_err(ReadError::Rejected)?)
+                Json(PolledMessages::from_bytes(body, strategy).map_err(ReadError::Rejected)?)
                     .into_response(),
             )
         }
@@ -2328,6 +2367,41 @@ mod tests {
     use crate::http::reply::classify_partition_reply;
     use crate::http::wire::build_request_message;
     use crate::reply_frame::build_deny_reply;
+
+    #[tokio::test]
+    async fn given_a_committing_poll_when_sent_as_get_should_refuse_it_and_name_the_post_route() {
+        // A GET poll with `auto_commit` stored its offset, and anything that
+        // resent the GET skipped the batch that the first one stored. The bare
+        // refusal then left an older client without a hint where to send it.
+        let parse = |uri: &str| {
+            Query::<PollMessages>::try_from_uri(&uri.parse().unwrap())
+                .unwrap()
+                .0
+        };
+        let committing =
+            parse("/x?consumer_id=1&partition_id=0&kind=offset&value=0&count=1&auto_commit=true");
+        let reading = parse("/x?consumer_id=1&partition_id=0&kind=offset&value=0&count=1");
+
+        let response = refuse_committing_get(&committing)
+            .expect_err("a committing GET is refused")
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the error body reads");
+        let error: Value = serde_json::from_slice(&body).expect("the error body is JSON");
+        assert_eq!(
+            error,
+            serde_json::json!({
+                "id": IggyError::InvalidCommand.as_code(),
+                "code": "invalid_command",
+                "reason": "A poll with auto_commit stores its offset, so send it as POST /streams/{stream_id}/topics/{topic_id}/messages/deferred",
+                "field": "auto_commit",
+            })
+        );
+        assert!(refuse_committing_get(&reading).is_ok());
+    }
 
     /// A create body can carry the stream key, so it zeroes itself on drop and
     /// leaves its options block for the handler to erase.

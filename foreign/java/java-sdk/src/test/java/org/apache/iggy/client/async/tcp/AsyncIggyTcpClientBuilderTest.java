@@ -227,6 +227,19 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
+    /** A read returns a first message larger than its byte limit, so every link reads a reply of the largest one. */
+    @Test
+    void shouldRejectMaximumVsrFrameSizeBelowAReplyOfTheLargestMessage() {
+        AsyncIggyTcpClientBuilder builder =
+                AsyncIggyTcpClient.builder().maxVsrFrameSize(AsyncIggyTcpClientBuilder.MIN_MAX_VSR_FRAME_SIZE - 1);
+
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+        client = AsyncIggyTcpClient.builder()
+                .maxVsrFrameSize(AsyncIggyTcpClientBuilder.MIN_MAX_VSR_FRAME_SIZE)
+                .build();
+        assertThat(client).isNotNull();
+    }
+
     @Test
     void shouldRejectNonPositiveMaximumVsrFrameSize() {
         assertThatThrownBy(() -> AsyncIggyTcpClient.builder().maxVsrFrameSize(0).build())

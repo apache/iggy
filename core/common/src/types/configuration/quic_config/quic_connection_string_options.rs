@@ -19,6 +19,7 @@ use crate::{
     ConnectionStringOptions, IggyDuration, IggyError, NonZeroIggyDuration, PendingOperationsConfig,
     QuicClientReconnectionConfig,
 };
+use iggy_binary_protocol::MAX_RECORD_REPLY_SIZE;
 use std::str::FromStr;
 
 #[derive(Debug)]
@@ -95,7 +96,7 @@ impl ConnectionStringOptions for QuicConnectionStringOptions {
     fn parse_options(options: &str) -> Result<QuicConnectionStringOptions, IggyError> {
         let options = options.split('&').collect::<Vec<&str>>();
         let mut pending_operations = PendingOperationsConfig::default();
-        let mut response_buffer_size = 1000 * 1000 * 10;
+        let mut response_buffer_size = MAX_RECORD_REPLY_SIZE as u64;
         let mut max_concurrent_bidi_streams = 10000;
         let mut datagram_send_buffer_size = 100_000;
         let mut initial_mtu = 1200;
@@ -287,7 +288,7 @@ impl Default for QuicConnectionStringOptions {
         QuicConnectionStringOptions {
             pending_operations: PendingOperationsConfig::default(),
             reconnection: Default::default(),
-            response_buffer_size: 1000 * 1000 * 10,
+            response_buffer_size: MAX_RECORD_REPLY_SIZE as u64,
             max_concurrent_bidi_streams: 10000,
             datagram_send_buffer_size: 100_000,
             initial_mtu: 1200,

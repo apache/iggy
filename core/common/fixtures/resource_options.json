@@ -16,18 +16,18 @@
   },
   "constants": {
     "protocol_version": {
-      "packed": 12288,
-      "text": "0.12.0",
+      "packed": 12289,
+      "text": "0.12.1",
       "major": 0,
       "minor": 12,
-      "patch": 0
+      "patch": 1
     },
     "protocol_version_min": {
-      "packed": 12288,
-      "text": "0.12.0",
+      "packed": 12289,
+      "text": "0.12.1",
       "major": 0,
       "minor": 12,
-      "patch": 0
+      "patch": 1
     },
     "command_codes": {
       "create_stream": {
