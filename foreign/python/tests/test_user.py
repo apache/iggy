@@ -27,6 +27,8 @@ from apache_iggy import (
     HttpConfig,
     IdentityInfo,
     IggyClient,
+    IggyError,
+    IggyExpiry,
     Permissions,
     QuicConfig,
     QuicReconnectionConfig,
@@ -61,14 +63,7 @@ def _create_personal_access_token(
     name: str,
     expiry: int,
 ) -> tuple[str, str]:
-    login_req = urllib.request.Request(  # noqa: S310
-        f"{api}/users/login",
-        data=json.dumps({"username": username, "password": password}).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(login_req, timeout=10) as response:  # noqa: S310
-        jwt = json.loads(response.read())["access_token"]["token"]
+    jwt = _login_jwt(api, username, password)
     create_req = urllib.request.Request(  # noqa: S310
         f"{api}/personal-access-tokens",
         data=json.dumps({"name": name, "expiry": expiry}).encode(),
@@ -83,6 +78,17 @@ def _create_personal_access_token(
     return jwt, personal_access_token
 
 
+def _login_jwt(api: str, username: str, password: str) -> str:
+    login_req = urllib.request.Request(  # noqa: S310
+        f"{api}/users/login",
+        data=json.dumps({"username": username, "password": password}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(login_req, timeout=10) as response:  # noqa: S310
+        return json.loads(response.read())["access_token"]["token"]
+
+
 def _delete_personal_access_token(api: str, jwt: str, name: str) -> None:
     delete_req = urllib.request.Request(  # noqa: S310
         f"{api}/personal-access-tokens/{name}",
@@ -91,6 +97,15 @@ def _delete_personal_access_token(api: str, jwt: str, name: str) -> None:
     )
     with urllib.request.urlopen(delete_req, timeout=10):  # noqa: S310
         pass
+
+
+def _delete_if_present(api: str, jwt: str, name: str) -> None:
+    """Delete a token, treating a token that does not exist as deleted."""
+    try:
+        _delete_personal_access_token(api, jwt, name)
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise
 
 
 class TestCreateUser:
@@ -358,6 +373,108 @@ class TestLoginIdentity:
         finally:
             _delete_personal_access_token(api, jwt, name)
 
+    @pytest.mark.asyncio
+    async def test_create_personal_access_token(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test that a token created through the client logs in as the same user."""
+        name = unique_name(min_bytes=16, max_bytes=30)
+        http_host, http_port = get_http_server_config()
+        api = f"http://{http_host}:{http_port}"
+        jwt = _login_jwt(api, "iggy", "iggy")
+
+        try:
+            personal_access_token = await iggy_client.create_personal_access_token(
+                name, IggyExpiry.NeverExpire()
+            )
+            client = None
+            try:
+                host, port = get_server_config()
+                client = IggyClient(f"{host}:{port}")
+                await client.connect()
+                identity = await client.login_with_personal_access_token(
+                    personal_access_token
+                )
+
+                user = await client.get_user("iggy")
+                assert user is not None
+                assert identity.user_id == user.id
+                assert identity.access_token is None
+            finally:
+                if client is not None:
+                    await client.shutdown()
+        finally:
+            _delete_if_present(api, jwt, name)
+
+    @pytest.mark.asyncio
+    async def test_create_personal_access_token_rejects_empty_name(
+        self, iggy_client: IggyClient
+    ):
+        """Test that an empty token name raises code 4 before anything is sent."""
+        with pytest.raises(IggyError) as refusal:
+            await iggy_client.create_personal_access_token("", IggyExpiry.NeverExpire())
+        assert refusal.value.code == 4
+
+    @pytest.mark.asyncio
+    async def test_create_personal_access_token_rejects_duplicate_name(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test that a second token with the same name raises code 51."""
+        name = unique_name(min_bytes=16, max_bytes=30)
+        http_host, http_port = get_http_server_config()
+        api = f"http://{http_host}:{http_port}"
+        jwt = _login_jwt(api, "iggy", "iggy")
+
+        try:
+            await iggy_client.create_personal_access_token(
+                name, IggyExpiry.NeverExpire()
+            )
+            with pytest.raises(IggyError) as clash:
+                await iggy_client.create_personal_access_token(
+                    name, IggyExpiry.NeverExpire()
+                )
+            assert clash.value.code == 51
+        finally:
+            _delete_if_present(api, jwt, name)
+
+    @pytest.mark.asyncio
+    async def test_create_personal_access_token_refuses_empty_name_on_every_transport(
+        self, transport_client: IggyClient, request: pytest.FixtureRequest
+    ):
+        """Test that every transport refuses an empty token name with its code."""
+        transport = request.node.callspec.params["transport_client"]
+        with pytest.raises(IggyError) as refusal:
+            await transport_client.create_personal_access_token(
+                "", IggyExpiry.NeverExpire()
+            )
+        assert refusal.value.code == (300 if transport == "http" else 4)
+
+    @pytest.mark.asyncio
+    async def test_create_personal_access_token_refuses_duplicate_on_every_transport(
+        self,
+        transport_client: IggyClient,
+        unique_name,
+        request: pytest.FixtureRequest,
+    ):
+        """Test that every transport refuses a second token with the same name."""
+        transport = request.node.callspec.params["transport_client"]
+        name = unique_name(min_bytes=16, max_bytes=30)
+        http_host, http_port = get_http_server_config()
+        api = f"http://{http_host}:{http_port}"
+        jwt = _login_jwt(api, "iggy", "iggy")
+
+        try:
+            await transport_client.create_personal_access_token(
+                name, IggyExpiry.NeverExpire()
+            )
+            with pytest.raises(IggyError) as clash:
+                await transport_client.create_personal_access_token(
+                    name, IggyExpiry.NeverExpire()
+                )
+            assert clash.value.code == (300 if transport == "http" else 51)
+        finally:
+            _delete_if_present(api, jwt, name)
+
     @pytest.mark.parametrize(
         "token",
         ["unknown-personal-access-token", "%%%garbled-token%%%"],
@@ -391,11 +508,7 @@ class TestLoginIdentity:
             with pytest.raises(RuntimeError):
                 await client.login_with_personal_access_token(personal_access_token)
         finally:
-            try:
-                _delete_personal_access_token(api, jwt, name)
-            except urllib.error.HTTPError as error:
-                if error.code != 404:
-                    raise
+            _delete_if_present(api, jwt, name)
 
     @pytest.mark.asyncio
     async def test_deleted_personal_access_token_fails(self, unique_name):
