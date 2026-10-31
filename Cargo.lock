@@ -7354,7 +7354,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.11.1-edge.5"
+version = "0.11.1-edge.6"
 dependencies = [
  "aligned-vec",
  "bytemuck",
@@ -7369,7 +7369,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.11.1-edge.6"
+version = "0.11.1-edge.7"
 dependencies = [
  "aes-gcm 0.11.1",
  "aes-gcm-siv",
@@ -12999,7 +12999,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.9.1-edge.5"
+version = "0.9.1-edge.6"
 dependencies = [
  "ahash",
  "arc-swap",

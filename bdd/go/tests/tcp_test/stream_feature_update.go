@@ -55,7 +55,7 @@ var _ = ginkgo.Describe("UPDATE STREAM:", func() {
 		ginkgo.Context("and tries to update non-existing stream", func() {
 			client := createAuthorizedConnection()
 			name := createRandomString(128)
-			err := client.UpdateStream(context.Background(), randomU32Identifier(), iggcon.StreamUpdate{Name: &name})
+			err := client.UpdateStream(context.Background(), nonExistingStreamIdentifier(client), iggcon.StreamUpdate{Name: &name})
 
 			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})

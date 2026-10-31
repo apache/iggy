@@ -87,7 +87,7 @@ var _ = ginkgo.Describe("LEAVE CONSUMER GROUP:", func() {
 
 			err := client.LeaveConsumerGroup(
 				context.Background(),
-				randomU32Identifier(),
+				nonExistingStreamIdentifier(client),
 				randomU32Identifier(),
 				randomU32Identifier(),
 			)

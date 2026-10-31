@@ -68,7 +68,7 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			messages := createDefaultMessages()
 			_, err := client.SendMessages(
 				context.Background(),
-				randomU32Identifier(),
+				nonExistingStreamIdentifier(client),
 				randomU32Identifier(),
 				iggcon.None(),
 				messages,
