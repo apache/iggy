@@ -2085,9 +2085,12 @@ impl IggyClient {
     /// each reply, and `CommitPolicy.Auto(...)` makes the consumer store counted positions.
     /// `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (the larger of 16,000 and
     /// the poll count by default) bound the requests in flight and the queued batches.
+    /// `offset_drain_timeout` controls how long shutdown waits for pending automatic offset
+    /// stores before closing the reader. It defaults to five seconds; zero skips that wait.
     /// Call `shutdown()` before dropping the consumer.
     /// Returns the consumer or raises `IggyError` on failure. Raises `ValueError` if
-    /// `polling_retry_interval` or `init_retry_interval` is negative or zero.
+    /// `polling_retry_interval` or `init_retry_interval` is negative or zero, or if
+    /// `offset_drain_timeout` is negative.
     ///
     /// Consumer groups are not available over HTTP: this call raises `FeatureUnavailable`.
     /// Use `Consumer.Single(...)` with `poll_messages(...)` or `reader(...)` there.
@@ -2105,6 +2108,7 @@ impl IggyClient {
         polling_retry_interval=None,
         init_retries=None,
         init_retry_interval=None,
+        offset_drain_timeout=None,
         allow_replay=false,
     ))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[IggyConsumer]", imports=("collections.abc")))]
@@ -2130,6 +2134,8 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] init_retries: Option<u32>,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         init_retry_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        offset_drain_timeout: Option<Py<PyDelta>>,
         allow_replay: bool,
     ) -> PyResult<Bound<'a, PyAny>> {
         let mut builder = self
@@ -2142,6 +2148,10 @@ impl IggyClient {
         } else {
             builder.do_not_create_consumer_group_if_not_exists()
         };
+        if let Some(offset_drain_timeout) = offset_drain_timeout {
+            builder =
+                builder.offset_drain_timeout(py_delta_to_iggy_duration(&offset_drain_timeout)?);
+        }
         let settings = ConsumerSettings {
             polling_strategy: polling_strategy.map(|strategy| strategy.inner),
             poll_options,
