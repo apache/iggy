@@ -124,6 +124,10 @@ pub struct ReadError {
     #[pyo3(get)]
     offset: Option<u64>,
     record: Option<Bytes>,
+    /// Whether the reader stopped the partition after six refusals in a row that a retry does
+    /// not change, such as `Unauthorized` (41). A `seek()` of the partition reads it again.
+    #[pyo3(get)]
+    is_lasting_refusal: bool,
 }
 
 #[gen_stub_pymethods]
@@ -189,12 +193,14 @@ impl PyErrArguments for ReadErrorArguments {
         let error = self.0;
         let message = error.to_string();
         let coded = PyIggyError::from(&error.error);
+        let is_lasting_refusal = error.is_lasting_refusal();
         let read_error = ReadError {
             partition_id: error.partition_id,
             error: runtime_error_value(py, error.error),
             skip: error.skip,
             offset: error.offset,
             record: error.record,
+            is_lasting_refusal,
         };
         exception_value(
             py,
@@ -2589,6 +2595,37 @@ mod tests {
                 cause.getattr("code").unwrap().extract::<u32>().unwrap(),
                 code
             );
+        });
+    }
+
+    #[test]
+    fn given_read_error_of_a_lasting_refusal_when_mapping_should_flag_only_the_stop() {
+        Python::initialize();
+        Python::attach(|py| {
+            for (partition_id, error, flagged) in [
+                (Some(1), IggyError::Unauthorized, true),
+                (None, IggyError::Unauthorized, false),
+                (Some(1), IggyError::HistoryUnavailable, false),
+            ] {
+                let error = to_read_error(RustReadError {
+                    partition_id,
+                    error,
+                    skip: None,
+                    offset: None,
+                    record: None,
+                });
+
+                let value = error.value(py);
+                assert_eq!(
+                    value
+                        .getattr("is_lasting_refusal")
+                        .unwrap()
+                        .extract::<bool>()
+                        .unwrap(),
+                    flagged
+                );
+                assert!(value.setattr("is_lasting_refusal", false).is_err());
+            }
         });
     }
 

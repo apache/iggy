@@ -20,3 +20,4 @@ mod error_isolation;
 mod http_state;
 mod schema_tagging;
 mod sink_clients;
+mod sink_refusal;

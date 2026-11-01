@@ -42,6 +42,8 @@ const SERVED = { incarnation: 11n, ownerGeneration: 4n, metadataOp: 42n };
 const BATCH_BASE_OFFSET_AT = 8;
 const HISTORY_UNAVAILABLE = 87;
 const INVALID_COMMAND = 3;
+const UNAUTHORIZED = 41;
+const INVALID_SIZE_BYTES = 80;
 const CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009;
 /** A poll body ends with the strategy kind and value, the count and the auto-commit flag. */
 const POLL_SUFFIX_SIZE = 1 + 8 + 4 + 1;
@@ -95,6 +97,8 @@ class FakeTopic {
   ownerGeneration = SERVED.ownerGeneration;
   /** Partitions that the member does not own, whatever a fetch target names. */
   readonly notOwned = new Set<number>();
+  /** The status that refuses each fetch section of a partition. */
+  readonly refused = new Map<number, number>();
   /** A read by offset finds nothing, as after its messages were removed. */
   emptyOffsetReads = false;
   /** Every offset store fails with this error. */
@@ -212,6 +216,11 @@ class FakeTopic {
       const read = { code, partition, kind: payload[at + FETCH_TARGET_FIELD.kind],
         value: payload.readBigUInt64LE(at + FETCH_TARGET_FIELD.value), autocommit, count, at: Date.now() };
       this.reads.push(read);
+      const refusal = this.refused.get(partition);
+      if (refusal !== undefined) {
+        sections.push({ partition, status: refusal, start: 0n, records: Buffer.alloc(0) });
+        continue;
+      }
       if (this.history.has(partition)) {
         sections.push({ partition, status: HISTORY_UNAVAILABLE, start: 0n, records: Buffer.alloc(0) });
         continue;
@@ -1084,6 +1093,100 @@ describe('consumer', () => {
     assert.equal(errors[0]?.partitionId, undefined);
     assert.equal(first.value?.message.headers.offset, 0n);
   });
+
+  for (const [stop, status] of [['six refusals in a row', UNAUTHORIZED], ['a lost history', HISTORY_UNAVAILABLE]] as const) {
+    it(`reads a partition again after its stored offset once the reader stops it after ${stop}`, async () => {
+      const topic = new FakeTopic(4n);
+      topic.stored.set(1, 1n);
+      const client = topic.client();
+      const errors: ReadError[] = [];
+      const consumer = new IggyConsumer(await PartitionReader.open(async () => client, {
+        streamId: 1, topicId: 2, consumer: { kind: ConsumerKind.Single, id: 4 }, partitions: [1],
+        options: { maxWait: 100 }, retryInterval: 5
+      }), undefined, (error) => {
+        errors.push(error);
+        topic.refused.delete(1);
+      });
+      const messages = consumer[Symbol.asyncIterator]();
+      try {
+        const before = [await messages.next(), await messages.next()];
+        topic.refused.set(1, status);
+        const resumed = await Promise.race([messages.next(),
+          new Promise<'stalled'>((resolve) => setTimeout(resolve, 2_000, 'stalled'))]);
+
+        assert.notEqual(resumed, 'stalled', 'the consumer did not read the stopped partition again');
+        assert.deepEqual([...before, resumed].map((read) => typeof read === 'string' ? read : read.value?.message.headers.offset),
+          [2n, 3n, 2n]);
+        assert.deepEqual(errors.map(({ partitionId, error, resumable }) =>
+          [partitionId, (error as { errorCode: number }).errorCode, resumable]), [[1, status, true]]);
+      } finally {
+        await consumer.shutdown();
+      }
+    });
+  }
+
+  it('reads a stopped partition from where its error handler seeks it, not after its stored offset', async () => {
+    const topic = new FakeTopic(4n);
+    topic.stored.set(1, 1n);
+    const consumer: IggyConsumer = new IggyConsumer(await open(topic, [1]), undefined, () => {
+      topic.refused.delete(1);
+      void consumer.seek(1, PollingStrategy.Offset(1n));
+    });
+    const messages = consumer[Symbol.asyncIterator]();
+    try {
+      await messages.next();
+      await messages.next();
+      topic.refused.set(1, HISTORY_UNAVAILABLE);
+      const resumed = await messages.next();
+
+      assert.equal(resumed.value?.message.headers.offset, 1n);
+    } finally {
+      await consumer.shutdown();
+    }
+  });
+
+  it('reads a stopped partition from where its error handler seeks it after an await', async () => {
+    const topic = new FakeTopic(4n);
+    topic.stored.set(1, 1n);
+    const consumer: IggyConsumer = new IggyConsumer(await open(topic, [1]), undefined, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      topic.refused.delete(1);
+      await consumer.seek(1, PollingStrategy.Offset(1n));
+    });
+    const messages = consumer[Symbol.asyncIterator]();
+    try {
+      await messages.next();
+      await messages.next();
+      topic.refused.set(1, HISTORY_UNAVAILABLE);
+      const resumed = await messages.next();
+
+      assert.equal(resumed.value?.message.headers.offset, 1n);
+    } finally {
+      await consumer.shutdown();
+    }
+  });
+
+  for (const read of ['iterator', 'consume', 'readable'] as const) {
+    it(`ends the ${read} with the error of a stop that the consumer does not resume`, async () => {
+      const topic = new FakeTopic(4n);
+      topic.refused.set(1, INVALID_SIZE_BYTES);
+      const errors: ReadError[] = [];
+      const consumer = new IggyConsumer(await open(topic, [1]), undefined, (error) => { errors.push(error); });
+      try {
+        const ended = read === 'iterator' ? consumer[Symbol.asyncIterator]().next()
+          : read === 'consume' ? consumer.consume(() => undefined)
+          : once(consumer.toReadable().resume(), 'error').then(([error]) => Promise.reject(error));
+        const outcome = await Promise.race([ended.then(() => 'ended', (error: unknown) => error),
+          new Promise((resolve) => setTimeout(resolve, 2_000, 'stalled'))]);
+
+        assert.ok(outcome instanceof ReadError, `the ${read} did not end with a read error: ${String(outcome)}`);
+        assert.deepEqual([outcome.partitionId, (outcome.error as { errorCode: number }).errorCode,
+          outcome.stopsPartition, outcome.resumable, errors.length], [1, INVALID_SIZE_BYTES, true, false, 0]);
+      } finally {
+        await consumer.shutdown();
+      }
+    });
+  }
 
   it('shuts down when its readable is destroyed while a read waits for messages', async () => {
     const topic = new FakeTopic(0n);

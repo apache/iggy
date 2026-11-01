@@ -209,13 +209,17 @@ public actor IggyConsumer: AsyncSequence {
     }
 
     /// Hands every message to `handler` until the consumer shuts down, the
-    /// task is cancelled, or a read error ends the reading: a client that is
-    /// shut down or cannot come back without the caller, or an invalid
-    /// address. Other read errors are logged and reading goes on. Under
-    /// ``CommitAfter/processing`` a message counts once its handler returned,
-    /// and a handler that throws leaves its message uncounted and ends the
-    /// reading with its error. Under any other policy a handler that throws
-    /// is logged.
+    /// task is cancelled, or a read error ends the reading with that error.
+    /// A message that does not decode ends it, and so does
+    /// ``IggyErrorCode/historyUnavailable`` for a position read in a history
+    /// that is gone. Both stop their partition until a
+    /// ``seek(partitionID:to:)``, and a seek to ``ReadError/skip`` steps over
+    /// the message. A client that is shut down or cannot come back without
+    /// the caller ends it, and so does an invalid address. Other read errors
+    /// are logged and reading goes on. Under ``CommitAfter/processing`` a
+    /// message counts once its handler returned, and a handler that throws
+    /// leaves its message uncounted and ends the reading with its error.
+    /// Under any other policy a handler that throws is logged.
     public func consumeMessages(_ handler: @Sendable (ReceivedMessage) async throws -> Void) async throws {
         await countUnprocessed()
         let processing = configuration.pollOptions.autoCommit?.after == .processing
@@ -228,7 +232,7 @@ public actor IggyConsumer: AsyncSequence {
                 received = next
             } catch let error as ReadError {
                 let recovers = await client.canRecover
-                if Self.endsConsumption(error.error) || !recovers {
+                if error.stopsPartition || Self.endsConsumption(error.error) || !recovers {
                     logger.error("Reading stopped", metadata: metadata.merging(["error": "\(error)"]) { $1 })
                     throw error
                 }

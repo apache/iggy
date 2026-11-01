@@ -101,7 +101,14 @@ export class ReadError extends Error {
      * reader reads the message again until a `seek` to this continuation
      * skips it. The messages before it arrive in a batch before this error.
      */
-    readonly skip?: Continuation
+    readonly skip?: Continuation,
+    /** The reader stopped the partition, which it reads again only after a `seek`. */
+    readonly stopsPartition = false,
+    /**
+     * The reader stopped the partition after refusals in a row or a lost
+     * history. A `seek` to Next reads it again after its stored offset.
+     */
+    readonly resumable = false
   ) {
     super(partitionId === undefined ? `reading failed: ${String(error)}`
       : `reading partition ${partitionId} failed: ${String(error)}`, { cause: error });
@@ -1027,8 +1034,8 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
     state.backlogged = undefined;
     const now = Date.now();
     const code = errorCode(error);
-    const report = (stop: boolean) => {
-      const readError = new ReadError(target.partition, error);
+    const report = (stop: boolean, resumable = false) => {
+      const readError = new ReadError(target.partition, error, undefined, stop, resumable);
       if (stop) state.stopped = readError;
       this.enqueue({ partitionId: target.partition, generation: target.generation, error: readError,
         messages: 0, bytes: 0 });
@@ -1049,13 +1056,13 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
       return;
     }
     if (code === HISTORY_UNAVAILABLE || code === INVALID_SIZE_BYTES) {
-      report(true);
+      report(true, code === HISTORY_UNAVAILABLE);
       return;
     }
     if (code !== undefined && LASTING_REFUSALS.has(code)) {
       state.lasting += 1;
       if (state.lasting >= MAX_LASTING_REFUSALS) {
-        report(true);
+        report(true, true);
         return;
       }
       state.retryAt = now + this.retryInterval * 2 ** (state.lasting - 1);

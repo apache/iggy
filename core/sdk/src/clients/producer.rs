@@ -1804,6 +1804,21 @@ mod tests {
         }
     }
 
+    /// A caller holds the send future in its own state, so a large one costs every caller.
+    #[test]
+    fn given_a_direct_producer_when_a_send_is_created_should_hold_at_most_four_kibibytes() {
+        const MAX_SEND_FUTURE_BYTES: usize = 4096;
+        let producer = producer_on(IggyRwLock::new(ClientWrapper::Tcp(TcpClient::default())));
+
+        let send = producer.send_with_partitioning(Vec::new(), None);
+
+        let bytes = std::mem::size_of_val(&send);
+        assert!(
+            bytes <= MAX_SEND_FUTURE_BYTES,
+            "the send future holds {bytes} bytes"
+        );
+    }
+
     #[tokio::test]
     async fn test_aged_out_request_over_http_stops_producer_retries() {
         const SEND_REQUEST_LINE: &str = "POST /streams/1/topics/1/messages ";

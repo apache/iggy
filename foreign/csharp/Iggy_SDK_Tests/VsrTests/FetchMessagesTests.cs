@@ -521,6 +521,48 @@ public sealed class FetchMessagesTests
         await client.StoreOffsetAsync(Consumer.New(4), Stream, Topic, 0, 3, token);
     }
 
+    /// <summary>
+    ///     A permission lost before the store fails the fetch as a refusal that stored nothing, so its partitions
+    ///     stay open instead of blocked behind an unknown outcome.
+    /// </summary>
+    [Fact]
+    public async Task given_a_committing_fetch_refused_as_unauthorized_when_fetching_should_leave_its_partitions_open()
+    {
+        using var node = new MockNode();
+        var fetches = 0;
+        node.Serve(request => request.Code == FetchCode && ++fetches == 1
+            ? Reply(request.Operation, [], VsrError.UNAUTHORIZED)
+            : Standalone(node, request));
+        using var client = await ConnectAsync(node);
+        var token = TestContext.Current.CancellationToken;
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => client.FetchMessagesAsync(Stream,
+            Topic, Targets(1), Consumer.New(4), 10, true, LongWait, token));
+
+        Assert.Equal(VsrError.UNAUTHORIZED, error.StatusCode);
+        await client.StoreOffsetAsync(Consumer.New(4), Stream, Topic, 0, 1, token);
+    }
+
+    [Fact]
+    public async Task given_a_section_refused_as_unauthorized_beside_a_served_one_when_fetching_should_leave_its_partition_open()
+    {
+        using var node = new MockNode();
+        node.Serve(request => request.Code == FetchCode
+            ? Reply(request.Operation, FetchBody(GoldenSection(1, 0, Served), EmptySection(3, 0, default, (uint)VsrError.UNAUTHORIZED)))
+            : Standalone(node, request));
+        using var client = await ConnectAsync(node);
+        var token = TestContext.Current.CancellationToken;
+        using var reply = await client.FetchMessagesAsync(Stream, Topic,
+            [(1, PollingStrategy.Offset(0)), (3, PollingStrategy.Offset(0))], Consumer.New(4), 10, true, LongWait, token);
+
+        Assert.Equal((int)GOLDEN_BATCH_MESSAGES, reply.Sections[0].Decode().Messages.Count);
+        var refused = reply.Sections[1];
+        Assert.Equal((uint)VsrError.UNAUTHORIZED, refused.Status);
+        Assert.Equal(VsrError.UNAUTHORIZED,
+            Assert.Throws<IggyInvalidStatusCodeException>(() => refused.Decode()).StatusCode);
+        await client.StoreOffsetAsync(Consumer.New(4), Stream, Topic, 0, 3, token);
+    }
+
     [Theory]
     [InlineData("missing table")]
     [InlineData("duplicate target")]

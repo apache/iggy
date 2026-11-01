@@ -3842,4 +3842,52 @@ mod tests {
             "{series} is not in the scrape:\n{scrape}"
         );
     }
+
+    /// The SDKs take a request-level or section-level `Unauthorized` after a committing fetch as a
+    /// refusal that stored nothing, which holds only while this keeps the stored sections and fails
+    /// the request only when none stored.
+    #[test]
+    fn given_a_permission_lost_during_the_reads_when_serving_should_fail_only_what_stored_nothing()
+    {
+        let stored = |partition_id| {
+            (
+                FetchMessagesSectionHeader {
+                    status: STATUS_OK,
+                    messages_count: 2,
+                    ..error_section(partition_id, &IggyError::Unauthorized).0
+                },
+                Vec::new(),
+            )
+        };
+        let empty = |partition_id| {
+            (
+                FetchMessagesSectionHeader {
+                    status: STATUS_OK,
+                    ..error_section(partition_id, &IggyError::Unauthorized).0
+                },
+                Vec::new(),
+            )
+        };
+
+        let mixed = served_sections(
+            vec![stored(1), empty(2)],
+            Err(IggyError::Unauthorized),
+            true,
+        )
+        .expect("a stored section keeps the reply");
+        let nothing_stored =
+            served_sections(vec![empty(1), empty(2)], Err(IggyError::Unauthorized), true);
+        let not_committing = served_sections(vec![stored(1)], Err(IggyError::Unauthorized), false);
+
+        assert_eq!(
+            mixed
+                .iter()
+                .map(|(header, _)| (header.partition_id, header.status, header.messages_count))
+                .collect::<Vec<_>>(),
+            [(1, STATUS_OK, 2), (2, IggyError::Unauthorized.as_code(), 0)],
+            "the stored section reaches the client and the other reports the loss"
+        );
+        assert_eq!(nothing_stored.unwrap_err(), IggyError::Unauthorized);
+        assert_eq!(not_committing.unwrap_err(), IggyError::Unauthorized);
+    }
 }

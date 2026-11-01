@@ -20,7 +20,7 @@ import type { ClientProvider } from '../client/client.type.js';
 import type { Id } from '../wire/identifier.utils.js';
 import { ConsumerKind } from '../wire/offset/offset.utils.js';
 import { ensureConsumerGroup } from '../wire/consumer-group/ensure-group.virtual.command.js';
-import type { Message, PollingStrategy } from '../wire/message/poll.utils.js';
+import { PollingStrategy, type Message } from '../wire/message/poll.utils.js';
 import type { PollOptions } from '../wire/message/poll-options.js';
 import type { Checkpoint, PolledBatch } from '../wire/message/checkpoint.js';
 import { PartitionReader, ReadError } from './partition-reader.js';
@@ -44,8 +44,12 @@ export type ConsumerRequest = {
   start?: PollingStrategy,
   /** The limits of each read and the commit policy. A read waits up to 5 s by default. */
   options?: Partial<PollOptions>,
-  /** Gets each read error that the reader retries by itself, while the consumer goes on. */
-  onError?: (error: ReadError) => void
+  /**
+   * Gets each read error after which the consumer goes on. A returned promise
+   * is awaited, so a seek that the handler makes after an await still comes
+   * before the consumer resumes a stopped partition.
+   */
+  onError?: (error: ReadError) => Promise<void> | void
 };
 
 /** Parameters of `client.consumerGroup`: a member of a consumer group, created when it is missing. */
@@ -61,20 +65,25 @@ export type ConsumerGroupRequest = Omit<ConsumerRequest, 'partitions'>;
  * `consume()` returns with success (`after: processing`), or on `mark()`,
  * and the latest counted position is stored at the interval or event of the
  * policy and on shutdown. A read error that the reader retries by itself goes
- * to `onError` and the consumer goes on. A message that does not decode ends
- * the iteration with its `ReadError`, whose `skip` passes it with `seek`.
+ * to `onError` and the consumer goes on. So does a `resumable` error, after
+ * which the consumer seeks its partition to Next, so it resumes after its
+ * stored offset, unless `onError` sought it. Any other stop of a partition ends
+ * the iteration with its `ReadError`, and so does a message that does not
+ * decode, whose `skip` passes it with `seek`.
  */
 export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
   private uncounted?: { checkpoint: Checkpoint, endsBatch: boolean };
   private stopped = false;
   /** The batch whose messages the consumer hands over, until a seek of its partition drops the rest. */
   private current?: PolledBatch;
+  /** The seeks of each partition, so a seek of `onError` wins over the resume of a stopped partition. */
+  private readonly seeks = new Map<number, number>();
 
   /** @internal */
   constructor(
     private readonly reader: PartitionReader,
     private readonly after?: string,
-    private readonly onError?: (error: ReadError) => void
+    private readonly onError?: (error: ReadError) => Promise<void> | void
   ) {
     reader.countsMessages = true;
   }
@@ -137,6 +146,7 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
    * hands over.
    */
   async seek(partitionId: number, start: PollingStrategy): Promise<void> {
+    this.seeks.set(partitionId, (this.seeks.get(partitionId) ?? 0) + 1);
     await this.reader.seek(partitionId, start);
     if (this.current?.partitionId === partitionId) this.current = undefined;
   }
@@ -178,14 +188,23 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
     });
   }
 
+  /** A seek to Next stores nothing, so a stopped partition whose refusal lasts stops again after six reads. */
   private async nextBatch(): Promise<PolledBatch | undefined> {
     while (true) {
       try {
         return await this.reader.next();
       } catch (error) {
         if (this.stopped && !(error instanceof ReadError)) return undefined;
-        if (!(error instanceof ReadError) || error.skip) throw error;
-        this.onError?.(error);
+        if (!(error instanceof ReadError) || error.skip || (error.stopsPartition && !error.resumable)) throw error;
+        const seeks = error.resumable ? this.seeks.get(error.partitionId!) : undefined;
+        await this.onError?.(error);
+        if (error.resumable && this.seeks.get(error.partitionId!) === seeks) {
+          try {
+            await this.seek(error.partitionId!, PollingStrategy.Next);
+          } catch (failure) {
+            await this.onError?.(new ReadError(error.partitionId, failure));
+          }
+        }
       }
     }
   }

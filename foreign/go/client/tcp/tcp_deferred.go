@@ -272,8 +272,11 @@ func fetchRefusedBeforeAdmission(err error, section bool) bool {
 		return false
 	}
 	switch coded.Code() {
-	case ierror.TransientNotAcceptedCode, ierror.InvalidSizeBytesCode, ierror.HistoryUnavailableCode, ierror.NotPrimaryCode,
-		ierror.PartitionNotFoundCode, ierror.TooManyConsumerOffsetsCode, ierror.ConsumerGroupPartitionNotOwnedCode:
+	// A permission lost during the reads fails the whole request only when no read stored, and reaches only the
+	// sections that stored nothing.
+	case ierror.UnauthorizedCode, ierror.TransientNotAcceptedCode, ierror.InvalidSizeBytesCode, ierror.HistoryUnavailableCode,
+		ierror.NotPrimaryCode, ierror.PartitionNotFoundCode, ierror.TooManyConsumerOffsetsCode,
+		ierror.ConsumerGroupPartitionNotOwnedCode:
 		return true
 	case ierror.FeatureUnavailableCode, ierror.InvalidIdentifierCode, ierror.DeferredPollCapacityExceededCode,
 		ierror.StreamIdNotFoundCode, ierror.StreamNameNotFoundCode, ierror.TopicIdNotFoundCode, ierror.TopicNameNotFoundCode,

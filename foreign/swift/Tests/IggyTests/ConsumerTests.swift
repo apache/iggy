@@ -549,7 +549,7 @@ struct ConsumerTests {
     /// A committing section whose error leaves the outcome unknown may have
     /// stored its read, so the reader reads that range again, or the close
     /// moves the offset back over it.
-    @Test(arguments: [false, true], [IggyErrorCode.shardCommunicationError, .cannotDecryptData, .staleClient, .unauthorized])
+    @Test(arguments: [false, true], [IggyErrorCode.shardCommunicationError, .cannotDecryptData, .staleClient])
     func anUncertainCommittedSectionKeepsItsSiblingAndRecoversOrRewinds(closing: Bool, status: IggyErrorCode) async throws {
         let server = try await FakeVSRServer.started()
         let topic = FakeTopic(ends: [1: 7, 2: 1])
@@ -1366,6 +1366,41 @@ struct ConsumerTests {
         }
         await consumer.shutdown()
         #expect(topic.stored[1] == 0)
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// A position whose history is gone stops its partition until a seek, so
+    /// the handler run ends with that error instead of going on without the
+    /// partition.
+    @Test func aReadErrorThatStopsItsPartitionEndsConsumeMessages() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 2])
+        await serve(server, topic: topic) { request in
+            guard request.code == CommandCode.fetchMessages.rawValue, let fetch = try? request.fetch, fetch.targets.allSatisfy({ $0.value == 1 })
+            else {
+                return nil
+            }
+            return .ok(FakeVSRServer.fetchedBody([.init(partitionID: 1, status: IggyErrorCode.historyUnavailable.rawValue)]))
+        }
+        let client = try await signedInClient(server)
+        let consumer = try client.consumer(
+            name: "reader", streamID: 1, topicID: 2, partitions: [1],
+            configuration: ConsumerConfiguration(pollingStrategy: .first, pollOptions: PollOptions(count: 1, maxWait: .milliseconds(200))))
+        try await consumer.initialize()
+        let handled = Locked<[UInt64]>([])
+
+        let error = await #expect(throws: ReadError.self, "the run did not end within 2 seconds") {
+            try await withDeadline(.now + .seconds(2)) {
+                try await consumer.consumeMessages { received in
+                    handled.withLock { $0.append(received.message.offset) }
+                }
+            }
+        }
+
+        #expect(error?.partitionID == 1 && error?.error.code == .historyUnavailable)
+        #expect(handled.withLock { $0 } == [0])
+        await consumer.shutdown()
         await client.shutdown()
         await server.stop()
     }

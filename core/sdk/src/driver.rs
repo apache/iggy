@@ -4572,6 +4572,7 @@ mod tests {
         for status in [
             IggyError::TooManyConsumerOffsets.as_code(),
             IggyError::PartitionNotFound(0, Identifier::default(), Identifier::default()).as_code(),
+            IggyError::Unauthorized.as_code(),
         ] {
             let f = Fixture::new().await;
             f.cluster.script(
@@ -4657,10 +4658,11 @@ mod tests {
             (80, false),
             // A new offset key above the limit refuses the read before it returns messages.
             (3024, false),
+            // A permission lost during the reads fails the fetch only while no read stored.
+            (41, false),
             (3, true),
             (30, true),
             (40, true),
-            (41, true),
             (57, true),
             (59, true),
             (11001, true),

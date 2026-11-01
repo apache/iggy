@@ -64,6 +64,12 @@ internal class EventAggregator<T>
         _ = PublishInternal(message);
     }
 
+    /// <summary>Publishes and completes once every handler has.</summary>
+    public Task PublishAsync(T message)
+    {
+        return PublishInternal(message);
+    }
+
     public void Clear()
     {
         lock (_lock)

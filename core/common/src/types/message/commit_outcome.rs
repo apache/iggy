@@ -34,7 +34,10 @@ impl CommitErrorScope {
         match self {
             Self::Request => matches!(
                 error,
-                IggyError::FeatureUnavailable
+                // The server checks the permission before the reads, and a permission lost
+                // during the reads fails the whole request only when no read stored.
+                IggyError::Unauthorized
+                    | IggyError::FeatureUnavailable
                     | IggyError::InvalidIdentifier
                     | IggyError::TransientNotAccepted
                     | IggyError::HistoryUnavailable
@@ -53,10 +56,12 @@ impl CommitErrorScope {
                     // A read that needs a new offset key above the limit returns no messages.
                     | IggyError::TooManyConsumerOffsets
             ),
-            // None of these leaves an offset stored in the history that the request named.
+            // None of these leaves an offset stored in the history that the request named. A
+            // permission lost during the reads reaches only the sections that stored nothing.
             Self::Section => matches!(
                 error,
-                IggyError::TransientNotAccepted
+                IggyError::Unauthorized
+                    | IggyError::TransientNotAccepted
                     | IggyError::InvalidSizeBytes
                     | IggyError::HistoryUnavailable
                     | IggyError::NotPrimary
@@ -78,10 +83,15 @@ mod tests {
     }
 
     #[test]
+    fn given_unauthorized_when_classifying_then_should_prove_nothing_stored_in_both_scopes() {
+        assert!(CommitErrorScope::Request.proves_nothing_stored(&IggyError::Unauthorized));
+        assert!(CommitErrorScope::Section.proves_nothing_stored(&IggyError::Unauthorized));
+    }
+
+    #[test]
     fn given_lost_session_when_classifying_then_should_leave_outcome_unknown_in_both_scopes() {
         for error in [
             IggyError::Unauthenticated,
-            IggyError::Unauthorized,
             IggyError::StaleClient,
             IggyError::TransientNotCommitted,
             IggyError::CannotDecryptData,

@@ -507,7 +507,6 @@ mod tests {
             ("lost reply", Reply::hang_up()),
             ("cut body", Reply::polled().cut()),
             ("401", Reply::error(401, &IggyError::Unauthenticated)),
-            ("403", Reply::error(403, &IggyError::Unauthorized)),
             ("other 4xx", Reply::error(400, &IggyError::InvalidCommand)),
             ("4xx without an error id", Reply::empty(400)),
             ("500", Reply::empty(500)),
@@ -542,9 +541,10 @@ mod tests {
 
     /// A 503 refuses a poll before the server takes it, and the server sends a 404 only before
     /// the read. Another 4xx proves the outcome when binary takes its error as proof too, also
-    /// when the client returns it as `HttpResponseError`. None of them leaves a block.
-    /// `HistoryUnavailable` after the read means that the history the poll read is gone. A
-    /// non-admission refusal is sent again within the request timeout.
+    /// when the client returns it as `HttpResponseError`. A 403 does, because the server fails a
+    /// committing read with `Unauthorized` only while no read stored. None of them leaves a
+    /// block. `HistoryUnavailable` after the read means that the history the poll read is gone.
+    /// A non-admission refusal is sent again within the request timeout.
     #[tokio::test]
     async fn given_an_on_read_poll_when_its_refusal_proves_the_outcome_should_leave_no_block() {
         let server = ScriptedServer::start(vec![
@@ -553,6 +553,7 @@ mod tests {
             Reply::empty(503),
             Reply::error(400, &IggyError::HistoryUnavailable),
             Reply::error(400, &IggyError::InvalidOffset(START)),
+            Reply::error(403, &IggyError::Unauthorized),
             Reply::empty(404),
             Reply::polled(),
         ])
@@ -563,6 +564,7 @@ mod tests {
         let refused = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
         let history_gone = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
         let invalid_offset = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
+        let unauthorized = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
         let not_found = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
         let next = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
 
@@ -576,12 +578,13 @@ mod tests {
             matches!(invalid_offset, Err(IggyError::HttpResponseError(400, _))),
             "{invalid_offset:?}"
         );
+        assert_eq!(unauthorized.map(drop), Err(IggyError::Unauthorized));
         assert!(
             matches!(not_found, Err(IggyError::ResourceNotFound(_))),
             "{not_found:?}"
         );
         next.unwrap();
-        assert_eq!(server.requests().len(), 7);
+        assert_eq!(server.requests().len(), 8);
     }
 
     /// The server returns a first message above `max_bytes` alone in the reply, so it refuses a

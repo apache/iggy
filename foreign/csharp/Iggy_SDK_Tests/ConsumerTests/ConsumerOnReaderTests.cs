@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Collections.Concurrent;
 using System.Text;
 using Apache.Iggy.Consumers;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
+using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Kinds;
+using Apache.Iggy.Vsr;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Apache.Iggy.Tests.ConsumerTests;
@@ -34,6 +37,7 @@ public sealed class ConsumerOnReaderTests
     private static readonly Identifier Stream = Identifier.Numeric(1);
     private static readonly Identifier Topic = Identifier.Numeric(2);
     private static readonly TimeSpan PromptLimit = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan RetryInterval = TimeSpan.FromMilliseconds(20);
 
     private static CancellationToken Token => TestContext.Current.CancellationToken;
 
@@ -230,6 +234,146 @@ public sealed class ConsumerOnReaderTests
         Assert.Equal((MessagePolling.Offset, 3ul), (error.Skip!.Value.Kind, error.Skip.Value.Value));
     }
 
+    /// <summary>
+    ///     Six refusals in a row stop the partition in the reader. The consumer seeks it to Next, so it reads the
+    ///     partition again after its stored offset once the refusal clears, without a restart.
+    /// </summary>
+    [Fact]
+    public async Task given_lasting_refusals_that_stop_a_partition_when_the_refusal_clears_should_read_it_again()
+    {
+        using var cluster = new ReaderCluster(1);
+        cluster.Unauthorized.Add(1);
+        using var client = await cluster.ConnectAsync();
+        await using var consumer = await StartAsync(client, CommitPolicy.Manual, 1);
+        ConcurrentBag<Exception> errors = [];
+        consumer.SubscribeToErrorEvents(error =>
+        {
+            errors.Add(error.Exception);
+            cluster.Unauthorized.Clear();
+            return Task.CompletedTask;
+        });
+
+        var received = await ReceiveAsync(consumer, 2);
+
+        var error = Assert.IsType<ReadException>(Assert.Single(errors));
+        Assert.Equal((1u, VsrError.UNAUTHORIZED, true, true), (error.PartitionId,
+            Assert.IsType<IggyInvalidStatusCodeException>(error.InnerException).StatusCode, error.StopsPartition,
+            error.IsResumable));
+        Assert.Equal([0ul, 1ul], received.Select(message => message.CurrentOffset));
+    }
+
+    /// <summary>
+    ///     The history of the position is gone, so the reader stops the partition. The consumer seeks it to Next, so
+    ///     it reads on after the last committed message.
+    /// </summary>
+    [Fact]
+    public async Task given_a_lost_history_that_stops_a_partition_when_receiving_should_read_on_after_the_stored_offset()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 4 };
+        using var client = await cluster.ConnectAsync();
+        await using var consumer = await StartAsync(client, CommitPolicy.Manual, 1);
+        ConcurrentBag<Exception> errors = [];
+        consumer.SubscribeToErrorEvents(error =>
+        {
+            errors.Add(error.Exception);
+            cluster.HistoryRefused.Clear();
+            return Task.CompletedTask;
+        });
+
+        var resumed = await ReceiveAfterLostHistoryAsync(consumer, cluster, errors);
+
+        var error = Assert.IsType<ReadException>(Assert.Single(errors));
+        Assert.Equal((1u, VsrError.HISTORY_UNAVAILABLE, true, true), (error.PartitionId,
+            Assert.IsType<IggyInvalidStatusCodeException>(error.InnerException).StatusCode, error.StopsPartition,
+            error.IsResumable));
+        Assert.Equal(1ul, resumed);
+    }
+
+    /// <summary>
+    ///     An error handler seeks the stopped partition to an offset of its choice before its first await. The
+    ///     consumer leaves that seek in place instead of seeking the partition to Next.
+    /// </summary>
+    [Fact]
+    public async Task given_an_error_handler_that_seeks_a_stopped_partition_when_receiving_should_read_from_its_seek()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 4 };
+        using var client = await cluster.ConnectAsync();
+        await using var consumer = await StartAsync(client, CommitPolicy.Manual, 1);
+        ConcurrentBag<Exception> errors = [];
+        consumer.SubscribeToErrorEvents(error =>
+        {
+            errors.Add(error.Exception);
+            cluster.HistoryRefused.Clear();
+            return consumer.SeekAsync(1, PollingStrategy.Offset(3), Token);
+        });
+
+        var resumed = await ReceiveAfterLostHistoryAsync(consumer, cluster, errors);
+
+        Assert.Single(errors);
+        Assert.Equal(3ul, resumed);
+    }
+
+    /// <summary>
+    ///     An error handler awaits before it seeks the stopped partition. The consumer waits for the handler, so that
+    ///     seek stays in place too.
+    /// </summary>
+    [Fact]
+    public async Task given_an_error_handler_that_seeks_a_stopped_partition_after_an_await_when_receiving_should_read_from_its_seek()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 4 };
+        using var client = await cluster.ConnectAsync();
+        await using var consumer = await StartAsync(client, CommitPolicy.Manual, 1);
+        ConcurrentBag<Exception> errors = [];
+        consumer.SubscribeToErrorEvents(async error =>
+        {
+            errors.Add(error.Exception);
+            await Task.Delay(RetryInterval, Token);
+            cluster.HistoryRefused.Clear();
+            await consumer.SeekAsync(1, PollingStrategy.Offset(3), Token);
+        });
+
+        var resumed = await ReceiveAfterLostHistoryAsync(consumer, cluster, errors);
+
+        Assert.Single(errors);
+        Assert.Equal(3ul, resumed);
+    }
+
+    /// <summary>
+    ///     The first message of a last start is above the byte limit of a read, so the reader stops the partition
+    ///     until a seek that only the application can choose. The stream ends with the error, as it does for a message
+    ///     that does not decode, instead of waiting on a partition that never reads again.
+    /// </summary>
+    [Fact]
+    public async Task given_a_last_start_with_an_oversized_first_message_when_receiving_should_end_the_stream_with_its_stop()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 4, OversizedLast = true };
+        using var client = await cluster.ConnectAsync();
+        await using var consumer = new IggyConsumer(client, new IggyConsumerConfig
+        {
+            StreamId = Stream,
+            TopicId = Topic,
+            Consumer = Consumer.New(4),
+            Partitions = [1],
+            PollingStrategy = PollingStrategy.Last(),
+            PollOptions = new PollOptions { MaxWait = TimeSpan.FromMilliseconds(100) },
+            RetryInterval = RetryInterval
+        }, NullLoggerFactory.Instance);
+        await consumer.InitAsync(Token);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(Token);
+        timeout.CancelAfter(PromptLimit);
+
+        var error = await Assert.ThrowsAsync<ReadException>(async () =>
+        {
+            await foreach (var _ in consumer.ReceiveAsync(timeout.Token))
+            {
+            }
+        });
+
+        Assert.Equal((1u, VsrError.INVALID_SIZE_BYTES, true, false), (error.PartitionId,
+            Assert.IsType<IggyInvalidStatusCodeException>(error.InnerException).StatusCode, error.StopsPartition,
+            error.IsResumable));
+    }
+
     [Fact]
     public async Task given_a_cancel_after_a_message_when_receiving_should_stop_without_an_error()
     {
@@ -344,7 +488,8 @@ public sealed class ConsumerOnReaderTests
             TopicId = Topic,
             Consumer = Consumer.New(4),
             Partitions = partitions,
-            PollOptions = new PollOptions { MaxWait = TimeSpan.FromMilliseconds(100), Commit = commit }
+            PollOptions = new PollOptions { MaxWait = TimeSpan.FromMilliseconds(100), Commit = commit },
+            RetryInterval = RetryInterval
         }, NullLoggerFactory.Instance);
         await consumer.InitAsync(Token);
         return consumer;
@@ -365,6 +510,31 @@ public sealed class ConsumerOnReaderTests
         }
 
         return received;
+    }
+
+    /// <summary>
+    ///     Commits offset 0 of partition 1, then loses the history of its position, and returns the first offset
+    ///     received after the error, or null when none arrives in time.
+    /// </summary>
+    private static async Task<ulong?> ReceiveAfterLostHistoryAsync(IggyConsumer consumer, ReaderCluster cluster,
+        ConcurrentBag<Exception> errors)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(Token);
+        timeout.CancelAfter(PromptLimit);
+        await foreach (var message in consumer.ReceiveAsync(timeout.Token))
+        {
+            if (message.CurrentOffset == 0)
+            {
+                await consumer.CommitAsync(message.Checkpoint!, Token);
+                cluster.HistoryRefused.Add(1);
+            }
+            else if (!errors.IsEmpty)
+            {
+                return message.CurrentOffset;
+            }
+        }
+
+        return null;
     }
 
     private static async Task UntilAsync(Func<bool> predicate)

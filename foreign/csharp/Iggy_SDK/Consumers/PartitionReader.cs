@@ -1496,7 +1496,11 @@ public sealed class PartitionReader : IAsyncDisposable
                     state.Lasting++;
                     if (state.Lasting >= MaxLastingRefusals)
                     {
-                        report = new ReadException(target.Partition, error);
+                        report = new ReadException(target.Partition, error)
+                        {
+                            StopsPartition = true,
+                            IsResumable = true
+                        };
                         state.Stopped = report;
                         break;
                     }
@@ -1510,15 +1514,23 @@ public sealed class PartitionReader : IAsyncDisposable
                         target.Partition);
                     state.RetryAt = now + interval;
                     return;
-                case IggyInvalidStatusCodeException { StatusCode: VsrError.HISTORY_UNAVAILABLE or VsrError.INVALID_SIZE_BYTES }:
-                    report = new ReadException(target.Partition, error);
+                case IggyInvalidStatusCodeException { StatusCode: VsrError.HISTORY_UNAVAILABLE or VsrError.INVALID_SIZE_BYTES } refusal:
+                    report = new ReadException(target.Partition, error)
+                    {
+                        StopsPartition = true,
+                        IsResumable = refusal.StatusCode == VsrError.HISTORY_UNAVAILABLE
+                    };
                     state.Stopped = report;
                     break;
                 case IggyInvalidStatusCodeException status when IsLasting(status.StatusCode):
                     state.Lasting++;
                     if (state.Lasting >= MaxLastingRefusals)
                     {
-                        report = new ReadException(target.Partition, error);
+                        report = new ReadException(target.Partition, error)
+                        {
+                            StopsPartition = true,
+                            IsResumable = true
+                        };
                         state.Stopped = report;
                         break;
                     }
