@@ -123,7 +123,8 @@ pub(crate) enum ConnectorConfigAction {
     Create(ConnectorConfigCreateArgs),
     /// Delete a configuration version
     ///
-    /// Without a version deletes the active version.
+    /// The version is required: the runtime deletes the active version when
+    /// none is given.
     ///
     /// Examples:
     ///  iggy connector config delete sink my-sink --version 3
@@ -179,9 +180,9 @@ pub(crate) struct ConnectorConfigDeleteArgs {
     pub(crate) kind: ConnectorKind,
     /// Connector key
     pub(crate) key: String,
-    /// Configuration version, defaults to the active version
+    /// Configuration version to delete
     #[clap(short, long)]
-    pub(crate) version: Option<u64>,
+    pub(crate) version: u64,
 }
 
 #[derive(Debug, Clone, Args)]

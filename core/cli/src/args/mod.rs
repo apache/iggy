@@ -74,6 +74,7 @@ pub(crate) mod session;
 
 static CARGO_BIN_NAME: &str = env!("CARGO_BIN_NAME");
 static CARGO_PKG_HOMEPAGE: &str = env!("CARGO_PKG_HOMEPAGE");
+static ENV_CONNECTORS_API_KEY: &str = "IGGY_CONNECTORS_API_KEY";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -318,7 +319,11 @@ impl IggyMergedConsoleArgs {
             token_name: args.cli.token_name.or(context.token_name),
             generator: args.cli.generator,
             connectors_api_url: args.cli.connectors_api_url.or(context.connectors_api_url),
-            connectors_api_key: args.cli.connectors_api_key.or(context.connectors_api_key),
+            connectors_api_key: resolve_connectors_api_key(
+                args.cli.connectors_api_key,
+                std::env::var(ENV_CONNECTORS_API_KEY).ok(),
+                context.connectors_api_key,
+            ),
             connectors_tls_ca_file: args
                 .cli
                 .connectors_tls_ca_file
@@ -329,5 +334,49 @@ impl IggyMergedConsoleArgs {
             iggy: IggyArgs::from(vec![context.iggy, args.iggy]),
             cli: merged_cli_options,
         }
+    }
+}
+
+/// Flag first, then the environment, then the saved context. An empty
+/// variable counts as unset.
+fn resolve_connectors_api_key(
+    flag: Option<String>,
+    env: Option<String>,
+    context: Option<String>,
+) -> Option<String> {
+    flag.or(env.filter(|key| !key.is_empty())).or(context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(value: &str) -> Option<String> {
+        Some(value.to_string())
+    }
+
+    #[test]
+    fn should_prefer_flag_over_env_over_context() {
+        assert_eq!(
+            resolve_connectors_api_key(key("flag"), key("env"), key("context")),
+            key("flag")
+        );
+        assert_eq!(
+            resolve_connectors_api_key(None, key("env"), key("context")),
+            key("env")
+        );
+        assert_eq!(
+            resolve_connectors_api_key(None, None, key("context")),
+            key("context")
+        );
+        assert_eq!(resolve_connectors_api_key(None, None, None), None);
+    }
+
+    #[test]
+    fn should_ignore_empty_env_key() {
+        assert_eq!(
+            resolve_connectors_api_key(None, key(""), key("context")),
+            key("context")
+        );
     }
 }

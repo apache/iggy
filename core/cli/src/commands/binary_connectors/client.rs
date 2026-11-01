@@ -21,9 +21,11 @@ use reqwest::{Method, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::time::Duration;
 
-static ENV_CONNECTORS_API_KEY: &str = "IGGY_CONNECTORS_API_KEY";
 static DEFAULT_API_URL: &str = "http://localhost:8081";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Sink or source: separate routes, and both sides may use the same key.
 #[derive(Debug, Clone, Copy)]
@@ -82,7 +84,11 @@ impl ConnectorsApiClient {
         api_key: Option<String>,
         tls_ca_file: Option<PathBuf>,
     ) -> Result<Self> {
-        let mut builder = reqwest::Client::builder();
+        // No redirects: a redirect would resend the api-key header to another host.
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none());
         if let Some(ca_file) = tls_ca_file {
             let pem = std::fs::read(&ca_file)
                 .with_context(|| format!("problem reading CA file {}", ca_file.display()))?;
@@ -97,9 +103,7 @@ impl ConnectorsApiClient {
             .unwrap_or_else(|| DEFAULT_API_URL.to_string())
             .trim_end_matches('/')
             .to_string();
-        let api_key = api_key
-            .or_else(|| std::env::var(ENV_CONNECTORS_API_KEY).ok())
-            .map(SecretString::from);
+        let api_key = api_key.map(SecretString::from);
         Ok(Self {
             inner,
             base_url,

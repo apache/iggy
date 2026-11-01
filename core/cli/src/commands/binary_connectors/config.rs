@@ -139,6 +139,10 @@ impl CliCommand for GetConnectorConfigCmd {
         }
     }
 
+    fn stdout_is_data(&self) -> bool {
+        true
+    }
+
     fn login_required(&self) -> bool {
         false
     }
@@ -200,6 +204,10 @@ impl CliCommand for GetConnectorPluginConfigCmd {
             self.kind.singular(),
             self.key
         )
+    }
+
+    fn stdout_is_data(&self) -> bool {
+        true
     }
 
     fn login_required(&self) -> bool {
@@ -265,6 +273,10 @@ impl CliCommand for CreateConnectorConfigCmd {
         )
     }
 
+    fn stdout_is_data(&self) -> bool {
+        true
+    }
+
     fn login_required(&self) -> bool {
         false
     }
@@ -307,7 +319,7 @@ impl CliCommand for CreateConnectorConfigCmd {
 pub struct DeleteConnectorConfigCmd {
     kind: ConnectorKind,
     key: String,
-    version: Option<u64>,
+    version: u64,
     endpoint: ConnectorEndpoint,
 }
 
@@ -315,7 +327,7 @@ impl DeleteConnectorConfigCmd {
     pub fn new(
         kind: ConnectorKind,
         key: String,
-        version: Option<u64>,
+        version: u64,
         endpoint: ConnectorEndpoint,
     ) -> Self {
         Self {
@@ -330,18 +342,12 @@ impl DeleteConnectorConfigCmd {
 #[async_trait]
 impl CliCommand for DeleteConnectorConfigCmd {
     fn explain(&self) -> String {
-        match self.version {
-            Some(version) => format!(
-                "delete configuration version {version} of {} {}",
-                self.kind.singular(),
-                self.key
-            ),
-            None => format!(
-                "delete active configuration of {} {}",
-                self.kind.singular(),
-                self.key
-            ),
-        }
+        format!(
+            "delete configuration version {} of {} {}",
+            self.version,
+            self.kind.singular(),
+            self.key
+        )
     }
 
     fn login_required(&self) -> bool {
@@ -354,10 +360,7 @@ impl CliCommand for DeleteConnectorConfigCmd {
 
     async fn execute_cmd(&mut self, _client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         let mut api = self.endpoint.connect()?;
-        let query: Vec<(&str, String)> = self
-            .version
-            .map(|version| vec![("version", version.to_string())])
-            .unwrap_or_default();
+        let query = [("version", self.version.to_string())];
         api.delete(&configs_path(self.kind, &self.key), &query)
             .await
             .with_context(|| {
@@ -369,7 +372,8 @@ impl CliCommand for DeleteConnectorConfigCmd {
             })?;
 
         event!(target: PRINT_TARGET, Level::INFO,
-            "configuration deleted successfully for {} {}", self.kind.singular(), self.key);
+            "configuration version {} deleted successfully for {} {}",
+            self.version, self.kind.singular(), self.key);
 
         Ok(())
     }
@@ -431,7 +435,7 @@ impl CliCommand for ActivateConnectorConfigCmd {
         })?;
 
         event!(target: PRINT_TARGET, Level::INFO,
-            "configuration version {} activated for {} {}, takes effect on restart",
+            "configuration version {} marked active for {} {}, the running connector keeps its configuration",
             self.version, self.kind.singular(), self.key);
 
         Ok(())
