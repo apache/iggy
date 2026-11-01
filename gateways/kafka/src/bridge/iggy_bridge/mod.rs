@@ -329,6 +329,12 @@ impl IggyBridge {
         self.topic_shapes.subscribe()
     }
 
+    /// Shows `shapes` as a read of the change log would.
+    #[cfg(test)]
+    pub(crate) fn show_topic_shapes(&self, shapes: TopicShapes) {
+        self.topic_shapes.send_replace(Arc::new(shapes));
+    }
+
     /// Waits until the change log follower has read Iggy's change log once, or turned out not to
     /// be able to, at most until `deadline`. `Some(true)` once it read it, `Some(false)` when the
     /// bridge user may not read it or Iggy does not serve it, `None` at the deadline.

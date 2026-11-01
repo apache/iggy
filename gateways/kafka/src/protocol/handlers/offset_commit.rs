@@ -25,15 +25,19 @@
 //! commit counts only once the log holds it. The log answers `OffsetFetch`. A partition that
 //! Iggy's change log shows appends at once with the Iggy store, as Kafka checks a commit against
 //! its metadata and writes once. Any other appends once Iggy stored it, since that store checks
-//! the topic and the partition.
+//! the topic and the partition, and once the change log shows the topic. So each logged offset
+//! names its topic's incarnation, and a late deletion of an older topic of that name leaves it.
 
 use bytes::Bytes;
 use kafka_protocol::messages::offset_commit_response::{
     OffsetCommitResponsePartition, OffsetCommitResponseTopic,
 };
 use kafka_protocol::messages::{OffsetCommitRequest, OffsetCommitResponse};
+use tokio::time::{Instant, timeout_at};
 
-use crate::bridge::{BridgeError, IggyBridge, OffsetCalls, TopicShape, TopicTarget};
+use crate::bridge::{
+    BridgeError, IggyBridge, OffsetCalls, OffsetGroupSource, TopicShape, TopicShapes, TopicTarget,
+};
 use crate::coordinator::record::CommittedOffset;
 use crate::coordinator::{Coordination, unix_millis};
 use crate::error::Result;
@@ -135,44 +139,20 @@ async fn commit_logged(
     let targets = targets(bridge, request);
     let (mut topics, planned) = plan(request, &targets, true);
     let group = request.group_id.0.as_str();
-    let shapes: Vec<Option<TopicShape>> = request
-        .topics
-        .iter()
-        .map(|topic| bridge.topic_shape(topic.name.0.as_str()))
-        .collect();
+    let shapes = request_shapes(request, &bridge.topic_shapes().borrow());
     let (checked, unchecked): (Vec<&Planned<'_>>, Vec<&Planned<'_>>) =
         planned.iter().partition(|planned| {
             shapes[planned.at.0].is_some_and(|shape| planned.index < shape.partitions)
         });
     let commit_timestamp_ms = unix_millis();
-    let offsets = |entries: &[&Planned<'_>]| {
-        entries
-            .iter()
-            .map(|planned| {
-                let (topic_at, partition_at) = planned.at;
-                let topic = &request.topics[topic_at];
-                let partition = &topic.partitions[partition_at];
-                let committed = CommittedOffset {
-                    offset: partition.committed_offset,
-                    leader_epoch: partition.committed_leader_epoch,
-                    metadata: partition
-                        .committed_metadata
-                        .as_ref()
-                        .map(ToString::to_string),
-                    commit_timestamp_ms,
-                    topic_incarnation: shapes[topic_at].map(|shape| shape.incarnation),
-                };
-                (
-                    topic.name.0.to_string(),
-                    partition.partition_index,
-                    committed,
-                )
-            })
-            .collect::<Vec<_>>()
-    };
     let ((), logged) = tokio::join!(
         store_in_iggy(bridge, request, &planned, calls, &mut topics),
-        log_offsets(coordination, group, offsets(&checked), calls),
+        log_offsets(
+            coordination,
+            group,
+            logged_offsets(request, &checked, &shapes, commit_timestamp_ms),
+            calls
+        ),
     );
     if let Err(code) = logged {
         set_code(&mut topics, &checked, code);
@@ -181,10 +161,85 @@ async fn commit_logged(
         .into_iter()
         .filter(|planned| code_of(&topics, planned) == ERROR_NONE)
         .collect();
-    if let Err(code) = log_offsets(coordination, group, offsets(&stored), calls).await {
-        set_code(&mut topics, &stored, code);
+    // A change log that the bridge lost shows no new topic and reports no deletion, so an offset
+    // then logs without its topic's incarnation.
+    let follows = bridge.offset_group_source() == OffsetGroupSource::ChangeLog;
+    let shapes = if follows && !stored.is_empty() {
+        let waiting: Vec<usize> = stored.iter().map(|planned| planned.at.0).collect();
+        shown_shapes(bridge, request, &waiting, calls.deadline()).await
+    } else {
+        shapes
+    };
+    let (shown, unshown): (Vec<&Planned<'_>>, Vec<&Planned<'_>>) = stored
+        .into_iter()
+        .partition(|planned| !follows || shapes[planned.at.0].is_some());
+    set_code(&mut topics, &unshown, ERROR_COORDINATOR_LOAD_IN_PROGRESS);
+    let offsets = logged_offsets(request, &shown, &shapes, commit_timestamp_ms);
+    if let Err(code) = log_offsets(coordination, group, offsets, calls).await {
+        set_code(&mut topics, &shown, code);
     }
     topics
+}
+
+/// The change log's shape of each requested topic, in request order.
+fn request_shapes(request: &OffsetCommitRequest, shown: &TopicShapes) -> Vec<Option<TopicShape>> {
+    request
+        .topics
+        .iter()
+        .map(|topic| shown.get(topic.name.0.as_str()).copied())
+        .collect()
+}
+
+/// [`request_shapes`] once the change log shows each requested topic at `waiting`, positions in
+/// the request, or at `deadline`. Iggy holds those topics, since it stored their offsets, and the
+/// change log shows a new topic about a second after Iggy creates it.
+async fn shown_shapes(
+    bridge: &IggyBridge,
+    request: &OffsetCommitRequest,
+    waiting: &[usize],
+    deadline: Instant,
+) -> Vec<Option<TopicShape>> {
+    let mut changes = bridge.topic_shapes();
+    loop {
+        let shapes = request_shapes(request, &changes.borrow_and_update());
+        let shown = waiting.iter().all(|topic_at| shapes[*topic_at].is_some());
+        if shown || !matches!(timeout_at(deadline, changes.changed()).await, Ok(Ok(()))) {
+            return shapes;
+        }
+    }
+}
+
+/// The offset of each of `entries` as the coordinator log keeps it, with the incarnation of its
+/// topic from `shapes`.
+fn logged_offsets(
+    request: &OffsetCommitRequest,
+    entries: &[&Planned<'_>],
+    shapes: &[Option<TopicShape>],
+    commit_timestamp_ms: i64,
+) -> Vec<(String, i32, CommittedOffset)> {
+    entries
+        .iter()
+        .map(|planned| {
+            let (topic_at, partition_at) = planned.at;
+            let topic = &request.topics[topic_at];
+            let partition = &topic.partitions[partition_at];
+            let committed = CommittedOffset {
+                offset: partition.committed_offset,
+                leader_epoch: partition.committed_leader_epoch,
+                metadata: partition
+                    .committed_metadata
+                    .as_ref()
+                    .map(ToString::to_string),
+                commit_timestamp_ms,
+                topic_incarnation: shapes[topic_at].map(|shape| shape.incarnation),
+            };
+            (
+                topic.name.0.to_string(),
+                partition.partition_index,
+                committed,
+            )
+        })
+        .collect()
 }
 
 /// The Iggy topic of each requested topic, in request order.
@@ -356,6 +411,9 @@ pub fn encode_response(version: i16, topics: Vec<OffsetCommitResponseTopic>) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use bytes::BytesMut;
     use iggy::prelude::IggyError;
     use kafka_protocol::messages::offset_commit_request::{
@@ -483,5 +541,45 @@ mod tests {
                 .await
                 .is_close()
         );
+    }
+
+    /// Iggy stored the commit, so it holds the topic, but its change log can show the topic a
+    /// moment later. Logged before then, the offset would name no incarnation, and a late
+    /// deletion of an older topic of that name would remove it.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_topic_the_change_log_shows_late_should_wait_for_its_incarnation() {
+        let bridge = Arc::new(IggyBridge::offline());
+        let request = request(1, "m").with_topics(vec![
+            OffsetCommitRequestTopic::default()
+                .with_name(TopicName(StrBytes::from_static_str("orders"))),
+            OffsetCommitRequestTopic::default()
+                .with_name(TopicName(StrBytes::from_static_str("payments"))),
+        ]);
+        let shape = TopicShape {
+            incarnation: 7,
+            partitions: 1,
+        };
+        let change_log = Arc::clone(&bridge);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            change_log.show_topic_shapes(TopicShapes::from([("orders".to_string(), shape)]));
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let shapes = shown_shapes(&bridge, &request, &[0], deadline).await;
+
+        assert_eq!(shapes, [Some(shape), None]);
+        assert!(Instant::now() < deadline, "it ends once the topic shows");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_topic_the_change_log_never_shows_should_stop_waiting_at_the_deadline() {
+        let bridge = IggyBridge::offline();
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let shapes = shown_shapes(&bridge, &request(1, "m"), &[0], deadline).await;
+
+        assert_eq!(shapes, [None]);
+        assert!(Instant::now() >= deadline);
     }
 }

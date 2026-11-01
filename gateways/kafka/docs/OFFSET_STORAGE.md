@@ -115,7 +115,9 @@ log decides each offset:
   does not confirm it in the request's time.
 - A partition that Iggy's change log shows goes to Iggy and the log at once, as Kafka checks a
   commit against its metadata. Any other goes to the log once Iggy stored it, since that store
-  checks the topic and the partition.
+  checks the topic and the partition. It also waits until the change log shows the topic, so the
+  log names the topic's incarnation. A commit that the change log does not catch up with in the
+  request's time answers `COORDINATOR_LOAD_IN_PROGRESS` (14).
 - A commit equal to the logged one writes no record, until the logged one is an hour old.
 - A coordinator that lost the group's log partition can append, but its record does not count,
   and the commit answers `NOT_COORDINATOR` (16). Its Iggy copy can still land, so the copy can

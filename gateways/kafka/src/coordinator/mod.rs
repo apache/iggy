@@ -43,6 +43,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::{Notify, mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval, interval_at, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -221,6 +222,10 @@ pub struct Coordination {
     /// The owners that a listener of this gateway does not list, each warned of once.
     unlisted: Mutex<HashSet<u16>>,
     stopped: mpsc::UnboundedSender<Stopped>,
+    /// Stops the lease loop and the loads. A child of `cancel`, and the first step of a shutdown.
+    leasing: CancellationToken,
+    /// The lease loop, which a shutdown waits for.
+    lease_loop: Mutex<Option<JoinHandle<()>>>,
     cancel: CancellationToken,
 }
 
@@ -282,10 +287,16 @@ impl Coordination {
             topics,
             unlisted: Mutex::new(HashSet::new()),
             stopped,
+            leasing: cancel.child_token(),
+            lease_loop: Mutex::new(None),
             cancel,
         });
         groups.set_home(Arc::clone(&this) as Arc<dyn GroupHome>);
-        tokio::spawn(Arc::clone(&this).lease_on(stops));
+        let lease_loop = tokio::spawn(Arc::clone(&this).lease_on(stops));
+        *this
+            .lease_loop
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(lease_loop);
         tokio::spawn(Arc::clone(&this).follow_owners());
         tokio::spawn(Arc::clone(&this).announce_on());
         tokio::spawn(Arc::clone(&this).sweep_on());
@@ -303,7 +314,21 @@ impl Coordination {
 
     /// Leaves the lease group, so Iggy hands this gateway's partitions to the others at once,
     /// then stops serving them. Their groups move with their members, so they do not rebalance.
+    ///
+    /// The lease loop stops first, and its read in flight ends: a read that finds this gateway no
+    /// member would join the group again, and Iggy would hand partitions back to it.
     pub async fn shutdown(&self) {
+        self.leasing.cancel();
+        let lease_loop = self
+            .lease_loop
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(lease_loop) = lease_loop
+            && let Err(error) = lease_loop.await
+        {
+            warn!(%error, "the coordinator lease loop did not end cleanly");
+        }
         if let Err(error) = self.link.leave_lease().await {
             warn!(%error, "could not leave the coordinator lease group; the other gateways take over when the session ends");
         }
@@ -531,18 +556,25 @@ impl Coordination {
         let mut last_read = Instant::now();
         loop {
             tokio::select! {
-                () = self.cancel.cancelled() => return,
+                () = self.leasing.cancelled() => return,
                 Some(stopped) = stops.recv() => self.take_stop(stopped).await,
                 _ = tick.tick() => {
-                    match self.link.assignment().await {
+                    let read = tokio::select! {
+                        () = self.leasing.cancelled() => return,
+                        read = self.link.assignment() => read,
+                    };
+                    match read {
                         Ok(Some(assigned)) => {
                             last_read = Instant::now();
                             self.reconcile(&assigned).await;
                         }
                         Ok(None) => {
                             last_read = Instant::now();
-                            warn!("this gateway is no member of the coordinator lease group; joining again");
                             self.release_all(Stop::Released).await;
+                            if self.leasing.is_cancelled() {
+                                return;
+                            }
+                            warn!("this gateway is no member of the coordinator lease group; joining again");
                             if let Err(error) = self.link.join_lease().await {
                                 warn!(%error, "could not join the coordinator lease group");
                             }
@@ -599,7 +631,7 @@ impl Coordination {
             .evict(|group_id| partition_of_group(group_id) == partition)
             .await;
         let claimed = tokio::select! {
-            () = self.cancel.cancelled() => {
+            () = self.leasing.cancelled() => {
                 self.loading().remove(&partition);
                 return;
             }
@@ -624,7 +656,21 @@ impl Coordination {
                     &self.cancel,
                 );
                 let claim = log.claim;
-                let previous = self.served_mut().insert(partition, Arc::clone(&log));
+                let served = {
+                    let mut served = self.served_mut();
+                    // Under the lock that a shutdown's release takes after it stops the leasing: a
+                    // load either serves before the release, or sees the shutdown and does not.
+                    (!self.leasing.is_cancelled())
+                        .then(|| served.insert(partition, Arc::clone(&log)))
+                };
+                let Some(previous) = served else {
+                    log.stop();
+                    self.groups
+                        .evict(|group_id| partition_of_group(group_id) == partition)
+                        .await;
+                    self.loading().remove(&partition);
+                    return;
+                };
                 if let Some(previous) = previous {
                     previous.stop();
                 }

@@ -43,6 +43,7 @@ const KIND_OFFSET: u8 = 5;
 const KIND_GROUP_OFFSETS_DELETED: u8 = 6;
 const KIND_TOPIC_OFFSETS_DELETED: u8 = 7;
 const KIND_GROUP_OFFSETS_EXPIRED: u8 = 8;
+const KIND_GROUP_OFFSETS_COMPLETE: u8 = 9;
 
 const KIND_ANNOUNCEMENT: u8 = 1;
 
@@ -92,6 +93,10 @@ pub enum Body {
     /// The group had no members and no commit for the retention period, so the log drops its
     /// offsets. Iggy still holds them.
     GroupOffsetsExpired { group_id: String },
+    /// A checkpoint's mark that the log holds every offset of the group, as after
+    /// [`Body::GroupOffsetsDeleted`]. The group's offsets follow it. It removes none, so a load
+    /// that replays a checkpoint cut short keeps the offsets the checkpoint did not reach.
+    GroupOffsetsComplete { group_id: String },
 }
 
 /// One committed offset, with what Kafka keeps beside it.
@@ -174,7 +179,9 @@ impl Record {
                     }
                 }
             }
-            Body::GroupOffsetsDeleted { group_id } | Body::GroupOffsetsExpired { group_id } => {
+            Body::GroupOffsetsDeleted { group_id }
+            | Body::GroupOffsetsExpired { group_id }
+            | Body::GroupOffsetsComplete { group_id } => {
                 put_str(&mut buf, group_id, "group id")?;
             }
             Body::TopicOffsetsDeleted { topic, incarnation } => {
@@ -250,6 +257,9 @@ impl Record {
             KIND_GROUP_OFFSETS_EXPIRED => Body::GroupOffsetsExpired {
                 group_id: get_str(&mut bytes, "group id")?,
             },
+            KIND_GROUP_OFFSETS_COMPLETE => Body::GroupOffsetsComplete {
+                group_id: get_str(&mut bytes, "group id")?,
+            },
             _ => return Err(RecordError::Unreadable { version, kind }),
         };
         Ok(Self {
@@ -271,6 +281,7 @@ impl Body {
             Self::GroupOffsetsDeleted { .. } => KIND_GROUP_OFFSETS_DELETED,
             Self::TopicOffsetsDeleted { .. } => KIND_TOPIC_OFFSETS_DELETED,
             Self::GroupOffsetsExpired { .. } => KIND_GROUP_OFFSETS_EXPIRED,
+            Self::GroupOffsetsComplete { .. } => KIND_GROUP_OFFSETS_COMPLETE,
         }
     }
 
@@ -281,7 +292,8 @@ impl Body {
             Self::Group { group_id, .. }
             | Self::Offset { group_id, .. }
             | Self::GroupOffsetsDeleted { group_id }
-            | Self::GroupOffsetsExpired { group_id } => Some(group_id),
+            | Self::GroupOffsetsExpired { group_id }
+            | Self::GroupOffsetsComplete { group_id } => Some(group_id),
             Self::Claim { .. }
             | Self::CheckpointBegin { .. }
             | Self::CheckpointEnd { .. }
@@ -579,6 +591,9 @@ mod tests {
                 incarnation: 41,
             },
             Body::GroupOffsetsExpired {
+                group_id: "orders".to_string(),
+            },
+            Body::GroupOffsetsComplete {
                 group_id: "orders".to_string(),
             },
         ];

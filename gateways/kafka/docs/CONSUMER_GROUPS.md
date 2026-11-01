@@ -286,8 +286,9 @@ Iggy's change log. Without it the gateway does not start. The code is in `src/co
   record. It writes one after 10,000 records, or after as many records as there are live
   entries when that is more, and when the last one is a day old, also across a change of owner.
   Each record names where the last complete checkpoint begins, so a load reads only from there.
-  Appends go between the checkpoint's chunks, so a commit waits for one chunk at most. Iggy keeps
-  the log for 2 days.
+  A checkpoint record only repeats what the log holds. So a checkpoint that stops before its end
+  changes nothing for the next load, which starts at the checkpoint before it. Appends go between
+  the checkpoint's chunks, so a commit waits for one chunk at most. Iggy keeps the log for 2 days.
 - A commit equal to the logged one writes nothing, until the logged one is an hour old.
 - The log drops the offsets of a group without members 7 days after its last commit, Kafka's
   `offsets.retention.minutes` default. Iggy still holds them, and answers from then on.
@@ -299,9 +300,9 @@ Iggy's change log. Without it the gateway does not start. The code is in `src/co
   own one partition. So each commit and each stored generation also waits for a stable-storage
   write on a quorum. The owner topic is `replicated`. A gateway refuses a log topic that is not
   `persisted`, or that expires records within 25 hours, which could drop the last checkpoint.
-- On SIGTERM, the gateway leaves the Iggy group before its drain, so the others take its
-  partitions over at once. Its group requests in flight answer `NOT_COORDINATOR`, and their
-  clients go to the new coordinator.
+- On SIGTERM, the gateway stops accepting connections and leaves the Iggy group, so the others
+  take its partitions over at once. Its group requests in flight answer `NOT_COORDINATOR`, and
+  their clients go to the new coordinator. Then the gateway closes its connections.
 - `ListGroups`, `DescribeGroups`, `DeleteGroups` and `OffsetDelete` answer only for the groups of
   this gateway. The others get `NOT_COORDINATOR` per group. The Java admin client asks every
   broker and keeps one answer per group.

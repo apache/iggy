@@ -186,6 +186,9 @@ impl PartitionState {
             Body::GroupOffsetsExpired { group_id } => {
                 self.offsets.remove(&group_id);
             }
+            Body::GroupOffsetsComplete { group_id } => {
+                self.offsets.entry(group_id).or_default().complete = true;
+            }
         }
         Applied::Valid
     }
@@ -310,12 +313,13 @@ impl PartitionState {
 
     /// Hands `write` each record that rewrites `unit` as the state holds it now, with the offset
     /// it rewrites, until `write` returns false. Offsets go in key order, from the one after
-    /// `after`. A group whose offsets the log alone holds starts with its deletion when `after` is
-    /// `None`, so its offsets must follow that record. Nothing when the state no longer holds the
-    /// unit.
+    /// `after`. A group whose offsets the log alone holds starts with
+    /// [`Body::GroupOffsetsComplete`] when `after` is `None`. Nothing when the state no longer
+    /// holds the unit.
     ///
-    /// A deletion of one offset stays, since without it a load would find the offset in Iggy
-    /// again.
+    /// Every record repeats what the state holds, so a replay that reads only part of a
+    /// checkpoint, after the records it repeats, ends in the same state. A deletion of one offset
+    /// stays, since without it a load would find the offset in Iggy again.
     pub fn rewrite_unit(
         &self,
         unit: &CheckpointUnit,
@@ -338,10 +342,10 @@ impl PartitionState {
         let Some(offsets) = self.offsets.get(group_id) else {
             return;
         };
-        let deletion = Body::GroupOffsetsDeleted {
+        let complete = Body::GroupOffsetsComplete {
             group_id: group_id.clone(),
         };
-        if offsets.complete && after.is_none() && !write(deletion, None) {
+        if offsets.complete && after.is_none() && !write(complete, None) {
             return;
         }
         let start = after.map_or(Bound::Unbounded, Bound::Excluded);
@@ -604,6 +608,52 @@ mod tests {
         assert!(rebuilt.offsets["b"].complete);
     }
 
+    /// A gateway that stops between two sends of a checkpoint leaves only its first part in the
+    /// log. The next load replays that part after the records it repeats, so the part must change
+    /// nothing, also for a group that a deletion made complete.
+    #[test]
+    fn given_a_checkpoint_cut_short_when_replayed_after_what_it_repeats_should_keep_every_offset() {
+        let mut state = PartitionState::default();
+        state.apply(0, 0, record(1, Body::Claim { node_id: 1 }));
+        state.apply(
+            1,
+            0,
+            record(
+                1,
+                Body::GroupOffsetsDeleted {
+                    group_id: "a".to_string(),
+                },
+            ),
+        );
+        for (offset, partition) in (2..).zip(0..3) {
+            state.apply(
+                offset,
+                0,
+                record(1, commit("a", "orders", partition, 5, Some(1))),
+            );
+        }
+        let held = state.offsets.clone();
+
+        let begin = 5;
+        state.apply(begin, 0, record(1, Body::CheckpointBegin { node_id: 1 }));
+        let mut written = Vec::new();
+        state.rewrite_unit(
+            &CheckpointUnit::Offsets("a".to_string()),
+            None,
+            |body, _| {
+                written.push(body);
+                written.len() < 2
+            },
+        );
+        assert_eq!(written.len(), 2, "the mark and the first offset");
+        for (offset, body) in (begin + 1..).zip(written) {
+            assert_eq!(state.apply(offset, 0, record(1, body)), Applied::Valid);
+        }
+
+        assert_eq!(state.offsets, held);
+        assert_eq!(state.checkpoint, NO_CHECKPOINT, "no checkpoint completed");
+    }
+
     #[test]
     fn given_an_end_without_its_begin_before_it_should_not_move_the_checkpoint() {
         let mut state = PartitionState::default();
@@ -808,7 +858,7 @@ mod tests {
         assert_eq!(
             partitions(None),
             [-1, 0, 1, 2],
-            "the deletion first, from the start"
+            "the mark first, from the start"
         );
         assert_eq!(partitions(Some(&("orders".to_string(), 0))), [1, 2]);
     }

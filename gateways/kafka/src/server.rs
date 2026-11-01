@@ -587,7 +587,7 @@ impl KafkaGateway {
             },
         };
         // The accept loops stop first, so no connection is spawned after the drain starts waiting.
-        cancel.cancel();
+        // Aborted, not cancelled: the connections still answer while the drain hands groups over.
         accept_loops.shutdown().await;
         drain(&state, &tracker, &cancel, drain_timeout).await;
         // After the drain, so no connection starts one after it, and before `run` returns, so

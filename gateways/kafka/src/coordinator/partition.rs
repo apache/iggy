@@ -58,8 +58,9 @@ const CLAIM_TIMEOUT: Duration = Duration::from_secs(15);
 /// confirmed meanwhile.
 const READ_FAILURE_LIMIT: Duration = Duration::from_secs(10);
 
-/// What one send of appends carries at most, so a burst of small appends shares one send. Iggy's
-/// message size caps it too. A checkpoint chunk fills up to the bytes alone.
+/// What one send carries at most, so a burst of small appends shares one send. Iggy's message
+/// size caps it too. A checkpoint builds each send under the state's lock, which the reader and
+/// offset reads wait for, so the records cap how long it holds the lock.
 const MAX_BATCH_RECORDS: usize = 1_000;
 const MAX_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -850,8 +851,8 @@ impl PartitionLog {
             let after = cursor.after.take();
             let mut last = after.clone();
             let mut full = false;
-            // A group's deletion alone in the chunk still takes the next offset, so a chunk
-            // always gets past it.
+            // A group's mark alone in the chunk still takes the next offset, so a chunk always
+            // gets past it.
             let mut alone = false;
             state.rewrite_unit(unit, after.as_ref(), |body, key| {
                 let record = Record {
@@ -881,7 +882,10 @@ impl PartitionLog {
                     return true;
                 }
                 let record_bytes = send_bytes(&payload);
-                if !chunk.is_empty() && !alone && bytes + record_bytes > max_bytes {
+                if !chunk.is_empty()
+                    && !alone
+                    && (chunk.len() >= MAX_BATCH_RECORDS || bytes + record_bytes > max_bytes)
+                {
                     full = true;
                     return false;
                 }
@@ -1098,6 +1102,35 @@ mod tests {
             .changed_commits("g", commits(&[(0, 5, 1_000 + refresh)]))
             .await;
         assert_eq!(refreshed.len(), 1, "an hour later it is logged again");
+    }
+
+    /// Each chunk is built under the state's lock, which the reader and offset reads wait for, so
+    /// many small offsets still go in chunks of a bounded count.
+    #[test]
+    fn given_many_small_offsets_should_cap_each_checkpoint_chunk_at_the_batch_records() {
+        let bodies = (0..2_500)
+            .map(|partition| Body::Offset {
+                group_id: "g".to_string(),
+                topic: "orders".to_string(),
+                partition,
+                committed: Some(committed(i64::from(partition), 0)),
+            })
+            .collect();
+        let state = applied(bodies);
+        let (log, _queue) = unserved(MAX_BATCH_BYTES);
+        let units = state.checkpoint_units();
+        let mut cursor = CheckpointCursor::default();
+        let mut sizes = Vec::new();
+        loop {
+            let chunk = log
+                .checkpoint_chunk(&state, &units, &mut cursor, NO_CHECKPOINT)
+                .expect("the records encode");
+            if chunk.is_empty() {
+                break;
+            }
+            sizes.push(chunk.len());
+        }
+        assert_eq!(sizes, [MAX_BATCH_RECORDS, MAX_BATCH_RECORDS, 500]);
     }
 
     /// A load from the checkpoint's begin must rebuild what the owner holds, also when the chunks

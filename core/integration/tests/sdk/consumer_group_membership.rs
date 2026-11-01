@@ -883,21 +883,23 @@ async fn given_a_handoff_when_members_read_their_assignment_should_drop_the_part
 
     // Polled and not committed, so neither partition drains until the source commits it.
     let mut polled = std::collections::BTreeMap::new();
-    while polled.len() < 2 {
+    for &partition in &whole.partitions {
         let messages = source
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                None,
+                partition,
                 &consumer,
                 &PollingStrategy::offset(0),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
         assert_eq!(messages.messages.len(), 1);
-        polled.insert(messages.partition_id, messages.messages[0].header.offset);
+        polled.insert(partition, messages.messages[0].header.offset);
     }
 
     target
