@@ -579,7 +579,7 @@ An idempotent producer writes each batch once. If it sends a batch again, the pa
 
 For exactly-once delivery, give the topic `persisted` durability. With `replicated`, a quorum of nodes that crash at the same time can lose acknowledged batches.
 
-The client puts the producer id, the epoch and the sequence of the first message in the batch header. The epoch is a counter that fences an older copy of the same producer. `BatchProducer::new` returns `None` for an id above `i64::MAX`, an epoch above `i16::MAX` or a sequence above `i32::MAX`. Each limit fits a signed integer, so SDKs in languages without unsigned integers read the fields as they are.
+The client puts the producer id, the epoch and the sequence of the first message in the batch header. The epoch is a counter that fences an older copy of the same producer. `BatchProducer::new` returns `None` for an id above `i64::MAX`, an epoch above `i16::MAX` or a sequence above `i32::MAX`. These are Kafka's ranges, so the Kafka gateway passes the epoch and the sequence of a Kafka batch through unchanged. A sequence wraps to 0 after `i32::MAX`, and `BatchProducer::next` does the wrap.
 
 `next_producer_id` returns a producer id that no other client of the cluster gets. It sends no request, because the id holds the session number of the client and a local index. One session hands out 2^20 ids. After that, the call fails with `ProducerIdsExhausted` (91), and a new sign-in starts a new range. An id stays unique after its session ends, so a producer can store its id and use it again after a restart.
 

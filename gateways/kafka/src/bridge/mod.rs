@@ -34,7 +34,7 @@ pub use iggy_bridge::{
     CLUSTER_ID_TOPIC, ClusterIdCall, DEFAULT_TOPIC_PARTITIONS, IggyBridge, KafkaTopicMetadata,
     MAX_TOPIC_PARTITIONS, OFFSET_GROUP_PREFIX, OffsetCalls, OffsetGroups, PartitionBatch,
     ProduceTurn, Producer, ScannedGroups, StreamTopicCache, TopicCreationOutcome, TopicLoad,
-    TopicTarget, cluster_id_stream,
+    TopicTarget, cluster_id_stream, iggy_producer_id, kafka_producer_id,
 };
 pub use nodes::KnownNodes;
 pub use topic_map::{TopicMapping, TopicOverride};

@@ -28,9 +28,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Batches each producer keeps.
 ///
-/// A producer can have up to five batches in flight to one partition when it
-/// spreads them over several sessions, and a resend of any of them still finds
-/// the offset of its first write.
+/// Five is Kafka's `max.in.flight.requests.per.connection`, so a resend of any
+/// in-flight batch of a Kafka producer still finds the offset of its first
+/// write. Checkpoints and transfers carry the batch count of each producer, so
+/// this can change without a new format version.
 pub const PRODUCER_BATCHES_RETAINED: usize = 5;
 
 /// Producers a partition keeps, which bounds its memory. Past this, the one

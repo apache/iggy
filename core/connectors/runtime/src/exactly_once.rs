@@ -22,12 +22,12 @@
 //! batch sent again after a lost reply or a crash lands once.
 //!
 //! The runtime keeps the producer in the source's state, around the plugin's own bytes. The record
-//! names the epoch and the sequence of the next batch, and the save after a batch moves the
-//! sequence past it. After a NACK or a restart, the plugin produces the unsaved batch again from
-//! its saved state, and the batch goes with the same section, so the partition answers it with its
-//! first offset. A new record or a new epoch is saved before its first batch goes. The save after
-//! the first batch of a restarted source moves to the next epoch, which fences an older copy of the
-//! runtime.
+//! names the epoch and the sequence of the next batch, and the save of the plugin's new bytes after
+//! a batch moves the sequence past it. A batch without new plugin bytes is not saved. After a NACK
+//! or a restart, the plugin produces the unsaved batches again from its saved state, and they go
+//! with the same sections, so the partition answers them with their first offsets. A new record or
+//! a new epoch is saved before its first batch goes. The first save after a batch of a restarted
+//! source moves to the next epoch, which fences an older copy of the runtime.
 
 use std::time::Instant;
 
@@ -275,7 +275,7 @@ impl ExactlyOnce {
     }
 
     /// Saves the state after a batch: the plugin's new bytes, and the record past the batch that
-    /// went out. `None` when there is nothing to save.
+    /// went out. `None` when the plugin gave no new bytes, so nothing is saved.
     pub(crate) async fn commit(
         &mut self,
         client: &IggyClient,
@@ -283,9 +283,16 @@ impl ExactlyOnce {
         plugin: Option<ConnectorState>,
     ) -> Option<Result<(), SdkError>> {
         let sent = self.sent.take();
-        if sent.is_none() && plugin.is_none() {
+        let Some(plugin) = plugin else {
+            // A restart starts the plugin from its saved bytes, which come before the batch, so
+            // the stored record keeps the batch's sequence. Only this run moves past it.
+            if let Some((producer, count)) = sent
+                && let Some(record) = self.record
+            {
+                self.record = Some(record.settled(producer, count));
+            }
             return None;
-        }
+        };
         let record = match self.record(client, storage).await {
             Ok(record) => record,
             Err(error) => return Some(Err(SdkError::TransientState(error.to_string()))),
@@ -294,8 +301,8 @@ impl ExactlyOnce {
             Some((producer, count)) => record.settled(producer, count),
             None => record,
         };
-        // The first batch of this run went at the epoch of the last run, so a replay found its
-        // first write. Later batches take the next epoch, which fences an older copy.
+        // The batches of this run before this save went at the epoch of the last run, so a replay
+        // found their first writes. Later batches take the next epoch, which fences an older copy.
         let fences = sent.is_some() && self.fence;
         if fences {
             record = match self.next_epoch(client, record).await {
@@ -303,13 +310,7 @@ impl ExactlyOnce {
                 Err(error) => return Some(Err(SdkError::TransientState(error.to_string()))),
             };
         }
-        let plugin = plugin.map(|state| state.0);
-        let saved = storage
-            .save(encode(
-                &record,
-                plugin.as_deref().or(self.plugin.as_deref()),
-            ))
-            .await;
+        let saved = storage.save(encode(&record, Some(&plugin.0))).await;
         if saved.is_ok() {
             if fences {
                 self.fence = false;
@@ -319,9 +320,7 @@ impl ExactlyOnce {
                 );
             }
             self.record = Some(record);
-            if plugin.is_some() {
-                self.plugin = plugin;
-            }
+            self.plugin = Some(plugin.0);
         }
         Some(saved)
     }
@@ -540,6 +539,47 @@ mod tests {
             ..record()
         };
         assert_eq!(last.next_epoch(), None);
+    }
+
+    #[tokio::test]
+    async fn given_a_batch_without_plugin_state_when_committed_should_keep_the_stored_record() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = StateStorage::File(FileStateProvider::new(
+            dir.path().join("state").to_string_lossy().to_string(),
+        ));
+        storage
+            .save(encode(&record(), Some(b"saved")))
+            .await
+            .unwrap();
+        let init = StoredState::split(storage.load().await.unwrap()).unwrap();
+        let target = ExactlyOnceTarget {
+            stream: Identifier::named("stream").unwrap(),
+            topic: Identifier::named("topic").unwrap(),
+            partition_id: record().partition_id,
+        };
+        let mut exactly_once = ExactlyOnce::new("source", target, init);
+        let client = IggyClient::default();
+        let resumed = exactly_once.record(&client, &storage).await.unwrap();
+        exactly_once.sent = Some((resumed.producer().unwrap(), 3));
+
+        assert!(exactly_once.commit(&client, &storage, None).await.is_none());
+
+        // A restart produces the batch again from the saved bytes, with the same sequence.
+        let stored = StoredState::split(storage.load().await.unwrap()).unwrap();
+        assert_eq!(stored.record, Some(record()));
+        assert_eq!(stored.plugin.map(|state| state.0), Some(b"saved".to_vec()));
+        let next = exactly_once.record.unwrap();
+        assert_eq!(next.next_sequence, 12);
+
+        exactly_once.sent = Some((next.producer().unwrap(), 2));
+        let saved = exactly_once
+            .commit(&client, &storage, Some(ConnectorState(b"later".to_vec())))
+            .await;
+
+        assert!(matches!(saved, Some(Ok(()))));
+        let stored = StoredState::split(storage.load().await.unwrap()).unwrap();
+        assert_eq!(stored.record, record().next_epoch());
+        assert_eq!(stored.plugin.map(|state| state.0), Some(b"later".to_vec()));
     }
 
     #[tokio::test]

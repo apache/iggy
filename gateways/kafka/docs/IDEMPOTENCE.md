@@ -31,8 +31,8 @@ does. The core SDK README has the rules, under "Idempotent producers". In short:
   its uncommitted writes.
 
 With `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, Produce passes the three fields of a Kafka batch to
-Iggy unchanged. So every resend finds the first write: through any gateway, on any Iggy session,
-and across a gateway restart.
+Iggy, the id without the gateway's mark. So every resend finds the first write: through any
+gateway, on any Iggy session, and across a gateway restart.
 
 The switch is off by default. Released gateways, and released consumers built on the Rust SDK,
 refuse to read a batch that carries a producer, and older Iggy nodes cannot store it. Upgrade every
@@ -57,6 +57,9 @@ InitProducerId with no `transactional_id`, with the bridge:
 - ask Iggy for the next producer id, and return it with epoch 0 and error code 0.
 - Iggy builds the id from the session number of the bridge's id client and an index. No other
   client of the cluster gets that id, on any gateway and across restarts.
+- the gateway marks the id: it sets bit 46 and moves the bits from 46 up one place. Ids from older
+  gateways hold a clock in milliseconds in their low 47 bits, so bit 46 stays clear there until
+  the year 4199.
 - a request that names its current id and epoch (KIP-360, v3 and later) also gets a new id. Kafka
   does the same for a producer without a transactional id.
 - if Iggy cannot give an id, answer `COORDINATOR_LOAD_IN_PROGRESS` (14), which the Java producer
@@ -105,8 +108,10 @@ for consumer groups and has to refuse a `TXN`-type coordinator lookup explicitly
 Produce:
 
 - pass `producer_id`, `producer_epoch` and `base_sequence` of an idempotent batch to Iggy, when
-  `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` is `true`. A batch with a producer id but a negative epoch or
-  sequence gets `INVALID_RECORD` (87).
+  `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` is `true`. The id goes without its mark. A batch with a
+  producer id but a negative epoch or sequence gets `INVALID_RECORD` (87).
+- write a batch whose id has no mark as a plain batch. A Java producer keeps its id across
+  reconnects, and older gateways on the same instance number gave two producers the same id.
 - a resend of a batch that the partition holds answers the offset of its first write.
 - answer `OUT_OF_ORDER_SEQUENCE_NUMBER` (45) for a gap, as Kafka does. The Java producer retries
   a 45. For a real gap, it moves to the next epoch.
@@ -168,6 +173,7 @@ branch load-bearing.
 
 - A producer without idempotence still gets at-least-once delivery. A retry that follows a
   network timeout writes the record twice.
+- A producer that keeps an id from an older gateway gets at-least-once delivery until it restarts.
 - A partition forgets a producer that wrote nothing for a day. Past 4096 producers, it also
   forgets the one idle the longest. A resend of an old batch of a forgotten producer can write it
   twice, as in Kafka.

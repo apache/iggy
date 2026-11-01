@@ -40,7 +40,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use iggy_gateway_kafka::bridge::{IggyBridge, IggyBridgeConfig, PartitionBatch, Producer};
+use iggy_gateway_kafka::bridge::{
+    IggyBridge, IggyBridgeConfig, PartitionBatch, Producer, kafka_producer_id,
+};
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_INIT_PRODUCER_ID, API_KEY_PRODUCE, ERROR_INVALID_PRODUCER_EPOCH, ERROR_NONE,
@@ -1053,7 +1055,10 @@ async fn given_an_idempotent_batch_sent_twice_when_handled_should_store_it_once(
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let state = gateway_with_topic(&server, 1).await;
-    let entries = [(0, producer_batch(7, 0, 0, &[b"v"]))];
+    let entries = [(
+        0,
+        producer_batch(kafka_producer_id(7).unwrap(), 0, 0, &[b"v"]),
+    )];
 
     assert_eq!(
         produce(&state, 3, -1, TOPIC, &entries).await,
@@ -1070,6 +1075,28 @@ async fn given_an_idempotent_batch_sent_twice_when_handled_should_store_it_once(
         1,
         "the partition writes the batch once"
     );
+}
+
+/// Older gateways gave ids without the Iggy mark, and two of their producers can hold the same
+/// one. Such a batch writes as a plain batch.
+#[tokio::test]
+#[serial]
+async fn given_an_id_without_the_iggy_mark_when_sent_twice_should_store_it_twice() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = gateway_with_topic(&server, 1).await;
+    let entries = [(0, producer_batch(7, 0, 0, &[b"v"]))];
+
+    assert_eq!(
+        produce(&state, 3, -1, TOPIC, &entries).await,
+        vec![(0, ERROR_NONE, 0)]
+    );
+    assert_eq!(
+        produce(&state, 3, -1, TOPIC, &entries).await,
+        vec![(0, ERROR_NONE, 1)],
+        "the partition holds no producer for the id"
+    );
+    assert_eq!(stored(&server, 0, 10).await.len(), 2);
 }
 
 #[tokio::test]
@@ -1090,22 +1117,24 @@ async fn given_idempotent_batches_out_of_line_when_handled_should_refuse_them_as
         }
     };
 
+    let id = kafka_producer_id(7).unwrap();
+    let unknown = kafka_producer_id(8).unwrap();
     assert_eq!(
-        send(vec![(0, producer_batch(7, 1, 0, &[b"a", b"b"]))]).await,
+        send(vec![(0, producer_batch(id, 1, 0, &[b"a", b"b"]))]).await,
         vec![(0, ERROR_NONE, 0, Some(-1))]
     );
     assert_eq!(
-        send(vec![(0, producer_batch(7, 1, 5, &[b"gap"]))]).await,
+        send(vec![(0, producer_batch(id, 1, 5, &[b"gap"]))]).await,
         vec![(0, ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, -1, Some(-1))],
         "a batch after a gap"
     );
     assert_eq!(
-        send(vec![(0, producer_batch(7, 0, 2, &[b"old"]))]).await,
+        send(vec![(0, producer_batch(id, 0, 2, &[b"old"]))]).await,
         vec![(0, ERROR_INVALID_PRODUCER_EPOCH, -1, Some(-1))],
         "a batch of an older epoch"
     );
     assert_eq!(
-        send(vec![(0, producer_batch(8, 0, 3, &[b"late"]))]).await,
+        send(vec![(0, producer_batch(unknown, 0, 3, &[b"late"]))]).await,
         vec![(0, ERROR_UNKNOWN_PRODUCER_ID, -1, Some(0))],
         "a producer the partition does not hold, with a log start so the client starts over"
     );

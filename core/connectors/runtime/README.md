@@ -151,10 +151,10 @@ partition_id = 0 # the partition of every batch, 0 when unset
 The runtime keeps a producer record in the state of the source, in front of the plugin's bytes. The record holds these values:
 
 - The producer id. The runtime gets it from the session of its Iggy client.
-- The epoch. After each start, the first batch keeps the stored epoch, and the save after it moves to the next epoch. The new epoch fences an older copy of the runtime.
+- The epoch. After each start, batches keep the stored epoch until the first save after a batch, which moves to the next epoch. The new epoch fences an older copy of the runtime.
 - The partition, and the first sequence of the next batch in it.
 
-The runtime saves the state once for each batch, after the send. The save moves the next sequence past the batch and stores the plugin's new bytes. The plugin gets only its own bytes. A new record, a new epoch or a new partition is also saved before its first batch goes. The `iggy_send` stage histogram includes that save.
+The runtime saves the state after each batch for which the plugin returns new state. The save moves the next sequence past the batch and stores the plugin's new bytes. A batch without new state is not saved. The plugin gets only its own bytes. A new record, a new epoch or a new partition is also saved before its first batch goes. The `iggy_send` stage histogram includes that save.
 
 After a NACK or a restart, the plugin produces a batch again from its saved state. No save moved the record past that batch, so the runtime sends it with the same producer id, epoch and sequence. The partition answers with the offset of the first write, and the batch lands once.
 
@@ -166,6 +166,7 @@ These limits apply:
 - If the plugin produces another message count, the partition refuses the batch as out of order, and the runtime moves to a new epoch and logs a warning. The unsaved batch can then land twice.
 - A partition drops a producer that sent no batch for 24 hours. Above 4096 producers, it drops the one idle the longest.
 - If the partition dropped the producer, the runtime moves to a new epoch. The unsaved batch can then land twice.
+- The partition keeps the last five batches of a producer. If the plugin returns no state for more than five batches in a row, a restart can write those batches twice.
 - If you change `partition_id`, the unsaved batch can land twice.
 - Give the topic `persisted` durability. With `replicated`, a quorum of nodes that crash at the same time can lose acknowledged batches.
 - The record starts with the bytes `\0IGGYEO\x01`. Plugin state that starts with these bytes is not supported.

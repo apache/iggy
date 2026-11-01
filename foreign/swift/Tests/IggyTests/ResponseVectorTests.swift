@@ -425,14 +425,6 @@ struct ResponseVectorTests {
         let producedHeader = try Batch.Header.decode(golden.bytes("response.poll_messages.producer")[40...])
         #expect(producedHeader.producer == Batch.Producer(producerID: 4_000, epoch: 3, baseSequence: 17))
 
-        // The transactional flag is read, and sits under the checksum too.
-        let transactional = golden.bytes("response.poll_messages.transactional")
-        let polledTransactional = try Responses.polledMessages(body("response.poll_messages.transactional"), verifyChecksums: true)
-        #expect(polledTransactional.messages.map(\.payloadString) == ["k"])
-        let transactionalHeader = try Batch.Header.decode(transactional[40...])
-        #expect(transactionalHeader.producer == Batch.Producer(producerID: 4_000, epoch: 3, baseSequence: 17, transactional: true))
-        #expect(transactionalHeader.encode() == Array(transactional[40..<40 + Batch.headerSize]))
-
         var corrupted = golden.bytes("response.poll_messages")
         corrupted[corrupted.count - 1] ^= 0xFF
         #expect(throws: IggyError.self) {

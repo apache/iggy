@@ -724,8 +724,8 @@ pub(crate) async fn source_forwarding_loop(
 
             let mut state_saved = true;
             let state_save_start = Instant::now();
-            // An exactly-once source saves its producer with the plugin's bytes, also after a
-            // batch whose plugin returned no state.
+            // An exactly-once source saves its producer only with new plugin bytes. Without
+            // them, a restart produces the batch again with the same producer section.
             let saved = match exactly_once.as_mut() {
                 Some(exactly_once) => {
                     exactly_once

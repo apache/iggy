@@ -123,8 +123,9 @@ const PRODUCER_ENTRY_PREFIX_LEN: usize =
     size_of::<u64>() + size_of::<u16>() + size_of::<u64>() + size_of::<u8>();
 /// `first_sequence u32 | last_sequence u32 | base_offset u64`.
 const PRODUCER_BATCH_LEN: usize = 2 * size_of::<u32>() + size_of::<u64>();
+/// An entry holds up to `u8::MAX` batches, whatever window its writer kept.
 const PRODUCER_ENTRY_LEN_MAX: usize =
-    PRODUCER_ENTRY_PREFIX_LEN + PRODUCER_BATCHES_RETAINED * PRODUCER_BATCH_LEN;
+    PRODUCER_ENTRY_PREFIX_LEN + u8::MAX as usize * PRODUCER_BATCH_LEN;
 
 /// One in-flight partition state transfer on the receiving replica.
 ///
@@ -841,8 +842,9 @@ impl ConsumerOffsetsWire {
     }
 
     /// The producer section, ascending by producer id. Every field stays
-    /// within its maximum, and each producer keeps one to
-    /// [`PRODUCER_BATCHES_RETAINED`] batches.
+    /// within its maximum, and each producer has at least one batch. Only the
+    /// newest [`PRODUCER_BATCHES_RETAINED`] batches are kept, so a writer with
+    /// another window needs no new version.
     fn decode_producer_section(
         cursor: &mut LeCursor<'_>,
     ) -> Result<Vec<(u64, ProducerEntry)>, ConsumerOffsetsWireError> {
@@ -871,15 +873,16 @@ impl ConsumerOffsetsWire {
             let batch_count = usize::from(cursor.u8()?);
             if producer_id > BatchProducer::PRODUCER_ID_MAX
                 || epoch > BatchProducer::EPOCH_MAX
-                || !(1..=PRODUCER_BATCHES_RETAINED).contains(&batch_count)
+                || batch_count == 0
                 || previous.is_some_and(|previous| previous >= producer_id)
             {
                 return Err(ConsumerOffsetsWireError::InvalidProducer);
             }
             previous = Some(producer_id);
+            let dropped = batch_count.saturating_sub(PRODUCER_BATCHES_RETAINED);
             let mut batches = [ProducerBatch::default(); PRODUCER_BATCHES_RETAINED];
-            for batch in &mut batches[..batch_count] {
-                *batch = ProducerBatch {
+            for index in 0..batch_count {
+                let batch = ProducerBatch {
                     first_sequence: cursor.u32()?,
                     last_sequence: cursor.u32()?,
                     base_offset: cursor.u64()?,
@@ -889,9 +892,13 @@ impl ConsumerOffsetsWire {
                 {
                     return Err(ConsumerOffsetsWireError::InvalidProducer);
                 }
+                if let Some(slot) = index.checked_sub(dropped) {
+                    batches[slot] = batch;
+                }
             }
-            let entry = ProducerEntry::restored(epoch, last_timestamp, &batches[..batch_count])
-                .ok_or(ConsumerOffsetsWireError::InvalidProducer)?;
+            let entry =
+                ProducerEntry::restored(epoch, last_timestamp, &batches[..batch_count - dropped])
+                    .ok_or(ConsumerOffsetsWireError::InvalidProducer)?;
             producers.push((producer_id, entry));
         }
         Ok(producers)
@@ -1446,24 +1453,34 @@ mod tests {
                 "{producers:?}"
             );
         }
+    }
 
-        let full = ConsumerOffsetsWire {
-            producers: vec![producer_entry(1, &[(0, 0, 1); PRODUCER_BATCHES_RETAINED])],
+    /// A writer with a wider window stores more batches, and the decoder keeps
+    /// the newest.
+    #[test]
+    fn given_more_batches_than_the_window_when_decoded_should_keep_the_newest() {
+        let newest: Vec<(u32, u32, u64)> = (1..=PRODUCER_BATCHES_RETAINED)
+            .map(|batch| {
+                let sequence = u32::try_from(batch).unwrap();
+                (sequence, sequence, u64::from(sequence))
+            })
+            .collect();
+        let kept = ConsumerOffsetsWire {
+            producers: vec![producer_entry(1, &newest)],
             ..table()
         };
-        let mut encoded = full.encode();
-        assert!(ConsumerOffsetsWire::decode(&encoded).is_ok());
-
-        // An entry cannot hold one batch more, so the count is set on the wire.
+        let encoded = kept.encode();
+        // An entry cannot hold one batch more, so the older batch goes in on the wire.
         let content_len = encoded.len() - size_of::<u64>();
-        let batch_count_at = content_len - PRODUCER_BATCHES_RETAINED * PRODUCER_BATCH_LEN - 1;
-        encoded[batch_count_at] += 1;
-        let trailer = state_artifact_checksum(&encoded[..content_len]);
-        encoded[content_len..].copy_from_slice(&trailer.to_le_bytes());
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&encoded),
-            Err(ConsumerOffsetsWireError::InvalidProducer)
-        );
+        let batches_at = content_len - PRODUCER_BATCHES_RETAINED * PRODUCER_BATCH_LEN;
+        let mut wider = encoded[..batches_at].to_vec();
+        wider[batches_at - 1] += 1;
+        wider.extend_from_slice(&[0; PRODUCER_BATCH_LEN]);
+        wider.extend_from_slice(&encoded[batches_at..content_len]);
+        let trailer = state_artifact_checksum(&wider);
+        wider.extend_from_slice(&trailer.to_le_bytes());
+
+        assert_eq!(ConsumerOffsetsWire::decode(&wider), Ok(kept));
     }
 
     /// Version 8 ends at the paid-through op, and its builds kept no

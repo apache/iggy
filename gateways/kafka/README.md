@@ -270,7 +270,8 @@ gateway restart.
 The switch is off by default. Released builds of the gateway, of the Rust SDK and of every client
 that embeds it cannot read a batch that carries a producer, and older Iggy nodes cannot store it.
 Upgrade every Iggy node, every gateway and every consumer of the topics first, then turn it on.
-While it is off, an idempotent producer gets at-least-once delivery.
+While it is off, an idempotent producer gets at-least-once delivery. So does a producer that keeps
+an id from an older gateway, until it restarts.
 
 A producer without idempotence gets at-least-once delivery. A retry that follows a network timeout
 writes the record twice. The partition keeps the last 5 batches of each producer, and at most 4096
@@ -519,7 +520,7 @@ One partition, one Iggy send. Each partition answers for itself.
 | Topics | Creates none. Missing: 3. Bad name: 17. |
 | `timeout_ms` | Honored, max 20 s. The Iggy send stops by then too. Past it: 7. A send that never went out: 6. |
 | Compression | gzip, snappy, lz4. zstd from v7, else 76. |
-| Producer id | Picks the producer's Iggy session. See [Concurrency ceiling](#concurrency-ceiling). Goes to Iggy with the batch only with `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`. |
+| Producer id | Picks the producer's Iggy session. See [Concurrency ceiling](#concurrency-ceiling). Goes to Iggy with the batch only with `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, and only an id that a gateway got from Iggy. |
 | Producer epoch, sequence | With `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, go to Iggy with the batch. A resend answers the first offset. A gap: 45. An older epoch: 47. A producer that the partition does not hold, above sequence 0: 59. Off (the default): not checked, so a resend can write twice. |
 | Producer id with a negative epoch or sequence | 87. |
 | Timestamps over about 71 min apart | Clamped into one send. `kafka.ts` keeps the real one. |

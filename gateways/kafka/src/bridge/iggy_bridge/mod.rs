@@ -53,6 +53,7 @@ pub use group_offsets::{OFFSET_GROUP_PREFIX, OffsetCalls};
 pub(crate) use offsets::{LocatedRecord, RecordLookup};
 use produce::ProducePool;
 pub use produce::{PartitionBatch, ProduceTurn, Producer};
+pub use producer_ids::{iggy_producer_id, kafka_producer_id};
 pub use topics::{
     DEFAULT_TOPIC_PARTITIONS, KafkaTopicMetadata, MAX_TOPIC_PARTITIONS, StreamTopicCache,
     TopicCreationOutcome, TopicLoad,

@@ -4763,10 +4763,6 @@ where
         let Some(producer) = batch.producer else {
             return Ok(ProducerAdmission::Append);
         };
-        // Iggy has no transactions yet.
-        if producer.is_transactional() {
-            return Err(IggyError::FeatureUnavailable);
-        }
         let in_flight = self.in_flight_producer_batches(producer.producer_id())?;
         Ok(self
             .producers

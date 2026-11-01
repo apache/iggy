@@ -7188,7 +7188,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-cli"
-version = "0.14.1-edge.6"
+version = "0.14.1-edge.7"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",

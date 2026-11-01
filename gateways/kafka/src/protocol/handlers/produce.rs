@@ -29,7 +29,9 @@ use kafka_protocol::protocol::StrBytes;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit};
 
 use crate::auth::AuthenticatedPrincipal;
-use crate::bridge::{BridgeError, IggyBridge, PartitionBatch, ProduceTurn, Producer, TopicTarget};
+use crate::bridge::{
+    BridgeError, IggyBridge, PartitionBatch, ProduceTurn, Producer, TopicTarget, iggy_producer_id,
+};
 use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_PRODUCE, ApiVersionRange, ConnectionState, ERROR_INVALID_RECORD,
@@ -489,17 +491,20 @@ fn plan_partition(
     };
 
     // An idempotent batch carries its producer to Iggy, which writes it once. A batch with a
-    // producer id but a negative epoch or sequence is one no Kafka producer sends.
+    // producer id but a negative epoch or sequence is one no Kafka producer sends. An id without
+    // the Iggy mark, as older gateways gave out, writes as a plain batch.
     let producer = match batch_producer(blob) {
         None => None,
-        Some(fields) => Some(
-            u64::try_from(fields.producer_id)
-                .ok()
-                .zip(u16::try_from(fields.producer_epoch).ok())
-                .zip(u32::try_from(fields.base_sequence).ok())
-                .and_then(|((id, epoch), sequence)| BatchProducer::new(id, epoch, sequence))
-                .ok_or(ERROR_INVALID_RECORD)?,
-        ),
+        Some(fields) => {
+            let (Ok(id), Ok(epoch), Ok(sequence)) = (
+                u64::try_from(fields.producer_id),
+                u16::try_from(fields.producer_epoch),
+                u32::try_from(fields.base_sequence),
+            ) else {
+                return Err(ERROR_INVALID_RECORD.into());
+            };
+            iggy_producer_id(id).and_then(|id| BatchProducer::new(id, epoch, sequence))
+        }
     };
 
     // The clone is a refcount, and `decode_batch` drains what it is given.
@@ -734,6 +739,7 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
+    use crate::bridge::kafka_producer_id;
     use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
     use crate::protocol::acl::PrincipalPermissions;
     use crate::records::encode_batch;
@@ -791,11 +797,15 @@ mod tests {
             .map_err(|refusal| refusal.code)
     }
 
-    /// Two records of producer 7 at epoch 1, the first at `base_sequence`.
+    /// Two records of Iggy producer 7 at epoch 1, the first at `base_sequence`.
     fn idempotent_batch(base_sequence: i32) -> Bytes {
+        batch_of_producer(kafka_producer_id(7).unwrap(), base_sequence)
+    }
+
+    fn batch_of_producer(producer_id: i64, base_sequence: i32) -> Bytes {
         let records: Vec<Record> = (0..2)
             .map(|offset| Record {
-                producer_id: 7,
+                producer_id,
                 producer_epoch: 1,
                 sequence: base_sequence.wrapping_add(i32::try_from(offset).unwrap()),
                 ..record(offset, b"v")
@@ -829,6 +839,21 @@ mod tests {
         )
         .unwrap_or_else(|refusal| panic!("refused with {}", refusal.code));
         assert_eq!(plain.producer, None);
+    }
+
+    #[test]
+    fn given_a_producer_id_without_the_iggy_mark_when_planned_should_write_a_plain_batch() {
+        let planned = plan_partition(
+            &partition_budget(TEST_BUDGET, usize::MAX),
+            Zstd::Allowed,
+            TOPIC,
+            &entry(0, Some(batch_of_producer(7, 5))),
+            u64::MAX,
+        )
+        .unwrap_or_else(|refusal| panic!("refused with {}", refusal.code));
+
+        assert_eq!(planned.producer, None);
+        assert_eq!(planned.messages.len(), 2);
     }
 
     #[test]
