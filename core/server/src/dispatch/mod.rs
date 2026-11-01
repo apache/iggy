@@ -2877,6 +2877,7 @@ mod tests {
 
         fn roster_node(name: &str) -> ClusterNodeConfig {
             ClusterNodeConfig {
+                rack: None,
                 name: name.to_owned(),
                 ip: "127.0.0.1".to_owned(),
                 advertised_address: None,

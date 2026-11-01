@@ -305,6 +305,7 @@ mod tests {
                         initial_view: 0,
                         partition_id,
                         consensus_group_id: u64::from(partition_id) + 1,
+                        members: Vec::new(),
                     })
                     .collect(),
             }

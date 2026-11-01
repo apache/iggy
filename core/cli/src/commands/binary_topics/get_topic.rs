@@ -121,6 +121,8 @@ fn topic_table(topic: &TopicDetails) -> Table {
             "Current offset",
             "Size",
             "Messages count",
+            "Members",
+            "In sync",
         ]);
 
         for partition in &topic.partitions {
@@ -131,6 +133,8 @@ fn topic_table(topic: &TopicDetails) -> Table {
                 partition.current_offset.to_string(),
                 partition.size.to_string(),
                 partition.messages_count.to_string(),
+                node_list(&partition.members),
+                node_list(&partition.in_sync_members),
             ]);
         }
         table.add_row(vec!["Partitions", partitions_table.to_string().as_str()]);
@@ -156,6 +160,18 @@ fn topic_table(topic: &TopicDetails) -> Table {
     }
 
     table
+}
+
+/// Node ids as `0,2,4`, or `-` for none.
+fn node_list(nodes: &[u8]) -> String {
+    if nodes.is_empty() {
+        return "-".to_owned();
+    }
+    nodes
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(test)]
@@ -202,6 +218,8 @@ mod tests {
                 size: IggyByteSize::from(1230_u64),
                 messages_count: 5,
                 context: PartitionContext::default(),
+                members: vec![0, 2, 4],
+                in_sync_members: vec![0, 4],
             },
             Partition {
                 id: 2,
@@ -211,6 +229,8 @@ mod tests {
                 size: IggyByteSize::from(0_u64),
                 messages_count: 13,
                 context: PartitionContext::default(),
+                members: vec![1],
+                in_sync_members: Vec::new(),
             },
         ];
         let output = topic_table(&topic).to_string();
@@ -220,12 +240,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(
             rows.contains(&format!(
-                "| | 9 | 1970-01-01 00:00:00 | 3 | {} | 1.23 KB | 5 |",
+                "| | 9 | 1970-01-01 00:00:00 | 3 | {} | 1.23 KB | 5 | 0,2,4 | 0,4 |",
                 u64::MAX
             )),
             "{output}"
         );
-        assert!(rows.contains(&"| | 2 | 1970-01-01 00:00:01 | 7 | 11 | 0 B | 13 |".to_owned()));
+        assert!(
+            rows.contains(&"| | 2 | 1970-01-01 00:00:01 | 7 | 11 | 0 B | 13 | 1 | - |".to_owned())
+        );
     }
 
     #[test]

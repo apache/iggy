@@ -591,6 +591,15 @@ repair_chunk_max = 128
 # a transient disk hiccup cannot kill the process.
 superblock_wedged_fatal_timeout = "2m"
 
+# Replication factor of a topic created without one ("all" or an integer).
+# "all" stores each of its partitions on every node, the layout from before
+# per-topic replication factors, so clients that never send the option keep it.
+# An integer from 1 to 32 stores each partition on that many nodes, lowered to
+# the node count when larger, so "3" keeps three copies on clusters of any size.
+# Read by the metadata primary when it admits the create, which stores the
+# resolved factor with the topic: set the same value on every node.
+default_replication_factor = "all"
+
 # Superblock compatibility: version 2 atomically records adopted view/head/header
 # identity separately from WAL body certification. Legacy version 1 records with
 # 66/74-byte payloads remain readable. After a version 2 write, an older binary
@@ -734,6 +743,7 @@ skip_shard_zero_for_clients = false
 #   ip = "10.0.1.5"                        # replica plane, literal IP only
 #   advertised_address = "203.0.113.10"    # catch-all for unmatched clients
 #   replica_id = 0
+#   rack = "eu-west-1a"                    # copies of a partition go to different racks
 #   ports = { tcp = 8090, http = 3000, tcp_replica = 9090 }
 #
 #   [[cluster.nodes.advertised_addresses]]

@@ -28,7 +28,7 @@ The package installation and API examples target server/SDK 0.9.0. For source bu
 from the same checkout. The SDK targets .NET 8 and .NET 10. Repository examples require .NET 10.
 `0.9.0` includes the independent message and consumer-offset durability options.
 
-This checkout uses binary protocol 0.12.1. Servers and applicable SDKs must deploy together. Mixed versions and
+This checkout uses binary protocol 0.12.2. Servers and applicable SDKs must deploy together. Mixed versions and
 rolling upgrades are unsupported. This checkout requires fresh storage and refuses older data directories
 without modification. `--fresh` deletes existing data in the configured directory.
 See the [server recovery guide](../../core/server/README.md#upgrade-recovery).

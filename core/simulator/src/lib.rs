@@ -1658,11 +1658,11 @@ impl Simulator {
         // makes the carried-forward superblock load-bearing: the group recovers its
         // recorded `(view, log_view)` instead of re-entering view 0. The metadata half
         // of the seed already ran inside `new_shard`, ahead of the replay.
+        // A group the replay has not committed yet comes up once it has, the way
+        // the production reconciler builds it after boot.
         for namespace in materialized_namespaces {
             let replica = &self.replicas[idx];
-            if !materialise_partition(replica, namespace, self.consumer_offsets_max)
-                && replica.seeded_namespaces.borrow().contains_key(&namespace)
-            {
+            if !materialise_partition(replica, namespace, self.consumer_offsets_max) {
                 replica.deferred_partitions.borrow_mut().insert(namespace);
             }
         }
@@ -2090,6 +2090,19 @@ fn materialise_partition(
     let created_view = streams
         .created_view_for_namespace(namespace)
         .expect("a committed partition records its creation view");
+    let members = streams
+        .members_for_namespace(namespace)
+        .expect("a committed partition records its members");
+    let metadata_consensus = replica.shards[0]
+        .plane
+        .metadata()
+        .consensus
+        .as_ref()
+        .expect("shard 0 runs metadata consensus");
+    // Production builds a partition only on the nodes that store it.
+    if members.is_some_and(|members| members.member(metadata_consensus.replica()).is_none()) {
+        return false;
+    }
     // One store per incarnation, minted on first materialisation and reused after, so
     // the recorded view survives a replica restart. A deleted incarnation's store
     // must not reach its successor, and metadata replayed behind the store waits for
@@ -2142,7 +2155,8 @@ fn materialise_partition(
             retained,
             persistence,
             PartitionMaterialisation::new(epoch, created_view, first_initialization)
-                .with_consumer_offsets_max(consumer_offsets_max),
+                .with_consumer_offsets_max(consumer_offsets_max)
+                .with_members(members),
         );
     }
     for shard in &replica.shards {
@@ -2172,6 +2186,16 @@ fn view_scoped_partition_frame(
         }
         Command::DoViewChange => {
             let header = message.try_as_typed::<DoViewChangeHeader>().ok()?.header();
+            // An empty vote leaves its sender in its own view by design: it
+            // holds no log and the sender acks nothing until a transfer.
+            let empty_vote = header.untrusted_log()
+                && header.log_view == 0
+                && header.op == 0
+                && header.commit == 0
+                && header.size as usize == size_of::<DoViewChangeHeader>();
+            if empty_vote {
+                return None;
+            }
             (header.group, header.partition_incarnation)
         }
         Command::StartView => {
@@ -5388,7 +5412,25 @@ mod tests {
         request: Message<RoutedRequestHeader>,
     ) {
         const PROGRESS_STEPS: usize = 4_000;
-        let reply = submit_and_wait_for_reply(sim, client.client_id(), 0, request);
+        const TRANSIENT_RETRIES: usize = 64;
+        const RETRY_STEPS: usize = 100;
+        // Placement refuses a create until the coordinator heard from every
+        // replica of its view, and a client retries that refusal.
+        let mut accepted = None;
+        for _ in 0..TRANSIENT_RETRIES {
+            let reply = submit_and_wait_for_reply(sim, client.client_id(), 0, request.clone());
+            if metadata::stm::result::result_code(reply.body())
+                != Some(IggyError::TransientNotAccepted.as_code())
+            {
+                accepted = Some(reply);
+                break;
+            }
+            for _ in 0..RETRY_STEPS {
+                sim.step();
+            }
+        }
+        let reply = accepted
+            .unwrap_or_else(|| submit_and_wait_for_reply(sim, client.client_id(), 0, request));
         let code = metadata::stm::result::result_code(reply.body());
         assert!(
             code == Some(0) || code == Some(IggyError::TransientNotCommitted.as_code()),
@@ -12074,10 +12116,12 @@ mod view_change_data_loss_tests {
 
     /// The metadata primary admits a create that both backups journal, then
     /// crashes before any ack reaches it, so its client has no reply. The
-    /// survivors elect a primary that inherits the create uncommitted. A create
-    /// that primary admits meanwhile must count the inherited partitions once,
-    /// and the inherited create must commit once, with the assignments the
-    /// crashed primary persisted.
+    /// survivors elect a primary that inherits the create uncommitted. Until it
+    /// commits, that primary has not applied its view and has no readiness for
+    /// it, so it refuses another create rather than presume the crashed node
+    /// ready. The inherited create must commit once, with the assignments the
+    /// crashed primary persisted, and the other create must lead only on the
+    /// survivors.
     #[test]
     #[allow(clippy::too_many_lines)]
     fn given_an_inherited_create_when_the_new_primary_admits_another_should_count_and_commit_it_once()
@@ -12092,10 +12136,8 @@ mod view_change_data_loss_tests {
         const ADMITTED_PARTITIONS: u32 = 3;
         // Nothing is placed before the inherited create, so it takes replica 0.
         const INHERITED_VIEWS: [u32; 1] = [0];
-        // Counting the inherited partition once fills replicas 1 and 2 first.
-        // Dropping it starts again at replica 0 ([0, 1, 2]), and counting it
-        // twice repeats replica 1 ([1, 2, 1]).
-        const ADMITTED_VIEWS: [u32; 3] = [1, 2, 0];
+        // Replica 0 crashed, so only the survivors lead, alternating.
+        const ADMITTED_VIEWS: [u32; 3] = [1, 2, 1];
         const PREPARE_STEPS: usize = 200;
         const ELECTION_STEPS: usize = 5_000;
         const ADMISSION_STEPS: usize = 2_000;
@@ -12196,7 +12238,31 @@ mod view_change_data_loss_tests {
 
         let admitted_create = admitter.create_topic(STREAM, ADMITTED_TOPIC, ADMITTED_PARTITIONS);
         let admitted_request = admitted_create.header().request;
-        let (admitted_op, admitted_assignments) = (0..ADMISSION_STEPS)
+        sim.submit_request(ADMITTER, leader, admitted_create.deep_copy().into_generic());
+        let refused = (0..ADMISSION_STEPS)
+            .find_map(|_| {
+                sim.step()
+                    .into_iter()
+                    .find(|reply| reply.header().client == ADMITTER)
+            })
+            .expect("the new primary must answer the second create");
+        assert!(
+            setup_reply_is_transient(&refused),
+            "the new primary must refuse a create while it has no readiness for its view"
+        );
+        assert!(
+            journaled_creates(&sim, leader, ADMITTER, admitted_request).is_empty(),
+            "the refused create must not be prepared"
+        );
+        assert!(
+            metadata_progress(&sim, leader).1 < inherited_op,
+            "the inherited create must still be pending when the second one is refused"
+        );
+
+        for (from, to) in [(1, 2), (2, 1)] {
+            set_prepare_ok_delivery(&mut sim, from, to, true);
+        }
+        let reply = (0..COMMIT_STEPS)
             .find_map(|step| {
                 if step % RESUBMIT_STEPS == 0 {
                     sim.submit_request(
@@ -12205,33 +12271,6 @@ mod view_change_data_loss_tests {
                         admitted_create.deep_copy().into_generic(),
                     );
                 }
-                for reply in sim.step() {
-                    assert!(
-                        reply.header().client == ADMITTER && setup_reply_is_transient(&reply),
-                        "only a transient refusal of the second create may be answered \
-                         before the survivors ack"
-                    );
-                }
-                journaled_creates(&sim, leader, ADMITTER, admitted_request)
-                    .into_iter()
-                    .next()
-            })
-            .expect("the new primary must admit a create while it holds the inherited one");
-        assert!(
-            metadata_progress(&sim, leader).1 < inherited_op,
-            "the inherited create must still be pending when the second one is admitted"
-        );
-        assert_eq!(
-            views(&admitted_assignments),
-            ADMITTED_VIEWS,
-            "the second create must count the inherited partition exactly once"
-        );
-
-        for (from, to) in [(1, 2), (2, 1)] {
-            set_prepare_ok_delivery(&mut sim, from, to, true);
-        }
-        let reply = (0..COMMIT_STEPS)
-            .find_map(|_| {
                 sim.step().into_iter().find(|reply| {
                     reply.header().client == ADMITTER
                         && reply.header().request == admitted_request
@@ -12239,12 +12278,20 @@ mod view_change_data_loss_tests {
                 })
             })
             .expect("the second create must commit once the survivors ack");
+        assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        let admitted_op = reply.header().op;
+        assert!(
+            admitted_op > inherited_op,
+            "the second create must be admitted after the inherited one commits"
+        );
+        let [(journaled_op, admitted_assignments)] =
+            <[_; 1]>::try_from(journaled_creates(&sim, leader, ADMITTER, admitted_request))
+                .expect("the leader must journal the second create once");
+        assert_eq!(journaled_op, admitted_op);
         assert_eq!(
-            (
-                reply.header().op,
-                iggy_binary_protocol::result_code(reply.body())
-            ),
-            (admitted_op, Some(0))
+            views(&admitted_assignments),
+            ADMITTED_VIEWS,
+            "the crashed primary must lead none of the second create's partitions"
         );
 
         // Commits are ordered, so the inherited create committed before the
@@ -15795,6 +15842,15 @@ mod metadata_read_frontier_tests {
         replicas: u8,
         seed: u64,
     ) -> (Simulator, SimClient, IggyNamespace) {
+        placed_partition_cluster(replicas, replicas, seed)
+    }
+
+    /// A cluster of `replicas` nodes with one partition stored on `factor` of them.
+    fn placed_partition_cluster(
+        replicas: u8,
+        factor: u8,
+        seed: u64,
+    ) -> (Simulator, SimClient, IggyNamespace) {
         server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
@@ -15814,11 +15870,21 @@ mod metadata_read_frontier_tests {
         let client = SimClient::new(1);
         sim.shell_login(&client);
         commit_write(&mut sim, 1, 0, client.create_stream("freshness"));
+        if factor < replicas {
+            // Loads the lowest nodes first, so the measured partition lands on
+            // members whose indices are not their node ids.
+            commit_write(
+                &mut sim,
+                1,
+                0,
+                client.create_topic_with_factor("freshness", "filler", 1, Some(u32::from(factor))),
+            );
+        }
         let created = commit_write(
             &mut sim,
             1,
             0,
-            client.create_topic("freshness", "partition", 1),
+            client.create_topic_with_factor("freshness", "partition", 1, Some(u32::from(factor))),
         );
         let namespace = sim.replicas[0].shards[0]
             .plane
@@ -15835,12 +15901,32 @@ mod metadata_read_frontier_tests {
             step_until_applied(&mut sim, replica, created);
         }
         sim.init_partition(namespace);
+        if factor < replicas {
+            // The gauges count a partition no member runs as unable to commit,
+            // so the filler runs too.
+            sim.init_partition(
+                sim.replicas[0].shards[0]
+                    .plane
+                    .metadata()
+                    .mux_stm
+                    .streams()
+                    .namespace_from_partition(
+                        &iggy_binary_protocol::WireIdentifier::named("freshness").unwrap(),
+                        &iggy_binary_protocol::WireIdentifier::named("filler").unwrap(),
+                        0,
+                    )
+                    .unwrap(),
+            );
+        }
+        let members = partition_members(&sim, namespace);
+        assert_eq!(members.len(), factor);
         assert!(
             (0..replicas).all(|replica| {
                 sim.partition_consensus_state(usize::from(replica), namespace)
                     .is_some()
+                    == members.member(replica).is_some()
             }),
-            "freshness fixture must materialise its committed partition"
+            "fixture must materialise its partition on exactly its members"
         );
         sim.discover_partition_contexts(&client);
         for replica in 1..replicas {
@@ -15859,6 +15945,475 @@ mod metadata_read_frontier_tests {
             sim.step();
         }
         panic!("healthy cluster never credited every node");
+    }
+
+    fn partition_members(sim: &Simulator, namespace: IggyNamespace) -> consensus::ReplicaSet {
+        sim.replicas[0].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .members_for_namespace(namespace)
+            .flatten()
+            .expect("a placed partition lists its members")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_a_three_member_partition_on_five_nodes_when_a_member_fails_should_commit_and_catch_up()
+    {
+        const REPLICAS: u8 = 5;
+        let (mut sim, client, namespace) = placed_partition_cluster(REPLICAS, 3, 0xF2E5_0030);
+        let members = partition_members(&sim, namespace);
+        assert_eq!(members.nodes(), &[1, 3, 4]);
+        let primary = (0..REPLICAS)
+            .find(|replica| {
+                sim.partition_consensus_state(usize::from(*replica), namespace)
+                    .is_some_and(|state| state.is_primary)
+            })
+            .expect("one member leads the partition");
+        assert!(members.member(primary).is_some());
+        let write = |sim: &mut Simulator, payload: &'static [u8]| {
+            super::tests::submit_and_wait_for_reply(
+                sim,
+                1,
+                primary,
+                client.send_messages(namespace, &[bytes::Bytes::from_static(payload)]),
+            )
+            .header()
+            .status
+        };
+        assert_eq!(write(&mut sim, b"all members"), 0);
+
+        let filler = sim.replicas[0].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .namespace_from_partition(
+                &iggy_binary_protocol::WireIdentifier::named("freshness").unwrap(),
+                &iggy_binary_protocol::WireIdentifier::named("filler").unwrap(),
+                0,
+            )
+            .expect("the filler topic places the lowest nodes first");
+        let filler_members = partition_members(&sim, filler);
+        // The gauges count every partition, so the crash spares the filler's.
+        let backup = *members
+            .nodes()
+            .iter()
+            .find(|node| **node != primary && filler_members.member(**node).is_none())
+            .expect("a backup the filler does not store");
+        let under_replicated = |sim: &Simulator| {
+            sim.replicas
+                .iter()
+                .enumerate()
+                .filter(|(replica, _)| !sim.is_crashed(u8::try_from(*replica).unwrap()))
+                .flat_map(|(_, replica)| replica.shards.iter())
+                .fold((0, 0), |(under, below), shard| {
+                    let metrics = shard.metrics();
+                    (
+                        under + metrics.partitions_under_replicated_value(),
+                        below + metrics.partitions_below_write_quorum_value(),
+                    )
+                })
+        };
+        assert_eq!(under_replicated(&sim), (0, 0));
+
+        sim.replica_crash(backup);
+        assert_eq!(
+            write(&mut sim, b"two of three"),
+            0,
+            "a quorum of the members still commits"
+        );
+        advance_freshness_time(
+            &mut sim,
+            consensus::MEMBER_LAG_MAX + shard::PARTITION_REPORT_INTERVAL,
+        );
+        assert_eq!(
+            under_replicated(&sim),
+            (1, 0),
+            "one member down leaves two copies, still a write quorum"
+        );
+        let committed = sim
+            .partition_consensus_state(usize::from(primary), namespace)
+            .expect("the primary hosts the partition")
+            .commit_min;
+
+        sim.replica_restart(backup);
+        assert!(
+            (0..SETUP_TOTAL_STEPS).any(|_| {
+                sim.step();
+                sim.partition_consensus_state(usize::from(backup), namespace)
+                    .is_some_and(|state| state.commit_min >= committed)
+            }),
+            "the restarted member catches up"
+        );
+        assert_eq!(
+            write(&mut sim, b"all members again"),
+            0,
+            "the returned member acks again"
+        );
+        assert!(
+            (0..SETUP_TOTAL_STEPS).any(|_| {
+                sim.step();
+                under_replicated(&sim) == (0, 0)
+            }),
+            "the partition is fully replicated again"
+        );
+        let outsiders: Vec<u8> = (0..REPLICAS)
+            .filter(|replica| members.member(*replica).is_none())
+            .collect();
+        for &replica in &outsiders {
+            assert!(
+                sim.partition_consensus_state(usize::from(replica), namespace)
+                    .is_none(),
+                "node {replica} stores no copy"
+            );
+            let refused = super::tests::submit_and_wait_for_reply(
+                &mut sim,
+                1,
+                replica,
+                client.send_messages(namespace, &[bytes::Bytes::from_static(b"elsewhere")]),
+            );
+            assert_eq!(
+                refused.header().status,
+                IggyError::NotPrimary.as_code(),
+                "node {replica} redirects instead of waiting for a partition it never stores"
+            );
+        }
+
+        advance_freshness_time(&mut sim, std::time::Duration::from_secs(5));
+        let view = sim
+            .partition_consensus_state(usize::from(primary), namespace)
+            .expect("the primary hosts the partition")
+            .view;
+        for &replica in &outsiders {
+            let streams = sim.replicas[usize::from(replica)].shards[0]
+                .plane
+                .metadata()
+                .mux_stm
+                .streams();
+            let status = streams
+                .partition_status(namespace)
+                .unwrap_or_else(|| panic!("node {replica} heard from the primary"));
+            assert_eq!(status.view, view, "node {replica}");
+            assert_eq!(status.messages_count, 3, "node {replica}");
+            let counted = streams.read(|inner| {
+                inner
+                    .stats_registry
+                    .partition_get(
+                        namespace.stream_id(),
+                        namespace.topic_id(),
+                        namespace.partition_id(),
+                    )
+                    .map(|stats| stats.messages_count_inconsistent())
+            });
+            assert_eq!(
+                counted,
+                Some(3),
+                "node {replica} counts the remote partition"
+            );
+        }
+    }
+
+    /// The normal primary of `namespace` and its view, ignoring `skip`.
+    fn partition_leader(
+        sim: &Simulator,
+        namespace: IggyNamespace,
+        skip: Option<u8>,
+    ) -> Option<(u8, u32)> {
+        (0..u8::try_from(sim.replicas.len()).unwrap())
+            .filter(|replica| Some(*replica) != skip)
+            .find_map(|replica| {
+                sim.partition_consensus_state(usize::from(replica), namespace)
+                    .filter(|state| state.is_primary && state.status == consensus::Status::Normal)
+                    .map(|state| (replica, state.view))
+            })
+    }
+
+    /// A write's final status, retrying transient refusals as clients do.
+    fn write_through(
+        sim: &mut Simulator,
+        client: &SimClient,
+        namespace: IggyNamespace,
+        target: u8,
+        payload: &'static [u8],
+    ) -> u32 {
+        const TRANSIENT_RETRIES: usize = 64;
+        const RETRY_STEPS: usize = 10;
+        let mut status = IggyError::TransientNotAccepted.as_code();
+        for _ in 0..TRANSIENT_RETRIES {
+            status = super::tests::submit_and_wait_for_reply(
+                sim,
+                1,
+                target,
+                client.send_messages(namespace, &[bytes::Bytes::from_static(payload)]),
+            )
+            .header()
+            .status;
+            if status != IggyError::TransientNotAccepted.as_code() {
+                break;
+            }
+            for _ in 0..RETRY_STEPS {
+                sim.step();
+            }
+        }
+        status
+    }
+
+    #[test]
+    fn given_a_three_member_partition_on_five_nodes_when_its_primary_fails_should_elect_among_members()
+     {
+        const REPLICAS: u8 = 5;
+        let (mut sim, client, namespace) = placed_partition_cluster(REPLICAS, 3, 0xF2E5_0040);
+        let members = partition_members(&sim, namespace);
+        let (primary, view) =
+            partition_leader(&sim, namespace, None).expect("one member leads the partition");
+        assert!(members.member(primary).is_some());
+        assert_eq!(
+            write_through(&mut sim, &client, namespace, primary, b"first primary"),
+            0
+        );
+
+        sim.replica_crash(primary);
+        let (elected, elected_view) = (0..SETUP_TOTAL_STEPS)
+            .find_map(|_| {
+                sim.step();
+                partition_leader(&sim, namespace, Some(primary))
+                    .filter(|(_, elected_view)| *elected_view > view)
+            })
+            .expect("the surviving members elect a new primary");
+        assert!(
+            members.member(elected).is_some(),
+            "node {elected} leads a partition it does not store"
+        );
+        assert_eq!(
+            write_through(&mut sim, &client, namespace, elected, b"second primary"),
+            0,
+            "two of three members still commit"
+        );
+        let committed = sim
+            .partition_consensus_state(usize::from(elected), namespace)
+            .expect("the elected primary hosts the partition")
+            .commit_min;
+
+        advance_freshness_time(&mut sim, std::time::Duration::from_secs(5));
+        for replica in (0..REPLICAS).filter(|replica| members.member(*replica).is_none()) {
+            assert!(
+                sim.partition_consensus_state(usize::from(replica), namespace)
+                    .is_none(),
+                "node {replica} took part in a view change of a partition it does not store"
+            );
+            let status = sim.replicas[usize::from(replica)].shards[0]
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .partition_status(namespace)
+                .unwrap_or_else(|| panic!("node {replica} heard from the elected primary"));
+            assert!(
+                status.view >= elected_view,
+                "node {replica} still routes to view {}",
+                status.view
+            );
+        }
+
+        sim.replica_restart(primary);
+        assert!(
+            (0..SETUP_TOTAL_STEPS).any(|_| {
+                sim.step();
+                sim.partition_consensus_state(usize::from(primary), namespace)
+                    .is_some_and(|state| {
+                        state.status == consensus::Status::Normal
+                            && state.view >= elected_view
+                            && state.commit_min >= committed
+                    })
+            }),
+            "the old primary rejoins the new view and catches up"
+        );
+        let (leader, _) = partition_leader(&sim, namespace, None).expect("a member leads");
+        assert_eq!(
+            write_through(&mut sim, &client, namespace, leader, b"all members again"),
+            0
+        );
+    }
+
+    #[test]
+    fn given_a_two_member_partition_when_its_primary_fails_should_wait_for_it_without_electing() {
+        const REPLICAS: u8 = 5;
+        const OUTAGE_STEPS: u32 = 2_000;
+        let (mut sim, client, namespace) = placed_partition_cluster(REPLICAS, 2, 0xF2E5_0050);
+        let members = partition_members(&sim, namespace);
+        let (primary, view) =
+            partition_leader(&sim, namespace, None).expect("one member leads the partition");
+        assert!(members.member(primary).is_some());
+        assert_eq!(
+            write_through(&mut sim, &client, namespace, primary, b"both members"),
+            0
+        );
+
+        // Two members need both for a view change, so the survivor never leads.
+        sim.replica_crash(primary);
+        for _ in 0..OUTAGE_STEPS {
+            sim.step();
+            assert_eq!(partition_leader(&sim, namespace, Some(primary)), None);
+        }
+        assert_eq!(
+            cluster_below_write_quorum(&sim, Some(primary)),
+            1,
+            "the metadata primary counts the pair that no primary is up to count"
+        );
+
+        sim.replica_restart(primary);
+        let (leader, _) = (0..SETUP_TOTAL_STEPS)
+            .find_map(|_| {
+                sim.step();
+                partition_leader(&sim, namespace, None)
+                    .filter(|(_, leader_view)| *leader_view >= view)
+            })
+            .expect("the pair resumes once both members are back");
+        assert!(members.member(leader).is_some());
+        assert_eq!(
+            write_through(&mut sim, &client, namespace, leader, b"pair again"),
+            0
+        );
+        assert!(
+            (0..SETUP_TOTAL_STEPS).any(|_| {
+                sim.step();
+                cluster_below_write_quorum(&sim, None) == 0
+            }),
+            "no node counts the pair once both members are back"
+        );
+    }
+
+    /// A two-member partition with its backup down cannot commit. Its primary
+    /// hears too few members, steps down and keeps trying to elect, so the
+    /// count must not depend on which node leads it at the moment.
+    #[test]
+    fn given_a_two_member_partition_when_its_backup_is_down_should_count_it_below_write_quorum_once()
+     {
+        const REPLICAS: u8 = 5;
+        const SAMPLES: usize = 200;
+        let (mut sim, client, namespace) = placed_partition_cluster(REPLICAS, 2, 0xF2E5_0070);
+        let members = partition_members(&sim, namespace);
+        let (primary, _) =
+            partition_leader(&sim, namespace, None).expect("one member leads the partition");
+        assert_eq!(
+            write_through(&mut sim, &client, namespace, primary, b"both members"),
+            0
+        );
+        let backup = *members
+            .nodes()
+            .iter()
+            .find(|node| **node != primary)
+            .expect("two members");
+
+        sim.replica_crash(backup);
+        advance_freshness_time(
+            &mut sim,
+            consensus::MEMBER_LAG_MAX + shard::PARTITION_REPORT_INTERVAL,
+        );
+        for _ in 0..SAMPLES {
+            for _ in 0..10 {
+                sim.step();
+            }
+            assert_eq!(cluster_below_write_quorum(&sim, Some(backup)), 1);
+        }
+    }
+
+    /// `partitions_below_write_quorum` summed over every shard of every node
+    /// but `down`, as an operator sums it over the cluster.
+    fn cluster_below_write_quorum(sim: &Simulator, down: Option<u8>) -> i64 {
+        sim.replicas
+            .iter()
+            .enumerate()
+            .filter(|(replica, _)| down.is_none_or(|down| *replica != usize::from(down)))
+            .flat_map(|(_, replica)| replica.shards.iter())
+            .map(|shard| shard.metrics().partitions_below_write_quorum_value())
+            .sum()
+    }
+
+    /// Either member of a two-member partition can lose its storage, as one
+    /// `--fresh` replica at a time does. Both durabilities are persisted, so
+    /// only that member's empty vote lets the survivor, which holds every
+    /// committed op, lead a view to transfer the history back from. In-memory
+    /// storage does not model the transfer, so this stops at the view.
+    #[test]
+    fn given_a_two_member_partition_when_either_member_returns_without_its_storage_should_lead_on_the_survivor()
+     {
+        const REPLICAS: u8 = 5;
+        for wipe_primary in [true, false] {
+            let (mut sim, client, namespace) =
+                placed_partition_cluster(REPLICAS, 2, 0xF2E5_0060 + u64::from(wipe_primary));
+            let members = partition_members(&sim, namespace);
+            let (primary, _) =
+                partition_leader(&sim, namespace, None).expect("one member leads the partition");
+            let survivor = *members
+                .nodes()
+                .iter()
+                .find(|node| **node != primary)
+                .expect("two members");
+            let (wiped, survivor) = if wipe_primary {
+                (primary, survivor)
+            } else {
+                (survivor, primary)
+            };
+            assert_eq!(
+                write_through(&mut sim, &client, namespace, primary, b"before the wipe"),
+                0
+            );
+            let committed = sim
+                .partition_consensus_state(usize::from(primary), namespace)
+                .expect("the primary hosts the partition")
+                .commit_min;
+
+            sim.replica_crash(wiped);
+            sim.replica_restart_losing_partitions(wiped, &[namespace]);
+            let rebuilt = |sim: &Simulator| {
+                sim.replicas[usize::from(wiped)]
+                    .partition_shard(namespace)
+                    .plane
+                    .partitions()
+                    .contains(&namespace)
+            };
+            assert!(
+                (0..SETUP_TOTAL_STEPS).any(|_| {
+                    sim.step();
+                    rebuilt(&sim)
+                }),
+                "the restarted member rebuilds the partition"
+            );
+            // As the server marks a group whose storage went with the disk.
+            sim.replicas[usize::from(wiped)]
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .get_mut_by_ns(&namespace)
+                .expect("the rebuilt partition is live")
+                .force_requires_state_transfer_for_test();
+            // Nothing commits until the transfer lands, since both members ack.
+            assert!(
+                (0..SETUP_TOTAL_STEPS).any(|_| {
+                    sim.step();
+                    sim.partition_consensus_state(usize::from(survivor), namespace)
+                        .is_some_and(|state| {
+                            state.status == Status::Normal
+                                && state.is_primary
+                                && (!wipe_primary || state.view > 0)
+                        })
+                }),
+                "wipe_primary={wipe_primary}: node {survivor} never led: {:?}",
+                sim.partition_consensus_state(usize::from(survivor), namespace)
+            );
+            let kept =
+                super::tests::retained_prepare(&sim, usize::from(survivor), namespace, committed);
+            assert!(
+                kept.body()
+                    .windows(b"before the wipe".len())
+                    .any(|bytes| bytes == b"before the wipe"),
+                "wipe_primary={wipe_primary}: the view dropped the committed op"
+            );
+        }
     }
 
     fn partition_fresh(sim: &Simulator, replica: u8) -> bool {
@@ -16235,13 +16790,22 @@ mod metadata_read_frontier_tests {
         request: Message<RoutedRequestHeader>,
     ) -> u64 {
         let request_id = request.header().request;
-        sim.submit_request(client_id, target, request.into_generic());
+        let request = request.into_generic();
+        sim.submit_request(client_id, target, request.deep_copy());
         for _ in 0..SETUP_TOTAL_STEPS {
             if let Some(reply) = sim
                 .step()
                 .into_iter()
                 .find(|reply| reply.header().request == request_id)
             {
+                // Placement refuses a create until the primary has heard from
+                // every node in its view, and a client retries that refusal.
+                if iggy_binary_protocol::result_code(reply.body())
+                    == Some(iggy_common::IggyError::TransientNotAccepted.as_code())
+                {
+                    sim.submit_request(client_id, target, request.deep_copy());
+                    continue;
+                }
                 assert_eq!(
                     reply.header().status,
                     0,

@@ -36,6 +36,7 @@ mod register_forwarding;
 mod replica_links;
 mod replica_raw_request;
 mod replica_read_batching;
+mod replication_factor;
 mod rolling_sigkill_repro;
 mod root_credentials;
 mod staggered_bootstrap;

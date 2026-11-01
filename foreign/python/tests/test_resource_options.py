@@ -258,7 +258,7 @@ class TestTopicOptions:
     """Typed topic create options and generic topic updates."""
 
     @pytest.mark.asyncio
-    async def test_given_keyword_topic_options_when_creating_should_preserve_all_ten_settings(  # noqa: E501
+    async def test_given_keyword_topic_options_when_creating_should_preserve_all_eleven_settings(  # noqa: E501
         self, transport_client: IggyClient, unique_name
     ):
         """Every known create setting has a typed field and reads back explicit."""
@@ -281,6 +281,7 @@ class TestTopicOptions:
                 messages_required_to_save=7,
                 size_of_messages_required_to_save=4096,
                 preallocate_segments=True,
+                replication_factor=1,
             ),
         )
 
@@ -298,6 +299,7 @@ class TestTopicOptions:
             "messages_required_to_save": 7,
             "size_of_messages_required_to_save": 4096,
             "preallocate_segments": True,
+            "replication_factor": 1,
         }
         assert topic.derived_options.to_scalar_dict() == {}
         assert topic.compression_algorithm == "gzip"

@@ -25,6 +25,7 @@ use Iggy\CommitEvery;
 use Iggy\CommitPolicy;
 use Iggy\Exception\NotFoundException;
 use Iggy\Exception\PendingOperationException;
+use Iggy\Partition;
 use Iggy\PolledMessages;
 use Iggy\PollingStrategy;
 use Iggy\PollOptions;
@@ -197,6 +198,10 @@ final class IggySdkTest extends TestCase
             assert_same($topicName, $topic->name);
             assert_true($topic->id >= 0, 'expected non-negative topic id');
             assert_same(2, $topic->partitions_count);
+            assert_same([0, 1], array_map(static fn (Partition $partition): int => $partition->id, $topic->partitions));
+            foreach ($topic->partitions as $partition) {
+                assert_same(0, $partition->messages_count, "partition {$partition->id}");
+            }
         } finally {
             cleanup_stream_with_topics($client, $streamName, [$topicName]);
         }

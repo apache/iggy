@@ -191,6 +191,7 @@ result_enum!(DeleteStreamResult { StreamNotFound = 1009 });
 result_enum!(CreateTopicResult {
     StreamNotFound = 1009,
     NameAlreadyExists = 2013,
+    InvalidReplicationFactor = 2018,
     InvalidPartitionsCount = 2019,
     TooManyTopics = 2021,
     PartitionIdSpaceExhausted = 3013,
@@ -216,6 +217,7 @@ result_enum!(DeleteTopicResult {
 result_enum!(CreatePartitionsResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
+    InvalidReplicationFactor = 2018,
     InvalidPartitionsCount = 2019,
     PartitionResizeDisabled = 2023,
     PartitionIdSpaceExhausted = 3013,

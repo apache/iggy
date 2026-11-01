@@ -105,6 +105,9 @@ public final class BytesDeserializer {
     // 33-byte fixed part + a one-character name (the server rejects an empty
     // one) + two u32 options-block length prefixes.
     private static final int MIN_TOPIC_BYTES = 42;
+    // Counters, context and the u8 counts of two empty node lists.
+    private static final int MIN_PARTITION_BYTES =
+            2 * Integer.BYTES + 4 * Long.BYTES + PartitionContext.ENCODED_SIZE + 2;
     private static final int OPEN_FILES_FIELDS_BYTES = 2 * Long.BYTES;
 
     private BytesDeserializer() {}
@@ -142,8 +145,11 @@ public final class BytesDeserializer {
     public static TopicDetails readTopicDetails(ByteBuf response) {
         var topic = readTopic(response);
 
-        List<Partition> partitions = new ArrayList<>();
-        while (response.isReadable()) {
+        // Count-driven: a partition entry ends in variable-length node lists.
+        int partitionsCount = validatedCollectionSize(
+                topic.partitionsCount(), response.readableBytes(), MIN_PARTITION_BYTES, "Topic partitions count");
+        List<Partition> partitions = new ArrayList<>(partitionsCount);
+        for (int i = 0; i < partitionsCount; i++) {
             partitions.add(readPartition(response));
         }
 
@@ -156,12 +162,19 @@ public final class BytesDeserializer {
     }
 
     public static Partition readPartition(ByteBuf response) {
+        if (response.readableBytes() < MIN_PARTITION_BYTES) {
+            throw new IggyMalformedResponseException("Partition needs at least " + MIN_PARTITION_BYTES
+                    + " bytes, remaining payload has " + response.readableBytes());
+        }
         var partitionId = response.readUnsignedIntLE();
         var createdAt = readU64AsBigInteger(response);
         var segmentsCount = response.readUnsignedIntLE();
         var currentOffset = readU64AsBigInteger(response);
         var size = readU64AsBigInteger(response);
         var messagesCount = readU64AsBigInteger(response);
+        var context = readPartitionContext(response);
+        var members = readNodeIds(response, "partition members");
+        var inSyncMembers = readNodeIds(response, "partition in-sync members");
         return new Partition(
                 partitionId,
                 createdAt,
@@ -169,7 +182,9 @@ public final class BytesDeserializer {
                 currentOffset,
                 size.toString(),
                 messagesCount,
-                readPartitionContext(response));
+                context,
+                members,
+                inSyncMembers);
     }
 
     public static Topic readTopic(ByteBuf response) {
@@ -888,6 +903,19 @@ public final class BytesDeserializer {
                     + " exceeds remaining payload of " + buffer.readableBytes() + " bytes");
         }
         return buffer.readCharSequence(toInt(length), StandardCharsets.UTF_8).toString();
+    }
+
+    private static List<Integer> readNodeIds(ByteBuf buffer, String field) {
+        if (!buffer.isReadable()) {
+            throw new IggyMalformedResponseException("Missing count for " + field);
+        }
+        int count = validatedCollectionSize(
+                buffer.readUnsignedByte(), buffer.readableBytes(), Byte.BYTES, field + " count");
+        List<Integer> nodeIds = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            nodeIds.add((int) buffer.readUnsignedByte());
+        }
+        return nodeIds;
     }
 
     static int validatedCollectionSize(long count, int readableBytes, int entryBytes, String field) {

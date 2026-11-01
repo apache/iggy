@@ -687,6 +687,7 @@ mod tests {
     const READ_PATH: &str = "/streams?consistency=linearizable";
     fn node(replica_id: u8, ip: &str, http: Option<u16>) -> ClusterNodeConfig {
         ClusterNodeConfig {
+            rack: None,
             name: format!("node-{replica_id}"),
             ip: ip.to_owned(),
             advertised_address: None,
