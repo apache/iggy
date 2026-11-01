@@ -287,6 +287,12 @@ permissions read at admission, so everything written about the SASL identity abo
 it is not cached across connections, and nothing acts as it on the data plane yet
 ([#4518](https://github.com/apache/iggy/issues/4518)).
 
+The snapshot follows Iggy's metadata change log when the bridge's Iggy user can read it, which needs root
+or the global `manage_servers` permission. A connection then takes each permission change of its user
+within about a second, and closes once its user is deleted or deactivated.
+[`ACL_MAPPING.md`](ACL_MAPPING.md#staleness) has the detail. Without that permission, the snapshot holds
+until the connection closes.
+
 ## Re-authentication
 
 Iggy's only correct re-authentication is logout followed by login, which drops and re-mints the VSR session.
