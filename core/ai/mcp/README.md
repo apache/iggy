@@ -118,6 +118,12 @@ abandoning it can duplicate an earlier effect. Both tools take
 `{"operation_id": "123"}` and require at least one of the `create`, `update`, or
 `delete` MCP permissions. A process restart loses this local recovery state.
 
+A poll with auto-commit (`auto_commit = true` or `strategy = "next"`) stores the
+consumer offset, so a lost reply leaves it uncertain too. Its error carries
+`data.operation_id`, and later polls and offset writes of that partition fail
+until `abandon_operation` releases it. `resolve_operation` cannot prove such a
+poll and keeps it uncertain. After the abandon, the stored offset stays unknown.
+
 ## Systemd integration
 
 Build with the `systemd` feature to enable systemd readiness and watchdog notifications:

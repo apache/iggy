@@ -64,6 +64,10 @@ pub struct LifecyclePartition {
     pub partition_id: u32,
     pub fence: LifecycleFence,
     pub partition_op: Option<u64>,
+    /// Bit per node that retired its lost copy of a deleted partition. See
+    /// [`retired_member_op`].
+    #[serde(default)]
+    pub retired_members: u32,
 }
 
 /// Retained until every affected partition durably installs its exact fence.
@@ -117,6 +121,27 @@ impl LifecycleIntent {
 /// can install its fence, so a durable retirement fence that keeps the
 /// incarnation offline completes it instead.
 pub const RETIRED_PARTITION_OP: u64 = u64::MAX;
+
+/// The `partition_op` with which `node` reports retiring its lost copy of a
+/// partition that a delete removes.
+///
+/// It only records the member. Once too few members remain to commit, a member
+/// completes the target with [`RETIRED_PARTITION_OP`], since then no log can
+/// install its fence either.
+#[must_use]
+pub const fn retired_member_op(node: u8) -> u64 {
+    RETIRED_PARTITION_OP - 1 - node as u64
+}
+
+/// The node a [`retired_member_op`] names.
+#[must_use]
+pub const fn retiring_member(partition_op: u64) -> Option<u8> {
+    match (RETIRED_PARTITION_OP - 1).checked_sub(partition_op) {
+        #[allow(clippy::cast_possible_truncation)]
+        Some(node) if node < u32::BITS as u64 => Some(node as u8),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LifecycleCompletion {
@@ -266,6 +291,9 @@ impl Streams {
                 return state.lifecycle_blocks_topic_creation(stream_id);
             }
             if !topic_scoped {
+                if operation == Operation::DeleteStream {
+                    return state.lifecycle_blocks_delete(stream_id, None);
+                }
                 return state.lifecycle_blocks(stream_id, None);
             }
             let Ok((topic, topic_bytes)) = WireIdentifier::decode(&body[consumed..]) else {
@@ -291,6 +319,9 @@ impl Streams {
                     .and_then(|topic| topic.resolve_group_id(&group));
                 return state.lifecycle_blocks_consumer(stream_id, topic_id, group_id);
             }
+            if operation == Operation::DeleteTopic {
+                return state.lifecycle_blocks_delete(stream_id, Some(topic_id));
+            }
             state.lifecycle_blocks(stream_id, Some(topic_id))
         })
     }
@@ -301,6 +332,32 @@ impl StreamsInner {
         self.lifecycle_blockers(stream_id, topic_id)
             .next()
             .is_some()
+    }
+
+    /// A topic or stream delete removes the topic's consumer groups too, so a
+    /// pending group deletion does not hold it back: the delete takes it over.
+    /// A group deletion whose partition can never elect a primary would
+    /// otherwise keep the topic from ever being deleted.
+    pub(crate) fn lifecycle_blocks_delete(
+        &self,
+        stream_id: usize,
+        topic_id: Option<usize>,
+    ) -> bool {
+        self.lifecycle_blockers(stream_id, topic_id)
+            .any(|intent| !matches!(intent.action, LifecycleAction::DeleteConsumerGroup { .. }))
+    }
+
+    fn take_over_group_deletions(&mut self, stream_id: usize, topic_id: Option<usize>) {
+        let taken: Vec<u64> = self
+            .lifecycle_blockers(stream_id, topic_id)
+            .filter(|intent| matches!(intent.action, LifecycleAction::DeleteConsumerGroup { .. }))
+            .map(|intent| intent.context.metadata_op)
+            .collect();
+        for metadata_op in taken {
+            if let Some(intent) = self.lifecycle_intents.remove(&metadata_op) {
+                self.lifecycle_scopes.remove(&intent.scope());
+            }
+        }
     }
 
     /// A topic-scoped intent leaves the rest of its stream writable, so only a
@@ -366,7 +423,16 @@ impl StreamsInner {
         if self.finalizing_lifecycle.is_some() {
             return None;
         }
-        if self.lifecycle_blocks(stream_id, topic_id) {
+        let deletes = matches!(
+            action,
+            LifecycleAction::DeleteStream | LifecycleAction::DeleteTopic
+        );
+        let busy = if deletes {
+            self.lifecycle_blocks_delete(stream_id, topic_id)
+        } else {
+            self.lifecycle_blocks(stream_id, topic_id)
+        };
+        if busy {
             return Some(ApplyReply::err(IggyError::LifecycleBusy.as_code()));
         }
         let stream = self.items.get(stream_id)?;
@@ -421,14 +487,18 @@ impl StreamsInner {
                     partition_id,
                     fence,
                     partition_op: None,
+                    retired_members: 0,
                 });
             }
         }
+        if !partitions.is_empty() && self.apply_context.metadata_op == 0 {
+            return Some(ApplyReply::err(IggyError::InvalidCommand.as_code()));
+        }
+        if deletes {
+            self.take_over_group_deletions(stream_id, topic_id);
+        }
         if partitions.is_empty() {
             return None;
-        }
-        if self.apply_context.metadata_op == 0 {
-            return Some(ApplyReply::err(IggyError::InvalidCommand.as_code()));
         }
         let mut intent = LifecycleIntent {
             context: self.apply_context,
@@ -460,6 +530,7 @@ impl StateHandler for CompleteLifecycleRequest {
         // A batch applies whole or not at all, so nothing is recorded until
         // every completion passes.
         let mut recorded = Vec::with_capacity(self.completions.len());
+        let mut retirements = Vec::new();
         for completion in &self.completions {
             let Some(&index) = intent
                 .partition_index
@@ -467,14 +538,28 @@ impl StateHandler for CompleteLifecycleRequest {
             else {
                 return ApplyReply::err(IggyError::InvalidCommand.as_code());
             };
-            match intent
-                .partitions
-                .get(index)
-                .map(|partition| partition.partition_op)
-            {
-                Some(None) => recorded.push((index, completion.partition_op)),
-                Some(Some(op)) if op == completion.partition_op => {}
-                _ => return ApplyReply::err(IggyError::InvalidCommand.as_code()),
+            let Some(partition) = intent.partitions.get(index) else {
+                return ApplyReply::err(IggyError::InvalidCommand.as_code());
+            };
+            if let Some(node) = retiring_member(completion.partition_op) {
+                // Only a delete may lose a copy for good.
+                if !matches!(partition.fence, LifecycleFence::History(_)) {
+                    return ApplyReply::err(IggyError::InvalidCommand.as_code());
+                }
+                if partition.partition_op.is_none() {
+                    retirements.push((index, node));
+                }
+                continue;
+            }
+            match partition.partition_op {
+                None => recorded.push((index, completion.partition_op)),
+                Some(op) if op == completion.partition_op => {}
+                Some(_) => return ApplyReply::err(IggyError::InvalidCommand.as_code()),
+            }
+        }
+        for &(index, node) in &retirements {
+            if let Some(partition) = intent.partitions.get_mut(index) {
+                partition.retired_members |= 1 << node;
             }
         }
         for &(index, partition_op) in &recorded {
@@ -1486,14 +1571,15 @@ mod tests {
         }
         assert!(!streams.request_lifecycle_blocked(Operation::SendMessages, &[]));
         assert!(
-            streams.request_lifecycle_blocked(
+            !streams.request_lifecycle_blocked(
                 Operation::DeleteTopic,
                 &DeleteTopicRequest {
                     stream_id: WireIdentifier::numeric(0),
                     topic_id: WireIdentifier::numeric(0),
                 }
                 .to_bytes()
-            )
+            ),
+            "a topic delete takes the group deletion over"
         );
         complete(&streams, 0, 12);
         assert!(streams.read(|inner| inner.lifecycle_blocks_consumer(0, 0, Some(0))));
@@ -1565,6 +1651,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         for stream_wide in [false, true] {
@@ -1678,6 +1765,155 @@ mod tests {
             crate::stm::snapshot::MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
         let restored = Streams::from_snapshot(decoded.streams.unwrap()).unwrap();
         assert_eq!(catalog(&restored), (REMOVAL_OP, 2, vec![1]));
+    }
+
+    /// A group deletion can wait forever on a partition that cannot elect, so
+    /// it must not keep its topic from being deleted: the topic delete takes
+    /// it over and removes the group with the topic.
+    #[test]
+    fn given_a_pending_group_deletion_when_deleting_its_topic_should_take_it_over() {
+        const TOPIC_DELETE_OP: u64 = INTENT_OP + 10;
+        let streams = pending_owned_group_deletion(INTENT_OP - 1);
+        let delete = DeleteTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+        };
+        assert!(!streams.request_lifecycle_blocked(Operation::DeleteTopic, &delete.to_bytes()));
+        let create_partitions =
+            iggy_binary_protocol::requests::partitions::CreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+            };
+        assert!(
+            streams.request_lifecycle_blocked(
+                Operation::CreatePartitions,
+                &create_partitions.to_bytes()
+            ),
+            "only a delete of the scope takes a group deletion over"
+        );
+
+        let refused = apply(
+            &streams,
+            Operation::DeleteTopic,
+            &delete,
+            ApplyContext {
+                metadata_op: 0,
+                ..context()
+            },
+        );
+        assert_eq!(refused.code, IggyError::InvalidCommand.as_code());
+        assert!(
+            streams.lifecycle_pending(INTENT_OP),
+            "a refused delete leaves the group deletion in place"
+        );
+
+        let reply = apply(
+            &streams,
+            Operation::DeleteTopic,
+            &delete,
+            ApplyContext {
+                metadata_op: TOPIC_DELETE_OP,
+                ..context()
+            },
+        );
+        assert_eq!(reply.code, 0);
+        assert!(!streams.lifecycle_pending(INTENT_OP));
+        assert!(streams.lifecycle_pending(TOPIC_DELETE_OP));
+
+        for (partition_id, metadata_op) in [(0, TOPIC_DELETE_OP + 1), (1, TOPIC_DELETE_OP + 2)] {
+            let reply = apply(
+                &streams,
+                Operation::CompleteLifecycle,
+                &CompleteLifecycleRequest::new(
+                    TOPIC_DELETE_OP,
+                    0,
+                    vec![completion(partition_id, 3)],
+                )
+                .unwrap(),
+                ApplyContext {
+                    metadata_op,
+                    ..ApplyContext::default()
+                },
+            );
+            assert_eq!(reply.code, 0);
+        }
+        assert!(!streams.lifecycle_pending(TOPIC_DELETE_OP));
+        assert!(streams.read(|inner| inner.items[0].topics.is_empty()));
+    }
+
+    #[test]
+    fn given_a_member_retirement_when_completing_should_record_it_and_leave_the_target_pending() {
+        assert_eq!(retiring_member(retired_member_op(5)), Some(5));
+        assert_eq!(retiring_member(RETIRED_PARTITION_OP), None);
+        assert_eq!(retiring_member(12), None);
+        let streams = streams();
+        let reply = apply(
+            &streams,
+            Operation::DeleteTopic,
+            &DeleteTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+            },
+            context(),
+        );
+        assert_eq!(reply.code, 0);
+        let retire = |streams: &Streams, metadata_op| {
+            complete_batch(
+                streams,
+                vec![completion(0, retired_member_op(2))],
+                metadata_op,
+            )
+            .code
+        };
+        assert_eq!(retire(&streams, INTENT_OP + 1), 0);
+        assert_eq!(
+            retire(&streams, INTENT_OP + 2),
+            0,
+            "a repeated report changes nothing"
+        );
+        let retired =
+            |streams: &Streams| streams.pending_lifecycles()[0].partitions[0].retired_members;
+        assert_eq!(retired(&streams), 1 << 2);
+        assert!(
+            streams.lifecycle_pending(INTENT_OP),
+            "a retirement completes no target"
+        );
+
+        let mut snapshot = crate::stm::snapshot::MetadataSnapshot::new(INTENT_OP + 2);
+        snapshot.streams = Some(streams.to_snapshot());
+        let decoded =
+            crate::stm::snapshot::MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
+        let restored = Streams::from_snapshot(decoded.streams.unwrap()).unwrap();
+        assert_eq!(retired(&restored), 1 << 2);
+
+        for (partition_id, partition_op, metadata_op) in [
+            (0, RETIRED_PARTITION_OP, INTENT_OP + 3),
+            (1, 7, INTENT_OP + 4),
+        ] {
+            let reply = complete_batch(
+                &streams,
+                vec![completion(partition_id, partition_op)],
+                metadata_op,
+            );
+            assert_eq!(reply.code, 0);
+        }
+        assert!(!streams.lifecycle_pending(INTENT_OP));
+    }
+
+    #[test]
+    fn given_a_group_deletion_when_a_member_reports_retiring_its_copy_should_refuse() {
+        let streams = pending_owned_group_deletion(INTENT_OP - 1);
+        let reply = complete_batch(
+            &streams,
+            vec![completion(0, retired_member_op(1))],
+            INTENT_OP + 1,
+        );
+        assert_eq!(reply.code, IggyError::InvalidCommand.as_code());
+        assert_eq!(
+            streams.pending_lifecycles()[0].partitions[0].retired_members,
+            0
+        );
     }
 
     #[test]

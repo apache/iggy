@@ -35,9 +35,29 @@ protocol IggyConnection: AnyObject, Sendable {
     var localAddress: String? { get }
     /// Writes a frame and reads the reply, bounded by `timeout`. A timeout
     /// leaves the stream at an unknown boundary, so the connection closes
-    /// itself and every later call fails.
-    func exchange(_ frame: [UInt8], timeout: Duration) async throws -> RawFrame
+    /// itself and every later call fails. So does a cancelled caller, unless
+    /// `cancellation` holds the frame that cancels a deferred request: then
+    /// that frame follows the request and the connection stays usable. A
+    /// request that ``DeferredCancellation/isAnswered`` waits for its one
+    /// reply, any other gets `CancellationError` and the connection drops
+    /// its late reply.
+    func exchange(_ frame: [UInt8], timeout: Duration, cancellation: DeferredCancellation?) async throws -> RawFrame
     func close() async
+}
+
+/// The command 108 frame that cancels a deferred request.
+struct DeferredCancellation: Sendable {
+    let frame: [UInt8]
+    /// A committing request answers its cancellation once: with
+    /// `transientNotAccepted` when nothing was stored, or with its messages
+    /// when its read committed first. Any other request is not answered.
+    let isAnswered: Bool
+}
+
+extension IggyConnection {
+    func exchange(_ frame: [UInt8], timeout: Duration) async throws -> RawFrame {
+        try await exchange(frame, timeout: timeout, cancellation: nil)
+    }
 }
 
 /// A dialer that produces connections; swapped out by tests.
@@ -121,7 +141,7 @@ final class TCPConnection: IggyConnection, @unchecked Sendable {
         return TCPConnection(channel: channel, handler: handler)
     }
 
-    func exchange(_ frame: [UInt8], timeout: Duration) async throws -> RawFrame {
+    func exchange(_ frame: [UInt8], timeout: Duration, cancellation: DeferredCancellation?) async throws -> RawFrame {
         let channel = self.channel
         let handler = self.handler
         return try await withTaskCancellationHandler {
@@ -131,10 +151,14 @@ final class TCPConnection: IggyConnection, @unchecked Sendable {
                 }
             }
         } onCancel: {
-            // The caller stopped waiting, and a reply that still arrives would
-            // be read as the answer to the next request.
             channel.eventLoop.execute {
-                handler.abort(with: IggyError(.disconnected, context: "the request was cancelled"), on: channel)
+                if let cancellation {
+                    handler.cancel(with: cancellation, on: channel)
+                } else {
+                    // The caller stopped waiting, and a reply that still arrives
+                    // would be read as the answer to the next request.
+                    handler.abort(with: IggyError(.disconnected, context: "the request was cancelled"), on: channel)
+                }
             }
         }
     }
@@ -182,6 +206,11 @@ final class ExchangeHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = RawFrame
 
     private var pending: CheckedContinuation<RawFrame, Error>?
+    private var pendingRequestID: UInt64?
+    /// The highest request id whose deferred request was cancelled. Ids only
+    /// rise on a connection, so a reply at or below it answers a cancelled
+    /// request, one the server sent before the cancellation reached it.
+    private var cancelledThrough: UInt64?
     private var replyDeadline: Scheduled<Void>?
     private var handshake: CheckedContinuation<Void, Error>?
     private var handshakeDeadline: Scheduled<Void>?
@@ -198,14 +227,47 @@ final class ExchangeHandler: ChannelInboundHandler, @unchecked Sendable {
             continuation.resume(throwing: IggyError(.notConnected, context: "the connection closed before the request was written: \(cause)"))
             return
         }
+        let requestID = VSRFrame.readRequestID(frame[...])
+        if let requestID, let cancelledThrough, requestID <= cancelledThrough {
+            // The caller cancelled the request before it was written.
+            continuation.resume(throwing: CancellationError())
+            return
+        }
         if let previous = pending {
             replyDeadline?.cancel()
             previous.resume(throwing: IggyError(.invalidCommand, context: "a reply was already awaited on this connection"))
         }
         pending = continuation
+        pendingRequestID = requestID
         replyDeadline = channel.eventLoop.scheduleTask(in: .nanoseconds(timeout.nanosecondsClamped)) { [self] in
             abort(with: IggyError(.disconnected, context: "timed out after \(timeout) waiting for the reply"), on: channel)
         }
+        write(frame, on: channel)
+    }
+
+    /// Ends a deferred request whose caller stopped waiting. One that is
+    /// written is cancelled with its command 108 frame, and one that is not
+    /// written yet never will be. The server answers no cancellation. It
+    /// answers a cancelled committing request once, so that request keeps
+    /// waiting for its reply. Any other cancelled request is not answered.
+    func cancel(with cancellation: DeferredCancellation, on channel: Channel) {
+        guard let requestID = VSRFrame.readRequestID(cancellation.frame[...]) else {
+            return
+        }
+        let written = !closed && pendingRequestID == requestID
+        if written, cancellation.isAnswered {
+            write(cancellation.frame, on: channel)
+            return
+        }
+        cancelledThrough = max(cancelledThrough ?? 0, requestID)
+        guard written else {
+            return
+        }
+        fail(with: CancellationError())
+        write(cancellation.frame, on: channel)
+    }
+
+    private func write(_ frame: [UInt8], on channel: Channel) {
         var buffer = channel.allocator.buffer(capacity: frame.count)
         buffer.writeBytes(frame)
         channel.writeAndFlush(buffer).whenFailure { [self] error in
@@ -226,11 +288,12 @@ final class ExchangeHandler: ChannelInboundHandler, @unchecked Sendable {
         channel.close(promise: nil)
     }
 
-    private func fail(with error: IggyError) {
+    private func fail(with error: any Error) {
         replyDeadline?.cancel()
         replyDeadline = nil
         pending?.resume(throwing: error)
         pending = nil
+        pendingRequestID = nil
     }
 
     /// Waits for the TLS handshake for at most `timeout`. A peer that accepts
@@ -262,10 +325,17 @@ final class ExchangeHandler: ChannelInboundHandler, @unchecked Sendable {
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let frame = unwrapInboundIn(data)
+        let header = frame.header[...]
+        if let cancelledThrough, VSRFrame.peekCommand(header) == .reply, let requestID = VSRFrame.readReplyRequestID(header),
+            requestID <= cancelledThrough
+        {
+            return
+        }
         if let pending {
             replyDeadline?.cancel()
             replyDeadline = nil
             self.pending = nil
+            pendingRequestID = nil
             pending.resume(returning: frame)
         }
         // A frame nobody waits for is either a stray reply or a session-level

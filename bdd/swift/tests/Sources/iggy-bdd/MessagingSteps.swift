@@ -86,7 +86,7 @@ enum BasicMessagingSteps {
         registry.step("I poll messages from stream (\\d+), topic (\\d+), partition (\\d+) starting from offset (\\d+)") { world, groups in
             world.lastPolled = try await world.requireClient().pollMessages(
                 streamID: Identifier(numeric: try number(groups[0])), topicID: Identifier(numeric: try number(groups[1])),
-                partitionID: try number(groups[2]), strategy: .offset(try number(groups[3], as: UInt64.self)), count: 100, autoCommit: false)
+                partitionID: try number(groups[2]), strategy: .offset(try number(groups[3], as: UInt64.self)), options: PollOptions(count: 100))
         }
         registry.step("I should receive (\\d+) messages") { world, groups in
             let expected: Int = try number(groups[0])

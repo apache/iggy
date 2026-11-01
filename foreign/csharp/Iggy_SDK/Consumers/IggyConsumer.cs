@@ -15,102 +15,58 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
-using System.Runtime.ExceptionServices;
-using System.Threading.Channels;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Extensions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Utils;
-using Apache.Iggy.Vsr;
 using Microsoft.Extensions.Logging;
 
 namespace Apache.Iggy.Consumers;
 
 /// <summary>
-///     High-level consumer for receiving messages from Iggy streams.
-///     Provides automatic polling, offset management, and consumer group support.
+///     Hands over the messages of a topic one at a time, on a <see cref="PartitionReader" />: a standalone consumer
+///     reads the partitions of its configuration, a consumer group reads the assignment of its member.
 /// </summary>
+/// <remarks>
+///     <para>
+///         <see cref="IggyConsumerConfig.PollOptions" /> holds the <see cref="CommitPolicy" />. With
+///         <see cref="CommitMode.Manual" /> the application commits <see cref="ReceivedMessage.Checkpoint" /> with
+///         <see cref="CommitAsync" />. With <see cref="CommitMode.OnRead" /> the server stores the offset of each read,
+///         and <see cref="ShutdownAsync" /> moves it back to the last message handed over. With
+///         <see cref="CommitMode.Auto" /> the consumer counts each message, with <see cref="CommitAfter.Delivery" />
+///         when it is handed over, with <see cref="CommitAfter.Processing" /> once the stream is read again, or once
+///         the handler of <see cref="ConsumeAsync" /> returns with success, and with <see cref="CommitAfter.Marked" />
+///         on <see cref="Mark" />. It stores the latest counted position at the interval or the event of the policy,
+///         before a rebalance takes a partition away, and on shutdown.
+///     </para>
+///     <para>
+///         A read error does not end the stream: the reader retries by itself, and the error reaches the callbacks of
+///         <see cref="SubscribeToErrorEvents" />.
+///     </para>
+/// </remarks>
 public partial class IggyConsumer : IAsyncDisposable
 {
-    /// <summary>
-    ///     Backoff between poll iterations that found the group membership missing. It bounds the retry rate of
-    ///     the poll-side rejoin below and keeps the receive loop from spinning while the membership is
-    ///     unrecoverable (client disconnected, group deleted).
-    /// </summary>
-    private const int GroupRejoinRetryDelayMs = 1_000;
+    private const int ConsumerGroupAlreadyExists = 5004;
+    private const int StateReading = 1;
+    private const int StateShutDown = 2;
 
-    /// <summary>
-    ///     Backoff after a group poll reported <see cref="PolledMessages.NoAssignedPartition" />. Without it a
-    ///     member holding zero partitions re-polls in a hot loop whenever <c>PollingIntervalMs</c> is zero.
-    /// </summary>
-    private const int NoAssignedPartitionBackoffMs = 100;
-
-    /// <summary>
-    ///     Delay after a failed poll, the default polling retry interval of the Rust consumer. Without it a client
-    ///     that keeps failing, for example while it is disconnected, is polled in a hot loop whenever
-    ///     <c>PollingIntervalMs</c> is zero.
-    /// </summary>
-    private const int PollRetryDelayMs = 1_000;
-    private const int OperationTimeoutMs = 30_000;
-
-    private readonly Channel<ReceivedMessage> _channel;
     private readonly IIggyClient _client;
     private readonly IggyConsumerConfig _config;
-
-    /// <summary>
-    ///     Never disposed, like <see cref="_pollingSemaphore" />: a group rejoin that runs during
-    ///     <see cref="DisposeAsync" />, from a poll or from a state event, still releases it. A poll or a state event
-    ///     that takes it after the dispose started skips the rejoin.
-    /// </summary>
-    private readonly SemaphoreSlim _connectionStateSemaphore = new(1, 1);
-
     private readonly EventAggregator<ConsumerErrorEventArgs> _consumerErrorEvents;
-    private readonly ConcurrentDictionary<uint, PartitionContext> _lastPolledContext = new();
-    private readonly ConcurrentDictionary<uint, ulong> _lastPolledOffset = new();
+    private readonly AsyncLocal<bool> _handlerRunning = new();
+    private readonly SemaphoreSlim _initialization = new(1, 1);
     private readonly ILogger<IggyConsumer> _logger;
-
-    /// <summary>
-    ///     The poll that continues each partition after the last batch it delivered, under the context of that batch.
-    ///     The configured strategy only says where reading a partition starts, as in the Rust consumer. A
-    ///     continuation pinned to its context is refused by a recreated partition instead of reading a later offset
-    ///     of the new incarnation, and it never moves to another partition of a consumer group.
-    /// </summary>
-    private readonly ConcurrentDictionary<uint, PollingStrategy> _nextPollingStrategies = new();
-
-    /// <summary>
-    ///     Never disposed: a poll in flight during <see cref="DisposeAsync" /> still releases it, and a semaphore whose
-    ///     wait handle is never used holds nothing to free.
-    /// </summary>
-    private readonly SemaphoreSlim _pollingSemaphore = new(1, 1);
-
-    private readonly Channel<ReceivedRentedMessage> _rentedChannel;
-    private string? _consumerGroupName;
-    private readonly object _deliveryGate = new();
-    private readonly Dictionary<uint, (ulong Offset, PartitionContext Context)> _deliveredOffsets = [];
-    private readonly Dictionary<uint, (ulong Offset, PartitionContext Context)> _storedOffsets = [];
-    private readonly SemaphoreSlim _offsetSemaphore = new(1, 1);
+    private readonly ILoggerFactory _loggerFactory;
     private readonly CancellationTokenSource _lifetime = new();
-    private int _disposeState;
-    private volatile bool _isInitialized;
-    private volatile bool _joinedConsumerGroup;
-
-    /// <summary>
-    ///     Consensus session generation the group membership was established under. A later generation means the
-    ///     server session that held the membership is gone and the group must be rejoined.
-    /// </summary>
-    private ulong _joinedSessionGeneration;
-
-    private long _lastPolledAtMs;
-
-    /// <summary>Whether this consumer has been initialized via <see cref="InitAsync" />.</summary>
-    protected bool IsInitialized => _isInitialized;
-
-    /// <summary>Whether <see cref="DisposeAsync" /> has started. The receive loops end once it has.</summary>
-    private protected bool IsDisposed => Volatile.Read(ref _disposeState) == 1;
+    private TaskCompletionSource? _handling;
+    private TaskCompletionSource? _shutdown;
+    private PartitionReader? _reader;
+    private int _state;
+    private (Checkpoint Checkpoint, bool EndsBatch)? _uncounted;
 
     /// <summary>
     ///     Initializes a new instance of the <see cref="IggyConsumer" /> class
@@ -122,332 +78,278 @@ public partial class IggyConsumer : IAsyncDisposable
     {
         _client = client;
         _config = config;
+        _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<IggyConsumer>();
-
-        _channel = Channel.CreateBounded<ReceivedMessage>(new BoundedChannelOptions((int)config.BatchSize * 2));
-        _rentedChannel
-            = Channel.CreateBounded<ReceivedRentedMessage>(new BoundedChannelOptions((int)config.BatchSize * 2));
         _consumerErrorEvents = new EventAggregator<ConsumerErrorEventArgs>(loggerFactory);
     }
 
+    /// <summary>Whether this consumer has been initialized via <see cref="InitAsync" />.</summary>
+    protected bool IsInitialized => Volatile.Read(ref _state) == StateReading;
+
+    /// <summary>Whether <see cref="ShutdownAsync" /> has started. The receive loops end once it has.</summary>
+    private protected bool IsDisposed => Volatile.Read(ref _state) == StateShutDown;
+
     /// <summary>
-    ///     Disposes the consumer, leaving consumer groups and logging out if applicable
+    ///     The partitions that the consumer reads: those of its configuration, or the current assignment of a group
+    ///     member.
     /// </summary>
+    public IReadOnlyList<uint> Partitions => _reader?.Partitions ?? [];
+
+    /// <summary>Shuts the consumer down as <see cref="ShutdownAsync" /> does, and logs its error instead of throwing it.</summary>
     public async ValueTask DisposeAsync()
     {
-        lock (_deliveryGate)
-        {
-            if (IsDisposed)
-            {
-                return;
-            }
-            Volatile.Write(ref _disposeState, 1);
-        }
-        _lifetime.Cancel();
-        CompleteReceiveChannels();
-        await _connectionStateSemaphore.WaitAsync();
         try
         {
-            if (_isInitialized)
-            {
-                _client.UnsubscribeConnectionEvents(OnClientConnectionStateChangedAsync);
-            }
-            // Cancellation drains stores already in flight before the final checkpoint and leave.
-            await _offsetSemaphore.WaitAsync();
-            try
-            {
-                using var checkpoint = new CancellationTokenSource(OperationTimeoutMs);
-                if (_config.AutoCommitMode != AutoCommitMode.Disabled)
-                {
-                    foreach (var (partition, position) in _deliveredOffsets)
-                    {
-                        if (checkpoint.IsCancellationRequested)
-                        {
-                            break;
-                        }
-                        if (_storedOffsets.TryGetValue(partition, out var stored)
-                            && SamePartition(stored.Context, position.Context) && stored.Offset >= position.Offset)
-                        {
-                            continue;
-                        }
-                        try
-                        {
-                            await WithLaneRecoveryAsync(token => _client.StoreOffsetAsync(_config.Consumer,
-                                _config.StreamId, _config.TopicId, position.Offset, partition, position.Context, token),
-                                checkpoint.Token);
-                        }
-                        catch (Exception error)
-                        {
-                            _logger.LogWarning(error, "Failed to checkpoint consumed offset {Offset} for partition {PartitionId}",
-                                position.Offset, partition);
-                        }
-                    }
-                }
-            }
-            finally
-            {
-                _offsetSemaphore.Release();
-            }
-            if (!string.IsNullOrEmpty(_consumerGroupName) && _joinedConsumerGroup)
-            {
-                await LeaveConsumerGroupAsync(_consumerGroupName);
-                _joinedConsumerGroup = false;
-            }
-            if (_config.CreateIggyClient)
-            {
-                try
-                {
-                    try
-                    {
-                        if (_isInitialized)
-                        {
-                            await _client.LogoutUserAsync();
-                        }
-                    }
-                    finally
-                    {
-                        _client.Dispose();
-                    }
-                }
-                catch (Exception error)
-                {
-                    LogFailedToLogoutOrDispose(error);
-                }
-            }
-            _isInitialized = false;
-            _consumerErrorEvents.Clear();
+            await ShutdownAsync();
         }
-        finally
+        catch (Exception error)
         {
-            _connectionStateSemaphore.Release();
+            _logger.LogWarning(error, "Shutting the consumer down failed.");
         }
+
+        GC.SuppressFinalize(this);
     }
-
-    private protected virtual void CompleteReceiveChannels()
-    {
-        _channel.Writer.TryComplete();
-        _rentedChannel.Writer.TryComplete();
-        while (_channel.Reader.TryRead(out _)) { }
-        while (_rentedChannel.Reader.TryRead(out var queued))
-        {
-            queued.Dispose();
-        }
-    }
-
-    // Under AfterReceive a message counts as delivered once its loop body completes, in CommitDeliveredAsync.
-    private protected bool BeginDelivery(ulong offset, uint partition, PartitionContext context) =>
-        _config.AutoCommitMode == AutoCommitMode.AfterReceive ? !IsDisposed : RecordDelivery(offset, partition, context);
-
-    private bool RecordDelivery(ulong offset, uint partition, PartitionContext context)
-    {
-        lock (_deliveryGate)
-        {
-            if (IsDisposed)
-            {
-                return false;
-            }
-            if (!_deliveredOffsets.TryGetValue(partition, out var previous)
-                || !SamePartition(previous.Context, context) || previous.Offset < offset)
-            {
-                _deliveredOffsets[partition] = (offset, context);
-            }
-            return true;
-        }
-    }
-
-    private static bool SamePartition(PartitionContext first, PartitionContext second) =>
-        first.Incarnation == second.Incarnation && first.OwnerGeneration == second.OwnerGeneration;
-
-    private protected Task CommitDeliveredAsync(ulong offset, uint partition, PartitionContext context, CancellationToken ct) =>
-        RecordDelivery(offset, partition, context)
-            ? StoreOffsetCoreAsync(offset, partition, context, ct, afterReceive: true)
-            : Task.CompletedTask;
 
     /// <summary>
-    ///     Initializes the consumer by logging in (if needed) and setting up consumer groups
+    ///     Connects the client when the consumer created it, creates the consumer group when it is missing and the
+    ///     configuration asks for it, and starts the reader, which joins the group.
     /// </summary>
-    /// <param name="ct">Cancellation token</param>
-    /// <exception cref="InvalidConsumerGroupNameException">Thrown when consumer group name is invalid</exception>
-    /// <exception cref="ConsumerGroupNotFoundException">Thrown when consumer group doesn't exist and auto-creation is disabled</exception>
-    /// <exception cref="ObjectDisposedException">The consumer is disposed before it was initialized.</exception>
+    /// <exception cref="ObjectDisposedException">The consumer was shut down.</exception>
     public async Task InitAsync(CancellationToken ct = default)
     {
-        ObjectDisposedException.ThrowIf(IsDisposed, this);
-        if (_isInitialized)
-        {
-            return;
-        }
-        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
-        ct = cancellation.Token;
-        await _connectionStateSemaphore.WaitAsync(ct);
+        await _initialization.WaitAsync(ct);
         try
         {
             ObjectDisposedException.ThrowIf(IsDisposed, this);
-            if (_isInitialized)
+            if (IsInitialized)
             {
                 return;
             }
 
-            if (_config.Consumer.Type == ConsumerType.ConsumerGroup && _config.PartitionId != null)
-            {
-                LogPartitionIdIsIgnoredWhenConsumerTypeIsConsumerGroup();
-                _config.PartitionId = null;
-            }
-
             await _client.ConnectAsync(ct);
-
             if (!string.IsNullOrEmpty(_config.Login) && !_config.CreateIggyClient)
             {
                 await _client.LoginUserAsync(_config.Login, _config.Password, ct);
             }
 
-            await InitializeConsumerGroupAsync(ct);
-            lock (_deliveryGate)
+            var consumer = _config.Consumer;
+            if (consumer.Type == ConsumerType.ConsumerGroup)
             {
-                ObjectDisposedException.ThrowIf(IsDisposed, this);
-                _client.SubscribeConnectionEvents(OnClientConnectionStateChangedAsync);
-                _isInitialized = true;
+                consumer = await PrepareGroupAsync(ct);
             }
+
+            var builder = _client.Reader(_config.StreamId, _config.TopicId, consumer)
+                .WithStart(_config.PollingStrategy)
+                .WithOptions(_config.PollOptions)
+                .WithLoggerFactory(_loggerFactory)
+                .CountingMessages();
+            if (consumer.Type == ConsumerType.Consumer)
+            {
+                builder.WithPartitions([.. _config.Partitions]);
+            }
+
+            _reader = await builder.BuildAsync(ct);
+            Volatile.Write(ref _state, StateReading);
         }
         finally
         {
-            _connectionStateSemaphore.Release();
+            _initialization.Release();
         }
     }
 
     /// <summary>
-    ///     Receives messages asynchronously from the consumer as an async stream.
-    ///     Messages are automatically polled from the server and buffered in a bounded channel.
-    ///     The stream ends once the consumer is disposed.
+    ///     Receives messages one at a time. The stream ends once the consumer shuts down. With
+    ///     <see cref="CommitAfter.Processing" /> a message counts once the stream is read again, or on shutdown.
     /// </summary>
     /// <param name="ct">Cancellation token to stop receiving messages</param>
-    /// <returns>An async enumerable of received messages</returns>
     /// <exception cref="ConsumerNotInitializedException">Thrown when InitAsync has not been called</exception>
     public async IAsyncEnumerable<ReceivedMessage> ReceiveAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
-        if (IsDisposed)
+        ThrowIfNotReading();
+        while (await NextBatchAsync(ct) is { } batch)
         {
-            yield break;
-        }
-        if (!_isInitialized)
-        {
-            throw new ConsumerNotInitializedException();
-        }
-
-        do
-        {
-            if (!_channel.Reader.TryRead(out var message))
+            for (var index = 0; index < batch.Messages.Count; index++)
             {
-                await PollMessagesAsync(ct);
-                continue;
-            }
-
-            if (!BeginDelivery(message.CurrentOffset, message.PartitionId, message.Context))
-            {
-                yield break;
-            }
-            yield return message;
-
-            if (_config.AutoCommitMode == AutoCommitMode.AfterReceive)
-            {
-                await CommitDeliveredAsync(message.CurrentOffset, message.PartitionId, message.Context, ct);
-            }
-        } while (!ct.IsCancellationRequested && !IsDisposed);
-    }
-
-    /// <summary>
-    ///     Manually stores the consumer offset for a specific partition.
-    ///     Use this when auto-commit is disabled or when you need manual offset control.
-    ///     The offset is stored under the context of the partition's last poll, so the server refuses it when the
-    ///     partition was deleted and recreated since then or moved to another member of the consumer group.
-    ///     An offset taken from a message of an earlier poll belongs under that message's context: store it with
-    ///     <see cref="StoreOffsetAsync(ulong, uint, PartitionContext, CancellationToken)" /> instead.
-    ///     Before the first poll of the partition the store takes the context the partition's route reports. It can
-    ///     then fail once with status 87, or 5009 for a consumer group, after another client recreated the
-    ///     partition. The failed route is dropped and the next call routes again.
-    /// </summary>
-    /// <param name="offset">The offset to store</param>
-    /// <param name="partitionId">The partition ID</param>
-    /// <param name="resetLastPolled">
-    ///     When true, changes the cached duplicate-filter offset for the partition.
-    ///     Does not change the polling strategy or clear buffered messages.
-    /// </param>
-    /// <param name="ct">Cancellation token</param>
-    public async Task StoreOffsetAsync(ulong offset, uint partitionId, bool resetLastPolled = false,
-        CancellationToken ct = default)
-    {
-        PartitionContext? context = _lastPolledContext.TryGetValue(partitionId, out var polled) ? polled : null;
-        await StoreOffsetCoreAsync(offset, partitionId, context, ct);
-
-        if (resetLastPolled)
-        {
-            _lastPolledOffset[partitionId] = offset;
-        }
-    }
-
-    /// <summary>
-    ///     Stores the offset of a received message under the context of the poll that delivered it, taken from
-    ///     <see cref="ReceivedMessage.Context" />. The server refuses it with status 87 when the partition was
-    ///     deleted and recreated after that poll, and with status 5009 when the partition moved to another member
-    ///     of the consumer group, so a late commit never lands on the newer partition.
-    /// </summary>
-    /// <param name="offset">The offset to store</param>
-    /// <param name="partitionId">The partition that delivered the offset</param>
-    /// <param name="context">The context of the message the offset belongs to</param>
-    /// <param name="ct">Cancellation token</param>
-    public async Task StoreOffsetAsync(ulong offset, uint partitionId, PartitionContext context,
-        CancellationToken ct = default)
-    {
-        await StoreOffsetCoreAsync(offset, partitionId, context, ct);
-    }
-
-    private async Task StoreOffsetCoreAsync(ulong offset, uint partitionId, PartitionContext? context,
-        CancellationToken ct, bool afterReceive = false)
-    {
-        if (afterReceive && IsDisposed) { return; }
-        ObjectDisposedException.ThrowIf(IsDisposed, this);
-        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
-        try
-        {
-            await _offsetSemaphore.WaitAsync(cancellation.Token);
-            try
-            {
-                if (afterReceive && IsDisposed) { return; }
-                ObjectDisposedException.ThrowIf(IsDisposed, this);
-                await WithLaneRecoveryAsync(token => context is { } captured
-                    ? _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId,
-                        offset, partitionId, captured, token)
-                    : _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId,
-                        offset, partitionId, token), cancellation.Token);
-                if (context is { } stored && (!_storedOffsets.TryGetValue(partitionId, out var previous)
-                    || !SamePartition(previous.Context, stored) || previous.Offset < offset))
+                if (ct.IsCancellationRequested || IsDisposed)
                 {
-                    _storedOffsets[partitionId] = (offset, stored);
+                    yield break;
+                }
+
+                var message = batch.Messages[index];
+                var checkpoint = batch.CheckpointAt(index)!;
+                Hand(checkpoint, index == batch.Messages.Count - 1);
+                yield return new ReceivedMessage
+                {
+                    Message = message,
+                    CurrentOffset = message.Header.Offset,
+                    PartitionId = batch.PartitionId,
+                    Context = batch.Context,
+                    Checkpoint = checkpoint
+                };
+                CountProcessed();
+            }
+        }
+    }
+
+    /// <summary>
+    ///     Hands each message to <paramref name="handler" /> until the consumer shuts down or a handler fails. With
+    ///     <see cref="CommitAfter.Delivery" /> a message counts before its handler runs, with
+    ///     <see cref="CommitAfter.Processing" /> only after its handler returned with success. A
+    ///     <see cref="ShutdownAsync" /> from outside the handler waits for the handler that runs.
+    /// </summary>
+    /// <exception cref="Exception">The error of the first handler that failed. Its message is not counted.</exception>
+    public async Task ConsumeAsync(Func<ReceivedMessage, CancellationToken, Task> handler,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+        ThrowIfNotReading();
+        while (await NextBatchAsync(ct) is { } batch)
+        {
+            for (var index = 0; index < batch.Messages.Count; index++)
+            {
+                if (ct.IsCancellationRequested || IsDisposed)
+                {
+                    return;
+                }
+
+                var message = batch.Messages[index];
+                var checkpoint = batch.CheckpointAt(index)!;
+                var endsBatch = index == batch.Messages.Count - 1;
+                Hand(checkpoint, endsBatch, false);
+                var handling = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                Volatile.Write(ref _handling, handling);
+                _handlerRunning.Value = true;
+                try
+                {
+                    await handler(new ReceivedMessage
+                    {
+                        Message = message,
+                        CurrentOffset = message.Header.Offset,
+                        PartitionId = batch.PartitionId,
+                        Context = batch.Context,
+                        Checkpoint = checkpoint
+                    }, ct);
+                    if (_config.PollOptions.Commit.Settings?.After == CommitAfter.Processing)
+                    {
+                        Reader.CountDelivered(checkpoint, 1, endsBatch);
+                    }
+                }
+                finally
+                {
+                    _handlerRunning.Value = false;
+                    handling.SetResult();
                 }
             }
-            finally { _offsetSemaphore.Release(); }
-        }
-        catch (OperationCanceledException) when (afterReceive && IsDisposed && !ct.IsCancellationRequested)
-        {
-        }
-        catch (VsrRequestOutcomeUnknownException) when (afterReceive && IsDisposed && !ct.IsCancellationRequested)
-        {
         }
     }
 
-    /// <summary>
-    ///     Deletes the stored consumer offset for a specific partition.
-    ///     The local duplicate filter, polling strategy, and buffered messages remain unchanged.
-    ///     The delete takes the context the partition's route reports, so it can fail once with status 87, or 5009
-    ///     for a consumer group, after another client recreated the partition. The failed route is dropped and the
-    ///     next call routes again.
-    /// </summary>
-    /// <param name="partitionId">The partition ID</param>
-    /// <param name="ct">Cancellation token</param>
-    public async Task DeleteOffsetAsync(uint partitionId, CancellationToken ct = default)
+    /// <summary>Stores the offset of a checkpoint that this consumer handed over.</summary>
+    /// <exception cref="IggyInvalidStatusCodeException">
+    ///     Status 3 with <see cref="CommitMode.OnRead" />, and for a checkpoint of another consumer.
+    /// </exception>
+    public Task CommitAsync(Checkpoint checkpoint, CancellationToken ct = default)
     {
-        await WithLaneRecoveryAsync(token => _client.DeleteOffsetAsync(_config.Consumer, _config.StreamId,
-            _config.TopicId, partitionId, token), ct);
+        return Reader.CommitAsync(checkpoint, ct);
+    }
+
+    /// <summary>
+    ///     Counts a checkpoint under <see cref="CommitMode.Auto" />, for messages processed concurrently with
+    ///     <see cref="CommitAfter.Marked" />.
+    /// </summary>
+    /// <exception cref="IggyInvalidStatusCodeException">Status 3 without <see cref="CommitMode.Auto" />.</exception>
+    public void Mark(Checkpoint checkpoint)
+    {
+        Reader.Mark(checkpoint);
+    }
+
+    /// <summary>Sets the next read position of a partition, as <see cref="PartitionReader.SeekAsync" /> does.</summary>
+    public Task SeekAsync(uint partitionId, PollingStrategy start, CancellationToken ct = default)
+    {
+        return Reader.SeekAsync(partitionId, start, ct);
+    }
+
+    /// <summary>
+    ///     Stops reading. It waits for a handler of <see cref="ConsumeAsync" /> that runs, unless that handler calls
+    ///     it, counts the last message of <see cref="ReceiveAsync" /> under <see cref="CommitAfter.Processing" />,
+    ///     closes the reader, which stores the counted positions or moves an on read offset back and leaves the
+    ///     group, and disposes a client that the consumer created. A later call waits for the first shutdown and
+    ///     ends as it does, unless the handler that the first one waits for makes it.
+    /// </summary>
+    /// <exception cref="Exception">The first failed store of the close.</exception>
+    public async Task ShutdownAsync()
+    {
+        var shutdown = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (Interlocked.CompareExchange(ref _shutdown, shutdown, null) is { } running)
+        {
+            if (!_handlerRunning.Value)
+            {
+                await running.Task;
+            }
+
+            return;
+        }
+
+        Volatile.Write(ref _state, StateShutDown);
+        try
+        {
+            await ShutdownOnceAsync();
+            shutdown.SetResult();
+        }
+        catch (Exception error)
+        {
+            shutdown.SetException(error);
+        }
+
+        await shutdown.Task;
+    }
+
+    private async Task ShutdownOnceAsync()
+    {
+        await _lifetime.CancelAsync();
+        // The message of a running handler counts only once the handler returns with success.
+        if (!_handlerRunning.Value && Volatile.Read(ref _handling) is { } handling)
+        {
+            await handling.Task;
+        }
+
+        Exception? failure = null;
+        if (_reader is { } reader)
+        {
+            CountProcessed();
+            try
+            {
+                await reader.CloseAsync();
+            }
+            catch (Exception error)
+            {
+                failure = error;
+            }
+        }
+
+        if (_config.CreateIggyClient)
+        {
+            try
+            {
+                if (_reader is not null)
+                {
+                    await _client.LogoutUserAsync();
+                }
+            }
+            catch (Exception error)
+            {
+                _logger.LogWarning(error, "The consumer could not log out its client.");
+            }
+            finally
+            {
+                _client.Dispose();
+            }
+        }
+
+        _consumerErrorEvents.Clear();
+        if (failure is not null)
+        {
+            throw failure;
+        }
     }
 
     /// <summary>
@@ -468,563 +370,103 @@ public partial class IggyConsumer : IAsyncDisposable
         _consumerErrorEvents.Unsubscribe(callback);
     }
 
+    private PartitionReader Reader => _reader ?? throw new ConsumerNotInitializedException();
+
     /// <summary>
-    ///     Initializes consumer group if configured, creating and joining as needed
+    ///     The next batch of the reader, or null once the consumer shut down or <paramref name="ct" /> was canceled. A
+    ///     read error goes to the error events and the reader goes on. A message that does not decode ends the stream
+    ///     with its <see cref="ReadException" />, whose <see cref="ReadException.Skip" /> passes it.
     /// </summary>
-    private async Task InitializeConsumerGroupAsync(CancellationToken ct = default)
+    private protected async Task<PolledMessages?> NextBatchAsync(CancellationToken ct)
     {
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
-        ct = cancellation.Token;
-        if (IsDisposed || _joinedConsumerGroup)
+        while (!IsDisposed && !ct.IsCancellationRequested)
         {
-            return;
+            try
+            {
+                return await Reader.NextAsync(cancellation.Token);
+            }
+            catch (ReadException error) when (error.Skip is null)
+            {
+                _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(error, error.Message));
+            }
+            catch (OperationCanceledException) when (IsDisposed || ct.IsCancellationRequested)
+            {
+                return null;
+            }
+            catch (Exception) when (IsDisposed)
+            {
+                return null;
+            }
         }
 
-        // Captured before the join: a session reset racing the join lands the membership on a later generation,
-        // and the mismatch triggers one redundant (idempotent) rejoin instead of a missed one.
-        var sessionGeneration = (_client as ISessionGenerationProvider)?.SessionGeneration ?? 0;
+        return null;
+    }
 
-        if (_config.Consumer.Type == ConsumerType.Consumer)
+    /// <summary>
+    ///     Records a message as handed over, and counts it there under <see cref="CommitAfter.Delivery" />. Under
+    ///     <see cref="CommitAfter.Processing" /> a message of a stream counts once the stream is read again.
+    /// </summary>
+    private protected void Hand(Checkpoint checkpoint, bool endsBatch, bool streamed = true)
+    {
+        Reader.Delivered(checkpoint);
+        switch (_config.PollOptions.Commit.Settings?.After)
         {
-            Interlocked.Exchange(ref _joinedSessionGeneration, sessionGeneration);
-            _joinedConsumerGroup = true;
-            return;
+            case CommitAfter.Delivery:
+                Reader.CountDelivered(checkpoint, 1, endsBatch);
+                break;
+            case CommitAfter.Processing when streamed:
+                _uncounted = (checkpoint, endsBatch);
+                break;
         }
+    }
 
-        _consumerGroupName = _config.Consumer.ConsumerId.Kind == IdKind.String
+    /// <summary>Under <see cref="CommitAfter.Processing" />, counts the message that was processed last.</summary>
+    private protected void CountProcessed()
+    {
+        if (_uncounted is { } processed)
+        {
+            _uncounted = null;
+            Reader.CountDelivered(processed.Checkpoint, 1, processed.EndsBatch);
+        }
+    }
+
+    private void ThrowIfNotReading()
+    {
+        if (!IsInitialized && !IsDisposed)
+        {
+            throw new ConsumerNotInitializedException();
+        }
+    }
+
+    /// <summary>Creates a missing group when the configuration asks for it, and returns the group to read.</summary>
+    private async Task<Consumer> PrepareGroupAsync(CancellationToken ct)
+    {
+        var name = _config.Consumer.ConsumerId.Kind == IdKind.String
             ? _config.Consumer.ConsumerId.GetString()
             : _config.ConsumerGroupName;
-
-        if (string.IsNullOrEmpty(_consumerGroupName))
+        if (string.IsNullOrEmpty(name))
         {
             throw new InvalidConsumerGroupNameException("Consumer group name is empty or null.");
         }
 
-        try
+        var group = Identifier.String(name);
+        if (await _client.GetConsumerGroupByIdAsync(_config.StreamId, _config.TopicId, group, ct) is null)
         {
-            var existingGroup = await _client.GetConsumerGroupByIdAsync(_config.StreamId, _config.TopicId,
-                Identifier.String(_consumerGroupName), ct);
-
-            if (existingGroup == null && _config.CreateConsumerGroupIfNotExists)
+            if (!_config.CreateConsumerGroupIfNotExists)
             {
-                LogCreatingConsumerGroup(_consumerGroupName, _config.StreamId, _config.TopicId);
-
-                var createdGroup = await TryCreateConsumerGroupAsync(_consumerGroupName, ct);
-
-                if (createdGroup)
-                {
-                    LogConsumerGroupCreated(_consumerGroupName);
-                }
-            }
-            else if (existingGroup == null)
-            {
-                throw new ConsumerGroupNotFoundException(_consumerGroupName);
+                throw new ConsumerGroupNotFoundException(name);
             }
 
-            if (_config.JoinConsumerGroup && !IsDisposed)
-            {
-                LogJoiningConsumerGroup(_consumerGroupName, _config.StreamId, _config.TopicId);
-
-                await _client.JoinConsumerGroupAsync(_config.StreamId, _config.TopicId,
-                    Identifier.String(_consumerGroupName), ct);
-
-                Interlocked.Exchange(ref _joinedSessionGeneration, sessionGeneration);
-                _joinedConsumerGroup = true;
-                LogConsumerGroupJoined(_consumerGroupName);
-            }
-        }
-        catch (Exception ex)
-        {
-            LogFailedToInitializeConsumerGroup(ex, _consumerGroupName);
-            throw;
-        }
-    }
-
-    private async Task LeaveConsumerGroupAsync(string groupName)
-    {
-        try
-        {
-            await _client.LeaveConsumerGroupAsync(_config.StreamId, _config.TopicId, Identifier.String(groupName));
-            LogLeftConsumerGroup(groupName);
-        }
-        catch (Exception e)
-        {
-            LogFailedToLeaveConsumerGroup(e, groupName);
-        }
-    }
-
-    /// <summary>
-    ///     Attempts to create a consumer group, handling the case where it already exists
-    /// </summary>
-    /// <returns>True if the group was created or already exists, false on error</returns>
-    private async Task<bool> TryCreateConsumerGroupAsync(string groupName, CancellationToken ct)
-    {
-        try
-        {
-            await _client.CreateConsumerGroupAsync(_config.StreamId, _config.TopicId,
-                groupName, ct);
-        }
-        catch (IggyInvalidStatusCodeException ex)
-        {
-            // 5004 - Consumer group already exists TODO: refactor errors
-            if (ex.StatusCode != 5004)
-            {
-                LogFailedToCreateConsumerGroup(ex, groupName);
-                return false;
-            }
-
-            return true;
-        }
-
-        return true;
-    }
-
-    /// <summary>
-    ///     Guards the wire-driving auto-commit flag against an encrypting client. The builder enforces this via
-    ///     AutoCommitMode, but AutoCommit and AutoCommitMode are independent config fields and the consumer is
-    ///     constructible without the builder, so the load-bearing check lives here at the poll site.
-    /// </summary>
-    private void ThrowIfAutoCommitWithEncryptor()
-    {
-        if (_config.AutoCommit && _client.MessageEncryptor != null)
-        {
-            throw new InvalidOperationException(
-                "AutoCommit with a message encryptor risks silent message loss: the offset is committed before decryption. Use AutoCommitMode.AfterReceive or AutoCommitMode.Disabled.");
-        }
-    }
-
-    /// <summary>
-    ///     Polls messages from the server and writes them to the internal channel.
-    ///     Handles offset tracking and auto-commit logic.
-    ///     Uses semaphore to ensure single concurrent polling operation.
-    ///     Once the consumer is disposed it returns without polling.
-    /// </summary>
-    private async Task PollMessagesAsync(CancellationToken ct)
-    {
-        if (IsDisposed)
-        {
-            return;
-        }
-
-        if (!_joinedConsumerGroup || !IsGroupMembershipCurrent())
-        {
-            LogConsumerGroupNotJoinedYetSkippingPolling();
-            await TryRecoverGroupMembershipAsync(ct);
-            return;
-        }
-
-        ThrowIfAutoCommitWithEncryptor();
-
-        await _pollingSemaphore.WaitAsync(ct);
-
-        var polledPartition = PolledMessages.NoAssignedPartition;
-        try
-        {
-            if (_config.PollingIntervalMs > 0)
-            {
-                await WaitBeforePollingAsync(ct);
-            }
-
-            var messages = await _client.PollMessagesAsync(_config.StreamId, _config.TopicId,
-                _config.PartitionId, _config.Consumer, partitionId =>
-                {
-                    polledPartition = partitionId;
-                    return PollingStrategyFor(partitionId);
-                }, _config.BatchSize, _config.AutoCommit, ct);
-
-            if (messages.Messages.Count == 0)
-            {
-                if (messages.PartitionId == PolledMessages.NoAssignedPartition)
-                {
-                    // Partitions come back under a new owner generation, which refuses a kept continuation.
-                    _nextPollingStrategies.Clear();
-                    LogNoPartitionAssignedBackingOff(NoAssignedPartitionBackoffMs);
-                    await Task.Delay(NoAssignedPartitionBackoffMs, ct);
-                }
-
-                return;
-            }
-
-            RememberPolledContext(messages.PartitionId, messages.Context);
-            var hasLastOffset = _lastPolledOffset.TryGetValue(messages.PartitionId,
-                out var lastPolledPartitionOffset);
-
-            var currentOffset = 0ul;
-            var anyNewMessages = false;
-            foreach (var message in messages.Messages)
-            {
-                if (hasLastOffset && message.Header.Offset <= lastPolledPartitionOffset)
-                {
-                    continue;
-                }
-
-                var receivedMessage = new ReceivedMessage
-                {
-                    Message = message,
-                    CurrentOffset = message.Header.Offset,
-                    PartitionId = messages.PartitionId,
-                    Context = messages.Context,
-                    Status = MessageStatus.Success,
-                    Error = null
-                };
-
-                await _channel.Writer.WriteAsync(receivedMessage, ct);
-                currentOffset = receivedMessage.CurrentOffset;
-                anyNewMessages = true;
-            }
-
-            if (!anyNewMessages)
-            {
-                if (_config.AutoCommitMode != AutoCommitMode.Disabled)
-                {
-                    _logger.LogDebug("No new messages found, committing offset {Offset} for partition {PartitionId}",
-                        lastPolledPartitionOffset, messages.PartitionId);
-                    await StoreOffsetAsync(lastPolledPartitionOffset, messages.PartitionId, messages.Context, ct);
-                }
-
-                return;
-            }
-
-            _lastPolledOffset[messages.PartitionId] = currentOffset;
-            RememberNextPollingStrategy(messages.PartitionId, currentOffset, messages.Context);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (MessageDecryptionException ex)
-        {
-            LogFailedToDecryptMessage(ex, ex.Offset, ex.PartitionId);
-            throw;
-        }
-        // Without an operation id nothing is retained to resolve, so the next poll can run.
-        catch (Exception ex) when (ex is not (MalformedResponseException
-            or VsrRequestOutcomeUnknownException { OperationId: not null } or VsrLaneBlockedException))
-        {
-            await ReportPollFailureAsync(ex, polledPartition, ct);
-        }
-        finally
-        {
-            _pollingSemaphore.Release();
-        }
-    }
-
-    /// <summary>
-    ///     Publishes a failed poll as an error event and waits <see cref="PollRetryDelayMs" /> before the next poll.
-    ///     A cancellation can interrupt an in-flight poll with another exception, so after a cancellation the failure
-    ///     ends the receive loop as a cancellation instead. A dispose can fail an in-flight poll too, and no poll
-    ///     follows it, so then the failure is neither reported nor waited out.
-    /// </summary>
-    private async Task ReportPollFailureAsync(Exception error, uint polledPartition, CancellationToken ct)
-    {
-        ForgetRefusedPollingStrategy(error, polledPartition);
-        if (ct.IsCancellationRequested)
-        {
-            throw new OperationCanceledException("The poll was canceled.", error, ct);
-        }
-
-        if (IsDisposed)
-        {
-            return;
-        }
-
-        LogFailedToPollMessages(error);
-        _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(error, "Failed to poll messages"));
-        await Task.Delay(PollRetryDelayMs, ct);
-    }
-
-    private async Task WithLaneRecoveryAsync(Func<CancellationToken, Task> operation, CancellationToken ct)
-    {
-        var deadline = Environment.TickCount64 + OperationTimeoutMs;
-        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cancellation.CancelAfter(OperationTimeoutMs);
-        try
-        {
             try
             {
-                await operation(cancellation.Token);
+                await _client.CreateConsumerGroupAsync(_config.StreamId, _config.TopicId, name, ct);
             }
-            catch (VsrLaneBlockedException blocked)
+            catch (IggyInvalidStatusCodeException error) when (error.StatusCode == ConsumerGroupAlreadyExists)
             {
-                ct.ThrowIfCancellationRequested();
-                var remainingMs = deadline - Environment.TickCount64;
-                if (remainingMs <= 0)
-                {
-                    throw;
-                }
-
-                try
-                {
-                    await _client.ResolveOperationAsync(blocked.OperationId, TimeSpan.FromMilliseconds(remainingMs),
-                        cancellation.Token);
-                }
-                catch (VsrRequestOutcomeUnknownException)
-                {
-                    ct.ThrowIfCancellationRequested();
-                    ExceptionDispatchInfo.Throw(blocked);
-                }
-                catch (OperationCanceledException) when (cancellation.IsCancellationRequested && !ct.IsCancellationRequested)
-                {
-                    ExceptionDispatchInfo.Throw(blocked);
-                }
-                catch (VsrOperationNotRetainedException)
-                {
-                }
-                catch (IggyInvalidStatusCodeException error) when (error.Committed)
-                {
-                    // The blocker can belong to the application, which reads this rejection through
-                    // ResolveOperationAsync. The store only needs the free lane.
-                }
-
-                cancellation.Token.ThrowIfCancellationRequested();
-                if (Environment.TickCount64 >= deadline)
-                {
-                    throw VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED, "The consumer operation deadline expired.");
-                }
-
-                await operation(cancellation.Token);
-            }
-        }
-        catch (OperationCanceledException) when (cancellation.IsCancellationRequested && !ct.IsCancellationRequested)
-        {
-            throw VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED, "The consumer operation deadline expired.");
-        }
-    }
-
-    /// <summary>
-    ///     The strategy for the partition a poll reads: the continuation after its last batch, or the configured
-    ///     strategy before the first batch and after a refused continuation.
-    /// </summary>
-    private PollingStrategy PollingStrategyFor(uint partitionId)
-    {
-        return _nextPollingStrategies.TryGetValue(partitionId, out var next) ? next : _config.PollingStrategy;
-    }
-
-    /// <summary>
-    ///     Under <see cref="MessagePolling.Next" /> the server keeps the position, so nothing is recorded.
-    /// </summary>
-    private void RememberNextPollingStrategy(uint partitionId, ulong lastOffset, PartitionContext context)
-    {
-        if (_config.PollingStrategy.Kind != MessagePolling.Next)
-        {
-            _nextPollingStrategies[partitionId] = PollingStrategy.Offset(lastOffset + 1).WithContext(context);
-        }
-    }
-
-    /// <summary>
-    ///     A refusal names no partition: it answers the poll of the partition the client asked a strategy for last.
-    ///     Status 87 or 5009 means the partition no longer has the incarnation or owner the continuation was pinned
-    ///     to, so its next poll starts over from the configured strategy.
-    /// </summary>
-    private void ForgetRefusedPollingStrategy(Exception error, uint polledPartition)
-    {
-        if (error is IggyInvalidStatusCodeException
-            {
-                FromServer: true,
-                StatusCode: VsrError.HISTORY_UNAVAILABLE or VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED
-            })
-        {
-            _nextPollingStrategies.TryRemove(polledPartition, out _);
-        }
-    }
-
-    /// <summary>
-    ///     Records the context a poll of the partition was served under. Offsets compare only within one
-    ///     incarnation and owner, as in the Rust consumer: a recreated partition restarts at offset 0, so a duplicate
-    ///     filter carried over from the old incarnation would drop the replacement's messages and then commit the
-    ///     old offset into it. The metadata operation is left out because unrelated metadata commits advance it.
-    /// </summary>
-    private void RememberPolledContext(uint partitionId, PartitionContext context)
-    {
-        if (_lastPolledContext.TryGetValue(partitionId, out var previous)
-            && (previous.Incarnation != context.Incarnation || previous.OwnerGeneration != context.OwnerGeneration))
-        {
-            _lastPolledOffset.TryRemove(partitionId, out _);
-        }
-
-        _lastPolledContext[partitionId] = context;
-    }
-
-    /// <summary>
-    ///     Whether the session generation the group membership was stamped under is still the transport's
-    ///     current one. Gating the poll here instead of clearing the joined flag on a Disconnected event survives
-    ///     a late event landing after a rejoin already re-stamped the generation: state events are published
-    ///     outside the state lock, so their order is not guaranteed. Runs outside
-    ///     <see cref="_connectionStateSemaphore" />, hence the interlocked read.
-    /// </summary>
-    private bool IsGroupMembershipCurrent()
-    {
-        if (_config.Consumer.Type != ConsumerType.ConsumerGroup
-            || _client is not ISessionGenerationProvider generationProvider)
-        {
-            return true;
-        }
-
-        return generationProvider.SessionGeneration == Interlocked.Read(ref _joinedSessionGeneration);
-    }
-
-    /// <summary>
-    ///     Poll-side rejoin for a membership found missing or stamped under a dead session. The state-event
-    ///     rejoin swallows its failures so the event loop survives them, and the transport suppresses a repeat
-    ///     event for an unchanged state, so without this backstop one failed rejoin would park the consumer for
-    ///     good. The trailing delay keeps the receive loop from spinning while the membership stays gone.
-    /// </summary>
-    private async Task TryRecoverGroupMembershipAsync(CancellationToken ct)
-    {
-        if (_config.Consumer.Type == ConsumerType.ConsumerGroup && _config.JoinConsumerGroup)
-        {
-            await _connectionStateSemaphore.WaitAsync(ct);
-            try
-            {
-                // The dispose left the group, so a rejoin now would add a member that never polls.
-                if (IsDisposed)
-                {
-                    return;
-                }
-
-                if (!_joinedConsumerGroup || !IsGroupMembershipCurrent())
-                {
-                    _joinedConsumerGroup = false;
-                    await RejoinConsumerGroupOnReconnectionAsync();
-                }
-            }
-            finally
-            {
-                _connectionStateSemaphore.Release();
-            }
-
-            if (_joinedConsumerGroup && IsGroupMembershipCurrent())
-            {
-                return;
             }
         }
 
-        await Task.Delay(GroupRejoinRetryDelayMs, ct);
-    }
-
-    /// <summary>
-    ///     Implements polling interval throttling to avoid excessive server requests.
-    ///     Uses monotonic time tracking to ensure proper intervals even with clock adjustments.
-    /// </summary>
-    private async Task WaitBeforePollingAsync(CancellationToken ct)
-    {
-        var intervalMs = _config.PollingIntervalMs;
-        if (intervalMs <= 0)
-        {
-            return;
-        }
-
-        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        var lastPolledAtMs = Interlocked.Read(ref _lastPolledAtMs);
-
-        if (nowMs < lastPolledAtMs)
-        {
-            LogMonotonicTimeWentBackwards(nowMs, lastPolledAtMs);
-            await Task.Delay(intervalMs, ct);
-            Interlocked.Exchange(ref _lastPolledAtMs, nowMs);
-            return;
-        }
-
-        var elapsedMs = nowMs - lastPolledAtMs;
-        if (elapsedMs >= intervalMs)
-        {
-            LogNoNeedToWaitBeforePolling(nowMs, lastPolledAtMs, elapsedMs);
-            Interlocked.Exchange(ref _lastPolledAtMs, nowMs);
-            return;
-        }
-
-        var remainingMs = intervalMs - elapsedMs;
-        LogWaitingBeforePolling(remainingMs);
-
-        if (remainingMs > 0)
-        {
-            await Task.Delay((int)remainingMs, ct);
-        }
-
-        Interlocked.Exchange(ref _lastPolledAtMs, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-    }
-
-    /// <summary>
-    ///     Handles connection state changes from the client.
-    /// </summary>
-    /// <param name="e">Event object</param>
-    private async Task OnClientConnectionStateChangedAsync(ConnectionStateChangedEventArgs e)
-    {
-        LogConnectionStateChanged(e.PreviousState, e.CurrentState);
-
-        if (_config.Consumer.Type == ConsumerType.Consumer)
-        {
-            return;
-        }
-
-        await _connectionStateSemaphore.WaitAsync();
-        try
-        {
-            if (IsDisposed)
-            {
-                return;
-            }
-
-            if (_client is ISessionGenerationProvider generationProvider)
-            {
-                if (e.CurrentState != ConnectionState.Authenticated)
-                {
-                    return;
-                }
-
-                if (_joinedConsumerGroup
-                    && generationProvider.SessionGeneration == Interlocked.Read(ref _joinedSessionGeneration))
-                {
-                    return;
-                }
-
-                _joinedConsumerGroup = false;
-                await RejoinConsumerGroupOnReconnectionAsync();
-
-                return;
-            }
-
-            if (e.CurrentState == ConnectionState.Disconnected)
-            {
-                _joinedConsumerGroup = false;
-            }
-
-            if (e.CurrentState != ConnectionState.Authenticated
-                || e.PreviousState == ConnectionState.Authenticated
-                || _joinedConsumerGroup)
-            {
-                return;
-            }
-
-            await RejoinConsumerGroupOnReconnectionAsync();
-        }
-        finally
-        {
-            _connectionStateSemaphore.Release();
-        }
-    }
-
-    /// <summary>
-    ///     Asynchronously rejoins the consumer group after a client reconnection.
-    ///     This restores the consumer group membership that was lost during the connection failure.
-    /// </summary>
-    private async Task RejoinConsumerGroupOnReconnectionAsync()
-    {
-        if (string.IsNullOrEmpty(_consumerGroupName))
-        {
-            LogConsumerGroupNameIsEmptySkippingRejoiningConsumerGroup();
-            return;
-        }
-
-        try
-        {
-            await InitializeConsumerGroupAsync();
-        }
-        catch (Exception ex)
-        {
-            LogFailedToRejoinConsumerGroup(ex, _consumerGroupName);
-            _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(ex,
-                "Failed to rejoin consumer group after reconnection"));
-        }
+        return Consumer.Group(name);
     }
 }

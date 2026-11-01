@@ -94,6 +94,14 @@ final class World: @unchecked Sendable {
     var currentItems: [MetadataCurrentItem] = []
     var signedInAsAnotherUser = false
 
+    var poll: Task<PolledMessages, any Error>?
+    var pollStarted = ContinuousClock.now
+    var pollEnd = PollEnd()
+    var reader: PartitionReader?
+    var consumer: IggyConsumer?
+    /// The operation of a committing poll whose outcome is unknown.
+    var lostOperation: UInt128Value?
+
     func requireClient() throws -> IggyClient {
         guard let client else {
             throw StepFailure("the client is not connected; the background must sign in first")
@@ -122,6 +130,20 @@ final class World: @unchecked Sendable {
         return Identifier(numeric: userID)
     }
 
+    func requirePoll() throws -> Task<PolledMessages, any Error> {
+        guard let poll else {
+            throw StepFailure("no deferred poll was started")
+        }
+        return poll
+    }
+
+    func requireConsumer() throws -> IggyConsumer {
+        guard let consumer else {
+            throw StepFailure("no consumer is open")
+        }
+        return consumer
+    }
+
     /// A client for `address`, connected but not signed in.
     func connect(to address: String) async throws -> IggyClient {
         let client = IggyClient(address: address)
@@ -134,6 +156,11 @@ final class World: @unchecked Sendable {
     /// scenario created, and shuts the client down. A failed cleanup fails
     /// the scenario, since it would leak into the next one.
     func tearDown() async -> [any Error] {
+        poll?.cancel()
+        if let reader {
+            try? await reader.close()
+        }
+        await consumer?.shutdown()
         guard let client else {
             return []
         }

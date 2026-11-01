@@ -23,6 +23,9 @@
  * the headers lead with unaligned u128 fields.
  */
 
+import { COMMAND_CODE } from '../command.code.js';
+import { Operation } from './operation.js';
+
 /** Size of every consensus header, both directions. */
 export const HEADER_SIZE = 256;
 
@@ -147,6 +150,10 @@ export type RequestHeaderFields = {
 };
 
 const U64_MASK = 0xFFFFFFFFFFFFFFFFn;
+/** The requests that park on the server until their wait ends. */
+const DEFERRED_CODES = new Set<number>([
+  COMMAND_CODE.PollMessagesDeferred, COMMAND_CODE.FetchMessages
+]);
 
 /** Encodes one request identity and its captured partition context. */
 export const encodeRequestHeader = (fields: RequestHeaderFields): Buffer => {
@@ -166,6 +173,28 @@ export const encodeRequestHeader = (fields: RequestHeaderFields): Buffer => {
   if (fields.nonReplicatedCode !== undefined)
     header.writeUInt32LE(fields.nonReplicatedCode, REQUEST_OFFSET.reserved);
   return header;
+};
+
+/**
+ * The header-only frame that cancels a deferred poll (106) or a fetch (109)
+ * parked on the server. It names the client, session
+ * and request id of `request`, as `RequestHeader::deferred_cancellation` in
+ * `core/binary_protocol/src/consensus/request.rs` does. Other requests do not
+ * park, so they have none.
+ */
+export const deferredCancellation = (request: Buffer): Buffer | undefined => {
+  if (request.readUInt8(REQUEST_OFFSET.operation) !== Operation.NonReplicated ||
+      !DEFERRED_CODES.has(request.readUInt32LE(REQUEST_OFFSET.reserved)))
+    return undefined;
+  return encodeRequestHeader({
+    size: HEADER_SIZE,
+    client: request.readBigUInt64LE(REQUEST_OFFSET.client) |
+      (request.readBigUInt64LE(REQUEST_OFFSET.client + 8) << 64n),
+    request: request.readBigUInt64LE(REQUEST_OFFSET.request),
+    operation: Operation.NonReplicated,
+    session: request.readBigUInt64LE(REQUEST_OFFSET.session),
+    nonReplicatedCode: COMMAND_CODE.CancelDeferredRequest
+  });
 };
 
 /**

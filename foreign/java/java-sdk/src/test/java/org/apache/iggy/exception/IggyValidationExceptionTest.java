@@ -46,6 +46,7 @@ class IggyValidationExceptionTest {
     @EnumSource(
             value = IggyErrorCode.class,
             names = {
+                "INVALID_CONFIGURATION",
                 "INVALID_COMMAND",
                 "INVALID_FORMAT",
                 "FEATURE_UNAVAILABLE",
@@ -81,6 +82,7 @@ class IggyValidationExceptionTest {
     @EnumSource(
             value = IggyErrorCode.class,
             names = {
+                "INVALID_CONFIGURATION",
                 "INVALID_COMMAND",
                 "INVALID_FORMAT",
                 "FEATURE_UNAVAILABLE",

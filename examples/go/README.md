@@ -42,6 +42,15 @@ go run ./getting-started/producer/main.go
 go run ./getting-started/consumer/main.go
 ```
 
+### Reader Consumer
+
+Reads the messages of the getting started producer as a member of a consumer group, through a partition reader that waits on the server for new messages and stores the offset of each message once it is processed:
+
+```bash
+go run ./getting-started/producer/main.go
+go run ./reader-consumer/main.go
+```
+
 ## TLS Examples
 
 From the repository root, start a disposable TLS server with the development certificate pair and the same credential prerequisites:

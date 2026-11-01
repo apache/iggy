@@ -104,6 +104,27 @@ enum VSRFrame {
         /// can be replayed as it is after a reconnect.
         let clientID: UInt128Value
         let session: UInt64
+
+        /// A cancellation for a deferred poll or fetch, as
+        /// `RequestHeader::deferred_cancellation` in Rust: the header of this
+        /// request with command 108, no body and no partition context. It
+        /// must follow the request on the same connection, so the server sees
+        /// the request queued or admitted when the cancellation arrives. Nil
+        /// for any other request.
+        var deferredCancellation: [UInt8]? {
+            let code = UInt32(littleEndianBytes: bytes[RequestOffset.reserved..<RequestOffset.reserved + 4])
+            guard operation == .nonReplicated, CommandCode.isDeferred(code) else {
+                return nil
+            }
+            var frame = Array(bytes[..<VSRFrame.headerSize])
+            frame.withUnsafeMutableBytes { buffer in
+                buffer.storeBytes(of: UInt32(VSRFrame.headerSize).littleEndian, toByteOffset: RequestOffset.size, as: UInt32.self)
+                buffer.storeBytes(of: CommandCode.cancelDeferredRequest.rawValue.littleEndian, toByteOffset: RequestOffset.reserved, as: UInt32.self)
+            }
+            let context = RequestOffset.partitionIncarnation..<RequestOffset.minimumMetadataOp + 8
+            frame.replaceSubrange(context, with: repeatElement(0, count: context.count))
+            return frame
+        }
     }
 
     /// Builds the complete request frame for a command code and its encoded
@@ -190,6 +211,14 @@ enum VSRFrame {
             return nil
         }
         return Command(rawValue: header[header.startIndex + ReplyOffset.command])
+    }
+
+    static func readRequestID(_ header: ArraySlice<UInt8>) -> UInt64? {
+        guard header.count >= RequestOffset.request + 8 else {
+            return nil
+        }
+        let start = header.startIndex + RequestOffset.request
+        return UInt64(littleEndianBytes: header[start..<start + 8])
     }
 
     static func readReplyRequestID(_ header: ArraySlice<UInt8>) -> UInt64? {

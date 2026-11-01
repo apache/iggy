@@ -578,11 +578,25 @@ fn with_identity(
     })
 }
 
-/// Protocol, release and storage identity, independent of executable packaging.
+/// Protocol, replica wire, release and storage identity, independent of
+/// executable packaging.
 #[must_use]
 pub fn binary_identity(release: &str, storage_format: &[u8]) -> [u8; auth::IDENTITY_LEN] {
+    identity_at(
+        iggy_binary_protocol::REPLICA_WIRE_REVISION,
+        release,
+        storage_format,
+    )
+}
+
+fn identity_at(
+    wire_revision: u32,
+    release: &str,
+    storage_format: &[u8],
+) -> [u8; auth::IDENTITY_LEN] {
     let mut hasher = blake3::Hasher::new_derive_key("apache.iggy replica identity v2");
     hasher.update(&iggy_binary_protocol::IGGY_PROTOCOL_VERSION.to_le_bytes());
+    hasher.update(&wire_revision.to_le_bytes());
     hasher.update(&(release.len() as u64).to_le_bytes());
     hasher.update(release.as_bytes());
     hasher.update(&(storage_format.len() as u64).to_le_bytes());
@@ -642,6 +656,15 @@ mod tests {
         let identity = binary_identity("release-1", b"storage-1");
         assert_ne!(identity, binary_identity("release-2", b"storage-1"));
         assert_ne!(identity, binary_identity("release-1", b"storage-2"));
+        assert_ne!(
+            identity,
+            super::identity_at(
+                iggy_binary_protocol::REPLICA_WIRE_REVISION + 1,
+                "release-1",
+                b"storage-1"
+            ),
+            "builds that send replicas different encodings refuse each other"
+        );
         assert_ne!(
             binary_identity("release", b"-storage"),
             binary_identity("release-", b"storage")

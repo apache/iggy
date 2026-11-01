@@ -16,197 +16,111 @@
 // under the License.
 
 use crate::{
-    Consumer, ConsumerKind, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages,
-    PollingStrategy, SendMessagesResponse,
+    Consumer, DecodeError, Identifier, IggyError, IggyMessage, Partitioning, PollOptions,
+    PolledMessages, PollingStrategy, SendMessagesResponse,
 };
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the messaging module.
 #[async_trait]
 pub trait MessageClient {
-    /// Poll given amount of messages using the specified consumer and strategy from the specified stream and topic by unique IDs or names.
+    /// Read up to `options.count` messages of one partition, from `strategy`.
     ///
     /// Authentication is required, and the permission to poll the messages.
     ///
-    /// Polling a consumer group the client is not (or no longer) a member of fails with `ConsumerGroupMemberNotFound` rather than returning an empty batch, so the caller can rejoin.
-    /// A member that holds no partitions gets an empty batch whose `partition_id` is [`NO_ASSIGNED_PARTITION`](crate::NO_ASSIGNED_PARTITION).
-    /// A [`ConsumerKind::ExternalGroup`] consumer only holds offsets, so polling with it returns [`IggyError::FeatureUnavailable`].
+    /// The server waits up to `options.max_wait` until the partition holds `options.min_count`
+    /// messages, and a zero wait answers at once. `options.max_bytes` bounds the reply, and a
+    /// first message larger than it comes alone in the reply. The request timeout is `max_wait`
+    /// plus 10 s. Invalid options fail before anything is sent, with the errors of
+    /// [`PollOptions::validate`], and [`CommitPolicy::Auto`](crate::CommitPolicy::Auto) with
+    /// [`IggyError::InvalidConfiguration`]: one call has nothing to count, so it takes
+    /// [`CommitPolicy::Manual`](crate::CommitPolicy::Manual) or
+    /// [`CommitPolicy::OnRead`](crate::CommitPolicy::OnRead).
     ///
-    /// Binary clients cache the route to a partition with the partition context it reported.
-    /// After another client deletes and recreates the partition, a poll without a caller context
-    /// ([`PollingStrategy::with_context`]) can fail once with `HistoryUnavailable` (87), or with
-    /// `ConsumerGroupPartitionNotOwned` (5009) for a consumer group. The failed route is dropped,
-    /// so the next call routes again and takes the new context. A poll with a caller context keeps
-    /// getting the refusal for that context.
+    /// One call has one deadline for admission, route refreshes and retries. If the deadline
+    /// passes before the request leaves the client, the call returns
+    /// [`IggyError::TransientNotAccepted`], and a retry is safe.
     ///
-    /// With automatic commits enabled, a new consumer offset key can be
-    /// rejected with `TooManyConsumerOffsets` at the partition's configured
-    /// limit. That poll returns no messages. Existing keys remain writable,
-    /// and polling without automatic commits does not allocate a stored offset.
-    /// A refused automatic commit submission returns `TransientNotAccepted` with no
-    /// messages and may be retried. A capacity error requires capacity to be freed.
-    /// Local cursors without a committed offset can be evicted at the limit.
-    /// Their next `Next` poll resumes from the earliest retained messages,
-    /// which can redeliver messages from earlier polls.
+    /// # Continuations and checkpoints
     ///
-    /// # Recovering from a missing response
+    /// To read on, pass [`PolledMessages::continuation`] as the next `strategy`. A continuation
+    /// belongs to the partition of its batch, so a poll of another partition refuses it with
+    /// [`IggyError::InvalidCommand`]. Serde drops that partition, so a deserialized continuation
+    /// fits every partition. It carries the partition history of its batch. After
+    /// another client deletes and recreates the partition, a poll from it keeps getting
+    /// [`IggyError::HistoryUnavailable`] (87), or `ConsumerGroupPartitionNotOwned` (5009) for a
+    /// consumer group. A strategy from [`PollingStrategy::offset`] or the other constructors
+    /// has no history, so binary clients use the history of their cached route. Such a poll
+    /// can fail once with the same errors, and the next call routes again and takes the new
+    /// history.
     ///
-    /// A timeout or communication failure does not establish that the server
-    /// rejected the poll. With `auto_commit` enabled, the server can advance its
-    /// consumer cursor before the caller receives the messages. Retrying with
-    /// [`PollingStrategy::next()`] can then skip messages from the missing response.
-    /// Even a successful poll response does not acknowledge a durable offset commit.
+    /// To commit, pass [`PolledMessages::checkpoint`] to
+    /// [`store_consumer_position`](crate::ConsumerOffsetClient::store_consumer_position).
+    /// A [`ConsumerKind::ExternalGroup`](crate::ConsumerKind::ExternalGroup) consumer only holds
+    /// offsets, so polling with it returns [`IggyError::FeatureUnavailable`].
     ///
-    /// Keep a checkpoint for each partition: one past the last message successfully
-    /// processed in order, or the intended starting offset if none was processed.
-    /// Recover with [`PollingStrategy::offset(checkpoint)`](PollingStrategy::offset)
-    /// and advance the checkpoint only after processing the returned messages.
-    /// Use each message's header offset, not [`PolledMessages::current_offset`],
-    /// which reports the partition's current offset rather than the last message
-    /// returned. Persist checkpoints if recovery must survive a client restart.
+    /// # Server commits and lost replies
     ///
-    /// Continue using explicit offsets until all messages through the server's
-    /// cursor have been processed: replay does not rewind an advanced cursor.
-    /// For a consumer group, recover each partition with its own checkpoint and
-    /// respect the current assignment. [`Self::poll_messages_with_strategy_for`]
-    /// selects the strategy after the partition is known.
-    /// Recovery assumes the same partition message history and requires the
-    /// messages to remain retained. It can repeat messages already processed.
-    #[allow(clippy::too_many_arguments)]
+    /// Without [`CommitPolicy::OnRead`](crate::CommitPolicy::OnRead), the server
+    /// stores no offset. If a [`PollingStrategy::next`] request left the client and its reply
+    /// does not arrive, the call returns [`IggyError::TransientNotCommitted`]. The server stored
+    /// nothing, so a retry is safe.
+    ///
+    /// With `OnRead`, the server stores the offset of the last message of a read as part of the
+    /// read, in one round trip. While the primary stays up a message is delivered at most once.
+    /// A failover before the store replicates can deliver the last batch again. A new offset key
+    /// can be refused with `TooManyConsumerOffsets` at the configured limit of the partition,
+    /// and that poll returns no messages.
+    ///
+    /// An `OnRead` call whose outcome is unknown fails with
+    /// [`IggyError::FetchProgressUncertain`] naming its operation, never with
+    /// `TransientNotCommitted`: its request left the client and no reply proves what the server
+    /// stored, also when the client disconnects while the call waits. Every later poll of that
+    /// partition with `OnRead` or from `Next`, and every offset store or delete of it, on the
+    /// same client then fails with [`IggyError::PartitionLaneBlocked`] naming that operation,
+    /// until [`abandon_operation`](crate::Client::abandon_operation) or a reply proves the
+    /// outcome, because the server can still store the offset after the client gives up. The
+    /// block survives a reconnect and a new session of the same client, and it names the
+    /// partition by its incarnation, so another spelling of its stream or topic meets it too. An
+    /// `OnRead` call dropped after its request left keeps its reply slot and sends a cancel over
+    /// TCP, QUIC and WebSocket, and its block lasts until that one reply proves the outcome. An
+    /// `OnRead` poll is never sent again after an unknown outcome.
+    ///
+    /// HTTP has no cancel and no connection to close, so a dropped call keeps its block until
+    /// `abandon_operation`, and `disconnect` leaves a call in flight to its reply. An HTTP block
+    /// covers the stream and the topic as the lost call spelled them, and any spelling for a
+    /// call that carries a context of the same partition incarnation.
     async fn poll_messages(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: u32,
         consumer: &Consumer,
         strategy: &PollingStrategy,
-        count: u32,
-        auto_commit: bool,
+        options: PollOptions,
     ) -> Result<PolledMessages, IggyError>;
 
-    /// [`poll_messages`](Self::poll_messages) whose strategy is chosen once the partition is
-    /// known. A consumer-group poll without a partition picks one of the member's assigned
-    /// partitions first and then asks `strategy_for` for it, so a caller can continue every
-    /// partition from its own position. Any other poll has its partition up front and asks
-    /// `strategy_for` for that one, or for `0` when none was given, which is the partition the
-    /// server reads then.
-    ///
-    /// The default implementation is for transports that cannot pick a partition client-side:
-    /// a consumer-group poll without a partition fails with `FeatureUnavailable`.
-    #[allow(clippy::too_many_arguments)]
-    async fn poll_messages_with_strategy_for(
+    /// [`Self::poll_messages`], keeping the record of a reply that does not decode.
+    #[doc(hidden)]
+    async fn poll_messages_raw(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: u32,
         consumer: &Consumer,
-        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
-        count: u32,
-        auto_commit: bool,
-    ) -> Result<PolledMessages, IggyError> {
-        if consumer.kind == ConsumerKind::ConsumerGroup && partition_id.is_none() {
-            return Err(IggyError::FeatureUnavailable);
-        }
-        let strategy = strategy_for(partition_id.unwrap_or(0));
+        strategy: &PollingStrategy,
+        options: PollOptions,
+    ) -> Result<PolledMessages, DecodeError> {
         self.poll_messages(
             stream_id,
             topic_id,
             partition_id,
             consumer,
-            &strategy,
-            count,
-            auto_commit,
+            strategy,
+            options,
         )
         .await
-    }
-
-    /// Wait for the readiness minimum and return up to `count` messages.
-    /// Expiry returns an available partial; response bytes are independently bounded.
-    /// A lost response can follow progress admission; see `poll_messages`.
-    ///
-    /// A consumer group poll without a partition waits on one assigned partition, chosen
-    /// round-robin, so messages on the other partitions wait up to `max_wait`. To wait on the
-    /// whole assignment, call `wait_for_messages` first and poll a partition that it lists.
-    #[allow(clippy::too_many_arguments)]
-    async fn poll_messages_deferred(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: Option<u32>,
-        consumer: &Consumer,
-        strategy: &PollingStrategy,
-        count: u32,
-        auto_commit: bool,
-        options: crate::DeferredPollOptions,
-    ) -> Result<PolledMessages, IggyError> {
-        self.poll_messages_with_strategy_for_and_options(
-            stream_id,
-            topic_id,
-            partition_id,
-            consumer,
-            &|_| *strategy,
-            count,
-            auto_commit,
-            Some(options),
-        )
-        .await
-    }
-
-    /// Deferred polling with the strategy resolved after choosing a partition.
-    /// Custom transports must opt in; positive waits never silently downgrade.
-    #[allow(clippy::too_many_arguments)]
-    async fn poll_messages_with_strategy_for_and_options(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: Option<u32>,
-        consumer: &Consumer,
-        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
-        count: u32,
-        auto_commit: bool,
-        options: Option<crate::DeferredPollOptions>,
-    ) -> Result<PolledMessages, IggyError> {
-        if options.is_some() {
-            return Err(IggyError::FeatureUnavailable);
-        }
-        self.poll_messages_with_strategy_for(
-            stream_id,
-            topic_id,
-            partition_id,
-            consumer,
-            strategy_for,
-            count,
-            auto_commit,
-        )
-        .await
-    }
-
-    /// Wait until at least one of `partitions` holds a message at its start point, and return
-    /// the ids of the partitions that do. An empty list means that `options.max_wait` expired.
-    /// The wait reads and commits no message. Only `max_wait` and `request_timeout` apply.
-    ///
-    /// Each start point is [`PollingStrategy::offset`] or [`PollingStrategy::next`] of
-    /// `consumer`, and each partition appears once. A reported partition returns at least one
-    /// message to a poll with the same consumer and strategy, unless a purge or retention
-    /// removed the messages, or another commit moved `next` past them, in the meantime. A
-    /// reply can leave out a `next` partition whose stored offset moved back during the wait.
-    ///
-    /// The wait runs on the primary of each partition. If the partitions have more than one
-    /// primary, the call waits on each of them and returns the first reply that lists a
-    /// partition. It then cancels the other waits on their shared connections.
-    ///
-    /// A consumer group member that does not own one of the partitions gets
-    /// `ConsumerGroupPartitionNotOwned`. The default implementation is for transports without
-    /// the command, such as HTTP: it fails with `FeatureUnavailable`.
-    async fn wait_for_messages(
-        &self,
-        _stream_id: &Identifier,
-        _topic_id: &Identifier,
-        _partitions: &[(u32, PollingStrategy)],
-        _consumer: &Consumer,
-        _options: crate::DeferredPollOptions,
-    ) -> Result<Vec<u32>, IggyError> {
-        Err(IggyError::FeatureUnavailable)
+        .map_err(DecodeError::without_record)
     }
 
     /// Send messages using specified partitioning strategy to the given stream and topic by unique IDs or names.

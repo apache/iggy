@@ -462,6 +462,7 @@ mod tests {
         http: Option<u16>,
     ) -> configs::cluster::ClusterNodeConfig {
         configs::cluster::ClusterNodeConfig {
+            rack: None,
             name: "node".to_owned(),
             ip: ip.to_owned(),
             advertised_address: None,

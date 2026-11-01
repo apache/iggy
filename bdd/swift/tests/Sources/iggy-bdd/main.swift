@@ -34,6 +34,7 @@ let features: [(name: String, register: (inout StepRegistry) -> Void)] = [
             MetadataChangesSteps.register(into: &registry)
         }
     ),
+    ("deferred_polling", DeferredPollingSteps.register),
 ]
 
 let selected = ProcessInfo.processInfo.environment["BDD_FEATURE"].flatMap { $0.isEmpty || $0 == "all" ? nil : $0 }

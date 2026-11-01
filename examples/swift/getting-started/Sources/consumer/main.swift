@@ -28,9 +28,9 @@ try await client.connect()
 
 let consumer = try client.consumer(
     name: "getting-started", streamID: try Identifier(named: Sample.streamName), topicID: try Identifier(named: Sample.topicName),
-    partitionID: Sample.partitionID,
+    partitions: [Sample.partitionID],
     configuration: ConsumerConfiguration(
-        pollingStrategy: .first, batchLength: UInt32(Sample.messagesPerBatch), pollInterval: Sample.interval, autoCommit: .disabled,
+        pollingStrategy: .first, pollOptions: PollOptions(count: UInt32(Sample.messagesPerBatch), maxWait: Sample.interval),
         initRetries: 20, initRetryInterval: Sample.interval))
 try await consumer.initialize()
 

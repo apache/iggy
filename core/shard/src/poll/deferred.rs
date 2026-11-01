@@ -20,17 +20,30 @@
 //! carry only a request identity and a reservation that survives cancellation.
 //! Readiness waits share the registry, because it owns the one poll notifier
 //! of each partition.
+//!
+//! A readiness wait runs on the shard of its connection. That shard keeps a
+//! mirror of each partition of another shard that its waits name, and the
+//! owner pushes the partition state after every change while that shard
+//! holds a parked wait on it. A wait that parks on a mirror tells the owner,
+//! and the first push that finds no parked wait ends the pushes. So a wait in
+//! steady state sends no frame to the owners, and its cancel stays local. The
+//! first wait on a partition goes to the owner, which answers it and starts
+//! the watch.
 
 use std::cell::RefCell;
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use consensus::client_table::SessionAttachment;
 use consensus::{Consensus, MetadataHandle, PartitionsHandle};
+use crossfire::TrySendError;
+use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
 use iggy_common::{DeferredPollOptions, IggyError, PollingKind, PollingStrategy};
 use journal::superblock::SuperblockStore;
@@ -38,7 +51,8 @@ use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::PollMetadata;
 use partitions::{
-    DISK_POLL_CHUNK_MAX, Partition, PollReadResult, PollVisibility, PollingArgs, PollingConsumer,
+    DISK_POLL_CHUNK_MAX, IggyPartition, Partition, PollReadResult, PollVisibility, PollingArgs,
+    PollingConsumer,
 };
 use server_common::poll::PollHistoryId;
 use server_common::sharding::IggyNamespace;
@@ -46,7 +60,7 @@ use server_common::sharding::IggyNamespace;
 use crate::config::DeferredPollConfig;
 use crate::metrics::DeferredPollMetrics;
 use crate::shards_table::ShardsTable;
-use crate::{IggyShard, PartitionReadReply, Sender};
+use crate::{IggyShard, LifecycleFrame, PartitionReadReply, Sender, ShardFrame, TaggedSender};
 use prometheus_client::metrics::gauge::Gauge;
 
 const SERVICE_BUDGET: usize = 8;
@@ -58,6 +72,25 @@ const READ_BUDGET_PARTS: usize = 3;
 #[allow(clippy::cast_possible_truncation)]
 const READ_PART_MIN_BYTES: usize = DISK_POLL_CHUNK_MAX as usize;
 const MAINTENANCE_BUDGET: usize = 16;
+/// A mirror that no wait named for this long ends its watch at the next push
+/// or sweep. The waits of a consumer that keeps polling name their
+/// partitions more often.
+const MIRROR_IDLE_US: u64 = 1_000_000;
+
+/// The `min_count` of a wait that ends at its first message. An owner
+/// evaluator sees only its own targets, so it gets this, and the shard of
+/// the wait decides on the sum.
+pub const ANY_MESSAGE: u32 = 1;
+
+/// What the `max_bytes` of a read counts besides the batches of
+/// [`ReadyTarget::known_bytes`]: the poll response header.
+#[allow(clippy::cast_possible_truncation)]
+pub const KNOWN_BYTES_SLACK: u32 = POLL_RESPONSE_HEADER_SIZE as u32;
+
+/// The history, the visibility and the view of a partition that a readiness
+/// evaluation reads, and whether the partition serves the target now. Only a
+/// mirror that lags the install of a group owner does not.
+type Reading = (PollHistoryId, PollVisibility, u32, bool);
 
 /// Auxiliary connections are charged to their parent session. HTTP requests
 /// without a binary session are charged to their authenticated user.
@@ -80,10 +113,10 @@ pub struct DeferredPollContext {
 
 /// A deferred poll as the origin resolved it.
 ///
-/// The origin shard sets both deadlines in `partition_read` from the bus
-/// clock, which every shard of the process shares, before it routes the
-/// request to the owner. A request that skips `partition_read` keeps the
-/// zero deadlines of `new` and expires at once.
+/// The origin shard sets both deadlines in `partition_read` or
+/// `deferred_read` from the bus clock, which every shard of the process
+/// shares, before it routes the request to the owner. A request that skips
+/// both keeps the zero deadlines of `new` and expires at once.
 #[derive(Debug)]
 pub struct DeferredPollRequest {
     pub consumer: PollingConsumer,
@@ -91,6 +124,17 @@ pub struct DeferredPollRequest {
     pub metadata: PollMetadata,
     pub context: DeferredPollContext,
     pub options: DeferredPollOptions,
+    /// The gate of a committing request that its client can cancel.
+    pub commit_gate: Option<CommitGate>,
+    /// Shared by the reads of one fetch, so at most one of them returns a
+    /// first message larger than its `max_bytes`. A poll alone has none and
+    /// always may.
+    pub oversized_turn: Option<OversizedTurn>,
+    /// From when, on the bus clock, a client store of the consumer offset
+    /// fences out a committing `Next` read, also a store of the value it
+    /// started from. `None` means from its admission. A fetch that resolved
+    /// its starts before it waited sets that time.
+    pub stores_fenced_from: Option<u64>,
     pub(crate) deadline: u64,
     pub(crate) request_deadline: u64,
 }
@@ -110,9 +154,88 @@ impl DeferredPollRequest {
             metadata,
             context,
             options,
+            commit_gate: None,
+            oversized_turn: None,
+            stores_fenced_from: None,
             deadline: 0,
             request_deadline: 0,
         }
+    }
+}
+
+/// The one turn of a fetch to return a first message larger than the byte
+/// limit of its read, which bounds the reply by one such message.
+#[derive(Debug, Clone, Default)]
+pub struct OversizedTurn {
+    state: Arc<AtomicU8>,
+    /// A follower shares the turn of the first read and never takes it.
+    follower: bool,
+}
+
+impl OversizedTurn {
+    /// The same turn for a read after the first, which serves only a first
+    /// message within its byte limit, so all reads of a fetch can start at
+    /// once while only the first may return a larger one.
+    #[must_use]
+    pub fn follower(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            follower: true,
+        }
+    }
+
+    /// Takes the turn, unless another read took it or this read follows.
+    #[must_use]
+    pub fn take(&self) -> bool {
+        !self.follower
+            && self
+                .state
+                .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+    }
+
+    fn accept_normal(&self) -> bool {
+        matches!(
+            self.state
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst),
+            Ok(_) | Err(1)
+        )
+    }
+}
+
+/// The cancel gate of one committing deferred request.
+///
+/// The origin and the owners of its reads share it. A cancel wins only while
+/// no read passed the gate, and a read commits only while no cancel won, so a
+/// cancelled request stored nothing and a request whose cancel lost answers as
+/// usual.
+#[derive(Debug, Clone, Default)]
+pub struct CommitGate(Arc<AtomicU64>);
+
+const GATE_CANCELLED: u64 = 1 << 63;
+
+impl CommitGate {
+    /// Lets one read commit, unless a cancel won.
+    #[must_use]
+    pub fn enter(&self) -> bool {
+        self.0
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+                (state & GATE_CANCELLED == 0).then_some(state + 1)
+            })
+            .is_ok()
+    }
+
+    /// Cancels the request, unless a read already passed the gate.
+    #[must_use]
+    pub fn cancel(&self) -> bool {
+        self.0
+            .compare_exchange(0, GATE_CANCELLED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst) & GATE_CANCELLED != 0
     }
 }
 
@@ -127,21 +250,203 @@ pub struct ReadinessTarget {
     pub metadata: PollMetadata,
 }
 
-/// The targets of one readiness wait that a single owner shard holds. They
-/// name one stream and topic, so one check of `context` covers all of them.
+/// The targets of one readiness wait that a single shard evaluates.
+///
+/// The evaluator is their owner, or the shard of the wait for the targets
+/// that it mirrors. They name one stream and topic, so one check of
+/// `context` covers all of them.
 #[derive(Debug)]
 pub struct ReadinessWait {
     pub context: DeferredPollContext,
     pub targets: Vec<ReadinessTarget>,
     pub deadline: u64,
+    /// The evaluator answers once its targets hold this many messages, or
+    /// at the deadline with the targets that hold any.
+    pub min_count: u32,
 }
 
-/// A readiness waiter answers once. Its targets are sorted by namespace.
-/// `admitted` holds the history and view of each target at admission, and a
-/// change that an evaluation finds rejects the waiter.
+/// A target that holds messages at its start point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadyTarget {
+    pub partition_id: u32,
+    /// The offsets from the start through the committed offset. A start
+    /// before the offsets that retention kept counts removed ones too, so
+    /// this bounds the messages from above.
+    pub available: u64,
+    /// The bytes with batch framing that a read from the start returns, if
+    /// the start was the next offset to commit when the wait parked. A read
+    /// whose `max_bytes` and read budget cover them plus
+    /// [`KNOWN_BYTES_SLACK`] returns them all.
+    pub known_bytes: Option<u64>,
+}
+
+/// A shard that watches partitions of another shard.
+///
+/// Pushes and unwatches carry the sequence of the watch, so a frame from
+/// before a later watch of the same partition cannot change that watch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadinessWatch {
+    pub shard: u16,
+    pub seq: u64,
+}
+
+/// The state of a watched partition that its owner pushes. `None` means
+/// that the owner does not serve the partition.
+#[derive(Debug)]
+pub struct WatchedState {
+    pub namespace: IggyNamespace,
+    pub seq: u64,
+    pub state: Option<ServedState>,
+}
+
+/// What a readiness evaluation reads from a partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedState {
+    history: PollHistoryId,
+    visibility: PollVisibility,
+    view: u32,
+    status: PartitionStatus,
+    /// The installed owner of each group that a watching wait names.
+    owners: Vec<(u64, Option<ConsumerGroupOwner>)>,
+}
+
+impl ServedState {
+    fn check(&self, primary: bool, target: &ReadinessTarget) -> Result<bool, IggyError> {
+        self.status.check(
+            target.namespace,
+            primary,
+            &target.metadata,
+            target.consumer,
+            |group| {
+                self.owners
+                    .iter()
+                    .find(|(id, _)| *id == group)
+                    .and_then(|(_, owner)| *owner)
+            },
+        )
+    }
+}
+
+/// The conditions on a partition that the checks of a read use.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PartitionStatus {
+    deleted: bool,
+    backup: bool,
+    /// A fault, a read history that changes, a state transfer, or a status
+    /// other than normal.
+    unstable: bool,
+    view_started: bool,
+    primary: bool,
+    /// The incarnation that the owner of the partition serves.
+    incarnation: Option<u64>,
+}
+
+impl PartitionStatus {
+    fn of<B: MessageBus, SB: SuperblockStore>(
+        partition: &IggyPartition<B, SB>,
+        incarnation: Option<u64>,
+    ) -> Self {
+        let consensus = partition.consensus();
+        Self {
+            deleted: partition.history_deleted(),
+            backup: consensus.is_normal_backup(),
+            unstable: partition.fatal().is_some()
+                || partition.read_history_is_changing()
+                || partition.requires_state_transfer()
+                || !consensus.is_normal()
+                || consensus.is_transferring(),
+            view_started: consensus.applied_view_start(),
+            primary: consensus.is_primary(),
+            incarnation,
+        }
+    }
+
+    /// `owner` looks up the installed owner of a group. `Ok(false)` means
+    /// that the partition has not applied the install of the group owner
+    /// that `metadata` names yet.
+    fn check(
+        self,
+        namespace: IggyNamespace,
+        primary: bool,
+        metadata: &PollMetadata,
+        consumer: PollingConsumer,
+        owner: impl FnOnce(u64) -> Option<ConsumerGroupOwner>,
+    ) -> Result<bool, IggyError> {
+        if self.deleted {
+            return Err(IggyError::HistoryUnavailable);
+        }
+        if primary && self.backup {
+            return Err(IggyError::NotPrimary);
+        }
+        let installed = match consumer {
+            PollingConsumer::ConsumerGroup(group, _) => {
+                match super::group_owner_rejection(
+                    namespace,
+                    group as u64,
+                    owner(group as u64),
+                    metadata,
+                ) {
+                    None => true,
+                    Some(IggyError::TransientNotAccepted) => false,
+                    Some(error) => return Err(error),
+                }
+            }
+            PollingConsumer::Consumer(..) => true,
+        };
+        if self.unstable
+            || (primary && (!self.view_started || !self.primary))
+            || !metadata.matches_partition(self.incarnation)
+        {
+            return Err(IggyError::TransientNotAccepted);
+        }
+        Ok(installed)
+    }
+}
+
+/// A target as one readiness evaluation finds it.
+#[derive(Debug, Clone, Copy)]
+struct Readiness {
+    history: PollHistoryId,
+    view: u32,
+    /// The offsets from the start through the committed offset.
+    available: u64,
+    committed_bytes: u64,
+    /// The start is the next offset to commit, so the bytes that later
+    /// commits add are those that a read from the start returns.
+    at_end: bool,
+}
+
+/// A target of a waiter at admission and at its last evaluation.
+#[derive(Debug, Clone, Copy)]
+struct TargetReadiness {
+    admitted: Readiness,
+    last: Readiness,
+}
+
+impl TargetReadiness {
+    fn ready(&self, partition_id: u32) -> Option<ReadyTarget> {
+        (self.last.available > 0).then(|| ReadyTarget {
+            partition_id,
+            available: self.last.available,
+            known_bytes: self.admitted.at_end.then(|| {
+                self.last
+                    .committed_bytes
+                    .saturating_sub(self.admitted.committed_bytes)
+            }),
+        })
+    }
+}
+
+/// A readiness waiter answers once. Its targets are sorted by namespace, and
+/// `targets` holds the readiness of each. A history or a view that an
+/// evaluation finds changed since the admission rejects the waiter.
 struct ReadinessWaiter {
     wait: ReadinessWait,
-    admitted: Vec<(PollHistoryId, u32)>,
+    targets: Vec<TargetReadiness>,
+    /// The sum of the available offsets of the targets. It saturates only
+    /// above any `min_count`.
+    available: u64,
     /// Namespaces that changed since the last probe. A commit makes only its
     /// own target ready, so a probe evaluates these targets.
     dirty: Vec<IggyNamespace>,
@@ -152,12 +457,30 @@ struct ReadinessWaiter {
     reply: Sender<PartitionReadReply>,
 }
 
+impl ReadinessWaiter {
+    fn fires(&self) -> bool {
+        self.available >= u64::from(self.wait.min_count.max(ANY_MESSAGE))
+    }
+
+    fn ready(&self) -> Vec<ReadyTarget> {
+        self.wait
+            .targets
+            .iter()
+            .zip(&self.targets)
+            .filter_map(|(target, readiness)| readiness.ready(target.partition_id))
+            .collect()
+    }
+}
+
 struct Waiter {
     namespace: IggyNamespace,
     request: DeferredPollRequest,
     /// Admission turned this `Next` poll into an `Offset` poll that starts
     /// after the stored offset.
     next: bool,
+    /// A client store of the consumer offset at or after this time fences
+    /// the poll if it commits.
+    fenced_from: u64,
     reply: Sender<PartitionReadReply>,
     history: PollHistoryId,
     view: u32,
@@ -242,15 +565,48 @@ fn reply_byte_limit(options: &DeferredPollOptions, max_read_bytes: usize) -> usi
         .saturating_sub(POLL_RESPONSE_HEADER_SIZE)
 }
 
+/// The part of a read reservation that its disk selection may hold. Index
+/// loading stays under one part (`SEALED_INDEX_RESIDENT_MAX_BYTES`) and the
+/// snapshot pins journal buffers that exist anyway, so each keeps one minimum
+/// part and the selection gets the rest, at least its third.
+fn walk_bytes(reservation: usize) -> usize {
+    reservation
+        .saturating_sub((READ_BUDGET_PARTS - 1) * READ_PART_MIN_BYTES)
+        .max(reservation / READ_BUDGET_PARTS)
+}
+
+/// Up to `MAINTENANCE_BUDGET` keys of `map` after `cursor`. After the last
+/// key, the sweep starts again at the first.
+fn keys_after<K: Ord + Copy, V>(map: &BTreeMap<K, V>, cursor: Option<K>) -> Vec<K> {
+    let after = cursor.map_or(Unbounded, Excluded);
+    let keys: Vec<_> = map
+        .range((after, Unbounded))
+        .map(|(key, _)| *key)
+        .take(MAINTENANCE_BUDGET)
+        .collect();
+    if keys.is_empty() {
+        return map.keys().copied().take(MAINTENANCE_BUDGET).collect();
+    }
+    keys
+}
+
 /// Only a watched partition has a notifier, so only its commits mark it.
 #[derive(Default)]
 struct Signals {
     queued: HashSet<IggyNamespace>,
     dirty: VecDeque<IggyNamespace>,
+    /// Marked partitions whose status changed, so every parked read of them
+    /// checks it, also a poll that a commit alone would leave parked.
+    changed: HashSet<IggyNamespace>,
     waker: Option<Waker>,
 }
 
 impl Signals {
+    fn mark_changed(&mut self, namespace: IggyNamespace) {
+        self.changed.insert(namespace);
+        self.mark(namespace);
+    }
+
     fn mark(&mut self, namespace: IggyNamespace) {
         if self.queued.insert(namespace) {
             self.dirty.push_back(namespace);
@@ -259,6 +615,49 @@ impl Signals {
             }
         }
     }
+}
+
+/// A partition of this shard that other shards watch.
+struct Watch {
+    watchers: Vec<ReadinessWatch>,
+    /// The watching shards that hold a parked wait on the partition. Only
+    /// they get the pushes of its commits.
+    parked: BTreeSet<u16>,
+    /// The groups whose installed owner each push carries.
+    groups: BTreeSet<u64>,
+    notifier: Rc<dyn Fn()>,
+    /// The state of the last push, so that a sweep pushes only a change.
+    last: Option<ServedState>,
+}
+
+/// The copy of a partition of another shard that local waits evaluate.
+struct Mirror {
+    owner: u16,
+    seq: u64,
+    /// `None` until the owner pushes the state of a partition that it serves.
+    state: Option<ServedState>,
+    /// When a wait last named the partition.
+    used: u64,
+    /// When this shard applied the last push.
+    pushed: u64,
+    /// The owner took the news that this shard holds a parked wait on the
+    /// partition, so its commits come as pushes.
+    interest: bool,
+}
+
+impl Mirror {
+    /// Whether no wait named the partition for `MIRROR_IDLE_US`. A parked
+    /// wait also needs the mirror, and the caller checks that.
+    const fn unused(&self, now: u64) -> bool {
+        now.saturating_sub(self.used) >= MIRROR_IDLE_US
+    }
+}
+
+#[derive(Default)]
+struct Mirrors {
+    next_seq: u64,
+    entries: BTreeMap<IggyNamespace, Mirror>,
+    cursor: Option<IggyNamespace>,
 }
 
 #[derive(Default)]
@@ -274,6 +673,12 @@ struct State {
     /// Parked waiters whose read the budget refused, by `(refused_at, id)`.
     read_queue: BTreeSet<(u64, u64)>,
     maintenance_cursor: u64,
+    watches: BTreeMap<IggyNamespace, Watch>,
+    /// The watched partitions to push at the next flush, by watching shard.
+    /// A flush reads the current state, so the latest state wins.
+    pushes: BTreeMap<u16, BTreeSet<IggyNamespace>>,
+    watch_cursor: Option<IggyNamespace>,
+    status_cursor: Option<IggyNamespace>,
     closed: bool,
 }
 
@@ -312,6 +717,28 @@ impl State {
         Ok(id)
     }
 
+    /// Removes the watchers of `namespace` that `stop` selects. Returns
+    /// whether the partition lost its last watcher.
+    fn unwatch(
+        &mut self,
+        namespace: IggyNamespace,
+        stop: impl Fn(&ReadinessWatch) -> bool,
+    ) -> bool {
+        let Some(watch) = self.watches.get_mut(&namespace) else {
+            return false;
+        };
+        watch.watchers.retain(|watcher| !stop(watcher));
+        let watchers = &watch.watchers;
+        watch
+            .parked
+            .retain(|shard| watchers.iter().any(|watcher| watcher.shard == *shard));
+        if !watch.watchers.is_empty() {
+            return false;
+        }
+        self.watches.remove(&namespace);
+        true
+    }
+
     fn ids_after(&self, cursor: u64) -> Vec<u64> {
         let after = (Excluded(cursor), Unbounded);
         let mut ids: Vec<_> = self
@@ -337,7 +764,11 @@ pub struct DeferredPolls {
     config: RefCell<DeferredPollConfig>,
     state: RefCell<State>,
     signals: Rc<RefCell<Signals>>,
+    mirrors: RefCell<Mirrors>,
     inflight_bytes: Arc<AtomicUsize>,
+    /// The status and view of each partition with parked reads, from when
+    /// they parked or from the last tick that checked it.
+    statuses: RefCell<BTreeMap<IggyNamespace, (PartitionStatus, u32)>>,
 }
 
 impl DeferredPolls {
@@ -347,7 +778,9 @@ impl DeferredPolls {
             config: RefCell::new(DeferredPollConfig::default()),
             state: RefCell::new(State::default()),
             signals: Rc::new(RefCell::new(Signals::default())),
+            mirrors: RefCell::new(Mirrors::default()),
             inflight_bytes: Arc::new(AtomicUsize::new(0)),
+            statuses: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -355,6 +788,16 @@ impl DeferredPolls {
     /// this server's limit waits for the limit instead of failing.
     pub(crate) fn wait_us(&self, wait_us: u64) -> u64 {
         wait_us.min(self.config.borrow().max_wait_us)
+    }
+
+    /// The notifier that a change of the partition at `namespace` calls.
+    fn notifier(&self, namespace: IggyNamespace) -> Rc<dyn Fn()> {
+        let signals = Rc::downgrade(&self.signals);
+        Rc::new(move || {
+            if let Some(signals) = signals.upgrade() {
+                signals.borrow_mut().mark(namespace);
+            }
+        })
     }
 
     pub(crate) fn earliest_deadline(&self) -> Option<u64> {
@@ -414,13 +857,49 @@ impl DeferredPolls {
         }
     }
 
-    pub(crate) const fn pump_guard(&self) -> PumpGuard<'_> {
-        PumpGuard(self)
+    pub(crate) const fn pump_guard<'a>(
+        &'a self,
+        shard: u16,
+        senders: &'a [TaggedSender],
+    ) -> PumpGuard<'a> {
+        PumpGuard {
+            polls: self,
+            shard,
+            senders,
+        }
     }
 
-    pub(crate) fn close(&self) {
+    /// Rejects the parked waiters, and tells every watching shard that
+    /// `shard` no longer serves the partitions that it watches.
+    pub(crate) fn close(&self, shard: u16, senders: &[TaggedSender]) {
         let mut state = self.state.borrow_mut();
         state.closed = true;
+        let mut unavailable: BTreeMap<u16, Vec<WatchedState>> = BTreeMap::new();
+        for (namespace, watch) in std::mem::take(&mut state.watches) {
+            for watcher in watch.watchers {
+                unavailable
+                    .entry(watcher.shard)
+                    .or_default()
+                    .push(WatchedState {
+                        namespace,
+                        seq: watcher.seq,
+                        state: None,
+                    });
+            }
+        }
+        for (watcher, states) in unavailable {
+            if let Some(sender) = senders.get(usize::from(watcher)) {
+                let _ = sender.reply_sender().try_send(ShardFrame::lifecycle(
+                    LifecycleFrame::ReadinessUpdate {
+                        from: shard,
+                        states,
+                    },
+                ));
+            }
+        }
+        state.pushes.clear();
+        self.mirrors.borrow_mut().entries.clear();
+        self.metrics.readiness_watches.set(0);
         for reply in state
             .waiters
             .values()
@@ -441,14 +920,15 @@ impl DeferredPolls {
         state.read_queue.clear();
         self.metrics.pending.set(0);
         *self.signals.borrow_mut() = Signals::default();
+        self.statuses.borrow_mut().clear();
     }
 
-    /// The budget that a disk read of `options` reserves. Its snapshot, disk
-    /// selection and index loading can coexist, so it reserves one part as
-    /// large as its reply for each, at least [`READ_PART_MIN_BYTES`], up to
-    /// `max_read_bytes` in total.
-    fn read_bytes(&self, options: &DeferredPollOptions) -> usize {
-        (options.max_bytes as usize)
+    /// The budget that a disk read with `max_bytes` reserves. Its snapshot,
+    /// disk selection and index loading can coexist, so it reserves one part
+    /// as large as its reply for each, at least [`READ_PART_MIN_BYTES`], up
+    /// to `max_read_bytes` in total. [`walk_bytes`] splits it.
+    fn read_bytes(&self, max_bytes: u32) -> usize {
+        (max_bytes as usize)
             .max(READ_PART_MIN_BYTES)
             .saturating_mul(READ_BUDGET_PARTS)
             .min(self.config.borrow().max_read_bytes)
@@ -469,10 +949,9 @@ impl DeferredPolls {
     /// loop drops it instead of stalling the queue.
     fn head_read_fits(&self, state: &State) -> bool {
         state.read_queue.first().is_some_and(|(_, id)| {
-            state
-                .waiters
-                .get(id)
-                .is_none_or(|waiter| self.has_read_room(self.read_bytes(&waiter.request.options)))
+            state.waiters.get(id).is_none_or(|waiter| {
+                self.has_read_room(self.read_bytes(waiter.request.options.max_bytes))
+            })
         })
     }
 
@@ -534,7 +1013,8 @@ impl DeferredPolls {
             .filter(|next| *next <= config.max_inflight_bytes)
     }
 
-    /// Returns the namespaces that no waiter watches any more.
+    /// Returns the namespaces that no waiter and no watching shard needs any
+    /// more.
     fn remove(
         &self,
         id: u64,
@@ -546,9 +1026,15 @@ impl DeferredPolls {
         for deadline in deadlines {
             state.deadlines.remove(&(*deadline, id));
         }
-        state.queued.remove(&id);
-        state.ready.retain(|queued| *queued != id);
-        state.read_queue.retain(|(_, queued)| *queued != id);
+        // The pump takes a waiter off `ready` before it finishes it, so only a
+        // waiter that a wake queued again needs the scan.
+        if state.queued.remove(&id) {
+            state.ready.retain(|queued| *queued != id);
+        }
+        debug_assert!(
+            state.read_queue.iter().all(|(_, queued)| *queued != id),
+            "a probe takes the read place of a waiter before it removes the waiter"
+        );
         self.metrics.pending.dec();
         if let Some(count) = state.sessions.get_mut(&quota) {
             *count -= 1;
@@ -564,18 +1050,25 @@ impl DeferredPolls {
             });
             if empty {
                 state.partitions.remove(&namespace);
-                unwatched.push(namespace);
+                self.statuses.borrow_mut().remove(&namespace);
+                if !state.watches.contains_key(&namespace) {
+                    unwatched.push(namespace);
+                }
             }
         }
         unwatched
     }
 }
 
-pub struct PumpGuard<'a>(&'a DeferredPolls);
+pub struct PumpGuard<'a> {
+    polls: &'a DeferredPolls,
+    shard: u16,
+    senders: &'a [TaggedSender],
+}
 
 impl Drop for PumpGuard<'_> {
     fn drop(&mut self) {
-        self.0.close();
+        self.polls.close(self.shard, self.senders);
     }
 }
 
@@ -607,6 +1100,12 @@ where
 
     pub fn deferred_wait_us(&self, wait_us: u64) -> u64 {
         self.deferred_polls.wait_us(wait_us)
+    }
+
+    /// The deferred poll limits, which every shard shares.
+    #[must_use]
+    pub fn deferred_poll_config(&self) -> DeferredPollConfig {
+        *self.deferred_polls.config.borrow()
     }
 
     fn validate_deferred_context(
@@ -670,39 +1169,22 @@ where
         if !metadata.is_valid(self.plane.metadata().mux_stm.streams(), namespace) {
             return Err(IggyError::TransientNotAccepted);
         }
+        let incarnation = self.shards_table.epoch_for(namespace);
         self.plane
             .partitions()
             .with_partition(&namespace, |partition| {
-                let consensus = partition.consensus();
-                if partition.history_deleted() {
-                    return Err(IggyError::HistoryUnavailable);
-                }
-                if primary && consensus.is_normal_backup() {
-                    return Err(IggyError::NotPrimary);
-                }
-                if let PollingConsumer::ConsumerGroup(group, _) = consumer
-                    && let Some(error) = super::group_owner_rejection(
-                        namespace,
-                        group as u64,
-                        partition.consumer_group_owner(group as u64),
-                        metadata,
-                    )
-                {
-                    return Err(error);
-                }
-                if partition.fatal().is_some()
-                    || partition.read_history_is_changing()
-                    || (primary && !consensus.applied_view_start())
-                    || partition.requires_state_transfer()
-                    || !consensus.is_normal()
-                    || consensus.is_transferring()
-                    || (primary && !consensus.is_primary())
-                    || !metadata.matches_partition(self.shards_table.epoch_for(namespace))
-                {
+                let installed = PartitionStatus::of(partition, incarnation).check(
+                    namespace,
+                    primary,
+                    metadata,
+                    consumer,
+                    |group| partition.consumer_group_owner(group),
+                )?;
+                if !installed {
                     return Err(IggyError::TransientNotAccepted);
                 }
                 let (history, visibility) = partition.poll_visibility();
-                Ok((history, visibility, consensus.view()))
+                Ok((history, visibility, partition.consensus().view()))
             })
             .ok_or(IggyError::TransientNotAccepted)?
     }
@@ -710,7 +1192,9 @@ where
     /// The visibility of the partition, while its history and view are those
     /// of the admission. A `Next` poll also needs the stored offset of its
     /// admission: another session can store an offset while it waits, and a
-    /// commit of this poll would then pass over a rewind.
+    /// commit of this poll would then pass over a rewind. A committing one
+    /// also needs no client store since then, as a rewind can store the
+    /// value it started from.
     fn validate_waiter(&self, waiter: &Waiter) -> Result<PollVisibility, IggyError> {
         let (history, visibility, view) =
             self.validate_deferred_context(waiter.namespace, &waiter.request)?;
@@ -719,10 +1203,31 @@ where
             || (waiter.next
                 && self.next_offset(waiter.namespace, waiter.request.consumer)?
                     != waiter.request.args.value)
+            || (waiter.next
+                && waiter.request.args.auto_commit
+                && self.offset_stored_since(
+                    waiter.namespace,
+                    waiter.request.consumer,
+                    waiter.fenced_from,
+                )?)
         {
             return Err(IggyError::TransientNotAccepted);
         }
         Ok(visibility)
+    }
+
+    fn offset_stored_since(
+        &self,
+        namespace: IggyNamespace,
+        consumer: PollingConsumer,
+        since: u64,
+    ) -> Result<bool, IggyError> {
+        self.plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                partition.consumer_offset_stored_since(consumer, since)
+            })
+            .ok_or(IggyError::TransientNotAccepted)
     }
 
     /// Where a `Next` poll of `consumer` starts: after its stored offset.
@@ -762,6 +1267,9 @@ where
             let mut state = self.deferred_polls.state.borrow_mut();
             let id = state.admit(request.context.quota, &config)?;
             let next = request.args.kind == PollingKind::Next;
+            let fenced_from = request
+                .stores_fenced_from
+                .unwrap_or_else(|| self.bus.monotonic_micros());
             if next {
                 request.args.kind = PollingKind::Offset;
                 request.args.value = self.next_offset(namespace, request.consumer)?;
@@ -778,6 +1286,7 @@ where
                     namespace,
                     request,
                     next,
+                    fenced_from,
                     reply: reply.clone(),
                     history,
                     view,
@@ -797,6 +1306,56 @@ where
         }
     }
 
+    /// One consensus tick of the deferred polls. A partition that loses its
+    /// primary, changes view or starts a state transfer marks nothing, so the
+    /// tick compares the status of `MAINTENANCE_BUDGET` partitions with parked
+    /// reads, from a cursor, to what it saw when they parked or at their last
+    /// check, and wakes the reads of a changed one at once. Each such change
+    /// is found within one pass over them. The watch sweep pushes the changes
+    /// of a watched partition.
+    pub(crate) fn tick_deferred_polls(&self) {
+        let namespaces = {
+            let mut state = self.deferred_polls.state.borrow_mut();
+            let namespaces = keys_after(&state.partitions, state.status_cursor);
+            if let Some(last) = namespaces.last() {
+                state.status_cursor = Some(*last);
+            }
+            namespaces
+        };
+        for namespace in namespaces {
+            let Some(current) = self.partition_status(namespace) else {
+                continue;
+            };
+            if self
+                .deferred_polls
+                .statuses
+                .borrow_mut()
+                .insert(namespace, current)
+                .is_some_and(|previous| previous != current)
+            {
+                self.deferred_polls
+                    .signals
+                    .borrow_mut()
+                    .mark_changed(namespace);
+            }
+        }
+        self.deferred_polls.maintenance();
+    }
+
+    /// The status and view of the partition at `namespace`, `None` if this
+    /// shard has no such partition.
+    fn partition_status(&self, namespace: IggyNamespace) -> Option<(PartitionStatus, u32)> {
+        let incarnation = self.shards_table.epoch_for(namespace);
+        self.plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                (
+                    PartitionStatus::of(partition, incarnation),
+                    partition.consensus().view(),
+                )
+            })
+    }
+
     #[allow(clippy::future_not_send)]
     pub(crate) async fn service_deferred_polls(&self) {
         for _ in 0..SERVICE_BUDGET {
@@ -814,13 +1373,14 @@ where
                     // first, ahead of the other wakes.
                     Some(id)
                 } else {
-                    let namespace = {
+                    let (namespace, changed) = {
                         let mut signals = self.deferred_polls.signals.borrow_mut();
                         let namespace = signals.dirty.pop_front();
-                        if let Some(namespace) = namespace {
+                        let changed = namespace.is_some_and(|namespace| {
                             signals.queued.remove(&namespace);
-                        }
-                        namespace
+                            signals.changed.remove(&namespace)
+                        });
+                        (namespace, changed)
                     };
                     if let Some(namespace) = namespace {
                         // A commit queues a poll only if its history or view
@@ -843,7 +1403,8 @@ where
                             .flat_map(|ids| ids.iter().copied())
                             .collect();
                         for id in ids {
-                            if let Some((history, visibility, view)) = current
+                            if !changed
+                                && let Some((history, visibility, view)) = current
                                 && let Some(waiter) = state.waiters.get_mut(&id)
                                 && waiter.history == history
                                 && waiter.view == view
@@ -858,10 +1419,22 @@ where
                             }
                             state.enqueue(id);
                         }
+                        let state = &mut *state;
+                        if let Some(watch) = state.watches.get(&namespace) {
+                            for shard in &watch.parked {
+                                state.pushes.entry(*shard).or_default().insert(namespace);
+                            }
+                        }
                     }
                     let next = state.ready.pop_front();
-                    if let Some(id) = next {
-                        state.queued.remove(&id);
+                    match next {
+                        Some(id) => {
+                            state.queued.remove(&id);
+                        }
+                        // A change that woke no waiter, such as one that only
+                        // other shards watch, does not end the turn.
+                        None if namespace.is_some() => continue,
+                        None => {}
                     }
                     next
                 }
@@ -925,7 +1498,9 @@ where
             refused_at.unwrap_or_else(|| self.bus.monotonic_micros()),
             id,
         );
-        let read_bytes = self.deferred_polls.read_bytes(&waiter.request.options);
+        let read_bytes = self
+            .deferred_polls
+            .read_bytes(waiter.request.options.max_bytes);
         if refused_at.is_some() && !self.deferred_polls.read_turn(place, read_bytes) {
             self.deferred_polls.queue_read(id, waiter, place);
             return;
@@ -948,8 +1523,7 @@ where
             self.deferred_polls.queue_read(id, waiter, place);
             return;
         };
-        // Snapshot, disk selection and index loading can coexist.
-        let max_bytes = reservation.bytes / READ_BUDGET_PARTS;
+        let max_bytes = walk_bytes(reservation.bytes);
         let max_selected_bytes = reply_byte_limit(
             &waiter.request.options,
             self.deferred_polls.config.borrow().max_read_bytes,
@@ -990,11 +1564,7 @@ where
 
     #[allow(clippy::future_not_send)]
     async fn accept_deferred_result(&self, id: u64, mut waiter: Waiter, result: PollReadResult) {
-        if waiter.reply.is_disconnected() {
-            self.metrics.deferred_polls.cancelled.inc();
-            self.remove_deferred_poll(id, &waiter);
-            return;
-        }
+        // The disconnect check sits right before the store, in `finish_deferred_poll`.
         if self.bus.monotonic_micros() >= waiter.request.request_deadline {
             self.reject_deferred_poll(id, &waiter, IggyError::TransientNotCommitted);
             return;
@@ -1014,14 +1584,32 @@ where
             }
         };
         let max_read_bytes = self.deferred_polls.config.borrow().max_read_bytes;
-        let (mut result, byte_limited) =
-            match result.limit_bytes(waiter.request.options.max_bytes as usize, max_read_bytes) {
-                Ok(result) => result,
-                Err(error) => {
-                    self.reject_deferred_poll(id, &waiter, error);
-                    return;
-                }
+        let (mut result, byte_limited) = match result.limit_bytes(
+            waiter.request.options.max_bytes as usize,
+            max_read_bytes,
+            || true,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                self.reject_deferred_poll(id, &waiter, error);
+                return;
+            }
+        };
+        if result.message_count() > 0
+            && let Some(turn) = &waiter.request.oversized_turn
+        {
+            let oversized =
+                result.encoded_bytes() > reply_byte_limit(&waiter.request.options, max_read_bytes);
+            let accepted = if oversized {
+                turn.take()
+            } else {
+                turn.accept_normal()
             };
+            if !accepted {
+                self.reject_deferred_poll(id, &waiter, IggyError::DeferredPollCapacityExceeded);
+                return;
+            }
+        }
         if result.message_count() >= waiter.request.options.min_count
             || byte_limited
             || result.truncated()
@@ -1073,14 +1661,19 @@ where
         *state.sessions.entry(quota).or_default() += 1;
         state.deadlines.insert((deadline, id));
         for namespace in namespaces {
-            state.partitions.entry(namespace).or_default().insert(id);
-            let signals = Rc::downgrade(&self.deferred_polls.signals);
+            let ids = state.partitions.entry(namespace).or_default();
+            // A change before the tick reaches the partition still counts.
+            if ids.is_empty()
+                && let Some(current) = self.partition_status(namespace)
+            {
+                self.deferred_polls
+                    .statuses
+                    .borrow_mut()
+                    .insert(namespace, current);
+            }
+            ids.insert(id);
             if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
-                partition.set_poll_notifier(Some(Rc::new(move || {
-                    if let Some(signals) = signals.upgrade() {
-                        signals.borrow_mut().mark(namespace);
-                    }
-                })));
+                partition.set_poll_notifier(Some(self.deferred_polls.notifier(namespace)));
             }
         }
     }
@@ -1114,24 +1707,73 @@ where
             self.metrics.deferred_polls.cancelled.inc();
             return;
         }
+        // A read that stores nothing needs no gate. One that would commit after
+        // a cancel won stores nothing either.
+        if result.message_count() > 0
+            && let Some(gate) = &waiter.request.commit_gate
+            && !gate.enter()
+        {
+            self.metrics.deferred_polls.cancelled.inc();
+            let _ = waiter.reply.try_send(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ));
+            return;
+        }
         let before_deadline = self.bus.monotonic_micros() < waiter.request.deadline;
         if before_deadline {
             self.metrics.deferred_polls.filled.inc();
         } else {
             self.metrics.deferred_polls.expired.inc();
         }
-        self.accept_poll_result(waiter.namespace, result, waiter.reply)
+        let next_offset = self.next_read_offset(waiter.namespace, &waiter.request.args, &result);
+        self.accept_poll_result(waiter.namespace, result, waiter.reply, next_offset)
             .await;
+    }
+
+    /// Where the read after `result` starts: after its last message. An empty
+    /// `Offset` read moves to the first offset that retention kept, so that a
+    /// start in deleted segments moves on. `None` for an empty read of another
+    /// kind, whose request names no start.
+    fn next_read_offset(
+        &self,
+        namespace: IggyNamespace,
+        args: &PollingArgs,
+        result: &PollReadResult,
+    ) -> Option<u64> {
+        if let Some(last) = result.last_matching_offset() {
+            return Some(last.saturating_add(1));
+        }
+        if args.kind != PollingKind::Offset {
+            return None;
+        }
+        let first = self
+            .plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                partition
+                    .log
+                    .segments()
+                    .first()
+                    .map(|segment| segment.start_offset)
+            })
+            .flatten();
+        Some(first.map_or(args.value, |first| first.max(args.value)))
     }
 
     /// Answers at once with the ready targets. If none is ready and the wait
     /// did not expire, parks one waiter for all targets and answers with its
-    /// id, so that the origin can cancel it.
+    /// id, so that the origin can cancel it. With `watch`, this shard also
+    /// starts to push the state of the `Offset` targets to the watching
+    /// shard, which then evaluates its waits on them itself.
     pub(crate) fn admit_readiness_wait(
         &self,
         wait: ReadinessWait,
         reply: &Sender<PartitionReadReply>,
+        watch: Option<ReadinessWatch>,
     ) {
+        if let Some(watch) = watch {
+            self.watch_partitions(watch, &wait.targets);
+        }
         if reply.is_disconnected() {
             return;
         }
@@ -1171,76 +1813,128 @@ where
         self.validate_caller(first, &wait.context)?;
         // A probe finds the target of a changed namespace by binary search.
         wait.targets.sort_unstable_by_key(|target| target.namespace);
-        let mut admitted = Vec::with_capacity(wait.targets.len());
-        let mut partitions = Vec::new();
+        let mut targets = Vec::with_capacity(wait.targets.len());
+        let mut available = 0_u64;
         for target in &wait.targets {
-            let (history, view, ready) = self.evaluate_readiness(wait.context.primary, target)?;
-            admitted.push((history, view));
-            if ready {
-                partitions.push(target.partition_id);
-            }
+            let readiness = self.evaluate_readiness(wait.context.primary, target)?;
+            available = available.saturating_add(readiness.available);
+            targets.push(TargetReadiness {
+                admitted: readiness,
+                last: readiness,
+            });
         }
-        let expired = self.bus.monotonic_micros() >= wait.deadline;
-        if !partitions.is_empty() || expired {
-            if partitions.is_empty() {
-                self.metrics.deferred_polls.expired.inc();
-            } else {
+        let waiter = ReadinessWaiter {
+            wait,
+            targets,
+            available,
+            dirty: Vec::new(),
+            swept: 0,
+            sweep: 0,
+            reply: reply.clone(),
+        };
+        let fires = waiter.fires();
+        if fires || self.bus.monotonic_micros() >= waiter.wait.deadline {
+            if fires {
                 self.metrics.deferred_polls.filled.inc();
+            } else {
+                self.metrics.deferred_polls.expired.inc();
             }
             return Ok(PartitionReadReply::Ready {
                 shard: self.id,
                 parked: None,
-                partitions,
+                partitions: waiter.ready(),
             });
         }
         let config = *self.deferred_polls.config.borrow();
         let mut state = self.deferred_polls.state.borrow_mut();
-        let quota = wait.context.quota;
+        let quota = waiter.wait.context.quota;
         let id = state.admit(quota, &config)?;
         self.register_waiter(
             &mut state,
             id,
-            (quota, wait.deadline),
-            wait.targets.iter().map(|target| target.namespace),
+            (quota, waiter.wait.deadline),
+            waiter.wait.targets.iter().map(|target| target.namespace),
         );
-        state.readiness.insert(
-            id,
-            ReadinessWaiter {
-                wait,
-                admitted,
-                dirty: Vec::new(),
-                swept: 0,
-                sweep: 0,
-                reply: reply.clone(),
-            },
-        );
+        let namespaces = waiter
+            .wait
+            .targets
+            .iter()
+            .map(|target| target.namespace)
+            .collect();
+        state.readiness.insert(id, waiter);
+        drop(state);
+        self.tell_mirror_owners(namespaces, true);
         Ok(PartitionReadReply::Ready {
             shard: self.id,
             parked: Some(id),
-            partitions,
+            partitions: Vec::new(),
         })
     }
 
-    /// Returns the history and view of the target, and whether a poll with its
-    /// strategy returns a message now. This is the empty-plan test of
-    /// `build_poll_plan`. The caller of the wait is checked before.
+    /// The target as a poll with its strategy finds it now. Its available
+    /// offsets follow the empty-plan test of `build_poll_plan`. The caller of
+    /// the wait is checked before.
     fn evaluate_readiness(
         &self,
         primary: bool,
         target: &ReadinessTarget,
-    ) -> Result<(PollHistoryId, u32, bool), IggyError> {
-        let (history, visibility, view) =
-            self.validate_partition(target.namespace, primary, &target.metadata, target.consumer)?;
+    ) -> Result<Readiness, IggyError> {
+        let (history, visibility, view, serves) =
+            self.evaluate_mirror(primary, target).unwrap_or_else(|| {
+                self.validate_partition(
+                    target.namespace,
+                    primary,
+                    &target.metadata,
+                    target.consumer,
+                )
+                .map(|(history, visibility, view)| (history, visibility, view, true))
+            })?;
         let start = match target.strategy.kind {
             PollingKind::Offset => target.strategy.value,
             PollingKind::Next => self.next_offset(target.namespace, target.consumer)?,
             _ => return Err(IggyError::InvalidCommand),
         };
-        Ok((
+        let available = match visibility.offset {
+            Some(committed) if serves && start <= committed => {
+                (committed - start).saturating_add(1)
+            }
+            _ => 0,
+        };
+        Ok(Readiness {
             history,
             view,
-            visibility.offset.is_some_and(|commit| start <= commit),
-        ))
+            available,
+            committed_bytes: visibility.committed_bytes,
+            at_end: visibility
+                .offset
+                .and_then(|committed| committed.checked_add(1))
+                == Some(start),
+        })
+    }
+
+    /// The reading of a target that this shard mirrors, `None` if it has no
+    /// mirror of the target.
+    fn evaluate_mirror(
+        &self,
+        primary: bool,
+        target: &ReadinessTarget,
+    ) -> Option<Result<Reading, IggyError>> {
+        let mirrors = self.deferred_polls.mirrors.borrow();
+        let mirror = mirrors.entries.get(&target.namespace)?;
+        if !target
+            .metadata
+            .is_valid(self.plane.metadata().mux_stm.streams(), target.namespace)
+        {
+            return Some(Err(IggyError::TransientNotAccepted));
+        }
+        let Some(state) = &mirror.state else {
+            return Some(Err(IggyError::TransientNotAccepted));
+        };
+        Some(
+            state
+                .check(primary, target)
+                .map(|serves| (state.history, state.visibility, state.view, serves)),
+        )
     }
 
     fn probe_readiness(&self, id: u64, mut waiter: ReadinessWaiter) {
@@ -1249,18 +1943,72 @@ where
             self.remove_readiness_wait(id, &waiter);
             return;
         }
-        // The origin answers an expired wait itself.
+        let now = self.bus.monotonic_micros();
+        let answer = match self.evaluate_readiness_waiter(&mut waiter) {
+            Ok(()) if waiter.fires() => {
+                self.metrics.deferred_polls.filled.inc();
+                self.record_push_to_fire(&waiter, now);
+                Some(PartitionReadReply::Ready {
+                    shard: self.id,
+                    parked: None,
+                    partitions: waiter.ready(),
+                })
+            }
+            // An expired wait reads what it has. The origin answers one
+            // without data itself.
+            Ok(()) if now >= waiter.wait.deadline => {
+                self.metrics.deferred_polls.expired.inc();
+                let partitions = waiter.ready();
+                (!partitions.is_empty()).then(|| PartitionReadReply::Ready {
+                    shard: self.id,
+                    parked: None,
+                    partitions,
+                })
+            }
+            Ok(()) => {
+                self.deferred_polls
+                    .state
+                    .borrow_mut()
+                    .readiness
+                    .insert(id, waiter);
+                return;
+            }
+            Err(error) => {
+                self.metrics.deferred_polls.failed.inc();
+                Some(PartitionReadReply::Rejected(error))
+            }
+        };
+        self.remove_readiness_wait(id, &waiter);
+        if let Some(answer) = answer {
+            let _ = waiter.reply.try_send(answer);
+        }
+    }
+
+    /// Ends the waiter `id` that this shard parked for the targets that it
+    /// evaluates of a wait that ends here, and returns those that hold
+    /// messages, also below `min_count`.
+    pub(crate) fn take_readiness_wait(&self, id: u64) -> Result<Vec<ReadyTarget>, IggyError> {
+        let Some(mut waiter) = self.deferred_polls.state.borrow_mut().readiness.remove(&id) else {
+            return Ok(Vec::new());
+        };
+        let evaluated = self.evaluate_readiness_waiter(&mut waiter);
         if self.bus.monotonic_micros() >= waiter.wait.deadline {
             self.metrics.deferred_polls.expired.inc();
-            self.remove_readiness_wait(id, &waiter);
-            return;
+        } else {
+            self.metrics.deferred_polls.cancelled.inc();
         }
+        self.remove_readiness_wait(id, &waiter);
+        evaluated.map(|()| waiter.ready())
+    }
+
+    /// Evaluates the targets of `waiter` that can have changed since its last
+    /// evaluation. A commit marks only its own namespace. This evaluates the
+    /// targets of marked namespaces, also of those that the pump has not
+    /// taken yet, and the targets that maintenance assigned. Maintenance
+    /// reaches every other target in turn. A lookup per target keeps the cost
+    /// of the marks that the shard still holds within the wait size.
+    fn evaluate_readiness_waiter(&self, waiter: &mut ReadinessWaiter) -> Result<(), IggyError> {
         let targets = &waiter.wait.targets;
-        // A commit marks only its own namespace. The probe evaluates the
-        // targets of marked namespaces, also of those that the pump has not
-        // taken yet, and the targets that maintenance assigned. Maintenance
-        // reaches every other target in turn. A lookup per target keeps the
-        // cost of the marks that the shard still holds within the wait size.
         let mut evaluated: Vec<usize> = {
             let signals = self.deferred_polls.signals.borrow();
             waiter
@@ -1283,57 +2031,55 @@ where
         };
         evaluated.sort_unstable();
         evaluated.dedup();
+        waiter.dirty.clear();
+        waiter.swept += waiter.sweep;
+        waiter.sweep = 0;
+        if waiter.swept >= targets.len() {
+            waiter.swept = 0;
+        }
         let context = &waiter.wait.context;
-        let partitions = targets
-            .first()
-            .map_or(Ok(()), |first| {
-                self.validate_caller(first.namespace, context)
-            })
-            .and_then(|()| {
-                evaluated
-                    .iter()
-                    .filter_map(|index| targets.get(*index).zip(waiter.admitted.get(*index)))
-                    .filter_map(|(target, admitted)| {
-                        match self.evaluate_readiness(context.primary, target) {
-                            Ok((history, view, ready)) if (history, view) == *admitted => {
-                                ready.then_some(Ok(target.partition_id))
-                            }
-                            Ok(_) => Some(Err(IggyError::TransientNotAccepted)),
-                            Err(error) => Some(Err(error)),
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            });
-        let answer = match partitions {
-            Ok(partitions) if partitions.is_empty() => {
-                waiter.dirty.clear();
-                waiter.swept += waiter.sweep;
-                waiter.sweep = 0;
-                if waiter.swept >= waiter.wait.targets.len() {
-                    waiter.swept = 0;
-                }
-                self.deferred_polls
-                    .state
-                    .borrow_mut()
-                    .readiness
-                    .insert(id, waiter);
-                return;
+        if let Some(first) = targets.first() {
+            self.validate_caller(first.namespace, context)?;
+        }
+        for index in evaluated {
+            let (Some(target), Some(readiness)) =
+                (targets.get(index), waiter.targets.get_mut(index))
+            else {
+                continue;
+            };
+            let last = self.evaluate_readiness(context.primary, target)?;
+            if (last.history, last.view) != (readiness.admitted.history, readiness.admitted.view) {
+                return Err(IggyError::TransientNotAccepted);
             }
-            Ok(partitions) => {
-                self.metrics.deferred_polls.filled.inc();
-                PartitionReadReply::Ready {
-                    shard: self.id,
-                    parked: None,
-                    partitions,
-                }
-            }
-            Err(error) => {
-                self.metrics.deferred_polls.failed.inc();
-                PartitionReadReply::Rejected(error)
-            }
+            waiter.available = waiter
+                .available
+                .saturating_sub(readiness.last.available)
+                .saturating_add(last.available);
+            readiness.last = last;
+        }
+        Ok(())
+    }
+
+    /// Observes the time from the last push that this shard applied for a
+    /// ready target to the fire of `waiter`. Targets of this shard have no
+    /// push.
+    fn record_push_to_fire(&self, waiter: &ReadinessWaiter, now: u64) {
+        let pushed = {
+            let mirrors = self.deferred_polls.mirrors.borrow();
+            waiter
+                .wait
+                .targets
+                .iter()
+                .zip(&waiter.targets)
+                .filter(|(_, readiness)| readiness.last.available > 0)
+                .filter_map(|(target, _)| mirrors.entries.get(&target.namespace))
+                .map(|mirror| mirror.pushed)
+                .max()
         };
-        self.remove_readiness_wait(id, &waiter);
-        let _ = waiter.reply.try_send(answer);
+        if let Some(pushed) = pushed {
+            self.metrics
+                .record_readiness_push_to_fire(Duration::from_micros(now.saturating_sub(pushed)));
+        }
     }
 
     fn remove_readiness_wait(&self, id: u64, waiter: &ReadinessWaiter) {
@@ -1343,6 +2089,435 @@ where
             waiter.wait.context.quota,
             waiter.wait.targets.iter().map(|target| target.namespace),
         ));
+    }
+
+    /// Starts or renews the watch of `watch.shard` on the `Offset` targets,
+    /// and queues their state for it.
+    fn watch_partitions(&self, watch: ReadinessWatch, targets: &[ReadinessTarget]) {
+        let mut state = self.deferred_polls.state.borrow_mut();
+        if state.closed {
+            return;
+        }
+        let state = &mut *state;
+        for target in targets
+            .iter()
+            .filter(|target| target.strategy.kind == PollingKind::Offset)
+        {
+            let namespace = target.namespace;
+            let entry = match state.watches.entry(namespace) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let notifier = self.deferred_polls.notifier(namespace);
+                    if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
+                        partition.set_poll_notifier(Some(Rc::clone(&notifier)));
+                    }
+                    self.metrics.deferred_polls.readiness_watches.inc();
+                    entry.insert(Watch {
+                        watchers: Vec::new(),
+                        parked: BTreeSet::new(),
+                        groups: BTreeSet::new(),
+                        notifier,
+                        last: None,
+                    })
+                }
+            };
+            match entry
+                .watchers
+                .iter_mut()
+                .find(|watcher| watcher.shard == watch.shard)
+            {
+                Some(watcher) => watcher.seq = watch.seq,
+                None => entry.watchers.push(watch),
+            }
+            if let PollingConsumer::ConsumerGroup(group, _) = target.consumer {
+                entry.groups.insert(group as u64);
+            }
+            state
+                .pushes
+                .entry(watch.shard)
+                .or_default()
+                .insert(namespace);
+        }
+    }
+
+    /// The state of a watched partition, `None` if this shard does not serve
+    /// it.
+    fn served_state(
+        &self,
+        namespace: IggyNamespace,
+        groups: &BTreeSet<u64>,
+    ) -> Option<ServedState> {
+        let incarnation = self.shards_table.epoch_for(namespace);
+        self.plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                let (history, visibility) = partition.poll_visibility();
+                ServedState {
+                    history,
+                    visibility,
+                    view: partition.consensus().view(),
+                    status: PartitionStatus::of(partition, incarnation),
+                    owners: groups
+                        .iter()
+                        .map(|group| (*group, partition.consumer_group_owner(*group)))
+                        .collect(),
+                }
+            })
+    }
+
+    /// Sends the queued pushes, one frame per watching shard. They ride the
+    /// reply lane, so that consensus traffic cannot hold them back. A lane
+    /// that holds half its capacity keeps them for the next flush, which reads
+    /// the state again, so pushes never fill the lane that client replies
+    /// and transient denies need.
+    pub(crate) fn flush_readiness_pushes(&self) {
+        let mut idle = Vec::new();
+        {
+            let mut state = self.deferred_polls.state.borrow_mut();
+            let state = &mut *state;
+            let mut disconnected = Vec::new();
+            state.pushes.retain(|watcher, namespaces| {
+                let Some(sender) = self.senders.get(usize::from(*watcher)) else {
+                    return false;
+                };
+                let lane = sender.reply_sender();
+                let room = lane
+                    .capacity()
+                    .map_or(usize::MAX, |capacity| (capacity / 2).max(1));
+                if lane.len() >= room {
+                    return true;
+                }
+                let states: Vec<_> = namespaces
+                    .iter()
+                    .filter_map(|namespace| {
+                        let watch = state.watches.get_mut(namespace)?;
+                        let seq = watch
+                            .watchers
+                            .iter()
+                            .find(|candidate| candidate.shard == *watcher)?
+                            .seq;
+                        let served = self.served_state(*namespace, &watch.groups);
+                        watch.last.clone_from(&served);
+                        Some(WatchedState {
+                            namespace: *namespace,
+                            seq,
+                            state: served,
+                        })
+                    })
+                    .collect();
+                if states.is_empty() {
+                    return false;
+                }
+                let pushed = states.len() as u64;
+                let update = LifecycleFrame::ReadinessUpdate {
+                    from: self.id,
+                    states,
+                };
+                match lane.try_send(ShardFrame::lifecycle(update)) {
+                    Ok(()) => {
+                        self.metrics.deferred_polls.readiness_pushes.inc_by(pushed);
+                        false
+                    }
+                    Err(TrySendError::Full(_)) => true,
+                    Err(TrySendError::Disconnected(_)) => {
+                        disconnected.push(*watcher);
+                        false
+                    }
+                }
+            });
+            for watcher in disconnected {
+                let namespaces: Vec<_> = state.watches.keys().copied().collect();
+                for namespace in namespaces {
+                    if state.unwatch(namespace, |candidate| candidate.shard == watcher) {
+                        self.metrics.deferred_polls.readiness_watches.dec();
+                        if !state.partitions.contains_key(&namespace) {
+                            idle.push(namespace);
+                        }
+                    }
+                }
+            }
+        }
+        self.unwatch_partitions(idle);
+    }
+
+    /// A tick sweeps `MAINTENANCE_BUDGET` watched partitions and as many
+    /// mirrors. It installs the notifier of a watched partition again,
+    /// because a rebuilt partition starts without one, and it queues for the
+    /// shards with a parked wait the changes that no notifier reports, such
+    /// as a view change or a group owner install. It ends the watch of a
+    /// mirror that no wait needs, also for a partition without commits, which
+    /// pushes nothing.
+    pub(crate) fn sweep_readiness_watches(&self) {
+        let now = self.bus.monotonic_micros();
+        let mut unused: BTreeMap<u16, Vec<(IggyNamespace, u64)>> = BTreeMap::new();
+        let mut interested = Vec::new();
+        {
+            let mut state = self.deferred_polls.state.borrow_mut();
+            let state = &mut *state;
+            for namespace in keys_after(&state.watches, state.watch_cursor) {
+                state.watch_cursor = Some(namespace);
+                let Some(watch) = state.watches.get(&namespace) else {
+                    continue;
+                };
+                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
+                    partition.set_poll_notifier(Some(Rc::clone(&watch.notifier)));
+                }
+                if !watch.parked.is_empty()
+                    && self.served_state(namespace, &watch.groups) != watch.last
+                {
+                    for shard in &watch.parked {
+                        state.pushes.entry(*shard).or_default().insert(namespace);
+                    }
+                }
+            }
+            let mut mirrors = self.deferred_polls.mirrors.borrow_mut();
+            for namespace in keys_after(&mirrors.entries, mirrors.cursor) {
+                mirrors.cursor = Some(namespace);
+                let Some(mirror) = mirrors.entries.get(&namespace) else {
+                    continue;
+                };
+                let parked = state.partitions.contains_key(&namespace);
+                if mirror.unused(now) && !parked {
+                    unused
+                        .entry(mirror.owner)
+                        .or_default()
+                        .push((namespace, mirror.seq));
+                } else if parked && !mirror.interest {
+                    // An owner whose inbox refused the news hears it again.
+                    interested.push(namespace);
+                }
+            }
+        }
+        for (owner, watches) in unused {
+            self.unwatch_mirrors(owner, watches);
+        }
+        self.tell_mirror_owners(interested, true);
+    }
+
+    /// Ends the watches of `from` whose sequence matches.
+    pub(crate) fn unwatch_readiness(&self, from: u16, watches: Vec<(IggyNamespace, u64)>) {
+        let mut idle = Vec::new();
+        {
+            let mut state = self.deferred_polls.state.borrow_mut();
+            for (namespace, seq) in watches {
+                if state.unwatch(namespace, |watcher| {
+                    watcher.shard == from && watcher.seq == seq
+                }) {
+                    self.metrics.deferred_polls.readiness_watches.dec();
+                    if !state.partitions.contains_key(&namespace) {
+                        idle.push(namespace);
+                    }
+                }
+            }
+        }
+        self.unwatch_partitions(idle);
+    }
+
+    /// Starts or ends the pushes of commits to `from` for those of `watches`
+    /// whose sequence matches. A start pushes the state at once, because the
+    /// mirror that the parked wait read can be behind.
+    pub(crate) fn set_readiness_interest(
+        &self,
+        from: u16,
+        watches: Vec<(IggyNamespace, u64)>,
+        parked: bool,
+    ) {
+        let mut state = self.deferred_polls.state.borrow_mut();
+        let state = &mut *state;
+        for (namespace, seq) in watches {
+            let Some(watch) = state.watches.get_mut(&namespace) else {
+                continue;
+            };
+            if !watch
+                .watchers
+                .iter()
+                .any(|watcher| watcher.shard == from && watcher.seq == seq)
+            {
+                continue;
+            }
+            if parked {
+                watch.parked.insert(from);
+                state.pushes.entry(from).or_default().insert(namespace);
+            } else {
+                watch.parked.remove(&from);
+            }
+        }
+    }
+
+    /// Stores pushed states in their mirrors and marks their partitions, so
+    /// that the service loop probes the local waiters on them. A push for a
+    /// mirror that no wait needs ends its watch, and so does a push for a
+    /// partition without a mirror. A push that finds no parked wait ends the
+    /// pushes of commits.
+    pub(crate) fn apply_readiness_update(&self, from: u16, states: Vec<WatchedState>) {
+        let now = self.bus.monotonic_micros();
+        let mut unused = Vec::new();
+        let mut idle = Vec::new();
+        {
+            let state = self.deferred_polls.state.borrow();
+            let mut mirrors = self.deferred_polls.mirrors.borrow_mut();
+            let mut signals = self.deferred_polls.signals.borrow_mut();
+            for update in states {
+                let Some(mirror) = mirrors.entries.get_mut(&update.namespace) else {
+                    unused.push((update.namespace, update.seq));
+                    continue;
+                };
+                // A push from before the current watch.
+                if mirror.owner != from || mirror.seq != update.seq {
+                    continue;
+                }
+                // The state goes in also if the unwatch is refused, because
+                // the next wait can still read the mirror.
+                mirror.state = update.state;
+                mirror.pushed = now;
+                let parked = state.partitions.contains_key(&update.namespace);
+                if mirror.unused(now) && !parked {
+                    unused.push((update.namespace, update.seq));
+                    continue;
+                }
+                if !parked && mirror.interest {
+                    idle.push(update.namespace);
+                }
+                signals.mark(update.namespace);
+            }
+        }
+        self.unwatch_mirrors(from, unused);
+        self.tell_mirror_owners(idle, false);
+    }
+
+    /// Tells the owners of the mirrors of `namespaces` whose interest is not
+    /// `parked` yet that this shard now holds a parked wait on them, or no
+    /// longer does. A mirror changes its interest only if the inbox of its
+    /// owner takes the frame, so that the next sweep or push repeats a
+    /// refused one.
+    fn tell_mirror_owners(&self, namespaces: Vec<IggyNamespace>, parked: bool) {
+        if namespaces.is_empty() {
+            return;
+        }
+        let mut mirrors = self.deferred_polls.mirrors.borrow_mut();
+        let mut owners: BTreeMap<u16, Vec<(IggyNamespace, u64)>> = BTreeMap::new();
+        for namespace in namespaces {
+            if let Some(mirror) = mirrors.entries.get(&namespace)
+                && mirror.interest != parked
+            {
+                owners
+                    .entry(mirror.owner)
+                    .or_default()
+                    .push((namespace, mirror.seq));
+            }
+        }
+        for (owner, watches) in owners {
+            let Some(sender) = self.senders.get(usize::from(owner)) else {
+                continue;
+            };
+            let namespaces: Vec<_> = watches.iter().map(|(namespace, _)| *namespace).collect();
+            let interest = LifecycleFrame::ReadinessInterest {
+                from: self.id,
+                watches,
+                parked,
+            };
+            if sender.try_send(ShardFrame::lifecycle(interest)).is_ok() {
+                for namespace in namespaces {
+                    if let Some(mirror) = mirrors.entries.get_mut(&namespace) {
+                        mirror.interest = parked;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ends the watches of this shard on `watches` of `owner`. Their mirrors
+    /// go only if the inbox of `owner` takes the unwatch, so that the next
+    /// sweep or push repeats a refused one.
+    fn unwatch_mirrors(&self, owner: u16, watches: Vec<(IggyNamespace, u64)>) {
+        if watches.is_empty() {
+            return;
+        }
+        let Some(sender) = self.senders.get(usize::from(owner)) else {
+            return;
+        };
+        let namespaces: Vec<_> = watches.iter().map(|(namespace, _)| *namespace).collect();
+        let unwatch = LifecycleFrame::ReadinessUnwatch {
+            from: self.id,
+            watches,
+        };
+        if sender.try_send(ShardFrame::lifecycle(unwatch)).is_ok() {
+            let mut mirrors = self.deferred_polls.mirrors.borrow_mut();
+            for namespace in namespaces {
+                mirrors.entries.remove(&namespace);
+            }
+        }
+    }
+}
+
+/// The routing of a readiness wait on the shard of its connection.
+impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
+where
+    B: MessageBus + 'static,
+    T: ShardsTable,
+    SB: SuperblockStore,
+{
+    /// The watch that the next frame to an owner asks for.
+    pub(crate) fn next_readiness_watch(&self) -> ReadinessWatch {
+        let mut mirrors = self.deferred_polls.mirrors.borrow_mut();
+        mirrors.next_seq = mirrors.next_seq.wrapping_add(1);
+        ReadinessWatch {
+            shard: self.id,
+            seq: mirrors.next_seq,
+        }
+    }
+
+    /// Whether this shard evaluates `target` against its mirror. A mirror
+    /// that finds an error in the partition, or that lags the install of a
+    /// group owner, sends the target to the owner, so that no wait gets a
+    /// stale error from a mirror.
+    pub(crate) fn mirror_serves(
+        &self,
+        owner: u16,
+        target: &ReadinessTarget,
+        primary: bool,
+        now: u64,
+    ) -> bool {
+        let mut mirrors = self.deferred_polls.mirrors.borrow_mut();
+        let Some(mirror) = mirrors.entries.get_mut(&target.namespace) else {
+            return false;
+        };
+        mirror.used = now;
+        mirror.owner == owner
+            && mirror
+                .state
+                .as_ref()
+                .is_some_and(|state| matches!(state.check(primary, target), Ok(true)))
+    }
+
+    /// Mirrors `namespaces` under `seq`, after `owner` took the frame that
+    /// watches them. A mirror keeps its state until the owner pushes for the
+    /// new sequence.
+    pub(crate) fn mirror_partitions(
+        &self,
+        owner: u16,
+        seq: u64,
+        namespaces: &[IggyNamespace],
+        now: u64,
+    ) {
+        let mut mirrors = self.deferred_polls.mirrors.borrow_mut();
+        for namespace in namespaces {
+            let mirror = mirrors.entries.entry(*namespace).or_insert(Mirror {
+                owner,
+                seq,
+                state: None,
+                used: now,
+                pushed: now,
+                interest: false,
+            });
+            // A new owner holds no news of this shard's parked waits.
+            if mirror.owner != owner {
+                mirror.interest = false;
+            }
+            mirror.owner = owner;
+            mirror.seq = seq;
+            mirror.used = now;
+        }
     }
 }
 

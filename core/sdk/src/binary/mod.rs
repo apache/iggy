@@ -138,11 +138,18 @@ macro_rules! impl_binary_client {
                 self.driver.poll(request, context).await
             }
 
-            async fn send_wait_with_response(
+            async fn send_fetch_with_response(
                 &self,
-                request: &iggy_binary_protocol::requests::messages::WaitForMessagesRequest,
+                request: &iggy_binary_protocol::requests::messages::FetchMessagesRequest,
             ) -> Result<bytes::Bytes, iggy_common::IggyError> {
-                self.driver.wait_for_messages(request).await
+                self.driver.fetch_messages(request).await
+            }
+
+            async fn send_fetch_sections(
+                &self,
+                request: &iggy_binary_protocol::requests::messages::FetchMessagesRequest,
+            ) -> Result<Vec<iggy_common::FetchedSection>, iggy_common::IggyError> {
+                self.driver.fetch_sections(request).await
             }
 
             async fn send_poll_with_response_and_options(

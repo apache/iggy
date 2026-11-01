@@ -598,7 +598,7 @@ jobs:
     name: Warm macOS cache
     needs: detect
     if: needs.detect.outputs.rust == 'true'
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1

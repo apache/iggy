@@ -40,7 +40,7 @@ runs:
       if: inputs.task == 'lint'
       run: |
         cd foreign/swift
-        swift format lint --strict --recursive Sources Tests Package.swift
+        swift format lint --strict --recursive Sources Tests Examples Package.swift
         cd ../..
         for package in examples/swift/getting-started bdd/swift/tests; do
           swift format lint --strict --recursive --configuration foreign/swift/.swift-format "$package/Sources" "$package/Package.swift"
