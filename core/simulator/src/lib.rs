@@ -2244,6 +2244,10 @@ fn stamp_metadata_watermark(
 
 #[cfg(test)]
 mod deferred_commit_tests;
+
+#[cfg(test)]
+mod idempotent_producer_tests;
+
 #[cfg(test)]
 mod slow_replica_tests;
 

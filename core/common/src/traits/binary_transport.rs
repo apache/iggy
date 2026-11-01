@@ -378,6 +378,12 @@ pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
     /// Implemented by the transports so the value is the SDK crate's own
     /// `CARGO_PKG_VERSION` (`iggy` for Rust), not `iggy_common`'s.
     fn sdk_version(&self) -> &'static str;
+    /// The next producer id of this client's session. See
+    /// [`crate::MessageClient::next_producer_id`].
+    #[doc(hidden)]
+    fn next_producer_id(&self) -> Result<u64, IggyError> {
+        Err(IggyError::FeatureUnavailable)
+    }
 }
 
 pub use vsr_session_sealed::Sealed as VsrSessionSealed;

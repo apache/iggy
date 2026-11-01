@@ -1447,7 +1447,7 @@ mod tests {
     const REPLICA: u8 = 1;
     const REPLICAS: u8 = 3;
     const OFFSETS_MAGIC: &[u8; 4] = b"ICO1";
-    const OFFSETS_VERSION: u8 = 8;
+    const OFFSETS_VERSION: u8 = 9;
     const RETRY_CHECKPOINT_MAGIC: &[u8; 4] = b"IRP2";
 
     #[compio::test]
@@ -2482,6 +2482,8 @@ mod tests {
         protection.extend_from_slice(&0_u32.to_le_bytes());
         protection.push(0);
         protection.extend_from_slice(&0_u128.to_le_bytes());
+        protection.extend_from_slice(&0_u32.to_le_bytes());
+        protection.extend_from_slice(&0_u64.to_le_bytes());
         protection.extend_from_slice(&0_u32.to_le_bytes());
         protection
             .extend_from_slice(&consensus::state_artifact_checksum(&protection).to_le_bytes());
