@@ -193,7 +193,6 @@ struct TestConsumerGroupGetLagWithoutStoredOffsetCmd {
     messages_count: u32,
     stream_id: u32,
     topic_id: u32,
-    group_id: u32,
 }
 
 impl TestConsumerGroupGetLagWithoutStoredOffsetCmd {
@@ -205,7 +204,6 @@ impl TestConsumerGroupGetLagWithoutStoredOffsetCmd {
             messages_count: 10,
             stream_id: 0,
             topic_id: 0,
-            group_id: 0,
         }
     }
 }
@@ -230,7 +228,7 @@ impl IggyCmdTestCase for TestConsumerGroupGetLagWithoutStoredOffsetCmd {
             .unwrap();
         self.topic_id = topic.id;
 
-        let consumer_group = client
+        client
             .create_consumer_group(
                 &self.stream_id.try_into().unwrap(),
                 &self.topic_id.try_into().unwrap(),
@@ -238,7 +236,6 @@ impl IggyCmdTestCase for TestConsumerGroupGetLagWithoutStoredOffsetCmd {
             )
             .await
             .unwrap();
-        self.group_id = consumer_group.id;
 
         let mut messages = (1..=self.messages_count)
             .filter_map(|id| IggyMessage::from_str(format!("Test message {id}").as_str()).ok())
