@@ -140,14 +140,14 @@ impl SessionOwner {
 
     /// The next producer id of the current session. See [`ProducerIds`].
     pub(crate) fn next_producer_id(&self) -> Result<u64, IggyError> {
-        let session = self
-            .session()?
-            .session()
-            .ok_or(IggyError::Unauthenticated)?;
+        // Hold the session until the id is taken. A reset in between would
+        // restart the range of the old session and hand out its ids again.
+        let session = self.session()?;
+        let number = session.session().ok_or(IggyError::Unauthenticated)?;
         self.producer_ids
             .lock()
             .map_err(|_| IggyError::InvalidConfiguration)?
-            .next(session)
+            .next(number)
     }
 
     /// The caller must not replace the session through the guard, because

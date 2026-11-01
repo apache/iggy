@@ -116,6 +116,13 @@ impl StoredState {
             record: Some(record),
         })
     }
+
+    /// A copy of the plugin's bytes, without the record, for the plugin's init.
+    pub(crate) fn plugin_state(&self) -> Option<ConnectorState> {
+        self.plugin
+            .as_ref()
+            .map(|state| ConnectorState(state.0.clone()))
+    }
 }
 
 /// The state that an exactly-once source saves: the record, then the plugin's bytes.
@@ -131,13 +138,6 @@ pub(crate) fn encode(record: &ProducerRecord, plugin: Option<&[u8]>) -> Connecto
         bytes.extend_from_slice(plugin);
     }
     ConnectorState(bytes)
-}
-
-/// The plugin's bytes of a stored state, without the record of an exactly-once source.
-pub(crate) fn plugin_state(
-    state: Option<ConnectorState>,
-) -> Result<Option<ConnectorState>, SdkError> {
-    StoredState::split(state).map(|stored| stored.plugin)
 }
 
 impl ProducerRecord {
@@ -174,7 +174,9 @@ impl ProducerRecord {
 pub(crate) struct ExactlyOnce {
     key: String,
     target: ExactlyOnceTarget,
-    /// Read from the state at the first batch of this run.
+    /// The record that the state held at init. The first batch starts from it.
+    stored: Option<ProducerRecord>,
+    /// The record of this run, set at the first batch.
     record: Option<ProducerRecord>,
     /// The plugin's bytes of the last save. A save of a new record keeps them.
     plugin: Option<Vec<u8>>,
@@ -186,12 +188,15 @@ pub(crate) struct ExactlyOnce {
 }
 
 impl ExactlyOnce {
-    pub(crate) fn new(key: &str, target: ExactlyOnceTarget) -> Self {
+    /// Starts from `stored`, the state that init gave the plugin. A reload at the first batch
+    /// would take the version of another runtime's save, so its conflict would go unseen.
+    pub(crate) fn new(key: &str, target: ExactlyOnceTarget, stored: StoredState) -> Self {
         Self {
             key: key.to_owned(),
             target,
+            stored: stored.record,
             record: None,
-            plugin: None,
+            plugin: stored.plugin.map(|state| state.0),
             sent: None,
             fence: false,
         }
@@ -321,9 +326,9 @@ impl ExactlyOnce {
         Some(saved)
     }
 
-    /// The record of this run, read from the state at the first batch. A new source gets a new
-    /// producer id. A source that ran before keeps its record, so the batch that no save settled
-    /// goes again with the same section.
+    /// The record of this run, from the state at init. A new source gets a new producer id. A
+    /// source that ran before keeps its record, so the batch that no save settled goes again with
+    /// the same section.
     async fn record(
         &mut self,
         client: &IggyClient,
@@ -332,19 +337,7 @@ impl ExactlyOnce {
         if let Some(record) = self.record {
             return Ok(record);
         }
-        let stored = storage
-            .load()
-            .await
-            .and_then(StoredState::split)
-            .map_err(|error| {
-                error!(
-                    "Exactly-once source {} could not read its state: {error}",
-                    self.key
-                );
-                IggyError::Error
-            })?;
-        self.plugin = stored.plugin.map(|state| state.0);
-        let record = match stored.record {
+        let record = match self.stored {
             Some(record) if record.partition_id == self.target.partition_id => {
                 self.fence = true;
                 info!(
@@ -456,6 +449,7 @@ impl Reader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::FileStateProvider;
 
     fn record() -> ProducerRecord {
         ProducerRecord {
@@ -546,5 +540,34 @@ mod tests {
             ..record()
         };
         assert_eq!(last.next_epoch(), None);
+    }
+
+    #[tokio::test]
+    async fn given_a_save_after_init_when_the_first_batch_goes_should_start_from_the_init_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = StateStorage::File(FileStateProvider::new(
+            dir.path().join("state").to_string_lossy().to_string(),
+        ));
+        // Another runtime saved after this one read the state at init.
+        let other = ProducerRecord {
+            producer_id: 9 << 20,
+            ..record()
+        };
+        storage.save(encode(&other, Some(b"other"))).await.unwrap();
+        let init = StoredState::split(Some(encode(&record(), Some(b"mine")))).unwrap();
+        let target = ExactlyOnceTarget {
+            stream: Identifier::named("stream").unwrap(),
+            topic: Identifier::named("topic").unwrap(),
+            partition_id: record().partition_id,
+        };
+        let mut exactly_once = ExactlyOnce::new("source", target, init);
+
+        let resumed = exactly_once
+            .record(&IggyClient::default(), &storage)
+            .await
+            .unwrap();
+
+        assert_eq!(resumed, record());
+        assert_eq!(exactly_once.plugin.as_deref(), Some(&b"mine"[..]));
     }
 }

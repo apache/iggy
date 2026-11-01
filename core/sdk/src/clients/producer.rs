@@ -21,7 +21,7 @@ use crate::clients::MAX_BATCH_LENGTH;
 use crate::clients::producer_builder::SendMode;
 use crate::clients::producer_config::DirectConfig;
 use crate::clients::producer_dispatcher::ProducerDispatcher;
-use crate::clients::producer_idempotence::{Idempotence, RESENDS};
+use crate::clients::producer_idempotence::{Idempotence, RESENDS, TopicProducer};
 use crate::driver::operation_deadline;
 use bytes::Bytes;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
@@ -163,7 +163,8 @@ impl ProducerCore {
             }
 
             if let Some(idempotence) = &self.idempotence {
-                self.ensure_producer_id(idempotence).await?;
+                self.ensure_producer_id(&idempotence.topic_producer(&stream_id, &topic_id))
+                    .await?;
             }
 
             let _ = self
@@ -245,12 +246,13 @@ impl ProducerCore {
         messages: &mut [IggyMessage],
     ) -> Result<SendMessagesResponse, IggyError> {
         let explicit = Partitioning::partition_id(partition_id);
-        let lock = idempotence.sequence(stream, topic, partition_id);
+        let topic_producer = idempotence.topic_producer(stream, topic);
+        let lock = topic_producer.sequence(partition_id);
         let mut sequence = lock.lock().await;
-        self.ensure_producer_id(idempotence).await?;
+        self.ensure_producer_id(&topic_producer).await?;
         // Every resend carries this section, also after a chunk of another
         // partition moved the producer to a new epoch.
-        let mut producer = idempotence.next_producer(&mut sequence)?;
+        let mut producer = idempotence.next_producer(&topic_producer, &mut sequence)?;
         let mut uncertain = None;
         let mut attempts = 0;
         loop {
@@ -266,9 +268,9 @@ impl ProducerCore {
                 // The partition no longer holds the producer, so the chunk
                 // starts the next epoch at sequence 0.
                 Err(IggyError::ProducerUnknown) if attempts <= RESENDS => {
-                    idempotence.next_epoch(producer);
-                    self.ensure_producer_id(idempotence).await?;
-                    producer = idempotence.next_producer(&mut sequence)?;
+                    topic_producer.next_epoch(producer);
+                    self.ensure_producer_id(&topic_producer).await?;
+                    producer = idempotence.next_producer(&topic_producer, &mut sequence)?;
                 }
                 // The same producer section makes a resend safe, whether or
                 // not the first send landed.
@@ -282,7 +284,7 @@ impl ProducerCore {
                     }
                     // The chunk may have landed. The next chunk starts a new
                     // epoch, so it never follows a hole.
-                    idempotence.next_epoch(producer);
+                    topic_producer.next_epoch(producer);
                     // An earlier send of the chunk can still land, so its
                     // outcome stays unknown.
                     return Err(match uncertain {
@@ -297,10 +299,10 @@ impl ProducerCore {
     }
 
     /// Asks the client for a producer id, once and again after the last epoch.
-    async fn ensure_producer_id(&self, idempotence: &Idempotence) -> Result<(), IggyError> {
-        if idempotence.producer_id().is_none() {
+    async fn ensure_producer_id(&self, topic_producer: &TopicProducer) -> Result<(), IggyError> {
+        if topic_producer.producer_id().is_none() {
             let producer_id = super::with_client!(self, client => client.next_producer_id().await)?;
-            idempotence.set_producer_id(producer_id);
+            topic_producer.set_producer_id(producer_id);
         }
         Ok(())
     }
@@ -821,6 +823,9 @@ unsafe impl Sync for IggyProducer {}
 /// for good, the next chunk also starts a new epoch, so it never follows a hole.
 /// [`IggyError::ProducerEpochFenced`] means that another copy of this producer took over, and the
 /// producer refuses every later send.
+///
+/// Each stream and topic, as you spell them, gets its own producer id, so a topic named by number
+/// and by name never shares a sequence.
 ///
 /// The id comes from [`next_producer_id`], so the mode needs a binary client. Released builds of
 /// this SDK refuse a polled batch with a producer section. So do the Python, C++ and PHP SDKs, the
@@ -1673,6 +1678,43 @@ mod tests {
         assert_eq!(
             sent,
             [producer(id, 0, 0), producer(id, 0, 1), producer(id, 0, 2)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_topic_named_by_number_and_by_name_when_sending_idempotently_should_use_two_producer_ids()
+     {
+        let (cluster, plain) = connected_producer().await;
+        let producer_under_test =
+            idempotent_producer(plain.core.client.clone(), Partitioning::partition_id(0));
+        cluster.script(
+            &endpoint(0),
+            SEND_MESSAGES_CODE,
+            [confirmation(0), confirmation(1)],
+        );
+
+        producer_under_test.send(vec![message(b"1")]).await.unwrap();
+        producer_under_test
+            .send_to(
+                Arc::new(Identifier::named("stream").unwrap()),
+                Arc::new(Identifier::named("topic").unwrap()),
+                vec![message(b"2")],
+                None,
+            )
+            .await
+            .unwrap();
+
+        // One id for both would send sequence 0 twice, and the partition would
+        // answer the second chunk with the offset of the first.
+        let sent = sent_producers(&cluster);
+        assert_eq!(sent.len(), 2);
+        assert_ne!(sent[0].producer_id(), sent[1].producer_id());
+        assert_eq!(
+            sent,
+            [
+                producer(sent[0].producer_id(), 0, 0),
+                producer(sent[1].producer_id(), 0, 0)
+            ]
         );
     }
 

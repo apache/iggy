@@ -169,7 +169,8 @@ These limits apply:
 - If you change `partition_id`, the unsaved batch can land twice.
 - The record starts with the bytes `\0IGGYEO\x01`. Plugin state that starts with these bytes is not supported.
 
-You can turn `exactly_once` on or off for a source that has state. The runtime reads both state formats. Builds released before idempotent producers cannot poll the batches of an exactly-once source. These are the Rust SDK and every client that embeds it (the Python, C++ and PHP SDKs, the CLI, the Kafka gateway and older connector runtimes), and the Swift SDK. Upgrade every consumer of the topic first.
+You can turn `exactly_once` on or off for a source that has state. The runtime reads both state formats.
+An older runtime does not know the record: its plugin fails to read the state and starts again without its cursor. To roll back, turn `exactly_once` off first and wait until the source saves its state. Builds released before idempotent producers cannot poll the batches of an exactly-once source. These are the Rust SDK and every client that embeds it (the Python, C++ and PHP SDKs, the CLI, the Kafka gateway and older connector runtimes), and the Swift SDK. Upgrade every consumer of the topic first.
 
 ## Logging
 

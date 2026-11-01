@@ -46,7 +46,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::benchmark;
 use crate::configs::connectors::SourceConfig;
 use crate::context::RuntimeContext;
-use crate::exactly_once::{self, ExactlyOnce, ExactlyOnceTarget};
+use crate::exactly_once::{ExactlyOnce, ExactlyOnceTarget, StoredState};
 use crate::log::LOG_CALLBACK;
 use crate::manager::source::StopReport;
 use crate::metrics::SourceLabels;
@@ -185,8 +185,8 @@ pub async fn init(
 
         // An exactly-once source keeps its producer around the plugin's bytes. The plugin gets
         // only its own.
-        let state = match exactly_once::plugin_state(state) {
-            Ok(state) => state,
+        let stored = match StoredState::split(state) {
+            Ok(stored) => stored,
             Err(error) => {
                 let message = format!("Failed to read source state: {error}");
                 error!("Source: {name} ({key}) - {message}");
@@ -241,7 +241,7 @@ pub async fn init(
             &connector.container,
             &config.plugin_config.clone().unwrap_or_default(),
             plugin_id,
-            state,
+            stored.plugin_state(),
         )
         .err()
         .map(|error| error.to_string());
@@ -275,7 +275,7 @@ pub async fn init(
             PluginInstanceGuard::for_source(connector.container.clone(), plugin_id, &key)
         };
 
-        match setup_source_producer(&key, &config, iggy_client).await {
+        match setup_source_producer(&key, &config, iggy_client, stored).await {
             Ok((producer, transforms)) => {
                 let connector = source_connectors
                     .get_mut(&path)
@@ -353,10 +353,12 @@ pub(crate) fn init_source(
 }
 
 /// Returns the last stream's producer with its encoder, and the transforms.
+/// `stored` is the state that init gave the plugin. An exactly-once source starts from it.
 pub(crate) async fn setup_source_producer(
     key: &str,
     config: &SourceConfig,
     iggy_client: &IggyClient,
+    stored: StoredState,
 ) -> Result<(SourceConnectorProducer, Vec<Arc<dyn Transform>>), RuntimeError> {
     let transforms = if let Some(transforms_config) = &config.transforms {
         let loaded = transform::load(transforms_config).map_err(|error| {
@@ -437,7 +439,7 @@ pub(crate) async fn setup_source_producer(
         SourceConnectorProducer {
             encoder,
             producer,
-            exactly_once: last_target,
+            exactly_once: last_target.map(|target| ExactlyOnce::new(key, target, stored)),
         },
         transforms,
     ))
@@ -514,9 +516,8 @@ pub(crate) async fn source_forwarding_loop(
     let SourceConnectorProducer {
         encoder,
         producer,
-        exactly_once,
+        mut exactly_once,
     } = producer;
-    let mut exactly_once = exactly_once.map(|target| ExactlyOnce::new(&plugin_key, target));
     info!("Source connector with ID: {plugin_id} started.");
     if benchmark {
         info!(

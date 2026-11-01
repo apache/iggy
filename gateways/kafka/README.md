@@ -519,8 +519,8 @@ One partition, one Iggy send. Each partition answers for itself.
 | Topics | Creates none. Missing: 3. Bad name: 17. |
 | `timeout_ms` | Honored, max 20 s. The Iggy send stops by then too. Past it: 7. A send that never went out: 6. |
 | Compression | gzip, snappy, lz4. zstd from v7, else 76. |
-| Producer id | Goes to Iggy with the batch. It also picks the producer's Iggy session. See [Concurrency ceiling](#concurrency-ceiling). |
-| Producer epoch, sequence | Go to Iggy with the batch. A resend answers the first offset. A gap: 45. An older epoch: 47. A producer that the partition does not hold, above sequence 0: 59. |
+| Producer id | Picks the producer's Iggy session. See [Concurrency ceiling](#concurrency-ceiling). Goes to Iggy with the batch only with `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`. |
+| Producer epoch, sequence | With `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, go to Iggy with the batch. A resend answers the first offset. A gap: 45. An older epoch: 47. A producer that the partition does not hold, above sequence 0: 59. Off (the default): not checked, so a resend can write twice. |
 | Producer id with a negative epoch or sequence | 87. |
 | Timestamps over about 71 min apart | Clamped into one send. `kafka.ts` keeps the real one. |
 | Several batches in one partition | 87, as Kafka. |
@@ -810,9 +810,10 @@ With auto-creation off, the default, nothing changes: a missing topic is answere
   `Admin.createPartitions` report a `TimeoutException`, and the caller must retry.
 - OffsetCommit and OffsetFetch cost one Iggy call per partition, spread over the offset slots. In a
   cluster, an offset commit client can also open one connection per node for stores.
-- Order: an idempotent producer keeps its order. The partition refuses a batch that does not
-  follow with 45, and the producer sends it again. Without idempotence, set
-  `max.in.flight.requests.per.connection=1`, or `retries=0`. Otherwise a retried batch can land
+- Order: with `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, an idempotent producer keeps its order. The
+  partition refuses a batch that does not follow with 45, and the producer sends it again. With
+  the switch off (the default), every producer, the idempotent Java default too, needs
+  `max.in.flight.requests.per.connection=1` or `retries=0`. Otherwise a retried batch can land
   after later ones.
 - Order after a 7: the send can still run. A producer with a producer id waits behind it on any
   connection. A producer that is its connection does not once it reconnects, so its retry or its

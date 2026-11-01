@@ -586,7 +586,7 @@ struct SourceConnectorProducer {
     encoder: Arc<dyn StreamEncoder>,
     producer: IggyProducer,
     /// Set when the source delivers exactly once. See `exactly_once`.
-    exactly_once: Option<exactly_once::ExactlyOnceTarget>,
+    exactly_once: Option<exactly_once::ExactlyOnce>,
 }
 
 struct SourceConnectorWrapper {
