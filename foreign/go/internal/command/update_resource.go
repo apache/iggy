@@ -69,6 +69,7 @@ var optionCatalog = []optionRule{
 	{key: string(iggcon.TopicOptionMessagesRequiredToSave), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}},
 	{key: string(iggcon.TopicOptionSizeOfMessagesRequiredToSave), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}},
 	{key: string(iggcon.TopicOptionPreallocateSegments), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}},
+	{key: string(iggcon.TopicOptionReplicationFactor), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}},
 	{key: string(iggcon.StreamOptionEncryptionKey), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream}},
 	{key: "encryption_key_wrapped", scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream}, readOnly: true},
 	{key: string(iggcon.StreamOptionEncryptionKeySource), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream}, readOnly: true},

@@ -61,7 +61,7 @@ use crate::reader::PartitionReader;
 use crate::receive_message::{Checkpoint, PolledMessages, PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
 use crate::stream::StreamDetails;
-use crate::topic::TopicDetails;
+use crate::topic::{Partition, TopicDetails};
 
 #[php_module]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
@@ -109,6 +109,7 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .class::<SendMessagesResponse>()
         .class::<StreamDetails>()
         .class::<TopicDetails>()
+        .class::<Partition>()
         .class::<OptionSpec>()
         .class::<MetadataChanges>()
         .class::<MetadataChangeRecord>()

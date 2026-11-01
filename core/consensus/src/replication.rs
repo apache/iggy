@@ -341,7 +341,7 @@ where
         if !self.admit_replication(replica, op, size, send) {
             return Ok(false);
         }
-        if let Err(error) = self.message_bus().send_to_replica(replica, prepare).await {
+        if let Err(error) = self.send_to_member(replica, prepare).await {
             self.record_replication_failure(replica, op);
             return Err(error);
         }
@@ -441,8 +441,7 @@ where
             },
         );
         if self
-            .message_bus()
-            .send_to_replica(replica, probe.into_generic().into_frozen())
+            .send_to_member(replica, probe.into_generic().into_frozen())
             .await
             .is_err()
         {
