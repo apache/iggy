@@ -19,6 +19,7 @@ import type { Readable } from 'stream';
 import { type TcpNetConnectOpts } from 'node:net';
 import { type ConnectionOptions } from 'node:tls';
 import type { PartitionContext } from '../wire/vsr/header.js';
+import type { Id } from '../wire/identifier.utils.js';
 
 /**
  * TCP socket connection options.
@@ -43,7 +44,9 @@ export type CommandResponse = {
   /** Length of the response data in bytes */
   length: number,
   /** Response payload data */
-  data: Buffer
+  data: Buffer,
+  /** Local recovery metadata for uncertain sections. The wire bytes stay unchanged. */
+  fetchProgress?: { operationId: bigint, partitions: ReadonlySet<number> }
 };
 
 export type SendCommandOptions = {
@@ -101,13 +104,13 @@ export type RawClient = {
   isAuthenticated: boolean
   /** Raised by each sign-in and logout of the caller. */
   readonly lineage?: number
-  /** Uses caller credentials; any failed attempt withdraws automatic sign-in. */
+  /** Uses caller credentials. Any failed attempt withdraws automatic sign-in. */
   authenticate: (c: ClientCredentials) => Promise<boolean>
   /** Typed login delegates validation to the session owner when supported. */
   _authWithPassword?: (c: PasswordCredentials) => Promise<{ userId: number }>
   _authWithToken?: (c: TokenCredentials) => Promise<{ userId: number }>
   /**
-   * Resolves the original frozen operation; never sends it under a fresh identity.
+   * Resolves the original frozen operation. Never sends it under a fresh identity.
    * The client keeps the proved outcomes of its last `maxPendingOperations`
    * replays, also across a session reset, so a later resolve of the same
    * operation returns the same outcome without a request.
@@ -121,6 +124,12 @@ export type RawClient = {
    * client keeps the outcome that it proves.
    */
   abandonOperation?: (operationId: bigint) => void,
+  /**
+   * Groups partitions of a topic by their primary, from the cached routes,
+   * so a partition reader can keep one fetch in flight per group.
+   */
+  readinessGroups?: (streamId: Id, topicId: Id, partitions: number[], options?: SendCommandOptions) =>
+    Promise<number[][]>,
   /** Destroys the client connection */
   destroy: () => void,
   /** Tracks one facade operation across multiple command submissions. */
@@ -203,9 +212,9 @@ export type ClientCredentials = TokenCredentials | PasswordCredentials;
  * Legacy logical-client count. Replica links are managed independently.
  */
 export type PoolSizeOption = {
-  /** Minimum logical clients; normalized to one */
+  /** Minimum logical clients. Normalized to one */
   min?: number,
-  /** Maximum logical clients; only one is supported */
+  /** Maximum logical clients. Only one is supported */
   max?: number
 }
 
@@ -225,7 +234,7 @@ export type ClientConfig = {
   options: TransportOption,
   /** Authentication credentials */
   credentials: ClientCredentials,
-  /** Legacy logical-client count; does not limit replica links. */
+  /** Legacy logical-client count. Does not limit replica links. */
   poolSize?: PoolSizeOption,
   /** Automatic reconnection configuration */
   reconnect?: ReconnectOption,

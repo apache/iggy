@@ -56,8 +56,10 @@ fn consumer_config() -> IggyConsumerConfig {
         .topic_name(TOPIC_NAME)
         .consumer_name(CONSUMER_NAME)
         .consumer_kind(ConsumerKind::Consumer)
-        .auto_commit(AutoCommit::Disabled)
-        .batch_length(1)
+        .poll_options(PollOptions {
+            count: 1,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .create_stream_if_not_exists(true)
         .create_topic_if_not_exists(true)
         .partitions_count(1)

@@ -39,7 +39,7 @@ runs:
       if: inputs.task == 'lint'
       run: |
         cd foreign/swift
-        swift format lint --strict --recursive Sources Tests Package.swift
+        swift format lint --strict --recursive Sources Tests Examples Package.swift
 
     # A warning-free build is the lint gate the Swift compiler provides: the
     # SDK builds in Swift 6 language mode with strict concurrency checking.

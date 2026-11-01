@@ -517,10 +517,11 @@ fn request_timeout(timeout_ms: i32) -> Duration {
         .min(REQUEST_DEADLINE)
 }
 
-/// Sends one partition's messages, or answers 7 once the deadline has passed. Hands `held` back,
+/// Sends one partition's messages, and gives up on them at the deadline. Hands `held` back,
 /// unless the send still runs and keeps it.
 ///
-/// 7 means nothing was written, or the send may still land and a retry duplicate it.
+/// 7 means nothing was written, or the send may still land and a retry duplicate it. 6 means that
+/// it never went out.
 async fn send_by(
     bridge: &IggyBridge,
     (turn, admission): Held,
@@ -535,22 +536,31 @@ async fn send_by(
         .await;
     let sent = match sent {
         Ok(base_offset) => Ok(base_offset),
-        Err(BridgeError::Timeout) => {
+        // The SDK retries a send until the deadline, and then ends it with one of these two: not
+        // sent, or in doubt.
+        Err(
+            error @ (BridgeError::Timeout
+            | BridgeError::Iggy(
+                IggyError::TransientNotAccepted | IggyError::OperationUncertain(_),
+            )),
+        ) => {
             // The client picks `timeout_ms`, so its expiry is no signal to the operator.
             if deadline.ceiling {
                 tracing::warn!(
+                    %error,
                     kafka_topic,
                     partition_id,
                     "Produce ran past the gateway deadline"
                 );
             } else {
                 tracing::debug!(
+                    %error,
                     kafka_topic,
                     partition_id,
                     "Produce ran past the client deadline"
                 );
             }
-            Err(ERROR_REQUEST_TIMED_OUT)
+            Err(error.to_produce_error_code())
         }
         Err(error) => Err(refusal_code(kafka_topic, &error)),
     };
@@ -559,7 +569,7 @@ async fn send_by(
 
 /// The Kafka code for a bridge refusal, logged at a level that matches who can fix it.
 fn refusal_code(kafka_topic: &str, error: &BridgeError) -> i16 {
-    let code = error.to_kafka_error_code();
+    let code = error.to_produce_error_code();
     if error.is_bridge_login_rejected() {
         tracing::error!(%error, kafka_topic, "Iggy rejected the bridge's credentials");
     } else if matches!(code, ERROR_UNKNOWN_SERVER_ERROR) {

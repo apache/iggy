@@ -26,6 +26,7 @@
 use bytes::Bytes;
 use consensus::{PartitionsHandle, Status};
 use futures::FutureExt;
+use iggy_binary_protocol::Command;
 use iggy_common::PollingStrategy;
 use partitions::{PollingArgs, PollingConsumer};
 use server_common::send_messages::{BatchIntegrity, decode_batch_slice_with};
@@ -33,7 +34,7 @@ use server_common::sharding::IggyNamespace;
 
 use crate::Simulator;
 use crate::client::SimClient;
-use crate::packet::ProcessId;
+use crate::packet::{Packet, ProcessId};
 use crate::partition_repair_driver_tests::{cluster, group_state};
 
 const REPLICAS: u8 = 3;
@@ -42,8 +43,6 @@ const STEPS_PER_SEND: usize = 12;
 /// Well past `NORMAL_HEARTBEAT_TICKS` (500), so the majority elects.
 const ELECTION_STEPS: usize = 5_000;
 const SETTLE_STEPS: usize = 5_000;
-/// Long enough for a lone survivor's view changes to rotate onto the old primary.
-const REJOIN_STEPS: usize = 40_000;
 
 fn send(sim: &mut Simulator, client: &SimClient, namespace: IggyNamespace, to: u8, payload: &str) {
     let request = client.send_messages(namespace, &[Bytes::from(payload.to_owned())]);
@@ -152,13 +151,17 @@ fn given_an_old_primary_holding_an_uncommitted_prepare_when_it_rejoins_a_view_th
 
     // The new view commits different prepares at op 4 and beyond.
     for index in 0..4 {
-        send(
-            &mut sim,
+        let request = client
+            .send_messages(namespace, &[Bytes::from(format!("fresh-{index}"))])
+            .into_generic();
+        let reply = sim.await_setup_reply(
             &client,
-            namespace,
             new_primary,
-            &format!("fresh-{index}"),
+            &request,
+            iggy_binary_protocol::Operation::SendMessages,
+            "fresh view setup",
         );
+        assert_eq!(reply.header().status, 0);
     }
     let (_, _, majority_commit, _) = group_state(&sim, new_primary, namespace);
     assert!(
@@ -218,13 +221,17 @@ fn given_an_old_primary_holding_an_uncommitted_prepare_when_it_is_elected_over_a
         .expect("replicas 1 and 2 never elected a new view");
     let new_primary = primary_of(&sim, 1, namespace, new_view);
     for index in 0..4 {
-        send(
-            &mut sim,
+        let request = client
+            .send_messages(namespace, &[Bytes::from(format!("fresh-{index}"))])
+            .into_generic();
+        let reply = sim.await_setup_reply(
             &client,
-            namespace,
             new_primary,
-            &format!("fresh-{index}"),
+            &request,
+            iggy_binary_protocol::Operation::SendMessages,
+            "fresh view setup",
         );
+        assert_eq!(reply.header().status, 0);
     }
     let (_, _, majority_commit, _) = group_state(&sim, new_primary, namespace);
     assert!(
@@ -232,19 +239,17 @@ fn given_an_old_primary_holding_an_uncommitted_prepare_when_it_is_elected_over_a
         "the new view committed only through {majority_commit}"
     );
 
-    // Cut the new primary off and keep the old one apart until the survivor's view
-    // changes reach a view the old primary leads; then let those two meet.
+    // Cut the new primary off and let the old primary meet the survivor. The old
+    // primary's DoViewChange is lost on the way, so the view the survivor leads
+    // cannot start, and the next view, which the old primary leads, starts.
     let survivor = (0..REPLICAS)
         .find(|replica| *replica != OLD_PRIMARY && *replica != new_primary)
         .expect("three replicas");
     isolate(&mut sim, new_primary, true);
-    (0..REJOIN_STEPS)
-        .find(|_| {
-            sim.step();
-            let (_, view, _, _) = group_state(&sim, survivor, namespace);
-            primary_of(&sim, survivor, namespace, view) == OLD_PRIMARY
-        })
-        .expect("the survivor never reached a view the old primary leads");
+    *sim.network.link_drop_packet_fn(
+        ProcessId::Replica(OLD_PRIMARY),
+        ProcessId::Replica(survivor),
+    ) = Some(is_do_view_change);
     connect(&mut sim, OLD_PRIMARY, survivor);
     let led_view = (0..SETTLE_STEPS)
         .find_map(|_| {
@@ -256,6 +261,10 @@ fn given_an_old_primary_holding_an_uncommitted_prepare_when_it_is_elected_over_a
                 .then_some(view)
         })
         .expect("the old primary never led a view: the primary-elect path did not run");
+    *sim.network.link_drop_packet_fn(
+        ProcessId::Replica(OLD_PRIMARY),
+        ProcessId::Replica(survivor),
+    ) = None;
 
     isolate(&mut sim, new_primary, false);
     for _ in 0..SETTLE_STEPS {
@@ -308,12 +317,18 @@ fn given_a_fenced_window_wider_than_a_repair_chunk_when_the_old_primary_rejoins_
         .expect("replicas 1 and 2 never elected a new view");
     let new_primary = primary_of(&sim, 1, namespace, new_view);
     for index in 0..12 {
-        send(
-            &mut sim,
+        let request = client.send_messages(namespace, &[Bytes::from(format!("fresh-{index}"))]);
+        let reply = sim.await_setup_reply(
             &client,
-            namespace,
             new_primary,
-            &format!("fresh-{index}"),
+            &request.into_generic(),
+            iggy_binary_protocol::Operation::SendMessages,
+            "fresh rejoin setup",
+        );
+        assert_eq!(
+            reply.header().status,
+            0,
+            "fresh operation {index} must commit before rejoining"
         );
     }
     let (_, _, majority_commit, _) = group_state(&sim, new_primary, namespace);
@@ -395,13 +410,17 @@ fn cut_to_catch_up(seed: u64) -> Option<usize> {
         .expect("replicas 1 and 2 never elected a new view");
     let new_primary = primary_of(&sim, 1, namespace, new_view);
     for index in 0..6 {
-        send(
-            &mut sim,
+        let request = client
+            .send_messages(namespace, &[Bytes::from(format!("fresh-{index}"))])
+            .into_generic();
+        let reply = sim.await_setup_reply(
             &client,
-            namespace,
             new_primary,
-            &format!("fresh-{index}"),
+            &request,
+            iggy_binary_protocol::Operation::SendMessages,
+            "fresh view setup",
         );
+        assert_eq!(reply.header().status, 0);
     }
     let (_, _, majority_commit, _) = group_state(&sim, new_primary, namespace);
 
@@ -495,6 +514,10 @@ fn primary_of(sim: &Simulator, replica: u8, namespace: IggyNamespace, view: u32)
         .expect("replica hosts the group")
         .consensus()
         .primary_index(view)
+}
+
+fn is_do_view_change(packet: &Packet) -> bool {
+    packet.message.header().command == Command::DoViewChange
 }
 
 fn connect(sim: &mut Simulator, left: u8, right: u8) {

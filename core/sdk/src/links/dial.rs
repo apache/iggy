@@ -75,6 +75,16 @@ impl Dialer {
                     .unwrap_or(usize::MAX)
                     .saturating_sub(iggy_binary_protocol::HEADER_SIZE),
             ),
+            // The server sends each reply as one frame of one message, and a reply above
+            // either cap fails the whole link.
+            Self::WebSocket(config) => [
+                config.ws_config.max_frame_size,
+                config.ws_config.max_message_size,
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(|size| size.saturating_sub(iggy_binary_protocol::HEADER_SIZE)),
             _ => None,
         }
     }
@@ -359,6 +369,8 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use crate::links::test_support::{LOCALHOST, SERVER_NAME, quic_server};
+    use iggy_binary_protocol::{HEADER_SIZE, MAX_RECORD_REPLY_SIZE};
+    use iggy_common::WebSocketConfig;
     use rustls::RootCertStore;
     use tokio::net::TcpListener;
 
@@ -497,6 +509,49 @@ mod tests {
             Dialer::Tcp(Arc::new(TcpClientConfig::default())).reply_body_limit(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn given_default_configs_when_limiting_replies_should_hold_the_largest_record() {
+        for dialer in [
+            Dialer::WebSocket(Arc::new(WebSocketClientConfig::default())),
+            quic_dialer(QuicClientConfig::default()),
+        ] {
+            assert_eq!(
+                dialer.reply_body_limit(),
+                Some(MAX_RECORD_REPLY_SIZE - HEADER_SIZE),
+                "{:?}",
+                dialer.protocol()
+            );
+        }
+    }
+
+    #[test]
+    fn given_websocket_frame_and_message_caps_when_limiting_replies_should_take_the_smaller_less_the_header()
+     {
+        const FRAME: usize = 1 << 20;
+        const MESSAGE: usize = 4 << 20;
+        for (max_frame_size, max_message_size, limit) in [
+            (Some(FRAME), Some(MESSAGE), Some(FRAME - HEADER_SIZE)),
+            (Some(MESSAGE), Some(FRAME), Some(FRAME - HEADER_SIZE)),
+            (None, Some(MESSAGE), Some(MESSAGE - HEADER_SIZE)),
+            (None, None, None),
+        ] {
+            let dialer = Dialer::WebSocket(Arc::new(WebSocketClientConfig {
+                ws_config: WebSocketConfig {
+                    max_frame_size,
+                    max_message_size,
+                    ..WebSocketConfig::default()
+                },
+                ..WebSocketClientConfig::default()
+            }));
+
+            assert_eq!(
+                dialer.reply_body_limit(),
+                limit,
+                "frame: {max_frame_size:?}, message: {max_message_size:?}"
+            );
+        }
     }
 
     #[test]

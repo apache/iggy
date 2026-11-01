@@ -86,8 +86,17 @@ const MAX_PROTOCOL_TYPE_BYTES: usize = 255;
 /// to leave this much room or the id itself will not fit a legacy string.
 const MEMBER_ID_SUFFIX_BYTES: usize = 1 + 36;
 
-/// Prefix for a generated member id when the client sent no `group_instance_id`. Kafka uses the
-/// header's `client_id`, which handlers do not receive.
+/// Cap on the `client_id` that a member keeps.
+///
+/// Kafka sets none, but a header can carry 32 KiB, and every member keeps the id twice: as its
+/// client id, and as the start of its member id. Stock clients send well under 1 KiB, a Kafka
+/// Streams thread included.
+pub const MAX_CLIENT_ID_BYTES: usize = 1024;
+
+const _: () = assert!(MAX_CLIENT_ID_BYTES + MEMBER_ID_SUFFIX_BYTES <= MAX_LEGACY_STRING_BYTES);
+
+/// Prefix for a generated member id when the client sent no `group_instance_id` and no
+/// `client_id`.
 const DEFAULT_MEMBER_PREFIX: &str = "member";
 
 /// Floor on how long a parked waiter sleeps. Every deadline a tick leaves behind is strictly in
@@ -132,6 +141,9 @@ struct Departures {
 
 pub struct Member {
     group_instance_id: Option<StrBytes>,
+    /// The `client_id` and `client_host` of the connection that the member last joined through.
+    client_id: StrBytes,
+    client_host: StrBytes,
     session_timeout: Duration,
     rebalance_timeout: Duration,
     protocols: Vec<(StrBytes, Bytes)>,
@@ -164,6 +176,8 @@ impl Member {
     fn new(request: &JoinRequest, now: Instant, max_rebalance_timeout: Duration) -> Self {
         Self {
             group_instance_id: request.group_instance_id.as_ref().map(owned_str),
+            client_id: request.client_id.clone(),
+            client_host: request.client_host.clone(),
             session_timeout: request.session_timeout,
             rebalance_timeout: request.rebalance_timeout.min(max_rebalance_timeout),
             protocols: retained_protocols(&request.protocols),
@@ -178,6 +192,7 @@ impl Member {
     /// Keeps `group_instance_id`: a rejoin that names one was already checked against it, and one
     /// that names none does not make a static member dynamic, as in Kafka.
     fn rejoin(&mut self, request: &JoinRequest, now: Instant, max_rebalance_timeout: Duration) {
+        self.note_client(request);
         self.session_timeout = request.session_timeout;
         self.rebalance_timeout = request.rebalance_timeout.min(max_rebalance_timeout);
         self.protocols = retained_protocols(&request.protocols);
@@ -187,6 +202,11 @@ impl Member {
         // for the next generation's answer, while one still parked on the previous generation
         // must keep the snapshot it is waiting to collect.
         self.join_response = None;
+    }
+
+    fn note_client(&mut self, request: &JoinRequest) {
+        self.client_id.clone_from(&request.client_id);
+        self.client_host.clone_from(&request.client_host);
     }
 
     fn roster_bytes(&self, member_id: &StrBytes) -> usize {
@@ -238,9 +258,8 @@ impl Member {
                 self.group_instance_id.as_ref().map(|id| id.len()),
             );
         }
-        // `client_id` and `client_host` stay empty: the coordinator does not retain them.
-        total += kafka_string_len(flexible, 0);
-        total += kafka_string_len(flexible, 0);
+        total += kafka_string_len(flexible, self.client_id.len());
+        total += kafka_string_len(flexible, self.client_host.len());
         let metadata_len = if include_blobs {
             protocol_name.map_or(0, |name| self.metadata_len(name))
         } else {
@@ -849,6 +868,8 @@ impl GroupState {
             .map(|(member_id, member)| MemberDescription {
                 member_id: member_id.clone(),
                 group_instance_id: member.group_instance_id.clone(),
+                client_id: member.client_id.clone(),
+                client_host: member.client_host.clone(),
                 metadata: if summary {
                     Bytes::new()
                 } else {
@@ -1205,7 +1226,7 @@ fn join_new_member(
         );
         return reject(groups, ERROR_COORDINATOR_NOT_AVAILABLE);
     }
-    let member_id = generate_member_id(request.group_instance_id.as_ref());
+    let member_id = generate_member_id(request);
     // Checked before an id is handed out too, so a member that could never be admitted is
     // not sent round a `MEMBER_ID_REQUIRED` trip first.
     if group.roster_overflows(config, &member_id, request) {
@@ -1258,6 +1279,7 @@ fn rejoin_step(
         }
         Phase::Stable | Phase::CompletingRebalance => {
             if let Some(member) = group.members.get_mut(&request.member_id) {
+                member.note_client(request);
                 member.session_timeout = request.session_timeout;
                 member.session_deadline = now + request.session_timeout;
                 // Answering without consuming the snapshot would leave an uncollected one on a
@@ -1957,7 +1979,7 @@ fn replace_static(
     request: &JoinRequest,
     now: Instant,
 ) -> Step<JoinResult> {
-    let new_member_id = generate_member_id(request.group_instance_id.as_ref());
+    let new_member_id = generate_member_id(request);
     if group.roster_overflows_replacing(config, old_member_id, &new_member_id, request) {
         return Step::Respond(JoinResult::error(
             ERROR_GROUP_MAX_SIZE_REACHED,
@@ -2032,12 +2054,15 @@ fn park_or_respond(group: &mut GroupState, member_id: &StrBytes, now: Instant) -
     }
 }
 
-/// Kafka shapes a member id as `clientId-UUID`. Handlers never see the header's `client_id`, so
-/// the static-membership id stands in for it when present. The UUID matters on its own: a
-/// counter would repeat across a gateway restart and turn a stale client's `UNKNOWN_MEMBER_ID`
-/// into a silent identity theft.
-fn generate_member_id(group_instance_id: Option<&StrBytes>) -> StrBytes {
-    let prefix = group_instance_id.map_or(DEFAULT_MEMBER_PREFIX, StrBytes::as_str);
+/// Kafka shapes a member id as `groupInstanceId-UUID` for a static member, and as `clientId-UUID`
+/// for any other. The UUID matters on its own: a counter would repeat across a gateway restart and
+/// turn a stale client's `UNKNOWN_MEMBER_ID` into a silent identity theft.
+fn generate_member_id(request: &JoinRequest) -> StrBytes {
+    let prefix = match &request.group_instance_id {
+        Some(instance_id) => instance_id.as_str(),
+        None if !request.client_id.is_empty() => request.client_id.as_str(),
+        None => DEFAULT_MEMBER_PREFIX,
+    };
     StrBytes::from_string(format!("{prefix}-{}", Uuid::new_v4()))
 }
 
@@ -2196,6 +2221,8 @@ mod tests {
             rebalance_timeout: Duration::from_secs(rebalance_secs),
             member_id: StrBytes::from_string(member_id.to_owned()),
             group_instance_id: None,
+            client_id: StrBytes::new(),
+            client_host: StrBytes::new(),
             protocol_type: StrBytes::from_static_str("consumer"),
             protocols: protocols
                 .iter()
@@ -2564,8 +2591,8 @@ mod tests {
     }
 
     /// The frame check has to match what `DescribeGroups` actually encodes, header included.
-    /// Fields are past the compact-varint boundary and the member has an instance id, which v4+
-    /// writes and v0-v3 does not.
+    /// Fields, the client id among them, are past the compact-varint boundary, and the member has
+    /// an instance id, which v4+ writes and v0-v3 does not.
     #[test]
     fn given_a_described_group_when_pricing_the_frame_should_match_the_encoder() {
         let config = config();
@@ -2669,6 +2696,69 @@ mod tests {
         assert!(group.members.is_empty());
         assert!(group.protocol_name.is_none());
         assert!(groups.contains_key(&group_id()));
+    }
+
+    /// `kafka-consumer-groups --describe --members` shows these two columns. A member that
+    /// rejoins through another connection is shown there.
+    #[test]
+    fn given_a_member_when_describing_should_report_the_client_of_its_last_join() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let mut request = request("", &["range"]);
+        request.client_id = StrBytes::from_static_str("consumer-g-1");
+        request.client_host = StrBytes::from_static_str("/192.0.2.10");
+        let Step::Respond(joined) = join_step(&mut groups, &config, &request, now) else {
+            panic!("an immediate join must answer");
+        };
+        assert_eq!(joined.error, ERROR_NONE);
+        assert_eq!(
+            described_client(&mut groups, now),
+            ("consumer-g-1".to_owned(), "/192.0.2.10".to_owned())
+        );
+
+        request.member_id = joined.member_id;
+        request.client_host = StrBytes::from_static_str("/192.0.2.11");
+        join_step(&mut groups, &config, &request, now);
+        assert_eq!(
+            described_client(&mut groups, now),
+            ("consumer-g-1".to_owned(), "/192.0.2.11".to_owned())
+        );
+    }
+
+    /// Kafka starts a member id with the instance id of a static member, and with the client id
+    /// of any other.
+    #[test]
+    fn given_a_client_id_when_joining_should_start_the_member_id_with_it() {
+        let config = config();
+        let now = Instant::now();
+        let member_id = |request: &JoinRequest| {
+            let Step::Respond(joined) = join_step(&mut Groups::new(), &config, request, now) else {
+                panic!("an immediate join must answer");
+            };
+            assert_eq!(joined.error, ERROR_NONE);
+            joined.member_id.as_str().to_owned()
+        };
+        let mut request = request("", &["range"]);
+        assert!(member_id(&request).starts_with("member-"));
+
+        request.client_id = StrBytes::from_static_str("consumer-g-1");
+        assert!(member_id(&request).starts_with("consumer-g-1-"));
+
+        request.group_instance_id = Some(StrBytes::from_static_str("static-1"));
+        assert!(member_id(&request).starts_with("static-1-"));
+    }
+
+    /// The client id and host of the only member of the group, as `DescribeGroups` reports them.
+    fn described_client(groups: &mut Groups, now: Instant) -> (String, String) {
+        let described = describe_groups(groups, &[group_id()], 6, usize::MAX, now);
+        let group = described[0].as_ref().unwrap();
+        assert_eq!(group.members.len(), 1);
+        let member = &group.members[0];
+        (
+            member.client_id.as_str().to_owned(),
+            member.client_host.as_str().to_owned(),
+        )
     }
 
     /// A `ConsumerProtocolSubscription` as a consumer sends it: its version, then its fields.
@@ -2954,6 +3044,8 @@ mod tests {
         let wide = "x".repeat(130);
         let mut request = request("", &["range"]);
         request.group_instance_id = Some(StrBytes::from_string(wide.clone()));
+        request.client_id = StrBytes::from_string(wide.clone());
+        request.client_host = StrBytes::from_static_str("/192.0.2.10");
         request.protocols = vec![(StrBytes::from_string(wide), Bytes::from(vec![b'm'; 130]))];
         let step = join_step(groups, config, &request, now);
         let Step::Respond(result) = step else {

@@ -63,6 +63,11 @@ let package = Package(
             name: "IggyE2ETests",
             dependencies: ["Iggy"]
         ),
+        .executableTarget(
+            name: "reader-example",
+            dependencies: ["Iggy"],
+            path: "Examples/Reader"
+        ),
     ],
     swiftLanguageModes: [.v6]
 )

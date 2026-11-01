@@ -232,6 +232,26 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    authorize_served_topic_read(shard, attachment, namespace, rule)?;
+    authorize_served_incarnation(shard, namespace, incarnation)
+}
+
+/// The session and permission half of [`authorize_served_partition_read`]. A
+/// fetch runs it once, because all of its partitions share one stream and
+/// topic.
+pub(in crate::dispatch) fn authorize_served_topic_read<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    attachment: Option<&SessionAttachment>,
+    namespace: IggyNamespace,
+    rule: impl FnOnce(&Permissioner, u32, usize, usize) -> Result<(), IggyError>,
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
     authorize_attached(attachment, || {
         authorize_uid(
             shard,
@@ -244,19 +264,35 @@ where
                     namespace.topic_id(),
                 )
             },
-        )?;
-        let current = shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .created_revision_for_namespace(namespace);
-        if current == Some(incarnation) {
-            Ok(())
-        } else {
-            Err(IggyError::TransientNotAccepted)
-        }
+        )
     })
+}
+
+/// The history half of [`authorize_served_partition_read`], which a fetch
+/// runs for each of its sections.
+pub(in crate::dispatch) fn authorize_served_incarnation<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+    incarnation: u64,
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let current = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .created_revision_for_namespace(namespace);
+    if current == Some(incarnation) {
+        Ok(())
+    } else {
+        Err(IggyError::TransientNotAccepted)
+    }
 }
 
 /// Authorize a non-replicated read routed through `build_non_replicated_response`
@@ -462,17 +498,18 @@ mod tests {
     use crate::dispatch::test_support::{FIRST_BOOT, SpyBus, TestShard, test_shard};
     use iggy_binary_protocol::COMMAND_TABLE;
     use iggy_binary_protocol::codes::{
-        BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, CREATE_STREAM_CODE, GET_CLIENT_CODE,
-        GET_CLIENTS_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_METADATA_CHANGES_CODE,
-        GET_PARTITION_ROUTE_CODE, GET_SNAPSHOT_FILE_CODE, LOGIN_REGISTER_CODE,
-        LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
-        LOGOUT_USER_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE,
-        SYNC_CONSUMER_GROUP_CODE, WAIT_FOR_MESSAGES_CODE,
+        BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, CREATE_STREAM_CODE, FETCH_MESSAGES_CODE,
+        GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE,
+        GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE, GET_SNAPSHOT_FILE_CODE,
+        LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE,
+        LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, LOGOUT_USER_CODE, PING_CODE, POLL_MESSAGES_CODE,
+        POLL_MESSAGES_DEFERRED_CODE, SYNC_CONSUMER_GROUP_CODE,
     };
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 
     /// A code no `COMMAND_TABLE` entry claims.
     const UNKNOWN_CODE: u32 = 9999;
+    const RETIRED_WAIT_FOR_MESSAGES_CODE: u32 = 107;
 
     /// The gate's answer as the wire sees it: status 0 allows, anything else
     /// is the deny code stamped into `ReplyHeader.status`.
@@ -542,7 +579,7 @@ mod tests {
                 invalid_command,
                 invalid_command,
             ),
-            (WAIT_FOR_MESSAGES_CODE, invalid_command, invalid_command),
+            (FETCH_MESSAGES_CODE, invalid_command, invalid_command),
             (
                 CANCEL_DEFERRED_REQUEST_CODE,
                 invalid_command,
@@ -605,18 +642,20 @@ mod tests {
     }
 
     #[test]
-    fn unknown_code_is_refused_as_invalid_command() {
-        assert!(
-            lookup_command(UNKNOWN_CODE).is_none(),
-            "test needs a code absent from COMMAND_TABLE"
-        );
+    fn unknown_or_retired_code_is_refused_as_invalid_command() {
         let shard = gate_shard();
         let invalid_command = Verdict::Deny(IggyError::InvalidCommand.as_code());
-        assert_eq!(gate(&shard, UNKNOWN_CODE, None), invalid_command);
-        assert_eq!(
-            gate(&shard, UNKNOWN_CODE, Some(DEFAULT_ROOT_USER_ID)),
-            invalid_command
-        );
+        for code in [UNKNOWN_CODE, RETIRED_WAIT_FOR_MESSAGES_CODE] {
+            assert!(
+                lookup_command(code).is_none(),
+                "test needs a code absent from COMMAND_TABLE"
+            );
+            assert_eq!(gate(&shard, code, None), invalid_command);
+            assert_eq!(
+                gate(&shard, code, Some(DEFAULT_ROOT_USER_ID)),
+                invalid_command
+            );
+        }
     }
 
     #[test]

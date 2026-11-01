@@ -25,7 +25,8 @@ use crate::connectors::fixtures::{
 };
 use iggy::prelude::IggyClient;
 use iggy_common::MessageClient;
-use iggy_common::{Consumer, Identifier, PollingStrategy};
+use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
+use iggy_common::{CommitPolicy, Consumer, Identifier, PollOptions, PollingStrategy};
 use iggy_connector_sdk::api::ConnectorStatus;
 use integration::harness::seeds;
 use integration::iggy_harness;
@@ -73,11 +74,14 @@ async fn poll_cdc_records_with_attempts(
             .poll_messages(
                 stream_id,
                 topic_id,
-                None,
+                DEFAULT_PARTITION_ID,
                 &Consumer::new(consumer_id.clone()),
                 &PollingStrategy::next(),
-                10,
-                true,
+                PollOptions {
+                    count: 10,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
             )
             .await
         {

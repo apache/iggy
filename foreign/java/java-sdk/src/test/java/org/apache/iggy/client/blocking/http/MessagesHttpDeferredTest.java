@@ -26,12 +26,15 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyException;
 import org.apache.iggy.exception.IggyMalformedResponseException;
+import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.CommitPolicy;
 import org.apache.iggy.message.DeferredPollOptions;
+import org.apache.iggy.message.PollOptions;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.partition.PartitionContext;
@@ -64,6 +67,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 /**
  * The HTTP deferred poll against a peer that can misbehave: the route and its
@@ -176,7 +180,8 @@ class MessagesHttpDeferredTest {
     void shouldDiscardARefusedBodyInsteadOfWaitingForTheRest() throws Exception {
         var release = new CountDownLatch(1);
         var peer = new FakePeer(exchange -> {
-            exchange.sendResponseHeaders(200, 1024 * 1024);
+            exchange.sendResponseHeaders(
+                    200, Math.multiplyExact(DeferredPollOptions.MAX_RECORD_POLL_REPLY_SIZE, 16L) + 1);
             OutputStream body = exchange.getResponseBody();
             body.write(new byte[8 * 1024]);
             body.flush();
@@ -232,6 +237,45 @@ class MessagesHttpDeferredTest {
                         .isLessThan(options.requestTimeout().plus(DEADLINE_SLACK));
             } finally {
                 release.countDown();
+            }
+        }
+    }
+
+    @Test
+    void shouldEndAPollWaitingForItsHeadersWhenTheCallerIsInterrupted() throws Exception {
+        var arrived = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var peer = new FakePeer(exchange -> {
+            arrived.countDown();
+            hold(release, STALL);
+        });
+        Thread caller = Thread.currentThread();
+        var interrupter = Executors.newSingleThreadExecutor();
+        try (var server = peer.start();
+                var client = client(peer)) {
+            try {
+                interrupter.execute(() -> {
+                    hold(arrived, STALL);
+                    caller.interrupt();
+                });
+                var options = DeferredPollOptions.defaults()
+                        .withMaxWait(Duration.ofSeconds(10))
+                        .withRequestTimeout(Duration.ofSeconds(11));
+                long startNanos = System.nanoTime();
+
+                assertThatThrownBy(() -> poll(client, Consumer.of(3L), options))
+                        .isInstanceOf(IggyServerException.class)
+                        .extracting(error -> ((IggyServerException) error).getErrorCode())
+                        .isEqualTo(IggyErrorCode.TRANSIENT_NOT_COMMITTED);
+
+                assertThat(Duration.ofNanos(System.nanoTime() - startNanos))
+                        .as("an interrupt ends the wait long before the request timeout")
+                        .isLessThan(Duration.ofSeconds(2));
+                assertThat(caller.isInterrupted()).isTrue();
+            } finally {
+                Thread.interrupted();
+                release.countDown();
+                interrupter.shutdownNow();
             }
         }
     }
@@ -336,7 +380,7 @@ class MessagesHttpDeferredTest {
     }
 
     @Test
-    void shouldReportALostAutoCommitReplyAsNotCommittedWithoutRetrying() throws Exception {
+    void shouldReportALostCommittingReplyAsUncertainProgressWithoutRetrying() throws Exception {
         var peer = new FakePeer(HttpExchange::close);
         try (var server = peer.start();
                 var client = client(peer)) {
@@ -353,9 +397,172 @@ class MessagesHttpDeferredTest {
                     .isInstanceOf(IggyServerException.class)
                     .hasCauseInstanceOf(IOException.class)
                     .extracting(error -> ((IggyServerException) error).getErrorCode())
-                    .isEqualTo(IggyErrorCode.TRANSIENT_NOT_COMMITTED);
-            assertThat(peer.queries).hasSize(1);
+                    .isEqualTo(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN);
+            assertThat(peer.methods).containsExactly("POST");
             assertThat(peer.queries.get(0).get("auto_commit")).isEqualTo("true");
+        }
+    }
+
+    /**
+     * The server can have stored the offset of a committing poll whose answer is lost, so its partition takes no
+     * committing poll and no offset store on this client until the caller abandons that poll.
+     */
+    @Test
+    void shouldBlockThePartitionOfALostCommittingPollUntilItIsAbandoned() throws Exception {
+        var answers = new AtomicInteger();
+        var peer = new FakePeer(exchange -> {
+            if (answers.getAndIncrement() > 0) {
+                respond(exchange, 200, EMPTY_POLL);
+            }
+        });
+        try (var server = peer.start();
+                var client = client(peer)) {
+            var lost = (IggyOperationException) catchThrowable(() -> committingPoll(client));
+            assertThat(lost.getErrorCode()).isEqualTo(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN);
+
+            assertBlockedBy(catchThrowable(() -> committingPoll(client)), lost.getOperationId());
+            assertBlockedBy(
+                    catchThrowable(() -> client.consumerOffsets()
+                            .storeConsumerOffset(
+                                    StreamId.of(1L), TopicId.of(1L), Optional.of(0L), Consumer.of(3L), BigInteger.ONE)),
+                    lost.getOperationId());
+            assertThat(peer.methods).containsExactly("POST");
+            client.abandonOperation(lost.getOperationId());
+
+            assertThat(committingPoll(client).messages()).isEmpty();
+            assertThat(peer.methods).containsExactly("POST", "POST");
+        }
+    }
+
+    /**
+     * Progress polls of one partition take turns, so a committing poll that starts while another one of its partition
+     * waits for its answer goes out only after it, and then meets the block that the lost answer left.
+     */
+    @Test
+    void shouldLetASecondCommittingPollWaitForTheFirstAndMeetItsBlock() throws Exception {
+        var firstArrived = new CountDownLatch(1);
+        var secondArrived = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var requests = new AtomicInteger();
+        var peer = new FakePeer(exchange -> {
+            if (requests.getAndIncrement() == 0) {
+                firstArrived.countDown();
+                hold(release, STALL);
+                return;
+            }
+            secondArrived.countDown();
+            respond(exchange, 200, EMPTY_POLL);
+        });
+        var callers = Executors.newFixedThreadPool(2);
+        try (var server = peer.start(Executors.newCachedThreadPool());
+                var client = client(peer)) {
+            Future<Throwable> first = callers.submit(() -> catchThrowable(() -> committingPoll(client)));
+            assertThat(firstArrived.await(STALL.toMillis(), TimeUnit.MILLISECONDS))
+                    .isTrue();
+            Future<Throwable> second = callers.submit(() -> catchThrowable(() -> committingPoll(client)));
+            // The second poll gets the time to go out, which only a missing lane lets it do.
+            assertThat(secondArrived.await(DEADLINE_SLACK.toMillis(), TimeUnit.MILLISECONDS))
+                    .isFalse();
+            release.countDown();
+
+            var lost = (IggyOperationException) first.get(STALL.toMillis(), TimeUnit.MILLISECONDS);
+            assertThat(lost.getErrorCode()).isEqualTo(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN);
+            assertBlockedBy(second.get(STALL.toMillis(), TimeUnit.MILLISECONDS), lost.getOperationId());
+            assertThat(requests).hasValue(1);
+        } finally {
+            release.countDown();
+            callers.shutdownNow();
+        }
+    }
+
+    /**
+     * A block covers its partition for every consumer of the client, and in any spelling of the stream and topic for
+     * a call that carries the context of the same incarnation.
+     */
+    @Test
+    void shouldBlockAnotherConsumerAndAnotherSpellingOfTheSameIncarnation() throws Exception {
+        var peer = new FakePeer(exchange -> {});
+        var context = new PartitionContext(BigInteger.valueOf(7), BigInteger.ONE, BigInteger.ONE);
+        try (var server = peer.start();
+                var client = client(peer)) {
+            var lost = (IggyOperationException) catchThrowable(() -> client.messages()
+                    .pollMessagesDeferred(
+                            StreamId.of(1L),
+                            TopicId.of(1L),
+                            Optional.of(0L),
+                            Consumer.of(3L),
+                            PollingStrategy.next().withContext(context),
+                            10L,
+                            true,
+                            DeferredPollOptions.defaults()));
+            assertThat(lost.getErrorCode()).isEqualTo(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN);
+
+            assertBlockedBy(
+                    catchThrowable(() -> client.consumerOffsets()
+                            .storeConsumerOffset(
+                                    StreamId.of(1L), TopicId.of(1L), Optional.of(0L), Consumer.of(4L), BigInteger.ONE)),
+                    lost.getOperationId());
+            assertBlockedBy(
+                    catchThrowable(() -> client.consumerOffsets()
+                            .storeConsumerOffset(
+                                    StreamId.of("orders"),
+                                    TopicId.of("events"),
+                                    0L,
+                                    Consumer.of(4L),
+                                    BigInteger.ONE,
+                                    context)),
+                    lost.getOperationId());
+            assertThat(peer.methods).containsExactly("POST");
+        }
+    }
+
+    @ParameterizedTest(name = "on read={0}")
+    @ValueSource(booleans = {false, true})
+    void shouldSendAPollOfOnePartitionWithItsOptionsAndPostItWhenItStores(boolean onRead) throws Exception {
+        var peer = new FakePeer(exchange -> respond(exchange, 200, EMPTY_POLL));
+        try (var server = peer.start();
+                var client = client(peer)) {
+            var options = PollOptions.waitFor(Duration.ofSeconds(2))
+                    .withCount(7)
+                    .withMinCount(2)
+                    .withMaxBytes(4096)
+                    .withCommit(onRead ? CommitPolicy.onRead() : CommitPolicy.manual());
+
+            client.messages()
+                    .pollMessages(
+                            StreamId.of(1L), TopicId.of(1L), 0L, Consumer.of(3L), PollingStrategy.next(), options);
+
+            assertThat(peer.methods).containsExactly(onRead ? "POST" : "GET");
+            assertThat(peer.paths).containsExactly("/streams/1/topics/1/messages/deferred");
+            Map<String, String> query = peer.queries.get(0);
+            assertThat(query.get("auto_commit")).isEqualTo(Boolean.toString(onRead));
+            assertThat(query.get("count")).isEqualTo("7");
+            assertThat(query.get("min_count")).isEqualTo("2");
+            assertThat(query.get("max_bytes")).isEqualTo("4096");
+            assertThat(Long.parseLong(query.get("request_timeout_us")))
+                    .isGreaterThan(Long.parseLong(query.get("wait_us")) + 9_000_000L);
+        }
+    }
+
+    @Test
+    void shouldRefuseAnAutomaticCommitOfOnePollWithoutReachingTheServer() throws Exception {
+        var peer = new FakePeer(exchange -> respond(exchange, 200, EMPTY_POLL));
+        try (var server = peer.start();
+                var client = client(peer)) {
+            var options = PollOptions.defaults().withCommit(CommitPolicy.auto());
+
+            assertThatThrownBy(() -> client.messages()
+                            .pollMessages(
+                                    StreamId.of(1L),
+                                    TopicId.of(1L),
+                                    0L,
+                                    Consumer.of(3L),
+                                    PollingStrategy.next(),
+                                    options))
+                    .isInstanceOf(IggyServerException.class)
+                    .extracting(error -> ((IggyServerException) error).getErrorCode())
+                    .isEqualTo(IggyErrorCode.INVALID_CONFIGURATION);
+            assertThat(peer.paths).isEmpty();
         }
     }
 
@@ -437,18 +644,11 @@ class MessagesHttpDeferredTest {
         }
     }
 
+    /** A first message larger than the byte limit comes alone, so the bound holds one of the largest size. */
     @Test
     void shouldRefuseABodyLargerThanTheDeclaredBound() throws Exception {
-        var peer = new FakePeer(exchange -> {
-            // Chunked, so the bound has to hold while the body is read.
-            exchange.sendResponseHeaders(200, 0);
-            try (OutputStream body = exchange.getResponseBody()) {
-                byte[] chunk = new byte[8 * 1024];
-                for (int written = 0; written < 1024 * 1024; written += chunk.length) {
-                    body.write(chunk);
-                }
-            }
-        });
+        long beyondBound = Math.multiplyExact(DeferredPollOptions.MAX_RECORD_POLL_REPLY_SIZE, 16L) + 1;
+        var peer = new FakePeer(exchange -> exchange.sendResponseHeaders(200, beyondBound));
         try (var server = peer.start();
                 var client = client(peer)) {
             var options = DeferredPollOptions.defaults().withMaxBytes(1024);
@@ -457,6 +657,27 @@ class MessagesHttpDeferredTest {
                     .isInstanceOf(IggyException.class)
                     .hasMessageContaining("bytes");
         }
+    }
+
+    private static PolledMessages committingPoll(IggyHttpClient client) {
+        return client.messages()
+                .pollMessagesDeferred(
+                        StreamId.of(1L),
+                        TopicId.of(1L),
+                        Optional.of(0L),
+                        Consumer.of(3L),
+                        PollingStrategy.next(),
+                        10L,
+                        true,
+                        DeferredPollOptions.defaults());
+    }
+
+    private static void assertBlockedBy(Throwable failure, long operation) {
+        assertThat(failure).isInstanceOf(IggyOperationException.class);
+        var blocked = (IggyOperationException) failure;
+        assertThat(blocked.getErrorCode()).isEqualTo(IggyErrorCode.PARTITION_LANE_BLOCKED);
+        assertThat(blocked.getOperationId()).isEqualTo(operation);
+        assertThat(blocked.getPartitionId()).hasValue(0);
     }
 
     private static IggyHttpClient client(FakePeer peer) {
@@ -496,6 +717,7 @@ class MessagesHttpDeferredTest {
 
     private static final class FakePeer implements HttpHandler {
         private final List<String> paths = new CopyOnWriteArrayList<>();
+        private final List<String> methods = new CopyOnWriteArrayList<>();
         private final List<Map<String, String>> queries = new CopyOnWriteArrayList<>();
         private final HttpHandler handler;
         private int port;
@@ -520,6 +742,7 @@ class MessagesHttpDeferredTest {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             paths.add(exchange.getRequestURI().getPath());
+            methods.add(exchange.getRequestMethod());
             queries.add(parseQuery(exchange.getRequestURI().getRawQuery()));
             try {
                 handler.handle(exchange);

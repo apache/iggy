@@ -436,9 +436,9 @@ async fn given_fresh_topic_when_polling_over_http_should_serve_a_context_at_or_a
     let polled = http.poll(STREAM, TOPIC, PARTITION_ID, 0, 10).await;
     assert_eq!(polled.messages.len(), 1, "the sent message must come back");
     assert!(
-        polled.context.metadata_op >= topic_create_op,
+        polled.context().metadata_op >= topic_create_op,
         "the served context {:?} must cover the topic create at op {topic_create_op}",
-        polled.context
+        polled.context()
     );
 }
 
@@ -935,7 +935,7 @@ async fn given_ack_none_when_denied_before_the_partition_should_answer_the_deny(
         StatusCode::CREATED,
         "produce must commit"
     );
-    let mut context = http.poll(STREAM, TOPIC, PARTITION_ID, 0, 1).await.context;
+    let mut context = http.poll(STREAM, TOPIC, PARTITION_ID, 0, 1).await.context();
     context.metadata_op += UNAPPLIED_METADATA_OPS;
 
     let response = http

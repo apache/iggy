@@ -50,7 +50,7 @@ jobs:
         if: matrix.task == 'examples-node'
         uses: ./.github/actions/utils/setup-node
         with:
-          node-version: "23"
+          node-version: "24"
           workspace: examples/node
 
       - name: Install PHP build dependencies

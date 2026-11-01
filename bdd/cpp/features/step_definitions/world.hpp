@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <optional>
@@ -65,6 +66,20 @@ struct GlobalContext {
     std::optional<iggy::MetadataChangeCursor> last_change_cursor;
     std::vector<iggy::MetadataChangeRecord> last_changes;
     std::vector<iggy::MetadataCurrentItem> last_current_items;
+    // Deferred polling steps. A parked poll holds its connection, so it runs on a client of
+    // its own, which outlives the poll so that a cancelled poll still has a link for its
+    // cancellation.
+    std::optional<std::string> last_stream_name;
+    std::optional<std::string> last_topic_name;
+    std::optional<iggy::IggyBlockingClient> background;
+    std::optional<iggy::PendingPoll> deferred_poll;
+    std::chrono::steady_clock::time_point deferred_poll_started;
+    std::optional<iggy::PartitionReader> reader;
+    std::optional<iggy::IggyConsumer> consumer;
+    // The client that disconnected under its poll. Its partition block belongs to it, so the
+    // later polls of the scenario run on it.
+    iggy::IggyBlockingClient *poll_owner = nullptr;
+    std::optional<std::uint64_t> lost_operation_id;
 
     GlobalContext()                                 = default;
     GlobalContext(const GlobalContext &)            = delete;
@@ -89,15 +104,20 @@ inline std::string required_env(const char *name) {
     return std::string(value);
 }
 
-// Public client for the option and metadata change steps, connected as root on first use.
+inline iggy::IggyBlockingClient connect_root_client() {
+    auto client = iggy::IggyBlockingClient::Builder()
+                      .WithServerAddress(required_env("IGGY_TCP_ADDRESS"))
+                      .WithAutoLogin(required_env("IGGY_ROOT_USERNAME"), required_env("IGGY_ROOT_PASSWORD"))
+                      .Build();
+    client.Connect();
+    return client;
+}
+
+// Public client for the option, metadata change and deferred polling steps, connected as root
+// on first use.
 inline iggy::IggyBlockingClient &sdk_client(GlobalContext &context) {
     if (!context.sdk) {
-        auto client = iggy::IggyBlockingClient::Builder()
-                          .WithServerAddress(required_env("IGGY_TCP_ADDRESS"))
-                          .WithAutoLogin(required_env("IGGY_ROOT_USERNAME"), required_env("IGGY_ROOT_PASSWORD"))
-                          .Build();
-        client.Connect();
-        context.sdk.emplace(std::move(client));
+        context.sdk.emplace(connect_root_client());
     }
     return *context.sdk;
 }
@@ -112,6 +132,19 @@ inline iggy::ffi::Identifier make_numeric_identifier(const std::uint32_t value) 
     iggy::ffi::Identifier identifier;
     identifier.set_numeric(value);
     return identifier;
+}
+
+inline iggy::ffi::PollingStrategy make_offset_strategy(const std::uint64_t offset) {
+    iggy::ffi::PollingStrategy strategy{};
+    strategy.kind  = "offset";
+    strategy.value = offset;
+    return strategy;
+}
+
+inline iggy::ffi::PollOptions make_poll_options(const std::uint32_t count) {
+    iggy::ffi::PollOptions options = iggy::ffi::default_poll_options();
+    options.count                  = count;
+    return options;
 }
 
 inline rust::Vec<std::uint8_t> to_payload(const std::string &value) {

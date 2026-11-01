@@ -23,6 +23,7 @@ use secrecy::SecretString;
 use tracing::warn;
 
 use crate::bridge::error::BridgeError;
+use crate::bridge::nodes::KnownNodes;
 use crate::bridge::topic_map::{TopicMapping, validate_identifier_name};
 use crate::env::parse_bool;
 
@@ -132,6 +133,9 @@ pub struct IggyBridgeConfig {
     /// Transport security of every client the bridge opens.
     pub tls: IggyTls,
     pub produce_sessions: ProduceSessionLimits,
+    /// The nodes of the last roster the bridge read, which each new client dials after `address`.
+    /// No variable sets it: the bridge fills it, and every clone of this config shares it.
+    pub nodes: KnownNodes,
 }
 
 impl IggyBridgeConfig {
@@ -278,6 +282,7 @@ impl IggyBridgeConfig {
             max_message_size,
             tls,
             produce_sessions,
+            nodes: KnownNodes::default(),
         })
     }
 }
@@ -313,6 +318,7 @@ mod tests {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             tls: IggyTls::default(),
             produce_sessions: ProduceSessionLimits::default(),
+            nodes: KnownNodes::default(),
         }
     }
 

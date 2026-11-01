@@ -62,6 +62,8 @@ Run `iggy-mcp --list-config-env-vars` to print the supported configuration envir
 
 A non-empty `iggy.token` takes precedence over username and password. It accepts a literal PAT or a `file:` reference such as `file:/run/secrets/iggy_pat`; file contents are trimmed and a leading `~/` expands to the home directory.
 
+`iggy.consumer` names the consumer that `get_consumer_offset`, `store_consumer_offset`, `delete_consumer_offset` and auto-committing `poll_messages` act on. These tools take no consumer argument, so clients that need separate offsets need separate MCP server instances, each with its own `consumer`.
+
 `iggy-mcp` rejects unknown command-line arguments with exit code 2. Keep the client or container `args` list empty unless it contains a supported flag.
 
 Set `command` to the absolute path of the built executable. This Claude Desktop example uses the development broker credentials:
@@ -84,6 +86,8 @@ Set `command` to the absolute path of the built executable. This Claude Desktop 
 ```
 
 **Remember to use the appropriate Iggy account credentials for your environment** (e.g. create the user with read-only permissions to avoid modifying the data). On top of this, you can also configure the `permissions` for the MCP server to control which operations are allowed (this will be checked first, before forwarding the actual request to the Iggy server).
+
+The HTTP transport does not authenticate MCP clients. Anyone who can reach the HTTP address acts as the configured Iggy account. The default address (`127.0.0.1:8082` in `config.toml`, `localhost:8082` if unset) accepts local connections only; when you bind another address, keep it on a private network or put an authenticating proxy in front of it.
 
 ![MCP](../../../assets/iggy_mcp_server.png)
 
@@ -113,6 +117,12 @@ the write or establish whether it committed. Retrying the business action after
 abandoning it can duplicate an earlier effect. Both tools take
 `{"operation_id": "123"}` and require at least one of the `create`, `update`, or
 `delete` MCP permissions. A process restart loses this local recovery state.
+
+A poll with auto-commit (`auto_commit = true` or `strategy = "next"`) stores the
+consumer offset, so a lost reply leaves it uncertain too. Its error carries
+`data.operation_id`, and later polls and offset writes of that partition fail
+until `abandon_operation` releases it. `resolve_operation` cannot prove such a
+poll and keeps it uncertain. After the abandon, the stored offset stays unknown.
 
 ## Systemd integration
 

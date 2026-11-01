@@ -17,17 +17,17 @@
 
 //! Both the writer task and the reader task observe an abnormal
 //! connection close. They MUST emit exactly one `connection_lost`
-//! notification per peer disconnect so shard 0 doesn't churn the
-//! mapping broadcast twice in a row.
+//! notification per link close, so shard 0 tears the bundle of the peer
+//! down once.
 
 mod common;
 
 use common::{
     install_dialed_replicas_locally, install_replicas_locally, loopback, set_replica_ctx,
 };
-use message_bus::IggyMessageBus;
 use message_bus::connector::start as start_connector;
 use message_bus::replica::listener::{MessageHandler, bind, run};
+use message_bus::{IggyMessageBus, ReplicaLinkId};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -41,13 +41,13 @@ async fn connection_lost_fires_exactly_once_per_peer_disconnect() {
     let bus1 = Rc::new(IggyMessageBus::new(0));
 
     let counter: Rc<Cell<u32>> = Rc::new(Cell::new(0));
-    let notified_peer: Rc<Cell<Option<u8>>> = Rc::new(Cell::new(None));
+    let notified_link: Rc<Cell<Option<ReplicaLinkId>>> = Rc::new(Cell::new(None));
     {
         let counter = Rc::clone(&counter);
-        let notified_peer = Rc::clone(&notified_peer);
-        bus0.set_connection_lost_fn(Rc::new(move |peer_id| {
+        let notified_link = Rc::clone(&notified_link);
+        bus0.set_connection_lost_fn(Rc::new(move |link| {
             counter.set(counter.get() + 1);
-            notified_peer.set(Some(peer_id));
+            notified_link.set(Some(link));
         }));
     }
 
@@ -110,7 +110,14 @@ async fn connection_lost_fires_exactly_once_per_peer_disconnect() {
         "notify_connection_lost must fire exactly once per peer disconnect, got {}",
         counter.get(),
     );
-    assert_eq!(notified_peer.get(), Some(1u8));
+    assert_eq!(
+        notified_link.get(),
+        Some(ReplicaLinkId {
+            replica: 1,
+            link: 0,
+            epoch: 0
+        })
+    );
 
     bus0.shutdown(Duration::from_secs(2)).await;
 }

@@ -373,7 +373,7 @@ struct MessagingE2ETests {
             #expect(baseOffsets == [0, 4, 8])
 
             let polled = try await client.pollMessages(
-                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: .default, strategy: .offset(0), count: 12, autoCommit: false)
+                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: .default, strategy: .offset(0), options: PollOptions(count: 12))
             #expect(polled.partitionID == 0)
             #expect(polled.currentOffset == 11)
             #expect(polled.messages.count == 12)
@@ -387,13 +387,13 @@ struct MessagingE2ETests {
             #expect(ids.count == 12)
 
             let last = try await client.pollMessages(
-                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: .default, strategy: .last, count: 1, autoCommit: false)
+                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: .default, strategy: .last, options: PollOptions(count: 1))
             #expect(last.messages.map(\.offset) == [11])
             let tail = try await client.pollMessages(
-                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: .default, strategy: .offset(10), count: 100, autoCommit: false)
+                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: .default, strategy: .offset(10), options: PollOptions(count: 100))
             #expect(tail.messages.map(\.offset) == [10, 11])
             let empty = try await client.pollMessages(
-                streamID: scratch.stream, topicID: scratch.topic, partitionID: 1, consumer: .default, strategy: .first, count: 10, autoCommit: false)
+                streamID: scratch.stream, topicID: scratch.topic, partitionID: 1, consumer: .default, strategy: .first, options: PollOptions(count: 10))
             #expect(empty.messages.isEmpty)
         }
     }
@@ -410,7 +410,7 @@ struct MessagingE2ETests {
             _ = try await client.sendBatch(streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(0), messages: [message, binary])
 
             let polled = try await client.pollMessages(
-                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: .default, strategy: .first, count: 10, autoCommit: false)
+                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: .default, strategy: .first, options: PollOptions(count: 10))
             #expect(polled.messages.count == 2)
             let first = polled.messages[0]
             #expect(first.id == id)
@@ -479,7 +479,8 @@ struct MessagingE2ETests {
             #expect(stored.partitionID == 0)
 
             let next = try await client.pollMessages(
-                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: consumer, strategy: .next, count: 10, autoCommit: true)
+                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: consumer, strategy: .next,
+                options: PollOptions(count: 10, commit: .onRead))
             #expect(next.messages.map(\.offset) == [4])
             #expect(try await client.getConsumerOffset(consumer: consumer, streamID: scratch.stream, topicID: scratch.topic, partitionID: 0)?.storedOffset == 4)
 
@@ -499,15 +500,15 @@ struct MessagingE2ETests {
             _ = try await client.sendBatch(
                 streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(1), messages: try E2EEnvironment.messages(3))
             let polled = try await client.pollMessages(
-                streamID: scratch.stream, topicID: scratch.topic, partitionID: 1, consumer: consumer, strategy: .first, count: 3, autoCommit: false)
-            #expect(polled.messages.map(\.offset) == [0, 1, 2])
-            let position = ConsumerPosition(partitionID: 1, offset: 2, context: polled.context)
-            try await client.storeConsumerPosition(consumer: consumer, streamID: scratch.stream, topicID: scratch.topic, position: position)
-            #expect(try await client.getConsumerOffset(consumer: consumer, streamID: scratch.stream, topicID: scratch.topic, partitionID: 1)?.storedOffset == 2)
-            let continued = PollingStrategy.offset(1, context: polled.context)
+                streamID: scratch.stream, topicID: scratch.topic, partitionID: 1, consumer: consumer, strategy: .first, options: PollOptions(count: 1))
+            #expect(polled.messages.map(\.offset) == [0])
+            let continued = polled.continuation
             let more = try await client.pollMessages(
-                streamID: scratch.stream, topicID: scratch.topic, partitionID: 1, consumer: consumer, strategy: continued, count: 10, autoCommit: false)
+                streamID: scratch.stream, topicID: scratch.topic, partitionID: 1, consumer: consumer, strategy: continued, options: PollOptions(count: 10))
             #expect(more.messages.map(\.offset) == [1, 2])
+            let checkpoint = try #require(more.checkpoint)
+            try await client.storeConsumerPosition(consumer: consumer, streamID: scratch.stream, topicID: scratch.topic, checkpoint: checkpoint)
+            #expect(try await client.getConsumerOffset(consumer: consumer, streamID: scratch.stream, topicID: scratch.topic, partitionID: 1)?.storedOffset == 2)
 
             // Another client recreates the partition, so its id now names a
             // new incarnation this client has not seen.
@@ -522,14 +523,14 @@ struct MessagingE2ETests {
             // Neither a checkpoint nor a continuation of the old incarnation
             // lands on the new one.
             await expectIggyError(.historyUnavailable) {
-                try await client.storeConsumerPosition(consumer: consumer, streamID: scratch.stream, topicID: scratch.topic, position: position)
+                try await client.storeConsumerPosition(consumer: consumer, streamID: scratch.stream, topicID: scratch.topic, checkpoint: checkpoint)
             }
             await expectIggyError(.historyUnavailable) {
                 _ = try await client.pollMessages(
-                    streamID: scratch.stream, topicID: scratch.topic, partitionID: 1, consumer: consumer, strategy: continued, count: 10, autoCommit: false)
+                    streamID: scratch.stream, topicID: scratch.topic, partitionID: 1, consumer: consumer, strategy: continued, options: PollOptions(count: 10))
             }
             let fresh = try await client.pollMessages(
-                streamID: scratch.stream, topicID: scratch.topic, partitionID: 1, consumer: consumer, strategy: .first, count: 10, autoCommit: false)
+                streamID: scratch.stream, topicID: scratch.topic, partitionID: 1, consumer: consumer, strategy: .first, options: PollOptions(count: 10))
             #expect(fresh.messages.count == 1)
             #expect(fresh.context.incarnation != polled.context.incarnation)
         }
@@ -567,40 +568,48 @@ struct MessagingE2ETests {
         withUnsafeBytes(of: value.littleEndian) { Array($0) }
     }
 
-    @Test func consumerGroupPolling() async throws {
+    @Test func consumerGroupReading() async throws {
         try await E2EEnvironment.withSession() { session in
             let client = session.client
             let scratch = try await session.scratchTopic(partitions: 3)
             let group = try await client.createConsumerGroup(streamID: scratch.stream, topicID: scratch.topic, name: "swift-e2e-group")
             let groupID = Identifier(numeric: group.id)
+            let options = PollOptions(count: 2, maxWait: .seconds(1), commit: .onRead)
 
-            // Polling a group this client never joined is an error, not silence.
-            await expectIggyError(.consumerGroupMemberNotFound) {
-                _ = try await client.pollMessages(
-                    streamID: scratch.stream, topicID: scratch.topic, partitionID: nil, consumer: .group(groupID), strategy: .next, count: 2, autoCommit: true)
+            // Reading a group this client never joined is an error, not silence.
+            let outsider = try await client.reader(
+                streamID: scratch.stream, topicID: scratch.topic, consumer: .group(groupID),
+                configuration: ReaderConfiguration(options: options, autoJoinConsumerGroup: false))
+            do {
+                _ = try await outsider.next()
+                Issue.record("a reader outside the group read")
+            } catch let error as ReadError {
+                #expect(error.error.code == .consumerGroupMemberNotFound)
             }
+            try await outsider.close()
 
-            try await client.joinConsumerGroup(streamID: scratch.stream, topicID: scratch.topic, groupID: groupID)
             for partition: UInt32 in 0..<3 {
                 _ = try await client.sendBatch(
                     streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(partition), messages: try E2EEnvironment.messages(2))
             }
-            // The server installs the member's partitions after the join, so
-            // the member polls until it has read every one of them. A group
-            // poll without a partition round-robins the owned partitions.
-            var polledPartitions = Set<UInt32>()
-            let polledAll = try await E2EEnvironment.eventually {
-                let polled = try await client.pollMessages(
-                    streamID: scratch.stream, topicID: scratch.topic, partitionID: nil, consumer: .group(groupID), strategy: .next, count: 2, autoCommit: true)
-                if !polled.messages.isEmpty {
-                    #expect(polled.messages.count == 2)
-                    polledPartitions.insert(polled.partitionID)
+            // The reader joins, and the server installs the member's
+            // partitions after the join, so it reads until it has read every
+            // one of them.
+            let reader = try await client.reader(
+                streamID: scratch.stream, topicID: scratch.topic, consumer: .group(groupID), configuration: ReaderConfiguration(options: options))
+            // A read of the group shares its count between the partitions of
+            // one primary, so a batch can hold fewer than two messages.
+            var read: [UInt32: Int] = [:]
+            let readAll = try await E2EEnvironment.eventually {
+                guard let batch = try await reader.next() else {
+                    return false
                 }
-                return polledPartitions.count == 3
+                read[batch.partitionID, default: 0] += batch.messages.count
+                return read.count == 3 && read.values.allSatisfy { $0 == 2 }
             }
-            #expect(polledAll)
-            #expect(polledPartitions == [0, 1, 2])
-            try await client.leaveConsumerGroup(streamID: scratch.stream, topicID: scratch.topic, groupID: groupID)
+            #expect(readAll)
+            #expect(read == [0: 2, 1: 2, 2: 2])
+            try await reader.close()
             try await client.deleteConsumerGroup(streamID: scratch.stream, topicID: scratch.topic, groupID: groupID)
         }
     }
@@ -615,7 +624,7 @@ struct MessagingE2ETests {
             // segment, so the request is accepted and removes nothing.
             try await client.deleteSegments(streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, count: 1)
             let polled = try await client.pollMessages(
-                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: .default, strategy: .first, count: 10, autoCommit: false)
+                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: .default, strategy: .first, options: PollOptions(count: 10))
             #expect(polled.messages.map(\.offset) == [0, 1, 2])
             // Topic stats come from the replica that answers, which can trail
             // the partition primary until it applies the commit.
@@ -635,7 +644,7 @@ struct MessagingE2ETests {
             let many = try (0..<1000).map { try IggyMessage("message \($0)") }
             _ = try await client.sendBatch(streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(0), messages: [big] + many)
             let polled = try await client.pollMessages(
-                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: .default, strategy: .first, count: 1001, autoCommit: false)
+                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: .default, strategy: .first, options: PollOptions(count: 1001))
             #expect(polled.messages.count == 1001)
             #expect(polled.messages[0].payload.count == 512 * 1024)
             #expect(polled.messages[1000].payloadString == "message 999")

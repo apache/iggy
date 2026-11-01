@@ -199,11 +199,11 @@ fn error_group(
 }
 
 fn described_member(member: MemberDescription) -> DescribedGroupMember {
-    // `client_id` and `client_host` stay empty: the coordinator does not retain the request
-    // header's client id, and handlers are not given the connection's peer address.
     DescribedGroupMember::default()
         .with_member_id(member.member_id)
         .with_group_instance_id(member.group_instance_id)
+        .with_client_id(member.client_id)
+        .with_client_host(member.client_host)
         .with_member_metadata(member.metadata)
         .with_member_assignment(member.assignment)
 }

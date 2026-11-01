@@ -44,6 +44,7 @@ pub mod config;
 mod context;
 pub mod disk;
 mod error;
+pub mod ext_auth_server;
 mod fixture;
 pub mod handle;
 mod helpers;
@@ -68,8 +69,9 @@ pub use orchestrator::{TestHarness, TestHarnessBuilder, TestLogs};
 pub use traits::{IggyServerDependent, Restartable, TestBinary};
 
 pub use helpers::{
-    USER_PASSWORD, assert_clean_system, backup_commit_budget, create_user, delete_user, login_root,
-    login_user, wait_for_consumer_group_assignment, wait_for_topic, wait_for_topic_messages_count,
+    GroupPoller, USER_PASSWORD, assert_clean_system, backup_commit_budget, create_user,
+    delete_user, fetch_sections, group_partitions, login_root, login_user, partition_primary,
+    wait_for_consumer_group_assignment, wait_for_topic, wait_for_topic_messages_count,
 };
 
 pub use fixture::TestFixture;

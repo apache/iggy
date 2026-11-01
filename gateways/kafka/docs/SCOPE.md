@@ -17,11 +17,11 @@ once you configure a bridge ([#3535](https://github.com/apache/iggy/issues/3535)
 | ------------- | -------- | ---------- |
 | TCP listener on `127.0.0.1:9093` (configurable), one listener per security protocol with TLS on the `SSL` ones | Done | `src/server.rs`, `src/listener.rs`, `src/tls/`, `src/main.rs` |
 | Length-prefixed frame read/write with `max_frame_size` cap | Done | `src/server.rs` |
-| Request header v1/v2 auto-detection | Done | `src/protocol/header.rs` (delegates to `kafka_protocol::messages::ApiKey`) |
+| Request header v1/v2 auto-detection | Done | `core/kafka_wire/src/header.rs` (delegates to `kafka_protocol::messages::ApiKey`) |
 | Version negotiation firewall (`SUPPORTED_RANGES`) | Done | `src/protocol/api.rs` |
 | Request decode + stub encode for 7 API keys | Done | `src/protocol/api.rs`, `src/protocol/handlers/` (via the `kafka_protocol` crate) |
 | Produce hot path: RecordBatch as opaque `Bytes` | Done | `src/protocol/responses.rs` |
-| Pre-decode bounds guard against unbounded allocation | Done | `src/protocol/bounds_guard.rs` |
+| Pre-decode bounds guard against unbounded allocation | Done | `core/kafka_wire/src/bounds_guard.rs` |
 | Graceful errors (corrupt decode, invalid header) | Done | `src/protocol/api.rs`, `src/server.rs` |
 | Regression test suite | Done | `tests/` — see [`TEST_SUITE.md`](TEST_SUITE.md) |
 | Manual testing procedure | Done | [`MANUAL_TESTING.md`](MANUAL_TESTING.md) |
@@ -372,7 +372,7 @@ below it are still open for the issues that build on top of it.
   - `validate_only` runs every check, including the topic read and the fixed partition count
     check, and skips only the write.
   - A manual `assignments` list must hold one entry per new partition, each naming this
-    gateway's single broker (node id 1) once, else `INVALID_REPLICA_ASSIGNMENT` (39). Iggy
+    gateway's node id once, else `INVALID_REPLICA_ASSIGNMENT` (39). Iggy
     cannot take a placement, so a valid list changes nothing about the write, but a list this
     gateway cannot honor is refused rather than answered `NONE`.
   - More than 1000 partitions added to one topic in one request answers `INVALID_REQUEST` (42)
@@ -401,8 +401,9 @@ below it are still open for the issues that build on top of it.
       topics array ("all topics") answers from `IggyBridge::list_kafka_topics` - the target of
       every configured `TopicMapping` override plus every other topic in the default stream, so
       an Iggy stream this bridge has no mapping rule pointing at is never listed (nothing a Kafka
-      client ever named). Every reported partition names this gateway's single broker (node id 1)
-      as leader/replica/ISR, since there is only ever one. `src/protocol/handlers/metadata.rs`,
+      client ever named). Every reported partition names this gateway (`IGGY_KAFKA_NODE_ID`, 1 by
+      default) as leader, replica and ISR. With `IGGY_KAFKA_BROKERS`, the broker list names the
+      other gateways too. `src/protocol/handlers/metadata.rs`,
       `src/bridge/iggy_bridge/topics.rs` (`get_kafka_topic`/`list_kafka_topics`),
       `tests/metadata_real_bridge_tests.rs`. With the bridge off, the stub from #3421 reports
       every requested topic unknown, as before.
@@ -442,9 +443,9 @@ below it are still open for the issues that build on top of it.
     and the Java client use - fail identically and permanently once the cluster's total partition
     count crosses the trip point, since that size is the catalog's own, not anything the
     requesting client chose or can shrink.
-- [ ] Multi-broker topology (this gateway is, and will stay, a single logical broker - node id 1
-      always leads every partition it reports; nothing here models an Iggy cluster as multiple
-      Kafka-visible brokers)
+- [x] Several gateways as brokers (`IGGY_KAFKA_BROKERS`): Metadata lists every gateway, and
+      each one leads every partition it reports. Leaders spread over the gateways, one
+      controller, and a coordinator per group are later work (#4515).
 - [ ] A raw/non-conformant client's extra trailing byte on some Metadata request shapes seen
       against real `kcat`/`librdkafka` traffic in earlier testing on a since-restructured branch -
       not reproduced or root-caused against the current `kafka_protocol`-based decode path in this

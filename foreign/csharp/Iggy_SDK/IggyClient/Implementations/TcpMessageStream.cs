@@ -44,7 +44,7 @@ namespace Apache.Iggy.IggyClient.Implementations;
 /// <summary>
 ///     A TCP client with one logical consensus session and independently managed, multiplexed replica links.
 /// </summary>
-public sealed partial class TcpMessageStream : IIggyClient
+public sealed partial class TcpMessageStream : IIggyClient, IPartitionFetchClient
 {
     private static readonly HashSet<uint> SessionControlCodes =
     [
@@ -53,6 +53,16 @@ public sealed partial class TcpMessageStream : IIggyClient
         CommandCodes.LOGIN_REGISTER_CODE,
         CommandCodes.LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
         CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE
+    ];
+
+    /// <summary>
+    ///     Refused as raw requests: the typed deferred poll and fetch own their deadline, their lease and their cancel.
+    /// </summary>
+    private static readonly HashSet<uint> DeferredCodes =
+    [
+        CommandCodes.POLL_MESSAGES_DEFERRED_CODE,
+        CommandCodes.CANCEL_DEFERRED_REQUEST_CODE,
+        CommandCodes.FETCH_MESSAGES_CODE
     ];
 
     private readonly IggyClientConfigurator _configuration;
@@ -85,7 +95,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     // The credentials a sign-in succeeded with, so a reconnect - on this node or, after a failover, another one -
     // can re-establish the session instead of leaving every later request unauthenticated. A caller that signs in
     // by hand is otherwise less reconnectable than one that configures auto login, which is a surprising
-    // difference between two ways of doing the same thing. Cleared on sign-out and on Dispose; a server-side
+    // difference between two ways of doing the same thing. Cleared on sign-out and on Dispose. A server-side
     // eviction is not caller intent and leaves them in place.
     private AutoLoginSettings? _rememberedLogin;
     private bool _signInWithdrawn;
@@ -317,6 +327,28 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint partitionId,
+        Consumer consumer, PollingStrategy strategy, PollOptions options, CancellationToken token = default)
+    {
+        using var rental = await PollMessagesRentedAsync(streamId, topicId, partitionId, consumer, strategy, options,
+            token);
+        var polled = BinaryMapper.MaterializeMessages(rental);
+        polled.RequestStart = strategy;
+        return polled;
+    }
+
+    /// <inheritdoc />
+    public Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
+        uint partitionId, Consumer consumer, PollingStrategy strategy, PollOptions options,
+        CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        options.ValidatePoll(partitionId, strategy);
+        return PollRentedAsync(streamId, topicId, partitionId, consumer, _ => strategy, options.Count,
+            options.Commit.Mode == CommitMode.OnRead, options.Wire, token);
+    }
+
+    /// <inheritdoc />
     public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
         Consumer consumer,
         PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
@@ -351,19 +383,123 @@ public sealed partial class TcpMessageStream : IIggyClient
         uint? partitionId, Consumer consumer, Func<uint, PollingStrategy> pollingStrategyFor, uint count,
         bool autoCommit, CancellationToken token = default)
     {
+        return PollRentedAsync(streamId, topicId, partitionId, consumer, pollingStrategyFor, count, autoCommit, null,
+            token);
+    }
+
+    internal async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+        Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit, DeferredPollOptions options,
+        CancellationToken token = default)
+    {
+        using var rental = await PollMessagesRentedAsync(streamId, topicId, partitionId, consumer, pollingStrategy,
+            count, autoCommit, options, token);
+        return BinaryMapper.MaterializeMessages(rental);
+    }
+
+    internal Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
+        uint? partitionId, Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit,
+        DeferredPollOptions options, CancellationToken token = default)
+    {
+        return PollMessagesRentedAsync(streamId, topicId, partitionId, consumer, _ => pollingStrategy, count,
+            autoCommit, options, token);
+    }
+
+    internal async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+        Consumer consumer, Func<uint, PollingStrategy> pollingStrategyFor, uint count, bool autoCommit,
+        DeferredPollOptions options, CancellationToken token = default)
+    {
+        using var rental = await PollMessagesRentedAsync(streamId, topicId, partitionId, consumer, pollingStrategyFor,
+            count, autoCommit, options, token);
+        return BinaryMapper.MaterializeMessages(rental);
+    }
+
+    internal Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
+        uint? partitionId, Consumer consumer, Func<uint, PollingStrategy> pollingStrategyFor, uint count,
+        bool autoCommit, DeferredPollOptions options, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        options.Validate(count);
+        return PollRentedAsync(streamId, topicId, partitionId, consumer, pollingStrategyFor, count, autoCommit,
+            options, token);
+    }
+
+    internal async Task<FetchedMessages> FetchMessagesAsync(Identifier streamId, Identifier topicId,
+        IReadOnlyList<(uint PartitionId, PollingStrategy Strategy)> targets, Consumer consumer, uint count,
+        bool autoCommit, DeferredPollOptions options, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(targets);
+        ArgumentNullException.ThrowIfNull(options);
+        options.ValidateFetch(count);
+        if (targets.Count is 0 or > TcpContracts.MAX_PARTITIONS_PER_REQUEST)
+        {
+            throw VsrError.Exception(VsrError.INVALID_COMMAND,
+                $"A fetch names 1 to {TcpContracts.MAX_PARTITIONS_PER_REQUEST} partitions, got {targets.Count}.");
+        }
+
+        if (targets.DistinctBy(target => target.PartitionId).Count() != targets.Count)
+        {
+            throw VsrError.Exception(VsrError.INVALID_COMMAND, "A fetch names each partition once.");
+        }
+
+        if (targets.Any(target => target.Strategy.Kind is not (MessagePolling.Offset or MessagePolling.Next)))
+        {
+            throw VsrError.Exception(VsrError.INVALID_COMMAND, "A fetch starts each partition at Offset or Next.");
+        }
+
+        ThrowIfAutoCommitWithEncryptor(autoCommit);
+        return await FetchMessagesCoreAsync(streamId, topicId, targets, consumer, count, autoCommit, options, token,
+            _consensusSession.Generation);
+    }
+
+    internal async Task<IReadOnlyList<IReadOnlyList<uint>>> ReadinessGroupsAsync(Identifier streamId,
+        Identifier topicId, IReadOnlyList<uint> partitions, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(partitions);
+        return await ReadinessGroupsAsync(streamId, topicId, partitions, partition => partition,
+            Environment.TickCount64 + VsrRequestTimeoutMs, token);
+    }
+
+    Task<FetchedMessages> IPartitionFetchClient.FetchMessagesAsync(Identifier streamId, Identifier topicId,
+        IReadOnlyList<(uint PartitionId, PollingStrategy Strategy)> targets, Consumer consumer, uint count,
+        bool autoCommit, DeferredPollOptions options, CancellationToken token)
+    {
+        return FetchMessagesAsync(streamId, topicId, targets, consumer, count, autoCommit, options, token);
+    }
+
+    Task<IReadOnlyList<IReadOnlyList<uint>>> IPartitionFetchClient.ReadinessGroupsAsync(Identifier streamId,
+        Identifier topicId, IReadOnlyList<uint> partitions, CancellationToken token)
+    {
+        return ReadinessGroupsAsync(streamId, topicId, partitions, token);
+    }
+
+    private Task<PolledMessagesRental> PollRentedAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+        Consumer consumer, Func<uint, PollingStrategy> pollingStrategyFor, uint count, bool autoCommit,
+        DeferredPollOptions? options, CancellationToken token)
+    {
         var generation = _consensusSession.Generation;
         ThrowIfAutoCommitWithEncryptor(autoCommit);
 
         // The broker routes explicit partitions only, so a group poll picks one of the member's assigned
-        // partitions client-side.
+        // partitions client-side. A deferred one would wait on a single partition while others hold messages, so a
+        // member fetches its partitions instead.
         if (consumer.Type == ConsumerType.ConsumerGroup && partitionId is null)
         {
-            return PollGroupMessagesRentedAsync(streamId, topicId, consumer, pollingStrategyFor, count, autoCommit,
-                token, generation);
+            return options is null
+                ? PollGroupMessagesRentedAsync(streamId, topicId, consumer, pollingStrategyFor, count, autoCommit,
+                    token, generation)
+                : Task.FromException<PolledMessagesRental>(VsrError.Exception(VsrError.INVALID_COMMAND,
+                    "A deferred consumer group poll needs a partition. Fetch the member's partitions with " +
+                    "FetchMessagesAsync, one fetch per readiness group."));
         }
 
-        return PollPartitionMessagesRentedAsync(streamId, topicId, partitionId, consumer,
-            pollingStrategyFor(partitionId ?? 0), count, autoCommit, token, generation);
+        var strategy = pollingStrategyFor(partitionId ?? 0);
+        if (partitionId is { } partition)
+        {
+            strategy.ValidatePartition(partition);
+        }
+
+        return PollPartitionMessagesRentedAsync(streamId, topicId, partitionId, consumer, strategy, count,
+            autoCommit, token, generation, options);
     }
 
     /// <inheritdoc />
@@ -381,6 +517,15 @@ public sealed partial class TcpMessageStream : IIggyClient
         var message = TcpContracts.UpdateOffset(streamId, topicId, consumer, offset, partitionId);
         using var response = await SendWithResponseAsync(CommandCodes.STORE_CONSUMER_OFFSET_CODE, message,
             token: token, capturedContext: context);
+    }
+
+    /// <inheritdoc />
+    public Task StoreConsumerPositionAsync(Consumer consumer, Identifier streamId, Identifier topicId,
+        Checkpoint checkpoint, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(checkpoint);
+        return StoreOffsetAsync(consumer, streamId, topicId, checkpoint.Offset, checkpoint.PartitionId,
+            checkpoint.Context, token);
     }
 
     /// <inheritdoc />
@@ -405,6 +550,23 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         var message = TcpContracts.DeleteOffset(streamId, topicId, consumer, partitionId);
         using var response = await SendWithResponseAsync(CommandCodes.DELETE_CONSUMER_OFFSET_CODE, message, token: token);
+    }
+
+    /// <inheritdoc />
+    public async Task DeleteOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, uint partitionId,
+        PartitionContext context, CancellationToken token = default)
+    {
+        var message = TcpContracts.DeleteOffset(streamId, topicId, consumer, partitionId);
+        using var response = await SendWithResponseAsync(CommandCodes.DELETE_CONSUMER_OFFSET_CODE, message,
+            token: token, capturedContext: context);
+    }
+
+    /// <inheritdoc />
+    public Task DeleteConsumerPositionAsync(Consumer consumer, Identifier streamId, Identifier topicId,
+        Checkpoint checkpoint, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(checkpoint);
+        return DeleteOffsetAsync(consumer, streamId, topicId, checkpoint.PartitionId, checkpoint.Context, token);
     }
 
     /// <inheritdoc />
@@ -609,7 +771,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     /// <inheritdoc />
     public async Task<byte[]> SendBinaryRequestAsync(uint code, byte[] payload, CancellationToken token = default)
     {
-        if (SessionControlCodes.Contains(code))
+        if (SessionControlCodes.Contains(code) || DeferredCodes.Contains(code))
         {
             throw VsrError.Exception(VsrError.INVALID_COMMAND,
                 $"Command {code} cannot be sent as a raw binary request.");
@@ -624,7 +786,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     public async Task<byte[]> SendBinaryRequestToReplicaAsync(uint code, byte[] payload, byte replicaId,
         CancellationToken token = default)
     {
-        if (SessionControlCodes.Contains(code) || code == CommandCodes.POLL_MESSAGES_CODE
+        if (SessionControlCodes.Contains(code) || DeferredCodes.Contains(code) || code == CommandCodes.POLL_MESSAGES_CODE
             || code == CommandCodes.GET_CONSUMER_OFFSET_CODE
             || VsrOperations.ForCode((int)code) != VsrOperation.NonReplicated)
         {
@@ -648,6 +810,17 @@ public sealed partial class TcpMessageStream : IIggyClient
         }
 
         return ConnectAsync(true, token);
+    }
+
+    /// <summary>
+    ///     Closes the links of the client without a sign-out, as a lost network does, so the server keeps the session
+    ///     until it expires. <see cref="ConnectAsync(CancellationToken)" /> and a sign-in open the client again. A
+    ///     committing read in flight ends with an unknown outcome and keeps its partition blocked.
+    /// </summary>
+    internal Task DisconnectAsync()
+    {
+        CancelSessionRecovery();
+        return ResetConsensusSessionAsync(stops: true, interrupt: true).AsTask();
     }
 
     /// <inheritdoc />
@@ -925,22 +1098,40 @@ public sealed partial class TcpMessageStream : IIggyClient
         }
     }
 
+    /// <summary>
+    ///     Polls one partition, deferred when <paramref name="deferred" /> is given. A deferred poll ends at its own
+    ///     request timeout, and asks for no reply wider than a frame this client reads: a wider one would fail the
+    ///     whole link instead of the poll.
+    /// </summary>
     private async Task<PolledMessagesRental> PollPartitionMessagesRentedAsync(Identifier streamId, Identifier topicId,
         uint? partitionId, Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit,
-        CancellationToken token, ulong generation)
+        CancellationToken token, ulong generation, DeferredPollOptions? deferred = null)
     {
-        var messageBufferSize = CalculateMessageBufferSize(streamId, topicId, consumer);
+        var messageBufferSize = CalculateMessageBufferSize(streamId, topicId, consumer)
+                                + (deferred is null ? 0 : TcpContracts.DEFERRED_POLL_TAIL_SIZE);
         var payload = ArrayPool<byte>.Shared.Rent(messageBufferSize);
         IMemoryOwner<byte>? responseBuffer = null;
 
         try
         {
+            long? deadline = null;
+            if (deferred is not null)
+            {
+                deadline = Environment.TickCount64 + (long)deferred.RequestTimeout.TotalMilliseconds;
+                deferred = deferred with
+                {
+                    MaxBytes = Math.Min(deferred.MaxBytes,
+                        (uint)Math.Max(0, _configuration.MaxResponseFrameSize - VsrHeader.HEADER_SIZE))
+                };
+            }
+
             TcpContracts.GetMessages(payload.AsSpan(0, messageBufferSize), consumer, streamId,
-                topicId, pollingStrategy, count, autoCommit, partitionId ?? 0);
+                topicId, pollingStrategy, count, autoCommit, partitionId ?? 0, deferred);
 
             var body = payload.AsMemory(0, messageBufferSize);
-            responseBuffer = await SendWithResponseAsync(CommandCodes.POLL_MESSAGES_CODE, body,
-                token: token, capturedContext: pollingStrategy.Context, startedUnder: generation);
+            responseBuffer = await SendWithResponseAsync(
+                deferred is null ? CommandCodes.POLL_MESSAGES_CODE : CommandCodes.POLL_MESSAGES_DEFERRED_CODE, body,
+                token: token, capturedContext: pollingStrategy.Context, deadline: deadline, startedUnder: generation);
             if (responseBuffer.Memory.Length == 0)
             {
                 responseBuffer.Dispose();
@@ -979,7 +1170,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         var encryptor = _configuration.MessageEncryptor;
 
-        // With an encryptor this is an upper bound; the fill reports the size actually written and only that
+        // With an encryptor this is an upper bound. The fill reports the size actually written and only that
         // prefix is sent.
         var metadataLength = 2 + streamId.Length + 2 + topicId.Length
                              + 2 + partitioning.Length + 4 + 4;
@@ -1239,6 +1430,7 @@ public sealed partial class TcpMessageStream : IIggyClient
             throw PollNotAccepted();
         }
         if (code is CommandCodes.SEND_MESSAGES_CODE or CommandCodes.POLL_MESSAGES_CODE
+            or CommandCodes.POLL_MESSAGES_DEFERRED_CODE
             or CommandCodes.GET_CONSUMER_OFFSET_CODE or CommandCodes.STORE_CONSUMER_OFFSET_CODE
             or CommandCodes.DELETE_CONSUMER_OFFSET_CODE)
         {

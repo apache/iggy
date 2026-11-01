@@ -106,7 +106,10 @@ consumer still uses a group, and Iggy keeps no commit time.
 ## More than one gateway
 
 Offsets are shared, since the key depends only on the Kafka group id. Membership is not
-([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)).
+([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)). With `IGGY_KAFKA_BROKERS`, `FindCoordinator` names
+one gateway for every group, so consumers and admin tools commit through that gateway. The cases
+below remain for gateways without that list, and for a client that sends group requests to
+another gateway.
 
 - A gateway with no members in a group accepts a commit with no generation, as admin tools and
   `assign()` consumers send, even when another gateway has live members in it. That commit
@@ -142,16 +145,8 @@ The Iggy HTTP API cannot carry kind 3. The gateway uses TCP, so this does not li
 
 ## Reads in a cluster
 
-An offset read goes to the Iggy node that the gateway is connected to. That is not always the
-partition primary (the node that orders the partition writes). So an OffsetFetch right after an
-OffsetCommit can return the older value until that node applies the commit.
-
-- After a later commit, the consumer reads some records again.
-- After the first commit of a group, the node has no offset and answers -1. The consumer then
-  applies `auto.offset.reset`. With `latest`, it skips records.
-
-Reads from the primary are [#4409](https://github.com/apache/iggy/issues/4409). Until then, use
-`auto.offset.reset=earliest` for a group that a cluster serves.
+OffsetCommit and OffsetFetch both go to the partition primary, whichever Iggy node the gateway
+dials. So an OffsetFetch right after an OffsetCommit returns the committed offset.
 
 ## References
 

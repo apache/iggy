@@ -33,7 +33,7 @@ use kafka_protocol::protocol::StrBytes;
 use crate::cluster_id::ClusterId;
 use crate::error::Result;
 use crate::protocol::api::{
-    API_KEY_DESCRIBE_CLUSTER, ApiVersionRange, BrokerAdvertise, ConnectionState,
+    API_KEY_DESCRIBE_CLUSTER, ApiVersionRange, BrokerAdvertise, Brokers, ConnectionState,
     ERROR_INVALID_REQUEST, ERROR_MISMATCHED_ENDPOINT_TYPE, ERROR_UNSUPPORTED_ENDPOINT_TYPE,
     ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, is_supported_version,
 };
@@ -59,9 +59,6 @@ const MISMATCHED_CONTROLLER_MESSAGE: &str = concat!(
     "The request was sent to an endpoint of type BROKER, ",
     "but we wanted an endpoint of type CONTROLLER"
 );
-
-/// The node id this gateway advertises for itself, in Metadata and here alike.
-const SELF_NODE_ID: i32 = 1;
 
 #[expect(
     clippy::unused_async,
@@ -94,7 +91,13 @@ pub async fn handle(
         }
     };
     respond_or_close(
-        encode_response(api_version, &request, &state.cluster_id, &connection.broker),
+        encode_response(
+            api_version,
+            &request,
+            &state.cluster_id,
+            &connection.broker,
+            &connection.brokers,
+        ),
         "DescribeCluster",
     )
 }
@@ -107,6 +110,7 @@ pub fn encode_response(
     request: &DescribeClusterRequest,
     cluster_id: &ClusterId,
     broker: &BrokerAdvertise,
+    brokers: &Brokers,
 ) -> Result<Bytes> {
     // Kafka's `AuthHelper.computeDescribeClusterResponse`, whose refusals leave the endpoint
     // type at its default. v0 has no endpoint type field, so it decodes as the broker default
@@ -128,15 +132,21 @@ pub fn encode_response(
             .with_error_message(Some(message));
         return encode_message(&response, version, 128);
     }
-    let broker_entry = DescribeClusterBroker::default()
-        .with_broker_id(BrokerId(SELF_NODE_ID))
-        .with_host(StrBytes::from_string(broker.host.clone()))
-        .with_port(broker.port);
+    let entries = brokers
+        .listed(broker)
+        .into_iter()
+        .map(|(node, endpoint)| {
+            DescribeClusterBroker::default()
+                .with_broker_id(BrokerId(node))
+                .with_host(StrBytes::from_string(endpoint.host.clone()))
+                .with_port(endpoint.port)
+        })
+        .collect();
     let response = DescribeClusterResponse::default()
         .with_endpoint_type(ENDPOINT_TYPE_BROKER)
         .with_cluster_id(StrBytes::from_string(cluster_id.to_string()))
-        .with_controller_id(BrokerId(SELF_NODE_ID))
-        .with_brokers(vec![broker_entry]);
+        .with_controller_id(BrokerId(brokers.node_id))
+        .with_brokers(entries);
     encode_message(&response, version, 128)
 }
 
@@ -175,16 +185,17 @@ mod tests {
                 &DescribeClusterRequest::default(),
                 &cluster_id,
                 &broker(),
+                &Brokers::default(),
             )
             .expect("encode");
             let response = decode(version, body);
             assert_eq!(response.error_code, 0, "v{version}");
             assert_eq!(response.cluster_id.as_str(), cluster_id.as_str());
-            assert_eq!(response.controller_id, BrokerId(SELF_NODE_ID));
+            assert_eq!(response.controller_id, BrokerId(1));
             assert_eq!(response.cluster_authorized_operations, i32::MIN);
             assert_eq!(response.brokers.len(), 1);
             let entry = &response.brokers[0];
-            assert_eq!(entry.broker_id, BrokerId(SELF_NODE_ID));
+            assert_eq!(entry.broker_id, BrokerId(1));
             assert_eq!(entry.host.as_str(), "gateway.example");
             assert_eq!(entry.port, 19092);
             assert_eq!(entry.rack, None);
@@ -193,12 +204,46 @@ mod tests {
     }
 
     #[test]
+    fn given_other_gateways_when_described_should_list_each_and_name_this_one_controller() {
+        let peer = BrokerAdvertise {
+            host: "gateway-1.example".to_string(),
+            port: 19092,
+        };
+        let brokers = Brokers {
+            node_id: 2,
+            peers: vec![(1, peer)],
+        };
+        let body = encode_response(
+            0,
+            &DescribeClusterRequest::default(),
+            &ClusterId::random(),
+            &broker(),
+            &brokers,
+        )
+        .expect("encode");
+        let response = decode(0, body);
+        let listed: Vec<(i32, &str)> = response
+            .brokers
+            .iter()
+            .map(|entry| (entry.broker_id.0, entry.host.as_str()))
+            .collect();
+        assert_eq!(listed, [(1, "gateway-1.example"), (2, "gateway.example")]);
+        assert_eq!(response.controller_id, BrokerId(2));
+    }
+
+    #[test]
     fn given_the_controller_endpoint_type_when_described_should_answer_mismatched() {
         let request =
             DescribeClusterRequest::default().with_endpoint_type(ENDPOINT_TYPE_CONTROLLER);
         for version in 1..=RANGE.max_version {
-            let body = encode_response(version, &request, &ClusterId::random(), &broker())
-                .expect("encode");
+            let body = encode_response(
+                version,
+                &request,
+                &ClusterId::random(),
+                &broker(),
+                &Brokers::default(),
+            )
+            .expect("encode");
             let response = decode(version, body);
             assert_eq!(response.error_code, ERROR_MISMATCHED_ENDPOINT_TYPE);
             assert_eq!(
@@ -218,8 +263,14 @@ mod tests {
     fn given_an_unknown_endpoint_type_when_described_should_answer_unsupported() {
         for endpoint_type in [0, 3, -1] {
             let request = DescribeClusterRequest::default().with_endpoint_type(endpoint_type);
-            let body =
-                encode_response(1, &request, &ClusterId::random(), &broker()).expect("encode");
+            let body = encode_response(
+                1,
+                &request,
+                &ClusterId::random(),
+                &broker(),
+                &Brokers::default(),
+            )
+            .expect("encode");
             let response = decode(1, body);
             assert_eq!(response.error_code, ERROR_UNSUPPORTED_ENDPOINT_TYPE);
             assert_eq!(

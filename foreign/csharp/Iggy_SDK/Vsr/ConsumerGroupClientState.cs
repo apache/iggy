@@ -122,6 +122,17 @@ internal sealed class ConsumerGroupClientState
         }
     }
 
+    /// <summary>
+    ///     The assigned partitions of a group, in assignment order, or an empty list when nothing is cached.
+    /// </summary>
+    internal IReadOnlyList<uint> AssignedPartitions(GroupKey key)
+    {
+        lock (_gate)
+        {
+            return _assignments.TryGetValue(key, out var assignment) ? assignment.Partitions : [];
+        }
+    }
+
     /// <summary>The next balanced produce partition for a topic, advancing the cursor.</summary>
     internal uint NextBalancedPartition(TopicKey key, uint partitionCount)
     {
