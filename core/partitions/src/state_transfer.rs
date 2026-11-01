@@ -576,6 +576,9 @@ pub(crate) struct ConsumerOffsetsWire {
     pub history_transition: Option<InstalledPartitionHistory>,
     pub owner_retirement:
         Option<iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest>,
+    /// Trailing and optional on decode, so artifacts written before
+    /// retirement debt read as `0`.
+    pub retirement_paid_through: u64,
 }
 
 impl ConsumerOffsetsWire {
@@ -589,7 +592,8 @@ impl ConsumerOffsetsWire {
     /// history_present u8 | [history fence, partition_op u64] |
     /// retirement_length u32 | retirement bytes | checksum_present u8 |
     /// prepare_checksum u128 | prepare_length u32 | checkpoint_prepare bytes |
-    /// XxHash3_64 trailer`. Little-endian throughout.
+    /// retirement_paid_through u64 | XxHash3_64 trailer`. Little-endian
+    /// throughout.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let sections = self.offset_sections();
@@ -666,6 +670,7 @@ impl ConsumerOffsetsWire {
                 .to_le_bytes(),
         );
         out.extend_from_slice(&self.checkpoint_prepare);
+        out.extend_from_slice(&self.retirement_paid_through.to_le_bytes());
         debug_assert_eq!(out.len() + size_of::<u64>(), reserved, "encode reservation");
         let trailer = state_artifact_checksum(&out);
         out.extend_from_slice(&trailer.to_le_bytes());
@@ -757,6 +762,11 @@ impl ConsumerOffsetsWire {
             return Err(ConsumerOffsetsWireError::InvalidPrepareChecksum);
         }
         let checkpoint_prepare = cursor.take(prepare_length)?.to_vec();
+        let retirement_paid_through = if cursor.remaining().len() >= size_of::<u64>() {
+            cursor.u64()?
+        } else {
+            0
+        };
         if !cursor.remaining().is_empty() {
             // Distinct from `Truncated`: extra bytes point at a NEWER
             // encoder, and telling the operator the artifact is short would
@@ -779,6 +789,7 @@ impl ConsumerOffsetsWire {
             owners,
             history_transition,
             owner_retirement,
+            retirement_paid_through,
         })
     }
 
@@ -819,6 +830,7 @@ impl ConsumerOffsetsWire {
                 .owner_retirement
                 .as_ref()
                 .map_or(0, WireEncode::encoded_size)
+            + size_of::<u64>()
             + size_of::<u64>()
     }
 
@@ -1252,6 +1264,7 @@ mod tests {
                 dedup_entry(11, 4, 90),
                 dedup_entry(usize::MAX as u128 + 5, 9, 91),
             ],
+            retirement_paid_through: 0,
         }
     }
 
@@ -1435,6 +1448,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            retirement_paid_through: 0,
         };
         let encoded = empty.encode();
         assert_eq!(
@@ -1521,9 +1535,10 @@ mod tests {
         // forgotten, and a peer on another release then reads the artifact out
         // of place. One entry per section makes each length cover the header,
         // every count field and every entry stride. Changing a length is the
-        // reminder to change its version.
-        const WITHOUT_EXTERNAL_LEN: usize = 555;
-        const WITH_EXTERNAL_LEN: usize = 567;
+        // reminder to change its version. The trailing `retirement_paid_through`
+        // is optional on decode, so it kept version 8 readable without a bump.
+        const WITHOUT_EXTERNAL_LEN: usize = 563;
+        const WITH_EXTERNAL_LEN: usize = 575;
 
         const INCARNATION: u64 = 1;
         let with_external = ConsumerOffsetsWire {
@@ -1563,6 +1578,7 @@ mod tests {
                 next_group_id: 2,
                 live_group_ids: vec![1],
             }),
+            retirement_paid_through: 0,
         };
         let without_external = ConsumerOffsetsWire {
             external_groups: Vec::new(),
@@ -1671,6 +1687,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: vec![dedup_entry(9, 1, 1), dedup_entry(4, 2, 2)],
+            retirement_paid_through: 0,
         };
         assert_eq!(
             ConsumerOffsetsWire::decode(&unordered.encode()),
@@ -1694,6 +1711,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: vec![dedup_entry(0, 1, 1), dedup_entry(4, 2, 2)],
+            retirement_paid_through: 0,
         };
         assert_eq!(
             ConsumerOffsetsWire::decode(&reserved.encode()),
@@ -1831,6 +1849,7 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            retirement_paid_through: 0,
         };
         assert_eq!(
             ConsumerOffsetsWire::decode(&duplicate.encode()),
@@ -1853,6 +1872,7 @@ mod tests {
             groups: vec![(9, 1), (4, 2)],
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            retirement_paid_through: 0,
         };
         assert_eq!(
             ConsumerOffsetsWire::decode(&unordered.encode()),
@@ -1876,6 +1896,20 @@ mod tests {
             Err(ConsumerOffsetsWireError::TrailingBytes { extra: 1 }),
             "bytes past the last section must fail closed"
         );
+    }
+
+    #[test]
+    fn given_an_artifact_without_paid_through_when_decoded_should_read_it_as_zero() {
+        let paid = ConsumerOffsetsWire {
+            retirement_paid_through: 9,
+            ..table()
+        };
+        let encoded = paid.encode();
+        assert_eq!(ConsumerOffsetsWire::decode(&encoded), Ok(paid));
+        let mut legacy = encoded[..encoded.len() - 2 * size_of::<u64>()].to_vec();
+        let trailer = state_artifact_checksum(&legacy);
+        legacy.extend_from_slice(&trailer.to_le_bytes());
+        assert_eq!(ConsumerOffsetsWire::decode(&legacy), Ok(table()));
     }
 
     #[test]
@@ -3620,6 +3654,7 @@ where
             owners: self.consumer_group_owners.values().copied().collect(),
             history_transition: self.history_transition,
             owner_retirement: self.owner_retirement.clone(),
+            retirement_paid_through: self.retirement_paid_through,
         })
     }
 
@@ -4298,6 +4333,12 @@ where
                 if let (Some(persistence), Some(drain)) = (&self.persistence, &install.drain) {
                     persistence.finish_drain(drain);
                 }
+                // The installed copy is what a primary of this view committed, so
+                // this member may vote and lead again. Nothing else lifts the bar
+                // a member that came back without its data was held under.
+                if install.failure.is_none() {
+                    self.consensus().set_recovery_election_allowed(true);
+                }
                 let outcome = install.failure.take().map_or_else(
                     || {
                         Ok(PartitionInstallOutcome {
@@ -4651,6 +4692,7 @@ where
                 InstallFilePhase::FinishBackup => InstallPhase::ClearMissing,
                 InstallFilePhase::ClearMissing => {
                     self.materialization_missing = false;
+                    self.refresh_recovered_log_complete();
                     InstallPhase::Done
                 }
                 _ => unreachable!("transfer file result matches captured phase"),
@@ -4878,6 +4920,9 @@ where
         self.required_metadata_frontier = self
             .required_metadata_frontier
             .max(install.offsets_wire.required_metadata_frontier);
+        self.retirement_paid_through = self
+            .retirement_paid_through
+            .max(install.offsets_wire.retirement_paid_through);
         self.consumer_group_owners = install
             .offsets_wire
             .owners
@@ -5974,6 +6019,7 @@ where
             owners: self.consumer_group_owners.values().copied().collect(),
             history_transition: self.history_transition,
             owner_retirement: self.owner_retirement.clone(),
+            retirement_paid_through: self.retirement_paid_through,
             ..Default::default()
         };
         Ok(retry_checkpoint_bytes(
@@ -6062,6 +6108,9 @@ where
         self.required_metadata_frontier = self
             .required_metadata_frontier
             .max(wire.required_metadata_frontier);
+        self.retirement_paid_through = self
+            .retirement_paid_through
+            .max(wire.retirement_paid_through);
         if let Err(error) = self.reclaim_retry_checkpoints(through_op).await {
             tracing::warn!(%error, namespace_raw = self.consensus().group(), "cannot reclaim obsolete receipt checkpoints during recovery");
         }

@@ -89,7 +89,7 @@ use metadata::AppliedFrontier;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use server_common::Message;
-use shard::{CommitGate, PartitionRead, PartitionReadReply};
+use shard::{CommitGate, PartitionReadReply};
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::net::IpAddr;
@@ -971,9 +971,8 @@ where
         .ok_or(IggyError::TransientNotAccepted)?;
     let partitions_count =
         u32::try_from(partitions_count).map_err(|_| IggyError::TransientNotAccepted)?;
-    let Some(PartitionReadReply::Primary { view, primary }) = shard
-        .partition_read(namespace, PartitionRead::Primary)
-        .await
+    let Some(PartitionReadReply::Primary { view, primary }) =
+        crate::namespace::partition_primary(shard, namespace).await
     else {
         return Err(IggyError::TransientNotAccepted);
     };

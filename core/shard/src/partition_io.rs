@@ -1028,6 +1028,7 @@ mod tests {
                 .send_request_state_chunk(
                     consensus.cluster(),
                     consensus.replica(),
+                    *consensus.members(),
                     PEER,
                     1,
                     group,
@@ -1042,6 +1043,66 @@ mod tests {
                 assert_eq!(control_frame_incarnation(frame.as_slice()), incarnation);
             }
         }
+    }
+
+    #[compio::test]
+    async fn given_a_prepare_ok_from_outside_the_group_when_dispatched_should_drop_it() {
+        const OUTSIDER: u8 = 4;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let partitions = owner.plane.partitions();
+        partitions.remove(&namespace).unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            2,
+            namespace.inner(),
+            Rc::clone(&bus),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        partitions.insert(
+            namespace,
+            IggyPartition::with_in_memory_storage(
+                Arc::new(PartitionStats::default()),
+                consensus,
+                IggyByteSize::from(SEGMENT_BYTES),
+            ),
+        );
+        partitions
+            .on_request_with_reply(send_request(namespace, 1), None)
+            .await;
+        let prepare = partitions
+            .get_by_ns(&namespace)
+            .unwrap()
+            .consensus()
+            .pipeline_head_header()
+            .expect("the write is pipelined");
+        let ack = Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>()).transmute_header(
+            |_, ack: &mut PrepareOkHeader| {
+                ack.command = Command::PrepareOk;
+                ack.cluster = 1;
+                ack.replica = OUTSIDER;
+                ack.view = prepare.view;
+                ack.op = prepare.op;
+                ack.prepare_checksum = prepare.checksum;
+                ack.operation = prepare.operation;
+                ack.group = prepare.group;
+                ack.size = u32::try_from(size_of::<PrepareOkHeader>()).unwrap();
+                ack.seal();
+            },
+        );
+        owner.on_message(MessageBag::PrepareOk(ack)).await;
+        assert_eq!(
+            partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .consensus()
+                .pipeline_head_header(),
+            Some(prepare),
+            "an ack from a replica outside the group must not count"
+        );
     }
 
     #[compio::test]
@@ -1064,6 +1125,25 @@ mod tests {
         let namespace = IggyNamespace::new(0, 0, 0);
         let directory = tempfile::tempdir().unwrap();
         let partitions = owner.plane.partitions();
+        // The requester has to be a member of the group it pulls from.
+        partitions.remove(&namespace).unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            2,
+            namespace.inner(),
+            Rc::clone(&bus),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        partitions.insert(
+            namespace,
+            IggyPartition::with_in_memory_storage(
+                Arc::new(PartitionStats::default()),
+                consensus,
+                IggyByteSize::from(SEGMENT_BYTES),
+            ),
+        );
         let partition = partitions.get_mut_by_ns(&namespace).unwrap();
         partition.set_created_revision(INCARNATION);
         attach_segment_files(partition, directory.path(), false).await;
@@ -1074,6 +1154,30 @@ mod tests {
             });
         let (reply, replied) = consensus::oneshot_channel();
         partitions.on_request_with_reply(request, Some(reply)).await;
+        owner
+            .process_loopback(&mut crate::router::LoopbackRound::default())
+            .await;
+        let prepare = partitions
+            .get_by_ns(&namespace)
+            .unwrap()
+            .consensus()
+            .pipeline_head_header()
+            .expect("the write is pipelined");
+        let ack = Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>()).transmute_header(
+            |_, ack: &mut PrepareOkHeader| {
+                ack.command = Command::PrepareOk;
+                ack.cluster = 1;
+                ack.replica = REQUESTER;
+                ack.view = prepare.view;
+                ack.op = prepare.op;
+                ack.prepare_checksum = prepare.checksum;
+                ack.operation = prepare.operation;
+                ack.group = prepare.group;
+                ack.size = u32::try_from(size_of::<PrepareOkHeader>()).unwrap();
+                ack.seal();
+            },
+        );
+        owner.on_message(MessageBag::PrepareOk(ack)).await;
         owner
             .process_loopback(&mut crate::router::LoopbackRound::default())
             .await;
@@ -1145,25 +1249,14 @@ mod tests {
         let namespace = IggyNamespace::new(0, 0, 0);
         let directory = tempfile::tempdir().unwrap();
         let partitions = owner.plane.partitions();
+        serve_to_requester(&owner, &bus, namespace);
         let partition = partitions.get_mut_by_ns(&namespace).unwrap();
-        partition.set_created_revision(SERVED_INCARNATION);
         attach_segment_files(partition, directory.path(), false).await;
         let journal = &partition.log.journal().inner;
         journal.set_repair_retention(true);
         journal.set_ring_caps(1, u64::MAX);
         for op in 1..=OPS {
-            let request = send_request(namespace, op).transmute_header(
-                |old, header: &mut RoutedRequestHeader| {
-                    *header = old;
-                    header.partition_incarnation = SERVED_INCARNATION;
-                },
-            );
-            let (reply, replied) = consensus::oneshot_channel();
-            partitions.on_request_with_reply(request, Some(reply)).await;
-            owner
-                .process_loopback(&mut crate::router::LoopbackRound::default())
-                .await;
-            assert_eq!(replied.await.unwrap().header().status, 0);
+            commit_acked_write(&owner, namespace, op).await;
             if op == 1 {
                 owner
                     .on_message(request_state_transfer(namespace, NONCE, SERVED_INCARNATION))
@@ -1243,12 +1336,7 @@ mod tests {
             let (mut owner, _sender) = test_owner(&bus, None);
             owner.partition_consensus.replica_count = TRANSFER_REQUESTER + 1;
             let namespace = IggyNamespace::new(0, 0, 0);
-            owner
-                .plane
-                .partitions()
-                .get_mut_by_ns(&namespace)
-                .unwrap()
-                .set_created_revision(SERVED_INCARNATION);
+            serve_to_requester(&owner, &bus, namespace);
             let directory = tempfile::tempdir().unwrap();
             let log_path = directory.path().join("segment.log");
             let mut bytes = [PREFIX, SUFFIX].concat();
@@ -1341,12 +1429,7 @@ mod tests {
         let (mut owner, _sender) = test_owner(&bus, None);
         owner.partition_consensus.replica_count = TRANSFER_REQUESTER + 1;
         let namespace = IggyNamespace::new(0, 0, 0);
-        owner
-            .plane
-            .partitions()
-            .get_mut_by_ns(&namespace)
-            .unwrap()
-            .set_created_revision(SERVED_INCARNATION);
+        serve_to_requester(&owner, &bus, namespace);
         let directory = tempfile::tempdir().unwrap();
         let offer_of = |name: &str, bytes: &[u8]| {
             let log_path = directory.path().join(name);
@@ -11020,6 +11103,73 @@ mod tests {
     /// The replica that asks a [`serving_shard`] for every transfer.
     const TRANSFER_REQUESTER: u8 = 1;
 
+    /// Rebuilds `namespace` at [`SERVED_INCARNATION`] as a two-member group
+    /// with [`TRANSFER_REQUESTER`] as its backup: a requester has to be a member
+    /// of the group it pulls from.
+    fn serve_to_requester(owner: &IoTestShard, bus: &Rc<IggyMessageBus>, namespace: IggyNamespace) {
+        let partitions = owner.plane.partitions();
+        partitions.remove(&namespace).unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            TRANSFER_REQUESTER + 1,
+            namespace.inner(),
+            Rc::clone(bus),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let mut partition = IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(SEGMENT_BYTES),
+        );
+        partition.set_created_revision(SERVED_INCARNATION);
+        partitions.insert(namespace, partition);
+    }
+
+    /// Commits write `op` of a [`serve_to_requester`] group once
+    /// [`TRANSFER_REQUESTER`] acks it.
+    #[allow(clippy::future_not_send)]
+    async fn commit_acked_write(owner: &IoTestShard, namespace: IggyNamespace, op: u64) {
+        let partitions = owner.plane.partitions();
+        let request = send_request(namespace, op).transmute_header(
+            |old, header: &mut RoutedRequestHeader| {
+                *header = old;
+                header.partition_incarnation = SERVED_INCARNATION;
+            },
+        );
+        let (reply, replied) = consensus::oneshot_channel();
+        partitions.on_request_with_reply(request, Some(reply)).await;
+        owner
+            .process_loopback(&mut crate::router::LoopbackRound::default())
+            .await;
+        let prepare = partitions
+            .get_by_ns(&namespace)
+            .unwrap()
+            .consensus()
+            .pipeline_head_header()
+            .expect("the write is pipelined");
+        let ack = Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>()).transmute_header(
+            |_, ack: &mut PrepareOkHeader| {
+                ack.command = Command::PrepareOk;
+                ack.cluster = 1;
+                ack.replica = TRANSFER_REQUESTER;
+                ack.view = prepare.view;
+                ack.op = prepare.op;
+                ack.prepare_checksum = prepare.checksum;
+                ack.operation = prepare.operation;
+                ack.group = prepare.group;
+                ack.size = u32::try_from(size_of::<PrepareOkHeader>()).unwrap();
+                ack.seal();
+            },
+        );
+        owner.on_message(MessageBag::PrepareOk(ack)).await;
+        owner
+            .process_loopback(&mut crate::router::LoopbackRound::default())
+            .await;
+        assert_eq!(replied.await.unwrap().header().status, 0);
+    }
+
     /// A shard whose primaries of `namespaces` each hold one committed op in
     /// segment files under `directory`. Its I/O owner pins their transfer
     /// plans, so a transfer request parks until an I/O turn pins its plan.
@@ -11036,21 +11186,10 @@ mod tests {
         for namespace in namespaces {
             let directory = directory.join(namespace.inner().to_string());
             std::fs::create_dir(&directory).unwrap();
+            serve_to_requester(&owner, bus, *namespace);
             let partition = partitions.get_mut_by_ns(namespace).unwrap();
-            partition.set_created_revision(SERVED_INCARNATION);
             attach_segment_files(partition, &directory, false).await;
-            let request = send_request(*namespace, 1).transmute_header(
-                |old, header: &mut RoutedRequestHeader| {
-                    *header = old;
-                    header.partition_incarnation = SERVED_INCARNATION;
-                },
-            );
-            let (reply, replied) = consensus::oneshot_channel();
-            partitions.on_request_with_reply(request, Some(reply)).await;
-            owner
-                .process_loopback(&mut crate::router::LoopbackRound::default())
-                .await;
-            assert_eq!(replied.await.unwrap().header().status, 0);
+            commit_acked_write(&owner, *namespace, 1).await;
         }
         partitions.set_io_notifier(
             owner.partition_io.notifier(),

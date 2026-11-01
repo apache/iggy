@@ -104,6 +104,11 @@ mod ffi {
         /// The owner generation is zero: topic details belong to no consumer
         /// group.
         context: PartitionContext,
+        /// Node ids that store the partition, in member order.
+        members: Vec<u8>,
+        /// Members the partition's primary last reported in sync and that are
+        /// up. Empty until the primary first reports.
+        in_sync_members: Vec<u8>,
     }
 
     struct TopicDetails {
@@ -690,6 +695,8 @@ mod ffi {
         size_of_messages_required_to_save: u64,
         has_preallocate_segments: bool,
         preallocate_segments: bool,
+        has_replication_factor: bool,
+        replication_factor: u32,
         has_partition_resize_policy: bool,
         partition_resize_policy: String,
         raw_options: Vec<HeaderEntry>,

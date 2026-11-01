@@ -26,21 +26,24 @@ use crate::stm::id_slab::IdSlab;
 use crate::stm::lifecycle::{
     CompleteLifecycleRequest, LifecycleAction, LifecycleIntent, LifecycleScope,
 };
+use crate::stm::partition_directory::PartitionDirectory;
 use crate::stm::result::{
     ApplyReply, CreatePartitionsResult, CreateStreamResult, CreateTopicResult,
     DeletePartitionsResult, DeleteStreamResult, DeleteTopicResult, DeletedResource,
     TruncatePartitionResult, UpdateStreamResult, UpdateTopicResult,
 };
-use crate::stm::snapshot::Snapshotable;
+use crate::stm::snapshot::{SnapshotError, Snapshotable};
 use crate::stm::{ApplyContext, StateHandler};
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::{AHashMap, AHashSet};
 use bytes::{BufMut, Bytes, BytesMut};
+use consensus::{ReplicaSet, ReplicaSetError};
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
 use iggy_binary_protocol::primitives::metadata_changes::{
     WireMetadataChange, WireStreamBody, WireStreamDeletedBody, WireStreamKey, WireTopicDeletedBody,
 };
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+use iggy_binary_protocol::primitives::partition_status::PartitionStatusEntry;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
 };
@@ -57,6 +60,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 // their cfg the import is dead and `-p <crate>` clippy (which skips the
 // simulator feature) rejects it.
 use iggy_binary_protocol::primitives::partition_history::{ConsumerGroupOwner, PartitionContext};
+use iggy_binary_protocol::requests::system::RetirementDebt;
 #[cfg(any(test, feature = "simulator"))]
 use iggy_binary_protocol::requests::topics::CreateTopicRequest;
 use iggy_binary_protocol::requests::topics::{
@@ -83,6 +87,7 @@ use serde::{Deserialize, Serialize};
 use server_common::sharding::{IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 /// Removals [`RemovedPartitions`] keeps. A reader that falls further behind
 /// rebuilds from the tree, which a delete of this many partitions costs anyway.
@@ -105,6 +110,13 @@ pub struct PartitionSnapshot {
     /// view every group started in before it existed.
     #[serde(default)]
     pub created_view: u32,
+    /// Node ids storing the partition, in member order. Empty for a partition
+    /// every node stores, the only layout before replication factors.
+    #[serde(default)]
+    pub members: Vec<u8>,
+    /// `#[serde(default)]` so snapshots predating retirement debt restore at 0.
+    #[serde(default)]
+    pub retirement_debt_op: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +139,13 @@ pub struct Partition {
     /// `TruncatePartition` (the resolved form of a client `DeleteSegments`).
     /// `0` means nothing has been trimmed.
     pub deleted_up_to_offset: u64,
+    /// The nodes storing this partition. `None` for one created before
+    /// replication factors, which every node stores.
+    pub members: Option<ReplicaSet>,
+    /// Newest `FinalizeSession` op that finalized a session this incarnation
+    /// had not proven retired, `0` for none. The partition pays it by
+    /// committing a retirement whose `paid_through` reaches it.
+    pub retirement_debt_op: u64,
 }
 
 impl Partition {
@@ -145,6 +164,180 @@ impl Partition {
             created_revision,
             created_view,
             deleted_up_to_offset: 0,
+            members: None,
+            retirement_debt_op: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_members(mut self, members: ReplicaSet) -> Self {
+        self.members = Some(members);
+        self
+    }
+
+    /// The nodes storing this partition in a cluster of `nodes` nodes.
+    ///
+    /// # Panics
+    /// If `nodes` is zero or above the replica limit.
+    #[must_use]
+    pub fn replica_set(&self, nodes: u8) -> ReplicaSet {
+        self.members.unwrap_or_else(|| ReplicaSet::all(nodes))
+    }
+
+    /// Node id of the primary `view` assigns, in a cluster of `nodes` nodes.
+    #[must_use]
+    pub fn primary_node(&self, view: u32, nodes: u8) -> Option<u8> {
+        primary_of(self.members, view, nodes)
+    }
+}
+
+/// Whether `status` reports the committed incarnation of its partition.
+fn committed_report(inner: &StreamsInner, status: &PartitionStatusEntry) -> bool {
+    let namespace = IggyNamespace::from_raw(status.namespace);
+    inner
+        .items
+        .get(namespace.stream_id())
+        .and_then(|stream| stream.topics.get(namespace.topic_id()))
+        .and_then(|topic| find_partition(&topic.partitions, namespace.partition_id()))
+        .is_some_and(|partition| partition.created_revision == status.created_revision)
+}
+
+/// Partitions short of their factor and partitions that cannot commit, as
+/// [`Streams::partition_replication`] counts them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PartitionReplication {
+    pub under_replicated: usize,
+    pub below_write_quorum: usize,
+}
+
+/// When each committed partition, by namespace and incarnation, was first
+/// found without a report, kept by the metadata primary from one
+/// [`Streams::partition_replication`] scan to the next.
+#[derive(Debug, Default)]
+pub struct UnreportedPartitions {
+    since: AHashMap<(u64, u64), Instant>,
+}
+
+/// Node id of the primary `view` assigns among `members`, or among nodes
+/// `0..nodes` when there is no member list.
+#[must_use]
+pub fn primary_of(members: Option<ReplicaSet>, view: u32, nodes: u8) -> Option<u8> {
+    match members {
+        Some(members) => members.node(u8::try_from(view % u32::from(members.len())).ok()?),
+        None if nodes > 0 => u8::try_from(view % u32::from(nodes)).ok(),
+        None => None,
+    }
+}
+
+/// Decode the member list of every committed assignment. Empty means every node.
+fn assignment_members(
+    assignments: &[CreatedPartitionAssignment],
+) -> Result<Vec<Option<ReplicaSet>>, ReplicaSetError> {
+    assignments
+        .iter()
+        .map(|assignment| {
+            (!assignment.members.is_empty())
+                .then(|| ReplicaSet::new(&assignment.members))
+                .transpose()
+        })
+        .collect()
+}
+
+/// The assignments' member lists, when each lists as many members as `topic`'s
+/// replication factor, and none for a topic created without one. Admission
+/// reads the factor from a possibly older view of the topic.
+fn members_for_topic(
+    topic: &Topic,
+    assignments: &[CreatedPartitionAssignment],
+) -> Option<Vec<Option<ReplicaSet>>> {
+    let factor = TopicCreateOptions::from_resource_options(&topic.options)
+        .replication_factor
+        .map_or(0, |factor| factor as usize);
+    assignments
+        .iter()
+        .all(|assignment| assignment.members.len() == factor)
+        .then(|| assignment_members(assignments).ok())
+        .flatten()
+}
+
+impl TryFrom<PartitionSnapshot> for Partition {
+    type Error = ReplicaSetError;
+
+    fn try_from(snapshot: PartitionSnapshot) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: snapshot.id,
+            consensus_group_id: snapshot.consensus_group_id,
+            created_at: snapshot.created_at,
+            created_revision: snapshot.created_revision,
+            created_view: snapshot.created_view,
+            deleted_up_to_offset: snapshot.deleted_up_to_offset,
+            members: (!snapshot.members.is_empty())
+                .then(|| ReplicaSet::new(&snapshot.members))
+                .transpose()?,
+            retirement_debt_op: snapshot.retirement_debt_op,
+        })
+    }
+}
+
+/// Committed partitions counted the ways placement reads them, so it needs no
+/// walk. Rebuilt on restore.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PlacementIndex {
+    /// Partitions without a member list, by created view.
+    pub(crate) created_views: BTreeMap<u32, u64>,
+    /// Partitions with a member list, by the node their created view names.
+    pub(crate) created_primaries: BTreeMap<u8, u64>,
+    /// Partitions with a member list, once for every node storing them.
+    pub(crate) stored_replicas: BTreeMap<u8, u64>,
+}
+
+impl PlacementIndex {
+    fn build(items: &IdSlab<Stream>) -> Self {
+        let mut index = Self::default();
+        for partition in items
+            .iter()
+            .flat_map(|(_, stream)| stream.topics.iter())
+            .flat_map(|(_, topic)| topic.partitions.iter())
+        {
+            index.insert(partition);
+        }
+        index
+    }
+
+    fn insert(&mut self, partition: &Partition) {
+        let Some(members) = partition.members else {
+            *self
+                .created_views
+                .entry(partition.created_view)
+                .or_default() += 1;
+            return;
+        };
+        if let Some(primary) = primary_of(Some(members), partition.created_view, members.len()) {
+            *self.created_primaries.entry(primary).or_default() += 1;
+        }
+        for node in members.nodes() {
+            *self.stored_replicas.entry(*node).or_default() += 1;
+        }
+    }
+
+    fn remove(&mut self, partition: &Partition) {
+        fn decrement<K: Ord>(counts: &mut BTreeMap<K, u64>, key: &K) {
+            if let Some(count) = counts.get_mut(key) {
+                *count -= 1;
+                if *count == 0 {
+                    counts.remove(key);
+                }
+            }
+        }
+        let Some(members) = partition.members else {
+            decrement(&mut self.created_views, &partition.created_view);
+            return;
+        };
+        if let Some(primary) = primary_of(Some(members), partition.created_view, members.len()) {
+            decrement(&mut self.created_primaries, &primary);
+        }
+        for node in members.nodes() {
+            decrement(&mut self.stored_replicas, node);
         }
     }
 }
@@ -423,11 +616,15 @@ impl Stream {
 /// the next `publish()` still sees the partition listed and can mint the entry
 /// back. What it does buy is that the resurrected entry carries an id the
 /// evicting op named, so the deferred `absorb_second` run evicts it again.
+///
+/// It also carries the [`PartitionDirectory`]: the same node-local, cross-shard
+/// lifetime, for partitions this node hears about but does not store.
 #[derive(Debug, Default)]
 pub struct StatsRegistry {
     streams: std::sync::Mutex<AHashMap<usize, Arc<StreamStats>>>,
     topics: std::sync::Mutex<AHashMap<(usize, usize), Arc<TopicStats>>>,
     partitions: std::sync::Mutex<AHashMap<(usize, usize, usize), PartitionEntry>>,
+    directory: PartitionDirectory,
 }
 
 /// Shared partition counters plus the identity of the partition they count.
@@ -445,6 +642,11 @@ struct PartitionEntry {
 }
 
 impl StatsRegistry {
+    #[must_use]
+    pub const fn directory(&self) -> &PartitionDirectory {
+        &self.directory
+    }
+
     fn stream(&self, id: usize) -> Arc<StreamStats> {
         self.streams
             .lock()
@@ -791,6 +993,11 @@ define_state! {
         // Retirement proofs survive truncation, but not a changed set of
         // partition incarnations.
         pub namespace_revision: u64,
+        // Newest op that recorded a retirement debt. Rebuilt on restore.
+        pub retirement_debt_revision: u64,
+        // Debts the newest commits recorded, so a debt reader absorbs only new
+        // ones without a walk. A restore starts it empty.
+        pub(crate) recent_retirement_debts: RecentRetirementDebts,
         pub lifecycle_intents: BTreeMap<u64, LifecycleIntent>,
         // The keys of `lifecycle_intents` ordered by stream and topic, so a
         // blocker query visits only its own scope. Rebuilt on restore.
@@ -802,9 +1009,7 @@ define_state! {
         pub(crate) pending_revocations: BTreeMap<(usize, usize, u64, usize), ConsumerGroupOwnershipTransition>,
         // Locations are (stream, topic, group, member); never persisted.
         pub(crate) consumer_group_members: AHashMap<u128, Vec<(usize, usize, u64, usize)>>,
-        // Committed partitions per created view, so placement counts them
-        // without a walk. Rebuilt on restore.
-        pub(crate) created_views: BTreeMap<u32, u64>,
+        pub(crate) placement_index: PlacementIndex,
         // Partitions the newest commits removed, so placement retires what it
         // observed of them without a walk. A restore starts it empty.
         pub(crate) removed_partitions: RemovedPartitions,
@@ -812,6 +1017,44 @@ define_state! {
         // left-right buffers (see `StatsRegistry`). Not snapshotted -- rebuilt
         // as streams/topics restore.
         pub stats_registry: Arc<StatsRegistry>,
+    }
+}
+
+/// A partition owing a retirement: `(namespace, created_revision, debt_op)`.
+pub type OwedRetirement = (IggyNamespace, u64, u64);
+
+/// Debt entries [`RecentRetirementDebts`] keeps. A reader that falls further
+/// behind rescans the tree.
+pub(crate) const RECENT_RETIREMENT_DEBTS_RETAINED: usize = 65_536;
+
+/// Retirement debts that recent commits recorded, oldest first, each stamped
+/// with the op that recorded it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RecentRetirementDebts {
+    entries: VecDeque<(u64, RetirementDebt)>,
+    /// Newest op whose entries are gone, evicted or never recorded.
+    forgotten_through: u64,
+}
+
+impl RecentRetirementDebts {
+    /// Every debt recorded after `op`, or `None` when some of them are no
+    /// longer recorded.
+    fn since(&self, op: u64) -> Option<impl Iterator<Item = &(u64, RetirementDebt)>> {
+        (self.forgotten_through <= op).then(|| {
+            let first = self
+                .entries
+                .partition_point(|(recorded, _)| *recorded <= op);
+            self.entries.range(first..)
+        })
+    }
+
+    fn push(&mut self, op: u64, debt: RetirementDebt) {
+        if self.entries.len() == RECENT_RETIREMENT_DEBTS_RETAINED
+            && let Some((evicted, _)) = self.entries.pop_front()
+        {
+            self.forgotten_through = evicted;
+        }
+        self.entries.push_back((op, debt));
     }
 }
 
@@ -1021,7 +1264,41 @@ collect_handlers! {
         CompleteLifecycle,
         RewrapStreamKeys,
     }
-    internal { RefreshConsumerGroupSession, RemoveConsumerGroupMembers }
+    internal { RefreshConsumerGroupSession, RemoveConsumerGroupMembers, RecordRetirementDebt }
+}
+
+/// The retirement debts of one committed `FinalizeSession`. Never decoded from
+/// the wire: the op body carries them.
+#[derive(Debug, Clone)]
+pub struct RecordRetirementDebtRequest {
+    pub debts: Vec<RetirementDebt>,
+}
+
+impl StateHandler for RecordRetirementDebtRequest {
+    type State = StreamsInner;
+    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
+        let op = state.apply_context.metadata_op;
+        for debt in &self.debts {
+            let namespace = IggyNamespace::from_raw(debt.namespace);
+            let Some(partition) = state
+                .items
+                .get_mut(namespace.stream_id())
+                .and_then(|stream| stream.topics.get_mut(namespace.topic_id()))
+                .and_then(|topic| {
+                    find_partition_mut(&mut topic.partitions, namespace.partition_id())
+                })
+            else {
+                continue;
+            };
+            // A recreated incarnation never inherits an older one's debt.
+            if partition.created_revision == debt.created_revision {
+                partition.retirement_debt_op = partition.retirement_debt_op.max(op);
+                state.retirement_debt_revision = state.retirement_debt_revision.max(op);
+                state.recent_retirement_debts.push(op, *debt);
+            }
+        }
+        ApplyReply::ok(Bytes::new())
+    }
 }
 
 impl StreamsInner {
@@ -1058,12 +1335,7 @@ impl StreamsInner {
     /// that commit set `namespace_revision`.
     fn retire_partitions(&mut self, stream_id: usize, topic_id: usize, partitions: &[Partition]) {
         for partition in partitions {
-            if let Some(count) = self.created_views.get_mut(&partition.created_view) {
-                *count -= 1;
-                if *count == 0 {
-                    self.created_views.remove(&partition.created_view);
-                }
-            }
+            self.placement_index.remove(partition);
             self.removed_partitions.push(RemovedPartition {
                 namespace_revision: self.namespace_revision,
                 namespace: IggyNamespace::new(stream_id, topic_id, partition.id),
@@ -2029,6 +2301,399 @@ impl Streams {
         self.with_committed_partition(namespace, |partition| partition.created_view)
     }
 
+    /// Take in partition reports from their primaries, received at `now`.
+    /// Counters of a partition `self_node` does not store follow its report;
+    /// a stored one keeps its own.
+    pub fn record_partition_statuses(
+        &self,
+        statuses: &[PartitionStatusEntry],
+        self_node: u8,
+        nodes: u8,
+        now: Instant,
+    ) {
+        self.inner.read(|inner| {
+            let registry = &inner.stats_registry;
+            for status in registry.directory().record(statuses.iter().copied(), now) {
+                let namespace = IggyNamespace::from_raw(status.namespace);
+                let Some(topic) = inner
+                    .items
+                    .get(namespace.stream_id())
+                    .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                else {
+                    continue;
+                };
+                let Some(partition) = find_partition(&topic.partitions, namespace.partition_id())
+                else {
+                    continue;
+                };
+                if partition.created_revision != status.created_revision
+                    || partition.replica_set(nodes).member(self_node).is_some()
+                {
+                    continue;
+                }
+                registry
+                    .partition(
+                        namespace.stream_id(),
+                        namespace.topic_id(),
+                        partition,
+                        topic.stats.clone(),
+                    )
+                    .store_reported(
+                        status.size_bytes,
+                        status.messages_count,
+                        status.segments_count,
+                        status.current_offset,
+                    );
+            }
+        });
+    }
+
+    /// The newest directory change, so a cursor starting there sends only
+    /// later ones.
+    #[must_use]
+    pub fn partition_status_last_change(&self) -> u64 {
+        self.inner
+            .read(|inner| inner.stats_registry.directory().last_change())
+    }
+
+    /// Count the reports of `namespaces` as changed after every earlier
+    /// change, so a cursor that already passed them sends them again.
+    pub fn mark_partition_statuses_changed(&self, namespaces: &[u64]) {
+        self.inner.read(|inner| {
+            inner
+                .stats_registry
+                .directory()
+                .mark_changed(namespaces.iter().copied());
+        });
+    }
+
+    /// How many partition reports this node holds.
+    #[must_use]
+    pub fn partition_status_count(&self) -> usize {
+        self.inner
+            .read(|inner| inner.stats_registry.directory().report_count())
+    }
+
+    /// Up to `limit` directory reports that still name a committed incarnation
+    /// and changed their incarnation, view or in-sync nodes after change
+    /// `after`, with the last change they reach as the next call's `after`.
+    #[must_use]
+    pub fn partition_status_changes(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> (Vec<PartitionStatusEntry>, u64) {
+        self.inner.read(|inner| {
+            inner
+                .stats_registry
+                .directory()
+                .changed_after(after, limit, |status| committed_report(inner, status))
+        })
+    }
+
+    /// Up to `limit` directory reports after `after` that still name a
+    /// committed incarnation. A peer storing a partition reads its counters
+    /// locally but still takes its report, for the in-sync nodes. Visits at
+    /// most `scan_max` reports and returns the last one visited as the next
+    /// cursor.
+    #[must_use]
+    pub fn partition_status_batch(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+        scan_max: usize,
+    ) -> (Vec<PartitionStatusEntry>, Option<u64>) {
+        self.inner.read(|inner| {
+            inner
+                .stats_registry
+                .directory()
+                .scan(after, limit, scan_max, |status| {
+                    committed_report(inner, status)
+                })
+        })
+    }
+
+    /// Narrow the in-sync nodes the directory's reports carry to
+    /// `ready_nodes`, the nodes the metadata primary hears from, or stop
+    /// narrowing them with `u32::MAX`.
+    pub fn set_partition_directory_ready_nodes(&self, ready_nodes: u32) {
+        self.inner.read(|inner| {
+            inner
+                .stats_registry
+                .directory()
+                .set_ready_nodes(ready_nodes);
+        });
+    }
+
+    /// The directory's latest report of `namespace`, if it still names the
+    /// committed incarnation.
+    #[must_use]
+    pub fn partition_status(&self, namespace: IggyNamespace) -> Option<PartitionStatusEntry> {
+        self.inner.read(|inner| {
+            let created_revision = inner
+                .items
+                .get(namespace.stream_id())
+                .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                .and_then(|topic| find_partition(&topic.partitions, namespace.partition_id()))?
+                .created_revision;
+            inner
+                .stats_registry
+                .directory()
+                .get(namespace, created_revision)
+        })
+    }
+
+    /// Forget, among at most `limit` reports after `after`, those of
+    /// partitions no longer committed in the incarnation they describe.
+    /// Returns where the next chunk starts, `None` after the last one.
+    pub fn retain_partition_directory(&self, after: Option<u64>, limit: usize) -> Option<u64> {
+        self.inner.read(|inner| {
+            inner
+                .stats_registry
+                .directory()
+                .retain_chunk(after, limit, |status| {
+                    let namespace = IggyNamespace::from_raw(status.namespace);
+                    inner
+                        .items
+                        .get(namespace.stream_id())
+                        .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                        .and_then(|topic| {
+                            find_partition(&topic.partitions, namespace.partition_id())
+                        })
+                        .is_some_and(|partition| {
+                            partition.created_revision == status.created_revision
+                        })
+                })
+        })
+    }
+
+    /// Record what a committed `FinalizeSession` at `metadata_op` left owed.
+    /// Applied on every replica as a side effect of that op.
+    pub fn record_retirement_debt(&self, debts: &[RetirementDebt], metadata_op: u64) {
+        if debts.is_empty() {
+            return;
+        }
+        let command = StreamsCommand::RecordRetirementDebt(
+            RecordRetirementDebtRequest {
+                debts: debts.to_vec(),
+            },
+            IggyTimestamp::default(),
+            ApplyContext {
+                metadata_op,
+                ..ApplyContext::default()
+            },
+        );
+        if let Err(error) = self.inner.try_apply(command) {
+            tracing::error!(%error, "record_retirement_debt dispatched to reader-only Streams STM");
+        }
+    }
+
+    /// Every committed partition `node` stores that owes a retirement, as
+    /// `(namespace, created_revision, retirement_debt_op)`, with the newest
+    /// debt op. A walk: prefer [`Self::retirement_debts_since`].
+    #[must_use]
+    pub fn retirement_debts_stored_by(&self, node: u8, nodes: u8) -> (Vec<OwedRetirement>, u64) {
+        self.inner.read(|inner| {
+            let mut debts = Vec::new();
+            for (stream_id, stream) in &inner.items {
+                for (topic_id, topic) in &stream.topics {
+                    for partition in &topic.partitions {
+                        if partition.retirement_debt_op != 0
+                            && partition.replica_set(nodes).member(node).is_some()
+                        {
+                            debts.push((
+                                IggyNamespace::new(stream_id, topic_id, partition.id),
+                                partition.created_revision,
+                                partition.retirement_debt_op,
+                            ));
+                        }
+                    }
+                }
+            }
+            (debts, inner.retirement_debt_revision)
+        })
+    }
+
+    /// The debts of committed partitions `node` stores that ops after
+    /// `seen_through` recorded, with the newest debt op, or `None` when they
+    /// are no longer all recorded.
+    #[must_use]
+    pub fn retirement_debts_since(
+        &self,
+        seen_through: u64,
+        node: u8,
+        nodes: u8,
+    ) -> Option<(Vec<OwedRetirement>, u64)> {
+        self.inner.read(|inner| {
+            let debts = inner
+                .recent_retirement_debts
+                .since(seen_through)?
+                .filter_map(|(op, debt)| {
+                    let namespace = IggyNamespace::from_raw(debt.namespace);
+                    let partition = find_partition(
+                        &inner
+                            .items
+                            .get(namespace.stream_id())?
+                            .topics
+                            .get(namespace.topic_id())?
+                            .partitions,
+                        namespace.partition_id(),
+                    )?;
+                    (partition.created_revision == debt.created_revision
+                        && partition.replica_set(nodes).member(node).is_some())
+                    .then_some((namespace, debt.created_revision, *op))
+                })
+                .collect();
+            Some((debts, inner.retirement_debt_revision))
+        })
+    }
+
+    /// The committed partition's retirement debt op if it is still the
+    /// `created_revision` incarnation.
+    #[must_use]
+    pub fn retirement_debt_for(
+        &self,
+        namespace: IggyNamespace,
+        created_revision: u64,
+    ) -> Option<u64> {
+        self.with_committed_partition(namespace, |partition| {
+            (partition.created_revision == created_revision).then_some(partition.retirement_debt_op)
+        })
+        .flatten()
+    }
+
+    /// A committed partition naming a member outside a cluster of `nodes`
+    /// nodes, with that member: state the cluster cannot serve.
+    #[must_use]
+    pub fn member_outside_cluster(&self, nodes: u8) -> Option<(IggyNamespace, u8)> {
+        self.inner.read(|inner| {
+            inner.items.iter().find_map(|(stream_id, stream)| {
+                stream.topics.iter().find_map(|(topic_id, topic)| {
+                    topic.partitions.iter().find_map(|partition| {
+                        let node = partition
+                            .members?
+                            .nodes()
+                            .iter()
+                            .copied()
+                            .find(|node| *node >= nodes)?;
+                        Some((IggyNamespace::new(stream_id, topic_id, partition.id), node))
+                    })
+                })
+            })
+        })
+    }
+
+    /// The committed partition's member list and created view, with the view
+    /// its primary last reported for that incarnation, from one read.
+    #[must_use]
+    pub fn partition_route_inputs(
+        &self,
+        namespace: IggyNamespace,
+    ) -> Option<(Option<ReplicaSet>, u32, Option<u32>)> {
+        self.inner.read(|inner| {
+            let partition = find_partition(
+                &inner
+                    .items
+                    .get(namespace.stream_id())?
+                    .topics
+                    .get(namespace.topic_id())?
+                    .partitions,
+                namespace.partition_id(),
+            )?;
+            let reported = inner
+                .stats_registry
+                .directory()
+                .get(namespace, partition.created_revision)
+                .map(|status| status.view);
+            Some((partition.members, partition.created_view, reported))
+        })
+    }
+
+    /// How many committed partitions run short of their factor, and how many
+    /// cannot commit, counted once for the whole cluster at `now`. A partition
+    /// whose primary, as last reported or created before any report, is `live`
+    /// counts the members of its last report that are live too. One whose
+    /// primary is not live counts its live members, which must elect a primary
+    /// before anything commits.
+    ///
+    /// A primary reports only while it leads, so a report received before
+    /// `stale_before` lists no member in sync, here and in every read of it
+    /// on this node. A partition with no report counts the same way once it
+    /// was first found without one before `stale_before`, and is left out
+    /// until then.
+    #[must_use]
+    pub fn partition_replication(
+        &self,
+        live: &[bool],
+        now: Instant,
+        stale_before: Option<Instant>,
+        unreported: &mut UnreportedPartitions,
+    ) -> PartitionReplication {
+        let nodes = u8::try_from(live.len()).unwrap_or(u8::MAX);
+        let is_live = |node: u8| live.get(usize::from(node)).copied().unwrap_or(false);
+        let mut previous = std::mem::take(&mut unreported.since);
+        self.inner.read(|inner| {
+            let directory = inner.stats_registry.directory();
+            let mut counts = PartitionReplication::default();
+            for (stream_id, stream) in &inner.items {
+                for (topic_id, topic) in &stream.topics {
+                    for partition in &topic.partitions {
+                        let members = partition.replica_set(nodes);
+                        let namespace = IggyNamespace::new(stream_id, topic_id, partition.id);
+                        let report = directory.expire_and_get(
+                            namespace,
+                            partition.created_revision,
+                            stale_before,
+                        );
+                        let unreported_long = report.is_none() && {
+                            let key = (namespace.inner(), partition.created_revision);
+                            let since = previous.remove(&key).unwrap_or(now);
+                            unreported.since.insert(key, since);
+                            stale_before.is_some_and(|before| since < before)
+                        };
+                        let view = report.map_or(partition.created_view, |status| status.view);
+                        let (holding, quorum) =
+                            if partition.primary_node(view, nodes).is_some_and(is_live) {
+                                let in_sync_nodes = match report {
+                                    Some(report) => report.in_sync_nodes,
+                                    None if unreported_long => 0,
+                                    None => continue,
+                                };
+                                let in_sync = members
+                                    .nodes()
+                                    .iter()
+                                    .filter(|&&node| {
+                                        1_u32
+                                            .checked_shl(u32::from(node))
+                                            .is_some_and(|bit| in_sync_nodes & bit != 0)
+                                    })
+                                    .count();
+                                (in_sync, consensus::quorum_replication(members.len()))
+                            } else {
+                                let live_members = members
+                                    .nodes()
+                                    .iter()
+                                    .filter(|&&node| is_live(node))
+                                    .count();
+                                (live_members, consensus::quorum_view_change(members.len()))
+                            };
+                        counts.under_replicated +=
+                            usize::from(holding < usize::from(members.len()));
+                        counts.below_write_quorum += usize::from(holding < quorum);
+                    }
+                }
+            }
+            counts
+        })
+    }
+
+    /// The committed partition's member list, `Some(None)` when every node
+    /// stores it.
+    #[must_use]
+    pub fn members_for_namespace(&self, namespace: IggyNamespace) -> Option<Option<ReplicaSet>> {
+        self.with_committed_partition(namespace, |partition| partition.members)
+    }
+
     fn with_committed_partition<T>(
         &self,
         namespace: IggyNamespace,
@@ -2104,6 +2769,12 @@ impl Streams {
             } else {
                 Vec::new()
             };
+            let replication_factor = partitions
+                .first()
+                .filter(|partition| !partition.members.is_empty())
+                .map(|partition| {
+                    u32::try_from(partition.members.len()).expect("member count fits u32")
+                });
             self.inner
                 .try_apply(StreamsCommand::CreateTopicWithAssignments(
                     CreateTopicWithAssignmentsRequest {
@@ -2116,6 +2787,7 @@ impl Streams {
                             options: iggy_common::TopicCreateOptions {
                                 durability,
                                 consumer_offset_durability: durability,
+                                replication_factor,
                                 ..Default::default()
                             }
                             .to_wire()
@@ -2178,6 +2850,24 @@ impl Streams {
         created_view: u32,
         durability: iggy_common::Durability,
     ) {
+        self.seed_namespace_on(namespace, consensus_group_id, created_view, durability, &[]);
+    }
+
+    /// [`Self::seed_namespace_with_durability`] storing the partitions on
+    /// `members`, in member order, with a topic whose replication factor is
+    /// their count. Empty `members` seeds the every-node layout.
+    ///
+    /// # Panics
+    /// As [`Self::seed_namespace`].
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn seed_namespace_on(
+        &self,
+        namespace: IggyNamespace,
+        consensus_group_id: u64,
+        created_view: u32,
+        durability: iggy_common::Durability,
+        members: &[u8],
+    ) {
         let stream_slab = namespace.stream_id();
         let topic_slab = namespace.topic_id();
         let partition_id =
@@ -2208,6 +2898,7 @@ impl Streams {
                 initial_view: created_view,
                 partition_id: id,
                 consensus_group_id: sibling_group_id(id),
+                members: members.to_vec(),
             })
             .collect();
         self.seed_stream_slabs(stream_slab);
@@ -2233,6 +2924,7 @@ impl Streams {
                 initial_view: created_view,
                 partition_id: id - base,
                 consensus_group_id: sibling_group_id(id),
+                members: members.to_vec(),
             })
             .collect::<Vec<_>>();
         self.inner
@@ -2267,18 +2959,6 @@ impl Streams {
     }
 }
 
-fn count_created_views(items: &IdSlab<Stream>) -> BTreeMap<u32, u64> {
-    let mut created_views = BTreeMap::new();
-    for partition in items
-        .iter()
-        .flat_map(|(_, stream)| stream.topics.iter())
-        .flat_map(|(_, topic)| topic.partitions.iter())
-    {
-        *created_views.entry(partition.created_view).or_default() += 1;
-    }
-    created_views
-}
-
 /// Whether the next insert's slab key still fits the packed namespace layout.
 ///
 /// Takes `vacant_key()` rather than `len()` because the KEY is what gets packed
@@ -2306,6 +2986,20 @@ pub(crate) fn find_partition(partitions: &[Partition], partition_id: usize) -> O
     partitions
         .iter()
         .find(|partition| partition.id == partition_id)
+}
+
+fn find_partition_mut(partitions: &mut [Partition], partition_id: usize) -> Option<&mut Partition> {
+    let index = if partitions
+        .get(partition_id)
+        .is_some_and(|partition| partition.id == partition_id)
+    {
+        partition_id
+    } else {
+        partitions
+            .iter()
+            .position(|partition| partition.id == partition_id)?
+    };
+    partitions.get_mut(index)
 }
 
 /// Range and distinctness for the ABSOLUTE partition ids on a topic create,
@@ -2592,6 +3286,10 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             }
         }
 
+        let Ok(members) = assignment_members(&self.partitions) else {
+            return ApplyReply::err(CreateTopicResult::InvalidReplicationFactor);
+        };
+
         // Past validation: this commit adds partitions, so bump the
         // monotonic revision and stamp every new partition with it.
         let new_revision = state.revision.wrapping_add(1);
@@ -2636,7 +3334,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         let inserted = stream.topics.insert(topic);
         debug_assert_eq!(inserted, topic_id, "vacant_key must match the insert slot");
         if let Some(topic) = stream.topics.get_mut(inserted) {
-            for partition in &self.partitions {
+            for (partition, members) in self.partitions.iter().zip(members) {
                 let partition = Partition {
                     id: partition.partition_id as usize,
                     consensus_group_id: partition.consensus_group_id,
@@ -2644,11 +3342,10 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
                     created_revision: new_revision,
                     created_view: partition.initial_view,
                     deleted_up_to_offset: 0,
+                    members,
+                    retirement_debt_op: 0,
                 };
-                *state
-                    .created_views
-                    .entry(partition.created_view)
-                    .or_default() += 1;
+                state.placement_index.insert(&partition);
                 topic.partitions.push(partition);
             }
         }
@@ -2735,6 +3432,13 @@ fn encode_create_topic_reply(
                     owner_generation: 0,
                     metadata_op,
                 },
+                // A new topic always lists its members. Nothing is in sync
+                // before the partition's primary first reports.
+                members: p
+                    .members
+                    .map(|members| members.nodes().to_vec())
+                    .unwrap_or_default(),
+                in_sync_members: Vec::new(),
             })
         })
         .collect::<Result<Vec<PartitionResponse>, _>>()
@@ -3035,7 +3739,7 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
         // the revision bump. Validate every id transition before mutating
         // topic.partitions; mid-batch overflow + retry would otherwise
         // re-base over a partial set and mint duplicate ids.
-        let resolved: Vec<usize> = {
+        let (resolved, members) = {
             let Some(stream) = state.items.get_mut(stream_id) else {
                 return ApplyReply::err(CreatePartitionsResult::StreamNotFound);
             };
@@ -3045,6 +3749,11 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
             if topic.resolved.partition_resize_policy == PartitionResizePolicy::Fixed {
                 return ApplyReply::err(CreatePartitionsResult::PartitionResizeDisabled);
             }
+            // Not `TransientNotAccepted`: a committed refusal is cached against
+            // the request id, so a retry would replay it instead of admitting.
+            let Some(members) = members_for_topic(topic, &self.partitions) else {
+                return ApplyReply::err(CreatePartitionsResult::InvalidReplicationFactor);
+            };
 
             let base_partition_id = topic
                 .partitions
@@ -3082,7 +3791,7 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
                 }
                 resolved.push(resolved_id_usize);
             }
-            resolved
+            (resolved, members)
         };
 
         let new_revision = state.revision.wrapping_add(1);
@@ -3095,19 +3804,23 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
         let Some(topic) = stream.topics.get_mut(topic_id) else {
             return ApplyReply::err(CreatePartitionsResult::TopicNotFound);
         };
-        for (resolved_id_usize, partition) in resolved.into_iter().zip(self.partitions.iter()) {
-            *state
-                .created_views
-                .entry(partition.initial_view)
-                .or_default() += 1;
-            topic.partitions.push(Partition {
+        for ((resolved_id_usize, partition), members) in resolved
+            .into_iter()
+            .zip(self.partitions.iter())
+            .zip(members)
+        {
+            let partition = Partition {
                 id: resolved_id_usize,
                 consensus_group_id: partition.consensus_group_id,
                 created_at: timestamp,
                 created_revision: new_revision,
                 created_view: partition.initial_view,
                 deleted_up_to_offset: 0,
-            });
+                members,
+                retirement_debt_op: 0,
+            };
+            state.placement_index.insert(&partition);
+            topic.partitions.push(partition);
         }
         // Added partitions are unassigned until the groups rebalance.
         topic.rebalance_consumer_groups(state.apply_context.metadata_op, timestamp);
@@ -3274,6 +3987,11 @@ impl Snapshotable for Streams {
                                             created_revision: p.created_revision,
                                             created_view: p.created_view,
                                             deleted_up_to_offset: p.deleted_up_to_offset,
+                                            members: p
+                                                .members
+                                                .map(|members| members.nodes().to_vec())
+                                                .unwrap_or_default(),
+                                            retirement_debt_op: p.retirement_debt_op,
                                         })
                                         .collect(),
                                     consumer_groups: topic
@@ -3321,6 +4039,7 @@ impl Snapshotable for Streams {
         snapshot: Self::Snapshot,
     ) -> Result<Self, crate::stm::snapshot::SnapshotError> {
         snapshot.validate_ownership_history(u64::MAX)?;
+        snapshot.validate_partition_members()?;
         // Boot: no live registry exists yet, so mint one. Safe because
         // `new_from_empty` clones this single inner onto the other left-right
         // buffer rather than building a second one.
@@ -3330,6 +4049,26 @@ impl Snapshotable for Streams {
         // folds the real ones back in from disk.
         let inner = StreamsInner::inner_from_snapshot(snapshot, Arc::new(StatsRegistry::default()));
         Ok(inner.into())
+    }
+}
+
+impl StreamsSnapshot {
+    pub(crate) fn validate_partition_members(&self) -> Result<(), SnapshotError> {
+        let valid = self
+            .items
+            .iter()
+            .flat_map(|(_, stream)| stream.topics.iter())
+            .flat_map(|(_, topic)| topic.partitions.iter())
+            .all(|partition| {
+                partition.members.is_empty() || ReplicaSet::new(&partition.members).is_ok()
+            });
+        if valid {
+            Ok(())
+        } else {
+            Err(SnapshotError::InvalidState(
+                "partition member list is empty, oversized or repeats a node",
+            ))
+        }
     }
 }
 
@@ -3372,6 +4111,7 @@ impl StreamsInner {
     /// stream that never held it, clamps, and raises the rollup-underflow alarm
     /// on every boot with no real divergence behind it. A snapshot's totals are
     /// the DONOR's, over children the receiver kept the whole time.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn inner_from_snapshot(
         snapshot: StreamsSnapshot,
         stats_registry: Arc<StatsRegistry>,
@@ -3399,13 +4139,10 @@ impl StreamsInner {
                     partitions: topic_snap
                         .partitions
                         .into_iter()
-                        .map(|p| Partition {
-                            id: p.id,
-                            consensus_group_id: p.consensus_group_id,
-                            created_at: p.created_at,
-                            created_revision: p.created_revision,
-                            created_view: p.created_view,
-                            deleted_up_to_offset: p.deleted_up_to_offset,
+                        .map(|partition| {
+                            Partition::try_from(partition).expect(
+                                "StreamsSnapshot::validate_partition_members runs before restore",
+                            )
                         })
                         .collect(),
                     // Not snapshotted (see `TopicSnapshot`): start fresh.
@@ -3462,19 +4199,31 @@ impl StreamsInner {
             .values()
             .map(LifecycleIntent::scope)
             .collect();
-        let created_views = count_created_views(&items);
+        let placement_index = PlacementIndex::build(&items);
+        let retirement_debt_revision = items
+            .iter()
+            .flat_map(|(_, stream)| stream.topics.iter())
+            .flat_map(|(_, topic)| topic.partitions.iter())
+            .map(|partition| partition.retirement_debt_op)
+            .max()
+            .unwrap_or(0);
         let mut inner = Self {
             index,
             items,
             revision: snapshot.revision,
             namespace_revision: snapshot.namespace_revision,
+            retirement_debt_revision,
+            recent_retirement_debts: RecentRetirementDebts {
+                entries: VecDeque::new(),
+                forgotten_through: retirement_debt_revision,
+            },
             lifecycle_intents,
             lifecycle_scopes,
             finalizing_lifecycle: None,
             // Recomputed from the restored groups just below.
             pending_revocations: BTreeMap::new(),
             consumer_group_members: AHashMap::new(),
-            created_views,
+            placement_index,
             removed_partitions: RemovedPartitions {
                 entries: VecDeque::new(),
                 forgotten_through: snapshot.namespace_revision,
@@ -3513,6 +4262,7 @@ mod tests {
         topic_option_keys,
     };
     use std::str::FromStr;
+    use std::time::Duration;
 
     #[test]
     fn truncate_partition_request_round_trips() {
@@ -3584,6 +4334,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         let reply = StateHandler::apply(&request, &mut inner, IggyTimestamp::from(1));
@@ -3648,11 +4399,13 @@ mod tests {
                     partition_id: 0,
                     consensus_group_id: 1,
                     initial_view: 7,
+                    members: Vec::new(),
                 },
                 CreatedPartitionAssignment {
                     partition_id: 1,
                     consensus_group_id: 2,
                     initial_view: 8,
+                    members: Vec::new(),
                 },
             ],
         };
@@ -3672,11 +4425,13 @@ mod tests {
                     partition_id: 0,
                     consensus_group_id: 3,
                     initial_view: 9,
+                    members: Vec::new(),
                 },
                 CreatedPartitionAssignment {
                     partition_id: 1,
                     consensus_group_id: 4,
                     initial_view: 10,
+                    members: Vec::new(),
                 },
             ],
         };
@@ -3758,6 +4513,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         assert!(explicit.max_topic_size.is_some(), "sentinel was sent");
@@ -4096,6 +4852,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         assert_eq!(
@@ -4188,6 +4945,7 @@ mod tests {
                     partition_id: 0,
                     consensus_group_id: 1,
                     initial_view: 0,
+                    members: Vec::new(),
                 }],
             };
 
@@ -4298,6 +5056,7 @@ mod tests {
                 partition_id: 0,
                 consensus_group_id: 1,
                 initial_view: 0,
+                members: Vec::new(),
             }],
         };
         assert_eq!(
@@ -4374,6 +5133,7 @@ mod tests {
                 partition_id: 0,
                 consensus_group_id: 1,
                 initial_view: 0,
+                members: Vec::new(),
             }],
         };
         assert_eq!(
@@ -4422,6 +5182,7 @@ mod tests {
                     partition_id: 0,
                     consensus_group_id: 1,
                     initial_view: 0,
+                    members: Vec::new(),
                 }],
             };
             assert_eq!(
@@ -4492,6 +5253,7 @@ mod tests {
                 partition_id: 0,
                 consensus_group_id: 1,
                 initial_view: 0,
+                members: Vec::new(),
             }],
         };
         assert_eq!(
@@ -4605,11 +5367,13 @@ mod tests {
                     initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 1,
+                    members: Vec::new(),
                 },
                 CreatedPartitionAssignment {
                     initial_view: 0,
                     partition_id: 1,
                     consensus_group_id: 2,
+                    members: Vec::new(),
                 },
             ],
         };
@@ -4660,6 +5424,7 @@ mod tests {
                     initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 3,
+                    members: Vec::new(),
                 }],
             };
             let delete = DeletePartitionsRequest {
@@ -4736,11 +5501,13 @@ mod tests {
                             initial_view: 0,
                             partition_id: 0,
                             consensus_group_id: 1,
+                            members: Vec::new(),
                         },
                         CreatedPartitionAssignment {
                             initial_view: 0,
                             partition_id: 1,
                             consensus_group_id: 2,
+                            members: Vec::new(),
                         },
                     ],
                 };
@@ -4806,11 +5573,13 @@ mod tests {
                     initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 1,
+                    members: Vec::new(),
                 },
                 CreatedPartitionAssignment {
                     initial_view: 0,
                     partition_id: 1,
                     consensus_group_id: 2,
+                    members: Vec::new(),
                 },
             ],
         };
@@ -4836,11 +5605,13 @@ mod tests {
                     initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 10,
+                    members: Vec::new(),
                 },
                 CreatedPartitionAssignment {
                     initial_view: 0,
                     partition_id: 1,
                     consensus_group_id: 11,
+                    members: Vec::new(),
                 },
             ],
         };
@@ -4857,11 +5628,13 @@ mod tests {
                     initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 12,
+                    members: Vec::new(),
                 },
                 CreatedPartitionAssignment {
                     initial_view: 0,
                     partition_id: 1,
                     consensus_group_id: 13,
+                    members: Vec::new(),
                 },
             ],
         };
@@ -4895,11 +5668,13 @@ mod tests {
                     initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 100,
+                    members: Vec::new(),
                 },
                 CreatedPartitionAssignment {
                     initial_view: 0,
                     partition_id: 1,
                     consensus_group_id: 101,
+                    members: Vec::new(),
                 },
             ],
         };
@@ -4931,11 +5706,13 @@ mod tests {
                     initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 50,
+                    members: Vec::new(),
                 },
                 CreatedPartitionAssignment {
                     initial_view: 0,
                     partition_id: 1,
                     consensus_group_id: 51,
+                    members: Vec::new(),
                 },
             ],
         };
@@ -4954,11 +5731,13 @@ mod tests {
                     initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 60,
+                    members: Vec::new(),
                 },
                 CreatedPartitionAssignment {
                     initial_view: 0,
                     partition_id: 1,
                     consensus_group_id: 61,
+                    members: Vec::new(),
                 },
             ],
         };
@@ -4990,6 +5769,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         let apply = StateHandler::apply(&create_partitions, &mut inner, IggyTimestamp::now());
@@ -5031,6 +5811,7 @@ mod tests {
                         initial_view: 0,
                         partition_id,
                         consensus_group_id: 1,
+                        members: Vec::new(),
                     })
                     .collect(),
             };
@@ -5079,6 +5860,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         let _ = crate::stm::lifecycle::apply_with_lifecycle_completion(
@@ -5360,11 +6142,13 @@ mod tests {
                     initial_view: 0,
                     partition_id: 3,
                     consensus_group_id: 1,
+                    members: Vec::new(),
                 },
                 CreatedPartitionAssignment {
                     initial_view: 0,
                     partition_id: 4,
                     consensus_group_id: 2,
+                    members: Vec::new(),
                 },
             ],
         };
@@ -5436,6 +6220,7 @@ mod tests {
                     initial_view: 0,
                     partition_id,
                     consensus_group_id: u64::from(partition_id) + 1,
+                    members: Vec::new(),
                 })
                 .collect(),
         };
@@ -5519,6 +6304,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         let _ = crate::stm::lifecycle::apply_with_lifecycle_completion(
@@ -5605,6 +6391,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
@@ -5680,6 +6467,7 @@ mod tests {
                     initial_view: 0,
                     partition_id,
                     consensus_group_id: u64::from(partition_id) + 1,
+                    members: Vec::new(),
                 })
                 .collect(),
         };
@@ -5977,6 +6765,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: u32::try_from(MAX_PARTITIONS - 2).unwrap(),
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         assert_eq!(
@@ -5995,6 +6784,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 2,
+                members: Vec::new(),
             }],
         };
         assert_eq!(
@@ -6013,6 +6803,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 3,
+                members: Vec::new(),
             }],
         };
         let reply = StateHandler::apply(&overflow, &mut inner, IggyTimestamp::now());
@@ -6042,6 +6833,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: u32::try_from(MAX_PARTITIONS).unwrap(),
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         let reply = StateHandler::apply(&request, &mut inner, IggyTimestamp::now());
@@ -6173,11 +6965,13 @@ mod tests {
                     initial_view: 0,
                     partition_id: 7,
                     consensus_group_id: 1,
+                    members: Vec::new(),
                 },
                 CreatedPartitionAssignment {
                     initial_view: 0,
                     partition_id: 7,
                     consensus_group_id: 2,
+                    members: Vec::new(),
                 },
             ],
         };
@@ -6208,6 +7002,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         assert_eq!(
@@ -6226,11 +7021,13 @@ mod tests {
                     initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 2,
+                    members: Vec::new(),
                 },
                 CreatedPartitionAssignment {
                     initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 3,
+                    members: Vec::new(),
                 },
             ],
         };
@@ -6262,6 +7059,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         assert_eq!(
@@ -6280,11 +7078,13 @@ mod tests {
                     initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 2,
+                    members: Vec::new(),
                 },
                 CreatedPartitionAssignment {
                     initial_view: 0,
                     partition_id: 1,
                     consensus_group_id: 3,
+                    members: Vec::new(),
                 },
             ],
         };
@@ -6325,5 +7125,258 @@ mod tests {
             StreamsInner::inner_from_snapshot(snapshot, Arc::new(StatsRegistry::default()));
 
         assert_eq!(restored.items.vacant_key(), before);
+    }
+
+    #[test]
+    fn given_directory_reports_when_batching_for_a_peer_should_relay_committed_ones_narrowed_and_retain_in_chunks()
+     {
+        let streams = Streams::default();
+        let stored_by_peer = IggyNamespace::new(0, 0, 0);
+        let elsewhere = IggyNamespace::new(1, 0, 0);
+        streams.seed_namespace_on(
+            stored_by_peer,
+            1,
+            0,
+            iggy_common::Durability::Persisted,
+            &[1],
+        );
+        streams.seed_namespace_on(elsewhere, 2, 0, iggy_common::Durability::Persisted, &[2]);
+        let status = |namespace: IggyNamespace| PartitionStatusEntry {
+            namespace: namespace.inner(),
+            created_revision: streams.created_revision_for_namespace(namespace).unwrap(),
+            view: 0,
+            commit: 0,
+            current_offset: 0,
+            messages_count: 0,
+            size_bytes: 0,
+            segments_count: 1,
+            in_sync_nodes: 0,
+        };
+        streams.record_partition_statuses(
+            &[status(stored_by_peer), status(elsewhere)],
+            0,
+            3,
+            Instant::now(),
+        );
+        let (batch, cursor) = streams.partition_status_batch(None, 4, 4);
+        assert_eq!(
+            batch,
+            [status(stored_by_peer), status(elsewhere)],
+            "a peer storing a partition still takes its report, for the in-sync nodes"
+        );
+        assert_eq!(cursor, Some(elsewhere.inner()));
+        streams.record_partition_statuses(
+            &[PartitionStatusEntry {
+                commit: 1,
+                in_sync_nodes: 0b111,
+                ..status(elsewhere)
+            }],
+            0,
+            3,
+            Instant::now(),
+        );
+        streams.set_partition_directory_ready_nodes(0b011);
+        assert_eq!(
+            streams.partition_status(elsewhere).unwrap().in_sync_nodes,
+            0b011,
+            "a node the metadata primary cannot hear is not in sync"
+        );
+        streams.set_partition_directory_ready_nodes(u32::MAX);
+
+        streams.record_partition_statuses(
+            &[PartitionStatusEntry {
+                created_revision: 99,
+                ..status(elsewhere)
+            }],
+            0,
+            3,
+            Instant::now(),
+        );
+        assert_eq!(
+            streams.retain_partition_directory(None, 1),
+            Some(stored_by_peer.inner())
+        );
+        assert_eq!(
+            streams.retain_partition_directory(Some(stored_by_peer.inner()), 1),
+            Some(elsewhere.inner())
+        );
+        assert_eq!(
+            streams.retain_partition_directory(Some(elsewhere.inner()), 1),
+            None
+        );
+        assert_eq!(
+            streams.partition_status_batch(None, 4, 4).0,
+            [status(stored_by_peer)],
+            "the stale incarnation's report is gone once the sweep reached it"
+        );
+    }
+
+    #[test]
+    fn given_members_down_when_counting_partitions_without_a_ready_quorum_should_leave_those_with_a_ready_primary()
+     {
+        let streams = Streams::default();
+        let seed = |stream: usize, view: u32, members: &[u8]| {
+            let namespace = IggyNamespace::new(stream, 0, 0);
+            streams.seed_namespace_on(
+                namespace,
+                u64::try_from(stream + 1).unwrap(),
+                view,
+                iggy_common::Durability::Persisted,
+                members,
+            );
+            namespace
+        };
+        seed(0, 0, &[0, 1]);
+        seed(1, 1, &[0, 1]);
+        seed(2, 0, &[0, 1, 2]);
+        seed(3, 0, &[0]);
+        let moved = seed(4, 0, &[0, 1]);
+        seed(5, 0, &[]);
+        streams.record_partition_statuses(
+            &[PartitionStatusEntry {
+                namespace: moved.inner(),
+                created_revision: streams.created_revision_for_namespace(moved).unwrap(),
+                view: 1,
+                commit: 0,
+                current_offset: 0,
+                messages_count: 0,
+                size_bytes: 0,
+                segments_count: 1,
+                in_sync_nodes: 0b011,
+            }],
+            2,
+            3,
+            Instant::now(),
+        );
+        let counts = |live: &[bool]| {
+            streams.partition_replication(
+                live,
+                Instant::now(),
+                None,
+                &mut UnreportedPartitions::default(),
+            )
+        };
+        assert_eq!(
+            counts(&[false, true, true]).below_write_quorum,
+            2,
+            "only the pair led by the down node and the single copy on it"
+        );
+        assert_eq!(counts(&[true; 3]).below_write_quorum, 0);
+    }
+
+    /// A primary reports only while it leads, so a pair whose members are
+    /// both up but neither leads, as after both came back on empty storage,
+    /// keeps the last healthy report until it goes stale.
+    #[test]
+    fn given_reports_no_primary_refreshed_when_counting_should_count_no_member_in_sync() {
+        let streams = Streams::default();
+        let reported = IggyNamespace::new(0, 0, 0);
+        let silent = IggyNamespace::new(1, 0, 0);
+        streams.seed_namespace_on(reported, 1, 0, iggy_common::Durability::Persisted, &[0, 1]);
+        streams.seed_namespace_on(silent, 2, 0, iggy_common::Durability::Persisted, &[1, 2]);
+        let healthy = PartitionStatusEntry {
+            namespace: reported.inner(),
+            created_revision: streams.created_revision_for_namespace(reported).unwrap(),
+            view: 0,
+            commit: 0,
+            current_offset: 0,
+            messages_count: 0,
+            size_bytes: 0,
+            segments_count: 1,
+            in_sync_nodes: 0b011,
+        };
+        let received = Instant::now();
+        let cutoff = received + Duration::from_secs(1);
+        let later = received + Duration::from_secs(10);
+        streams.record_partition_statuses(&[healthy], 2, 3, received);
+        let mut unreported = UnreportedPartitions::default();
+        let mut counts = |now: Instant, stale_before: Option<Instant>| {
+            streams.partition_replication(&[true; 3], now, stale_before, &mut unreported)
+        };
+        assert_eq!(
+            counts(received, None),
+            PartitionReplication::default(),
+            "a partition yet to report is left out"
+        );
+        assert_eq!(
+            counts(later, Some(received)),
+            PartitionReplication::default(),
+            "both were seen at the cutoff"
+        );
+        assert_eq!(
+            counts(later, Some(cutoff)),
+            PartitionReplication {
+                under_replicated: 2,
+                below_write_quorum: 2,
+            }
+        );
+        assert_eq!(
+            streams.partition_status(reported).unwrap().in_sync_nodes,
+            0,
+            "GetTopic lists no member in sync either"
+        );
+
+        streams.record_partition_statuses(&[healthy], 2, 3, later);
+        assert_eq!(
+            counts(later, Some(cutoff)),
+            PartitionReplication {
+                under_replicated: 1,
+                below_write_quorum: 1,
+            },
+            "a primary that reports again holds its members"
+        );
+        assert_eq!(
+            streams.partition_status(reported).unwrap().in_sync_nodes,
+            0b011
+        );
+    }
+
+    /// A partition without its primary needs a view-change quorum to elect,
+    /// three of four, while a replication quorum is only two.
+    #[test]
+    fn given_four_members_without_their_primary_when_two_remain_should_count_them_as_unable_to_elect()
+     {
+        let streams: Streams = StreamsInner::new().into();
+        streams.seed_namespace_on(
+            IggyNamespace::new(0, 0, 0),
+            1,
+            0,
+            iggy_common::Durability::Persisted,
+            &[0, 1, 2, 3],
+        );
+        let counts = |live: &[bool]| {
+            streams.partition_replication(
+                live,
+                Instant::now(),
+                None,
+                &mut UnreportedPartitions::default(),
+            )
+        };
+        assert_eq!(
+            counts(&[false, false, true, true]),
+            PartitionReplication {
+                under_replicated: 1,
+                below_write_quorum: 1,
+            }
+        );
+        assert_eq!(
+            counts(&[false, true, true, true]).below_write_quorum,
+            0,
+            "three members elect a new primary"
+        );
+        assert_eq!(
+            counts(&[true, false, false, true]),
+            PartitionReplication::default(),
+            "a live primary that has not reported yet is not counted"
+        );
+    }
+
+    #[test]
+    fn given_a_member_beyond_the_node_count_when_checking_the_cluster_should_name_it() {
+        let streams = Streams::default();
+        let namespace = IggyNamespace::new(0, 0, 0);
+        streams.seed_namespace_on(namespace, 1, 0, iggy_common::Durability::Persisted, &[1, 4]);
+        assert_eq!(streams.member_outside_cluster(3), Some((namespace, 4)));
+        assert_eq!(streams.member_outside_cluster(5), None);
     }
 }

@@ -65,9 +65,9 @@ fn given_live_wire_constants_when_comparing_fixture_should_match_codes_and_versi
     );
     assert_eq!(
         constants.protocol_version.packed,
-        pack_protocol_version(0, 12, 1)
+        pack_protocol_version(0, 12, 2)
     );
-    assert_eq!(constants.protocol_version.text, "0.12.1");
+    assert_eq!(constants.protocol_version.text, "0.12.2");
     assert_eq!(
         constants.command_codes["update_resource"],
         CommandCode {
@@ -189,7 +189,7 @@ fn given_describe_options_vectors_when_decoding_should_match_catalog_flags() {
             .expect("entries decode");
         assert_eq!(entries, vector.entries, "{}", vector.scope);
 
-        let rebuilt = describe_options_response(vector.scope).expect("server response builds");
+        let rebuilt = describe_options_response(vector.scope, &[]).expect("server response builds");
         assert_eq!(
             rebuilt.to_bytes().as_ref(),
             bytes.as_slice(),

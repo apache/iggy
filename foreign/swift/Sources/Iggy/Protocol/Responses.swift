@@ -98,10 +98,19 @@ enum Responses {
         let sizeBytes = try reader.readUInt64()
         let messagesCount = try reader.readUInt64()
         let context = try PartitionContext.decode(from: &reader)
+        let members = try nodes(from: &reader)
+        let inSyncMembers = try nodes(from: &reader)
         return Partition(
             id: id, createdAt: IggyTimestamp(microseconds: createdAt),
             segmentsCount: segmentsCount, currentOffset: currentOffset,
-            sizeBytes: sizeBytes, messagesCount: messagesCount, context: context)
+            sizeBytes: sizeBytes, messagesCount: messagesCount, context: context,
+            members: members, inSyncMembers: inSyncMembers)
+    }
+
+    /// `[count: u8][ids: count x u8]`, one node list of a partition.
+    private static func nodes(from reader: inout ByteReader) throws -> [UInt8] {
+        let count = Int(try reader.readUInt8())
+        return Array(try reader.readBytes(count))
     }
 
     static func topicDetails(_ body: ArraySlice<UInt8>) throws -> TopicDetails {

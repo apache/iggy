@@ -270,6 +270,8 @@ pub(crate) fn topic_details_json(contexts: &[(u32, PartitionContext)]) -> String
             size: IggyByteSize::default(),
             messages_count: 0,
             context,
+            members: Vec::new(),
+            in_sync_members: Vec::new(),
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&TopicDetails {

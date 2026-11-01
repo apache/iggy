@@ -46,8 +46,16 @@ class TopicDetailsTest {
                         "compression_algorithm",
                         HeaderValue.fromString("gzip")),
                 Map.of("max_topic_size", HeaderValue.fromUint64(BigInteger.TWO)));
-        var partitions = List.of(
-                new Partition(1L, BigInteger.TEN, 2L, BigInteger.ZERO, "size", BigInteger.ONE, PartitionContext.EMPTY));
+        var partitions = List.of(new Partition(
+                1L,
+                BigInteger.TEN,
+                2L,
+                BigInteger.ZERO,
+                "size",
+                BigInteger.ONE,
+                PartitionContext.EMPTY,
+                List.of(0, 1, 2),
+                List.of(0)));
 
         var topicDetails = new TopicDetails(topic, partitions);
 

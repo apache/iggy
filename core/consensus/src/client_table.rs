@@ -527,8 +527,9 @@ pub const COMMITTED_WINDOW_BITS: u64 = 128;
 ///
 /// Metadata registration stores an immutable principal, epoch and bind
 /// verifier. Matching login retries resolve that same registration. Explicit
-/// logout or lease expiry ends it; ordered retirement in every partition group
-/// precedes removal. Capacity pressure never evicts a live registration.
+/// logout or lease expiry ends it. Removal follows its retirement in every
+/// partition group, or a retirement debt the group pays before it serves
+/// sessions again. Capacity pressure never evicts a live registration.
 ///
 /// Partition slices retain session-qualified receipts, committed windows
 /// and exact results. The first committed prepare fixes the group's capacity.
@@ -1464,6 +1465,13 @@ impl ClientTable {
             .as_ref()
             .filter(|entry| entry.ended_op.is_none())
             .map(|entry| entry.epoch)
+    }
+
+    /// Epoch of the session `client_id` holds a slot for, ended or not.
+    #[must_use]
+    pub fn session_epoch(&self, client_id: u128) -> Option<u64> {
+        let &slot_idx = self.index.get(&client_id)?;
+        self.slots[slot_idx].as_ref().map(|entry| entry.epoch)
     }
 
     /// Attach only after the caller has authenticated `user_id` and waited

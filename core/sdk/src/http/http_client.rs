@@ -856,8 +856,9 @@ fn deferred_reply_limit(max_bytes: u32) -> usize {
 
 /// Decodes the refusals the client acts on: a producer never repeats `RequestTooOld`, a send
 /// refreshes its context once on `HistoryUnavailable`, `LifecycleBusy` is retried,
-/// non-admission and capacity refusals permit a retry without risking duplicate progress, and a
-/// poll refused for its byte limit returns `InvalidSizeBytes`.
+/// non-admission and capacity refusals permit a retry without risking duplicate progress, a
+/// poll refused for its byte limit returns `InvalidSizeBytes`, and a topic refused for a factor
+/// above the node count returns `InvalidReplicationFactor`, as over the binary transports.
 fn typed_refusal(body: &str) -> Option<IggyError> {
     let id = error_id(body)?;
     [
@@ -867,6 +868,7 @@ fn typed_refusal(body: &str) -> Option<IggyError> {
         IggyError::TransientNotAccepted,
         IggyError::DeferredPollCapacityExceeded,
         IggyError::InvalidSizeBytes,
+        IggyError::InvalidReplicationFactor,
     ]
     .into_iter()
     .find(|error| error.as_code() == id)
@@ -889,7 +891,7 @@ fn error_id(body: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::http::scripted_server::{Recorded, Reply, ScriptedServer};
-    use crate::prelude::{Identifier, StreamClient};
+    use crate::prelude::{Identifier, StreamClient, TopicClient, TopicCreateOptions};
     use std::iter;
 
     /// The number of `LifecycleBusy` refusals scripted for a request retried until the deadline,
@@ -1062,6 +1064,7 @@ mod tests {
             IggyError::TransientNotAccepted,
             IggyError::DeferredPollCapacityExceeded,
             IggyError::InvalidSizeBytes,
+            IggyError::InvalidReplicationFactor,
         ] {
             let body = format!(r#"{{"id":{},"reason":"unavailable"}}"#, error.as_code());
             assert_eq!(typed_refusal(&body), Some(error));
@@ -1069,6 +1072,30 @@ mod tests {
         for body in ["", "unavailable", r#"{"id":500}"#, r#"{"id":"87"}"#] {
             assert_eq!(typed_refusal(body), None);
         }
+    }
+
+    #[tokio::test]
+    async fn given_factor_above_node_count_when_creating_topic_should_return_typed_error() {
+        let server = ScriptedServer::start(vec![Reply::error(
+            400,
+            &IggyError::InvalidReplicationFactor,
+        )])
+        .await;
+        let options = TopicCreateOptions {
+            replication_factor: Some(2),
+            ..Default::default()
+        };
+
+        let created = server
+            .client()
+            .create_topic(&stream_id(), "topic", &options)
+            .await;
+
+        assert!(
+            matches!(created, Err(IggyError::InvalidReplicationFactor)),
+            "{created:?}"
+        );
+        assert_eq!(server.requests().len(), 1);
     }
 
     use iggy_common::{Consumer, PollMessages, PollingStrategy};

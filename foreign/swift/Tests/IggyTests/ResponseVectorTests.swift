@@ -25,9 +25,26 @@ import Testing
 struct ResponseVectorTests {
     let golden = GoldenFixture.shared
     let createdAt = IggyTimestamp(microseconds: 1_710_000_000_000_000)
+    /// `get_topic.rs` pins these bytes for its sample partition, so every SDK
+    /// decodes the same entry.
+    let pinnedPartition = [UInt8](
+        hex: "01000000004cf1238e0100000200000063000000000000000004000000000000640000000000000017000000000000000000000000000000650000000000000003010304020104"
+    )
 
     func body(_ name: String) -> ArraySlice<UInt8> {
         golden.bytes(name)[...]
+    }
+
+    /// The pinned partition's counters and context under `id`, then the two
+    /// node lists.
+    func partitionEntry(id: UInt32, members: [UInt8], inSyncMembers: [UInt8]) -> [UInt8] {
+        var entry = Array(pinnedPartition.prefix(64))
+        entry.replaceSubrange(0..<4, with: id.littleEndianBytes)
+        entry.append(UInt8(members.count))
+        entry += members
+        entry.append(UInt8(inSyncMembers.count))
+        entry += inSyncMembers
+        return entry
     }
 
     func expectSampleTopic(_ topic: Topic, id: UInt32, name: String) {
@@ -84,18 +101,69 @@ struct ResponseVectorTests {
         #expect(details.partitions[0].segmentsCount == 2)
         #expect(details.partitions[2].messagesCount == 8)
         #expect(details.partitions.map(\.context) == [.empty, .empty, .empty])
+        #expect(details.partitions.map(\.members) == [[0, 1, 2], [1, 2, 0], [2, 0, 1]])
+        #expect(details.partitions.map(\.inSyncMembers) == [[0, 1], [], [2]])
 
-        // The partitions are the body's tail, 64 bytes each, context last.
+        // The last partition ends with its context and then its node lists,
+        // [2, 0, 1] and [2], which take six bytes.
         var fenced = golden.bytes("response.get_topic")
         let context = PartitionContext(incarnation: 17, ownerGeneration: 9, metadataOp: 52)
-        fenced.replaceSubrange(fenced.count - 24..<fenced.count, with: golden.bytes("partition.context"))
+        let contextEnd = fenced.count - 6
+        fenced.replaceSubrange(contextEnd - 24..<contextEnd, with: golden.bytes("partition.context"))
         let fencedPartitions = try Responses.topicDetails(fenced[...]).partitions
         #expect(fencedPartitions.map(\.context) == [.empty, .empty, context])
         #expect(fencedPartitions[2].messagesCount == 8)
+        #expect(fencedPartitions[2].members == [2, 0, 1])
 
         let topics = try Responses.topics(body("response.get_topics"))
         #expect(topics.map(\.name) == ["events", "logs"])
         #expect(try Responses.topics(body("response.get_topics.empty")).isEmpty)
+    }
+
+    @Test func partitionNodeLists() throws {
+        #expect(pinnedPartition.count == 71)
+        var reader = ByteReader(pinnedPartition)
+        let partition = try Responses.partition(from: &reader)
+        #expect(reader.isAtEnd)
+        #expect(partition.id == 1)
+        #expect(partition.createdAt == IggyTimestamp(microseconds: 1_710_000_000_000))
+        #expect(partition.segmentsCount == 2)
+        #expect(partition.currentOffset == 99)
+        #expect(partition.sizeBytes == 1024)
+        #expect(partition.messagesCount == 100)
+        #expect(partition.context == PartitionContext(incarnation: 23, ownerGeneration: 0, metadataOp: 101))
+        #expect(partition.members == [1, 3, 4])
+        #expect(partition.inSyncMembers == [1, 4])
+
+        let unlisted = partitionEntry(id: 1, members: [], inSyncMembers: [])
+        #expect(unlisted.count == 66)
+        var unlistedReader = ByteReader(unlisted)
+        let bare = try Responses.partition(from: &unlistedReader)
+        #expect(unlistedReader.isAtEnd)
+        #expect(bare.context == partition.context)
+        #expect(bare.members.isEmpty)
+        #expect(bare.inSyncMembers.isEmpty)
+
+        for length in 0..<pinnedPartition.count {
+            var truncated = ByteReader(Array(pinnedPartition.prefix(length)))
+            #expect(throws: WireError.self, "\(length)") { try Responses.partition(from: &truncated) }
+        }
+    }
+
+    @Test func topicPartitionsAdvanceByTheirOwnLength() throws {
+        let entries = [
+            partitionEntry(id: 0, members: [0, 1, 2], inSyncMembers: [0, 1, 2]),
+            partitionEntry(id: 1, members: [], inSyncMembers: []),
+            partitionEntry(id: 2, members: [1, 3, 4], inSyncMembers: [1, 4]),
+        ]
+        #expect(entries.map(\.count) == [72, 66, 71])
+        let topic = golden.bytes("response.topic_header") + entries.joined()
+        let partitions = try Responses.topicDetails(topic[...]).partitions
+        #expect(partitions.map(\.id) == [0, 1, 2])
+        #expect(partitions.map(\.members) == [[0, 1, 2], [], [1, 3, 4]])
+        #expect(partitions.map(\.inSyncMembers) == [[0, 1, 2], [], [1, 4]])
+        #expect(partitions.allSatisfy { $0.messagesCount == 100 && $0.context.metadataOp == 101 })
+        #expect(throws: IggyError(.invalidCommand)) { try Responses.topicDetails(topic.dropLast()) }
     }
 
     @Test func consumerGroups() throws {

@@ -1822,6 +1822,7 @@ fn is_option_error(error: &IggyError) -> bool {
             | IggyError::StreamEncryptionUnavailable
             | IggyError::UnsupportedCriticalOption(_)
             | IggyError::CannotModifyRootUser
+            | IggyError::InvalidReplicationFactor
     )
 }
 
@@ -1933,6 +1934,15 @@ mod tests {
         ));
         assert_eq!(root.code, IggyError::CannotModifyRootUser.as_code());
         assert_eq!(root.kind, "cannot_modify_root_user");
+
+        let mut factor = ffi::ErrorInfo::default();
+        factor.record(&IggyError::HttpResponseError(
+            400,
+            r#"{"id":2018,"code":"invalid_replication_factor","reason":"Invalid replication factor","field":null}"#
+                .to_owned(),
+        ));
+        assert_eq!(factor.code, IggyError::InvalidReplicationFactor.as_code());
+        assert_eq!(factor.kind, "invalid_replication_factor");
 
         let mut other = ffi::ErrorInfo::default();
         other.record(&IggyError::HttpResponseError(

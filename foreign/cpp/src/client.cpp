@@ -317,6 +317,13 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
             ffi_options.has_preallocate_segments = false;
             ffi_options.preallocate_segments     = false;
         }
+        if (auto value = options.ReplicationFactor()) {
+            ffi_options.has_replication_factor = true;
+            ffi_options.replication_factor     = *value;
+        } else {
+            ffi_options.has_replication_factor = false;
+            ffi_options.replication_factor     = 0;
+        }
         return TopicDetails::FromFfi(Handle()->create_topic(stream.ToFfi(), name, std::move(ffi_options), error_info));
     });
 }
