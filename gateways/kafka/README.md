@@ -268,9 +268,9 @@ A resend answers the offset of the first write. That holds through any gateway, 
 gateway restart.
 
 The switch is off by default. Released builds of the gateway, of the Rust SDK and of every client
-that embeds it cannot read a batch that carries a producer. Upgrade every gateway and every
-consumer of the topics first, then turn it on. While it is off, an idempotent producer gets
-at-least-once delivery.
+that embeds it cannot read a batch that carries a producer, and older Iggy nodes cannot store it.
+Upgrade every Iggy node, every gateway and every consumer of the topics first, then turn it on.
+While it is off, an idempotent producer gets at-least-once delivery.
 
 A producer without idempotence gets at-least-once delivery. A retry that follows a network timeout
 writes the record twice. The partition keeps the last 5 batches of each producer, and at most 4096
@@ -635,7 +635,7 @@ Limits:
 | `IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE` | `64MiB` | Iggy's `message_bus.max_message_size`. Set both together. Larger partitions answer 10 |
 | `IGGY_KAFKA_PRODUCE_SESSIONS` | `256` | Producers that get an Iggy client of their own. The rest share one. `0`: all share one |
 | `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` | `600` | An unused Produce client closes after this long |
-| `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` | `false` | `true` passes the producer of an idempotent batch to Iggy, so each batch lands once. Turn it on after every gateway and consumer of the topics is upgraded. See [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) |
+| `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` | `false` | `true` passes the producer of an idempotent batch to Iggy, so each batch lands once. Turn it on after every Iggy node, gateway and consumer of the topics is upgraded. See [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) |
 
 The initial connect retries a fixed, bounded number of times (`RECONNECTION_RETRIES = 3`, not the
 Iggy SDK client's own default of unlimited retries, one dial per second, forever), and the whole

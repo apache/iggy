@@ -50,7 +50,7 @@ pub const BATCH_MESSAGE_COUNT_OFFSET: usize = 48;
 /// then the [`BatchProducer`] fields.
 ///
 /// ```text
-/// [52] flags: bit 0 = producer present  [53..56] zero
+/// [52] flags: bit 0 = producer present, bit 1 = transactional  [53..56] zero
 /// [56..64] producer_id  [64..66] epoch  [66..68] zero  [68..72] base_sequence
 /// ```
 pub const BATCH_PRODUCER_OFFSET: usize = 52;
@@ -59,6 +59,7 @@ pub const BATCH_PRODUCER_OFFSET: usize = 52;
 pub const BATCH_RESERVED_OFFSET: usize = 72;
 
 const PRODUCER_PRESENT: u8 = 1;
+const PRODUCER_TRANSACTIONAL: u8 = 1 << 1;
 const PRODUCER_ID_OFFSET: usize = 56;
 const PRODUCER_EPOCH_OFFSET: usize = 64;
 const PRODUCER_SEQUENCE_OFFSET: usize = 68;
@@ -79,6 +80,7 @@ pub struct BatchProducer {
     producer_id: u64,
     epoch: u16,
     base_sequence: u32,
+    transactional: bool,
 }
 
 impl BatchProducer {
@@ -100,7 +102,23 @@ impl BatchProducer {
             producer_id,
             epoch,
             base_sequence,
+            transactional: false,
         })
+    }
+
+    /// This producer with the transactional flag. Iggy has no transactions
+    /// yet, so the server refuses its batches.
+    #[must_use]
+    pub const fn transactional(self) -> Self {
+        Self {
+            transactional: true,
+            ..self
+        }
+    }
+
+    #[must_use]
+    pub const fn is_transactional(&self) -> bool {
+        self.transactional
     }
 
     #[must_use]
@@ -140,6 +158,15 @@ impl BatchProducer {
     #[allow(clippy::cast_possible_truncation)]
     pub const fn advance(sequence: u32, by: u32) -> u32 {
         ((sequence as u64 + by as u64) % (Self::SEQUENCE_MAX as u64 + 1)) as u32
+    }
+
+    /// The flags byte at [`BATCH_PRODUCER_OFFSET`].
+    const fn flags(&self) -> u8 {
+        if self.transactional {
+            PRODUCER_PRESENT | PRODUCER_TRANSACTIONAL
+        } else {
+            PRODUCER_PRESENT
+        }
     }
 }
 
@@ -242,7 +269,7 @@ impl BatchHeader {
         bytes[BATCH_MESSAGE_COUNT_OFFSET..BATCH_MESSAGE_COUNT_OFFSET + 4]
             .copy_from_slice(&self.message_count.to_le_bytes());
         if let Some(producer) = self.producer {
-            bytes[BATCH_PRODUCER_OFFSET] = PRODUCER_PRESENT;
+            bytes[BATCH_PRODUCER_OFFSET] = producer.flags();
             bytes[PRODUCER_ID_OFFSET..PRODUCER_ID_OFFSET + 8]
                 .copy_from_slice(&producer.producer_id.to_le_bytes());
             bytes[PRODUCER_EPOCH_OFFSET..PRODUCER_EPOCH_OFFSET + 2]
@@ -562,7 +589,7 @@ fn write_batch_header_fields(hasher: &mut XxHash3_64, header: &BatchHeader) {
     // Hashed only when present, so a batch without a producer keeps the
     // checksum every earlier build computed for it.
     if let Some(producer) = header.producer {
-        hasher.write(&[PRODUCER_PRESENT]);
+        hasher.write(&[producer.flags()]);
         hasher.write(&producer.producer_id.to_le_bytes());
         hasher.write(&producer.epoch.to_le_bytes());
         hasher.write(&producer.base_sequence.to_le_bytes());
@@ -577,29 +604,35 @@ fn decode_producer(bytes: &[u8]) -> Result<Option<BatchProducer>, WireError> {
         ))
     };
     let section = &bytes[BATCH_PRODUCER_OFFSET..BATCH_RESERVED_OFFSET];
-    match bytes[BATCH_PRODUCER_OFFSET] {
-        0 if section.iter().all(|&byte| byte == 0) => Ok(None),
-        PRODUCER_PRESENT
-            if bytes[BATCH_PRODUCER_OFFSET + 1..PRODUCER_ID_OFFSET]
-                .iter()
-                .chain(&bytes[PRODUCER_EPOCH_OFFSET + 2..PRODUCER_SEQUENCE_OFFSET])
-                .all(|&byte| byte == 0) =>
-        {
-            let epoch = u16::from_le_bytes(
-                bytes[PRODUCER_EPOCH_OFFSET..PRODUCER_EPOCH_OFFSET + 2]
-                    .try_into()
-                    .expect("2-byte slice"),
-            );
-            BatchProducer::new(
-                read_u64(bytes, PRODUCER_ID_OFFSET),
-                epoch,
-                read_u32(bytes, PRODUCER_SEQUENCE_OFFSET),
-            )
-            .map(Some)
-            .ok_or_else(invalid)
-        }
-        _ => Err(invalid()),
+    let transactional = match bytes[BATCH_PRODUCER_OFFSET] {
+        0 if section.iter().all(|&byte| byte == 0) => return Ok(None),
+        PRODUCER_PRESENT => false,
+        flags if flags == PRODUCER_PRESENT | PRODUCER_TRANSACTIONAL => true,
+        _ => return Err(invalid()),
+    };
+    if !bytes[BATCH_PRODUCER_OFFSET + 1..PRODUCER_ID_OFFSET]
+        .iter()
+        .chain(&bytes[PRODUCER_EPOCH_OFFSET + 2..PRODUCER_SEQUENCE_OFFSET])
+        .all(|&byte| byte == 0)
+    {
+        return Err(invalid());
     }
+    let epoch = u16::from_le_bytes(
+        bytes[PRODUCER_EPOCH_OFFSET..PRODUCER_EPOCH_OFFSET + 2]
+            .try_into()
+            .expect("2-byte slice"),
+    );
+    let producer = BatchProducer::new(
+        read_u64(bytes, PRODUCER_ID_OFFSET),
+        epoch,
+        read_u32(bytes, PRODUCER_SEQUENCE_OFFSET),
+    )
+    .ok_or_else(invalid)?;
+    Ok(Some(if transactional {
+        producer.transactional()
+    } else {
+        producer
+    }))
 }
 
 /// Verify every per-message checksum in `batch` and return the recomputed
@@ -810,9 +843,13 @@ mod tests {
     }
 
     fn producer_batch_bytes(frames: &[Vec<u8>]) -> Vec<u8> {
+        batch_bytes_of(frames, producer())
+    }
+
+    fn batch_bytes_of(frames: &[Vec<u8>], producer: BatchProducer) -> Vec<u8> {
         let mut bytes = batch_bytes(frames);
         let mut header = BatchHeader::decode(&bytes).unwrap();
-        header.producer = Some(producer());
+        header.producer = Some(producer);
         header.batch_checksum = calculate_batch_checksum(&header, &bytes[BATCH_HEADER_SIZE..]);
         header.encode_into(&mut bytes[..BATCH_HEADER_SIZE]);
         bytes
@@ -826,6 +863,55 @@ mod tests {
 
         assert_eq!(batch.header.producer, Some(producer()));
         assert_eq!(bytes[BATCH_PRODUCER_OFFSET], PRODUCER_PRESENT);
+    }
+
+    #[test]
+    fn given_a_transactional_producer_when_round_tripping_should_keep_the_flag_under_the_checksum()
+    {
+        let mut bytes = batch_bytes_of(&[frame(1, 0, 0, b"payload")], producer().transactional());
+
+        let batch = decode_batch_slice(&bytes).unwrap();
+
+        assert_eq!(batch.header.producer, Some(producer().transactional()));
+        assert!(
+            batch
+                .header
+                .producer
+                .is_some_and(|sent| sent.is_transactional())
+        );
+        assert_eq!(bytes[BATCH_PRODUCER_OFFSET], 0b11);
+
+        bytes[BATCH_PRODUCER_OFFSET] = PRODUCER_PRESENT;
+        assert!(matches!(
+            decode_batch_slice(&bytes),
+            Err(WireError::InvalidBatchChecksum { .. })
+        ));
+    }
+
+    /// A batch without the transactional flag hashes a flags byte of 1, as
+    /// every build before the flag did.
+    #[test]
+    fn given_a_producer_when_checksumming_should_hash_a_flags_byte_of_one() {
+        let bytes = producer_batch_bytes(&[frame(1, 0, 0, b"payload")]);
+        let header = BatchHeader::decode(&bytes).unwrap();
+        let mut hasher = XxHash3_64::new();
+        for field in [
+            header.partition_id,
+            header.base_offset,
+            header.base_timestamp,
+            header.origin_timestamp,
+            header.batch_length,
+        ] {
+            hasher.write(&field.to_le_bytes());
+        }
+        hasher.write(&header.message_count.to_le_bytes());
+        hasher.write(&[1]);
+        hasher.write(&producer().producer_id().to_le_bytes());
+        hasher.write(&producer().epoch().to_le_bytes());
+        hasher.write(&producer().base_sequence().to_le_bytes());
+        hasher.write(&bytes[BATCH_HEADER_SIZE..BATCH_HEADER_SIZE + 8]);
+
+        assert_eq!(header.batch_checksum, hasher.finish());
     }
 
     #[test]
@@ -868,8 +954,10 @@ mod tests {
     #[test]
     fn given_a_malformed_producer_section_when_decoding_should_refuse_it() {
         let valid = producer_batch_bytes(&[frame(1, 0, 0, b"payload")]);
-        let mutations: [(usize, u8); 5] = [
+        let mutations: [(usize, u8); 7] = [
             (BATCH_PRODUCER_OFFSET, 2),
+            (BATCH_PRODUCER_OFFSET, 4),
+            (BATCH_PRODUCER_OFFSET, 0x83),
             (BATCH_PRODUCER_OFFSET + 1, 1),
             (PRODUCER_EPOCH_OFFSET + 2, 1),
             (PRODUCER_ID_OFFSET + 7, 0x80),

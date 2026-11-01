@@ -167,10 +167,12 @@ These limits apply:
 - A partition drops a producer that sent no batch for 24 hours. Above 4096 producers, it drops the one idle the longest.
 - If the partition dropped the producer, the runtime moves to a new epoch. The unsaved batch can then land twice.
 - If you change `partition_id`, the unsaved batch can land twice.
+- Give the topic `persisted` durability. With `replicated`, a quorum of nodes that crash at the same time can lose acknowledged batches.
 - The record starts with the bytes `\0IGGYEO\x01`. Plugin state that starts with these bytes is not supported.
 
 You can turn `exactly_once` on or off for a source that has state. The runtime reads both state formats.
-An older runtime does not know the record: its plugin fails to read the state and starts again without its cursor. To roll back, turn `exactly_once` off first and wait until the source saves its state. Builds released before idempotent producers cannot poll the batches of an exactly-once source. These are the Rust SDK and every client that embeds it (the Python, C++ and PHP SDKs, the CLI, the Kafka gateway and older connector runtimes), and the Swift SDK. Upgrade every consumer of the topic first.
+An older runtime does not know the record: its plugin fails to read the state and starts again without its cursor. To roll back, turn `exactly_once` off first and wait until the source saves its state.
+Builds released before idempotent producers cannot poll the batches of an exactly-once source. These are the Rust SDK and every client that embeds it (the Python, C++ and PHP SDKs, the CLI, the Kafka gateway and older connector runtimes), and the Swift SDK. Older Iggy nodes cannot store these batches. Upgrade every Iggy node and every consumer of the topic first.
 
 ## Logging
 

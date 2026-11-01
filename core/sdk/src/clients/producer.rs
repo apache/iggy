@@ -266,8 +266,10 @@ impl ProducerCore {
                     return Ok(response);
                 }
                 // The partition no longer holds the producer, so the chunk
-                // starts the next epoch at sequence 0.
-                Err(IggyError::ProducerUnknown) if attempts <= RESENDS => {
+                // starts the next epoch at sequence 0. Not after an uncertain
+                // send: it can have landed before the partition dropped the
+                // producer, and the new epoch would write it twice.
+                Err(IggyError::ProducerUnknown) if attempts <= RESENDS && uncertain.is_none() => {
                     topic_producer.next_epoch(producer);
                     self.ensure_producer_id(&topic_producer).await?;
                     producer = idempotence.next_producer(&topic_producer, &mut sequence)?;
@@ -819,8 +821,10 @@ unsafe impl Sync for IggyProducer {}
 /// background producer with [`BalancedSharding`].
 ///
 /// When a partition no longer holds the producer, for example after a day without a write, the
-/// producer moves to its next epoch and sends the chunk again from sequence 0. When a chunk fails
-/// for good, the next chunk also starts a new epoch, so it never follows a hole.
+/// producer moves to its next epoch and sends the chunk again from sequence 0. If an earlier send
+/// of the chunk was uncertain, the send fails with `OperationUncertain` instead, because that send
+/// can have landed before the partition dropped the producer. When a chunk fails for good, the
+/// next chunk also starts a new epoch, so it never follows a hole.
 /// [`IggyError::ProducerEpochFenced`] means that another copy of this producer took over, and the
 /// producer refuses every later send.
 ///
@@ -1883,6 +1887,43 @@ mod tests {
         assert_eq!(uncertain, 1);
         assert!(producer_under_test.send(vec![message(b"2")]).await.is_err());
         assert_eq!(cluster.count(SEND_MESSAGES_CODE), 2, "the fence holds");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_uncertain_chunk_when_the_partition_lost_the_producer_should_report_an_unknown_outcome()
+     {
+        let (cluster, plain) = connected_producer().await;
+        let producer_under_test =
+            idempotent_producer(plain.core.client.clone(), Partitioning::partition_id(0));
+        cluster.script(
+            &endpoint(0),
+            SEND_MESSAGES_CODE,
+            [
+                Answer::Silence,
+                Answer::Refuse(IggyError::ProducerUnknown),
+                confirmation(0),
+            ],
+        );
+
+        let Err(IggyError::ProducerSendFailed { cause, .. }) =
+            producer_under_test.send(vec![message(b"1")]).await
+        else {
+            panic!("the resend must fail");
+        };
+        producer_under_test.send(vec![message(b"2")]).await.unwrap();
+
+        // The first send can have landed, so the chunk never goes at a new
+        // epoch. The next chunk starts one, so it never follows a hole.
+        assert!(
+            matches!(*cause, IggyError::OperationUncertain(_)),
+            "{cause:?}"
+        );
+        let sent = sent_producers(&cluster);
+        let id = sent[0].producer_id();
+        assert_eq!(
+            sent,
+            [producer(id, 0, 0), producer(id, 0, 0), producer(id, 1, 0)]
+        );
     }
 
     #[tokio::test(start_paused = true)]

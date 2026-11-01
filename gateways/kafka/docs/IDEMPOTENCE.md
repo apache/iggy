@@ -35,9 +35,10 @@ Iggy unchanged. So every resend finds the first write: through any gateway, on a
 and across a gateway restart.
 
 The switch is off by default. Released gateways, and released consumers built on the Rust SDK,
-refuse to read a batch that carries a producer. Upgrade every gateway and every consumer of the
-topics, then turn the switch on for every gateway. While it is off, Produce drops the three
-fields, and an idempotent producer gets at-least-once delivery.
+refuse to read a batch that carries a producer, and older Iggy nodes cannot store it. Upgrade every
+Iggy node, every gateway and every consumer of the topics, then turn the switch on for every
+gateway. While it is off, Produce drops the three fields, and an idempotent producer gets
+at-least-once delivery.
 
 Iggy's client table does not do this job. It guards the hop from the gateway to Iggy. It keys on a
 request number that the Iggy client picks. A Kafka retry is a new Produce request. The gateway
@@ -173,8 +174,10 @@ branch load-bearing.
 - A resend older than the 5 batches that the partition keeps gets 45, as in Kafka.
 - Released builds refuse a polled batch with a producer section: the gateway, the Rust SDK and
   every client that embeds it (the Python, C++ and PHP SDKs, the CLI and the connectors runtime),
-  and the Swift SDK. Before you set `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, upgrade every gateway
-  and every consumer of the topics.
+  and the Swift SDK. Before you set `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, upgrade every Iggy
+  node, every gateway and every consumer of the topics.
+- Exactly-once delivery needs topics with `persisted` durability. With `replicated`, a quorum of
+  nodes that crash at the same time can lose acknowledged batches.
 - Transactions are not supported.
 
 ## Resolution

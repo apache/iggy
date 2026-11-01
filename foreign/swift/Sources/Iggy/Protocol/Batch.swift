@@ -41,6 +41,11 @@ enum Batch {
         var producerID: UInt64
         var epoch: UInt16
         var baseSequence: UInt32
+        /// Reserved for transactions. The server refuses it for now.
+        var transactional = false
+
+        /// The flags byte at `producerOffset`: bit 0 for the producer, bit 1 for a transaction.
+        fileprivate var flags: UInt8 { transactional ? 0b11 : 0b01 }
     }
 
     struct Header: Equatable {
@@ -89,14 +94,15 @@ enum Batch {
             case 0:
                 guard section.allSatisfy({ $0 == 0 }) else { throw malformed }
                 return nil
-            case 1:
+            case 0b01, 0b11:
                 guard bytes[start + 1..<start + 4].allSatisfy({ $0 == 0 }),
                     bytes[start + 14..<start + 16].allSatisfy({ $0 == 0 })
                 else { throw malformed }
                 let producer = Producer(
                     producerID: UInt64(littleEndianBytes: bytes[start + 4..<start + 12]),
                     epoch: UInt16(littleEndianBytes: bytes[start + 12..<start + 14]),
-                    baseSequence: UInt32(littleEndianBytes: bytes[start + 16..<start + 20]))
+                    baseSequence: UInt32(littleEndianBytes: bytes[start + 16..<start + 20]),
+                    transactional: bytes[start] == 0b11)
                 guard producer.producerID <= UInt64(Int64.max),
                     producer.epoch <= UInt16(Int16.max),
                     producer.baseSequence <= UInt32(Int32.max)
@@ -117,7 +123,7 @@ enum Batch {
             writer.write(batchChecksum)
             writer.write(messageCount)
             if let producer {
-                writer.write(UInt8(1))
+                writer.write(producer.flags)
                 writer.writeZeros(3)
                 writer.write(producer.producerID)
                 writer.write(producer.epoch)
@@ -141,7 +147,7 @@ enum Batch {
             writer.write(messageCount)
             // Hashed only when present, as the Rust checksum does.
             if let producer {
-                writer.write(UInt8(1))
+                writer.write(producer.flags)
                 writer.write(producer.producerID)
                 writer.write(producer.epoch)
                 writer.write(producer.baseSequence)

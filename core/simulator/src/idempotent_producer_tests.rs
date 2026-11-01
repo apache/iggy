@@ -135,6 +135,36 @@ fn given_a_producer_batch_in_flight_when_another_client_resends_it_to_the_same_p
     assert_eq!(payloads, ["warmup", "once"], "the batch must land once");
 }
 
+/// Iggy has no transactions yet, so the primary refuses a transactional batch
+/// before it gets offsets.
+#[test]
+fn given_a_transactional_batch_when_sent_should_refuse_it_and_write_nothing() {
+    let (mut sim, first, _) = two_client_cluster(SEED);
+    let namespace = IggyNamespace::new(1, 1, 0);
+    sim.init_partition(namespace);
+    sim.register_client_with_primary(&first);
+    let producer = BatchProducer::new(23_000, 0, 0)
+        .expect("a producer within the field limits")
+        .transactional();
+
+    let warmup = first.send_messages(namespace, &[Bytes::from_static(b"warmup")]);
+    let reply = submit_and_wait(&mut sim, &first, OLD_PRIMARY, warmup);
+    assert_eq!(reply.header().status, 0, "the warmup send must commit");
+
+    let batch = first.send_producer_messages(namespace, producer, &[Bytes::from_static(b"txn")]);
+    let reply = submit_and_wait(&mut sim, &first, OLD_PRIMARY, batch);
+
+    assert_eq!(
+        reply.header().status,
+        IggyError::FeatureUnavailable.as_code()
+    );
+    let payloads: Vec<String> = polled(&mut sim, OLD_PRIMARY, namespace)
+        .into_iter()
+        .map(|(_, payload)| payload)
+        .collect();
+    assert_eq!(payloads, ["warmup"], "the refused batch must not land");
+}
+
 /// Cut or restore the links from the backups to the old primary, which carry
 /// their acks.
 fn set_acks(sim: &mut Simulator, delivered: bool) {
