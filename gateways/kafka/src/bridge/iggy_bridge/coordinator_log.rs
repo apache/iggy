@@ -21,7 +21,8 @@
 //! partition per coordinator partition. Every gateway joins the Iggy consumer group
 //! [`COORDINATOR_LEASE_GROUP`] on it, and Iggy spreads the partitions over the gateways. The
 //! gateways never poll through that group: it only tells each gateway which partitions to
-//! claim, and a partition that no member polled moves at once when Iggy hands it over.
+//! claim. The claims in the log decide who owns a partition, so how long Iggy takes to hand one
+//! over changes no owner.
 //!
 //! Who owns which partition is announced on the one-partition topic
 //! [`COORDINATOR_OWNER_TOPIC`], which every gateway reads.
@@ -352,29 +353,33 @@ fn coordinator_call_failed(
 /// Refuses a log topic that can lose records the log needs. Only an operator makes one.
 fn check_log_topic(stream: &str, topic: &TopicDetails) -> Result<(), BridgeError> {
     let durability = TopicCreateOptions::from_resource_options(&topic.options).durability;
-    let expiry = topic.resolved_options().message_expiry;
-    if keeps_log_records(durability, expiry) {
+    let resolved = topic.resolved_options();
+    let (expiry, max_size) = (resolved.message_expiry, resolved.max_topic_size);
+    if keeps_log_records(durability, expiry, max_size) {
         return Ok(());
     }
     Err(BridgeError::InvalidConfig(format!(
-        "Iggy topic '{stream}/{COORDINATOR_LOG_TOPIC}' has durability {durability} and expiry \
-         {expiry}. The coordinator log needs durability persisted, or a crash of a quorum can \
-         give one partition two owners, and an expiry of at least {} hours or none, or a load \
-         can miss the last checkpoint. Update the expiry, or recreate the topic with durability \
-         persisted",
+        "Iggy topic '{stream}/{COORDINATOR_LOG_TOPIC}' has durability {durability}, expiry \
+         {expiry} and max size {max_size}. The coordinator log needs durability persisted, or a \
+         crash of a quorum can give one partition two owners. It needs an expiry of at least {} \
+         hours or none, and an unlimited max size, or a load can miss the last checkpoint. \
+         Update the expiry and the max size, or recreate the topic with durability persisted",
         MIN_LOG_EXPIRY.as_secs() / 3600
     )))
 }
 
 /// Whether a log topic keeps each claim through a crash of a quorum, and each record until a
-/// newer checkpoint replaces it.
-fn keeps_log_records(durability: Durability, expiry: IggyExpiry) -> bool {
+/// newer checkpoint replaces it. Iggy deletes the oldest segments past a max size whatever their
+/// age, and the log has no compaction, so any max size can drop the last checkpoint.
+fn keeps_log_records(durability: Durability, expiry: IggyExpiry, max_size: MaxTopicSize) -> bool {
     let expires_early = match expiry {
         IggyExpiry::ExpireDuration(duration) => duration.get_duration() < MIN_LOG_EXPIRY,
         // Iggy expires nothing under its server default.
         IggyExpiry::NeverExpire | IggyExpiry::ServerDefault => false,
     };
-    durability == Durability::Persisted && !expires_early
+    // Iggy's server default is unlimited.
+    let capped = matches!(max_size, MaxTopicSize::Custom(_));
+    durability == Durability::Persisted && !expires_early && !capped
 }
 
 impl CoordinatorLink {
@@ -410,14 +415,13 @@ impl CoordinatorLink {
         .await
     }
 
-    /// The partitions Iggy gives this gateway now, or `None` when it is no member. A partition
-    /// that Iggy hands to another gateway leaves the list when the handoff starts.
+    /// The partitions Iggy gives this gateway now, or `None` when it is no member.
     ///
     /// # Errors
     ///
     /// [`BridgeError`] when the call to Iggy fails.
     pub async fn assignment(&self) -> Result<Option<Vec<u32>>, BridgeError> {
-        let assignment = with_request_timeout(self.lease.get_consumer_group_assignment(
+        let assignment = with_request_timeout(self.lease.sync_consumer_group(
             &self.stream_id,
             &self.log_topic,
             &self.group_id,
@@ -646,30 +650,50 @@ mod tests {
 
     #[test]
     fn given_the_settings_a_gateway_creates_should_keep_the_log_records() {
-        assert!(keeps_log_records(Durability::Persisted, expiry(LOG_EXPIRY)));
+        assert!(keeps_log_records(
+            Durability::Persisted,
+            expiry(LOG_EXPIRY),
+            MaxTopicSize::Unlimited
+        ));
     }
 
     #[test]
     fn given_log_topic_settings_should_refuse_only_those_that_lose_records() {
+        let unlimited = MaxTopicSize::Unlimited;
         assert!(
-            !keeps_log_records(Durability::Replicated, IggyExpiry::NeverExpire),
+            !keeps_log_records(Durability::Replicated, IggyExpiry::NeverExpire, unlimited),
             "a crash of a quorum can lose a claim"
         );
         assert!(
-            !keeps_log_records(Durability::Persisted, expiry(Duration::from_hours(24))),
+            !keeps_log_records(
+                Durability::Persisted,
+                expiry(Duration::from_hours(24)),
+                unlimited
+            ),
             "the last checkpoint can expire"
+        );
+        assert!(
+            !keeps_log_records(
+                Durability::Persisted,
+                IggyExpiry::NeverExpire,
+                MaxTopicSize::Custom(IggyByteSize::from(u64::from(u32::MAX)))
+            ),
+            "the segment cleaner can delete the last checkpoint"
         );
         assert!(keeps_log_records(
             Durability::Persisted,
-            IggyExpiry::NeverExpire
+            IggyExpiry::NeverExpire,
+            unlimited
         ));
         assert!(keeps_log_records(
             Durability::Persisted,
-            IggyExpiry::ServerDefault
+            IggyExpiry::ServerDefault,
+            MaxTopicSize::ServerDefault
         ));
         assert!(keeps_log_records(
             Durability::Persisted,
-            expiry(MIN_LOG_EXPIRY)
+            expiry(MIN_LOG_EXPIRY),
+            unlimited
         ));
     }
 }

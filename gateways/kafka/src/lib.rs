@@ -30,4 +30,4 @@ pub mod server;
 pub mod tls;
 
 pub use iggy_kafka_wire::records;
-pub use server::{GatewayConfig, KafkaGateway};
+pub use server::{CoordinatorLog, GatewayConfig, KafkaGateway};

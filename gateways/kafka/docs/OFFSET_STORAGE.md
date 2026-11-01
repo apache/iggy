@@ -130,6 +130,9 @@ log decides each offset:
   topic created again under the name keeps its own, as Kafka keeps offsets by topic id. The
   gateway learns of deletions from Iggy's change log, so the log needs `manage_servers` on the
   bridge's Iggy user.
+- An answer skips each offset of an older incarnation than the change log shows. So a deletion
+  that no gateway heard of, as while every gateway was down, changes no answer, and each load
+  removes those offsets from the log.
 - The log drops the offsets of a group without members 7 days after its last commit. Iggy still
   holds them, and answers from then on.
 - Only the coordinator answers offset requests for a group, so a commit made through another

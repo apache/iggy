@@ -79,13 +79,13 @@ impl ConsumerGroupClient for IggyClient {
         super::with_client!(self, client => client.leave_consumer_group(stream_id, topic_id, group_id).await)
     }
 
-    async fn get_consumer_group_assignment(
+    async fn sync_consumer_group(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<Option<ConsumerGroupAssignment>, IggyError> {
-        super::with_client!(self, client => client.get_consumer_group_assignment(stream_id, topic_id, group_id).await)
+        super::with_client!(self, client => client.sync_consumer_group(stream_id, topic_id, group_id).await)
     }
 }
 

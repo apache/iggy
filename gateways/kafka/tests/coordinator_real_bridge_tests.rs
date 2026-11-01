@@ -30,10 +30,12 @@ mod tcp;
 mod wire;
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use iggy::prelude::{
-    Consumer, Identifier, IggyMessage, MessageClient, Partitioning, PollOptions, PollingStrategy,
-    StreamClient, StreamCreateOptions, TopicClient, TopicCreateOptions,
+    Consumer, ConsumerGroupClient, GlobalPermissions, Identifier, IggyMessage, MessageClient,
+    Partitioning, Permissions, PollOptions, PollingStrategy, StreamClient, StreamCreateOptions,
+    TopicClient, TopicCreateOptions, UserClient, UserCreateOptions, UserStatus,
 };
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
@@ -42,10 +44,12 @@ use kafka_protocol::messages::{
     GroupId, MetadataRequest, MetadataResponse, TopicName,
 };
 use kafka_protocol::protocol::StrBytes;
+use secrecy::SecretString;
 use serial_test::serial;
 
-use iggy_gateway_kafka::GatewayConfig;
-use iggy_gateway_kafka::bridge::{COORDINATOR_LOG_TOPIC, cluster_id_stream};
+use iggy_gateway_kafka::bridge::{
+    COORDINATOR_LEASE_GROUP, COORDINATOR_LOG_TOPIC, cluster_id_stream,
+};
 use iggy_gateway_kafka::coordinator::record::{Body, Record};
 use iggy_gateway_kafka::coordinator::{CoordinationConfig, PARTITIONS, partition_of_group};
 use iggy_gateway_kafka::listener::parse_brokers;
@@ -54,6 +58,7 @@ use iggy_gateway_kafka::protocol::api::{
     ERROR_NOT_CONTROLLER, ERROR_NOT_COORDINATOR,
 };
 use iggy_gateway_kafka::server::bind_listener;
+use iggy_gateway_kafka::{CoordinatorLog, GatewayConfig};
 
 use gateways::{
     Gateway, SETTLE, TOPIC, agreed_coordinator, call, commit, connect, coordinators, create_topic,
@@ -490,4 +495,190 @@ async fn given_a_log_topic_that_is_not_persisted_when_linking_should_refuse_it()
         "{error}"
     );
     bridge.close().await.expect("close the bridge");
+}
+
+/// A topic deleted and created again while no gateway runs reaches no gateway as a deletion, so
+/// the log still holds the group's offset of the old topic. The group must not resume the new
+/// topic at it.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn given_a_topic_created_again_while_no_gateway_runs_when_fetching_should_not_answer_its_old_offset()
+ {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    create_topic(server.test_config()).await;
+    let group = "audit";
+
+    let socket = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = socket.local_addr().expect("local addr");
+    let brokers = parse_brokers(&format!("1@{addr}")).expect("one listed gateway");
+    let gateway = start_gateway(
+        server.test_config(),
+        gateway_config(1, brokers.clone()),
+        socket,
+        addr,
+    )
+    .await;
+    agreed_coordinator(&[&gateway], group).await;
+    let (member_id, generation) = join_and_sync(addr, group).await;
+    assert_eq!(
+        commit(addr, group, &member_id, generation, 7, "old topic").await,
+        ERROR_NONE
+    );
+    gateway.stop().await;
+
+    let bridge = connect(server.test_config()).await;
+    bridge
+        .delete_kafka_topic(TOPIC)
+        .await
+        .expect("delete the topic");
+    bridge
+        .create_kafka_topic(TOPIC, 2)
+        .await
+        .expect("create the topic again");
+    bridge.close().await.expect("close the bridge");
+
+    let socket = bind_listener(&addr.to_string()).expect("bind the same port again");
+    let gateway = start_gateway(
+        server.test_config(),
+        gateway_config(1, brokers),
+        socket,
+        addr,
+    )
+    .await;
+    agreed_coordinator(&[&gateway], group).await;
+    assert_eq!(
+        fetch(addr, group).await,
+        (ERROR_NONE, -1, String::new()),
+        "the topic created again holds no offset of the group"
+    );
+
+    gateway.stop().await;
+}
+
+/// A bridge user without `manage_servers` cannot read Iggy's change log. With the log on only by
+/// default, the gateway then starts without it, as before the log, and coordinates its groups
+/// alone.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn given_a_bridge_user_without_manage_servers_when_the_log_is_on_by_default_should_start_without_it()
+ {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    create_topic(server.test_config()).await;
+    let username = "no-servers";
+    raw_client(&server)
+        .await
+        .create_user(
+            username,
+            "no-servers-password",
+            UserStatus::Active,
+            Some(Permissions {
+                global: GlobalPermissions {
+                    manage_streams: true,
+                    read_streams: true,
+                    manage_topics: true,
+                    read_topics: true,
+                    poll_messages: true,
+                    send_messages: true,
+                    ..GlobalPermissions::default()
+                },
+                ..Permissions::default()
+            }),
+            &UserCreateOptions::default(),
+        )
+        .await
+        .expect("create the user");
+    let mut bridge = server.test_config();
+    bridge.username = username.to_string();
+    bridge.password = SecretString::from("no-servers-password");
+    let group = "fallback";
+
+    let socket = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = socket.local_addr().expect("local addr");
+    let brokers = parse_brokers(&format!("1@{addr}")).expect("one listed gateway");
+    let config = GatewayConfig {
+        coordinator_log: CoordinatorLog::Preferred,
+        ..gateway_config(1, brokers)
+    };
+    let gateway = start_gateway(bridge, config, socket, addr).await;
+    assert_eq!(agreed_coordinator(&[&gateway], group).await, 1);
+    let (member_id, generation) = join_and_sync(addr, group).await;
+    assert_eq!(
+        heartbeat(addr, group, &member_id, generation).await,
+        ERROR_NONE
+    );
+    let log_topic = raw_client(&server)
+        .await
+        .get_topic(
+            &Identifier::named(&cluster_id_stream("kafka")).expect("stream name"),
+            &Identifier::named(COORDINATOR_LOG_TOPIC).expect("topic name"),
+        )
+        .await
+        .expect("read the log topic");
+    assert!(log_topic.is_none(), "the gateway runs without the log");
+
+    gateway.stop().await;
+}
+
+/// Iggy can take until the lease group's rebalancing timeout to hand a partition over, and the
+/// next gateway claims it only then. A lease member that never claims stands for that wait: the
+/// partitions Iggy gives it must keep their coordinator meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn given_a_partition_that_leaves_the_share_when_no_gateway_claims_it_should_stay_served() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    create_topic(server.test_config()).await;
+    let socket = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = socket.local_addr().expect("local addr");
+    let brokers = parse_brokers(&format!("1@{addr}")).expect("one listed gateway");
+    let gateway = start_gateway(
+        server.test_config(),
+        gateway_config(1, brokers),
+        socket,
+        addr,
+    )
+    .await;
+    let groups: Vec<String> = (0..64).map(|n| format!("group-{n}")).collect();
+    eventually(SETTLE, "the gateway to coordinate every group", || async {
+        let named = coordinators(addr, &groups).await?;
+        named.iter().all(|node| *node == 1).then_some(())
+    })
+    .await;
+
+    let silent = raw_client(&server).await;
+    let stream = Identifier::named(&cluster_id_stream("kafka")).expect("stream name");
+    let topic = Identifier::named(COORDINATOR_LOG_TOPIC).expect("topic name");
+    let lease = Identifier::named(COORDINATOR_LEASE_GROUP).expect("group name");
+    silent
+        .join_consumer_group(&stream, &topic, &lease)
+        .await
+        .expect("join the lease group");
+    let share = eventually(SETTLE, "a share for the silent member", || async {
+        let share = silent
+            .sync_consumer_group(&stream, &topic, &lease)
+            .await
+            .ok()??;
+        (!share.partitions.is_empty()).then_some(share.partitions)
+    })
+    .await;
+    // The gateway reads its share every second.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let named = coordinators(addr, &groups)
+        .await
+        .expect("every group keeps a coordinator");
+    assert!(named.iter().all(|node| *node == 1), "{named:?}");
+    let moved = groups
+        .iter()
+        .find(|group| share.contains(&partition_of_group(group)))
+        .expect("a group of a partition the silent member got");
+    let (member_id, generation) = join_and_sync(addr, moved).await;
+    assert_eq!(
+        heartbeat(addr, moved, &member_id, generation).await,
+        ERROR_NONE
+    );
+
+    gateway.stop().await;
 }

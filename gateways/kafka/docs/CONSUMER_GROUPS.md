@@ -249,16 +249,18 @@ can pin it.
 The gateways share their groups through the coordinator log, the Iggy topic `coordinators` in the
 stream `<default stream>.meta`. The log is on by default with `IGGY_KAFKA_BROKERS` and the bridge
 (`IGGY_KAFKA_COORDINATOR_LOG`). It needs `manage_servers` on the bridge's Iggy user, to follow
-Iggy's change log. Without it the gateway does not start. The code is in `src/coordinator/`.
+Iggy's change log. Without it, a gateway with the log on by default runs without the log and logs
+a warning. A gateway with `IGGY_KAFKA_COORDINATOR_LOG=true` does not start. The code is in
+`src/coordinator/`.
 
 - Each group belongs to one of 16 log partitions, by an FNV-1a hash of its id. The count never
   changes, since a new count would move nearly every group.
 - Every gateway joins the Iggy consumer group `kafka-gateways` on the log topic, and Iggy spreads
   the partitions over the gateways. No gateway polls through that group. It only tells each
-  gateway which partitions to claim. A partition that no member polled has nothing to drain, so
-  Iggy hands it to another member at once. Each gateway reads its own share every second
-  (`ConsumerGroupClient::get_consumer_group_assignment`). A partition leaves that share as soon
-  as Iggy starts to hand it over.
+  gateway which partitions to claim. Each gateway reads its own share every second
+  (`ConsumerGroupClient::sync_consumer_group`). Iggy can take until the group's rebalancing
+  timeout to hand a partition over, 30 s by default. So a partition that leaves a gateway's share
+  stays served there until the next gateway claims it, and its groups keep a coordinator.
 - A gateway that Iggy gives a partition reads the partition from its last checkpoint. Then it
   appends a claim, numbered above every claim before it, and reads on to the claim. The first
   claim with the highest number owns the partition. The owner restores the groups of the
@@ -277,8 +279,8 @@ Iggy's change log. Without it the gateway does not start. The code is in `src/co
   claim. So a gateway that lost a partition can still append, but nothing it appends then counts.
   The owner also follows its partitions with a waiting read (#4629), so another gateway's claim
   ends its coordination at once, also for heartbeats and offset reads, which write nothing.
-- The owner stops serving a partition when Iggy takes it away, when its reads or appends fail,
-  or when it cannot read its share for 10 s.
+- The owner stops serving a partition in three cases: another gateway claims it, its reads or
+  appends fail, or it cannot read its share for 10 s.
 - A new owner restores each group `Stable` in its stored generation, and starts each member's
   session again. A member that heartbeats within its session timeout keeps its assignment, with
   no rebalance.
@@ -299,10 +301,13 @@ Iggy's change log. Without it the gateway does not start. The code is in `src/co
 - The log topic is `persisted`: a claim that a crash of a quorum loses would let two gateways
   own one partition. So each commit and each stored generation also waits for a stable-storage
   write on a quorum. The owner topic is `replicated`. A gateway refuses a log topic that is not
-  `persisted`, or that expires records within 25 hours, which could drop the last checkpoint.
+  `persisted`. It also refuses one that expires records within 25 hours, or that has a max size,
+  since either can drop the last checkpoint.
 - On SIGTERM, the gateway stops accepting connections and leaves the Iggy group, so the others
-  take its partitions over at once. Its group requests in flight answer `NOT_COORDINATOR`, and
-  their clients go to the new coordinator. Then the gateway closes its connections.
+  take its partitions over without waiting for its session to end. Its group requests in flight
+  answer `NOT_COORDINATOR`, and their clients go to the new coordinator. Then the gateway closes
+  its connections. All of it ends within the drain deadline, 25 s, even with an Iggy node that
+  does not answer.
 - `ListGroups`, `DescribeGroups`, `DeleteGroups` and `OffsetDelete` answer only for the groups of
   this gateway. The others get `NOT_COORDINATOR` per group. The Java admin client asks every
   broker and keeps one answer per group.

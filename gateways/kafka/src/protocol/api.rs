@@ -26,6 +26,7 @@ use kafka_protocol::messages::{
 };
 use kafka_protocol::protocol::StrBytes;
 use tokio::sync::{OwnedMutexGuard, Semaphore};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::AuthenticatedPrincipal;
@@ -362,11 +363,19 @@ impl GatewayState {
         )
     }
 
-    /// Hands this gateway's groups to the other gateways, when it shares them. A shutdown calls it
-    /// before its drain, so its group requests send their clients to the new coordinators.
-    pub async fn hand_over_groups(&self) {
+    /// Hands this gateway's groups to the other gateways, when it shares them, giving up on Iggy
+    /// at `until`. A shutdown calls it before its drain, so its group requests send their clients
+    /// to the new coordinators.
+    pub async fn hand_over_groups(&self, until: Instant) {
         if let Some(coordination) = &self.coordination {
-            coordination.shutdown().await;
+            coordination.shutdown(until).await;
+        }
+    }
+
+    /// Signs the coordinator log's clients out of Iggy, after [`Self::hand_over_groups`].
+    pub async fn close_coordination(&self) {
+        if let Some(coordination) = &self.coordination {
+            coordination.close().await;
         }
     }
 

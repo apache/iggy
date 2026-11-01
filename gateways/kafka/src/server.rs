@@ -180,11 +180,10 @@ pub struct GatewayConfig {
     /// Empty for a gateway alone.
     pub brokers: Vec<BrokerEntry>,
     /// Whether the gateways share the consumer groups through the coordinator log in Iggy
-    /// (`IGGY_KAFKA_COORDINATOR_LOG`). Needs the bridge, and a bridge user that may read Iggy's
-    /// metadata change log. Off here by default. `load_config` in `main.rs` turns it on when the
-    /// bridge is on, `IGGY_KAFKA_BROKERS` lists the gateways and the variable is unset. Off, this
-    /// gateway keeps its groups in memory alone.
-    pub coordinator_log: bool,
+    /// (`IGGY_KAFKA_COORDINATOR_LOG`). Off here by default. `load_config` in `main.rs` makes it
+    /// [`CoordinatorLog::Preferred`] when the bridge is on, `IGGY_KAFKA_BROKERS` lists the
+    /// gateways and the variable is unset.
+    pub coordinator_log: CoordinatorLog,
     /// How the coordinator log behaves. No environment variable maps onto it yet.
     pub coordination: CoordinationConfig,
 }
@@ -210,10 +209,23 @@ impl Default for GatewayConfig {
             auto_topic_creation: AutoTopicCreationConfig::default(),
             node_id: DEFAULT_NODE_ID,
             brokers: Vec::new(),
-            coordinator_log: false,
+            coordinator_log: CoordinatorLog::Off,
             coordination: CoordinationConfig::default(),
         }
     }
+}
+
+/// Whether the gateways share the consumer groups through the coordinator log. The log needs the
+/// bridge, and a bridge user that may read Iggy's metadata change log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinatorLog {
+    /// This gateway keeps its groups in memory alone.
+    Off,
+    /// On while the bridge can read the change log. Without it, the gateway runs as with
+    /// [`Self::Off`] and warns, so a bridge user that lacks `manage_servers` keeps working.
+    Preferred,
+    /// On. The gateway does not start when the bridge cannot read the change log.
+    Required,
 }
 
 impl GatewayConfig {
@@ -627,7 +639,7 @@ impl KafkaGateway {
         &self,
         groups: &GroupCoordinator,
     ) -> Result<Option<Arc<Coordination>>> {
-        if !self.config.coordinator_log {
+        if self.config.coordinator_log == CoordinatorLog::Off {
             return Ok(None);
         }
         let Some(bridge) = &self.bridge else {
@@ -638,6 +650,18 @@ impl KafkaGateway {
             ));
         };
         let give_up = Instant::now() + COORDINATION_STARTUP_LIMIT;
+        if self.config.coordinator_log == CoordinatorLog::Preferred
+            && bridge.follows_change_log(give_up).await == Some(false)
+        {
+            warn!(
+                "the bridge's Iggy user cannot read Iggy's metadata change log, so this gateway \
+                 runs without the coordinator log, as with IGGY_KAFKA_COORDINATOR_LOG=false: \
+                 the gateway with the lowest node id coordinates every group. To share the \
+                 groups, grant the bridge's Iggy user (IGGY_KAFKA_IGGY_USERNAME) the \
+                 manage_servers permission and restart every gateway"
+            );
+            return Ok(None);
+        }
         loop {
             // Its own token, not the drain's: the shutdown hands the groups over before the drain.
             let started = Coordination::start(
@@ -983,7 +1007,7 @@ async fn serve_connection(stream: TcpStream, connection: Connection) {
 }
 
 /// Hand the groups to the other gateways, cancel in-flight connections, close the tracker to new
-/// spawns, and wait for tasks to finish (bounded by `deadline`). The groups go first, so their
+/// spawns, and wait for tasks to finish, all within `deadline`. The groups go first, so their
 /// requests in flight send their clients to the new coordinators. Cancellation is what actually
 /// drops idle sockets; `tracker.wait` alone would leave tasks parked in `read_frame` until
 /// `idle_timeout`.
@@ -993,14 +1017,21 @@ async fn drain(
     cancel: &CancellationToken,
     deadline: Duration,
 ) {
-    state.hand_over_groups().await;
+    // One deadline for every step, so an Iggy node that does not answer the handover cannot keep
+    // the connections open past it.
+    let until = Instant::now() + deadline;
+    state.hand_over_groups(until).await;
     cancel.cancel();
     tracker.close();
-    if timeout(deadline, tracker.wait()).await.is_err() {
+    if timeout_at(until, tracker.wait()).await.is_err() {
         warn!(
             ?deadline,
             "shutdown drain deadline exceeded; remaining connection tasks will be dropped with the runtime"
         );
+    }
+    // Last, since no connection uses the coordinator log any more.
+    if timeout_at(until, state.close_coordination()).await.is_err() {
+        debug!("the coordinator log clients did not sign out within the shutdown drain deadline");
     }
 }
 

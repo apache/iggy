@@ -102,7 +102,7 @@ impl ConsumerGroupClient for ClientWrapper {
         .await
     }
 
-    async fn get_consumer_group_assignment(
+    async fn sync_consumer_group(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -110,7 +110,7 @@ impl ConsumerGroupClient for ClientWrapper {
     ) -> Result<Option<ConsumerGroupAssignment>, IggyError> {
         super::dispatch_client!(
             self,
-            ConsumerGroupClient::get_consumer_group_assignment(stream_id, topic_id, group_id)
+            ConsumerGroupClient::sync_consumer_group(stream_id, topic_id, group_id)
         )
         .await
     }

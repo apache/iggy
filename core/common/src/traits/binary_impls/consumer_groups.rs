@@ -195,7 +195,7 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
         Ok(())
     }
 
-    async fn get_consumer_group_assignment(
+    async fn sync_consumer_group(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,

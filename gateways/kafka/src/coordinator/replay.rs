@@ -51,6 +51,22 @@ pub struct GroupOffsets {
     pub entries: BTreeMap<TopicPartition, Option<CommittedOffset>>,
 }
 
+impl GroupOffsets {
+    /// Drops each offset of an older incarnation of its topic than `incarnation_of` names. Iggy
+    /// deleted that topic with its offsets, so the topic of that name now holds none of them.
+    /// An offset whose incarnation the gateway did not know stays.
+    pub fn drop_older_incarnations(&mut self, incarnation_of: impl Fn(&str) -> Option<u64>) {
+        self.entries.retain(|(topic, _), committed| {
+            let logged = committed
+                .as_ref()
+                .and_then(|committed| committed.topic_incarnation);
+            logged
+                .zip(incarnation_of(topic))
+                .is_none_or(|(logged, current)| logged >= current)
+        });
+    }
+}
+
 /// What one record did to the state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Applied {
@@ -222,22 +238,11 @@ impl PartitionState {
     /// incarnation the log holds offsets of, and one for a topic Iggy no longer holds.
     #[must_use]
     pub fn deletions_against(&self, incarnation_of: impl Fn(&str) -> Option<u64>) -> Vec<Body> {
-        let mut logged: BTreeMap<&str, BTreeSet<u64>> = BTreeMap::new();
-        for offsets in self.offsets.values() {
-            for ((topic, _), committed) in &offsets.entries {
-                let known = logged.entry(topic.as_str()).or_default();
-                let incarnation = committed
-                    .as_ref()
-                    .and_then(|committed| committed.topic_incarnation);
-                if let Some(incarnation) = incarnation {
-                    known.insert(incarnation);
-                }
-            }
-        }
         let mut deletions = Vec::new();
-        for (topic, known) in logged {
+        for (topic, logged) in self.logged_incarnations() {
             let current = incarnation_of(topic);
-            let mut stale: Vec<u64> = known
+            let mut stale: Vec<u64> = logged
+                .known
                 .into_iter()
                 .filter(|incarnation| current.is_none_or(|current| *incarnation < current))
                 .collect();
@@ -256,6 +261,53 @@ impl PartitionState {
             );
         }
         deletions
+    }
+
+    /// The deletions of each topic incarnation older than the one `incarnation_of` names, so a
+    /// topic created again under a deleted one's name holds none of its offsets, also when no
+    /// gateway heard of the deletion. A topic that `incarnation_of` names none for stays, since a
+    /// change log that lags shows a new topic late. So does a topic with an offset of unknown
+    /// incarnation, which such a deletion takes too.
+    #[must_use]
+    pub fn older_incarnations(&self, incarnation_of: impl Fn(&str) -> Option<u64>) -> Vec<Body> {
+        let mut deletions = Vec::new();
+        for (topic, logged) in self.logged_incarnations() {
+            let Some(current) = incarnation_of(topic).filter(|_| !logged.unknown) else {
+                continue;
+            };
+            deletions.extend(
+                logged
+                    .known
+                    .into_iter()
+                    .filter(|incarnation| *incarnation < current)
+                    .map(|incarnation| Body::TopicOffsetsDeleted {
+                        topic: topic.to_owned(),
+                        incarnation,
+                    }),
+            );
+        }
+        deletions
+    }
+
+    /// The incarnations the log holds offsets of, for each topic it holds an entry of.
+    fn logged_incarnations(&self) -> BTreeMap<&str, LoggedIncarnations> {
+        let mut logged: BTreeMap<&str, LoggedIncarnations> = BTreeMap::new();
+        for offsets in self.offsets.values() {
+            for ((topic, _), committed) in &offsets.entries {
+                let held = logged.entry(topic.as_str()).or_default();
+                match committed
+                    .as_ref()
+                    .map(|committed| committed.topic_incarnation)
+                {
+                    Some(Some(incarnation)) => {
+                        held.known.insert(incarnation);
+                    }
+                    Some(None) => held.unknown = true,
+                    None => {}
+                }
+            }
+        }
+        logged
     }
 
     /// The groups whose offsets the log drops at `now_ms`: no stored state, so no members here,
@@ -381,6 +433,14 @@ impl PartitionState {
         }
         bodies
     }
+}
+
+/// The incarnations of one topic that the log holds offsets of.
+#[derive(Debug, Default)]
+struct LoggedIncarnations {
+    known: BTreeSet<u64>,
+    /// An offset names no incarnation, since the gateway did not know it.
+    unknown: bool,
 }
 
 /// Whether a deletion of incarnation `incarnation` of a topic removes `committed`, an entry of
@@ -777,6 +837,58 @@ mod tests {
             state.offsets["b"].entries.keys().collect::<Vec<_>>(),
             [&("shipped".to_string(), 0)],
             "an offset of no known incarnation stays while Iggy holds the topic"
+        );
+    }
+
+    /// A deletion while no gateway ran reaches no gateway, but the change log shows the topic
+    /// created again under a newer incarnation.
+    #[test]
+    fn given_a_newer_incarnation_shown_should_delete_only_the_offsets_of_older_ones() {
+        let mut state = PartitionState::default();
+        state.apply(0, 0, record(1, commit("a", "orders", 0, 5, Some(3))));
+        state.apply(1, 0, record(1, commit("a", "orders", 1, 6, Some(9))));
+        state.apply(2, 0, record(1, commit("a", "payments", 0, 7, Some(5))));
+        state.apply(3, 0, record(1, commit("b", "refunds", 0, 8, Some(2))));
+        state.apply(4, 0, record(1, commit("b", "refunds", 1, 9, None)));
+        let shown = |topic: &str| match topic {
+            "orders" => Some(9),
+            "refunds" => Some(4),
+            _ => None,
+        };
+
+        assert_eq!(
+            state.older_incarnations(shown),
+            [Body::TopicOffsetsDeleted {
+                topic: "orders".to_string(),
+                incarnation: 3,
+            }],
+            "a topic the change log does not show, and one with an offset of unknown \
+             incarnation, keep their offsets"
+        );
+    }
+
+    #[test]
+    fn given_an_older_incarnation_shown_newer_should_drop_its_offsets_from_an_answer() {
+        let mut state = PartitionState::default();
+        state.apply(0, 0, record(1, commit("a", "orders", 0, 5, Some(3))));
+        state.apply(1, 0, record(1, commit("a", "orders", 1, 6, Some(9))));
+        state.apply(2, 0, record(1, commit("a", "orders", 2, 7, None)));
+        state.apply(3, 0, record(1, commit("a", "payments", 0, 8, Some(5))));
+        state.apply(4, 0, record(1, commit("a", "orders", 3, 9, Some(12))));
+        let mut offsets = state.offsets["a"].clone();
+
+        offsets.drop_older_incarnations(|topic| (topic == "orders").then_some(9));
+
+        assert_eq!(
+            offsets.entries.keys().collect::<Vec<_>>(),
+            [
+                &("orders".to_string(), 1),
+                &("orders".to_string(), 2),
+                &("orders".to_string(), 3),
+                &("payments".to_string(), 0),
+            ],
+            "an unknown incarnation, a newer one than a lagging change log shows, and a topic it \
+             does not show stay"
         );
     }
 

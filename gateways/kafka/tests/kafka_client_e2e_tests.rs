@@ -59,7 +59,7 @@ use iggy_gateway_kafka::bridge::{
 use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol, parse_brokers};
 use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
 use iggy_gateway_kafka::server::{BoundListener, bind_listener};
-use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
+use iggy_gateway_kafka::{CoordinatorLog, GatewayConfig, KafkaGateway};
 
 #[path = "common/certs.rs"]
 mod certs;
@@ -373,7 +373,7 @@ async fn start_bridged_gateway_with(
 /// drain lets a stop take effect at once. With `coordinator_log`, they share their groups.
 async fn start_listed_gateways(
     server: &TestServer,
-    coordinator_log: bool,
+    coordinator_log: CoordinatorLog,
 ) -> (BridgedGateway, BridgedGateway) {
     let sockets = [
         bind_listener("127.0.0.1:0").expect("bind ephemeral port"),
@@ -2622,7 +2622,7 @@ async fn given_two_listed_gateways_when_the_first_stops_should_keep_producing_th
         .ensure_stream_and_topic(FAILOVER_TOPIC, 1)
         .await
         .expect("create the topic");
-    let (first, second) = start_listed_gateways(&server, false).await;
+    let (first, second) = start_listed_gateways(&server, CoordinatorLog::Off).await;
     let (first_addr, second_addr) = (first.addr.to_string(), second.addr.to_string());
 
     let listing = run_client(KCAT_IMAGE, &["-b", &first_addr, "-L"], &[]).expect_ran("kcat -L");
@@ -2714,7 +2714,7 @@ async fn given_two_gateways_with_the_coordinator_log_when_the_coordinator_stops_
         .ensure_stream_and_topic(GROUP_FAILOVER_TOPIC, 2)
         .await
         .expect("create the topic");
-    let (first, second) = start_listed_gateways(&server, true).await;
+    let (first, second) = start_listed_gateways(&server, CoordinatorLog::Required).await;
     let bootstrap = format!("{},{}", first.addr, second.addr);
     let coordinator = gateways::eventually(gateways::SETTLE, "a coordinator", || async {
         let named = gateways::coordinators(first.addr, &[GROUP.to_string()]).await?;

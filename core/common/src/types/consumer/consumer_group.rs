@@ -73,8 +73,7 @@ pub struct ConsumerGroupMember {
 /// `ConsumerGroupAssignment` is the calling client's own share of a consumer group.
 /// It consists of the following fields:
 /// - `generation`: the group generation the assignment belongs to.
-/// - `partitions`: the partitions the client may poll. A partition that the group hands to
-///   another member leaves this list as soon as the handoff starts.
+/// - `partitions`: the partitions the client may poll.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsumerGroupAssignment {
     /// The group generation the assignment belongs to.

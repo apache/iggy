@@ -342,8 +342,9 @@ cargo run -p iggy-gateway-kafka
   describes the log.
 - When a gateway stops, Iggy gives its partitions to the others, and they take its groups over
   with their members and offsets. A member that keeps its heartbeat goes on without a rebalance.
-  A stop on SIGTERM hands the partitions over at once. After a crash, the takeover waits for the
-  Iggy session timeout, 1.2 times `heartbeat.interval`, 36 s by default (not tested).
+  A stop on SIGTERM hands the partitions over without waiting for the session timeout. After a
+  crash, the takeover waits for the Iggy session timeout, 1.2 times `heartbeat.interval`, 36 s by
+  default (not tested).
 - Metadata lists each gateway that owns a log partition, and this gateway. It names this gateway
   as the leader of every partition. Any gateway can serve any partition, because the Iggy SDK
   sends each partition request to its primary. A client of a stopped or crashed gateway goes on
@@ -355,11 +356,14 @@ cargo run -p iggy-gateway-kafka
   consumer group `kafka-gateways` in the stream `<default stream>.meta`, where the cluster id
   lives. It needs `manage_topics` there, or an operator creates the topics first and grants it
   `read_topics`, `poll_messages` and `send_messages`. `read_topics` also covers the group.
-- An operator's `coordinators` topic needs 16 partitions, durability `persisted`, and an expiry
-  of 25 hours or more, or none. The gateway does not start with any other.
+- An operator's `coordinators` topic needs 16 partitions, durability `persisted`, an expiry of
+  25 hours or more, or none, and an unlimited max size. The gateway does not start with any
+  other.
 - The log needs `manage_servers` on the bridge's Iggy user, to learn from Iggy's change log which
-  topics Iggy deletes. Without it the gateway does not start: a topic created again would start
-  at the deleted topic's offsets.
+  topics Iggy deletes. Without it, a gateway with the log on by default runs without the log and
+  logs a warning. With `IGGY_KAFKA_COORDINATOR_LOG=true` it does not start: a topic created again
+  would start at the deleted topic's offsets. Give every gateway's bridge user the same
+  permissions, since gateways with and without the log name different coordinators.
 - With `IGGY_KAFKA_COORDINATOR_LOG=false`, the gateway with the lowest node id coordinates every
   group, and while it is down the groups wait for it.
 - Gateways with and without the log name different coordinators for a group. To upgrade from a

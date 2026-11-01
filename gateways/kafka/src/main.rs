@@ -38,7 +38,7 @@ use iggy_gateway_kafka::listener::{
 use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
 use iggy_gateway_kafka::server::{bind_listeners, init_tracing};
 use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
-use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
+use iggy_gateway_kafka::{CoordinatorLog, GatewayConfig, KafkaGateway};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -399,10 +399,19 @@ fn load_config() -> Result<GatewayConfig, String> {
 }
 
 /// Whether the gateways share their groups through the coordinator log. On by default when
-/// `IGGY_KAFKA_BROKERS` lists the gateways and the bridge is on.
-fn load_coordinator_log(config: &GatewayConfig, bridge_enabled: bool) -> Result<bool, String> {
+/// `IGGY_KAFKA_BROKERS` lists the gateways and the bridge is on, unless the bridge user cannot
+/// read Iggy's metadata change log. Set on, the log needs that.
+fn load_coordinator_log(
+    config: &GatewayConfig,
+    bridge_enabled: bool,
+) -> Result<CoordinatorLog, String> {
     let Some(raw) = env_var("IGGY_KAFKA_COORDINATOR_LOG") else {
-        return Ok(bridge_enabled && !config.brokers.is_empty());
+        let preferred = bridge_enabled && !config.brokers.is_empty();
+        return Ok(if preferred {
+            CoordinatorLog::Preferred
+        } else {
+            CoordinatorLog::Off
+        });
     };
     let enabled = parse_bool("IGGY_KAFKA_COORDINATOR_LOG", &raw)?;
     if enabled && !bridge_enabled {
@@ -415,7 +424,11 @@ fn load_coordinator_log(config: &GatewayConfig, bridge_enabled: bool) -> Result<
              groups do not move when it stops"
         );
     }
-    Ok(enabled)
+    Ok(if enabled {
+        CoordinatorLog::Required
+    } else {
+        CoordinatorLog::Off
+    })
 }
 
 /// This gateway's node id and the list of every gateway, from `IGGY_KAFKA_NODE_ID` and

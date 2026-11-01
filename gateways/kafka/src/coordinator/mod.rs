@@ -27,9 +27,11 @@
 //! Every gateway announces the partitions it owns on a second topic and reads the others'
 //! announcements, so any gateway can name the coordinator of a group and the controller.
 //!
-//! The log learns that Iggy deleted a topic from Iggy's metadata change log, so it needs the bridge
-//! to read that log. Without it, a topic created again under a deleted one's name would start at
-//! the deleted topic's offsets.
+//! Each logged offset names its topic's incarnation, the op of Iggy's metadata log that created the
+//! topic. The gateway learns of new and deleted topics from Iggy's metadata change log, so it
+//! needs the bridge to read that log. An answer skips each offset of an older incarnation than the
+//! change log shows. So a topic created again under a deleted one's name never starts at the
+//! deleted topic's offsets, also when no gateway heard of the deletion.
 
 mod partition;
 pub mod record;
@@ -44,7 +46,7 @@ use async_trait::async_trait;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, MissedTickBehavior, interval, interval_at, sleep_until};
+use tokio::time::{Instant, MissedTickBehavior, interval, interval_at, sleep_until, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -104,9 +106,10 @@ const CHANGE_LOG_WAIT: Duration = Duration::from_secs(10);
 /// Clients that append to the log. A client sends one append at a time.
 const WRITERS: usize = 4;
 
-/// How long a load still removes the offsets of a topic Iggy deleted. A partition that changes
-/// owner meanwhile has no owner to remove them, and a takeover after a crash waits for Iggy's
-/// session timeout, 36 s by default.
+/// How long a load and each sweep still remove the offsets of a topic Iggy deleted. A partition
+/// that changes owner meanwhile has no owner to remove them, and a takeover after a crash waits
+/// for Iggy's session timeout, 36 s by default. A sweep also takes a commit that was in flight at
+/// the deletion, and a removal that failed.
 const DELETION_MEMORY: Duration = Duration::from_mins(2);
 
 /// How the coordinator log behaves. No environment variable maps onto it.
@@ -312,12 +315,29 @@ impl Coordination {
         Ok(this)
     }
 
-    /// Leaves the lease group, so Iggy hands this gateway's partitions to the others at once,
-    /// then stops serving them. Their groups move with their members, so they do not rebalance.
-    ///
-    /// The lease loop stops first, and its read in flight ends: a read that finds this gateway no
-    /// member would join the group again, and Iggy would hand partitions back to it.
-    pub async fn shutdown(&self) {
+    /// Leaves the lease group, so Iggy hands this gateway's partitions to the others without
+    /// waiting for its session to end, then stops serving them. Their groups move with their
+    /// members, so they do not rebalance. Gives up on Iggy at `until`: the others then take over
+    /// when the session ends.
+    pub async fn shutdown(&self, until: Instant) {
+        if timeout_at(until, self.leave()).await.is_err() {
+            warn!(
+                "could not leave the coordinator lease group in time; the other gateways take over when the session ends"
+            );
+        }
+        self.release_all(Stop::Released).await;
+        self.cancel.cancel();
+    }
+
+    /// Signs the log's clients out of Iggy, after [`Self::shutdown`].
+    pub async fn close(&self) {
+        self.link.close().await;
+    }
+
+    /// Leaves the lease group. The lease loop stops first, and its read in flight ends: a read
+    /// that finds this gateway no member would join the group again, and Iggy would hand
+    /// partitions back to it.
+    async fn leave(&self) {
         self.leasing.cancel();
         let lease_loop = self
             .lease_loop
@@ -332,9 +352,6 @@ impl Coordination {
         if let Err(error) = self.link.leave_lease().await {
             warn!(%error, "could not leave the coordinator lease group; the other gateways take over when the session ends");
         }
-        self.release_all(Stop::Released).await;
-        self.cancel.cancel();
-        self.link.close().await;
     }
 
     /// The gateway that coordinates `group_id`, or `None` while no gateway is known to.
@@ -452,7 +469,8 @@ impl Coordination {
     }
 
     /// The offsets the log holds of `group_id` for the partitions of each topic of `partitions`,
-    /// or for every partition with `None`. `None` when the log holds none of the group.
+    /// or for every partition with `None`. `None` when the log holds none of the group. Leaves
+    /// out each offset of an older incarnation of its topic than the change log shows.
     ///
     /// # Errors
     ///
@@ -463,7 +481,10 @@ impl Coordination {
         partitions: Option<&[(&str, &[i32])]>,
     ) -> Result<Option<GroupOffsets>, i16> {
         let log = self.serving(group_id)?;
-        Ok(log
+        // A newer incarnation that the change log shows proves the older one deleted, however
+        // far the change log is behind the log.
+        let topics = Arc::clone(&self.topics.borrow());
+        let offsets = log
             .with_state(|state| {
                 let offsets = state.offsets.get(group_id)?;
                 let Some(partitions) = partitions else {
@@ -484,7 +505,12 @@ impl Coordination {
                     entries,
                 })
             })
-            .await)
+            .await;
+        Ok(offsets.map(|mut offsets| {
+            offsets
+                .drop_older_incarnations(|topic| topics.get(topic).map(|shape| shape.incarnation));
+            offsets
+        }))
     }
 
     /// Every group the log holds state or offsets for, in the partitions this gateway serves.
@@ -566,7 +592,7 @@ impl Coordination {
                     match read {
                         Ok(Some(assigned)) => {
                             last_read = Instant::now();
-                            self.reconcile(&assigned).await;
+                            self.reconcile(&assigned);
                         }
                         Ok(None) => {
                             last_read = Instant::now();
@@ -592,24 +618,16 @@ impl Coordination {
         }
     }
 
-    /// Releases the partitions Iggy took away and loads the ones it gave.
-    async fn reconcile(self: &Arc<Self>, assigned: &[u32]) {
-        let assigned: HashSet<u32> = assigned
+    /// Loads the partitions Iggy gives this gateway. A partition that leaves its share stays served
+    /// until another gateway claims it: Iggy can take until the lease group's rebalancing timeout
+    /// to hand it over, and its groups keep a coordinator meanwhile.
+    fn reconcile(self: &Arc<Self>, assigned: &[u32]) {
+        let now = Instant::now();
+        for partition in assigned
             .iter()
             .copied()
             .filter(|partition| *partition < PARTITIONS)
-            .collect();
-        let taken: Vec<u32> = self
-            .served()
-            .keys()
-            .copied()
-            .filter(|partition| !assigned.contains(partition))
-            .collect();
-        for partition in taken {
-            self.release(partition, Stop::Released).await;
-        }
-        let now = Instant::now();
-        for partition in assigned {
+        {
             // A log that stopped on its own stays until `take_stop` releases it, which evicts the
             // partition's groups. A load before that would lose the groups it restored.
             let held = self.served().contains_key(&partition);
@@ -682,11 +700,11 @@ impl Coordination {
                     "took the coordinator log partition over"
                 );
                 self.announce(partition, claim);
-                for deleted in self.recent_deletions() {
-                    forget_topic(&log, &deleted).await;
-                }
+                self.forget_recent_deletions(&log).await;
                 if self.missed_recently() {
                     self.forget_missed_topics(&log).await;
+                } else {
+                    self.forget_older_incarnations(&log).await;
                 }
             }
             Ok(None) => {
@@ -917,6 +935,7 @@ impl Coordination {
             let logs: Vec<Arc<PartitionLog>> = self.served().values().cloned().collect();
             for log in logs {
                 self.forget_gone_groups(&log).await;
+                self.forget_recent_deletions(&log).await;
                 if expire {
                     self.expire_offsets(&log).await;
                 }
@@ -986,7 +1005,14 @@ impl Coordination {
             self.remember_deletion(&deleted);
             let logs: Vec<Arc<PartitionLog>> = self.served().values().cloned().collect();
             for log in logs {
-                forget_topic(&log, &deleted).await;
+                if let Err(error) = forget_topic(&log, &deleted).await {
+                    warn!(
+                        partition = log.partition,
+                        topic = deleted.name,
+                        error,
+                        "could not remove a deleted topic's offsets from the coordinator log; the next sweep tries again"
+                    );
+                }
             }
         }
     }
@@ -1027,6 +1053,33 @@ impl Coordination {
             })
             .await;
         append_drops(log, bodies, "missed topic deletions").await;
+    }
+
+    /// Removes from `log` the offsets of each topic incarnation older than the one the change log
+    /// shows, so a deletion that no gateway heard of, as while every gateway was down, still
+    /// reaches the log.
+    async fn forget_older_incarnations(&self, log: &PartitionLog) {
+        let bodies = log
+            .with_state(|state| {
+                let topics = Arc::clone(&self.topics.borrow());
+                state.older_incarnations(|topic| topics.get(topic).map(|shape| shape.incarnation))
+            })
+            .await;
+        append_drops(log, bodies, "older topic incarnations").await;
+    }
+
+    /// Removes from `log` the offsets of each topic Iggy deleted within [`DELETION_MEMORY`].
+    async fn forget_recent_deletions(&self, log: &PartitionLog) {
+        for deleted in self.recent_deletions() {
+            if let Err(error) = forget_topic(log, &deleted).await {
+                debug!(
+                    partition = log.partition,
+                    topic = deleted.name,
+                    error,
+                    "could not remove a deleted topic's offsets from the coordinator log"
+                );
+            }
+        }
     }
 
     fn recent_deletions(&self) -> Vec<DeletedTopic> {
@@ -1122,26 +1175,22 @@ fn logs_group(state: &PartitionState, group_id: &str) -> bool {
 }
 
 /// Removes from `log` the offsets that `deleted` takes, when it holds any.
-async fn forget_topic(log: &PartitionLog, deleted: &DeletedTopic) {
+///
+/// # Errors
+///
+/// The Kafka code of the failed append.
+async fn forget_topic(log: &PartitionLog, deleted: &DeletedTopic) -> Result<(), i16> {
     let holds = log
         .with_state(|state| state.holds_topic(&deleted.name, deleted.incarnation))
         .await;
     if !holds {
-        return;
+        return Ok(());
     }
-    let partition = log.partition;
     let body = Body::TopicOffsetsDeleted {
         topic: deleted.name.clone(),
         incarnation: deleted.incarnation,
     };
-    if let Err(error) = log.append(vec![body]).await {
-        warn!(
-            partition,
-            topic = deleted.name,
-            error,
-            "could not remove a deleted topic's offsets from the coordinator log"
-        );
-    }
+    log.append(vec![body]).await.map(drop)
 }
 
 #[async_trait]

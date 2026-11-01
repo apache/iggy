@@ -563,8 +563,9 @@ impl PartitionLog {
                 next = last.offset + 1;
             }
         };
+        // Also after a cancel of the parent token, as in `write_on`.
+        self.stop();
         if let Some(stop) = stop {
-            self.stop();
             let _ = stopped.send(Stopped {
                 partition: self.partition,
                 claim: self.claim,
@@ -642,7 +643,9 @@ impl PartitionLog {
             let first = if let Some(first) = held.take() {
                 Some(first)
             } else {
+                // The stop first, so the writer takes no append after it.
                 tokio::select! {
+                    biased;
                     () = self.stop.cancelled() => break None,
                     first = queue.recv() => match first {
                         Some(first) => Some(first),
@@ -668,6 +671,10 @@ impl PartitionLog {
                 })
                 .await;
             if due && let Err(error) = self.write_checkpoint(&link, &mut queue, &mut held).await {
+                // A stop during the checkpoint ends it, and is no failure.
+                if !self.is_serving() {
+                    break None;
+                }
                 warn!(partition = self.partition, %error, "a coordinator log checkpoint failed; giving the partition up");
                 break Some(Stop::InDoubt);
             }
@@ -680,8 +687,10 @@ impl PartitionLog {
         for append in unsent {
             let _ = append.done.send(Err(ERROR_NOT_COORDINATOR));
         }
+        // Also after a cancel of the parent token, which stops the partition without a call to
+        // `stop`: the appends that wait for the reader get an answer.
+        self.stop();
         if let Some(stop) = stop {
-            self.stop();
             let _ = stopped.send(Stopped {
                 partition: self.partition,
                 claim: self.claim,
@@ -740,9 +749,27 @@ impl PartitionLog {
             records.extend(append.records);
         }
         let ids = waiters.iter().map(|(id, _)| *id).collect();
-        self.pending().extend(waiters);
+        if !self.track(waiters) {
+            return Ok(Vec::new());
+        }
         link.append(self.partition, records).await?;
         Ok(ids)
+    }
+
+    /// Adds `waiters` to `pending` under the lock that [`Self::stop`] drains it with. A waiter
+    /// added before a stop is answered by the stop. One that comes after gets `NOT_COORDINATOR`
+    /// here, and its records are not sent. Returns whether the waiters went to `pending`.
+    fn track(&self, waiters: Vec<(u128, Waiter)>) -> bool {
+        let mut pending = self.pending();
+        if self.is_serving() {
+            pending.extend(waiters);
+            return true;
+        }
+        drop(pending);
+        for (_, waiter) in waiters {
+            let _ = waiter.done.send(Err(ERROR_NOT_COORDINATOR));
+        }
+        false
     }
 
     /// Sends one batch of the queued appends, if any. Returns the ids that [`Self::send`] does.
@@ -932,7 +959,9 @@ impl PartitionLog {
                 done,
                 _flight: None,
             };
-            self.pending().insert(*last, waiter);
+            if !self.track(vec![(*last, waiter)]) {
+                return Err(WriteError::Lost);
+            }
         }
         link.append(self.partition, records).await?;
         match timeout(APPEND_TIMEOUT, answer).await {
@@ -1058,6 +1087,35 @@ mod tests {
             Some(4),
             "the next send starts with what did not fit"
         );
+    }
+
+    /// A stop drains `pending` while the writer can be inside a send. A waiter the send adds
+    /// after that must still get an answer, or its caller waits out its deadline.
+    #[test]
+    fn given_a_stop_when_tracking_waiters_should_answer_each_not_coordinator() {
+        let (log, _queue) = unserved(MAX_BATCH_BYTES);
+        let waiter = |done| Waiter {
+            done,
+            _flight: None,
+        };
+        let (before, mut answer_before) = oneshot::channel();
+        assert!(log.track(vec![(1, waiter(before))]));
+
+        log.stop();
+        assert_eq!(
+            answer_before.try_recv(),
+            Ok(Err(ERROR_NOT_COORDINATOR)),
+            "the stop answers a waiter added before it"
+        );
+
+        let (after, mut answer_after) = oneshot::channel();
+        assert!(!log.track(vec![(2, waiter(after))]));
+        assert_eq!(
+            answer_after.try_recv(),
+            Ok(Err(ERROR_NOT_COORDINATOR)),
+            "a waiter added after the stop is answered at once"
+        );
+        assert!(log.pending().is_empty());
     }
 
     /// The Java consumer commits every assigned partition every 5 s, also when its position did

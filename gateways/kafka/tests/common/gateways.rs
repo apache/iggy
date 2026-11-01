@@ -55,7 +55,7 @@ use iggy_gateway_kafka::protocol::api::{
     API_KEY_OFFSET_FETCH, API_KEY_SYNC_GROUP, ERROR_NONE,
 };
 use iggy_gateway_kafka::server::{BoundListener, bind_listener};
-use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
+use iggy_gateway_kafka::{CoordinatorLog, GatewayConfig, KafkaGateway};
 
 use super::{tcp, wire};
 
@@ -121,7 +121,7 @@ pub fn gateway_config(node_id: u16, brokers: Vec<BrokerEntry>) -> GatewayConfig 
     GatewayConfig {
         node_id,
         brokers,
-        coordinator_log: true,
+        coordinator_log: CoordinatorLog::Required,
         shutdown_drain_timeout: Duration::from_secs(1),
         group: GroupCoordinatorConfig {
             initial_rebalance_delay: Duration::ZERO,
