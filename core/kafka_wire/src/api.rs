@@ -60,6 +60,8 @@ pub const ERROR_NOT_LEADER_OR_FOLLOWER: i16 = ResponseError::NotLeaderOrFollower
 /// Outcome unknown: the write may have landed. Retriable, so a retry can duplicate it.
 /// Idempotent produce (#3545) closes that.
 pub const ERROR_REQUEST_TIMED_OUT: i16 = ResponseError::RequestTimedOut.code();
+/// `OffsetCommit`: a partition's metadata is over Kafka's `offset.metadata.max.bytes`. Not retried.
+pub const ERROR_OFFSET_METADATA_TOO_LARGE: i16 = ResponseError::OffsetMetadataTooLarge.code();
 /// Produce: a record, send or partition too large, even alone. Not retried as-is. Java splits a
 /// multi-record batch and sends the halves.
 pub const ERROR_MESSAGE_TOO_LARGE: i16 = ResponseError::MessageTooLarge.code();
