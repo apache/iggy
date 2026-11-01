@@ -206,6 +206,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
 FROM debian:trixie-slim AS runtime-base
 WORKDIR /app
 
+# reqwest 0.13 fails to build a client when the system trust store is empty,
+# even for plain http:// URLs, which breaks open() in several plugins.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY LICENSE NOTICE /usr/share/doc/iggy-connect/
 
 ENTRYPOINT ["iggy-connectors"]
