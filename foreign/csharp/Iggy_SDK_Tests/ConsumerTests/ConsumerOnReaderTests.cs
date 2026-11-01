@@ -38,6 +38,9 @@ public sealed class ConsumerOnReaderTests
     private static readonly TimeSpan PromptLimit = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan RetryInterval = TimeSpan.FromMilliseconds(20);
 
+    /// <summary>A lost reply drops the connection, so what follows it waits for the client to connect again.</summary>
+    private static readonly TimeSpan LostReplyLimit = TimeSpan.FromSeconds(30);
+
     private static CancellationToken Token => TestContext.Current.CancellationToken;
 
     [Fact]
@@ -292,7 +295,7 @@ public sealed class ConsumerOnReaderTests
         var first = await ReceiveAsync(consumer, 2);
         cluster.LoseNextCommittingRead = true;
 
-        var error = await Assert.ThrowsAsync<ReadException>(() => ReceiveAsync(consumer, 1));
+        var error = await Assert.ThrowsAsync<ReadException>(() => ReceiveAsync(consumer, 1, LostReplyLimit));
 
         Assert.Equal([0ul, 1ul], first.Select(message => message.CurrentOffset));
         Assert.Equal((1u, VsrError.FETCH_PROGRESS_UNCERTAIN, true, true), (error.PartitionId,
@@ -457,10 +460,11 @@ public sealed class ConsumerOnReaderTests
         return consumer;
     }
 
-    private static async Task<List<ReceivedMessage>> ReceiveAsync(IggyConsumer consumer, int count)
+    private static async Task<List<ReceivedMessage>> ReceiveAsync(IggyConsumer consumer, int count,
+        TimeSpan? limit = null)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(Token);
-        timeout.CancelAfter(PromptLimit);
+        timeout.CancelAfter(limit ?? PromptLimit);
         List<ReceivedMessage> received = [];
         await foreach (var message in consumer.ReceiveAsync(timeout.Token))
         {
