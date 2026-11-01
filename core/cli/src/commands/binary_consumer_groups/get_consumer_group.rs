@@ -83,14 +83,6 @@ impl CliCommand for GetConsumerGroupCmd {
             })?;
 
         let consumer = Consumer::group(self.group_id.clone());
-        if consumer_group.partitions_count > iggy_common::MAX_PARTITIONS_COUNT {
-            anyhow::bail!(
-                "Consumer group with ID: {} reports partitions count {} above the limit {}",
-                self.group_id,
-                consumer_group.partitions_count,
-                iggy_common::MAX_PARTITIONS_COUNT
-            );
-        }
         // Size the indexes from the topic partition list. `partitions_count` is a
         // wire field, and a huge value must not allocate before the missing-id check.
         let index_len = topic.partitions.len();
@@ -175,7 +167,11 @@ impl CliCommand for GetConsumerGroupCmd {
 
             let (current_offset, stored_offset, lag) = match consumer_offset {
                 Some(offset_info) => {
-                    let lag = offset_info.current_offset - offset_info.stored_offset;
+                    // Recovery keeps a stored offset above the commit head when
+                    // acked messages were not flushed. Subtracting underflows.
+                    let lag = offset_info
+                        .current_offset
+                        .saturating_sub(offset_info.stored_offset);
                     (
                         format!("{}", offset_info.current_offset),
                         format!("{}", offset_info.stored_offset),
@@ -229,7 +225,9 @@ impl CliCommand for GetConsumerGroupCmd {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliCommand, GetConsumerGroupCmd};
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
     use async_broadcast::Receiver;
     use async_trait::async_trait;
     use iggy_common::{
@@ -246,6 +244,9 @@ mod tests {
         TopicCreateOptions, TopicDetails, TopicUpdateOptions, UserClient, UserInfo,
         UserInfoDetails, UserStatus, UserUpdateOptions,
     };
+    use tracing_subscriber::fmt::MakeWriter;
+
+    use super::{CliCommand, GetConsumerGroupCmd};
 
     #[derive(Debug, Clone, Copy)]
     enum TopicReply {
@@ -253,6 +254,7 @@ mod tests {
         Missing,
         Empty,
         OnePartition,
+        Count(u32),
     }
 
     #[derive(Debug)]
@@ -260,6 +262,31 @@ mod tests {
         partitions_count: u32,
         topic: TopicReply,
         offset_fails: bool,
+        /// `(current_offset, stored_offset)` returned for every partition.
+        offset: Option<(u64, u64)>,
+    }
+
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for LogBuffer {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(Arc::clone(&self.0))
+        }
     }
 
     fn fail<T>() -> Result<T, IggyError> {
@@ -509,6 +536,15 @@ mod tests {
                 TopicReply::Missing => Ok(None),
                 TopicReply::Empty => Ok(Some(topic_details(Vec::new()))),
                 TopicReply::OnePartition => Ok(Some(topic_details(vec![partition_zero()]))),
+                TopicReply::Count(count) => Ok(Some(topic_details(
+                    (0..count)
+                        .map(|id| {
+                            let mut partition = partition_zero();
+                            partition.id = id;
+                            partition
+                        })
+                        .collect(),
+                ))),
             }
         }
 
@@ -636,6 +672,12 @@ mod tests {
         ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
             if self.offset_fails {
                 Err(IggyError::Error)
+            } else if let Some((current_offset, stored_offset)) = self.offset {
+                Ok(Some(ConsumerOffsetInfo {
+                    partition_id: 0,
+                    current_offset,
+                    stored_offset,
+                }))
             } else {
                 Ok(None)
             }
@@ -733,6 +775,7 @@ mod tests {
             partitions_count: 1,
             topic: TopicReply::Error,
             offset_fails: false,
+            offset: None,
         })
         .await;
 
@@ -745,6 +788,7 @@ mod tests {
             partitions_count: 1,
             topic: TopicReply::Missing,
             offset_fails: false,
+            offset: None,
         })
         .await;
 
@@ -757,6 +801,7 @@ mod tests {
             partitions_count: 1,
             topic: TopicReply::Empty,
             offset_fails: false,
+            offset: None,
         })
         .await;
 
@@ -769,6 +814,7 @@ mod tests {
             partitions_count: 1,
             topic: TopicReply::OnePartition,
             offset_fails: true,
+            offset: None,
         })
         .await;
 
@@ -780,14 +826,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_reject_partitions_count_above_the_limit() {
-        let error = error_from(&ScriptedClient {
+    async fn should_render_group_above_the_per_request_partition_limit() {
+        let mut cmd = command();
+        cmd.execute_cmd(&ScriptedClient {
             partitions_count: MAX_PARTITIONS_COUNT + 1,
-            topic: TopicReply::Empty,
+            topic: TopicReply::Count(MAX_PARTITIONS_COUNT + 1),
             offset_fails: false,
+            offset: None,
         })
-        .await;
+        .await
+        .expect("a topic can grow past one create request");
+    }
 
-        assert!(error.to_string().contains("above the limit"));
+    #[tokio::test(flavor = "current_thread")]
+    async fn should_report_zero_lag_when_stored_offset_leads_current() {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_level(false)
+            .with_writer(LogBuffer(Arc::clone(&logs)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut cmd = command();
+        cmd.execute_cmd(&ScriptedClient {
+            partitions_count: 1,
+            topic: TopicReply::OnePartition,
+            offset_fails: false,
+            offset: Some((4, 10)),
+        })
+        .await
+        .expect("lag stays defined when the stored offset leads");
+
+        drop(_guard);
+        let output =
+            String::from_utf8(logs.lock().expect("log buffer").clone()).expect("log is utf-8");
+        assert!(
+            output.contains("4") && output.contains("10") && output.contains("| 0"),
+            "lag should clamp to zero, got {output}"
+        );
     }
 }
