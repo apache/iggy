@@ -63,6 +63,20 @@ pub async fn sync_group_assignment<B: BinaryClient>(
     topic_id: &Identifier,
     group_id: &Identifier,
 ) -> Result<(), IggyError> {
+    synced_group_assignment(client, stream_id, topic_id, group_id)
+        .await
+        .map(drop)
+}
+
+/// [`sync_group_assignment`], returning the generation and partitions it put in
+/// the cache, or `None` when the client is not a member. A read of the cache
+/// after it could see another call's change.
+pub(crate) async fn synced_group_assignment<B: BinaryClient>(
+    client: &B,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    group_id: &Identifier,
+) -> Result<Option<(u64, Vec<u32>)>, IggyError> {
     with_binary_lineage(client.operation_lineage(), async {
         let state = client.consumer_group_state();
         let request = SyncConsumerGroupRequest {
@@ -87,12 +101,13 @@ pub async fn sync_group_assignment<B: BinaryClient>(
                 generation,
                 group_cache_key(stream_id, topic_id, group_id),
                 (stream_id.clone(), topic_id.clone(), group_id.clone()),
-                assignment,
+                assignment.clone(),
             );
             match applied {
                 // A successful read from the replaced session cannot publish its old membership.
                 Err(IggyError::TransientNotAccepted) if tokio::time::Instant::now() < deadline => {}
-                outcome => return outcome,
+                Err(error) => return Err(error),
+                Ok(()) => return Ok(assignment),
             }
         }
     })

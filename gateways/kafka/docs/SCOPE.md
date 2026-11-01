@@ -443,9 +443,11 @@ below it are still open for the issues that build on top of it.
     and the Java client use - fail identically and permanently once the cluster's total partition
     count crosses the trip point, since that size is the catalog's own, not anything the
     requesting client chose or can shrink.
-- [x] Several gateways as brokers (`IGGY_KAFKA_BROKERS`): Metadata lists every gateway, and
-      each one leads every partition it reports. Leaders spread over the gateways, one
-      controller, and a coordinator per group are later work (#4515).
+- [x] Several gateways as brokers (`IGGY_KAFKA_BROKERS`): Metadata lists every live gateway.
+      With the coordinator log, a hash of each partition names its leader, the owner of log
+      partition 0 is the controller, and each group has one coordinator that another gateway
+      takes over when it stops (#4515, `docs/CONSUMER_GROUPS.md`). Without it, each gateway
+      leads every partition it reports.
 - [ ] A raw/non-conformant client's extra trailing byte on some Metadata request shapes seen
       against real `kcat`/`librdkafka` traffic in earlier testing on a since-restructured branch -
       not reproduced or root-caused against the current `kafka_protocol`-based decode path in this

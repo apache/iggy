@@ -964,6 +964,7 @@ mod tests {
     fn principal(username: &str) -> AuthenticatedPrincipal {
         AuthenticatedPrincipal {
             username: username.to_string(),
+            user: None,
             permissions: PrincipalPermissions::default(),
             permissions_known: true,
         }
