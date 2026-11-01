@@ -44,6 +44,7 @@ mod group_index;
 mod group_offsets;
 mod offsets;
 mod produce;
+mod producer_ids;
 mod topics;
 
 pub use change_log::{DeletedTopic, PermissionBoard, TopicShape, TopicShapes, UserAccess};
@@ -61,7 +62,8 @@ use group_offsets::OffsetPool;
 pub use group_offsets::{OFFSET_GROUP_PREFIX, OffsetCalls};
 pub(crate) use offsets::{LocatedRecord, RecordLookup};
 use produce::ProducePool;
-pub use produce::{ProduceTurn, Producer};
+pub use produce::{PartitionBatch, ProduceTurn, Producer};
+pub use producer_ids::{iggy_producer_id, kafka_producer_id};
 pub use topics::{
     DEFAULT_TOPIC_PARTITIONS, KafkaTopicMetadata, MAX_TOPIC_PARTITIONS, StreamTopicCache,
     TopicCreationOutcome, TopicLoad,
@@ -195,6 +197,10 @@ pub struct IggyBridge {
     permissions: Arc<PermissionBoard>,
     /// Gets each topic that the change log shows deleted.
     topic_deletions: broadcast::Sender<DeletedTopic>,
+    /// The client whose session hands out producer ids. See `next_producer_id`.
+    id_client: LazyClient,
+    /// The producer ids this gateway gave out, which Produce may key a session on.
+    issued_producer_ids: producer_ids::IssuedProducerIds,
 }
 
 /// The task that follows the change log. Dropping it stops the task.
@@ -280,6 +286,8 @@ impl IggyBridge {
             topic_shapes: Arc::new(watch::Sender::new(Arc::default())),
             permissions: Arc::default(),
             topic_deletions: broadcast::Sender::new(TOPIC_DELETIONS_CAPACITY),
+            id_client: LazyClient::default(),
+            issued_producer_ids: producer_ids::IssuedProducerIds::default(),
         };
         bridge.follow_change_log().await;
         Ok(bridge)
@@ -468,6 +476,7 @@ impl IggyBridge {
             offset_clients,
             scan_client,
             change_client,
+            id_client,
             shared_client,
         ) = tokio::join!(
             self.produce_pool.close(),
@@ -478,6 +487,7 @@ impl IggyBridge {
             self.offset_pool.close(),
             self.scan_client.close(),
             change_client,
+            self.id_client.close(),
             sign_out_and_shut_down(&self.client),
         );
         produce_clients
@@ -488,6 +498,7 @@ impl IggyBridge {
             .and(offset_clients)
             .and(scan_client)
             .and(change_client)
+            .and(id_client)
             .and(shared_client)
     }
 
@@ -562,6 +573,7 @@ impl IggyBridge {
             max_message_size: crate::bridge::DEFAULT_MAX_MESSAGE_SIZE,
             produce_sessions: crate::bridge::ProduceSessionLimits::default(),
             tls: crate::bridge::IggyTls::default(),
+            idempotent_producers: false,
             nodes: KnownNodes::default(),
         };
         let client = Arc::new(client);
@@ -584,6 +596,8 @@ impl IggyBridge {
             topic_shapes: Arc::new(watch::Sender::new(Arc::default())),
             permissions: Arc::default(),
             topic_deletions: broadcast::Sender::new(TOPIC_DELETIONS_CAPACITY),
+            id_client: LazyClient::default(),
+            issued_producer_ids: producer_ids::IssuedProducerIds::default(),
         }
     }
 }
